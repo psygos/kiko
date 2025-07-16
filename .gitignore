@@ -1,0 +1,4 @@
+# We should ignore all the targets and logs
+**/target/
+*.log
+
