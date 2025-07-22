@@ -186,6 +186,11 @@ fn main() -> ! {
 
                                 // Toggle LED to show command received
                                 led.toggle();
+                                
+                                // Send confirmation
+                                for byte in b"CMD_OK\r\n" {
+                                    block!(serial.write(*byte)).ok();
+                                }
                             }
                             parser_state = ParserState::WaitingForStart;
                             cmd_buffer.clear();
@@ -211,7 +216,7 @@ fn main() -> ! {
 
             // Optional: Simple telemetry (removed for minimal implementation)
             _loop_counter += 1;
-            if false {
+            if _loop_counter % 1000 == 0 {
                 // Disabled telemetry for minimal implementation
                 // Send simple telemetry without format! macro
                 for byte in b"TEL," {

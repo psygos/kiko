@@ -102,7 +102,8 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
         // freq 50Hz
         // parser based uart comms
         if last_command_time.elapsed() > tokio::time::Duration::from_millis(20) {
-            if let Some(cmd) = state.read().await.last_command.clone() {
+            let cmd_opt = state.read().await.last_command.clone();
+            if let Some(cmd) = cmd_opt {
                 let packet = format!(
                     "CMD,{},{},{}\n",
                     cmd.left_speed, cmd.right_speed, cmd.timeout_ms
@@ -117,7 +118,7 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                     println!("Successfully sent to STM32");
                 }
             } else {
-                println!("No command to send to STM32");
+                println!("No command to send to STM32 (last_command is None)");
             }
             last_command_time = tokio::time::Instant::now();
         }
