@@ -48,12 +48,20 @@ pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                     state_guard.last_command = Some(cmd);
                     state_guard.dashboard_addr = Some(addr);
 
-                    // Send immediate ACK with telemetry
-                    if let Some(ref telemetry) = state_guard.last_telemetry {
-                        if let Ok(data) = bincode::serialize(telemetry) {
-                            drop(state_guard); // Release lock before await
-                            socket.send_to(&data, addr).await?;
-                        }
+                    // Send immediate ACK with telemetry or default values
+                    let telemetry = state_guard.last_telemetry.clone().unwrap_or(RobotTelemetry {
+                        left_actual: 0,
+                        right_actual: 0,
+                        battery_mv: 0,
+                        timestamp_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u32,
+                    });
+                    
+                    if let Ok(data) = bincode::serialize(&telemetry) {
+                        drop(state_guard); // Release lock before await
+                        socket.send_to(&data, addr).await?;
                     }
                 }
             }
