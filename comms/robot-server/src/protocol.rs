@@ -63,22 +63,28 @@ pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
 }
 
 pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
+    println!("Starting serial service...");
     // this is where the stm32 port goes
     let port_names = vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyAMA0"];
     let mut port = None;
 
     for name in port_names {
+        println!("Trying to open serial port: {}", name);
         if let Ok(p) = tokio_serial::new(name, 115200)
             .timeout(std::time::Duration::from_millis(10))
             .open_native_async()
         {
+            println!("Serial port opened successfully: {}", name);
             log::info!("Serial port opened: {}", name);
             port = Some(p);
             break;
+        } else {
+            println!("Failed to open serial port: {}", name);
         }
     }
 
     let mut port = port.ok_or_else(|| anyhow::anyhow!("No serial port found"))?;
+    println!("Serial service initialized, entering main loop...");
 
     let mut serial_buf = vec![0u8; 256];
     let mut rx_buffer = Vec::new();
