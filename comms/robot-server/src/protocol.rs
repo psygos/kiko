@@ -94,10 +94,16 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                     cmd.left_speed, cmd.right_speed, cmd.timeout_ms
                 );
 
+                println!("Sending to STM32: {}", packet.trim());
                 use tokio::io::AsyncWriteExt;
                 if let Err(e) = port.write_all(packet.as_bytes()).await {
+                    println!("Serial write error: {}", e);
                     log::error!("Serial write error: {}", e);
+                } else {
+                    println!("Successfully sent to STM32");
                 }
+            } else {
+                println!("No command to send to STM32");
             }
             last_command_time = tokio::time::Instant::now();
         }
@@ -105,10 +111,12 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
         use tokio::io::AsyncReadExt;
         match port.read(&mut serial_buf).await {
             Ok(n) if n > 0 => {
+                println!("Received {} bytes from STM32: {:?}", n, &serial_buf[..n]);
                 rx_buffer.extend_from_slice(&serial_buf[..n]);
 
                 while let Some(pos) = rx_buffer.iter().position(|&b| b == b'\n') {
                     let line = String::from_utf8_lossy(&rx_buffer[..pos]).to_string();
+                    println!("STM32 response: {}", line);
                     rx_buffer.drain(..=pos);
 
                     let parts: Vec<&str> = line.split(',').collect();
