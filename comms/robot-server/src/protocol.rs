@@ -39,7 +39,9 @@ pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, addr)) => {
+                println!("Received {} bytes from {}", len, addr);
                 if let Ok(cmd) = bincode::deserialize::<RobotCommand>(&buf[..len]) {
+                    println!("Received command: {:?} from {}", cmd, addr);
                     log::debug!("Received command: {:?} from {}", cmd, addr);
 
                     let mut state_guard = state.write().await;
