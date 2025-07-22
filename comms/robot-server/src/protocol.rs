@@ -96,7 +96,7 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
 
     let mut serial_buf = vec![0u8; 256];
     let mut rx_buffer = Vec::new();
-    let mut last_command_time = tokio::time::Instant::now();
+    let mut last_command_time = tokio::time::Instant::now() - tokio::time::Duration::from_millis(25);
 
     loop {
         // freq 50Hz
