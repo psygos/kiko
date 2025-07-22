@@ -33,24 +33,38 @@ fn main() -> ! {
         let mut delay = cp.SYST.delay(&clocks);
 
         let gpioa = dp.GPIOA.split();
+        let gpiob = dp.GPIOB.split();
 
         // PA5 is the onboard led. We will use it to indicate update in pwm
         let mut led = gpioa.pa5.into_push_pull_output();
 
-        // HAL 0.20 uses a *ChannelBuilder* wrapper per channel.  Wrap our
-        // PA6 pin in a `Channel1` builder, pass it as a 1-tuple, then obtain
-        // the split single-channel handle.
-        let channels = (
-            Channel1::new(gpioa.pa6.into_alternate()),
-            Channel2::new(gpioa.pa7.into_alternate()),
+        // Left motor on TIM2 (PA0, PA1)
+        let left_channels = (
+            Channel1::new(gpioa.pa0.into_alternate()),
+            Channel2::new(gpioa.pa1.into_alternate()),
         );
-        let (mut pwm_channel, _) = dp.TIM3
-            .pwm_hz(channels, 20.kHz(), &clocks)
-            .split();
+        let (mut left_ch1, mut left_ch2) = dp.TIM2.pwm_hz(left_channels, 20.kHz(), &clocks).split();
 
-        let max_duty = pwm_channel.get_max_duty();
-        pwm_channel.enable();
-        pwm_channel.set_duty(0);
+        // Right motor on TIM3 (PB4, PB5)
+        let right_channels = (
+            Channel1::new(gpiob.pb4.into_alternate()),
+            Channel2::new(gpiob.pb5.into_alternate()),
+        );
+        let (mut right_ch1, mut right_ch2) = dp.TIM3.pwm_hz(right_channels, 20.kHz(), &clocks).split();
+
+        let max_duty = left_ch1.get_max_duty();
+        
+        // Enable all PWM channels
+        left_ch1.enable();
+        left_ch2.enable();
+        right_ch1.enable();
+        right_ch2.enable();
+        
+        // Initialize all channels to 0
+        left_ch1.set_duty(0);
+        left_ch2.set_duty(0);
+        right_ch1.set_duty(0);
+        right_ch2.set_duty(0);
 
         let mut duty: i16 = 0;
         let mut sign: i16 = 1;
@@ -69,7 +83,10 @@ fn main() -> ! {
             }
 
             let pwm_value = (duty as u32 * max_duty as u32 / 255) as u16;
-            pwm_channel.set_duty(pwm_value);
+            
+            // Set both motors to same speed for demo
+            left_ch1.set_duty(pwm_value);
+            right_ch1.set_duty(pwm_value);
 
             led.toggle();
             delay.delay_ms(5000_u32);
@@ -80,5 +97,3 @@ fn main() -> ! {
         cortex_m::asm::nop();
     }
 }
-
-
