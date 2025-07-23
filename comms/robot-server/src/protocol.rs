@@ -105,7 +105,7 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
             let cmd_opt = state.read().await.last_command.clone();
             if let Some(cmd) = cmd_opt {
                 let packet = format!(
-                    "CMD,{},{},{}\n",
+                    "CMD,{},{},{}\n", 
                     cmd.left_speed, cmd.right_speed, cmd.timeout_ms
                 );
 
