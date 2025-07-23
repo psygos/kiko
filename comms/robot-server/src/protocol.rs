@@ -5,6 +5,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio_serial::SerialPortBuilderExt;
 use warp::Filter;
+use std::convert::Infallible;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RobotCommand {
@@ -73,7 +74,21 @@ pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
 pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
     println!("Starting serial service...");
     // this is where the stm32 port goes
-    let port_names = vec!["/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyAMA0"];
+    // Try a set of common serial port paths for Linux and macOS so the server works cross-platform.
+    // On macOS, USB CDC devices typically appear as /dev/cu.usb* or /dev/tty.usb*.
+    let port_names = vec![
+        // Typical Linux interfaces
+        "/dev/ttyACM0",
+        "/dev/ttyUSB0",
+        "/dev/ttyAMA0",
+        // Common macOS interfaces
+        "/dev/cu.usbmodem1103",
+        "/dev/tty.usbmodem1103",
+        "/dev/cu.usbmodem",
+        "/dev/tty.usbmodem",
+        "/dev/cu.usbserial",
+        "/dev/tty.usbserial",
+    ];
     let mut port = None;
 
     for name in port_names {
@@ -182,7 +197,18 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
             .body("Video streaming coming soon")
     });
 
-    let routes = status.or(video);
+    // /debug returns latest command & telemetry so we can trace end-to-end
+    let debug = warp::path("debug")
+        .and(state_filter.clone())
+        .and_then(|state: Arc<RwLock<RobotState>>| async move {
+            let s = state.read().await;
+            Ok::<_, Infallible>(warp::reply::json(&serde_json::json!({
+                "last_command": s.last_command,
+                "last_telemetry": s.last_telemetry,
+            })))
+        });
+
+    let routes = status.or(video).or(debug);
 
     log::info!("HTTP service starting on :3030");
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
