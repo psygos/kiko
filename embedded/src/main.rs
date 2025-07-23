@@ -49,9 +49,9 @@ fn main() -> ! {
         // PA5 is the onboard led. We will use it to indicate update in pwm
         let mut led = gpioa.pa5.into_push_pull_output();
 
-        // UART Setup (PA2/PA3 for USART2)
-        let tx = gpioa.pa2.into_alternate();
-        let rx = gpioa.pa3.into_alternate();
+        // UART Setup via CN1 VCP: PA2 (USART2_TX) and PA3 (USART2_RX)
+        let tx = gpioa.pa2.into_alternate::<7>();
+        let rx = gpioa.pa3.into_alternate::<7>();
 
         let mut serial = Serial::new(
             dp.USART2,
@@ -110,6 +110,10 @@ fn main() -> ! {
             // Handle UART reception
             if let Ok(byte) = serial.read() {
                 match parser_state {
+                    // Ignore carriage return characters
+                    _ if byte == b'\r' => {
+                        // skip '\r' characters entirely
+                    }
                     ParserState::WaitingForStart => {
                         if byte == b'C' {
                             parser_state = ParserState::ReadingCommand;
@@ -158,11 +162,12 @@ fn main() -> ! {
                                 // Apply motor speeds
                                 // Left motor speed control
                                 if left_speed > 0 {
-                                    let duty = (left_speed as u16 * max_duty / 100) as u16;
+                                    // Compute duty in u32 to avoid u16 overflow then cast back
+                                    let duty = (left_speed as u32 * max_duty as u32 / 100) as u16;
                                     left_ch1.set_duty(duty);
                                     left_ch2.set_duty(0);
                                 } else if left_speed < 0 {
-                                    let duty = ((-left_speed) as u16 * max_duty / 100) as u16;
+                                    let duty = ((-left_speed) as u32 * max_duty as u32 / 100) as u16;
                                     left_ch1.set_duty(0);
                                     left_ch2.set_duty(duty);
                                 } else {
@@ -172,11 +177,11 @@ fn main() -> ! {
 
                                 // Right motor speed control
                                 if right_speed > 0 {
-                                    let duty = (right_speed as u16 * max_duty / 100) as u16;
+                                    let duty = (right_speed as u32 * max_duty as u32 / 100) as u16;
                                     right_ch1.set_duty(duty);
                                     right_ch2.set_duty(0);
                                 } else if right_speed < 0 {
-                                    let duty = ((-right_speed) as u16 * max_duty / 100) as u16;
+                                    let duty = ((-right_speed) as u32 * max_duty as u32 / 100) as u16;
                                     right_ch1.set_duty(0);
                                     right_ch2.set_duty(duty);
                                 } else {
@@ -186,9 +191,24 @@ fn main() -> ! {
 
                                 // Toggle LED to show command received
                                 led.toggle();
-                                
-                                // Send confirmation
-                                for byte in b"CMD_OK\r\n" {
+
+                                // --- Immediate telemetry so host can verify PWM update ---
+                                // Send prefix
+                                for byte in b"TEL," {
+                                    block!(serial.write(*byte)).ok();
+                                }
+
+                                // Write left and right speeds as ASCII using heapless String to avoid borrow checker issues
+                                use core::fmt::Write as _;
+                                let mut buf: heapless::String<8> = heapless::String::new();
+                                // guaranteed to fit: "-100,-100" is 8 bytes
+                                let _ = write!(buf, "{},{}", left_speed, right_speed);
+                                for &b in buf.as_bytes() {
+                                    block!(serial.write(b)).ok();
+                                }
+
+                                // Placeholder battery value zero and line termination
+                                for byte in b",0\r\n" {
                                     block!(serial.write(*byte)).ok();
                                 }
                             }
@@ -219,6 +239,7 @@ fn main() -> ! {
             if _loop_counter % 1000 == 0 {
                 // Disabled telemetry for minimal implementation
                 // Send simple telemetry without format! macro
+                // --- Telemetry output ---
                 for byte in b"TEL," {
                     block!(serial.write(*byte)).ok();
                 }
@@ -268,11 +289,9 @@ fn main() -> ! {
                         block!(serial.write(byte)).ok();
                     }
                 }
-                for byte in b"\r\n" {
-                    block!(serial.write(*byte)).ok();
-                }
-                for byte in b"dummy" {
-                    // Disabled code
+
+                // Send a placeholder battery value of 0 and terminate with CR LF
+                for byte in b",0\r\n" {
                     block!(serial.write(*byte)).ok();
                 }
             }
