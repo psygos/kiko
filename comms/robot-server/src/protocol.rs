@@ -185,8 +185,6 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
 }
 
 pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
-    let state_filter = warp::any().map(move || state.clone());
-    
     // Create video broadcast channel
     let (video_tx, _) = broadcast::channel::<Bytes>(4);
     
@@ -195,6 +193,8 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
         let mut state_guard = state.write().await;
         state_guard.video_tx = Some(video_tx.clone());
     }
+    
+    let state_filter = warp::any().map(move || state.clone());
     
     // Spawn GStreamer process for USB camera
     tokio::spawn(async move {
