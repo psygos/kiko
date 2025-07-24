@@ -2,10 +2,16 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, broadcast};
 use tokio_serial::SerialPortBuilderExt;
 use warp::Filter;
 use std::convert::Infallible;
+use futures::StreamExt;
+use bytes::Bytes;
+use std::process::Stdio;
+use tokio::process::Command;
+use warp::hyper::Body;
+use tokio_stream::wrappers::BroadcastStream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RobotCommand {
@@ -27,8 +33,9 @@ pub struct RobotTelemetry {
 pub struct RobotState {
     pub last_command: Option<RobotCommand>,
     pub last_telemetry: Option<RobotTelemetry>,
-    pub video_frame: Vec<u8>, // This is a placeholder rn, will add functionality next
+    pub video_frame: Vec<u8>,
     pub dashboard_addr: Option<std::net::SocketAddr>,
+    pub video_tx: Option<broadcast::Sender<Bytes>>,
 }
 
 pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
@@ -179,6 +186,93 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
 
 pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
     let state_filter = warp::any().map(move || state.clone());
+    
+    // Create video broadcast channel
+    let (video_tx, _) = broadcast::channel::<Bytes>(4);
+    
+    // Store the sender in state
+    {
+        let mut state_guard = state.write().await;
+        state_guard.video_tx = Some(video_tx.clone());
+    }
+    
+    // Spawn GStreamer process for USB camera
+    tokio::spawn(async move {
+        println!("Starting camera stream...");
+        
+        // Try different camera devices
+        let devices = vec!["/dev/video0", "/dev/video1", "/dev/video2"];
+        let mut camera_found = false;
+        
+        for device in devices {
+            // Check if device exists
+            if std::path::Path::new(device).exists() {
+                println!("Found camera at {}", device);
+                camera_found = true;
+                
+                // Simple v4l2 capture and JPEG encoding
+                let output = Command::new("ffmpeg")
+                    .args(&[
+                        "-f", "v4l2",
+                        "-video_size", "640x480",
+                        "-framerate", "30",
+                        "-i", device,
+                        "-f", "mjpeg",
+                        "-q:v", "5",  // Quality 1-31 (lower is better)
+                        "-"
+                    ])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn();
+                
+                if let Ok(mut child) = output {
+                    if let Some(stdout) = child.stdout.take() {
+                        let mut reader = tokio::io::BufReader::new(stdout);
+                        let mut buffer = vec![0u8; 65536];
+                        let mut jpeg_buffer = Vec::new();
+                        
+                        loop {
+                            use tokio::io::AsyncReadExt;
+                            match reader.read(&mut buffer).await {
+                                Ok(0) => break, // EOF
+                                Ok(n) => {
+                                    jpeg_buffer.extend_from_slice(&buffer[..n]);
+                                    
+                                    // Look for JPEG markers
+                                    while let Some(start) = find_jpeg_start(&jpeg_buffer) {
+                                        if let Some(end) = find_jpeg_end(&jpeg_buffer[start..]) {
+                                            let frame_end = start + end + 2;
+                                            let frame = jpeg_buffer[start..frame_end].to_vec();
+                                            
+                                            // Broadcast the frame
+                                            let _ = video_tx.send(Bytes::from(frame));
+                                            
+                                            // Remove processed data
+                                            jpeg_buffer.drain(..frame_end);
+                                        } else {
+                                            break; // Wait for more data
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Camera read error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Clean up
+                    let _ = child.kill().await;
+                }
+                break;
+            }
+        }
+        
+        if !camera_found {
+            eprintln!("No camera found. Video streaming disabled.");
+        }
+    });
 
     let status = warp::path("status")
         .and(state_filter.clone())
@@ -190,14 +284,49 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
             }))
         });
 
-    let video = warp::path("video").map(|| {
-        warp::http::Response::builder()
-            .status(200)
-            .header("Content-Type", "text/plain")
-            .body("Video streaming coming soon")
-    });
+    // MJPEG stream endpoint
+    let video = warp::path("video.mjpeg")
+        .and(state_filter.clone())
+        .and_then(|state: Arc<RwLock<RobotState>>| async move {
+            let rx = {
+                let state_guard = state.read().await;
+                state_guard.video_tx.as_ref().map(|tx| tx.subscribe())
+            };
+            
+            if let Some(rx) = rx {
+                let stream = BroadcastStream::new(rx);
+                let body_stream = stream
+                    .filter_map(|result| async move {
+                        result.ok().map(|frame| {
+                            let mut data = Vec::new();
+                            data.extend_from_slice(b"--frame\r\n");
+                            data.extend_from_slice(b"Content-Type: image/jpeg\r\n");
+                            data.extend_from_slice(b"Content-Length: ");
+                            data.extend_from_slice(frame.len().to_string().as_bytes());
+                            data.extend_from_slice(b"\r\n\r\n");
+                            data.extend_from_slice(&frame);
+                            data.extend_from_slice(b"\r\n");
+                            
+                            Ok::<_, std::convert::Infallible>(Bytes::from(data))
+                        })
+                    });
+                
+                let response = warp::http::Response::builder()
+                    .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                    .header("Cache-Control", "no-cache")
+                    .body(Body::wrap_stream(body_stream))
+                    .unwrap();
+                
+                Ok::<_, std::convert::Infallible>(response)
+            } else {
+                let response = warp::http::Response::builder()
+                    .status(503)
+                    .body(Body::from("Video stream not available"))
+                    .unwrap();
+                Ok(response)
+            }
+        });
 
-    // /debug returns latest command & telemetry so we can trace end-to-end
     let debug = warp::path("debug")
         .and(state_filter.clone())
         .and_then(|state: Arc<RwLock<RobotState>>| async move {
@@ -214,4 +343,15 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
 
     Ok(())
+}
+
+// Helper functions for JPEG parsing
+fn find_jpeg_start(data: &[u8]) -> Option<usize> {
+    data.windows(2)
+        .position(|window| window[0] == 0xFF && window[1] == 0xD8)
+}
+
+fn find_jpeg_end(data: &[u8]) -> Option<usize> {
+    data.windows(2)
+        .position(|window| window[0] == 0xFF && window[1] == 0xD9)
 }
