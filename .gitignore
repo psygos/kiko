@@ -2,3 +2,29 @@
 **/target/
 *.log
 
+# Rust lock files
+Cargo.lock
+
+# Node modules and dependencies
+node_modules/
+package-lock.json
+
+# Build outputs
+dist/
+dist-ssr/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+.env.local
+
