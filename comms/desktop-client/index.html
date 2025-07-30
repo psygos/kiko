@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kiko's Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: #F6F7F2;
+            color: #333;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .dashboard {
+            display: grid;
+            grid-template-columns: minmax(800px, 920px) 82px 1fr;
+            grid-template-rows: 1fr;
+            height: 100vh;
+            gap: 0;
+            padding: 0;
+            min-width: 1200px;
+        }
+        
+        /* Responsive breakpoints */
+        @media (max-width: 1400px) {
+            .dashboard {
+                grid-template-columns: 856px 82px 1fr;
+                min-width: 1100px;
+            }
+            
+            .video-panel {
+                width: 720px;
+                height: 405px;
+                margin: 30px 20px 0 30px;
+            }
+            
+            .control-panel {
+                margin: 30px 30px 20px 30px;
+            }
+            
+            .odometry-box, .status-box, .control-box, .debug-log {
+                width: 360px;
+            }
+            
+            .odometry-box {
+                height: 240px;
+            }
+        }
+        
+        @media (max-width: 1200px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+                grid-template-rows: auto auto;
+                min-width: 800px;
+                padding: 20px;
+                gap: 20px;
+            }
+            
+            .blue-separator {
+                display: none;
+            }
+            
+            .video-panel {
+                width: 100%;
+                max-width: 800px;
+                height: auto;
+                aspect-ratio: 16/9;
+                margin: 0 auto;
+                justify-self: center;
+            }
+            
+            .control-panel {
+                margin: 0;
+                max-width: 800px;
+                justify-self: center;
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+                gap: 20px;
+            }
+            
+            .odometry-box, .status-box, .control-box, .debug-log {
+                width: 100%;
+                min-width: 380px;
+            }
+            
+            .debug-log {
+                grid-column: 1 / -1;
+            }
+        }
+        
+        @media (max-width: 900px) {
+            .dashboard {
+                padding: 15px;
+                gap: 15px;
+            }
+            
+            .video-panel {
+                height: auto;
+                aspect-ratio: 16/9;
+            }
+            
+            .control-panel {
+                grid-template-columns: 1fr;
+            }
+            
+            .odometry-box, .status-box, .control-box, .debug-log {
+                min-width: 300px;
+            }
+            
+            .odometry-box {
+                height: 200px;
+            }
+            
+            .status-box {
+                height: 100px;
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .status-box > div {
+                flex-direction: row;
+                gap: 15px;
+            }
+        }
+        
+        /* Video Panel */
+        .video-panel {
+            background: #fff;
+            width: 800px;
+            height: 450px;
+            border: 3px solid #F08484;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow: hidden;
+            position: relative;
+            margin: 40px 41px 0 36px;
+            box-sizing: content-box;
+        }
+        
+        .video-stream {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #000;
+        }
+        
+        .video-offline {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #666;
+        }
+        
+        .video-offline svg {
+            width: 64px;
+            height: 64px;
+            margin-bottom: 16px;
+            opacity: 0.3;
+        }
+        
+        /* Blue Separator */
+        .blue-separator {
+            grid-column: 2;
+            grid-row: 1;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            height: 100vh;
+            position: relative;
+            width: 82px;
+        }
+        
+        .blue-separator svg {
+            position: absolute;
+            left: 0;
+            top: 0;
+            height: 100vh;
+            width: 82px;
+        }
+        
+        /* Right Panel */
+        .control-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin: 40px 40px 20px 41px;
+        }
+        
+        /* Odometry Display */
+        .odometry-box {
+            background: #F9F9F9;
+            border: 1px solid #333;
+            padding: 20px;
+            width: 418px;
+            height: 284px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+        
+        .odometry-placeholder {
+            color: #999;
+            font-size: 14px;
+            text-align: center;
+        }
+        
+        /* Status Box */
+        .status-box {
+            background: white;
+            border: 1px solid #333;
+            padding: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-around;
+            width: 418px;
+            height: 120px;
+        }
+        
+        .connection-status {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .status-indicator {
+            width: 60px;
+            height: 20px;
+            background: #87a96b;
+            border: 2px solid #333;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 9px;
+            font-weight: 700;
+            color: white;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+        }
+        
+        .status-indicator::before {
+            content: 'ONLINE';
+        }
+        
+        .status-indicator.offline {
+            background: #f44336;
+        }
+        
+        .status-indicator.offline::before {
+            content: 'OFFLINE';
+        }
+        
+        .direction-indicator {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .direction-arrow {
+            width: 60px;
+            height: 60px;
+            position: relative;
+            background: #87a96b;
+            border: 3px solid #333;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .direction-arrow::before {
+            content: '';
+            width: 0;
+            height: 0;
+            border-left: 14px solid transparent;
+            border-right: 14px solid transparent;
+            border-bottom: 18px solid #fff;
+            transition: all 0.2s ease;
+            filter: drop-shadow(0 1px 2px rgba(0,0,0,0.3));
+        }
+        
+        .direction-arrow.up::before { 
+            transform: rotate(0deg);
+        }
+        .direction-arrow.right::before { 
+            transform: rotate(90deg);
+        }
+        .direction-arrow.down::before { 
+            transform: rotate(180deg);
+        }
+        .direction-arrow.left::before { 
+            transform: rotate(-90deg);
+        }
+        .direction-arrow.stopped {
+            background: #555;
+        }
+        .direction-arrow.stopped::before { 
+            border-bottom-color: #bbb;
+            transform: scale(0.8);
+        }
+        
+        .direction-arrow:hover {
+            background: #9bb87a;
+            transform: scale(1.1) rotate(2deg);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        
+        .direction-arrow.stopped:hover {
+            background: #666;
+            transform: scale(1.05);
+        }
+        
+        .telemetry-stats {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            font-size: 12px;
+        }
+        
+        .telemetry-item {
+            display: flex;
+            justify-content: space-between;
+            gap: 16px;
+        }
+        
+        .telemetry-label {
+            color: #666;
+        }
+        
+        .telemetry-value {
+            font-weight: 600;
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
+        
+        /* Control Box */
+        .control-box {
+            background: white;
+            border: 1px solid #333;
+            padding: 20px;
+            width: 418px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+        
+        .control-section {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .control-label {
+            font-family: 'Montserrat', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #555;
+        }
+        
+
+        
+        .speed-display {
+            width: 100%;
+            height: 20px;
+            background: #333;
+            border: 2px solid #000;
+            position: relative;
+            display: flex;
+        }
+        
+        .speed-segment {
+            flex: 1;
+            height: 100%;
+            border-right: 1px solid #000;
+            background: #666;
+            transition: background-color 0.1s ease;
+            cursor: pointer;
+        }
+        
+        .speed-segment:last-child {
+            border-right: none;
+        }
+        
+        .speed-segment.filled {
+            background: #87a96b;
+            box-shadow: inset 0 0 0 1px #9bb87a;
+        }
+        
+        .speed-segment:hover {
+            background: #9bb87a;
+        }
+        
+        .speed-segment.preview {
+            background: #a8c278;
+        }
+        
+        .speed-text {
+            position: absolute;
+            top: -25px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-family: 'Montserrat', sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            color: #333;
+            letter-spacing: 0.5px;
+        }
+        
+        .video-feeds {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+        
+        .feed-option {
+            padding: 16px;
+            background: #f5f5f5;
+            border: 2px dashed #ddd;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .feed-option:hover {
+            background: #e8e8e8;
+            border-color: #bbb;
+        }
+        
+        .feed-option.active {
+            background: #87a96b;
+            color: white;
+            border: 2px solid #87a96b;
+        }
+        
+        .feed-option.disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            border: 2px dotted #ccc;
+        }
+        
+        /* Connection Button */
+        .connect-button {
+            background: #F08484;
+            color: white;
+            border: 2px solid #F08484;
+            padding: 12px 24px;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            margin-top: auto;
+        }
+        
+        .connect-button:hover {
+            background: #e67373;
+            border-color: #e67373;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(240,132,132,0.3);
+        }
+        
+        .connect-button:active {
+            transform: translateY(0);
+        }
+        
+        .connect-button.connected {
+            background: #f44336;
+        }
+        
+        .connect-button.connected:hover {
+            background: #da190b;
+        }
+        
+        /* Debug log panel */
+        .debug-log {
+            background: #111;
+            color: #0f0;
+            font-family: monospace;
+            font-size: 10px;
+            line-height: 1.2em;
+            width: 418px;
+            height: 150px;
+            overflow-y: auto;
+            padding: 8px;
+            border: 1px solid #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <!-- Video Panel -->
+        <div class="video-panel">
+            <img id="videoStream" class="video-stream" style="display: none;" />
+            <div id="videoOffline" class="video-offline">
+                <svg viewBox="0 0 24 24" fill="currentColor">
+                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+                </svg>
+                <div>No Video Signal</div>
+            </div>
+        </div>
+        
+        <!-- Blue Separator -->
+        <div class="blue-separator">
+            <svg width="82" height="982" viewBox="0 0 82 982" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <rect x="31" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="20.2574" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="40.5147" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="60.7721" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="81.0295" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="101.287" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="121.544" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="141.802" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="162.059" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="182.316" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="202.574" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="222.831" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="243.088" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="263.346" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="283.603" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="303.861" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="324.118" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="344.375" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="364.633" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="384.89" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="405.147" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="425.405" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="445.662" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="465.919" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="486.177" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="506.434" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="526.692" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="546.949" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="567.206" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="587.464" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="607.721" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="627.978" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="648.236" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="668.493" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="688.75" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="709.008" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="729.265" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="749.523" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="769.78" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="790.037" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="810.295" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="830.552" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="850.809" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="871.067" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="891.324" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="911.582" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="931.839" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="952.096" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="31" y="972.354" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="-9" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="11.2574" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="31.5147" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="51.7721" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="72.0295" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="92.2868" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="112.544" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="132.802" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="153.059" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="173.316" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="193.574" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="213.831" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="234.088" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="254.346" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="274.603" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="294.861" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="315.118" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="335.375" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="355.633" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="375.89" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="396.147" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="416.405" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="436.662" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="456.919" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="477.177" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="497.434" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="517.692" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="537.949" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="558.206" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="578.464" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="598.721" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="618.978" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="639.236" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="659.493" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="679.75" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="700.008" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="720.265" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="740.523" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="760.78" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="781.037" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="801.295" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="821.552" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="841.809" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="862.067" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="882.324" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="902.582" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="922.839" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="943.096" width="20" height="9.64637" fill="#4964FF"/>
+                <rect y="963.354" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="-9" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="11.2574" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="31.5147" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="51.7721" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="72.0295" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="92.2868" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="112.544" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="132.802" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="153.059" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="173.316" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="193.574" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="213.831" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="234.088" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="254.346" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="274.603" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="294.861" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="315.118" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="335.375" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="355.633" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="375.89" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="396.147" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="416.405" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="436.662" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="456.919" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="477.177" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="497.434" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="517.692" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="537.949" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="558.206" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="578.464" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="598.721" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="618.978" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="639.236" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="659.493" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="679.75" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="700.008" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="720.265" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="740.523" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="760.78" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="781.037" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="801.295" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="821.552" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="841.809" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="862.067" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="882.324" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="902.582" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="922.839" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="943.096" width="20" height="9.64637" fill="#4964FF"/>
+                <rect x="62" y="963.354" width="20" height="9.64637" fill="#4964FF"/>
+            </svg>
+        </div>
+        
+        <!-- Control Panel -->
+        <div class="control-panel">
+            <!-- Odometry Box -->
+            <div class="odometry-box">
+                <div class="odometry-placeholder">
+                    Odometry Display<br>
+                    (Not Implemented)
+                </div>
+            </div>
+            
+            <!-- Status Box -->
+            <div class="status-box">
+                <div class="connection-status">
+                    <div id="statusIndicator" class="status-indicator offline"></div>
+                </div>
+                
+                <div class="direction-indicator">
+                    <div id="directionArrow" class="direction-arrow stopped"></div>
+                    <div style="font-size: 10px; color: #666;">
+                        <span>L:</span><span id="leftSpeed">0</span>
+                        <span style="margin-left: 8px;">R:</span><span id="rightSpeed">0</span>
+                    </div>
+                </div>
+                
+                <div class="telemetry-stats">
+                    <div class="telemetry-item">
+                        <span class="telemetry-label">lat:</span>
+                        <span class="telemetry-value" id="latency">0ms</span>
+                    </div>
+                    <div class="telemetry-item">
+                        <span class="telemetry-label">seq:</span>
+                        <span class="telemetry-value" id="sequence">0</span>
+                    </div>
+                    <div class="telemetry-item">
+                        <span class="telemetry-label">bat:</span>
+                        <span class="telemetry-value" id="battery">0.0V</span>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Control Box -->
+            <div class="control-box">
+                <div class="control-section">
+                    <div class="control-label">Speed</div>
+                    <div class="speed-display" id="speedDisplay">
+                        <div class="speed-segment filled"></div>
+                        <div class="speed-segment filled"></div>
+                        <div class="speed-segment filled"></div>
+                        <div class="speed-segment filled"></div>
+                        <div class="speed-segment filled"></div>
+                        <div class="speed-segment"></div>
+                        <div class="speed-segment"></div>
+                        <div class="speed-segment"></div>
+                        <div class="speed-segment"></div>
+                        <div class="speed-segment"></div>
+                        <div class="speed-text" id="speedText">50%</div>
+                    </div>
+                </div>
+                
+                <div class="control-section">
+                    <div class="control-label">Video Feed</div>
+                    <div class="video-feeds">
+                        <div class="feed-option active" data-feed="left">l cam</div>
+                        <div class="feed-option disabled" data-feed="right">r cam</div>
+                    </div>
+                </div>
+                
+                <button id="connectBtn" class="connect-button">Connect</button>
+            </div>
+            
+            <div class="debug-log" id="debugLog"></div>
+        </div>
+    </div>
+    
+    <script>
+        let currentSpeed = 50;
+        
+        function updateSpeedDisplay() {
+            const segments = document.querySelectorAll('.speed-segment');
+            const speedText = document.getElementById('speedText');
+            const filledSegments = Math.floor(currentSpeed / 10);
+            
+            segments.forEach((segment, index) => {
+                segment.classList.remove('filled', 'preview');
+                if (index < filledSegments) {
+                    segment.classList.add('filled');
+                }
+            });
+            
+            speedText.textContent = currentSpeed + '%';
+        }
+        
+        function showPreview(hoveredIndex) {
+            const segments = document.querySelectorAll('.speed-segment');
+            const currentFilledSegments = Math.floor(currentSpeed / 10);
+            
+            segments.forEach((segment, index) => {
+                segment.classList.remove('preview');
+                if (index <= hoveredIndex && index >= currentFilledSegments) {
+                    segment.classList.add('preview');
+                }
+            });
+        }
+        
+        function hidePreview() {
+            const segments = document.querySelectorAll('.speed-segment');
+            segments.forEach(segment => {
+                segment.classList.remove('preview');
+            });
+        }
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            const segments = document.querySelectorAll('.speed-segment');
+            
+            segments.forEach((segment, index) => {
+                segment.addEventListener('click', function() {
+                    currentSpeed = (index + 1) * 10;
+                    updateSpeedDisplay();
+                    
+                    // Update the baseSpeed variable for the robot control
+                    if (typeof baseSpeed !== 'undefined') {
+                        baseSpeed = currentSpeed;
+                    }
+                });
+                
+                segment.addEventListener('mouseenter', function() {
+                    showPreview(index);
+                });
+                
+                segment.addEventListener('mouseleave', function() {
+                    hidePreview();
+                });
+            });
+            
+            updateSpeedDisplay();
+        });
+    </script>
+    <script src="main.js"></script>
+</body>
+</html>
