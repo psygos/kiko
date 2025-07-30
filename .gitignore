@@ -3,7 +3,7 @@
 *.log
 
 # Rust lock files
-Cargo.lock
+**/Cargo.lock
 
 # Node modules and dependencies
 node_modules/
@@ -13,13 +13,6 @@ package-lock.json
 dist/
 dist-ssr/
 
-# IDE and editor files
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
 # OS files
 .DS_Store
 Thumbs.db
@@ -27,4 +20,15 @@ Thumbs.db
 # Local environment files
 .env
 .env.local
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+venv/
+.venv/
+.coverage
+htmlcov/
 
