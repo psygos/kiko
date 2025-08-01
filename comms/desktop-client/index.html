@@ -202,16 +202,86 @@
         .odometry-box {
             background: #F9F9F9;
             border: 1px solid #333;
-            padding: 20px;
+            padding: 0;
             width: 418px;
             height: 284px;
             display: flex;
-            align-items: center;
-            justify-content: center;
+            flex-direction: column;
             position: relative;
+            overflow: hidden;
+        }
+        
+        .odometry-header {
+            background: #333;
+            color: white;
+            padding: 8px 12px;
+            font-family: 'Montserrat', sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .odometry-controls {
+            display: flex;
+            gap: 6px;
+        }
+        
+        .odometry-btn {
+            background: #555;
+            border: none;
+            color: white;
+            padding: 2px 6px;
+            font-size: 9px;
+            cursor: pointer;
+            border-radius: 2px;
+            transition: background 0.2s;
+        }
+        
+        .odometry-btn:hover {
+            background: #777;
+        }
+        
+        .odometry-canvas-container {
+            flex: 1;
+            position: relative;
+            background: #fff;
+        }
+        
+        .odometry-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+            cursor: grab;
+        }
+        
+        .odometry-canvas:active {
+            cursor: grabbing;
+        }
+        
+        .odometry-info {
+            position: absolute;
+            top: 35px;
+            left: 8px;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid #ddd;
+            padding: 6px 8px;
+            font-family: 'Consolas', monospace;
+            font-size: 10px;
+            line-height: 1.2;
+            border-radius: 3px;
+            pointer-events: none;
+            z-index: 10;
         }
         
         .odometry-placeholder {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
             color: #999;
             font-size: 14px;
             text-align: center;
@@ -679,9 +749,25 @@
         <div class="control-panel">
             <!-- Odometry Box -->
             <div class="odometry-box">
-                <div class="odometry-placeholder">
-                    Odometry Display<br>
-                    (Not Implemented)
+                <div class="odometry-header">
+                    <span>Robot Path Visualization</span>
+                    <div class="odometry-controls">
+                        <button class="odometry-btn" id="resetPath">Reset</button>
+                        <button class="odometry-btn" id="centerView">Center</button>
+                        <button class="odometry-btn" id="toggleTrail">Trail</button>
+                    </div>
+                </div>
+                <div class="odometry-canvas-container">
+                    <canvas class="odometry-canvas" id="odometryCanvas" width="418" height="252"></canvas>
+                    <div class="odometry-info" id="odometryInfo">
+                        <div>Position: (0.00, 0.00) m</div>
+                        <div>Heading: 0.0°</div>
+                        <div>Speed: 0.00 m/s</div>
+                        <div>Distance: 0.00 m</div>
+                    </div>
+                    <div class="odometry-placeholder" id="odometryPlaceholder">
+                        Waiting for odometry data...
+                    </div>
                 </div>
             </div>
             

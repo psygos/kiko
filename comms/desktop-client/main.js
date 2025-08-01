@@ -249,7 +249,6 @@ function setConnected(isConnected) {
     
     if (isConnected) {
         statusIndicator.classList.remove('offline');
-        connectionText.textContent = 'Online';
         connectBtn.textContent = 'Disconnect';
         connectBtn.classList.add('connected');
         
@@ -257,9 +256,11 @@ function setConnected(isConnected) {
         videoStream.src = `http://${robotAddress.split(':')[0]}:3030/video.mjpeg`;
         videoStream.style.display = 'block';
         videoOffline.style.display = 'none';
+        
+        // Start odometry polling
+        startOdometryPolling();
     } else {
         statusIndicator.classList.add('offline');
-        connectionText.textContent = 'Offline';
         connectBtn.textContent = 'Connect';
         connectBtn.classList.remove('connected');
         
@@ -268,8 +269,12 @@ function setConnected(isConnected) {
         videoStream.style.display = 'none';
         videoOffline.style.display = 'flex';
         
+        // Stop odometry polling
+        stopOdometryPolling();
+        
         // Reset displays
         updateDirection(0, 0);
+        updateOdometryDisplay(null);
         currentLeft = 0;
         currentRight = 0;
         
@@ -308,6 +313,7 @@ document.addEventListener('keydown', async (e) => {
 let telemetryListener = null;
 let connectionLostListener = null;
 let connectionErrorListener = null;
+let odometryInterval = null;
 
 async function setupEventListeners() {
     // Telemetry updates
@@ -369,11 +375,454 @@ document.querySelectorAll('.feed-option').forEach(option => {
     });
 });
 
+// Odometry polling functions
+function startOdometryPolling() {
+    console.log('Starting odometry polling');
+    stopOdometryPolling(); // Clear any existing interval
+    
+    odometryInterval = setInterval(async () => {
+        try {
+            const odometry = await invoke('get_odometry');
+            updateOdometryDisplay(odometry);
+        } catch (err) {
+            console.error('Failed to get odometry:', err);
+        }
+    }, 100); // 10Hz polling for smoother updates
+}
+
+function stopOdometryPolling() {
+    if (odometryInterval) {
+        clearInterval(odometryInterval);
+        odometryInterval = null;
+        console.log('Stopped odometry polling');
+    }
+}
+
+// ==================== REAL-TIME PATH VISUALIZATION SYSTEM ====================
+
+class RobotPathVisualizer {
+    constructor(canvasId, infoId, placeholderId) {
+        this.canvas = document.getElementById(canvasId);
+        this.ctx = this.canvas.getContext('2d');
+        this.infoDiv = document.getElementById(infoId);
+        this.placeholder = document.getElementById(placeholderId);
+        
+        // Robot physical parameters
+        this.WHEEL_BASE = 0.15; // meters (distance between wheels)
+        this.TICKS_PER_METER = 1000; // encoder ticks per meter (configurable)
+        
+        // Robot state
+        this.position = {x: 0, y: 0}; // meters
+        this.heading = 0; // radians
+        this.totalDistance = 0; // meters
+        this.lastOdometry = null;
+        this.isInitialized = false;
+        
+        // Path history
+        this.pathHistory = [];
+        this.maxPathPoints = 2000; // Limit memory usage
+        this.showTrail = true;
+        
+        // Visualization parameters
+        this.scale = 50; // pixels per meter
+        this.centerOffset = {x: 209, y: 126}; // Canvas center
+        this.panOffset = {x: 0, y: 0}; // Pan offset
+        this.minScale = 10;
+        this.maxScale = 500;
+        
+        // Interaction state
+        this.isDragging = false;
+        this.lastMousePos = {x: 0, y: 0};
+        
+        // Animation
+        this.lastUpdateTime = 0;
+        this.targetPosition = {x: 0, y: 0};
+        this.targetHeading = 0;
+        
+        this.setupEventListeners();
+        this.startRenderLoop();
+        
+        console.log('🤖 Path Visualizer initialized');
+    }
+    
+    setupEventListeners() {
+        // Mouse interactions
+        this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
+        this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
+        this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
+        this.canvas.addEventListener('wheel', (e) => this.handleWheel(e));
+        
+        // Control buttons
+        document.getElementById('resetPath').addEventListener('click', () => this.resetPath());
+        document.getElementById('centerView').addEventListener('click', () => this.centerView());
+        document.getElementById('toggleTrail').addEventListener('click', () => this.toggleTrail());
+        
+        // Prevent context menu
+        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    }
+    
+    // ==================== ODOMETRY CALCULATIONS ====================
+    
+    updateOdometry(odometry) {
+        if (!odometry) {
+            this.showPlaceholder(true);
+            return;
+        }
+        
+        this.showPlaceholder(false);
+        
+        if (!this.isInitialized) {
+            this.initializeOdometry(odometry);
+            return;
+        }
+        
+        const dt = (odometry.timestamp_ms - this.lastOdometry.timestamp_ms) / 1000.0; // seconds
+        if (dt <= 0 || dt > 1.0) { // Skip invalid time deltas
+            this.lastOdometry = odometry;
+            return;
+        }
+        
+        // Calculate wheel distances (delta)
+        const leftDelta = (odometry.left_ticks - this.lastOdometry.left_ticks) / this.TICKS_PER_METER;
+        const rightDelta = (odometry.right_ticks - this.lastOdometry.right_ticks) / this.TICKS_PER_METER;
+        
+        // Differential drive kinematics
+        const distance = (leftDelta + rightDelta) / 2.0; // forward distance
+        const deltaHeading = (rightDelta - leftDelta) / this.WHEEL_BASE; // heading change
+        
+        // Update robot state with smooth interpolation
+        const newX = this.position.x + distance * Math.cos(this.heading + deltaHeading / 2.0);
+        const newY = this.position.y + distance * Math.sin(this.heading + deltaHeading / 2.0);
+        const newHeading = this.heading + deltaHeading;
+        
+        // Smooth interpolation for animation
+        this.targetPosition = {x: newX, y: newY};
+        this.targetHeading = newHeading;
+        
+        this.totalDistance += Math.abs(distance);
+        
+        // Add to path history (with decimation for performance)
+        if (this.pathHistory.length === 0 || 
+            Math.abs(newX - this.pathHistory[this.pathHistory.length - 1].x) > 0.01 ||
+            Math.abs(newY - this.pathHistory[this.pathHistory.length - 1].y) > 0.01) {
+            
+            this.pathHistory.push({
+                x: newX, 
+                y: newY, 
+                timestamp: odometry.timestamp_ms,
+                heading: newHeading
+            });
+            
+            // Manage memory
+            if (this.pathHistory.length > this.maxPathPoints) {
+                this.pathHistory.shift();
+            }
+        }
+        
+        this.lastOdometry = odometry;
+        this.updateInfoDisplay(odometry, dt);
+    }
+    
+    initializeOdometry(odometry) {
+        this.lastOdometry = odometry;
+        this.position = {x: 0, y: 0};
+        this.heading = 0;
+        this.totalDistance = 0;
+        this.pathHistory = [{x: 0, y: 0, timestamp: odometry.timestamp_ms, heading: 0}];
+        this.targetPosition = {x: 0, y: 0};
+        this.targetHeading = 0;
+        this.isInitialized = true;
+        console.log('🎯 Odometry initialized');
+    }
+    
+    // ==================== VISUALIZATION ====================
+    
+    startRenderLoop() {
+        const animate = (currentTime) => {
+            this.render(currentTime);
+            requestAnimationFrame(animate);
+        };
+        requestAnimationFrame(animate);
+    }
+    
+    render(currentTime) {
+        const dt = currentTime - this.lastUpdateTime;
+        this.lastUpdateTime = currentTime;
+        
+        // Smooth interpolation (60fps)
+        const alpha = Math.min(dt / 16.67, 1.0); // 16.67ms = 60fps
+        this.position.x += (this.targetPosition.x - this.position.x) * alpha * 0.3;
+        this.position.y += (this.targetPosition.y - this.position.y) * alpha * 0.3;
+        this.heading += this.normalizeAngle(this.targetHeading - this.heading) * alpha * 0.3;
+        
+        this.clearCanvas();
+        this.drawGrid();
+        this.drawPath();
+        this.drawRobot();
+        this.drawOrigin();
+    }
+    
+    clearCanvas() {
+        this.ctx.fillStyle = '#ffffff';
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    }
+    
+    drawGrid() {
+        const ctx = this.ctx;
+        ctx.strokeStyle = '#f0f0f0';
+        ctx.lineWidth = 1;
+        
+        const gridSize = this.scale; // 1 meter grid
+        const startX = (-this.panOffset.x % gridSize);
+        const startY = (-this.panOffset.y % gridSize);
+        
+        // Vertical lines
+        for (let x = startX; x < this.canvas.width; x += gridSize) {
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, this.canvas.height);
+            ctx.stroke();
+        }
+        
+        // Horizontal lines
+        for (let y = startY; y < this.canvas.height; y += gridSize) {
+            ctx.beginPath();
+            ctx.moveTo(0, y);
+            ctx.lineTo(this.canvas.width, y);
+            ctx.stroke();
+        }
+    }
+    
+    drawPath() {
+        if (!this.showTrail || this.pathHistory.length < 2) return;
+        
+        const ctx = this.ctx;
+        ctx.strokeStyle = '#2196f3';
+        ctx.lineWidth = 2;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        
+        // Draw path with gradient opacity
+        ctx.beginPath();
+        for (let i = 1; i < this.pathHistory.length; i++) {
+            const point = this.pathHistory[i];
+            const screenPos = this.worldToScreen(point.x, point.y);
+            
+            if (i === 1) {
+                ctx.moveTo(screenPos.x, screenPos.y);
+            } else {
+                ctx.lineTo(screenPos.x, screenPos.y);
+            }
+        }
+        ctx.stroke();
+        
+        // Draw path points (recent ones more opaque)
+        for (let i = Math.max(0, this.pathHistory.length - 50); i < this.pathHistory.length; i++) {
+            const point = this.pathHistory[i];
+            const screenPos = this.worldToScreen(point.x, point.y);
+            const age = (this.pathHistory.length - i) / 50.0;
+            
+            ctx.fillStyle = `rgba(33, 150, 243, ${0.8 - age * 0.6})`;
+            ctx.beginPath();
+            ctx.arc(screenPos.x, screenPos.y, 2, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+    
+    drawRobot() {
+        const screenPos = this.worldToScreen(this.position.x, this.position.y);
+        const ctx = this.ctx;
+        
+        ctx.save();
+        ctx.translate(screenPos.x, screenPos.y);
+        ctx.rotate(this.heading);
+        
+        // Robot body (rectangle)
+        const width = this.scale * 0.08; // 8cm width
+        const height = this.scale * 0.12; // 12cm length
+        
+        ctx.fillStyle = '#4caf50';
+        ctx.strokeStyle = '#2e7d32';
+        ctx.lineWidth = 2;
+        ctx.fillRect(-width/2, -height/2, width, height);
+        ctx.strokeRect(-width/2, -height/2, width, height);
+        
+        // Direction indicator (triangle)
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.moveTo(height/3, 0);
+        ctx.lineTo(-height/6, -width/4);
+        ctx.lineTo(-height/6, width/4);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Wheels
+        ctx.fillStyle = '#333';
+        const wheelWidth = this.scale * 0.02;
+        const wheelHeight = this.scale * 0.04;
+        const wheelOffset = this.scale * this.WHEEL_BASE / 2;
+        
+        // Left wheel
+        ctx.fillRect(-wheelWidth/2, wheelOffset - wheelHeight/2, wheelWidth, wheelHeight);
+        // Right wheel
+        ctx.fillRect(-wheelWidth/2, -wheelOffset - wheelHeight/2, wheelWidth, wheelHeight);
+        
+        ctx.restore();
+    }
+    
+    drawOrigin() {
+        const originScreen = this.worldToScreen(0, 0);
+        const ctx = this.ctx;
+        
+        // Origin cross
+        ctx.strokeStyle = '#f44336';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(originScreen.x - 8, originScreen.y);
+        ctx.lineTo(originScreen.x + 8, originScreen.y);
+        ctx.moveTo(originScreen.x, originScreen.y - 8);
+        ctx.lineTo(originScreen.x, originScreen.y + 8);
+        ctx.stroke();
+        
+        // Origin label
+        ctx.fillStyle = '#f44336';
+        ctx.font = '10px Consolas';
+        ctx.fillText('(0,0)', originScreen.x + 12, originScreen.y - 4);
+    }
+    
+    // ==================== COORDINATE TRANSFORMS ====================
+    
+    worldToScreen(worldX, worldY) {
+        return {
+            x: (worldX * this.scale) + this.centerOffset.x + this.panOffset.x,
+            y: (-worldY * this.scale) + this.centerOffset.y + this.panOffset.y // Flip Y
+        };
+    }
+    
+    screenToWorld(screenX, screenY) {
+        return {
+            x: (screenX - this.centerOffset.x - this.panOffset.x) / this.scale,
+            y: -((screenY - this.centerOffset.y - this.panOffset.y) / this.scale) // Flip Y
+        };
+    }
+    
+    // ==================== INTERACTION HANDLERS ====================
+    
+    handleMouseDown(e) {
+        this.isDragging = true;
+        this.lastMousePos = {x: e.offsetX, y: e.offsetY};
+        this.canvas.style.cursor = 'grabbing';
+    }
+    
+    handleMouseMove(e) {
+        if (this.isDragging) {
+            const dx = e.offsetX - this.lastMousePos.x;
+            const dy = e.offsetY - this.lastMousePos.y;
+            this.panOffset.x += dx;
+            this.panOffset.y += dy;
+            this.lastMousePos = {x: e.offsetX, y: e.offsetY};
+        }
+    }
+    
+    handleMouseUp(e) {
+        this.isDragging = false;
+        this.canvas.style.cursor = 'grab';
+    }
+    
+    handleWheel(e) {
+        e.preventDefault();
+        const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+        const newScale = Math.max(this.minScale, Math.min(this.maxScale, this.scale * zoomFactor));
+        
+        // Zoom towards mouse position
+        const mouseWorld = this.screenToWorld(e.offsetX, e.offsetY);
+        this.scale = newScale;
+        const newMouseScreen = this.worldToScreen(mouseWorld.x, mouseWorld.y);
+        
+        this.panOffset.x += e.offsetX - newMouseScreen.x;
+        this.panOffset.y += e.offsetY - newMouseScreen.y;
+    }
+    
+    // ==================== CONTROL FUNCTIONS ====================
+    
+    resetPath() {
+        this.position = {x: 0, y: 0};
+        this.heading = 0;
+        this.totalDistance = 0;
+        this.pathHistory = [{x: 0, y: 0, timestamp: Date.now(), heading: 0}];
+        this.targetPosition = {x: 0, y: 0};
+        this.targetHeading = 0;
+        this.centerView();
+        console.log('🔄 Path reset');
+    }
+    
+    centerView() {
+        this.panOffset = {x: 0, y: 0};
+        this.scale = 50;
+        console.log('🎯 View centered');
+    }
+    
+    toggleTrail() {
+        this.showTrail = !this.showTrail;
+        const btn = document.getElementById('toggleTrail');
+        btn.style.background = this.showTrail ? '#777' : '#333';
+        console.log(`👁️ Trail ${this.showTrail ? 'enabled' : 'disabled'}`);
+    }
+    
+    // ==================== UI UPDATES ====================
+    
+    updateInfoDisplay(odometry, dt) {
+        const speed = this.calculateSpeed(odometry, dt);
+        const headingDeg = (this.heading * 180 / Math.PI) % 360;
+        
+        this.infoDiv.innerHTML = `
+            <div>Position: (${this.position.x.toFixed(2)}, ${this.position.y.toFixed(2)}) m</div>
+            <div>Heading: ${headingDeg.toFixed(1)}°</div>
+            <div>Speed: ${speed.toFixed(2)} m/s</div>
+            <div>Distance: ${this.totalDistance.toFixed(2)} m</div>
+        `;
+    }
+    
+    calculateSpeed(odometry, dt) {
+        if (!this.lastOdometry || dt <= 0) return 0;
+        
+        const leftDelta = (odometry.left_ticks - this.lastOdometry.left_ticks) / this.TICKS_PER_METER;
+        const rightDelta = (odometry.right_ticks - this.lastOdometry.right_ticks) / this.TICKS_PER_METER;
+        const distance = (leftDelta + rightDelta) / 2.0;
+        
+        return Math.abs(distance / dt);
+    }
+    
+    showPlaceholder(show) {
+        this.placeholder.style.display = show ? 'block' : 'none';
+        this.infoDiv.style.display = show ? 'none' : 'block';
+    }
+    
+    // ==================== UTILITY FUNCTIONS ====================
+    
+    normalizeAngle(angle) {
+        while (angle > Math.PI) angle -= 2 * Math.PI;
+        while (angle < -Math.PI) angle += 2 * Math.PI;
+        return angle;
+    }
+}
+
+// Global path visualizer instance
+let pathVisualizer = null;
+
+function updateOdometryDisplay(odometry) {
+    if (!pathVisualizer) {
+        pathVisualizer = new RobotPathVisualizer('odometryCanvas', 'odometryInfo', 'odometryPlaceholder');
+    }
+    pathVisualizer.updateOdometry(odometry);
+}
+
 // Cleanup on window close
 window.addEventListener('beforeunload', () => {
     if (connected) {
         disconnect();
     }
+    stopOdometryPolling();
     if (telemetryListener) telemetryListener();
     if (connectionLostListener) connectionLostListener();
     if (connectionErrorListener) connectionErrorListener();

@@ -29,10 +29,20 @@ pub struct RobotTelemetry {
     pub timestamp_ms: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RobotOdometry {
+    pub left_ticks: i64,
+    pub right_ticks: i64,
+    pub left_velocity: i16,
+    pub right_velocity: i16,
+    pub timestamp_ms: u32,
+}
+
 #[derive(Default)]
 pub struct RobotState {
     pub last_command: Option<RobotCommand>,
     pub last_telemetry: Option<RobotTelemetry>,
+    pub last_odometry: Option<RobotOdometry>,
     pub video_frame: Vec<u8>,
     pub dashboard_addr: Option<std::net::SocketAddr>,
     pub video_tx: Option<broadcast::Sender<Bytes>>,
@@ -172,6 +182,26 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
 
                             state.write().await.last_telemetry = Some(telemetry);
                         }
+                    } else if parts.len() >= 6 && parts[0] == "ODO" {
+                        if let (Ok(left_ticks), Ok(right_ticks), Ok(left_vel), Ok(right_vel), Ok(timestamp)) = (
+                            parts[1].parse::<i64>(),
+                            parts[2].parse::<i64>(),
+                            parts[3].parse::<i16>(),
+                            parts[4].parse::<i16>(),
+                            parts[5].parse::<u32>(),
+                        ) {
+                            let odometry = RobotOdometry {
+                                left_ticks,
+                                right_ticks,
+                                left_velocity: left_vel,
+                                right_velocity: right_vel,
+                                timestamp_ms: timestamp,
+                            };
+
+                            println!("Odometry: left_ticks={}, right_ticks={}, left_vel={}, right_vel={}", 
+                                left_ticks, right_ticks, left_vel, right_vel);
+                            state.write().await.last_odometry = Some(odometry);
+                        }
                     }
                 }
             }
@@ -281,6 +311,7 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                 "status": "running",
                 "has_command": state.try_read().map(|s| s.last_command.is_some()).unwrap_or(false),
                 "has_telemetry": state.try_read().map(|s| s.last_telemetry.is_some()).unwrap_or(false),
+                "has_odometry": state.try_read().map(|s| s.last_odometry.is_some()).unwrap_or(false),
             }))
         });
 
@@ -334,10 +365,24 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
             Ok::<_, Infallible>(warp::reply::json(&serde_json::json!({
                 "last_command": s.last_command,
                 "last_telemetry": s.last_telemetry,
+                "last_odometry": s.last_odometry,
             })))
         });
 
-    let routes = status.or(video).or(debug);
+    let odometry = warp::path("odometry")
+        .and(state_filter.clone())
+        .and_then(|state: Arc<RwLock<RobotState>>| async move {
+            let s = state.read().await;
+            if let Some(odo) = &s.last_odometry {
+                Ok::<_, Infallible>(warp::reply::json(odo))
+            } else {
+                Ok(warp::reply::json(&serde_json::json!({
+                    "error": "No odometry data available"
+                })))
+            }
+        });
+
+    let routes = status.or(video).or(debug).or(odometry);
 
     log::info!("HTTP service starting on :3030");
     warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;

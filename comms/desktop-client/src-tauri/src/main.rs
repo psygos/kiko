@@ -26,6 +26,15 @@ pub struct RobotTelemetry {
     pub timestamp_ms: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RobotOdometry {
+    pub left_ticks: i64,
+    pub right_ticks: i64,
+    pub left_velocity: i16,
+    pub right_velocity: i16,
+    pub timestamp_ms: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TelemetryUpdate {
     pub telemetry: RobotTelemetry,
@@ -41,6 +50,7 @@ struct CommandStream {
     last_telemetry: Option<RobotTelemetry>,
     left_speed: i8,
     right_speed: i8,
+    base_http_url: String,
 }
 
 impl CommandStream {
@@ -77,6 +87,8 @@ impl CommandStream {
             }
         }
         
+        let base_http_url = format!("http://{}:3030", server_addr.split(':').next().unwrap_or("localhost"));
+        
         Ok(CommandStream {
             socket,
             sequence: 0,
@@ -84,6 +96,7 @@ impl CommandStream {
             last_telemetry: None,
             left_speed: 0,
             right_speed: 0,
+            base_http_url,
         })
     }
     
@@ -277,6 +290,51 @@ async fn emergency_stop(state: State<'_, StreamState>) -> Result<(), String> {
     }
 }
 
+#[tauri::command]
+async fn get_odometry(state: State<'_, StreamState>) -> Result<Option<RobotOdometry>, String> {
+    let url = {
+        let state_guard = state.lock().unwrap();
+        if let Some(stream) = state_guard.as_ref() {
+            stream.base_http_url.clone()
+        } else {
+            return Err("Not connected".to_string());
+        }
+    }; // Lock is released here
+    
+    let url = format!("{}/odometry", url);
+    let client = reqwest::Client::new();
+    match client.get(&url)
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<RobotOdometry>().await {
+                    Ok(odometry) => {
+                        debug!("Fetched odometry: left_ticks={}, right_ticks={}, left_vel={}, right_vel={}", 
+                            odometry.left_ticks, odometry.right_ticks, 
+                            odometry.left_velocity, odometry.right_velocity);
+                        Ok(Some(odometry))
+                    }
+                    Err(e) => {
+                        // Check if this is the "no data available" response
+                        warn!("Failed to parse odometry JSON: {}", e);
+                        Ok(None)
+                    }
+                }
+            } else {
+                warn!("Odometry request failed with status: {}", response.status());
+                Ok(None)
+            }
+        }
+        Err(e) => {
+            warn!("Failed to fetch odometry: {}", e);
+            Ok(None)
+        }
+    }
+}
+
 fn main() {
     // Initialize logger
     env_logger::Builder::from_default_env()
@@ -295,6 +353,7 @@ fn main() {
             set_motor_speeds,
             emergency_stop,
             get_connection_status,
+            get_odometry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
