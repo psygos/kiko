@@ -17,8 +17,8 @@ static mut RX_BUFFER: [u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE];
 static mut RX_HEAD: usize = 0;
 static mut RX_TAIL: usize = 0;
 
-// Ring buffer for outgoing UART data
-const TX_BUFFER_SIZE: usize = 128;
+// Ring buffer for outgoing UART data  
+const TX_BUFFER_SIZE: usize = 512;
 static mut TX_BUFFER: [u8; TX_BUFFER_SIZE] = [0; TX_BUFFER_SIZE];
 static mut TX_HEAD: usize = 0;
 static mut TX_TAIL: usize = 0;
@@ -286,14 +286,14 @@ fn main() -> ! {
 
             // Update odometry at 100Hz (every 10ms)
             odometry_counter += 1;
-            if odometry_counter >= 10 {
+            if odometry_counter >= 2 {
                 odometry_counter = 0;
                 update_odometry(system_time_ms);
             }
 
-            // Periodic telemetry (non-blocking)
+            // Periodic telemetry (non-blocking) - offset timing to avoid collision
             telemetry_counter += 1;
-            if telemetry_counter >= 200 {  // 10Hz telemetry
+            if telemetry_counter >= 20 {  // 10Hz odometry telemetry 
                 telemetry_counter = 0;
                 send_odometry_telemetry();
             }
@@ -407,10 +407,13 @@ fn queue_tx(byte: u8) -> bool {
     }
 }
 
-fn queue_tx_string(s: &[u8]) {
+fn queue_tx_string(s: &[u8]) -> bool {
     for &byte in s {
-        queue_tx(byte);
+        if !queue_tx(byte) {
+            return false; // Buffer overflow
+        }
     }
+    true
 }
 
 fn service_tx() {
@@ -634,17 +637,19 @@ fn send_odometry_telemetry() {
                  ODOMETRY.timestamp)
             });
         
-        queue_tx_string(b"ODO,");
-        send_i64(left_ticks);
-        queue_tx(b',');
-        send_i64(right_ticks);
-        queue_tx(b',');
-        send_i16(left_vel);
-        queue_tx(b',');
-        send_i16(right_vel);
-        queue_tx(b',');
-        send_u32(timestamp);
-        queue_tx_string(b"\r\n");
+        // Send complete ODO message atomically
+        if queue_tx_string(b"ODO,") {
+            send_i64(left_ticks);
+            queue_tx(b',');
+            send_i64(right_ticks);
+            queue_tx(b',');
+            send_i16(left_vel);
+            queue_tx(b',');
+            send_i16(right_vel);
+            queue_tx(b',');
+            send_u32(timestamp);
+            queue_tx_string(b"\r\n");
+        }
     }
 }
 
