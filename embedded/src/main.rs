@@ -604,6 +604,19 @@ fn update_odometry(timestamp_ms: u32) {
             ODOMETRY.right_velocity = right_delta;
             ODOMETRY.timestamp = timestamp_ms;
             
+            // Debug: Send raw encoder counts every 50 updates (0.5 seconds)
+            static mut DEBUG_COUNTER: u32 = 0;
+            DEBUG_COUNTER += 1;
+            if DEBUG_COUNTER >= 50 {
+                DEBUG_COUNTER = 0;
+                // Send debug info outside interrupt context
+                queue_tx_string(b"DBG,");
+                send_u32(left_count as u32);
+                queue_tx(b',');
+                send_u32(right_count as u32);
+                queue_tx_string(b"\r\n");
+            }
+            
             // Store for next iteration
             LAST_LEFT_COUNT = left_count;
             LAST_RIGHT_COUNT = right_count;

@@ -374,11 +374,14 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
         .and_then(|state: Arc<RwLock<RobotState>>| async move {
             let s = state.read().await;
             if let Some(odo) = &s.last_odometry {
-                Ok::<_, Infallible>(warp::reply::json(odo))
+                Ok::<_, Infallible>(Box::new(warp::reply::json(odo)) as Box<dyn warp::Reply>)
             } else {
-                Ok(warp::reply::json(&serde_json::json!({
-                    "error": "No odometry data available"
-                })))
+                Ok(Box::new(warp::reply::with_status(
+                    warp::reply::json(&serde_json::json!({
+                        "error": "No odometry data available"
+                    })),
+                    warp::http::StatusCode::SERVICE_UNAVAILABLE
+                )) as Box<dyn warp::Reply>)
             }
         });
 
