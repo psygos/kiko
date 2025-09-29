@@ -162,7 +162,7 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                 rx_buffer.extend_from_slice(&serial_buf[..n]);
 
                 while let Some(pos) = rx_buffer.iter().position(|&b| b == b'\n') {
-                    let line = String::from_utf8_lossy(&rx_buffer[..pos]).to_string().trim_end_matches('\r').to_string();
+                    let line = String::from_utf8_lossy(&rx_buffer[..pos]).to_string();
                     println!("STM32 response: {}", line);
                     rx_buffer.drain(..=pos);
 
@@ -183,7 +183,6 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                             state.write().await.last_telemetry = Some(telemetry);
                         }
                     } else if parts.len() >= 6 && parts[0] == "ODO" {
-                        log::debug!("Attempting to parse ODO with {} parts: {:?}", parts.len(), parts);
                         if let (Ok(left_ticks), Ok(right_ticks), Ok(left_vel), Ok(right_vel), Ok(timestamp)) = (
                             parts[1].parse::<i64>(),
                             parts[2].parse::<i64>(),
@@ -199,18 +198,10 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> Result<()> {
                                 timestamp_ms: timestamp,
                             };
 
-                            log::info!("Odometry: left_ticks={}, right_ticks={}, left_vel={}, right_vel={}, timestamp={}", 
-                                left_ticks, right_ticks, left_vel, right_vel, timestamp);
+                            println!("Odometry: left_ticks={}, right_ticks={}, left_vel={}, right_vel={}", 
+                                left_ticks, right_ticks, left_vel, right_vel);
                             state.write().await.last_odometry = Some(odometry);
-                        } else {
-                            log::warn!("Failed to parse odometry data: {:?}", parts);
                         }
-                    } else if parts.len() > 0 && parts[0] == "ODO" {
-                        log::warn!("ODO message with insufficient parts ({}): {:?}", parts.len(), parts);
-                    } else if parts.len() >= 3 && parts[0] == "DBG" {
-                        // Debug messages from STM32 - just log them, don't process
-                        log::debug!("STM32 debug: left_count={}, right_count={}", 
-                            parts[1], parts[2]);
                     }
                 }
             }
