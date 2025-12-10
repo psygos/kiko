@@ -17,7 +17,7 @@
             background: #F6F7F2;
             color: #333;
             height: 100vh;
-            overflow: hidden;
+            overflow: auto;
         }
         
         .dashboard {
@@ -27,7 +27,6 @@
             height: 100vh;
             gap: 0;
             padding: 0;
-            min-width: 1200px;
         }
         
         /* Responsive breakpoints */
@@ -135,8 +134,10 @@
         /* Video Panel */
         .video-panel {
             background: #fff;
-            width: 800px;
-            height: 450px;
+            width: 100%;
+            max-width: 920px;
+            aspect-ratio: 16 / 9;
+            height: auto;
             border: 3px solid #F08484;
             display: flex;
             align-items: center;
@@ -203,7 +204,7 @@
             background: #F9F9F9;
             border: 1px solid #333;
             padding: 0;
-            width: 418px;
+            width: 100%;
             height: 284px;
             display: flex;
             flex-direction: column;
@@ -295,7 +296,7 @@
             display: flex;
             align-items: center;
             justify-content: space-around;
-            width: 418px;
+            width: 100%;
             height: 120px;
         }
         
@@ -424,7 +425,7 @@
             background: white;
             border: 1px solid #333;
             padding: 20px;
-            width: 418px;
+            width: 100%;
             flex: 1;
             display: flex;
             flex-direction: column;
@@ -571,11 +572,25 @@
             font-family: monospace;
             font-size: 10px;
             line-height: 1.2em;
-            width: 418px;
+            width: 100%;
             height: 150px;
             overflow-y: auto;
             padding: 8px;
             border: 1px solid #333;
+        }
+        
+        /* Connection inputs */
+        .connection-grid {
+            display: grid;
+            grid-template-columns: 1.5fr 1fr 1fr;
+            gap: 8px;
+        }
+        .connection-grid input {
+            padding: 8px;
+            border: 1px solid #ccc;
+            font-size: 12px;
+            border-radius: 2px;
+            width: 100%;
         }
     </style>
 </head>
@@ -803,6 +818,14 @@
             
             <!-- Control Box -->
             <div class="control-box">
+                <div class="control-section">
+                    <div class="control-label">Connection</div>
+                    <div class="connection-grid">
+                        <input id="hostInput" placeholder="Host (e.g. 10.42.200.50)" />
+                        <input id="udpPortInput" placeholder="UDP Port" type="number" min="1" max="65535" />
+                        <input id="httpPortInput" placeholder="HTTP Port" type="number" min="1" max="65535" />
+                    </div>
+                </div>
                 <div class="control-section">
                     <div class="control-label">Speed</div>
                     <div class="speed-display" id="speedDisplay">

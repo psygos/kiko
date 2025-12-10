@@ -54,7 +54,7 @@ struct CommandStream {
 }
 
 impl CommandStream {
-    fn new(server_addr: String) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(server_addr: String, http_port: Option<u16>) -> Result<Self, Box<dyn std::error::Error>> {
         info!("Creating new command stream to {}", server_addr);
         
         let socket = UdpSocket::bind("0.0.0.0:0")?;
@@ -87,7 +87,10 @@ impl CommandStream {
             }
         }
         
-        let base_http_url = format!("http://{}:3030", server_addr.split(':').next().unwrap_or("localhost"));
+        // Derive HTTP base URL using provided port or default 3030
+        let udp_host = server_addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(server_addr.as_str());
+        let http_port = http_port.unwrap_or(3030);
+        let base_http_url = format!("http://{}:{}/", udp_host.trim_matches(|c| c == '[' || c == ']'), http_port).trim_end_matches('/').to_string();
         
         Ok(CommandStream {
             socket,
@@ -173,6 +176,7 @@ async fn get_connection_status(state: State<'_, StreamState>) -> Result<bool, St
 async fn connect(
     state: State<'_, StreamState>,
     address: String,
+    http_port: Option<u16>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     // Disconnect existing if any
@@ -192,7 +196,7 @@ async fn connect(
     info!("Parsed server address: {}", server_addr);
     
     // Create new connection
-    let stream = CommandStream::new(server_addr.clone())
+    let stream = CommandStream::new(server_addr.clone(), http_port)
         .map_err(|e| {
             error!("Failed to create command stream: {}", e);
             format!("Connection failed: {}", e)

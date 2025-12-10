@@ -25,7 +25,11 @@ listen = listen || (() => Promise.reject('Tauri listen not ready'));
 
 // Control state
 let connected = false;
-let robotAddress = '10.42.200.50'; // Default address
+// Connection settings with persistence
+let host = localStorage.getItem('kiko_host') || '10.42.200.50';
+let udpPort = parseInt(localStorage.getItem('kiko_udp_port') || '8080', 10);
+let httpPort = parseInt(localStorage.getItem('kiko_http_port') || '3030', 10);
+let robotAddress = `${host}:${udpPort}`;
 let currentLeft = 0;
 let currentRight = 0;
 let baseSpeed = 50;
@@ -52,6 +56,9 @@ const connectionText = document.getElementById('connectionText');
 const directionArrow = document.getElementById('directionArrow');
 const speedDisplay = document.getElementById('speedDisplay');
 const connectBtn = document.getElementById('connectBtn');
+const hostInput = document.getElementById('hostInput');
+const udpPortInput = document.getElementById('udpPortInput');
+const httpPortInput = document.getElementById('httpPortInput');
 // -------------------- DEBUG LOGGING SETUP --------------------
 const debugDiv = document.getElementById('debugLog');
 if (debugDiv) {
@@ -159,7 +166,7 @@ async function setMotorSpeeds(left, right) {
     } catch (err) {
         console.error('Failed to set motor speeds:', err);
         // If not connected, try to reconnect
-        if (err.includes('Not connected')) {
+        if (String(err).includes('Not connected')) {
             setConnected(false);
         }
     }
@@ -197,17 +204,20 @@ function updateDirection(left, right) {
 // Connection management
 async function connect() {
     try {
-        // Prompt for address if needed
-        const input = prompt('Enter robot address:', robotAddress);
-        if (input) {
-            robotAddress = input;
-        }
-        
-        console.log('Attempting to connect to:', robotAddress);
+        // Build address from inputs and persist
+        host = hostInput?.value?.trim() || host;
+        udpPort = parseInt(udpPortInput?.value || String(udpPort), 10) || udpPort;
+        httpPort = parseInt(httpPortInput?.value || String(httpPort), 10) || httpPort;
+        localStorage.setItem('kiko_host', host);
+        localStorage.setItem('kiko_udp_port', String(udpPort));
+        localStorage.setItem('kiko_http_port', String(httpPort));
+        robotAddress = `${host}:${udpPort}`;
+
+        console.log('Attempting to connect to:', robotAddress, 'http:', httpPort);
 
         // Quick sanity check – ping HTTP status endpoint
         try {
-            const statusUrl = `http://${robotAddress.split(':')[0]}:3030/status`;
+            const statusUrl = `http://${host}:${httpPort}/status`;
             console.log('Pinging status endpoint:', statusUrl);
             const resp = await fetch(statusUrl).catch(e => { throw e; });
             console.log('Status response:', resp.status, resp.ok);
@@ -215,7 +225,7 @@ async function connect() {
             console.error('Status ping failed (this is okay if server runs on another subnet):', pingErr);
         }
 
-        const result = await invoke('connect', { address: robotAddress });
+        const result = await invoke('connect', { address: robotAddress, http_port: httpPort });
         console.log('Connection result:', result);
         
         // Verify connection status
@@ -253,7 +263,7 @@ function setConnected(isConnected) {
         connectBtn.classList.add('connected');
         
         // Start video stream
-        videoStream.src = `http://${robotAddress.split(':')[0]}:3030/video.mjpeg`;
+        videoStream.src = `http://${host}:${httpPort}/video.mjpeg`;
         videoStream.style.display = 'block';
         videoOffline.style.display = 'none';
         
@@ -348,6 +358,31 @@ async function setupEventListeners() {
 // Initialize
 window.addEventListener('DOMContentLoaded', () => {
     console.log('Dashboard loaded – JS initialised');
+    // Populate connection inputs and wire persistence
+    if (hostInput) hostInput.value = host;
+    if (udpPortInput) udpPortInput.value = isFinite(udpPort) ? udpPort : 8080;
+    if (httpPortInput) httpPortInput.value = isFinite(httpPort) ? httpPort : 3030;
+
+    hostInput?.addEventListener('change', () => {
+        host = hostInput.value.trim();
+        localStorage.setItem('kiko_host', host);
+    });
+    udpPortInput?.addEventListener('change', () => {
+        const v = parseInt(udpPortInput.value, 10);
+        udpPort = isFinite(v) && v > 0 ? v : 8080;
+        udpPortInput.value = udpPort;
+        localStorage.setItem('kiko_udp_port', String(udpPort));
+    });
+    httpPortInput?.addEventListener('change', () => {
+        const v = parseInt(httpPortInput.value, 10);
+        httpPort = isFinite(v) && v > 0 ? v : 3030;
+        httpPortInput.value = httpPort;
+        localStorage.setItem('kiko_http_port', String(httpPort));
+        if (connected) {
+            videoStream.src = `http://${host}:${httpPort}/video.mjpeg`;
+        }
+    });
+
     setupEventListeners();
     setConnected(false);
     updateDirection(0, 0);
@@ -359,6 +394,9 @@ window.addEventListener('DOMContentLoaded', () => {
             setMotorSpeeds(0, 0);
         }
     });
+    // Responsive canvas sizing
+    resizeOdometryCanvas();
+    window.addEventListener('resize', resizeOdometryCanvas);
 });
 
 // Handle video feed selection
@@ -813,6 +851,10 @@ let pathVisualizer = null;
 function updateOdometryDisplay(odometry) {
     if (!pathVisualizer) {
         pathVisualizer = new RobotPathVisualizer('odometryCanvas', 'odometryInfo', 'odometryPlaceholder');
+        const c = document.getElementById('odometryCanvas');
+        if (c) {
+            pathVisualizer.centerOffset = { x: c.width / 2, y: c.height / 2 };
+        }
     }
     pathVisualizer.updateOdometry(odometry);
 }
@@ -827,3 +869,21 @@ window.addEventListener('beforeunload', () => {
     if (connectionLostListener) connectionLostListener();
     if (connectionErrorListener) connectionErrorListener();
 });
+
+// Resize odometry canvas to its container and keep visualizer centered
+function resizeOdometryCanvas() {
+    const canvas = document.getElementById('odometryCanvas');
+    if (!canvas) return;
+    const container = canvas.parentElement;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const newWidth = Math.max(200, Math.floor(rect.width));
+    const newHeight = Math.max(150, Math.floor(rect.height));
+    if (canvas.width !== newWidth || canvas.height !== newHeight) {
+        canvas.width = newWidth;
+        canvas.height = newHeight;
+        if (pathVisualizer) {
+            pathVisualizer.centerOffset = { x: newWidth / 2, y: newHeight / 2 };
+        }
+    }
+}

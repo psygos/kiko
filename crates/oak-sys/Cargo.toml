@@ -1,0 +1,13 @@
+[package]
+name = "oak-sys"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings to OAK-D camera via DepthAI"
+
+[dependencies]
+cxx = "1.0"
+rerun = "0.27.2"
+thiserror = "1.0"
+
+[build-dependencies]
+cxx-build = "1.0"
