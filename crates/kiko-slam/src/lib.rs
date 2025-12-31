@@ -1,4 +1,7 @@
 #![warn(clippy::all)]
+use std::marker::PhantomData;
+use std::sync::Arc;
+
 pub use inference::SuperPoint;
 mod inference;
 mod preprocess;
@@ -164,4 +167,73 @@ impl Detections {
 
 pub trait FrameSource {
     fn next_frame(&mut self) -> Option<Frame>;
+}
+
+// Typesstates for Matches
+pub struct Raw;
+pub struct Verified;
+
+#[derive(Debug)]
+pub enum MatchError {
+    MissMatch {
+        score_len: usize,
+        indices_len: usize,
+    },
+}
+
+pub struct Matches<State> {
+    source_a: Arc<Detections>,
+    source_b: Arc<Detections>,
+    indices: Vec<(usize, usize)>,
+    scores: Vec<f32>,
+    _state: PhantomData<State>,
+}
+
+impl Matches<Raw> {
+    pub fn new(
+        source_a: Arc<Detections>,
+        source_b: Arc<Detections>,
+        indices: Vec<(usize, usize)>,
+        scores: Vec<f32>,
+    ) -> Result<Self, MatchError> {
+        if indices.len() != scores.len() {
+            return Err(MatchError::MissMatch {
+                score_len: (scores.len()),
+                indices_len: (indices.len()),
+            });
+        }
+        Ok(Self {
+            source_a,
+            source_b,
+            indices,
+            scores,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<State> Matches<State> {
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
+    pub fn source_a(&self) -> &Detections {
+        &self.source_a
+    }
+
+    pub fn source_b(&self) -> &Detections {
+        &self.source_b
+    }
+
+    pub fn indices(&self) -> &[(usize, usize)] {
+        &self.indices
+    }
+
+    pub fn scores(&self) -> &[f32] {
+        &self.scores
+    }
 }
