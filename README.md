@@ -19,7 +19,7 @@ kiko/
 └── embedded/         # STM32F446 firmware
 ```
 
-## Roadmap
+## Immediate Roadmap
 
 - Quick dataset recording
 - Live match visualisation in Rerun
