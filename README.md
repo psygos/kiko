@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/kiko-logo.png" alt="kiko" width="200">
+  <img src="assets/kiko-logo.svg" alt="kiko" width="200">
 </p>
 
 Kiko is a social robot combining custom SLAM and an expression engine. The SLAM implementation is designed for model hot-swap—vision models improve, and Kiko improves with them. Built entirely in Rust.
