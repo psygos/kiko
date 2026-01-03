@@ -1,0 +1,2 @@
+[alias]
+slam = "run -p kiko-slam"

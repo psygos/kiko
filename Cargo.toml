@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/kiko-slam",
+  "crates/oak-sys",
+  "comms/robot-server",
+  "comms/desktop-client/src-tauri",
+  "embedded",
+]
+default-members = ["crates/kiko-slam"]
+
+[profile.release.package.embedded]
+opt-level = "z"
+debug = true
