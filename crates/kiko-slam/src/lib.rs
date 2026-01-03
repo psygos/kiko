@@ -2,7 +2,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-pub use inference::SuperPoint;
+pub use inference::{LightGlue, SuperPoint};
 mod inference;
 mod preprocess;
 

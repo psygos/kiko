@@ -50,5 +50,5 @@ impl std::fmt::Display for InferenceError {
         }
     }
 }
-//pub use lightglue::LightGlue;
+pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
