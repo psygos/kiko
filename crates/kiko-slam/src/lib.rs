@@ -237,3 +237,28 @@ impl<State> Matches<State> {
         &self.scores
     }
 }
+
+// create a dumb tab for frames that composes source and action
+
+pub struct Tap<S, A> {
+    source: S,
+    action: A,
+}
+
+impl<S, A> FrameSource for Tap<S, A>
+where
+    S: FrameSource,
+    A: FnMut(&Frame),
+{
+    fn next_frame(&mut self) -> Option<Frame> {
+        let frame = self.source.next_frame()?;
+        (self.action)(&frame);
+        Some(frame)
+    }
+}
+
+impl<S, A> Tap<S, A> {
+    pub fn new(source: S, action: A) -> Self {
+        Self { source, action }
+    }
+}
