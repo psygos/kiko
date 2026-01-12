@@ -150,7 +150,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let recording = {
         let writer = &writer;
-        StereoTap::new(source, move |pair: &kiko_slam::StereoPair| {
+        StereoTap::new(source, move |pair| {
             writer.write_frame(&pair.left);
             writer.write_frame(&pair.right);
         })
