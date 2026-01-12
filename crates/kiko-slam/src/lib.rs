@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 pub use inference::{LightGlue, SuperPoint};
+pub mod dataset;
 mod inference;
 mod preprocess;
 
@@ -169,6 +170,35 @@ pub trait FrameSource {
     fn next_frame(&mut self) -> Option<Frame>;
 }
 
+pub struct StereoPair {
+    pub left: Frame,
+    pub right: Frame,
+}
+
+impl StereoPair {
+    pub fn timestamp_delta_ns(&self) -> i64 {
+        (self.left.timestamp().as_nanos() - self.right.timestamp().as_nanos()).abs()
+    }
+}
+
+pub trait StereoSource {
+    fn left(&mut self) -> Option<Frame>;
+    fn right(&mut self) -> Option<Frame>;
+
+    fn stereo_pair(&mut self) -> Option<StereoPair> {
+        Some(StereoPair {
+            left: self.left()?,
+            right: self.right()?,
+        })
+    }
+}
+
+impl<T: StereoSource> FrameSource for T {
+    fn next_frame(&mut self) -> Option<Frame> {
+        self.left()
+    }
+}
+
 // Typesstates for Matches
 pub struct Raw;
 pub struct Verified;
@@ -260,5 +290,30 @@ where
 impl<S, A> Tap<S, A> {
     pub fn new(source: S, action: A) -> Self {
         Self { source, action }
+    }
+}
+
+pub struct StereoTap<S, A> {
+    source: S,
+    action: A,
+}
+
+impl<S, A> StereoTap<S, A> {
+    pub fn new(source: S, action: A) -> Self {
+        Self { source, action }
+    }
+}
+
+impl<S, A> Iterator for StereoTap<S, A>
+where
+    S: StereoSource,
+    A: FnMut(&StereoPair),
+{
+    type Item = StereoPair;
+
+    fn next(&mut self) -> Option<StereoPair> {
+        let pair = self.source.stereo_pair()?;
+        (self.action)(&pair);
+        Some(pair)
     }
 }
