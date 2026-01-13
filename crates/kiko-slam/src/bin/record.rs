@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
-use kiko_slam::{Frame, SensorId, StereoSource, StereoTap, Timestamp};
+use kiko_slam::{Frame, SensorId, StereoSource, Timestamp};
 use oak_sys::{Device, DeviceConfig, ImageError, ImageFrame, ImuConfig, MonoConfig, QueueConfig};
 
 struct OakStereo {
@@ -141,20 +141,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let calibration = build_calibration(&device, baseline_m);
 
     eprintln!("creating dataset at {}", output_path);
-    let writer = DatasetWriter::create(output_path, &meta, &calibration)?;
+    let (writer, writer_handle) = DatasetWriter::create(output_path, &meta, &calibration)?;
 
     let source = OakStereo::new(device, running);
     let mut pair_count = 0u64;
 
     eprintln!("recording... press ctrl+c to stop");
 
-    let recording = {
-        let writer = &writer;
-        StereoTap::new(source, move |pair| {
-            writer.write_frame(&pair.left);
-            writer.write_frame(&pair.right);
-        })
-    };
+    let recording = source.stereo_pairs().inspect(|pair| {
+        writer.write_frame(&pair.left);
+        writer.write_frame(&pair.right);
+    });
 
     for _pair in recording {
         pair_count += 1;
@@ -163,7 +160,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let stats = writer.finish()?;
+    drop(writer);
+    let stats = writer_handle.finish()?;
     eprintln!(
         "finished. captured: {}, frames written: {}, frames dropped: {}",
         pair_count, stats.frames_written, stats.frames_dropped
