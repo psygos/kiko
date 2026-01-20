@@ -11,6 +11,7 @@ pub mod format {
     pub const FRAMES_DIR: &str = "frames";
     pub const META_FILE: &str = "meta.json";
     pub const CALIBRATION_FILE: &str = "calibration.json";
+    pub const MANIFEST_FILE: &str = "manifest.json";
     pub const FRAME_SUFFIX: &str = ".raw";
 
     pub fn frame_name(timestamp_ns: i64, sensor: &str) -> String {
@@ -104,6 +105,7 @@ pub struct WriterStats {
     pub bytes_enqueued: u64,
     pub bytes_written: u64,
     pub bytes_dropped: u64,
+    pub write_failed: u64,
     pub spool_frames: u64,
     pub spool_bytes: u64,
     pub spool_max_frames: u64,
@@ -129,6 +131,14 @@ pub enum DatasetError {
         path: PathBuf,
         source: std::io::Error,
     },
+    ReadDirectory {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     InvalidConfig {
         msg: &'static str,
     },
@@ -140,6 +150,9 @@ pub enum DatasetError {
         source: std::io::Error,
     },
     SerializeJson {
+        source: serde_json::Error,
+    },
+    DeserializeJson {
         source: serde_json::Error,
     },
     WorkerJoin {
@@ -158,6 +171,17 @@ impl std::fmt::Display for DatasetError {
                     source
                 )
             }
+            DatasetError::ReadDirectory { path, source } => {
+                write!(
+                    f,
+                    "failed to read directory {}: {}",
+                    path.display(),
+                    source
+                )
+            }
+            DatasetError::ReadFile { path, source } => {
+                write!(f, "failed to read file {}: {}", path.display(), source)
+            }
             DatasetError::InvalidConfig { msg } => {
                 write!(f, "invalid dataset writer config: {msg}")
             }
@@ -169,6 +193,9 @@ impl std::fmt::Display for DatasetError {
             }
             DatasetError::SerializeJson { source } => {
                 write!(f, "failed to serialize JSON: {}", source)
+            }
+            DatasetError::DeserializeJson { source } => {
+                write!(f, "failed to deserialize JSON: {}", source)
             }
             DatasetError::WorkerJoin { message } => {
                 write!(f, "writer thread panicked: {message}")
@@ -276,7 +303,11 @@ impl DatasetWriter {
         serde_json::to_writer_pretty(meta_file, meta)
             .map_err(|e| DatasetError::SerializeJson { source: e })?;
 
-        let state = Arc::new(WriterState::new(config));
+        let state = Arc::new(WriterState::new(
+            config,
+            path.clone(),
+            frames_dir.clone(),
+        ));
         let state_for_thread = state.clone();
 
         let handle = thread::Builder::new()
@@ -383,7 +414,12 @@ impl DatasetWriterHandle {
             message: panic_message(err),
         })?;
 
-        if let Some(err) = self.state.take_error() {
+        let writer_error = self.state.take_error();
+        if let Err(err) = write_manifest(&self.state) {
+            return Err(err);
+        }
+
+        if let Some(err) = writer_error {
             return Err(err);
         }
 
@@ -417,6 +453,8 @@ impl Spool {
 #[derive(Debug)]
 struct WriterState {
     config: DatasetWriterConfig,
+    dataset_dir: PathBuf,
+    frames_dir: PathBuf,
     spool: Mutex<Spool>,
     spool_cvar: Condvar,
     enqueued: AtomicU64,
@@ -425,6 +463,7 @@ struct WriterState {
     bytes_enqueued: AtomicU64,
     bytes_written: AtomicU64,
     bytes_dropped: AtomicU64,
+    write_failed: AtomicU64,
     spool_frames: AtomicU64,
     spool_bytes: AtomicU64,
     open_writers: AtomicUsize,
@@ -433,9 +472,11 @@ struct WriterState {
 }
 
 impl WriterState {
-    fn new(config: DatasetWriterConfig) -> Self {
+    fn new(config: DatasetWriterConfig, dataset_dir: PathBuf, frames_dir: PathBuf) -> Self {
         Self {
             config,
+            dataset_dir,
+            frames_dir,
             spool: Mutex::new(Spool::new()),
             spool_cvar: Condvar::new(),
             enqueued: AtomicU64::new(0),
@@ -444,6 +485,7 @@ impl WriterState {
             bytes_enqueued: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             bytes_dropped: AtomicU64::new(0),
+            write_failed: AtomicU64::new(0),
             spool_frames: AtomicU64::new(0),
             spool_bytes: AtomicU64::new(0),
             open_writers: AtomicUsize::new(1),
@@ -478,6 +520,7 @@ impl WriterState {
             bytes_enqueued: self.bytes_enqueued.load(Ordering::Relaxed),
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             bytes_dropped: self.bytes_dropped.load(Ordering::Relaxed),
+            write_failed: self.write_failed.load(Ordering::Relaxed),
             spool_frames: self.spool_frames.load(Ordering::Relaxed),
             spool_bytes: self.spool_bytes.load(Ordering::Relaxed),
             spool_max_frames: self.config.max_spool_frames as u64,
@@ -543,6 +586,7 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
         for frame in batch {
             let bytes = frame.data().len() as u64;
             if let Err(err) = write_frame_to_dir(&frames_dir, frame) {
+                state.write_failed.fetch_add(1, Ordering::Relaxed);
                 state.fail(err);
                 return;
             }
@@ -597,4 +641,481 @@ fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
     } else {
         "unknown panic".to_string()
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Manifest {
+    header: ManifestHeader,
+    stats: ManifestStats,
+    entries: Vec<ManifestEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestHeader {
+    dataset_id: String,
+    created_at: String,
+    device: String,
+    format: String,
+    width: u32,
+    height: u32,
+    fps: u32,
+    timebase: String,
+    pairing_policy: String,
+    pairing_window_ns: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestStats {
+    total_left: u64,
+    total_right: u64,
+    paired_count: u64,
+    left_orphans: u64,
+    right_orphans: u64,
+    drops_by_reason: DropStats,
+    delta_stats: Option<DeltaStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DropStats {
+    spool_full: u64,
+    write_fail: u64,
+    parse_fail: u64,
+    size_mismatch: u64,
+    outside_window: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DeltaStats {
+    min: u64,
+    median: u64,
+    p95: u64,
+    p99: u64,
+    max: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestEntry {
+    left: ManifestFrameRef,
+    right: Option<ManifestFrameRef>,
+    delta_ns: Option<u64>,
+    status: PairStatus,
+    reason: Option<PairReason>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManifestFrameRef {
+    timestamp_ns: i64,
+    path: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PairStatus {
+    Paired,
+    MissingRight,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PairReason {
+    OutsideWindow,
+    NoRightFrames,
+    RightExhausted,
+}
+
+#[derive(Debug, Clone)]
+struct FrameInfo {
+    timestamp_ns: i64,
+    path: String,
+}
+
+#[derive(Debug)]
+struct FrameSet {
+    left: Vec<FrameInfo>,
+    right: Vec<FrameInfo>,
+    parse_fail: u64,
+    size_mismatch: u64,
+}
+
+fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
+    let meta = read_meta(&state.dataset_dir)?;
+    let mono = meta.mono.ok_or(DatasetError::InvalidConfig {
+        msg: "meta.json missing mono config",
+    })?;
+
+    let mut frames = scan_frames(&state.frames_dir, mono.width, mono.height)?;
+    let parse_fail = frames.parse_fail;
+    let size_mismatch = frames.size_mismatch;
+    let mut left = std::mem::take(&mut frames.left);
+    let mut right = std::mem::take(&mut frames.right);
+
+    left.sort_by_key(|f| f.timestamp_ns);
+    right.sort_by_key(|f| f.timestamp_ns);
+
+    let left_period = compute_period_ns(&left);
+    let gate = left_period.map(|p| p / 4).filter(|p| *p > 0);
+    let deltas = collect_deltas(&left, &right, gate);
+    let delta_stats = build_delta_stats(&deltas);
+    let pairing_window_ns = compute_pairing_window_ns(&deltas, delta_stats.as_ref(), left_period);
+
+    let (entries, paired_count, left_orphans, right_orphans, outside_window) =
+        pair_entries(&left, &right, pairing_window_ns);
+
+    let manifest = Manifest {
+        header: ManifestHeader {
+            dataset_id: dataset_id(&state.dataset_dir),
+            created_at: meta.created,
+            device: meta.device,
+            format: "raw".to_string(),
+            width: mono.width,
+            height: mono.height,
+            fps: mono.fps,
+            timebase: "device_ns".to_string(),
+            pairing_policy: "time_symmetric".to_string(),
+            pairing_window_ns,
+        },
+        stats: ManifestStats {
+            total_left: left.len() as u64,
+            total_right: right.len() as u64,
+            paired_count,
+            left_orphans,
+            right_orphans,
+            drops_by_reason: DropStats {
+                spool_full: state.dropped.load(Ordering::Relaxed),
+                write_fail: state.write_failed.load(Ordering::Relaxed),
+                parse_fail,
+                size_mismatch,
+                outside_window,
+            },
+            delta_stats,
+        },
+        entries,
+    };
+
+    let manifest_path = state.dataset_dir.join(format::MANIFEST_FILE);
+    let manifest_file = std::fs::File::create(&manifest_path).map_err(|e| DatasetError::WriteFile {
+        path: manifest_path.clone(),
+        source: e,
+    })?;
+    serde_json::to_writer_pretty(manifest_file, &manifest)
+        .map_err(|e| DatasetError::SerializeJson { source: e })?;
+    Ok(())
+}
+
+fn read_meta(dataset_dir: &Path) -> Result<Meta, DatasetError> {
+    let meta_path = dataset_dir.join(format::META_FILE);
+    let meta_file = std::fs::File::open(&meta_path).map_err(|e| DatasetError::ReadFile {
+        path: meta_path.clone(),
+        source: e,
+    })?;
+    serde_json::from_reader(meta_file).map_err(|e| DatasetError::DeserializeJson { source: e })
+}
+
+fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {
+    let mut frames = FrameSet {
+        left: Vec::new(),
+        right: Vec::new(),
+        parse_fail: 0,
+        size_mismatch: 0,
+    };
+    let expected_len = (width as u64).saturating_mul(height as u64);
+
+    let entries = std::fs::read_dir(frames_dir).map_err(|e| DatasetError::ReadDirectory {
+        path: frames_dir.to_path_buf(),
+        source: e,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| DatasetError::ReadDirectory {
+            path: frames_dir.to_path_buf(),
+            source: e,
+        })?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let filename = match path.file_name().and_then(|f| f.to_str()) {
+            Some(name) => name,
+            None => {
+                frames.parse_fail += 1;
+                continue;
+            }
+        };
+
+        let (timestamp_ns, sensor) = match format::parse_frame_filename(filename) {
+            Some(info) => info,
+            None => {
+                frames.parse_fail += 1;
+                continue;
+            }
+        };
+
+        let metadata = entry.metadata().map_err(|e| DatasetError::ReadFile {
+            path: path.clone(),
+            source: e,
+        })?;
+        if metadata.len() != expected_len {
+            frames.size_mismatch += 1;
+            continue;
+        }
+
+        let rel_path = format!("{}/{}", format::FRAMES_DIR, filename);
+        let info = FrameInfo {
+            timestamp_ns,
+            path: rel_path,
+        };
+        match sensor.as_str() {
+            "mono_left" => frames.left.push(info),
+            "mono_right" => frames.right.push(info),
+            _ => {
+                frames.parse_fail += 1;
+            }
+        }
+    }
+
+    Ok(frames)
+}
+
+fn compute_period_ns(frames: &[FrameInfo]) -> Option<u64> {
+    if frames.len() < 2 {
+        return None;
+    }
+    let mut deltas: Vec<i64> = frames
+        .windows(2)
+        .map(|pair| pair[1].timestamp_ns - pair[0].timestamp_ns)
+        .collect();
+    deltas.sort_unstable();
+    Some(median_i64(&deltas).abs() as u64)
+}
+
+fn collect_deltas(
+    left: &[FrameInfo],
+    right: &[FrameInfo],
+    gate: Option<u64>,
+) -> Vec<i64> {
+    let mut deltas = Vec::new();
+    if right.is_empty() {
+        return deltas;
+    }
+
+    let mut right_idx = 0usize;
+    for left_frame in left {
+        while right_idx + 1 < right.len()
+            && right[right_idx].timestamp_ns < left_frame.timestamp_ns
+        {
+            right_idx += 1;
+        }
+
+        let mut best: Option<i64> = None;
+        let candidates = [
+            Some(right_idx),
+            right_idx.checked_sub(1),
+        ];
+
+        for idx in candidates.into_iter().flatten() {
+            if idx >= right.len() {
+                continue;
+            }
+            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).abs();
+            if let Some(gate_ns) = gate {
+                if delta as u64 > gate_ns {
+                    continue;
+                }
+            }
+            if best.map_or(true, |b| delta < b) {
+                best = Some(delta);
+            }
+        }
+
+        if let Some(delta) = best {
+            deltas.push(delta);
+        }
+    }
+    deltas
+}
+
+fn build_delta_stats(deltas: &[i64]) -> Option<DeltaStats> {
+    if deltas.is_empty() {
+        return None;
+    }
+    let mut sorted = deltas.to_vec();
+    sorted.sort_unstable();
+    let min = *sorted.first().unwrap() as u64;
+    let max = *sorted.last().unwrap() as u64;
+    let median = median_i64(&sorted) as u64;
+    let p95 = percentile_i64(&sorted, 0.95) as u64;
+    let p99 = percentile_i64(&sorted, 0.99) as u64;
+    Some(DeltaStats {
+        min,
+        median,
+        p95,
+        p99,
+        max,
+    })
+}
+
+fn compute_pairing_window_ns(
+    deltas: &[i64],
+    stats: Option<&DeltaStats>,
+    left_period: Option<u64>,
+) -> u64 {
+    if deltas.is_empty() {
+        return left_period.unwrap_or(0) / 4;
+    }
+    let mut sorted = deltas.to_vec();
+    sorted.sort_unstable();
+    let median = median_i64(&sorted);
+    let mad = median_absolute_deviation(&sorted, median);
+    let p99 = stats.map(|s| s.p99).unwrap_or(sorted.last().copied().unwrap() as u64);
+    let mut window = p99.max((median + 6 * mad).max(0) as u64);
+    if let Some(period) = left_period {
+        if period > 0 {
+            window = window.min(period / 4);
+        }
+    }
+    window
+}
+
+fn pair_entries(
+    left: &[FrameInfo],
+    right: &[FrameInfo],
+    window_ns: u64,
+) -> (Vec<ManifestEntry>, u64, u64, u64, u64) {
+    let mut entries = Vec::with_capacity(left.len());
+    let mut right_used = vec![false; right.len()];
+    let mut paired_count = 0u64;
+    let mut left_orphans = 0u64;
+    let mut outside_window = 0u64;
+    let has_right = !right.is_empty();
+
+    let mut right_idx = 0usize;
+    for left_frame in left {
+        while right_idx + 1 < right.len()
+            && right[right_idx].timestamp_ns < left_frame.timestamp_ns
+        {
+            right_idx += 1;
+        }
+
+        let mut left_candidate = right_idx as i64 - 1;
+        while left_candidate >= 0 && right_used[left_candidate as usize] {
+            left_candidate -= 1;
+        }
+        let left_candidate = if left_candidate >= 0 {
+            Some(left_candidate as usize)
+        } else {
+            None
+        };
+
+        let mut right_candidate = right_idx;
+        while right_candidate < right.len() && right_used[right_candidate] {
+            right_candidate += 1;
+        }
+        let right_candidate = if right_candidate < right.len() {
+            Some(right_candidate)
+        } else {
+            None
+        };
+
+        let mut best_idx = None;
+        let mut best_delta = None;
+
+        for idx in [left_candidate, right_candidate].into_iter().flatten() {
+            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).abs() as u64;
+            if best_delta.map_or(true, |b| delta < b) {
+                best_delta = Some(delta);
+                best_idx = Some(idx);
+            }
+        }
+
+        let entry = if let (Some(idx), Some(delta)) = (best_idx, best_delta) {
+            if window_ns > 0 && delta > window_ns {
+                left_orphans += 1;
+                outside_window += 1;
+                ManifestEntry {
+                    left: ManifestFrameRef {
+                        timestamp_ns: left_frame.timestamp_ns,
+                        path: left_frame.path.clone(),
+                    },
+                    right: None,
+                    delta_ns: None,
+                    status: PairStatus::MissingRight,
+                    reason: Some(PairReason::OutsideWindow),
+                }
+            } else {
+                right_used[idx] = true;
+                paired_count += 1;
+                ManifestEntry {
+                    left: ManifestFrameRef {
+                        timestamp_ns: left_frame.timestamp_ns,
+                        path: left_frame.path.clone(),
+                    },
+                    right: Some(ManifestFrameRef {
+                        timestamp_ns: right[idx].timestamp_ns,
+                        path: right[idx].path.clone(),
+                    }),
+                    delta_ns: Some(delta),
+                    status: PairStatus::Paired,
+                    reason: None,
+                }
+            }
+        } else {
+            left_orphans += 1;
+            let reason = if has_right {
+                PairReason::RightExhausted
+            } else {
+                PairReason::NoRightFrames
+            };
+            ManifestEntry {
+                left: ManifestFrameRef {
+                    timestamp_ns: left_frame.timestamp_ns,
+                    path: left_frame.path.clone(),
+                },
+                right: None,
+                delta_ns: None,
+                status: PairStatus::MissingRight,
+                reason: Some(reason),
+            }
+        };
+
+        entries.push(entry);
+    }
+
+    let right_orphans = right_used.iter().filter(|used| !**used).count() as u64;
+    (entries, paired_count, left_orphans, right_orphans, outside_window)
+}
+
+fn median_i64(sorted: &[i64]) -> i64 {
+    let len = sorted.len();
+    if len == 0 {
+        return 0;
+    }
+    if len % 2 == 1 {
+        sorted[len / 2]
+    } else {
+        let a = sorted[len / 2 - 1];
+        let b = sorted[len / 2];
+        (a + b) / 2
+    }
+}
+
+fn percentile_i64(sorted: &[i64], pct: f64) -> i64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * pct).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn median_absolute_deviation(sorted: &[i64], median: i64) -> i64 {
+    let mut deviations: Vec<i64> = sorted.iter().map(|v| (v - median).abs()).collect();
+    deviations.sort_unstable();
+    median_i64(&deviations)
+}
+
+fn dataset_id(dataset_dir: &Path) -> String {
+    dataset_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dataset")
+        .to_string()
 }
