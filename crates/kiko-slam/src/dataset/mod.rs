@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::{Frame, SensorId};
@@ -10,13 +11,14 @@ pub mod format {
     pub const FRAMES_DIR: &str = "frames";
     pub const META_FILE: &str = "meta.json";
     pub const CALIBRATION_FILE: &str = "calibration.json";
+    pub const FRAME_SUFFIX: &str = ".raw";
 
     pub fn frame_name(timestamp_ns: i64, sensor: &str) -> String {
-        format!("{}_{}.png", timestamp_ns, sensor)
+        format!("{}_{}{}", timestamp_ns, sensor, FRAME_SUFFIX)
     }
 
     pub fn parse_frame_filename(filename: &str) -> Option<(i64, String)> {
-        let stem = filename.strip_suffix(".png")?;
+        let stem = filename.strip_suffix(FRAME_SUFFIX)?;
         let (timestamp_str, sensor) = stem.split_once('_')?;
         let timestamp_ns = timestamp_str.parse::<i64>().ok()?;
         Some((timestamp_ns, sensor.to_string()))
@@ -70,14 +72,18 @@ pub enum Backpressure {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DatasetWriterConfig {
-    pub queue_capacity: usize,
+    pub max_spool_frames: usize,
+    pub max_spool_bytes: usize,
+    pub flush_batch_frames: usize,
     pub backpressure: Backpressure,
 }
 
 impl Default for DatasetWriterConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 64,
+            max_spool_frames: 64,
+            max_spool_bytes: 32 * 1024 * 1024,
+            flush_batch_frames: 16,
             backpressure: Backpressure::DropNewest,
         }
     }
@@ -95,6 +101,13 @@ pub struct WriterStats {
     pub frames_enqueued: u64,
     pub frames_written: u64,
     pub frames_dropped: u64,
+    pub bytes_enqueued: u64,
+    pub bytes_written: u64,
+    pub bytes_dropped: u64,
+    pub spool_frames: u64,
+    pub spool_bytes: u64,
+    pub spool_max_frames: u64,
+    pub spool_max_bytes: u64,
     pub writer_failed: bool,
 }
 
@@ -102,6 +115,11 @@ impl WriterStats {
     pub fn frames_pending(&self) -> u64 {
         self.frames_enqueued
             .saturating_sub(self.frames_written.saturating_add(self.frames_dropped))
+    }
+
+    pub fn bytes_pending(&self) -> u64 {
+        self.bytes_enqueued
+            .saturating_sub(self.bytes_written.saturating_add(self.bytes_dropped))
     }
 }
 
@@ -161,10 +179,9 @@ impl std::fmt::Display for DatasetError {
 
 impl std::error::Error for DatasetError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DatasetWriter {
-    tx: mpsc::SyncSender<Frame>,
-    backpressure: Backpressure,
+    config: DatasetWriterConfig,
     state: Arc<WriterState>,
 }
 
@@ -172,6 +189,29 @@ pub struct DatasetWriter {
 pub struct DatasetWriterHandle {
     handle: Option<thread::JoinHandle<()>>,
     state: Arc<WriterState>,
+}
+
+impl Clone for DatasetWriter {
+    fn clone(&self) -> Self {
+        self.state.open_writers.fetch_add(1, Ordering::Relaxed);
+        Self {
+            config: self.config,
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl Drop for DatasetWriter {
+    fn drop(&mut self) {
+        if self
+            .state
+            .open_writers
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            self.state.close_spool();
+        }
+    }
 }
 
 impl DatasetWriter {
@@ -189,9 +229,19 @@ impl DatasetWriter {
         calibration: &Calibration,
         config: DatasetWriterConfig,
     ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
-        if config.queue_capacity == 0 {
+        if config.max_spool_frames == 0 {
             return Err(DatasetError::InvalidConfig {
-                msg: "queue_capacity must be > 0",
+                msg: "max_spool_frames must be > 0",
+            });
+        }
+        if config.max_spool_bytes == 0 {
+            return Err(DatasetError::InvalidConfig {
+                msg: "max_spool_bytes must be > 0",
+            });
+        }
+        if config.flush_batch_frames == 0 {
+            return Err(DatasetError::InvalidConfig {
+                msg: "flush_batch_frames must be > 0",
             });
         }
 
@@ -226,18 +276,16 @@ impl DatasetWriter {
         serde_json::to_writer_pretty(meta_file, meta)
             .map_err(|e| DatasetError::SerializeJson { source: e })?;
 
-        let (tx, rx) = mpsc::sync_channel::<Frame>(config.queue_capacity);
-        let state = Arc::new(WriterState::new());
+        let state = Arc::new(WriterState::new(config));
         let state_for_thread = state.clone();
 
         let handle = thread::Builder::new()
             .name("dataset-writer".to_string())
-            .spawn(move || writer_loop(frames_dir, rx, state_for_thread))
+            .spawn(move || writer_loop(frames_dir, state_for_thread))
             .map_err(|e| DatasetError::ThreadSpawn { source: e })?;
 
         let writer = Self {
-            tx,
-            backpressure: config.backpressure,
+            config,
             state: state.clone(),
         };
 
@@ -255,32 +303,67 @@ impl DatasetWriter {
             return WriteOutcome::WriterFailed;
         }
 
-        match self.backpressure {
-            Backpressure::DropNewest => match self.tx.try_send(frame.clone()) {
-                Ok(()) => {
-                    self.state.enqueued.fetch_add(1, Ordering::Relaxed);
-                    WriteOutcome::Enqueued
-                }
-                Err(mpsc::TrySendError::Full(_frame)) => {
-                    self.state.dropped.fetch_add(1, Ordering::Relaxed);
-                    WriteOutcome::Dropped
-                }
-                Err(mpsc::TrySendError::Disconnected(_frame)) => {
-                    self.state.failed.store(true, Ordering::Release);
-                    WriteOutcome::WriterFailed
-                }
-            },
-            Backpressure::Block => match self.tx.send(frame.clone()) {
-                Ok(()) => {
-                    self.state.enqueued.fetch_add(1, Ordering::Relaxed);
-                    WriteOutcome::Enqueued
-                }
-                Err(_err) => {
-                    self.state.failed.store(true, Ordering::Release);
-                    WriteOutcome::WriterFailed
-                }
-            },
+        let bytes = frame.data().len();
+        if bytes > self.config.max_spool_bytes {
+            self.state.fail(DatasetError::InvalidConfig {
+                msg: "frame exceeds max_spool_bytes",
+            });
+            return WriteOutcome::WriterFailed;
         }
+
+        let mut spool = self
+            .state
+            .spool
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        match self.config.backpressure {
+            Backpressure::DropNewest => {
+                if spool.closed || self.state.failed.load(Ordering::Acquire) {
+                    return WriteOutcome::WriterFailed;
+                }
+                if !self.state.can_accept(&spool, bytes) {
+                    self.state.dropped.fetch_add(1, Ordering::Relaxed);
+                    self.state
+                        .bytes_dropped
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
+                    return WriteOutcome::Dropped;
+                }
+            }
+            Backpressure::Block => {
+                while !self.state.can_accept(&spool, bytes) {
+                    if spool.closed || self.state.failed.load(Ordering::Acquire) {
+                        return WriteOutcome::WriterFailed;
+                    }
+                    spool = self
+                        .state
+                        .spool_cvar
+                        .wait(spool)
+                        .unwrap_or_else(|err| err.into_inner());
+                }
+            }
+        }
+
+        if spool.closed {
+            return WriteOutcome::WriterFailed;
+        }
+
+        spool.frames += 1;
+        spool.bytes += bytes;
+        spool.queue.push_back(frame.clone());
+
+        self.state.enqueued.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .bytes_enqueued
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.state
+            .spool_frames
+            .store(spool.frames as u64, Ordering::Relaxed);
+        self.state
+            .spool_bytes
+            .store(spool.bytes as u64, Ordering::Relaxed);
+        self.state.spool_cvar.notify_one();
+        WriteOutcome::Enqueued
     }
 
     pub fn stats(&self) -> WriterStats {
@@ -313,23 +396,78 @@ impl DatasetWriterHandle {
 }
 
 #[derive(Debug)]
+struct Spool {
+    queue: VecDeque<Frame>,
+    frames: usize,
+    bytes: usize,
+    closed: bool,
+}
+
+impl Spool {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            frames: 0,
+            bytes: 0,
+            closed: false,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct WriterState {
+    config: DatasetWriterConfig,
+    spool: Mutex<Spool>,
+    spool_cvar: Condvar,
     enqueued: AtomicU64,
     written: AtomicU64,
     dropped: AtomicU64,
+    bytes_enqueued: AtomicU64,
+    bytes_written: AtomicU64,
+    bytes_dropped: AtomicU64,
+    spool_frames: AtomicU64,
+    spool_bytes: AtomicU64,
+    open_writers: AtomicUsize,
     failed: AtomicBool,
     error: Mutex<Option<DatasetError>>,
 }
 
 impl WriterState {
-    fn new() -> Self {
+    fn new(config: DatasetWriterConfig) -> Self {
         Self {
+            config,
+            spool: Mutex::new(Spool::new()),
+            spool_cvar: Condvar::new(),
             enqueued: AtomicU64::new(0),
             written: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            bytes_enqueued: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+            bytes_dropped: AtomicU64::new(0),
+            spool_frames: AtomicU64::new(0),
+            spool_bytes: AtomicU64::new(0),
+            open_writers: AtomicUsize::new(1),
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
         }
+    }
+
+    fn can_accept(&self, spool: &Spool, bytes: usize) -> bool {
+        let next_frames = spool.frames.saturating_add(1);
+        let next_bytes = spool.bytes.saturating_add(bytes);
+        next_frames <= self.config.max_spool_frames && next_bytes <= self.config.max_spool_bytes
+    }
+
+    fn close_spool(&self) {
+        let mut spool = self.spool.lock().unwrap_or_else(|err| err.into_inner());
+        spool.closed = true;
+        self.spool_cvar.notify_all();
+    }
+
+    fn fail(&self, err: DatasetError) {
+        self.failed.store(true, Ordering::Release);
+        self.record_error(err);
+        self.close_spool();
     }
 
     fn stats(&self) -> WriterStats {
@@ -337,6 +475,13 @@ impl WriterState {
             frames_enqueued: self.enqueued.load(Ordering::Relaxed),
             frames_written: self.written.load(Ordering::Relaxed),
             frames_dropped: self.dropped.load(Ordering::Relaxed),
+            bytes_enqueued: self.bytes_enqueued.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            bytes_dropped: self.bytes_dropped.load(Ordering::Relaxed),
+            spool_frames: self.spool_frames.load(Ordering::Relaxed),
+            spool_bytes: self.spool_bytes.load(Ordering::Relaxed),
+            spool_max_frames: self.config.max_spool_frames as u64,
+            spool_max_bytes: self.config.max_spool_bytes as u64,
             writer_failed: self.failed.load(Ordering::Acquire),
         }
     }
@@ -359,17 +504,50 @@ impl WriterState {
     }
 }
 
-fn writer_loop(frames_dir: PathBuf, rx: mpsc::Receiver<Frame>, state: Arc<WriterState>) {
-    for frame in rx {
-        match write_frame_to_dir(&frames_dir, frame) {
-            Ok(()) => {
-                state.written.fetch_add(1, Ordering::Relaxed);
+fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
+    loop {
+        let batch = {
+            let mut spool = state.spool.lock().unwrap_or_else(|err| err.into_inner());
+            while spool.queue.is_empty() && !spool.closed {
+                spool = state
+                    .spool_cvar
+                    .wait(spool)
+                    .unwrap_or_else(|err| err.into_inner());
             }
-            Err(err) => {
-                state.failed.store(true, Ordering::Release);
-                state.record_error(err);
+
+            if spool.queue.is_empty() && spool.closed {
                 break;
             }
+
+            let mut batch = Vec::new();
+            while let Some(frame) = spool.queue.pop_front() {
+                let bytes = frame.data().len();
+                spool.frames = spool.frames.saturating_sub(1);
+                spool.bytes = spool.bytes.saturating_sub(bytes);
+                batch.push(frame);
+                if batch.len() >= state.config.flush_batch_frames {
+                    break;
+                }
+            }
+
+            state
+                .spool_frames
+                .store(spool.frames as u64, Ordering::Relaxed);
+            state
+                .spool_bytes
+                .store(spool.bytes as u64, Ordering::Relaxed);
+            state.spool_cvar.notify_all();
+            batch
+        };
+
+        for frame in batch {
+            let bytes = frame.data().len() as u64;
+            if let Err(err) = write_frame_to_dir(&frames_dir, frame) {
+                state.fail(err);
+                return;
+            }
+            state.written.fetch_add(1, Ordering::Relaxed);
+            state.bytes_written.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 }
@@ -385,20 +563,20 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
     let filename = format::frame_name(timestamp.as_nanos(), sensor_to_str(id));
     let path = frames_dir.join(&filename);
 
-    let img =
-        image::GrayImage::from_raw(width, height, data.as_ref().to_vec()).ok_or_else(|| {
-            DatasetError::WriteFile {
-                path: path.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "failed to create image from frame data",
-                ),
-            }
-        })?;
+    let expected_len = (width as usize).saturating_mul(height as usize);
+    if data.len() != expected_len {
+        return Err(DatasetError::WriteFile {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame data len does not match width * height",
+            ),
+        });
+    }
 
-    img.save(&path).map_err(|e| DatasetError::WriteFile {
+    std::fs::write(&path, data.as_ref()).map_err(|e| DatasetError::WriteFile {
         path,
-        source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+        source: e,
     })?;
 
     Ok(())
