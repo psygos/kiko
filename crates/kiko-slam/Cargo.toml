@@ -11,6 +11,7 @@ ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]
 
 [dependencies]
+clap = { version = "4.5.28", features = ["derive", "env"] }
 crossbeam-channel = "0.5.13"
 image = "0.25.9"
 libc = "0.2.153"
@@ -24,19 +25,5 @@ ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }
 
 [[bin]]
-name = "record"
-path = "src/bin/record.rs"
-required-features = ["record"]
-
-[[bin]]
-name = "live_match"
-path = "src/bin/live_match.rs"
-required-features = ["record"]
-
-[[bin]]
-name = "bench_dataset"
-path = "src/bin/bench_dataset.rs"
-
-[[bin]]
-name = "viz_dataset"
-path = "src/bin/viz_dataset.rs"
+name = "kiko-slam"
+path = "src/bin/kiko_slam.rs"
