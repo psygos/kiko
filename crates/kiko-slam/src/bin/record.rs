@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
-use kiko_slam::{Frame, SensorId, Timestamp};
+use kiko_slam::{Frame, FrameId, SensorId, Timestamp};
 use oak_sys::{Device, DeviceConfig, ImageError, ImageFrame, ImuConfig, MonoConfig, QueueConfig};
 
 fn build_meta(config: &MonoConfig, imu_config: Option<&ImuConfig>) -> Meta {
@@ -44,9 +44,10 @@ fn build_calibration(device: &Device, baseline_m: f32) -> Calibration {
     }
 }
 
-fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId) -> Frame {
+fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId, frame_id: FrameId) -> Frame {
     Frame::new(
         sensor,
+        frame_id,
         Timestamp::from_nanos(oak_frame.timestamp.as_nanos()),
         oak_frame.width,
         oak_frame.height,
@@ -136,6 +137,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pair_count = 0u64;
     let mut left_count = 0u64;
     let mut right_count = 0u64;
+    let mut left_seq = 0u64;
+    let mut right_seq = 0u64;
     let mut left_buf: VecDeque<Frame> = VecDeque::with_capacity(8);
     let mut right_buf: VecDeque<Frame> = VecDeque::with_capacity(8);
     let max_delta_ns = 5_000_000; // 5ms pairing window
@@ -149,8 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Poll left (non-blocking)
         match device.mono_left(0) {
             Ok(frame) => {
-                left_buf.push_back(oak_to_frame(frame, SensorId::StereoLeft));
+                left_buf.push_back(oak_to_frame(
+                    frame,
+                    SensorId::StereoLeft,
+                    FrameId::new(left_seq),
+                ));
                 left_count += 1;
+                left_seq += 1;
                 got_any = true;
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
@@ -163,8 +171,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Poll right (non-blocking)
         match device.mono_right(0) {
             Ok(frame) => {
-                right_buf.push_back(oak_to_frame(frame, SensorId::StereoRight));
+                right_buf.push_back(oak_to_frame(
+                    frame,
+                    SensorId::StereoRight,
+                    FrameId::new(right_seq),
+                ));
                 right_count += 1;
+                right_seq += 1;
                 got_any = true;
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}

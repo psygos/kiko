@@ -598,13 +598,14 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
 
 fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetError> {
     let Frame {
-        id,
+        sensor_id,
+        frame_id: _,
         timestamp,
         width,
         height,
         data,
     } = frame;
-    let filename = format::frame_name(timestamp.as_nanos(), sensor_to_str(id));
+    let filename = format::frame_name(timestamp.as_nanos(), sensor_to_str(sensor_id));
     let path = frames_dir.join(&filename);
 
     let expected_len = (width as usize).saturating_mul(height as usize);

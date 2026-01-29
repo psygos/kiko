@@ -1,5 +1,5 @@
 use image::ImageReader;
-use kiko_slam::{Detections, Frame, LightGlue, SensorId, SuperPoint, Timestamp};
+use kiko_slam::{Detections, Frame, FrameId, LightGlue, SensorId, SuperPoint, Timestamp};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,31 +15,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn limit_detections(detections: Detections, max: usize) -> Detections {
-    if detections.len() <= max {
-        return detections;
-    }
-
-    let scores = detections.scores();
-    let mut order: Vec<usize> = (0..detections.len()).collect();
-    order.sort_unstable_by(|&a, &b| {
-        scores[b]
-            .partial_cmp(&scores[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    order.truncate(max);
-
-    let mut keypoints = Vec::with_capacity(order.len());
-    let mut new_scores = Vec::with_capacity(order.len());
-    let mut descriptors = Vec::with_capacity(order.len());
-
-    for &idx in &order {
-        keypoints.push(detections.keypoints()[idx]);
-        new_scores.push(scores[idx]);
-        descriptors.push(detections.descriptors()[idx].clone());
-    }
-
-    Detections::new(keypoints, new_scores, descriptors)
-        .expect("filtered detections should be consistent")
+    detections.top_k(max)
 }
 
 fn stitch_rgb(
@@ -105,6 +81,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let frame_1 = Frame::new(
         SensorId::StereoLeft,
+        FrameId::new(0),
         Timestamp::from_nanos(0),
         w_1,
         h_1,
@@ -112,6 +89,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     )?;
     let frame_2 = Frame::new(
         SensorId::StereoLeft,
+        FrameId::new(1),
         Timestamp::from_nanos(0),
         w_2,
         h_2,

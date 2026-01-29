@@ -14,6 +14,19 @@ pub enum SensorId {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub struct FrameId(u64);
+
+impl FrameId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
@@ -43,9 +56,55 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+#[derive(Debug)]
+pub enum PairError {
+    DimensionMismatch {
+        left: (u32, u32),
+        right: (u32, u32),
+    },
+    TimestampDelta {
+        delta_ns: i64,
+        max_delta_ns: i64,
+    },
+    SensorMismatch {
+        left: SensorId,
+        right: SensorId,
+    },
+}
+
+impl std::fmt::Display for PairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PairError::DimensionMismatch { left, right } => {
+                write!(
+                    f,
+                    "stereo dimension mismatch: left={}x{}, right={}x{}",
+                    left.0, left.1, right.0, right.1
+                )
+            }
+            PairError::TimestampDelta {
+                delta_ns,
+                max_delta_ns,
+            } => {
+                write!(
+                    f,
+                    "stereo delta {}ns exceeds window {}ns",
+                    delta_ns, max_delta_ns
+                )
+            }
+            PairError::SensorMismatch { left, right } => {
+                write!(f, "stereo sensor mismatch: left={left:?}, right={right:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PairError {}
+
 #[derive(Clone, Debug)]
 pub struct Frame {
-    id: SensorId,
+    sensor_id: SensorId,
+    frame_id: FrameId,
     timestamp: Timestamp,
     width: u32,
     height: u32,
@@ -54,7 +113,8 @@ pub struct Frame {
 
 impl Frame {
     pub fn new(
-        id: SensorId,
+        sensor_id: SensorId,
+        frame_id: FrameId,
         timestamp: Timestamp,
         width: u32,
         height: u32,
@@ -70,7 +130,8 @@ impl Frame {
         }
 
         Ok(Self {
-            id,
+            sensor_id,
+            frame_id,
             timestamp,
             width,
             height,
@@ -88,8 +149,12 @@ impl Frame {
         self.data.as_ref()
     }
 
-    pub fn id(&self) -> SensorId {
-        self.id
+    pub fn sensor_id(&self) -> SensorId {
+        self.sensor_id
+    }
+
+    pub fn frame_id(&self) -> FrameId {
+        self.frame_id
     }
 
     pub fn timestamp(&self) -> Timestamp {
@@ -120,12 +185,17 @@ pub enum DetectionError {
 // i need to create invariant of descriptors.len() and keypoint.len() remain the same
 #[derive(Debug, Clone)]
 pub struct Detections {
+    frame_id: FrameId,
     keypoints: Vec<Keypoint>,
     scores: Vec<f32>,
     descriptors: Vec<Descriptor>,
 }
 
 impl Detections {
+    pub fn frame_id(&self) -> FrameId {
+        self.frame_id
+    }
+
     pub fn keypoints(&self) -> &[Keypoint] {
         &self.keypoints
     }
@@ -147,6 +217,7 @@ impl Detections {
     }
 
     pub fn new(
+        frame_id: FrameId,
         keypoints: Vec<Keypoint>,
         scores: Vec<f32>,
         descriptors: Vec<Descriptor>,
@@ -159,10 +230,49 @@ impl Detections {
         }
 
         Ok(Self {
+            frame_id,
             keypoints,
             scores,
             descriptors,
         })
+    }
+
+    pub fn top_k(self, max: usize) -> Self {
+        if self.descriptors.len() <= max {
+            return self;
+        }
+
+        let Detections {
+            frame_id,
+            keypoints,
+            scores,
+            descriptors,
+        } = self;
+
+        let mut order: Vec<usize> = (0..descriptors.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        order.truncate(max);
+
+        let mut new_keypoints = Vec::with_capacity(order.len());
+        let mut new_scores = Vec::with_capacity(order.len());
+        let mut new_descriptors = Vec::with_capacity(order.len());
+
+        for &idx in &order {
+            new_keypoints.push(keypoints[idx]);
+            new_scores.push(scores[idx]);
+            new_descriptors.push(descriptors[idx].clone());
+        }
+
+        Self {
+            frame_id,
+            keypoints: new_keypoints,
+            scores: new_scores,
+            descriptors: new_descriptors,
+        }
     }
 }
 
@@ -201,6 +311,32 @@ pub struct StereoPair {
 }
 
 impl StereoPair {
+    pub fn try_new(left: Frame, right: Frame, max_delta_ns: i64) -> Result<Self, PairError> {
+        if left.sensor_id() != SensorId::StereoLeft || right.sensor_id() != SensorId::StereoRight {
+            return Err(PairError::SensorMismatch {
+                left: left.sensor_id(),
+                right: right.sensor_id(),
+            });
+        }
+
+        if left.width() != right.width() || left.height() != right.height() {
+            return Err(PairError::DimensionMismatch {
+                left: (left.width(), left.height()),
+                right: (right.width(), right.height()),
+            });
+        }
+
+        let delta = (left.timestamp().as_nanos() - right.timestamp().as_nanos()).abs();
+        if delta > max_delta_ns {
+            return Err(PairError::TimestampDelta {
+                delta_ns: delta,
+                max_delta_ns,
+            });
+        }
+
+        Ok(Self { left, right })
+    }
+
     pub fn timestamp_delta_ns(&self) -> i64 {
         (self.left.timestamp().as_nanos() - self.right.timestamp().as_nanos()).abs()
     }
@@ -305,6 +441,7 @@ pub enum MatchError {
     },
 }
 
+#[derive(Debug)]
 pub struct Matches<State> {
     source_a: Arc<Detections>,
     source_b: Arc<Detections>,
@@ -359,5 +496,77 @@ impl<State> Matches<State> {
 
     pub fn scores(&self) -> &[f32] {
         &self.scores
+    }
+}
+
+#[derive(Debug)]
+pub enum VizError {
+    FrameMismatch {
+        left: FrameId,
+        right: FrameId,
+        matches_left: FrameId,
+        matches_right: FrameId,
+    },
+}
+
+impl std::fmt::Display for VizError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VizError::FrameMismatch {
+                left,
+                right,
+                matches_left,
+                matches_right,
+            } => write!(
+                f,
+                "viz packet frame mismatch: left={}, right={}, matches_left={}, matches_right={}",
+                left.as_u64(),
+                right.as_u64(),
+                matches_left.as_u64(),
+                matches_right.as_u64()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for VizError {}
+
+#[derive(Debug)]
+pub struct VizPacket<State> {
+    left: Frame,
+    right: Frame,
+    matches: Matches<State>,
+}
+
+impl<State> VizPacket<State> {
+    pub fn try_new(left: Frame, right: Frame, matches: Matches<State>) -> Result<Self, VizError> {
+        let matches_left = matches.source_a().frame_id();
+        let matches_right = matches.source_b().frame_id();
+        if left.frame_id() != matches_left || right.frame_id() != matches_right {
+            return Err(VizError::FrameMismatch {
+                left: left.frame_id(),
+                right: right.frame_id(),
+                matches_left,
+                matches_right,
+            });
+        }
+
+        Ok(Self {
+            left,
+            right,
+            matches,
+        })
+    }
+
+    pub fn left(&self) -> &Frame {
+        &self.left
+    }
+
+    pub fn right(&self) -> &Frame {
+        &self.right
+    }
+
+    pub fn matches(&self) -> &Matches<State> {
+        &self.matches
     }
 }
