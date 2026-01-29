@@ -6,6 +6,8 @@ pub use inference::{LightGlue, SuperPoint};
 pub mod dataset;
 mod inference;
 mod preprocess;
+mod pairing;
+pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensorId {
@@ -185,6 +187,7 @@ pub enum DetectionError {
 // i need to create invariant of descriptors.len() and keypoint.len() remain the same
 #[derive(Debug, Clone)]
 pub struct Detections {
+    sensor_id: SensorId,
     frame_id: FrameId,
     keypoints: Vec<Keypoint>,
     scores: Vec<f32>,
@@ -192,6 +195,10 @@ pub struct Detections {
 }
 
 impl Detections {
+    pub fn sensor_id(&self) -> SensorId {
+        self.sensor_id
+    }
+
     pub fn frame_id(&self) -> FrameId {
         self.frame_id
     }
@@ -217,6 +224,7 @@ impl Detections {
     }
 
     pub fn new(
+        sensor_id: SensorId,
         frame_id: FrameId,
         keypoints: Vec<Keypoint>,
         scores: Vec<f32>,
@@ -230,6 +238,7 @@ impl Detections {
         }
 
         Ok(Self {
+            sensor_id,
             frame_id,
             keypoints,
             scores,
@@ -243,6 +252,7 @@ impl Detections {
         }
 
         let Detections {
+            sensor_id,
             frame_id,
             keypoints,
             scores,
@@ -268,6 +278,7 @@ impl Detections {
         }
 
         Self {
+            sensor_id,
             frame_id,
             keypoints: new_keypoints,
             scores: new_scores,
@@ -311,7 +322,7 @@ pub struct StereoPair {
 }
 
 impl StereoPair {
-    pub fn try_new(left: Frame, right: Frame, max_delta_ns: i64) -> Result<Self, PairError> {
+    pub fn try_new(left: Frame, right: Frame, window: PairingWindowNs) -> Result<Self, PairError> {
         if left.sensor_id() != SensorId::StereoLeft || right.sensor_id() != SensorId::StereoRight {
             return Err(PairError::SensorMismatch {
                 left: left.sensor_id(),
@@ -327,10 +338,10 @@ impl StereoPair {
         }
 
         let delta = (left.timestamp().as_nanos() - right.timestamp().as_nanos()).abs();
-        if delta > max_delta_ns {
+        if delta > window.as_ns() {
             return Err(PairError::TimestampDelta {
                 delta_ns: delta,
-                max_delta_ns,
+                max_delta_ns: window.as_ns(),
             });
         }
 
@@ -507,6 +518,12 @@ pub enum VizError {
         matches_left: FrameId,
         matches_right: FrameId,
     },
+    SensorMismatch {
+        left: SensorId,
+        right: SensorId,
+        matches_left: SensorId,
+        matches_right: SensorId,
+    },
 }
 
 impl std::fmt::Display for VizError {
@@ -525,6 +542,15 @@ impl std::fmt::Display for VizError {
                 matches_left.as_u64(),
                 matches_right.as_u64()
             ),
+            VizError::SensorMismatch {
+                left,
+                right,
+                matches_left,
+                matches_right,
+            } => write!(
+                f,
+                "viz packet sensor mismatch: left={left:?}, right={right:?}, matches_left={matches_left:?}, matches_right={matches_right:?}"
+            ),
         }
     }
 }
@@ -542,12 +568,22 @@ impl<State> VizPacket<State> {
     pub fn try_new(left: Frame, right: Frame, matches: Matches<State>) -> Result<Self, VizError> {
         let matches_left = matches.source_a().frame_id();
         let matches_right = matches.source_b().frame_id();
+        let matches_left_sensor = matches.source_a().sensor_id();
+        let matches_right_sensor = matches.source_b().sensor_id();
         if left.frame_id() != matches_left || right.frame_id() != matches_right {
             return Err(VizError::FrameMismatch {
                 left: left.frame_id(),
                 right: right.frame_id(),
                 matches_left,
                 matches_right,
+            });
+        }
+        if left.sensor_id() != matches_left_sensor || right.sensor_id() != matches_right_sensor {
+            return Err(VizError::SensorMismatch {
+                left: left.sensor_id(),
+                right: right.sensor_id(),
+                matches_left: matches_left_sensor,
+                matches_right: matches_right_sensor,
             });
         }
 

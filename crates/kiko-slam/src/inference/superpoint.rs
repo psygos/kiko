@@ -62,7 +62,13 @@ impl SuperPoint {
             .map(|chunk| Descriptor(chunk.try_into().unwrap()))
             .collect();
 
-        Detections::new(frame.frame_id(), keypoints, scores, descriptors)
+        Detections::new(
+            frame.sensor_id(),
+            frame.frame_id(),
+            keypoints,
+            scores,
+            descriptors,
+        )
             .map_err(|e| InferenceError::Domain(format!("{e:?}")))
     }
 }

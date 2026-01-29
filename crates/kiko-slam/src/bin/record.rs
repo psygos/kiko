@@ -1,9 +1,8 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
-use kiko_slam::{Frame, FrameId, SensorId, Timestamp};
+use kiko_slam::{Frame, FrameId, PairingWindowNs, SensorId, StereoPairer, Timestamp};
 use oak_sys::{Device, DeviceConfig, ImageError, ImageFrame, ImuConfig, MonoConfig, QueueConfig};
 
 fn build_meta(config: &MonoConfig, imu_config: Option<&ImuConfig>) -> Meta {
@@ -56,42 +55,6 @@ fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId, frame_id: FrameId) -> F
     .expect("oak frame dimensions should be valid")
 }
 
-/// Pair frames by closest timestamp within a window
-fn try_pair(
-    left_buf: &mut VecDeque<Frame>,
-    right_buf: &mut VecDeque<Frame>,
-    max_delta_ns: i64,
-) -> Option<(Frame, Frame)> {
-    if left_buf.is_empty() || right_buf.is_empty() {
-        return None;
-    }
-
-    let left = left_buf.front()?;
-    let left_ts = left.timestamp().as_nanos();
-
-    // Find closest right frame
-    let mut best_idx = 0;
-    let mut best_delta = i64::MAX;
-
-    for (i, right) in right_buf.iter().enumerate() {
-        let delta = (right.timestamp().as_nanos() - left_ts).abs();
-        if delta < best_delta {
-            best_delta = delta;
-            best_idx = i;
-        }
-    }
-
-    if best_delta <= max_delta_ns {
-        let left = left_buf.pop_front().unwrap();
-        let right = right_buf.remove(best_idx).unwrap();
-        Some((left, right))
-    } else {
-        // Left frame too old, discard it
-        left_buf.pop_front();
-        None
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
@@ -139,9 +102,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut right_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
-    let mut left_buf: VecDeque<Frame> = VecDeque::with_capacity(8);
-    let mut right_buf: VecDeque<Frame> = VecDeque::with_capacity(8);
-    let max_delta_ns = 5_000_000; // 5ms pairing window
+    let pairing_window =
+        PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
+    let mut pairer = StereoPairer::new(pairing_window);
     let start = std::time::Instant::now();
 
     eprintln!("recording... press ctrl+c to stop");
@@ -152,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Poll left (non-blocking)
         match device.mono_left(0) {
             Ok(frame) => {
-                left_buf.push_back(oak_to_frame(
+                pairer.push_left(oak_to_frame(
                     frame,
                     SensorId::StereoLeft,
                     FrameId::new(left_seq),
@@ -171,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Poll right (non-blocking)
         match device.mono_right(0) {
             Ok(frame) => {
-                right_buf.push_back(oak_to_frame(
+                pairer.push_right(oak_to_frame(
                     frame,
                     SensorId::StereoRight,
                     FrameId::new(right_seq),
@@ -188,9 +151,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Try to pair and write
-        while let Some((left, right)) = try_pair(&mut left_buf, &mut right_buf, max_delta_ns) {
-            writer.write_frame(&left);
-            writer.write_frame(&right);
+        while let Some(pair) = pairer.next_pair()? {
+            writer.write_frame(&pair.left);
+            writer.write_frame(&pair.right);
             pair_count += 1;
 
             if pair_count % 30 == 0 {
