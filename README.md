@@ -22,5 +22,5 @@ kiko/
 ## Immediate Roadmap
 
 - ~~Quick dataset recording~~
-- Live match visualisation in Rerun
+- ~~Live match visualisation in Rerun~~
 - Hardware-in-the-loop status bar
