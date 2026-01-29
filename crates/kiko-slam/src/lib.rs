@@ -7,7 +7,11 @@ pub mod dataset;
 mod inference;
 mod preprocess;
 mod pairing;
+mod pipeline;
+mod viz;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
+pub use pipeline::{InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError};
+pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensorId {
