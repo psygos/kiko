@@ -1,8 +1,12 @@
+use ort::session::Session;
 use ort::Error as OrtError;
 use std::path::PathBuf;
 
+mod backend;
 mod lightglue;
 mod superpoint;
+
+pub use backend::InferenceBackend;
 
 #[derive(Debug)]
 pub enum InferenceError {
@@ -52,3 +56,29 @@ impl std::fmt::Display for InferenceError {
 }
 pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
+
+fn build_session(
+    path: &std::path::Path,
+    backend: InferenceBackend,
+) -> Result<(Session, InferenceBackend), InferenceError> {
+    let mut builder = Session::builder().map_err(|e| InferenceError::LoadFailed {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+
+    let selection = backend::select_backend(backend)?;
+    if !selection.providers().is_empty() {
+        builder = builder
+            .with_execution_providers(selection.providers())
+            .map_err(InferenceError::Execution)?;
+    }
+
+    let session = builder
+        .commit_from_file(path)
+        .map_err(|e| InferenceError::LoadFailed {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+
+    Ok((session, selection.selected()))
+}

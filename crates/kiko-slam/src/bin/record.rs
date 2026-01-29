@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
-use kiko_slam::{Frame, FrameId, PairingWindowNs, SensorId, StereoPairer, Timestamp};
-use oak_sys::{Device, DeviceConfig, ImageError, ImageFrame, ImuConfig, MonoConfig, QueueConfig};
+use kiko_slam::{oak_to_frame, FrameId, PairingWindowNs, SensorId, StereoPairer};
+use oak_sys::{Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig};
 
 fn build_meta(config: &MonoConfig, imu_config: Option<&ImuConfig>) -> Meta {
     Meta {
@@ -41,18 +41,6 @@ fn build_calibration(device: &Device, baseline_m: f32) -> Calibration {
         },
         baseline_m,
     }
-}
-
-fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId, frame_id: FrameId) -> Frame {
-    Frame::new(
-        sensor,
-        frame_id,
-        Timestamp::from_nanos(oak_frame.timestamp.as_nanos()),
-        oak_frame.width,
-        oak_frame.height,
-        oak_frame.into_pixels(),
-    )
-    .expect("oak frame dimensions should be valid")
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

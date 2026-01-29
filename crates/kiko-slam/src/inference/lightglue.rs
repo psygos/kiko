@@ -1,4 +1,4 @@
-use super::InferenceError;
+use super::{build_session, InferenceBackend, InferenceError};
 use crate::Detections;
 use crate::Matches;
 use crate::Raw;
@@ -9,23 +9,29 @@ use std::sync::Arc;
 
 pub struct LightGlue {
     session: Session,
+    backend: InferenceBackend,
 }
 
 impl LightGlue {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, InferenceError> {
-        let path = path.as_ref();
-        let session = Session::builder()
-            .map_err(|e| InferenceError::LoadFailed {
-                path: path.to_path_buf(),
-                source: e,
-            })?
-            .commit_from_file(path)
-            .map_err(|e| InferenceError::LoadFailed {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
+        Self::new_with_backend(path, InferenceBackend::auto())
+    }
 
-        Ok(Self { session })
+    pub fn new_with_backend(
+        path: impl AsRef<Path>,
+        backend: InferenceBackend,
+    ) -> Result<Self, InferenceError> {
+        let path = path.as_ref();
+        let (session, selected) = build_session(path, backend)?;
+
+        Ok(Self {
+            session,
+            backend: selected,
+        })
+    }
+
+    pub fn backend(&self) -> InferenceBackend {
+        self.backend
     }
 
     pub fn match_these(

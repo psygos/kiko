@@ -1,4 +1,4 @@
-use super::InferenceError;
+use super::{build_session, InferenceBackend, InferenceError};
 use crate::{Descriptor, Detections, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::Tensor;
@@ -6,22 +6,28 @@ use std::path::Path;
 
 pub struct SuperPoint {
     session: Session,
+    backend: InferenceBackend,
 }
 
 impl SuperPoint {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, InferenceError> {
+        Self::new_with_backend(path, InferenceBackend::auto())
+    }
+
+    pub fn new_with_backend(
+        path: impl AsRef<Path>,
+        backend: InferenceBackend,
+    ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
-        let session = Session::builder()
-            .map_err(|e| InferenceError::LoadFailed {
-                path: path.to_path_buf(),
-                source: e,
-            })?
-            .commit_from_file(path)
-            .map_err(|e| InferenceError::LoadFailed {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        Ok(Self { session })
+        let (session, selected) = build_session(path, backend)?;
+        Ok(Self {
+            session,
+            backend: selected,
+        })
+    }
+
+    pub fn backend(&self) -> InferenceBackend {
+        self.backend
     }
 
     pub fn detect(&mut self, frame: &Frame) -> Result<Detections, InferenceError> {

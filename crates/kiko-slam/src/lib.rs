@@ -2,16 +2,25 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-pub use inference::{LightGlue, SuperPoint};
+pub use inference::{InferenceBackend, LightGlue, SuperPoint};
 pub mod dataset;
 mod inference;
 mod preprocess;
 mod pairing;
 mod pipeline;
 mod viz;
+mod channel;
+#[cfg(feature = "record")]
+mod oak;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
 pub use pipeline::{InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError};
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
+pub use channel::{
+    bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
+    DropPolicy, DropReceiver, DropSender, SendOutcome,
+};
+#[cfg(feature = "record")]
+pub use oak::oak_to_frame;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensorId {
