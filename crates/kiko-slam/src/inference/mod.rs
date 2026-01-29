@@ -1,4 +1,5 @@
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::Error as OrtError;
 use std::path::PathBuf;
 
@@ -67,6 +68,7 @@ fn build_session(
     })?;
 
     let selection = backend::select_backend(backend)?;
+    builder = apply_session_config(builder, selection.selected())?;
     if !selection.providers().is_empty() {
         builder = builder
             .with_execution_providers(selection.providers())
@@ -81,4 +83,67 @@ fn build_session(
         })?;
 
     Ok((session, selection.selected()))
+}
+
+fn apply_session_config(
+    builder: ort::session::builder::SessionBuilder,
+    selected: InferenceBackend,
+) -> Result<ort::session::builder::SessionBuilder, InferenceError> {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let default_intra = match selected {
+        InferenceBackend::Cpu => (cores / 2).max(1),
+        _ => 1,
+    };
+    let intra = env_usize("KIKO_ORT_INTRA_THREADS").unwrap_or(default_intra);
+    let inter = env_usize("KIKO_ORT_INTER_THREADS").unwrap_or(1);
+    let opt_level = env_opt_level("KIKO_ORT_OPT_LEVEL").unwrap_or(GraphOptimizationLevel::Level3);
+    let mem_pattern = env_bool("KIKO_ORT_MEM_PATTERN").unwrap_or(true);
+    let parallel_exec = env_bool("KIKO_ORT_PARALLEL_EXEC").unwrap_or(false);
+
+    builder
+        .with_optimization_level(opt_level)
+        .and_then(|b| b.with_memory_pattern(mem_pattern))
+        .and_then(|b| b.with_intra_threads(intra))
+        .and_then(|b| b.with_inter_threads(inter))
+        .and_then(|b| b.with_parallel_execution(parallel_exec))
+        .map_err(InferenceError::Execution)
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    let raw = std::env::var(key).ok()?;
+    match raw.parse::<usize>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
+    }
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
+    }
+}
+
+fn env_opt_level(key: &str) -> Option<GraphOptimizationLevel> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_lowercase().as_str() {
+        "disable" | "0" => Some(GraphOptimizationLevel::Disable),
+        "1" | "level1" | "basic" => Some(GraphOptimizationLevel::Level1),
+        "2" | "level2" | "extended" => Some(GraphOptimizationLevel::Level2),
+        "3" | "level3" | "all" => Some(GraphOptimizationLevel::Level3),
+        _ => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
+    }
 }

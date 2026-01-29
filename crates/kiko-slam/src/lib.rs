@@ -236,12 +236,14 @@ impl Frame {
     }
 }
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Keypoint {
     pub x: f32,
     pub y: f32,
 }
 
+#[repr(transparent)]
 #[derive(Debug, Clone)]
 pub struct Descriptor(pub [f32; 256]);
 
@@ -279,12 +281,27 @@ impl Detections {
         &self.keypoints
     }
 
+    pub fn keypoints_flat(&self) -> &[f32] {
+        let len = self.keypoints.len() * 2;
+        let ptr = self.keypoints.as_ptr() as *const f32;
+        // Safety: Keypoint is #[repr(C)] over two f32 values, so this is a
+        // contiguous [f32; 2] slice with no padding.
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
     pub fn scores(&self) -> &[f32] {
         &self.scores
     }
 
     pub fn descriptors(&self) -> &[Descriptor] {
         &self.descriptors
+    }
+
+    pub fn descriptors_flat(&self) -> &[f32] {
+        let len = self.descriptors.len() * 256;
+        let ptr = self.descriptors.as_ptr() as *const f32;
+        // Safety: Descriptor is #[repr(transparent)] over [f32; 256].
+        unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
     pub fn len(&self) -> usize {
@@ -332,12 +349,18 @@ impl Detections {
         } = self;
 
         let mut order: Vec<usize> = (0..descriptors.len()).collect();
-        order.sort_unstable_by(|&a, &b| {
+        let kth = max.saturating_sub(1);
+        order.select_nth_unstable_by(kth, |&a, &b| {
             scores[b]
                 .partial_cmp(&scores[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         order.truncate(max);
+        order.sort_unstable_by(|&a, &b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let mut new_keypoints = Vec::with_capacity(order.len());
         let mut new_scores = Vec::with_capacity(order.len());

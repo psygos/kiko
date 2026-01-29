@@ -3,6 +3,7 @@ use std::fs;
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::execution_providers::ExecutionProvider;
 use ort::execution_providers::ExecutionProviderDispatch;
+use ort::execution_providers::cpu::CPUExecutionProvider;
 
 use super::InferenceError;
 
@@ -93,7 +94,26 @@ pub(crate) fn select_backend(
         selected = InferenceBackend::Cpu;
     }
 
+    let use_cpu_arena = env_bool("KIKO_ORT_CPU_ARENA").unwrap_or(true);
+    providers.push(
+        CPUExecutionProvider::default()
+            .with_arena_allocator(use_cpu_arena)
+            .build(),
+    );
+
     Ok(BackendSelection { selected, providers })
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let raw = std::env::var(key).ok()?;
+    match raw.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
+    }
 }
 
 fn detect_backend() -> InferenceBackend {

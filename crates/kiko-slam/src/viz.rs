@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::{Frame, Raw, VizPacket};
+use crate::{Detections, Frame, Keypoint, Raw, VizPacket};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
@@ -77,6 +77,7 @@ pub struct RerunSink {
     rec: rerun::RecordingStream,
     decimation: VizDecimation,
     frame_index: u64,
+    tracks: TrackState,
 }
 
 impl RerunSink {
@@ -85,6 +86,7 @@ impl RerunSink {
             rec,
             decimation,
             frame_index: 0,
+            tracks: TrackState::new(),
         }
     }
 
@@ -97,6 +99,7 @@ impl RerunSink {
 
         let left = packet.left();
         let right = packet.right();
+        let track_ids = self.tracks.assign_tracks(packet.matches().source_a());
 
         self.rec.set_time(
             "capture_ns",
@@ -110,7 +113,7 @@ impl RerunSink {
             rerun::ChannelDatatype::U8,
         )
         .with_draw_order(0.0);
-        self.rec.log("view/left/image", &left_image)?;
+        self.rec.log("view/left", &left_image)?;
 
         let right_image = rerun::Image::from_color_model_and_bytes(
             right.data().to_vec(),
@@ -119,7 +122,7 @@ impl RerunSink {
             rerun::ChannelDatatype::U8,
         )
         .with_draw_order(0.0);
-        self.rec.log("view/right/image", &right_image)?;
+        self.rec.log("view/right", &right_image)?;
 
         let (stitched, width, height) = stitch_luma(left, right);
         let matches_image = rerun::Image::from_color_model_and_bytes(
@@ -129,11 +132,112 @@ impl RerunSink {
             rerun::ChannelDatatype::U8,
         )
         .with_draw_order(0.0);
-        self.rec.log("view/matches/image", &matches_image)?;
+        self.rec.log("view/matches", &matches_image)?;
 
-        log_matches(&self.rec, packet, left.width() as f32)?;
+        log_matches(&self.rec, packet, left.width() as f32, &track_ids)?;
 
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackConfig {
+    max_distance_px: f32,
+    min_similarity: f32,
+}
+
+impl TrackConfig {
+    fn load() -> Self {
+        let max_distance_px = env_f32("KIKO_TRACK_MAX_DIST").unwrap_or(24.0);
+        let min_similarity = env_f32("KIKO_TRACK_MIN_SIM").unwrap_or(0.8);
+        Self {
+            max_distance_px,
+            min_similarity,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct TrackState {
+    config: TrackConfig,
+    prev_left: Option<std::sync::Arc<Detections>>,
+    prev_track_ids: Vec<u64>,
+    next_track_id: u64,
+}
+
+impl TrackState {
+    fn new() -> Self {
+        Self {
+            config: TrackConfig::load(),
+            prev_left: None,
+            prev_track_ids: Vec::new(),
+            next_track_id: 0,
+        }
+    }
+
+    fn assign_tracks(&mut self, left: &Detections) -> Vec<u64> {
+        let count = left.len();
+        let mut track_ids = vec![0u64; count];
+
+        let (prev_left, prev_ids) = match self.prev_left.as_ref() {
+            Some(prev) if self.prev_track_ids.len() == prev.len() => (Some(prev), &self.prev_track_ids),
+            _ => (None, &self.prev_track_ids),
+        };
+
+        if let Some(prev) = prev_left {
+            let mut used_prev = vec![false; prev.len()];
+            let max_dist_sq = self.config.max_distance_px * self.config.max_distance_px;
+
+            for (i, desc) in left.descriptors().iter().enumerate() {
+                let kp = left.keypoints()[i];
+                let mut best_idx = None;
+                let mut best_sim = self.config.min_similarity;
+
+                for (j, prev_desc) in prev.descriptors().iter().enumerate() {
+                    if used_prev[j] {
+                        continue;
+                    }
+                    let prev_kp = prev.keypoints()[j];
+                    if distance_sq(kp, prev_kp) > max_dist_sq {
+                        continue;
+                    }
+                    let sim = dot(desc.0.as_slice(), prev_desc.0.as_slice());
+                    if sim > best_sim {
+                        best_sim = sim;
+                        best_idx = Some(j);
+                    }
+                }
+
+                if let Some(j) = best_idx {
+                    track_ids[i] = prev_ids[j];
+                    used_prev[j] = true;
+                } else {
+                    track_ids[i] = self.next_track_id;
+                    self.next_track_id = self.next_track_id.saturating_add(1);
+                }
+            }
+        } else {
+            for id in &mut track_ids {
+                *id = self.next_track_id;
+                self.next_track_id = self.next_track_id.saturating_add(1);
+            }
+        }
+
+        self.prev_left = Some(std::sync::Arc::new(left.clone()));
+        self.prev_track_ids = track_ids.clone();
+
+        track_ids
+    }
+}
+
+fn env_f32(key: &str) -> Option<f32> {
+    let raw = std::env::var(key).ok()?;
+    match raw.parse::<f32>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
     }
 }
 
@@ -141,6 +245,7 @@ fn log_matches(
     rec: &rerun::RecordingStream,
     packet: &VizPacket<Raw>,
     x_offset: f32,
+    track_ids: &[u64],
 ) -> Result<(), rerun::RecordingStreamError> {
     let matches = packet.matches();
     if matches.is_empty() {
@@ -176,12 +281,17 @@ fn log_matches(
         rerun::Color::from_rgb(251, 86, 7),
         rerun::Color::from_rgb(131, 56, 236),
     ];
-    let colors: Vec<rerun::Color> = (0..strips.len())
-        .map(|idx| palette[idx % palette.len()])
+    let colors: Vec<rerun::Color> = matches
+        .indices()
+        .iter()
+        .map(|(idx_left, _)| {
+            let track_id = track_ids.get(*idx_left).copied().unwrap_or(0);
+            palette[(track_id as usize) % palette.len()]
+        })
         .collect();
 
     rec.log(
-        "view/matches/lines",
+        "view/matches",
         &rerun::LineStrips2D::new(strips)
             .with_colors(colors)
             .with_radii([rerun::Radius::new_ui_points(1.5)])
@@ -189,6 +299,16 @@ fn log_matches(
     )?;
 
     Ok(())
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+fn distance_sq(a: Keypoint, b: Keypoint) -> f32 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    dx * dx + dy * dy
 }
 
 fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {

@@ -1,12 +1,13 @@
 use super::{build_session, InferenceBackend, InferenceError};
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
-use ort::value::Tensor;
+use ort::value::TensorRef;
 use std::path::Path;
 
 pub struct SuperPoint {
     session: Session,
     backend: InferenceBackend,
+    scratch: Vec<f32>,
 }
 
 impl SuperPoint {
@@ -23,6 +24,7 @@ impl SuperPoint {
         Ok(Self {
             session,
             backend: selected,
+            scratch: Vec::new(),
         })
     }
 
@@ -31,13 +33,23 @@ impl SuperPoint {
     }
 
     pub fn detect(&mut self, frame: &Frame) -> Result<Detections, InferenceError> {
-        let input_data: Vec<f32> = crate::preprocess::normalise(frame.data());
-        let input_tensor = Tensor::from_array((
+        let expected = (frame.width() as usize) * (frame.height() as usize);
+        self.scratch.resize(expected, 0.0);
+        crate::preprocess::normalise_into(frame.data(), &mut self.scratch);
+
+        let input_tensor = TensorRef::from_array_view((
             [1, 1, frame.height() as usize, frame.width() as usize],
-            input_data,
+            self.scratch.as_slice(),
         ))?;
 
-        self.run_inference(frame, input_tensor, frame.width(), frame.height(), None)
+        run_inference(
+            &mut self.session,
+            frame,
+            input_tensor,
+            frame.width(),
+            frame.height(),
+            None,
+        )
     }
 
     pub fn detect_with_downscale(
@@ -49,20 +61,22 @@ impl SuperPoint {
             return self.detect(frame);
         }
 
-        let (input_data, width, height) = crate::preprocess::normalise_downscale(
+        let (width, height) = crate::preprocess::normalise_downscale_into(
             frame.data(),
             frame.width(),
             frame.height(),
             downscale,
+            &mut self.scratch,
         )
         .map_err(|e| InferenceError::Domain(format!("{e}")))?;
 
-        let input_tensor = Tensor::from_array((
+        let input_tensor = TensorRef::from_array_view((
             [1, 1, height as usize, width as usize],
-            input_data,
+            self.scratch.as_slice(),
         ))?;
 
-        self.run_inference(
+        run_inference(
+            &mut self.session,
             frame,
             input_tensor,
             width,
@@ -70,58 +84,57 @@ impl SuperPoint {
             Some(downscale),
         )
     }
+}
 
-    fn run_inference(
-        &mut self,
-        frame: &Frame,
-        input_tensor: Tensor<f32>,
-        width: u32,
-        height: u32,
-        downscale: Option<DownscaleFactor>,
-    ) -> Result<Detections, InferenceError> {
-        let outputs = self.session.run(ort::inputs!["image" => input_tensor])?;
+fn run_inference(
+    session: &mut Session,
+    frame: &Frame,
+    input_tensor: TensorRef<'_, f32>,
+    width: u32,
+    height: u32,
+    downscale: Option<DownscaleFactor>,
+) -> Result<Detections, InferenceError> {
+    let outputs = session.run(ort::inputs!["image" => input_tensor])?;
 
-        let keypoints_value = &outputs["keypoints"];
-        let scores_raw = outputs["scores"].try_extract_tensor::<f32>()?;
-        let descriptors_raw = outputs["descriptors"].try_extract_tensor::<f32>()?;
+    let keypoints_value = &outputs["keypoints"];
+    let scores_raw = outputs["scores"].try_extract_tensor::<f32>()?;
+    let descriptors_raw = outputs["descriptors"].try_extract_tensor::<f32>()?;
 
-        let scores = scores_raw.1.to_vec();
-        let keypoints_pairs = if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>()
-        {
-            parse_keypoint_pairs(shape, data, "keypoints")?
-        } else if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<i64>() {
-            let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
-            parse_keypoint_pairs(shape, &data_f32, "keypoints")?
-        } else {
-            return Err(InferenceError::UnexpectedOutput {
-                name: "keypoints".to_string(),
-                expected: "tensor of f32 or i64".to_string(),
-                actual: format!("{:?}", keypoints_value.dtype()),
-            });
-        };
-        let mut keypoints = to_keypoints(&keypoints_pairs, width as f32, height as f32);
-        if let Some(scale) = downscale {
-            let factor = scale.get() as f32;
-            for kp in &mut keypoints {
-                kp.x *= factor;
-                kp.y *= factor;
-            }
+    let scores = scores_raw.1.to_vec();
+    let keypoints_pairs = if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>() {
+        parse_keypoint_pairs(shape, data, "keypoints")?
+    } else if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<i64>() {
+        let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        parse_keypoint_pairs(shape, &data_f32, "keypoints")?
+    } else {
+        return Err(InferenceError::UnexpectedOutput {
+            name: "keypoints".to_string(),
+            expected: "tensor of f32 or i64".to_string(),
+            actual: format!("{:?}", keypoints_value.dtype()),
+        });
+    };
+    let mut keypoints = to_keypoints(&keypoints_pairs, width as f32, height as f32);
+    if let Some(scale) = downscale {
+        let factor = scale.get() as f32;
+        for kp in &mut keypoints {
+            kp.x *= factor;
+            kp.y *= factor;
         }
-        let descriptors = descriptors_raw
-            .1
-            .chunks(256)
-            .map(|chunk| Descriptor(chunk.try_into().unwrap()))
-            .collect();
-
-        Detections::new(
-            frame.sensor_id(),
-            frame.frame_id(),
-            keypoints,
-            scores,
-            descriptors,
-        )
-            .map_err(|e| InferenceError::Domain(format!("{e:?}")))
     }
+    let descriptors = descriptors_raw
+        .1
+        .chunks(256)
+        .map(|chunk| Descriptor(chunk.try_into().unwrap()))
+        .collect();
+
+    Detections::new(
+        frame.sensor_id(),
+        frame.frame_id(),
+        keypoints,
+        scores,
+        descriptors,
+    )
+    .map_err(|e| InferenceError::Domain(format!("{e:?}")))
 }
 
 #[derive(Clone, Copy, Debug)]

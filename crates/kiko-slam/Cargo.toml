@@ -36,3 +36,7 @@ required-features = ["record"]
 [[bin]]
 name = "bench_dataset"
 path = "src/bin/bench_dataset.rs"
+
+[[bin]]
+name = "viz_dataset"
+path = "src/bin/viz_dataset.rs"

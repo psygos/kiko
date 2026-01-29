@@ -69,7 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let superpoint_left = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
     let superpoint_right = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
     let lightglue = LightGlue::new_with_backend(&lg_path, lightglue_backend)?;
-    let key_limit = KeypointLimit::try_from(MAX_KEYPOINTS)?;
+    let max_keypoints = env_usize("KIKO_MAX_KEYPOINTS").unwrap_or(MAX_KEYPOINTS);
+    let key_limit = KeypointLimit::try_from(max_keypoints)?;
     let downscale = env_usize("KIKO_DOWNSCALE")
         .map(DownscaleFactor::try_from)
         .transpose()
@@ -81,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lightglue.backend()
     );
     eprintln!("downscale: {}", downscale.get());
+    eprintln!("max_keypoints: {}", max_keypoints);
 
     let inference_handle = thread::spawn(move || {
         let mut pipeline =
