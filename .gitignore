@@ -32,3 +32,25 @@ venv/
 .coverage
 htmlcov/
 
+# Tooling artifacts
+.claude/
+recordings/
+
+# Desktop client local artifacts
+comms/desktop-client/logs/
+comms/desktop-client/*.local
+comms/desktop-client/*.suo
+comms/desktop-client/*.ntvs*
+comms/desktop-client/*.njsproj
+comms/desktop-client/*.sln
+comms/desktop-client/*.sw?
+comms/desktop-client/npm-debug.log*
+comms/desktop-client/yarn-debug.log*
+comms/desktop-client/yarn-error.log*
+comms/desktop-client/pnpm-debug.log*
+comms/desktop-client/lerna-debug.log*
+comms/desktop-client/src-tauri/target/
+
+# kiko-slam artifacts
+crates/kiko-slam/dataset/
+*.rrd
