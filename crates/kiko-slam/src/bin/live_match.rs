@@ -1,12 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use kiko_slam::{
-    bounded_channel, oak_to_frame, ChannelCapacity, DropPolicy, InferencePipeline, KeypointLimit,
-    LightGlue, PairingWindowNs, RerunSink, SendOutcome, StereoPairer, SuperPoint, VizDecimation,
+    bounded_channel, oak_to_frame, ChannelCapacity, DownscaleFactor, DropPolicy, InferenceBackend,
+    InferencePipeline, KeypointLimit, LightGlue, PairingWindowNs, RerunSink, SendOutcome,
+    StereoPairer, SuperPoint, VizDecimation,
 };
 use oak_sys::{Device, DeviceConfig, ImageError, MonoConfig, QueueConfig};
 
@@ -52,13 +53,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let viz_capacity = ChannelCapacity::try_from(VIZ_QUEUE_DEPTH)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
 
+    let default_backend = env_backend("KIKO_BACKEND").unwrap_or(InferenceBackend::auto());
+    let superpoint_backend = env_backend("KIKO_SUPERPOINT_BACKEND").unwrap_or(default_backend);
+    let lightglue_backend = env_backend("KIKO_LIGHTGLUE_BACKEND").unwrap_or(default_backend);
+
     let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
-    let superpoint = SuperPoint::new(model_dir.join("sp.onnx"))?;
-    let lightglue = LightGlue::new(model_dir.join("lg.onnx"))?;
+    let sp_path = model_path(&model_dir, "KIKO_SUPERPOINT_MODEL", "sp.onnx");
+    let lg_path = model_path(&model_dir, "KIKO_LIGHTGLUE_MODEL", "lg.onnx");
+    eprintln!(
+        "models: superpoint={} lightglue={}",
+        sp_path.display(),
+        lg_path.display()
+    );
+
+    let superpoint_left = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
+    let superpoint_right = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
+    let lightglue = LightGlue::new_with_backend(&lg_path, lightglue_backend)?;
     let key_limit = KeypointLimit::try_from(MAX_KEYPOINTS)?;
+    let downscale = env_usize("KIKO_DOWNSCALE")
+        .map(DownscaleFactor::try_from)
+        .transpose()
+        .map_err(|e| format!("invalid KIKO_DOWNSCALE: {e}"))?
+        .unwrap_or_else(DownscaleFactor::identity);
+    eprintln!(
+        "inference backend: superpoint={:?}, lightglue={:?}",
+        superpoint_left.backend(),
+        lightglue.backend()
+    );
+    eprintln!("downscale: {}", downscale.get());
 
     let inference_handle = thread::spawn(move || {
-        let mut pipeline = InferencePipeline::new(superpoint, lightglue, key_limit);
+        let mut pipeline =
+            InferencePipeline::new(superpoint_left, superpoint_right, lightglue, key_limit)
+                .with_downscale(downscale);
         for pair in pair_rx.iter() {
             match pipeline.process_pair(pair) {
                 Ok(packet) => {
@@ -165,4 +192,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+fn env_backend(key: &str) -> Option<InferenceBackend> {
+    let raw = std::env::var(key).ok()?;
+    match InferenceBackend::parse(&raw) {
+        Some(backend) => Some(backend),
+        None => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
+    }
+}
+
+fn model_path(model_dir: &Path, key: &str, default_name: &str) -> PathBuf {
+    match std::env::var(key) {
+        Ok(value) => {
+            let candidate = PathBuf::from(value);
+            if candidate.is_absolute() {
+                candidate
+            } else {
+                model_dir.join(candidate)
+            }
+        }
+        Err(_) => model_dir.join(default_name),
+    }
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    let raw = std::env::var(key).ok()?;
+    match raw.parse::<usize>() {
+        Ok(value) => Some(value),
+        Err(_) => {
+            eprintln!("invalid {key}={raw}, ignoring");
+            None
+        }
+    }
 }

@@ -1,5 +1,5 @@
 use super::{build_session, InferenceBackend, InferenceError};
-use crate::{Descriptor, Detections, Frame, Keypoint};
+use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::path::Path;
@@ -37,6 +37,48 @@ impl SuperPoint {
             input_data,
         ))?;
 
+        self.run_inference(frame, input_tensor, frame.width(), frame.height(), None)
+    }
+
+    pub fn detect_with_downscale(
+        &mut self,
+        frame: &Frame,
+        downscale: DownscaleFactor,
+    ) -> Result<Detections, InferenceError> {
+        if downscale.get() == 1 {
+            return self.detect(frame);
+        }
+
+        let (input_data, width, height) = crate::preprocess::normalise_downscale(
+            frame.data(),
+            frame.width(),
+            frame.height(),
+            downscale,
+        )
+        .map_err(|e| InferenceError::Domain(format!("{e}")))?;
+
+        let input_tensor = Tensor::from_array((
+            [1, 1, height as usize, width as usize],
+            input_data,
+        ))?;
+
+        self.run_inference(
+            frame,
+            input_tensor,
+            width,
+            height,
+            Some(downscale),
+        )
+    }
+
+    fn run_inference(
+        &mut self,
+        frame: &Frame,
+        input_tensor: Tensor<f32>,
+        width: u32,
+        height: u32,
+        downscale: Option<DownscaleFactor>,
+    ) -> Result<Detections, InferenceError> {
         let outputs = self.session.run(ort::inputs!["image" => input_tensor])?;
 
         let keypoints_value = &outputs["keypoints"];
@@ -57,11 +99,14 @@ impl SuperPoint {
                 actual: format!("{:?}", keypoints_value.dtype()),
             });
         };
-        let keypoints = to_keypoints(
-            &keypoints_pairs,
-            frame.width() as f32,
-            frame.height() as f32,
-        );
+        let mut keypoints = to_keypoints(&keypoints_pairs, width as f32, height as f32);
+        if let Some(scale) = downscale {
+            let factor = scale.get() as f32;
+            for kp in &mut keypoints {
+                kp.x *= factor;
+                kp.y *= factor;
+            }
+        }
         let descriptors = descriptors_raw
             .1
             .chunks(256)

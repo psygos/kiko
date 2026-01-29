@@ -103,15 +103,33 @@ impl RerunSink {
             rerun::TimeCell::from_duration_nanos(left.timestamp().as_nanos()),
         );
 
+        let left_image = rerun::Image::from_color_model_and_bytes(
+            left.data().to_vec(),
+            [left.width(), left.height()],
+            rerun::ColorModel::L,
+            rerun::ChannelDatatype::U8,
+        )
+        .with_draw_order(0.0);
+        self.rec.log("view/left/image", &left_image)?;
+
+        let right_image = rerun::Image::from_color_model_and_bytes(
+            right.data().to_vec(),
+            [right.width(), right.height()],
+            rerun::ColorModel::L,
+            rerun::ChannelDatatype::U8,
+        )
+        .with_draw_order(0.0);
+        self.rec.log("view/right/image", &right_image)?;
+
         let (stitched, width, height) = stitch_luma(left, right);
-        let image = rerun::Image::from_color_model_and_bytes(
+        let matches_image = rerun::Image::from_color_model_and_bytes(
             stitched,
             [width, height],
             rerun::ColorModel::L,
             rerun::ChannelDatatype::U8,
         )
         .with_draw_order(0.0);
-        self.rec.log("view/matches/image", &image)?;
+        self.rec.log("view/matches/image", &matches_image)?;
 
         log_matches(&self.rec, packet, left.width() as f32)?;
 

@@ -13,6 +13,7 @@ ort-tensorrt = ["ort/tensorrt"]
 [dependencies]
 crossbeam-channel = "0.5.13"
 image = "0.25.9"
+libc = "0.2.153"
 ndarray = "0.17.1"
 ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
 rerun = "=0.27.2"
@@ -31,3 +32,7 @@ required-features = ["record"]
 name = "live_match"
 path = "src/bin/live_match.rs"
 required-features = ["record"]
+
+[[bin]]
+name = "bench_dataset"
+path = "src/bin/bench_dataset.rs"

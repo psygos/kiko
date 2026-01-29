@@ -19,6 +19,17 @@ impl InferenceBackend {
     pub fn auto() -> Self {
         Self::Auto
     }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_lowercase().as_str() {
+            "auto" => Some(InferenceBackend::Auto),
+            "cpu" => Some(InferenceBackend::Cpu),
+            "coreml" | "coreml-gpu" => Some(InferenceBackend::CoreMLGpu),
+            "cuda" => Some(InferenceBackend::Cuda),
+            "tensorrt" => Some(InferenceBackend::TensorRT),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

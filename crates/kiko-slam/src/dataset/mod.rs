@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{Frame, SensorId};
+use crate::{Frame, PairError, SensorId};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -25,6 +25,9 @@ pub mod format {
         Some((timestamp_ns, sensor.to_string()))
     }
 }
+
+mod reader;
+pub use reader::{DatasetReadTimings, DatasetReader, DatasetStats, TimedPair};
 
 // Meta Structs
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +161,9 @@ pub enum DatasetError {
     WorkerJoin {
         message: String,
     },
+    PairingFailed {
+        source: PairError,
+    },
 }
 
 impl std::fmt::Display for DatasetError {
@@ -199,6 +205,9 @@ impl std::fmt::Display for DatasetError {
             }
             DatasetError::WorkerJoin { message } => {
                 write!(f, "writer thread panicked: {message}")
+            }
+            DatasetError::PairingFailed { source } => {
+                write!(f, "dataset pairing failed: {source}")
             }
         }
     }
@@ -694,7 +703,7 @@ struct DeltaStats {
     max: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ManifestEntry {
     left: ManifestFrameRef,
     right: Option<ManifestFrameRef>,
@@ -703,20 +712,20 @@ struct ManifestEntry {
     reason: Option<PairReason>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct ManifestFrameRef {
     timestamp_ns: i64,
     path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 enum PairStatus {
     Paired,
     MissingRight,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
 enum PairReason {
     OutsideWindow,
@@ -810,6 +819,16 @@ fn read_meta(dataset_dir: &Path) -> Result<Meta, DatasetError> {
         source: e,
     })?;
     serde_json::from_reader(meta_file).map_err(|e| DatasetError::DeserializeJson { source: e })
+}
+
+fn read_manifest(dataset_dir: &Path) -> Result<Manifest, DatasetError> {
+    let manifest_path = dataset_dir.join(format::MANIFEST_FILE);
+    let manifest_file =
+        std::fs::File::open(&manifest_path).map_err(|e| DatasetError::ReadFile {
+            path: manifest_path.clone(),
+            source: e,
+        })?;
+    serde_json::from_reader(manifest_file).map_err(|e| DatasetError::DeserializeJson { source: e })
 }
 
 fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {

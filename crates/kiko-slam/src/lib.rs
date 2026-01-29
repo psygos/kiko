@@ -1,5 +1,6 @@
 #![warn(clippy::all)]
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 pub use inference::{InferenceBackend, LightGlue, SuperPoint};
@@ -13,7 +14,9 @@ mod channel;
 #[cfg(feature = "record")]
 mod oak;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
-pub use pipeline::{InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError};
+pub use pipeline::{
+    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
+};
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 pub use channel::{
     bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
@@ -115,6 +118,62 @@ impl std::fmt::Display for PairError {
 }
 
 impl std::error::Error for PairError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownscaleFactor(NonZeroUsize);
+
+impl DownscaleFactor {
+    pub fn new(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+
+    pub fn identity() -> Self {
+        Self(NonZeroUsize::new(1).expect("nonzero"))
+    }
+}
+
+#[derive(Debug)]
+pub enum DownscaleError {
+    Zero,
+    NonDivisible {
+        width: u32,
+        height: u32,
+        factor: usize,
+    },
+}
+
+impl std::fmt::Display for DownscaleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
+            DownscaleError::NonDivisible {
+                width,
+                height,
+                factor,
+            } => write!(
+                f,
+                "downscale factor {factor} does not divide frame {}x{}",
+                width, height
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DownscaleError {}
+
+impl TryFrom<usize> for DownscaleFactor {
+    type Error = DownscaleError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        NonZeroUsize::new(value)
+            .map(DownscaleFactor)
+            .ok_or(DownscaleError::Zero)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Frame {
@@ -329,6 +388,7 @@ impl<S: FrameSource> Iterator for Frames<S> {
     }
 }
 
+#[derive(Debug)]
 pub struct StereoPair {
     pub left: Frame,
     pub right: Frame,
