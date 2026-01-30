@@ -3,12 +3,16 @@ use std::time::{Duration, Instant};
 
 use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
-use super::{format, read_manifest, read_meta, scan_frames, DatasetError, FrameInfo, Manifest};
+use super::{
+    format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
+    FrameInfo, Manifest,
+};
 
 #[derive(Debug)]
 pub struct DatasetReader {
     root: PathBuf,
     meta: super::Meta,
+    calibration: Calibration,
     manifest: Manifest,
     pairing_window: PairingWindowNs,
     left_seq: u64,
@@ -34,6 +38,7 @@ impl DatasetReader {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, DatasetError> {
         let root = path.into();
         let meta = read_meta(&root)?;
+        let calibration = read_calibration(&root)?;
         let manifest = read_manifest(&root)?;
         let pairing_window = PairingWindowNs::new(manifest.header.pairing_window_ns as i64)
             .map_err(|_| DatasetError::InvalidConfig {
@@ -42,6 +47,7 @@ impl DatasetReader {
         Ok(Self {
             root,
             meta,
+            calibration,
             manifest,
             pairing_window,
             left_seq: 0,
@@ -51,6 +57,10 @@ impl DatasetReader {
 
     pub fn meta(&self) -> &super::Meta {
         &self.meta
+    }
+
+    pub fn calibration(&self) -> &Calibration {
+        &self.calibration
     }
 
     pub fn stats(&self) -> Result<DatasetStats, DatasetError> {

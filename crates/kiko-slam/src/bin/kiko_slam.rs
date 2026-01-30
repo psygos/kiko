@@ -5,8 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
-    DownscaleFactor, InferenceBackend, InferencePipeline, KeypointLimit, LightGlue, RerunSink,
-    SuperPoint, VizDecimation,
+    DownscaleFactor, InferenceBackend, InferencePipeline, KeypointLimit, LightGlue,
+    RectifiedStereo, RectifiedStereoConfig, RerunSink, SuperPoint, TriangulationConfig,
+    TriangulationError, Triangulator, VizDecimation,
 };
 
 #[cfg(feature = "record")]
@@ -76,6 +77,8 @@ struct VizArgs {
     inference: InferenceArgs,
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value_t = VizDecimationArg::default())]
     rerun_decimation: VizDecimationArg,
+    #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
+    rectify_tolerance: Option<f32>,
     #[command(flatten)]
     dataset: DatasetArgs,
 }
@@ -97,6 +100,8 @@ struct CameraArgs {
     height: u32,
     #[arg(long, default_value_t = 30)]
     fps: u32,
+    #[arg(long, default_value_t = true)]
+    rectified: bool,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -364,6 +369,14 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference = InferenceConfig::from_args(&args.inference)?;
     let decimation = args.rerun_decimation.get();
 
+    let rectified = RectifiedStereo::from_calibration_with_config(
+        reader.calibration(),
+        RectifiedStereoConfig {
+            max_principal_delta_px: args.rectify_tolerance,
+        },
+    )?;
+    let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
+
     let rec = rerun::RecordingStreamBuilder::new("kiko-slam-dataset").connect_grpc()?;
     let mut sink = RerunSink::new(rec, decimation);
 
@@ -373,6 +386,9 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut processed = 0usize;
     let mut inference_errors = 0usize;
     let mut read_errors = 0usize;
+    let mut triangulation_empty = 0usize;
+    let mut triangulation_errors = 0usize;
+    let mut triangulated_points = 0usize;
 
     for pair in reader.pairs() {
         let pair = match pair {
@@ -386,7 +402,23 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match pipeline.process_pair(pair) {
             Ok(packet) => {
-                if let Err(err) = sink.log(&packet) {
+                let mut keyframe = None;
+                match triangulator.triangulate(packet.matches()) {
+                    Ok(result) => {
+                        triangulated_points += result.keyframe.landmarks().len();
+                        keyframe = Some(result.keyframe);
+                    }
+                    Err(TriangulationError::NoLandmarks { .. }) => {
+                        triangulation_empty += 1;
+                    }
+                    Err(err) => {
+                        triangulation_errors += 1;
+                        eprintln!("triangulation error: {err}");
+                    }
+                };
+
+                let points = keyframe.as_ref().map(|kf| kf.landmarks());
+                if let Err(err) = sink.log_with_points(&packet, points) {
                     eprintln!("rerun log error: {err}");
                 }
                 processed += 1;
@@ -412,8 +444,15 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, inference_errors={}",
-        processed, elapsed, fps, read_errors, inference_errors
+        "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, inference_errors={}, triangulation_empty={}, triangulation_errors={}, triangulated_points={}",
+        processed,
+        elapsed,
+        fps,
+        read_errors,
+        inference_errors,
+        triangulation_empty,
+        triangulation_errors,
+        triangulated_points
     );
 
     Ok(())
@@ -636,6 +675,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         width: args.camera.width,
         height: args.camera.height,
         fps: args.camera.fps,
+        rectified: args.camera.rectified,
     };
 
     let config = DeviceConfig {
@@ -758,6 +798,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         width: args.camera.width,
         height: args.camera.height,
         fps: args.camera.fps,
+        rectified: args.camera.rectified,
     };
 
     let config = DeviceConfig {

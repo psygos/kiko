@@ -62,6 +62,7 @@ private:
     bool mono_enabled_;
     uint32_t mono_width_;
     uint32_t mono_height_;
+    bool mono_rectified_;
 
     bool depth_enabled_;
     bool imu_enabled_;

@@ -40,6 +40,7 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
     , mono_enabled_(config.mono_enabled)
     , mono_width_(config.mono_width)
     , mono_height_(config.mono_height)
+    , mono_rectified_(config.mono_rectified)
     , depth_enabled_(config.depth_enabled)
     , imu_enabled_(config.imu_enabled)
 {
@@ -70,17 +71,27 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
         auto* leftOut = left->requestOutput({w, h}, dai::ImgFrame::Type::GRAY8, dai::ImgResizeMode::CROP, fps);
         auto* rightOut = right->requestOutput({w, h}, dai::ImgFrame::Type::GRAY8, dai::ImgResizeMode::CROP, fps);
 
-        if (mono_enabled_) {
+        if (mono_enabled_ && !mono_rectified_) {
             mono_left_queue_ = leftOut->createOutputQueue(config.queue_size, config.queue_blocking);
             mono_right_queue_ = rightOut->createOutputQueue(config.queue_size, config.queue_blocking);
         }
 
-        if (depth_enabled_) {
+        if (depth_enabled_ || mono_rectified_) {
             auto stereo = pipeline_->create<dai::node::StereoDepth>();
             leftOut->link(stereo->left);
             rightOut->link(stereo->right);
             stereo->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::DEFAULT);
-            depth_queue_ = stereo->depth.createOutputQueue(config.queue_size, config.queue_blocking);
+            stereo->enableDistortionCorrection(true);
+            stereo->setRectifyEdgeFillColor(0);
+
+            if (mono_rectified_) {
+                mono_left_queue_ = stereo->rectifiedLeft.createOutputQueue(config.queue_size, config.queue_blocking);
+                mono_right_queue_ = stereo->rectifiedRight.createOutputQueue(config.queue_size, config.queue_blocking);
+            }
+
+            if (depth_enabled_) {
+                depth_queue_ = stereo->depth.createOutputQueue(config.queue_size, config.queue_blocking);
+            }
         }
     }
 
@@ -276,7 +287,15 @@ Intrinsics OakDevice::get_left_intrinsics() const {
     intr.height = mono_height_;
     try {
         auto i = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, mono_width_, mono_height_);
-        intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
+        if (mono_rectified_) {
+            auto j = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, mono_width_, mono_height_);
+            intr.fx = 0.5f * (i[0][0] + j[0][0]);
+            intr.fy = 0.5f * (i[1][1] + j[1][1]);
+            intr.cx = 0.5f * (i[0][2] + j[0][2]);
+            intr.cy = 0.5f * (i[1][2] + j[1][2]);
+        } else {
+            intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
+        }
     } catch (...) {
         float scale = static_cast<float>(mono_width_) / 640.0f;
         intr.fx = 398.17f * scale; intr.fy = 398.19f * scale;
@@ -291,7 +310,15 @@ Intrinsics OakDevice::get_right_intrinsics() const {
     intr.height = mono_height_;
     try {
         auto i = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, mono_width_, mono_height_);
-        intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
+        if (mono_rectified_) {
+            auto j = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, mono_width_, mono_height_);
+            intr.fx = 0.5f * (i[0][0] + j[0][0]);
+            intr.fy = 0.5f * (i[1][1] + j[1][1]);
+            intr.cx = 0.5f * (i[0][2] + j[0][2]);
+            intr.cy = 0.5f * (i[1][2] + j[1][2]);
+        } else {
+            intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
+        }
     } catch (...) {
         float scale = static_cast<float>(mono_width_) / 640.0f;
         intr.fx = 396.99f * scale; intr.fy = 397.00f * scale;

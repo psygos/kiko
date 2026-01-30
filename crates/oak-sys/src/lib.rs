@@ -65,6 +65,7 @@ mod ffi {
         pub mono_width: u32,
         pub mono_height: u32,
         pub mono_fps: u32,
+        pub mono_rectified: bool,
 
         pub depth_enabled: bool,
         pub depth_width: u32,
@@ -263,6 +264,7 @@ pub struct MonoConfig {
     pub width: u32,
     pub height: u32,
     pub fps: u32,
+    pub rectified: bool,
 }
 
 /// Stereo depth stream configuration
@@ -311,7 +313,7 @@ impl DeviceConfig {
     pub fn all_streams() -> Self {
         Self {
             rgb: Some(RgbConfig { width: 640, height: 480, fps: 30 }),
-            mono: Some(MonoConfig { width: 640, height: 480, fps: 30 }),
+            mono: Some(MonoConfig { width: 640, height: 480, fps: 30, rectified: true }),
             depth: Some(DepthConfig { width: 640, height: 480, fps: 30, align_to_rgb: true }),
             imu: Some(ImuConfig { rate_hz: 400 }),
             queue: QueueConfig::default(),
@@ -340,6 +342,7 @@ impl DeviceConfig {
             mono_width: self.mono.map(|c| c.width).unwrap_or(0),
             mono_height: self.mono.map(|c| c.height).unwrap_or(0),
             mono_fps: self.mono.map(|c| c.fps).unwrap_or(0),
+            mono_rectified: self.mono.map(|c| c.rectified).unwrap_or(false),
 
             depth_enabled: self.depth.is_some(),
             depth_width: self.depth.map(|c| c.width).unwrap_or(0),

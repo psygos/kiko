@@ -831,6 +831,17 @@ fn read_manifest(dataset_dir: &Path) -> Result<Manifest, DatasetError> {
     serde_json::from_reader(manifest_file).map_err(|e| DatasetError::DeserializeJson { source: e })
 }
 
+fn read_calibration(dataset_dir: &Path) -> Result<Calibration, DatasetError> {
+    let calibration_path = dataset_dir.join(format::CALIBRATION_FILE);
+    let calibration_file =
+        std::fs::File::open(&calibration_path).map_err(|e| DatasetError::ReadFile {
+            path: calibration_path.clone(),
+            source: e,
+        })?;
+    serde_json::from_reader(calibration_file)
+        .map_err(|e| DatasetError::DeserializeJson { source: e })
+}
+
 fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {
     let mut frames = FrameSet {
         left: Vec::new(),

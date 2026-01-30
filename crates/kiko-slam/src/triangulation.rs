@@ -1,0 +1,484 @@
+use std::sync::Arc;
+
+use crate::dataset::{Calibration, CameraIntrinsics};
+use crate::{Detections, FrameId, Keypoint, Matches, Raw, SensorId};
+
+#[derive(Clone, Copy, Debug)]
+pub struct RectifiedStereoConfig {
+    pub max_principal_delta_px: Option<f32>,
+}
+
+impl Default for RectifiedStereoConfig {
+    fn default() -> Self {
+        Self {
+            max_principal_delta_px: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RectifiedStereo {
+    left: CameraIntrinsics,
+    right: CameraIntrinsics,
+    baseline_m: f32,
+}
+
+#[derive(Debug)]
+pub enum RectifiedStereoError {
+    NonPositiveBaseline { baseline_m: f32 },
+    DimensionMismatch {
+        left: (u32, u32),
+        right: (u32, u32),
+    },
+    InvalidFocal {
+        fx: f32,
+        fy: f32,
+    },
+    PrincipalPointMismatch {
+        delta_cx: f32,
+        delta_cy: f32,
+        tolerance: f32,
+    },
+}
+
+impl std::fmt::Display for RectifiedStereoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RectifiedStereoError::NonPositiveBaseline { baseline_m } => {
+                write!(f, "baseline must be > 0, got {baseline_m}")
+            }
+            RectifiedStereoError::DimensionMismatch { left, right } => {
+                write!(
+                    f,
+                    "rectified stereo requires same dimensions: left={}x{}, right={}x{}",
+                    left.0, left.1, right.0, right.1
+                )
+            }
+            RectifiedStereoError::InvalidFocal { fx, fy } => {
+                write!(f, "rectified stereo requires positive focal lengths: fx={fx}, fy={fy}")
+            }
+            RectifiedStereoError::PrincipalPointMismatch {
+                delta_cx,
+                delta_cy,
+                tolerance,
+            } => {
+                write!(
+                    f,
+                    "principal points differ too much: delta_cx={delta_cx}, delta_cy={delta_cy}, tolerance={tolerance}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RectifiedStereoError {}
+
+impl RectifiedStereo {
+    pub fn from_calibration(
+        calibration: &Calibration,
+    ) -> Result<Self, RectifiedStereoError> {
+        Self::from_calibration_with_config(calibration, RectifiedStereoConfig::default())
+    }
+
+    pub fn from_calibration_with_config(
+        calibration: &Calibration,
+        config: RectifiedStereoConfig,
+    ) -> Result<Self, RectifiedStereoError> {
+        let left = calibration.left.clone();
+        let right = calibration.right.clone();
+
+        if calibration.baseline_m <= 0.0 {
+            return Err(RectifiedStereoError::NonPositiveBaseline {
+                baseline_m: calibration.baseline_m,
+            });
+        }
+
+        if left.width != right.width || left.height != right.height {
+            return Err(RectifiedStereoError::DimensionMismatch {
+                left: (left.width, left.height),
+                right: (right.width, right.height),
+            });
+        }
+
+        if left.fx <= 0.0 || left.fy <= 0.0 {
+            return Err(RectifiedStereoError::InvalidFocal {
+                fx: left.fx,
+                fy: left.fy,
+            });
+        }
+
+        if let Some(tolerance) = config.max_principal_delta_px {
+            let delta_cx = (left.cx - right.cx).abs();
+            let delta_cy = (left.cy - right.cy).abs();
+            if delta_cx > tolerance || delta_cy > tolerance {
+                return Err(RectifiedStereoError::PrincipalPointMismatch {
+                    delta_cx,
+                    delta_cy,
+                    tolerance,
+                });
+            }
+        }
+
+        Ok(Self {
+            left,
+            right,
+            baseline_m: calibration.baseline_m,
+        })
+    }
+
+    pub fn left(&self) -> &CameraIntrinsics {
+        &self.left
+    }
+
+    pub fn right(&self) -> &CameraIntrinsics {
+        &self.right
+    }
+
+    pub fn baseline_m(&self) -> f32 {
+        self.baseline_m
+    }
+
+    pub fn width(&self) -> u32 {
+        self.left.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.left.height
+    }
+
+    pub fn fx(&self) -> f32 {
+        self.left.fx
+    }
+
+    pub fn fy(&self) -> f32 {
+        self.left.fy
+    }
+
+    pub fn cx(&self) -> f32 {
+        self.left.cx
+    }
+
+    pub fn cy(&self) -> f32 {
+        self.left.cy
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TriangulationConfig {
+    pub min_disparity_px: f32,
+    pub max_depth_m: Option<f32>,
+}
+
+impl Default for TriangulationConfig {
+    fn default() -> Self {
+        Self {
+            min_disparity_px: 1.0,
+            max_depth_m: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TriangulationStats {
+    pub candidate_matches: usize,
+    pub kept: usize,
+    pub dropped_disparity: usize,
+    pub dropped_out_of_bounds: usize,
+    pub dropped_depth: usize,
+    pub dropped_duplicate: usize,
+}
+
+#[derive(Debug)]
+pub enum TriangulationError {
+    SensorMismatch {
+        left: SensorId,
+        right: SensorId,
+    },
+    IndexOutOfBounds {
+        left_len: usize,
+        right_len: usize,
+        left_index: usize,
+        right_index: usize,
+    },
+    NoLandmarks {
+        stats: TriangulationStats,
+    },
+    InvalidDetections {
+        message: String,
+    },
+}
+
+impl std::fmt::Display for TriangulationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriangulationError::SensorMismatch { left, right } => {
+                write!(
+                    f,
+                    "triangulation requires stereo left/right detections, got left={left:?}, right={right:?}"
+                )
+            }
+            TriangulationError::IndexOutOfBounds {
+                left_len,
+                right_len,
+                left_index,
+                right_index,
+            } => {
+                write!(
+                    f,
+                    "match index out of bounds: left_index={left_index} (len={left_len}), right_index={right_index} (len={right_len})"
+                )
+            }
+            TriangulationError::NoLandmarks { stats } => {
+                write!(
+                    f,
+                    "triangulation produced no landmarks (candidates={}, dropped_disparity={}, dropped_out_of_bounds={}, dropped_depth={}, dropped_duplicate={})",
+                    stats.candidate_matches,
+                    stats.dropped_disparity,
+                    stats.dropped_out_of_bounds,
+                    stats.dropped_depth,
+                    stats.dropped_duplicate
+                )
+            }
+            TriangulationError::InvalidDetections { message } => {
+                write!(f, "failed to build detections: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TriangulationError {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Point3 {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+#[derive(Debug)]
+pub struct Keyframe {
+    frame_id: FrameId,
+    detections: Arc<Detections>,
+    landmarks: Vec<Point3>,
+}
+
+#[derive(Debug)]
+pub enum KeyframeError {
+    Empty,
+    LenMismatch {
+        detections: usize,
+        landmarks: usize,
+    },
+    SensorMismatch {
+        expected: SensorId,
+        actual: SensorId,
+    },
+}
+
+impl std::fmt::Display for KeyframeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyframeError::Empty => write!(f, "keyframe must contain at least one landmark"),
+            KeyframeError::LenMismatch {
+                detections,
+                landmarks,
+            } => write!(
+                f,
+                "keyframe detections/landmarks length mismatch: detections={detections}, landmarks={landmarks}"
+            ),
+            KeyframeError::SensorMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "keyframe detections must be from {expected:?}, got {actual:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for KeyframeError {}
+
+impl Keyframe {
+    pub fn new(
+        detections: Detections,
+        landmarks: Vec<Point3>,
+    ) -> Result<Self, KeyframeError> {
+        Self::from_arc(Arc::new(detections), landmarks)
+    }
+
+    pub fn from_arc(
+        detections: Arc<Detections>,
+        landmarks: Vec<Point3>,
+    ) -> Result<Self, KeyframeError> {
+        if detections.is_empty() || landmarks.is_empty() {
+            return Err(KeyframeError::Empty);
+        }
+        if detections.len() != landmarks.len() {
+            return Err(KeyframeError::LenMismatch {
+                detections: detections.len(),
+                landmarks: landmarks.len(),
+            });
+        }
+        if detections.sensor_id() != SensorId::StereoLeft {
+            return Err(KeyframeError::SensorMismatch {
+                expected: SensorId::StereoLeft,
+                actual: detections.sensor_id(),
+            });
+        }
+        Ok(Self {
+            frame_id: detections.frame_id(),
+            detections,
+            landmarks,
+        })
+    }
+
+    pub fn frame_id(&self) -> FrameId {
+        self.frame_id
+    }
+
+    pub fn detections(&self) -> &Arc<Detections> {
+        &self.detections
+    }
+
+    pub fn landmarks(&self) -> &[Point3] {
+        &self.landmarks
+    }
+}
+
+#[derive(Debug)]
+pub struct TriangulationResult {
+    pub keyframe: Keyframe,
+    pub stats: TriangulationStats,
+}
+
+#[derive(Debug)]
+pub struct Triangulator {
+    stereo: RectifiedStereo,
+    config: TriangulationConfig,
+}
+
+impl Triangulator {
+    pub fn new(stereo: RectifiedStereo, config: TriangulationConfig) -> Self {
+        Self { stereo, config }
+    }
+
+    pub fn triangulate(
+        &self,
+        matches: &Matches<Raw>,
+    ) -> Result<TriangulationResult, TriangulationError> {
+        let left = matches.source_a();
+        let right = matches.source_b();
+
+        if left.sensor_id() != SensorId::StereoLeft || right.sensor_id() != SensorId::StereoRight {
+            return Err(TriangulationError::SensorMismatch {
+                left: left.sensor_id(),
+                right: right.sensor_id(),
+            });
+        }
+
+        let left_len = left.len();
+        let right_len = right.len();
+        let mut stats = TriangulationStats::default();
+        stats.candidate_matches = matches.len();
+
+        let mut best: Vec<Option<(usize, f32)>> = vec![None; left_len];
+        for (&(li, ri), &score) in matches.indices().iter().zip(matches.scores()) {
+            if li >= left_len || ri >= right_len {
+                return Err(TriangulationError::IndexOutOfBounds {
+                    left_len,
+                    right_len,
+                    left_index: li,
+                    right_index: ri,
+                });
+            }
+            match best[li] {
+                Some((_, best_score)) if best_score >= score => {
+                    stats.dropped_duplicate += 1;
+                }
+                Some(_) => {
+                    stats.dropped_duplicate += 1;
+                    best[li] = Some((ri, score));
+                }
+                None => {
+                    best[li] = Some((ri, score));
+                }
+            }
+        }
+
+        let width = self.stereo.width() as f32;
+        let height = self.stereo.height() as f32;
+        let fx = self.stereo.fx();
+        let fy = self.stereo.fy();
+        let cx = self.stereo.cx();
+        let cy = self.stereo.cy();
+        let baseline = self.stereo.baseline_m();
+
+        let mut keypoints = Vec::new();
+        let mut scores = Vec::new();
+        let mut descriptors = Vec::new();
+        let mut landmarks = Vec::new();
+
+        for (li, candidate) in best.into_iter().enumerate() {
+            let Some((ri, _match_score)) = candidate else {
+                continue;
+            };
+
+            let left_kp = left.keypoints()[li];
+            let right_kp = right.keypoints()[ri];
+
+            if !in_bounds(left_kp, width, height) || !in_bounds(right_kp, width, height) {
+                stats.dropped_out_of_bounds += 1;
+                continue;
+            }
+
+            let disparity = left_kp.x - right_kp.x;
+            if disparity <= self.config.min_disparity_px {
+                stats.dropped_disparity += 1;
+                continue;
+            }
+
+            let z = fx * baseline / disparity;
+            if let Some(max_depth) = self.config.max_depth_m {
+                if z > max_depth {
+                    stats.dropped_depth += 1;
+                    continue;
+                }
+            }
+
+            let x = (left_kp.x - cx) * z / fx;
+            let y = (left_kp.y - cy) * z / fy;
+
+            keypoints.push(left_kp);
+            scores.push(left.scores()[li]);
+            descriptors.push(left.descriptors()[li].clone());
+            landmarks.push(Point3 { x, y, z });
+            stats.kept += 1;
+        }
+
+        if landmarks.is_empty() {
+            return Err(TriangulationError::NoLandmarks { stats });
+        }
+
+        let detections = Detections::new(
+            left.sensor_id(),
+            left.frame_id(),
+            keypoints,
+            scores,
+            descriptors,
+        )
+        .map_err(|e| TriangulationError::InvalidDetections {
+            message: format!("{e:?}"),
+        })?;
+
+        let keyframe =
+            Keyframe::new(detections, landmarks).map_err(|err| TriangulationError::InvalidDetections {
+                message: err.to_string(),
+            })?;
+
+        Ok(TriangulationResult { keyframe, stats })
+    }
+}
+
+fn in_bounds(kp: Keypoint, width: f32, height: f32) -> bool {
+    kp.x >= 0.0 && kp.y >= 0.0 && kp.x < width && kp.y < height
+}

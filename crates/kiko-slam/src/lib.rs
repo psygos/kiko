@@ -11,6 +11,7 @@ mod pairing;
 mod pipeline;
 mod viz;
 mod channel;
+mod triangulation;
 #[cfg(feature = "record")]
 mod oak;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
@@ -21,6 +22,11 @@ pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 pub use channel::{
     bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
     DropPolicy, DropReceiver, DropSender, SendOutcome,
+};
+pub use triangulation::{
+    Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig,
+    RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
+    TriangulationStats, Triangulator,
 };
 #[cfg(feature = "record")]
 pub use oak::oak_to_frame;

@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::{Detections, Frame, Keypoint, Raw, VizPacket};
+use crate::{Detections, Frame, Keypoint, Point3, Raw, VizPacket};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
@@ -91,6 +91,14 @@ impl RerunSink {
     }
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {
+        self.log_with_points(packet, None)
+    }
+
+    pub fn log_with_points(
+        &mut self,
+        packet: &VizPacket<Raw>,
+        points: Option<&[Point3]>,
+    ) -> Result<(), VizLogError> {
         let index = self.frame_index;
         self.frame_index = self.frame_index.saturating_add(1);
         if !self.decimation.should_log(index) {
@@ -135,6 +143,17 @@ impl RerunSink {
         self.rec.log("view/matches", &matches_image)?;
 
         log_matches(&self.rec, packet, left.width() as f32, &track_ids)?;
+
+        if let Some(points) = points {
+            if !points.is_empty() {
+                let positions: Vec<[f32; 3]> = points
+                    .iter()
+                    .map(|p| [p.x, p.y, p.z])
+                    .collect();
+                let cloud = rerun::Points3D::new(positions);
+                self.rec.log("world/points", &cloud)?;
+            }
+        }
 
         Ok(())
     }
