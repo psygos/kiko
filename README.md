@@ -23,4 +23,6 @@ kiko/
 
 - ~~Quick dataset recording~~
 - ~~Live match visualisation in Rerun~~
-- Hardware-in-the-loop status bar
+- Stereo triangulation
+- Frame-to-keyframe tracking
+- 30 FPS visual odometry
