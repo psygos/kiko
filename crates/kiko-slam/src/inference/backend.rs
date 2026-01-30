@@ -1,5 +1,7 @@
 use std::fs;
 
+use crate::env::env_bool;
+
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::execution_providers::ExecutionProvider;
 use ort::execution_providers::ExecutionProviderDispatch;
@@ -102,18 +104,6 @@ pub(crate) fn select_backend(
     );
 
     Ok(BackendSelection { selected, providers })
-}
-
-fn env_bool(key: &str) -> Option<bool> {
-    let raw = std::env::var(key).ok()?;
-    match raw.trim().to_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => {
-            eprintln!("invalid {key}={raw}, ignoring");
-            None
-        }
-    }
 }
 
 fn detect_backend() -> InferenceBackend {

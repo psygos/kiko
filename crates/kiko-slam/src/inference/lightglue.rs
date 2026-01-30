@@ -39,13 +39,13 @@ impl LightGlue {
         dec_1: Arc<Detections>,
         dec_2: Arc<Detections>,
     ) -> Result<Matches<Raw>, InferenceError> {
-        let kpts_0 = dec_1.keypoints_flat();
-        let kpts_1 = dec_2.keypoints_flat();
+        let kpts_0 = normalize_keypoints(&dec_1);
+        let kpts_1 = normalize_keypoints(&dec_2);
         let desc_0 = dec_1.descriptors_flat();
         let desc_1 = dec_2.descriptors_flat();
 
-        let kpts_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), 2], kpts_0))?;
-        let kpts_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 2], kpts_1))?;
+        let kpts_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), 2], kpts_0.as_slice()))?;
+        let kpts_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 2], kpts_1.as_slice()))?;
         let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), 256], desc_0))?;
         let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 256], desc_1))?;
 
@@ -68,4 +68,19 @@ impl LightGlue {
         Matches::new(dec_1, dec_2, indices, scores)
             .map_err(|e| InferenceError::Domain(format!("{e:?}")))
     }
+}
+
+fn normalize_keypoints(detections: &Detections) -> Vec<f32> {
+    let width = detections.width() as f32;
+    let height = detections.height() as f32;
+    let scale = 0.5 * width.max(height);
+    let cx = width * 0.5;
+    let cy = height * 0.5;
+
+    let mut out = Vec::with_capacity(detections.len() * 2);
+    for kp in detections.keypoints() {
+        out.push((kp.x - cx) / scale);
+        out.push((kp.y - cy) / scale);
+    }
+    out
 }

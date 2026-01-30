@@ -6,9 +6,15 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
     DownscaleFactor, InferenceBackend, InferencePipeline, KeypointLimit, LightGlue,
-    RectifiedStereo, RectifiedStereoConfig, RerunSink, SuperPoint, TriangulationConfig,
-    TriangulationError, Triangulator, VizDecimation,
+    LocalBaConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
+    RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError,
+    Triangulator, VizDecimation, VizPacket, KeyframePolicy,
 };
+
+use kiko_slam::env::{env_f32, env_usize};
+
+#[cfg(feature = "record")]
+use kiko_slam::{Frame, Point3, Pose, Raw};
 
 #[cfg(feature = "record")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +25,7 @@ use std::thread;
 #[cfg(feature = "record")]
 use kiko_slam::{
     bounded_channel, oak_to_frame, ChannelCapacity, DropPolicy, FrameId, PairingWindowNs,
-    SendOutcome, SensorId, StereoPairer,
+    SendOutcome, SensorId, StereoPair, StereoPairer,
 };
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
@@ -77,8 +83,12 @@ struct VizArgs {
     inference: InferenceArgs,
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value_t = VizDecimationArg::default())]
     rerun_decimation: VizDecimationArg,
+    #[arg(long, env = "KIKO_VIZ_ODOMETRY", default_value_t = false)]
+    odometry: bool,
     #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
     rectify_tolerance: Option<f32>,
+    #[arg(long, env = "KIKO_ALLOW_UNRECTIFIED", default_value_t = false)]
+    allow_unrectified: bool,
     #[command(flatten)]
     dataset: DatasetArgs,
 }
@@ -325,6 +335,15 @@ impl InferenceConfig {
         .with_downscale(self.downscale)
     }
 
+    fn into_models(self) -> (SuperPoint, SuperPoint, LightGlue, KeypointLimit, DownscaleFactor) {
+        (
+            self.superpoint_left,
+            self.superpoint_right,
+            self.lightglue,
+            self.key_limit,
+            self.downscale,
+        )
+    }
 }
 
 fn resolve_model_path(
@@ -357,6 +376,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.odometry {
+        return run_viz_odometry(&args);
+    }
+    run_viz_matches(&args)
+}
+
+fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats()?;
 
@@ -373,6 +399,7 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         reader.calibration(),
         RectifiedStereoConfig {
             max_principal_delta_px: args.rectify_tolerance,
+            allow_unrectified: args.allow_unrectified,
         },
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
@@ -389,6 +416,7 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut triangulation_empty = 0usize;
     let mut triangulation_errors = 0usize;
     let mut triangulated_points = 0usize;
+    let mut total_matches = 0usize;
 
     for pair in reader.pairs() {
         let pair = match pair {
@@ -402,6 +430,7 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match pipeline.process_pair(pair) {
             Ok(packet) => {
+                total_matches += packet.matches().len();
                 let mut keyframe = None;
                 match triangulator.triangulate(packet.matches()) {
                     Ok(result) => {
@@ -442,6 +471,16 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         0.0
     };
+    let avg_matches = if processed > 0 {
+        total_matches as f64 / processed as f64
+    } else {
+        0.0
+    };
+    let avg_triangulated = if processed > 0 {
+        triangulated_points as f64 / processed as f64
+    } else {
+        0.0
+    };
 
     eprintln!(
         "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, inference_errors={}, triangulation_empty={}, triangulation_errors={}, triangulated_points={}",
@@ -453,6 +492,165 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         triangulation_empty,
         triangulation_errors,
         triangulated_points
+    );
+    eprintln!(
+        "summary: avg_matches={:.1}, avg_triangulated={:.1}",
+        avg_matches, avg_triangulated
+    );
+
+    Ok(())
+}
+
+fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = DatasetReader::open(&args.dataset.path)?;
+    let stats = reader.stats()?;
+
+    eprintln!("dataset: {}", args.dataset.path.display());
+    eprintln!(
+        "camera fps: left={:.2?} right={:.2?} paired={:.2?} (left={}, right={})",
+        stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count
+    );
+
+    let inference = InferenceConfig::from_args(&args.inference)?;
+    let decimation = args.rerun_decimation.get();
+
+    let rectified = RectifiedStereo::from_calibration_with_config(
+        reader.calibration(),
+        RectifiedStereoConfig {
+            max_principal_delta_px: args.rectify_tolerance,
+            allow_unrectified: args.allow_unrectified,
+        },
+    )?;
+    let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
+
+    let (superpoint_left, superpoint_right, lightglue, key_limit, downscale) =
+        inference.into_models();
+
+    let min_keyframe_points = env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(12);
+    let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(12);
+    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
+    let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
+    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(8);
+    let ransac = RansacConfig {
+        min_inliers,
+        ..RansacConfig::default()
+    };
+    let ba_config = build_ba_config()?;
+    let keyframe_policy = KeyframePolicy::new(
+        refresh_inliers,
+        parallax_px,
+        min_covisibility,
+    )?;
+    let tracker_config = TrackerConfig {
+        max_keypoints: key_limit,
+        downscale,
+        min_keyframe_points,
+        ransac,
+        triangulation: TriangulationConfig::default(),
+        keyframe_policy,
+        ba: ba_config,
+    };
+
+    eprintln!(
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
+        min_keyframe_points,
+        refresh_inliers,
+        parallax_px,
+        min_covisibility,
+        min_inliers,
+        downscale.get(),
+        key_limit.get()
+    );
+
+    let rec = rerun::RecordingStreamBuilder::new("kiko-slam-dataset-odometry").connect_grpc()?;
+    let mut sink = RerunSink::new(rec, decimation);
+    let mut tracker = SlamTracker::new(
+        superpoint_left,
+        superpoint_right,
+        lightglue,
+        rectified,
+        intrinsics,
+        tracker_config,
+    );
+
+    let start = Instant::now();
+    let mut processed = 0usize;
+    let mut inference_errors = 0usize;
+    let mut read_errors = 0usize;
+    let mut poses_logged = 0usize;
+    let mut keyframes = 0usize;
+
+    for pair in reader.pairs() {
+        let pair = match pair {
+            Ok(pair) => pair,
+            Err(err) => {
+                read_errors += 1;
+                eprintln!("read error: {err}");
+                continue;
+            }
+        };
+
+        let left = pair.left.clone();
+        let right = pair.right.clone();
+
+        match tracker.process(pair) {
+            Ok(output) => {
+                if let Some(matches) = output.stereo_matches {
+                    let points = output
+                        .keyframe
+                        .as_ref()
+                        .map(|kf| kf.landmarks())
+                        .filter(|pts| !pts.is_empty());
+                    if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
+                        if let Err(err) = sink.log_with_points(&packet, points) {
+                            eprintln!("rerun log error: {err}");
+                        }
+                    }
+                    if output.keyframe.is_some() {
+                        keyframes += 1;
+                    }
+                } else if let Err(err) = sink.log_frames(&left, &right) {
+                    eprintln!("rerun log error: {err}");
+                }
+
+                if let Some(pose) = output.pose.as_ref() {
+                    if let Err(err) = sink.log_pose(left.timestamp(), pose) {
+                        eprintln!("rerun log error: {err}");
+                    } else {
+                        poses_logged += 1;
+                    }
+                }
+                processed += 1;
+            }
+            Err(err) => {
+                inference_errors += 1;
+                eprintln!("tracker error: {err}");
+            }
+        }
+
+        if let Some(limit) = args.dataset.max_pairs {
+            if processed >= limit {
+                break;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let fps = if elapsed > 0.0 {
+        processed as f64 / elapsed
+    } else {
+        0.0
+    };
+
+    eprintln!(
+        "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, tracker_errors={}, poses_logged={}, keyframes={}",
+        processed,
+        elapsed,
+        fps,
+        read_errors,
+        inference_errors,
+        poses_logged,
+        keyframes
     );
 
     Ok(())
@@ -694,7 +892,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let baseline_m = device.stereo_baseline_m();
 
     let meta = build_meta(&mono_config, None);
-    let calibration = build_calibration(&device, baseline_m);
+    let calibration = build_calibration(&device, baseline_m, &mono_config);
 
     eprintln!("creating dataset at {}", output_path.display());
     let (writer, writer_handle) = DatasetWriter::create(output_path, &meta, &calibration)?;
@@ -783,6 +981,15 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "record")]
+struct LiveVizMsg {
+    left: Frame,
+    right: Frame,
+    pose: Option<Pose>,
+    packet: Option<VizPacket<Raw>>,
+    points: Option<Vec<Point3>>,
+}
+
+#[cfg(feature = "record")]
 fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     const PAIR_QUEUE_DEPTH: usize = 4;
     const VIZ_QUEUE_DEPTH: usize = 8;
@@ -820,24 +1027,93 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut pairer = StereoPairer::new(pairing_window);
 
     let pair_capacity = ChannelCapacity::try_from(PAIR_QUEUE_DEPTH)?;
-    let (pair_tx, pair_rx, pair_stats) = bounded_channel(pair_capacity, DropPolicy::DropOldest);
+    let (pair_tx, pair_rx, pair_stats) =
+        bounded_channel::<StereoPair>(pair_capacity, DropPolicy::DropOldest);
 
     let viz_capacity = ChannelCapacity::try_from(VIZ_QUEUE_DEPTH)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
 
     let inference = InferenceConfig::from_args(&args.inference)?;
+    let (superpoint_left, superpoint_right, lightglue, key_limit, downscale) =
+        inference.into_models();
+
+    let calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config);
+    let rectified = RectifiedStereo::from_calibration(&calibration)?;
+    let intrinsics = PinholeIntrinsics::try_from(&calibration.left)?;
+
+    let min_keyframe_points = env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(200);
+    let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(30);
+    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
+    let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
+    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(30);
+    let ransac = RansacConfig {
+        min_inliers,
+        ..RansacConfig::default()
+    };
+    let ba_config = build_ba_config()?;
+    let keyframe_policy = KeyframePolicy::new(
+        refresh_inliers,
+        parallax_px,
+        min_covisibility,
+    )?;
+    let tracker_config = TrackerConfig {
+        max_keypoints: key_limit,
+        downscale,
+        min_keyframe_points,
+        ransac,
+        triangulation: TriangulationConfig::default(),
+        keyframe_policy,
+        ba: ba_config,
+    };
+
+    eprintln!(
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
+        min_keyframe_points,
+        refresh_inliers,
+        parallax_px,
+        min_covisibility,
+        min_inliers,
+        downscale.get(),
+        key_limit.get()
+    );
 
     let inference_handle = thread::spawn(move || {
-        let mut pipeline = inference.into_pipeline();
+        let mut tracker = SlamTracker::new(
+            superpoint_left,
+            superpoint_right,
+            lightglue,
+            rectified,
+            intrinsics,
+            tracker_config,
+        );
         for pair in pair_rx.iter() {
-            match pipeline.process_pair(pair) {
-                Ok(packet) => {
-                    if matches!(viz_tx.try_send(packet), SendOutcome::Disconnected) {
+            let left = pair.left.clone();
+            let right = pair.right.clone();
+            match tracker.process(pair) {
+                Ok(output) => {
+                    let mut packet = None;
+                    let mut points = None;
+                    if let Some(matches) = output.stereo_matches {
+                        if let Some(keyframe) = output.keyframe.as_ref() {
+                            points = Some(keyframe.landmarks().to_vec());
+                        }
+                        if let Ok(viz_packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
+                            packet = Some(viz_packet);
+                        }
+                    }
+                    let msg = LiveVizMsg {
+                        left,
+                        right,
+                        pose: output.pose,
+                        packet,
+                        points,
+                    };
+                    if matches!(viz_tx.try_send(msg), SendOutcome::Disconnected) {
                         break;
                     }
                 }
                 Err(err) => {
-                    eprintln!("inference error: {err}");
+                    eprintln!("tracker error: {err}");
                 }
             }
         }
@@ -854,9 +1130,19 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let mut sink = RerunSink::new(rec, decimation);
-        for packet in viz_rx.iter() {
-            if let Err(err) = sink.log(&packet) {
+        for msg in viz_rx.iter() {
+            if let Some(packet) = msg.packet.as_ref() {
+                if let Err(err) = sink.log_with_points(packet, msg.points.as_deref()) {
+                    eprintln!("rerun log error: {err}");
+                }
+            } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
                 eprintln!("rerun log error: {err}");
+            }
+
+            if let Some(pose) = msg.pose.as_ref() {
+                if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
+                    eprintln!("rerun log error: {err}");
+                }
             }
         }
     });
@@ -953,7 +1239,7 @@ fn build_meta(config: &MonoConfig, imu_config: Option<&ImuConfig>) -> Meta {
 }
 
 #[cfg(feature = "record")]
-fn build_calibration(device: &Device, baseline_m: f32) -> Calibration {
+fn build_calibration(device: &Device, baseline_m: f32, config: &MonoConfig) -> Calibration {
     let left = device.left_intrinsics();
     let right = device.right_intrinsics();
 
@@ -975,7 +1261,28 @@ fn build_calibration(device: &Device, baseline_m: f32) -> Calibration {
             height: right.height,
         },
         baseline_m,
+        rectified: config.rectified,
     }
+}
+
+fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
+    let window = env_usize("KIKO_BA_WINDOW").unwrap_or(10);
+    let iters = env_usize("KIKO_BA_ITERS").unwrap_or(6);
+    let min_obs = env_usize("KIKO_BA_MIN_OBS").unwrap_or(8);
+    let huber = env_f32("KIKO_BA_HUBER_PX").unwrap_or(3.0);
+    let damping = env_f32("KIKO_BA_DAMPING").unwrap_or(1e-3);
+    let motion = env_f32("KIKO_BA_MOTION_WEIGHT").unwrap_or(0.0);
+    let config = LocalBaConfig::new(window, iters, min_obs, huber, damping, motion)?;
+    eprintln!(
+        "local BA: window={} iters={} min_obs={} huber_px={} damping={} motion_weight={}",
+        config.window(),
+        config.max_iterations(),
+        config.min_observations(),
+        config.huber_delta_px(),
+        config.damping(),
+        config.motion_prior_weight()
+    );
+    Ok(config)
 }
 
 #[derive(Clone, Copy, Debug)]

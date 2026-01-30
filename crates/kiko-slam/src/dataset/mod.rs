@@ -56,6 +56,8 @@ pub struct Calibration {
     pub left: CameraIntrinsics,
     pub right: CameraIntrinsics,
     pub baseline_m: f32,
+    #[serde(default)]
+    pub rectified: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

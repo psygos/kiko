@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::{Detections, Frame, Keypoint, Point3, Raw, VizPacket};
+use crate::{env::env_f32, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp, VizPacket};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
@@ -78,6 +78,8 @@ pub struct RerunSink {
     decimation: VizDecimation,
     frame_index: u64,
     tracks: TrackState,
+    trajectory: Vec<[f32; 3]>,
+    logged_world: bool,
 }
 
 impl RerunSink {
@@ -87,11 +89,43 @@ impl RerunSink {
             decimation,
             frame_index: 0,
             tracks: TrackState::new(),
+            trajectory: Vec::new(),
+            logged_world: false,
         }
     }
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {
         self.log_with_points(packet, None)
+    }
+
+    pub fn log_frames(&mut self, left: &Frame, right: &Frame) -> Result<(), VizLogError> {
+        let index = self.frame_index;
+        self.frame_index = self.frame_index.saturating_add(1);
+        if !self.decimation.should_log(index) {
+            return Ok(());
+        }
+
+        self.set_time(left.timestamp());
+
+        let left_image = rerun::Image::from_color_model_and_bytes(
+            left.data().to_vec(),
+            [left.width(), left.height()],
+            rerun::ColorModel::L,
+            rerun::ChannelDatatype::U8,
+        )
+        .with_draw_order(0.0);
+        self.rec.log("view/left", &left_image)?;
+
+        let right_image = rerun::Image::from_color_model_and_bytes(
+            right.data().to_vec(),
+            [right.width(), right.height()],
+            rerun::ColorModel::L,
+            rerun::ChannelDatatype::U8,
+        )
+        .with_draw_order(0.0);
+        self.rec.log("view/right", &right_image)?;
+
+        Ok(())
     }
 
     pub fn log_with_points(
@@ -109,10 +143,7 @@ impl RerunSink {
         let right = packet.right();
         let track_ids = self.tracks.assign_tracks(packet.matches().source_a());
 
-        self.rec.set_time(
-            "capture_ns",
-            rerun::TimeCell::from_duration_nanos(left.timestamp().as_nanos()),
-        );
+        self.set_time(left.timestamp());
 
         let left_image = rerun::Image::from_color_model_and_bytes(
             left.data().to_vec(),
@@ -157,6 +188,40 @@ impl RerunSink {
 
         Ok(())
     }
+
+    pub fn log_pose(&mut self, timestamp: Timestamp, pose: &Pose) -> Result<(), VizLogError> {
+        self.set_time(timestamp);
+
+        if !self.logged_world {
+            let coords = rerun::archetypes::ViewCoordinates::RDF();
+            self.rec.log("world", &coords)?;
+            self.logged_world = true;
+        }
+
+        let camera_pose = pose.inverse();
+        let position = camera_pose.translation();
+        let rotation = camera_pose.rotation();
+        let quat = quat_from_rotation(rotation);
+
+        let transform = rerun::Transform3D::update_fields()
+            .with_translation(position)
+            .with_quaternion(rerun::Quaternion::from_xyzw(quat));
+        self.rec.log("world/camera", &transform)?;
+
+        self.trajectory.push(position);
+        let strips = vec![self.trajectory.clone()];
+        self.rec
+            .log("world/trajectory", &rerun::LineStrips3D::new(strips))?;
+
+        Ok(())
+    }
+
+    fn set_time(&self, timestamp: Timestamp) {
+        self.rec.set_time(
+            "capture_ns",
+            rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,7 +244,7 @@ impl TrackConfig {
 #[derive(Debug)]
 struct TrackState {
     config: TrackConfig,
-    prev_left: Option<std::sync::Arc<Detections>>,
+    prev_left: Option<Detections>,
     prev_track_ids: Vec<u64>,
     next_track_id: u64,
 }
@@ -242,21 +307,43 @@ impl TrackState {
             }
         }
 
-        self.prev_left = Some(std::sync::Arc::new(left.clone()));
+        self.prev_left = Some(left.clone());
         self.prev_track_ids = track_ids.clone();
 
         track_ids
     }
 }
 
-fn env_f32(key: &str) -> Option<f32> {
-    let raw = std::env::var(key).ok()?;
-    match raw.parse::<f32>() {
-        Ok(value) => Some(value),
-        Err(_) => {
-            eprintln!("invalid {key}={raw}, ignoring");
-            None
-        }
+fn quat_from_rotation(r: [[f32; 3]; 3]) -> [f32; 4] {
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        let w = 0.25 * s;
+        let x = (r[2][1] - r[1][2]) / s;
+        let y = (r[0][2] - r[2][0]) / s;
+        let z = (r[1][0] - r[0][1]) / s;
+        [x, y, z, w]
+    } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
+        let s = (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt() * 2.0;
+        let w = (r[2][1] - r[1][2]) / s;
+        let x = 0.25 * s;
+        let y = (r[0][1] + r[1][0]) / s;
+        let z = (r[0][2] + r[2][0]) / s;
+        [x, y, z, w]
+    } else if r[1][1] > r[2][2] {
+        let s = (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt() * 2.0;
+        let w = (r[0][2] - r[2][0]) / s;
+        let x = (r[0][1] + r[1][0]) / s;
+        let y = 0.25 * s;
+        let z = (r[1][2] + r[2][1]) / s;
+        [x, y, z, w]
+    } else {
+        let s = (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt() * 2.0;
+        let w = (r[1][0] - r[0][1]) / s;
+        let x = (r[0][2] + r[2][0]) / s;
+        let y = (r[1][2] + r[2][1]) / s;
+        let z = 0.25 * s;
+        [x, y, z, w]
     }
 }
 

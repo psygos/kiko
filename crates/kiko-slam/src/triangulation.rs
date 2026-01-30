@@ -6,12 +6,14 @@ use crate::{Detections, FrameId, Keypoint, Matches, Raw, SensorId};
 #[derive(Clone, Copy, Debug)]
 pub struct RectifiedStereoConfig {
     pub max_principal_delta_px: Option<f32>,
+    pub allow_unrectified: bool,
 }
 
 impl Default for RectifiedStereoConfig {
     fn default() -> Self {
         Self {
             max_principal_delta_px: None,
+            allow_unrectified: false,
         }
     }
 }
@@ -34,6 +36,7 @@ pub enum RectifiedStereoError {
         fx: f32,
         fy: f32,
     },
+    NotRectified,
     PrincipalPointMismatch {
         delta_cx: f32,
         delta_cy: f32,
@@ -56,6 +59,9 @@ impl std::fmt::Display for RectifiedStereoError {
             }
             RectifiedStereoError::InvalidFocal { fx, fy } => {
                 write!(f, "rectified stereo requires positive focal lengths: fx={fx}, fy={fy}")
+            }
+            RectifiedStereoError::NotRectified => {
+                write!(f, "calibration is not marked rectified")
             }
             RectifiedStereoError::PrincipalPointMismatch {
                 delta_cx,
@@ -105,6 +111,10 @@ impl RectifiedStereo {
                 fx: left.fx,
                 fy: left.fy,
             });
+        }
+
+        if !calibration.rectified && !config.allow_unrectified {
+            return Err(RectifiedStereoError::NotRectified);
         }
 
         if let Some(tolerance) = config.max_principal_delta_px {
@@ -260,6 +270,8 @@ pub struct Keyframe {
     frame_id: FrameId,
     detections: Arc<Detections>,
     landmarks: Vec<Point3>,
+    landmark_indices: Vec<usize>,
+    index_to_landmark: Vec<Option<usize>>,
 }
 
 #[derive(Debug)]
@@ -268,6 +280,13 @@ pub enum KeyframeError {
     LenMismatch {
         detections: usize,
         landmarks: usize,
+    },
+    LandmarkIndexOutOfBounds {
+        detections: usize,
+        index: usize,
+    },
+    DuplicateLandmarkIndex {
+        index: usize,
     },
     SensorMismatch {
         expected: SensorId,
@@ -284,8 +303,15 @@ impl std::fmt::Display for KeyframeError {
                 landmarks,
             } => write!(
                 f,
-                "keyframe detections/landmarks length mismatch: detections={detections}, landmarks={landmarks}"
+                "keyframe landmarks/indices length mismatch: detections={detections}, landmarks={landmarks}"
             ),
+            KeyframeError::LandmarkIndexOutOfBounds { detections, index } => write!(
+                f,
+                "keyframe landmark index out of bounds: index={index} (detections={detections})"
+            ),
+            KeyframeError::DuplicateLandmarkIndex { index } => {
+                write!(f, "keyframe landmark index used twice: index={index}")
+            }
             KeyframeError::SensorMismatch { expected, actual } => {
                 write!(
                     f,
@@ -302,18 +328,20 @@ impl Keyframe {
     pub fn new(
         detections: Detections,
         landmarks: Vec<Point3>,
+        landmark_indices: Vec<usize>,
     ) -> Result<Self, KeyframeError> {
-        Self::from_arc(Arc::new(detections), landmarks)
+        Self::from_arc(Arc::new(detections), landmarks, landmark_indices)
     }
 
     pub fn from_arc(
         detections: Arc<Detections>,
         landmarks: Vec<Point3>,
+        landmark_indices: Vec<usize>,
     ) -> Result<Self, KeyframeError> {
-        if detections.is_empty() || landmarks.is_empty() {
+        if detections.is_empty() || landmarks.is_empty() || landmark_indices.is_empty() {
             return Err(KeyframeError::Empty);
         }
-        if detections.len() != landmarks.len() {
+        if landmarks.len() != landmark_indices.len() {
             return Err(KeyframeError::LenMismatch {
                 detections: detections.len(),
                 landmarks: landmarks.len(),
@@ -325,10 +353,27 @@ impl Keyframe {
                 actual: detections.sensor_id(),
             });
         }
+
+        let mut index_to_landmark = vec![None; detections.len()];
+        for (landmark_idx, &det_idx) in landmark_indices.iter().enumerate() {
+            if det_idx >= detections.len() {
+                return Err(KeyframeError::LandmarkIndexOutOfBounds {
+                    detections: detections.len(),
+                    index: det_idx,
+                });
+            }
+            if index_to_landmark[det_idx].is_some() {
+                return Err(KeyframeError::DuplicateLandmarkIndex { index: det_idx });
+            }
+            index_to_landmark[det_idx] = Some(landmark_idx);
+        }
+
         Ok(Self {
             frame_id: detections.frame_id(),
             detections,
             landmarks,
+            landmark_indices,
+            index_to_landmark,
         })
     }
 
@@ -342,6 +387,15 @@ impl Keyframe {
 
     pub fn landmarks(&self) -> &[Point3] {
         &self.landmarks
+    }
+
+    pub fn landmark_indices(&self) -> &[usize] {
+        &self.landmark_indices
+    }
+
+    pub fn landmark_for_detection(&self, index: usize) -> Option<Point3> {
+        let landmark_idx = *self.index_to_landmark.get(index)?;
+        landmark_idx.map(|idx| self.landmarks[idx])
     }
 }
 
@@ -366,7 +420,7 @@ impl Triangulator {
         &self,
         matches: &Matches<Raw>,
     ) -> Result<TriangulationResult, TriangulationError> {
-        let left = matches.source_a();
+        let left = matches.source_a_arc();
         let right = matches.source_b();
 
         if left.sensor_id() != SensorId::StereoLeft || right.sensor_id() != SensorId::StereoRight {
@@ -396,7 +450,6 @@ impl Triangulator {
                     stats.dropped_duplicate += 1;
                 }
                 Some(_) => {
-                    stats.dropped_duplicate += 1;
                     best[li] = Some((ri, score));
                 }
                 None => {
@@ -413,17 +466,15 @@ impl Triangulator {
         let cy = self.stereo.cy();
         let baseline = self.stereo.baseline_m();
 
-        let mut keypoints = Vec::new();
-        let mut scores = Vec::new();
-        let mut descriptors = Vec::new();
         let mut landmarks = Vec::new();
+        let mut landmark_indices = Vec::new();
 
         for (li, candidate) in best.into_iter().enumerate() {
             let Some((ri, _match_score)) = candidate else {
                 continue;
             };
 
-            let left_kp = left.keypoints()[li];
+        let left_kp = left.keypoints()[li];
             let right_kp = right.keypoints()[ri];
 
             if !in_bounds(left_kp, width, height) || !in_bounds(right_kp, width, height) {
@@ -448,10 +499,8 @@ impl Triangulator {
             let x = (left_kp.x - cx) * z / fx;
             let y = (left_kp.y - cy) * z / fy;
 
-            keypoints.push(left_kp);
-            scores.push(left.scores()[li]);
-            descriptors.push(left.descriptors()[li].clone());
             landmarks.push(Point3 { x, y, z });
+            landmark_indices.push(li);
             stats.kept += 1;
         }
 
@@ -459,19 +508,8 @@ impl Triangulator {
             return Err(TriangulationError::NoLandmarks { stats });
         }
 
-        let detections = Detections::new(
-            left.sensor_id(),
-            left.frame_id(),
-            keypoints,
-            scores,
-            descriptors,
-        )
-        .map_err(|e| TriangulationError::InvalidDetections {
-            message: format!("{e:?}"),
-        })?;
-
-        let keyframe =
-            Keyframe::new(detections, landmarks).map_err(|err| TriangulationError::InvalidDetections {
+        let keyframe = Keyframe::from_arc(left, landmarks, landmark_indices)
+            .map_err(|err| TriangulationError::InvalidDetections {
                 message: err.to_string(),
             })?;
 

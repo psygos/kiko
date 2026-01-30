@@ -12,6 +12,11 @@ mod pipeline;
 mod viz;
 mod channel;
 mod triangulation;
+mod pnp;
+mod tracker;
+pub mod env;
+mod math;
+mod local_ba;
 #[cfg(feature = "record")]
 mod oak;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
@@ -28,6 +33,16 @@ pub use triangulation::{
     RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
     TriangulationStats, Triangulator,
 };
+pub use pnp::{
+    build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation, PinholeIntrinsics,
+    PnpError, PnpResult, Pose, RansacConfig,
+};
+pub use tracker::{
+    KeyframePolicy, KeyframePolicyError, ParallaxPx, CovisibilityRatio, SlamTracker, TrackerConfig,
+    TrackerError, TrackerOutput,
+};
+pub use local_ba::{LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, ObservationSet, ObservationSetError};
+pub use env::{env_bool, env_f32, env_usize};
 #[cfg(feature = "record")]
 pub use oak::oak_to_frame;
 
@@ -250,7 +265,7 @@ pub struct Keypoint {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Descriptor(pub [f32; 256]);
 
 impl Descriptor {
@@ -269,6 +284,8 @@ pub enum DetectionError {
 pub struct Detections {
     sensor_id: SensorId,
     frame_id: FrameId,
+    width: u32,
+    height: u32,
     keypoints: Vec<Keypoint>,
     scores: Vec<f32>,
     descriptors: Vec<Descriptor>,
@@ -281,6 +298,14 @@ impl Detections {
 
     pub fn frame_id(&self) -> FrameId {
         self.frame_id
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
     }
 
     pub fn keypoints(&self) -> &[Keypoint] {
@@ -315,12 +340,14 @@ impl Detections {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.descriptors.len() == 0
+        self.descriptors.is_empty()
     }
 
     pub fn new(
         sensor_id: SensorId,
         frame_id: FrameId,
+        width: u32,
+        height: u32,
         keypoints: Vec<Keypoint>,
         scores: Vec<f32>,
         descriptors: Vec<Descriptor>,
@@ -335,6 +362,8 @@ impl Detections {
         Ok(Self {
             sensor_id,
             frame_id,
+            width,
+            height,
             keypoints,
             scores,
             descriptors,
@@ -349,6 +378,8 @@ impl Detections {
         let Detections {
             sensor_id,
             frame_id,
+            width,
+            height,
             keypoints,
             scores,
             descriptors,
@@ -381,6 +412,8 @@ impl Detections {
         Self {
             sensor_id,
             frame_id,
+            width,
+            height,
             keypoints: new_keypoints,
             scores: new_scores,
             descriptors: new_descriptors,
@@ -543,7 +576,9 @@ impl<S: StereoSource> Iterator for RightFrames<S> {
 }
 
 // Typesstates for Matches
+#[derive(Debug)]
 pub struct Raw;
+#[derive(Debug)]
 pub struct Verified;
 
 #[derive(Debug)]
@@ -584,6 +619,45 @@ impl Matches<Raw> {
             _state: PhantomData,
         })
     }
+
+    pub fn with_landmarks(
+        &self,
+        keyframe: &Keyframe,
+    ) -> Result<Matches<Verified>, MatchError> {
+        let mut indices = Vec::new();
+        let mut scores = Vec::new();
+        for (idx, &(a, b)) in self.indices.iter().enumerate() {
+            if keyframe.landmark_for_detection(b).is_some() {
+                indices.push((a, b));
+                scores.push(self.scores[idx]);
+            }
+        }
+
+        Matches::new_verified(self.source_a_arc(), self.source_b_arc(), indices, scores)
+    }
+}
+
+impl Matches<Verified> {
+    pub fn new_verified(
+        source_a: Arc<Detections>,
+        source_b: Arc<Detections>,
+        indices: Vec<(usize, usize)>,
+        scores: Vec<f32>,
+    ) -> Result<Self, MatchError> {
+        if indices.len() != scores.len() {
+            return Err(MatchError::MissMatch {
+                score_len: (scores.len()),
+                indices_len: (indices.len()),
+            });
+        }
+        Ok(Self {
+            source_a,
+            source_b,
+            indices,
+            scores,
+            _state: PhantomData,
+        })
+    }
 }
 
 impl<State> Matches<State> {
@@ -601,6 +675,14 @@ impl<State> Matches<State> {
 
     pub fn source_b(&self) -> &Detections {
         &self.source_b
+    }
+
+    pub fn source_a_arc(&self) -> Arc<Detections> {
+        Arc::clone(&self.source_a)
+    }
+
+    pub fn source_b_arc(&self) -> Arc<Detections> {
+        Arc::clone(&self.source_b)
     }
 
     pub fn indices(&self) -> &[(usize, usize)] {

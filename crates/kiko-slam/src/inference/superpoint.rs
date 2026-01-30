@@ -130,6 +130,8 @@ fn run_inference(
     Detections::new(
         frame.sensor_id(),
         frame.frame_id(),
+        frame.width(),
+        frame.height(),
         keypoints,
         scores,
         descriptors,
