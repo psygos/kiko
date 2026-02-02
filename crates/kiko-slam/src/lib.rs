@@ -17,6 +17,7 @@ mod tracker;
 pub mod env;
 mod math;
 mod local_ba;
+pub mod map;
 #[cfg(feature = "record")]
 mod oak;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
@@ -52,7 +53,7 @@ pub enum SensorId {
     StereoRight,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
 pub struct FrameId(u64);
 
 impl FrameId {
