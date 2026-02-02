@@ -482,12 +482,7 @@ impl SlamMap {
             .get(first_obs.keyframe_id)
             .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         let idx = first_obs.index.as_usize();
-        if idx >= entry.point_refs.len() {
-            return Err(MapError::KeypointIndexOutOfBounds {
-                index: idx,
-                len: entry.point_refs.len(),
-            });
-        }
+        debug_assert!(idx < entry.point_refs.len(), "KeyframeKeypoint out of bounds");
         if let Some(existing) = entry.point_ref(first_obs.index) {
             return Err(MapError::DetectionAlreadyAssociated {
                 keyframe_id: first_obs.keyframe_id,
@@ -522,12 +517,7 @@ impl SlamMap {
             .get(obs.keyframe_id)
             .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         let idx = obs.index.as_usize();
-        if idx >= entry.point_refs.len() {
-            return Err(MapError::KeypointIndexOutOfBounds {
-                index: idx,
-                len: entry.point_refs.len(),
-            });
-        }
+        debug_assert!(idx < entry.point_refs.len(), "KeyframeKeypoint out of bounds");
         if let Some(existing) = entry.point_ref(obs.index) {
             return Err(MapError::DetectionAlreadyAssociated {
                 keyframe_id: obs.keyframe_id,
@@ -536,25 +526,22 @@ impl SlamMap {
             });
         }
 
-        let (other_keyframes, already_observed) = {
+        let other_keyframes: Vec<KeyframeId> = {
             let point = self
                 .points
                 .get(point_id)
                 .ok_or(MapError::MapPointNotFound(point_id))?;
-            let already_observed = point.observes_keyframe(obs.keyframe_id);
-            let other_keyframes: Vec<KeyframeId> = point
-                .observations
+            if point.observes_keyframe(obs.keyframe_id) {
+                return Err(MapError::DuplicateObservation {
+                    point_id,
+                    keyframe_id: obs.keyframe_id,
+                });
+            }
+            point.observations
                 .iter()
                 .map(|o| o.keyframe_id)
-                .collect();
-            (other_keyframes, already_observed)
+                .collect()
         };
-        if already_observed {
-            return Err(MapError::DuplicateObservation {
-                point_id,
-                keyframe_id: obs.keyframe_id,
-            });
-        }
 
         for other in other_keyframes {
             self.covisibility.increment_pair(obs.keyframe_id, other);
@@ -648,21 +635,34 @@ impl SlamMap {
         Ok(())
     }
 
-    pub fn cull_points(&mut self, min_observations: usize) -> Result<usize, MapError> {
+    pub fn cull_points(&mut self, min_observations: usize) -> usize {
         let to_remove: Vec<MapPointId> = self
             .points
             .iter()
             .filter(|(_, p)| p.observation_count() < min_observations)
             .map(|(id, _)| id)
             .collect();
-        for id in &to_remove {
-            self.remove_map_point(*id)?;
+        let count = to_remove.len();
+        for id in to_remove {
+            let removed = self.remove_map_point(id);
+            debug_assert!(removed.is_ok(), "map point missing during cull");
         }
-        Ok(to_remove.len())
+        count
     }
 
     pub fn keyframe(&self, id: KeyframeId) -> Option<&KeyframeEntry> {
         self.keyframes.get(id)
+    }
+
+    pub fn map_point_for_keypoint(
+        &self,
+        keypoint: KeyframeKeypoint,
+    ) -> Result<Option<MapPointId>, MapError> {
+        let entry = self
+            .keyframes
+            .get(keypoint.keyframe_id)
+            .ok_or(MapError::KeyframeNotFound(keypoint.keyframe_id))?;
+        Ok(entry.point_ref(keypoint.index))
     }
 
     pub fn point(&self, id: MapPointId) -> Option<&MapPoint> {
@@ -725,7 +725,7 @@ mod tests {
     }
 
     fn make_descriptor() -> Descriptor {
-        Descriptor([0.0; 256])
+        Descriptor([1.0; 256])
     }
 
     #[test]
@@ -809,5 +809,92 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn remove_keyframe_removes_orphaned_points() {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let pose = Pose::identity();
+
+        let kf1 = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                pose,
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe1");
+
+        let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
+        let point = map
+            .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
+            .expect("map point");
+        assert!(map.point(point).is_some());
+
+        map.remove_keyframe(kf1).expect("remove keyframe");
+        assert_eq!(map.num_keyframes(), 0);
+        assert_eq!(map.num_points(), 0);
+    }
+
+    #[test]
+    fn covisibility_updates_for_shared_points() {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let pose = Pose::identity();
+
+        let kf1 = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                pose,
+                size,
+                make_keypoints(3),
+            )
+            .expect("keyframe1");
+        let kf2 = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                pose,
+                size,
+                make_keypoints(3),
+            )
+            .expect("keyframe2");
+        let kf3 = map
+            .add_keyframe(
+                FrameId::new(3),
+                Timestamp::from_nanos(3),
+                pose,
+                size,
+                make_keypoints(3),
+            )
+            .expect("keyframe3");
+
+        let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
+        let point_a = map
+            .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
+            .expect("point A");
+        let obs2 = map.keyframe_keypoint(kf2, 0).expect("obs2");
+        map.add_observation(point_a, obs2).expect("obs2 add");
+        let obs3 = map.keyframe_keypoint(kf3, 0).expect("obs3");
+        map.add_observation(point_a, obs3).expect("obs3 add");
+
+        assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
+        assert_eq!(map.covisibility().covisibility_count(kf1, kf3), 1);
+        assert_eq!(map.covisibility().covisibility_count(kf2, kf3), 1);
+
+        let obs1b = map.keyframe_keypoint(kf1, 1).expect("obs1b");
+        let point_b = map
+            .add_map_point(Point3 { x: 1.0, y: 0.0, z: 2.0 }, make_descriptor(), obs1b)
+            .expect("point B");
+        let obs2b = map.keyframe_keypoint(kf2, 1).expect("obs2b");
+        map.add_observation(point_b, obs2b).expect("obs2b add");
+
+        assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 2);
+
+        map.remove_map_point(point_b).expect("remove point B");
+        assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
     }
 }

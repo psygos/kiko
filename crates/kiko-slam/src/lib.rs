@@ -42,7 +42,10 @@ pub use tracker::{
     KeyframePolicy, KeyframePolicyError, ParallaxPx, CovisibilityRatio, SlamTracker, TrackerConfig,
     TrackerError, TrackerOutput,
 };
-pub use local_ba::{LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, ObservationSet, ObservationSetError};
+pub use local_ba::{
+    LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet,
+    ObservationSetError,
+};
 pub use env::{env_bool, env_f32, env_usize};
 #[cfg(feature = "record")]
 pub use oak::oak_to_frame;

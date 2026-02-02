@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use crate::{
     build_observations, solve_pnp_ransac, DownscaleFactor, Frame, FrameId, Keyframe, KeypointLimit,
-    LightGlue, LocalBaConfig, LocalBundleAdjuster, Matches, ObservationSet, PinholeIntrinsics,
-    Pose, Raw, RansacConfig, RectifiedStereo, StereoPair, SuperPoint, TriangulationConfig,
-    TriangulationError, Triangulator, Verified,
+    LightGlue, LocalBaConfig, LocalBundleAdjuster, Matches, MapObservation, ObservationSet,
+    PinholeIntrinsics, Pose, Raw, RansacConfig, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
+    TriangulationConfig, TriangulationError, Triangulator, Verified,
+    map::{KeyframeId, SlamMap},
 };
 
 use std::cmp::Ordering;
@@ -125,6 +126,7 @@ pub enum TrackerError {
     Inference(InferenceError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
+    Map(crate::map::MapError),
     KeyframeRejected { landmarks: usize },
 }
 
@@ -134,6 +136,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
+            TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -161,6 +164,12 @@ impl From<crate::PnpError> for TrackerError {
     }
 }
 
+impl From<crate::map::MapError> for TrackerError {
+    fn from(err: crate::map::MapError) -> Self {
+        TrackerError::Map(err)
+    }
+}
+
 #[derive(Debug)]
 pub struct TrackerOutput {
     pub pose: Option<Pose>,
@@ -176,6 +185,7 @@ enum TrackerState {
     Tracking {
         keyframe: Arc<Keyframe>,
         keyframe_pose: Pose,
+        keyframe_id: KeyframeId,
     },
 }
 
@@ -188,6 +198,7 @@ pub struct SlamTracker {
     config: TrackerConfig,
     state: TrackerState,
     ba: LocalBundleAdjuster,
+    map: SlamMap,
 }
 
 impl SlamTracker {
@@ -210,6 +221,7 @@ impl SlamTracker {
             config,
             state: TrackerState::NeedKeyframe,
             ba,
+            map: SlamMap::new(),
         }
     }
 
@@ -219,11 +231,12 @@ impl SlamTracker {
             TrackerState::Tracking {
                 keyframe,
                 keyframe_pose,
-            } => Some((Arc::clone(keyframe), *keyframe_pose)),
+                keyframe_id,
+            } => Some((Arc::clone(keyframe), *keyframe_pose, *keyframe_id)),
         };
 
-        if let Some((keyframe, keyframe_pose)) = tracking {
-            self.track(pair, &keyframe, keyframe_pose)
+        if let Some((keyframe, keyframe_pose, keyframe_id)) = tracking {
+            self.track(pair, &keyframe, keyframe_pose, keyframe_id)
         } else {
             self.create_keyframe(pair, Pose::identity())
         }
@@ -234,6 +247,7 @@ impl SlamTracker {
         pair: StereoPair,
         keyframe: &Arc<Keyframe>,
         keyframe_pose: Pose,
+        keyframe_id: KeyframeId,
     ) -> Result<TrackerOutput, TrackerError> {
         let StereoPair { left, right } = pair;
         let frame_id = left.frame_id();
@@ -290,11 +304,24 @@ impl SlamTracker {
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
-        let inlier_observations: Vec<_> = result
-            .inliers
-            .iter()
-            .filter_map(|&idx| observations.get(idx).copied())
-            .collect();
+        let mut map_observations = Vec::with_capacity(result.inliers.len());
+        for &idx in &result.inliers {
+            let (ci, ki) = *verified
+                .indices()
+                .get(idx)
+                .ok_or_else(|| {
+                    TrackerError::Inference(InferenceError::Domain(
+                        "verified match index out of bounds".to_string(),
+                    ))
+                })?;
+            let pixel = *current.keypoints().get(ci).ok_or_else(|| {
+                TrackerError::Inference(InferenceError::Domain(
+                    "current keypoint index out of bounds".to_string(),
+                ))
+            })?;
+            let keypoint_ref = self.map.keyframe_keypoint(keyframe_id, ki)?;
+            map_observations.push(MapObservation::new(keypoint_ref, pixel));
+        }
 
         let parallax_px = median_parallax_px(&verified, &result.inliers, keyframe);
         let covisibility = if keyframe.landmarks().is_empty() {
@@ -303,9 +330,9 @@ impl SlamTracker {
             result.inliers.len() as f32 / keyframe.landmarks().len() as f32
         };
 
-        let refined_rel = ObservationSet::new(inlier_observations, self.ba.min_observations())
+        let refined_rel = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()
-            .and_then(|set| self.ba.push_frame(result.pose, set));
+            .and_then(|set| self.ba.push_frame(&self.map, result.pose, set));
 
         let pose_rel = refined_rel.unwrap_or(result.pose);
         let pose_world = keyframe_pose.compose(pose_rel);
@@ -325,11 +352,14 @@ impl SlamTracker {
 
         if should_refresh {
             let new_pose = pose_world;
-            if let Ok(keyframe_output) = self.create_keyframe_internal(left, right) {
+            if let Ok((keyframe_output, keyframe_id)) =
+                self.create_keyframe_internal(left, right, new_pose)
+            {
                 if let Some(keyframe) = keyframe_output.keyframe {
                     self.state = TrackerState::Tracking {
                         keyframe: keyframe.clone(),
                         keyframe_pose: new_pose,
+                        keyframe_id,
                     };
                     self.ba.reset();
                     output.keyframe = Some(keyframe);
@@ -348,11 +378,12 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         let StereoPair { left, right } = pair;
         let frame_id = left.frame_id();
-        let output = self.create_keyframe_internal(left, right)?;
+        let (output, keyframe_id) = self.create_keyframe_internal(left, right, pose_world)?;
         let keyframe = output.keyframe.clone().expect("keyframe");
         self.state = TrackerState::Tracking {
             keyframe,
             keyframe_pose: pose_world,
+            keyframe_id,
         };
         self.ba.reset();
         Ok(TrackerOutput {
@@ -364,11 +395,12 @@ impl SlamTracker {
         })
     }
 
-fn create_keyframe_internal(
-    &mut self,
-    left: Frame,
-    right: Frame,
-) -> Result<TrackerOutput, TrackerError> {
+    fn create_keyframe_internal(
+        &mut self,
+        left: Frame,
+        right: Frame,
+        pose_world: Pose,
+    ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
 
@@ -415,13 +447,113 @@ fn create_keyframe_internal(
         }
 
         let keyframe = Arc::new(result.keyframe);
-        Ok(TrackerOutput {
-            pose: None,
-            inliers: 0,
-            keyframe: Some(keyframe),
-            stereo_matches: Some(matches),
-            frame_id,
-        })
+        let keyframe_id =
+            insert_keyframe_into_map(&mut self.map, &keyframe, left.timestamp(), pose_world)?;
+
+        Ok((
+            TrackerOutput {
+                pose: None,
+                inliers: 0,
+                keyframe: Some(keyframe),
+                stereo_matches: Some(matches),
+                frame_id,
+            },
+            keyframe_id,
+        ))
+    }
+}
+
+fn insert_keyframe_into_map(
+    map: &mut SlamMap,
+    keyframe: &Arc<Keyframe>,
+    timestamp: Timestamp,
+    pose_world: Pose,
+) -> Result<KeyframeId, TrackerError> {
+    let keyframe_id = map.add_keyframe_from_detections(
+        keyframe.detections().as_ref(),
+        timestamp,
+        pose_world,
+    )?;
+
+    for (landmark, &det_idx) in keyframe
+        .landmarks()
+        .iter()
+        .zip(keyframe.landmark_indices().iter())
+    {
+        let keypoint_ref = map.keyframe_keypoint(keyframe_id, det_idx)?;
+        let descriptor = keyframe.detections().descriptors()[det_idx];
+        map.add_map_point(*landmark, descriptor, keypoint_ref)?;
+    }
+    Ok(keyframe_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Detections, Descriptor, Keypoint, SensorId, Point3, Timestamp};
+
+    fn make_descriptor() -> Descriptor {
+        Descriptor([0.0; 256])
+    }
+
+    #[test]
+    fn keyframe_insertion_populates_map_points() {
+        let keypoints = vec![
+            Keypoint { x: 1.0, y: 2.0 },
+            Keypoint { x: 3.0, y: 4.0 },
+            Keypoint { x: 5.0, y: 6.0 },
+        ];
+        let scores = vec![1.0, 1.0, 1.0];
+        let descriptors = vec![make_descriptor(), make_descriptor(), make_descriptor()];
+
+        let detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(10),
+            640,
+            480,
+            keypoints,
+            scores,
+            descriptors,
+        )
+        .expect("detections");
+
+        let landmarks = vec![
+            Point3 { x: 0.0, y: 0.0, z: 1.0 },
+            Point3 { x: 1.0, y: 0.0, z: 1.5 },
+        ];
+        let landmark_indices = vec![0, 2];
+        let keyframe = Arc::new(
+            Keyframe::from_arc(Arc::new(detections), landmarks, landmark_indices)
+                .expect("keyframe"),
+        );
+
+        let mut map = SlamMap::new();
+        let keyframe_id = insert_keyframe_into_map(
+            &mut map,
+            &keyframe,
+            Timestamp::from_nanos(42),
+            Pose::identity(),
+        )
+        .expect("insert keyframe");
+
+        assert_eq!(map.num_keyframes(), 1);
+        assert_eq!(map.num_points(), keyframe.landmarks().len());
+
+        for &det_idx in keyframe.landmark_indices() {
+            let kp_ref = map.keyframe_keypoint(keyframe_id, det_idx).expect("kp ref");
+            let point_id = map
+                .map_point_for_keypoint(kp_ref)
+                .expect("map lookup")
+                .expect("point id");
+            let point = map.point(point_id).expect("point");
+            let landmark = keyframe
+                .landmark_for_detection(det_idx)
+                .expect("landmark");
+            let Point3 { x, y, z } = point.position();
+            assert_eq!(x, landmark.x);
+            assert_eq!(y, landmark.y);
+            assert_eq!(z, landmark.z);
+        }
     }
 }
 

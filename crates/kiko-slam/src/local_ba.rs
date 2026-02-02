@@ -1,6 +1,9 @@
 use std::num::NonZeroUsize;
 
-use crate::{math, Observation, PinholeIntrinsics, Pose};
+use crate::{
+    math, Observation, PinholeIntrinsics, Pose, Keypoint,
+    map::{KeyframeKeypoint, SlamMap},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalBaConfig {
@@ -139,14 +142,37 @@ impl std::fmt::Display for ObservationSetError {
 
 impl std::error::Error for ObservationSetError {}
 
+#[derive(Debug, Clone, Copy)]
+pub struct MapObservation {
+    keyframe_keypoint: KeyframeKeypoint,
+    pixel: Keypoint,
+}
+
+impl MapObservation {
+    pub fn new(keyframe_keypoint: KeyframeKeypoint, pixel: Keypoint) -> Self {
+        Self {
+            keyframe_keypoint,
+            pixel,
+        }
+    }
+
+    pub fn keyframe_keypoint(&self) -> KeyframeKeypoint {
+        self.keyframe_keypoint
+    }
+
+    pub fn pixel(&self) -> Keypoint {
+        self.pixel
+    }
+}
+
 #[derive(Debug)]
 pub struct ObservationSet {
-    observations: Vec<Observation>,
+    observations: Vec<MapObservation>,
 }
 
 impl ObservationSet {
     pub fn new(
-        observations: Vec<Observation>,
+        observations: Vec<MapObservation>,
         min_required: NonZeroUsize,
     ) -> Result<Self, ObservationSetError> {
         if observations.len() < min_required.get() {
@@ -158,7 +184,38 @@ impl ObservationSet {
         Ok(Self { observations })
     }
 
-    pub fn observations(&self) -> &[Observation] {
+    pub fn observations(&self) -> &[MapObservation] {
+        &self.observations
+    }
+
+    fn resolve(
+        &self,
+        map: &SlamMap,
+        intrinsics: PinholeIntrinsics,
+        min_required: NonZeroUsize,
+    ) -> Option<ResolvedObservationSet> {
+        let mut resolved = Vec::with_capacity(self.observations.len());
+        for obs in &self.observations {
+            let keypoint_ref = obs.keyframe_keypoint();
+            let point_id = map.map_point_for_keypoint(keypoint_ref).ok().flatten()?;
+            let world = map.point(point_id)?.position();
+            let observation = Observation::try_new(world, obs.pixel(), intrinsics).ok()?;
+            resolved.push(observation);
+        }
+        if resolved.len() < min_required.get() {
+            return None;
+        }
+        Some(ResolvedObservationSet { observations: resolved })
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedObservationSet {
+    observations: Vec<Observation>,
+}
+
+impl ResolvedObservationSet {
+    fn observations(&self) -> &[Observation] {
         &self.observations
     }
 }
@@ -200,7 +257,12 @@ impl LocalBundleAdjuster {
         self.config.min_observations
     }
 
-    pub fn push_frame(&mut self, pose: Pose, observations: ObservationSet) -> Option<Pose> {
+    pub fn push_frame(
+        &mut self,
+        map: &SlamMap,
+        pose: Pose,
+        observations: ObservationSet,
+    ) -> Option<Pose> {
         self.frames.push(BaFrame {
             pose,
             observations,
@@ -210,13 +272,13 @@ impl LocalBundleAdjuster {
             self.frames.drain(0..excess);
         }
 
-        if !self.optimize() {
+        if !self.optimize(map) {
             return None;
         }
         self.frames.last().map(|frame| frame.pose)
     }
 
-    fn optimize(&mut self) -> bool {
+    fn optimize(&mut self, map: &SlamMap) -> bool {
         let frame_count = self.frames.len();
         if frame_count == 0 {
             return false;
@@ -236,7 +298,15 @@ impl LocalBundleAdjuster {
 
             for (idx, frame) in self.frames.iter().enumerate() {
                 let base = idx * 6;
-                for obs in frame.observations.observations() {
+                let resolved = match frame.observations.resolve(
+                    map,
+                    self.intrinsics,
+                    self.config.min_observations,
+                ) {
+                    Some(set) => set,
+                    None => return false,
+                };
+                for obs in resolved.observations() {
                     if let Some((residual, jac)) =
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
                     {

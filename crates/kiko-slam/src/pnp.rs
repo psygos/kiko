@@ -82,6 +82,19 @@ impl Observation {
     pub fn bearing(&self) -> [f32; 3] {
         self.bearing
     }
+
+    pub fn try_new(
+        world: Point3,
+        pixel: Keypoint,
+        intrinsics: PinholeIntrinsics,
+    ) -> Result<Self, PnpError> {
+        let bearing = normalize_bearing(pixel, intrinsics)?;
+        Ok(Self {
+            world,
+            pixel,
+            bearing,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
