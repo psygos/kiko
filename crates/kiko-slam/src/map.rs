@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::num::NonZeroU32;
+use std::collections::{HashMap, HashSet};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use slotmap::{new_key_type, SlotMap};
 
@@ -372,6 +372,25 @@ pub struct SlamMap {
     frame_to_keyframe: HashMap<FrameId, KeyframeId>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CovisibilityNode {
+    pub id: KeyframeId,
+    pub pose: Pose,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CovisibilityEdge {
+    pub a: KeyframeId,
+    pub b: KeyframeId,
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CovisibilitySnapshot {
+    pub nodes: Vec<CovisibilityNode>,
+    pub edges: Vec<CovisibilityEdge>,
+}
+
 impl SlamMap {
     pub fn new() -> Self {
         Self {
@@ -654,6 +673,81 @@ impl SlamMap {
         self.keyframes.get(id)
     }
 
+    pub fn keyframe_observation_pixels(
+        &self,
+        keyframe_id: KeyframeId,
+    ) -> Result<Vec<(KeyframeKeypoint, Keypoint)>, MapError> {
+        let entry = self
+            .keyframes
+            .get(keyframe_id)
+            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+        let mut observations = Vec::new();
+        for (idx, point_id) in entry.point_refs.iter().enumerate() {
+            if point_id.is_some() {
+                let index = KeypointIndex::new(idx, entry.len())
+                    .expect("keypoint index within bounds");
+                let keypoint_ref = KeyframeKeypoint {
+                    keyframe_id,
+                    index,
+                };
+                observations.push((keypoint_ref, entry.keypoints[idx]));
+            }
+        }
+        Ok(observations)
+    }
+
+    pub fn keyframe_point_count(&self, keyframe_id: KeyframeId) -> Result<usize, MapError> {
+        let entry = self
+            .keyframes
+            .get(keyframe_id)
+            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+        Ok(entry.map_point_ids().count())
+    }
+
+    pub fn covisible_window(
+        &self,
+        seed: KeyframeId,
+        max: NonZeroUsize,
+    ) -> Result<Vec<KeyframeId>, MapError> {
+        if !self.keyframes.contains_key(seed) {
+            return Err(MapError::KeyframeNotFound(seed));
+        }
+        let mut window = Vec::new();
+        window.push(seed);
+
+        let neighbors = match self.covisibility.neighbors(seed) {
+            Some(neighbors) => neighbors,
+            None => return Ok(window),
+        };
+
+        let mut sorted: Vec<(KeyframeId, NonZeroU32)> =
+            neighbors.iter().map(|(&id, &w)| (id, w)).collect();
+        sorted.sort_by(|a, b| b.1.get().cmp(&a.1.get()));
+
+        let limit = max.get().saturating_sub(1);
+        for (id, _) in sorted.into_iter().take(limit) {
+            window.push(id);
+        }
+        Ok(window)
+    }
+
+    pub fn covisibility_ratio(
+        &self,
+        a: KeyframeId,
+        b: KeyframeId,
+    ) -> Result<f32, MapError> {
+        let count = self.covisibility.covisibility_count(a, b) as f32;
+        if count == 0.0 {
+            return Ok(0.0);
+        }
+        let a_points = self.keyframe_point_count(a)? as f32;
+        let b_points = self.keyframe_point_count(b)? as f32;
+        if a_points == 0.0 || b_points == 0.0 {
+            return Ok(0.0);
+        }
+        Ok(count / a_points.min(b_points))
+    }
+
     pub fn map_point_for_keypoint(
         &self,
         keypoint: KeyframeKeypoint,
@@ -675,6 +769,38 @@ impl SlamMap {
 
     pub fn covisibility(&self) -> &CovisibilityGraph {
         &self.covisibility
+    }
+
+    pub fn covisibility_snapshot(&self) -> CovisibilitySnapshot {
+        let nodes: Vec<CovisibilityNode> = self
+            .keyframes
+            .iter()
+            .map(|(id, entry)| CovisibilityNode {
+                id,
+                pose: entry.pose(),
+            })
+            .collect();
+
+        let mut edges = Vec::new();
+        let mut seen: HashSet<(KeyframeId, KeyframeId)> = HashSet::new();
+        for (&a, neighbors) in &self.covisibility.edges {
+            for (&b, weight) in neighbors {
+                if a == b {
+                    continue;
+                }
+                if seen.contains(&(b, a)) {
+                    continue;
+                }
+                seen.insert((a, b));
+                edges.push(CovisibilityEdge {
+                    a,
+                    b,
+                    weight: weight.get(),
+                });
+            }
+        }
+
+        CovisibilitySnapshot { nodes, edges }
     }
 
     pub fn num_points(&self) -> usize {

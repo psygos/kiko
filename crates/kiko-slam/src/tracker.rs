@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
 use crate::{
-    build_observations, solve_pnp_ransac, DownscaleFactor, Frame, FrameId, Keyframe, KeypointLimit,
+    solve_pnp_ransac, DownscaleFactor, Detections, Frame, FrameId, Keyframe, KeypointLimit,
     LightGlue, LocalBaConfig, LocalBundleAdjuster, Matches, MapObservation, ObservationSet,
-    PinholeIntrinsics, Pose, Raw, RansacConfig, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
+    PinholeIntrinsics, Point3, Pose, Raw, RansacConfig, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
     TriangulationConfig, TriangulationError, Triangulator, Verified,
     map::{KeyframeId, SlamMap},
 };
@@ -21,6 +21,7 @@ pub struct TrackerConfig {
     pub triangulation: TriangulationConfig,
     pub keyframe_policy: KeyframePolicy,
     pub ba: LocalBaConfig,
+    pub redundancy: Option<RedundancyPolicy>,
 }
 
 impl TrackerConfig {
@@ -42,10 +43,20 @@ pub struct ParallaxPx(f32);
 #[derive(Clone, Copy, Debug)]
 pub struct CovisibilityRatio(f32);
 
+#[derive(Clone, Copy, Debug)]
+pub struct RedundancyPolicy {
+    max_covisibility: CovisibilityRatio,
+}
+
 #[derive(Debug)]
 pub enum KeyframePolicyError {
     ZeroInliers,
     NonPositiveParallax { value: f32 },
+    CovisibilityOutOfRange { value: f32 },
+}
+
+#[derive(Debug)]
+pub enum RedundancyPolicyError {
     CovisibilityOutOfRange { value: f32 },
 }
 
@@ -65,6 +76,19 @@ impl std::fmt::Display for KeyframePolicyError {
 }
 
 impl std::error::Error for KeyframePolicyError {}
+
+impl std::fmt::Display for RedundancyPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedundancyPolicyError::CovisibilityOutOfRange { value } => write!(
+                f,
+                "redundancy covisibility must be within [0, 1] (got {value})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RedundancyPolicyError {}
 
 impl KeyframePolicy {
     pub fn new(
@@ -118,6 +142,23 @@ impl KeyframePolicy {
             return true;
         }
         false
+    }
+}
+
+impl RedundancyPolicy {
+    pub fn new(max_covisibility: f32) -> Result<Self, RedundancyPolicyError> {
+        if !max_covisibility.is_finite() || max_covisibility < 0.0 || max_covisibility > 1.0 {
+            return Err(RedundancyPolicyError::CovisibilityOutOfRange {
+                value: max_covisibility,
+            });
+        }
+        Ok(Self {
+            max_covisibility: CovisibilityRatio(max_covisibility),
+        })
+    }
+
+    pub fn max_covisibility(&self) -> f32 {
+        self.max_covisibility.0
     }
 }
 
@@ -184,9 +225,14 @@ enum TrackerState {
     NeedKeyframe,
     Tracking {
         keyframe: Arc<Keyframe>,
-        keyframe_pose: Pose,
         keyframe_id: KeyframeId,
     },
+}
+
+#[derive(Debug)]
+struct SharedMatches {
+    keyframe_id: KeyframeId,
+    pairs: Vec<(usize, usize)>,
 }
 
 pub struct SlamTracker {
@@ -230,23 +276,25 @@ impl SlamTracker {
             TrackerState::NeedKeyframe => None,
             TrackerState::Tracking {
                 keyframe,
-                keyframe_pose,
                 keyframe_id,
-            } => Some((Arc::clone(keyframe), *keyframe_pose, *keyframe_id)),
+            } => Some((Arc::clone(keyframe), *keyframe_id)),
         };
 
-        if let Some((keyframe, keyframe_pose, keyframe_id)) = tracking {
-            self.track(pair, &keyframe, keyframe_pose, keyframe_id)
+        if let Some((keyframe, keyframe_id)) = tracking {
+            self.track(pair, &keyframe, keyframe_id)
         } else {
             self.create_keyframe(pair, Pose::identity())
         }
+    }
+
+    pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
+        self.map.covisibility_snapshot()
     }
 
     fn track(
         &mut self,
         pair: StereoPair,
         keyframe: &Arc<Keyframe>,
-        keyframe_pose: Pose,
         keyframe_id: KeyframeId,
     ) -> Result<TrackerOutput, TrackerError> {
         let StereoPair { left, right } = pair;
@@ -276,7 +324,13 @@ impl SlamTracker {
             Err(err) => return Err(TrackerError::Inference(InferenceError::Domain(format!("{err:?}")))),
         };
 
-        let observations = match build_observations(keyframe, &verified, self.intrinsics) {
+        let observations = match build_map_observations(
+            &self.map,
+            keyframe_id,
+            &verified,
+            current.as_ref(),
+            self.intrinsics,
+        ) {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
                 return Ok(TrackerOutput {
@@ -330,12 +384,12 @@ impl SlamTracker {
             result.inliers.len() as f32 / keyframe.landmarks().len() as f32
         };
 
-        let refined_rel = ObservationSet::new(map_observations, self.ba.min_observations())
+        let pose_world = result.pose;
+        let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()
-            .and_then(|set| self.ba.push_frame(&self.map, result.pose, set));
+            .and_then(|set| self.ba.push_frame(&self.map, pose_world, set));
 
-        let pose_rel = refined_rel.unwrap_or(result.pose);
-        let pose_world = keyframe_pose.compose(pose_rel);
+        let pose_world = refined_world.unwrap_or(pose_world);
 
         let mut output = TrackerOutput {
             pose: Some(pose_world),
@@ -352,18 +406,36 @@ impl SlamTracker {
 
         if should_refresh {
             let new_pose = pose_world;
-            if let Ok((keyframe_output, keyframe_id)) =
-                self.create_keyframe_internal(left, right, new_pose)
-            {
+            let shared = build_shared_matches(keyframe_id, &verified, &result.inliers);
+            if let Ok((keyframe_output, keyframe_id)) = self.create_keyframe_internal(
+                left,
+                right,
+                new_pose,
+                Some(current.clone()),
+                Some(shared),
+            ) {
                 if let Some(keyframe) = keyframe_output.keyframe {
-                    self.state = TrackerState::Tracking {
-                        keyframe: keyframe.clone(),
-                        keyframe_pose: new_pose,
-                        keyframe_id,
-                    };
-                    self.ba.reset();
-                    output.keyframe = Some(keyframe);
-                    output.stereo_matches = keyframe_output.stereo_matches;
+                    let redundant = self
+                        .config
+                        .redundancy
+                        .map(|policy| is_redundant(&self.map, keyframe_id, policy.max_covisibility()))
+                        .transpose()?
+                        .unwrap_or(false);
+                    if redundant {
+                        let _ = self.map.remove_keyframe(keyframe_id);
+                    } else {
+                        let window = self
+                            .map
+                            .covisible_window(keyframe_id, self.ba.window_size())?;
+                        let _ = self.ba.optimize_keyframe_window(&mut self.map, &window);
+                        self.state = TrackerState::Tracking {
+                            keyframe: keyframe.clone(),
+                            keyframe_id,
+                        };
+                        self.ba.reset();
+                        output.keyframe = Some(keyframe);
+                        output.stereo_matches = keyframe_output.stereo_matches;
+                    }
                 }
             }
         }
@@ -378,11 +450,11 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         let StereoPair { left, right } = pair;
         let frame_id = left.frame_id();
-        let (output, keyframe_id) = self.create_keyframe_internal(left, right, pose_world)?;
+        let (output, keyframe_id) =
+            self.create_keyframe_internal(left, right, pose_world, None, None)?;
         let keyframe = output.keyframe.clone().expect("keyframe");
         self.state = TrackerState::Tracking {
             keyframe,
-            keyframe_pose: pose_world,
             keyframe_id,
         };
         self.ba.reset();
@@ -395,43 +467,57 @@ impl SlamTracker {
         })
     }
 
-    fn create_keyframe_internal(
-        &mut self,
-        left: Frame,
-        right: Frame,
-        pose_world: Pose,
-    ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
+fn create_keyframe_internal(
+    &mut self,
+    left: Frame,
+    right: Frame,
+    pose_world: Pose,
+    left_det: Option<Arc<Detections>>,
+    shared: Option<SharedMatches>,
+) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
 
-        let (left_det, right_det) = std::thread::scope(|scope| {
-            let left_sp = &mut self.superpoint_left;
-            let right_sp = &mut self.superpoint_right;
-            let left_ref = &left;
-            let right_ref = &right;
-            let downscale = self.config.downscale;
+        let (left_arc, right_arc) = match left_det {
+            Some(left_arc) => {
+                let right_det = self
+                    .superpoint_right
+                    .detect_with_downscale(&right, self.config.downscale)?
+                    .top_k(max_keypoints);
+                (left_arc, Arc::new(right_det))
+            }
+            None => {
+                let (left_det, right_det) = std::thread::scope(|scope| {
+                    let left_sp = &mut self.superpoint_left;
+                    let right_sp = &mut self.superpoint_right;
+                    let left_ref = &left;
+                    let right_ref = &right;
+                    let downscale = self.config.downscale;
 
-            let left_handle = scope.spawn(move || {
-                left_sp
-                    .detect_with_downscale(left_ref, downscale)
-                    .map(|d| d.top_k(max_keypoints))
-            });
-            let right_handle = scope.spawn(move || {
-                right_sp
-                    .detect_with_downscale(right_ref, downscale)
-                    .map(|d| d.top_k(max_keypoints))
-            });
+                    let left_handle = scope.spawn(move || {
+                        left_sp
+                            .detect_with_downscale(left_ref, downscale)
+                            .map(|d| d.top_k(max_keypoints))
+                    });
+                    let right_handle = scope.spawn(move || {
+                        right_sp
+                            .detect_with_downscale(right_ref, downscale)
+                            .map(|d| d.top_k(max_keypoints))
+                    });
 
-            (left_handle.join(), right_handle.join())
-        });
+                    (left_handle.join(), right_handle.join())
+                });
 
-        let left_det = left_det
-            .map_err(|_| InferenceError::Domain("left superpoint thread panicked".to_string()))??;
-        let right_det = right_det
-            .map_err(|_| InferenceError::Domain("right superpoint thread panicked".to_string()))??;
+                let left_det = left_det.map_err(|_| {
+                    InferenceError::Domain("left superpoint thread panicked".to_string())
+                })??;
+                let right_det = right_det.map_err(|_| {
+                    InferenceError::Domain("right superpoint thread panicked".to_string())
+                })??;
 
-        let left_arc = Arc::new(left_det);
-        let right_arc = Arc::new(right_det);
+                (Arc::new(left_det), Arc::new(right_det))
+            }
+        };
 
         let matches = if left_arc.is_empty() || right_arc.is_empty() {
             return Err(TrackerError::KeyframeRejected { landmarks: 0 });
@@ -447,8 +533,13 @@ impl SlamTracker {
         }
 
         let keyframe = Arc::new(result.keyframe);
-        let keyframe_id =
-            insert_keyframe_into_map(&mut self.map, &keyframe, left.timestamp(), pose_world)?;
+        let keyframe_id = insert_keyframe_into_map(
+            &mut self.map,
+            &keyframe,
+            left.timestamp(),
+            pose_world,
+            shared.as_ref(),
+        )?;
 
         Ok((
             TrackerOutput {
@@ -468,6 +559,7 @@ fn insert_keyframe_into_map(
     keyframe: &Arc<Keyframe>,
     timestamp: Timestamp,
     pose_world: Pose,
+    shared: Option<&SharedMatches>,
 ) -> Result<KeyframeId, TrackerError> {
     let keyframe_id = map.add_keyframe_from_detections(
         keyframe.detections().as_ref(),
@@ -475,16 +567,121 @@ fn insert_keyframe_into_map(
         pose_world,
     )?;
 
+    if let Some(shared) = shared {
+        for &(current_idx, old_idx) in &shared.pairs {
+            let old_kp = map.keyframe_keypoint(shared.keyframe_id, old_idx)?;
+            let Some(point_id) = map.map_point_for_keypoint(old_kp)? else {
+                continue;
+            };
+            let new_kp = map.keyframe_keypoint(keyframe_id, current_idx)?;
+            if map.map_point_for_keypoint(new_kp)?.is_none() {
+                map.add_observation(point_id, new_kp)?;
+            }
+        }
+    }
+
     for (landmark, &det_idx) in keyframe
         .landmarks()
         .iter()
         .zip(keyframe.landmark_indices().iter())
     {
         let keypoint_ref = map.keyframe_keypoint(keyframe_id, det_idx)?;
+        if map.map_point_for_keypoint(keypoint_ref)?.is_some() {
+            continue;
+        }
         let descriptor = keyframe.detections().descriptors()[det_idx];
-        map.add_map_point(*landmark, descriptor, keypoint_ref)?;
+        let world = camera_to_world(pose_world, *landmark);
+        map.add_map_point(world, descriptor, keypoint_ref)?;
     }
     Ok(keyframe_id)
+}
+
+fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
+    let inv = pose_world.inverse();
+    let v = crate::math::transform_point(
+        inv.rotation(),
+        inv.translation(),
+        [point.x, point.y, point.z],
+    );
+    Point3 {
+        x: v[0],
+        y: v[1],
+        z: v[2],
+    }
+}
+
+fn build_shared_matches(
+    keyframe_id: KeyframeId,
+    matches: &Matches<Verified>,
+    inliers: &[usize],
+) -> SharedMatches {
+    let mut pairs = Vec::with_capacity(inliers.len());
+    for &idx in inliers {
+        if let Some(&(ci, ki)) = matches.indices().get(idx) {
+            pairs.push((ci, ki));
+        }
+    }
+    SharedMatches { keyframe_id, pairs }
+}
+
+fn is_redundant(
+    map: &SlamMap,
+    keyframe_id: KeyframeId,
+    max_covisibility: f32,
+) -> Result<bool, TrackerError> {
+    let Some(neighbors) = map.covisibility().neighbors(keyframe_id) else {
+        return Ok(false);
+    };
+    for &neighbor in neighbors.keys() {
+        let ratio = map.covisibility_ratio(keyframe_id, neighbor)?;
+        if ratio >= max_covisibility {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn build_map_observations(
+    map: &SlamMap,
+    keyframe_id: KeyframeId,
+    matches: &Matches<Verified>,
+    current: &Detections,
+    intrinsics: PinholeIntrinsics,
+) -> Result<Vec<crate::Observation>, crate::PnpError> {
+    let mut observations = Vec::with_capacity(matches.len());
+    let current_len = current.len();
+
+    for &(ci, ki) in matches.indices() {
+        if ci >= current_len {
+            return Err(crate::PnpError::IndexOutOfBounds {
+                current_len,
+                keyframe_len: 0,
+                current_index: ci,
+                keyframe_index: ki,
+            });
+        }
+        let keypoint_ref = match map.keyframe_keypoint(keyframe_id, ki) {
+            Ok(kp) => kp,
+            Err(_) => continue,
+        };
+        let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
+            continue;
+        };
+        let Some(point) = map.point(point_id) else {
+            continue;
+        };
+        let pixel = current.keypoints()[ci];
+        let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
+        observations.push(obs);
+    }
+
+    if observations.len() < 4 {
+        return Err(crate::PnpError::NotEnoughPoints {
+            required: 4,
+            actual: observations.len(),
+        });
+    }
+    Ok(observations)
 }
 
 #[cfg(test)]
@@ -533,6 +730,7 @@ mod tests {
             &keyframe,
             Timestamp::from_nanos(42),
             Pose::identity(),
+            None,
         )
         .expect("insert keyframe");
 

@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use crate::{
     math, Observation, PinholeIntrinsics, Pose, Keypoint,
-    map::{KeyframeKeypoint, SlamMap},
+    map::{KeyframeId, KeyframeKeypoint, SlamMap},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -257,6 +257,10 @@ impl LocalBundleAdjuster {
         self.config.min_observations
     }
 
+    pub fn window_size(&self) -> NonZeroUsize {
+        self.config.window
+    }
+
     pub fn push_frame(
         &mut self,
         map: &SlamMap,
@@ -276,6 +280,63 @@ impl LocalBundleAdjuster {
             return None;
         }
         self.frames.last().map(|frame| frame.pose)
+    }
+
+    pub fn optimize_keyframe_window(
+        &mut self,
+        map: &mut SlamMap,
+        window: &[KeyframeId],
+    ) -> bool {
+        let Some((&seed, rest)) = window.split_first() else {
+            return false;
+        };
+
+        let seed_obs = match build_keyframe_observations(map, seed, self.min_observations()) {
+            Some(obs) => obs,
+            None => return false,
+        };
+
+        self.frames.clear();
+        let mut selected = Vec::new();
+        if let Some(entry) = map.keyframe(seed) {
+            self.frames.push(BaFrame {
+                pose: entry.pose(),
+                observations: seed_obs,
+            });
+            selected.push(seed);
+        } else {
+            return false;
+        }
+
+        for &kf_id in rest {
+            let Some(entry) = map.keyframe(kf_id) else {
+                continue;
+            };
+            let Some(obs) = build_keyframe_observations(map, kf_id, self.min_observations()) else {
+                continue;
+            };
+            self.frames.push(BaFrame {
+                pose: entry.pose(),
+                observations: obs,
+            });
+            selected.push(kf_id);
+            if self.frames.len() >= self.config.window() {
+                break;
+            }
+        }
+
+        if self.frames.len() < 2 {
+            return false;
+        }
+
+        if !self.optimize(map) {
+            return false;
+        }
+
+        for (kf_id, frame) in selected.iter().zip(self.frames.iter()) {
+            let _ = map.set_keyframe_pose(*kf_id, frame.pose);
+        }
+        true
     }
 
     fn optimize(&mut self, map: &SlamMap) -> bool {
@@ -399,6 +460,19 @@ impl LocalBundleAdjuster {
 
         true
     }
+}
+
+fn build_keyframe_observations(
+    map: &SlamMap,
+    keyframe_id: KeyframeId,
+    min_required: NonZeroUsize,
+) -> Option<ObservationSet> {
+    let pairs = map.keyframe_observation_pixels(keyframe_id).ok()?;
+    let observations: Vec<MapObservation> = pairs
+        .into_iter()
+        .map(|(kp_ref, pixel)| MapObservation::new(kp_ref, pixel))
+        .collect();
+    ObservationSet::new(observations, min_required).ok()
 }
 
 fn reprojection_residual_and_jacobian(

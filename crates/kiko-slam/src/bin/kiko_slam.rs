@@ -7,8 +7,8 @@ use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
     DownscaleFactor, InferenceBackend, InferencePipeline, KeypointLimit, LightGlue,
     LocalBaConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
-    RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError,
-    Triangulator, VizDecimation, VizPacket, KeyframePolicy,
+    RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
+    TriangulationError, Triangulator, VizDecimation, VizPacket, KeyframePolicy,
 };
 
 use kiko_slam::env::{env_f32, env_usize};
@@ -83,6 +83,8 @@ struct VizArgs {
     inference: InferenceArgs,
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value_t = VizDecimationArg::default())]
     rerun_decimation: VizDecimationArg,
+    #[arg(long, env = "KIKO_RERUN_SAVE")]
+    save_rrd: Option<PathBuf>,
     #[arg(long, env = "KIKO_VIZ_ODOMETRY", default_value_t = false)]
     odometry: bool,
     #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
@@ -382,6 +384,27 @@ fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     run_viz_matches(&args)
 }
 
+fn build_recording(
+    args: &VizArgs,
+    name: &str,
+) -> Result<rerun::RecordingStream, Box<dyn std::error::Error>> {
+    if let Some(path) = &args.save_rrd {
+        let path = if path.is_dir() {
+            path.join(format!("{name}.rrd"))
+        } else {
+            path.clone()
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        eprintln!("rerun: saving to {}", path.display());
+        let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
+        Ok(rec)
+    } else {
+        Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc()?)
+    }
+}
+
 fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats()?;
@@ -404,7 +427,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
-    let rec = rerun::RecordingStreamBuilder::new("kiko-slam-dataset").connect_grpc()?;
+    let rec = build_recording(args, "kiko-slam-dataset")?;
     let mut sink = RerunSink::new(rec, decimation);
 
     let mut pipeline = inference.into_pipeline();
@@ -530,6 +553,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(12);
     let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
     let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
+    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY").unwrap_or(0.9);
     let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(8);
     let ransac = RansacConfig {
         min_inliers,
@@ -541,6 +565,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         parallax_px,
         min_covisibility,
     )?;
+    let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -549,20 +574,22 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         triangulation: TriangulationConfig::default(),
         keyframe_policy,
         ba: ba_config,
+        redundancy,
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
         min_keyframe_points,
         refresh_inliers,
         parallax_px,
         min_covisibility,
+        redundant_covisibility,
         min_inliers,
         downscale.get(),
         key_limit.get()
     );
 
-    let rec = rerun::RecordingStreamBuilder::new("kiko-slam-dataset-odometry").connect_grpc()?;
+    let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, decimation);
     let mut tracker = SlamTracker::new(
         superpoint_left,
@@ -608,6 +635,12 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if output.keyframe.is_some() {
                         keyframes += 1;
+                        let snapshot = tracker.covisibility_snapshot();
+                        if let Err(err) =
+                            sink.log_covisibility_graph(left.timestamp(), &snapshot)
+                        {
+                            eprintln!("rerun log error: {err}");
+                        }
                     }
                 } else if let Err(err) = sink.log_frames(&left, &right) {
                     eprintln!("rerun log error: {err}");
@@ -1045,6 +1078,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(30);
     let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
     let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
+    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY").unwrap_or(0.9);
     let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(30);
     let ransac = RansacConfig {
         min_inliers,
@@ -1056,6 +1090,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         parallax_px,
         min_covisibility,
     )?;
+    let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -1064,14 +1099,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         triangulation: TriangulationConfig::default(),
         keyframe_policy,
         ba: ba_config,
+        redundancy,
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
         min_keyframe_points,
         refresh_inliers,
         parallax_px,
         min_covisibility,
+        redundant_covisibility,
         min_inliers,
         downscale.get(),
         key_limit.get()

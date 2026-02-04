@@ -1,6 +1,11 @@
 use std::num::NonZeroUsize;
 
-use crate::{env::env_f32, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp, VizPacket};
+use crate::{
+    env::env_f32, CovisibilitySnapshot, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
+    VizPacket,
+};
+
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
@@ -216,12 +221,53 @@ impl RerunSink {
         Ok(())
     }
 
+    pub fn log_covisibility_graph(
+        &mut self,
+        timestamp: Timestamp,
+        snapshot: &CovisibilitySnapshot,
+    ) -> Result<(), VizLogError> {
+        self.set_time(timestamp);
+
+        let mut positions: HashMap<crate::map::KeyframeId, [f32; 3]> = HashMap::new();
+        for node in &snapshot.nodes {
+            let pos = pose_position(node.pose);
+            positions.insert(node.id, pos);
+        }
+
+        if !positions.is_empty() {
+            let points: Vec<[f32; 3]> = positions.values().copied().collect();
+            self.rec
+                .log("world/covisibility/nodes", &rerun::Points3D::new(points))?;
+        }
+
+        if !snapshot.edges.is_empty() {
+            let mut strips: Vec<Vec<[f32; 3]>> = Vec::new();
+            for edge in &snapshot.edges {
+                let (Some(a), Some(b)) = (positions.get(&edge.a), positions.get(&edge.b)) else {
+                    continue;
+                };
+                strips.push(vec![*a, *b]);
+            }
+            if !strips.is_empty() {
+                self.rec
+                    .log("world/covisibility/edges", &rerun::LineStrips3D::new(strips))?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn set_time(&self, timestamp: Timestamp) {
         self.rec.set_time(
             "capture_ns",
             rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
         );
     }
+}
+
+fn pose_position(pose: Pose) -> [f32; 3] {
+    let camera_pose = pose.inverse();
+    camera_pose.translation()
 }
 
 #[derive(Debug, Clone, Copy)]

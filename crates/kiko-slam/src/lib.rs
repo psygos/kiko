@@ -39,9 +39,10 @@ pub use pnp::{
     PnpError, PnpResult, Pose, RansacConfig,
 };
 pub use tracker::{
-    KeyframePolicy, KeyframePolicyError, ParallaxPx, CovisibilityRatio, SlamTracker, TrackerConfig,
-    TrackerError, TrackerOutput,
+    CovisibilityRatio, KeyframePolicy, KeyframePolicyError, ParallaxPx, RedundancyPolicy,
+    RedundancyPolicyError, SlamTracker, TrackerConfig, TrackerError, TrackerOutput,
 };
+pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use local_ba::{
     LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet,
     ObservationSetError,
