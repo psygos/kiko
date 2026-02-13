@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Host Workspace Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+
+      - name: Run host crate tests
+      run: cargo test -p kiko-slam
+
+      - name: Build oak-sys tests
+      run: cargo test -p oak-sys --no-run
+
+      - name: Build robot-server tests
+      run: cargo test -p robot-server --no-run
+
+      - name: Build desktop client tests
+      run: cargo test -p robot-control-client --no-run
+
+  embedded-check:
+    name: Embedded Target Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain + embedded target
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: thumbv7em-none-eabihf
+
+      - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+
+      - name: Check embedded crate for MCU target
+      run: cargo check -p embedded --target thumbv7em-none-eabihf
