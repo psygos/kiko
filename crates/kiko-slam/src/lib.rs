@@ -23,8 +23,8 @@ mod tracker;
 mod triangulation;
 mod viz;
 pub use channel::{
-    ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
-    DropReceiver, DropSender, SendOutcome, bounded_channel,
+    bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
+    DropPolicy, DropReceiver, DropSender, SendOutcome,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use local_ba::{
@@ -39,8 +39,8 @@ pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
 pub use pnp::{
-    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
-    build_observations, solve_pnp, solve_pnp_ransac,
+    build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation,
+    PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, KeyframePolicy,
@@ -263,12 +263,44 @@ pub struct Keypoint {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Descriptor(pub [f32; 256]);
 
 impl Descriptor {
     pub fn as_slice(&self) -> &[f32] {
         &self.0
+    }
+
+    pub fn quantize(&self) -> CompactDescriptor {
+        let mut out = [0_u8; 256];
+        for (idx, value) in self.0.iter().enumerate() {
+            let clamped = value.clamp(0.0, 1.0);
+            out[idx] = (clamped * 255.0).round() as u8;
+        }
+        CompactDescriptor(out)
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactDescriptor(pub [u8; 256]);
+
+impl CompactDescriptor {
+    pub fn cosine_similarity(&self, other: &Self) -> f32 {
+        let mut dot = 0_u32;
+        let mut norm_a = 0_u32;
+        let mut norm_b = 0_u32;
+        for i in 0..256 {
+            let a = self.0[i] as u32;
+            let b = other.0[i] as u32;
+            dot = dot.saturating_add(a.saturating_mul(b));
+            norm_a = norm_a.saturating_add(a.saturating_mul(a));
+            norm_b = norm_b.saturating_add(b.saturating_mul(b));
+        }
+        if norm_a == 0 || norm_b == 0 {
+            return 0.0;
+        }
+        (dot as f32) / ((norm_a as f32).sqrt() * (norm_b as f32).sqrt())
     }
 }
 
@@ -783,5 +815,80 @@ impl<State> VizPacket<State> {
 
     pub fn matches(&self) -> &Matches<State> {
         &self.matches
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactDescriptor, Descriptor};
+
+    fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
+        let mut dot = 0.0_f32;
+        let mut norm_a = 0.0_f32;
+        let mut norm_b = 0.0_f32;
+        for i in 0..256 {
+            let x = a.0[i];
+            let y = b.0[i];
+            dot += x * y;
+            norm_a += x * x;
+            norm_b += y * y;
+        }
+        if norm_a <= 0.0 || norm_b <= 0.0 {
+            return 0.0;
+        }
+        dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
+
+    #[test]
+    fn quantize_preserves_similarity_ordering() {
+        let mut base = [0.0_f32; 256];
+        let mut close = [0.0_f32; 256];
+        let mut far = [0.0_f32; 256];
+        for i in 0..256 {
+            let t = i as f32 / 255.0;
+            base[i] = t;
+            close[i] = (t + 0.02).clamp(0.0, 1.0);
+            far[i] = if i < 128 { 1.0 } else { 0.0 };
+        }
+        let base = Descriptor(base);
+        let close = Descriptor(close);
+        let far = Descriptor(far);
+
+        let float_close = cosine_f32(&base, &close);
+        let float_far = cosine_f32(&base, &far);
+        assert!(float_close > float_far);
+
+        let q_base = base.quantize();
+        let q_close = close.quantize();
+        let q_far = far.quantize();
+        let quant_close = q_base.cosine_similarity(&q_close);
+        let quant_far = q_base.cosine_similarity(&q_far);
+        assert!(quant_close > quant_far);
+    }
+
+    #[test]
+    fn compact_descriptor_cosine_identical_is_one() {
+        let mut data = [0_u8; 256];
+        for (idx, value) in data.iter_mut().enumerate() {
+            *value = ((idx * 7) % 251) as u8;
+        }
+        let a = CompactDescriptor(data.clone());
+        let b = CompactDescriptor(data);
+        let sim = a.cosine_similarity(&b);
+        assert!((sim - 1.0).abs() < 1e-6, "sim={sim}");
+    }
+
+    #[test]
+    fn compact_descriptor_cosine_orthogonal_is_zeroish() {
+        let mut a = [0_u8; 256];
+        let mut b = [0_u8; 256];
+        for i in 0..128 {
+            a[i] = 255;
+        }
+        for i in 128..256 {
+            b[i] = 255;
+        }
+        let sim = CompactDescriptor(a).cosine_similarity(&CompactDescriptor(b));
+        assert!(sim.abs() < 1e-6, "sim={sim}");
     }
 }
