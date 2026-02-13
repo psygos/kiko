@@ -15,6 +15,7 @@ mod math;
 mod oak;
 mod pairing;
 mod pipeline;
+pub mod pose_graph;
 mod pnp;
 mod preprocess;
 #[cfg(test)]
