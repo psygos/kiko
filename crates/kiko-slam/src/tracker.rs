@@ -6,10 +6,11 @@ use std::thread;
 
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac, Detections, DownscaleFactor, Frame, FrameId, Keyframe, KeypointLimit,
-    LightGlue, LocalBaConfig, LocalBundleAdjuster, MapObservation, Matches, ObservationSet,
-    PinholeIntrinsics, Point3, Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint,
-    Timestamp, TriangulationConfig, TriangulationError, Triangulator, Verified,
+    solve_pnp_ransac, BaCorrection, BaResult, Detections, DownscaleFactor, Frame, FrameId,
+    Keyframe, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster, MapObservation,
+    Matches, ObservationSet, PinholeIntrinsics, Point3, Pose, RansacConfig, Raw, RectifiedStereo,
+    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
+    Verified,
 };
 
 use crate::inference::InferenceError;
@@ -235,25 +236,12 @@ impl KeyframeEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PoseCorrection {
-    keyframe_id: KeyframeId,
-    pose: Pose,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LandmarkCorrection {
-    point_id: MapPointId,
-    position: Point3,
-}
-
 #[derive(Debug)]
 struct CorrectionEvent {
     request_id: BackendRequestId,
     map_version: MapVersion,
     trigger_keyframe: KeyframeId,
-    pose_corrections: Vec<PoseCorrection>,
-    landmark_corrections: Vec<LandmarkCorrection>,
+    correction: BaCorrection,
 }
 
 #[derive(Debug)]
@@ -281,53 +269,68 @@ impl CorrectionEvent {
     fn from_optimized_map(
         event: &KeyframeEvent,
         optimized_map: &SlamMap,
+        result: BaResult,
     ) -> Result<Self, CorrectionBuildError> {
-        let mut pose_corrections = Vec::with_capacity(event.window.as_slice().len());
-        for &keyframe_id in event.window.as_slice() {
-            let entry = optimized_map
-                .keyframe(keyframe_id)
-                .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
-            pose_corrections.push(PoseCorrection {
-                keyframe_id,
-                pose: entry.pose(),
-            });
-        }
+        let mut correction = BaCorrection {
+            pose_deltas: Vec::new(),
+            landmark_deltas: Vec::new(),
+            result: result.clone(),
+        };
 
-        let point_ids = collect_window_points(optimized_map, &event.window)?;
-        let mut landmark_corrections = Vec::with_capacity(point_ids.len());
-        for point_id in point_ids {
-            let point = optimized_map
-                .point(point_id)
-                .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
-            landmark_corrections.push(LandmarkCorrection {
-                point_id,
-                position: point.position(),
-            });
+        if matches!(result, BaResult::Converged { .. } | BaResult::MaxIterations { .. }) {
+            correction.pose_deltas = Vec::with_capacity(event.window.as_slice().len());
+            for &keyframe_id in event.window.as_slice() {
+                let before = event
+                    .map_snapshot
+                    .keyframe(keyframe_id)
+                    .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
+                let after = optimized_map
+                    .keyframe(keyframe_id)
+                    .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
+                let delta = crate::local_ba::se3_delta_between(before.pose(), after.pose());
+                correction.pose_deltas.push((keyframe_id, delta));
+            }
+
+            let point_ids = collect_window_points(optimized_map, &event.window)?;
+            correction.landmark_deltas = Vec::with_capacity(point_ids.len());
+            for point_id in point_ids {
+                let before = event
+                    .map_snapshot
+                    .point(point_id)
+                    .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
+                let after = optimized_map
+                    .point(point_id)
+                    .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
+                let before_pos = before.position();
+                let after_pos = after.position();
+                correction.landmark_deltas.push((
+                    point_id,
+                    [
+                        after_pos.x - before_pos.x,
+                        after_pos.y - before_pos.y,
+                        after_pos.z - before_pos.z,
+                    ],
+                ));
+            }
         }
 
         Ok(Self {
             request_id: event.request_id,
             map_version: event.map_version,
             trigger_keyframe: event.trigger_keyframe,
-            pose_corrections,
-            landmark_corrections,
+            correction,
         })
     }
 }
 
 #[derive(Debug)]
 enum BackendWorkerError {
-    OptimizationFailed { keyframe_id: KeyframeId },
     BuildCorrection(CorrectionBuildError),
 }
 
 impl std::fmt::Display for BackendWorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendWorkerError::OptimizationFailed { keyframe_id } => write!(
-                f,
-                "backend optimization failed for trigger keyframe {keyframe_id:?}"
-            ),
             BackendWorkerError::BuildCorrection(err) => {
                 write!(f, "backend correction build failed: {err}")
             }
@@ -445,17 +448,8 @@ impl BackendWorker {
             let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
             while let Ok(event) = rx_req.recv() {
                 let mut optimized_map = event.map_snapshot.clone();
-                if !ba.optimize_keyframe_window(&mut optimized_map, event.window.as_slice()) {
-                    let _ = tx_resp.send(BackendResponse::Failure {
-                        request_id: event.request_id,
-                        map_version: event.map_version,
-                        error: BackendWorkerError::OptimizationFailed {
-                            keyframe_id: event.trigger_keyframe,
-                        },
-                    });
-                    continue;
-                }
-                match CorrectionEvent::from_optimized_map(&event, &optimized_map) {
+                let result = ba.optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
+                match CorrectionEvent::from_optimized_map(&event, &optimized_map, result) {
                     Ok(correction) => {
                         let _ = tx_resp.send(BackendResponse::Correction(correction));
                     }
@@ -805,20 +799,34 @@ impl SlamTracker {
             };
             match response {
                 BackendResponse::Correction(correction) => {
-                    match apply_correction_event(&mut self.map, self.map_version, &correction) {
-                        Ok(()) => {
-                            self.bump_map_version();
-                            self.backend_stats.applied =
-                                self.backend_stats.applied.saturating_add(1);
+                    match &correction.correction.result {
+                        BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
+                            match apply_correction_event(&mut self.map, self.map_version, &correction) {
+                                Ok(()) => {
+                                    self.bump_map_version();
+                                    self.backend_stats.applied =
+                                        self.backend_stats.applied.saturating_add(1);
+                                }
+                                Err(ApplyCorrectionError::StaleVersion { .. }) => {
+                                    self.backend_stats.stale =
+                                        self.backend_stats.stale.saturating_add(1);
+                                }
+                                Err(err) => {
+                                    self.backend_stats.rejected =
+                                        self.backend_stats.rejected.saturating_add(1);
+                                    eprintln!(
+                                        "backend correction rejected (req={}, keyframe={:?}): {err}",
+                                        correction.request_id.as_u64(),
+                                        correction.trigger_keyframe
+                                    );
+                                }
+                            }
                         }
-                        Err(ApplyCorrectionError::StaleVersion { .. }) => {
-                            self.backend_stats.stale = self.backend_stats.stale.saturating_add(1);
-                        }
-                        Err(err) => {
+                        BaResult::Degenerate { reason } => {
                             self.backend_stats.rejected =
                                 self.backend_stats.rejected.saturating_add(1);
                             eprintln!(
-                                "backend correction rejected (req={}, keyframe={:?}): {err}",
+                                "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
                                 correction.request_id.as_u64(),
                                 correction.trigger_keyframe
                             );
@@ -1022,11 +1030,18 @@ impl SlamTracker {
                                 eprintln!(
                                     "backend submit failed for keyframe {keyframe_id:?}: {err}"
                                 );
-                                if self.ba.optimize_keyframe_window(&mut self.map, &window) {
+                                let result = self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                if matches!(
+                                    result,
+                                    BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                                ) {
                                     self.bump_map_version();
                                 }
                             }
-                        } else if self.ba.optimize_keyframe_window(&mut self.map, &window) {
+                        } else if matches!(
+                            self.ba.optimize_keyframe_window(&mut self.map, &window),
+                            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                        ) {
                             self.bump_map_version();
                         }
                         self.state = TrackerState::Tracking {
@@ -1286,26 +1301,44 @@ fn apply_correction_event(
         });
     }
 
-    for pose_correction in &correction.pose_corrections {
-        if map.keyframe(pose_correction.keyframe_id).is_none() {
+    for (keyframe_id, _) in &correction.correction.pose_deltas {
+        if map.keyframe(*keyframe_id).is_none() {
             return Err(ApplyCorrectionError::MissingKeyframe {
-                keyframe_id: pose_correction.keyframe_id,
+                keyframe_id: *keyframe_id,
             });
         }
     }
-    for landmark_correction in &correction.landmark_corrections {
-        if map.point(landmark_correction.point_id).is_none() {
+    for (point_id, _) in &correction.correction.landmark_deltas {
+        if map.point(*point_id).is_none() {
             return Err(ApplyCorrectionError::MissingMapPoint {
-                point_id: landmark_correction.point_id,
+                point_id: *point_id,
             });
         }
     }
 
-    for pose_correction in &correction.pose_corrections {
-        map.set_keyframe_pose(pose_correction.keyframe_id, pose_correction.pose)?;
+    for (keyframe_id, delta) in &correction.correction.pose_deltas {
+        let current_pose = map
+            .keyframe(*keyframe_id)
+            .ok_or(ApplyCorrectionError::MissingKeyframe {
+                keyframe_id: *keyframe_id,
+            })?
+            .pose();
+        let corrected = crate::local_ba::apply_se3_delta(current_pose, *delta);
+        map.set_keyframe_pose(*keyframe_id, corrected)?;
     }
-    for landmark_correction in &correction.landmark_corrections {
-        map.set_map_point_position(landmark_correction.point_id, landmark_correction.position)?;
+    for (point_id, delta) in &correction.correction.landmark_deltas {
+        let current = map
+            .point(*point_id)
+            .ok_or(ApplyCorrectionError::MissingMapPoint {
+                point_id: *point_id,
+            })?
+            .position();
+        let corrected = Point3 {
+            x: current.x + delta[0],
+            y: current.y + delta[1],
+            z: current.z + delta[2],
+        };
+        map.set_map_point_position(*point_id, corrected)?;
     }
     Ok(())
 }
@@ -1391,6 +1424,52 @@ mod tests {
             )
             .expect("map point");
         (map, keyframe_id, point_id)
+    }
+
+    fn make_map_with_two_keyframes_one_shared_point() -> (SlamMap, KeyframeId, KeyframeId) {
+        let detections_a = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(10),
+            320,
+            240,
+            vec![Keypoint { x: 100.0, y: 80.0 }],
+            vec![1.0],
+            vec![make_descriptor()],
+        )
+        .expect("detections a");
+        let detections_b = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(11),
+            320,
+            240,
+            vec![Keypoint { x: 110.0, y: 82.0 }],
+            vec![1.0],
+            vec![make_descriptor()],
+        )
+        .expect("detections b");
+
+        let mut map = SlamMap::new();
+        let kf_a = map
+            .add_keyframe_from_detections(&detections_a, Timestamp::from_nanos(10), Pose::identity())
+            .expect("kf a");
+        let kf_b = map
+            .add_keyframe_from_detections(&detections_b, Timestamp::from_nanos(11), Pose::identity())
+            .expect("kf b");
+        let kp_a = map.keyframe_keypoint(kf_a, 0).expect("kp a");
+        let point_id = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor().quantize(),
+                kp_a,
+            )
+            .expect("point");
+        let kp_b = map.keyframe_keypoint(kf_b, 0).expect("kp b");
+        map.add_observation(point_id, kp_b).expect("shared obs");
+        (map, kf_a, kf_b)
     }
 
     #[test]
@@ -1483,18 +1562,14 @@ mod tests {
             request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
             map_version: MapVersion::initial(),
             trigger_keyframe: keyframe_id,
-            pose_corrections: vec![PoseCorrection {
-                keyframe_id,
-                pose: Pose::identity(),
-            }],
-            landmark_corrections: vec![LandmarkCorrection {
-                point_id,
-                position: Point3 {
-                    x: 1.0,
-                    y: 2.0,
-                    z: 3.0,
+            correction: BaCorrection {
+                pose_deltas: vec![(keyframe_id, [0.0; 6])],
+                landmark_deltas: vec![(point_id, [1.0, 2.0, 3.0])],
+                result: BaResult::Converged {
+                    iterations: 1,
+                    final_cost: 0.0,
                 },
-            }],
+            },
         };
         let stale = MapVersion::initial().next();
         assert!(matches!(
@@ -1515,18 +1590,23 @@ mod tests {
             y: -0.3,
             z: 2.1,
         };
+        let initial_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        let pose_delta = crate::local_ba::se3_delta_between(initial_pose, corrected_pose);
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
             map_version: MapVersion::initial(),
             trigger_keyframe: keyframe_id,
-            pose_corrections: vec![PoseCorrection {
-                keyframe_id,
-                pose: corrected_pose,
-            }],
-            landmark_corrections: vec![LandmarkCorrection {
-                point_id,
-                position: corrected_point,
-            }],
+            correction: BaCorrection {
+                pose_deltas: vec![(keyframe_id, pose_delta)],
+                landmark_deltas: vec![(
+                    point_id,
+                    [corrected_point.x, corrected_point.y, corrected_point.z - 1.0],
+                )],
+                result: BaResult::Converged {
+                    iterations: 2,
+                    final_cost: 0.1,
+                },
+            },
         };
 
         apply_correction_event(&mut map, MapVersion::initial(), &correction)
@@ -1534,13 +1614,77 @@ mod tests {
         assert_map_invariants(&map).expect("post-correction invariants");
 
         let stored_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
-        assert_eq!(stored_pose.translation(), corrected_pose.translation());
-        assert_eq!(stored_pose.rotation(), corrected_pose.rotation());
+        for i in 0..3 {
+            let a = stored_pose.translation()[i];
+            let b = corrected_pose.translation()[i];
+            assert!((a - b).abs() < 1e-4, "translation mismatch at {i}: {a} vs {b}");
+        }
+        let stored_rot = stored_pose.rotation();
+        let corrected_rot = corrected_pose.rotation();
+        for row in 0..3 {
+            for col in 0..3 {
+                let a = stored_rot[row][col];
+                let b = corrected_rot[row][col];
+                assert!(
+                    (a - b).abs() < 2e-3,
+                    "rotation mismatch at ({row},{col}): {a} vs {b}"
+                );
+            }
+        }
 
         let stored_point = map.point(point_id).expect("map point").position();
-        assert_eq!(stored_point.x, corrected_point.x);
-        assert_eq!(stored_point.y, corrected_point.y);
-        assert_eq!(stored_point.z, corrected_point.z);
+        assert!((stored_point.x - corrected_point.x).abs() < 1e-6);
+        assert!((stored_point.y - corrected_point.y).abs() < 1e-6);
+        assert!((stored_point.z - corrected_point.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn backend_roundtrip_carries_typed_ba_result() {
+        let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let backend_cfg = BackendConfig::new(1).expect("backend config");
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
+            320, 240, 200.0, 200.0, 160.0, 120.0,
+        )
+        .expect("intrinsics");
+        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, 1e-3, 0.0).expect("ba config");
+        let mut worker = BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg);
+
+        let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
+        let event = KeyframeEvent::try_new(
+            worker.next_request_id(),
+            MapVersion::initial(),
+            kf_b,
+            window,
+            map,
+        )
+        .expect("event");
+        worker.try_submit(event).expect("submit");
+
+        let mut response = None;
+        for _ in 0..50 {
+            if let Some(msg) = worker.try_recv() {
+                response = Some(msg);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let Some(response) = response else {
+            panic!("backend did not produce a response in time");
+        };
+        match response {
+            BackendResponse::Correction(correction) => {
+                assert!(matches!(
+                    correction.correction.result,
+                    BaResult::Degenerate { .. }
+                        | BaResult::Converged { .. }
+                        | BaResult::MaxIterations { .. }
+                ));
+            }
+            BackendResponse::Failure { error, .. } => {
+                panic!("unexpected backend failure: {error}");
+            }
+        }
     }
 }
 

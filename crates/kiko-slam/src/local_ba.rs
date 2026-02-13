@@ -311,6 +311,20 @@ impl std::fmt::Display for FullBaBuildError {
 
 impl std::error::Error for FullBaBuildError {}
 
+fn degenerate_reason_from_build_error(err: &FullBaBuildError) -> DegenerateReason {
+    match err {
+        FullBaBuildError::EmptyWindow => DegenerateReason::TooFewPoses { count: 0 },
+        FullBaBuildError::TooFewKeyframes { actual, .. } => {
+            DegenerateReason::TooFewPoses { count: *actual }
+        }
+        FullBaBuildError::NoLandmarks => DegenerateReason::TooFewLandmarks { count: 0 },
+        FullBaBuildError::DuplicateKeyframe { .. }
+        | FullBaBuildError::MissingKeyframe { .. }
+        | FullBaBuildError::DuplicateLandmarkObservation { .. }
+        | FullBaBuildError::PoseHasTooFewObservations { .. } => DegenerateReason::NoFactors,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PoseVarIndex(usize);
 
@@ -567,7 +581,7 @@ impl LocalBundleAdjuster {
         self.frames.last().map(|frame| frame.pose)
     }
 
-    pub fn optimize_keyframe_window(&mut self, map: &mut SlamMap, window: &[KeyframeId]) -> bool {
+    pub fn optimize_keyframe_window(&mut self, map: &mut SlamMap, window: &[KeyframeId]) -> BaResult {
         let mut problem = match FullBaProblem::try_from_map(
             map,
             window,
@@ -575,15 +589,25 @@ impl LocalBundleAdjuster {
             self.config.min_observations,
         ) {
             Ok(problem) => problem,
-            Err(_) => return false,
+            Err(err) => {
+                return BaResult::Degenerate {
+                    reason: degenerate_reason_from_build_error(&err),
+                };
+            }
         };
 
-        match self.optimize_full(&mut problem) {
-            BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {}
-            BaResult::Degenerate { .. } => return false,
+        let result = self.optimize_full(&mut problem);
+        if matches!(
+            result,
+            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+        ) && !problem.write_back(map)
+        {
+            return BaResult::Degenerate {
+                reason: DegenerateReason::NoFactors,
+            };
         }
 
-        problem.write_back(map)
+        result
     }
 
     fn optimize(&mut self, map: &SlamMap) -> bool {
@@ -1075,13 +1099,34 @@ fn reprojection_residual_and_jacobians(
     Some((residual, jac_pose, jac_landmark))
 }
 
-fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
+pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
     let v = [delta[0], delta[1], delta[2]];
     let w = [delta[3], delta[4], delta[5]];
     let r_delta = so3_exp(w);
     let r = math::mat_mul(r_delta, pose.rotation());
     let t = math::mat_mul_vec(r_delta, pose.translation());
     Pose::from_rt(r, [t[0] + v[0], t[1] + v[1], t[2] + v[2]])
+}
+
+pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
+    let from_rot = from.rotation();
+    let mut from_rot_t = [[0.0_f32; 3]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            from_rot_t[row][col] = from_rot[col][row];
+        }
+    }
+
+    let r_delta = math::mat_mul(to.rotation(), from_rot_t);
+    let w = so3_log(r_delta);
+    let rotated_from_t = math::mat_mul_vec(r_delta, from.translation());
+    let to_t = to.translation();
+    let v = [
+        to_t[0] - rotated_from_t[0],
+        to_t[1] - rotated_from_t[1],
+        to_t[2] - rotated_from_t[2],
+    ];
+    [v[0], v[1], v[2], w[0], w[1], w[2]]
 }
 
 fn pose_to_vec(pose: Pose) -> [f32; 6] {
@@ -1990,9 +2035,13 @@ mod tests {
 
         let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let result = ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]);
         assert!(
-            ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]),
-            "full local BA should succeed"
+            matches!(
+                result,
+                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+            ),
+            "full local BA should succeed, got {result:?}"
         );
         assert_map_invariants(&map).expect("map invariants after BA");
 

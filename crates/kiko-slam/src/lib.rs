@@ -28,8 +28,8 @@ pub use channel::{
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use local_ba::{
-    LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet,
-    ObservationSetError,
+    BaCorrection, BaResult, DegenerateReason, LocalBaConfig, LocalBaConfigError,
+    LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 #[cfg(feature = "record")]
