@@ -528,6 +528,14 @@ fn reprojection_residual_and_jacobian(
     jac[1][4] = b1 * z - b3 * x;
     jac[1][5] = -b1 * y + b2 * x;
 
+    // The Jacobian above is for projected pixel coordinates [u, v].
+    // Residual is defined as [pixel.x - u, pixel.y - v], so dr/dx = -du/dx.
+    for row in &mut jac {
+        for value in row {
+            *value = -*value;
+        }
+    }
+
     Some((residual, jac))
 }
 
@@ -604,7 +612,58 @@ fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
             0.5 * (r[1][0] - r[0][1]),
         ];
     }
-    let factor = theta / (2.0 * theta.sin());
+
+    // Near pi, theta/sin(theta) becomes numerically unstable. Recover the
+    // axis from the diagonal of R (equivalently from R + I) and align the
+    // sign with the skew-symmetric part.
+    if std::f32::consts::PI - theta < 1e-3 {
+        let xx = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
+        let yy = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
+        let zz = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
+
+        let mut axis = if xx >= yy && xx >= zz && xx > 1e-6 {
+            [xx, (r[0][1] + r[1][0]) / (4.0 * xx), (r[0][2] + r[2][0]) / (4.0 * xx)]
+        } else if yy >= zz && yy > 1e-6 {
+            [(r[0][1] + r[1][0]) / (4.0 * yy), yy, (r[1][2] + r[2][1]) / (4.0 * yy)]
+        } else if zz > 1e-6 {
+            [(r[0][2] + r[2][0]) / (4.0 * zz), (r[1][2] + r[2][1]) / (4.0 * zz), zz]
+        } else {
+            [
+                r[2][1] - r[1][2],
+                r[0][2] - r[2][0],
+                r[1][0] - r[0][1],
+            ]
+        };
+
+        let norm =
+            (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        if norm > 1e-8 {
+            axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+        } else {
+            axis = [1.0, 0.0, 0.0];
+        }
+
+        let skew = [
+            r[2][1] - r[1][2],
+            r[0][2] - r[2][0],
+            r[1][0] - r[0][1],
+        ];
+        let sign = axis[0] * skew[0] + axis[1] * skew[1] + axis[2] * skew[2];
+        if sign < 0.0 {
+            axis = [-axis[0], -axis[1], -axis[2]];
+        }
+        return [axis[0] * theta, axis[1] * theta, axis[2] * theta];
+    }
+
+    let sin_theta = theta.sin();
+    if sin_theta.abs() < 1e-6 {
+        return [
+            0.5 * (r[2][1] - r[1][2]),
+            0.5 * (r[0][2] - r[2][0]),
+            0.5 * (r[1][0] - r[0][1]),
+        ];
+    }
+    let factor = theta / (2.0 * sin_theta);
     [
         factor * (r[2][1] - r[1][2]),
         factor * (r[0][2] - r[2][0]),
@@ -657,4 +716,195 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{axis_angle_pose, make_pinhole_intrinsics};
+    use crate::{Keypoint, Point3};
+
+    fn l2_3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        let dz = a[2] - b[2];
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    fn pose_close(a: Pose, b: Pose, tol: f32) -> bool {
+        let mut rot_sq = 0.0_f32;
+        let ra = a.rotation();
+        let rb = b.rotation();
+        for i in 0..3 {
+            for j in 0..3 {
+                let d = ra[i][j] - rb[i][j];
+                rot_sq += d * d;
+            }
+        }
+        rot_sq.sqrt() <= tol && l2_3(a.translation(), b.translation()) <= tol
+    }
+
+    fn projection_residual(
+        pose: Pose,
+        obs: &Observation,
+        intrinsics: PinholeIntrinsics,
+    ) -> [f32; 2] {
+        reprojection_residual_and_jacobian(pose, obs, intrinsics)
+            .expect("valid reprojection")
+            .0
+    }
+
+    fn project_pixel(pose_world_to_camera: Pose, point_world: Point3, intr: PinholeIntrinsics) -> Keypoint {
+        let pc = math::transform_point(
+            pose_world_to_camera.rotation(),
+            pose_world_to_camera.translation(),
+            [point_world.x, point_world.y, point_world.z],
+        );
+        Keypoint {
+            x: intr.fx() * (pc[0] / pc[2]) + intr.cx(),
+            y: intr.fy() * (pc[1] / pc[2]) + intr.cy(),
+        }
+    }
+
+    #[test]
+    fn local_ba_config_rejects_invalid_values() {
+        assert!(matches!(
+            LocalBaConfig::new(0, 10, 4, 1.0, 0.0, 0.0),
+            Err(LocalBaConfigError::ZeroWindow)
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 0, 4, 1.0, 0.0, 0.0),
+            Err(LocalBaConfigError::ZeroIterations)
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 0, 1.0, 0.0, 0.0),
+            Err(LocalBaConfigError::ZeroObservations)
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 3, 1.0, 0.0, 0.0),
+            Err(LocalBaConfigError::TooFewObservations { .. })
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 4, 0.0, 0.0, 0.0),
+            Err(LocalBaConfigError::NonPositiveHuber { .. })
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 4, 1.0, -1.0, 0.0),
+            Err(LocalBaConfigError::NegativeDamping { .. })
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 4, 1.0, 0.0, -1.0),
+            Err(LocalBaConfigError::NegativeMotionWeight { .. })
+        ));
+    }
+
+    #[test]
+    fn observation_set_rejects_too_few_points() {
+        let min_required = NonZeroUsize::new(4).expect("nonzero");
+        let err = ObservationSet::new(Vec::new(), min_required).expect_err("must reject");
+        match err {
+            ObservationSetError::TooFew { required, actual } => {
+                assert_eq!(required, 4);
+                assert_eq!(actual, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn so3_exp_log_round_trip_for_small_rotation() {
+        let w = [0.18, -0.06, 0.11];
+        let r = so3_exp(w);
+        let recovered = so3_log(r);
+        assert!(l2_3(w, recovered) < 2e-4, "round-trip mismatch: {recovered:?}");
+    }
+
+    #[test]
+    fn so3_log_is_finite_near_pi() {
+        let theta = std::f32::consts::PI - 1e-4;
+        let w = [0.0, theta, 0.0];
+        let r = so3_exp(w);
+        let recovered = so3_log(r);
+        assert!(recovered.iter().all(|v| v.is_finite()));
+
+        let recovered_norm =
+            (recovered[0] * recovered[0] + recovered[1] * recovered[1] + recovered[2] * recovered[2]).sqrt();
+        assert!(
+            (recovered_norm - theta).abs() < 3e-3,
+            "theta mismatch: recovered={recovered_norm}, expected={theta}"
+        );
+    }
+
+    #[test]
+    fn apply_se3_delta_zero_is_fixpoint() {
+        let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
+        let out = apply_se3_delta(pose, [0.0; 6]);
+        assert!(pose_close(pose, out, 1e-7));
+    }
+
+    #[test]
+    fn solve_linear_system_solves_identity_system() {
+        let mut a = vec![1.0_f32, 0.0, 0.0, 1.0];
+        let mut b = vec![2.5_f32, -3.0];
+        assert!(solve_linear_system(&mut a, &mut b, 2));
+        assert!((b[0] - 2.5).abs() < 1e-6);
+        assert!((b[1] + 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn solve_linear_system_reports_singular_matrix() {
+        let mut a = vec![1.0_f32, 2.0, 2.0, 4.0];
+        let mut b = vec![1.0_f32, 2.0];
+        assert!(!solve_linear_system(&mut a, &mut b, 2));
+    }
+
+    #[test]
+    fn reprojection_jacobian_matches_finite_difference() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let pose = axis_angle_pose([0.1, -0.05, 0.2], [0.06, -0.04, 0.03]);
+        let point = Point3 {
+            x: 0.4,
+            y: -0.2,
+            z: 3.8,
+        };
+        let mut pixel = project_pixel(pose, point, intrinsics);
+        pixel.x += 1.7;
+        pixel.y -= 0.9;
+
+        let obs = Observation::try_new(point, pixel, intrinsics).expect("observation");
+        let (_residual, jac) =
+            reprojection_residual_and_jacobian(pose, &obs, intrinsics).expect("jacobian");
+
+        let eps = 1e-3_f32;
+        for col in 0..6 {
+            let mut delta_pos = [0.0_f32; 6];
+            delta_pos[col] = eps;
+            let mut delta_neg = [0.0_f32; 6];
+            delta_neg[col] = -eps;
+
+            let r_plus = projection_residual(apply_se3_delta(pose, delta_pos), &obs, intrinsics);
+            let r_minus = projection_residual(apply_se3_delta(pose, delta_neg), &obs, intrinsics);
+            let numeric = [
+                (r_plus[0] - r_minus[0]) / (2.0 * eps),
+                (r_plus[1] - r_minus[1]) / (2.0 * eps),
+            ];
+
+            let err0 = (numeric[0] - jac[0][col]).abs();
+            let err1 = (numeric[1] - jac[1][col]).abs();
+            let tol0 = 4e-2_f32 + 3e-4_f32 * numeric[0].abs().max(jac[0][col].abs());
+            let tol1 = 4e-2_f32 + 3e-4_f32 * numeric[1].abs().max(jac[1][col].abs());
+            assert!(
+                err0 < tol0 && err1 < tol1,
+                "jacobian mismatch col={col}: analytic=({}, {}), numeric=({}, {}), err=({}, {}), tol=({}, {})",
+                jac[0][col],
+                jac[1][col],
+                numeric[0],
+                numeric[1],
+                err0,
+                err1,
+                tol0,
+                tol1
+            );
+        }
+    }
 }
