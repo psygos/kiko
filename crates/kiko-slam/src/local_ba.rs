@@ -16,6 +16,213 @@ pub struct LocalBaConfig {
     motion_prior_weight: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct LmConfig {
+    initial_lambda: f32,
+    lambda_factor: f32,
+    min_lambda: f32,
+    max_lambda: f32,
+    rho_accept: f32,
+    rho_good: f32,
+}
+
+#[derive(Debug)]
+pub enum LmConfigError {
+    NonPositiveInitialLambda { value: f32 },
+    NonPositiveLambdaFactor { value: f32 },
+    LambdaFactorTooSmall { value: f32 },
+    NonPositiveMinLambda { value: f32 },
+    NonPositiveMaxLambda { value: f32 },
+    MinLambdaExceedsMax { min: f32, max: f32 },
+    InvalidRhoAccept { value: f32 },
+    InvalidRhoGood { value: f32 },
+    InvalidRhoOrdering { rho_accept: f32, rho_good: f32 },
+}
+
+impl std::fmt::Display for LmConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LmConfigError::NonPositiveInitialLambda { value } => {
+                write!(f, "LM initial lambda must be > 0 (got {value})")
+            }
+            LmConfigError::NonPositiveLambdaFactor { value } => {
+                write!(f, "LM lambda factor must be > 0 (got {value})")
+            }
+            LmConfigError::LambdaFactorTooSmall { value } => {
+                write!(f, "LM lambda factor must be > 1 (got {value})")
+            }
+            LmConfigError::NonPositiveMinLambda { value } => {
+                write!(f, "LM min lambda must be > 0 (got {value})")
+            }
+            LmConfigError::NonPositiveMaxLambda { value } => {
+                write!(f, "LM max lambda must be > 0 (got {value})")
+            }
+            LmConfigError::MinLambdaExceedsMax { min, max } => {
+                write!(f, "LM min lambda must be <= max lambda (min={min}, max={max})")
+            }
+            LmConfigError::InvalidRhoAccept { value } => {
+                write!(f, "LM rho_accept must be in (0, 1) (got {value})")
+            }
+            LmConfigError::InvalidRhoGood { value } => {
+                write!(f, "LM rho_good must be in (0, 1) (got {value})")
+            }
+            LmConfigError::InvalidRhoOrdering {
+                rho_accept,
+                rho_good,
+            } => write!(
+                f,
+                "LM requires rho_accept < rho_good (rho_accept={rho_accept}, rho_good={rho_good})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LmConfigError {}
+
+impl LmConfig {
+    pub fn new(
+        initial_lambda: f32,
+        lambda_factor: f32,
+        min_lambda: f32,
+        max_lambda: f32,
+        rho_accept: f32,
+        rho_good: f32,
+    ) -> Result<Self, LmConfigError> {
+        if !initial_lambda.is_finite() || initial_lambda <= 0.0 {
+            return Err(LmConfigError::NonPositiveInitialLambda {
+                value: initial_lambda,
+            });
+        }
+        if !lambda_factor.is_finite() || lambda_factor <= 0.0 {
+            return Err(LmConfigError::NonPositiveLambdaFactor {
+                value: lambda_factor,
+            });
+        }
+        if lambda_factor <= 1.0 {
+            return Err(LmConfigError::LambdaFactorTooSmall {
+                value: lambda_factor,
+            });
+        }
+        if !min_lambda.is_finite() || min_lambda <= 0.0 {
+            return Err(LmConfigError::NonPositiveMinLambda { value: min_lambda });
+        }
+        if !max_lambda.is_finite() || max_lambda <= 0.0 {
+            return Err(LmConfigError::NonPositiveMaxLambda { value: max_lambda });
+        }
+        if min_lambda > max_lambda {
+            return Err(LmConfigError::MinLambdaExceedsMax {
+                min: min_lambda,
+                max: max_lambda,
+            });
+        }
+        if !rho_accept.is_finite() || rho_accept <= 0.0 || rho_accept >= 1.0 {
+            return Err(LmConfigError::InvalidRhoAccept { value: rho_accept });
+        }
+        if !rho_good.is_finite() || rho_good <= 0.0 || rho_good >= 1.0 {
+            return Err(LmConfigError::InvalidRhoGood { value: rho_good });
+        }
+        if rho_accept >= rho_good {
+            return Err(LmConfigError::InvalidRhoOrdering {
+                rho_accept,
+                rho_good,
+            });
+        }
+        Ok(Self {
+            initial_lambda,
+            lambda_factor,
+            min_lambda,
+            max_lambda,
+            rho_accept,
+            rho_good,
+        })
+    }
+
+    pub fn initial_lambda(self) -> f32 {
+        self.initial_lambda
+    }
+
+    pub fn lambda_factor(self) -> f32 {
+        self.lambda_factor
+    }
+
+    pub fn min_lambda(self) -> f32 {
+        self.min_lambda
+    }
+
+    pub fn max_lambda(self) -> f32 {
+        self.max_lambda
+    }
+
+    pub fn rho_accept(self) -> f32 {
+        self.rho_accept
+    }
+
+    pub fn rho_good(self) -> f32 {
+        self.rho_good
+    }
+}
+
+impl Default for LmConfig {
+    fn default() -> Self {
+        Self {
+            initial_lambda: 1e-4,
+            lambda_factor: 10.0,
+            min_lambda: 1e-8,
+            max_lambda: 1e4,
+            rho_accept: 0.25,
+            rho_good: 0.75,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LmAction {
+    Accept,
+    Reject,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LmState {
+    lambda: f32,
+    prev_cost: f64,
+}
+
+impl LmState {
+    fn new(config: LmConfig, prev_cost: f64) -> Self {
+        Self {
+            lambda: config.initial_lambda(),
+            prev_cost,
+        }
+    }
+
+    fn lambda(self) -> f32 {
+        self.lambda
+    }
+
+    fn prev_cost(self) -> f64 {
+        self.prev_cost
+    }
+
+    fn step(&mut self, cost: f64, predicted_decrease: f64, config: LmConfig) -> LmAction {
+        if !cost.is_finite() || !predicted_decrease.is_finite() || predicted_decrease <= 0.0 {
+            self.lambda = (self.lambda * config.lambda_factor()).min(config.max_lambda());
+            return LmAction::Reject;
+        }
+
+        let rho = (self.prev_cost - cost) / predicted_decrease;
+        if rho >= config.rho_accept() as f64 {
+            self.prev_cost = cost;
+            if rho > config.rho_good() as f64 {
+                self.lambda = (self.lambda / config.lambda_factor()).max(config.min_lambda());
+            }
+            LmAction::Accept
+        } else {
+            self.lambda = (self.lambda * config.lambda_factor()).min(config.max_lambda());
+            LmAction::Reject
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum LocalBaConfigError {
     ZeroWindow,
@@ -1691,6 +1898,46 @@ mod tests {
             LocalBaConfig::new(5, 10, 4, 1.0, 0.0, -1.0),
             Err(LocalBaConfigError::NegativeMotionWeight { .. })
         ));
+    }
+
+    #[test]
+    fn lm_config_rejects_invalid_values() {
+        assert!(matches!(
+            LmConfig::new(0.0, 10.0, 1e-8, 1e4, 0.25, 0.75),
+            Err(LmConfigError::NonPositiveInitialLambda { .. })
+        ));
+        assert!(matches!(
+            LmConfig::new(1e-4, 1.0, 1e-8, 1e4, 0.25, 0.75),
+            Err(LmConfigError::LambdaFactorTooSmall { .. })
+        ));
+        assert!(matches!(
+            LmConfig::new(1e-4, 10.0, 1e-2, 1e-3, 0.25, 0.75),
+            Err(LmConfigError::MinLambdaExceedsMax { .. })
+        ));
+        assert!(matches!(
+            LmConfig::new(1e-4, 10.0, 1e-8, 1e4, 0.8, 0.7),
+            Err(LmConfigError::InvalidRhoOrdering { .. })
+        ));
+    }
+
+    #[test]
+    fn lm_state_good_rho_decreases_lambda() {
+        let config = LmConfig::default();
+        let mut state = LmState::new(config, 10.0);
+        let action = state.step(8.0, 1.0, config);
+        assert_eq!(action, LmAction::Accept);
+        assert!(state.lambda() < config.initial_lambda());
+        assert!((state.prev_cost() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lm_state_bad_rho_rejects_and_increases_lambda() {
+        let config = LmConfig::default();
+        let mut state = LmState::new(config, 10.0);
+        let action = state.step(9.9, 10.0, config);
+        assert_eq!(action, LmAction::Reject);
+        assert!(state.lambda() > config.initial_lambda());
+        assert!((state.prev_cost() - 10.0).abs() < 1e-9);
     }
 
     #[test]
