@@ -41,6 +41,7 @@ pub use pnp::{
 pub use tracker::{
     CovisibilityRatio, KeyframePolicy, KeyframePolicyError, ParallaxPx, RedundancyPolicy,
     RedundancyPolicyError, SlamTracker, TrackerConfig, TrackerError, TrackerOutput,
+    TrackingHealth,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use local_ba::{

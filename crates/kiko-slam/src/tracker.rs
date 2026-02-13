@@ -211,6 +211,13 @@ impl From<crate::map::MapError> for TrackerError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackingHealth {
+    Good,
+    Degraded,
+    Lost,
+}
+
 #[derive(Debug)]
 pub struct TrackerOutput {
     pub pose: Option<Pose>,
@@ -218,6 +225,7 @@ pub struct TrackerOutput {
     pub keyframe: Option<Arc<Keyframe>>,
     pub stereo_matches: Option<Matches<Raw>>,
     pub frame_id: FrameId,
+    pub health: TrackingHealth,
 }
 
 #[derive(Debug)]
@@ -245,6 +253,7 @@ pub struct SlamTracker {
     state: TrackerState,
     ba: LocalBundleAdjuster,
     map: SlamMap,
+    consecutive_tracking_failures: usize,
 }
 
 impl SlamTracker {
@@ -268,6 +277,7 @@ impl SlamTracker {
             state: TrackerState::NeedKeyframe,
             ba,
             map: SlamMap::new(),
+            consecutive_tracking_failures: 0,
         }
     }
 
@@ -289,6 +299,16 @@ impl SlamTracker {
 
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
         self.map.covisibility_snapshot()
+    }
+
+    fn tracking_failure_health(&mut self) -> TrackingHealth {
+        const LOST_AFTER_CONSECUTIVE_FAILURES: usize = 3;
+        self.consecutive_tracking_failures = self.consecutive_tracking_failures.saturating_add(1);
+        if self.consecutive_tracking_failures >= LOST_AFTER_CONSECUTIVE_FAILURES {
+            TrackingHealth::Lost
+        } else {
+            TrackingHealth::Degraded
+        }
     }
 
     fn track(
@@ -313,6 +333,7 @@ impl SlamTracker {
                 keyframe: None,
                 stereo_matches: None,
                 frame_id,
+                health: self.tracking_failure_health(),
             });
         } else {
             self.lightglue
@@ -339,6 +360,7 @@ impl SlamTracker {
                     keyframe: None,
                     stereo_matches: None,
                     frame_id,
+                    health: self.tracking_failure_health(),
                 })
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
@@ -353,6 +375,7 @@ impl SlamTracker {
                     keyframe: None,
                     stereo_matches: None,
                     frame_id,
+                    health: self.tracking_failure_health(),
                 })
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
@@ -390,6 +413,7 @@ impl SlamTracker {
             .and_then(|set| self.ba.push_frame(&self.map, pose_world, set));
 
         let pose_world = refined_world.unwrap_or(pose_world);
+        self.consecutive_tracking_failures = 0;
 
         let mut output = TrackerOutput {
             pose: Some(pose_world),
@@ -397,6 +421,7 @@ impl SlamTracker {
             keyframe: None,
             stereo_matches: None,
             frame_id,
+            health: TrackingHealth::Good,
         };
 
         let should_refresh = self
@@ -458,12 +483,14 @@ impl SlamTracker {
             keyframe_id,
         };
         self.ba.reset();
+        self.consecutive_tracking_failures = 0;
         Ok(TrackerOutput {
             pose: Some(pose_world),
             inliers: 0,
             keyframe: output.keyframe,
             stereo_matches: output.stereo_matches,
             frame_id,
+            health: TrackingHealth::Good,
         })
     }
 
@@ -548,6 +575,7 @@ fn create_keyframe_internal(
                 keyframe: Some(keyframe),
                 stereo_matches: Some(matches),
                 frame_id,
+                health: TrackingHealth::Good,
             },
             keyframe_id,
         ))
