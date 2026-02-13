@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 
 use crate::{Descriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
 
@@ -42,11 +42,7 @@ struct KeypointIndex(usize);
 
 impl KeypointIndex {
     fn new(index: usize, len: usize) -> Option<Self> {
-        if index < len {
-            Some(Self(index))
-        } else {
-            None
-        }
+        if index < len { Some(Self(index)) } else { None }
     }
 
     fn as_usize(self) -> usize {
@@ -104,7 +100,7 @@ impl DescriptorBlend {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MapPoint {
     position: Point3,
     descriptor: Descriptor,
@@ -140,7 +136,8 @@ impl MapPoint {
 
     fn remove_observation_for(&mut self, keyframe_id: KeyframeId) -> bool {
         let before = self.observations.len();
-        self.observations.retain(|obs| obs.keyframe_id != keyframe_id);
+        self.observations
+            .retain(|obs| obs.keyframe_id != keyframe_id);
         before != self.observations.len()
     }
 
@@ -158,7 +155,7 @@ impl MapPoint {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct KeyframeEntry {
     frame_id: FrameId,
     timestamp: Timestamp,
@@ -222,7 +219,7 @@ impl KeyframeEntry {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CovisibilityGraph {
     edges: HashMap<KeyframeId, HashMap<KeyframeId, NonZeroU32>>,
 }
@@ -277,10 +274,7 @@ impl CovisibilityGraph {
     fn remove_point_observations(&mut self, observations: &[KeyframeKeypoint]) {
         for i in 0..observations.len() {
             for j in (i + 1)..observations.len() {
-                self.decrement_pair(
-                    observations[i].keyframe_id,
-                    observations[j].keyframe_id,
-                );
+                self.decrement_pair(observations[i].keyframe_id, observations[j].keyframe_id);
             }
         }
     }
@@ -315,13 +309,34 @@ impl CovisibilityGraph {
 pub enum MapError {
     KeyframeNotFound(KeyframeId),
     MapPointNotFound(MapPointId),
-    FrameAlreadyKeyframed { frame_id: FrameId, existing: KeyframeId },
-    KeypointIndexOutOfBounds { index: usize, len: usize },
-    DetectionAlreadyAssociated { keyframe_id: KeyframeId, index: usize, existing: MapPointId },
-    DuplicateObservation { point_id: MapPointId, keyframe_id: KeyframeId },
-    InvalidImageSize { width: u32, height: u32 },
-    EmptyKeyframe { frame_id: FrameId },
-    SensorMismatch { expected: SensorId, actual: SensorId },
+    FrameAlreadyKeyframed {
+        frame_id: FrameId,
+        existing: KeyframeId,
+    },
+    KeypointIndexOutOfBounds {
+        index: usize,
+        len: usize,
+    },
+    DetectionAlreadyAssociated {
+        keyframe_id: KeyframeId,
+        index: usize,
+        existing: MapPointId,
+    },
+    DuplicateObservation {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+    },
+    InvalidImageSize {
+        width: u32,
+        height: u32,
+    },
+    EmptyKeyframe {
+        frame_id: FrameId,
+    },
+    SensorMismatch {
+        expected: SensorId,
+        actual: SensorId,
+    },
 }
 
 impl std::fmt::Display for MapError {
@@ -329,10 +344,9 @@ impl std::fmt::Display for MapError {
         match self {
             MapError::KeyframeNotFound(id) => write!(f, "keyframe not found: {id:?}"),
             MapError::MapPointNotFound(id) => write!(f, "map point not found: {id:?}"),
-            MapError::FrameAlreadyKeyframed { frame_id, existing } => write!(
-                f,
-                "frame {frame_id:?} already has keyframe {existing:?}"
-            ),
+            MapError::FrameAlreadyKeyframed { frame_id, existing } => {
+                write!(f, "frame {frame_id:?} already has keyframe {existing:?}")
+            }
             MapError::KeypointIndexOutOfBounds { index, len } => {
                 write!(f, "keypoint index {index} out of bounds (len={len})")
             }
@@ -344,7 +358,10 @@ impl std::fmt::Display for MapError {
                 f,
                 "keypoint {index} on {keyframe_id:?} already maps to {existing:?}"
             ),
-            MapError::DuplicateObservation { point_id, keyframe_id } => write!(
+            MapError::DuplicateObservation {
+                point_id,
+                keyframe_id,
+            } => write!(
                 f,
                 "map point {point_id:?} already observed in keyframe {keyframe_id:?}"
             ),
@@ -364,7 +381,7 @@ impl std::fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SlamMap {
     points: SlotMap<MapPointId, MapPoint>,
     keyframes: SlotMap<KeyframeId, KeyframeEntry>,
@@ -414,11 +431,12 @@ impl SlamMap {
             });
         }
 
-        let image_size = ImageSize::try_new(detections.width(), detections.height())
-            .ok_or(MapError::InvalidImageSize {
+        let image_size = ImageSize::try_new(detections.width(), detections.height()).ok_or(
+            MapError::InvalidImageSize {
                 width: detections.width(),
                 height: detections.height(),
-            })?;
+            },
+        )?;
 
         let keypoints = detections.keypoints().to_vec();
         self.add_keyframe(
@@ -471,8 +489,8 @@ impl SlamMap {
             .keyframes
             .get(keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
-        let idx = KeypointIndex::new(index, entry.len())
-            .ok_or(MapError::KeypointIndexOutOfBounds {
+        let idx =
+            KeypointIndex::new(index, entry.len()).ok_or(MapError::KeypointIndexOutOfBounds {
                 index,
                 len: entry.len(),
             })?;
@@ -501,7 +519,10 @@ impl SlamMap {
             .get(first_obs.keyframe_id)
             .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         let idx = first_obs.index.as_usize();
-        debug_assert!(idx < entry.point_refs.len(), "KeyframeKeypoint out of bounds");
+        debug_assert!(
+            idx < entry.point_refs.len(),
+            "KeyframeKeypoint out of bounds"
+        );
         if let Some(existing) = entry.point_ref(first_obs.index) {
             return Err(MapError::DetectionAlreadyAssociated {
                 keyframe_id: first_obs.keyframe_id,
@@ -536,7 +557,10 @@ impl SlamMap {
             .get(obs.keyframe_id)
             .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         let idx = obs.index.as_usize();
-        debug_assert!(idx < entry.point_refs.len(), "KeyframeKeypoint out of bounds");
+        debug_assert!(
+            idx < entry.point_refs.len(),
+            "KeyframeKeypoint out of bounds"
+        );
         if let Some(existing) = entry.point_ref(obs.index) {
             return Err(MapError::DetectionAlreadyAssociated {
                 keyframe_id: obs.keyframe_id,
@@ -556,20 +580,14 @@ impl SlamMap {
                     keyframe_id: obs.keyframe_id,
                 });
             }
-            point.observations
-                .iter()
-                .map(|o| o.keyframe_id)
-                .collect()
+            point.observations.iter().map(|o| o.keyframe_id).collect()
         };
 
         for other in other_keyframes {
             self.covisibility.increment_pair(obs.keyframe_id, other);
         }
 
-        let point = self
-            .points
-            .get_mut(point_id)
-            .expect("map point exists");
+        let point = self.points.get_mut(point_id).expect("map point exists");
         point.add_observation(obs);
 
         let entry = self
@@ -607,7 +625,11 @@ impl SlamMap {
         Ok(())
     }
 
-    pub fn set_keyframe_pose(&mut self, keyframe_id: KeyframeId, pose: Pose) -> Result<(), MapError> {
+    pub fn set_keyframe_pose(
+        &mut self,
+        keyframe_id: KeyframeId,
+        pose: Pose,
+    ) -> Result<(), MapError> {
         let entry = self
             .keyframes
             .get_mut(keyframe_id)
@@ -627,7 +649,8 @@ impl SlamMap {
                 entry.clear_point_ref(obs.index);
             }
         }
-        self.covisibility.remove_point_observations(&point.observations);
+        self.covisibility
+            .remove_point_observations(&point.observations);
         Ok(())
     }
 
@@ -684,12 +707,9 @@ impl SlamMap {
         let mut observations = Vec::new();
         for (idx, point_id) in entry.point_refs.iter().enumerate() {
             if point_id.is_some() {
-                let index = KeypointIndex::new(idx, entry.len())
-                    .expect("keypoint index within bounds");
-                let keypoint_ref = KeyframeKeypoint {
-                    keyframe_id,
-                    index,
-                };
+                let index =
+                    KeypointIndex::new(idx, entry.len()).expect("keypoint index within bounds");
+                let keypoint_ref = KeyframeKeypoint { keyframe_id, index };
                 observations.push((keypoint_ref, entry.keypoints[idx]));
             }
         }
@@ -731,11 +751,7 @@ impl SlamMap {
         Ok(window)
     }
 
-    pub fn covisibility_ratio(
-        &self,
-        a: KeyframeId,
-        b: KeyframeId,
-    ) -> Result<f32, MapError> {
+    pub fn covisibility_ratio(&self, a: KeyframeId, b: KeyframeId) -> Result<f32, MapError> {
         let count = self.covisibility.covisibility_count(a, b) as f32;
         if count == 0.0 {
             return Ok(0.0);
@@ -1022,12 +1038,14 @@ impl std::fmt::Display for MapInvariantError {
                 "map point descriptor not normalized: point={point_id:?}, norm={norm}"
             ),
             MapInvariantError::CovisibilitySelfEdge { keyframe_id } => {
-                write!(f, "covisibility self edge present: keyframe={keyframe_id:?}")
+                write!(
+                    f,
+                    "covisibility self edge present: keyframe={keyframe_id:?}"
+                )
             }
-            MapInvariantError::CovisibilityMissingReverseEdge { a, b } => write!(
-                f,
-                "covisibility missing reverse edge: {a:?} -> {b:?}"
-            ),
+            MapInvariantError::CovisibilityMissingReverseEdge { a, b } => {
+                write!(f, "covisibility missing reverse edge: {a:?} -> {b:?}")
+            }
             MapInvariantError::CovisibilityAsymmetricWeight { a, b, ab, ba } => write!(
                 f,
                 "covisibility asymmetric weights: {a:?}->{b:?}={ab}, {b:?}->{a:?}={ba}"
@@ -1099,9 +1117,10 @@ pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantErr
                 });
             };
 
-            let backref_exists = point.observations.iter().any(|obs| {
-                obs.keyframe_id == keyframe_id && obs.index.as_usize() == index
-            });
+            let backref_exists = point
+                .observations
+                .iter()
+                .any(|obs| obs.keyframe_id == keyframe_id && obs.index.as_usize() == index);
             if !backref_exists {
                 return Err(MapInvariantError::KeyframePointBackrefMissing {
                     keyframe_id,
@@ -1274,11 +1293,20 @@ mod tests {
 
         let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
         let point = map
-            .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                obs1,
+            )
             .expect("map point");
 
         let obs2 = map.keyframe_keypoint(kf2, 0).expect("obs2");
-        map.add_observation(point, obs2).expect("second observation");
+        map.add_observation(point, obs2)
+            .expect("second observation");
 
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
         assert_map_invariants(&map).expect("after shared observation");
@@ -1316,17 +1344,31 @@ mod tests {
 
         let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
         let point = map
-            .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                obs1,
+            )
             .expect("map point");
 
         let obs2 = map.keyframe_keypoint(kf2, 0).expect("obs2");
-        map.add_observation(point, obs2).expect("second observation");
+        map.add_observation(point, obs2)
+            .expect("second observation");
         assert_map_invariants(&map).expect("after shared observation");
 
         let obs2_alt = map.keyframe_keypoint(kf2, 1).expect("obs2_alt");
-        let err = map.add_observation(point, obs2_alt).expect_err("duplicate observation");
+        let err = map
+            .add_observation(point, obs2_alt)
+            .expect_err("duplicate observation");
         match err {
-            MapError::DuplicateObservation { point_id, keyframe_id } => {
+            MapError::DuplicateObservation {
+                point_id,
+                keyframe_id,
+            } => {
                 assert_eq!(point_id, point);
                 assert_eq!(keyframe_id, kf2);
             }
@@ -1354,7 +1396,15 @@ mod tests {
 
         let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
         let point = map
-            .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                obs1,
+            )
             .expect("map point");
         assert!(map.point(point).is_some());
         assert_map_invariants(&map).expect("after point insertion");
@@ -1402,7 +1452,15 @@ mod tests {
 
         let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
         let point_a = map
-            .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                obs1,
+            )
             .expect("point A");
         let obs2 = map.keyframe_keypoint(kf2, 0).expect("obs2");
         map.add_observation(point_a, obs2).expect("obs2 add");
@@ -1416,7 +1474,15 @@ mod tests {
 
         let obs1b = map.keyframe_keypoint(kf1, 1).expect("obs1b");
         let point_b = map
-            .add_map_point(Point3 { x: 1.0, y: 0.0, z: 2.0 }, make_descriptor(), obs1b)
+            .add_map_point(
+                Point3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
+                make_descriptor(),
+                obs1b,
+            )
             .expect("point B");
         let obs2b = map.keyframe_keypoint(kf2, 1).expect("obs2b");
         map.add_observation(point_b, obs2b).expect("obs2b add");

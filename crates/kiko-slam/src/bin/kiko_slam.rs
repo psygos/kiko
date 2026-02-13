@@ -5,32 +5,32 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
-    DownscaleFactor, InferenceBackend, InferencePipeline, KeypointLimit, LightGlue,
-    LocalBaConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
-    RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
-    TriangulationError, Triangulator, VizDecimation, VizPacket, KeyframePolicy,
+    BackendConfig, DownscaleFactor, InferenceBackend, InferencePipeline, KeyframePolicy,
+    KeypointLimit, LightGlue, LocalBaConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo,
+    RectifiedStereoConfig, RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig,
+    TriangulationConfig, TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
 
-use kiko_slam::env::{env_f32, env_usize};
+use kiko_slam::env::{env_bool, env_f32, env_usize};
 
 #[cfg(feature = "record")]
 use kiko_slam::{Frame, Point3, Pose, Raw};
 
 #[cfg(feature = "record")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
+#[cfg(feature = "record")]
+use kiko_slam::{
+    ChannelCapacity, DropPolicy, FrameId, PairingWindowNs, SendOutcome, SensorId, StereoPair,
+    StereoPairer, bounded_channel, oak_to_frame,
+};
+#[cfg(feature = "record")]
+use oak_sys::{Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig};
 #[cfg(feature = "record")]
 use std::sync::Arc;
 #[cfg(feature = "record")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "record")]
 use std::thread;
-#[cfg(feature = "record")]
-use kiko_slam::{
-    bounded_channel, oak_to_frame, ChannelCapacity, DropPolicy, FrameId, PairingWindowNs,
-    SendOutcome, SensorId, StereoPair, StereoPairer,
-};
-#[cfg(feature = "record")]
-use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
-#[cfg(feature = "record")]
-use oak_sys::{Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig};
 
 const DEFAULT_MAX_KEYPOINTS: usize = 1024;
 
@@ -337,7 +337,15 @@ impl InferenceConfig {
         .with_downscale(self.downscale)
     }
 
-    fn into_models(self) -> (SuperPoint, SuperPoint, LightGlue, KeypointLimit, DownscaleFactor) {
+    fn into_models(
+        self,
+    ) -> (
+        SuperPoint,
+        SuperPoint,
+        LightGlue,
+        KeypointLimit,
+        DownscaleFactor,
+    ) {
         (
             self.superpoint_left,
             self.superpoint_right,
@@ -560,12 +568,15 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         ..RansacConfig::default()
     };
     let ba_config = build_ba_config()?;
-    let keyframe_policy = KeyframePolicy::new(
-        refresh_inliers,
-        parallax_px,
-        min_covisibility,
-    )?;
+    let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
     let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
+    let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
+        Some(BackendConfig::new(
+            env_usize("KIKO_BACKEND_QUEUE_DEPTH").unwrap_or(2),
+        )?)
+    } else {
+        None
+    };
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -575,6 +586,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         keyframe_policy,
         ba: ba_config,
         redundancy,
+        backend,
     };
 
     eprintln!(
@@ -636,9 +648,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                     if output.keyframe.is_some() {
                         keyframes += 1;
                         let snapshot = tracker.covisibility_snapshot();
-                        if let Err(err) =
-                            sink.log_covisibility_graph(left.timestamp(), &snapshot)
-                        {
+                        if let Err(err) = sink.log_covisibility_graph(left.timestamp(), &snapshot) {
                             eprintln!("rerun log error: {err}");
                         }
                     }
@@ -677,13 +687,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, tracker_errors={}, poses_logged={}, keyframes={}",
-        processed,
-        elapsed,
-        fps,
-        read_errors,
-        inference_errors,
-        poses_logged,
-        keyframes
+        processed, elapsed, fps, read_errors, inference_errors, poses_logged, keyframes
     );
 
     Ok(())
@@ -838,8 +842,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         let avg_sp_right_ms = (sum_sp_right.as_secs_f64() * 1000.0) / denom;
         let avg_lightglue_ms = (sum_lightglue.as_secs_f64() * 1000.0) / denom;
         let avg_total_ms = (sum_total.as_secs_f64() * 1000.0) / denom;
-        let overhead = sum_total
-            .saturating_sub(sum_sp_left + sum_sp_right + sum_lightglue);
+        let overhead = sum_total.saturating_sub(sum_sp_left + sum_sp_right + sum_lightglue);
         let avg_overhead_ms = (overhead.as_secs_f64() * 1000.0) / denom;
         let total_ms = sum_total.as_secs_f64().max(1e-9);
         let pct_sp_left = (sum_sp_left.as_secs_f64() / total_ms) * 100.0;
@@ -847,8 +850,10 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         let pct_lightglue = (sum_lightglue.as_secs_f64() / total_ms) * 100.0;
         let pct_overhead = (overhead.as_secs_f64() / total_ms) * 100.0;
 
-        eprintln!("timings avg ms: sp_left={:.2} sp_right={:.2} lightglue={:.2} overhead={:.2} total={:.2}",
-            avg_sp_left_ms, avg_sp_right_ms, avg_lightglue_ms, avg_overhead_ms, avg_total_ms);
+        eprintln!(
+            "timings avg ms: sp_left={:.2} sp_right={:.2} lightglue={:.2} overhead={:.2} total={:.2}",
+            avg_sp_left_ms, avg_sp_right_ms, avg_lightglue_ms, avg_overhead_ms, avg_total_ms
+        );
         eprintln!(
             "timings pct: sp_left={:.1}% sp_right={:.1}% lightglue={:.1}% overhead={:.1}%",
             pct_sp_left, pct_sp_right, pct_lightglue, pct_overhead
@@ -871,10 +876,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             cpu_pct
         );
         if let Some(rss) = end_usage.max_rss_bytes {
-            eprintln!(
-                "memory: max_rss={:.2} MB",
-                (rss as f64) / (1024.0 * 1024.0)
-            );
+            eprintln!("memory: max_rss={:.2} MB", (rss as f64) / (1024.0 * 1024.0));
         }
     }
 
@@ -935,8 +937,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut right_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
-    let pairing_window =
-        PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
+    let pairing_window = PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
     let mut pairer = StereoPairer::new(pairing_window);
     let start = Instant::now();
 
@@ -946,19 +947,17 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut got_any = false;
 
         match device.mono_left(0) {
-            Ok(frame) => {
-                match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
-                    Ok(frame) => {
-                        pairer.push_left(frame);
-                        left_count += 1;
-                        left_seq += 1;
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("left frame dropped (invalid dimensions): {err}");
-                    }
+            Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                Ok(frame) => {
+                    pairer.push_left(frame);
+                    left_count += 1;
+                    left_seq += 1;
+                    got_any = true;
                 }
-            }
+                Err(err) => {
+                    eprintln!("left frame dropped (invalid dimensions): {err}");
+                }
+            },
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
                 eprintln!("left error: {:?}", e);
@@ -1061,8 +1060,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("connecting to oak-d...");
     let mut device = Device::connect("", config)?;
 
-    let pairing_window =
-        PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
+    let pairing_window = PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
     let mut pairer = StereoPairer::new(pairing_window);
 
     let pair_capacity = ChannelCapacity::try_from(PAIR_QUEUE_DEPTH)?;
@@ -1091,12 +1089,15 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         ..RansacConfig::default()
     };
     let ba_config = build_ba_config()?;
-    let keyframe_policy = KeyframePolicy::new(
-        refresh_inliers,
-        parallax_px,
-        min_covisibility,
-    )?;
+    let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
     let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
+    let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
+        Some(BackendConfig::new(
+            env_usize("KIKO_BACKEND_QUEUE_DEPTH").unwrap_or(2),
+        )?)
+    } else {
+        None
+    };
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -1106,6 +1107,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         keyframe_policy,
         ba: ba_config,
         redundancy,
+        backend,
     };
 
     eprintln!(
@@ -1140,7 +1142,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(keyframe) = output.keyframe.as_ref() {
                             points = Some(keyframe.landmarks().to_vec());
                         }
-                        if let Ok(viz_packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
+                        if let Ok(viz_packet) =
+                            VizPacket::try_new(left.clone(), right.clone(), matches)
+                        {
                             packet = Some(viz_packet);
                         }
                     }
@@ -1199,18 +1203,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut got_any = false;
 
         match device.mono_left(0) {
-            Ok(frame) => {
-                match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
-                    Ok(frame) => {
-                        pairer.push_left(frame);
-                        left_seq += 1;
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("left frame dropped (invalid dimensions): {err}");
-                    }
+            Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                Ok(frame) => {
+                    pairer.push_left(frame);
+                    left_seq += 1;
+                    got_any = true;
                 }
-            }
+                Err(err) => {
+                    eprintln!("left frame dropped (invalid dimensions): {err}");
+                }
+            },
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
                 eprintln!("left error: {:?}", e);

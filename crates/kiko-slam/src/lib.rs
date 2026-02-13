@@ -4,55 +4,54 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 pub use inference::{InferenceBackend, LightGlue, SuperPoint};
-pub mod dataset;
-mod inference;
-mod preprocess;
-mod pairing;
-mod pipeline;
-mod viz;
 mod channel;
-mod triangulation;
-mod pnp;
-mod tracker;
+pub mod dataset;
 pub mod env;
-mod math;
+mod inference;
 mod local_ba;
 pub mod map;
+mod math;
 #[cfg(feature = "record")]
 mod oak;
+mod pairing;
+mod pipeline;
+mod pnp;
+mod preprocess;
 #[cfg(test)]
 pub(crate) mod test_helpers;
-pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
-pub use pipeline::{
-    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
-};
-pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
+mod tracker;
+mod triangulation;
+mod viz;
 pub use channel::{
-    bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
-    DropPolicy, DropReceiver, DropSender, SendOutcome,
+    ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
+    DropReceiver, DropSender, SendOutcome, bounded_channel,
 };
-pub use triangulation::{
-    Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
-    TriangulationStats, Triangulator,
-};
-pub use pnp::{
-    build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation, PinholeIntrinsics,
-    PnpError, PnpResult, Pose, RansacConfig,
-};
-pub use tracker::{
-    CovisibilityRatio, KeyframePolicy, KeyframePolicyError, ParallaxPx, RedundancyPolicy,
-    RedundancyPolicyError, SlamTracker, TrackerConfig, TrackerError, TrackerOutput,
-    TrackingHealth,
-};
-pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
+pub use env::{env_bool, env_f32, env_usize};
 pub use local_ba::{
     LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet,
     ObservationSetError,
 };
-pub use env::{env_bool, env_f32, env_usize};
+pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 #[cfg(feature = "record")]
 pub use oak::oak_to_frame;
+pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
+pub use pipeline::{
+    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
+};
+pub use pnp::{
+    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
+    build_observations, solve_pnp, solve_pnp_ransac,
+};
+pub use tracker::{
+    BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, KeyframePolicy,
+    KeyframePolicyError, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
+    TrackerConfig, TrackerError, TrackerOutput, TrackingHealth,
+};
+pub use triangulation::{
+    Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
+    TriangulationConfig, TriangulationError, TriangulationResult, TriangulationStats, Triangulator,
+};
+pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensorId {
@@ -105,18 +104,9 @@ impl std::error::Error for FrameError {}
 
 #[derive(Debug)]
 pub enum PairError {
-    DimensionMismatch {
-        left: (u32, u32),
-        right: (u32, u32),
-    },
-    TimestampDelta {
-        delta_ns: i64,
-        max_delta_ns: i64,
-    },
-    SensorMismatch {
-        left: SensorId,
-        right: SensorId,
-    },
+    DimensionMismatch { left: (u32, u32), right: (u32, u32) },
+    TimestampDelta { delta_ns: i64, max_delta_ns: i64 },
+    SensorMismatch { left: SensorId, right: SensorId },
 }
 
 impl std::fmt::Display for PairError {
@@ -628,10 +618,7 @@ impl Matches<Raw> {
         })
     }
 
-    pub fn with_landmarks(
-        &self,
-        keyframe: &Keyframe,
-    ) -> Result<Matches<Verified>, MatchError> {
+    pub fn with_landmarks(&self, keyframe: &Keyframe) -> Result<Matches<Verified>, MatchError> {
         let mut indices = Vec::new();
         let mut scores = Vec::new();
         for (idx, &(a, b)) in self.indices.iter().enumerate() {

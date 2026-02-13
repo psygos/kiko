@@ -1,16 +1,19 @@
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
+use std::thread;
 
 use crate::{
-    solve_pnp_ransac, DownscaleFactor, Detections, Frame, FrameId, Keyframe, KeypointLimit,
-    LightGlue, LocalBaConfig, LocalBundleAdjuster, Matches, MapObservation, ObservationSet,
-    PinholeIntrinsics, Point3, Pose, Raw, RansacConfig, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
-    TriangulationConfig, TriangulationError, Triangulator, Verified,
-    map::{KeyframeId, SlamMap},
+    map::{KeyframeId, MapPointId, SlamMap},
+    solve_pnp_ransac, Detections, DownscaleFactor, Frame, FrameId, Keyframe, KeypointLimit,
+    LightGlue, LocalBaConfig, LocalBundleAdjuster, MapObservation, Matches, ObservationSet,
+    PinholeIntrinsics, Point3, Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint,
+    Timestamp, TriangulationConfig, TriangulationError, Triangulator, Verified,
 };
 
-use std::cmp::Ordering;
-use std::num::NonZeroUsize;
 use crate::inference::InferenceError;
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 #[derive(Clone, Copy, Debug)]
 pub struct TrackerConfig {
@@ -22,11 +25,54 @@ pub struct TrackerConfig {
     pub keyframe_policy: KeyframePolicy,
     pub ba: LocalBaConfig,
     pub redundancy: Option<RedundancyPolicy>,
+    pub backend: Option<BackendConfig>,
 }
 
 impl TrackerConfig {
     pub fn max_keypoints(&self) -> usize {
         self.max_keypoints.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BackendConfig {
+    queue_depth: NonZeroUsize,
+}
+
+#[derive(Debug)]
+pub enum BackendConfigError {
+    ZeroQueueDepth,
+}
+
+impl std::fmt::Display for BackendConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendConfigError::ZeroQueueDepth => {
+                write!(f, "backend queue depth must be > 0")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackendConfigError {}
+
+impl BackendConfig {
+    pub fn new(queue_depth: usize) -> Result<Self, BackendConfigError> {
+        let queue_depth =
+            NonZeroUsize::new(queue_depth).ok_or(BackendConfigError::ZeroQueueDepth)?;
+        Ok(Self { queue_depth })
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.get()
+    }
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        Self {
+            queue_depth: NonZeroUsize::new(2).expect("non-zero"),
+        }
     }
 }
 
@@ -48,6 +94,409 @@ pub struct RedundancyPolicy {
     max_covisibility: CovisibilityRatio,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MapVersion(NonZeroU64);
+
+impl MapVersion {
+    fn initial() -> Self {
+        Self(NonZeroU64::new(1).expect("non-zero"))
+    }
+
+    fn next(self) -> Self {
+        let next = self.0.get().saturating_add(1).max(1);
+        Self(NonZeroU64::new(next).expect("non-zero"))
+    }
+
+    fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BackendRequestId(NonZeroU64);
+
+impl BackendRequestId {
+    fn from_counter(counter: &mut u64) -> Self {
+        *counter = counter.saturating_add(1).max(1);
+        Self(NonZeroU64::new(*counter).expect("non-zero"))
+    }
+
+    fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Debug)]
+struct BackendWindow {
+    keyframes: Vec<KeyframeId>,
+}
+
+#[derive(Debug)]
+enum BackendWindowError {
+    TooFewKeyframes { required: usize, actual: usize },
+    DuplicateKeyframe { keyframe_id: KeyframeId },
+}
+
+impl std::fmt::Display for BackendWindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendWindowError::TooFewKeyframes { required, actual } => write!(
+                f,
+                "backend window requires at least {required} keyframes, got {actual}"
+            ),
+            BackendWindowError::DuplicateKeyframe { keyframe_id } => {
+                write!(f, "backend window has duplicate keyframe {keyframe_id:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackendWindowError {}
+
+impl BackendWindow {
+    fn try_new(keyframes: Vec<KeyframeId>) -> Result<Self, BackendWindowError> {
+        if keyframes.len() < 2 {
+            return Err(BackendWindowError::TooFewKeyframes {
+                required: 2,
+                actual: keyframes.len(),
+            });
+        }
+        let mut seen = HashSet::new();
+        for &keyframe_id in &keyframes {
+            if !seen.insert(keyframe_id) {
+                return Err(BackendWindowError::DuplicateKeyframe { keyframe_id });
+            }
+        }
+        Ok(Self { keyframes })
+    }
+
+    fn as_slice(&self) -> &[KeyframeId] {
+        &self.keyframes
+    }
+}
+
+#[derive(Debug)]
+struct KeyframeEvent {
+    request_id: BackendRequestId,
+    map_version: MapVersion,
+    trigger_keyframe: KeyframeId,
+    window: BackendWindow,
+    map_snapshot: SlamMap,
+}
+
+#[derive(Debug)]
+enum KeyframeEventError {
+    TriggerMissingFromWindow { keyframe_id: KeyframeId },
+    MissingKeyframeInSnapshot { keyframe_id: KeyframeId },
+}
+
+impl std::fmt::Display for KeyframeEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyframeEventError::TriggerMissingFromWindow { keyframe_id } => write!(
+                f,
+                "backend keyframe event window does not contain trigger keyframe {keyframe_id:?}"
+            ),
+            KeyframeEventError::MissingKeyframeInSnapshot { keyframe_id } => write!(
+                f,
+                "backend keyframe event references missing snapshot keyframe {keyframe_id:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KeyframeEventError {}
+
+impl KeyframeEvent {
+    fn try_new(
+        request_id: BackendRequestId,
+        map_version: MapVersion,
+        trigger_keyframe: KeyframeId,
+        window: BackendWindow,
+        map_snapshot: SlamMap,
+    ) -> Result<Self, KeyframeEventError> {
+        if !window.as_slice().iter().any(|&id| id == trigger_keyframe) {
+            return Err(KeyframeEventError::TriggerMissingFromWindow {
+                keyframe_id: trigger_keyframe,
+            });
+        }
+        for &keyframe_id in window.as_slice() {
+            if map_snapshot.keyframe(keyframe_id).is_none() {
+                return Err(KeyframeEventError::MissingKeyframeInSnapshot { keyframe_id });
+            }
+        }
+        Ok(Self {
+            request_id,
+            map_version,
+            trigger_keyframe,
+            window,
+            map_snapshot,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoseCorrection {
+    keyframe_id: KeyframeId,
+    pose: Pose,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LandmarkCorrection {
+    point_id: MapPointId,
+    position: Point3,
+}
+
+#[derive(Debug)]
+struct CorrectionEvent {
+    request_id: BackendRequestId,
+    map_version: MapVersion,
+    trigger_keyframe: KeyframeId,
+    pose_corrections: Vec<PoseCorrection>,
+    landmark_corrections: Vec<LandmarkCorrection>,
+}
+
+#[derive(Debug)]
+enum CorrectionBuildError {
+    MissingKeyframe { keyframe_id: KeyframeId },
+    MissingMapPoint { point_id: MapPointId },
+}
+
+impl std::fmt::Display for CorrectionBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CorrectionBuildError::MissingKeyframe { keyframe_id } => {
+                write!(f, "optimized map missing keyframe {keyframe_id:?}")
+            }
+            CorrectionBuildError::MissingMapPoint { point_id } => {
+                write!(f, "optimized map missing map point {point_id:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CorrectionBuildError {}
+
+impl CorrectionEvent {
+    fn from_optimized_map(
+        event: &KeyframeEvent,
+        optimized_map: &SlamMap,
+    ) -> Result<Self, CorrectionBuildError> {
+        let mut pose_corrections = Vec::with_capacity(event.window.as_slice().len());
+        for &keyframe_id in event.window.as_slice() {
+            let entry = optimized_map
+                .keyframe(keyframe_id)
+                .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
+            pose_corrections.push(PoseCorrection {
+                keyframe_id,
+                pose: entry.pose(),
+            });
+        }
+
+        let point_ids = collect_window_points(optimized_map, &event.window)?;
+        let mut landmark_corrections = Vec::with_capacity(point_ids.len());
+        for point_id in point_ids {
+            let point = optimized_map
+                .point(point_id)
+                .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
+            landmark_corrections.push(LandmarkCorrection {
+                point_id,
+                position: point.position(),
+            });
+        }
+
+        Ok(Self {
+            request_id: event.request_id,
+            map_version: event.map_version,
+            trigger_keyframe: event.trigger_keyframe,
+            pose_corrections,
+            landmark_corrections,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum BackendWorkerError {
+    OptimizationFailed { keyframe_id: KeyframeId },
+    BuildCorrection(CorrectionBuildError),
+}
+
+impl std::fmt::Display for BackendWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendWorkerError::OptimizationFailed { keyframe_id } => write!(
+                f,
+                "backend optimization failed for trigger keyframe {keyframe_id:?}"
+            ),
+            BackendWorkerError::BuildCorrection(err) => {
+                write!(f, "backend correction build failed: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BackendWorkerError {}
+
+#[derive(Debug)]
+enum BackendResponse {
+    Correction(CorrectionEvent),
+    Failure {
+        request_id: BackendRequestId,
+        map_version: MapVersion,
+        error: BackendWorkerError,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackendStats {
+    pub submitted: u64,
+    pub dropped_full: u64,
+    pub dropped_disconnected: u64,
+    pub applied: u64,
+    pub stale: u64,
+    pub rejected: u64,
+    pub worker_failures: u64,
+}
+
+#[derive(Debug)]
+enum SubmitEventError {
+    InvalidWindow(BackendWindowError),
+    InvalidEvent(KeyframeEventError),
+    QueueFull,
+    Disconnected,
+}
+
+impl std::fmt::Display for SubmitEventError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitEventError::InvalidWindow(err) => write!(f, "invalid backend window: {err}"),
+            SubmitEventError::InvalidEvent(err) => write!(f, "invalid backend event: {err}"),
+            SubmitEventError::QueueFull => write!(f, "backend event queue is full"),
+            SubmitEventError::Disconnected => write!(f, "backend worker is disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for SubmitEventError {}
+
+#[derive(Debug)]
+enum ApplyCorrectionError {
+    StaleVersion {
+        current: MapVersion,
+        correction: MapVersion,
+    },
+    MissingKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    MissingMapPoint {
+        point_id: MapPointId,
+    },
+    Map(crate::map::MapError),
+}
+
+impl std::fmt::Display for ApplyCorrectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyCorrectionError::StaleVersion {
+                current,
+                correction,
+            } => write!(
+                f,
+                "stale correction: correction version={}, current version={}",
+                correction.as_u64(),
+                current.as_u64()
+            ),
+            ApplyCorrectionError::MissingKeyframe { keyframe_id } => {
+                write!(f, "correction references missing keyframe {keyframe_id:?}")
+            }
+            ApplyCorrectionError::MissingMapPoint { point_id } => {
+                write!(f, "correction references missing map point {point_id:?}")
+            }
+            ApplyCorrectionError::Map(err) => write!(f, "map correction apply error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ApplyCorrectionError {}
+
+impl From<crate::map::MapError> for ApplyCorrectionError {
+    fn from(value: crate::map::MapError) -> Self {
+        Self::Map(value)
+    }
+}
+
+#[derive(Debug)]
+struct BackendWorker {
+    tx: Sender<KeyframeEvent>,
+    rx: Receiver<BackendResponse>,
+    next_request_id: u64,
+}
+
+impl BackendWorker {
+    fn spawn(
+        config: BackendConfig,
+        intrinsics: PinholeIntrinsics,
+        ba_config: LocalBaConfig,
+    ) -> Self {
+        let (tx_req, rx_req) = crossbeam_channel::bounded::<KeyframeEvent>(config.queue_depth());
+        let (tx_resp, rx_resp) = crossbeam_channel::unbounded::<BackendResponse>();
+
+        thread::spawn(move || {
+            let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
+            while let Ok(event) = rx_req.recv() {
+                let mut optimized_map = event.map_snapshot.clone();
+                if !ba.optimize_keyframe_window(&mut optimized_map, event.window.as_slice()) {
+                    let _ = tx_resp.send(BackendResponse::Failure {
+                        request_id: event.request_id,
+                        map_version: event.map_version,
+                        error: BackendWorkerError::OptimizationFailed {
+                            keyframe_id: event.trigger_keyframe,
+                        },
+                    });
+                    continue;
+                }
+                match CorrectionEvent::from_optimized_map(&event, &optimized_map) {
+                    Ok(correction) => {
+                        let _ = tx_resp.send(BackendResponse::Correction(correction));
+                    }
+                    Err(err) => {
+                        let _ = tx_resp.send(BackendResponse::Failure {
+                            request_id: event.request_id,
+                            map_version: event.map_version,
+                            error: BackendWorkerError::BuildCorrection(err),
+                        });
+                    }
+                }
+            }
+        });
+
+        Self {
+            tx: tx_req,
+            rx: rx_resp,
+            next_request_id: 0,
+        }
+    }
+
+    fn next_request_id(&mut self) -> BackendRequestId {
+        BackendRequestId::from_counter(&mut self.next_request_id)
+    }
+
+    fn try_submit(&self, event: KeyframeEvent) -> Result<(), SubmitEventError> {
+        match self.tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SubmitEventError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SubmitEventError::Disconnected),
+        }
+    }
+
+    fn try_recv(&self) -> Option<BackendResponse> {
+        match self.rx.try_recv() {
+            Ok(response) => Some(response),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum KeyframePolicyError {
     ZeroInliers,
@@ -67,10 +516,9 @@ impl std::fmt::Display for KeyframePolicyError {
             KeyframePolicyError::NonPositiveParallax { value } => {
                 write!(f, "parallax threshold must be > 0 (got {value})")
             }
-            KeyframePolicyError::CovisibilityOutOfRange { value } => write!(
-                f,
-                "covisibility ratio must be within [0, 1] (got {value})"
-            ),
+            KeyframePolicyError::CovisibilityOutOfRange { value } => {
+                write!(f, "covisibility ratio must be within [0, 1] (got {value})")
+            }
         }
     }
 }
@@ -253,6 +701,9 @@ pub struct SlamTracker {
     state: TrackerState,
     ba: LocalBundleAdjuster,
     map: SlamMap,
+    map_version: MapVersion,
+    backend: Option<BackendWorker>,
+    backend_stats: BackendStats,
     consecutive_tracking_failures: usize,
 }
 
@@ -267,6 +718,9 @@ impl SlamTracker {
     ) -> Self {
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
+        let backend = config
+            .backend
+            .map(|backend_cfg| BackendWorker::spawn(backend_cfg, intrinsics, config.ba));
         Self {
             superpoint_left,
             superpoint_right,
@@ -277,11 +731,15 @@ impl SlamTracker {
             state: TrackerState::NeedKeyframe,
             ba,
             map: SlamMap::new(),
+            map_version: MapVersion::initial(),
+            backend,
+            backend_stats: BackendStats::default(),
             consecutive_tracking_failures: 0,
         }
     }
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
+        self.drain_backend_responses();
         let tracking = match &self.state {
             TrackerState::NeedKeyframe => None,
             TrackerState::Tracking {
@@ -299,6 +757,89 @@ impl SlamTracker {
 
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
         self.map.covisibility_snapshot()
+    }
+
+    pub fn backend_stats(&self) -> BackendStats {
+        self.backend_stats
+    }
+
+    fn bump_map_version(&mut self) {
+        self.map_version = self.map_version.next();
+    }
+
+    fn submit_backend_event(
+        &mut self,
+        trigger_keyframe: KeyframeId,
+        window_ids: Vec<KeyframeId>,
+    ) -> Result<(), SubmitEventError> {
+        let Some(worker) = self.backend.as_mut() else {
+            return Err(SubmitEventError::Disconnected);
+        };
+
+        let window = BackendWindow::try_new(window_ids).map_err(SubmitEventError::InvalidWindow)?;
+        let request_id = worker.next_request_id();
+        let event = KeyframeEvent::try_new(
+            request_id,
+            self.map_version,
+            trigger_keyframe,
+            window,
+            self.map.clone(),
+        )
+        .map_err(SubmitEventError::InvalidEvent)?;
+        worker.try_submit(event)?;
+        self.backend_stats.submitted = self.backend_stats.submitted.saturating_add(1);
+        Ok(())
+    }
+
+    fn drain_backend_responses(&mut self) {
+        loop {
+            let response = {
+                let Some(worker) = self.backend.as_ref() else {
+                    return;
+                };
+                worker.try_recv()
+            };
+
+            let Some(response) = response else {
+                break;
+            };
+            match response {
+                BackendResponse::Correction(correction) => {
+                    match apply_correction_event(&mut self.map, self.map_version, &correction) {
+                        Ok(()) => {
+                            self.bump_map_version();
+                            self.backend_stats.applied =
+                                self.backend_stats.applied.saturating_add(1);
+                        }
+                        Err(ApplyCorrectionError::StaleVersion { .. }) => {
+                            self.backend_stats.stale = self.backend_stats.stale.saturating_add(1);
+                        }
+                        Err(err) => {
+                            self.backend_stats.rejected =
+                                self.backend_stats.rejected.saturating_add(1);
+                            eprintln!(
+                                "backend correction rejected (req={}, keyframe={:?}): {err}",
+                                correction.request_id.as_u64(),
+                                correction.trigger_keyframe
+                            );
+                        }
+                    }
+                }
+                BackendResponse::Failure {
+                    request_id,
+                    map_version,
+                    error,
+                } => {
+                    self.backend_stats.worker_failures =
+                        self.backend_stats.worker_failures.saturating_add(1);
+                    eprintln!(
+                        "backend worker failure (req={}, version={}): {error}",
+                        request_id.as_u64(),
+                        map_version.as_u64()
+                    );
+                }
+            }
+        }
     }
 
     fn tracking_failure_health(&mut self) -> TrackingHealth {
@@ -342,7 +883,11 @@ impl SlamTracker {
 
         let verified = match matches.with_landmarks(keyframe) {
             Ok(verified) => verified,
-            Err(err) => return Err(TrackerError::Inference(InferenceError::Domain(format!("{err:?}")))),
+            Err(err) => {
+                return Err(TrackerError::Inference(InferenceError::Domain(format!(
+                    "{err:?}"
+                ))));
+            }
         };
 
         let observations = match build_map_observations(
@@ -361,7 +906,7 @@ impl SlamTracker {
                     stereo_matches: None,
                     frame_id,
                     health: self.tracking_failure_health(),
-                })
+                });
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
@@ -376,21 +921,18 @@ impl SlamTracker {
                     stereo_matches: None,
                     frame_id,
                     health: self.tracking_failure_health(),
-                })
+                });
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
         let mut map_observations = Vec::with_capacity(result.inliers.len());
         for &idx in &result.inliers {
-            let (ci, ki) = *verified
-                .indices()
-                .get(idx)
-                .ok_or_else(|| {
-                    TrackerError::Inference(InferenceError::Domain(
-                        "verified match index out of bounds".to_string(),
-                    ))
-                })?;
+            let (ci, ki) = *verified.indices().get(idx).ok_or_else(|| {
+                TrackerError::Inference(InferenceError::Domain(
+                    "verified match index out of bounds".to_string(),
+                ))
+            })?;
             let pixel = *current.keypoints().get(ci).ok_or_else(|| {
                 TrackerError::Inference(InferenceError::Domain(
                     "current keypoint index out of bounds".to_string(),
@@ -424,10 +966,11 @@ impl SlamTracker {
             health: TrackingHealth::Good,
         };
 
-        let should_refresh = self
-            .config
-            .keyframe_policy
-            .should_refresh(result.inliers.len(), parallax_px, covisibility);
+        let should_refresh = self.config.keyframe_policy.should_refresh(
+            result.inliers.len(),
+            parallax_px,
+            covisibility,
+        );
 
         if should_refresh {
             let new_pose = pose_world;
@@ -443,16 +986,49 @@ impl SlamTracker {
                     let redundant = self
                         .config
                         .redundancy
-                        .map(|policy| is_redundant(&self.map, keyframe_id, policy.max_covisibility()))
+                        .map(|policy| {
+                            is_redundant(&self.map, keyframe_id, policy.max_covisibility())
+                        })
                         .transpose()?
                         .unwrap_or(false);
                     if redundant {
                         let _ = self.map.remove_keyframe(keyframe_id);
+                        self.bump_map_version();
                     } else {
                         let window = self
                             .map
                             .covisible_window(keyframe_id, self.ba.window_size())?;
-                        let _ = self.ba.optimize_keyframe_window(&mut self.map, &window);
+                        if self.backend.is_some() {
+                            if let Err(err) = self.submit_backend_event(keyframe_id, window.clone())
+                            {
+                                match err {
+                                    SubmitEventError::QueueFull => {
+                                        self.backend_stats.dropped_full =
+                                            self.backend_stats.dropped_full.saturating_add(1);
+                                    }
+                                    SubmitEventError::Disconnected => {
+                                        self.backend_stats.dropped_disconnected = self
+                                            .backend_stats
+                                            .dropped_disconnected
+                                            .saturating_add(1);
+                                        self.backend = None;
+                                    }
+                                    SubmitEventError::InvalidWindow(_)
+                                    | SubmitEventError::InvalidEvent(_) => {
+                                        self.backend_stats.rejected =
+                                            self.backend_stats.rejected.saturating_add(1);
+                                    }
+                                }
+                                eprintln!(
+                                    "backend submit failed for keyframe {keyframe_id:?}: {err}"
+                                );
+                                if self.ba.optimize_keyframe_window(&mut self.map, &window) {
+                                    self.bump_map_version();
+                                }
+                            }
+                        } else if self.ba.optimize_keyframe_window(&mut self.map, &window) {
+                            self.bump_map_version();
+                        }
                         self.state = TrackerState::Tracking {
                             keyframe: keyframe.clone(),
                             keyframe_id,
@@ -494,14 +1070,14 @@ impl SlamTracker {
         })
     }
 
-fn create_keyframe_internal(
-    &mut self,
-    left: Frame,
-    right: Frame,
-    pose_world: Pose,
-    left_det: Option<Arc<Detections>>,
-    shared: Option<SharedMatches>,
-) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
+    fn create_keyframe_internal(
+        &mut self,
+        left: Frame,
+        right: Frame,
+        pose_world: Pose,
+        left_det: Option<Arc<Detections>>,
+        shared: Option<SharedMatches>,
+    ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
 
@@ -567,6 +1143,7 @@ fn create_keyframe_internal(
             pose_world,
             shared.as_ref(),
         )?;
+        self.bump_map_version();
 
         Ok((
             TrackerOutput {
@@ -589,11 +1166,8 @@ fn insert_keyframe_into_map(
     pose_world: Pose,
     shared: Option<&SharedMatches>,
 ) -> Result<KeyframeId, TrackerError> {
-    let keyframe_id = map.add_keyframe_from_detections(
-        keyframe.detections().as_ref(),
-        timestamp,
-        pose_world,
-    )?;
+    let keyframe_id =
+        map.add_keyframe_from_detections(keyframe.detections().as_ref(), timestamp, pose_world)?;
 
     if let Some(shared) = shared {
         for &(current_idx, old_idx) in &shared.pairs {
@@ -675,6 +1249,67 @@ fn is_redundant(
     Ok(false)
 }
 
+fn collect_window_points(
+    map: &SlamMap,
+    window: &BackendWindow,
+) -> Result<Vec<MapPointId>, CorrectionBuildError> {
+    let mut points = Vec::new();
+    let mut seen = HashSet::new();
+    for &keyframe_id in window.as_slice() {
+        let keyframe = map
+            .keyframe(keyframe_id)
+            .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
+        for index in 0..keyframe.len() {
+            let keypoint_ref = map
+                .keyframe_keypoint(keyframe_id, index)
+                .map_err(|_| CorrectionBuildError::MissingKeyframe { keyframe_id })?;
+            let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
+                continue;
+            };
+            if seen.insert(point_id) {
+                points.push(point_id);
+            }
+        }
+    }
+    Ok(points)
+}
+
+fn apply_correction_event(
+    map: &mut SlamMap,
+    current_version: MapVersion,
+    correction: &CorrectionEvent,
+) -> Result<(), ApplyCorrectionError> {
+    if correction.map_version != current_version {
+        return Err(ApplyCorrectionError::StaleVersion {
+            current: current_version,
+            correction: correction.map_version,
+        });
+    }
+
+    for pose_correction in &correction.pose_corrections {
+        if map.keyframe(pose_correction.keyframe_id).is_none() {
+            return Err(ApplyCorrectionError::MissingKeyframe {
+                keyframe_id: pose_correction.keyframe_id,
+            });
+        }
+    }
+    for landmark_correction in &correction.landmark_corrections {
+        if map.point(landmark_correction.point_id).is_none() {
+            return Err(ApplyCorrectionError::MissingMapPoint {
+                point_id: landmark_correction.point_id,
+            });
+        }
+    }
+
+    for pose_correction in &correction.pose_corrections {
+        map.set_keyframe_pose(pose_correction.keyframe_id, pose_correction.pose)?;
+    }
+    for landmark_correction in &correction.landmark_corrections {
+        map.set_map_point_position(landmark_correction.point_id, landmark_correction.position)?;
+    }
+    Ok(())
+}
+
 fn build_map_observations(
     map: &SlamMap,
     keyframe_id: KeyframeId,
@@ -722,10 +1357,40 @@ fn build_map_observations(
 mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
-    use crate::{Detections, Descriptor, Keypoint, SensorId, Point3, Timestamp};
+    use crate::{Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
+    }
+
+    fn make_map_with_single_point() -> (SlamMap, KeyframeId, MapPointId) {
+        let detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            320,
+            240,
+            vec![Keypoint { x: 100.0, y: 80.0 }],
+            vec![1.0],
+            vec![make_descriptor()],
+        )
+        .expect("detections");
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe_from_detections(&detections, Timestamp::from_nanos(1), Pose::identity())
+            .expect("keyframe");
+        let keypoint = map.keyframe_keypoint(keyframe_id, 0).expect("keypoint ref");
+        let point_id = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                keypoint,
+            )
+            .expect("map point");
+        (map, keyframe_id, point_id)
     }
 
     #[test]
@@ -750,8 +1415,16 @@ mod tests {
         .expect("detections");
 
         let landmarks = vec![
-            Point3 { x: 0.0, y: 0.0, z: 1.0 },
-            Point3 { x: 1.0, y: 0.0, z: 1.5 },
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            Point3 {
+                x: 1.0,
+                y: 0.0,
+                z: 1.5,
+            },
         ];
         let landmark_indices = vec![0, 2];
         let keyframe = Arc::new(
@@ -781,15 +1454,93 @@ mod tests {
                 .expect("map lookup")
                 .expect("point id");
             let point = map.point(point_id).expect("point");
-            let landmark = keyframe
-                .landmark_for_detection(det_idx)
-                .expect("landmark");
+            let landmark = keyframe.landmark_for_detection(det_idx).expect("landmark");
             let Point3 { x, y, z } = point.position();
             assert_eq!(x, landmark.x);
             assert_eq!(y, landmark.y);
             assert_eq!(z, landmark.z);
         }
         assert_map_invariants(&map).expect("final invariants");
+    }
+
+    #[test]
+    fn backend_window_enforces_non_empty_unique_keyframes() {
+        let duplicate = KeyframeId::default();
+        assert!(matches!(
+            BackendWindow::try_new(vec![duplicate]),
+            Err(BackendWindowError::TooFewKeyframes { .. })
+        ));
+        assert!(matches!(
+            BackendWindow::try_new(vec![duplicate, duplicate]),
+            Err(BackendWindowError::DuplicateKeyframe { .. })
+        ));
+    }
+
+    #[test]
+    fn correction_apply_rejects_stale_version() {
+        let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
+            map_version: MapVersion::initial(),
+            trigger_keyframe: keyframe_id,
+            pose_corrections: vec![PoseCorrection {
+                keyframe_id,
+                pose: Pose::identity(),
+            }],
+            landmark_corrections: vec![LandmarkCorrection {
+                point_id,
+                position: Point3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
+            }],
+        };
+        let stale = MapVersion::initial().next();
+        assert!(matches!(
+            apply_correction_event(&mut map, stale, &correction),
+            Err(ApplyCorrectionError::StaleVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn correction_apply_updates_pose_and_landmark_atomically() {
+        let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        let corrected_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 0.999, -0.01], [0.0, 0.01, 0.999]],
+            [0.2, -0.1, 0.05],
+        );
+        let corrected_point = Point3 {
+            x: 0.4,
+            y: -0.3,
+            z: 2.1,
+        };
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
+            map_version: MapVersion::initial(),
+            trigger_keyframe: keyframe_id,
+            pose_corrections: vec![PoseCorrection {
+                keyframe_id,
+                pose: corrected_pose,
+            }],
+            landmark_corrections: vec![LandmarkCorrection {
+                point_id,
+                position: corrected_point,
+            }],
+        };
+
+        apply_correction_event(&mut map, MapVersion::initial(), &correction)
+            .expect("correction apply");
+        assert_map_invariants(&map).expect("post-correction invariants");
+
+        let stored_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        assert_eq!(stored_pose.translation(), corrected_pose.translation());
+        assert_eq!(stored_pose.rotation(), corrected_pose.rotation());
+
+        let stored_point = map.point(point_id).expect("map point").position();
+        assert_eq!(stored_point.x, corrected_point.x);
+        assert_eq!(stored_point.y, corrected_point.y);
+        assert_eq!(stored_point.z, corrected_point.z);
     }
 }
 
