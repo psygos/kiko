@@ -3,7 +3,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 use slotmap::{new_key_type, SlotMap};
 
-use crate::{Descriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
+use crate::{CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
 
 new_key_type! {
     pub struct MapPointId;
@@ -107,7 +107,7 @@ impl DescriptorBlend {
 #[derive(Clone, Debug)]
 pub struct MapPoint {
     position: Point3,
-    descriptor: Descriptor,
+    descriptor: CompactDescriptor,
     observations: Vec<KeyframeKeypoint>,
 }
 
@@ -116,7 +116,7 @@ impl MapPoint {
         self.position
     }
 
-    pub fn descriptor(&self) -> &Descriptor {
+    pub fn descriptor(&self) -> &CompactDescriptor {
         &self.descriptor
     }
 
@@ -145,13 +145,16 @@ impl MapPoint {
         before != self.observations.len()
     }
 
-    fn update_descriptor(&mut self, new_desc: &Descriptor, blend: DescriptorBlend) {
-        let alpha = blend.alpha();
-        let inv = 1.0 - alpha;
+    fn update_descriptor(&mut self, new_desc: &CompactDescriptor, blend: DescriptorBlend) {
+        // Use fixed-point blending so descriptor updates stay bounded and deterministic.
+        let alpha_scaled = (blend.alpha() * 256.0).round().clamp(1.0, 256.0) as u16;
+        let inv_scaled = 256u16.saturating_sub(alpha_scaled);
         for i in 0..256 {
-            self.descriptor.0[i] = self.descriptor.0[i] * inv + new_desc.0[i] * alpha;
+            let prev = self.descriptor.0[i] as u32;
+            let next = new_desc.0[i] as u32;
+            let mixed = prev * inv_scaled as u32 + next * alpha_scaled as u32;
+            self.descriptor.0[i] = ((mixed + 128) / 256) as u8;
         }
-        normalize_descriptor(&mut self.descriptor);
     }
 
     fn set_position(&mut self, pos: Point3) {
@@ -539,7 +542,7 @@ impl SlamMap {
     pub fn add_map_point(
         &mut self,
         position: Point3,
-        descriptor: Descriptor,
+        descriptor: CompactDescriptor,
         first_obs: KeyframeKeypoint,
     ) -> Result<MapPointId, MapError> {
         let entry = self
@@ -559,11 +562,9 @@ impl SlamMap {
             });
         }
 
-        let mut desc = descriptor;
-        normalize_descriptor(&mut desc);
         let point_id = self.points.insert(MapPoint {
             position,
-            descriptor: desc,
+            descriptor,
             observations: vec![first_obs],
         });
 
@@ -631,7 +632,7 @@ impl SlamMap {
     pub fn update_map_point_descriptor(
         &mut self,
         point_id: MapPointId,
-        new_desc: &Descriptor,
+        new_desc: &CompactDescriptor,
         blend: DescriptorBlend,
     ) -> Result<(), MapError> {
         let point = self
@@ -881,16 +882,6 @@ impl Default for SlamMap {
     }
 }
 
-fn normalize_descriptor(desc: &mut Descriptor) {
-    let norm_sq: f32 = desc.0.iter().map(|x| x * x).sum();
-    if norm_sq > 0.0 {
-        let inv_norm = 1.0 / norm_sq.sqrt();
-        for v in &mut desc.0 {
-            *v *= inv_norm;
-        }
-    }
-}
-
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum MapInvariantError {
@@ -951,10 +942,6 @@ pub(crate) enum MapInvariantError {
         keyframe_id: KeyframeId,
         index: usize,
         found: Option<MapPointId>,
-    },
-    DescriptorNotNormalized {
-        point_id: MapPointId,
-        norm: f32,
     },
     CovisibilitySelfEdge {
         keyframe_id: KeyframeId,
@@ -1071,10 +1058,6 @@ impl std::fmt::Display for MapInvariantError {
             } => write!(
                 f,
                 "map point backref mismatch: point={point_id:?}, keyframe={keyframe_id:?}, index={index}, found={found:?}"
-            ),
-            MapInvariantError::DescriptorNotNormalized { point_id, norm } => write!(
-                f,
-                "map point descriptor not normalized: point={point_id:?}, norm={norm}"
             ),
             MapInvariantError::CovisibilitySelfEdge { keyframe_id } => {
                 write!(
@@ -1220,14 +1203,6 @@ pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantErr
             }
         }
 
-        let desc_norm = point.descriptor.0.iter().map(|v| v * v).sum::<f32>().sqrt();
-        if desc_norm > 1e-6 && (desc_norm - 1.0).abs() > 1e-3 {
-            return Err(MapInvariantError::DescriptorNotNormalized {
-                point_id,
-                norm: desc_norm,
-            });
-        }
-
         for i in 0..point.observations.len() {
             for j in (i + 1)..point.observations.len() {
                 let a = point.observations[i].keyframe_id;
@@ -1289,7 +1264,7 @@ pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Keypoint, Pose, Timestamp};
+    use crate::{CompactDescriptor, Keypoint, Pose, Timestamp};
 
     fn make_keypoints(n: usize) -> Vec<Keypoint> {
         (0..n)
@@ -1300,8 +1275,78 @@ mod tests {
             .collect()
     }
 
-    fn make_descriptor() -> Descriptor {
-        Descriptor([1.0; 256])
+    fn make_descriptor() -> CompactDescriptor {
+        CompactDescriptor([128; 256])
+    }
+
+    #[test]
+    fn descriptor_blend_uses_u8_weighted_average() {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let pose = Pose::identity();
+        let kf = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                pose,
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe");
+        let kp = map.keyframe_keypoint(kf, 0).expect("keypoint");
+        let point_id = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                CompactDescriptor([0; 256]),
+                kp,
+            )
+            .expect("point");
+
+        let blend = DescriptorBlend::try_new(0.25).expect("blend");
+        map.update_map_point_descriptor(point_id, &CompactDescriptor([255; 256]), blend)
+            .expect("update");
+        let stored = map.point(point_id).expect("point").descriptor();
+        assert_eq!(stored.0[0], 64);
+        assert_eq!(stored.0[255], 64);
+    }
+
+    #[test]
+    fn descriptor_update_preserves_map_invariants() {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let pose = Pose::identity();
+        let kf = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                pose,
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe");
+        let kp = map.keyframe_keypoint(kf, 0).expect("keypoint");
+        let point_id = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                CompactDescriptor([10; 256]),
+                kp,
+            )
+            .expect("point");
+        map.update_map_point_descriptor(
+            point_id,
+            &CompactDescriptor([240; 256]),
+            DescriptorBlend::try_new(0.5).expect("blend"),
+        )
+        .expect("update");
+        assert_map_invariants(&map).expect("invariants");
     }
 
     #[test]

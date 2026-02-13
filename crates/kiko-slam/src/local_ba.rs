@@ -1607,7 +1607,7 @@ mod tests {
                 z: point_true.z + ((idx % 2) as f32 - 0.5) * 0.040,
             };
             let point_id = map
-                .add_map_point(noisy_point, descriptor, kp_0)
+                .add_map_point(noisy_point, descriptor.quantize(), kp_0)
                 .expect("insert map point");
             map.add_observation(point_id, kp_1)
                 .expect("add shared observation");
@@ -1978,7 +1978,7 @@ mod tests {
                 z: point_true.z + ((idx % 2) as f32 - 0.5) * 0.040,
             };
             let point_id = map
-                .add_map_point(noisy_point, descriptor, kp_0)
+                .add_map_point(noisy_point, descriptor.quantize(), kp_0)
                 .expect("insert map point");
             map.add_observation(point_id, kp_1)
                 .expect("add shared observation");

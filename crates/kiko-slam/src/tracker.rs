@@ -1197,7 +1197,7 @@ fn insert_keyframe_into_map(
         if map.map_point_for_keypoint(keypoint_ref)?.is_some() {
             continue;
         }
-        let descriptor = keyframe.detections().descriptors()[det_idx];
+        let descriptor = keyframe.detections().descriptors()[det_idx].quantize();
         let world = camera_to_world(pose_world, *landmark);
         map.add_map_point(world, descriptor, keypoint_ref)?;
     }
@@ -1386,7 +1386,7 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor(),
+                make_descriptor().quantize(),
                 keypoint,
             )
             .expect("map point");
