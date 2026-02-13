@@ -373,9 +373,209 @@ fn perturb_axis(axis: usize, magnitude: f64, right_jacobian: [[f64; 3]; 3]) -> [
     delta
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PoseGraphConfig {
+    pub max_iterations: usize,
+    pub pcg_max_iters: usize,
+    pub pcg_tol: f64,
+    pub huber_delta: f64,
+}
+
+impl Default for PoseGraphConfig {
+    fn default() -> Self {
+        Self {
+            max_iterations: 20,
+            pcg_max_iters: 100,
+            pcg_tol: 1e-6,
+            huber_delta: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PoseGraphResult {
+    pub corrected_poses: Vec<Pose64>,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoseGraphOptimizer {
+    config: PoseGraphConfig,
+}
+
+impl PoseGraphOptimizer {
+    pub fn new(config: PoseGraphConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn optimize(&self, edges: &[PoseGraphEdge], initial_poses: &mut [Pose64]) -> PoseGraphResult {
+        let nposes = initial_poses.len();
+        if nposes == 0 {
+            return PoseGraphResult {
+                corrected_poses: Vec::new(),
+                iterations: 0,
+                converged: true,
+            };
+        }
+
+        let mut poses = initial_poses.to_vec();
+        let mut converged = false;
+        let mut iters_run = 0;
+
+        for iter in 0..self.config.max_iterations {
+            iters_run = iter + 1;
+            let mut h = BlockCsr6x6::new(nposes);
+            let mut b = vec![0.0_f64; nposes * 6];
+
+            for edge in edges {
+                if edge.from >= nposes || edge.to >= nposes {
+                    continue;
+                }
+                let error = compute_edge_error(edge, &poses);
+                let (j_from, j_to) = compute_edge_jacobians(edge, &poses);
+                let e_norm = error.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let weight = huber_weight(e_norm, self.config.huber_delta);
+                let mut information = edge.information;
+                for row in &mut information {
+                    for value in row {
+                        *value *= weight;
+                    }
+                }
+
+                let h_ff = jt_info_j(j_from, information, j_from);
+                let h_ft = jt_info_j(j_from, information, j_to);
+                let h_tf = jt_info_j(j_to, information, j_from);
+                let h_tt = jt_info_j(j_to, information, j_to);
+                h.add_to(edge.from, edge.from, h_ff);
+                h.add_to(edge.from, edge.to, h_ft);
+                h.add_to(edge.to, edge.from, h_tf);
+                h.add_to(edge.to, edge.to, h_tt);
+
+                let g_from = jt_info_vec(j_from, information, error);
+                let g_to = jt_info_vec(j_to, information, error);
+                for k in 0..6 {
+                    b[edge.from * 6 + k] += g_from[k];
+                    b[edge.to * 6 + k] += g_to[k];
+                }
+            }
+
+            // Anchor the first pose to remove gauge freedom.
+            h.add_to(0, 0, scaled_identity6(1e9));
+            for v in b.iter_mut().take(6) {
+                *v = 0.0;
+            }
+
+            let rhs: Vec<f64> = b.into_iter().map(|v| -v).collect();
+            let mut delta = vec![0.0_f64; nposes * 6];
+            let _pcg = solve_pcg(
+                &h,
+                &rhs,
+                &mut delta,
+                self.config.pcg_max_iters,
+                self.config.pcg_tol,
+            );
+
+            let mut max_step = 0.0_f64;
+            for (pose_idx, pose) in poses.iter_mut().enumerate().skip(1) {
+                let base = pose_idx * 6;
+                let mut xi = [
+                    delta[base],
+                    delta[base + 1],
+                    delta[base + 2],
+                    delta[base + 3],
+                    delta[base + 4],
+                    delta[base + 5],
+                ];
+                let mut step_norm = xi.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if !step_norm.is_finite() {
+                    continue;
+                }
+                if step_norm > 1.0 {
+                    let scale = 1.0 / step_norm;
+                    for v in &mut xi {
+                        *v *= scale;
+                    }
+                    step_norm = 1.0;
+                }
+                max_step = max_step.max(step_norm);
+                *pose = se3_exp_f64(xi).compose(*pose);
+            }
+
+            if max_step < 1e-6 {
+                converged = true;
+                break;
+            }
+        }
+
+        initial_poses.copy_from_slice(&poses);
+        PoseGraphResult {
+            corrected_poses: poses,
+            iterations: iters_run,
+            converged,
+        }
+    }
+}
+
+fn huber_weight(norm: f64, delta: f64) -> f64 {
+    if norm <= delta || norm <= 1e-12 {
+        1.0
+    } else {
+        delta / norm
+    }
+}
+
+fn jt_info_j(a: [[f64; 6]; 6], info: [[f64; 6]; 6], b: [[f64; 6]; 6]) -> [[f64; 6]; 6] {
+    let mut info_b = [[0.0_f64; 6]; 6];
+    for row in 0..6 {
+        for col in 0..6 {
+            for k in 0..6 {
+                info_b[row][col] += info[row][k] * b[k][col];
+            }
+        }
+    }
+
+    let mut out = [[0.0_f64; 6]; 6];
+    for row in 0..6 {
+        for col in 0..6 {
+            for k in 0..6 {
+                out[row][col] += a[k][row] * info_b[k][col];
+            }
+        }
+    }
+    out
+}
+
+fn jt_info_vec(j: [[f64; 6]; 6], info: [[f64; 6]; 6], e: [f64; 6]) -> [f64; 6] {
+    let mut info_e = [0.0_f64; 6];
+    for row in 0..6 {
+        for col in 0..6 {
+            info_e[row] += info[row][col] * e[col];
+        }
+    }
+    let mut out = [0.0_f64; 6];
+    for row in 0..6 {
+        for k in 0..6 {
+            out[row] += j[k][row] * info_e[k];
+        }
+    }
+    out
+}
+
+fn scaled_identity6(scale: f64) -> [[f64; 6]; 6] {
+    let mut out = [[0.0_f64; 6]; 6];
+    for (i, row) in out.iter_mut().enumerate() {
+        row[i] = scale;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, PoseGraphEdge};
+    use super::{
+        compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, PoseGraphConfig,
+        PoseGraphEdge, PoseGraphOptimizer,
+    };
     use crate::math::se3_exp_f64;
     use crate::Pose64;
 
@@ -542,6 +742,104 @@ mod tests {
             for col in 0..6 {
                 assert!(j_from[row][col].is_finite(), "non-finite J_from entry");
                 assert!(j_to[row][col].is_finite(), "non-finite J_to entry");
+            }
+        }
+    }
+
+    fn edge(from: usize, to: usize, from_pose: Pose64, to_pose: Pose64) -> PoseGraphEdge {
+        let measurement = from_pose.inverse().compose(to_pose);
+        PoseGraphEdge {
+            from,
+            to,
+            measurement,
+            information: scalar_block(1.0),
+        }
+    }
+
+    fn translation_error(poses: &[Pose64], target: &[Pose64]) -> f64 {
+        poses
+            .iter()
+            .zip(target.iter())
+            .map(|(a, b)| {
+                let dx = a.translation[0] - b.translation[0];
+                let dy = a.translation[1] - b.translation[1];
+                let dz = a.translation[2] - b.translation[2];
+                (dx * dx + dy * dy + dz * dz).sqrt()
+            })
+            .sum::<f64>()
+            / poses.len() as f64
+    }
+
+    #[test]
+    fn pose_graph_optimizer_ring_graph_converges() {
+        let gt = vec![
+            Pose64::identity(),
+            se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            se3_exp_f64([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            se3_exp_f64([3.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+        let edges = vec![
+            edge(0, 1, gt[0], gt[1]),
+            edge(1, 2, gt[1], gt[2]),
+            edge(2, 3, gt[2], gt[3]),
+            edge(3, 0, gt[3], gt[0]),
+        ];
+        let mut initial = vec![
+            gt[0],
+            se3_exp_f64([1.2, 0.1, 0.0, 0.0, 0.01, 0.0]),
+            se3_exp_f64([2.3, -0.2, 0.1, 0.0, -0.02, 0.0]),
+            se3_exp_f64([3.4, 0.2, -0.1, 0.0, 0.01, 0.0]),
+        ];
+        let before = translation_error(&initial, &gt);
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+        let result = optimizer.optimize(&edges, &mut initial);
+        let after = translation_error(&result.corrected_poses, &gt);
+        assert!(result.converged || result.iterations > 0);
+        assert!(after < before, "ring graph did not improve: before={before}, after={after}");
+    }
+
+    #[test]
+    fn pose_graph_optimizer_loop_closure_reduces_drift() {
+        let gt = vec![
+            Pose64::identity(),
+            se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            se3_exp_f64([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+        let edges = vec![
+            edge(0, 1, gt[0], gt[1]),
+            edge(1, 2, gt[1], gt[2]),
+            edge(0, 2, gt[0], gt[2]),
+        ];
+        let mut initial = vec![
+            gt[0],
+            se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            se3_exp_f64([2.7, 0.4, 0.0, 0.0, 0.03, 0.0]),
+        ];
+        let before = translation_error(&initial, &gt);
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+        let result = optimizer.optimize(&edges, &mut initial);
+        let after = translation_error(&result.corrected_poses, &gt);
+        assert!(after < before, "loop closure did not reduce drift");
+    }
+
+    #[test]
+    fn pose_graph_optimizer_keeps_anchor_pose_fixed() {
+        let gt = vec![
+            Pose64::identity(),
+            se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ];
+        let edges = vec![edge(0, 1, gt[0], gt[1])];
+        let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
+        let anchor_before = initial[0];
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+        let result = optimizer.optimize(&edges, &mut initial);
+        let anchor_after = result.corrected_poses[0];
+        for i in 0..3 {
+            assert!((anchor_before.translation[i] - anchor_after.translation[i]).abs() < 1e-12);
+            for j in 0..3 {
+                assert!(
+                    (anchor_before.rotation[i][j] - anchor_after.rotation[i][j]).abs() < 1e-12
+                );
             }
         }
     }
