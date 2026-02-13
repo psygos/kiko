@@ -1,8 +1,9 @@
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::{
-    math, Observation, PinholeIntrinsics, Pose, Keypoint,
-    map::{KeyframeId, KeyframeKeypoint, SlamMap},
+    map::{KeyframeId, KeyframeKeypoint, MapPointId, SlamMap},
+    math, Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -34,22 +35,18 @@ impl std::fmt::Display for LocalBaConfigError {
             LocalBaConfigError::ZeroObservations => {
                 write!(f, "local BA min observations must be > 0")
             }
-            LocalBaConfigError::TooFewObservations { min } => write!(
-                f,
-                "local BA min observations must be >= {min}"
-            ),
-            LocalBaConfigError::NonPositiveHuber { value } => write!(
-                f,
-                "local BA huber delta must be > 0 (got {value})"
-            ),
-            LocalBaConfigError::NegativeDamping { value } => write!(
-                f,
-                "local BA damping must be >= 0 (got {value})"
-            ),
-            LocalBaConfigError::NegativeMotionWeight { value } => write!(
-                f,
-                "local BA motion prior weight must be >= 0 (got {value})"
-            ),
+            LocalBaConfigError::TooFewObservations { min } => {
+                write!(f, "local BA min observations must be >= {min}")
+            }
+            LocalBaConfigError::NonPositiveHuber { value } => {
+                write!(f, "local BA huber delta must be > 0 (got {value})")
+            }
+            LocalBaConfigError::NegativeDamping { value } => {
+                write!(f, "local BA damping must be >= 0 (got {value})")
+            }
+            LocalBaConfigError::NegativeMotionWeight { value } => {
+                write!(f, "local BA motion prior weight must be >= 0 (got {value})")
+            }
         }
     }
 }
@@ -123,10 +120,7 @@ impl LocalBaConfig {
 
 #[derive(Debug)]
 pub enum ObservationSetError {
-    TooFew {
-        required: usize,
-        actual: usize,
-    },
+    TooFew { required: usize, actual: usize },
 }
 
 impl std::fmt::Display for ObservationSetError {
@@ -205,7 +199,9 @@ impl ObservationSet {
         if resolved.len() < min_required.get() {
             return None;
         }
-        Some(ResolvedObservationSet { observations: resolved })
+        Some(ResolvedObservationSet {
+            observations: resolved,
+        })
     }
 }
 
@@ -224,6 +220,277 @@ impl ResolvedObservationSet {
 struct BaFrame {
     pose: Pose,
     observations: ObservationSet,
+}
+
+#[derive(Debug)]
+enum FullBaBuildError {
+    EmptyWindow,
+    DuplicateKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    MissingKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    TooFewKeyframes {
+        required: usize,
+        actual: usize,
+    },
+    DuplicateLandmarkObservation {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+    },
+    NoLandmarks,
+    PoseHasTooFewObservations {
+        keyframe_id: KeyframeId,
+        required: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for FullBaBuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FullBaBuildError::EmptyWindow => write!(f, "full BA window is empty"),
+            FullBaBuildError::DuplicateKeyframe { keyframe_id } => {
+                write!(f, "full BA window has duplicate keyframe {keyframe_id:?}")
+            }
+            FullBaBuildError::MissingKeyframe { keyframe_id } => {
+                write!(
+                    f,
+                    "full BA window references missing keyframe {keyframe_id:?}"
+                )
+            }
+            FullBaBuildError::TooFewKeyframes { required, actual } => {
+                write!(
+                    f,
+                    "full BA requires at least {required} keyframes, got {actual}"
+                )
+            }
+            FullBaBuildError::DuplicateLandmarkObservation {
+                point_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "landmark {point_id:?} has duplicate observation in keyframe {keyframe_id:?}"
+            ),
+            FullBaBuildError::NoLandmarks => {
+                write!(f, "full BA window has no optimizable landmarks")
+            }
+            FullBaBuildError::PoseHasTooFewObservations {
+                keyframe_id,
+                required,
+                actual,
+            } => write!(
+                f,
+                "keyframe {keyframe_id:?} has too few BA observations: required={required}, actual={actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FullBaBuildError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct PoseVarIndex(usize);
+
+impl PoseVarIndex {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+
+    fn offset6(self) -> usize {
+        self.0 * 6
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct LandmarkVarIndex(usize);
+
+impl LandmarkVarIndex {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoseVariable {
+    keyframe_id: KeyframeId,
+    pose: Pose,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LandmarkVariable {
+    point_id: MapPointId,
+    position: Point3,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ReprojectionFactor {
+    pose: PoseVarIndex,
+    landmark: LandmarkVarIndex,
+    pixel: Keypoint,
+}
+
+#[derive(Debug)]
+struct FullBaProblem {
+    poses: Vec<PoseVariable>,
+    landmarks: Vec<LandmarkVariable>,
+    factors: Vec<ReprojectionFactor>,
+}
+
+impl FullBaProblem {
+    fn try_from_map(
+        map: &SlamMap,
+        requested_window: &[KeyframeId],
+        max_window: NonZeroUsize,
+        min_observations: NonZeroUsize,
+    ) -> Result<Self, FullBaBuildError> {
+        if requested_window.is_empty() {
+            return Err(FullBaBuildError::EmptyWindow);
+        }
+
+        let mut poses = Vec::new();
+        let mut seen_keyframes = HashSet::new();
+        for &keyframe_id in requested_window.iter().take(max_window.get()) {
+            if !seen_keyframes.insert(keyframe_id) {
+                return Err(FullBaBuildError::DuplicateKeyframe { keyframe_id });
+            }
+            let entry = map
+                .keyframe(keyframe_id)
+                .ok_or(FullBaBuildError::MissingKeyframe { keyframe_id })?;
+            poses.push(PoseVariable {
+                keyframe_id,
+                pose: entry.pose(),
+            });
+        }
+
+        if poses.len() < 2 {
+            return Err(FullBaBuildError::TooFewKeyframes {
+                required: 2,
+                actual: poses.len(),
+            });
+        }
+
+        let mut pose_lookup = HashMap::new();
+        for (idx, pose) in poses.iter().enumerate() {
+            pose_lookup.insert(pose.keyframe_id, PoseVarIndex(idx));
+        }
+
+        let mut landmarks = Vec::new();
+        let mut factors = Vec::new();
+        let mut pose_counts = vec![0_usize; poses.len()];
+
+        for (point_id, point) in map.points() {
+            let mut local_observations = Vec::new();
+            let mut seen_local_poses = HashSet::new();
+
+            for &obs in point.observations() {
+                let Some(&pose_idx) = pose_lookup.get(&obs.keyframe_id()) else {
+                    continue;
+                };
+                if !seen_local_poses.insert(pose_idx) {
+                    return Err(FullBaBuildError::DuplicateLandmarkObservation {
+                        point_id,
+                        keyframe_id: obs.keyframe_id(),
+                    });
+                }
+                let Ok(pixel) = map.keypoint(obs) else {
+                    continue;
+                };
+                local_observations.push((pose_idx, pixel));
+            }
+
+            if local_observations.len() < 2 {
+                continue;
+            }
+
+            let landmark_idx = LandmarkVarIndex(landmarks.len());
+            landmarks.push(LandmarkVariable {
+                point_id,
+                position: point.position(),
+            });
+
+            for (pose_idx, pixel) in local_observations {
+                pose_counts[pose_idx.as_usize()] += 1;
+                factors.push(ReprojectionFactor {
+                    pose: pose_idx,
+                    landmark: landmark_idx,
+                    pixel,
+                });
+            }
+        }
+
+        if landmarks.is_empty() {
+            return Err(FullBaBuildError::NoLandmarks);
+        }
+
+        for (idx, pose) in poses.iter().enumerate() {
+            if pose_counts[idx] < min_observations.get() {
+                return Err(FullBaBuildError::PoseHasTooFewObservations {
+                    keyframe_id: pose.keyframe_id,
+                    required: min_observations.get(),
+                    actual: pose_counts[idx],
+                });
+            }
+        }
+
+        Ok(Self {
+            poses,
+            landmarks,
+            factors,
+        })
+    }
+
+    fn write_back(self, map: &mut SlamMap) -> bool {
+        for pose in &self.poses {
+            if map.set_keyframe_pose(pose.keyframe_id, pose.pose).is_err() {
+                return false;
+            }
+        }
+        for landmark in &self.landmarks {
+            if map
+                .set_map_point_position(landmark.point_id, landmark.position)
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PoseLandmarkCross {
+    pose: PoseVarIndex,
+    b: [[f32; 3]; 6],
+}
+
+#[derive(Debug, Default)]
+struct LandmarkAccumulator {
+    c: [[f32; 3]; 3],
+    b: [f32; 3],
+    links: Vec<PoseLandmarkCross>,
+}
+
+impl LandmarkAccumulator {
+    fn add_link(&mut self, pose: PoseVarIndex, cross: [[f32; 3]; 6]) {
+        if let Some(existing) = self.links.iter_mut().find(|link| link.pose == pose) {
+            for row in 0..6 {
+                for col in 0..3 {
+                    existing.b[row][col] += cross[row][col];
+                }
+            }
+            return;
+        }
+        self.links.push(PoseLandmarkCross { pose, b: cross });
+    }
+}
+
+#[derive(Debug)]
+struct LandmarkSchur {
+    inv_c: [[f32; 3]; 3],
+    b: [f32; 3],
+    links: Vec<PoseLandmarkCross>,
 }
 
 #[derive(Debug)]
@@ -267,10 +534,7 @@ impl LocalBundleAdjuster {
         pose: Pose,
         observations: ObservationSet,
     ) -> Option<Pose> {
-        self.frames.push(BaFrame {
-            pose,
-            observations,
-        });
+        self.frames.push(BaFrame { pose, observations });
         if self.frames.len() > self.config.window() {
             let excess = self.frames.len() - self.config.window();
             self.frames.drain(0..excess);
@@ -282,61 +546,22 @@ impl LocalBundleAdjuster {
         self.frames.last().map(|frame| frame.pose)
     }
 
-    pub fn optimize_keyframe_window(
-        &mut self,
-        map: &mut SlamMap,
-        window: &[KeyframeId],
-    ) -> bool {
-        let Some((&seed, rest)) = window.split_first() else {
-            return false;
+    pub fn optimize_keyframe_window(&mut self, map: &mut SlamMap, window: &[KeyframeId]) -> bool {
+        let mut problem = match FullBaProblem::try_from_map(
+            map,
+            window,
+            self.config.window,
+            self.config.min_observations,
+        ) {
+            Ok(problem) => problem,
+            Err(_) => return false,
         };
 
-        let seed_obs = match build_keyframe_observations(map, seed, self.min_observations()) {
-            Some(obs) => obs,
-            None => return false,
-        };
-
-        self.frames.clear();
-        let mut selected = Vec::new();
-        if let Some(entry) = map.keyframe(seed) {
-            self.frames.push(BaFrame {
-                pose: entry.pose(),
-                observations: seed_obs,
-            });
-            selected.push(seed);
-        } else {
+        if !self.optimize_full(&mut problem) {
             return false;
         }
 
-        for &kf_id in rest {
-            let Some(entry) = map.keyframe(kf_id) else {
-                continue;
-            };
-            let Some(obs) = build_keyframe_observations(map, kf_id, self.min_observations()) else {
-                continue;
-            };
-            self.frames.push(BaFrame {
-                pose: entry.pose(),
-                observations: obs,
-            });
-            selected.push(kf_id);
-            if self.frames.len() >= self.config.window() {
-                break;
-            }
-        }
-
-        if self.frames.len() < 2 {
-            return false;
-        }
-
-        if !self.optimize(map) {
-            return false;
-        }
-
-        for (kf_id, frame) in selected.iter().zip(self.frames.iter()) {
-            let _ = map.set_keyframe_pose(*kf_id, frame.pose);
-        }
-        true
+        problem.write_back(map)
     }
 
     fn optimize(&mut self, map: &SlamMap) -> bool {
@@ -372,11 +597,7 @@ impl LocalBundleAdjuster {
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
                     {
                         let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                        let weight = if r_norm <= huber {
-                            1.0
-                        } else {
-                            huber / r_norm
-                        };
+                        let weight = if r_norm <= huber { 1.0 } else { huber / r_norm };
                         let scale = weight.sqrt();
                         let r0 = residual[0] * scale;
                         let r1 = residual[1] * scale;
@@ -388,7 +609,7 @@ impl LocalBundleAdjuster {
 
                         for c in 0..6 {
                             let jr = j[0][c] * r0 + j[1][c] * r1;
-                            b[base + c] += jr;
+                            b[base + c] -= jr;
                             for d in 0..6 {
                                 let jt_j = j[0][c] * j[0][d] + j[1][c] * j[1][d];
                                 a[(base + c) * dim + (base + d)] += jt_j;
@@ -414,8 +635,8 @@ impl LocalBundleAdjuster {
 
                     for k in 0..6 {
                         let r = residual[k] * weight;
-                        b[base_prev + k] -= r;
-                        b[base_curr + k] += r;
+                        b[base_prev + k] += r;
+                        b[base_curr + k] -= r;
 
                         let w = weight * weight;
                         a[(base_prev + k) * dim + (base_prev + k)] += w;
@@ -460,19 +681,219 @@ impl LocalBundleAdjuster {
 
         true
     }
-}
 
-fn build_keyframe_observations(
-    map: &SlamMap,
-    keyframe_id: KeyframeId,
-    min_required: NonZeroUsize,
-) -> Option<ObservationSet> {
-    let pairs = map.keyframe_observation_pixels(keyframe_id).ok()?;
-    let observations: Vec<MapObservation> = pairs
-        .into_iter()
-        .map(|(kp_ref, pixel)| MapObservation::new(kp_ref, pixel))
-        .collect();
-    ObservationSet::new(observations, min_required).ok()
+    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> bool {
+        let pose_count = problem.poses.len();
+        let landmark_count = problem.landmarks.len();
+        if pose_count < 2 || landmark_count == 0 || problem.factors.is_empty() {
+            return false;
+        }
+
+        let pose_dim = pose_count * 6;
+        let max_iters = self.config.max_iterations();
+        let huber = self.config.huber_delta_px();
+        let pose_damping = self.config.damping().max(1e-9);
+        let landmark_damping = self.config.damping().max(1e-6);
+        let motion_weight = self.config.motion_prior_weight();
+
+        for _ in 0..max_iters {
+            let s = &mut self.a_buf[..pose_dim * pose_dim];
+            let rhs = &mut self.b_buf[..pose_dim];
+            s.fill(0.0);
+            rhs.fill(0.0);
+
+            let mut landmark_accumulators = (0..landmark_count)
+                .map(|_| LandmarkAccumulator::default())
+                .collect::<Vec<_>>();
+
+            for factor in &problem.factors {
+                let pose_idx = factor.pose;
+                let landmark_idx = factor.landmark;
+                let pose = problem.poses[pose_idx.as_usize()].pose;
+                let point = problem.landmarks[landmark_idx.as_usize()].position;
+
+                let Some((residual, j_pose, j_landmark)) =
+                    reprojection_residual_and_jacobians(pose, point, factor.pixel, self.intrinsics)
+                else {
+                    continue;
+                };
+
+                let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                let weight = if r_norm <= huber { 1.0 } else { huber / r_norm };
+                let scale = weight.sqrt();
+
+                let r_scaled = [residual[0] * scale, residual[1] * scale];
+                let j_pose_scaled = [
+                    [
+                        j_pose[0][0] * scale,
+                        j_pose[0][1] * scale,
+                        j_pose[0][2] * scale,
+                        j_pose[0][3] * scale,
+                        j_pose[0][4] * scale,
+                        j_pose[0][5] * scale,
+                    ],
+                    [
+                        j_pose[1][0] * scale,
+                        j_pose[1][1] * scale,
+                        j_pose[1][2] * scale,
+                        j_pose[1][3] * scale,
+                        j_pose[1][4] * scale,
+                        j_pose[1][5] * scale,
+                    ],
+                ];
+                let j_landmark_scaled = [
+                    [
+                        j_landmark[0][0] * scale,
+                        j_landmark[0][1] * scale,
+                        j_landmark[0][2] * scale,
+                    ],
+                    [
+                        j_landmark[1][0] * scale,
+                        j_landmark[1][1] * scale,
+                        j_landmark[1][2] * scale,
+                    ],
+                ];
+
+                accumulate_pose_hessian(s, pose_dim, pose_idx, j_pose_scaled);
+                accumulate_pose_rhs(rhs, pose_idx, j_pose_scaled, r_scaled);
+
+                let acc = &mut landmark_accumulators[landmark_idx.as_usize()];
+                accumulate_landmark_hessian(&mut acc.c, j_landmark_scaled);
+                accumulate_landmark_rhs(&mut acc.b, j_landmark_scaled, r_scaled);
+                acc.add_link(
+                    pose_idx,
+                    pose_landmark_cross(j_pose_scaled, j_landmark_scaled),
+                );
+            }
+
+            if motion_weight > 0.0 && pose_count >= 2 {
+                for i in 1..pose_count {
+                    let prev = &problem.poses[i - 1].pose;
+                    let curr = &problem.poses[i].pose;
+                    let r_prev = pose_to_vec(*prev);
+                    let r_curr = pose_to_vec(*curr);
+                    let mut residual = [0.0_f32; 6];
+                    for k in 0..6 {
+                        residual[k] = r_curr[k] - r_prev[k];
+                    }
+                    let base_prev = (i - 1) * 6;
+                    let base_curr = i * 6;
+
+                    for k in 0..6 {
+                        let r = residual[k] * motion_weight;
+                        rhs[base_prev + k] += r;
+                        rhs[base_curr + k] -= r;
+
+                        let w = motion_weight * motion_weight;
+                        s[(base_prev + k) * pose_dim + (base_prev + k)] += w;
+                        s[(base_curr + k) * pose_dim + (base_curr + k)] += w;
+                        s[(base_prev + k) * pose_dim + (base_curr + k)] -= w;
+                        s[(base_curr + k) * pose_dim + (base_prev + k)] -= w;
+                    }
+                }
+            }
+
+            for i in 0..pose_dim {
+                s[i * pose_dim + i] += pose_damping;
+            }
+
+            let mut schur_landmarks = Vec::with_capacity(landmark_count);
+            for acc in landmark_accumulators.into_iter() {
+                let mut c = acc.c;
+                for i in 0..3 {
+                    c[i][i] += landmark_damping;
+                }
+                let Some(inv_c) = invert_3x3(c) else {
+                    return false;
+                };
+
+                let inv_c_b = mat3_mul_vec3(inv_c, acc.b);
+                for link_i in &acc.links {
+                    let base_i = link_i.pose.offset6();
+                    let rhs_contrib = mat63_mul_vec3(link_i.b, inv_c_b);
+                    for row in 0..6 {
+                        rhs[base_i + row] -= rhs_contrib[row];
+                    }
+
+                    for link_j in &acc.links {
+                        let base_j = link_j.pose.offset6();
+                        let block = schur_block(link_i.b, inv_c, link_j.b);
+                        for row in 0..6 {
+                            for col in 0..6 {
+                                s[(base_i + row) * pose_dim + (base_j + col)] -= block[row][col];
+                            }
+                        }
+                    }
+                }
+
+                schur_landmarks.push(LandmarkSchur {
+                    inv_c,
+                    b: acc.b,
+                    links: acc.links,
+                });
+            }
+
+            fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
+
+            if !solve_linear_system(s, rhs, pose_dim) {
+                return false;
+            }
+
+            let mut max_step = 0.0_f32;
+            for (pose_i, pose_var) in problem.poses.iter_mut().enumerate() {
+                let base = pose_i * 6;
+                let delta = [
+                    rhs[base],
+                    rhs[base + 1],
+                    rhs[base + 2],
+                    rhs[base + 3],
+                    rhs[base + 4],
+                    rhs[base + 5],
+                ];
+                max_step = max_step.max(norm6(delta));
+                pose_var.pose = apply_se3_delta(pose_var.pose, delta);
+            }
+
+            for (landmark_i, landmark_var) in problem.landmarks.iter_mut().enumerate() {
+                let schur = &schur_landmarks[landmark_i];
+                let mut coupling = [0.0_f32; 3];
+                for link in &schur.links {
+                    let base = link.pose.offset6();
+                    let pose_delta = [
+                        rhs[base],
+                        rhs[base + 1],
+                        rhs[base + 2],
+                        rhs[base + 3],
+                        rhs[base + 4],
+                        rhs[base + 5],
+                    ];
+                    for col in 0..3 {
+                        for row in 0..6 {
+                            coupling[col] += link.b[row][col] * pose_delta[row];
+                        }
+                    }
+                }
+
+                let rhs_landmark = [
+                    schur.b[0] - coupling[0],
+                    schur.b[1] - coupling[1],
+                    schur.b[2] - coupling[2],
+                ];
+                let delta_landmark = mat3_mul_vec3(schur.inv_c, rhs_landmark);
+                max_step = max_step.max(norm3(delta_landmark));
+
+                landmark_var.position.x += delta_landmark[0];
+                landmark_var.position.y += delta_landmark[1];
+                landmark_var.position.z += delta_landmark[2];
+            }
+
+            if max_step < 1e-4 {
+                break;
+            }
+        }
+
+        true
+    }
 }
 
 fn reprojection_residual_and_jacobian(
@@ -480,9 +901,20 @@ fn reprojection_residual_and_jacobian(
     obs: &Observation,
     intrinsics: PinholeIntrinsics,
 ) -> Option<([f32; 2], [[f32; 6]; 2])> {
-    let world = obs.world();
+    let (residual, jac_pose, _) =
+        reprojection_residual_and_jacobians(pose, obs.world(), obs.pixel(), intrinsics)?;
+    Some((residual, jac_pose))
+}
+
+fn reprojection_residual_and_jacobians(
+    pose: Pose,
+    world: Point3,
+    pixel: Keypoint,
+    intrinsics: PinholeIntrinsics,
+) -> Option<([f32; 2], [[f32; 6]; 2], [[f32; 3]; 2])> {
     let pw = [world.x, world.y, world.z];
-    let pc = math::transform_point(pose.rotation(), pose.translation(), pw);
+    let rotation = pose.rotation();
+    let pc = math::transform_point(rotation, pose.translation(), pw);
     let x = pc[0];
     let y = pc[1];
     let z = pc[2];
@@ -492,7 +924,6 @@ fn reprojection_residual_and_jacobian(
 
     let u = intrinsics.fx() * (x / z) + intrinsics.cx();
     let v = intrinsics.fy() * (y / z) + intrinsics.cy();
-    let pixel = obs.pixel();
     let residual = [pixel.x - u, pixel.y - v];
 
     let inv_z = 1.0 / z;
@@ -511,32 +942,45 @@ fn reprojection_residual_and_jacobian(
     let b2 = dv_dy;
     let b3 = dv_dz;
 
-    let mut jac = [[0.0_f32; 6]; 2];
+    let mut jac_pose = [[0.0_f32; 6]; 2];
 
-    jac[0][0] = a1;
-    jac[0][1] = a2;
-    jac[0][2] = a3;
-    jac[1][0] = b1;
-    jac[1][1] = b2;
-    jac[1][2] = b3;
+    jac_pose[0][0] = a1;
+    jac_pose[0][1] = a2;
+    jac_pose[0][2] = a3;
+    jac_pose[1][0] = b1;
+    jac_pose[1][1] = b2;
+    jac_pose[1][2] = b3;
 
-    jac[0][3] = -(a2 * z - a3 * y);
-    jac[0][4] = a1 * z - a3 * x;
-    jac[0][5] = -a1 * y + a2 * x;
+    jac_pose[0][3] = -(a2 * z - a3 * y);
+    jac_pose[0][4] = a1 * z - a3 * x;
+    jac_pose[0][5] = -a1 * y + a2 * x;
 
-    jac[1][3] = -(b2 * z - b3 * y);
-    jac[1][4] = b1 * z - b3 * x;
-    jac[1][5] = -b1 * y + b2 * x;
+    jac_pose[1][3] = -(b2 * z - b3 * y);
+    jac_pose[1][4] = b1 * z - b3 * x;
+    jac_pose[1][5] = -b1 * y + b2 * x;
+
+    let mut jac_landmark = [[0.0_f32; 3]; 2];
+    for col in 0..3 {
+        jac_landmark[0][col] =
+            a1 * rotation[0][col] + a2 * rotation[1][col] + a3 * rotation[2][col];
+        jac_landmark[1][col] =
+            b1 * rotation[0][col] + b2 * rotation[1][col] + b3 * rotation[2][col];
+    }
 
     // The Jacobian above is for projected pixel coordinates [u, v].
     // Residual is defined as [pixel.x - u, pixel.y - v], so dr/dx = -du/dx.
-    for row in &mut jac {
+    for row in &mut jac_pose {
+        for value in row {
+            *value = -*value;
+        }
+    }
+    for row in &mut jac_landmark {
         for value in row {
             *value = -*value;
         }
     }
 
-    Some((residual, jac))
+    Some((residual, jac_pose, jac_landmark))
 }
 
 fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
@@ -571,11 +1015,7 @@ fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
     }
 
     let k = [w[0] / theta, w[1] / theta, w[2] / theta];
-    let kx = [
-        [0.0, -k[2], k[1]],
-        [k[2], 0.0, -k[0]],
-        [-k[1], k[0], 0.0],
-    ];
+    let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
 
     let sin_t = theta.sin();
     let cos_t = theta.cos();
@@ -588,9 +1028,7 @@ fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
 
     for i in 0..3 {
         for j in 0..3 {
-            r[i][j] = if i == j { 1.0 } else { 0.0 }
-                + sin_t * kx[i][j]
-                + (1.0 - cos_t) * kx2[i][j];
+            r[i][j] = if i == j { 1.0 } else { 0.0 } + sin_t * kx[i][j] + (1.0 - cos_t) * kx2[i][j];
         }
     }
     r
@@ -622,32 +1060,35 @@ fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
         let zz = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
 
         let mut axis = if xx >= yy && xx >= zz && xx > 1e-6 {
-            [xx, (r[0][1] + r[1][0]) / (4.0 * xx), (r[0][2] + r[2][0]) / (4.0 * xx)]
-        } else if yy >= zz && yy > 1e-6 {
-            [(r[0][1] + r[1][0]) / (4.0 * yy), yy, (r[1][2] + r[2][1]) / (4.0 * yy)]
-        } else if zz > 1e-6 {
-            [(r[0][2] + r[2][0]) / (4.0 * zz), (r[1][2] + r[2][1]) / (4.0 * zz), zz]
-        } else {
             [
-                r[2][1] - r[1][2],
-                r[0][2] - r[2][0],
-                r[1][0] - r[0][1],
+                xx,
+                (r[0][1] + r[1][0]) / (4.0 * xx),
+                (r[0][2] + r[2][0]) / (4.0 * xx),
             ]
+        } else if yy >= zz && yy > 1e-6 {
+            [
+                (r[0][1] + r[1][0]) / (4.0 * yy),
+                yy,
+                (r[1][2] + r[2][1]) / (4.0 * yy),
+            ]
+        } else if zz > 1e-6 {
+            [
+                (r[0][2] + r[2][0]) / (4.0 * zz),
+                (r[1][2] + r[2][1]) / (4.0 * zz),
+                zz,
+            ]
+        } else {
+            [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]]
         };
 
-        let norm =
-            (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
         if norm > 1e-8 {
             axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
         } else {
             axis = [1.0, 0.0, 0.0];
         }
 
-        let skew = [
-            r[2][1] - r[1][2],
-            r[0][2] - r[2][0],
-            r[1][0] - r[0][1],
-        ];
+        let skew = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
         let sign = axis[0] * skew[0] + axis[1] * skew[1] + axis[2] * skew[2];
         if sign < 0.0 {
             axis = [-axis[0], -axis[1], -axis[2]];
@@ -669,6 +1110,159 @@ fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
         factor * (r[0][2] - r[2][0]),
         factor * (r[1][0] - r[0][1]),
     ]
+}
+
+fn accumulate_pose_hessian(
+    hessian: &mut [f32],
+    pose_dim: usize,
+    pose_idx: PoseVarIndex,
+    j_pose: [[f32; 6]; 2],
+) {
+    let base = pose_idx.offset6();
+    for row in 0..6 {
+        for col in 0..6 {
+            let jt_j = j_pose[0][row] * j_pose[0][col] + j_pose[1][row] * j_pose[1][col];
+            hessian[(base + row) * pose_dim + (base + col)] += jt_j;
+        }
+    }
+}
+
+fn accumulate_pose_rhs(
+    rhs: &mut [f32],
+    pose_idx: PoseVarIndex,
+    j_pose: [[f32; 6]; 2],
+    residual: [f32; 2],
+) {
+    let base = pose_idx.offset6();
+    for col in 0..6 {
+        rhs[base + col] -= j_pose[0][col] * residual[0] + j_pose[1][col] * residual[1];
+    }
+}
+
+fn accumulate_landmark_hessian(c: &mut [[f32; 3]; 3], j_landmark: [[f32; 3]; 2]) {
+    for row in 0..3 {
+        for col in 0..3 {
+            c[row][col] +=
+                j_landmark[0][row] * j_landmark[0][col] + j_landmark[1][row] * j_landmark[1][col];
+        }
+    }
+}
+
+fn accumulate_landmark_rhs(b: &mut [f32; 3], j_landmark: [[f32; 3]; 2], residual: [f32; 2]) {
+    for col in 0..3 {
+        b[col] -= j_landmark[0][col] * residual[0] + j_landmark[1][col] * residual[1];
+    }
+}
+
+fn pose_landmark_cross(j_pose: [[f32; 6]; 2], j_landmark: [[f32; 3]; 2]) -> [[f32; 3]; 6] {
+    let mut cross = [[0.0_f32; 3]; 6];
+    for row in 0..6 {
+        for col in 0..3 {
+            cross[row][col] =
+                j_pose[0][row] * j_landmark[0][col] + j_pose[1][row] * j_landmark[1][col];
+        }
+    }
+    cross
+}
+
+fn mat3_mul_vec3(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
+    let mut out = [0.0_f32; 6];
+    for row in 0..6 {
+        out[row] = m[row][0] * v[0] + m[row][1] * v[1] + m[row][2] * v[2];
+    }
+    out
+}
+
+fn schur_block(b_i: [[f32; 3]; 6], inv_c: [[f32; 3]; 3], b_j: [[f32; 3]; 6]) -> [[f32; 6]; 6] {
+    let mut block = [[0.0_f32; 6]; 6];
+    for row in 0..6 {
+        for col in 0..6 {
+            let mut sum = 0.0_f32;
+            for k in 0..3 {
+                for l in 0..3 {
+                    sum += b_i[row][k] * inv_c[k][l] * b_j[col][l];
+                }
+            }
+            block[row][col] = sum;
+        }
+    }
+    block
+}
+
+fn fix_pose_block(hessian: &mut [f32], rhs: &mut [f32], pose_dim: usize, pose_idx: PoseVarIndex) {
+    let base = pose_idx.offset6();
+    for row in 0..6 {
+        let idx = base + row;
+        for col in 0..pose_dim {
+            hessian[idx * pose_dim + col] = 0.0;
+            hessian[col * pose_dim + idx] = 0.0;
+        }
+        hessian[idx * pose_dim + idx] = 1.0;
+        rhs[idx] = 0.0;
+    }
+}
+
+fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let a = m[0][0] as f64;
+    let b = m[0][1] as f64;
+    let c = m[0][2] as f64;
+    let d = m[1][0] as f64;
+    let e = m[1][1] as f64;
+    let f = m[1][2] as f64;
+    let g = m[2][0] as f64;
+    let h = m[2][1] as f64;
+    let i = m[2][2] as f64;
+
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if !det.is_finite() || det.abs() < 1e-18 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let inv = [
+        [
+            (e * i - f * h) * inv_det,
+            (c * h - b * i) * inv_det,
+            (b * f - c * e) * inv_det,
+        ],
+        [
+            (f * g - d * i) * inv_det,
+            (a * i - c * g) * inv_det,
+            (c * d - a * f) * inv_det,
+        ],
+        [
+            (d * h - e * g) * inv_det,
+            (b * g - a * h) * inv_det,
+            (a * e - b * d) * inv_det,
+        ],
+    ];
+    if inv
+        .iter()
+        .flat_map(|row| row.iter())
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    Some([
+        [inv[0][0] as f32, inv[0][1] as f32, inv[0][2] as f32],
+        [inv[1][0] as f32, inv[1][1] as f32, inv[1][2] as f32],
+        [inv[2][0] as f32, inv[2][1] as f32, inv[2][2] as f32],
+    ])
+}
+
+fn norm3(v: [f32; 3]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn norm6(v: [f32; 6]) -> f32 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3] + v[4] * v[4] + v[5] * v[5]).sqrt()
 }
 
 fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
@@ -721,8 +1315,11 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{axis_angle_pose, make_pinhole_intrinsics};
-    use crate::{Keypoint, Point3};
+    use crate::map::{assert_map_invariants, KeyframeId, SlamMap};
+    use crate::test_helpers::{
+        axis_angle_pose, make_detections, make_pinhole_intrinsics, project_world_point,
+    };
+    use crate::{FrameId, Keypoint, Point3, SensorId, Timestamp};
 
     fn l2_3(a: [f32; 3], b: [f32; 3]) -> f32 {
         let dx = a[0] - b[0];
@@ -754,7 +1351,11 @@ mod tests {
             .0
     }
 
-    fn project_pixel(pose_world_to_camera: Pose, point_world: Point3, intr: PinholeIntrinsics) -> Keypoint {
+    fn project_pixel(
+        pose_world_to_camera: Pose,
+        point_world: Point3,
+        intr: PinholeIntrinsics,
+    ) -> Keypoint {
         let pc = math::transform_point(
             pose_world_to_camera.rotation(),
             pose_world_to_camera.translation(),
@@ -764,6 +1365,38 @@ mod tests {
             x: intr.fx() * (pc[0] / pc[2]) + intr.cx(),
             y: intr.fy() * (pc[1] / pc[2]) + intr.cy(),
         }
+    }
+
+    fn pose_distance(a: Pose, b: Pose) -> f32 {
+        let mut rot_sq = 0.0_f32;
+        let ra = a.rotation();
+        let rb = b.rotation();
+        for i in 0..3 {
+            for j in 0..3 {
+                let d = ra[i][j] - rb[i][j];
+                rot_sq += d * d;
+            }
+        }
+        rot_sq.sqrt() + l2_3(a.translation(), b.translation())
+    }
+
+    fn mean_landmark_error(map: &SlamMap, keyframe_id: KeyframeId, expected: &[Point3]) -> f32 {
+        let mut sum = 0.0_f32;
+        for (idx, target) in expected.iter().enumerate() {
+            let kp = map
+                .keyframe_keypoint(keyframe_id, idx)
+                .expect("keypoint index in map");
+            let point_id = map
+                .map_point_for_keypoint(kp)
+                .expect("keyframe lookup")
+                .expect("point exists");
+            let point = map.point(point_id).expect("point lookup").position();
+            let dx = point.x - target.x;
+            let dy = point.y - target.y;
+            let dz = point.z - target.z;
+            sum += (dx * dx + dy * dy + dz * dz).sqrt();
+        }
+        sum / expected.len() as f32
     }
 
     #[test]
@@ -815,7 +1448,10 @@ mod tests {
         let w = [0.18, -0.06, 0.11];
         let r = so3_exp(w);
         let recovered = so3_log(r);
-        assert!(l2_3(w, recovered) < 2e-4, "round-trip mismatch: {recovered:?}");
+        assert!(
+            l2_3(w, recovered) < 2e-4,
+            "round-trip mismatch: {recovered:?}"
+        );
     }
 
     #[test]
@@ -826,8 +1462,10 @@ mod tests {
         let recovered = so3_log(r);
         assert!(recovered.iter().all(|v| v.is_finite()));
 
-        let recovered_norm =
-            (recovered[0] * recovered[0] + recovered[1] * recovered[1] + recovered[2] * recovered[2]).sqrt();
+        let recovered_norm = (recovered[0] * recovered[0]
+            + recovered[1] * recovered[1]
+            + recovered[2] * recovered[2])
+            .sqrt();
         assert!(
             (recovered_norm - theta).abs() < 3e-3,
             "theta mismatch: recovered={recovered_norm}, expected={theta}"
@@ -859,8 +1497,8 @@ mod tests {
 
     #[test]
     fn reprojection_jacobian_matches_finite_difference() {
-        let intrinsics = make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0)
-            .expect("intrinsics");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let pose = axis_angle_pose([0.1, -0.05, 0.2], [0.06, -0.04, 0.03]);
         let point = Point3 {
             x: 0.4,
@@ -906,5 +1544,144 @@ mod tests {
                 tol1
             );
         }
+    }
+
+    #[test]
+    fn optimize_keyframe_window_refines_pose_and_landmarks_with_schur() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let true_pose_0 = Pose::identity();
+        let true_pose_1 = axis_angle_pose([0.20, -0.02, 0.03], [0.0, 0.03, -0.01]);
+        let noisy_pose_1 = apply_se3_delta(true_pose_1, [0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
+
+        let points_true = vec![
+            Point3 {
+                x: -0.35,
+                y: -0.25,
+                z: 3.2,
+            },
+            Point3 {
+                x: -0.10,
+                y: -0.22,
+                z: 3.5,
+            },
+            Point3 {
+                x: 0.14,
+                y: -0.20,
+                z: 3.8,
+            },
+            Point3 {
+                x: 0.32,
+                y: -0.10,
+                z: 3.4,
+            },
+            Point3 {
+                x: -0.30,
+                y: 0.10,
+                z: 3.6,
+            },
+            Point3 {
+                x: -0.08,
+                y: 0.16,
+                z: 4.0,
+            },
+            Point3 {
+                x: 0.16,
+                y: 0.12,
+                z: 3.3,
+            },
+            Point3 {
+                x: 0.34,
+                y: 0.24,
+                z: 3.9,
+            },
+        ];
+
+        let mut keypoints_0 = Vec::with_capacity(points_true.len());
+        let mut keypoints_1 = Vec::with_capacity(points_true.len());
+        for &point in &points_true {
+            keypoints_0.push(
+                project_world_point(true_pose_0, point, intrinsics)
+                    .expect("point visible in pose 0"),
+            );
+            keypoints_1.push(
+                project_world_point(true_pose_1, point, intrinsics)
+                    .expect("point visible in pose 1"),
+            );
+        }
+
+        let detections_0 = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(500),
+            640,
+            480,
+            keypoints_0,
+        )
+        .expect("detections 0");
+        let detections_1 = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(501),
+            640,
+            480,
+            keypoints_1,
+        )
+        .expect("detections 1");
+
+        let mut map = SlamMap::new();
+        let kf_0 = map
+            .add_keyframe_from_detections(
+                detections_0.as_ref(),
+                Timestamp::from_nanos(1_000_000),
+                true_pose_0,
+            )
+            .expect("insert keyframe 0");
+        let kf_1 = map
+            .add_keyframe_from_detections(
+                detections_1.as_ref(),
+                Timestamp::from_nanos(2_000_000),
+                noisy_pose_1,
+            )
+            .expect("insert keyframe 1");
+
+        for (idx, &point_true) in points_true.iter().enumerate() {
+            let kp_0 = map.keyframe_keypoint(kf_0, idx).expect("kf0 keypoint");
+            let kp_1 = map.keyframe_keypoint(kf_1, idx).expect("kf1 keypoint");
+            let descriptor = detections_0.descriptors()[idx];
+            let i = idx as f32;
+            let noisy_point = Point3 {
+                x: point_true.x + (i - 3.5) * 0.010,
+                y: point_true.y - (i - 3.5) * 0.008,
+                z: point_true.z + ((idx % 2) as f32 - 0.5) * 0.040,
+            };
+            let point_id = map
+                .add_map_point(noisy_point, descriptor, kp_0)
+                .expect("insert map point");
+            map.add_observation(point_id, kp_1)
+                .expect("add shared observation");
+        }
+
+        assert_map_invariants(&map).expect("map invariants before BA");
+        let before_pose_err = pose_distance(map.keyframe(kf_1).expect("kf1").pose(), true_pose_1);
+        let before_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
+
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        assert!(
+            ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]),
+            "full local BA should succeed"
+        );
+        assert_map_invariants(&map).expect("map invariants after BA");
+
+        let after_pose_err = pose_distance(map.keyframe(kf_1).expect("kf1").pose(), true_pose_1);
+        let after_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
+
+        assert!(
+            after_pose_err < before_pose_err,
+            "pose error did not improve: before={before_pose_err}, after={after_pose_err}"
+        );
+        assert!(
+            after_landmark_err < before_landmark_err,
+            "landmark error did not improve: before={before_landmark_err}, after={after_landmark_err}"
+        );
     }
 }
