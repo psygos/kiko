@@ -959,16 +959,27 @@ impl LocalBundleAdjuster {
         let pose_dim = pose_count * 6;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
-        let pose_damping = self.config.damping().max(1e-9);
-        let landmark_damping = self.config.damping().max(1e-6);
         let motion_weight = self.config.motion_prior_weight();
+        let lm_config = LmConfig::new(self.config.damping().max(1e-8), 10.0, 1e-8, 1e4, 0.25, 0.75)
+            .expect("valid LM config");
         let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+        let mut lm_state = LmState::new(lm_config, final_cost);
 
         for iter in 0..max_iters {
+            let pose_backup: Vec<Pose> = problem.poses.iter().map(|pose_var| pose_var.pose).collect();
+            let landmark_backup: Vec<Point3> = problem
+                .landmarks
+                .iter()
+                .map(|landmark_var| landmark_var.position)
+                .collect();
+
             let s = &mut self.a_buf[..pose_dim * pose_dim];
             let rhs = &mut self.b_buf[..pose_dim];
             s.fill(0.0);
             rhs.fill(0.0);
+
+            let pose_damping = lm_state.lambda().max(lm_config.min_lambda());
+            let landmark_damping = pose_damping.max(1e-6);
 
             let mut landmark_accumulators = (0..landmark_count)
                 .map(|_| LandmarkAccumulator::default())
@@ -1105,14 +1116,16 @@ impl LocalBundleAdjuster {
             }
 
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
+            let rhs_before_solve = rhs.to_vec();
 
             if !solve_linear_system(s, rhs, pose_dim) {
                 return BaResult::MaxIterations {
                     iterations: iter + 1,
-                    final_cost,
+                    final_cost: lm_state.prev_cost(),
                 };
             }
 
+            let mut predicted_decrease = 0.0_f64;
             let mut max_step = 0.0_f32;
             for (pose_i, pose_var) in problem.poses.iter_mut().enumerate() {
                 let base = pose_i * 6;
@@ -1125,6 +1138,11 @@ impl LocalBundleAdjuster {
                     rhs[base + 5],
                 ];
                 max_step = max_step.max(norm6(delta));
+                for k in 0..6 {
+                    let d = delta[k] as f64;
+                    let gradient = rhs_before_solve[base + k] as f64;
+                    predicted_decrease += d * ((pose_damping as f64) * d + gradient);
+                }
                 pose_var.pose = apply_se3_delta(pose_var.pose, delta);
             }
 
@@ -1155,24 +1173,50 @@ impl LocalBundleAdjuster {
                 ];
                 let delta_landmark = mat3_mul_vec3(schur.inv_c, rhs_landmark);
                 max_step = max_step.max(norm3(delta_landmark));
+                for axis in 0..3 {
+                    let d = delta_landmark[axis] as f64;
+                    let gradient = schur.b[axis] as f64;
+                    predicted_decrease += d * ((landmark_damping as f64) * d + gradient);
+                }
 
                 landmark_var.position.x += delta_landmark[0];
                 landmark_var.position.y += delta_landmark[1];
                 landmark_var.position.z += delta_landmark[2];
             }
 
-            final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
-            if max_step < 1e-4 {
-                return BaResult::Converged {
-                    iterations: iter + 1,
-                    final_cost,
-                };
+            let candidate_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+            let prev_cost = lm_state.prev_cost();
+            match lm_state.step(candidate_cost, predicted_decrease, lm_config) {
+                LmAction::Accept => {
+                    final_cost = candidate_cost;
+                    let threshold = 1e-6_f64 * prev_cost.abs().max(1e-12);
+                    if max_step < 1e-4 || (prev_cost - candidate_cost).abs() <= threshold {
+                        return BaResult::Converged {
+                            iterations: iter + 1,
+                            final_cost,
+                        };
+                    }
+                }
+                LmAction::Reject => {
+                    for (pose_var, pose) in problem.poses.iter_mut().zip(pose_backup.iter().copied())
+                    {
+                        pose_var.pose = pose;
+                    }
+                    for (landmark_var, point) in problem
+                        .landmarks
+                        .iter_mut()
+                        .zip(landmark_backup.iter().copied())
+                    {
+                        landmark_var.position = point;
+                    }
+                    final_cost = prev_cost;
+                }
             }
         }
 
         BaResult::MaxIterations {
             iterations: max_iters,
-            final_cost,
+            final_cost: lm_state.prev_cost(),
         }
     }
 }
@@ -2105,10 +2149,67 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
+        let result = ba.optimize_full(&mut problem);
+        match result {
+            BaResult::Converged {
+                iterations,
+                final_cost,
+            } => {
+                assert!(iterations < config.max_iterations());
+                assert!(final_cost.is_finite());
+            }
+            other => panic!("expected convergence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn optimize_full_recovers_from_large_perturbation() {
+        let (map, intrinsics, kf_0, kf_1, _, _) =
+            build_full_ba_fixture([0.45, -0.20, 0.28, 0.15, -0.08, 0.10]);
+        let config = LocalBaConfig::new(5, 30, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let result = ba.optimize_full(&mut problem);
+        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        assert!(after < before, "cost did not improve: before={before}, after={after}");
         assert!(matches!(
-            ba.optimize_full(&mut problem),
-            BaResult::Converged { .. }
+            result,
+            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
         ));
+    }
+
+    #[test]
+    fn optimize_full_final_cost_does_not_increase() {
+        let (map, intrinsics, kf_0, kf_1, _, _) =
+            build_full_ba_fixture([0.12, -0.05, 0.07, 0.03, -0.02, 0.01]);
+        let config = LocalBaConfig::new(5, 20, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let result = ba.optimize_full(&mut problem);
+        let final_cost = match result {
+            BaResult::Converged { final_cost, .. } | BaResult::MaxIterations { final_cost, .. } => {
+                final_cost
+            }
+            BaResult::Degenerate { reason } => panic!("unexpected degeneracy: {reason:?}"),
+        };
+        assert!(
+            final_cost <= before + 1e-6,
+            "final cost should not increase: before={before}, final={final_cost}"
+        );
     }
 
     #[test]
