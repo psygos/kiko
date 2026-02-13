@@ -183,6 +183,8 @@ struct KeyframeEvent {
     trigger_keyframe: KeyframeId,
     window: BackendWindow,
     map_snapshot: SlamMap,
+    #[cfg(test)]
+    force_panic: bool,
 }
 
 #[derive(Debug)]
@@ -232,6 +234,8 @@ impl KeyframeEvent {
             trigger_keyframe,
             window,
             map_snapshot,
+            #[cfg(test)]
+            force_panic: false,
         })
     }
 }
@@ -343,6 +347,10 @@ impl std::error::Error for BackendWorkerError {}
 #[derive(Debug)]
 enum BackendResponse {
     Correction(CorrectionEvent),
+    WorkerPanic {
+        request_id: BackendRequestId,
+        map_version: MapVersion,
+    },
     Failure {
         request_id: BackendRequestId,
         map_version: MapVersion,
@@ -444,25 +452,46 @@ impl BackendWorker {
         let (tx_req, rx_req) = crossbeam_channel::bounded::<KeyframeEvent>(config.queue_depth());
         let (tx_resp, rx_resp) = crossbeam_channel::unbounded::<BackendResponse>();
 
-        thread::spawn(move || {
-            let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
-            while let Ok(event) = rx_req.recv() {
-                let mut optimized_map = event.map_snapshot.clone();
-                let result = ba.optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
-                match CorrectionEvent::from_optimized_map(&event, &optimized_map, result) {
-                    Ok(correction) => {
-                        let _ = tx_resp.send(BackendResponse::Correction(correction));
-                    }
-                    Err(err) => {
-                        let _ = tx_resp.send(BackendResponse::Failure {
-                            request_id: event.request_id,
-                            map_version: event.map_version,
-                            error: BackendWorkerError::BuildCorrection(err),
-                        });
+        thread::Builder::new()
+            .name("kiko-backend".to_string())
+            .spawn(move || {
+                let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
+                while let Ok(event) = rx_req.recv() {
+                    let request_id = event.request_id;
+                    let map_version = event.map_version;
+                    let processing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        #[cfg(test)]
+                        if event.force_panic {
+                            panic!("forced backend worker panic");
+                        }
+                        let mut optimized_map = event.map_snapshot.clone();
+                        let result =
+                            ba.optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
+                        CorrectionEvent::from_optimized_map(&event, &optimized_map, result)
+                    }));
+
+                    match processing {
+                        Ok(Ok(correction)) => {
+                            let _ = tx_resp.send(BackendResponse::Correction(correction));
+                        }
+                        Ok(Err(err)) => {
+                            let _ = tx_resp.send(BackendResponse::Failure {
+                                request_id,
+                                map_version,
+                                error: BackendWorkerError::BuildCorrection(err),
+                            });
+                        }
+                        Err(_) => {
+                            let _ = tx_resp.send(BackendResponse::WorkerPanic {
+                                request_id,
+                                map_version,
+                            });
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .expect("spawn backend worker");
 
         Self {
             tx: tx_req,
@@ -483,11 +512,107 @@ impl BackendWorker {
         }
     }
 
-    fn try_recv(&self) -> Option<BackendResponse> {
+    fn try_recv(&self) -> Result<Option<BackendResponse>, ()> {
         match self.rx.try_recv() {
-            Ok(response) => Some(response),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+            Ok(response) => Ok(Some(response)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(()),
         }
+    }
+
+}
+
+#[derive(Debug)]
+struct BackendSupervisor {
+    worker: Option<BackendWorker>,
+    config: BackendConfig,
+    intrinsics: PinholeIntrinsics,
+    ba_config: LocalBaConfig,
+    respawn_count: u32,
+    max_respawns: u32,
+}
+
+impl BackendSupervisor {
+    fn spawn(config: BackendConfig, intrinsics: PinholeIntrinsics, ba_config: LocalBaConfig) -> Self {
+        Self {
+            worker: Some(BackendWorker::spawn(config, intrinsics, ba_config)),
+            config,
+            intrinsics,
+            ba_config,
+            respawn_count: 0,
+            max_respawns: 3,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max_respawns(
+        config: BackendConfig,
+        intrinsics: PinholeIntrinsics,
+        ba_config: LocalBaConfig,
+        max_respawns: u32,
+    ) -> Self {
+        let mut supervisor = Self::spawn(config, intrinsics, ba_config);
+        supervisor.max_respawns = max_respawns;
+        supervisor
+    }
+
+    fn check_health(&mut self) {
+        if self.worker.is_none() {
+            return;
+        }
+
+        if self.respawn_count >= self.max_respawns {
+            self.worker = None;
+            return;
+        }
+
+        eprintln!(
+            "backend worker disconnected; respawning ({}/{})",
+            self.respawn_count + 1,
+            self.max_respawns
+        );
+        self.worker = Some(BackendWorker::spawn(
+            self.config,
+            self.intrinsics,
+            self.ba_config,
+        ));
+        self.respawn_count = self.respawn_count.saturating_add(1);
+    }
+
+    fn submit(&mut self, event: KeyframeEvent) -> Result<(), SubmitEventError> {
+        let Some(worker) = self.worker.as_ref() else {
+            return Err(SubmitEventError::Disconnected);
+        };
+        let result = worker.try_submit(event);
+        if matches!(result, Err(SubmitEventError::Disconnected)) {
+            self.check_health();
+        }
+        result
+    }
+
+    fn try_recv(&mut self) -> Option<BackendResponse> {
+        let Some(worker) = self.worker.as_ref() else {
+            return None;
+        };
+        match worker.try_recv() {
+            Ok(response) => response,
+            Err(()) => {
+                self.check_health();
+                None
+            }
+        }
+    }
+
+    fn shutdown(&mut self) {
+        self.worker = None;
+    }
+
+    fn respawn_count(&self) -> u32 {
+        self.respawn_count
+    }
+
+    fn has_worker(&self) -> bool {
+        self.worker.is_some()
     }
 }
 
@@ -791,7 +916,10 @@ impl SlamTracker {
                 let Some(worker) = self.backend.as_ref() else {
                     return;
                 };
-                worker.try_recv()
+                match worker.try_recv() {
+                    Ok(response) => response,
+                    Err(()) => None,
+                }
             };
 
             let Some(response) = response else {
@@ -842,6 +970,18 @@ impl SlamTracker {
                         self.backend_stats.worker_failures.saturating_add(1);
                     eprintln!(
                         "backend worker failure (req={}, version={}): {error}",
+                        request_id.as_u64(),
+                        map_version.as_u64()
+                    );
+                }
+                BackendResponse::WorkerPanic {
+                    request_id,
+                    map_version,
+                } => {
+                    self.backend_stats.worker_failures =
+                        self.backend_stats.worker_failures.saturating_add(1);
+                    eprintln!(
+                        "backend worker panic (req={}, version={})",
                         request_id.as_u64(),
                         map_version.as_u64()
                     );
@@ -1472,6 +1612,25 @@ mod tests {
         (map, kf_a, kf_b)
     }
 
+    fn make_forced_panic_event(
+        request_id: BackendRequestId,
+        map: SlamMap,
+        kf_a: KeyframeId,
+        kf_b: KeyframeId,
+    ) -> KeyframeEvent {
+        let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
+        let mut event = KeyframeEvent::try_new(
+            request_id,
+            MapVersion::initial(),
+            kf_b,
+            window,
+            map,
+        )
+        .expect("event");
+        event.force_panic = true;
+        event
+    }
+
     #[test]
     fn keyframe_insertion_populates_map_points() {
         let keypoints = vec![
@@ -1663,9 +1822,13 @@ mod tests {
 
         let mut response = None;
         for _ in 0..50 {
-            if let Some(msg) = worker.try_recv() {
-                response = Some(msg);
-                break;
+            match worker.try_recv() {
+                Ok(Some(msg)) => {
+                    response = Some(msg);
+                    break;
+                }
+                Ok(None) => {}
+                Err(()) => break,
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -1685,7 +1848,146 @@ mod tests {
             BackendResponse::Failure { error, .. } => {
                 panic!("unexpected backend failure: {error}");
             }
+            BackendResponse::WorkerPanic { .. } => {
+                panic!("unexpected worker panic");
+            }
         }
+    }
+
+    #[test]
+    fn backend_supervisor_respawns_after_worker_panic() {
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
+            320, 240, 200.0, 200.0, 160.0, 120.0,
+        )
+        .expect("intrinsics");
+        let mut supervisor = BackendSupervisor::with_max_respawns(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            3,
+        );
+
+        let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let mut req_counter = 0;
+        let event =
+            make_forced_panic_event(BackendRequestId::from_counter(&mut req_counter), map, kf_a, kf_b);
+        supervisor.submit(event).expect("submit");
+
+        let mut saw_panic = false;
+        for _ in 0..100 {
+            if matches!(
+                supervisor.try_recv(),
+                Some(BackendResponse::WorkerPanic { .. })
+            ) {
+                saw_panic = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(saw_panic, "expected worker panic response");
+
+        for _ in 0..100 {
+            supervisor.check_health();
+            if supervisor.respawn_count() > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(supervisor.respawn_count(), 1);
+        assert!(supervisor.has_worker());
+    }
+
+    #[test]
+    fn backend_supervisor_enforces_max_respawns() {
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
+            320, 240, 200.0, 200.0, 160.0, 120.0,
+        )
+        .expect("intrinsics");
+        let mut supervisor = BackendSupervisor::with_max_respawns(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            1,
+        );
+
+        let mut req_counter = 0;
+
+        let (map1, kf_a1, kf_b1) = make_map_with_two_keyframes_one_shared_point();
+        let panic1 = make_forced_panic_event(
+            BackendRequestId::from_counter(&mut req_counter),
+            map1,
+            kf_a1,
+            kf_b1,
+        );
+        supervisor.submit(panic1).expect("submit panic1");
+        for _ in 0..100 {
+            if matches!(
+                supervisor.try_recv(),
+                Some(BackendResponse::WorkerPanic { .. })
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for _ in 0..100 {
+            supervisor.check_health();
+            if supervisor.respawn_count() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(supervisor.respawn_count(), 1);
+        assert!(supervisor.has_worker());
+
+        let (map2, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
+        let panic2 = make_forced_panic_event(
+            BackendRequestId::from_counter(&mut req_counter),
+            map2,
+            kf_a2,
+            kf_b2,
+        );
+        supervisor.submit(panic2).expect("submit panic2");
+        for _ in 0..100 {
+            if matches!(
+                supervisor.try_recv(),
+                Some(BackendResponse::WorkerPanic { .. })
+            ) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for _ in 0..100 {
+            supervisor.check_health();
+            if !supervisor.has_worker() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(supervisor.respawn_count(), 1);
+        assert!(!supervisor.has_worker());
+    }
+
+    #[test]
+    fn backend_supervisor_shutdown_does_not_respawn() {
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
+            320, 240, 200.0, 200.0, 160.0, 120.0,
+        )
+        .expect("intrinsics");
+        let mut supervisor = BackendSupervisor::with_max_respawns(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            3,
+        );
+        supervisor.shutdown();
+        supervisor.check_health();
+        assert_eq!(supervisor.respawn_count(), 0);
+        assert!(!supervisor.has_worker());
     }
 }
 
