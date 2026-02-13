@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+
 use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
+use crate::map::{KeyframeId, SlamMap};
 use crate::Pose64;
 
 #[derive(Clone, Debug)]
@@ -517,6 +521,183 @@ impl PoseGraphOptimizer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EssentialEdgeKind {
+    SpanningTree,
+    StrongCovisibility,
+    Loop,
+}
+
+#[derive(Clone, Debug)]
+pub struct EssentialEdge {
+    pub a: KeyframeId,
+    pub b: KeyframeId,
+    pub kind: EssentialEdgeKind,
+    pub relative_pose: Pose64,
+    pub information: [[f64; 6]; 6],
+}
+
+#[derive(Clone, Debug)]
+pub struct EssentialGraphSnapshot {
+    pub parent: HashMap<KeyframeId, KeyframeId>,
+    pub spanning_edges: Vec<EssentialEdge>,
+    pub strong_covis_edges: Vec<EssentialEdge>,
+    pub loop_edges: Vec<EssentialEdge>,
+    pub strong_threshold: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct EssentialGraph {
+    parent: HashMap<KeyframeId, KeyframeId>,
+    spanning_edges: Vec<EssentialEdge>,
+    strong_covis_edges: Vec<EssentialEdge>,
+    loop_edges: Vec<EssentialEdge>,
+    strong_threshold: u32,
+}
+
+impl EssentialGraph {
+    pub fn new(strong_threshold: u32) -> Self {
+        Self {
+            parent: HashMap::new(),
+            spanning_edges: Vec::new(),
+            strong_covis_edges: Vec::new(),
+            loop_edges: Vec::new(),
+            strong_threshold,
+        }
+    }
+
+    pub fn parent_of(&self, keyframe_id: KeyframeId) -> Option<KeyframeId> {
+        self.parent.get(&keyframe_id).copied()
+    }
+
+    pub fn add_keyframe(
+        &mut self,
+        keyframe_id: KeyframeId,
+        covisibility: Option<&HashMap<KeyframeId, NonZeroU32>>,
+        map: &SlamMap,
+    ) {
+        if self.parent.contains_key(&keyframe_id) {
+            return;
+        }
+        if self.parent.is_empty() {
+            self.parent.insert(keyframe_id, keyframe_id);
+            return;
+        }
+
+        let Some(neighbors) = covisibility else {
+            self.parent.insert(keyframe_id, keyframe_id);
+            return;
+        };
+        if neighbors.is_empty() {
+            self.parent.insert(keyframe_id, keyframe_id);
+            return;
+        }
+
+        let mut strongest = None;
+        for (&neighbor, &weight) in neighbors {
+            if strongest
+                .as_ref()
+                .is_none_or(|(_, best_w): &(KeyframeId, u32)| weight.get() > *best_w)
+            {
+                strongest = Some((neighbor, weight.get()));
+            }
+
+            if weight.get() >= self.strong_threshold
+                && !contains_edge(&self.strong_covis_edges, keyframe_id, neighbor)
+                && let Some(relative_pose) = relative_pose(map, keyframe_id, neighbor)
+            {
+                self.strong_covis_edges.push(EssentialEdge {
+                    a: keyframe_id,
+                    b: neighbor,
+                    kind: EssentialEdgeKind::StrongCovisibility,
+                    relative_pose,
+                    information: scaled_identity6(weight.get() as f64),
+                });
+            }
+        }
+
+        let Some((parent, weight)) = strongest else {
+            self.parent.insert(keyframe_id, keyframe_id);
+            return;
+        };
+        self.parent.insert(keyframe_id, parent);
+        if let Some(relative_pose) = relative_pose(map, parent, keyframe_id) {
+            self.spanning_edges.push(EssentialEdge {
+                a: parent,
+                b: keyframe_id,
+                kind: EssentialEdgeKind::SpanningTree,
+                relative_pose,
+                information: scaled_identity6(weight as f64),
+            });
+        }
+    }
+
+    pub fn add_loop_edge(&mut self, edge: EssentialEdge) {
+        self.loop_edges.push(edge);
+    }
+
+    pub fn snapshot(&self) -> EssentialGraphSnapshot {
+        EssentialGraphSnapshot {
+            parent: self.parent.clone(),
+            spanning_edges: self.spanning_edges.clone(),
+            strong_covis_edges: self.strong_covis_edges.clone(),
+            loop_edges: self.loop_edges.clone(),
+            strong_threshold: self.strong_threshold,
+        }
+    }
+
+    pub fn all_edges(&self) -> Vec<PoseGraphEdge> {
+        let mut id_to_idx = HashMap::new();
+        for &id in self.parent.keys() {
+            let next = id_to_idx.len();
+            id_to_idx.entry(id).or_insert(next);
+        }
+        for edge in self
+            .spanning_edges
+            .iter()
+            .chain(self.strong_covis_edges.iter())
+            .chain(self.loop_edges.iter())
+        {
+            if !id_to_idx.contains_key(&edge.a) {
+                let next = id_to_idx.len();
+                id_to_idx.insert(edge.a, next);
+            }
+            if !id_to_idx.contains_key(&edge.b) {
+                let next = id_to_idx.len();
+                id_to_idx.insert(edge.b, next);
+            }
+        }
+
+        self.spanning_edges
+            .iter()
+            .chain(self.strong_covis_edges.iter())
+            .chain(self.loop_edges.iter())
+            .filter_map(|edge| {
+                Some(PoseGraphEdge {
+                    from: *id_to_idx.get(&edge.a)?,
+                    to: *id_to_idx.get(&edge.b)?,
+                    measurement: edge.relative_pose,
+                    information: edge.information,
+                })
+            })
+            .collect()
+    }
+}
+
+fn contains_edge(edges: &[EssentialEdge], a: KeyframeId, b: KeyframeId) -> bool {
+    edges
+        .iter()
+        .any(|edge| (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a))
+}
+
+fn relative_pose(map: &SlamMap, from: KeyframeId, to: KeyframeId) -> Option<Pose64> {
+    let from_pose = map.keyframe(from)?.pose();
+    let to_pose = map.keyframe(to)?.pose();
+    let from_64 = Pose64::from_pose32(from_pose);
+    let to_64 = Pose64::from_pose32(to_pose);
+    Some(from_64.inverse().compose(to_64))
+}
+
 fn huber_weight(norm: f64, delta: f64) -> f64 {
     if norm <= delta || norm <= 1e-12 {
         1.0
@@ -573,10 +754,12 @@ fn scaled_identity6(scale: f64) -> [[f64; 6]; 6] {
 #[cfg(test)]
 mod tests {
     use super::{
-        compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, PoseGraphConfig,
-        PoseGraphEdge, PoseGraphOptimizer,
+        compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, EssentialEdge,
+        EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer,
     };
+    use crate::map::{ImageSize, SlamMap};
     use crate::math::se3_exp_f64;
+    use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
     use crate::Pose64;
 
     fn scalar_block(diagonal: f64) -> [[f64; 6]; 6] {
@@ -585,6 +768,83 @@ mod tests {
             row[i] = diagonal;
         }
         block
+    }
+
+    fn make_map_for_essential_graph() -> (SlamMap, crate::map::KeyframeId, crate::map::KeyframeId, crate::map::KeyframeId) {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("size");
+        let keypoints = vec![
+            Keypoint { x: 20.0, y: 20.0 },
+            Keypoint { x: 40.0, y: 20.0 },
+            Keypoint { x: 60.0, y: 20.0 },
+        ];
+        let kf0 = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                size,
+                keypoints.clone(),
+            )
+            .expect("kf0");
+        let kf1 = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                Pose::from_rt(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [1.0, 0.0, 0.0],
+                ),
+                size,
+                keypoints.clone(),
+            )
+            .expect("kf1");
+        let kf2 = map
+            .add_keyframe(
+                FrameId::new(3),
+                Timestamp::from_nanos(3),
+                Pose::from_rt(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [2.0, 0.0, 0.0],
+                ),
+                size,
+                keypoints,
+            )
+            .expect("kf2");
+
+        for i in 0..2 {
+            let kp0 = map.keyframe_keypoint(kf0, i).expect("kp0");
+            let point_id = map
+                .add_map_point(
+                    Point3 {
+                        x: i as f32,
+                        y: 0.0,
+                        z: 3.0,
+                    },
+                    CompactDescriptor([128; 256]),
+                    kp0,
+                )
+                .expect("point");
+            let kp1 = map.keyframe_keypoint(kf1, i).expect("kp1");
+            map.add_observation(point_id, kp1).expect("obs");
+        }
+
+        let kp1 = map.keyframe_keypoint(kf1, 2).expect("kp1 third");
+        let point_id = map
+            .add_map_point(
+                Point3 {
+                    x: 2.0,
+                    y: 0.0,
+                    z: 3.0,
+                },
+                CompactDescriptor([128; 256]),
+                kp1,
+            )
+            .expect("point third");
+        let kp2 = map.keyframe_keypoint(kf2, 0).expect("kp2");
+        map.add_observation(point_id, kp2).expect("obs third");
+
+        (map, kf0, kf1, kf2)
     }
 
     #[test]
@@ -842,5 +1102,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn essential_graph_builds_spanning_tree_connectivity() {
+        let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+        graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+
+        assert_eq!(graph.parent_of(kf0), Some(kf0));
+        assert_eq!(graph.parent_of(kf1), Some(kf0));
+        assert_eq!(graph.parent_of(kf2), Some(kf1));
+        assert!(graph.all_edges().len() >= 2);
+    }
+
+    #[test]
+    fn essential_graph_respects_strong_edge_threshold() {
+        let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+        graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+        let snapshot = graph.snapshot();
+        assert_eq!(snapshot.strong_covis_edges.len(), 1);
+        let strong = &snapshot.strong_covis_edges[0];
+        assert_eq!(strong.kind, EssentialEdgeKind::StrongCovisibility);
+        assert!((strong.a == kf1 && strong.b == kf0) || (strong.a == kf0 && strong.b == kf1));
+    }
+
+    #[test]
+    fn essential_graph_snapshot_is_independent_copy() {
+        let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+        graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+        let snapshot = graph.snapshot();
+        graph.add_loop_edge(EssentialEdge {
+            a: kf2,
+            b: kf0,
+            kind: EssentialEdgeKind::Loop,
+            relative_pose: Pose64::identity(),
+            information: scalar_block(1.0),
+        });
+        assert_eq!(snapshot.loop_edges.len(), 0);
+        assert_eq!(graph.snapshot().loop_edges.len(), 1);
     }
 }
