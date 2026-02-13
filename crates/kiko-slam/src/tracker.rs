@@ -1646,7 +1646,8 @@ mod tests {
             320, 240, 200.0, 200.0, 160.0, 120.0,
         )
         .expect("intrinsics");
-        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, 1e-3, 0.0).expect("ba config");
+        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            .expect("ba config");
         let mut worker = BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg);
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");

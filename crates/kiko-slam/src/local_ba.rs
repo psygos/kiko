@@ -12,7 +12,7 @@ pub struct LocalBaConfig {
     max_iterations: NonZeroUsize,
     min_observations: NonZeroUsize,
     huber_delta_px: f32,
-    damping: f32,
+    lm: LmConfig,
     motion_prior_weight: f32,
 }
 
@@ -230,7 +230,6 @@ pub enum LocalBaConfigError {
     ZeroObservations,
     TooFewObservations { min: usize },
     NonPositiveHuber { value: f32 },
-    NegativeDamping { value: f32 },
     NegativeMotionWeight { value: f32 },
 }
 
@@ -248,9 +247,6 @@ impl std::fmt::Display for LocalBaConfigError {
             LocalBaConfigError::NonPositiveHuber { value } => {
                 write!(f, "local BA huber delta must be > 0 (got {value})")
             }
-            LocalBaConfigError::NegativeDamping { value } => {
-                write!(f, "local BA damping must be >= 0 (got {value})")
-            }
             LocalBaConfigError::NegativeMotionWeight { value } => {
                 write!(f, "local BA motion prior weight must be >= 0 (got {value})")
             }
@@ -266,7 +262,7 @@ impl LocalBaConfig {
         max_iterations: usize,
         min_observations: usize,
         huber_delta_px: f32,
-        damping: f32,
+        lm: LmConfig,
         motion_prior_weight: f32,
     ) -> Result<Self, LocalBaConfigError> {
         let window = NonZeroUsize::new(window).ok_or(LocalBaConfigError::ZeroWindow)?;
@@ -282,9 +278,6 @@ impl LocalBaConfig {
                 value: huber_delta_px,
             });
         }
-        if damping < 0.0 || !damping.is_finite() {
-            return Err(LocalBaConfigError::NegativeDamping { value: damping });
-        }
         if motion_prior_weight < 0.0 || !motion_prior_weight.is_finite() {
             return Err(LocalBaConfigError::NegativeMotionWeight {
                 value: motion_prior_weight,
@@ -295,7 +288,7 @@ impl LocalBaConfig {
             max_iterations,
             min_observations,
             huber_delta_px,
-            damping,
+            lm,
             motion_prior_weight,
         })
     }
@@ -316,8 +309,8 @@ impl LocalBaConfig {
         self.huber_delta_px
     }
 
-    pub fn damping(&self) -> f32 {
-        self.damping
+    pub fn lm(&self) -> LmConfig {
+        self.lm
     }
 
     pub fn motion_prior_weight(&self) -> f32 {
@@ -826,7 +819,7 @@ impl LocalBundleAdjuster {
         let dim = frame_count * 6;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
-        let damping = self.config.damping();
+        let damping = self.config.lm().initial_lambda().max(1e-9);
         let motion_weight = self.config.motion_prior_weight();
 
         for _ in 0..max_iters {
@@ -960,8 +953,7 @@ impl LocalBundleAdjuster {
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
         let motion_weight = self.config.motion_prior_weight();
-        let lm_config = LmConfig::new(self.config.damping().max(1e-8), 10.0, 1e-8, 1e4, 0.25, 0.75)
-            .expect("valid LM config");
+        let lm_config = self.config.lm();
         let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
         let mut lm_state = LmState::new(lm_config, final_cost);
 
@@ -1716,6 +1708,10 @@ mod tests {
         (dx * dx + dy * dy + dz * dz).sqrt()
     }
 
+    fn lm(initial_lambda: f32) -> LmConfig {
+        LmConfig::new(initial_lambda, 10.0, 1e-8, 1e4, 0.25, 0.75).expect("valid lm")
+    }
+
     fn pose_close(a: Pose, b: Pose, tol: f32) -> bool {
         let mut rot_sq = 0.0_f32;
         let ra = a.rotation();
@@ -1915,31 +1911,27 @@ mod tests {
     #[test]
     fn local_ba_config_rejects_invalid_values() {
         assert!(matches!(
-            LocalBaConfig::new(0, 10, 4, 1.0, 0.0, 0.0),
+            LocalBaConfig::new(0, 10, 4, 1.0, lm(1e-3), 0.0),
             Err(LocalBaConfigError::ZeroWindow)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 0, 4, 1.0, 0.0, 0.0),
+            LocalBaConfig::new(5, 0, 4, 1.0, lm(1e-3), 0.0),
             Err(LocalBaConfigError::ZeroIterations)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 0, 1.0, 0.0, 0.0),
+            LocalBaConfig::new(5, 10, 0, 1.0, lm(1e-3), 0.0),
             Err(LocalBaConfigError::ZeroObservations)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 3, 1.0, 0.0, 0.0),
+            LocalBaConfig::new(5, 10, 3, 1.0, lm(1e-3), 0.0),
             Err(LocalBaConfigError::TooFewObservations { .. })
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 0.0, 0.0, 0.0),
+            LocalBaConfig::new(5, 10, 4, 0.0, lm(1e-3), 0.0),
             Err(LocalBaConfigError::NonPositiveHuber { .. })
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 1.0, -1.0, 0.0),
-            Err(LocalBaConfigError::NegativeDamping { .. })
-        ));
-        assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 1.0, 0.0, -1.0),
+            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), -1.0),
             Err(LocalBaConfigError::NegativeMotionWeight { .. })
         ));
     }
@@ -2052,7 +2044,7 @@ mod tests {
     fn optimize_full_reports_degenerate_variants() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
 
         let mut no_poses = FullBaProblem {
@@ -2121,7 +2113,7 @@ mod tests {
     fn optimize_full_returns_max_iterations_with_bad_init() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.8, -0.3, 0.4, 0.2, -0.1, 0.15]);
-        let config = LocalBaConfig::new(5, 1, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -2140,7 +2132,7 @@ mod tests {
     fn optimize_full_returns_converged_on_synthetic_scene() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -2166,7 +2158,7 @@ mod tests {
     fn optimize_full_recovers_from_large_perturbation() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.45, -0.20, 0.28, 0.15, -0.08, 0.10]);
-        let config = LocalBaConfig::new(5, 30, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 30, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -2189,7 +2181,7 @@ mod tests {
     fn optimize_full_final_cost_does_not_increase() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.12, -0.05, 0.07, 0.03, -0.02, 0.01]);
-        let config = LocalBaConfig::new(5, 20, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -2381,7 +2373,7 @@ mod tests {
         let before_pose_err = pose_distance(map.keyframe(kf_1).expect("kf1").pose(), true_pose_1);
         let before_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
 
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let result = ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]);
         assert!(

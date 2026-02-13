@@ -6,7 +6,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
     BackendConfig, DownscaleFactor, InferenceBackend, InferencePipeline, KeyframePolicy,
-    KeypointLimit, LightGlue, LocalBaConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo,
+    KeypointLimit, LightGlue, LocalBaConfig, LmConfig, PinholeIntrinsics, RansacConfig,
+    RectifiedStereo,
     RectifiedStereoConfig, RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig,
     TriangulationConfig, TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
@@ -1321,16 +1322,31 @@ fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
     let iters = env_usize("KIKO_BA_ITERS").unwrap_or(6);
     let min_obs = env_usize("KIKO_BA_MIN_OBS").unwrap_or(8);
     let huber = env_f32("KIKO_BA_HUBER_PX").unwrap_or(3.0);
-    let damping = env_f32("KIKO_BA_DAMPING").unwrap_or(1e-3);
+    let initial_lambda = env_f32("KIKO_BA_DAMPING").unwrap_or(1e-3);
+    let lambda_factor = env_f32("KIKO_LM_FACTOR").unwrap_or(10.0);
+    let min_lambda = env_f32("KIKO_LM_MIN").unwrap_or(1e-8);
+    let max_lambda = env_f32("KIKO_LM_MAX").unwrap_or(1e4);
     let motion = env_f32("KIKO_BA_MOTION_WEIGHT").unwrap_or(0.0);
-    let config = LocalBaConfig::new(window, iters, min_obs, huber, damping, motion)?;
+    let default_lm = LmConfig::default();
+    let lm = LmConfig::new(
+        initial_lambda,
+        lambda_factor,
+        min_lambda,
+        max_lambda,
+        default_lm.rho_accept(),
+        default_lm.rho_good(),
+    )?;
+    let config = LocalBaConfig::new(window, iters, min_obs, huber, lm, motion)?;
     eprintln!(
-        "local BA: window={} iters={} min_obs={} huber_px={} damping={} motion_weight={}",
+        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={} motion_weight={}",
         config.window(),
         config.max_iterations(),
         config.min_observations(),
         config.huber_delta_px(),
-        config.damping(),
+        config.lm().initial_lambda(),
+        config.lm().lambda_factor(),
+        config.lm().min_lambda(),
+        config.lm().max_lambda(),
         config.motion_prior_weight()
     );
     Ok(config)
@@ -1396,5 +1412,79 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
         Some(rss)
     } else {
         Some(rss * 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_ba_config;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_env(key: &str, value: &str) {
+        // Safety: tests hold a process-wide lock while mutating environment vars.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<OsString>) {
+        // Safety: tests hold a process-wide lock while mutating environment vars.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn build_ba_config_reads_lm_env_settings() {
+        let _guard = env_lock().lock().expect("env lock");
+        let keys = [
+            "KIKO_BA_WINDOW",
+            "KIKO_BA_ITERS",
+            "KIKO_BA_MIN_OBS",
+            "KIKO_BA_HUBER_PX",
+            "KIKO_BA_DAMPING",
+            "KIKO_LM_FACTOR",
+            "KIKO_LM_MIN",
+            "KIKO_LM_MAX",
+            "KIKO_BA_MOTION_WEIGHT",
+        ];
+        let saved: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|&key| (key.to_string(), std::env::var_os(key)))
+            .collect();
+
+        set_env("KIKO_BA_WINDOW", "12");
+        set_env("KIKO_BA_ITERS", "7");
+        set_env("KIKO_BA_MIN_OBS", "9");
+        set_env("KIKO_BA_HUBER_PX", "2.5");
+        set_env("KIKO_BA_DAMPING", "0.002");
+        set_env("KIKO_LM_FACTOR", "12.0");
+        set_env("KIKO_LM_MIN", "0.000001");
+        set_env("KIKO_LM_MAX", "5000");
+        set_env("KIKO_BA_MOTION_WEIGHT", "0.25");
+
+        let config = build_ba_config().expect("build config");
+        assert_eq!(config.window(), 12);
+        assert_eq!(config.max_iterations(), 7);
+        assert_eq!(config.min_observations(), 9);
+        assert!((config.huber_delta_px() - 2.5).abs() < 1e-6);
+        assert!((config.lm().initial_lambda() - 0.002).abs() < 1e-9);
+        assert!((config.lm().lambda_factor() - 12.0).abs() < 1e-9);
+        assert!((config.lm().min_lambda() - 1e-6).abs() < 1e-12);
+        assert!((config.lm().max_lambda() - 5000.0).abs() < 1e-6);
+        assert!((config.motion_prior_weight() - 0.25).abs() < 1e-6);
+
+        for (key, value) in saved {
+            restore_env(&key, value);
+        }
     }
 }
