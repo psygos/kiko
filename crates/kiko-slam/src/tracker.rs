@@ -367,6 +367,8 @@ pub struct BackendStats {
     pub stale: u64,
     pub rejected: u64,
     pub worker_failures: u64,
+    pub respawn_count: u32,
+    pub panics: u64,
 }
 
 #[derive(Debug)]
@@ -603,6 +605,11 @@ impl BackendSupervisor {
         }
     }
 
+    fn next_request_id(&mut self) -> Option<BackendRequestId> {
+        self.worker.as_mut().map(BackendWorker::next_request_id)
+    }
+
+    #[cfg(test)]
     fn shutdown(&mut self) {
         self.worker = None;
     }
@@ -821,7 +828,7 @@ pub struct SlamTracker {
     ba: LocalBundleAdjuster,
     map: SlamMap,
     map_version: MapVersion,
-    backend: Option<BackendWorker>,
+    backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
     consecutive_tracking_failures: usize,
 }
@@ -839,7 +846,7 @@ impl SlamTracker {
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend = config
             .backend
-            .map(|backend_cfg| BackendWorker::spawn(backend_cfg, intrinsics, config.ba));
+            .map(|backend_cfg| BackendSupervisor::spawn(backend_cfg, intrinsics, config.ba));
         Self {
             superpoint_left,
             superpoint_right,
@@ -891,12 +898,14 @@ impl SlamTracker {
         trigger_keyframe: KeyframeId,
         window_ids: Vec<KeyframeId>,
     ) -> Result<(), SubmitEventError> {
-        let Some(worker) = self.backend.as_mut() else {
+        let Some(supervisor) = self.backend.as_mut() else {
             return Err(SubmitEventError::Disconnected);
         };
 
         let window = BackendWindow::try_new(window_ids).map_err(SubmitEventError::InvalidWindow)?;
-        let request_id = worker.next_request_id();
+        let request_id = supervisor
+            .next_request_id()
+            .ok_or(SubmitEventError::Disconnected)?;
         let event = KeyframeEvent::try_new(
             request_id,
             self.map_version,
@@ -905,7 +914,8 @@ impl SlamTracker {
             self.map.clone(),
         )
         .map_err(SubmitEventError::InvalidEvent)?;
-        worker.try_submit(event)?;
+        supervisor.submit(event)?;
+        self.backend_stats.respawn_count = supervisor.respawn_count();
         self.backend_stats.submitted = self.backend_stats.submitted.saturating_add(1);
         Ok(())
     }
@@ -913,13 +923,12 @@ impl SlamTracker {
     fn drain_backend_responses(&mut self) {
         loop {
             let response = {
-                let Some(worker) = self.backend.as_ref() else {
+                let Some(supervisor) = self.backend.as_mut() else {
                     return;
                 };
-                match worker.try_recv() {
-                    Ok(response) => response,
-                    Err(()) => None,
-                }
+                let response = supervisor.try_recv();
+                self.backend_stats.respawn_count = supervisor.respawn_count();
+                response
             };
 
             let Some(response) = response else {
@@ -978,10 +987,16 @@ impl SlamTracker {
                     request_id,
                     map_version,
                 } => {
+                    self.backend_stats.panics = self.backend_stats.panics.saturating_add(1);
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
+                    self.map_version = MapVersion::initial();
+                    if let Some(supervisor) = self.backend.as_mut() {
+                        supervisor.check_health();
+                        self.backend_stats.respawn_count = supervisor.respawn_count();
+                    }
                     eprintln!(
-                        "backend worker panic (req={}, version={})",
+                        "backend worker panic (req={}, version={}); map version reset",
                         request_id.as_u64(),
                         map_version.as_u64()
                     );
@@ -1159,7 +1174,15 @@ impl SlamTracker {
                                             .backend_stats
                                             .dropped_disconnected
                                             .saturating_add(1);
-                                        self.backend = None;
+                                        if let Some(supervisor) = self.backend.as_ref() {
+                                            self.backend_stats.respawn_count =
+                                                supervisor.respawn_count();
+                                            if !supervisor.has_worker() {
+                                                self.backend = None;
+                                            }
+                                        } else {
+                                            self.backend = None;
+                                        }
                                     }
                                     SubmitEventError::InvalidWindow(_)
                                     | SubmitEventError::InvalidEvent(_) => {
@@ -1988,6 +2011,81 @@ mod tests {
         supervisor.check_health();
         assert_eq!(supervisor.respawn_count(), 0);
         assert!(!supervisor.has_worker());
+    }
+
+    #[test]
+    fn backend_supervisor_continues_after_panic_respawn() {
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
+            320, 240, 200.0, 200.0, 160.0, 120.0,
+        )
+        .expect("intrinsics");
+        let mut supervisor = BackendSupervisor::with_max_respawns(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            2,
+        );
+        let mut req_counter = 0;
+
+        let (map_panic, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let panic_event = make_forced_panic_event(
+            BackendRequestId::from_counter(&mut req_counter),
+            map_panic,
+            kf_a,
+            kf_b,
+        );
+        supervisor.submit(panic_event).expect("submit panic");
+
+        let mut saw_panic = false;
+        for _ in 0..100 {
+            if matches!(
+                supervisor.try_recv(),
+                Some(BackendResponse::WorkerPanic { .. })
+            ) {
+                saw_panic = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(saw_panic, "expected worker panic");
+
+        for _ in 0..100 {
+            supervisor.check_health();
+            if supervisor.respawn_count() >= 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(supervisor.has_worker(), "supervisor should respawn worker");
+
+        let (map_ok, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
+        let window = BackendWindow::try_new(vec![kf_a2, kf_b2]).expect("window");
+        let ok_event = KeyframeEvent::try_new(
+            BackendRequestId::from_counter(&mut req_counter),
+            MapVersion::initial(),
+            kf_b2,
+            window,
+            map_ok,
+        )
+        .expect("event");
+        supervisor.submit(ok_event).expect("submit event after respawn");
+
+        let mut got_non_panic = false;
+        for _ in 0..100 {
+            match supervisor.try_recv() {
+                Some(BackendResponse::Correction(_)) | Some(BackendResponse::Failure { .. }) => {
+                    got_non_panic = true;
+                    break;
+                }
+                Some(BackendResponse::WorkerPanic { .. }) => {
+                    panic!("worker panicked again on normal event");
+                }
+                None => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got_non_panic, "expected non-panic response after respawn");
     }
 }
 
