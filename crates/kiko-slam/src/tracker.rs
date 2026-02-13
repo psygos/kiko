@@ -580,6 +580,12 @@ fn insert_keyframe_into_map(
         }
     }
 
+    // Cull stale singleton landmarks from previous keyframes before adding
+    // new landmarks from this keyframe.
+    if map.num_points() > 0 {
+        let _ = map.cull_points(2);
+    }
+
     for (landmark, &det_idx) in keyframe
         .landmarks()
         .iter()
