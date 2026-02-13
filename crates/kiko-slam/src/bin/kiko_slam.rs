@@ -947,14 +947,17 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match device.mono_left(0) {
             Ok(frame) => {
-                pairer.push_left(oak_to_frame(
-                    frame,
-                    SensorId::StereoLeft,
-                    FrameId::new(left_seq),
-                ));
-                left_count += 1;
-                left_seq += 1;
-                got_any = true;
+                match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                    Ok(frame) => {
+                        pairer.push_left(frame);
+                        left_count += 1;
+                        left_seq += 1;
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("left frame dropped (invalid dimensions): {err}");
+                    }
+                }
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
@@ -965,14 +968,17 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match device.mono_right(0) {
             Ok(frame) => {
-                pairer.push_right(oak_to_frame(
-                    frame,
-                    SensorId::StereoRight,
-                    FrameId::new(right_seq),
-                ));
-                right_count += 1;
-                right_seq += 1;
-                got_any = true;
+                match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
+                    Ok(frame) => {
+                        pairer.push_right(frame);
+                        right_count += 1;
+                        right_seq += 1;
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("right frame dropped (invalid dimensions): {err}");
+                    }
+                }
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
@@ -1194,13 +1200,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match device.mono_left(0) {
             Ok(frame) => {
-                pairer.push_left(oak_to_frame(
-                    frame,
-                    SensorId::StereoLeft,
-                    FrameId::new(left_seq),
-                ));
-                left_seq += 1;
-                got_any = true;
+                match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                    Ok(frame) => {
+                        pairer.push_left(frame);
+                        left_seq += 1;
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("left frame dropped (invalid dimensions): {err}");
+                    }
+                }
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
@@ -1211,13 +1220,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match device.mono_right(0) {
             Ok(frame) => {
-                pairer.push_right(oak_to_frame(
-                    frame,
-                    SensorId::StereoRight,
-                    FrameId::new(right_seq),
-                ));
-                right_seq += 1;
-                got_any = true;
+                match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
+                    Ok(frame) => {
+                        pairer.push_right(frame);
+                        right_seq += 1;
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("right frame dropped (invalid dimensions): {err}");
+                    }
+                }
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {

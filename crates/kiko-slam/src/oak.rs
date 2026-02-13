@@ -1,7 +1,11 @@
-use crate::{Frame, FrameId, SensorId, Timestamp};
+use crate::{Frame, FrameError, FrameId, SensorId, Timestamp};
 use oak_sys::ImageFrame;
 
-pub fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId, frame_id: FrameId) -> Frame {
+pub fn oak_to_frame(
+    oak_frame: ImageFrame,
+    sensor: SensorId,
+    frame_id: FrameId,
+) -> Result<Frame, FrameError> {
     Frame::new(
         sensor,
         frame_id,
@@ -10,5 +14,4 @@ pub fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId, frame_id: FrameId) 
         oak_frame.height,
         oak_frame.into_pixels(),
     )
-    .expect("oak frame dimensions should be valid")
 }
