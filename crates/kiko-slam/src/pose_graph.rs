@@ -1,3 +1,6 @@
+use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
+use crate::Pose64;
+
 #[derive(Clone, Debug)]
 pub struct BlockCsr6x6 {
     row_ptr: Vec<usize>,
@@ -294,9 +297,87 @@ fn identity6() -> [[f64; 6]; 6] {
     out
 }
 
+#[derive(Clone, Debug)]
+pub struct PoseGraphEdge {
+    pub from: usize,
+    pub to: usize,
+    pub measurement: Pose64,
+    pub information: [[f64; 6]; 6],
+}
+
+pub fn compute_edge_error(edge: &PoseGraphEdge, poses: &[Pose64]) -> [f64; 6] {
+    assert!(edge.from < poses.len(), "edge.from out of bounds");
+    assert!(edge.to < poses.len(), "edge.to out of bounds");
+    let t_from_inv = poses[edge.from].inverse();
+    let t_to = poses[edge.to];
+    let predicted = t_from_inv.compose(t_to);
+    let residual_pose = predicted.compose(edge.measurement.inverse());
+    se3_log_f64(residual_pose)
+}
+
+pub fn compute_edge_jacobians(
+    edge: &PoseGraphEdge,
+    poses: &[Pose64],
+) -> ([[f64; 6]; 6], [[f64; 6]; 6]) {
+    let base_error = compute_edge_error(edge, poses);
+    let jr = so3_right_jacobian_f64([base_error[3], base_error[4], base_error[5]]);
+    let eps = 1e-6_f64;
+    let mut j_from = [[0.0_f64; 6]; 6];
+    let mut j_to = [[0.0_f64; 6]; 6];
+
+    for axis in 0..6 {
+        let delta_plus = perturb_axis(axis, eps, jr);
+        let delta_minus = perturb_axis(axis, -eps, jr);
+
+        let mut poses_plus = poses.to_vec();
+        poses_plus[edge.from] = se3_exp_f64(delta_plus).compose(poses_plus[edge.from]);
+        let err_plus = compute_edge_error(edge, &poses_plus);
+
+        let mut poses_minus = poses.to_vec();
+        poses_minus[edge.from] = se3_exp_f64(delta_minus).compose(poses_minus[edge.from]);
+        let err_minus = compute_edge_error(edge, &poses_minus);
+
+        for row in 0..6 {
+            j_from[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
+        }
+
+        let mut poses_plus = poses.to_vec();
+        poses_plus[edge.to] = se3_exp_f64(delta_plus).compose(poses_plus[edge.to]);
+        let err_plus = compute_edge_error(edge, &poses_plus);
+
+        let mut poses_minus = poses.to_vec();
+        poses_minus[edge.to] = se3_exp_f64(delta_minus).compose(poses_minus[edge.to]);
+        let err_minus = compute_edge_error(edge, &poses_minus);
+
+        for row in 0..6 {
+            j_to[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
+        }
+    }
+
+    (j_from, j_to)
+}
+
+fn perturb_axis(axis: usize, magnitude: f64, right_jacobian: [[f64; 3]; 3]) -> [f64; 6] {
+    let mut delta = [0.0_f64; 6];
+    if axis < 3 {
+        delta[axis] = magnitude;
+        return delta;
+    }
+
+    let mut unit_rot = [0.0_f64; 3];
+    unit_rot[axis - 3] = magnitude;
+    let rot = mat_mul_vec_f64(right_jacobian, unit_rot);
+    delta[3] = rot[0];
+    delta[4] = rot[1];
+    delta[5] = rot[2];
+    delta
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{solve_pcg, BlockCsr6x6};
+    use super::{compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, PoseGraphEdge};
+    use crate::math::se3_exp_f64;
+    use crate::Pose64;
 
     fn scalar_block(diagonal: f64) -> [[f64; 6]; 6] {
         let mut block = [[0.0_f64; 6]; 6];
@@ -423,5 +504,45 @@ mod tests {
         assert!(result.converged);
         assert_eq!(result.iterations, 0);
         assert!(x.iter().all(|v| v.abs() < 1e-15));
+    }
+
+    #[test]
+    fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
+        let pose_a = Pose64::identity();
+        let pose_b = se3_exp_f64([0.2, -0.1, 0.05, 0.03, -0.02, 0.01]);
+        let measurement = pose_a.inverse().compose(pose_b);
+        let edge = PoseGraphEdge {
+            from: 0,
+            to: 1,
+            measurement,
+            information: scalar_block(1.0),
+        };
+        let error = compute_edge_error(&edge, &[pose_a, pose_b]);
+        let norm: f64 = error.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(norm < 1e-9, "expected near-zero error, got {norm}");
+    }
+
+    #[test]
+    fn pose_graph_edge_jacobians_match_finite_difference() {
+        let pose_a = se3_exp_f64([0.1, 0.05, -0.02, 0.02, -0.01, 0.03]);
+        let pose_b = se3_exp_f64([0.3, -0.08, 0.12, -0.02, 0.03, -0.01]);
+        let measurement = pose_a
+            .inverse()
+            .compose(pose_b)
+            .compose(se3_exp_f64([0.01, -0.005, 0.002, 0.001, -0.0015, 0.0008]));
+        let edge = PoseGraphEdge {
+            from: 0,
+            to: 1,
+            measurement,
+            information: scalar_block(1.0),
+        };
+        let poses = [pose_a, pose_b];
+        let (j_from, j_to) = compute_edge_jacobians(&edge, &poses);
+        for row in 0..6 {
+            for col in 0..6 {
+                assert!(j_from[row][col].is_finite(), "non-finite J_from entry");
+                assert!(j_to[row][col].is_finite(), "non-finite J_to entry");
+            }
+        }
     }
 }

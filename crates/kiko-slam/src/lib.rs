@@ -34,6 +34,7 @@ pub use local_ba::{
     ObservationSetError,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
+pub use math::Pose64;
 #[cfg(feature = "record")]
 pub use oak::oak_to_frame;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
