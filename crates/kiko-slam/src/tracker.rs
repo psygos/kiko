@@ -721,6 +721,7 @@ fn build_map_observations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::assert_map_invariants;
     use crate::{Detections, Descriptor, Keypoint, SensorId, Point3, Timestamp};
 
     fn make_descriptor() -> Descriptor {
@@ -759,6 +760,7 @@ mod tests {
         );
 
         let mut map = SlamMap::new();
+        assert_map_invariants(&map).expect("empty map invariants");
         let keyframe_id = insert_keyframe_into_map(
             &mut map,
             &keyframe,
@@ -767,6 +769,7 @@ mod tests {
             None,
         )
         .expect("insert keyframe");
+        assert_map_invariants(&map).expect("post-insertion invariants");
 
         assert_eq!(map.num_keyframes(), 1);
         assert_eq!(map.num_points(), keyframe.landmarks().len());
@@ -786,6 +789,7 @@ mod tests {
             assert_eq!(y, landmark.y);
             assert_eq!(z, landmark.z);
         }
+        assert_map_invariants(&map).expect("final invariants");
     }
 }
 

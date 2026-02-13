@@ -837,6 +837,398 @@ fn normalize_descriptor(desc: &mut Descriptor) {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum MapInvariantError {
+    FrameIndexLenMismatch {
+        keyframes: usize,
+        frame_to_keyframe: usize,
+    },
+    FrameIndexMissingKeyframe {
+        frame_id: FrameId,
+        keyframe_id: KeyframeId,
+    },
+    FrameIndexMismatchedFrameId {
+        frame_id: FrameId,
+        keyframe_id: KeyframeId,
+        stored_frame_id: FrameId,
+    },
+    EmptyKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    KeypointPointRefLenMismatch {
+        keyframe_id: KeyframeId,
+        keypoints: usize,
+        point_refs: usize,
+    },
+    KeyframeReferencesMissingPoint {
+        keyframe_id: KeyframeId,
+        index: usize,
+        point_id: MapPointId,
+    },
+    KeyframePointBackrefMissing {
+        keyframe_id: KeyframeId,
+        index: usize,
+        point_id: MapPointId,
+    },
+    DuplicatePointInKeyframe {
+        keyframe_id: KeyframeId,
+        point_id: MapPointId,
+    },
+    EmptyMapPoint {
+        point_id: MapPointId,
+    },
+    MapPointDuplicateObservation {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+    },
+    MapPointObservationMissingKeyframe {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+    },
+    MapPointObservationIndexOutOfBounds {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+        index: usize,
+        keyframe_len: usize,
+    },
+    MapPointBackrefMismatch {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+        index: usize,
+        found: Option<MapPointId>,
+    },
+    DescriptorNotNormalized {
+        point_id: MapPointId,
+        norm: f32,
+    },
+    CovisibilitySelfEdge {
+        keyframe_id: KeyframeId,
+    },
+    CovisibilityMissingReverseEdge {
+        a: KeyframeId,
+        b: KeyframeId,
+    },
+    CovisibilityAsymmetricWeight {
+        a: KeyframeId,
+        b: KeyframeId,
+        ab: u32,
+        ba: u32,
+    },
+    CovisibilityUnexpectedWeight {
+        a: KeyframeId,
+        b: KeyframeId,
+        actual: u32,
+        expected: u32,
+    },
+}
+
+#[cfg(test)]
+impl std::fmt::Display for MapInvariantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MapInvariantError::FrameIndexLenMismatch {
+                keyframes,
+                frame_to_keyframe,
+            } => write!(
+                f,
+                "frame index mismatch: keyframes={keyframes}, frame_to_keyframe={frame_to_keyframe}"
+            ),
+            MapInvariantError::FrameIndexMissingKeyframe {
+                frame_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "frame index points to missing keyframe: frame={frame_id:?}, keyframe={keyframe_id:?}"
+            ),
+            MapInvariantError::FrameIndexMismatchedFrameId {
+                frame_id,
+                keyframe_id,
+                stored_frame_id,
+            } => write!(
+                f,
+                "frame index mismatch: frame={frame_id:?}, keyframe={keyframe_id:?}, stored_frame={stored_frame_id:?}"
+            ),
+            MapInvariantError::EmptyKeyframe { keyframe_id } => {
+                write!(f, "keyframe has no keypoints: keyframe={keyframe_id:?}")
+            }
+            MapInvariantError::KeypointPointRefLenMismatch {
+                keyframe_id,
+                keypoints,
+                point_refs,
+            } => write!(
+                f,
+                "keyframe keypoint/point_ref length mismatch: keyframe={keyframe_id:?}, keypoints={keypoints}, point_refs={point_refs}"
+            ),
+            MapInvariantError::KeyframeReferencesMissingPoint {
+                keyframe_id,
+                index,
+                point_id,
+            } => write!(
+                f,
+                "keyframe references missing map point: keyframe={keyframe_id:?}, index={index}, point={point_id:?}"
+            ),
+            MapInvariantError::KeyframePointBackrefMissing {
+                keyframe_id,
+                index,
+                point_id,
+            } => write!(
+                f,
+                "keyframe->point reference missing backref: keyframe={keyframe_id:?}, index={index}, point={point_id:?}"
+            ),
+            MapInvariantError::DuplicatePointInKeyframe {
+                keyframe_id,
+                point_id,
+            } => write!(
+                f,
+                "same map point referenced by multiple keypoints in keyframe={keyframe_id:?}, point={point_id:?}"
+            ),
+            MapInvariantError::EmptyMapPoint { point_id } => {
+                write!(f, "map point has zero observations: point={point_id:?}")
+            }
+            MapInvariantError::MapPointDuplicateObservation {
+                point_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "map point observes same keyframe twice: point={point_id:?}, keyframe={keyframe_id:?}"
+            ),
+            MapInvariantError::MapPointObservationMissingKeyframe {
+                point_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "map point observation references missing keyframe: point={point_id:?}, keyframe={keyframe_id:?}"
+            ),
+            MapInvariantError::MapPointObservationIndexOutOfBounds {
+                point_id,
+                keyframe_id,
+                index,
+                keyframe_len,
+            } => write!(
+                f,
+                "map point observation index out of bounds: point={point_id:?}, keyframe={keyframe_id:?}, index={index}, keyframe_len={keyframe_len}"
+            ),
+            MapInvariantError::MapPointBackrefMismatch {
+                point_id,
+                keyframe_id,
+                index,
+                found,
+            } => write!(
+                f,
+                "map point backref mismatch: point={point_id:?}, keyframe={keyframe_id:?}, index={index}, found={found:?}"
+            ),
+            MapInvariantError::DescriptorNotNormalized { point_id, norm } => write!(
+                f,
+                "map point descriptor not normalized: point={point_id:?}, norm={norm}"
+            ),
+            MapInvariantError::CovisibilitySelfEdge { keyframe_id } => {
+                write!(f, "covisibility self edge present: keyframe={keyframe_id:?}")
+            }
+            MapInvariantError::CovisibilityMissingReverseEdge { a, b } => write!(
+                f,
+                "covisibility missing reverse edge: {a:?} -> {b:?}"
+            ),
+            MapInvariantError::CovisibilityAsymmetricWeight { a, b, ab, ba } => write!(
+                f,
+                "covisibility asymmetric weights: {a:?}->{b:?}={ab}, {b:?}->{a:?}={ba}"
+            ),
+            MapInvariantError::CovisibilityUnexpectedWeight {
+                a,
+                b,
+                actual,
+                expected,
+            } => write!(
+                f,
+                "covisibility weight mismatch: {a:?}<->{b:?}, actual={actual}, expected={expected}"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for MapInvariantError {}
+
+#[cfg(test)]
+pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantError> {
+    if map.keyframes.len() != map.frame_to_keyframe.len() {
+        return Err(MapInvariantError::FrameIndexLenMismatch {
+            keyframes: map.keyframes.len(),
+            frame_to_keyframe: map.frame_to_keyframe.len(),
+        });
+    }
+
+    for (&frame_id, &keyframe_id) in &map.frame_to_keyframe {
+        let Some(entry) = map.keyframes.get(keyframe_id) else {
+            return Err(MapInvariantError::FrameIndexMissingKeyframe {
+                frame_id,
+                keyframe_id,
+            });
+        };
+        if entry.frame_id() != frame_id {
+            return Err(MapInvariantError::FrameIndexMismatchedFrameId {
+                frame_id,
+                keyframe_id,
+                stored_frame_id: entry.frame_id(),
+            });
+        }
+    }
+
+    for (keyframe_id, entry) in map.keyframes.iter() {
+        if entry.is_empty() {
+            return Err(MapInvariantError::EmptyKeyframe { keyframe_id });
+        }
+        if entry.keypoints.len() != entry.point_refs.len() {
+            return Err(MapInvariantError::KeypointPointRefLenMismatch {
+                keyframe_id,
+                keypoints: entry.keypoints.len(),
+                point_refs: entry.point_refs.len(),
+            });
+        }
+
+        let mut seen_points = HashSet::new();
+        for (index, maybe_point_id) in entry.point_refs.iter().enumerate() {
+            let Some(point_id) = *maybe_point_id else {
+                continue;
+            };
+
+            let Some(point) = map.points.get(point_id) else {
+                return Err(MapInvariantError::KeyframeReferencesMissingPoint {
+                    keyframe_id,
+                    index,
+                    point_id,
+                });
+            };
+
+            let backref_exists = point.observations.iter().any(|obs| {
+                obs.keyframe_id == keyframe_id && obs.index.as_usize() == index
+            });
+            if !backref_exists {
+                return Err(MapInvariantError::KeyframePointBackrefMissing {
+                    keyframe_id,
+                    index,
+                    point_id,
+                });
+            }
+
+            if !seen_points.insert(point_id) {
+                return Err(MapInvariantError::DuplicatePointInKeyframe {
+                    keyframe_id,
+                    point_id,
+                });
+            }
+        }
+    }
+
+    let mut expected_covisibility: HashMap<(KeyframeId, KeyframeId), u32> = HashMap::new();
+    for (point_id, point) in map.points.iter() {
+        if point.observations.is_empty() {
+            return Err(MapInvariantError::EmptyMapPoint { point_id });
+        }
+
+        let mut seen_keyframes = HashSet::new();
+        for obs in &point.observations {
+            if !seen_keyframes.insert(obs.keyframe_id) {
+                return Err(MapInvariantError::MapPointDuplicateObservation {
+                    point_id,
+                    keyframe_id: obs.keyframe_id,
+                });
+            }
+
+            let Some(entry) = map.keyframes.get(obs.keyframe_id) else {
+                return Err(MapInvariantError::MapPointObservationMissingKeyframe {
+                    point_id,
+                    keyframe_id: obs.keyframe_id,
+                });
+            };
+
+            let index = obs.index.as_usize();
+            if index >= entry.len() {
+                return Err(MapInvariantError::MapPointObservationIndexOutOfBounds {
+                    point_id,
+                    keyframe_id: obs.keyframe_id,
+                    index,
+                    keyframe_len: entry.len(),
+                });
+            }
+
+            let found = entry.point_ref(obs.index);
+            if found != Some(point_id) {
+                return Err(MapInvariantError::MapPointBackrefMismatch {
+                    point_id,
+                    keyframe_id: obs.keyframe_id,
+                    index,
+                    found,
+                });
+            }
+        }
+
+        let desc_norm = point.descriptor.0.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if desc_norm > 1e-6 && (desc_norm - 1.0).abs() > 1e-3 {
+            return Err(MapInvariantError::DescriptorNotNormalized {
+                point_id,
+                norm: desc_norm,
+            });
+        }
+
+        for i in 0..point.observations.len() {
+            for j in (i + 1)..point.observations.len() {
+                let a = point.observations[i].keyframe_id;
+                let b = point.observations[j].keyframe_id;
+                *expected_covisibility.entry((a, b)).or_insert(0) += 1;
+                *expected_covisibility.entry((b, a)).or_insert(0) += 1;
+            }
+        }
+    }
+
+    for (&a, neighbors) in &map.covisibility.edges {
+        for (&b, &weight) in neighbors {
+            if a == b {
+                return Err(MapInvariantError::CovisibilitySelfEdge { keyframe_id: a });
+            }
+
+            let Some(reverse_neighbors) = map.covisibility.edges.get(&b) else {
+                return Err(MapInvariantError::CovisibilityMissingReverseEdge { a, b });
+            };
+            let Some(reverse_weight) = reverse_neighbors.get(&a) else {
+                return Err(MapInvariantError::CovisibilityMissingReverseEdge { a, b });
+            };
+            if reverse_weight.get() != weight.get() {
+                return Err(MapInvariantError::CovisibilityAsymmetricWeight {
+                    a,
+                    b,
+                    ab: weight.get(),
+                    ba: reverse_weight.get(),
+                });
+            }
+
+            let expected = expected_covisibility.get(&(a, b)).copied().unwrap_or(0);
+            if expected != weight.get() {
+                return Err(MapInvariantError::CovisibilityUnexpectedWeight {
+                    a,
+                    b,
+                    actual: weight.get(),
+                    expected,
+                });
+            }
+        }
+    }
+
+    for ((a, b), expected) in expected_covisibility {
+        let actual = map.covisibility.covisibility_count(a, b);
+        if actual != expected {
+            return Err(MapInvariantError::CovisibilityUnexpectedWeight {
+                a,
+                b,
+                actual,
+                expected,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{Keypoint, Pose, Timestamp};
@@ -859,6 +1251,7 @@ mod tests {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
+        assert_map_invariants(&map).expect("empty map invariants");
 
         let kf1 = map
             .add_keyframe(
@@ -888,9 +1281,11 @@ mod tests {
         map.add_observation(point, obs2).expect("second observation");
 
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
+        assert_map_invariants(&map).expect("after shared observation");
 
         map.remove_map_point(point).expect("remove point");
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 0);
+        assert_map_invariants(&map).expect("after point removal");
     }
 
     #[test]
@@ -898,6 +1293,7 @@ mod tests {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
+        assert_map_invariants(&map).expect("empty map invariants");
 
         let kf1 = map
             .add_keyframe(
@@ -925,6 +1321,7 @@ mod tests {
 
         let obs2 = map.keyframe_keypoint(kf2, 0).expect("obs2");
         map.add_observation(point, obs2).expect("second observation");
+        assert_map_invariants(&map).expect("after shared observation");
 
         let obs2_alt = map.keyframe_keypoint(kf2, 1).expect("obs2_alt");
         let err = map.add_observation(point, obs2_alt).expect_err("duplicate observation");
@@ -935,6 +1332,7 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+        assert_map_invariants(&map).expect("after duplicate rejection");
     }
 
     #[test]
@@ -942,6 +1340,7 @@ mod tests {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
+        assert_map_invariants(&map).expect("empty map invariants");
 
         let kf1 = map
             .add_keyframe(
@@ -958,10 +1357,12 @@ mod tests {
             .add_map_point(Point3 { x: 0.0, y: 0.0, z: 1.0 }, make_descriptor(), obs1)
             .expect("map point");
         assert!(map.point(point).is_some());
+        assert_map_invariants(&map).expect("after point insertion");
 
         map.remove_keyframe(kf1).expect("remove keyframe");
         assert_eq!(map.num_keyframes(), 0);
         assert_eq!(map.num_points(), 0);
+        assert_map_invariants(&map).expect("after keyframe removal");
     }
 
     #[test]
@@ -969,6 +1370,7 @@ mod tests {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
+        assert_map_invariants(&map).expect("empty map invariants");
 
         let kf1 = map
             .add_keyframe(
@@ -1006,6 +1408,7 @@ mod tests {
         map.add_observation(point_a, obs2).expect("obs2 add");
         let obs3 = map.keyframe_keypoint(kf3, 0).expect("obs3");
         map.add_observation(point_a, obs3).expect("obs3 add");
+        assert_map_invariants(&map).expect("after first shared point");
 
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
         assert_eq!(map.covisibility().covisibility_count(kf1, kf3), 1);
@@ -1017,10 +1420,12 @@ mod tests {
             .expect("point B");
         let obs2b = map.keyframe_keypoint(kf2, 1).expect("obs2b");
         map.add_observation(point_b, obs2b).expect("obs2b add");
+        assert_map_invariants(&map).expect("after second shared point");
 
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 2);
 
         map.remove_map_point(point_b).expect("remove point B");
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
+        assert_map_invariants(&map).expect("after point B removal");
     }
 }
