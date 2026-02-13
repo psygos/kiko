@@ -450,6 +450,7 @@ impl Triangulator {
                     stats.dropped_duplicate += 1;
                 }
                 Some(_) => {
+                    stats.dropped_duplicate += 1;
                     best[li] = Some((ri, score));
                 }
                 None => {
@@ -519,4 +520,263 @@ impl Triangulator {
 
 fn in_bounds(kp: Keypoint, width: f32, height: f32) -> bool {
     kp.x >= 0.0 && kp.y >= 0.0 && kp.x < width && kp.y < height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{
+        make_detections, make_pinhole_intrinsics, make_rectified_stereo,
+        rectified_stereo_keypoints_from_points,
+    };
+    use crate::{FrameId, Matches};
+
+    fn assert_stats_accounting(stats: TriangulationStats) {
+        assert_eq!(
+            stats.kept
+                + stats.dropped_disparity
+                + stats.dropped_out_of_bounds
+                + stats.dropped_depth
+                + stats.dropped_duplicate,
+            stats.candidate_matches
+        );
+    }
+
+    #[test]
+    fn triangulate_recovers_known_depth_for_rectified_pairs() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 402.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let stereo = make_rectified_stereo(640, 480, 400.0, 402.0, 320.0, 240.0, 0.075)
+            .expect("stereo");
+        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
+
+        let points = vec![
+            Point3 {
+                x: -0.2,
+                y: -0.1,
+                z: 2.5,
+            },
+            Point3 {
+                x: 0.1,
+                y: 0.15,
+                z: 3.2,
+            },
+            Point3 {
+                x: 0.3,
+                y: -0.05,
+                z: 4.1,
+            },
+            Point3 {
+                x: -0.35,
+                y: 0.2,
+                z: 5.4,
+            },
+        ];
+
+        let kps = rectified_stereo_keypoints_from_points(&points, intrinsics, 0.075);
+        let mut left_kps = Vec::new();
+        let mut right_kps = Vec::new();
+        let mut pairs = Vec::new();
+        for (idx, (src_idx, left, right)) in kps.into_iter().enumerate() {
+            left_kps.push(left);
+            right_kps.push(right);
+            pairs.push((idx, idx));
+            assert_eq!(src_idx, idx);
+        }
+
+        let left = make_detections(SensorId::StereoLeft, FrameId::new(10), 640, 480, left_kps)
+            .expect("left detections");
+        let right =
+            make_detections(SensorId::StereoRight, FrameId::new(11), 640, 480, right_kps)
+                .expect("right detections");
+        let matches = Matches::new(left, right, pairs, vec![1.0; points.len()]).expect("matches");
+
+        let result = triangulator.triangulate(&matches).expect("triangulation");
+        assert_stats_accounting(result.stats);
+
+        let keyframe = result.keyframe;
+        assert_eq!(keyframe.landmarks().len(), points.len());
+        for (landmark, &det_idx) in keyframe.landmarks().iter().zip(keyframe.landmark_indices()) {
+            let expected = points[det_idx];
+            assert!((landmark.x - expected.x).abs() < 1e-4);
+            assert!((landmark.y - expected.y).abs() < 1e-4);
+            assert!((landmark.z - expected.z).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn triangulate_rejects_points_below_min_disparity() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
+            .expect("stereo");
+        let triangulator = Triangulator::new(
+            stereo,
+            TriangulationConfig {
+                min_disparity_px: 1.0,
+                max_depth_m: None,
+            },
+        );
+
+        let far_points = vec![Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 90.0,
+        }];
+        let kps = rectified_stereo_keypoints_from_points(&far_points, intrinsics, 0.075);
+        let (_, left_kp, right_kp) = kps[0];
+
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(20),
+            640,
+            480,
+            vec![left_kp],
+        )
+        .expect("left");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(21),
+            640,
+            480,
+            vec![right_kp],
+        )
+        .expect("right");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let err = triangulator
+            .triangulate(&matches)
+            .expect_err("should reject low disparity");
+        match err {
+            TriangulationError::NoLandmarks { stats } => {
+                assert_eq!(stats.candidate_matches, 1);
+                assert_eq!(stats.kept, 0);
+                assert_eq!(stats.dropped_disparity, 1);
+                assert_stats_accounting(stats);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triangulate_returns_index_out_of_bounds_for_bad_match_indices() {
+        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
+            .expect("stereo");
+        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
+
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(30),
+            640,
+            480,
+            vec![Keypoint { x: 320.0, y: 240.0 }],
+        )
+        .expect("left");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(31),
+            640,
+            480,
+            vec![Keypoint { x: 300.0, y: 240.0 }],
+        )
+        .expect("right");
+        let matches = Matches::new(left, right, vec![(0, 2)], vec![1.0]).expect("matches");
+
+        let err = triangulator
+            .triangulate(&matches)
+            .expect_err("index error expected");
+        match err {
+            TriangulationError::IndexOutOfBounds {
+                left_len,
+                right_len,
+                left_index,
+                right_index,
+            } => {
+                assert_eq!(left_len, 1);
+                assert_eq!(right_len, 1);
+                assert_eq!(left_index, 0);
+                assert_eq!(right_index, 2);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triangulate_uses_best_score_for_duplicate_left_matches() {
+        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
+            .expect("stereo");
+        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
+
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(40),
+            640,
+            480,
+            vec![Keypoint { x: 360.0, y: 240.0 }],
+        )
+        .expect("left");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(41),
+            640,
+            480,
+            vec![Keypoint { x: 335.0, y: 240.0 }, Keypoint { x: 345.0, y: 240.0 }],
+        )
+        .expect("right");
+
+        let matches = Matches::new(
+            left,
+            right,
+            vec![(0, 0), (0, 1)],
+            vec![0.1, 0.9], // winner should be (0,1): smaller disparity => larger depth
+        )
+        .expect("matches");
+
+        let result = triangulator.triangulate(&matches).expect("triangulation");
+        assert_eq!(result.stats.candidate_matches, 2);
+        assert_eq!(result.stats.dropped_duplicate, 1);
+        assert_eq!(result.stats.kept, 1);
+        assert_stats_accounting(result.stats);
+
+        let z = result.keyframe.landmarks()[0].z;
+        let expected_disparity = 360.0 - 345.0;
+        let expected_z = 400.0 * 0.075 / expected_disparity;
+        assert!((z - expected_z).abs() < 1e-4);
+    }
+
+    #[test]
+    fn triangulate_rejects_sensor_mismatch() {
+        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
+            .expect("stereo");
+        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
+
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(50),
+            640,
+            480,
+            vec![Keypoint { x: 360.0, y: 240.0 }],
+        )
+        .expect("left");
+        let right_wrong = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(51),
+            640,
+            480,
+            vec![Keypoint { x: 330.0, y: 240.0 }],
+        )
+        .expect("right_wrong");
+        let matches = Matches::new(left, right_wrong, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let err = triangulator
+            .triangulate(&matches)
+            .expect_err("sensor mismatch expected");
+        match err {
+            TriangulationError::SensorMismatch { left, right } => {
+                assert_eq!(left, SensorId::StereoLeft);
+                assert_eq!(right, SensorId::StereoLeft);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
 }

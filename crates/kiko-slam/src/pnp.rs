@@ -853,3 +853,207 @@ fn sample_three(rng: &mut XorShift64, max: usize) -> Option<[usize; 3]> {
 
     Some([a, b, c])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{axis_angle_pose, make_pinhole_intrinsics, observations_from_projection};
+
+    fn synthetic_world_points() -> Vec<Point3> {
+        let mut points = Vec::new();
+        for yi in -2..=2 {
+            for xi in -2..=2 {
+                let x = xi as f32 * 0.25;
+                let y = yi as f32 * 0.20;
+                let z = 3.0 + 0.08 * ((xi * xi + yi * yi) as f32);
+                points.push(Point3 { x, y, z });
+            }
+        }
+        points
+    }
+
+    fn rot_frob_norm(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> f32 {
+        let mut sum = 0.0_f32;
+        for i in 0..3 {
+            for j in 0..3 {
+                let d = a[i][j] - b[i][j];
+                sum += d * d;
+            }
+        }
+        sum.sqrt()
+    }
+
+    fn l2(a: [f32; 3], b: [f32; 3]) -> f32 {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        let dz = a[2] - b[2];
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    #[test]
+    fn normalize_bearing_has_unit_norm() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let pixel = Keypoint { x: 369.0, y: 211.0 };
+        let b = normalize_bearing(pixel, intrinsics).expect("bearing");
+        let n = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
+        assert!((n - 1.0).abs() < 1e-6, "bearing norm must be 1, got {n}");
+    }
+
+    #[test]
+    fn sample_three_returns_distinct_indices() {
+        let mut rng = XorShift64::new(0xDEADBEEF);
+        for _ in 0..500 {
+            let sample = sample_three(&mut rng, 17).expect("sample");
+            assert!(sample[0] < 17 && sample[1] < 17 && sample[2] < 17);
+            assert_ne!(sample[0], sample[1]);
+            assert_ne!(sample[0], sample[2]);
+            assert_ne!(sample[1], sample[2]);
+        }
+    }
+
+    #[test]
+    fn pose_inverse_is_involution() {
+        let pose = axis_angle_pose([0.3, -0.2, 0.7], [0.1, -0.05, 0.08]);
+        let recovered = pose.inverse().inverse();
+        assert!(rot_frob_norm(pose.rotation(), recovered.rotation()) < 1e-5);
+        assert!(l2(pose.translation(), recovered.translation()) < 1e-5);
+    }
+
+    #[test]
+    fn solve_pnp_ransac_recovers_pose_on_synthetic_scene() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let world = synthetic_world_points();
+        let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
+
+        let observations =
+            observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
+        assert!(observations.len() >= 20);
+
+        let config = RansacConfig {
+            max_iterations: 700,
+            reprojection_threshold_px: 1.0,
+            min_inliers: 20,
+            seed: 0xBAD5EED,
+        };
+        let result = solve_pnp_ransac(&observations, intrinsics, config).expect("pnp");
+        assert!(result.inliers.len() >= 20, "insufficient inliers");
+
+        let rot_err = rot_frob_norm(result.pose.rotation(), pose_gt.rotation());
+        let trans_err = l2(result.pose.translation(), pose_gt.translation());
+        assert!(rot_err < 0.03, "rotation error too high: {rot_err}");
+        assert!(trans_err < 0.08, "translation error too high: {trans_err}");
+    }
+
+    #[test]
+    fn solve_pnp_ransac_handles_outliers() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let world = synthetic_world_points();
+        let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
+
+        let clean =
+            observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
+        let mut with_outliers = Vec::with_capacity(clean.len());
+        for (idx, obs) in clean.iter().enumerate() {
+            let mut pixel = obs.pixel();
+            if idx % 6 == 0 {
+                pixel.x += 120.0;
+                pixel.y -= 85.0;
+            }
+            with_outliers.push(
+                Observation::try_new(obs.world(), pixel, intrinsics).expect("observation"),
+            );
+        }
+
+        let config = RansacConfig {
+            max_iterations: 1000,
+            reprojection_threshold_px: 2.0,
+            min_inliers: 14,
+            seed: 0x1337,
+        };
+        let result = solve_pnp_ransac(&with_outliers, intrinsics, config).expect("pnp");
+        assert!(
+            result.inliers.len() >= 14,
+            "expected robust inliers, got {}",
+            result.inliers.len()
+        );
+
+        let rot_err = rot_frob_norm(result.pose.rotation(), pose_gt.rotation());
+        let trans_err = l2(result.pose.translation(), pose_gt.translation());
+        assert!(rot_err < 0.08, "rotation error too high with outliers: {rot_err}");
+        assert!(
+            trans_err < 0.18,
+            "translation error too high with outliers: {trans_err}"
+        );
+    }
+
+    #[test]
+    fn solve_pnp_ransac_rejects_too_few_points() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let obs = vec![
+            Observation::try_new(
+                Point3 { x: 0.0, y: 0.0, z: 3.0 },
+                Keypoint { x: 320.0, y: 240.0 },
+                intrinsics,
+            )
+            .expect("obs"),
+            Observation::try_new(
+                Point3 { x: 0.2, y: 0.1, z: 3.5 },
+                Keypoint { x: 342.0, y: 252.0 },
+                intrinsics,
+            )
+            .expect("obs"),
+            Observation::try_new(
+                Point3 { x: -0.2, y: 0.2, z: 2.9 },
+                Keypoint { x: 290.0, y: 266.0 },
+                intrinsics,
+            )
+            .expect("obs"),
+        ];
+
+        let err = solve_pnp_ransac(&obs, intrinsics, RansacConfig::default())
+            .expect_err("should reject");
+        match err {
+            PnpError::NotEnoughPoints { required, actual } => {
+                assert_eq!(required, 4);
+                assert_eq!(actual, 3);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reprojection_error_is_zero_for_exact_projection() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0)
+            .expect("intrinsics");
+        let pose = axis_angle_pose([0.0, 0.0, 0.0], [0.05, -0.03, 0.01]);
+        let point = Point3 {
+            x: 0.3,
+            y: -0.1,
+            z: 4.2,
+        };
+        let pixel = project_pixel_from_pose(pose, point, intrinsics);
+        let obs = Observation::try_new(point, pixel, intrinsics).expect("obs");
+        let err_sq = reprojection_error_sq_px(pose, &obs, intrinsics).expect("error");
+        assert!(err_sq < 1e-8, "expected exact reprojection, got {err_sq}");
+    }
+
+    fn project_pixel_from_pose(
+        pose_world_to_camera: Pose,
+        point_world: Point3,
+        intrinsics: PinholeIntrinsics,
+    ) -> Keypoint {
+        let pc = math::transform_point(
+            pose_world_to_camera.rotation(),
+            pose_world_to_camera.translation(),
+            [point_world.x, point_world.y, point_world.z],
+        );
+        Keypoint {
+            x: intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx(),
+            y: intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy(),
+        }
+    }
+}

@@ -20,6 +20,8 @@ mod local_ba;
 pub mod map;
 #[cfg(feature = "record")]
 mod oak;
+#[cfg(test)]
+pub(crate) mod test_helpers;
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
