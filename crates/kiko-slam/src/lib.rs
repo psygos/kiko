@@ -34,7 +34,10 @@ pub use local_ba::{
     LocalBundleAdjuster, LmConfig, LmConfigError, MapObservation, ObservationSet,
     ObservationSetError,
 };
-pub use loop_closure::{GlobalDescriptor, KeyframeDatabase, PlaceMatch};
+pub use loop_closure::{
+    GlobalDescriptor, KeyframeDatabase, LoopCandidate, LoopVerificationError, PlaceMatch,
+    VerifiedLoop,
+};
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
 #[cfg(feature = "record")]

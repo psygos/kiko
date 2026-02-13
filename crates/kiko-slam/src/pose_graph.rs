@@ -540,6 +540,7 @@ pub struct EssentialEdge {
 #[derive(Clone, Debug)]
 pub struct EssentialGraphSnapshot {
     pub parent: HashMap<KeyframeId, KeyframeId>,
+    pub order: Vec<KeyframeId>,
     pub spanning_edges: Vec<EssentialEdge>,
     pub strong_covis_edges: Vec<EssentialEdge>,
     pub loop_edges: Vec<EssentialEdge>,
@@ -547,8 +548,15 @@ pub struct EssentialGraphSnapshot {
 }
 
 #[derive(Clone, Debug)]
+pub struct PoseGraphInput {
+    pub keyframe_ids: Vec<KeyframeId>,
+    pub edges: Vec<PoseGraphEdge>,
+}
+
+#[derive(Clone, Debug)]
 pub struct EssentialGraph {
     parent: HashMap<KeyframeId, KeyframeId>,
+    order: Vec<KeyframeId>,
     spanning_edges: Vec<EssentialEdge>,
     strong_covis_edges: Vec<EssentialEdge>,
     loop_edges: Vec<EssentialEdge>,
@@ -559,6 +567,7 @@ impl EssentialGraph {
     pub fn new(strong_threshold: u32) -> Self {
         Self {
             parent: HashMap::new(),
+            order: Vec::new(),
             spanning_edges: Vec::new(),
             strong_covis_edges: Vec::new(),
             loop_edges: Vec::new(),
@@ -579,6 +588,7 @@ impl EssentialGraph {
         if self.parent.contains_key(&keyframe_id) {
             return;
         }
+        self.order.push(keyframe_id);
         if self.parent.is_empty() {
             self.parent.insert(keyframe_id, keyframe_id);
             return;
@@ -633,12 +643,21 @@ impl EssentialGraph {
     }
 
     pub fn add_loop_edge(&mut self, edge: EssentialEdge) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.a) {
+            entry.insert(edge.a);
+            self.order.push(edge.a);
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.b) {
+            entry.insert(edge.b);
+            self.order.push(edge.b);
+        }
         self.loop_edges.push(edge);
     }
 
     pub fn snapshot(&self) -> EssentialGraphSnapshot {
         EssentialGraphSnapshot {
             parent: self.parent.clone(),
+            order: self.order.clone(),
             spanning_edges: self.spanning_edges.clone(),
             strong_covis_edges: self.strong_covis_edges.clone(),
             loop_edges: self.loop_edges.clone(),
@@ -646,29 +665,29 @@ impl EssentialGraph {
         }
     }
 
-    pub fn all_edges(&self) -> Vec<PoseGraphEdge> {
-        let mut id_to_idx = HashMap::new();
-        for &id in self.parent.keys() {
-            let next = id_to_idx.len();
-            id_to_idx.entry(id).or_insert(next);
-        }
+    pub fn pose_graph_input(&self) -> PoseGraphInput {
+        let mut keyframe_ids = self.order.clone();
         for edge in self
             .spanning_edges
             .iter()
             .chain(self.strong_covis_edges.iter())
             .chain(self.loop_edges.iter())
         {
-            if !id_to_idx.contains_key(&edge.a) {
-                let next = id_to_idx.len();
-                id_to_idx.insert(edge.a, next);
+            if !keyframe_ids.contains(&edge.a) {
+                keyframe_ids.push(edge.a);
             }
-            if !id_to_idx.contains_key(&edge.b) {
-                let next = id_to_idx.len();
-                id_to_idx.insert(edge.b, next);
+            if !keyframe_ids.contains(&edge.b) {
+                keyframe_ids.push(edge.b);
             }
         }
 
-        self.spanning_edges
+        let mut id_to_idx = HashMap::new();
+        for (idx, &id) in keyframe_ids.iter().enumerate() {
+            id_to_idx.insert(id, idx);
+        }
+
+        let edges = self
+            .spanning_edges
             .iter()
             .chain(self.strong_covis_edges.iter())
             .chain(self.loop_edges.iter())
@@ -680,7 +699,13 @@ impl EssentialGraph {
                     information: edge.information,
                 })
             })
-            .collect()
+            .collect();
+
+        PoseGraphInput { keyframe_ids, edges }
+    }
+
+    pub fn all_edges(&self) -> Vec<PoseGraphEdge> {
+        self.pose_graph_input().edges
     }
 }
 

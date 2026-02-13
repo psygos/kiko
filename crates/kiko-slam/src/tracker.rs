@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::thread;
@@ -11,6 +11,10 @@ use crate::{
     Matches, ObservationSet, PinholeIntrinsics, Point3, Pose, RansacConfig, Raw, RectifiedStereo,
     StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
     Verified,
+};
+use crate::loop_closure::VerifiedLoop;
+use crate::pose_graph::{
+    EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphOptimizer,
 };
 
 use crate::inference::InferenceError;
@@ -889,6 +893,8 @@ pub struct SlamTracker {
     state: TrackerState,
     ba: LocalBundleAdjuster,
     map: SlamMap,
+    essential_graph: EssentialGraph,
+    pose_graph_optimizer: PoseGraphOptimizer,
     map_version: MapVersion,
     backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
@@ -897,6 +903,8 @@ pub struct SlamTracker {
 }
 
 impl SlamTracker {
+    const DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD: u32 = 15;
+
     pub fn new(
         superpoint_left: SuperPoint,
         superpoint_right: SuperPoint,
@@ -920,6 +928,8 @@ impl SlamTracker {
             state: TrackerState::NeedKeyframe,
             ba,
             map: SlamMap::new(),
+            essential_graph: EssentialGraph::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD),
+            pose_graph_optimizer: PoseGraphOptimizer::new(PoseGraphConfig::default()),
             map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
@@ -962,6 +972,17 @@ impl SlamTracker {
             backend_alive,
             self.backend_stats,
         )
+    }
+
+    pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
+        apply_loop_closure_correction(
+            &mut self.map,
+            &mut self.essential_graph,
+            &self.pose_graph_optimizer,
+            &verified,
+        )?;
+        self.bump_map_version();
+        Ok(())
     }
 
     fn bump_map_version(&mut self) {
@@ -1404,6 +1425,11 @@ impl SlamTracker {
             pose_world,
             shared.as_ref(),
         )?;
+        self.essential_graph.add_keyframe(
+            keyframe_id,
+            self.map.covisibility().neighbors(keyframe_id),
+            &self.map,
+        );
         self.bump_map_version();
 
         Ok((
@@ -1589,6 +1615,125 @@ fn apply_correction_event(
     Ok(())
 }
 
+fn apply_loop_closure_correction(
+    map: &mut SlamMap,
+    essential_graph: &mut EssentialGraph,
+    optimizer: &PoseGraphOptimizer,
+    verified: &VerifiedLoop,
+) -> Result<(), TrackerError> {
+    let query_kf = verified.query_kf();
+    let match_kf = verified.match_kf();
+    let match_pose = map
+        .keyframe(match_kf)
+        .ok_or(TrackerError::Map(crate::map::MapError::KeyframeNotFound(match_kf)))?
+        .pose();
+    let query_pose_estimate = verified.relative_pose();
+    let loop_relative = crate::Pose64::from_pose32(match_pose)
+        .inverse()
+        .compose(crate::Pose64::from_pose32(query_pose_estimate));
+
+    essential_graph.add_loop_edge(EssentialEdge {
+        a: match_kf,
+        b: query_kf,
+        kind: EssentialEdgeKind::Loop,
+        relative_pose: loop_relative,
+        information: loop_information_matrix(verified.inlier_count()),
+    });
+
+    let input = essential_graph.pose_graph_input();
+    if input.keyframe_ids.len() < 2 || input.edges.is_empty() {
+        return Ok(());
+    }
+
+    let mut old_poses = HashMap::with_capacity(input.keyframe_ids.len());
+    let mut initial_poses = Vec::with_capacity(input.keyframe_ids.len());
+    for &keyframe_id in &input.keyframe_ids {
+        let pose = map
+            .keyframe(keyframe_id)
+            .ok_or(TrackerError::Map(crate::map::MapError::KeyframeNotFound(
+                keyframe_id,
+            )))?
+            .pose();
+        old_poses.insert(keyframe_id, pose);
+        initial_poses.push(crate::Pose64::from_pose32(pose));
+    }
+
+    let result = optimizer.optimize(&input.edges, &mut initial_poses);
+    let corrected_poses: HashMap<KeyframeId, Pose> = input
+        .keyframe_ids
+        .iter()
+        .copied()
+        .zip(result.corrected_poses.into_iter().map(|pose| pose.to_pose32()))
+        .collect();
+
+    for (keyframe_id, corrected_pose) in &corrected_poses {
+        map.set_keyframe_pose(*keyframe_id, *corrected_pose)?;
+    }
+
+    let mut point_updates = Vec::new();
+    for (point_id, point) in map.points() {
+        let world = point.position();
+        let world_vec = [world.x, world.y, world.z];
+        let mut accum = [0.0_f32; 3];
+        let mut count = 0usize;
+
+        for observation in point.observations() {
+            let keyframe_id = observation.keyframe_id();
+            let Some(old_pose) = old_poses.get(&keyframe_id).copied() else {
+                continue;
+            };
+            let Some(new_pose) = corrected_poses.get(&keyframe_id).copied() else {
+                continue;
+            };
+
+            let camera = crate::math::transform_point(
+                old_pose.rotation(),
+                old_pose.translation(),
+                world_vec,
+            );
+            let corrected_world = camera_to_world(
+                new_pose,
+                Point3 {
+                    x: camera[0],
+                    y: camera[1],
+                    z: camera[2],
+                },
+            );
+            accum[0] += corrected_world.x;
+            accum[1] += corrected_world.y;
+            accum[2] += corrected_world.z;
+            count = count.saturating_add(1);
+        }
+
+        if count > 0 {
+            let inv_count = 1.0_f32 / count as f32;
+            point_updates.push((
+                point_id,
+                Point3 {
+                    x: accum[0] * inv_count,
+                    y: accum[1] * inv_count,
+                    z: accum[2] * inv_count,
+                },
+            ));
+        }
+    }
+
+    for (point_id, corrected_world) in point_updates {
+        map.set_map_point_position(point_id, corrected_world)?;
+    }
+
+    Ok(())
+}
+
+fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
+    let weight = inlier_count.max(1) as f64;
+    let mut info = [[0.0_f64; 6]; 6];
+    for (axis, row) in info.iter_mut().enumerate() {
+        row[axis] = weight;
+    }
+    info
+}
+
 fn build_map_observations(
     map: &SlamMap,
     keyframe_id: KeyframeId,
@@ -1636,7 +1781,7 @@ fn build_map_observations(
 mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
-    use crate::{Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
+    use crate::{CompactDescriptor, Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
@@ -2169,6 +2314,168 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(got_non_panic, "expected non-panic response after respawn");
+    }
+
+    fn make_loop_closure_apply_fixture() -> (
+        SlamMap,
+        EssentialGraph,
+        crate::loop_closure::VerifiedLoop,
+        KeyframeId,
+        Vec<(MapPointId, Point3)>,
+    ) {
+        let mut map = SlamMap::new();
+        let image_size = crate::map::ImageSize::try_new(640, 480).expect("image size");
+        let keypoints = vec![
+            Keypoint { x: 120.0, y: 100.0 },
+            Keypoint { x: 220.0, y: 110.0 },
+            Keypoint { x: 320.0, y: 120.0 },
+            Keypoint { x: 420.0, y: 130.0 },
+        ];
+        let kf0 = map
+            .add_keyframe(
+                FrameId::new(100),
+                Timestamp::from_nanos(100),
+                Pose::identity(),
+                image_size,
+                keypoints.clone(),
+            )
+            .expect("kf0");
+        let kf1 = map
+            .add_keyframe(
+                FrameId::new(101),
+                Timestamp::from_nanos(101),
+                Pose::from_rt(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [1.0, 0.0, 0.0],
+                ),
+                image_size,
+                keypoints.clone(),
+            )
+            .expect("kf1");
+        let kf2 = map
+            .add_keyframe(
+                FrameId::new(102),
+                Timestamp::from_nanos(102),
+                Pose::from_rt(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [2.4, 0.2, 0.0],
+                ),
+                image_size,
+                keypoints.clone(),
+            )
+            .expect("kf2");
+
+        let world_points = [
+            Point3 {
+                x: -0.4,
+                y: -0.2,
+                z: 3.0,
+            },
+            Point3 {
+                x: -0.1,
+                y: -0.1,
+                z: 3.2,
+            },
+            Point3 {
+                x: 0.2,
+                y: 0.0,
+                z: 3.4,
+            },
+            Point3 {
+                x: 0.5,
+                y: 0.1,
+                z: 3.6,
+            },
+        ];
+
+        for (idx, &world) in world_points.iter().enumerate() {
+            let kp0 = map.keyframe_keypoint(kf0, idx).expect("kp0");
+            let point_id = map
+                .add_map_point(world, CompactDescriptor([128; 256]), kp0)
+                .expect("point");
+            let kp1 = map.keyframe_keypoint(kf1, idx).expect("kp1");
+            map.add_observation(point_id, kp1).expect("obs1");
+            let kp2 = map.keyframe_keypoint(kf2, idx).expect("kp2");
+            map.add_observation(point_id, kp2).expect("obs2");
+        }
+
+        let before_points: Vec<(MapPointId, Point3)> =
+            map.points().map(|(id, point)| (id, point.position())).collect();
+
+        let mut essential_graph = EssentialGraph::new(1);
+        essential_graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        essential_graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+        essential_graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+
+        let verified = crate::loop_closure::VerifiedLoop::from_parts(
+            kf2,
+            kf0,
+            Pose::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [2.0, 0.0, 0.0],
+            ),
+            60,
+        );
+
+        (map, essential_graph, verified, kf2, before_points)
+    }
+
+    #[test]
+    fn loop_closure_correction_reduces_synthetic_drift_ring() {
+        let (mut map, mut essential_graph, verified, query_kf, _) =
+            make_loop_closure_apply_fixture();
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+
+        let before = map.keyframe(query_kf).expect("query pose").pose().translation();
+        let before_error = ((before[0] - 2.0).powi(2) + (before[1]).powi(2) + (before[2]).powi(2))
+            .sqrt();
+
+        apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+            .expect("apply loop closure");
+
+        let after = map.keyframe(query_kf).expect("corrected query").pose().translation();
+        let after_error =
+            ((after[0] - 2.0).powi(2) + (after[1]).powi(2) + (after[2]).powi(2)).sqrt();
+        assert!(
+            after_error < before_error,
+            "loop closure should reduce drift: before={before_error}, after={after_error}"
+        );
+    }
+
+    #[test]
+    fn loop_closure_reprojects_map_points_with_pose_correction() {
+        let (mut map, mut essential_graph, verified, _query_kf, before_points) =
+            make_loop_closure_apply_fixture();
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+
+        apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+            .expect("apply loop closure");
+
+        let moved_points = before_points
+            .iter()
+            .filter(|(point_id, before)| {
+                let after = map.point(*point_id).expect("point").position();
+                let dx = after.x - before.x;
+                let dy = after.y - before.y;
+                let dz = after.z - before.z;
+                (dx * dx + dy * dy + dz * dz).sqrt() > 1e-5
+            })
+            .count();
+        assert!(moved_points > 0, "expected map points to move after loop correction");
+    }
+
+    #[test]
+    fn loop_closure_adds_loop_edge_to_essential_graph() {
+        let (mut map, mut essential_graph, verified, _query_kf, _before_points) =
+            make_loop_closure_apply_fixture();
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+
+        assert_eq!(essential_graph.snapshot().loop_edges.len(), 0);
+        apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+            .expect("apply loop closure");
+        let snapshot = essential_graph.snapshot();
+        assert_eq!(snapshot.loop_edges.len(), 1);
+        assert_eq!(snapshot.loop_edges[0].kind, EssentialEdgeKind::Loop);
     }
 
     #[test]

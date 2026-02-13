@@ -120,6 +120,21 @@ impl VerifiedLoop {
     pub fn inlier_count(&self) -> usize {
         self.inlier_count
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        query_kf: KeyframeId,
+        match_kf: KeyframeId,
+        relative_pose: Pose,
+        inlier_count: usize,
+    ) -> Self {
+        Self {
+            query_kf,
+            match_kf,
+            relative_pose,
+            inlier_count,
+        }
+    }
 }
 
 #[derive(Debug)]
