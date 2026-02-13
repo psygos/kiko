@@ -9,6 +9,7 @@ pub mod dataset;
 pub mod env;
 mod inference;
 mod local_ba;
+pub mod loop_closure;
 pub mod map;
 mod math;
 #[cfg(feature = "record")]
@@ -33,6 +34,7 @@ pub use local_ba::{
     LocalBundleAdjuster, LmConfig, LmConfigError, MapObservation, ObservationSet,
     ObservationSetError,
 };
+pub use loop_closure::{GlobalDescriptor, KeyframeDatabase, PlaceMatch};
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
 #[cfg(feature = "record")]
