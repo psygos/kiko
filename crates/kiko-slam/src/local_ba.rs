@@ -118,6 +118,27 @@ impl LocalBaConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum BaResult {
+    Converged { iterations: usize, final_cost: f64 },
+    MaxIterations { iterations: usize, final_cost: f64 },
+    Degenerate { reason: DegenerateReason },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DegenerateReason {
+    TooFewPoses { count: usize },
+    TooFewLandmarks { count: usize },
+    NoFactors,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BaCorrection {
+    pub pose_deltas: Vec<(KeyframeId, [f32; 6])>,
+    pub landmark_deltas: Vec<(MapPointId, [f32; 3])>,
+    pub result: BaResult,
+}
+
 #[derive(Debug)]
 pub enum ObservationSetError {
     TooFew { required: usize, actual: usize },
@@ -557,8 +578,9 @@ impl LocalBundleAdjuster {
             Err(_) => return false,
         };
 
-        if !self.optimize_full(&mut problem) {
-            return false;
+        match self.optimize_full(&mut problem) {
+            BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {}
+            BaResult::Degenerate { .. } => return false,
         }
 
         problem.write_back(map)
@@ -682,11 +704,25 @@ impl LocalBundleAdjuster {
         true
     }
 
-    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> bool {
+    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> BaResult {
         let pose_count = problem.poses.len();
         let landmark_count = problem.landmarks.len();
-        if pose_count < 2 || landmark_count == 0 || problem.factors.is_empty() {
-            return false;
+        if pose_count < 2 {
+            return BaResult::Degenerate {
+                reason: DegenerateReason::TooFewPoses { count: pose_count },
+            };
+        }
+        if landmark_count == 0 {
+            return BaResult::Degenerate {
+                reason: DegenerateReason::TooFewLandmarks {
+                    count: landmark_count,
+                },
+            };
+        }
+        if problem.factors.is_empty() {
+            return BaResult::Degenerate {
+                reason: DegenerateReason::NoFactors,
+            };
         }
 
         let pose_dim = pose_count * 6;
@@ -695,8 +731,9 @@ impl LocalBundleAdjuster {
         let pose_damping = self.config.damping().max(1e-9);
         let landmark_damping = self.config.damping().max(1e-6);
         let motion_weight = self.config.motion_prior_weight();
+        let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
 
-        for _ in 0..max_iters {
+        for iter in 0..max_iters {
             let s = &mut self.a_buf[..pose_dim * pose_dim];
             let rhs = &mut self.b_buf[..pose_dim];
             s.fill(0.0);
@@ -804,7 +841,10 @@ impl LocalBundleAdjuster {
                     c[i][i] += landmark_damping;
                 }
                 let Some(inv_c) = invert_3x3(c) else {
-                    return false;
+                    return BaResult::MaxIterations {
+                        iterations: iter + 1,
+                        final_cost,
+                    };
                 };
 
                 let inv_c_b = mat3_mul_vec3(inv_c, acc.b);
@@ -836,7 +876,10 @@ impl LocalBundleAdjuster {
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
 
             if !solve_linear_system(s, rhs, pose_dim) {
-                return false;
+                return BaResult::MaxIterations {
+                    iterations: iter + 1,
+                    final_cost,
+                };
             }
 
             let mut max_step = 0.0_f32;
@@ -887,13 +930,62 @@ impl LocalBundleAdjuster {
                 landmark_var.position.z += delta_landmark[2];
             }
 
+            final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
             if max_step < 1e-4 {
-                break;
+                return BaResult::Converged {
+                    iterations: iter + 1,
+                    final_cost,
+                };
             }
         }
 
-        true
+        BaResult::MaxIterations {
+            iterations: max_iters,
+            final_cost,
+        }
     }
+}
+
+fn full_problem_cost(
+    problem: &FullBaProblem,
+    intrinsics: PinholeIntrinsics,
+    huber_delta_px: f32,
+    motion_weight: f32,
+) -> f64 {
+    let mut cost = 0.0_f64;
+    let huber = huber_delta_px as f64;
+
+    for factor in &problem.factors {
+        let pose = problem.poses[factor.pose.as_usize()].pose;
+        let point = problem.landmarks[factor.landmark.as_usize()].position;
+        let Some((residual, _, _)) =
+            reprojection_residual_and_jacobians(pose, point, factor.pixel, intrinsics)
+        else {
+            continue;
+        };
+        let r0 = residual[0] as f64;
+        let r1 = residual[1] as f64;
+        let r_norm = (r0 * r0 + r1 * r1).sqrt();
+        cost += if r_norm <= huber {
+            0.5 * r_norm * r_norm
+        } else {
+            huber * (r_norm - 0.5 * huber)
+        };
+    }
+
+    if motion_weight > 0.0 {
+        let w2 = (motion_weight as f64) * (motion_weight as f64);
+        for i in 1..problem.poses.len() {
+            let prev = pose_to_vec(problem.poses[i - 1].pose);
+            let curr = pose_to_vec(problem.poses[i].pose);
+            for k in 0..6 {
+                let d = (curr[k] - prev[k]) as f64;
+                cost += 0.5 * w2 * d * d;
+            }
+        }
+    }
+
+    cost
 }
 
 fn reprojection_residual_and_jacobian(
@@ -1315,7 +1407,7 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{assert_map_invariants, KeyframeId, SlamMap};
+    use crate::map::{assert_map_invariants, KeyframeId, MapPointId, SlamMap};
     use crate::test_helpers::{
         axis_angle_pose, make_detections, make_pinhole_intrinsics, project_world_point,
     };
@@ -1397,6 +1489,131 @@ mod tests {
             sum += (dx * dx + dy * dy + dz * dz).sqrt();
         }
         sum / expected.len() as f32
+    }
+
+    fn build_full_ba_fixture(
+        noisy_pose_delta: [f32; 6],
+    ) -> (
+        SlamMap,
+        PinholeIntrinsics,
+        KeyframeId,
+        KeyframeId,
+        Pose,
+        Vec<Point3>,
+    ) {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let true_pose_0 = Pose::identity();
+        let true_pose_1 = axis_angle_pose([0.20, -0.02, 0.03], [0.0, 0.03, -0.01]);
+        let noisy_pose_1 = apply_se3_delta(true_pose_1, noisy_pose_delta);
+
+        let points_true = vec![
+            Point3 {
+                x: -0.35,
+                y: -0.25,
+                z: 3.2,
+            },
+            Point3 {
+                x: -0.10,
+                y: -0.22,
+                z: 3.5,
+            },
+            Point3 {
+                x: 0.14,
+                y: -0.20,
+                z: 3.8,
+            },
+            Point3 {
+                x: 0.32,
+                y: -0.10,
+                z: 3.4,
+            },
+            Point3 {
+                x: -0.30,
+                y: 0.10,
+                z: 3.6,
+            },
+            Point3 {
+                x: -0.08,
+                y: 0.16,
+                z: 4.0,
+            },
+            Point3 {
+                x: 0.16,
+                y: 0.12,
+                z: 3.3,
+            },
+            Point3 {
+                x: 0.34,
+                y: 0.24,
+                z: 3.9,
+            },
+        ];
+
+        let mut keypoints_0 = Vec::with_capacity(points_true.len());
+        let mut keypoints_1 = Vec::with_capacity(points_true.len());
+        for &point in &points_true {
+            keypoints_0.push(
+                project_world_point(true_pose_0, point, intrinsics)
+                    .expect("point visible in pose 0"),
+            );
+            keypoints_1.push(
+                project_world_point(true_pose_1, point, intrinsics)
+                    .expect("point visible in pose 1"),
+            );
+        }
+
+        let detections_0 = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(500),
+            640,
+            480,
+            keypoints_0,
+        )
+        .expect("detections 0");
+        let detections_1 = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(501),
+            640,
+            480,
+            keypoints_1,
+        )
+        .expect("detections 1");
+
+        let mut map = SlamMap::new();
+        let kf_0 = map
+            .add_keyframe_from_detections(
+                detections_0.as_ref(),
+                Timestamp::from_nanos(1_000_000),
+                true_pose_0,
+            )
+            .expect("insert keyframe 0");
+        let kf_1 = map
+            .add_keyframe_from_detections(
+                detections_1.as_ref(),
+                Timestamp::from_nanos(2_000_000),
+                noisy_pose_1,
+            )
+            .expect("insert keyframe 1");
+
+        for (idx, &point_true) in points_true.iter().enumerate() {
+            let kp_0 = map.keyframe_keypoint(kf_0, idx).expect("kf0 keypoint");
+            let kp_1 = map.keyframe_keypoint(kf_1, idx).expect("kf1 keypoint");
+            let descriptor = detections_0.descriptors()[idx];
+            let i = idx as f32;
+            let noisy_point = Point3 {
+                x: point_true.x + (i - 3.5) * 0.010,
+                y: point_true.y - (i - 3.5) * 0.008,
+                z: point_true.z + ((idx % 2) as f32 - 0.5) * 0.040,
+            };
+            let point_id = map
+                .add_map_point(noisy_point, descriptor, kp_0)
+                .expect("insert map point");
+            map.add_observation(point_id, kp_1)
+                .expect("add shared observation");
+        }
+
+        (map, intrinsics, kf_0, kf_1, true_pose_1, points_true)
     }
 
     #[test]
@@ -1493,6 +1710,113 @@ mod tests {
         let mut a = vec![1.0_f32, 2.0, 2.0, 4.0];
         let mut b = vec![1.0_f32, 2.0];
         assert!(!solve_linear_system(&mut a, &mut b, 2));
+    }
+
+    #[test]
+    fn optimize_full_reports_degenerate_variants() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+
+        let mut no_poses = FullBaProblem {
+            poses: Vec::new(),
+            landmarks: Vec::new(),
+            factors: Vec::new(),
+        };
+        assert!(matches!(
+            ba.optimize_full(&mut no_poses),
+            BaResult::Degenerate {
+                reason: DegenerateReason::TooFewPoses { count: 0 }
+            }
+        ));
+
+        let mut no_landmarks = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: Vec::new(),
+            factors: Vec::new(),
+        };
+        assert!(matches!(
+            ba.optimize_full(&mut no_landmarks),
+            BaResult::Degenerate {
+                reason: DegenerateReason::TooFewLandmarks { count: 0 }
+            }
+        ));
+
+        let mut no_factors = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 2.0,
+                },
+            }],
+            factors: Vec::new(),
+        };
+        assert!(matches!(
+            ba.optimize_full(&mut no_factors),
+            BaResult::Degenerate {
+                reason: DegenerateReason::NoFactors
+            }
+        ));
+    }
+
+    #[test]
+    fn optimize_full_returns_max_iterations_with_bad_init() {
+        let (map, intrinsics, kf_0, kf_1, _, _) =
+            build_full_ba_fixture([0.8, -0.3, 0.4, 0.2, -0.1, 0.15]);
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        assert!(matches!(
+            ba.optimize_full(&mut problem),
+            BaResult::MaxIterations { iterations: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn optimize_full_returns_converged_on_synthetic_scene() {
+        let (map, intrinsics, kf_0, kf_1, _, _) =
+            build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, 1e-3, 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        assert!(matches!(
+            ba.optimize_full(&mut problem),
+            BaResult::Converged { .. }
+        ));
     }
 
     #[test]
