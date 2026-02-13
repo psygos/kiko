@@ -792,6 +792,68 @@ pub enum TrackingHealth {
     Lost,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DegradationLevel {
+    Nominal,
+    TrackingDegraded,
+    BackendDown,
+    Lost,
+}
+
+impl DegradationLevel {
+    fn rank(self) -> u8 {
+        match self {
+            DegradationLevel::Nominal => 0,
+            DegradationLevel::TrackingDegraded => 1,
+            DegradationLevel::BackendDown => 2,
+            DegradationLevel::Lost => 3,
+        }
+    }
+
+    pub fn worst(a: Self, b: Self) -> Self {
+        if a.rank() >= b.rank() {
+            a
+        } else {
+            b
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SystemHealth {
+    pub tracking: TrackingHealth,
+    pub backend_alive: bool,
+    pub backend_stats: BackendStats,
+    pub degradation: DegradationLevel,
+}
+
+impl SystemHealth {
+    fn from_components(
+        tracking: TrackingHealth,
+        backend_expected: bool,
+        backend_alive: bool,
+        backend_stats: BackendStats,
+    ) -> Self {
+        let tracking_degradation = match tracking {
+            TrackingHealth::Good => DegradationLevel::Nominal,
+            TrackingHealth::Degraded => DegradationLevel::TrackingDegraded,
+            TrackingHealth::Lost => DegradationLevel::Lost,
+        };
+        let backend_degradation = if backend_expected && !backend_alive {
+            DegradationLevel::BackendDown
+        } else {
+            DegradationLevel::Nominal
+        };
+        let degradation = DegradationLevel::worst(tracking_degradation, backend_degradation);
+        Self {
+            tracking,
+            backend_alive,
+            backend_stats,
+            degradation,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TrackerOutput {
     pub pose: Option<Pose>,
@@ -799,7 +861,7 @@ pub struct TrackerOutput {
     pub keyframe: Option<Arc<Keyframe>>,
     pub stereo_matches: Option<Matches<Raw>>,
     pub frame_id: FrameId,
-    pub health: TrackingHealth,
+    pub health: SystemHealth,
 }
 
 #[derive(Debug)]
@@ -830,6 +892,7 @@ pub struct SlamTracker {
     map_version: MapVersion,
     backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
+    tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
 }
 
@@ -860,6 +923,7 @@ impl SlamTracker {
             map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
+            tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
         }
     }
@@ -889,8 +953,24 @@ impl SlamTracker {
         self.backend_stats
     }
 
+    pub fn system_health(&self) -> SystemHealth {
+        let backend_expected = self.backend.is_some();
+        let backend_alive = self.backend.as_ref().is_none_or(BackendSupervisor::has_worker);
+        SystemHealth::from_components(
+            self.tracking_health,
+            backend_expected,
+            backend_alive,
+            self.backend_stats,
+        )
+    }
+
     fn bump_map_version(&mut self) {
         self.map_version = self.map_version.next();
+    }
+
+    fn emit_health(&mut self, tracking: TrackingHealth) -> SystemHealth {
+        self.tracking_health = tracking;
+        self.system_health()
     }
 
     fn submit_backend_event(
@@ -1031,13 +1111,14 @@ impl SlamTracker {
         let current = Arc::new(current);
 
         let matches = if current.is_empty() || keyframe.detections().is_empty() {
+            let tracking_health = self.tracking_failure_health();
             return Ok(TrackerOutput {
                 pose: None,
                 inliers: 0,
                 keyframe: None,
                 stereo_matches: None,
                 frame_id,
-                health: self.tracking_failure_health(),
+                health: self.emit_health(tracking_health),
             });
         } else {
             self.lightglue
@@ -1062,13 +1143,14 @@ impl SlamTracker {
         ) {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
+                let tracking_health = self.tracking_failure_health();
                 return Ok(TrackerOutput {
                     pose: None,
                     inliers: 0,
                     keyframe: None,
                     stereo_matches: None,
                     frame_id,
-                    health: self.tracking_failure_health(),
+                    health: self.emit_health(tracking_health),
                 });
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
@@ -1077,13 +1159,14 @@ impl SlamTracker {
         let result = match solve_pnp_ransac(&observations, self.intrinsics, self.config.ransac) {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
+                let tracking_health = self.tracking_failure_health();
                 return Ok(TrackerOutput {
                     pose: None,
                     inliers: 0,
                     keyframe: None,
                     stereo_matches: None,
                     frame_id,
-                    health: self.tracking_failure_health(),
+                    health: self.emit_health(tracking_health),
                 });
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
@@ -1126,7 +1209,7 @@ impl SlamTracker {
             keyframe: None,
             stereo_matches: None,
             frame_id,
-            health: TrackingHealth::Good,
+            health: self.emit_health(TrackingHealth::Good),
         };
 
         let should_refresh = self.config.keyframe_policy.should_refresh(
@@ -1244,7 +1327,7 @@ impl SlamTracker {
             keyframe: output.keyframe,
             stereo_matches: output.stereo_matches,
             frame_id,
-            health: TrackingHealth::Good,
+            health: self.emit_health(TrackingHealth::Good),
         })
     }
 
@@ -1330,7 +1413,7 @@ impl SlamTracker {
                 keyframe: Some(keyframe),
                 stereo_matches: Some(matches),
                 frame_id,
-                health: TrackingHealth::Good,
+                health: self.system_health(),
             },
             keyframe_id,
         ))
@@ -2086,6 +2169,55 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(got_non_panic, "expected non-panic response after respawn");
+    }
+
+    #[test]
+    fn degradation_level_worst_returns_more_severe_variant() {
+        assert_eq!(
+            DegradationLevel::worst(DegradationLevel::Nominal, DegradationLevel::TrackingDegraded),
+            DegradationLevel::TrackingDegraded
+        );
+        assert_eq!(
+            DegradationLevel::worst(
+                DegradationLevel::TrackingDegraded,
+                DegradationLevel::BackendDown
+            ),
+            DegradationLevel::BackendDown
+        );
+        assert_eq!(
+            DegradationLevel::worst(DegradationLevel::BackendDown, DegradationLevel::Lost),
+            DegradationLevel::Lost
+        );
+    }
+
+    #[test]
+    fn system_health_aggregation_combines_tracking_and_backend_state() {
+        let stats = BackendStats {
+            submitted: 7,
+            ..BackendStats::default()
+        };
+        let nominal =
+            SystemHealth::from_components(TrackingHealth::Good, true, true, stats);
+        assert_eq!(nominal.degradation, DegradationLevel::Nominal);
+        assert!(nominal.backend_alive);
+        assert_eq!(nominal.backend_stats.submitted, 7);
+
+        let degraded =
+            SystemHealth::from_components(TrackingHealth::Degraded, true, true, stats);
+        assert_eq!(degraded.degradation, DegradationLevel::TrackingDegraded);
+
+        let backend_down =
+            SystemHealth::from_components(TrackingHealth::Good, true, false, stats);
+        assert_eq!(backend_down.degradation, DegradationLevel::BackendDown);
+        assert!(!backend_down.backend_alive);
+
+        let lost =
+            SystemHealth::from_components(TrackingHealth::Lost, true, false, stats);
+        assert_eq!(lost.degradation, DegradationLevel::Lost);
+
+        let backend_optional =
+            SystemHealth::from_components(TrackingHealth::Good, false, true, stats);
+        assert_eq!(backend_optional.degradation, DegradationLevel::Nominal);
     }
 }
 

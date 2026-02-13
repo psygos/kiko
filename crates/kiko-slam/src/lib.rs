@@ -49,8 +49,9 @@ pub use pnp::{
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, KeyframePolicy,
-    KeyframePolicyError, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
-    TrackerConfig, TrackerError, TrackerOutput, TrackingHealth,
+    DegradationLevel, KeyframePolicyError, ParallaxPx, RedundancyPolicy,
+    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError, TrackerOutput,
+    TrackingHealth,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
