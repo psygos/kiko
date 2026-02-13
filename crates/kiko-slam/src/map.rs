@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use slotmap::{SlotMap, new_key_type};
+use slotmap::{new_key_type, SlotMap};
 
 use crate::{Descriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
 
@@ -42,7 +42,11 @@ struct KeypointIndex(usize);
 
 impl KeypointIndex {
     fn new(index: usize, len: usize) -> Option<Self> {
-        if index < len { Some(Self(index)) } else { None }
+        if index < len {
+            Some(Self(index))
+        } else {
+            None
+        }
     }
 
     fn as_usize(self) -> usize {
@@ -381,12 +385,30 @@ impl std::fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MapGeneration(u64);
+
+impl MapGeneration {
+    fn initial() -> Self {
+        Self(0)
+    }
+
+    fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SlamMap {
     points: SlotMap<MapPointId, MapPoint>,
     keyframes: SlotMap<KeyframeId, KeyframeEntry>,
     covisibility: CovisibilityGraph,
     frame_to_keyframe: HashMap<FrameId, KeyframeId>,
+    generation: MapGeneration,
 }
 
 #[derive(Debug, Clone)]
@@ -415,7 +437,12 @@ impl SlamMap {
             keyframes: SlotMap::with_key(),
             covisibility: CovisibilityGraph::default(),
             frame_to_keyframe: HashMap::new(),
+            generation: MapGeneration::initial(),
         }
+    }
+
+    fn bump_generation(&mut self) {
+        self.generation = self.generation.next();
     }
 
     pub fn add_keyframe_from_detections(
@@ -477,6 +504,7 @@ impl SlamMap {
 
         let kf_id = self.keyframes.insert(entry);
         self.frame_to_keyframe.insert(frame_id, kf_id);
+        self.bump_generation();
         Ok(kf_id)
     }
 
@@ -544,6 +572,7 @@ impl SlamMap {
             .get_mut(first_obs.keyframe_id)
             .expect("keyframe exists");
         entry.set_point_ref(first_obs.index, point_id);
+        self.bump_generation();
         Ok(point_id)
     }
 
@@ -595,6 +624,7 @@ impl SlamMap {
             .get_mut(obs.keyframe_id)
             .expect("keyframe exists");
         entry.set_point_ref(obs.index, point_id);
+        self.bump_generation();
         Ok(())
     }
 
@@ -609,6 +639,7 @@ impl SlamMap {
             .get_mut(point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
         point.update_descriptor(new_desc, blend);
+        self.bump_generation();
         Ok(())
     }
 
@@ -622,6 +653,7 @@ impl SlamMap {
             .get_mut(point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
         point.set_position(position);
+        self.bump_generation();
         Ok(())
     }
 
@@ -635,6 +667,7 @@ impl SlamMap {
             .get_mut(keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
         entry.set_pose(pose);
+        self.bump_generation();
         Ok(())
     }
 
@@ -651,6 +684,7 @@ impl SlamMap {
         }
         self.covisibility
             .remove_point_observations(&point.observations);
+        self.bump_generation();
         Ok(())
     }
 
@@ -674,6 +708,7 @@ impl SlamMap {
         for point_id in to_remove {
             let _ = self.points.remove(point_id);
         }
+        self.bump_generation();
         Ok(())
     }
 
@@ -825,6 +860,10 @@ impl SlamMap {
 
     pub fn num_keyframes(&self) -> usize {
         self.keyframes.len()
+    }
+
+    pub fn generation(&self) -> MapGeneration {
+        self.generation
     }
 
     pub fn points(&self) -> impl Iterator<Item = (MapPointId, &MapPoint)> {
@@ -1263,6 +1302,57 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor([1.0; 256])
+    }
+
+    #[test]
+    fn map_generation_increments_on_mutation() {
+        let mut map = SlamMap::new();
+        assert_eq!(map.generation().as_u64(), 0);
+
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let pose = Pose::identity();
+        let kf1 = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                pose,
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe1");
+        assert_eq!(map.generation().as_u64(), 1);
+
+        let obs1 = map.keyframe_keypoint(kf1, 0).expect("obs1");
+        map.add_map_point(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            make_descriptor(),
+            obs1,
+        )
+        .expect("map point");
+        assert_eq!(map.generation().as_u64(), 2);
+    }
+
+    #[test]
+    fn map_clone_preserves_generation() {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let pose = Pose::identity();
+        let _ = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                pose,
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe1");
+
+        let cloned = map.clone();
+        assert_eq!(cloned.generation(), map.generation());
     }
 
     #[test]
