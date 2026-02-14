@@ -6,7 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
     BackendConfig, DownscaleFactor, InferenceBackend, InferencePipeline, KeyframePolicy,
-    KeypointLimit, LightGlue, LocalBaConfig, LmConfig, PinholeIntrinsics, RansacConfig,
+    KeypointLimit, LightGlue, LocalBaConfig, LoopClosureConfig, LmConfig, PinholeIntrinsics, RansacConfig,
     RectifiedStereo,
     RectifiedStereoConfig, RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig,
     TriangulationConfig, TriangulationError, Triangulator, VizDecimation, VizPacket,
@@ -578,6 +578,11 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let loop_closure = if env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true) {
+        Some(LoopClosureConfig::default())
+    } else {
+        None
+    };
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -588,6 +593,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         ba: ba_config,
         redundancy,
         backend,
+        loop_closure,
     };
 
     eprintln!(
@@ -1099,6 +1105,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let loop_closure = if env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true) {
+        Some(LoopClosureConfig::default())
+    } else {
+        None
+    };
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -1109,6 +1120,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         ba: ba_config,
         redundancy,
         backend,
+        loop_closure,
     };
 
     eprintln!(

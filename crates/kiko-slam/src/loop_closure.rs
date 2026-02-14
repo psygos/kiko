@@ -1,6 +1,243 @@
-use crate::map::KeyframeId;
-use crate::{solve_pnp_ransac, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose, RansacConfig};
-use crate::map::SlamMap;
+use std::num::NonZeroUsize;
+
+use crate::map::{KeyframeId, SlamMap};
+use crate::{
+    solve_pnp_ransac, CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics,
+    PnpError, Pose, RansacConfig,
+};
+
+#[derive(Clone, Copy, Debug)]
+pub struct LoopClosureConfig {
+    similarity_threshold: f32,
+    descriptor_match_threshold: f32,
+    min_inliers: NonZeroUsize,
+    max_candidates: NonZeroUsize,
+    temporal_gap: NonZeroUsize,
+    min_streak: NonZeroUsize,
+    max_correction_translation: f32,
+    max_correction_rotation_deg: f32,
+    ransac: RansacConfig,
+}
+
+#[derive(Debug)]
+pub enum LoopClosureConfigError {
+    SimilarityThresholdOutOfRange { value: f32 },
+    DescriptorMatchThresholdOutOfRange { value: f32 },
+    ZeroMinInliers,
+    ZeroMaxCandidates,
+    ZeroTemporalGap,
+    ZeroMinStreak,
+    TooFewMinInliers { value: usize, min: usize },
+    NonPositiveMaxCorrectionTranslation { value: f32 },
+    InvalidMaxCorrectionRotationDeg { value: f32 },
+    ZeroRansacIterations,
+    NonPositiveRansacThresholdPx { value: f32 },
+}
+
+impl std::fmt::Display for LoopClosureConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoopClosureConfigError::SimilarityThresholdOutOfRange { value } => {
+                write!(f, "loop similarity threshold must be in (0, 1], got {value}")
+            }
+            LoopClosureConfigError::DescriptorMatchThresholdOutOfRange { value } => write!(
+                f,
+                "loop descriptor match threshold must be in (0, 1], got {value}"
+            ),
+            LoopClosureConfigError::ZeroMinInliers => {
+                write!(f, "loop min inliers must be > 0")
+            }
+            LoopClosureConfigError::ZeroMaxCandidates => {
+                write!(f, "loop max candidates must be > 0")
+            }
+            LoopClosureConfigError::ZeroTemporalGap => {
+                write!(f, "loop temporal gap must be > 0")
+            }
+            LoopClosureConfigError::ZeroMinStreak => {
+                write!(f, "loop min streak must be > 0")
+            }
+            LoopClosureConfigError::TooFewMinInliers { value, min } => {
+                write!(f, "loop min inliers must be >= {min}, got {value}")
+            }
+            LoopClosureConfigError::NonPositiveMaxCorrectionTranslation { value } => write!(
+                f,
+                "loop max correction translation must be > 0, got {value}"
+            ),
+            LoopClosureConfigError::InvalidMaxCorrectionRotationDeg { value } => write!(
+                f,
+                "loop max correction rotation must be in (0, 180], got {value}"
+            ),
+            LoopClosureConfigError::ZeroRansacIterations => {
+                write!(f, "loop ransac max iterations must be > 0")
+            }
+            LoopClosureConfigError::NonPositiveRansacThresholdPx { value } => write!(
+                f,
+                "loop ransac reprojection threshold must be > 0, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoopClosureConfigError {}
+
+impl LoopClosureConfig {
+    pub fn new(
+        similarity_threshold: f32,
+        descriptor_match_threshold: f32,
+        min_inliers: usize,
+        max_candidates: usize,
+        temporal_gap: usize,
+        min_streak: usize,
+        max_correction_translation: f32,
+        max_correction_rotation_deg: f32,
+        ransac: RansacConfig,
+    ) -> Result<Self, LoopClosureConfigError> {
+        if !similarity_threshold.is_finite()
+            || similarity_threshold <= 0.0
+            || similarity_threshold > 1.0
+        {
+            return Err(LoopClosureConfigError::SimilarityThresholdOutOfRange {
+                value: similarity_threshold,
+            });
+        }
+        if !descriptor_match_threshold.is_finite()
+            || descriptor_match_threshold <= 0.0
+            || descriptor_match_threshold > 1.0
+        {
+            return Err(
+                LoopClosureConfigError::DescriptorMatchThresholdOutOfRange {
+                    value: descriptor_match_threshold,
+                },
+            );
+        }
+        let min_inliers =
+            NonZeroUsize::new(min_inliers).ok_or(LoopClosureConfigError::ZeroMinInliers)?;
+        let max_candidates =
+            NonZeroUsize::new(max_candidates).ok_or(LoopClosureConfigError::ZeroMaxCandidates)?;
+        let temporal_gap =
+            NonZeroUsize::new(temporal_gap).ok_or(LoopClosureConfigError::ZeroTemporalGap)?;
+        let min_streak =
+            NonZeroUsize::new(min_streak).ok_or(LoopClosureConfigError::ZeroMinStreak)?;
+        if min_inliers.get() < 4 {
+            return Err(LoopClosureConfigError::TooFewMinInliers {
+                value: min_inliers.get(),
+                min: 4,
+            });
+        }
+        if !max_correction_translation.is_finite() || max_correction_translation <= 0.0 {
+            return Err(
+                LoopClosureConfigError::NonPositiveMaxCorrectionTranslation {
+                    value: max_correction_translation,
+                },
+            );
+        }
+        if !max_correction_rotation_deg.is_finite()
+            || max_correction_rotation_deg <= 0.0
+            || max_correction_rotation_deg > 180.0
+        {
+            return Err(LoopClosureConfigError::InvalidMaxCorrectionRotationDeg {
+                value: max_correction_rotation_deg,
+            });
+        }
+        if ransac.max_iterations == 0 {
+            return Err(LoopClosureConfigError::ZeroRansacIterations);
+        }
+        if !ransac.reprojection_threshold_px.is_finite() || ransac.reprojection_threshold_px <= 0.0
+        {
+            return Err(LoopClosureConfigError::NonPositiveRansacThresholdPx {
+                value: ransac.reprojection_threshold_px,
+            });
+        }
+
+        Ok(Self {
+            similarity_threshold,
+            descriptor_match_threshold,
+            min_inliers,
+            max_candidates,
+            temporal_gap,
+            min_streak,
+            max_correction_translation,
+            max_correction_rotation_deg,
+            ransac,
+        })
+    }
+
+    pub fn similarity_threshold(self) -> f32 {
+        self.similarity_threshold
+    }
+
+    pub fn descriptor_match_threshold(self) -> f32 {
+        self.descriptor_match_threshold
+    }
+
+    pub fn min_inliers(self) -> usize {
+        self.min_inliers.get()
+    }
+
+    pub fn max_candidates(self) -> usize {
+        self.max_candidates.get()
+    }
+
+    pub fn temporal_gap(self) -> usize {
+        self.temporal_gap.get()
+    }
+
+    pub fn min_streak(self) -> usize {
+        self.min_streak.get()
+    }
+
+    pub fn max_correction_translation(self) -> f32 {
+        self.max_correction_translation
+    }
+
+    pub fn max_correction_rotation_deg(self) -> f32 {
+        self.max_correction_rotation_deg
+    }
+
+    pub fn ransac(self) -> RansacConfig {
+        self.ransac
+    }
+}
+
+impl Default for LoopClosureConfig {
+    fn default() -> Self {
+        Self::new(0.75, 0.7, 20, 3, 30, 3, 5.0, 30.0, RansacConfig::default())
+            .expect("default loop closure config should be valid")
+    }
+}
+
+#[derive(Debug)]
+pub enum LoopDetectError {
+    TooFewCorrespondences { count: usize },
+    VerificationFailed(LoopVerificationError),
+    CorrectionTooLarge { translation: f32, rotation_deg: f32 },
+    ApplyFailed(String),
+}
+
+impl std::fmt::Display for LoopDetectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoopDetectError::TooFewCorrespondences { count } => {
+                write!(f, "loop closure rejected: too few correspondences ({count})")
+            }
+            LoopDetectError::VerificationFailed(err) => {
+                write!(f, "loop closure verification failed: {err}")
+            }
+            LoopDetectError::CorrectionTooLarge {
+                translation,
+                rotation_deg,
+            } => write!(
+                f,
+                "loop closure rejected: correction too large (translation={translation:.3}m, rotation={rotation_deg:.2}deg)"
+            ),
+            LoopDetectError::ApplyFailed(err) => {
+                write!(f, "loop closure apply failed: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoopDetectError {}
 
 #[derive(Clone, Debug)]
 pub struct GlobalDescriptor(pub [f32; 512]);
@@ -22,6 +259,105 @@ impl GlobalDescriptor {
         }
         (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
     }
+}
+
+pub fn aggregate_global_descriptor(descriptors: &[Descriptor]) -> GlobalDescriptor {
+    if descriptors.is_empty() {
+        return GlobalDescriptor([0.0; 512]);
+    }
+
+    let mut out = [0.0_f32; 512];
+    let count = descriptors.len() as f32;
+    for d in descriptors {
+        for (idx, value) in d.0.iter().copied().enumerate() {
+            out[idx] += value;
+            let max_slot = &mut out[256 + idx];
+            if value > *max_slot {
+                *max_slot = value;
+            }
+        }
+    }
+    for value in &mut out[..256] {
+        *value /= count;
+    }
+
+    let norm_sq: f32 = out.iter().map(|v| v * v).sum();
+    if norm_sq <= 0.0 || !norm_sq.is_finite() {
+        return GlobalDescriptor([0.0; 512]);
+    }
+    let norm = norm_sq.sqrt();
+    for value in &mut out {
+        *value /= norm;
+    }
+    GlobalDescriptor(out)
+}
+
+pub fn match_descriptors_for_loop(
+    query_descriptors: &[Descriptor],
+    candidate_kf: KeyframeId,
+    map: &SlamMap,
+    similarity_threshold: f32,
+) -> Vec<(usize, usize)> {
+    if query_descriptors.is_empty()
+        || !similarity_threshold.is_finite()
+        || similarity_threshold <= 0.0
+        || similarity_threshold > 1.0
+    {
+        return Vec::new();
+    }
+
+    let candidate_descriptors = match map.keyframe_point_descriptors(candidate_kf) {
+        Ok(values) => values,
+        Err(_) => return Vec::new(),
+    };
+    if candidate_descriptors.is_empty() {
+        return Vec::new();
+    }
+
+    let query_quantized: Vec<CompactDescriptor> =
+        query_descriptors.iter().map(Descriptor::quantize).collect();
+
+    let mut query_best = vec![None::<(usize, f32)>; query_quantized.len()];
+    for (query_idx, query_desc) in query_quantized.iter().enumerate() {
+        let mut best = similarity_threshold;
+        let mut best_candidate = None;
+        for (candidate_pos, (_, candidate_desc)) in candidate_descriptors.iter().enumerate() {
+            let sim = query_desc.cosine_similarity(candidate_desc);
+            if sim >= best {
+                best = sim;
+                best_candidate = Some((candidate_pos, sim));
+            }
+        }
+        query_best[query_idx] = best_candidate;
+    }
+
+    let mut candidate_best = vec![None::<(usize, f32)>; candidate_descriptors.len()];
+    for (candidate_pos, (_, candidate_desc)) in candidate_descriptors.iter().enumerate() {
+        let mut best = similarity_threshold;
+        let mut best_query = None;
+        for (query_idx, query_desc) in query_quantized.iter().enumerate() {
+            let sim = query_desc.cosine_similarity(candidate_desc);
+            if sim >= best {
+                best = sim;
+                best_query = Some((query_idx, sim));
+            }
+        }
+        candidate_best[candidate_pos] = best_query;
+    }
+
+    let mut correspondences = Vec::new();
+    for (query_idx, best) in query_best.iter().enumerate() {
+        let Some((candidate_pos, _)) = best else {
+            continue;
+        };
+        let Some((back_query_idx, _)) = candidate_best[*candidate_pos] else {
+            continue;
+        };
+        if back_query_idx == query_idx {
+            correspondences.push((query_idx, candidate_descriptors[*candidate_pos].0.index()));
+        }
+    }
+    correspondences
 }
 
 #[derive(Clone, Debug)]
@@ -234,11 +570,14 @@ impl LoopCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
-        GlobalDescriptor, KeyframeDatabase, LoopCandidate, LoopVerificationError,
+        aggregate_global_descriptor, match_descriptors_for_loop, GlobalDescriptor,
+        KeyframeDatabase, LoopCandidate, LoopClosureConfig, LoopVerificationError,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
-    use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp};
+    use crate::{
+        CompactDescriptor, Descriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
+    };
 
     fn descriptor_with_basis(idx: usize) -> GlobalDescriptor {
         let mut d = [0.0_f32; 512];
@@ -432,5 +771,129 @@ mod tests {
             err,
             LoopVerificationError::PnpFailed(_) | LoopVerificationError::TooFewMatches { .. }
         ));
+    }
+
+    #[test]
+    fn aggregate_empty_descriptors_returns_zero() {
+        let descriptor = aggregate_global_descriptor(&[]);
+        assert!(descriptor.0.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn aggregate_single_descriptor_produces_unit_norm() {
+        let mut data = [0.0_f32; 256];
+        data[4] = 1.0;
+        data[17] = 0.5;
+        let descriptor = aggregate_global_descriptor(&[Descriptor(data)]);
+        let norm = descriptor.0.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-5, "descriptor norm should be 1, got {norm}");
+        assert!(descriptor.0[4] > 0.0);
+        assert!(descriptor.0[256 + 4] > 0.0);
+    }
+
+    #[test]
+    fn match_descriptors_finds_mutual_matches() {
+        let mut map = SlamMap::new();
+        let keypoints = vec![Keypoint { x: 20.0, y: 20.0 }, Keypoint { x: 40.0, y: 20.0 }];
+        let image_size = ImageSize::try_new(80, 60).expect("image size");
+        let kf = map
+            .add_keyframe(
+                FrameId::new(11),
+                Timestamp::from_nanos(11),
+                Pose::identity(),
+                image_size,
+                keypoints,
+            )
+            .expect("keyframe");
+
+        let mut q0 = [0.0_f32; 256];
+        q0[7] = 1.0;
+        let mut q1 = [0.0_f32; 256];
+        q1[23] = 1.0;
+        let query = vec![Descriptor(q0), Descriptor(q1)];
+
+        let kp0 = map.keyframe_keypoint(kf, 0).expect("kp0");
+        map.add_map_point(
+            Point3 {
+                x: -0.1,
+                y: 0.0,
+                z: 3.0,
+            },
+            query[0].quantize(),
+            kp0,
+        )
+        .expect("point0");
+        let kp1 = map.keyframe_keypoint(kf, 1).expect("kp1");
+        map.add_map_point(
+            Point3 {
+                x: 0.1,
+                y: 0.0,
+                z: 3.0,
+            },
+            query[1].quantize(),
+            kp1,
+        )
+        .expect("point1");
+
+        let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
+        assert_eq!(matches.len(), 2);
+        assert!(matches.contains(&(0, 0)));
+        assert!(matches.contains(&(1, 1)));
+    }
+
+    #[test]
+    fn match_descriptors_skips_keypoints_without_map_points() {
+        let mut map = SlamMap::new();
+        let keypoints = vec![
+            Keypoint { x: 20.0, y: 20.0 },
+            Keypoint { x: 40.0, y: 20.0 },
+            Keypoint { x: 60.0, y: 20.0 },
+        ];
+        let image_size = ImageSize::try_new(80, 60).expect("image size");
+        let kf = map
+            .add_keyframe(
+                FrameId::new(21),
+                Timestamp::from_nanos(21),
+                Pose::identity(),
+                image_size,
+                keypoints,
+            )
+            .expect("keyframe");
+
+        let mut q0 = [0.0_f32; 256];
+        q0[3] = 1.0;
+        let mut q1 = [0.0_f32; 256];
+        q1[8] = 1.0;
+        let mut q2 = [0.0_f32; 256];
+        q2[13] = 1.0;
+        let query = vec![Descriptor(q0), Descriptor(q1), Descriptor(q2)];
+
+        let only_observed = map.keyframe_keypoint(kf, 1).expect("kp1");
+        map.add_map_point(
+            Point3 {
+                x: 0.0,
+                y: 0.1,
+                z: 3.0,
+            },
+            query[1].quantize(),
+            only_observed,
+        )
+        .expect("point");
+
+        let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
+        assert_eq!(matches, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn loop_closure_config_default_values() {
+        let cfg = LoopClosureConfig::default();
+        assert!((cfg.similarity_threshold() - 0.75).abs() < 1e-6);
+        assert!((cfg.descriptor_match_threshold() - 0.7).abs() < 1e-6);
+        assert_eq!(cfg.min_inliers(), 20);
+        assert_eq!(cfg.max_candidates(), 3);
+        assert_eq!(cfg.temporal_gap(), 30);
+        assert_eq!(cfg.min_streak(), 3);
+        assert!((cfg.max_correction_translation() - 5.0).abs() < 1e-6);
+        assert!((cfg.max_correction_rotation_deg() - 30.0).abs() < 1e-6);
     }
 }

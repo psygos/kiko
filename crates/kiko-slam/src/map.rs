@@ -752,6 +752,33 @@ impl SlamMap {
         Ok(observations)
     }
 
+    pub fn keyframe_point_descriptors(
+        &self,
+        keyframe_id: KeyframeId,
+    ) -> Result<Vec<(KeyframeKeypoint, CompactDescriptor)>, MapError> {
+        let entry = self
+            .keyframes
+            .get(keyframe_id)
+            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+        let mut descriptors = Vec::new();
+        for (idx, point_ref) in entry.point_refs.iter().enumerate() {
+            let Some(point_id) = point_ref else {
+                continue;
+            };
+            let point = self
+                .points
+                .get(*point_id)
+                .ok_or(MapError::MapPointNotFound(*point_id))?;
+            let index =
+                KeypointIndex::new(idx, entry.len()).expect("point refs length matches keypoints");
+            descriptors.push((
+                KeyframeKeypoint { keyframe_id, index },
+                point.descriptor().clone(),
+            ));
+        }
+        Ok(descriptors)
+    }
+
     pub fn keyframe_point_count(&self, keyframe_id: KeyframeId) -> Result<usize, MapError> {
         let entry = self
             .keyframes

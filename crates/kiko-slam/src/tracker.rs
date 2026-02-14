@@ -12,7 +12,10 @@ use crate::{
     StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
     Verified,
 };
-use crate::loop_closure::VerifiedLoop;
+use crate::loop_closure::{
+    aggregate_global_descriptor, match_descriptors_for_loop, KeyframeDatabase, LoopCandidate,
+    LoopClosureConfig, LoopDetectError, PlaceMatch, VerifiedLoop,
+};
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphOptimizer,
 };
@@ -31,6 +34,7 @@ pub struct TrackerConfig {
     pub ba: LocalBaConfig,
     pub redundancy: Option<RedundancyPolicy>,
     pub backend: Option<BackendConfig>,
+    pub loop_closure: Option<LoopClosureConfig>,
 }
 
 impl TrackerConfig {
@@ -883,6 +887,13 @@ struct SharedMatches {
     pairs: Vec<(usize, usize)>,
 }
 
+#[derive(Debug)]
+struct PendingLoopCandidate {
+    query_kf: KeyframeId,
+    detections: Arc<Detections>,
+    candidates: Vec<PlaceMatch>,
+}
+
 pub struct SlamTracker {
     superpoint_left: SuperPoint,
     superpoint_right: SuperPoint,
@@ -898,6 +909,10 @@ pub struct SlamTracker {
     map_version: MapVersion,
     backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
+    loop_db: Option<KeyframeDatabase>,
+    loop_config: Option<LoopClosureConfig>,
+    pending_loop: Option<PendingLoopCandidate>,
+    loop_streak: HashMap<KeyframeId, usize>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
 }
@@ -918,6 +933,8 @@ impl SlamTracker {
         let backend = config
             .backend
             .map(|backend_cfg| BackendSupervisor::spawn(backend_cfg, intrinsics, config.ba));
+        let loop_config = config.loop_closure;
+        let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
         Self {
             superpoint_left,
             superpoint_right,
@@ -933,6 +950,10 @@ impl SlamTracker {
             map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
+            loop_db,
+            loop_config,
+            pending_loop: None,
+            loop_streak: HashMap::new(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
         }
@@ -940,6 +961,9 @@ impl SlamTracker {
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
         self.drain_backend_responses();
+        if let Err(err) = self.process_pending_loop_closure() {
+            eprintln!("loop closure: {err}");
+        }
         let tracking = match &self.state {
             TrackerState::NeedKeyframe => None,
             TrackerState::Tracking {
@@ -992,6 +1016,133 @@ impl SlamTracker {
     fn emit_health(&mut self, tracking: TrackingHealth) -> SystemHealth {
         self.tracking_health = tracking;
         self.system_health()
+    }
+
+    fn enqueue_loop_candidates(&mut self, keyframe_id: KeyframeId, detections: &Arc<Detections>) {
+        let (Some(config), Some(loop_db)) = (self.loop_config, self.loop_db.as_mut()) else {
+            return;
+        };
+
+        let global_descriptor = aggregate_global_descriptor(detections.descriptors());
+        loop_db.insert(keyframe_id, global_descriptor.clone());
+
+        let mut candidates = loop_db.query(&global_descriptor, config.max_candidates());
+        candidates.retain(|candidate| candidate.similarity >= config.similarity_threshold());
+
+        if candidates.is_empty() {
+            self.loop_streak.clear();
+            return;
+        }
+
+        let present: HashSet<KeyframeId> = candidates.iter().map(|m| m.candidate).collect();
+        self.loop_streak.retain(|candidate, _| present.contains(candidate));
+        for candidate in &candidates {
+            let streak = self.loop_streak.entry(candidate.candidate).or_insert(0);
+            *streak = streak.saturating_add(1);
+        }
+
+        if self.pending_loop.is_some() {
+            return;
+        }
+
+        let promoted: Vec<PlaceMatch> = candidates
+            .into_iter()
+            .filter(|candidate| {
+                self.loop_streak
+                    .get(&candidate.candidate)
+                    .copied()
+                    .unwrap_or(0)
+                    >= config.min_streak()
+            })
+            .collect();
+
+        if promoted.is_empty() {
+            return;
+        }
+
+        self.pending_loop = Some(PendingLoopCandidate {
+            query_kf: keyframe_id,
+            detections: Arc::clone(detections),
+            candidates: promoted,
+        });
+    }
+
+    fn process_pending_loop_closure(&mut self) -> Result<Option<VerifiedLoop>, LoopDetectError> {
+        let Some(config) = self.loop_config else {
+            self.pending_loop = None;
+            self.loop_streak.clear();
+            return Ok(None);
+        };
+        let Some(pending) = self.pending_loop.take() else {
+            return Ok(None);
+        };
+
+        let mut first_error: Option<LoopDetectError> = None;
+        for candidate in pending.candidates {
+            let correspondences = match_descriptors_for_loop(
+                pending.detections.descriptors(),
+                candidate.candidate,
+                &self.map,
+                config.descriptor_match_threshold(),
+            );
+
+            if correspondences.len() < 4 {
+                if first_error.is_none() {
+                    first_error = Some(LoopDetectError::TooFewCorrespondences {
+                        count: correspondences.len(),
+                    });
+                }
+                continue;
+            }
+
+            let loop_candidate = LoopCandidate {
+                query_kf: pending.query_kf,
+                match_kf: candidate.candidate,
+                similarity: candidate.similarity,
+            };
+
+            let verified = match loop_candidate.verify(
+                pending.detections.keypoints(),
+                &correspondences,
+                &self.map,
+                self.intrinsics,
+                config.ransac(),
+                config.min_inliers(),
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(LoopDetectError::VerificationFailed(err));
+                    }
+                    continue;
+                }
+            };
+
+            let translation = loop_translation_norm(verified.relative_pose());
+            let rotation_deg = loop_rotation_angle_deg(verified.relative_pose());
+            if translation > config.max_correction_translation()
+                || rotation_deg > config.max_correction_rotation_deg()
+            {
+                if first_error.is_none() {
+                    first_error = Some(LoopDetectError::CorrectionTooLarge {
+                        translation,
+                        rotation_deg,
+                    });
+                }
+                continue;
+            }
+
+            self.apply_loop_closure(verified.clone())
+                .map_err(|err| LoopDetectError::ApplyFailed(err.to_string()))?;
+            self.loop_streak.remove(&candidate.candidate);
+            return Ok(Some(verified));
+        }
+
+        if let Some(err) = first_error {
+            Err(err)
+        } else {
+            Ok(None)
+        }
     }
 
     fn submit_backend_event(
@@ -1091,13 +1242,13 @@ impl SlamTracker {
                     self.backend_stats.panics = self.backend_stats.panics.saturating_add(1);
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
-                    self.map_version = MapVersion::initial();
+                    self.map_version = self.map_version.next();
                     if let Some(supervisor) = self.backend.as_mut() {
                         supervisor.check_health();
                         self.backend_stats.respawn_count = supervisor.respawn_count();
                     }
                     eprintln!(
-                        "backend worker panic (req={}, version={}); map version reset",
+                        "backend worker panic (req={}, version={}); map version bumped to invalidate in-flight",
                         request_id.as_u64(),
                         map_version.as_u64()
                     );
@@ -1431,6 +1582,7 @@ impl SlamTracker {
             &self.map,
         );
         self.bump_map_version();
+        self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
 
         Ok((
             TrackerOutput {
@@ -1723,6 +1875,18 @@ fn apply_loop_closure_correction(
     }
 
     Ok(())
+}
+
+fn loop_translation_norm(pose: Pose) -> f32 {
+    let t = pose.translation();
+    (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
+}
+
+fn loop_rotation_angle_deg(pose: Pose) -> f32 {
+    let r = pose.rotation();
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
+    cos_theta.acos().to_degrees()
 }
 
 fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {

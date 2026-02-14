@@ -35,8 +35,9 @@ pub use local_ba::{
     ObservationSetError,
 };
 pub use loop_closure::{
-    GlobalDescriptor, KeyframeDatabase, LoopCandidate, LoopVerificationError, PlaceMatch,
-    VerifiedLoop,
+    aggregate_global_descriptor, match_descriptors_for_loop, GlobalDescriptor, KeyframeDatabase,
+    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopDetectError,
+    LoopVerificationError, PlaceMatch, VerifiedLoop,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
