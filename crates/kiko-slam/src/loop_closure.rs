@@ -417,10 +417,25 @@ pub struct PlaceMatch {
     pub similarity: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescriptorSource {
+    Bootstrap,
+    Learned,
+}
+
+#[derive(Clone, Debug)]
+struct KeyframeDescriptorEntry {
+    keyframe_id: KeyframeId,
+    descriptor: GlobalDescriptor,
+    source: DescriptorSource,
+    seq: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct KeyframeDatabase {
-    entries: Vec<(KeyframeId, GlobalDescriptor)>,
+    entries: Vec<KeyframeDescriptorEntry>,
     temporal_gap: usize,
+    next_seq: u64,
 }
 
 impl KeyframeDatabase {
@@ -428,6 +443,7 @@ impl KeyframeDatabase {
         Self {
             entries: Vec::new(),
             temporal_gap,
+            next_seq: 0,
         }
     }
 
@@ -435,28 +451,85 @@ impl KeyframeDatabase {
         self.temporal_gap
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn insert(&mut self, id: KeyframeId, descriptor: GlobalDescriptor) {
-        self.entries.push((id, descriptor));
+        self.insert_with_source(id, descriptor, DescriptorSource::Bootstrap);
+    }
+
+    pub fn insert_with_source(
+        &mut self,
+        id: KeyframeId,
+        descriptor: GlobalDescriptor,
+        source: DescriptorSource,
+    ) {
+        if let Some(existing) = self.entries.iter_mut().find(|entry| entry.keyframe_id == id) {
+            existing.descriptor = descriptor;
+            existing.source = source;
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        self.entries.push(KeyframeDescriptorEntry {
+            keyframe_id: id,
+            descriptor,
+            source,
+            seq,
+        });
+    }
+
+    pub fn replace_descriptor(
+        &mut self,
+        id: KeyframeId,
+        descriptor: GlobalDescriptor,
+        source: DescriptorSource,
+    ) -> bool {
+        let Some(existing) = self.entries.iter_mut().find(|entry| entry.keyframe_id == id) else {
+            return false;
+        };
+        existing.descriptor = descriptor;
+        existing.source = source;
+        true
+    }
+
+    pub fn remove(&mut self, id: KeyframeId) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|entry| entry.keyframe_id != id);
+        self.entries.len() != before
+    }
+
+    pub fn descriptor_source(&self, id: KeyframeId) -> Option<DescriptorSource> {
+        self.entries
+            .iter()
+            .find(|entry| entry.keyframe_id == id)
+            .map(|entry| entry.source)
     }
 
     pub fn query(&self, descriptor: &GlobalDescriptor, top_k: usize) -> Vec<PlaceMatch> {
         if top_k == 0 || self.entries.is_empty() {
             return Vec::new();
         }
-        let query_idx = self.entries.len() - 1;
-        let query_id = self.entries[query_idx].0;
+        let query_entry = self.entries.last().expect("non-empty checked");
+        let query_id = query_entry.keyframe_id;
+        let query_seq = query_entry.seq;
         let mut matches = Vec::new();
-        for (idx, (candidate, candidate_desc)) in self.entries.iter().enumerate() {
-            if idx == query_idx {
+        for candidate in &self.entries {
+            if candidate.keyframe_id == query_id {
                 continue;
             }
-            if query_idx.saturating_sub(idx) <= self.temporal_gap {
+            if query_seq.saturating_sub(candidate.seq) <= self.temporal_gap as u64 {
                 continue;
             }
             matches.push(PlaceMatch {
                 query: query_id,
-                candidate: *candidate,
-                similarity: descriptor.cosine_similarity(candidate_desc),
+                candidate: candidate.keyframe_id,
+                similarity: descriptor.cosine_similarity(&candidate.descriptor),
             });
         }
         matches.sort_by(|a, b| {
@@ -620,9 +693,9 @@ impl LoopCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_global_descriptor, match_descriptors_for_loop, GlobalDescriptor,
-        GlobalDescriptorError, KeyframeDatabase, LoopCandidate, LoopClosureConfig,
-        LoopVerificationError,
+        aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource,
+        GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
+        LoopClosureConfig, LoopVerificationError,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -747,6 +820,59 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert!(matches[0].similarity >= matches[1].similarity);
         assert!(matches.iter().all(|m| m.candidate != ids[2]));
+    }
+
+    #[test]
+    fn keyframe_database_remove_deletes_entry() {
+        let ids = make_keyframe_ids(3);
+        let mut db = KeyframeDatabase::new(0);
+        db.insert(ids[0], descriptor_with_basis(0));
+        db.insert(ids[1], descriptor_with_basis(1));
+        db.insert(ids[2], descriptor_with_basis(2));
+        assert_eq!(db.len(), 3);
+        assert!(db.remove(ids[1]));
+        assert_eq!(db.len(), 2);
+        assert!(!db.remove(ids[1]));
+    }
+
+    #[test]
+    fn keyframe_database_temporal_gap_uses_sequence_after_removal() {
+        let ids = make_keyframe_ids(5);
+        let mut db = KeyframeDatabase::new(2);
+        for (i, id) in ids.iter().enumerate() {
+            db.insert(*id, descriptor_with_basis(i));
+        }
+
+        // Remove a middle entry; sequence distance must still be respected.
+        assert!(db.remove(ids[2]));
+
+        let matches = db.query(&descriptor_with_basis(4), 10);
+        // kf3 is seq distance 1 (filtered), kf1 is distance 3 (kept), kf0 is distance 4 (kept).
+        assert_eq!(matches.len(), 2);
+        assert!(matches.iter().all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
+    }
+
+    #[test]
+    fn keyframe_database_replace_descriptor_updates_source() {
+        let ids = make_keyframe_ids(1);
+        let mut db = KeyframeDatabase::new(0);
+        db.insert_with_source(ids[0], descriptor_with_basis(0), DescriptorSource::Bootstrap);
+        assert_eq!(
+            db.descriptor_source(ids[0]),
+            Some(DescriptorSource::Bootstrap)
+        );
+
+        assert!(db.replace_descriptor(
+            ids[0],
+            descriptor_with_basis(1),
+            DescriptorSource::Learned
+        ));
+        assert_eq!(db.descriptor_source(ids[0]), Some(DescriptorSource::Learned));
+        assert!(!db.replace_descriptor(
+            make_keyframe_ids(2)[1],
+            descriptor_with_basis(2),
+            DescriptorSource::Learned
+        ));
     }
 
     #[test]
