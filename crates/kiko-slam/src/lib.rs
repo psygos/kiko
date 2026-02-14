@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-pub use inference::{InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint};
+pub use inference::{EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint};
 mod channel;
 pub mod dataset;
 pub mod env;

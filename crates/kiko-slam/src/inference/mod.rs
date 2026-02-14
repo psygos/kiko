@@ -4,6 +4,7 @@ use ort::Error as OrtError;
 use std::path::PathBuf;
 
 mod backend;
+mod eigenplaces;
 mod lightglue;
 mod place;
 mod superpoint;
@@ -11,6 +12,7 @@ mod superpoint;
 use crate::env::{env_bool, env_usize};
 
 pub use backend::InferenceBackend;
+pub use eigenplaces::EigenPlaces;
 pub use place::PlaceDescriptorExtractor;
 
 #[derive(Debug)]
