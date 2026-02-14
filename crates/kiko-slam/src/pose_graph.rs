@@ -563,6 +563,30 @@ pub struct EssentialGraph {
     strong_threshold: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EssentialGraphError {
+    KeyframeNotFound { keyframe_id: KeyframeId },
+    RootRemovalDenied { keyframe_id: KeyframeId },
+}
+
+impl std::fmt::Display for EssentialGraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EssentialGraphError::KeyframeNotFound { keyframe_id } => {
+                write!(f, "essential graph keyframe not found: {keyframe_id:?}")
+            }
+            EssentialGraphError::RootRemovalDenied { keyframe_id } => {
+                write!(
+                    f,
+                    "cannot remove essential graph root keyframe: {keyframe_id:?}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EssentialGraphError {}
+
 impl EssentialGraph {
     pub fn new(strong_threshold: u32) -> Self {
         Self {
@@ -652,6 +676,65 @@ impl EssentialGraph {
             self.order.push(edge.b);
         }
         self.loop_edges.push(edge);
+    }
+
+    pub fn remove_keyframe(
+        &mut self,
+        keyframe_id: KeyframeId,
+        map: &SlamMap,
+    ) -> Result<(), EssentialGraphError> {
+        let parent = self
+            .parent
+            .get(&keyframe_id)
+            .copied()
+            .ok_or(EssentialGraphError::KeyframeNotFound { keyframe_id })?;
+        if parent == keyframe_id {
+            return Err(EssentialGraphError::RootRemovalDenied { keyframe_id });
+        }
+
+        let children: Vec<KeyframeId> = self
+            .parent
+            .iter()
+            .filter_map(|(&child, &child_parent)| {
+                if child_parent == keyframe_id && child != keyframe_id {
+                    Some(child)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for child in &children {
+            if let Some(entry) = self.parent.get_mut(child) {
+                *entry = parent;
+            }
+        }
+
+        self.parent.remove(&keyframe_id);
+        self.order.retain(|&id| id != keyframe_id);
+        self.spanning_edges
+            .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
+        self.strong_covis_edges
+            .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
+        self.loop_edges
+            .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
+
+        for child in children {
+            if contains_edge(&self.spanning_edges, parent, child) {
+                continue;
+            }
+            if let Some(relative_pose) = relative_pose(map, parent, child) {
+                self.spanning_edges.push(EssentialEdge {
+                    a: parent,
+                    b: child,
+                    kind: EssentialEdgeKind::SpanningTree,
+                    relative_pose,
+                    information: scaled_identity6(1.0),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     pub fn snapshot(&self) -> EssentialGraphSnapshot {
@@ -780,7 +863,8 @@ fn scaled_identity6(scale: f64) -> [[f64; 6]; 6] {
 mod tests {
     use super::{
         compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, EssentialEdge,
-        EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer,
+        EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig, PoseGraphEdge,
+        PoseGraphOptimizer,
     };
     use crate::map::{ImageSize, SlamMap};
     use crate::math::se3_exp_f64;
@@ -1174,5 +1258,81 @@ mod tests {
         });
         assert_eq!(snapshot.loop_edges.len(), 0);
         assert_eq!(graph.snapshot().loop_edges.len(), 1);
+    }
+
+    #[test]
+    fn essential_graph_remove_keyframe_reparents_children() {
+        let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+        graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+        assert_eq!(graph.parent_of(kf2), Some(kf1));
+
+        graph
+            .remove_keyframe(kf1, &map)
+            .expect("remove non-root keyframe");
+        assert_eq!(graph.parent_of(kf2), Some(kf0));
+        assert_eq!(graph.parent_of(kf1), None);
+        let snapshot = graph.snapshot();
+        assert!(snapshot.order.iter().all(|&id| id != kf1));
+        assert!(
+            snapshot
+                .spanning_edges
+                .iter()
+                .all(|edge| edge.a != kf1 && edge.b != kf1)
+        );
+        let input = graph.pose_graph_input();
+        assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
+    }
+
+    #[test]
+    fn essential_graph_remove_keyframe_rejects_root() {
+        let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+
+        let err = graph
+            .remove_keyframe(kf0, &map)
+            .expect_err("root removal should fail");
+        assert_eq!(err, EssentialGraphError::RootRemovalDenied { keyframe_id: kf0 });
+    }
+
+    #[test]
+    fn essential_graph_remove_keyframe_rejects_missing_id() {
+        let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+
+        let err = graph
+            .remove_keyframe(kf1, &map)
+            .expect_err("missing keyframe should fail");
+        assert_eq!(err, EssentialGraphError::KeyframeNotFound { keyframe_id: kf1 });
+    }
+
+    #[test]
+    fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
+        let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+        let mut graph = EssentialGraph::new(2);
+        graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+        graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+        graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+        graph.add_loop_edge(EssentialEdge {
+            a: kf2,
+            b: kf0,
+            kind: EssentialEdgeKind::Loop,
+            relative_pose: Pose64::identity(),
+            information: scalar_block(1.0),
+        });
+        assert_eq!(graph.snapshot().loop_edges.len(), 1);
+
+        graph
+            .remove_keyframe(kf2, &map)
+            .expect("remove keyframe with loop edge");
+        let snapshot = graph.snapshot();
+        assert_eq!(snapshot.loop_edges.len(), 0);
+        assert!(snapshot.strong_covis_edges.iter().all(|e| e.a != kf2 && e.b != kf2));
+        assert!(snapshot.spanning_edges.iter().all(|e| e.a != kf2 && e.b != kf2));
     }
 }
