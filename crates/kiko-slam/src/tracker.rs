@@ -1023,7 +1023,9 @@ impl SlamTracker {
             return;
         };
 
-        let global_descriptor = aggregate_global_descriptor(detections.descriptors());
+        let Ok(global_descriptor) = aggregate_global_descriptor(detections.descriptors()) else {
+            return;
+        };
         loop_db.insert(keyframe_id, global_descriptor.clone());
 
         let mut candidates = loop_db.query(&global_descriptor, config.max_candidates());

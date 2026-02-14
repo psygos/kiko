@@ -6,6 +6,8 @@ use crate::{
     PnpError, Pose, RansacConfig,
 };
 
+const GLOBAL_DESCRIPTOR_DIM: usize = 512;
+
 #[derive(Clone, Copy, Debug)]
 pub struct LoopClosureConfig {
     similarity_threshold: f32,
@@ -239,15 +241,63 @@ impl std::fmt::Display for LoopDetectError {
 
 impl std::error::Error for LoopDetectError {}
 
-#[derive(Clone, Debug)]
-pub struct GlobalDescriptor(pub [f32; 512]);
+#[derive(Debug)]
+pub enum GlobalDescriptorError {
+    EmptyInput,
+    NonFiniteValue { index: usize, value: f32 },
+    ZeroNorm,
+}
+
+impl std::fmt::Display for GlobalDescriptorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GlobalDescriptorError::EmptyInput => {
+                write!(f, "global descriptor requires at least one local descriptor")
+            }
+            GlobalDescriptorError::NonFiniteValue { index, value } => write!(
+                f,
+                "global descriptor contains non-finite value at index {index}: {value}"
+            ),
+            GlobalDescriptorError::ZeroNorm => write!(f, "global descriptor norm must be > 0"),
+        }
+    }
+}
+
+impl std::error::Error for GlobalDescriptorError {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalDescriptor([f32; GLOBAL_DESCRIPTOR_DIM]);
 
 impl GlobalDescriptor {
+    pub fn try_new(values: [f32; GLOBAL_DESCRIPTOR_DIM]) -> Result<Self, GlobalDescriptorError> {
+        let mut norm_sq = 0.0_f32;
+        for (idx, &value) in values.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(GlobalDescriptorError::NonFiniteValue { index: idx, value });
+            }
+            norm_sq += value * value;
+        }
+        if norm_sq <= 0.0 {
+            return Err(GlobalDescriptorError::ZeroNorm);
+        }
+
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        let mut normalized = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
+        for (idx, value) in values.into_iter().enumerate() {
+            normalized[idx] = value * inv_norm;
+        }
+        Ok(Self(normalized))
+    }
+
+    pub fn as_array(&self) -> &[f32; GLOBAL_DESCRIPTOR_DIM] {
+        &self.0
+    }
+
     pub fn cosine_similarity(&self, other: &Self) -> f32 {
         let mut dot = 0.0_f64;
         let mut norm_a = 0.0_f64;
         let mut norm_b = 0.0_f64;
-        for i in 0..512 {
+        for i in 0..GLOBAL_DESCRIPTOR_DIM {
             let a = self.0[i] as f64;
             let b = other.0[i] as f64;
             dot += a * b;
@@ -259,37 +309,37 @@ impl GlobalDescriptor {
         }
         (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
     }
-}
 
-pub fn aggregate_global_descriptor(descriptors: &[Descriptor]) -> GlobalDescriptor {
-    if descriptors.is_empty() {
-        return GlobalDescriptor([0.0; 512]);
-    }
+    pub fn from_local_descriptors(
+        descriptors: &[Descriptor],
+    ) -> Result<Self, GlobalDescriptorError> {
+        if descriptors.is_empty() {
+            return Err(GlobalDescriptorError::EmptyInput);
+        }
 
-    let mut out = [0.0_f32; 512];
-    let count = descriptors.len() as f32;
-    for d in descriptors {
-        for (idx, value) in d.0.iter().copied().enumerate() {
-            out[idx] += value;
-            let max_slot = &mut out[256 + idx];
-            if value > *max_slot {
-                *max_slot = value;
+        let mut out = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
+        let count = descriptors.len() as f32;
+        for d in descriptors {
+            for (idx, value) in d.0.iter().copied().enumerate() {
+                out[idx] += value;
+                let max_slot = &mut out[256 + idx];
+                if value > *max_slot {
+                    *max_slot = value;
+                }
             }
         }
-    }
-    for value in &mut out[..256] {
-        *value /= count;
-    }
+        for value in &mut out[..256] {
+            *value /= count;
+        }
 
-    let norm_sq: f32 = out.iter().map(|v| v * v).sum();
-    if norm_sq <= 0.0 || !norm_sq.is_finite() {
-        return GlobalDescriptor([0.0; 512]);
+        Self::try_new(out)
     }
-    let norm = norm_sq.sqrt();
-    for value in &mut out {
-        *value /= norm;
-    }
-    GlobalDescriptor(out)
+}
+
+pub fn aggregate_global_descriptor(
+    descriptors: &[Descriptor],
+) -> Result<GlobalDescriptor, GlobalDescriptorError> {
+    GlobalDescriptor::from_local_descriptors(descriptors)
 }
 
 pub fn match_descriptors_for_loop(
@@ -571,7 +621,8 @@ impl LoopCandidate {
 mod tests {
     use super::{
         aggregate_global_descriptor, match_descriptors_for_loop, GlobalDescriptor,
-        KeyframeDatabase, LoopCandidate, LoopClosureConfig, LoopVerificationError,
+        GlobalDescriptorError, KeyframeDatabase, LoopCandidate, LoopClosureConfig,
+        LoopVerificationError,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -582,7 +633,7 @@ mod tests {
     fn descriptor_with_basis(idx: usize) -> GlobalDescriptor {
         let mut d = [0.0_f32; 512];
         d[idx] = 1.0;
-        GlobalDescriptor(d)
+        GlobalDescriptor::try_new(d).expect("valid basis descriptor")
     }
 
     fn make_keyframe_ids(n: usize) -> Vec<KeyframeId> {
@@ -685,7 +736,7 @@ mod tests {
         let mut q = [0.0_f32; 512];
         q[0] = 1.0;
         q[1] = 1.0;
-        let query = GlobalDescriptor(q);
+        let query = GlobalDescriptor::try_new(q).expect("valid query descriptor");
 
         db.insert(ids[0], descriptor_with_basis(0)); // sim ~= 0.707
         db.insert(ids[1], descriptor_with_basis(1)); // sim ~= 0.707
@@ -775,8 +826,8 @@ mod tests {
 
     #[test]
     fn aggregate_empty_descriptors_returns_zero() {
-        let descriptor = aggregate_global_descriptor(&[]);
-        assert!(descriptor.0.iter().all(|v| *v == 0.0));
+        let err = aggregate_global_descriptor(&[]).expect_err("empty descriptor set should fail");
+        assert!(matches!(err, GlobalDescriptorError::EmptyInput));
     }
 
     #[test]
@@ -784,11 +835,13 @@ mod tests {
         let mut data = [0.0_f32; 256];
         data[4] = 1.0;
         data[17] = 0.5;
-        let descriptor = aggregate_global_descriptor(&[Descriptor(data)]);
-        let norm = descriptor.0.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let descriptor =
+            aggregate_global_descriptor(&[Descriptor(data)]).expect("aggregated descriptor");
+        let values = descriptor.as_array();
+        let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "descriptor norm should be 1, got {norm}");
-        assert!(descriptor.0[4] > 0.0);
-        assert!(descriptor.0[256 + 4] > 0.0);
+        assert!(values[4] > 0.0);
+        assert!(values[256 + 4] > 0.0);
     }
 
     #[test]
