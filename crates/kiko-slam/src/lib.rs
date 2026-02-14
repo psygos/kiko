@@ -35,10 +35,10 @@ pub use local_ba::{
     ObservationSetError,
 };
 pub use loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, GlobalDescriptor, KeyframeDatabase,
-    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopDetectError,
-    LoopVerificationError, PlaceMatch, RelocalizationConfig, RelocalizationConfigError,
-    DescriptorSource, VerifiedLoop,
+    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, GlobalDescriptor,
+    GlobalDescriptorError, KeyframeDatabase, LoopCandidate, LoopClosureConfig,
+    LoopClosureConfigError, LoopDetectError, LoopVerificationError, PlaceMatch,
+    RelocalizationConfig, RelocalizationConfigError, RelocalizationMatch, VerifiedLoop,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;

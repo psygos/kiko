@@ -1041,6 +1041,15 @@ mod tests {
     }
 
     #[test]
+    fn relocalization_config_default_values() {
+        let cfg = RelocalizationConfig::default();
+        assert_eq!(cfg.max_attempts(), 30);
+        assert_eq!(cfg.min_inliers(), 20);
+        assert_eq!(cfg.max_candidates(), 3);
+        assert!((cfg.descriptor_match_threshold() - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
     fn loop_candidate_verify_succeeds_on_synthetic_geometry() {
         let (map, match_kf, query_keypoints, correspondences, intrinsics) = make_loop_fixture();
         let candidate = LoopCandidate {

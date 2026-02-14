@@ -595,6 +595,9 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let loop_closure_enabled = loop_closure.is_some();
+    let learned_descriptors_enabled = global_descriptor.is_some();
+    let relocalization_enabled = relocalization.is_some();
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -611,7 +614,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={}",
         min_keyframe_points,
         refresh_inliers,
         parallax_px,
@@ -619,7 +622,10 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         redundant_covisibility,
         min_inliers,
         downscale.get(),
-        key_limit.get()
+        key_limit.get(),
+        loop_closure_enabled,
+        learned_descriptors_enabled,
+        relocalization_enabled
     );
 
     let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
@@ -1136,6 +1142,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let loop_closure_enabled = loop_closure.is_some();
+    let learned_descriptors_enabled = global_descriptor.is_some();
+    let relocalization_enabled = relocalization.is_some();
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -1152,7 +1161,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={}",
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={}",
         min_keyframe_points,
         refresh_inliers,
         parallax_px,
@@ -1160,7 +1169,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         redundant_covisibility,
         min_inliers,
         downscale.get(),
-        key_limit.get()
+        key_limit.get(),
+        loop_closure_enabled,
+        learned_descriptors_enabled,
+        relocalization_enabled
     );
 
     let inference_handle = thread::spawn(move || {
