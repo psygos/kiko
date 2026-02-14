@@ -5,11 +5,11 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
-    BackendConfig, DownscaleFactor, InferenceBackend, InferencePipeline, KeyframePolicy,
-    KeypointLimit, LightGlue, LocalBaConfig, LoopClosureConfig, LmConfig, PinholeIntrinsics, RansacConfig,
-    RectifiedStereo,
-    RectifiedStereoConfig, RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig,
-    TriangulationConfig, TriangulationError, Triangulator, VizDecimation, VizPacket,
+    BackendConfig, DownscaleFactor, GlobalDescriptorConfig, InferenceBackend, InferencePipeline,
+    KeyframePolicy, KeypointLimit, LightGlue, LocalBaConfig, LoopClosureConfig, LmConfig,
+    PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig, RelocalizationConfig,
+    RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
+    TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
@@ -583,6 +583,18 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let global_descriptor = if env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true) {
+        Some(GlobalDescriptorConfig::new(
+            env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2),
+        )?)
+    } else {
+        None
+    };
+    let relocalization = if env_bool("KIKO_RELOCALIZATION").unwrap_or(true) {
+        Some(RelocalizationConfig::default())
+    } else {
+        None
+    };
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -594,7 +606,8 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         redundancy,
         backend,
         loop_closure,
-        global_descriptor: None,
+        global_descriptor,
+        relocalization,
     };
 
     eprintln!(
@@ -1111,6 +1124,18 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let global_descriptor = if env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true) {
+        Some(GlobalDescriptorConfig::new(
+            env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2),
+        )?)
+    } else {
+        None
+    };
+    let relocalization = if env_bool("KIKO_RELOCALIZATION").unwrap_or(true) {
+        Some(RelocalizationConfig::default())
+    } else {
+        None
+    };
     let tracker_config = TrackerConfig {
         max_keypoints: key_limit,
         downscale,
@@ -1122,7 +1147,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         redundancy,
         backend,
         loop_closure,
-        global_descriptor: None,
+        global_descriptor,
+        relocalization,
     };
 
     eprintln!(

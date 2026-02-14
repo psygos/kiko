@@ -15,7 +15,8 @@ use crate::{
 };
 use crate::loop_closure::{
     aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
-    LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch, VerifiedLoop,
+    LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch, RelocalizationConfig,
+    VerifiedLoop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
@@ -38,6 +39,7 @@ pub struct TrackerConfig {
     pub backend: Option<BackendConfig>,
     pub loop_closure: Option<LoopClosureConfig>,
     pub global_descriptor: Option<GlobalDescriptorConfig>,
+    pub relocalization: Option<RelocalizationConfig>,
 }
 
 impl TrackerConfig {
@@ -1032,6 +1034,10 @@ enum TrackerState {
         keyframe: Arc<Keyframe>,
         keyframe_id: KeyframeId,
     },
+    Relocalizing {
+        attempts: usize,
+        last_detections: Arc<Detections>,
+    },
 }
 
 #[derive(Debug)]
@@ -1133,7 +1139,16 @@ impl SlamTracker {
                 keyframe,
                 keyframe_id,
             } => Some((Arc::clone(keyframe), *keyframe_id)),
+            TrackerState::Relocalizing { .. } => None,
         };
+
+        if let TrackerState::Relocalizing {
+            attempts,
+            last_detections,
+        } = &self.state
+        {
+            return self.relocalize(pair, *attempts, Arc::clone(last_detections));
+        }
 
         if let Some((keyframe, keyframe_id)) = tracking {
             self.track(pair, &keyframe, keyframe_id)
@@ -1479,6 +1494,144 @@ impl SlamTracker {
         }
     }
 
+    fn maybe_enter_relocalization(&mut self, tracking_health: TrackingHealth, detections: Arc<Detections>) {
+        if tracking_health == TrackingHealth::Lost && self.config.relocalization.is_some() {
+            self.state = TrackerState::Relocalizing {
+                attempts: 0,
+                last_detections: detections,
+            };
+        }
+    }
+
+    fn relocalize(
+        &mut self,
+        pair: StereoPair,
+        attempts: usize,
+        _last_detections: Arc<Detections>,
+    ) -> Result<TrackerOutput, TrackerError> {
+        let StereoPair { left, right } = pair;
+        let frame_id = left.frame_id();
+        let Some(cfg) = self.config.relocalization else {
+            self.state = TrackerState::NeedKeyframe;
+            return Ok(TrackerOutput {
+                pose: None,
+                inliers: 0,
+                keyframe: None,
+                stereo_matches: None,
+                frame_id,
+                health: self.emit_health(TrackingHealth::Lost),
+            });
+        };
+
+        let current = self
+            .superpoint_left
+            .detect_with_downscale(&left, self.config.downscale)?
+            .top_k(self.config.max_keypoints());
+        let current = Arc::new(current);
+
+        if current.is_empty() {
+            let next_attempts = attempts.saturating_add(1);
+            if next_attempts >= cfg.max_attempts() {
+                self.state = TrackerState::NeedKeyframe;
+            } else {
+                self.state = TrackerState::Relocalizing {
+                    attempts: next_attempts,
+                    last_detections: Arc::clone(&current),
+                };
+            }
+            return Ok(TrackerOutput {
+                pose: None,
+                inliers: 0,
+                keyframe: None,
+                stereo_matches: None,
+                frame_id,
+                health: self.emit_health(TrackingHealth::Lost),
+            });
+        }
+
+        let Some(loop_db) = self.loop_db.as_ref() else {
+            self.state = TrackerState::NeedKeyframe;
+            return Ok(TrackerOutput {
+                pose: None,
+                inliers: 0,
+                keyframe: None,
+                stereo_matches: None,
+                frame_id,
+                health: self.emit_health(TrackingHealth::Lost),
+            });
+        };
+
+        let Ok(global_descriptor) = aggregate_global_descriptor(current.descriptors()) else {
+            self.state = TrackerState::NeedKeyframe;
+            return Ok(TrackerOutput {
+                pose: None,
+                inliers: 0,
+                keyframe: None,
+                stereo_matches: None,
+                frame_id,
+                health: self.emit_health(TrackingHealth::Lost),
+            });
+        };
+
+        let candidates = loop_db.query_for_relocalization(&global_descriptor, cfg.max_candidates());
+        for candidate in candidates {
+            let correspondences = match_descriptors_for_loop(
+                current.descriptors(),
+                candidate.candidate,
+                &self.map,
+                cfg.descriptor_match_threshold(),
+            );
+            if correspondences.len() < 4 {
+                continue;
+            }
+            let loop_candidate = LoopCandidate {
+                query_kf: candidate.candidate,
+                match_kf: candidate.candidate,
+                similarity: candidate.similarity,
+            };
+            let verified = match loop_candidate.verify(
+                current.keypoints(),
+                &correspondences,
+                &self.map,
+                self.intrinsics,
+                self.config.ransac,
+                cfg.min_inliers(),
+            ) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+
+            let pose_world = verified.relative_pose();
+            self.state = TrackerState::NeedKeyframe;
+            return self.create_keyframe(
+                StereoPair {
+                    left,
+                    right,
+                },
+                pose_world,
+            );
+        }
+
+        let next_attempts = attempts.saturating_add(1);
+        if next_attempts >= cfg.max_attempts() {
+            self.state = TrackerState::NeedKeyframe;
+        } else {
+            self.state = TrackerState::Relocalizing {
+                attempts: next_attempts,
+                last_detections: current,
+            };
+        }
+
+        Ok(TrackerOutput {
+            pose: None,
+            inliers: 0,
+            keyframe: None,
+            stereo_matches: None,
+            frame_id,
+            health: self.emit_health(TrackingHealth::Lost),
+        })
+    }
+
     fn track(
         &mut self,
         pair: StereoPair,
@@ -1496,6 +1649,7 @@ impl SlamTracker {
 
         let matches = if current.is_empty() || keyframe.detections().is_empty() {
             let tracking_health = self.tracking_failure_health();
+            self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
             return Ok(TrackerOutput {
                 pose: None,
                 inliers: 0,
@@ -1528,6 +1682,7 @@ impl SlamTracker {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
                 let tracking_health = self.tracking_failure_health();
+                self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
                 return Ok(TrackerOutput {
                     pose: None,
                     inliers: 0,
@@ -1544,6 +1699,7 @@ impl SlamTracker {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
                 let tracking_health = self.tracking_failure_health();
+                self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
                 return Ok(TrackerOutput {
                     pose: None,
                     inliers: 0,

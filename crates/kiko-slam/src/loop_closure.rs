@@ -21,6 +21,109 @@ pub struct LoopClosureConfig {
     ransac: RansacConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RelocalizationConfig {
+    max_attempts: NonZeroUsize,
+    min_inliers: NonZeroUsize,
+    max_candidates: NonZeroUsize,
+    descriptor_match_threshold: f32,
+}
+
+#[derive(Debug)]
+pub enum RelocalizationConfigError {
+    ZeroMaxAttempts,
+    ZeroMinInliers,
+    ZeroMaxCandidates,
+    TooFewMinInliers { value: usize, min: usize },
+    DescriptorMatchThresholdOutOfRange { value: f32 },
+}
+
+impl std::fmt::Display for RelocalizationConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelocalizationConfigError::ZeroMaxAttempts => {
+                write!(f, "relocalization max attempts must be > 0")
+            }
+            RelocalizationConfigError::ZeroMinInliers => {
+                write!(f, "relocalization min inliers must be > 0")
+            }
+            RelocalizationConfigError::ZeroMaxCandidates => {
+                write!(f, "relocalization max candidates must be > 0")
+            }
+            RelocalizationConfigError::TooFewMinInliers { value, min } => {
+                write!(f, "relocalization min inliers must be >= {min}, got {value}")
+            }
+            RelocalizationConfigError::DescriptorMatchThresholdOutOfRange { value } => write!(
+                f,
+                "relocalization descriptor match threshold must be in (0, 1], got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelocalizationConfigError {}
+
+impl RelocalizationConfig {
+    pub fn new(
+        max_attempts: usize,
+        min_inliers: usize,
+        max_candidates: usize,
+        descriptor_match_threshold: f32,
+    ) -> Result<Self, RelocalizationConfigError> {
+        let max_attempts =
+            NonZeroUsize::new(max_attempts).ok_or(RelocalizationConfigError::ZeroMaxAttempts)?;
+        let min_inliers =
+            NonZeroUsize::new(min_inliers).ok_or(RelocalizationConfigError::ZeroMinInliers)?;
+        let max_candidates = NonZeroUsize::new(max_candidates)
+            .ok_or(RelocalizationConfigError::ZeroMaxCandidates)?;
+        if min_inliers.get() < 4 {
+            return Err(RelocalizationConfigError::TooFewMinInliers {
+                value: min_inliers.get(),
+                min: 4,
+            });
+        }
+        if !descriptor_match_threshold.is_finite()
+            || descriptor_match_threshold <= 0.0
+            || descriptor_match_threshold > 1.0
+        {
+            return Err(
+                RelocalizationConfigError::DescriptorMatchThresholdOutOfRange {
+                    value: descriptor_match_threshold,
+                },
+            );
+        }
+
+        Ok(Self {
+            max_attempts,
+            min_inliers,
+            max_candidates,
+            descriptor_match_threshold,
+        })
+    }
+
+    pub fn max_attempts(self) -> usize {
+        self.max_attempts.get()
+    }
+
+    pub fn min_inliers(self) -> usize {
+        self.min_inliers.get()
+    }
+
+    pub fn max_candidates(self) -> usize {
+        self.max_candidates.get()
+    }
+
+    pub fn descriptor_match_threshold(self) -> f32 {
+        self.descriptor_match_threshold
+    }
+}
+
+impl Default for RelocalizationConfig {
+    fn default() -> Self {
+        Self::new(30, 20, 3, 0.7).expect("valid relocalization defaults")
+    }
+}
+
 #[derive(Debug)]
 pub enum LoopClosureConfigError {
     SimilarityThresholdOutOfRange { value: f32 },
@@ -417,6 +520,12 @@ pub struct PlaceMatch {
     pub similarity: f32,
 }
 
+#[derive(Clone, Debug)]
+pub struct RelocalizationMatch {
+    pub candidate: KeyframeId,
+    pub similarity: f32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorSource {
     Bootstrap,
@@ -532,6 +641,31 @@ impl KeyframeDatabase {
                 similarity: descriptor.cosine_similarity(&candidate.descriptor),
             });
         }
+        matches.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        matches.truncate(top_k);
+        matches
+    }
+
+    pub fn query_for_relocalization(
+        &self,
+        descriptor: &GlobalDescriptor,
+        top_k: usize,
+    ) -> Vec<RelocalizationMatch> {
+        if top_k == 0 || self.entries.is_empty() {
+            return Vec::new();
+        }
+        let mut matches: Vec<RelocalizationMatch> = self
+            .entries
+            .iter()
+            .map(|entry| RelocalizationMatch {
+                candidate: entry.keyframe_id,
+                similarity: descriptor.cosine_similarity(&entry.descriptor),
+            })
+            .collect();
         matches.sort_by(|a, b| {
             b.similarity
                 .partial_cmp(&a.similarity)
@@ -695,7 +829,8 @@ mod tests {
     use super::{
         aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource,
         GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
-        LoopClosureConfig, LoopVerificationError,
+        LoopClosureConfig, LoopVerificationError, RelocalizationConfig,
+        RelocalizationConfigError,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -872,6 +1007,36 @@ mod tests {
             make_keyframe_ids(2)[1],
             descriptor_with_basis(2),
             DescriptorSource::Learned
+        ));
+    }
+
+    #[test]
+    fn keyframe_database_relocalization_query_ignores_temporal_gap() {
+        let ids = make_keyframe_ids(4);
+        let mut db = KeyframeDatabase::new(1000);
+        for (i, id) in ids.iter().enumerate() {
+            db.insert(*id, descriptor_with_basis(i));
+        }
+
+        let matches = db.query_for_relocalization(&descriptor_with_basis(0), 4);
+        assert_eq!(matches.len(), 4);
+        assert_eq!(matches[0].candidate, ids[0]);
+        assert!(matches[0].similarity >= matches[1].similarity);
+    }
+
+    #[test]
+    fn relocalization_config_rejects_invalid_values() {
+        let err = RelocalizationConfig::new(0, 20, 3, 0.7).expect_err("zero attempts");
+        assert!(matches!(err, RelocalizationConfigError::ZeroMaxAttempts));
+        let err = RelocalizationConfig::new(10, 3, 3, 0.7).expect_err("too few inliers");
+        assert!(matches!(
+            err,
+            RelocalizationConfigError::TooFewMinInliers { .. }
+        ));
+        let err = RelocalizationConfig::new(10, 20, 3, 0.0).expect_err("invalid threshold");
+        assert!(matches!(
+            err,
+            RelocalizationConfigError::DescriptorMatchThresholdOutOfRange { .. }
         ));
     }
 

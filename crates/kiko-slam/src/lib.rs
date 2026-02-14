@@ -37,7 +37,8 @@ pub use local_ba::{
 pub use loop_closure::{
     aggregate_global_descriptor, match_descriptors_for_loop, GlobalDescriptor, KeyframeDatabase,
     LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopDetectError,
-    LoopVerificationError, PlaceMatch, VerifiedLoop,
+    LoopVerificationError, PlaceMatch, RelocalizationConfig, RelocalizationConfigError,
+    DescriptorSource, VerifiedLoop,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
@@ -53,9 +54,9 @@ pub use pnp::{
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, KeyframePolicy,
-    DegradationLevel, KeyframePolicyError, ParallaxPx, RedundancyPolicy,
-    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError, TrackerOutput,
-    TrackingHealth,
+    DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframePolicyError,
+    ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
+    TrackerError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
