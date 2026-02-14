@@ -8,6 +8,7 @@ pub use inference::{
 };
 mod channel;
 pub mod dataset;
+mod diagnostics;
 pub mod env;
 mod inference;
 mod local_ba;
@@ -16,6 +17,7 @@ pub mod map;
 mod math;
 #[cfg(feature = "record")]
 mod oak;
+mod observability;
 mod pairing;
 mod pipeline;
 mod pnp;
@@ -29,6 +31,9 @@ mod viz;
 pub use channel::{
     bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
     DropPolicy, DropReceiver, DropSender, SendOutcome,
+};
+pub use diagnostics::{
+    DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use local_ba::{

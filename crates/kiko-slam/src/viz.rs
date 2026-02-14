@@ -182,10 +182,7 @@ impl RerunSink {
 
         if let Some(points) = points {
             if !points.is_empty() {
-                let positions: Vec<[f32; 3]> = points
-                    .iter()
-                    .map(|p| [p.x, p.y, p.z])
-                    .collect();
+                let positions: Vec<[f32; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
                 let cloud = rerun::Points3D::new(positions);
                 self.rec.log("world/points", &cloud)?;
             }
@@ -249,12 +246,18 @@ impl RerunSink {
                 strips.push(vec![*a, *b]);
             }
             if !strips.is_empty() {
-                self.rec
-                    .log("world/covisibility/edges", &rerun::LineStrips3D::new(strips))?;
+                self.rec.log(
+                    "world/covisibility/edges",
+                    &rerun::LineStrips3D::new(strips),
+                )?;
             }
         }
 
         Ok(())
+    }
+
+    pub(crate) fn recording(&self) -> &rerun::RecordingStream {
+        &self.rec
     }
 
     fn set_time(&self, timestamp: Timestamp) {
@@ -310,7 +313,9 @@ impl TrackState {
         let mut track_ids = vec![0u64; count];
 
         let (prev_left, prev_ids) = match self.prev_left.as_ref() {
-            Some(prev) if self.prev_track_ids.len() == prev.len() => (Some(prev), &self.prev_track_ids),
+            Some(prev) if self.prev_track_ids.len() == prev.len() => {
+                (Some(prev), &self.prev_track_ids)
+            }
             _ => (None, &self.prev_track_ids),
         };
 
