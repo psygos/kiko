@@ -17,7 +17,8 @@ use crate::loop_closure::{
     LoopClosureConfig, LoopDetectError, PlaceMatch, VerifiedLoop,
 };
 use crate::pose_graph::{
-    EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphOptimizer,
+    EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
+    PoseGraphOptimizer,
 };
 
 use crate::inference::InferenceError;
@@ -750,6 +751,7 @@ pub enum TrackerError {
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
+    EssentialGraph(EssentialGraphError),
     KeyframeRejected { landmarks: usize },
 }
 
@@ -760,6 +762,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
             TrackerError::Map(err) => write!(f, "map error: {err}"),
+            TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -790,6 +793,12 @@ impl From<crate::PnpError> for TrackerError {
 impl From<crate::map::MapError> for TrackerError {
     fn from(err: crate::map::MapError) -> Self {
         TrackerError::Map(err)
+    }
+}
+
+impl From<EssentialGraphError> for TrackerError {
+    fn from(err: EssentialGraphError) -> Self {
+        TrackerError::EssentialGraph(err)
     }
 }
 
@@ -1412,8 +1421,29 @@ impl SlamTracker {
                         .transpose()?
                         .unwrap_or(false);
                     if redundant {
-                        let _ = self.map.remove_keyframe(keyframe_id);
-                        self.bump_map_version();
+                        if let Err(err) = remove_keyframe_from_graph_and_db(
+                            &mut self.map,
+                            &mut self.essential_graph,
+                            self.loop_db.as_mut(),
+                            keyframe_id,
+                        ) {
+                            eprintln!("failed to remove redundant keyframe {keyframe_id:?}: {err}");
+                        } else {
+                            self.loop_streak.remove(&keyframe_id);
+                            if let Some(pending) = self.pending_loop.as_mut() {
+                                if pending.query_kf == keyframe_id {
+                                    self.pending_loop = None;
+                                } else {
+                                    pending
+                                        .candidates
+                                        .retain(|candidate| candidate.candidate != keyframe_id);
+                                    if pending.candidates.is_empty() {
+                                        self.pending_loop = None;
+                                    }
+                                }
+                            }
+                            self.bump_map_version();
+                        }
                     } else {
                         let window = self
                             .map
@@ -1643,6 +1673,20 @@ fn insert_keyframe_into_map(
         map.add_map_point(world, descriptor, keypoint_ref)?;
     }
     Ok(keyframe_id)
+}
+
+fn remove_keyframe_from_graph_and_db(
+    map: &mut SlamMap,
+    essential_graph: &mut EssentialGraph,
+    loop_db: Option<&mut KeyframeDatabase>,
+    keyframe_id: KeyframeId,
+) -> Result<(), TrackerError> {
+    essential_graph.remove_keyframe(keyframe_id, map)?;
+    if let Some(loop_db) = loop_db {
+        loop_db.remove(keyframe_id);
+    }
+    map.remove_keyframe(keyframe_id)?;
+    Ok(())
 }
 
 fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
@@ -1951,6 +1995,12 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
+    }
+
+    fn make_global_descriptor_basis(idx: usize) -> crate::loop_closure::GlobalDescriptor {
+        let mut data = [0.0_f32; 512];
+        data[idx % 512] = 1.0;
+        crate::loop_closure::GlobalDescriptor::try_new(data).expect("basis descriptor")
     }
 
     fn make_map_with_single_point() -> (SlamMap, KeyframeId, MapPointId) {
@@ -2642,6 +2692,34 @@ mod tests {
         let snapshot = essential_graph.snapshot();
         assert_eq!(snapshot.loop_edges.len(), 1);
         assert_eq!(snapshot.loop_edges[0].kind, EssentialEdgeKind::Loop);
+    }
+
+    #[test]
+    fn remove_keyframe_from_graph_and_db_cleans_all_structures() {
+        let (mut map, mut essential_graph, _verified, removed_kf, _before_points) =
+            make_loop_closure_apply_fixture();
+        let mut loop_db = KeyframeDatabase::new(0);
+        for (idx, (keyframe_id, _)) in map.keyframes().enumerate() {
+            loop_db.insert_with_source(
+                keyframe_id,
+                make_global_descriptor_basis(idx),
+                crate::loop_closure::DescriptorSource::Bootstrap,
+            );
+        }
+
+        remove_keyframe_from_graph_and_db(
+            &mut map,
+            &mut essential_graph,
+            Some(&mut loop_db),
+            removed_kf,
+        )
+        .expect("remove keyframe");
+
+        assert!(map.keyframe(removed_kf).is_none());
+        assert!(essential_graph.parent_of(removed_kf).is_none());
+        assert!(loop_db.descriptor_source(removed_kf).is_none());
+        let input = essential_graph.pose_graph_input();
+        assert!(input.keyframe_ids.iter().all(|&id| id != removed_kf));
     }
 
     #[test]
