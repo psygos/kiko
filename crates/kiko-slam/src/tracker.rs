@@ -4,6 +4,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use crate::loop_closure::{
     aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
@@ -16,11 +17,12 @@ use crate::pose_graph::{
 };
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac, BaCorrection, BaResult, Detections, DownscaleFactor, EigenPlaces, Frame,
-    FrameId, Keyframe, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
-    MapObservation, Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3,
-    Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
-    TriangulationConfig, TriangulationError, Triangulator, Verified,
+    solve_pnp_ransac, BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor,
+    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit,
+    LightGlue, LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
+    Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose,
+    RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
+    TriangulationError, Triangulator, Verified,
 };
 
 use crate::inference::InferenceError;
@@ -1214,6 +1216,8 @@ pub struct TrackerOutput {
     pub stereo_matches: Option<Matches<Raw>>,
     pub frame_id: FrameId,
     pub health: SystemHealth,
+    pub diagnostics: FrameDiagnostics,
+    pub events: Vec<DiagnosticEvent>,
 }
 
 #[derive(Debug)]
@@ -1283,6 +1287,7 @@ pub struct SlamTracker {
     loop_config: Option<LoopClosureConfig>,
     pending_loop: Option<PendingLoopCandidate>,
     loop_streak: HashMap<KeyframeId, usize>,
+    pending_events: Vec<DiagnosticEvent>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
 }
@@ -1331,6 +1336,7 @@ impl SlamTracker {
             loop_config,
             pending_loop: None,
             loop_streak: HashMap::new(),
+            pending_events: Vec::new(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
         }
@@ -1355,14 +1361,22 @@ impl SlamTracker {
             _ => None,
         };
         if let Some(session) = relocalization_session {
-            return self.relocalize(pair, session);
+            let result = self.relocalize(pair, session);
+            if result.is_err() {
+                self.clear_events();
+            }
+            return result;
         }
 
-        if let Some((keyframe, keyframe_id)) = tracking {
+        let result = if let Some((keyframe, keyframe_id)) = tracking {
             self.track(pair, &keyframe, keyframe_id)
         } else {
             self.create_keyframe(pair, Pose::identity())
+        };
+        if result.is_err() {
+            self.clear_events();
         }
+        result
     }
 
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
@@ -1416,6 +1430,55 @@ impl SlamTracker {
     fn emit_health(&mut self, tracking: TrackingHealth) -> SystemHealth {
         self.tracking_health = tracking;
         self.system_health()
+    }
+
+    fn emit_event(&mut self, event: DiagnosticEvent) {
+        self.pending_events.push(event);
+    }
+
+    fn drain_events(&mut self) -> Vec<DiagnosticEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    fn clear_events(&mut self) {
+        self.pending_events.clear();
+    }
+
+    fn empty_diagnostics(&self) -> FrameDiagnostics {
+        let mut diagnostics =
+            FrameDiagnostics::empty(self.map.num_keyframes(), self.map.num_points());
+        diagnostics.loop_candidate_count = self
+            .pending_loop
+            .as_ref()
+            .map_or(0, |pending| pending.candidates.len());
+        diagnostics.loop_closure_applied = self
+            .pending_events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+        diagnostics
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn output_with_diagnostics(
+        &mut self,
+        pose: Option<Pose>,
+        inliers: usize,
+        keyframe: Option<Arc<Keyframe>>,
+        stereo_matches: Option<Matches<Raw>>,
+        frame_id: FrameId,
+        tracking: TrackingHealth,
+        diagnostics: FrameDiagnostics,
+    ) -> TrackerOutput {
+        TrackerOutput {
+            pose,
+            inliers,
+            keyframe,
+            stereo_matches,
+            frame_id,
+            health: self.emit_health(tracking),
+            diagnostics,
+            events: self.drain_events(),
+        }
     }
 
     fn enqueue_loop_candidates(&mut self, keyframe_id: KeyframeId, detections: &Arc<Detections>) {
@@ -1558,6 +1621,9 @@ impl SlamTracker {
                         "descriptor worker panic (keyframe={keyframe_id:?}, version={}): {message}",
                         map_version.as_u64()
                     );
+                    self.emit_event(DiagnosticEvent::DescriptorWorkerDied {
+                        respawn_count: self.descriptor_stats.respawn_count,
+                    });
                 }
             }
         }
@@ -1628,13 +1694,26 @@ impl SlamTracker {
                 continue;
             }
 
-            self.apply_loop_closure(verified.clone())
-                .map_err(|err| LoopDetectError::ApplyFailed(err.to_string()))?;
+            if let Err(err) = self.apply_loop_closure(verified.clone()) {
+                let detect_err = LoopDetectError::ApplyFailed(err.to_string());
+                self.emit_event(DiagnosticEvent::LoopClosureRejected {
+                    reason: loop_reject_reason(&detect_err),
+                });
+                return Err(detect_err);
+            }
+            self.emit_event(DiagnosticEvent::LoopClosureDetected {
+                query: pending.query_kf,
+                match_kf: candidate.candidate,
+                similarity: candidate.similarity,
+            });
             self.loop_streak.remove(&candidate.candidate);
             return Ok(Some(verified));
         }
 
         if let Some(err) = first_error {
+            self.emit_event(DiagnosticEvent::LoopClosureRejected {
+                reason: loop_reject_reason(&err),
+            });
             Err(err)
         } else {
             Ok(None)
@@ -1708,6 +1787,7 @@ impl SlamTracker {
                     }
                     BaResult::Degenerate { reason } => {
                         self.backend_stats.rejected = self.backend_stats.rejected.saturating_add(1);
+                        self.emit_event(DiagnosticEvent::BaDegenerate { reason: *reason });
                         eprintln!(
                             "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
                             correction.request_id.as_u64(),
@@ -1740,6 +1820,9 @@ impl SlamTracker {
                         supervisor.check_health();
                         self.backend_stats.respawn_count = supervisor.respawn_count();
                     }
+                    self.emit_event(DiagnosticEvent::BackendWorkerDied {
+                        respawn_count: self.backend_stats.respawn_count,
+                    });
                     eprintln!(
                         "backend worker panic (req={}, version={}); map version bumped to invalidate in-flight",
                         request_id.as_u64(),
@@ -1754,6 +1837,11 @@ impl SlamTracker {
         const LOST_AFTER_CONSECUTIVE_FAILURES: usize = 3;
         self.consecutive_tracking_failures = self.consecutive_tracking_failures.saturating_add(1);
         if self.consecutive_tracking_failures >= LOST_AFTER_CONSECUTIVE_FAILURES {
+            if self.tracking_health != TrackingHealth::Lost {
+                self.emit_event(DiagnosticEvent::TrackingLost {
+                    consecutive_failures: self.consecutive_tracking_failures,
+                });
+            }
             TrackingHealth::Lost
         } else {
             TrackingHealth::Degraded
@@ -1770,6 +1858,7 @@ impl SlamTracker {
             self.config.relocalization.is_some(),
             detections,
         ) {
+            self.emit_event(DiagnosticEvent::RelocalizationStarted);
             self.pending_loop = None;
             self.loop_streak.clear();
             self.state = TrackerState::Relocalizing(session);
@@ -1796,14 +1885,8 @@ impl SlamTracker {
         frame_id: FrameId,
         health: TrackingHealth,
     ) -> TrackerOutput {
-        TrackerOutput {
-            pose: None,
-            inliers: 0,
-            keyframe: None,
-            stereo_matches: None,
-            frame_id,
-            health: self.emit_health(health),
-        }
+        let diagnostics = self.empty_diagnostics();
+        self.output_with_diagnostics(None, 0, None, None, frame_id, health, diagnostics)
     }
 
     fn relocalization_pose_consistent(
@@ -1963,6 +2046,9 @@ impl SlamTracker {
         session.last_detections = current;
         match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
             RelocalizationStep::Recovered { pose_world } => {
+                self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
+                    keyframe_id: candidate_id,
+                });
                 self.pending_loop = None;
                 self.loop_streak.clear();
                 self.state = TrackerState::NeedKeyframe;
@@ -1981,6 +2067,7 @@ impl SlamTracker {
         keyframe: &Arc<Keyframe>,
         keyframe_id: KeyframeId,
     ) -> Result<TrackerOutput, TrackerError> {
+        let tracking_start = Instant::now();
         let StereoPair { left, right } = pair;
         let frame_id = left.frame_id();
 
@@ -1993,14 +2080,27 @@ impl SlamTracker {
         let matches = if current.is_empty() || keyframe.detections().is_empty() {
             let tracking_health = self.tracking_failure_health();
             self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
-            return Ok(TrackerOutput {
-                pose: None,
-                inliers: 0,
-                keyframe: None,
-                stereo_matches: None,
+            let mut diagnostics = self.empty_diagnostics();
+            diagnostics.features_detected = Some(current.len());
+            diagnostics.features_matched = Some(0);
+            diagnostics.tracking_time = Some(tracking_start.elapsed());
+            diagnostics.loop_candidate_count = self
+                .pending_loop
+                .as_ref()
+                .map_or(0, |pending| pending.candidates.len());
+            diagnostics.loop_closure_applied = self
+                .pending_events
+                .iter()
+                .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+            return Ok(self.output_with_diagnostics(
+                None,
+                0,
+                None,
+                None,
                 frame_id,
-                health: self.emit_health(tracking_health),
-            });
+                tracking_health,
+                diagnostics,
+            ));
         } else {
             self.lightglue
                 .match_these(current.clone(), keyframe.detections().clone())?
@@ -2026,14 +2126,27 @@ impl SlamTracker {
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
                 let tracking_health = self.tracking_failure_health();
                 self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
-                return Ok(TrackerOutput {
-                    pose: None,
-                    inliers: 0,
-                    keyframe: None,
-                    stereo_matches: None,
+                let mut diagnostics = self.empty_diagnostics();
+                diagnostics.features_detected = Some(current.len());
+                diagnostics.features_matched = Some(matches.len());
+                diagnostics.tracking_time = Some(tracking_start.elapsed());
+                diagnostics.loop_candidate_count = self
+                    .pending_loop
+                    .as_ref()
+                    .map_or(0, |pending| pending.candidates.len());
+                diagnostics.loop_closure_applied = self
+                    .pending_events
+                    .iter()
+                    .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+                return Ok(self.output_with_diagnostics(
+                    None,
+                    0,
+                    None,
+                    None,
                     frame_id,
-                    health: self.emit_health(tracking_health),
-                });
+                    tracking_health,
+                    diagnostics,
+                ));
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
@@ -2043,14 +2156,28 @@ impl SlamTracker {
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
                 let tracking_health = self.tracking_failure_health();
                 self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
-                return Ok(TrackerOutput {
-                    pose: None,
-                    inliers: 0,
-                    keyframe: None,
-                    stereo_matches: None,
+                let mut diagnostics = self.empty_diagnostics();
+                diagnostics.features_detected = Some(current.len());
+                diagnostics.features_matched = Some(matches.len());
+                diagnostics.pnp_observations = Some(observations.len());
+                diagnostics.tracking_time = Some(tracking_start.elapsed());
+                diagnostics.loop_candidate_count = self
+                    .pending_loop
+                    .as_ref()
+                    .map_or(0, |pending| pending.candidates.len());
+                diagnostics.loop_closure_applied = self
+                    .pending_events
+                    .iter()
+                    .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+                return Ok(self.output_with_diagnostics(
+                    None,
+                    0,
+                    None,
+                    None,
                     frame_id,
-                    health: self.emit_health(tracking_health),
-                });
+                    tracking_health,
+                    diagnostics,
+                ));
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
@@ -2084,16 +2211,15 @@ impl SlamTracker {
             .and_then(|set| self.ba.push_frame(&self.map, pose_world, set));
 
         let pose_world = refined_world.unwrap_or(pose_world);
+        if self.consecutive_tracking_failures > 0 {
+            self.emit_event(DiagnosticEvent::TrackingRecovered);
+        }
         self.consecutive_tracking_failures = 0;
-
-        let mut output = TrackerOutput {
-            pose: Some(pose_world),
-            inliers: result.inliers.len(),
-            keyframe: None,
-            stereo_matches: None,
-            frame_id,
-            health: self.emit_health(TrackingHealth::Good),
-        };
+        let mut output_keyframe = None;
+        let mut output_matches = None;
+        let mut keyframe_created = false;
+        let mut triangulation_stats = None;
+        let mut ba_result = None;
 
         let should_refresh = self.config.keyframe_policy.should_refresh(
             result.inliers.len(),
@@ -2111,6 +2237,9 @@ impl SlamTracker {
                 Some(current.clone()),
                 Some(shared),
             ) {
+                keyframe_created = true;
+                triangulation_stats = keyframe_output.diagnostics.triangulation;
+                ba_result = keyframe_output.diagnostics.ba_result.clone();
                 if let Some(keyframe) = keyframe_output.keyframe {
                     let redundant = self
                         .config
@@ -2129,6 +2258,10 @@ impl SlamTracker {
                         ) {
                             eprintln!("failed to remove redundant keyframe {keyframe_id:?}: {err}");
                         } else {
+                            self.emit_event(DiagnosticEvent::KeyframeRemoved {
+                                keyframe_id,
+                                reason: KeyframeRemovalReason::Redundant,
+                            });
                             self.loop_streak.remove(&keyframe_id);
                             if let Some(pending) = self.pending_loop.as_mut() {
                                 if pending.query_kf == keyframe_id {
@@ -2182,6 +2315,7 @@ impl SlamTracker {
                                 );
                                 let result =
                                     self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                ba_result = Some(result.clone());
                                 if matches!(
                                     result,
                                     BaResult::Converged { .. } | BaResult::MaxIterations { .. }
@@ -2190,7 +2324,12 @@ impl SlamTracker {
                                 }
                             }
                         } else if matches!(
-                            self.ba.optimize_keyframe_window(&mut self.map, &window),
+                            {
+                                let result =
+                                    self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                ba_result = Some(result.clone());
+                                result
+                            },
                             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
                         ) {
                             self.bump_map_version();
@@ -2200,14 +2339,54 @@ impl SlamTracker {
                             keyframe_id,
                         };
                         self.ba.reset();
-                        output.keyframe = Some(keyframe);
-                        output.stereo_matches = keyframe_output.stereo_matches;
+                        output_keyframe = Some(keyframe);
+                        output_matches = keyframe_output.stereo_matches;
                     }
                 }
             }
         }
 
-        Ok(output)
+        let inlier_observations: Vec<_> = result
+            .inliers
+            .iter()
+            .filter_map(|&idx| observations.get(idx).copied())
+            .collect();
+        let inlier_errors =
+            crate::pnp::reprojection_errors(&pose_world, &inlier_observations, self.intrinsics);
+
+        let mut diagnostics = self.empty_diagnostics();
+        diagnostics.inlier_ratio =
+            Some(result.inliers.len() as f32 / observations.len().max(1) as f32);
+        diagnostics.pnp_observations = Some(observations.len());
+        diagnostics.ransac_iterations = Some(result.iterations);
+        diagnostics.reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors);
+        diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors);
+        diagnostics.parallax_px = parallax_px;
+        diagnostics.covisibility = Some(covisibility);
+        diagnostics.keyframe_created = keyframe_created;
+        diagnostics.triangulation = triangulation_stats;
+        diagnostics.ba_result = ba_result;
+        diagnostics.loop_candidate_count = self
+            .pending_loop
+            .as_ref()
+            .map_or(0, |pending| pending.candidates.len());
+        diagnostics.loop_closure_applied = self
+            .pending_events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+        diagnostics.tracking_time = Some(tracking_start.elapsed());
+        diagnostics.features_detected = Some(current.len());
+        diagnostics.features_matched = Some(matches.len());
+
+        Ok(self.output_with_diagnostics(
+            Some(pose_world),
+            result.inliers.len(),
+            output_keyframe,
+            output_matches,
+            frame_id,
+            TrackingHealth::Good,
+            diagnostics,
+        ))
     }
 
     fn create_keyframe(
@@ -2226,14 +2405,16 @@ impl SlamTracker {
         };
         self.ba.reset();
         self.consecutive_tracking_failures = 0;
-        Ok(TrackerOutput {
-            pose: Some(pose_world),
-            inliers: 0,
-            keyframe: output.keyframe,
-            stereo_matches: output.stereo_matches,
+        let diagnostics = output.diagnostics;
+        Ok(self.output_with_diagnostics(
+            Some(pose_world),
+            0,
+            output.keyframe,
+            output.stereo_matches,
             frame_id,
-            health: self.emit_health(TrackingHealth::Good),
-        })
+            TrackingHealth::Good,
+            diagnostics,
+        ))
     }
 
     fn create_keyframe_internal(
@@ -2296,6 +2477,7 @@ impl SlamTracker {
         };
 
         let result = self.triangulator.triangulate(&matches)?;
+        let triangulation_stats = result.stats;
         let landmarks = result.keyframe.landmarks().len();
         if landmarks < self.config.min_keyframe_points {
             return Err(TrackerError::KeyframeRejected { landmarks });
@@ -2309,6 +2491,10 @@ impl SlamTracker {
             pose_world,
             shared.as_ref(),
         )?;
+        self.emit_event(DiagnosticEvent::KeyframeCreated {
+            keyframe_id,
+            landmarks,
+        });
         self.essential_graph.add_keyframe(
             keyframe_id,
             self.map.covisibility().neighbors(keyframe_id),
@@ -2318,6 +2504,20 @@ impl SlamTracker {
         self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
         self.enqueue_descriptor_request(keyframe_id, &left);
 
+        let mut diagnostics = self.empty_diagnostics();
+        diagnostics.keyframe_created = true;
+        diagnostics.triangulation = Some(triangulation_stats);
+        diagnostics.features_detected = Some(left_arc.len());
+        diagnostics.features_matched = Some(matches.len());
+        diagnostics.loop_candidate_count = self
+            .pending_loop
+            .as_ref()
+            .map_or(0, |pending| pending.candidates.len());
+        diagnostics.loop_closure_applied = self
+            .pending_events
+            .iter()
+            .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+
         Ok((
             TrackerOutput {
                 pose: None,
@@ -2326,6 +2526,8 @@ impl SlamTracker {
                 stereo_matches: Some(matches),
                 frame_id,
                 health: self.system_health(),
+                diagnostics,
+                events: Vec::new(),
             },
             keyframe_id,
         ))
@@ -2635,6 +2837,23 @@ fn apply_loop_closure_correction(
 fn loop_translation_norm(pose: Pose) -> f32 {
     let t = pose.translation();
     (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
+}
+
+fn loop_reject_reason(error: &LoopDetectError) -> LoopClosureRejectReason {
+    match error {
+        LoopDetectError::TooFewCorrespondences { count } => {
+            LoopClosureRejectReason::TooFewCorrespondences { count: *count }
+        }
+        LoopDetectError::VerificationFailed(_) => LoopClosureRejectReason::VerificationFailed,
+        LoopDetectError::CorrectionTooLarge {
+            translation,
+            rotation_deg,
+        } => LoopClosureRejectReason::CorrectionTooLarge {
+            translation_m: *translation,
+            rotation_deg: *rotation_deg,
+        },
+        LoopDetectError::ApplyFailed(_) => LoopClosureRejectReason::ApplyFailed,
+    }
 }
 
 fn loop_rotation_angle_deg(pose: Pose) -> f32 {

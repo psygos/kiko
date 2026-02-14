@@ -728,6 +728,34 @@ fn reprojection_error_sq_px(
     Some(dx * dx + dy * dy)
 }
 
+pub(crate) fn reprojection_errors(
+    pose: &Pose,
+    observations: &[Observation],
+    intrinsics: PinholeIntrinsics,
+) -> Vec<Option<f32>> {
+    observations
+        .iter()
+        .map(|obs| reprojection_error_sq_px(*pose, obs, intrinsics).map(f32::sqrt))
+        .collect()
+}
+
+pub(crate) fn reprojection_rmse(errors: &[Option<f32>]) -> Option<f32> {
+    let mut sum_sq = 0.0_f32;
+    let mut count = 0usize;
+    for &error in errors.iter().flatten() {
+        sum_sq += error * error;
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((sum_sq / count as f32).sqrt())
+}
+
+pub(crate) fn reprojection_max(errors: &[Option<f32>]) -> Option<f32> {
+    errors.iter().flatten().copied().reduce(f32::max)
+}
+
 fn pose_from_points(
     w1: [f32; 3],
     w2: [f32; 3],
@@ -1074,6 +1102,117 @@ mod tests {
         let obs = Observation::try_new(point, pixel, intrinsics).expect("obs");
         let err_sq = reprojection_error_sq_px(pose, &obs, intrinsics).expect("error");
         assert!(err_sq < 1e-8, "expected exact reprojection, got {err_sq}");
+    }
+
+    #[test]
+    fn reprojection_errors_zero_for_exact_projection() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let pose = Pose::identity();
+        let world = synthetic_world_points();
+        let observations =
+            observations_from_projection(pose, &world, intrinsics).expect("synthetic observations");
+        let errors = reprojection_errors(&pose, &observations, intrinsics);
+        assert_eq!(errors.len(), observations.len());
+        assert!(errors.iter().all(|e| e.is_some_and(|v| v < 1e-4)));
+    }
+
+    #[test]
+    fn reprojection_errors_none_for_behind_camera() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 2.0,
+            },
+            Keypoint { x: 320.0, y: 240.0 },
+            intrinsics,
+        )
+        .expect("observation");
+        let behind_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 0.0, -3.0],
+        );
+        let errors = reprojection_errors(&behind_pose, &[observation], intrinsics);
+        assert_eq!(errors, vec![None]);
+    }
+
+    #[test]
+    fn reprojection_rmse_matches_manual() {
+        let errors = vec![Some(3.0), None, Some(4.0)];
+        let rmse = reprojection_rmse(&errors).expect("rmse");
+        let expected = ((3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
+        assert!((rmse - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reprojection_errors_with_known_perturbation() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let pose = Pose::identity();
+        let world = [
+            Point3 {
+                x: -0.2,
+                y: 0.0,
+                z: 3.0,
+            },
+            Point3 {
+                x: 0.2,
+                y: 0.1,
+                z: 3.5,
+            },
+            Point3 {
+                x: 0.0,
+                y: -0.2,
+                z: 4.0,
+            },
+        ];
+        let observations: Vec<_> = world
+            .iter()
+            .map(|&point| {
+                let mut pixel = project_pixel_from_pose(pose, point, intrinsics);
+                pixel.x += 2.0;
+                Observation::try_new(point, pixel, intrinsics).expect("observation")
+            })
+            .collect();
+        let errors = reprojection_errors(&pose, &observations, intrinsics);
+        let rmse = reprojection_rmse(&errors).expect("rmse");
+        assert!(rmse >= 1.5 && rmse <= 2.5, "rmse={rmse}");
+        let max = reprojection_max(&errors).expect("max");
+        assert!(max >= 1.5 && max <= 2.5, "max={max}");
+    }
+
+    #[test]
+    fn reprojection_errors_len_matches_input() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let pose = Pose::identity();
+        let observations = vec![
+            Observation::try_new(
+                Point3 {
+                    x: -0.1,
+                    y: 0.0,
+                    z: 2.5,
+                },
+                Keypoint { x: 300.0, y: 240.0 },
+                intrinsics,
+            )
+            .expect("observation"),
+            Observation::try_new(
+                Point3 {
+                    x: 0.1,
+                    y: 0.0,
+                    z: 3.0,
+                },
+                Keypoint { x: 340.0, y: 240.0 },
+                intrinsics,
+            )
+            .expect("observation"),
+        ];
+        let errors = reprojection_errors(&pose, &observations, intrinsics);
+        assert_eq!(errors.len(), observations.len());
     }
 
     fn project_pixel_from_pose(
