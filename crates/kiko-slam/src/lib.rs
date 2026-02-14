@@ -37,8 +37,9 @@ pub use local_ba::{
 pub use loop_closure::{
     aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, GlobalDescriptor,
     GlobalDescriptorError, KeyframeDatabase, LoopCandidate, LoopClosureConfig,
-    LoopClosureConfigError, LoopDetectError, LoopVerificationError, PlaceMatch,
-    RelocalizationConfig, RelocalizationConfigError, RelocalizationMatch, VerifiedLoop,
+    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
+    PlaceMatch, RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+    RelocalizationMatch, VerifiedLoop,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
@@ -54,9 +55,9 @@ pub use pnp::{
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, KeyframePolicy,
-    DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframePolicyError,
-    ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
-    TrackerError, TrackerOutput, TrackingHealth,
+    DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
+    KeyframePolicyError, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
+    SystemHealth, TrackerConfig, TrackerError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
@@ -136,8 +137,7 @@ impl std::fmt::Display for PairError {
             } => {
                 write!(
                     f,
-                    "stereo delta {}ns exceeds window {}ns",
-                    delta_ns, max_delta_ns
+                    "stereo delta {delta_ns}ns exceeds window {max_delta_ns}ns"
                 )
             }
             PairError::SensorMismatch { left, right } => {
@@ -186,8 +186,7 @@ impl std::fmt::Display for DownscaleError {
                 factor,
             } => write!(
                 f,
-                "downscale factor {factor} does not divide frame {}x{}",
-                width, height
+                "downscale factor {factor} does not divide frame {width}x{height}"
             ),
         }
     }
@@ -447,7 +446,7 @@ impl Detections {
         for &idx in &order {
             new_keypoints.push(keypoints[idx]);
             new_scores.push(scores[idx]);
-            new_descriptors.push(descriptors[idx].clone());
+            new_descriptors.push(descriptors[idx]);
         }
 
         Self {

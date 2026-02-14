@@ -15,7 +15,7 @@ pub mod format {
     pub const FRAME_SUFFIX: &str = ".raw";
 
     pub fn frame_name(timestamp_ns: i64, sensor: &str) -> String {
-        format!("{}_{}{}", timestamp_ns, sensor, FRAME_SUFFIX)
+        format!("{timestamp_ns}_{sensor}{FRAME_SUFFIX}")
     }
 
     pub fn parse_frame_filename(filename: &str) -> Option<(i64, String)> {
@@ -180,12 +180,7 @@ impl std::fmt::Display for DatasetError {
                 )
             }
             DatasetError::ReadDirectory { path, source } => {
-                write!(
-                    f,
-                    "failed to read directory {}: {}",
-                    path.display(),
-                    source
-                )
+                write!(f, "failed to read directory {}: {}", path.display(), source)
             }
             DatasetError::ReadFile { path, source } => {
                 write!(f, "failed to read file {}: {}", path.display(), source)
@@ -200,10 +195,10 @@ impl std::fmt::Display for DatasetError {
                 write!(f, "failed to write file {}: {}", path.display(), source)
             }
             DatasetError::SerializeJson { source } => {
-                write!(f, "failed to serialize JSON: {}", source)
+                write!(f, "failed to serialize JSON: {source}")
             }
             DatasetError::DeserializeJson { source } => {
-                write!(f, "failed to deserialize JSON: {}", source)
+                write!(f, "failed to deserialize JSON: {source}")
             }
             DatasetError::WorkerJoin { message } => {
                 write!(f, "writer thread panicked: {message}")
@@ -241,12 +236,7 @@ impl Clone for DatasetWriter {
 
 impl Drop for DatasetWriter {
     fn drop(&mut self) {
-        if self
-            .state
-            .open_writers
-            .fetch_sub(1, Ordering::AcqRel)
-            == 1
-        {
+        if self.state.open_writers.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.state.close_spool();
         }
     }
@@ -314,11 +304,7 @@ impl DatasetWriter {
         serde_json::to_writer_pretty(meta_file, meta)
             .map_err(|e| DatasetError::SerializeJson { source: e })?;
 
-        let state = Arc::new(WriterState::new(
-            config,
-            path.clone(),
-            frames_dir.clone(),
-        ));
+        let state = Arc::new(WriterState::new(config, path.clone(), frames_dir.clone()));
         let state_for_thread = state.clone();
 
         let handle = thread::Builder::new()
@@ -426,9 +412,7 @@ impl DatasetWriterHandle {
         })?;
 
         let writer_error = self.state.take_error();
-        if let Err(err) = write_manifest(&self.state) {
-            return Err(err);
-        }
+        write_manifest(&self.state)?;
 
         if let Some(err) = writer_error {
             return Err(err);
@@ -541,10 +525,7 @@ impl WriterState {
     }
 
     fn record_error(&self, err: DatasetError) {
-        let mut guard = self
-            .error
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+        let mut guard = self.error.lock().unwrap_or_else(|err| err.into_inner());
         if guard.is_none() {
             *guard = Some(err);
         }
@@ -630,10 +611,8 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
         });
     }
 
-    std::fs::write(&path, data.as_ref()).map_err(|e| DatasetError::WriteFile {
-        path,
-        source: e,
-    })?;
+    std::fs::write(&path, data.as_ref())
+        .map_err(|e| DatasetError::WriteFile { path, source: e })?;
 
     Ok(())
 }
@@ -805,10 +784,11 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
     };
 
     let manifest_path = state.dataset_dir.join(format::MANIFEST_FILE);
-    let manifest_file = std::fs::File::create(&manifest_path).map_err(|e| DatasetError::WriteFile {
-        path: manifest_path.clone(),
-        source: e,
-    })?;
+    let manifest_file =
+        std::fs::File::create(&manifest_path).map_err(|e| DatasetError::WriteFile {
+            path: manifest_path.clone(),
+            source: e,
+        })?;
     serde_json::to_writer_pretty(manifest_file, &manifest)
         .map_err(|e| DatasetError::SerializeJson { source: e })?;
     Ok(())
@@ -918,14 +898,10 @@ fn compute_period_ns(frames: &[FrameInfo]) -> Option<u64> {
         .map(|pair| pair[1].timestamp_ns - pair[0].timestamp_ns)
         .collect();
     deltas.sort_unstable();
-    Some(median_i64(&deltas).abs() as u64)
+    Some(median_i64(&deltas).unsigned_abs())
 }
 
-fn collect_deltas(
-    left: &[FrameInfo],
-    right: &[FrameInfo],
-    gate: Option<u64>,
-) -> Vec<i64> {
+fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) -> Vec<i64> {
     let mut deltas = Vec::new();
     if right.is_empty() {
         return deltas;
@@ -933,17 +909,13 @@ fn collect_deltas(
 
     let mut right_idx = 0usize;
     for left_frame in left {
-        while right_idx + 1 < right.len()
-            && right[right_idx].timestamp_ns < left_frame.timestamp_ns
+        while right_idx + 1 < right.len() && right[right_idx].timestamp_ns < left_frame.timestamp_ns
         {
             right_idx += 1;
         }
 
         let mut best: Option<i64> = None;
-        let candidates = [
-            Some(right_idx),
-            right_idx.checked_sub(1),
-        ];
+        let candidates = [Some(right_idx), right_idx.checked_sub(1)];
 
         for idx in candidates.into_iter().flatten() {
             if idx >= right.len() {
@@ -955,7 +927,7 @@ fn collect_deltas(
                     continue;
                 }
             }
-            if best.map_or(true, |b| delta < b) {
+            if best.is_none_or(|b| delta < b) {
                 best = Some(delta);
             }
         }
@@ -999,7 +971,9 @@ fn compute_pairing_window_ns(
     sorted.sort_unstable();
     let median = median_i64(&sorted);
     let mad = median_absolute_deviation(&sorted, median);
-    let p99 = stats.map(|s| s.p99).unwrap_or(sorted.last().copied().unwrap() as u64);
+    let p99 = stats
+        .map(|s| s.p99)
+        .unwrap_or(sorted.last().copied().unwrap() as u64);
     let mut window = p99.max((median + 6 * mad).max(0) as u64);
     if let Some(period) = left_period {
         if period > 0 {
@@ -1023,8 +997,7 @@ fn pair_entries(
 
     let mut right_idx = 0usize;
     for left_frame in left {
-        while right_idx + 1 < right.len()
-            && right[right_idx].timestamp_ns < left_frame.timestamp_ns
+        while right_idx + 1 < right.len() && right[right_idx].timestamp_ns < left_frame.timestamp_ns
         {
             right_idx += 1;
         }
@@ -1053,8 +1026,8 @@ fn pair_entries(
         let mut best_delta = None;
 
         for idx in [left_candidate, right_candidate].into_iter().flatten() {
-            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).abs() as u64;
-            if best_delta.map_or(true, |b| delta < b) {
+            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).unsigned_abs();
+            if best_delta.is_none_or(|b| delta < b) {
                 best_delta = Some(delta);
                 best_idx = Some(idx);
             }
@@ -1114,7 +1087,13 @@ fn pair_entries(
     }
 
     let right_orphans = right_used.iter().filter(|used| !**used).count() as u64;
-    (entries, paired_count, left_orphans, right_orphans, outside_window)
+    (
+        entries,
+        paired_count,
+        left_orphans,
+        right_orphans,
+        outside_window,
+    )
 }
 
 fn median_i64(sorted: &[i64]) -> i64 {

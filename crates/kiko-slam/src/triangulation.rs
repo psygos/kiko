@@ -3,19 +3,10 @@ use std::sync::Arc;
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{Detections, FrameId, Keypoint, Matches, Raw, SensorId};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct RectifiedStereoConfig {
     pub max_principal_delta_px: Option<f32>,
     pub allow_unrectified: bool,
-}
-
-impl Default for RectifiedStereoConfig {
-    fn default() -> Self {
-        Self {
-            max_principal_delta_px: None,
-            allow_unrectified: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -27,7 +18,9 @@ pub struct RectifiedStereo {
 
 #[derive(Debug)]
 pub enum RectifiedStereoError {
-    NonPositiveBaseline { baseline_m: f32 },
+    NonPositiveBaseline {
+        baseline_m: f32,
+    },
     DimensionMismatch {
         left: (u32, u32),
         right: (u32, u32),
@@ -58,7 +51,10 @@ impl std::fmt::Display for RectifiedStereoError {
                 )
             }
             RectifiedStereoError::InvalidFocal { fx, fy } => {
-                write!(f, "rectified stereo requires positive focal lengths: fx={fx}, fy={fy}")
+                write!(
+                    f,
+                    "rectified stereo requires positive focal lengths: fx={fx}, fy={fy}"
+                )
             }
             RectifiedStereoError::NotRectified => {
                 write!(f, "calibration is not marked rectified")
@@ -80,9 +76,7 @@ impl std::fmt::Display for RectifiedStereoError {
 impl std::error::Error for RectifiedStereoError {}
 
 impl RectifiedStereo {
-    pub fn from_calibration(
-        calibration: &Calibration,
-    ) -> Result<Self, RectifiedStereoError> {
+    pub fn from_calibration(calibration: &Calibration) -> Result<Self, RectifiedStereoError> {
         Self::from_calibration_with_config(calibration, RectifiedStereoConfig::default())
     }
 
@@ -432,8 +426,10 @@ impl Triangulator {
 
         let left_len = left.len();
         let right_len = right.len();
-        let mut stats = TriangulationStats::default();
-        stats.candidate_matches = matches.len();
+        let mut stats = TriangulationStats {
+            candidate_matches: matches.len(),
+            ..TriangulationStats::default()
+        };
 
         let mut best: Vec<Option<(usize, f32)>> = vec![None; left_len];
         for (&(li, ri), &score) in matches.indices().iter().zip(matches.scores()) {
@@ -475,7 +471,7 @@ impl Triangulator {
                 continue;
             };
 
-        let left_kp = left.keypoints()[li];
+            let left_kp = left.keypoints()[li];
             let right_kp = right.keypoints()[ri];
 
             if !in_bounds(left_kp, width, height) || !in_bounds(right_kp, width, height) {
@@ -509,10 +505,11 @@ impl Triangulator {
             return Err(TriangulationError::NoLandmarks { stats });
         }
 
-        let keyframe = Keyframe::from_arc(left, landmarks, landmark_indices)
-            .map_err(|err| TriangulationError::InvalidDetections {
+        let keyframe = Keyframe::from_arc(left, landmarks, landmark_indices).map_err(|err| {
+            TriangulationError::InvalidDetections {
                 message: err.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(TriangulationResult { keyframe, stats })
     }
@@ -544,10 +541,10 @@ mod tests {
 
     #[test]
     fn triangulate_recovers_known_depth_for_rectified_pairs() {
-        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 402.0, 320.0, 240.0)
-            .expect("intrinsics");
-        let stereo = make_rectified_stereo(640, 480, 400.0, 402.0, 320.0, 240.0, 0.075)
-            .expect("stereo");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 400.0, 402.0, 320.0, 240.0).expect("intrinsics");
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 402.0, 320.0, 240.0, 0.075).expect("stereo");
         let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
 
         let points = vec![
@@ -586,9 +583,8 @@ mod tests {
 
         let left = make_detections(SensorId::StereoLeft, FrameId::new(10), 640, 480, left_kps)
             .expect("left detections");
-        let right =
-            make_detections(SensorId::StereoRight, FrameId::new(11), 640, 480, right_kps)
-                .expect("right detections");
+        let right = make_detections(SensorId::StereoRight, FrameId::new(11), 640, 480, right_kps)
+            .expect("right detections");
         let matches = Matches::new(left, right, pairs, vec![1.0; points.len()]).expect("matches");
 
         let result = triangulator.triangulate(&matches).expect("triangulation");
@@ -606,10 +602,10 @@ mod tests {
 
     #[test]
     fn triangulate_rejects_points_below_min_disparity() {
-        let intrinsics = make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0)
-            .expect("intrinsics");
-        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
-            .expect("stereo");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
         let triangulator = Triangulator::new(
             stereo,
             TriangulationConfig {
@@ -660,8 +656,8 @@ mod tests {
 
     #[test]
     fn triangulate_returns_index_out_of_bounds_for_bad_match_indices() {
-        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
-            .expect("stereo");
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
         let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
 
         let left = make_detections(
@@ -703,8 +699,8 @@ mod tests {
 
     #[test]
     fn triangulate_uses_best_score_for_duplicate_left_matches() {
-        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
-            .expect("stereo");
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
         let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
 
         let left = make_detections(
@@ -720,7 +716,10 @@ mod tests {
             FrameId::new(41),
             640,
             480,
-            vec![Keypoint { x: 335.0, y: 240.0 }, Keypoint { x: 345.0, y: 240.0 }],
+            vec![
+                Keypoint { x: 335.0, y: 240.0 },
+                Keypoint { x: 345.0, y: 240.0 },
+            ],
         )
         .expect("right");
 
@@ -746,8 +745,8 @@ mod tests {
 
     #[test]
     fn triangulate_rejects_sensor_mismatch() {
-        let stereo = make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075)
-            .expect("stereo");
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
         let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
 
         let left = make_detections(

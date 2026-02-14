@@ -22,11 +22,68 @@ pub struct LoopClosureConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct LoopClosureConfigInput {
+    pub similarity_threshold: f32,
+    pub descriptor_match_threshold: f32,
+    pub min_inliers: usize,
+    pub max_candidates: usize,
+    pub temporal_gap: usize,
+    pub min_streak: usize,
+    pub max_correction_translation: f32,
+    pub max_correction_rotation_deg: f32,
+    pub ransac: RansacConfig,
+}
+
+impl Default for LoopClosureConfigInput {
+    fn default() -> Self {
+        Self {
+            similarity_threshold: 0.75,
+            descriptor_match_threshold: 0.7,
+            min_inliers: 20,
+            max_candidates: 3,
+            temporal_gap: 30,
+            min_streak: 3,
+            max_correction_translation: 5.0,
+            max_correction_rotation_deg: 30.0,
+            ransac: RansacConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct RelocalizationConfig {
     max_attempts: NonZeroUsize,
     min_inliers: NonZeroUsize,
     max_candidates: NonZeroUsize,
     descriptor_match_threshold: f32,
+    min_confirmations: NonZeroUsize,
+    max_translation_delta_m: f32,
+    max_rotation_delta_deg: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RelocalizationConfigInput {
+    pub max_attempts: usize,
+    pub min_inliers: usize,
+    pub max_candidates: usize,
+    pub descriptor_match_threshold: f32,
+    pub min_confirmations: usize,
+    pub max_translation_delta_m: f32,
+    pub max_rotation_delta_deg: f32,
+}
+
+impl Default for RelocalizationConfigInput {
+    fn default() -> Self {
+        Self {
+            max_attempts: 30,
+            min_inliers: 20,
+            max_candidates: 3,
+            descriptor_match_threshold: 0.7,
+            min_confirmations: 2,
+            max_translation_delta_m: 1.5,
+            max_rotation_delta_deg: 10.0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -34,8 +91,11 @@ pub enum RelocalizationConfigError {
     ZeroMaxAttempts,
     ZeroMinInliers,
     ZeroMaxCandidates,
+    ZeroMinConfirmations,
     TooFewMinInliers { value: usize, min: usize },
     DescriptorMatchThresholdOutOfRange { value: f32 },
+    NonPositiveMaxTranslationDelta { value: f32 },
+    InvalidMaxRotationDeltaDeg { value: f32 },
 }
 
 impl std::fmt::Display for RelocalizationConfigError {
@@ -50,12 +110,23 @@ impl std::fmt::Display for RelocalizationConfigError {
             RelocalizationConfigError::ZeroMaxCandidates => {
                 write!(f, "relocalization max candidates must be > 0")
             }
+            RelocalizationConfigError::ZeroMinConfirmations => {
+                write!(f, "relocalization min confirmations must be > 0")
+            }
             RelocalizationConfigError::TooFewMinInliers { value, min } => {
                 write!(f, "relocalization min inliers must be >= {min}, got {value}")
             }
             RelocalizationConfigError::DescriptorMatchThresholdOutOfRange { value } => write!(
                 f,
                 "relocalization descriptor match threshold must be in (0, 1], got {value}"
+            ),
+            RelocalizationConfigError::NonPositiveMaxTranslationDelta { value } => write!(
+                f,
+                "relocalization max translation delta must be > 0, got {value}"
+            ),
+            RelocalizationConfigError::InvalidMaxRotationDeltaDeg { value } => write!(
+                f,
+                "relocalization max rotation delta must be in (0, 180], got {value}"
             ),
         }
     }
@@ -64,18 +135,24 @@ impl std::fmt::Display for RelocalizationConfigError {
 impl std::error::Error for RelocalizationConfigError {}
 
 impl RelocalizationConfig {
-    pub fn new(
-        max_attempts: usize,
-        min_inliers: usize,
-        max_candidates: usize,
-        descriptor_match_threshold: f32,
-    ) -> Result<Self, RelocalizationConfigError> {
+    pub fn new(input: RelocalizationConfigInput) -> Result<Self, RelocalizationConfigError> {
+        let RelocalizationConfigInput {
+            max_attempts,
+            min_inliers,
+            max_candidates,
+            descriptor_match_threshold,
+            min_confirmations,
+            max_translation_delta_m,
+            max_rotation_delta_deg,
+        } = input;
         let max_attempts =
             NonZeroUsize::new(max_attempts).ok_or(RelocalizationConfigError::ZeroMaxAttempts)?;
         let min_inliers =
             NonZeroUsize::new(min_inliers).ok_or(RelocalizationConfigError::ZeroMinInliers)?;
         let max_candidates = NonZeroUsize::new(max_candidates)
             .ok_or(RelocalizationConfigError::ZeroMaxCandidates)?;
+        let min_confirmations = NonZeroUsize::new(min_confirmations)
+            .ok_or(RelocalizationConfigError::ZeroMinConfirmations)?;
         if min_inliers.get() < 4 {
             return Err(RelocalizationConfigError::TooFewMinInliers {
                 value: min_inliers.get(),
@@ -92,12 +169,28 @@ impl RelocalizationConfig {
                 },
             );
         }
+        if !max_translation_delta_m.is_finite() || max_translation_delta_m <= 0.0 {
+            return Err(RelocalizationConfigError::NonPositiveMaxTranslationDelta {
+                value: max_translation_delta_m,
+            });
+        }
+        if !max_rotation_delta_deg.is_finite()
+            || max_rotation_delta_deg <= 0.0
+            || max_rotation_delta_deg > 180.0
+        {
+            return Err(RelocalizationConfigError::InvalidMaxRotationDeltaDeg {
+                value: max_rotation_delta_deg,
+            });
+        }
 
         Ok(Self {
             max_attempts,
             min_inliers,
             max_candidates,
             descriptor_match_threshold,
+            min_confirmations,
+            max_translation_delta_m,
+            max_rotation_delta_deg,
         })
     }
 
@@ -116,11 +209,24 @@ impl RelocalizationConfig {
     pub fn descriptor_match_threshold(self) -> f32 {
         self.descriptor_match_threshold
     }
+
+    pub fn min_confirmations(self) -> usize {
+        self.min_confirmations.get()
+    }
+
+    pub fn max_translation_delta_m(self) -> f32 {
+        self.max_translation_delta_m
+    }
+
+    pub fn max_rotation_delta_deg(self) -> f32 {
+        self.max_rotation_delta_deg
+    }
 }
 
 impl Default for RelocalizationConfig {
     fn default() -> Self {
-        Self::new(30, 20, 3, 0.7).expect("valid relocalization defaults")
+        Self::new(RelocalizationConfigInput::default())
+            .expect("valid relocalization defaults")
     }
 }
 
@@ -186,17 +292,18 @@ impl std::fmt::Display for LoopClosureConfigError {
 impl std::error::Error for LoopClosureConfigError {}
 
 impl LoopClosureConfig {
-    pub fn new(
-        similarity_threshold: f32,
-        descriptor_match_threshold: f32,
-        min_inliers: usize,
-        max_candidates: usize,
-        temporal_gap: usize,
-        min_streak: usize,
-        max_correction_translation: f32,
-        max_correction_rotation_deg: f32,
-        ransac: RansacConfig,
-    ) -> Result<Self, LoopClosureConfigError> {
+    pub fn new(input: LoopClosureConfigInput) -> Result<Self, LoopClosureConfigError> {
+        let LoopClosureConfigInput {
+            similarity_threshold,
+            descriptor_match_threshold,
+            min_inliers,
+            max_candidates,
+            temporal_gap,
+            min_streak,
+            max_correction_translation,
+            max_correction_rotation_deg,
+            ransac,
+        } = input;
         if !similarity_threshold.is_finite()
             || similarity_threshold <= 0.0
             || similarity_threshold > 1.0
@@ -306,7 +413,7 @@ impl LoopClosureConfig {
 
 impl Default for LoopClosureConfig {
     fn default() -> Self {
-        Self::new(0.75, 0.7, 20, 3, 30, 3, 5.0, 30.0, RansacConfig::default())
+        Self::new(LoopClosureConfigInput::default())
             .expect("default loop closure config should be valid")
     }
 }
@@ -830,6 +937,7 @@ mod tests {
         aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource,
         GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
         LoopClosureConfig, LoopVerificationError, RelocalizationConfig,
+        RelocalizationConfigInput,
         RelocalizationConfigError,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
@@ -1026,17 +1134,43 @@ mod tests {
 
     #[test]
     fn relocalization_config_rejects_invalid_values() {
-        let err = RelocalizationConfig::new(0, 20, 3, 0.7).expect_err("zero attempts");
+        let err = RelocalizationConfig::new(RelocalizationConfigInput {
+            max_attempts: 0,
+            ..RelocalizationConfigInput::default()
+        })
+        .expect_err("zero attempts");
         assert!(matches!(err, RelocalizationConfigError::ZeroMaxAttempts));
-        let err = RelocalizationConfig::new(10, 3, 3, 0.7).expect_err("too few inliers");
+        let err = RelocalizationConfig::new(RelocalizationConfigInput {
+            max_attempts: 10,
+            min_inliers: 3,
+            ..RelocalizationConfigInput::default()
+        })
+        .expect_err("too few inliers");
         assert!(matches!(
             err,
             RelocalizationConfigError::TooFewMinInliers { .. }
         ));
-        let err = RelocalizationConfig::new(10, 20, 3, 0.0).expect_err("invalid threshold");
+        let err = RelocalizationConfig::new(RelocalizationConfigInput {
+            max_attempts: 10,
+            min_inliers: 20,
+            descriptor_match_threshold: 0.0,
+            ..RelocalizationConfigInput::default()
+        })
+        .expect_err("invalid threshold");
         assert!(matches!(
             err,
             RelocalizationConfigError::DescriptorMatchThresholdOutOfRange { .. }
+        ));
+        let err = RelocalizationConfig::new(RelocalizationConfigInput {
+            max_attempts: 10,
+            min_inliers: 20,
+            max_translation_delta_m: 0.0,
+            ..RelocalizationConfigInput::default()
+        })
+        .expect_err("invalid translation threshold");
+        assert!(matches!(
+            err,
+            RelocalizationConfigError::NonPositiveMaxTranslationDelta { .. }
         ));
     }
 
@@ -1047,6 +1181,9 @@ mod tests {
         assert_eq!(cfg.min_inliers(), 20);
         assert_eq!(cfg.max_candidates(), 3);
         assert!((cfg.descriptor_match_threshold() - 0.7).abs() < 1e-6);
+        assert_eq!(cfg.min_confirmations(), 2);
+        assert!((cfg.max_translation_delta_m() - 1.5).abs() < 1e-6);
+        assert!((cfg.max_rotation_delta_deg() - 10.0).abs() < 1e-6);
     }
 
     #[test]

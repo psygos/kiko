@@ -38,10 +38,11 @@ impl Pose64 {
     }
 
     pub fn from_pose32(pose: Pose) -> Self {
+        let pose_rotation = pose.rotation();
         let mut rotation = [[0.0_f64; 3]; 3];
-        for row in 0..3 {
-            for col in 0..3 {
-                rotation[row][col] = pose.rotation()[row][col] as f64;
+        for (row_idx, row) in rotation.iter_mut().enumerate() {
+            for (col_idx, value) in row.iter_mut().enumerate() {
+                *value = pose_rotation[row_idx][col_idx] as f64;
             }
         }
         let t = pose.translation();
@@ -53,9 +54,9 @@ impl Pose64 {
 
     pub fn to_pose32(self) -> Pose {
         let mut rotation = [[0.0_f32; 3]; 3];
-        for row in 0..3 {
-            for col in 0..3 {
-                rotation[row][col] = self.rotation[row][col] as f32;
+        for (row_idx, row) in rotation.iter_mut().enumerate() {
+            for (col_idx, value) in row.iter_mut().enumerate() {
+                *value = self.rotation[row_idx][col_idx] as f32;
             }
         }
         let translation = [

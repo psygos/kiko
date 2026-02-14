@@ -237,14 +237,8 @@ impl std::fmt::Display for KeypointLimitArg {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct VizDecimationArg(VizDecimation);
-
-impl Default for VizDecimationArg {
-    fn default() -> Self {
-        Self(VizDecimation::default())
-    }
-}
 
 impl std::str::FromStr for VizDecimationArg {
     type Err = String;
@@ -515,19 +509,10 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, inference_errors={}, triangulation_empty={}, triangulation_errors={}, triangulated_points={}",
-        processed,
-        elapsed,
-        fps,
-        read_errors,
-        inference_errors,
-        triangulation_empty,
-        triangulation_errors,
-        triangulated_points
+        "done: processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, triangulated_points={triangulated_points}"
     );
     eprintln!(
-        "summary: avg_matches={:.1}, avg_triangulated={:.1}",
-        avg_matches, avg_triangulated
+        "summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}"
     );
 
     Ok(())
@@ -713,8 +698,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: processed={}, elapsed={:.2}s, fps={:.2}, read_errors={}, tracker_errors={}, poses_logged={}, keyframes={}",
-        processed, elapsed, fps, read_errors, inference_errors, poses_logged, keyframes
+        "done: processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, tracker_errors={inference_errors}, poses_logged={poses_logged}, keyframes={keyframes}"
     );
 
     Ok(())
@@ -843,24 +827,17 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "pipeline fps: {:.2} (processed={}, elapsed={:.2}s)",
-        fps, processed, elapsed_s
+        "pipeline fps: {fps:.2} (processed={processed}, elapsed={elapsed_s:.2}s)"
     );
     eprintln!(
-        "reader fps: {:.2} (read_time={:.2}s, throughput={:.2} MB/s)",
-        read_fps, read_s, read_mb_s
+        "reader fps: {read_fps:.2} (read_time={read_s:.2}s, throughput={read_mb_s:.2} MB/s)"
+    );
+    eprintln!("inference fps: {infer_fps:.2} (sum_infer_time={infer_s:.2}s)");
+    eprintln!(
+        "matching: nonzero_pairs={matches_nonzero}, match_rate={match_rate:.2} avg_matches={avg_matches:.1}"
     );
     eprintln!(
-        "inference fps: {:.2} (sum_infer_time={:.2}s)",
-        infer_fps, infer_s
-    );
-    eprintln!(
-        "matching: nonzero_pairs={}, match_rate={:.2} avg_matches={:.1}",
-        matches_nonzero, match_rate, avg_matches
-    );
-    eprintln!(
-        "errors: read={} pairing={} inference={}",
-        read_errors, pairing_errors, inference_errors
+        "errors: read={read_errors} pairing={pairing_errors} inference={inference_errors}"
     );
 
     if processed > 0 {
@@ -878,12 +855,10 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         let pct_overhead = (overhead.as_secs_f64() / total_ms) * 100.0;
 
         eprintln!(
-            "timings avg ms: sp_left={:.2} sp_right={:.2} lightglue={:.2} overhead={:.2} total={:.2}",
-            avg_sp_left_ms, avg_sp_right_ms, avg_lightglue_ms, avg_overhead_ms, avg_total_ms
+            "timings avg ms: sp_left={avg_sp_left_ms:.2} sp_right={avg_sp_right_ms:.2} lightglue={avg_lightglue_ms:.2} overhead={avg_overhead_ms:.2} total={avg_total_ms:.2}"
         );
         eprintln!(
-            "timings pct: sp_left={:.1}% sp_right={:.1}% lightglue={:.1}% overhead={:.1}%",
-            pct_sp_left, pct_sp_right, pct_lightglue, pct_overhead
+            "timings pct: sp_left={pct_sp_left:.1}% sp_right={pct_sp_right:.1}% lightglue={pct_lightglue:.1}% overhead={pct_overhead:.1}%"
         );
     }
 

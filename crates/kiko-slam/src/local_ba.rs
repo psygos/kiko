@@ -710,9 +710,9 @@ struct LandmarkAccumulator {
 impl LandmarkAccumulator {
     fn add_link(&mut self, pose: PoseVarIndex, cross: [[f32; 3]; 6]) {
         if let Some(existing) = self.links.iter_mut().find(|link| link.pose == pose) {
-            for row in 0..6 {
-                for col in 0..3 {
-                    existing.b[row][col] += cross[row][col];
+            for (row, cross_row) in cross.iter().enumerate() {
+                for (col, value) in cross_row.iter().enumerate() {
+                    existing.b[row][col] += *value;
                 }
             }
             return;
@@ -1071,8 +1071,8 @@ impl LocalBundleAdjuster {
             let mut schur_landmarks = Vec::with_capacity(landmark_count);
             for acc in landmark_accumulators.into_iter() {
                 let mut c = acc.c;
-                for i in 0..3 {
-                    c[i][i] += landmark_damping;
+                for (i, c_row) in c.iter_mut().enumerate() {
+                    c_row[i] += landmark_damping;
                 }
                 let Some(inv_c) = invert_3x3(c) else {
                     return BaResult::MaxIterations {
@@ -1133,7 +1133,7 @@ impl LocalBundleAdjuster {
                 for k in 0..6 {
                     let d = delta[k] as f64;
                     let gradient = rhs_before_solve[base + k] as f64;
-                    predicted_decrease += d * ((pose_damping as f64) * d + gradient);
+                    predicted_decrease += 0.5 * d * ((pose_damping as f64) * d + gradient);
                 }
                 pose_var.pose = apply_se3_delta(pose_var.pose, delta);
             }
@@ -1151,9 +1151,9 @@ impl LocalBundleAdjuster {
                         rhs[base + 4],
                         rhs[base + 5],
                     ];
-                    for col in 0..3 {
-                        for row in 0..6 {
-                            coupling[col] += link.b[row][col] * pose_delta[row];
+                    for (row, pose_delta_value) in pose_delta.iter().enumerate() {
+                        for (col, link_value) in link.b[row].iter().enumerate() {
+                            coupling[col] += *link_value * *pose_delta_value;
                         }
                     }
                 }
@@ -1165,10 +1165,10 @@ impl LocalBundleAdjuster {
                 ];
                 let delta_landmark = mat3_mul_vec3(schur.inv_c, rhs_landmark);
                 max_step = max_step.max(norm3(delta_landmark));
-                for axis in 0..3 {
-                    let d = delta_landmark[axis] as f64;
+                for (axis, d) in delta_landmark.iter().enumerate() {
+                    let d = *d as f64;
                     let gradient = schur.b[axis] as f64;
-                    predicted_decrease += d * ((landmark_damping as f64) * d + gradient);
+                    predicted_decrease += 0.5 * d * ((landmark_damping as f64) * d + gradient);
                 }
 
                 landmark_var.position.x += delta_landmark[0];
@@ -1265,12 +1265,14 @@ fn reprojection_residual_and_jacobian(
     Some((residual, jac_pose))
 }
 
+type ReprojectionWithJacobians = ([f32; 2], [[f32; 6]; 2], [[f32; 3]; 2]);
+
 fn reprojection_residual_and_jacobians(
     pose: Pose,
     world: Point3,
     pixel: Keypoint,
     intrinsics: PinholeIntrinsics,
-) -> Option<([f32; 2], [[f32; 6]; 2], [[f32; 3]; 2])> {
+) -> Option<ReprojectionWithJacobians> {
     let pw = [world.x, world.y, world.z];
     let rotation = pose.rotation();
     let pc = math::transform_point(rotation, pose.translation(), pw);
@@ -1354,9 +1356,9 @@ pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
 pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
     let from_rot = from.rotation();
     let mut from_rot_t = [[0.0_f32; 3]; 3];
-    for row in 0..3 {
-        for col in 0..3 {
-            from_rot_t[row][col] = from_rot[col][row];
+    for (row, row_values) in from_rot_t.iter_mut().enumerate() {
+        for (col, value) in row_values.iter_mut().enumerate() {
+            *value = from_rot[col][row];
         }
     }
 
@@ -1417,11 +1419,7 @@ fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
 fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
     let trace = r[0][0] + r[1][1] + r[2][2];
     let mut cos_theta = (trace - 1.0) * 0.5;
-    if cos_theta > 1.0 {
-        cos_theta = 1.0;
-    } else if cos_theta < -1.0 {
-        cos_theta = -1.0;
-    }
+    cos_theta = cos_theta.clamp(-1.0, 1.0);
     let theta = cos_theta.acos();
     if theta < 1e-6 {
         return [
@@ -1520,26 +1518,25 @@ fn accumulate_pose_rhs(
 }
 
 fn accumulate_landmark_hessian(c: &mut [[f32; 3]; 3], j_landmark: [[f32; 3]; 2]) {
-    for row in 0..3 {
-        for col in 0..3 {
-            c[row][col] +=
-                j_landmark[0][row] * j_landmark[0][col] + j_landmark[1][row] * j_landmark[1][col];
+    for (row, c_row) in c.iter_mut().enumerate().take(3) {
+        for (col, c_value) in c_row.iter_mut().enumerate().take(3) {
+            *c_value += j_landmark[0][row] * j_landmark[0][col]
+                + j_landmark[1][row] * j_landmark[1][col];
         }
     }
 }
 
 fn accumulate_landmark_rhs(b: &mut [f32; 3], j_landmark: [[f32; 3]; 2], residual: [f32; 2]) {
-    for col in 0..3 {
-        b[col] -= j_landmark[0][col] * residual[0] + j_landmark[1][col] * residual[1];
+    for (col, b_value) in b.iter_mut().enumerate().take(3) {
+        *b_value -= j_landmark[0][col] * residual[0] + j_landmark[1][col] * residual[1];
     }
 }
 
 fn pose_landmark_cross(j_pose: [[f32; 6]; 2], j_landmark: [[f32; 3]; 2]) -> [[f32; 3]; 6] {
     let mut cross = [[0.0_f32; 3]; 6];
-    for row in 0..6 {
-        for col in 0..3 {
-            cross[row][col] =
-                j_pose[0][row] * j_landmark[0][col] + j_pose[1][row] * j_landmark[1][col];
+    for (row, cross_row) in cross.iter_mut().enumerate() {
+        for (col, value) in cross_row.iter_mut().enumerate() {
+            *value = j_pose[0][row] * j_landmark[0][col] + j_pose[1][row] * j_landmark[1][col];
         }
     }
     cross
@@ -1563,15 +1560,15 @@ fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
 
 fn schur_block(b_i: [[f32; 3]; 6], inv_c: [[f32; 3]; 3], b_j: [[f32; 3]; 6]) -> [[f32; 6]; 6] {
     let mut block = [[0.0_f32; 6]; 6];
-    for row in 0..6 {
-        for col in 0..6 {
+    for (row, block_row) in block.iter_mut().enumerate() {
+        for (col, block_value) in block_row.iter_mut().enumerate() {
             let mut sum = 0.0_f32;
-            for k in 0..3 {
-                for l in 0..3 {
-                    sum += b_i[row][k] * inv_c[k][l] * b_j[col][l];
+            for (k, inv_c_row) in inv_c.iter().enumerate() {
+                for (l, inv_c_value) in inv_c_row.iter().enumerate() {
+                    sum += b_i[row][k] * *inv_c_value * b_j[col][l];
                 }
             }
-            block[row][col] = sum;
+            *block_value = sum;
         }
     }
     block

@@ -40,9 +40,9 @@ impl BlockCsr6x6 {
             self.insert_new(row, col, block);
             return;
         };
-        for r in 0..6 {
-            for c in 0..6 {
-                self.values[idx][r][c] += block[r][c];
+        for (r, block_row) in block.iter().enumerate() {
+            for (c, value) in block_row.iter().enumerate() {
+                self.values[idx][r][c] += *value;
             }
         }
     }
@@ -818,17 +818,17 @@ fn jt_info_j(a: [[f64; 6]; 6], info: [[f64; 6]; 6], b: [[f64; 6]; 6]) -> [[f64; 
     let mut info_b = [[0.0_f64; 6]; 6];
     for row in 0..6 {
         for col in 0..6 {
-            for k in 0..6 {
-                info_b[row][col] += info[row][k] * b[k][col];
+            for (k, b_row) in b.iter().enumerate() {
+                info_b[row][col] += info[row][k] * b_row[col];
             }
         }
     }
 
     let mut out = [[0.0_f64; 6]; 6];
-    for row in 0..6 {
-        for col in 0..6 {
-            for k in 0..6 {
-                out[row][col] += a[k][row] * info_b[k][col];
+    for (row, out_row) in out.iter_mut().enumerate() {
+        for (col, out_value) in out_row.iter_mut().enumerate() {
+            for (k, info_b_row) in info_b.iter().enumerate() {
+                *out_value += a[k][row] * info_b_row[col];
             }
         }
     }
@@ -838,14 +838,14 @@ fn jt_info_j(a: [[f64; 6]; 6], info: [[f64; 6]; 6], b: [[f64; 6]; 6]) -> [[f64; 
 fn jt_info_vec(j: [[f64; 6]; 6], info: [[f64; 6]; 6], e: [f64; 6]) -> [f64; 6] {
     let mut info_e = [0.0_f64; 6];
     for row in 0..6 {
-        for col in 0..6 {
-            info_e[row] += info[row][col] * e[col];
+        for (col, e_value) in e.iter().enumerate() {
+            info_e[row] += info[row][col] * *e_value;
         }
     }
     let mut out = [0.0_f64; 6];
-    for row in 0..6 {
-        for k in 0..6 {
-            out[row] += j[k][row] * info_e[k];
+    for (row, out_value) in out.iter_mut().enumerate() {
+        for (k, info_value) in info_e.iter().enumerate() {
+            *out_value += j[k][row] * *info_value;
         }
     }
     out
