@@ -594,6 +594,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         redundancy,
         backend,
         loop_closure,
+        global_descriptor: None,
     };
 
     eprintln!(
@@ -1121,6 +1122,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         redundancy,
         backend,
         loop_closure,
+        global_descriptor: None,
     };
 
     eprintln!(

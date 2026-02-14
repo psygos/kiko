@@ -1,20 +1,21 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac, BaCorrection, BaResult, Detections, DownscaleFactor, Frame, FrameId,
-    Keyframe, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster, MapObservation,
-    Matches, ObservationSet, PinholeIntrinsics, Point3, Pose, RansacConfig, Raw, RectifiedStereo,
-    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
-    Verified,
+    solve_pnp_ransac, BaCorrection, BaResult, Detections, DownscaleFactor, EigenPlaces, Frame,
+    FrameId, Keyframe, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
+    MapObservation, Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3,
+    Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
+    TriangulationConfig, TriangulationError, Triangulator, Verified,
 };
 use crate::loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, KeyframeDatabase, LoopCandidate,
-    LoopClosureConfig, LoopDetectError, PlaceMatch, VerifiedLoop,
+    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
+    LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch, VerifiedLoop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
@@ -36,11 +37,54 @@ pub struct TrackerConfig {
     pub redundancy: Option<RedundancyPolicy>,
     pub backend: Option<BackendConfig>,
     pub loop_closure: Option<LoopClosureConfig>,
+    pub global_descriptor: Option<GlobalDescriptorConfig>,
 }
 
 impl TrackerConfig {
     pub fn max_keypoints(&self) -> usize {
         self.max_keypoints.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GlobalDescriptorConfig {
+    queue_depth: NonZeroUsize,
+}
+
+#[derive(Debug)]
+pub enum GlobalDescriptorConfigError {
+    ZeroQueueDepth,
+}
+
+impl std::fmt::Display for GlobalDescriptorConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GlobalDescriptorConfigError::ZeroQueueDepth => {
+                write!(f, "global descriptor queue depth must be > 0")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GlobalDescriptorConfigError {}
+
+impl GlobalDescriptorConfig {
+    pub fn new(queue_depth: usize) -> Result<Self, GlobalDescriptorConfigError> {
+        let queue_depth =
+            NonZeroUsize::new(queue_depth).ok_or(GlobalDescriptorConfigError::ZeroQueueDepth)?;
+        Ok(Self { queue_depth })
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.get()
+    }
+}
+
+impl Default for GlobalDescriptorConfig {
+    fn default() -> Self {
+        Self {
+            queue_depth: NonZeroUsize::new(2).expect("non-zero"),
+        }
     }
 }
 
@@ -182,6 +226,106 @@ impl BackendWindow {
 
     fn as_slice(&self) -> &[KeyframeId] {
         &self.keyframes
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DescriptorRequest {
+    keyframe_id: KeyframeId,
+    map_version: MapVersion,
+    frame: Frame,
+}
+
+#[derive(Debug, Clone)]
+struct DescriptorResponse {
+    keyframe_id: KeyframeId,
+    map_version: MapVersion,
+    descriptor: crate::loop_closure::GlobalDescriptor,
+}
+
+#[derive(Debug)]
+enum SubmitDescriptorError {
+    QueueFull,
+    Disconnected,
+}
+
+struct DescriptorWorker {
+    tx: Sender<DescriptorRequest>,
+    rx: Receiver<DescriptorResponse>,
+    _thread: thread::JoinHandle<()>,
+}
+
+impl DescriptorWorker {
+    fn model_path() -> PathBuf {
+        if let Ok(path) = std::env::var("KIKO_EIGENPLACES_MODEL") {
+            return PathBuf::from(path);
+        }
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join("eigenplaces.onnx")
+    }
+
+    fn spawn_from_config(config: GlobalDescriptorConfig) -> Option<Self> {
+        let path = Self::model_path();
+        let extractor = EigenPlaces::try_load(path, crate::InferenceBackend::auto())?;
+        Some(Self::spawn_with_extractor(config, Box::new(extractor)))
+    }
+
+    fn spawn_with_extractor(
+        config: GlobalDescriptorConfig,
+        mut extractor: Box<dyn PlaceDescriptorExtractor>,
+    ) -> Self {
+        let (tx, req_rx) =
+            crossbeam_channel::bounded::<DescriptorRequest>(config.queue_depth());
+        let (resp_tx, rx) =
+            crossbeam_channel::bounded::<DescriptorResponse>(config.queue_depth());
+        let thread = thread::Builder::new()
+            .name("kiko-descriptor-worker".to_string())
+            .spawn(move || {
+                while let Ok(request) = req_rx.recv() {
+                    let descriptor = match extractor.compute_descriptor(&request.frame) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            eprintln!(
+                                "descriptor worker failed for keyframe {:?}: {err}",
+                                request.keyframe_id
+                            );
+                            continue;
+                        }
+                    };
+                    if resp_tx
+                        .send(DescriptorResponse {
+                            keyframe_id: request.keyframe_id,
+                            map_version: request.map_version,
+                            descriptor,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("descriptor worker thread");
+        Self {
+            tx,
+            rx,
+            _thread: thread,
+        }
+    }
+
+    fn submit(&self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
+        match self.tx.try_send(request) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SubmitDescriptorError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SubmitDescriptorError::Disconnected),
+        }
+    }
+
+    fn try_recv(&self) -> Option<DescriptorResponse> {
+        match self.rx.try_recv() {
+            Ok(value) => Some(value),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+        }
     }
 }
 
@@ -918,6 +1062,7 @@ pub struct SlamTracker {
     map_version: MapVersion,
     backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
+    descriptor_worker: Option<DescriptorWorker>,
     loop_db: Option<KeyframeDatabase>,
     loop_config: Option<LoopClosureConfig>,
     pending_loop: Option<PendingLoopCandidate>,
@@ -944,6 +1089,13 @@ impl SlamTracker {
             .map(|backend_cfg| BackendSupervisor::spawn(backend_cfg, intrinsics, config.ba));
         let loop_config = config.loop_closure;
         let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
+        let descriptor_worker = if loop_config.is_some() {
+            config
+                .global_descriptor
+                .and_then(DescriptorWorker::spawn_from_config)
+        } else {
+            None
+        };
         Self {
             superpoint_left,
             superpoint_right,
@@ -959,6 +1111,7 @@ impl SlamTracker {
             map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
+            descriptor_worker,
             loop_db,
             loop_config,
             pending_loop: None,
@@ -970,6 +1123,7 @@ impl SlamTracker {
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
         self.drain_backend_responses();
+        self.drain_descriptor_responses();
         if let Err(err) = self.process_pending_loop_closure() {
             eprintln!("loop closure: {err}");
         }
@@ -1035,7 +1189,7 @@ impl SlamTracker {
         let Ok(global_descriptor) = aggregate_global_descriptor(detections.descriptors()) else {
             return;
         };
-        loop_db.insert(keyframe_id, global_descriptor.clone());
+        loop_db.insert_with_source(keyframe_id, global_descriptor.clone(), DescriptorSource::Bootstrap);
 
         let mut candidates = loop_db.query(&global_descriptor, config.max_candidates());
         candidates.retain(|candidate| candidate.similarity >= config.similarity_threshold());
@@ -1076,6 +1230,53 @@ impl SlamTracker {
             detections: Arc::clone(detections),
             candidates: promoted,
         });
+    }
+
+    fn enqueue_descriptor_request(&mut self, keyframe_id: KeyframeId, frame: &Frame) {
+        let Some(worker) = self.descriptor_worker.as_ref() else {
+            return;
+        };
+        let request = DescriptorRequest {
+            keyframe_id,
+            map_version: self.map_version,
+            frame: frame.clone(),
+        };
+        match worker.submit(request) {
+            Ok(()) => {}
+            Err(SubmitDescriptorError::QueueFull) => {
+                eprintln!("descriptor worker queue full; keeping bootstrap descriptor");
+            }
+            Err(SubmitDescriptorError::Disconnected) => {
+                eprintln!("descriptor worker disconnected; disabling learned descriptors");
+                self.descriptor_worker = None;
+            }
+        }
+    }
+
+    fn drain_descriptor_responses(&mut self) {
+        loop {
+            let Some(worker) = self.descriptor_worker.as_ref() else {
+                return;
+            };
+            let Some(response) = worker.try_recv() else {
+                break;
+            };
+
+            if response.map_version.as_u64() > self.map_version.as_u64() {
+                continue;
+            }
+            if self.map.keyframe(response.keyframe_id).is_none() {
+                continue;
+            }
+            let Some(loop_db) = self.loop_db.as_mut() else {
+                continue;
+            };
+            let _ = loop_db.replace_descriptor(
+                response.keyframe_id,
+                response.descriptor,
+                DescriptorSource::Learned,
+            );
+        }
     }
 
     fn process_pending_loop_closure(&mut self) -> Result<Option<VerifiedLoop>, LoopDetectError> {
@@ -1615,6 +1816,7 @@ impl SlamTracker {
         );
         self.bump_map_version();
         self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
+        self.enqueue_descriptor_request(keyframe_id, &left);
 
         Ok((
             TrackerOutput {
@@ -1992,6 +2194,8 @@ mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
     use crate::{CompactDescriptor, Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
@@ -2001,6 +2205,26 @@ mod tests {
         let mut data = [0.0_f32; 512];
         data[idx % 512] = 1.0;
         crate::loop_closure::GlobalDescriptor::try_new(data).expect("basis descriptor")
+    }
+
+    struct StubDescriptorExtractor {
+        descriptor: crate::loop_closure::GlobalDescriptor,
+        calls: Arc<Mutex<usize>>,
+    }
+
+    impl PlaceDescriptorExtractor for StubDescriptorExtractor {
+        fn backend_name(&self) -> &'static str {
+            "stub"
+        }
+
+        fn compute_descriptor(
+            &mut self,
+            _frame: &Frame,
+        ) -> Result<crate::loop_closure::GlobalDescriptor, InferenceError> {
+            let mut calls = self.calls.lock().expect("calls lock");
+            *calls = calls.saturating_add(1);
+            Ok(self.descriptor.clone())
+        }
     }
 
     fn make_map_with_single_point() -> (SlamMap, KeyframeId, MapPointId) {
@@ -2530,6 +2754,49 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(got_non_panic, "expected non-panic response after respawn");
+    }
+
+    #[test]
+    fn descriptor_worker_processes_requests() {
+        let descriptor = make_global_descriptor_basis(42);
+        let calls = Arc::new(Mutex::new(0_usize));
+        let worker = DescriptorWorker::spawn_with_extractor(
+            GlobalDescriptorConfig::new(2).expect("config"),
+            Box::new(StubDescriptorExtractor {
+                descriptor: descriptor.clone(),
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(77),
+            Timestamp::from_nanos(77),
+            16,
+            12,
+            vec![128_u8; 16 * 12],
+        )
+        .expect("frame");
+        worker
+            .submit(DescriptorRequest {
+                keyframe_id: make_map_with_two_keyframes_one_shared_point().1,
+                map_version: MapVersion::initial(),
+                frame,
+            })
+            .expect("submit descriptor request");
+
+        let mut response = None;
+        for _ in 0..50 {
+            if let Some(value) = worker.try_recv() {
+                response = Some(value);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let response = response.expect("descriptor response");
+        assert_eq!(response.map_version, MapVersion::initial());
+        assert_eq!(response.descriptor, descriptor);
+        assert_eq!(*calls.lock().expect("calls lock"), 1);
     }
 
     fn make_loop_closure_apply_fixture() -> (
