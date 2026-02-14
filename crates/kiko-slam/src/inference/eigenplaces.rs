@@ -76,7 +76,7 @@ impl EigenPlaces {
         if raw_descriptor.len() != OUTPUT_DIM {
             return Err(InferenceError::UnexpectedOutput {
                 name: "eigenplaces-output".to_string(),
-                expected: format!("descriptor length {}", OUTPUT_DIM),
+                expected: format!("descriptor length {OUTPUT_DIM}"),
                 actual: format!("descriptor length {}", raw_descriptor.len()),
             });
         }
