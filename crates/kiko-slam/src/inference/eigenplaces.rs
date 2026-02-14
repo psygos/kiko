@@ -73,17 +73,7 @@ impl EigenPlaces {
             expected: "at least one f32 tensor output".to_string(),
             actual: "no f32 tensor output".to_string(),
         })?;
-        if raw_descriptor.len() != OUTPUT_DIM {
-            return Err(InferenceError::UnexpectedOutput {
-                name: "eigenplaces-output".to_string(),
-                expected: format!("descriptor length {OUTPUT_DIM}"),
-                actual: format!("descriptor length {}", raw_descriptor.len()),
-            });
-        }
-        let descriptor_array: [f32; OUTPUT_DIM] =
-            raw_descriptor.try_into().expect("length checked");
-        GlobalDescriptor::try_new(descriptor_array)
-            .map_err(|err| InferenceError::Domain(format!("invalid global descriptor: {err}")))
+        parse_descriptor_output(raw_descriptor.as_slice())
     }
 }
 
@@ -117,10 +107,37 @@ fn preprocess_frame_to_nchw(frame: &Frame, out: &mut Vec<f32>) {
     }
 }
 
+fn parse_descriptor_output(raw_descriptor: &[f32]) -> Result<GlobalDescriptor, InferenceError> {
+    if raw_descriptor.len() != OUTPUT_DIM {
+        return Err(InferenceError::UnexpectedOutput {
+            name: "eigenplaces-output".to_string(),
+            expected: format!("descriptor length {OUTPUT_DIM}"),
+            actual: format!("descriptor length {}", raw_descriptor.len()),
+        });
+    }
+    let descriptor_array: [f32; OUTPUT_DIM] = raw_descriptor.try_into().expect("length checked");
+    GlobalDescriptor::try_new(descriptor_array)
+        .map_err(|err| InferenceError::Domain(format!("invalid global descriptor: {err}")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::preprocess_frame_to_nchw;
-    use crate::{Frame, FrameId, SensorId, Timestamp};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{parse_descriptor_output, preprocess_frame_to_nchw, EigenPlaces};
+    use crate::inference::InferenceError;
+    use crate::{Frame, FrameId, InferenceBackend, SensorId, Timestamp};
+
+    fn unique_temp_file(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should advance")
+            .as_nanos();
+        path.push(format!("kiko-eigenplaces-{name}-{nanos}.onnx"));
+        path
+    }
 
     #[test]
     fn preprocess_eigenplaces_produces_expected_tensor_shape() {
@@ -174,5 +191,31 @@ mod tests {
         let c = out[2 * hw];
         assert!(a.is_finite() && b.is_finite() && c.is_finite());
         assert!((a - b).abs() > 0.0 || (b - c).abs() > 0.0);
+    }
+
+    #[test]
+    fn try_load_nonexistent_returns_none() {
+        let missing = unique_temp_file("missing");
+        assert!(!missing.exists());
+        assert!(EigenPlaces::try_load(&missing, InferenceBackend::Cpu).is_none());
+    }
+
+    #[test]
+    fn try_load_invalid_model_returns_none() {
+        let invalid = unique_temp_file("invalid");
+        fs::write(&invalid, b"not-an-onnx-model").expect("write invalid model");
+        assert!(EigenPlaces::try_load(&invalid, InferenceBackend::Cpu).is_none());
+        fs::remove_file(&invalid).expect("cleanup invalid model");
+    }
+
+    #[test]
+    fn parse_descriptor_output_rejects_non_finite_descriptor() {
+        let mut raw = [0.0_f32; 512];
+        raw[0] = f32::NAN;
+        let err = parse_descriptor_output(&raw).expect_err("non-finite descriptor should fail");
+        match err {
+            InferenceError::Domain(msg) => assert!(msg.contains("non-finite")),
+            other => panic!("expected domain error, got {other:?}"),
+        }
     }
 }
