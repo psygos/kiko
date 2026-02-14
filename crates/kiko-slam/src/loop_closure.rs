@@ -114,7 +114,10 @@ impl std::fmt::Display for RelocalizationConfigError {
                 write!(f, "relocalization min confirmations must be > 0")
             }
             RelocalizationConfigError::TooFewMinInliers { value, min } => {
-                write!(f, "relocalization min inliers must be >= {min}, got {value}")
+                write!(
+                    f,
+                    "relocalization min inliers must be >= {min}, got {value}"
+                )
             }
             RelocalizationConfigError::DescriptorMatchThresholdOutOfRange { value } => write!(
                 f,
@@ -225,8 +228,7 @@ impl RelocalizationConfig {
 
 impl Default for RelocalizationConfig {
     fn default() -> Self {
-        Self::new(RelocalizationConfigInput::default())
-            .expect("valid relocalization defaults")
+        Self::new(RelocalizationConfigInput::default()).expect("valid relocalization defaults")
     }
 }
 
@@ -249,7 +251,10 @@ impl std::fmt::Display for LoopClosureConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoopClosureConfigError::SimilarityThresholdOutOfRange { value } => {
-                write!(f, "loop similarity threshold must be in (0, 1], got {value}")
+                write!(
+                    f,
+                    "loop similarity threshold must be in (0, 1], got {value}"
+                )
             }
             LoopClosureConfigError::DescriptorMatchThresholdOutOfRange { value } => write!(
                 f,
@@ -316,11 +321,9 @@ impl LoopClosureConfig {
             || descriptor_match_threshold <= 0.0
             || descriptor_match_threshold > 1.0
         {
-            return Err(
-                LoopClosureConfigError::DescriptorMatchThresholdOutOfRange {
-                    value: descriptor_match_threshold,
-                },
-            );
+            return Err(LoopClosureConfigError::DescriptorMatchThresholdOutOfRange {
+                value: descriptor_match_threshold,
+            });
         }
         let min_inliers =
             NonZeroUsize::new(min_inliers).ok_or(LoopClosureConfigError::ZeroMinInliers)?;
@@ -430,7 +433,10 @@ impl std::fmt::Display for LoopDetectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LoopDetectError::TooFewCorrespondences { count } => {
-                write!(f, "loop closure rejected: too few correspondences ({count})")
+                write!(
+                    f,
+                    "loop closure rejected: too few correspondences ({count})"
+                )
             }
             LoopDetectError::VerificationFailed(err) => {
                 write!(f, "loop closure verification failed: {err}")
@@ -462,7 +468,10 @@ impl std::fmt::Display for GlobalDescriptorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GlobalDescriptorError::EmptyInput => {
-                write!(f, "global descriptor requires at least one local descriptor")
+                write!(
+                    f,
+                    "global descriptor requires at least one local descriptor"
+                )
             }
             GlobalDescriptorError::NonFiniteValue { index, value } => write!(
                 f,
@@ -685,7 +694,11 @@ impl KeyframeDatabase {
         descriptor: GlobalDescriptor,
         source: DescriptorSource,
     ) {
-        if let Some(existing) = self.entries.iter_mut().find(|entry| entry.keyframe_id == id) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.keyframe_id == id)
+        {
             existing.descriptor = descriptor;
             existing.source = source;
             return;
@@ -706,7 +719,11 @@ impl KeyframeDatabase {
         descriptor: GlobalDescriptor,
         source: DescriptorSource,
     ) -> bool {
-        let Some(existing) = self.entries.iter_mut().find(|entry| entry.keyframe_id == id) else {
+        let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.keyframe_id == id)
+        else {
             return false;
         };
         existing.descriptor = descriptor;
@@ -797,6 +814,12 @@ pub struct LoopCandidate {
 }
 
 #[derive(Clone, Debug)]
+pub struct RelocalizationCandidate {
+    pub match_kf: KeyframeId,
+    pub similarity: f32,
+}
+
+#[derive(Clone, Debug)]
 pub struct VerifiedLoop {
     query_kf: KeyframeId,
     match_kf: KeyframeId,
@@ -837,6 +860,27 @@ impl VerifiedLoop {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct VerifiedRelocalization {
+    match_kf: KeyframeId,
+    pose_world: Pose,
+    inlier_count: usize,
+}
+
+impl VerifiedRelocalization {
+    pub fn match_kf(&self) -> KeyframeId {
+        self.match_kf
+    }
+
+    pub fn pose_world(&self) -> Pose {
+        self.pose_world
+    }
+
+    pub fn inlier_count(&self) -> usize {
+        self.inlier_count
+    }
+}
+
 #[derive(Debug)]
 pub enum LoopVerificationError {
     TooFewMatches { count: usize },
@@ -850,7 +894,9 @@ impl std::fmt::Display for LoopVerificationError {
             LoopVerificationError::TooFewMatches { count } => {
                 write!(f, "loop verification needs at least 4 matches, got {count}")
             }
-            LoopVerificationError::PnpFailed(err) => write!(f, "loop verification PnP failed: {err}"),
+            LoopVerificationError::PnpFailed(err) => {
+                write!(f, "loop verification PnP failed: {err}")
+            }
             LoopVerificationError::InsufficientInliers { inliers, required } => write!(
                 f,
                 "loop verification inliers below threshold: inliers={inliers}, required={required}"
@@ -860,6 +906,69 @@ impl std::fmt::Display for LoopVerificationError {
 }
 
 impl std::error::Error for LoopVerificationError {}
+
+fn verify_pose_from_keyframe(
+    query_keypoints: &[Keypoint],
+    correspondences: &[(usize, usize)],
+    map: &SlamMap,
+    match_kf: KeyframeId,
+    intrinsics: PinholeIntrinsics,
+    ransac_config: RansacConfig,
+    min_inliers: usize,
+) -> Result<(Pose, usize), LoopVerificationError> {
+    let required_inliers = min_inliers.max(4);
+
+    if correspondences.len() < 4 {
+        return Err(LoopVerificationError::TooFewMatches {
+            count: correspondences.len(),
+        });
+    }
+
+    let mut observations = Vec::with_capacity(correspondences.len());
+    for &(query_idx, match_idx) in correspondences {
+        let Some(&pixel) = query_keypoints.get(query_idx) else {
+            continue;
+        };
+        let Ok(match_ref) = map.keyframe_keypoint(match_kf, match_idx) else {
+            continue;
+        };
+        let Some(point_id) = map.map_point_for_keypoint(match_ref).ok().flatten() else {
+            continue;
+        };
+        let Some(point) = map.point(point_id) else {
+            continue;
+        };
+        let obs = Observation::try_new(point.position(), pixel, intrinsics)
+            .map_err(LoopVerificationError::PnpFailed)?;
+        observations.push(obs);
+    }
+
+    if observations.len() < 4 {
+        return Err(LoopVerificationError::TooFewMatches {
+            count: observations.len(),
+        });
+    }
+
+    let pnp_min_inliers = ransac_config
+        .min_inliers
+        .min(required_inliers)
+        .min(observations.len())
+        .max(4);
+    let pnp_config = RansacConfig {
+        min_inliers: pnp_min_inliers,
+        ..ransac_config
+    };
+
+    let result = solve_pnp_ransac(&observations, intrinsics, pnp_config)
+        .map_err(LoopVerificationError::PnpFailed)?;
+    if result.inliers.len() < required_inliers {
+        return Err(LoopVerificationError::InsufficientInliers {
+            inliers: result.inliers.len(),
+            required: required_inliers,
+        });
+    }
+    Ok((result.pose, result.inliers.len()))
+}
 
 impl LoopCandidate {
     pub fn verify(
@@ -871,62 +980,47 @@ impl LoopCandidate {
         ransac_config: RansacConfig,
         min_inliers: usize,
     ) -> Result<VerifiedLoop, LoopVerificationError> {
-        let required_inliers = min_inliers.max(4);
-
-        if correspondences.len() < 4 {
-            return Err(LoopVerificationError::TooFewMatches {
-                count: correspondences.len(),
-            });
-        }
-
-        let mut observations = Vec::with_capacity(correspondences.len());
-        for &(query_idx, match_idx) in correspondences {
-            let Some(&pixel) = query_keypoints.get(query_idx) else {
-                continue;
-            };
-            let Ok(match_ref) = map.keyframe_keypoint(self.match_kf, match_idx) else {
-                continue;
-            };
-            let Some(point_id) = map.map_point_for_keypoint(match_ref).ok().flatten() else {
-                continue;
-            };
-            let Some(point) = map.point(point_id) else {
-                continue;
-            };
-            let obs = Observation::try_new(point.position(), pixel, intrinsics)
-                .map_err(LoopVerificationError::PnpFailed)?;
-            observations.push(obs);
-        }
-
-        if observations.len() < 4 {
-            return Err(LoopVerificationError::TooFewMatches {
-                count: observations.len(),
-            });
-        }
-
-        let pnp_min_inliers = ransac_config
-            .min_inliers
-            .min(required_inliers)
-            .min(observations.len())
-            .max(4);
-        let pnp_config = RansacConfig {
-            min_inliers: pnp_min_inliers,
-            ..ransac_config
-        };
-
-        let result = solve_pnp_ransac(&observations, intrinsics, pnp_config)
-            .map_err(LoopVerificationError::PnpFailed)?;
-        if result.inliers.len() < required_inliers {
-            return Err(LoopVerificationError::InsufficientInliers {
-                inliers: result.inliers.len(),
-                required: required_inliers,
-            });
-        }
+        let (relative_pose, inlier_count) = verify_pose_from_keyframe(
+            query_keypoints,
+            correspondences,
+            map,
+            self.match_kf,
+            intrinsics,
+            ransac_config,
+            min_inliers,
+        )?;
         Ok(VerifiedLoop {
             query_kf: self.query_kf,
             match_kf: self.match_kf,
-            relative_pose: result.pose,
-            inlier_count: result.inliers.len(),
+            relative_pose,
+            inlier_count,
+        })
+    }
+}
+
+impl RelocalizationCandidate {
+    pub fn verify(
+        &self,
+        query_keypoints: &[Keypoint],
+        correspondences: &[(usize, usize)],
+        map: &SlamMap,
+        intrinsics: PinholeIntrinsics,
+        ransac_config: RansacConfig,
+        min_inliers: usize,
+    ) -> Result<VerifiedRelocalization, LoopVerificationError> {
+        let (pose_world, inlier_count) = verify_pose_from_keyframe(
+            query_keypoints,
+            correspondences,
+            map,
+            self.match_kf,
+            intrinsics,
+            ransac_config,
+            min_inliers,
+        )?;
+        Ok(VerifiedRelocalization {
+            match_kf: self.match_kf,
+            pose_world,
+            inlier_count,
         })
     }
 }
@@ -936,9 +1030,8 @@ mod tests {
     use super::{
         aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource,
         GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
-        LoopClosureConfig, LoopVerificationError, RelocalizationConfig,
-        RelocalizationConfigInput,
-        RelocalizationConfigError,
+        LoopClosureConfig, LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
+        RelocalizationConfigError, RelocalizationConfigInput,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -984,12 +1077,36 @@ mod tests {
         let query_pose = Pose::identity();
 
         let world_points = vec![
-            Point3 { x: -0.3, y: -0.2, z: 3.2 },
-            Point3 { x: -0.1, y: -0.2, z: 3.5 },
-            Point3 { x: 0.1, y: -0.1, z: 3.8 },
-            Point3 { x: 0.3, y: -0.1, z: 3.4 },
-            Point3 { x: -0.2, y: 0.1, z: 3.6 },
-            Point3 { x: 0.2, y: 0.2, z: 3.9 },
+            Point3 {
+                x: -0.3,
+                y: -0.2,
+                z: 3.2,
+            },
+            Point3 {
+                x: -0.1,
+                y: -0.2,
+                z: 3.5,
+            },
+            Point3 {
+                x: 0.1,
+                y: -0.1,
+                z: 3.8,
+            },
+            Point3 {
+                x: 0.3,
+                y: -0.1,
+                z: 3.4,
+            },
+            Point3 {
+                x: -0.2,
+                y: 0.1,
+                z: 3.6,
+            },
+            Point3 {
+                x: 0.2,
+                y: 0.2,
+                z: 3.9,
+            },
         ];
 
         let mut match_keypoints = Vec::new();
@@ -1041,7 +1158,9 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(0), 10);
         // Query is the latest keyframe; with gap=2, only the first two are eligible.
         assert_eq!(matches.len(), 2);
-        assert!(matches.iter().all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
+        assert!(matches
+            .iter()
+            .all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
     }
 
     #[test]
@@ -1092,25 +1211,30 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(4), 10);
         // kf3 is seq distance 1 (filtered), kf1 is distance 3 (kept), kf0 is distance 4 (kept).
         assert_eq!(matches.len(), 2);
-        assert!(matches.iter().all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
+        assert!(matches
+            .iter()
+            .all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
     }
 
     #[test]
     fn keyframe_database_replace_descriptor_updates_source() {
         let ids = make_keyframe_ids(1);
         let mut db = KeyframeDatabase::new(0);
-        db.insert_with_source(ids[0], descriptor_with_basis(0), DescriptorSource::Bootstrap);
+        db.insert_with_source(
+            ids[0],
+            descriptor_with_basis(0),
+            DescriptorSource::Bootstrap,
+        );
         assert_eq!(
             db.descriptor_source(ids[0]),
             Some(DescriptorSource::Bootstrap)
         );
 
-        assert!(db.replace_descriptor(
-            ids[0],
-            descriptor_with_basis(1),
-            DescriptorSource::Learned
-        ));
-        assert_eq!(db.descriptor_source(ids[0]), Some(DescriptorSource::Learned));
+        assert!(db.replace_descriptor(ids[0], descriptor_with_basis(1), DescriptorSource::Learned));
+        assert_eq!(
+            db.descriptor_source(ids[0]),
+            Some(DescriptorSource::Learned)
+        );
         assert!(!db.replace_descriptor(
             make_keyframe_ids(2)[1],
             descriptor_with_basis(2),
@@ -1130,6 +1254,77 @@ mod tests {
         assert_eq!(matches.len(), 4);
         assert_eq!(matches[0].candidate, ids[0]);
         assert!(matches[0].similarity >= matches[1].similarity);
+    }
+
+    #[test]
+    fn keyframe_database_remove_does_not_affect_other_entries() {
+        let ids = make_keyframe_ids(4);
+        let mut db = KeyframeDatabase::new(0);
+        db.insert_with_source(
+            ids[0],
+            descriptor_with_basis(0),
+            DescriptorSource::Bootstrap,
+        );
+        db.insert_with_source(ids[1], descriptor_with_basis(1), DescriptorSource::Learned);
+        db.insert_with_source(
+            ids[2],
+            descriptor_with_basis(2),
+            DescriptorSource::Bootstrap,
+        );
+        db.insert_with_source(ids[3], descriptor_with_basis(3), DescriptorSource::Learned);
+
+        assert!(db.remove(ids[1]));
+        assert_eq!(db.len(), 3);
+        assert_eq!(db.descriptor_source(ids[1]), None);
+        assert_eq!(
+            db.descriptor_source(ids[0]),
+            Some(DescriptorSource::Bootstrap)
+        );
+        assert_eq!(
+            db.descriptor_source(ids[2]),
+            Some(DescriptorSource::Bootstrap)
+        );
+        assert_eq!(
+            db.descriptor_source(ids[3]),
+            Some(DescriptorSource::Learned)
+        );
+
+        let relocalization = db.query_for_relocalization(&descriptor_with_basis(3), 10);
+        assert_eq!(relocalization.len(), 3);
+        assert!(relocalization.iter().all(|m| m.candidate != ids[1]));
+    }
+
+    #[test]
+    fn keyframe_database_remove_last_entry_reanchors_query() {
+        let ids = make_keyframe_ids(3);
+        let mut db = KeyframeDatabase::new(0);
+        db.insert(ids[0], descriptor_with_basis(0));
+        db.insert(ids[1], descriptor_with_basis(1));
+        db.insert(ids[2], descriptor_with_basis(2));
+
+        assert!(db.remove(ids[2]));
+        let matches = db.query(&descriptor_with_basis(1), 10);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].query, ids[1]);
+        assert_eq!(matches[0].candidate, ids[0]);
+    }
+
+    #[test]
+    fn keyframe_database_remove_preserves_newest_query_identity() {
+        let ids = make_keyframe_ids(5);
+        let mut db = KeyframeDatabase::new(0);
+        for (i, id) in ids.iter().enumerate() {
+            db.insert(*id, descriptor_with_basis(i));
+        }
+
+        assert!(db.remove(ids[1]));
+        assert!(db.remove(ids[3]));
+        let matches = db.query(&descriptor_with_basis(4), 10);
+        assert!(!matches.is_empty());
+        assert!(matches.iter().all(|m| m.query == ids[4]));
+        assert!(matches
+            .iter()
+            .all(|m| m.candidate != ids[1] && m.candidate != ids[3]));
     }
 
     #[test]
@@ -1262,6 +1457,29 @@ mod tests {
     }
 
     #[test]
+    fn relocalization_candidate_verify_succeeds_without_map_mutation() {
+        let (map, match_kf, query_keypoints, correspondences, intrinsics) = make_loop_fixture();
+        let before_generation = map.generation();
+        let candidate = RelocalizationCandidate {
+            match_kf,
+            similarity: 0.91,
+        };
+        let verified = candidate
+            .verify(
+                &query_keypoints,
+                &correspondences,
+                &map,
+                intrinsics,
+                RansacConfig::default(),
+                4,
+            )
+            .expect("relocalization should verify");
+        assert_eq!(verified.match_kf(), match_kf);
+        assert!(verified.inlier_count() >= 4);
+        assert_eq!(map.generation(), before_generation);
+    }
+
+    #[test]
     fn aggregate_empty_descriptors_returns_zero() {
         let err = aggregate_global_descriptor(&[]).expect_err("empty descriptor set should fail");
         assert!(matches!(err, GlobalDescriptorError::EmptyInput));
@@ -1276,7 +1494,10 @@ mod tests {
             aggregate_global_descriptor(&[Descriptor(data)]).expect("aggregated descriptor");
         let values = descriptor.as_array();
         let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "descriptor norm should be 1, got {norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "descriptor norm should be 1, got {norm}"
+        );
         assert!(values[4] > 0.0);
         assert!(values[256 + 4] > 0.0);
     }

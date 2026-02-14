@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-pub use inference::{EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint};
+pub use inference::{
+    EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
+};
 mod channel;
 pub mod dataset;
 pub mod env;
@@ -16,8 +18,8 @@ mod math;
 mod oak;
 mod pairing;
 mod pipeline;
-pub mod pose_graph;
 mod pnp;
+pub mod pose_graph;
 mod preprocess;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -30,16 +32,15 @@ pub use channel::{
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use local_ba::{
-    BaCorrection, BaResult, DegenerateReason, LocalBaConfig, LocalBaConfigError,
-    LocalBundleAdjuster, LmConfig, LmConfigError, MapObservation, ObservationSet,
-    ObservationSetError,
+    BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
+    LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
     aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, GlobalDescriptor,
     GlobalDescriptorError, KeyframeDatabase, LoopCandidate, LoopClosureConfig,
     LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
-    PlaceMatch, RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
-    RelocalizationMatch, VerifiedLoop,
+    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
+    RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
@@ -54,8 +55,8 @@ pub use pnp::{
     PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
 };
 pub use tracker::{
-    BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, KeyframePolicy,
-    DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
+    BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, DegradationLevel,
+    DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframePolicy,
     KeyframePolicyError, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
     SystemHealth, TrackerConfig, TrackerError, TrackerOutput, TrackingHealth,
 };
