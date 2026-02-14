@@ -5,6 +5,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
+use crate::loop_closure::{
+    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
+    LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch, RelocalizationCandidate,
+    RelocalizationConfig, VerifiedLoop,
+};
+use crate::pose_graph::{
+    EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
+    PoseGraphOptimizer,
+};
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
     solve_pnp_ransac, BaCorrection, BaResult, Detections, DownscaleFactor, EigenPlaces, Frame,
@@ -12,15 +21,6 @@ use crate::{
     MapObservation, Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3,
     Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
     TriangulationConfig, TriangulationError, Triangulator, Verified,
-};
-use crate::loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
-    LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch, RelocalizationConfig,
-    VerifiedLoop,
-};
-use crate::pose_graph::{
-    EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
-    PoseGraphOptimizer,
 };
 
 use crate::inference::InferenceError;
@@ -289,26 +289,24 @@ impl DescriptorWorker {
         config: GlobalDescriptorConfig,
         mut extractor: Box<dyn PlaceDescriptorExtractor>,
     ) -> Self {
-        let (tx, req_rx) =
-            crossbeam_channel::bounded::<DescriptorRequest>(config.queue_depth());
+        let (tx, req_rx) = crossbeam_channel::bounded::<DescriptorRequest>(config.queue_depth());
         let (resp_tx, rx) =
             crossbeam_channel::bounded::<DescriptorWorkerResponse>(config.queue_depth());
         let thread = thread::Builder::new()
             .name("kiko-descriptor-worker".to_string())
             .spawn(move || {
                 while let Ok(request) = req_rx.recv() {
-                    let processing =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            extractor.compute_descriptor(&request.frame)
-                        }));
+                    let processing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        extractor.compute_descriptor(&request.frame)
+                    }));
                     let response = match processing {
-                        Ok(Ok(descriptor)) => DescriptorWorkerResponse::Descriptor(Box::new(
-                            DescriptorResponse {
+                        Ok(Ok(descriptor)) => {
+                            DescriptorWorkerResponse::Descriptor(Box::new(DescriptorResponse {
                                 keyframe_id: request.keyframe_id,
                                 map_version: request.map_version,
                                 descriptor,
-                            },
-                        )),
+                            }))
+                        }
                         Ok(Err(err)) => DescriptorWorkerResponse::Failure {
                             keyframe_id: request.keyframe_id,
                             map_version: request.map_version,
@@ -320,7 +318,8 @@ impl DescriptorWorker {
                             message: panic_payload_to_string(payload.as_ref()),
                         },
                     };
-                    let should_stop = matches!(response, DescriptorWorkerResponse::WorkerPanic { .. });
+                    let should_stop =
+                        matches!(response, DescriptorWorkerResponse::WorkerPanic { .. });
                     if resp_tx.send(response).is_err() {
                         break;
                     }
@@ -498,7 +497,6 @@ impl DescriptorSupervisor {
         self.respawn_count
     }
 
-    #[cfg(test)]
     fn has_worker(&self) -> bool {
         self.worker.is_some()
     }
@@ -609,7 +607,10 @@ impl CorrectionEvent {
             result: result.clone(),
         };
 
-        if matches!(result, BaResult::Converged { .. } | BaResult::MaxIterations { .. }) {
+        if matches!(
+            result,
+            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+        ) {
             correction.pose_deltas = Vec::with_capacity(event.window.as_slice().len());
             for &keyframe_id in event.window.as_slice() {
                 let before = event
@@ -795,8 +796,8 @@ impl BackendWorker {
                             panic!("forced backend worker panic");
                         }
                         let mut optimized_map = event.map_snapshot.clone();
-                        let result =
-                            ba.optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
+                        let result = ba
+                            .optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
                         CorrectionEvent::from_optimized_map(&event, &optimized_map, result)
                     }));
 
@@ -849,7 +850,6 @@ impl BackendWorker {
             Err(TryRecvError::Disconnected) => Err(()),
         }
     }
-
 }
 
 #[derive(Debug)]
@@ -863,7 +863,11 @@ struct BackendSupervisor {
 }
 
 impl BackendSupervisor {
-    fn spawn(config: BackendConfig, intrinsics: PinholeIntrinsics, ba_config: LocalBaConfig) -> Self {
+    fn spawn(
+        config: BackendConfig,
+        intrinsics: PinholeIntrinsics,
+        ba_config: LocalBaConfig,
+    ) -> Self {
         Self {
             worker: Some(BackendWorker::spawn(config, intrinsics, ba_config)),
             config,
@@ -1130,6 +1134,7 @@ pub enum TrackingHealth {
 pub enum DegradationLevel {
     Nominal,
     TrackingDegraded,
+    DescriptorDown,
     BackendDown,
     Lost,
 }
@@ -1139,8 +1144,9 @@ impl DegradationLevel {
         match self {
             DegradationLevel::Nominal => 0,
             DegradationLevel::TrackingDegraded => 1,
-            DegradationLevel::BackendDown => 2,
-            DegradationLevel::Lost => 3,
+            DegradationLevel::DescriptorDown => 2,
+            DegradationLevel::BackendDown => 3,
+            DegradationLevel::Lost => 4,
         }
     }
 
@@ -1157,6 +1163,7 @@ impl DegradationLevel {
 pub struct SystemHealth {
     pub tracking: TrackingHealth,
     pub backend_alive: bool,
+    pub descriptor_alive: bool,
     pub backend_stats: BackendStats,
     pub degradation: DegradationLevel,
 }
@@ -1166,6 +1173,8 @@ impl SystemHealth {
         tracking: TrackingHealth,
         backend_expected: bool,
         backend_alive: bool,
+        descriptor_expected: bool,
+        descriptor_alive: bool,
         backend_stats: BackendStats,
     ) -> Self {
         let tracking_degradation = match tracking {
@@ -1173,15 +1182,24 @@ impl SystemHealth {
             TrackingHealth::Degraded => DegradationLevel::TrackingDegraded,
             TrackingHealth::Lost => DegradationLevel::Lost,
         };
+        let descriptor_degradation = if descriptor_expected && !descriptor_alive {
+            DegradationLevel::DescriptorDown
+        } else {
+            DegradationLevel::Nominal
+        };
         let backend_degradation = if backend_expected && !backend_alive {
             DegradationLevel::BackendDown
         } else {
             DegradationLevel::Nominal
         };
-        let degradation = DegradationLevel::worst(tracking_degradation, backend_degradation);
+        let degradation = DegradationLevel::worst(
+            DegradationLevel::worst(tracking_degradation, descriptor_degradation),
+            backend_degradation,
+        );
         Self {
             tracking,
             backend_alive,
+            descriptor_alive,
             backend_stats,
             degradation,
         }
@@ -1223,6 +1241,12 @@ struct RelocalizationSession {
     attempts: usize,
     phase: RelocalizationPhase,
     last_detections: Arc<Detections>,
+}
+
+#[derive(Debug)]
+enum RelocalizationStep {
+    Continue(RelocalizationSession),
+    Recovered { pose_world: Pose },
 }
 
 #[derive(Debug)]
@@ -1355,11 +1379,21 @@ impl SlamTracker {
 
     pub fn system_health(&self) -> SystemHealth {
         let backend_expected = self.backend.is_some();
-        let backend_alive = self.backend.as_ref().is_none_or(BackendSupervisor::has_worker);
+        let backend_alive = self
+            .backend
+            .as_ref()
+            .is_none_or(BackendSupervisor::has_worker);
+        let descriptor_expected = self.descriptor_worker.is_some();
+        let descriptor_alive = self
+            .descriptor_worker
+            .as_ref()
+            .is_none_or(DescriptorSupervisor::has_worker);
         SystemHealth::from_components(
             self.tracking_health,
             backend_expected,
             backend_alive,
+            descriptor_expected,
+            descriptor_alive,
             self.backend_stats,
         )
     }
@@ -1392,7 +1426,11 @@ impl SlamTracker {
         let Ok(global_descriptor) = aggregate_global_descriptor(detections.descriptors()) else {
             return;
         };
-        loop_db.insert_with_source(keyframe_id, global_descriptor.clone(), DescriptorSource::Bootstrap);
+        loop_db.insert_with_source(
+            keyframe_id,
+            global_descriptor.clone(),
+            DescriptorSource::Bootstrap,
+        );
 
         let mut candidates = loop_db.query(&global_descriptor, config.max_candidates());
         candidates.retain(|candidate| candidate.similarity >= config.similarity_threshold());
@@ -1403,7 +1441,8 @@ impl SlamTracker {
         }
 
         let present: HashSet<KeyframeId> = candidates.iter().map(|m| m.candidate).collect();
-        self.loop_streak.retain(|candidate, _| present.contains(candidate));
+        self.loop_streak
+            .retain(|candidate, _| present.contains(candidate));
         for candidate in &candidates {
             let streak = self.loop_streak.entry(candidate.candidate).or_insert(0);
             *streak = streak.saturating_add(1);
@@ -1491,7 +1530,8 @@ impl SlamTracker {
                         response.descriptor,
                         DescriptorSource::Learned,
                     ) {
-                        self.descriptor_stats.applied = self.descriptor_stats.applied.saturating_add(1);
+                        self.descriptor_stats.applied =
+                            self.descriptor_stats.applied.saturating_add(1);
                     }
                 }
                 DescriptorWorkerResponse::Failure {
@@ -1643,41 +1683,38 @@ impl SlamTracker {
                 break;
             };
             match response {
-                BackendResponse::Correction(correction) => {
-                    match &correction.correction.result {
-                        BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
-                            match apply_correction_event(&mut self.map, self.map_version, &correction) {
-                                Ok(()) => {
-                                    self.bump_map_version();
-                                    self.backend_stats.applied =
-                                        self.backend_stats.applied.saturating_add(1);
-                                }
-                                Err(ApplyCorrectionError::StaleVersion { .. }) => {
-                                    self.backend_stats.stale =
-                                        self.backend_stats.stale.saturating_add(1);
-                                }
-                                Err(err) => {
-                                    self.backend_stats.rejected =
-                                        self.backend_stats.rejected.saturating_add(1);
-                                    eprintln!(
-                                        "backend correction rejected (req={}, keyframe={:?}): {err}",
-                                        correction.request_id.as_u64(),
-                                        correction.trigger_keyframe
-                                    );
-                                }
+                BackendResponse::Correction(correction) => match &correction.correction.result {
+                    BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
+                        match apply_correction_event(&mut self.map, self.map_version, &correction) {
+                            Ok(()) => {
+                                self.bump_map_version();
+                                self.backend_stats.applied =
+                                    self.backend_stats.applied.saturating_add(1);
+                            }
+                            Err(ApplyCorrectionError::StaleVersion { .. }) => {
+                                self.backend_stats.stale =
+                                    self.backend_stats.stale.saturating_add(1);
+                            }
+                            Err(err) => {
+                                self.backend_stats.rejected =
+                                    self.backend_stats.rejected.saturating_add(1);
+                                eprintln!(
+                                    "backend correction rejected (req={}, keyframe={:?}): {err}",
+                                    correction.request_id.as_u64(),
+                                    correction.trigger_keyframe
+                                );
                             }
                         }
-                        BaResult::Degenerate { reason } => {
-                            self.backend_stats.rejected =
-                                self.backend_stats.rejected.saturating_add(1);
-                            eprintln!(
-                                "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
-                                correction.request_id.as_u64(),
-                                correction.trigger_keyframe
-                            );
-                        }
                     }
-                }
+                    BaResult::Degenerate { reason } => {
+                        self.backend_stats.rejected = self.backend_stats.rejected.saturating_add(1);
+                        eprintln!(
+                            "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
+                            correction.request_id.as_u64(),
+                            correction.trigger_keyframe
+                        );
+                    }
+                },
                 BackendResponse::Failure {
                     request_id,
                     map_version,
@@ -1723,17 +1760,42 @@ impl SlamTracker {
         }
     }
 
-    fn maybe_enter_relocalization(&mut self, tracking_health: TrackingHealth, detections: Arc<Detections>) {
-        if tracking_health == TrackingHealth::Lost && self.config.relocalization.is_some() {
-            self.state = TrackerState::Relocalizing(RelocalizationSession {
-                attempts: 0,
-                phase: RelocalizationPhase::Searching,
-                last_detections: detections,
-            });
+    fn maybe_enter_relocalization(
+        &mut self,
+        tracking_health: TrackingHealth,
+        detections: Arc<Detections>,
+    ) {
+        if let Some(session) = Self::initial_relocalization_session(
+            tracking_health,
+            self.config.relocalization.is_some(),
+            detections,
+        ) {
+            self.pending_loop = None;
+            self.loop_streak.clear();
+            self.state = TrackerState::Relocalizing(session);
         }
     }
 
-    fn relocalization_output(&mut self, frame_id: FrameId, health: TrackingHealth) -> TrackerOutput {
+    fn initial_relocalization_session(
+        tracking_health: TrackingHealth,
+        relocalization_enabled: bool,
+        detections: Arc<Detections>,
+    ) -> Option<RelocalizationSession> {
+        if tracking_health != TrackingHealth::Lost || !relocalization_enabled {
+            return None;
+        }
+        Some(RelocalizationSession {
+            attempts: 0,
+            phase: RelocalizationPhase::Searching,
+            last_detections: detections,
+        })
+    }
+
+    fn relocalization_output(
+        &mut self,
+        frame_id: FrameId,
+        health: TrackingHealth,
+    ) -> TrackerOutput {
         TrackerOutput {
             pose: None,
             inliers: 0,
@@ -1752,10 +1814,9 @@ impl SlamTracker {
         let delta = crate::local_ba::se3_delta_between(previous_pose, current_pose);
         let translation_delta =
             (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        let rotation_delta_deg =
-            (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
-                .sqrt()
-                .to_degrees();
+        let rotation_delta_deg = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
+            .sqrt()
+            .to_degrees();
         translation_delta <= cfg.max_translation_delta_m()
             && rotation_delta_deg <= cfg.max_rotation_delta_deg()
     }
@@ -1764,18 +1825,26 @@ impl SlamTracker {
         &mut self,
         frame_id: FrameId,
         cfg: RelocalizationConfig,
-        mut session: RelocalizationSession,
+        session: RelocalizationSession,
         current: Arc<Detections>,
     ) -> TrackerOutput {
+        self.state = Self::next_state_after_relocalization_failure(cfg, session, current);
+        self.relocalization_output(frame_id, TrackingHealth::Lost)
+    }
+
+    fn next_state_after_relocalization_failure(
+        cfg: RelocalizationConfig,
+        mut session: RelocalizationSession,
+        current: Arc<Detections>,
+    ) -> TrackerState {
         session.attempts = session.attempts.saturating_add(1);
         session.phase = RelocalizationPhase::Searching;
         session.last_detections = current;
         if session.attempts >= cfg.max_attempts() {
-            self.state = TrackerState::NeedKeyframe;
+            TrackerState::NeedKeyframe
         } else {
-            self.state = TrackerState::Relocalizing(session);
+            TrackerState::Relocalizing(session)
         }
-        self.relocalization_output(frame_id, TrackingHealth::Lost)
     }
 
     fn relocalization_candidate(
@@ -1783,7 +1852,7 @@ impl SlamTracker {
         current: &Detections,
         cfg: RelocalizationConfig,
         loop_db: &KeyframeDatabase,
-    ) -> Option<(KeyframeId, Pose)> {
+    ) -> Option<crate::loop_closure::VerifiedRelocalization> {
         let global_descriptor = aggregate_global_descriptor(current.descriptors()).ok()?;
         let candidates = loop_db.query_for_relocalization(&global_descriptor, cfg.max_candidates());
         for candidate in candidates {
@@ -1796,12 +1865,11 @@ impl SlamTracker {
             if correspondences.len() < 4 {
                 continue;
             }
-            let loop_candidate = LoopCandidate {
-                query_kf: candidate.candidate,
+            let relocalization_candidate = RelocalizationCandidate {
                 match_kf: candidate.candidate,
                 similarity: candidate.similarity,
             };
-            let verified = match loop_candidate.verify(
+            let verified = match relocalization_candidate.verify(
                 current.keypoints(),
                 &correspondences,
                 &self.map,
@@ -1812,9 +1880,51 @@ impl SlamTracker {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            return Some((candidate.candidate, verified.relative_pose()));
+            return Some(verified);
         }
         None
+    }
+
+    fn relocalization_step(
+        session: RelocalizationSession,
+        candidate_id: KeyframeId,
+        pose_world: Pose,
+        cfg: RelocalizationConfig,
+    ) -> RelocalizationStep {
+        let required_confirmations = cfg.min_confirmations();
+        match session.phase {
+            RelocalizationPhase::Confirming {
+                candidate,
+                confirmations,
+                pose_world: previous_pose,
+            } if candidate == candidate_id
+                && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg) =>
+            {
+                let next_confirmations = confirmations.get().saturating_add(1);
+                if next_confirmations >= required_confirmations {
+                    return RelocalizationStep::Recovered { pose_world };
+                }
+                RelocalizationStep::Continue(RelocalizationSession {
+                    attempts: session.attempts,
+                    phase: RelocalizationPhase::Confirming {
+                        candidate,
+                        confirmations: NonZeroUsize::new(next_confirmations).expect("non-zero"),
+                        pose_world,
+                    },
+                    last_detections: session.last_detections,
+                })
+            }
+            _ if required_confirmations <= 1 => RelocalizationStep::Recovered { pose_world },
+            _ => RelocalizationStep::Continue(RelocalizationSession {
+                attempts: session.attempts,
+                phase: RelocalizationPhase::Confirming {
+                    candidate: candidate_id,
+                    confirmations: NonZeroUsize::new(1).expect("non-zero"),
+                    pose_world,
+                },
+                last_detections: session.last_detections,
+            }),
+        }
     }
 
     fn relocalize(
@@ -1844,58 +1954,24 @@ impl SlamTracker {
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
         };
 
-        let Some((candidate_id, pose_world)) =
-            self.relocalization_candidate(current.as_ref(), cfg, loop_db)
-        else {
+        let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg, loop_db) else {
             return Ok(self.fail_relocalization(frame_id, cfg, session, current));
         };
+        let candidate_id = verified.match_kf();
+        let pose_world = verified.pose_world();
 
-        let required_confirmations = cfg.min_confirmations();
-        match session.phase {
-            RelocalizationPhase::Confirming {
-                candidate,
-                confirmations,
-                pose_world: previous_pose,
-            } if candidate == candidate_id
-                && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg) =>
-            {
-                let next_confirmations = confirmations.get().saturating_add(1);
-                if next_confirmations >= required_confirmations {
-                    self.state = TrackerState::NeedKeyframe;
-                    return self.create_keyframe(
-                        StereoPair {
-                            left,
-                            right,
-                        },
-                        pose_world,
-                    );
-                }
-                session.phase = RelocalizationPhase::Confirming {
-                    candidate,
-                    confirmations: NonZeroUsize::new(next_confirmations).expect("non-zero"),
-                    pose_world,
-                };
-            }
-            _ if required_confirmations <= 1 => {
+        session.last_detections = current;
+        match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
+            RelocalizationStep::Recovered { pose_world } => {
+                self.pending_loop = None;
+                self.loop_streak.clear();
                 self.state = TrackerState::NeedKeyframe;
-                return self.create_keyframe(
-                    StereoPair {
-                        left,
-                        right,
-                    },
-                    pose_world,
-                );
+                return self.create_keyframe(StereoPair { left, right }, pose_world);
             }
-            _ => {
-                session.phase = RelocalizationPhase::Confirming {
-                    candidate: candidate_id,
-                    confirmations: NonZeroUsize::new(1).expect("non-zero"),
-                    pose_world,
-                };
+            RelocalizationStep::Continue(next_session) => {
+                self.state = TrackerState::Relocalizing(next_session);
             }
         }
-        session.last_detections = current;
-        self.state = TrackerState::Relocalizing(session);
         Ok(self.relocalization_output(frame_id, TrackingHealth::Degraded))
     }
 
@@ -2104,7 +2180,8 @@ impl SlamTracker {
                                 eprintln!(
                                     "backend submit failed for keyframe {keyframe_id:?}: {err}"
                                 );
-                                let result = self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                let result =
+                                    self.ba.optimize_keyframe_window(&mut self.map, &window);
                                 if matches!(
                                     result,
                                     BaResult::Converged { .. } | BaResult::MaxIterations { .. }
@@ -2448,7 +2525,9 @@ fn apply_loop_closure_correction(
     let match_kf = verified.match_kf();
     let match_pose = map
         .keyframe(match_kf)
-        .ok_or(TrackerError::Map(crate::map::MapError::KeyframeNotFound(match_kf)))?
+        .ok_or(TrackerError::Map(crate::map::MapError::KeyframeNotFound(
+            match_kf,
+        )))?
         .pose();
     let query_pose_estimate = verified.relative_pose();
     let loop_relative = crate::Pose64::from_pose32(match_pose)
@@ -2486,7 +2565,12 @@ fn apply_loop_closure_correction(
         .keyframe_ids
         .iter()
         .copied()
-        .zip(result.corrected_poses.into_iter().map(|pose| pose.to_pose32()))
+        .zip(
+            result
+                .corrected_poses
+                .into_iter()
+                .map(|pose| pose.to_pose32()),
+        )
         .collect();
 
     for (keyframe_id, corrected_pose) in &corrected_poses {
@@ -2625,6 +2709,21 @@ mod tests {
         Descriptor([0.0; 256])
     }
 
+    fn make_test_detections(frame_id: u64) -> Arc<Detections> {
+        Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(frame_id),
+                320,
+                240,
+                vec![Keypoint { x: 100.0, y: 80.0 }],
+                vec![1.0],
+                vec![make_descriptor()],
+            )
+            .expect("detections"),
+        )
+    }
+
     fn make_global_descriptor_basis(idx: usize) -> crate::loop_closure::GlobalDescriptor {
         let mut data = [0.0_f32; 512];
         data[idx % 512] = 1.0;
@@ -2720,10 +2819,18 @@ mod tests {
 
         let mut map = SlamMap::new();
         let kf_a = map
-            .add_keyframe_from_detections(&detections_a, Timestamp::from_nanos(10), Pose::identity())
+            .add_keyframe_from_detections(
+                &detections_a,
+                Timestamp::from_nanos(10),
+                Pose::identity(),
+            )
             .expect("kf a");
         let kf_b = map
-            .add_keyframe_from_detections(&detections_b, Timestamp::from_nanos(11), Pose::identity())
+            .add_keyframe_from_detections(
+                &detections_b,
+                Timestamp::from_nanos(11),
+                Pose::identity(),
+            )
             .expect("kf b");
         let kp_a = map.keyframe_keypoint(kf_a, 0).expect("kp a");
         let point_id = map
@@ -2749,14 +2856,9 @@ mod tests {
         kf_b: KeyframeId,
     ) -> KeyframeEvent {
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
-        let mut event = KeyframeEvent::try_new(
-            request_id,
-            MapVersion::initial(),
-            kf_b,
-            window,
-            map,
-        )
-        .expect("event");
+        let mut event =
+            KeyframeEvent::try_new(request_id, MapVersion::initial(), kf_b, window, map)
+                .expect("event");
         event.force_panic = true;
         event
     }
@@ -2889,7 +2991,11 @@ mod tests {
                 pose_deltas: vec![(keyframe_id, pose_delta)],
                 landmark_deltas: vec![(
                     point_id,
-                    [corrected_point.x, corrected_point.y, corrected_point.z - 1.0],
+                    [
+                        corrected_point.x,
+                        corrected_point.y,
+                        corrected_point.z - 1.0,
+                    ],
                 )],
                 result: BaResult::Converged {
                     iterations: 2,
@@ -2906,7 +3012,10 @@ mod tests {
         for i in 0..3 {
             let a = stored_pose.translation()[i];
             let b = corrected_pose.translation()[i];
-            assert!((a - b).abs() < 1e-4, "translation mismatch at {i}: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-4,
+                "translation mismatch at {i}: {a} vs {b}"
+            );
         }
         let stored_rot = stored_pose.rotation();
         let corrected_rot = corrected_pose.rotation();
@@ -2931,10 +3040,9 @@ mod tests {
     fn backend_roundtrip_carries_typed_ba_result() {
         let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
         let backend_cfg = BackendConfig::new(1).expect("backend config");
-        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
-            320, 240, 200.0, 200.0, 160.0, 120.0,
-        )
-        .expect("intrinsics");
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
         let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
             .expect("ba config");
         let mut worker = BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg);
@@ -2986,10 +3094,9 @@ mod tests {
 
     #[test]
     fn backend_supervisor_respawns_after_worker_panic() {
-        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
-            320, 240, 200.0, 200.0, 160.0, 120.0,
-        )
-        .expect("intrinsics");
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
@@ -3000,8 +3107,12 @@ mod tests {
 
         let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
         let mut req_counter = 0;
-        let event =
-            make_forced_panic_event(BackendRequestId::from_counter(&mut req_counter), map, kf_a, kf_b);
+        let event = make_forced_panic_event(
+            BackendRequestId::from_counter(&mut req_counter),
+            map,
+            kf_a,
+            kf_b,
+        );
         supervisor.submit(event).expect("submit");
 
         let mut saw_panic = false;
@@ -3031,10 +3142,9 @@ mod tests {
 
     #[test]
     fn backend_supervisor_enforces_max_respawns() {
-        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
-            320, 240, 200.0, 200.0, 160.0, 120.0,
-        )
-        .expect("intrinsics");
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
@@ -3103,10 +3213,9 @@ mod tests {
 
     #[test]
     fn backend_supervisor_shutdown_does_not_respawn() {
-        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
-            320, 240, 200.0, 200.0, 160.0, 120.0,
-        )
-        .expect("intrinsics");
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
@@ -3122,10 +3231,9 @@ mod tests {
 
     #[test]
     fn backend_supervisor_continues_after_panic_respawn() {
-        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
-            320, 240, 200.0, 200.0, 160.0, 120.0,
-        )
-        .expect("intrinsics");
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
@@ -3176,7 +3284,9 @@ mod tests {
             map_ok,
         )
         .expect("event");
-        supervisor.submit(ok_event).expect("submit event after respawn");
+        supervisor
+            .submit(ok_event)
+            .expect("submit event after respawn");
 
         let mut got_non_panic = false;
         for _ in 0..100 {
@@ -3267,7 +3377,8 @@ mod tests {
             })
         };
 
-        let mut supervisor = DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
+        let mut supervisor =
+            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
         let frame = Frame::new(
             SensorId::StereoLeft,
             FrameId::new(78),
@@ -3416,8 +3527,10 @@ mod tests {
             map.add_observation(point_id, kp2).expect("obs2");
         }
 
-        let before_points: Vec<(MapPointId, Point3)> =
-            map.points().map(|(id, point)| (id, point.position())).collect();
+        let before_points: Vec<(MapPointId, Point3)> = map
+            .points()
+            .map(|(id, point)| (id, point.position()))
+            .collect();
 
         let mut essential_graph = EssentialGraph::new(1);
         essential_graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
@@ -3443,14 +3556,22 @@ mod tests {
             make_loop_closure_apply_fixture();
         let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
 
-        let before = map.keyframe(query_kf).expect("query pose").pose().translation();
-        let before_error = ((before[0] - 2.0).powi(2) + (before[1]).powi(2) + (before[2]).powi(2))
-            .sqrt();
+        let before = map
+            .keyframe(query_kf)
+            .expect("query pose")
+            .pose()
+            .translation();
+        let before_error =
+            ((before[0] - 2.0).powi(2) + (before[1]).powi(2) + (before[2]).powi(2)).sqrt();
 
         apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
             .expect("apply loop closure");
 
-        let after = map.keyframe(query_kf).expect("corrected query").pose().translation();
+        let after = map
+            .keyframe(query_kf)
+            .expect("corrected query")
+            .pose()
+            .translation();
         let after_error =
             ((after[0] - 2.0).powi(2) + (after[1]).powi(2) + (after[2]).powi(2)).sqrt();
         assert!(
@@ -3478,7 +3599,10 @@ mod tests {
                 (dx * dx + dy * dy + dz * dz).sqrt() > 1e-5
             })
             .count();
-        assert!(moved_points > 0, "expected map points to move after loop correction");
+        assert!(
+            moved_points > 0,
+            "expected map points to move after loop correction"
+        );
     }
 
     #[test]
@@ -3526,12 +3650,22 @@ mod tests {
     #[test]
     fn degradation_level_worst_returns_more_severe_variant() {
         assert_eq!(
-            DegradationLevel::worst(DegradationLevel::Nominal, DegradationLevel::TrackingDegraded),
+            DegradationLevel::worst(
+                DegradationLevel::Nominal,
+                DegradationLevel::TrackingDegraded
+            ),
             DegradationLevel::TrackingDegraded
         );
         assert_eq!(
             DegradationLevel::worst(
                 DegradationLevel::TrackingDegraded,
+                DegradationLevel::DescriptorDown
+            ),
+            DegradationLevel::DescriptorDown
+        );
+        assert_eq!(
+            DegradationLevel::worst(
+                DegradationLevel::DescriptorDown,
                 DegradationLevel::BackendDown
             ),
             DegradationLevel::BackendDown
@@ -3549,27 +3683,156 @@ mod tests {
             ..BackendStats::default()
         };
         let nominal =
-            SystemHealth::from_components(TrackingHealth::Good, true, true, stats);
+            SystemHealth::from_components(TrackingHealth::Good, true, true, true, true, stats);
         assert_eq!(nominal.degradation, DegradationLevel::Nominal);
         assert!(nominal.backend_alive);
+        assert!(nominal.descriptor_alive);
         assert_eq!(nominal.backend_stats.submitted, 7);
 
         let degraded =
-            SystemHealth::from_components(TrackingHealth::Degraded, true, true, stats);
+            SystemHealth::from_components(TrackingHealth::Degraded, true, true, true, true, stats);
         assert_eq!(degraded.degradation, DegradationLevel::TrackingDegraded);
 
+        let descriptor_down =
+            SystemHealth::from_components(TrackingHealth::Good, true, true, true, false, stats);
+        assert_eq!(
+            descriptor_down.degradation,
+            DegradationLevel::DescriptorDown
+        );
+        assert!(!descriptor_down.descriptor_alive);
+
         let backend_down =
-            SystemHealth::from_components(TrackingHealth::Good, true, false, stats);
+            SystemHealth::from_components(TrackingHealth::Good, true, false, true, true, stats);
         assert_eq!(backend_down.degradation, DegradationLevel::BackendDown);
         assert!(!backend_down.backend_alive);
 
         let lost =
-            SystemHealth::from_components(TrackingHealth::Lost, true, false, stats);
+            SystemHealth::from_components(TrackingHealth::Lost, true, false, true, false, stats);
         assert_eq!(lost.degradation, DegradationLevel::Lost);
 
         let backend_optional =
-            SystemHealth::from_components(TrackingHealth::Good, false, true, stats);
+            SystemHealth::from_components(TrackingHealth::Good, false, true, false, true, stats);
         assert_eq!(backend_optional.degradation, DegradationLevel::Nominal);
+    }
+
+    #[test]
+    fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
+        let detections = make_test_detections(900);
+        assert!(SlamTracker::initial_relocalization_session(
+            TrackingHealth::Good,
+            true,
+            Arc::clone(&detections)
+        )
+        .is_none());
+        assert!(SlamTracker::initial_relocalization_session(
+            TrackingHealth::Lost,
+            false,
+            Arc::clone(&detections)
+        )
+        .is_none());
+
+        let session = SlamTracker::initial_relocalization_session(
+            TrackingHealth::Lost,
+            true,
+            Arc::clone(&detections),
+        )
+        .expect("lost tracking should create relocalization session");
+        assert_eq!(session.attempts, 0);
+        assert!(matches!(session.phase, RelocalizationPhase::Searching));
+    }
+
+    #[test]
+    fn relocalization_failure_transitions_respect_max_attempts() {
+        let cfg = RelocalizationConfig::new(crate::loop_closure::RelocalizationConfigInput {
+            max_attempts: 2,
+            ..crate::loop_closure::RelocalizationConfigInput::default()
+        })
+        .expect("relocalization config");
+        let detections = make_test_detections(901);
+
+        let keep_trying = SlamTracker::next_state_after_relocalization_failure(
+            cfg,
+            RelocalizationSession {
+                attempts: 0,
+                phase: RelocalizationPhase::Searching,
+                last_detections: Arc::clone(&detections),
+            },
+            Arc::clone(&detections),
+        );
+        assert!(matches!(keep_trying, TrackerState::Relocalizing(_)));
+        let TrackerState::Relocalizing(updated) = keep_trying else {
+            panic!("expected relocalizing state")
+        };
+        assert_eq!(updated.attempts, 1);
+        assert!(matches!(updated.phase, RelocalizationPhase::Searching));
+
+        let give_up = SlamTracker::next_state_after_relocalization_failure(
+            cfg,
+            RelocalizationSession {
+                attempts: 1,
+                phase: RelocalizationPhase::Searching,
+                last_detections: Arc::clone(&detections),
+            },
+            detections,
+        );
+        assert!(matches!(give_up, TrackerState::NeedKeyframe));
+    }
+
+    #[test]
+    fn relocalization_step_requires_confirmation_before_recovery() {
+        let cfg = RelocalizationConfig::default();
+        let candidate = KeyframeId::default();
+        let detections = make_test_detections(902);
+        let pose = Pose::identity();
+
+        let step = SlamTracker::relocalization_step(
+            RelocalizationSession {
+                attempts: 0,
+                phase: RelocalizationPhase::Searching,
+                last_detections: detections,
+            },
+            candidate,
+            pose,
+            cfg,
+        );
+        let RelocalizationStep::Continue(session) = step else {
+            panic!("first successful relocalization should begin confirmation")
+        };
+        let RelocalizationPhase::Confirming {
+            candidate: confirmed_candidate,
+            confirmations,
+            ..
+        } = session.phase
+        else {
+            panic!("expected confirming phase")
+        };
+        assert_eq!(confirmed_candidate, candidate);
+        assert_eq!(confirmations.get(), 1);
+    }
+
+    #[test]
+    fn relocalization_step_recovers_after_consistent_confirmation() {
+        let cfg = RelocalizationConfig::default();
+        let candidate = KeyframeId::default();
+        let detections = make_test_detections(903);
+        let pose = Pose::identity();
+
+        let step = SlamTracker::relocalization_step(
+            RelocalizationSession {
+                attempts: 2,
+                phase: RelocalizationPhase::Confirming {
+                    candidate,
+                    confirmations: NonZeroUsize::new(1).expect("non-zero"),
+                    pose_world: pose,
+                },
+                last_detections: detections,
+            },
+            candidate,
+            pose,
+            cfg,
+        );
+
+        assert!(matches!(step, RelocalizationStep::Recovered { .. }));
     }
 
     #[test]
