@@ -3,6 +3,14 @@ name = "embedded"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+firmware = []
+
+[[bin]]
+name = "embedded"
+path = "src/main.rs"
+required-features = ["firmware"]
 
 [dependencies]
 cortex-m = "0.7"

@@ -1,5 +1,5 @@
-use oak_sys::{Device, DeviceConfig, ImageError, ImageFrame, Timestamp};
-use rerun::{ChannelDatatype, ColorModel, Image, ImageFormat, RecordingStreamBuilder};
+use oak_sys::{Device, DeviceConfig, ImageFrame};
+use rerun::Image;
 
 fn imageframe_to_rerun(frame: ImageFrame) -> Image {
     let width = frame.width;

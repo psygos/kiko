@@ -10,8 +10,11 @@ fn main() {
 
     let (depthai_include, depthai_lib) = if std::env::consts::OS == "macos" {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ttrb".to_string());
-        let depthai_root = format!("{}/depthai-core", home);
-        (format!("{}/include", depthai_root), format!("{}/build", depthai_root))
+        let depthai_root = format!("{home}/depthai-core");
+        (
+            format!("{depthai_root}/include"),
+            format!("{depthai_root}/build"),
+        )
     } else {
         (
             std::env::var("DEPTHAI_INCLUDE").unwrap_or_else(|_| "/usr/local/include".to_string()),
@@ -23,19 +26,23 @@ fn main() {
 
     if std::env::consts::OS == "macos" {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ttrb".to_string());
-        let depthai_root = format!("{}/depthai-core", home);
+        let depthai_root = format!("{home}/depthai-core");
 
-        build.include(format!("{}/build", depthai_root));
-        build.include(format!("{}/build/_deps/xlink-src/include", depthai_root));
-        build.include(format!("{}/shared", depthai_root));
-        build.include(format!("{}/shared/depthai-shared/include", depthai_root));
-        build.include(format!("{}/shared/depthai-bootloader-shared/include", depthai_root));
-        build.include(format!("{}/build/vcpkg_installed/arm64-osx/include", depthai_root));
-        build.include(format!("{}/build/_deps/libnop-src/include", depthai_root));
+        build.include(format!("{depthai_root}/build"));
+        build.include(format!("{depthai_root}/build/_deps/xlink-src/include"));
+        build.include(format!("{depthai_root}/shared"));
+        build.include(format!("{depthai_root}/shared/depthai-shared/include"));
+        build.include(format!(
+            "{depthai_root}/shared/depthai-bootloader-shared/include"
+        ));
+        build.include(format!(
+            "{depthai_root}/build/vcpkg_installed/arm64-osx/include"
+        ));
+        build.include(format!("{depthai_root}/build/_deps/libnop-src/include"));
         build.include("/opt/homebrew/opt/opencv/include/opencv4");
     }
 
-    println!("cargo:rustc-link-search=native={}", depthai_lib);
+    println!("cargo:rustc-link-search=native={depthai_lib}");
     println!("cargo:rustc-link-lib=dylib=depthai-core");
 
     if std::env::consts::OS == "macos" {
