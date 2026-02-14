@@ -2281,58 +2281,61 @@ impl SlamTracker {
                         let window = self
                             .map
                             .covisible_window(keyframe_id, self.ba.window_size())?;
-                        if self.backend.is_some() {
-                            if let Err(err) = self.submit_backend_event(keyframe_id, window.clone())
-                            {
-                                match err {
-                                    SubmitEventError::QueueFull => {
-                                        self.backend_stats.dropped_full =
-                                            self.backend_stats.dropped_full.saturating_add(1);
-                                    }
-                                    SubmitEventError::Disconnected => {
-                                        self.backend_stats.dropped_disconnected = self
-                                            .backend_stats
-                                            .dropped_disconnected
-                                            .saturating_add(1);
-                                        if let Some(supervisor) = self.backend.as_ref() {
-                                            self.backend_stats.respawn_count =
-                                                supervisor.respawn_count();
-                                            if !supervisor.has_worker() {
+                        if window.len() >= 2 {
+                            if self.backend.is_some() {
+                                if let Err(err) =
+                                    self.submit_backend_event(keyframe_id, window.clone())
+                                {
+                                    match err {
+                                        SubmitEventError::QueueFull => {
+                                            self.backend_stats.dropped_full =
+                                                self.backend_stats.dropped_full.saturating_add(1);
+                                        }
+                                        SubmitEventError::Disconnected => {
+                                            self.backend_stats.dropped_disconnected = self
+                                                .backend_stats
+                                                .dropped_disconnected
+                                                .saturating_add(1);
+                                            if let Some(supervisor) = self.backend.as_ref() {
+                                                self.backend_stats.respawn_count =
+                                                    supervisor.respawn_count();
+                                                if !supervisor.has_worker() {
+                                                    self.backend = None;
+                                                }
+                                            } else {
                                                 self.backend = None;
                                             }
-                                        } else {
-                                            self.backend = None;
+                                        }
+                                        SubmitEventError::InvalidWindow(_)
+                                        | SubmitEventError::InvalidEvent(_) => {
+                                            self.backend_stats.rejected =
+                                                self.backend_stats.rejected.saturating_add(1);
                                         }
                                     }
-                                    SubmitEventError::InvalidWindow(_)
-                                    | SubmitEventError::InvalidEvent(_) => {
-                                        self.backend_stats.rejected =
-                                            self.backend_stats.rejected.saturating_add(1);
+                                    eprintln!(
+                                        "backend submit failed for keyframe {keyframe_id:?}: {err}"
+                                    );
+                                    let result =
+                                        self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                    ba_result = Some(result.clone());
+                                    if matches!(
+                                        result,
+                                        BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                                    ) {
+                                        self.bump_map_version();
                                     }
                                 }
-                                eprintln!(
-                                    "backend submit failed for keyframe {keyframe_id:?}: {err}"
-                                );
-                                let result =
-                                    self.ba.optimize_keyframe_window(&mut self.map, &window);
-                                ba_result = Some(result.clone());
-                                if matches!(
-                                    result,
-                                    BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                                ) {
-                                    self.bump_map_version();
-                                }
+                            } else if matches!(
+                                {
+                                    let result =
+                                        self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                    ba_result = Some(result.clone());
+                                    result
+                                },
+                                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                            ) {
+                                self.bump_map_version();
                             }
-                        } else if matches!(
-                            {
-                                let result =
-                                    self.ba.optimize_keyframe_window(&mut self.map, &window);
-                                ba_result = Some(result.clone());
-                                result
-                            },
-                            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                        ) {
-                            self.bump_map_version();
                         }
                         self.state = TrackerState::Tracking {
                             keyframe: keyframe.clone(),
