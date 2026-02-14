@@ -6,9 +6,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
     BackendConfig, DownscaleFactor, GlobalDescriptorConfig, InferenceBackend, InferencePipeline,
-    KeyframePolicy, KeypointLimit, LightGlue, LocalBaConfig, LoopClosureConfig, LmConfig,
-    PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig, RelocalizationConfig,
-    RedundancyPolicy, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
+    KeyframePolicy, KeypointLimit, LightGlue, LmConfig, LocalBaConfig, LoopClosureConfig,
+    PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig, RedundancyPolicy,
+    RelocalizationConfig, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
     TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
 
@@ -21,15 +21,15 @@ use kiko_slam::{Frame, Point3, Pose, Raw};
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
 #[cfg(feature = "record")]
 use kiko_slam::{
-    ChannelCapacity, DropPolicy, FrameId, PairingWindowNs, SendOutcome, SensorId, StereoPair,
-    StereoPairer, bounded_channel, oak_to_frame,
+    bounded_channel, oak_to_frame, ChannelCapacity, DiagnosticEvent, DropPolicy, FrameDiagnostics,
+    FrameId, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
 };
 #[cfg(feature = "record")]
 use oak_sys::{Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig};
 #[cfg(feature = "record")]
-use std::sync::Arc;
-#[cfg(feature = "record")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "record")]
+use std::sync::Arc;
 #[cfg(feature = "record")]
 use std::thread;
 
@@ -511,9 +511,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "done: processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, triangulated_points={triangulated_points}"
     );
-    eprintln!(
-        "summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}"
-    );
+    eprintln!("summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}");
 
     Ok(())
 }
@@ -646,6 +644,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         match tracker.process(pair) {
             Ok(output) => {
+                let timestamp = left.timestamp();
                 if let Some(matches) = output.stereo_matches {
                     let points = output
                         .keyframe
@@ -669,10 +668,18 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Some(pose) = output.pose.as_ref() {
-                    if let Err(err) = sink.log_pose(left.timestamp(), pose) {
+                    if let Err(err) = sink.log_pose(timestamp, pose) {
                         eprintln!("rerun log error: {err}");
                     } else {
                         poses_logged += 1;
+                    }
+                }
+                if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
+                    eprintln!("rerun diagnostics error: {err}");
+                }
+                for event in &output.events {
+                    if let Err(err) = sink.log_event(timestamp, event) {
+                        eprintln!("rerun event error: {err}");
                     }
                 }
                 processed += 1;
@@ -826,19 +833,13 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         0.0
     };
 
-    eprintln!(
-        "pipeline fps: {fps:.2} (processed={processed}, elapsed={elapsed_s:.2}s)"
-    );
-    eprintln!(
-        "reader fps: {read_fps:.2} (read_time={read_s:.2}s, throughput={read_mb_s:.2} MB/s)"
-    );
+    eprintln!("pipeline fps: {fps:.2} (processed={processed}, elapsed={elapsed_s:.2}s)");
+    eprintln!("reader fps: {read_fps:.2} (read_time={read_s:.2}s, throughput={read_mb_s:.2} MB/s)");
     eprintln!("inference fps: {infer_fps:.2} (sum_infer_time={infer_s:.2}s)");
     eprintln!(
         "matching: nonzero_pairs={matches_nonzero}, match_rate={match_rate:.2} avg_matches={avg_matches:.1}"
     );
-    eprintln!(
-        "errors: read={read_errors} pairing={pairing_errors} inference={inference_errors}"
-    );
+    eprintln!("errors: read={read_errors} pairing={pairing_errors} inference={inference_errors}");
 
     if processed > 0 {
         let denom = processed as f64;
@@ -1027,6 +1028,8 @@ struct LiveVizMsg {
     pose: Option<Pose>,
     packet: Option<VizPacket<Raw>>,
     points: Option<Vec<Point3>>,
+    diagnostics: FrameDiagnostics,
+    events: Vec<DiagnosticEvent>,
 }
 
 #[cfg(feature = "record")]
@@ -1182,6 +1185,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         pose: output.pose,
                         packet,
                         points,
+                        diagnostics: output.diagnostics,
+                        events: output.events,
                     };
                     if matches!(viz_tx.try_send(msg), SendOutcome::Disconnected) {
                         break;
@@ -1217,6 +1222,14 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(pose) = msg.pose.as_ref() {
                 if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
                     eprintln!("rerun log error: {err}");
+                }
+            }
+            if let Err(err) = sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics) {
+                eprintln!("rerun diagnostics error: {err}");
+            }
+            for event in &msg.events {
+                if let Err(err) = sink.log_event(msg.left.timestamp(), event) {
+                    eprintln!("rerun event error: {err}");
                 }
             }
         }
