@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
 use crate::map::{KeyframeId, SlamMap};
+use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
 use crate::Pose64;
 
 #[derive(Clone, Debug)]
@@ -413,7 +413,11 @@ impl PoseGraphOptimizer {
         Self { config }
     }
 
-    pub fn optimize(&self, edges: &[PoseGraphEdge], initial_poses: &mut [Pose64]) -> PoseGraphResult {
+    pub fn optimize(
+        &self,
+        edges: &[PoseGraphEdge],
+        initial_poses: &mut [Pose64],
+    ) -> PoseGraphResult {
         let nposes = initial_poses.len();
         if nposes == 0 {
             return PoseGraphResult {
@@ -784,7 +788,10 @@ impl EssentialGraph {
             })
             .collect();
 
-        PoseGraphInput { keyframe_ids, edges }
+        PoseGraphInput {
+            keyframe_ids,
+            edges,
+        }
     }
 
     pub fn all_edges(&self) -> Vec<PoseGraphEdge> {
@@ -861,6 +868,9 @@ fn scaled_identity6(scale: f64) -> [[f64; 6]; 6] {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::num::NonZeroU32;
+
     use super::{
         compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, EssentialEdge,
         EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig, PoseGraphEdge,
@@ -868,8 +878,27 @@ mod tests {
     };
     use crate::map::{ImageSize, SlamMap};
     use crate::math::se3_exp_f64;
-    use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
     use crate::Pose64;
+    use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
+
+    #[derive(Clone, Debug)]
+    struct Lcg {
+        state: u64,
+    }
+
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_usize(&mut self, upper: usize) -> usize {
+            self.state = self
+                .state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((self.state >> 32) as usize) % upper
+        }
+    }
 
     fn scalar_block(diagonal: f64) -> [[f64; 6]; 6] {
         let mut block = [[0.0_f64; 6]; 6];
@@ -879,7 +908,12 @@ mod tests {
         block
     }
 
-    fn make_map_for_essential_graph() -> (SlamMap, crate::map::KeyframeId, crate::map::KeyframeId, crate::map::KeyframeId) {
+    fn make_map_for_essential_graph() -> (
+        SlamMap,
+        crate::map::KeyframeId,
+        crate::map::KeyframeId,
+        crate::map::KeyframeId,
+    ) {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(640, 480).expect("size");
         let keypoints = vec![
@@ -956,6 +990,30 @@ mod tests {
         (map, kf0, kf1, kf2)
     }
 
+    fn make_chain_keyframes(count: usize) -> (SlamMap, Vec<crate::map::KeyframeId>) {
+        let mut map = SlamMap::new();
+        let size = ImageSize::try_new(640, 480).expect("size");
+        let keypoints = vec![Keypoint { x: 20.0, y: 20.0 }, Keypoint { x: 40.0, y: 20.0 }];
+        let mut ids = Vec::with_capacity(count);
+        for idx in 0..count {
+            let pose = Pose::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [idx as f32 * 0.5, 0.0, 0.0],
+            );
+            let id = map
+                .add_keyframe(
+                    FrameId::new((idx + 1) as u64),
+                    Timestamp::from_nanos((idx + 1) as i64),
+                    pose,
+                    size,
+                    keypoints.clone(),
+                )
+                .expect("keyframe");
+            ids.push(id);
+        }
+        (map, ids)
+    }
+
     #[test]
     fn block_csr_insert_and_get_are_consistent() {
         let mut h = BlockCsr6x6::new(3);
@@ -1027,7 +1085,9 @@ mod tests {
         let mut h = BlockCsr6x6::new(2);
         h.insert(0, 0, scalar_block(1.0));
         h.insert(1, 1, scalar_block(1.0));
-        let b = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0];
+        let b = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0,
+        ];
         let mut x = vec![0.0; b.len()];
         let result = solve_pcg(&h, &b, &mut x, 20, 1e-12);
         assert!(result.converged);
@@ -1045,7 +1105,9 @@ mod tests {
         h.insert(0, 1, scalar_block(0.2));
         h.insert(1, 0, scalar_block(0.2));
 
-        let x_true = vec![0.5, -0.3, 0.8, 0.1, -0.2, 0.4, 1.2, -0.6, 0.7, -0.9, 0.2, 0.3];
+        let x_true = vec![
+            0.5, -0.3, 0.8, 0.1, -0.2, 0.4, 1.2, -0.6, 0.7, -0.9, 0.2, 0.3,
+        ];
         let mut b = vec![0.0; x_true.len()];
         h.spmv(&x_true, &mut b);
 
@@ -1164,7 +1226,10 @@ mod tests {
         let result = optimizer.optimize(&edges, &mut initial);
         let after = translation_error(&result.corrected_poses, &gt);
         assert!(result.converged || result.iterations > 0);
-        assert!(after < before, "ring graph did not improve: before={before}, after={after}");
+        assert!(
+            after < before,
+            "ring graph did not improve: before={before}, after={after}"
+        );
     }
 
     #[test]
@@ -1206,9 +1271,7 @@ mod tests {
         for i in 0..3 {
             assert!((anchor_before.translation[i] - anchor_after.translation[i]).abs() < 1e-12);
             for j in 0..3 {
-                assert!(
-                    (anchor_before.rotation[i][j] - anchor_after.rotation[i][j]).abs() < 1e-12
-                );
+                assert!((anchor_before.rotation[i][j] - anchor_after.rotation[i][j]).abs() < 1e-12);
             }
         }
     }
@@ -1276,12 +1339,10 @@ mod tests {
         assert_eq!(graph.parent_of(kf1), None);
         let snapshot = graph.snapshot();
         assert!(snapshot.order.iter().all(|&id| id != kf1));
-        assert!(
-            snapshot
-                .spanning_edges
-                .iter()
-                .all(|edge| edge.a != kf1 && edge.b != kf1)
-        );
+        assert!(snapshot
+            .spanning_edges
+            .iter()
+            .all(|edge| edge.a != kf1 && edge.b != kf1));
         let input = graph.pose_graph_input();
         assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
     }
@@ -1296,7 +1357,10 @@ mod tests {
         let err = graph
             .remove_keyframe(kf0, &map)
             .expect_err("root removal should fail");
-        assert_eq!(err, EssentialGraphError::RootRemovalDenied { keyframe_id: kf0 });
+        assert_eq!(
+            err,
+            EssentialGraphError::RootRemovalDenied { keyframe_id: kf0 }
+        );
     }
 
     #[test]
@@ -1308,7 +1372,10 @@ mod tests {
         let err = graph
             .remove_keyframe(kf1, &map)
             .expect_err("missing keyframe should fail");
-        assert_eq!(err, EssentialGraphError::KeyframeNotFound { keyframe_id: kf1 });
+        assert_eq!(
+            err,
+            EssentialGraphError::KeyframeNotFound { keyframe_id: kf1 }
+        );
     }
 
     #[test]
@@ -1332,7 +1399,74 @@ mod tests {
             .expect("remove keyframe with loop edge");
         let snapshot = graph.snapshot();
         assert_eq!(snapshot.loop_edges.len(), 0);
-        assert!(snapshot.strong_covis_edges.iter().all(|e| e.a != kf2 && e.b != kf2));
-        assert!(snapshot.spanning_edges.iter().all(|e| e.a != kf2 && e.b != kf2));
+        assert!(snapshot
+            .strong_covis_edges
+            .iter()
+            .all(|e| e.a != kf2 && e.b != kf2));
+        assert!(snapshot
+            .spanning_edges
+            .iter()
+            .all(|e| e.a != kf2 && e.b != kf2));
+    }
+
+    #[test]
+    fn essential_graph_random_remove_preserves_connectivity_invariants() {
+        let (map, ids) = make_chain_keyframes(12);
+        let root = ids[0];
+        let mut graph = EssentialGraph::new(100);
+        for (idx, &id) in ids.iter().enumerate() {
+            if idx == 0 {
+                graph.add_keyframe(id, None, &map);
+            } else {
+                let mut covis = HashMap::new();
+                covis.insert(ids[idx - 1], NonZeroU32::new(10).expect("non-zero"));
+                graph.add_keyframe(id, Some(&covis), &map);
+            }
+        }
+
+        let mut alive = ids.clone();
+        let mut rng = Lcg::new(0x5EED_u64);
+        for _ in 0..64 {
+            let removable: Vec<_> = alive.iter().copied().filter(|id| *id != root).collect();
+            if removable.is_empty() {
+                break;
+            }
+            let remove_id = removable[rng.next_usize(removable.len())];
+            graph
+                .remove_keyframe(remove_id, &map)
+                .expect("non-root should be removable");
+            alive.retain(|id| *id != remove_id);
+
+            let alive_set: HashSet<_> = alive.iter().copied().collect();
+            let snapshot = graph.snapshot();
+            assert_eq!(snapshot.parent.len(), alive.len());
+            assert!(!snapshot.order.contains(&remove_id));
+
+            for (&child, &parent) in &snapshot.parent {
+                assert!(alive_set.contains(&child));
+                assert!(alive_set.contains(&parent));
+                if child == root {
+                    assert_eq!(parent, root);
+                }
+            }
+
+            for edge in snapshot
+                .spanning_edges
+                .iter()
+                .chain(snapshot.strong_covis_edges.iter())
+                .chain(snapshot.loop_edges.iter())
+            {
+                assert!(alive_set.contains(&edge.a));
+                assert!(alive_set.contains(&edge.b));
+            }
+
+            let input = graph.pose_graph_input();
+            let input_set: HashSet<_> = input.keyframe_ids.iter().copied().collect();
+            assert!(input_set.is_subset(&alive_set));
+            for edge in &input.edges {
+                assert!(edge.from < input.keyframe_ids.len());
+                assert!(edge.to < input.keyframe_ids.len());
+            }
+        }
     }
 }
