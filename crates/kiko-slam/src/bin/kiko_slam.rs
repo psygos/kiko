@@ -17,7 +17,7 @@ use kiko_slam::env::{env_bool, env_f32, env_usize};
 #[cfg(feature = "record")]
 use kiko_slam::dense::{DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
 #[cfg(feature = "record")]
-use kiko_slam::{DenseStats, DepthImage, Frame, Point3, Pose, Raw, ReconState};
+use kiko_slam::{DenseCommand, DenseStats, DepthImage, Frame, Point3, Pose, Raw, ReconState};
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
@@ -1341,7 +1341,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut dense_generation: u64 = 0;
         let mut dense_ctrl_tx = dense_ctrl_tx;
         let mut dense_data_tx = dense_data_tx;
-        let mut dense_stats_rx = dense_stats_rx;
+        let dense_stats_rx = dense_stats_rx;
         let mut dense_active = dense_enabled;
         let mut dense_data_dropped_newest: u64 = 0;
         let mut depth_reorder_warnings_seen: u64 = 0;
@@ -1472,6 +1472,36 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(Err(err)) => {
+                    if dense_active {
+                        if let Some(correction) = tracker.take_pending_loop_correction() {
+                            dense_generation = dense_generation.saturating_add(1);
+                            let rebuild_cmd = DenseCommand::RebuildFromSnapshot {
+                                corrected_poses: correction,
+                                generation: dense_generation,
+                            };
+                            if let Some(ref tx) = dense_ctrl_tx {
+                                match tx.send_timeout(rebuild_cmd, Duration::from_millis(5)) {
+                                    Ok(()) => {}
+                                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                        dense_active = false;
+                                        dense_ctrl_tx = None;
+                                        dense_data_tx = None;
+                                        eprintln!(
+                                            "dense control queue saturated after tracker error; disabling dense"
+                                        );
+                                    }
+                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                        dense_active = false;
+                                        dense_ctrl_tx = None;
+                                        dense_data_tx = None;
+                                        eprintln!(
+                                            "dense control disconnected after tracker error; disabling dense"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     eprintln!("tracker error: {err}");
                 }
                 Err(payload) => {
