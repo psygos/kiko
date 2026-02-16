@@ -1034,9 +1034,6 @@ struct LiveVizMsg {
 
 #[cfg(feature = "record")]
 fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
-    const PAIR_QUEUE_DEPTH: usize = 4;
-    const VIZ_QUEUE_DEPTH: usize = 8;
-
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -1068,11 +1065,13 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pairing_window = PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
     let mut pairer = StereoPairer::new(pairing_window);
 
-    let pair_capacity = ChannelCapacity::try_from(PAIR_QUEUE_DEPTH)?;
+    let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH").unwrap_or(12);
+    let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
     let (pair_tx, pair_rx, pair_stats) =
         bounded_channel::<StereoPair>(pair_capacity, DropPolicy::DropOldest);
 
-    let viz_capacity = ChannelCapacity::try_from(VIZ_QUEUE_DEPTH)?;
+    let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH").unwrap_or(12);
+    let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
 
     let inference = InferenceConfig::from_args(&args.inference)?;
@@ -1083,12 +1082,12 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rectified = RectifiedStereo::from_calibration(&calibration)?;
     let intrinsics = PinholeIntrinsics::try_from(&calibration.left)?;
 
-    let min_keyframe_points = env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(200);
-    let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(30);
+    let min_keyframe_points = env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(80);
+    let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(20);
     let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
     let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
     let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY").unwrap_or(0.9);
-    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(30);
+    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(15);
     let ransac = RansacConfig {
         min_inliers,
         ..RansacConfig::default()
@@ -1139,7 +1138,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={}",
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={} pair_queue_depth={} viz_queue_depth={}",
         min_keyframe_points,
         refresh_inliers,
         parallax_px,
@@ -1150,7 +1149,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         key_limit.get(),
         loop_closure_enabled,
         learned_descriptors_enabled,
-        relocalization_enabled
+        relocalization_enabled,
+        pair_queue_depth,
+        viz_queue_depth
     );
 
     let inference_handle = thread::spawn(move || {
