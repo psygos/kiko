@@ -59,7 +59,11 @@ impl EigenPlaces {
         ))?;
 
         // EigenPlaces ONNX exports use `input` for the image tensor.
-        let outputs = self.session.run(ort::inputs!["input" => input_tensor])?;
+        let outputs = super::run_with_watchdog("eigenplaces", || {
+            self.session
+                .run(ort::inputs!["input" => input_tensor])
+                .map_err(InferenceError::Execution)
+        })?;
 
         let mut raw_descriptor: Option<Vec<f32>> = None;
         for (_, value) in outputs.iter() {

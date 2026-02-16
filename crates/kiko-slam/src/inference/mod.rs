@@ -2,6 +2,7 @@ use ort::Error as OrtError;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 mod backend;
 mod eigenplaces;
@@ -63,6 +64,24 @@ impl std::fmt::Display for InferenceError {
 }
 pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
+
+pub(super) fn run_with_watchdog<T>(
+    model: &'static str,
+    run: impl FnOnce() -> Result<T, InferenceError>,
+) -> Result<T, InferenceError> {
+    let start = Instant::now();
+    let result = run();
+    let warn_ms = env_usize("KIKO_ORT_RUN_WARN_MS").unwrap_or(200);
+    let warn_after = Duration::from_millis(warn_ms as u64);
+    let elapsed = start.elapsed();
+    if elapsed > warn_after {
+        eprintln!(
+            "slow ONNX inference: model={model} elapsed_ms={:.1} threshold_ms={warn_ms}",
+            elapsed.as_secs_f64() * 1000.0
+        );
+    }
+    result
+}
 
 fn build_session(
     path: &std::path::Path,

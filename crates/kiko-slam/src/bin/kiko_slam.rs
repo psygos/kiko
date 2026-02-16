@@ -4,20 +4,20 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use kiko_slam::dataset::DatasetReader;
+use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
 use kiko_slam::{
-    BackendConfig, DownscaleFactor, GlobalDescriptorConfig, InferenceBackend, InferencePipeline,
-    KeyframePolicy, KeypointLimit, LightGlue, LmConfig, LocalBaConfig, LoopClosureConfig,
-    PinholeIntrinsics, RansacConfig, RectifiedStereo, RectifiedStereoConfig, RedundancyPolicy,
-    RelocalizationConfig, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
-    TriangulationError, Triangulator, VizDecimation, VizPacket,
+    BackendConfig, DenseCommand, DepthImage, DownscaleFactor, GlobalDescriptorConfig,
+    InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
+    LocalBaConfig, LoopClosureConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo,
+    RectifiedStereoConfig, RedundancyPolicy, RelocalizationConfig, RerunSink, SlamTracker,
+    SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
+    VizDecimation, VizPacket,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
 
 #[cfg(feature = "record")]
-use kiko_slam::dense::{DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
-#[cfg(feature = "record")]
-use kiko_slam::{DenseCommand, DenseStats, DepthImage, Frame, Point3, Pose, Raw, ReconState};
+use kiko_slam::{DenseStats, Frame, Point3, Pose, Raw, ReconState};
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
@@ -523,6 +523,109 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+struct OfflineDepthCursor {
+    entries: Vec<(i64, PathBuf)>,
+    next: usize,
+    width: u32,
+    height: u32,
+    frame_seq: u64,
+}
+
+impl OfflineDepthCursor {
+    fn new(
+        dataset_root: &Path,
+        depth_meta: Option<&kiko_slam::dataset::DepthMeta>,
+    ) -> Result<Option<Self>, std::io::Error> {
+        let Some(depth_meta) = depth_meta else {
+            return Ok(None);
+        };
+        let frames_dir = dataset_root.join(kiko_slam::dataset::format::FRAMES_DIR);
+        let mut entries = Vec::new();
+        for dir_entry in std::fs::read_dir(&frames_dir)? {
+            let dir_entry = dir_entry?;
+            let file_name = dir_entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let Some((timestamp_ns, sensor)) =
+                kiko_slam::dataset::format::parse_frame_filename(file_name.as_ref())
+            else {
+                continue;
+            };
+            if sensor == "depth" {
+                entries.push((timestamp_ns, dir_entry.path()));
+            }
+        }
+        entries.sort_by_key(|(timestamp_ns, _)| *timestamp_ns);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            entries,
+            next: 0,
+            width: depth_meta.width,
+            height: depth_meta.height,
+            frame_seq: 0,
+        }))
+    }
+
+    fn push_until(
+        &mut self,
+        timestamp: kiko_slam::Timestamp,
+        ring: &mut DepthRingBuffer,
+    ) -> Result<(), std::io::Error> {
+        let cutoff = timestamp.as_nanos();
+        while let Some((depth_ts, path)) = self.entries.get(self.next) {
+            if *depth_ts > cutoff {
+                break;
+            }
+            let depth = read_depth_image_file(
+                path,
+                self.width,
+                self.height,
+                kiko_slam::FrameId::new(self.frame_seq),
+                kiko_slam::Timestamp::from_nanos(*depth_ts),
+            )?;
+            self.frame_seq = self.frame_seq.saturating_add(1);
+            ring.push(depth);
+            self.next = self.next.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+fn read_depth_image_file(
+    path: &Path,
+    width: u32,
+    height: u32,
+    frame_id: kiko_slam::FrameId,
+    timestamp: kiko_slam::Timestamp,
+) -> Result<DepthImage, std::io::Error> {
+    let bytes = std::fs::read(path)?;
+    let pixel_count = (width as usize).saturating_mul(height as usize);
+    let expected_len = pixel_count.saturating_mul(std::mem::size_of::<f32>());
+    if bytes.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "depth file {} length mismatch: expected {expected_len}, got {}",
+                path.display(),
+                bytes.len()
+            ),
+        ));
+    }
+
+    let mut depth_m = Vec::with_capacity(pixel_count);
+    for chunk in bytes.chunks_exact(4) {
+        depth_m.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+
+    DepthImage::new(frame_id, timestamp, width, height, depth_m).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid depth image at {}: {err}", path.display()),
+        )
+    })
+}
+
 fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats()?;
@@ -628,6 +731,31 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         intrinsics,
         tracker_config,
     );
+    let dense_enabled = env_bool("KIKO_DENSE").unwrap_or(false);
+    let depth_ring_capacity = env_usize("KIKO_OFFLINE_DEPTH_RING_CAPACITY")
+        .unwrap_or(8)
+        .max(4);
+    let mut depth_ring = DepthRingBuffer::new(depth_ring_capacity);
+    let mut depth_cursor = if dense_enabled {
+        match OfflineDepthCursor::new(&args.dataset.path, reader.meta().depth.as_ref()) {
+            Ok(cursor) => cursor,
+            Err(err) => {
+                eprintln!("failed to initialize offline depth stream: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut dense_state = dense_enabled.then(|| dense::DenseState::new(&DenseConfig::default()));
+    let mut dense_generation = 0_u64;
+    if dense_enabled {
+        eprintln!(
+            "offline dense enabled: depth_stream={} ring_capacity={}",
+            depth_cursor.is_some(),
+            depth_ring_capacity
+        );
+    }
 
     let start = Instant::now();
     let mut processed = 0usize;
@@ -648,10 +776,41 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let left = pair.left.clone();
         let right = pair.right.clone();
+        if let Some(cursor) = depth_cursor.as_mut() {
+            if let Err(err) = cursor.push_until(left.timestamp(), &mut depth_ring) {
+                eprintln!("offline depth decode failed; disabling dense: {err}");
+                depth_cursor = None;
+                dense_state = None;
+            }
+        }
 
         match tracker.process(pair) {
             Ok(output) => {
                 let timestamp = left.timestamp();
+                let dense_stats = if let Some(state) = dense_state.as_mut() {
+                    let correction = tracker.take_pending_loop_correction();
+                    let cmds = command_mapper::map_output_to_dense_commands(
+                        &output,
+                        correction.as_deref(),
+                        &depth_ring,
+                        timestamp,
+                        &mut dense_generation,
+                    );
+                    let mut latest = None;
+                    for cmd in cmds {
+                        latest = Some(dense::process_dense_command(state, cmd));
+                    }
+                    latest
+                } else {
+                    None
+                };
+                if let Some(depth) =
+                    depth_ring.find_closest(timestamp, command_mapper::MAX_ASSOCIATION_WINDOW_NS)
+                {
+                    if let Err(err) = sink.log_depth(&depth) {
+                        eprintln!("rerun depth error: {err}");
+                    }
+                }
                 if let Some(matches) = output.stereo_matches {
                     let points = output
                         .keyframe
@@ -692,10 +851,30 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("rerun event error: {err}");
                     }
                 }
+                if let Some(stats) = dense_stats.as_ref() {
+                    if let Err(err) = sink.log_dense_stats(timestamp, stats) {
+                        eprintln!("rerun dense stats error: {err}");
+                    }
+                }
                 processed += 1;
             }
             Err(err) => {
                 inference_errors += 1;
+                if let Some(state) = dense_state.as_mut() {
+                    if let Some(correction) = tracker.take_pending_loop_correction() {
+                        dense_generation = dense_generation.saturating_add(1);
+                        let stats = dense::process_dense_command(
+                            state,
+                            DenseCommand::RebuildFromSnapshot {
+                                corrected_poses: correction,
+                                generation: dense_generation,
+                            },
+                        );
+                        if let Err(log_err) = sink.log_dense_stats(left.timestamp(), &stats) {
+                            eprintln!("rerun dense stats error: {log_err}");
+                        }
+                    }
+                }
                 eprintln!("tracker error: {err}");
             }
         }

@@ -96,7 +96,11 @@ fn run_inference(
     height: u32,
     downscale: Option<DownscaleFactor>,
 ) -> Result<Detections, InferenceError> {
-    let outputs = session.run(ort::inputs!["image" => input_tensor])?;
+    let outputs = super::run_with_watchdog("superpoint", || {
+        session
+            .run(ort::inputs!["image" => input_tensor])
+            .map_err(InferenceError::Execution)
+    })?;
 
     let keypoints_value =
         outputs
