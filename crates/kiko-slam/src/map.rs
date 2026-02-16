@@ -240,9 +240,13 @@ impl CovisibilityGraph {
         let entry = self.edges.entry(a).or_default();
         if let Some(weight) = entry.get_mut(&b) {
             let next = weight.get() + 1;
-            *weight = NonZeroU32::new(next).expect("non-zero");
+            if let Some(next_non_zero) = NonZeroU32::new(next) {
+                *weight = next_non_zero;
+            } else {
+                debug_assert!(false, "covisibility weight overflowed to zero");
+            }
         } else {
-            entry.insert(b, NonZeroU32::new(1).expect("non-zero"));
+            entry.insert(b, NonZeroU32::MIN);
         }
     }
 
@@ -260,8 +264,10 @@ impl CovisibilityGraph {
                 let next = weight.get().saturating_sub(1);
                 if next == 0 {
                     neighbors.remove(&b);
+                } else if let Some(next_non_zero) = NonZeroU32::new(next) {
+                    neighbors.insert(b, next_non_zero);
                 } else {
-                    neighbors.insert(b, NonZeroU32::new(next).expect("non-zero"));
+                    debug_assert!(false, "covisibility decrement produced zero");
                 }
             }
             neighbors.is_empty()
