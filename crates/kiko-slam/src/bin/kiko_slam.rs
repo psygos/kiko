@@ -1686,7 +1686,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Err(payload) => {
                     return Err(format!(
                         "inference panic while processing frame: {}",
-                        panic_payload_to_string(payload.as_ref())
+                        kiko_slam::panic_payload_to_string(payload.as_ref())
                     ));
                 }
             }
@@ -1838,7 +1838,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference_result = inference_handle.join().map_err(|payload| {
         std::io::Error::other(format!(
             "inference thread panicked: {}",
-            panic_payload_to_string(payload.as_ref())
+            kiko_slam::panic_payload_to_string(payload.as_ref())
         ))
     })?;
     if let Err(err) = inference_result {
@@ -1848,7 +1848,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let viz_result = viz_handle.join().map_err(|payload| {
         std::io::Error::other(format!(
             "viz thread panicked: {}",
-            panic_payload_to_string(payload.as_ref())
+            kiko_slam::panic_payload_to_string(payload.as_ref())
         ))
     })?;
     if let Err(err) = viz_result {
@@ -1860,7 +1860,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         handle.join().map_err(|payload| {
             std::io::Error::other(format!(
                 "dense thread panicked: {}",
-                panic_payload_to_string(payload.as_ref())
+                kiko_slam::panic_payload_to_string(payload.as_ref())
             ))
         })?;
     }
@@ -1911,17 +1911,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
-}
-
-#[cfg(feature = "record")]
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "unknown panic payload".to_string()
 }
 
 #[cfg(feature = "record")]

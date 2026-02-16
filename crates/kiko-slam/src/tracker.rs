@@ -318,7 +318,7 @@ impl DescriptorWorker {
                         Err(payload) => DescriptorWorkerResponse::WorkerPanic {
                             keyframe_id: request.keyframe_id,
                             map_version: request.map_version,
-                            message: panic_payload_to_string(payload.as_ref()),
+                            message: crate::panic_payload_to_string(payload.as_ref()),
                         },
                     };
                     let should_stop =
@@ -362,16 +362,6 @@ impl DescriptorWorker {
             Err(TryRecvError::Disconnected) => Err(()),
         }
     }
-}
-
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(msg) = payload.downcast_ref::<&'static str>() {
-        return (*msg).to_string();
-    }
-    if let Some(msg) = payload.downcast_ref::<String>() {
-        return msg.clone();
-    }
-    "unknown panic payload".to_string()
 }
 
 #[derive(Clone, Copy, Debug, Default)]

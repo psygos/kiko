@@ -74,6 +74,16 @@ pub use triangulation::{
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 
+pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&'static str>() {
+        return (*msg).to_string();
+    }
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        return msg.clone();
+    }
+    "unknown panic payload".to_string()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SensorId {
     StereoLeft,
@@ -275,14 +285,14 @@ impl Frame {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Keypoint {
     pub x: f32,
     pub y: f32,
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Descriptor(pub [f32; 256]);
 
 impl Descriptor {
@@ -382,13 +392,8 @@ impl Detections {
         &self.keypoints
     }
 
-    #[allow(unsafe_code)]
     pub fn keypoints_flat(&self) -> &[f32] {
-        let len = self.keypoints.len() * 2;
-        let ptr = self.keypoints.as_ptr() as *const f32;
-        // Safety: Keypoint is #[repr(C)] over two f32 values, so this is a
-        // contiguous [f32; 2] slice with no padding.
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+        bytemuck::cast_slice(self.keypoints.as_slice())
     }
 
     pub fn scores(&self) -> &[f32] {
@@ -399,12 +404,8 @@ impl Detections {
         &self.descriptors
     }
 
-    #[allow(unsafe_code)]
     pub fn descriptors_flat(&self) -> &[f32] {
-        let len = self.descriptors.len() * 256;
-        let ptr = self.descriptors.as_ptr() as *const f32;
-        // Safety: Descriptor is #[repr(transparent)] over [f32; 256].
-        unsafe { std::slice::from_raw_parts(ptr, len) }
+        bytemuck::cast_slice(self.descriptors.as_slice())
     }
 
     pub fn len(&self) -> usize {

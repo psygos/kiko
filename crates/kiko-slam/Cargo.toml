@@ -11,6 +11,7 @@ ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]
 
 [dependencies]
+bytemuck = { version = "1.24.0", features = ["derive"] }
 clap = { version = "4.5.28", features = ["derive", "env"] }
 crossbeam-channel = "0.5.13"
 image = "0.25.9"
