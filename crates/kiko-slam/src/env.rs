@@ -1,6 +1,9 @@
-pub fn env_usize(key: &str) -> Option<usize> {
+fn env_parse<T>(key: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
     let raw = std::env::var(key).ok()?;
-    match raw.parse::<usize>() {
+    match raw.parse::<T>() {
         Ok(value) => Some(value),
         Err(_) => {
             eprintln!("invalid {key}={raw}, ignoring");
@@ -9,15 +12,12 @@ pub fn env_usize(key: &str) -> Option<usize> {
     }
 }
 
+pub fn env_usize(key: &str) -> Option<usize> {
+    env_parse(key)
+}
+
 pub fn env_f32(key: &str) -> Option<f32> {
-    let raw = std::env::var(key).ok()?;
-    match raw.parse::<f32>() {
-        Ok(value) => Some(value),
-        Err(_) => {
-            eprintln!("invalid {key}={raw}, ignoring");
-            None
-        }
-    }
+    env_parse(key)
 }
 
 pub fn env_bool(key: &str) -> Option<bool> {

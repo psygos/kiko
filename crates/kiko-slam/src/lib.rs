@@ -325,7 +325,11 @@ impl CompactDescriptor {
 
 #[derive(Debug)]
 pub enum DetectionError {
-    ShapeMismatch { msg: String },
+    ShapeMismatch {
+        keypoints_len: usize,
+        scores_len: usize,
+        descriptors_len: usize,
+    },
 }
 
 // i need to create invariant of descriptors.len() and keypoint.len() remain the same
@@ -405,8 +409,9 @@ impl Detections {
     ) -> Result<Self, DetectionError> {
         if keypoints.len() != descriptors.len() || descriptors.len() != scores.len() {
             return Err(DetectionError::ShapeMismatch {
-                msg: "There is a mismatch between sizes of descriptors, scores and keypoints"
-                    .to_string(),
+                keypoints_len: keypoints.len(),
+                scores_len: scores.len(),
+                descriptors_len: descriptors.len(),
             });
         }
 
@@ -634,6 +639,11 @@ pub struct Verified;
 
 #[derive(Debug)]
 pub enum MatchError {
+    Mismatch {
+        score_len: usize,
+        indices_len: usize,
+    },
+    #[deprecated(note = "Use MatchError::Mismatch")]
     MissMatch {
         score_len: usize,
         indices_len: usize,
@@ -656,19 +666,7 @@ impl Matches<Raw> {
         indices: Vec<(usize, usize)>,
         scores: Vec<f32>,
     ) -> Result<Self, MatchError> {
-        if indices.len() != scores.len() {
-            return Err(MatchError::MissMatch {
-                score_len: (scores.len()),
-                indices_len: (indices.len()),
-            });
-        }
-        Ok(Self {
-            source_a,
-            source_b,
-            indices,
-            scores,
-            _state: PhantomData,
-        })
+        Matches::<Raw>::from_parts(source_a, source_b, indices, scores)
     }
 
     pub fn with_landmarks(&self, keyframe: &Keyframe) -> Result<Matches<Verified>, MatchError> {
@@ -692,10 +690,21 @@ impl Matches<Verified> {
         indices: Vec<(usize, usize)>,
         scores: Vec<f32>,
     ) -> Result<Self, MatchError> {
+        Matches::<Verified>::from_parts(source_a, source_b, indices, scores)
+    }
+}
+
+impl<State> Matches<State> {
+    fn from_parts(
+        source_a: Arc<Detections>,
+        source_b: Arc<Detections>,
+        indices: Vec<(usize, usize)>,
+        scores: Vec<f32>,
+    ) -> Result<Self, MatchError> {
         if indices.len() != scores.len() {
-            return Err(MatchError::MissMatch {
-                score_len: (scores.len()),
-                indices_len: (indices.len()),
+            return Err(MatchError::Mismatch {
+                score_len: scores.len(),
+                indices_len: indices.len(),
             });
         }
         Ok(Self {
@@ -706,9 +715,7 @@ impl Matches<Verified> {
             _state: PhantomData,
         })
     }
-}
 
-impl<State> Matches<State> {
     pub fn len(&self) -> usize {
         self.indices.len()
     }
