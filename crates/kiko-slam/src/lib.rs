@@ -1,4 +1,3 @@
-#![warn(clippy::all)]
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -7,8 +6,9 @@ pub use inference::{
     EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
 };
 mod channel;
-mod depth;
 pub mod dataset;
+pub mod dense;
+mod depth;
 mod diagnostics;
 pub mod env;
 mod inference;
@@ -30,9 +30,10 @@ mod tracker;
 mod triangulation;
 mod viz;
 pub use channel::{
-    bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
-    DropPolicy, DropReceiver, DropSender, SendOutcome,
+    ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
+    DropReceiver, DropSender, SendOutcome, bounded_channel,
 };
+pub use dense::{DenseCommand, DenseConfig, DenseStats, ReconState};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
@@ -43,11 +44,11 @@ pub use local_ba::{
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, GlobalDescriptor,
-    GlobalDescriptorError, KeyframeDatabase, LoopCandidate, LoopClosureConfig,
-    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
-    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
-    RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
+    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
+    LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError,
+    LoopVerificationError, PlaceMatch, RelocalizationCandidate, RelocalizationConfig,
+    RelocalizationConfigError, RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop,
+    VerifiedRelocalization, aggregate_global_descriptor, match_descriptors_for_loop,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
@@ -58,8 +59,8 @@ pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
 pub use pnp::{
-    build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation,
-    PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
+    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
+    build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, DegradationLevel,
@@ -360,6 +361,7 @@ impl Detections {
         &self.keypoints
     }
 
+    #[allow(unsafe_code)]
     pub fn keypoints_flat(&self) -> &[f32] {
         let len = self.keypoints.len() * 2;
         let ptr = self.keypoints.as_ptr() as *const f32;
@@ -376,6 +378,7 @@ impl Detections {
         &self.descriptors
     }
 
+    #[allow(unsafe_code)]
     pub fn descriptors_flat(&self) -> &[f32] {
         let len = self.descriptors.len() * 256;
         let ptr = self.descriptors.as_ptr() as *const f32;
@@ -890,7 +893,7 @@ mod tests {
         for (idx, value) in data.iter_mut().enumerate() {
             *value = ((idx * 7) % 251) as u8;
         }
-        let a = CompactDescriptor(data.clone());
+        let a = CompactDescriptor(data);
         let b = CompactDescriptor(data);
         let sim = a.cosine_similarity(&b);
         assert!((sim - 1.0).abs() < 1e-6, "sim={sim}");
@@ -900,11 +903,11 @@ mod tests {
     fn compact_descriptor_cosine_orthogonal_is_zeroish() {
         let mut a = [0_u8; 256];
         let mut b = [0_u8; 256];
-        for i in 0..128 {
-            a[i] = 255;
+        for value in a.iter_mut().take(128) {
+            *value = 255;
         }
-        for i in 128..256 {
-            b[i] = 255;
+        for value in b.iter_mut().skip(128) {
+            *value = 255;
         }
         let sim = CompactDescriptor(a).cosine_similarity(&CompactDescriptor(b));
         assert!(sim.abs() < 1e-6, "sim={sim}");

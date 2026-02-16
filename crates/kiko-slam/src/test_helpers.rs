@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
-    math, Detections, Descriptor, DetectionError, FrameId, IntrinsicsError, Keypoint, MatchError,
+    Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint, MatchError,
     Matches, Observation, PinholeIntrinsics, PnpError, Point3, Pose, Raw, RectifiedStereo,
-    RectifiedStereoConfig, RectifiedStereoError, SensorId,
+    RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp, math,
 };
 
 #[derive(Debug)]
@@ -268,18 +268,10 @@ pub(crate) fn axis_angle_pose(translation: [f32; 3], axis_angle: [f32; 3]) -> Po
 fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
     let theta = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
     if theta < 1e-6 {
-        return [
-            [1.0, -w[2], w[1]],
-            [w[2], 1.0, -w[0]],
-            [-w[1], w[0], 1.0],
-        ];
+        return [[1.0, -w[2], w[1]], [w[2], 1.0, -w[0]], [-w[1], w[0], 1.0]];
     }
     let k = [w[0] / theta, w[1] / theta, w[2] / theta];
-    let kx = [
-        [0.0, -k[2], k[1]],
-        [k[2], 0.0, -k[0]],
-        [-k[1], k[0], 0.0],
-    ];
+    let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
     let sin_t = theta.sin();
     let cos_t = theta.cos();
     let mut kx2 = [[0.0_f32; 3]; 3];
@@ -291,12 +283,23 @@ fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
     let mut r = [[0.0_f32; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
-            r[i][j] = if i == j { 1.0 } else { 0.0 }
-                + sin_t * kx[i][j]
-                + (1.0 - cos_t) * kx2[i][j];
+            r[i][j] = if i == j { 1.0 } else { 0.0 } + sin_t * kx[i][j] + (1.0 - cos_t) * kx2[i][j];
         }
     }
     r
+}
+
+pub(crate) fn make_depth_image(
+    frame_id: FrameId,
+    timestamp: Timestamp,
+    width: u32,
+    height: u32,
+    fill_value: f32,
+) -> crate::DepthImage {
+    let pixels = (width as usize) * (height as usize);
+    let data = vec![fill_value; pixels];
+    crate::DepthImage::new(frame_id, timestamp, width, height, data)
+        .expect("make_depth_image: valid dimensions")
 }
 
 fn indexed_descriptor(index: usize) -> Descriptor {

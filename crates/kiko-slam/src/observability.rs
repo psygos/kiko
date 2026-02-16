@@ -1,3 +1,4 @@
+use crate::dense::{DenseStats, ReconState};
 use crate::{
     BaResult, DegradationLevel, DiagnosticEvent, FrameDiagnostics, LoopClosureRejectReason,
     RerunSink, SystemHealth, Timestamp, TrackingHealth, VizLogError,
@@ -48,6 +49,12 @@ const PATH_BA_ITERATIONS: &str = "diagnostics/ba/iterations";
 
 const PATH_LOOP_CANDIDATES: &str = "diagnostics/loop/candidates";
 const PATH_LOOP_APPLIED: &str = "diagnostics/loop/applied";
+
+const PATH_DENSE_INTEGRATED: &str = "diagnostics/dense/integrated_count";
+const PATH_DENSE_REMOVED: &str = "diagnostics/dense/removed_count";
+const PATH_DENSE_REBUILT: &str = "diagnostics/dense/rebuild_count";
+const PATH_DENSE_STORED: &str = "diagnostics/dense/stored_keyframes";
+const PATH_DENSE_STATE: &str = "diagnostics/dense/state";
 
 const PATH_EVENTS_LOG: &str = "diagnostics/events/log";
 
@@ -143,10 +150,9 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             format!("tracking lost after {consecutive_failures} consecutive failures"),
             rerun::TextLogLevel::WARN,
         ),
-        DiagnosticEvent::TrackingRecovered => (
-            "tracking recovered".to_string(),
-            rerun::TextLogLevel::INFO,
-        ),
+        DiagnosticEvent::TrackingRecovered => {
+            ("tracking recovered".to_string(), rerun::TextLogLevel::INFO)
+        }
         DiagnosticEvent::KeyframeCreated {
             keyframe_id,
             landmarks,
@@ -176,9 +182,7 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
                 LoopClosureRejectReason::TooFewCorrespondences { count } => {
                     format!("too few correspondences ({count})")
                 }
-                LoopClosureRejectReason::VerificationFailed => {
-                    "verification failed".to_string()
-                }
+                LoopClosureRejectReason::VerificationFailed => "verification failed".to_string(),
                 LoopClosureRejectReason::CorrectionTooLarge {
                     translation_m,
                     rotation_deg,
@@ -325,13 +329,45 @@ impl RerunSink {
         )?;
         Ok(())
     }
+
+    pub fn log_dense_stats(
+        &self,
+        timestamp: Timestamp,
+        stats: &DenseStats,
+    ) -> Result<(), VizLogError> {
+        let rec = self.recording();
+        set_capture_time(rec, timestamp);
+        rec.log(
+            PATH_DENSE_INTEGRATED,
+            &rerun::Scalars::single(stats.integrated_count as f64),
+        )?;
+        rec.log(
+            PATH_DENSE_REMOVED,
+            &rerun::Scalars::single(stats.removed_count as f64),
+        )?;
+        rec.log(
+            PATH_DENSE_REBUILT,
+            &rerun::Scalars::single(stats.rebuild_count as f64),
+        )?;
+        rec.log(
+            PATH_DENSE_STORED,
+            &rerun::Scalars::single(stats.stored_keyframes as f64),
+        )?;
+        let state_scalar = match stats.state {
+            ReconState::Nominal => 0.0,
+            ReconState::Rebuilding { .. } => 1.0,
+            ReconState::Down => 2.0,
+        };
+        rec.log(PATH_DENSE_STATE, &rerun::Scalars::single(state_scalar))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        diagnostics_scalars, format_event, PATH_HEALTH_INLIER_RATIO, PATH_MAP_KEYFRAMES,
-        PATH_MAP_POINTS,
+        PATH_HEALTH_INLIER_RATIO, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS, diagnostics_scalars,
+        format_event,
     };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
@@ -342,12 +378,16 @@ mod tests {
     fn diagnostics_scalars_empty_has_baselines() {
         let diag = FrameDiagnostics::empty(5, 13);
         let scalars = diagnostics_scalars(&diag);
-        assert!(scalars
-            .iter()
-            .any(|(path, value)| *path == PATH_MAP_KEYFRAMES && *value == 5.0));
-        assert!(scalars
-            .iter()
-            .any(|(path, value)| *path == PATH_MAP_POINTS && *value == 13.0));
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, value)| *path == PATH_MAP_KEYFRAMES && *value == 5.0)
+        );
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, value)| *path == PATH_MAP_POINTS && *value == 13.0)
+        );
     }
 
     #[test]
@@ -370,12 +410,16 @@ mod tests {
                 .any(|(path, value)| *path == PATH_HEALTH_INLIER_RATIO
                     && (*value - 0.75).abs() < 1e-6)
         );
-        assert!(scalars
-            .iter()
-            .any(|(path, _)| *path == "diagnostics/tracking/features_detected"));
-        assert!(scalars
-            .iter()
-            .any(|(path, _)| *path == "diagnostics/triangulation/candidates"));
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, _)| *path == "diagnostics/tracking/features_detected")
+        );
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, _)| *path == "diagnostics/triangulation/candidates")
+        );
     }
 
     #[test]

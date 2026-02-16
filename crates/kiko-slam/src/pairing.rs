@@ -48,24 +48,38 @@ pub struct StereoPairer {
     window: PairingWindowNs,
     left: VecDeque<Frame>,
     right: VecDeque<Frame>,
+    max_pending_per_side: usize,
     stats: PairingStats,
 }
 
 impl StereoPairer {
     pub fn new(window: PairingWindowNs) -> Self {
+        Self::new_with_max_pending(window, 64)
+    }
+
+    pub fn new_with_max_pending(window: PairingWindowNs, max_pending_per_side: usize) -> Self {
         Self {
             window,
             left: VecDeque::new(),
             right: VecDeque::new(),
+            max_pending_per_side: max_pending_per_side.max(1),
             stats: PairingStats::default(),
         }
     }
 
     pub fn push_left(&mut self, frame: Frame) {
+        if self.left.len() >= self.max_pending_per_side {
+            self.left.pop_front();
+            self.stats.dropped_left = self.stats.dropped_left.saturating_add(1);
+        }
         self.left.push_back(frame);
     }
 
     pub fn push_right(&mut self, frame: Frame) {
+        if self.right.len() >= self.max_pending_per_side {
+            self.right.pop_front();
+            self.stats.dropped_right = self.stats.dropped_right.saturating_add(1);
+        }
         self.right.push_back(frame);
     }
 
@@ -83,11 +97,13 @@ impl StereoPairer {
             };
 
             if best_delta <= self.window.as_ns() {
-                let left = self.left.pop_front().expect("left frame should exist");
-                let right = self
-                    .right
-                    .remove(best_idx)
-                    .expect("right frame should exist");
+                let Some(left) = self.left.pop_front() else {
+                    return Ok(None);
+                };
+                let Some(right) = self.right.remove(best_idx) else {
+                    self.left.push_front(left);
+                    return Ok(None);
+                };
                 let pair = StereoPair::try_new(left, right, self.window)?;
                 self.stats.paired += 1;
                 return Ok(Some(pair));
@@ -113,6 +129,10 @@ impl StereoPairer {
         self.window
     }
 
+    pub fn max_pending_per_side(&self) -> usize {
+        self.max_pending_per_side
+    }
+
     fn best_right(&self, left_ts: i64) -> Option<(usize, i64, i64)> {
         if self.right.is_empty() {
             return None;
@@ -133,5 +153,59 @@ impl StereoPairer {
         }
 
         Some((best_idx, best_delta, best_ts))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FrameId, SensorId, Timestamp};
+
+    fn frame(sensor: SensorId, ts_ns: i64, id: u64) -> Frame {
+        Frame::new(
+            sensor,
+            FrameId::new(id),
+            Timestamp::from_nanos(ts_ns),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("valid frame")
+    }
+
+    #[test]
+    fn pending_left_is_capped() {
+        let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
+        let mut pairer = StereoPairer::new_with_max_pending(window, 2);
+        pairer.push_left(frame(SensorId::StereoLeft, 1, 1));
+        pairer.push_left(frame(SensorId::StereoLeft, 2, 2));
+        pairer.push_left(frame(SensorId::StereoLeft, 3, 3));
+
+        assert_eq!(pairer.stats().dropped_left, 1);
+        assert_eq!(pairer.max_pending_per_side(), 2);
+    }
+
+    #[test]
+    fn pending_right_is_capped() {
+        let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
+        let mut pairer = StereoPairer::new_with_max_pending(window, 2);
+        pairer.push_right(frame(SensorId::StereoRight, 1, 1));
+        pairer.push_right(frame(SensorId::StereoRight, 2, 2));
+        pairer.push_right(frame(SensorId::StereoRight, 3, 3));
+
+        assert_eq!(pairer.stats().dropped_right, 1);
+    }
+
+    #[test]
+    fn next_pair_returns_none_when_side_becomes_empty() {
+        let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
+        let mut pairer = StereoPairer::new_with_max_pending(window, 1);
+        pairer.push_left(frame(SensorId::StereoLeft, 10, 1));
+        assert!(
+            pairer
+                .next_pair()
+                .expect("pairing should not fail")
+                .is_none()
+        );
     }
 }

@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
@@ -157,6 +157,11 @@ impl<T> DropReceiver<T> {
 
     pub fn iter(&self) -> crossbeam_channel::Iter<'_, T> {
         self.rx.iter()
+    }
+
+    /// Expose the inner crossbeam receiver for use in `crossbeam_channel::select!`.
+    pub fn as_receiver(&self) -> &Receiver<T> {
+        &self.rx
     }
 }
 

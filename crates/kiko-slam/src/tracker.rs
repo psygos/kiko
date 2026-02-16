@@ -7,22 +7,23 @@ use std::thread;
 use std::time::Instant;
 
 use crate::loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
-    LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch, RelocalizationCandidate,
-    RelocalizationConfig, VerifiedLoop,
+    DescriptorSource, KeyframeDatabase, LoopCandidate, LoopClosureConfig, LoopDetectError,
+    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
+    aggregate_global_descriptor, match_descriptors_for_loop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
     PoseGraphOptimizer,
 };
 use crate::{
+    BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor, EigenPlaces, Frame,
+    FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit, LightGlue,
+    LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation, Matches,
+    ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw,
+    RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
+    Triangulator, Verified,
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac, BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor,
-    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit,
-    LightGlue, LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
-    Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose,
-    RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
-    TriangulationError, Triangulator, Verified,
+    solve_pnp_ransac,
 };
 
 use crate::inference::InferenceError;
@@ -402,8 +403,8 @@ impl DescriptorSupervisor {
         })
     }
 
-    fn spawn(config: GlobalDescriptorConfig) -> Self {
-        Self::with_factory_and_max_respawns(config, Self::default_factory(), 3)
+    fn spawn_with_max_respawns(config: GlobalDescriptorConfig, max_respawns: u32) -> Self {
+        Self::with_factory_and_max_respawns(config, Self::default_factory(), max_respawns)
     }
 
     fn with_factory_and_max_respawns(
@@ -805,20 +806,35 @@ impl BackendWorker {
 
                     match processing {
                         Ok(Ok(correction)) => {
-                            let _ = tx_resp.send(BackendResponse::Correction(correction));
+                            if tx_resp
+                                .send(BackendResponse::Correction(correction))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         Ok(Err(err)) => {
-                            let _ = tx_resp.send(BackendResponse::Failure {
-                                request_id,
-                                map_version,
-                                error: BackendWorkerError::BuildCorrection(err),
-                            });
+                            if tx_resp
+                                .send(BackendResponse::Failure {
+                                    request_id,
+                                    map_version,
+                                    error: BackendWorkerError::BuildCorrection(err),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         Err(_) => {
-                            let _ = tx_resp.send(BackendResponse::WorkerPanic {
-                                request_id,
-                                map_version,
-                            });
+                            if tx_resp
+                                .send(BackendResponse::WorkerPanic {
+                                    request_id,
+                                    map_version,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
                             break;
                         }
                     }
@@ -865,10 +881,11 @@ struct BackendSupervisor {
 }
 
 impl BackendSupervisor {
-    fn spawn(
+    fn spawn_with_max_respawns(
         config: BackendConfig,
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
+        max_respawns: u32,
     ) -> Self {
         Self {
             worker: Some(BackendWorker::spawn(config, intrinsics, ba_config)),
@@ -876,7 +893,7 @@ impl BackendSupervisor {
             intrinsics,
             ba_config,
             respawn_count: 0,
-            max_respawns: 3,
+            max_respawns,
         }
     }
 
@@ -887,9 +904,7 @@ impl BackendSupervisor {
         ba_config: LocalBaConfig,
         max_respawns: u32,
     ) -> Self {
-        let mut supervisor = Self::spawn(config, intrinsics, ba_config);
-        supervisor.max_respawns = max_respawns;
-        supervisor
+        Self::spawn_with_max_respawns(config, intrinsics, ba_config, max_respawns)
     }
 
     fn check_health(&mut self) {
@@ -1153,11 +1168,7 @@ impl DegradationLevel {
     }
 
     pub fn worst(a: Self, b: Self) -> Self {
-        if a.rank() >= b.rank() {
-            a
-        } else {
-            b
-        }
+        if a.rank() >= b.rank() { a } else { b }
     }
 }
 
@@ -1288,6 +1299,7 @@ pub struct SlamTracker {
     pending_loop: Option<PendingLoopCandidate>,
     loop_streak: HashMap<KeyframeId, usize>,
     pending_events: Vec<DiagnosticEvent>,
+    pending_loop_correction: Option<Vec<(KeyframeId, Pose)>>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
@@ -1307,13 +1319,26 @@ impl SlamTracker {
     ) -> Self {
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
-        let backend = config
-            .backend
-            .map(|backend_cfg| BackendSupervisor::spawn(backend_cfg, intrinsics, config.ba));
+        let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(3);
+        let backend = config.backend.map(|backend_cfg| {
+            BackendSupervisor::spawn_with_max_respawns(
+                backend_cfg,
+                intrinsics,
+                config.ba,
+                backend_max_respawns,
+            )
+        });
         let loop_config = config.loop_closure;
         let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
+        let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(3);
         let descriptor_worker = if loop_config.is_some() {
-            config.global_descriptor.map(DescriptorSupervisor::spawn)
+            config.global_descriptor.map(|cfg| {
+                DescriptorSupervisor::spawn_with_max_respawns(cfg, descriptor_max_respawns)
+            })
         } else {
             None
         };
@@ -1340,6 +1365,7 @@ impl SlamTracker {
             pending_loop: None,
             loop_streak: HashMap::new(),
             pending_events: Vec::new(),
+            pending_loop_correction: None,
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
@@ -1432,14 +1458,28 @@ impl SlamTracker {
     }
 
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
-        apply_loop_closure_correction(
+        let corrected = apply_loop_closure_correction(
             &mut self.map,
             &mut self.essential_graph,
             &self.pose_graph_optimizer,
             &verified,
         )?;
+        self.pending_loop_correction = if corrected.is_empty() {
+            None
+        } else {
+            Some(corrected)
+        };
         self.bump_map_version();
         Ok(())
+    }
+
+    /// Take the pending loop closure correction, if any.
+    ///
+    /// Returns the corrected poses produced by the most recent
+    /// `apply_loop_closure` call. The caller (pipeline) uses this to
+    /// send a `RebuildFromSnapshot` command to the dense worker.
+    pub fn take_pending_loop_correction(&mut self) -> Option<Vec<(KeyframeId, Pose)>> {
+        self.pending_loop_correction.take()
     }
 
     fn bump_map_version(&mut self) {
@@ -2120,7 +2160,10 @@ impl SlamTracker {
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
                 if self.trace_transitions {
-                    eprintln!("relocalization confirmation pending frame={}", frame_id.as_u64());
+                    eprintln!(
+                        "relocalization confirmation pending frame={}",
+                        frame_id.as_u64()
+                    );
                 }
             }
         }
@@ -2491,39 +2534,40 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         let StereoPair { left, right } = pair;
         let frame_id = left.frame_id();
-        let (output, keyframe_id) =
-            match self.create_keyframe_internal(left, right, pose_world, None, None) {
-                Ok(value) => value,
-                Err(TrackerError::KeyframeRejected { landmarks }) => {
-                    if self.trace_transitions {
-                        eprintln!(
-                            "keyframe bootstrap rejected frame={} landmarks={} -> staying in NeedKeyframe",
-                            frame_id.as_u64(),
-                            landmarks
-                        );
-                    }
-                    let mut diagnostics = self.empty_diagnostics();
-                    diagnostics.keyframe_created = false;
-                    return Ok(self.output_with_diagnostics(
-                        self.last_pose_world,
-                        0,
-                        None,
-                        None,
-                        frame_id,
-                        TrackingHealth::Degraded,
-                        diagnostics,
-                    ));
+        let (output, keyframe_id) = match self
+            .create_keyframe_internal(left, right, pose_world, None, None)
+        {
+            Ok(value) => value,
+            Err(TrackerError::KeyframeRejected { landmarks }) => {
+                if self.trace_transitions {
+                    eprintln!(
+                        "keyframe bootstrap rejected frame={} landmarks={} -> staying in NeedKeyframe",
+                        frame_id.as_u64(),
+                        landmarks
+                    );
                 }
-                Err(err) => {
-                    if self.trace_transitions {
-                        eprintln!(
-                            "keyframe bootstrap rejected frame={} error={err}",
-                            frame_id.as_u64()
-                        );
-                    }
-                    return Err(err);
+                let mut diagnostics = self.empty_diagnostics();
+                diagnostics.keyframe_created = false;
+                return Ok(self.output_with_diagnostics(
+                    self.last_pose_world,
+                    0,
+                    None,
+                    None,
+                    frame_id,
+                    TrackingHealth::Degraded,
+                    diagnostics,
+                ));
+            }
+            Err(err) => {
+                if self.trace_transitions {
+                    eprintln!(
+                        "keyframe bootstrap rejected frame={} error={err}",
+                        frame_id.as_u64()
+                    );
                 }
-            };
+                return Err(err);
+            }
+        };
         let keyframe = output.keyframe.clone().expect("keyframe");
         self.state = TrackerState::Tracking {
             keyframe,
@@ -2859,7 +2903,7 @@ fn apply_loop_closure_correction(
     essential_graph: &mut EssentialGraph,
     optimizer: &PoseGraphOptimizer,
     verified: &VerifiedLoop,
-) -> Result<(), TrackerError> {
+) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
     let query_kf = verified.query_kf();
     let match_kf = verified.match_kf();
     let match_pose = map
@@ -2883,7 +2927,7 @@ fn apply_loop_closure_correction(
 
     let input = essential_graph.pose_graph_input();
     if input.keyframe_ids.len() < 2 || input.edges.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut old_poses = HashMap::with_capacity(input.keyframe_ids.len());
@@ -2968,7 +3012,7 @@ fn apply_loop_closure_correction(
         map.set_map_point_position(point_id, corrected_world)?;
     }
 
-    Ok(())
+    Ok(corrected_poses.into_iter().collect())
 }
 
 fn loop_translation_norm(pose: Pose) -> f32 {
@@ -3052,13 +3096,53 @@ fn build_map_observations(
     Ok(observations)
 }
 
+fn median_parallax_px(
+    matches: &Matches<Verified>,
+    inliers: &[usize],
+    keyframe: &Keyframe,
+) -> Option<f32> {
+    if inliers.is_empty() {
+        return None;
+    }
+
+    let left_kps = matches.source_a().keypoints();
+    let key_kps = keyframe.detections().keypoints();
+    let mut parallax = Vec::with_capacity(inliers.len());
+
+    for &idx in inliers {
+        let Some(&(li, ki)) = matches.indices().get(idx) else {
+            continue;
+        };
+        let (Some(left), Some(key)) = (left_kps.get(li), key_kps.get(ki)) else {
+            continue;
+        };
+        let dx = left.x - key.x;
+        let dy = left.y - key.y;
+        parallax.push((dx * dx + dy * dy).sqrt());
+    }
+
+    if parallax.is_empty() {
+        return None;
+    }
+
+    parallax.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let mid = parallax.len() / 2;
+    let median = if parallax.len() % 2 == 0 {
+        (parallax[mid - 1] + parallax[mid]) * 0.5
+    } else {
+        parallax[mid]
+    };
+
+    Some(median)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
     use crate::{CompactDescriptor, Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     fn make_descriptor() -> Descriptor {
@@ -4074,18 +4158,22 @@ mod tests {
     #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
         let detections = make_test_detections(900);
-        assert!(SlamTracker::initial_relocalization_session(
-            TrackingHealth::Good,
-            true,
-            Arc::clone(&detections)
-        )
-        .is_none());
-        assert!(SlamTracker::initial_relocalization_session(
-            TrackingHealth::Lost,
-            false,
-            Arc::clone(&detections)
-        )
-        .is_none());
+        assert!(
+            SlamTracker::initial_relocalization_session(
+                TrackingHealth::Good,
+                true,
+                Arc::clone(&detections)
+            )
+            .is_none()
+        );
+        assert!(
+            SlamTracker::initial_relocalization_session(
+                TrackingHealth::Lost,
+                false,
+                Arc::clone(&detections)
+            )
+            .is_none()
+        );
 
         let session = SlamTracker::initial_relocalization_session(
             TrackingHealth::Lost,
@@ -4246,44 +4334,4 @@ mod tests {
             cfg
         ));
     }
-}
-
-fn median_parallax_px(
-    matches: &Matches<Verified>,
-    inliers: &[usize],
-    keyframe: &Keyframe,
-) -> Option<f32> {
-    if inliers.is_empty() {
-        return None;
-    }
-
-    let left_kps = matches.source_a().keypoints();
-    let key_kps = keyframe.detections().keypoints();
-    let mut parallax = Vec::with_capacity(inliers.len());
-
-    for &idx in inliers {
-        let Some(&(li, ki)) = matches.indices().get(idx) else {
-            continue;
-        };
-        let (Some(left), Some(key)) = (left_kps.get(li), key_kps.get(ki)) else {
-            continue;
-        };
-        let dx = left.x - key.x;
-        let dy = left.y - key.y;
-        parallax.push((dx * dx + dy * dy).sqrt());
-    }
-
-    if parallax.is_empty() {
-        return None;
-    }
-
-    parallax.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let mid = parallax.len() / 2;
-    let median = if parallax.len() % 2 == 0 {
-        (parallax[mid - 1] + parallax[mid]) * 0.5
-    } else {
-        parallax[mid]
-    };
-
-    Some(median)
 }
