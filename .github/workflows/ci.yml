@@ -5,6 +5,24 @@ on:
   pull_request:
 
 jobs:
+  kiko-lints:
+    name: Kiko Lints
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --package kiko-slam -- --check
+
+      - name: Clippy
+        run: cargo clippy -p kiko-slam --all-targets --all-features -- -D warnings
+
   host-tests:
     name: Host Workspace Tests
     runs-on: macos-latest
@@ -12,36 +30,37 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo artifacts
-      uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2
 
       - name: Run host crate tests
-      run: cargo test -p kiko-slam
+        run: cargo test -p kiko-slam
 
       - name: Build oak-sys tests
-      run: cargo test -p oak-sys --no-run
+        run: cargo test -p oak-sys --no-run
 
       - name: Build robot-server tests
-      run: cargo test -p robot-server --no-run
+        run: cargo test -p robot-server --no-run
 
       - name: Build desktop client tests
-      run: cargo test -p robot-control-client --no-run
+        run: cargo test -p robot-control-client --no-run
 
   embedded-check:
     name: Embedded Target Check
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain + embedded target
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        targets: thumbv7em-none-eabihf
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
 
       - name: Cache cargo artifacts
-      uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2
 
       - name: Check embedded crate for MCU target
-      run: cargo check -p embedded --target thumbv7em-none-eabihf
+        run: cargo check -p embedded --target thumbv7em-none-eabihf

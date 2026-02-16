@@ -9,6 +9,12 @@ members = [
 ]
 default-members = ["crates/kiko-slam"]
 
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
 [profile.release.package.embedded]
 opt-level = "z"
 debug = true
