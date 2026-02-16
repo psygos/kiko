@@ -332,6 +332,23 @@ pub enum DetectionError {
     },
 }
 
+impl std::fmt::Display for DetectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DetectionError::ShapeMismatch {
+                keypoints_len,
+                scores_len,
+                descriptors_len,
+            } => write!(
+                f,
+                "detections shape mismatch: keypoints={keypoints_len}, scores={scores_len}, descriptors={descriptors_len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DetectionError {}
+
 // i need to create invariant of descriptors.len() and keypoint.len() remain the same
 #[derive(Debug, Clone)]
 pub struct Detections {
@@ -643,12 +660,32 @@ pub enum MatchError {
         score_len: usize,
         indices_len: usize,
     },
-    #[deprecated(note = "Use MatchError::Mismatch")]
+    #[doc(hidden)]
     MissMatch {
         score_len: usize,
         indices_len: usize,
     },
 }
+
+impl std::fmt::Display for MatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatchError::Mismatch {
+                score_len,
+                indices_len,
+            }
+            | MatchError::MissMatch {
+                score_len,
+                indices_len,
+            } => write!(
+                f,
+                "match shape mismatch: scores={score_len}, indices={indices_len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MatchError {}
 
 #[derive(Debug)]
 pub struct Matches<State> {

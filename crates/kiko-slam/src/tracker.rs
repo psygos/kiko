@@ -813,6 +813,9 @@ impl BackendWorker {
                                 .send(BackendResponse::Correction(correction))
                                 .is_err()
                             {
+                                eprintln!(
+                                    "backend response channel disconnected during correction send"
+                                );
                                 break;
                             }
                         }
@@ -825,6 +828,9 @@ impl BackendWorker {
                                 })
                                 .is_err()
                             {
+                                eprintln!(
+                                    "backend response channel disconnected during failure send"
+                                );
                                 break;
                             }
                         }
@@ -836,6 +842,9 @@ impl BackendWorker {
                                 })
                                 .is_err()
                             {
+                                eprintln!(
+                                    "backend response channel disconnected during panic send"
+                                );
                                 break;
                             }
                             break;

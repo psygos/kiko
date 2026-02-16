@@ -743,8 +743,12 @@ impl SlamMap {
         let mut observations = Vec::new();
         for (idx, point_id) in entry.point_refs.iter().enumerate() {
             if point_id.is_some() {
-                let index =
-                    KeypointIndex::new(idx, entry.len()).expect("keypoint index within bounds");
+                let index = KeypointIndex::new(idx, entry.len()).ok_or(
+                    MapError::KeypointIndexOutOfBounds {
+                        index: idx,
+                        len: entry.len(),
+                    },
+                )?;
                 let keypoint_ref = KeyframeKeypoint { keyframe_id, index };
                 observations.push((keypoint_ref, entry.keypoints[idx]));
             }
@@ -770,7 +774,10 @@ impl SlamMap {
                 .get(*point_id)
                 .ok_or(MapError::MapPointNotFound(*point_id))?;
             let index =
-                KeypointIndex::new(idx, entry.len()).expect("point refs length matches keypoints");
+                KeypointIndex::new(idx, entry.len()).ok_or(MapError::KeypointIndexOutOfBounds {
+                    index: idx,
+                    len: entry.len(),
+                })?;
             descriptors.push((
                 KeyframeKeypoint { keyframe_id, index },
                 point.descriptor().clone(),
