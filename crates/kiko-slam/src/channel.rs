@@ -151,6 +151,10 @@ impl<T> DropReceiver<T> {
         self.rx.recv()
     }
 
+    pub fn try_recv(&self) -> Result<T, crossbeam_channel::TryRecvError> {
+        self.rx.try_recv()
+    }
+
     pub fn iter(&self) -> crossbeam_channel::Iter<'_, T> {
         self.rx.iter()
     }

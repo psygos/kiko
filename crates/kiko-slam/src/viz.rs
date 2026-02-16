@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    env::env_f32, CovisibilitySnapshot, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
-    VizPacket,
+    env::env_f32, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw,
+    Timestamp, VizPacket,
 };
 
 use std::collections::HashMap;
@@ -82,6 +82,7 @@ pub struct RerunSink {
     rec: rerun::RecordingStream,
     decimation: VizDecimation,
     frame_index: u64,
+    depth_index: u64,
     tracks: TrackState,
     trajectory: Vec<[f32; 3]>,
     logged_world: bool,
@@ -93,6 +94,7 @@ impl RerunSink {
             rec,
             decimation,
             frame_index: 0,
+            depth_index: 0,
             tracks: TrackState::new(),
             trajectory: Vec::new(),
             logged_world: false,
@@ -130,6 +132,29 @@ impl RerunSink {
         .with_draw_order(0.0);
         self.rec.log("view/right", &right_image)?;
 
+        Ok(())
+    }
+
+    pub fn log_depth(&mut self, depth: &DepthImage) -> Result<(), VizLogError> {
+        let index = self.depth_index;
+        self.depth_index = self.depth_index.saturating_add(1);
+        if !self.decimation.should_log(index) {
+            return Ok(());
+        }
+
+        self.set_time(depth.timestamp());
+        let mut bytes = Vec::with_capacity(depth.depth_m().len().saturating_mul(4));
+        for sample in depth.depth_m() {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let depth_image = rerun::Image::from_color_model_and_bytes(
+            bytes,
+            [depth.width(), depth.height()],
+            rerun::ColorModel::L,
+            rerun::ChannelDatatype::F32,
+        )
+        .with_draw_order(0.0);
+        self.rec.log("view/depth", &depth_image)?;
         Ok(())
     }
 

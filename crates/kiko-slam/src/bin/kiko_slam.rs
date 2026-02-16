@@ -24,8 +24,8 @@ use kiko_slam::dataset::{
 #[cfg(feature = "record")]
 use kiko_slam::{
     bounded_channel, oak_to_depth_image, oak_to_frame, ChannelCapacity, DiagnosticEvent,
-    DropPolicy, FrameDiagnostics, FrameId, PairingWindowNs, SendOutcome, SensorId, StereoPair,
-    StereoPairer,
+    DropPolicy, DropReceiver, FrameDiagnostics, FrameId, PairingWindowNs, SendOutcome, SensorId,
+    StereoPair, StereoPairer, SystemHealth,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -679,6 +679,9 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                         poses_logged += 1;
                     }
                 }
+                if let Err(err) = sink.log_system_health(timestamp, &output.health) {
+                    eprintln!("rerun health error: {err}");
+                }
                 if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
                     eprintln!("rerun diagnostics error: {err}");
                 }
@@ -1060,11 +1063,26 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 struct LiveVizMsg {
     left: Frame,
     right: Frame,
+    depth: Option<DepthImage>,
     pose: Option<Pose>,
     packet: Option<VizPacket<Raw>>,
     points: Option<Vec<Point3>>,
+    health: SystemHealth,
     diagnostics: FrameDiagnostics,
     events: Vec<DiagnosticEvent>,
+}
+
+#[cfg(feature = "record")]
+fn drain_latest_depth(rx: &DropReceiver<DepthImage>) -> Option<DepthImage> {
+    let mut latest = None;
+    loop {
+        match rx.try_recv() {
+            Ok(depth) => latest = Some(depth),
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+        }
+    }
+    latest
 }
 
 #[cfg(feature = "record")]
@@ -1115,20 +1133,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH").unwrap_or(12);
     let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
-    let (depth_tx, depth_handle, depth_stats_handle) = if depth_enabled {
+    let (depth_tx, depth_rx, depth_stats_handle) = if depth_enabled {
         let depth_capacity = ChannelCapacity::try_from(depth_queue_depth)?;
         let (depth_tx, depth_rx, depth_stats) =
             bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
-        let depth_handle = thread::spawn(move || {
-            let mut received = 0u64;
-            let mut last_timestamp_ns = None;
-            for depth in depth_rx.iter() {
-                received = received.saturating_add(1);
-                last_timestamp_ns = Some(depth.timestamp().as_nanos());
-            }
-            (received, last_timestamp_ns)
-        });
-        (Some(depth_tx), Some(depth_handle), Some(depth_stats))
+        (Some(depth_tx), Some(depth_rx), Some(depth_stats))
     } else {
         (None, None, None)
     };
@@ -1224,11 +1233,14 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             intrinsics,
             tracker_config,
         );
+        let depth_rx = depth_rx;
         for pair in pair_rx.iter() {
             let left = pair.left.clone();
             let right = pair.right.clone();
             match tracker.process(pair) {
                 Ok(output) => {
+                    let depth = depth_rx.as_ref().and_then(drain_latest_depth);
+                    let health = output.health.clone();
                     let mut packet = None;
                     let mut points = None;
                     if let Some(matches) = output.stereo_matches {
@@ -1244,9 +1256,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     let msg = LiveVizMsg {
                         left,
                         right,
+                        depth,
                         pose: output.pose,
                         packet,
                         points,
+                        health,
                         diagnostics: output.diagnostics,
                         events: output.events,
                     };
@@ -1280,11 +1294,19 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
                 eprintln!("rerun log error: {err}");
             }
+            if let Some(depth) = msg.depth.as_ref() {
+                if let Err(err) = sink.log_depth(depth) {
+                    eprintln!("rerun log error: {err}");
+                }
+            }
 
             if let Some(pose) = msg.pose.as_ref() {
                 if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
                     eprintln!("rerun log error: {err}");
                 }
+            }
+            if let Err(err) = sink.log_system_health(msg.left.timestamp(), &msg.health) {
+                eprintln!("rerun health error: {err}");
             }
             if let Err(err) = sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics) {
                 eprintln!("rerun diagnostics error: {err}");
@@ -1381,7 +1403,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     drop(depth_tx);
     inference_handle.join().ok();
     viz_handle.join().ok();
-    let depth_summary = depth_handle.and_then(|handle| handle.join().ok());
 
     let pair_snapshot = pair_stats.snapshot();
     let viz_snapshot = viz_stats.snapshot();
@@ -1407,12 +1428,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             depth_snapshot.dropped_oldest,
             depth_snapshot.dropped_newest,
             depth_snapshot.disconnected
-        );
-    }
-    if let Some((depth_received, last_timestamp_ns)) = depth_summary {
-        eprintln!(
-            "depth consumer: received={} last_timestamp_ns={:?}",
-            depth_received, last_timestamp_ns
         );
     }
 

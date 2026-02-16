@@ -1,6 +1,6 @@
 use crate::{
-    BaResult, DiagnosticEvent, FrameDiagnostics, LoopClosureRejectReason, RerunSink, Timestamp,
-    VizLogError,
+    BaResult, DegradationLevel, DiagnosticEvent, FrameDiagnostics, LoopClosureRejectReason,
+    RerunSink, SystemHealth, Timestamp, TrackingHealth, VizLogError,
 };
 
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
@@ -8,6 +8,20 @@ const TIMELINE_CAPTURE_NS: &str = "capture_ns";
 const PATH_HEALTH_INLIER_RATIO: &str = "diagnostics/health/inlier_ratio";
 const PATH_HEALTH_REPROJECTION_RMSE: &str = "diagnostics/health/reprojection_rmse_px";
 const PATH_HEALTH_REPROJECTION_MAX: &str = "diagnostics/health/reprojection_max_px";
+const PATH_HEALTH_TRACKING_STATE: &str = "diagnostics/health/tracking_state";
+const PATH_HEALTH_DEGRADATION_LEVEL: &str = "diagnostics/health/degradation_level";
+const PATH_HEALTH_BACKEND_ALIVE: &str = "diagnostics/health/backend_alive";
+const PATH_HEALTH_DESCRIPTOR_ALIVE: &str = "diagnostics/health/descriptor_alive";
+const PATH_HEALTH_BACKEND_SUBMITTED: &str = "diagnostics/health/backend_submitted";
+const PATH_HEALTH_BACKEND_APPLIED: &str = "diagnostics/health/backend_applied";
+const PATH_HEALTH_BACKEND_DROPPED_FULL: &str = "diagnostics/health/backend_dropped_full";
+const PATH_HEALTH_BACKEND_DROPPED_DISCONNECTED: &str =
+    "diagnostics/health/backend_dropped_disconnected";
+const PATH_HEALTH_BACKEND_STALE: &str = "diagnostics/health/backend_stale";
+const PATH_HEALTH_BACKEND_REJECTED: &str = "diagnostics/health/backend_rejected";
+const PATH_HEALTH_BACKEND_WORKER_FAILURES: &str = "diagnostics/health/backend_worker_failures";
+const PATH_HEALTH_BACKEND_RESPAWN_COUNT: &str = "diagnostics/health/backend_respawn_count";
+const PATH_HEALTH_BACKEND_PANICS: &str = "diagnostics/health/backend_panics";
 
 const PATH_TRACKING_FEATURES_DETECTED: &str = "diagnostics/tracking/features_detected";
 const PATH_TRACKING_FEATURES_MATCHED: &str = "diagnostics/tracking/features_matched";
@@ -201,6 +215,24 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
     }
 }
 
+fn tracking_state_scalar(state: TrackingHealth) -> f64 {
+    match state {
+        TrackingHealth::Good => 0.0,
+        TrackingHealth::Degraded => 1.0,
+        TrackingHealth::Lost => 2.0,
+    }
+}
+
+fn degradation_scalar(level: DegradationLevel) -> f64 {
+    match level {
+        DegradationLevel::Nominal => 0.0,
+        DegradationLevel::TrackingDegraded => 1.0,
+        DegradationLevel::DescriptorDown => 2.0,
+        DegradationLevel::BackendDown => 3.0,
+        DegradationLevel::Lost => 4.0,
+    }
+}
+
 impl RerunSink {
     /// Recommended Rerun dashboard:
     /// 1) `diagnostics/health/*` and `diagnostics/timing/*` as top time-series plots.
@@ -229,6 +261,68 @@ impl RerunSink {
         let (message, level) = format_event(event);
         let text = rerun::TextLog::new(message).with_level(level);
         rec.log(PATH_EVENTS_LOG, &text)?;
+        Ok(())
+    }
+
+    pub fn log_system_health(
+        &self,
+        timestamp: Timestamp,
+        health: &SystemHealth,
+    ) -> Result<(), VizLogError> {
+        let rec = self.recording();
+        set_capture_time(rec, timestamp);
+        rec.log(
+            PATH_HEALTH_TRACKING_STATE,
+            &rerun::Scalars::single(tracking_state_scalar(health.tracking)),
+        )?;
+        rec.log(
+            PATH_HEALTH_DEGRADATION_LEVEL,
+            &rerun::Scalars::single(degradation_scalar(health.degradation)),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_ALIVE,
+            &rerun::Scalars::single(if health.backend_alive { 1.0 } else { 0.0 }),
+        )?;
+        rec.log(
+            PATH_HEALTH_DESCRIPTOR_ALIVE,
+            &rerun::Scalars::single(if health.descriptor_alive { 1.0 } else { 0.0 }),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_SUBMITTED,
+            &rerun::Scalars::single(health.backend_stats.submitted as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_APPLIED,
+            &rerun::Scalars::single(health.backend_stats.applied as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_DROPPED_FULL,
+            &rerun::Scalars::single(health.backend_stats.dropped_full as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_DROPPED_DISCONNECTED,
+            &rerun::Scalars::single(health.backend_stats.dropped_disconnected as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_STALE,
+            &rerun::Scalars::single(health.backend_stats.stale as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_REJECTED,
+            &rerun::Scalars::single(health.backend_stats.rejected as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_WORKER_FAILURES,
+            &rerun::Scalars::single(health.backend_stats.worker_failures as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_RESPAWN_COUNT,
+            &rerun::Scalars::single(health.backend_stats.respawn_count as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_PANICS,
+            &rerun::Scalars::single(health.backend_stats.panics as f64),
+        )?;
         Ok(())
     }
 }
