@@ -15,17 +15,20 @@ use kiko_slam::{
 use kiko_slam::env::{env_bool, env_f32, env_usize};
 
 #[cfg(feature = "record")]
-use kiko_slam::{Frame, Point3, Pose, Raw};
+use kiko_slam::{DepthImage, Frame, Point3, Pose, Raw};
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
 #[cfg(feature = "record")]
 use kiko_slam::{
-    bounded_channel, oak_to_frame, ChannelCapacity, DiagnosticEvent, DropPolicy, FrameDiagnostics,
-    FrameId, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
+    bounded_channel, oak_to_depth_image, oak_to_frame, ChannelCapacity, DiagnosticEvent,
+    DropPolicy, FrameDiagnostics, FrameId, PairingWindowNs, SendOutcome, SensorId, StereoPair,
+    StereoPairer,
 };
 #[cfg(feature = "record")]
-use oak_sys::{Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig};
+use oak_sys::{
+    DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig,
+};
 #[cfg(feature = "record")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "record")]
@@ -1047,11 +1050,18 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: args.camera.fps,
         rectified: args.camera.rectified,
     };
+    let depth_enabled = env_bool("KIKO_LIVE_DEPTH").unwrap_or(false);
+    let depth_queue_depth = env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH").unwrap_or(8);
 
     let config = DeviceConfig {
         rgb: None,
         mono: Some(mono_config),
-        depth: None,
+        depth: depth_enabled.then_some(DepthConfig {
+            width: mono_config.width,
+            height: mono_config.height,
+            fps: mono_config.fps,
+            align_to_rgb: false,
+        }),
         imu: None,
         queue: QueueConfig {
             size: 8,
@@ -1073,6 +1083,23 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH").unwrap_or(12);
     let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
+    let (depth_tx, depth_handle, depth_stats_handle) = if depth_enabled {
+        let depth_capacity = ChannelCapacity::try_from(depth_queue_depth)?;
+        let (depth_tx, depth_rx, depth_stats) =
+            bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
+        let depth_handle = thread::spawn(move || {
+            let mut received = 0u64;
+            let mut last_timestamp_ns = None;
+            for depth in depth_rx.iter() {
+                received = received.saturating_add(1);
+                last_timestamp_ns = Some(depth.timestamp().as_nanos());
+            }
+            (received, last_timestamp_ns)
+        });
+        (Some(depth_tx), Some(depth_handle), Some(depth_stats))
+    } else {
+        (None, None, None)
+    };
 
     let inference = InferenceConfig::from_args(&args.inference)?;
     let (superpoint_left, superpoint_right, lightglue, key_limit, downscale) =
@@ -1138,7 +1165,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={} pair_queue_depth={} viz_queue_depth={}",
+        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={} pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={}",
         min_keyframe_points,
         refresh_inliers,
         parallax_px,
@@ -1151,7 +1178,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         learned_descriptors_enabled,
         relocalization_enabled,
         pair_queue_depth,
-        viz_queue_depth
+        viz_queue_depth,
+        depth_enabled,
+        depth_queue_depth
     );
 
     let inference_handle = thread::spawn(move || {
@@ -1282,6 +1311,29 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if depth_enabled {
+            match device.depth(0) {
+                Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
+                    Ok(depth_image) => {
+                        got_any = true;
+                        if let Some(depth_tx) = depth_tx.as_ref() {
+                            if matches!(depth_tx.try_send(depth_image), SendOutcome::Disconnected) {
+                                break;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("depth frame dropped (invalid dimensions): {err}");
+                    }
+                },
+                Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                Err(e) => {
+                    eprintln!("depth error: {:?}", e);
+                    break;
+                }
+            }
+        }
+
         while let Some(pair) = pairer.next_pair()? {
             if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
                 break;
@@ -1294,8 +1346,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     drop(pair_tx);
+    drop(depth_tx);
     inference_handle.join().ok();
     viz_handle.join().ok();
+    let depth_summary = depth_handle.and_then(|handle| handle.join().ok());
 
     let pair_snapshot = pair_stats.snapshot();
     let viz_snapshot = viz_stats.snapshot();
@@ -1313,6 +1367,22 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         viz_snapshot.dropped_newest,
         viz_snapshot.disconnected
     );
+    if let Some(depth_stats_handle) = depth_stats_handle {
+        let depth_snapshot = depth_stats_handle.snapshot();
+        eprintln!(
+            "depth queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+            depth_snapshot.enqueued,
+            depth_snapshot.dropped_oldest,
+            depth_snapshot.dropped_newest,
+            depth_snapshot.disconnected
+        );
+    }
+    if let Some((depth_received, last_timestamp_ns)) = depth_summary {
+        eprintln!(
+            "depth consumer: received={} last_timestamp_ns={:?}",
+            depth_received, last_timestamp_ns
+        );
+    }
 
     Ok(())
 }
