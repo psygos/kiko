@@ -18,7 +18,9 @@ use kiko_slam::env::{env_bool, env_f32, env_usize};
 use kiko_slam::{DepthImage, Frame, Point3, Pose, Raw};
 
 #[cfg(feature = "record")]
-use kiko_slam::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
+use kiko_slam::dataset::{
+    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta,
+};
 #[cfg(feature = "record")]
 use kiko_slam::{
     bounded_channel, oak_to_depth_image, oak_to_frame, ChannelCapacity, DiagnosticEvent,
@@ -916,11 +918,18 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: args.camera.fps,
         rectified: args.camera.rectified,
     };
+    let depth_enabled = env_bool("KIKO_RECORD_DEPTH").unwrap_or(false);
+    let depth_config = depth_enabled.then_some(DepthConfig {
+        width: mono_config.width,
+        height: mono_config.height,
+        fps: mono_config.fps,
+        align_to_rgb: false,
+    });
 
     let config = DeviceConfig {
         rgb: None,
         mono: Some(mono_config),
-        depth: None,
+        depth: depth_config,
         imu: None,
         queue: QueueConfig {
             size: 8,
@@ -932,7 +941,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut device = Device::connect("", config)?;
     let baseline_m = device.stereo_baseline_m();
 
-    let meta = build_meta(&mono_config, None);
+    let meta = build_meta(&mono_config, depth_config.as_ref(), None);
     let calibration = build_calibration(&device, baseline_m, &mono_config);
 
     eprintln!("creating dataset at {}", output_path.display());
@@ -941,6 +950,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut pair_count = 0u64;
     let mut left_count = 0u64;
     let mut right_count = 0u64;
+    let mut depth_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
     let pairing_window = PairingWindowNs::new(5_000_000).expect("pairing window must be positive");
@@ -992,6 +1002,26 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if depth_enabled {
+            match device.depth(0) {
+                Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
+                    Ok(depth) => {
+                        writer.write_depth(&depth);
+                        depth_count = depth_count.saturating_add(1);
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("depth frame dropped (invalid dimensions): {err}");
+                    }
+                },
+                Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                Err(e) => {
+                    eprintln!("depth error: {:?}", e);
+                    break;
+                }
+            }
+        }
+
         while let Some(pair) = pairer.next_pair()? {
             writer.write_frame(&pair.left);
             writer.write_frame(&pair.right);
@@ -1011,13 +1041,15 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     drop(writer);
     let stats = writer_handle.finish()?;
     eprintln!(
-        "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), written={}, dropped={}",
+        "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), written={}, dropped={}",
         elapsed,
         pair_count,
         left_count,
         left_count as f64 / elapsed,
         right_count,
         right_count as f64 / elapsed,
+        depth_count,
+        depth_count as f64 / elapsed,
         stats.frames_written,
         stats.frames_dropped
     );
@@ -1388,7 +1420,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "record")]
-fn build_meta(config: &MonoConfig, imu_config: Option<&ImuConfig>) -> Meta {
+fn build_meta(
+    config: &MonoConfig,
+    depth_config: Option<&DepthConfig>,
+    imu_config: Option<&ImuConfig>,
+) -> Meta {
     Meta {
         created: chrono::Utc::now().to_rfc3339(),
         device: "OAK-D".to_string(),
@@ -1396,6 +1432,12 @@ fn build_meta(config: &MonoConfig, imu_config: Option<&ImuConfig>) -> Meta {
             width: config.width,
             height: config.height,
             fps: config.fps,
+        }),
+        depth: depth_config.map(|c| DepthMeta {
+            width: c.width,
+            height: c.height,
+            fps: c.fps,
+            encoding: "f32_meters_le".to_string(),
         }),
         imu: imu_config.map(|c| ImuMeta { rate_hz: c.rate_hz }),
     }

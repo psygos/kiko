@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{Frame, PairError, SensorId};
+use crate::{DepthImage, Frame, PairError, SensorId};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -35,6 +35,8 @@ pub struct Meta {
     pub created: String,
     pub device: String,
     pub mono: Option<MonoMeta>,
+    #[serde(default)]
+    pub depth: Option<DepthMeta>,
     pub imu: Option<ImuMeta>,
 }
 
@@ -48,6 +50,14 @@ pub struct MonoMeta {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImuMeta {
     pub rate_hz: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DepthMeta {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub encoding: String,
 }
 
 // Calibration structs
@@ -327,15 +337,34 @@ impl DatasetWriter {
 
     /// Enqueue a frame according to the configured backpressure policy.
     pub fn write_frame(&self, frame: &Frame) -> WriteOutcome {
+        self.write_item(
+            SpoolItem::Mono(frame.clone()),
+            frame.data().len(),
+            "frame exceeds max_spool_bytes",
+        )
+    }
+
+    /// Enqueue a depth image according to the configured backpressure policy.
+    pub fn write_depth(&self, depth: &DepthImage) -> WriteOutcome {
+        let bytes = depth
+            .depth_m()
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>());
+        self.write_item(
+            SpoolItem::Depth(depth.clone()),
+            bytes,
+            "depth image exceeds max_spool_bytes",
+        )
+    }
+
+    fn write_item(&self, item: SpoolItem, bytes: usize, oversize_msg: &'static str) -> WriteOutcome {
         if self.state.failed.load(Ordering::Acquire) {
             return WriteOutcome::WriterFailed;
         }
 
-        let bytes = frame.data().len();
         if bytes > self.config.max_spool_bytes {
-            self.state.fail(DatasetError::InvalidConfig {
-                msg: "frame exceeds max_spool_bytes",
-            });
+            self.state
+                .fail(DatasetError::InvalidConfig { msg: oversize_msg });
             return WriteOutcome::WriterFailed;
         }
 
@@ -378,7 +407,7 @@ impl DatasetWriter {
 
         spool.frames += 1;
         spool.bytes += bytes;
-        spool.queue.push_back(frame.clone());
+        spool.queue.push_back(item);
 
         self.state.enqueued.fetch_add(1, Ordering::Relaxed);
         self.state
@@ -427,8 +456,26 @@ impl DatasetWriterHandle {
 }
 
 #[derive(Debug)]
+enum SpoolItem {
+    Mono(Frame),
+    Depth(DepthImage),
+}
+
+impl SpoolItem {
+    fn bytes_len(&self) -> usize {
+        match self {
+            SpoolItem::Mono(frame) => frame.data().len(),
+            SpoolItem::Depth(depth) => depth
+                .depth_m()
+                .len()
+                .saturating_mul(std::mem::size_of::<f32>()),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Spool {
-    queue: VecDeque<Frame>,
+    queue: VecDeque<SpoolItem>,
     frames: usize,
     bytes: usize,
     closed: bool,
@@ -555,11 +602,11 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             }
 
             let mut batch = Vec::new();
-            while let Some(frame) = spool.queue.pop_front() {
-                let bytes = frame.data().len();
+            while let Some(item) = spool.queue.pop_front() {
+                let bytes = item.bytes_len();
                 spool.frames = spool.frames.saturating_sub(1);
                 spool.bytes = spool.bytes.saturating_sub(bytes);
-                batch.push(frame);
+                batch.push(item);
                 if batch.len() >= state.config.flush_batch_frames {
                     break;
                 }
@@ -575,9 +622,9 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             batch
         };
 
-        for frame in batch {
-            let bytes = frame.data().len() as u64;
-            if let Err(err) = write_frame_to_dir(&frames_dir, frame) {
+        for item in batch {
+            let bytes = item.bytes_len() as u64;
+            if let Err(err) = write_item_to_dir(&frames_dir, item) {
                 state.write_failed.fetch_add(1, Ordering::Relaxed);
                 state.fail(err);
                 return;
@@ -585,6 +632,13 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             state.written.fetch_add(1, Ordering::Relaxed);
             state.bytes_written.fetch_add(bytes, Ordering::Relaxed);
         }
+    }
+}
+
+fn write_item_to_dir(frames_dir: &Path, item: SpoolItem) -> Result<(), DatasetError> {
+    match item {
+        SpoolItem::Mono(frame) => write_frame_to_dir(frames_dir, frame),
+        SpoolItem::Depth(depth) => write_depth_to_dir(frames_dir, depth),
     }
 }
 
@@ -614,6 +668,27 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
     std::fs::write(&path, data.as_ref())
         .map_err(|e| DatasetError::WriteFile { path, source: e })?;
 
+    Ok(())
+}
+
+fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), DatasetError> {
+    let filename = format::frame_name(depth.timestamp().as_nanos(), "depth");
+    let path = frames_dir.join(&filename);
+    let expected = (depth.width() as usize).saturating_mul(depth.height() as usize);
+    if depth.depth_m().len() != expected {
+        return Err(DatasetError::WriteFile {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "depth data len does not match width * height",
+            ),
+        });
+    }
+    let mut bytes = Vec::with_capacity(expected.saturating_mul(std::mem::size_of::<f32>()));
+    for value in depth.depth_m() {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).map_err(|e| DatasetError::WriteFile { path, source: e })?;
     Ok(())
 }
 
@@ -724,6 +799,7 @@ struct FrameInfo {
 struct FrameSet {
     left: Vec<FrameInfo>,
     right: Vec<FrameInfo>,
+    depth: Vec<FrameInfo>,
     parse_fail: u64,
     size_mismatch: u64,
 }
@@ -734,14 +810,17 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         msg: "meta.json missing mono config",
     })?;
 
-    let mut frames = scan_frames(&state.frames_dir, mono.width, mono.height)?;
+    let mut frames =
+        scan_frames_with_depth(&state.frames_dir, mono.width, mono.height, meta.depth.as_ref())?;
     let parse_fail = frames.parse_fail;
     let size_mismatch = frames.size_mismatch;
     let mut left = std::mem::take(&mut frames.left);
     let mut right = std::mem::take(&mut frames.right);
+    let mut depth_frames = std::mem::take(&mut frames.depth);
 
     left.sort_by_key(|f| f.timestamp_ns);
     right.sort_by_key(|f| f.timestamp_ns);
+    depth_frames.sort_by_key(|f| f.timestamp_ns);
 
     let left_period = compute_period_ns(&left);
     let gate = left_period.map(|p| p / 4).filter(|p| *p > 0);
@@ -825,13 +904,28 @@ fn read_calibration(dataset_dir: &Path) -> Result<Calibration, DatasetError> {
 }
 
 fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {
+    scan_frames_with_depth(frames_dir, width, height, None)
+}
+
+fn scan_frames_with_depth(
+    frames_dir: &Path,
+    width: u32,
+    height: u32,
+    depth: Option<&DepthMeta>,
+) -> Result<FrameSet, DatasetError> {
     let mut frames = FrameSet {
         left: Vec::new(),
         right: Vec::new(),
+        depth: Vec::new(),
         parse_fail: 0,
         size_mismatch: 0,
     };
-    let expected_len = (width as u64).saturating_mul(height as u64);
+    let mono_expected_len = (width as u64).saturating_mul(height as u64);
+    let depth_expected_len = depth.map(|meta| {
+        (meta.width as u64)
+            .saturating_mul(meta.height as u64)
+            .saturating_mul(std::mem::size_of::<f32>() as u64)
+    });
 
     let entries = std::fs::read_dir(frames_dir).map_err(|e| DatasetError::ReadDirectory {
         path: frames_dir.to_path_buf(),
@@ -863,23 +957,36 @@ fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, D
             }
         };
 
-        let metadata = entry.metadata().map_err(|e| DatasetError::ReadFile {
-            path: path.clone(),
-            source: e,
-        })?;
-        if metadata.len() != expected_len {
-            frames.size_mismatch += 1;
-            continue;
-        }
-
         let rel_path = format!("{}/{}", format::FRAMES_DIR, filename);
         let info = FrameInfo {
             timestamp_ns,
             path: rel_path,
         };
         match sensor.as_str() {
-            "mono_left" => frames.left.push(info),
-            "mono_right" => frames.right.push(info),
+            "mono_left" | "mono_right" | "depth" => {
+                let metadata = entry.metadata().map_err(|e| DatasetError::ReadFile {
+                    path: path.clone(),
+                    source: e,
+                })?;
+                let expected_len = match sensor.as_str() {
+                    "mono_left" | "mono_right" => mono_expected_len,
+                    "depth" => match depth_expected_len {
+                        Some(len) => len,
+                        None => continue,
+                    },
+                    _ => unreachable!(),
+                };
+                if metadata.len() != expected_len {
+                    frames.size_mismatch += 1;
+                    continue;
+                }
+                match sensor.as_str() {
+                    "mono_left" => frames.left.push(info),
+                    "mono_right" => frames.right.push(info),
+                    "depth" => frames.depth.push(info),
+                    _ => unreachable!(),
+                }
+            }
             _ => {
                 frames.parse_fail += 1;
             }
