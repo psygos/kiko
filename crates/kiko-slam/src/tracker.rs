@@ -1290,6 +1290,8 @@ pub struct SlamTracker {
     pending_events: Vec<DiagnosticEvent>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
+    last_pose_world: Option<Pose>,
+    trace_transitions: bool,
 }
 
 impl SlamTracker {
@@ -1315,6 +1317,7 @@ impl SlamTracker {
         } else {
             None
         };
+        let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
         Self {
             superpoint_left,
             superpoint_right,
@@ -1339,6 +1342,8 @@ impl SlamTracker {
             pending_events: Vec::new(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
+            last_pose_world: None,
+            trace_transitions,
         }
     }
 
@@ -1371,7 +1376,21 @@ impl SlamTracker {
         let result = if let Some((keyframe, keyframe_id)) = tracking {
             self.track(pair, &keyframe, keyframe_id)
         } else {
-            self.create_keyframe(pair, Pose::identity())
+            let bootstrap_pose = self.last_pose_world.unwrap_or(Pose::identity());
+            if self.trace_transitions {
+                eprintln!(
+                    "tracker bootstrap keyframe: pose_source={} tx={:.3} ty={:.3} tz={:.3}",
+                    if self.last_pose_world.is_some() {
+                        "last_pose"
+                    } else {
+                        "identity"
+                    },
+                    bootstrap_pose.translation()[0],
+                    bootstrap_pose.translation()[1],
+                    bootstrap_pose.translation()[2]
+                );
+            }
+            self.create_keyframe(pair, bootstrap_pose)
         };
         if result.is_err() {
             self.clear_events();
@@ -1469,6 +1488,9 @@ impl SlamTracker {
         tracking: TrackingHealth,
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
+        if let Some(pose_world) = pose {
+            self.last_pose_world = Some(pose_world);
+        }
         TrackerOutput {
             pose,
             inliers,
@@ -1834,9 +1856,9 @@ impl SlamTracker {
     }
 
     fn tracking_failure_health(&mut self) -> TrackingHealth {
-        const LOST_AFTER_CONSECUTIVE_FAILURES: usize = 3;
+        const LOST_AFTER_CONSECUTIVE_FAILURES: usize = 5;
         self.consecutive_tracking_failures = self.consecutive_tracking_failures.saturating_add(1);
-        if self.consecutive_tracking_failures >= LOST_AFTER_CONSECUTIVE_FAILURES {
+        let health = if self.consecutive_tracking_failures >= LOST_AFTER_CONSECUTIVE_FAILURES {
             if self.tracking_health != TrackingHealth::Lost {
                 self.emit_event(DiagnosticEvent::TrackingLost {
                     consecutive_failures: self.consecutive_tracking_failures,
@@ -1845,7 +1867,14 @@ impl SlamTracker {
             TrackingHealth::Lost
         } else {
             TrackingHealth::Degraded
+        };
+        if self.trace_transitions {
+            eprintln!(
+                "tracking failure count={} health={health:?}",
+                self.consecutive_tracking_failures
+            );
         }
+        health
     }
 
     fn maybe_enter_relocalization(
@@ -1862,6 +1891,9 @@ impl SlamTracker {
             self.pending_loop = None;
             self.loop_streak.clear();
             self.state = TrackerState::Relocalizing(session);
+            if self.trace_transitions {
+                eprintln!("entering relocalization after tracking loss");
+            }
         }
     }
 
@@ -1886,7 +1918,15 @@ impl SlamTracker {
         health: TrackingHealth,
     ) -> TrackerOutput {
         let diagnostics = self.empty_diagnostics();
-        self.output_with_diagnostics(None, 0, None, None, frame_id, health, diagnostics)
+        self.output_with_diagnostics(
+            self.last_pose_world,
+            0,
+            None,
+            None,
+            frame_id,
+            health,
+            diagnostics,
+        )
     }
 
     fn relocalization_pose_consistent(
@@ -1911,6 +1951,15 @@ impl SlamTracker {
         session: RelocalizationSession,
         current: Arc<Detections>,
     ) -> TrackerOutput {
+        let next_attempts = session.attempts.saturating_add(1);
+        if self.trace_transitions {
+            eprintln!(
+                "relocalization failure frame={} attempt={}/{}",
+                frame_id.as_u64(),
+                next_attempts,
+                cfg.max_attempts()
+            );
+        }
         self.state = Self::next_state_after_relocalization_failure(cfg, session, current);
         self.relocalization_output(frame_id, TrackingHealth::Lost)
     }
@@ -2042,20 +2091,37 @@ impl SlamTracker {
         };
         let candidate_id = verified.match_kf();
         let pose_world = verified.pose_world();
+        if self.trace_transitions {
+            eprintln!(
+                "relocalization candidate frame={} candidate={candidate_id:?} inliers={}",
+                frame_id.as_u64(),
+                verified.inlier_count()
+            );
+        }
 
         session.last_detections = current;
         match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
             RelocalizationStep::Recovered { pose_world } => {
+                self.last_pose_world = Some(pose_world);
                 self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
                     keyframe_id: candidate_id,
                 });
                 self.pending_loop = None;
                 self.loop_streak.clear();
                 self.state = TrackerState::NeedKeyframe;
+                if self.trace_transitions {
+                    eprintln!(
+                        "relocalization recovered frame={} candidate={candidate_id:?}; creating bootstrap keyframe from recovered pose",
+                        frame_id.as_u64()
+                    );
+                }
                 return self.create_keyframe(StereoPair { left, right }, pose_world);
             }
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
+                if self.trace_transitions {
+                    eprintln!("relocalization confirmation pending frame={}", frame_id.as_u64());
+                }
             }
         }
         Ok(self.relocalization_output(frame_id, TrackingHealth::Degraded))
@@ -2078,6 +2144,14 @@ impl SlamTracker {
         let current = Arc::new(current);
 
         let matches = if current.is_empty() || keyframe.detections().is_empty() {
+            if self.trace_transitions {
+                eprintln!(
+                    "tracking failure frame={} reason=empty_features current={} keyframe={}",
+                    frame_id.as_u64(),
+                    current.len(),
+                    keyframe.detections().len()
+                );
+            }
             let tracking_health = self.tracking_failure_health();
             self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
             let mut diagnostics = self.empty_diagnostics();
@@ -2093,7 +2167,7 @@ impl SlamTracker {
                 .iter()
                 .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
             return Ok(self.output_with_diagnostics(
-                None,
+                self.last_pose_world,
                 0,
                 None,
                 None,
@@ -2124,6 +2198,15 @@ impl SlamTracker {
         ) {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
+                if self.trace_transitions {
+                    eprintln!(
+                        "tracking failure frame={} reason=not_enough_map_points matches={} verified={} current={}",
+                        frame_id.as_u64(),
+                        matches.len(),
+                        verified.len(),
+                        current.len()
+                    );
+                }
                 let tracking_health = self.tracking_failure_health();
                 self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
                 let mut diagnostics = self.empty_diagnostics();
@@ -2139,7 +2222,7 @@ impl SlamTracker {
                     .iter()
                     .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
                 return Ok(self.output_with_diagnostics(
-                    None,
+                    self.last_pose_world,
                     0,
                     None,
                     None,
@@ -2154,6 +2237,15 @@ impl SlamTracker {
         let result = match solve_pnp_ransac(&observations, self.intrinsics, self.config.ransac) {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
+                if self.trace_transitions {
+                    eprintln!(
+                        "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={}",
+                        frame_id.as_u64(),
+                        observations.len(),
+                        matches.len(),
+                        verified.len()
+                    );
+                }
                 let tracking_health = self.tracking_failure_health();
                 self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
                 let mut diagnostics = self.empty_diagnostics();
@@ -2170,7 +2262,7 @@ impl SlamTracker {
                     .iter()
                     .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
                 return Ok(self.output_with_diagnostics(
-                    None,
+                    self.last_pose_world,
                     0,
                     None,
                     None,
@@ -2400,7 +2492,38 @@ impl SlamTracker {
         let StereoPair { left, right } = pair;
         let frame_id = left.frame_id();
         let (output, keyframe_id) =
-            self.create_keyframe_internal(left, right, pose_world, None, None)?;
+            match self.create_keyframe_internal(left, right, pose_world, None, None) {
+                Ok(value) => value,
+                Err(TrackerError::KeyframeRejected { landmarks }) => {
+                    if self.trace_transitions {
+                        eprintln!(
+                            "keyframe bootstrap rejected frame={} landmarks={} -> staying in NeedKeyframe",
+                            frame_id.as_u64(),
+                            landmarks
+                        );
+                    }
+                    let mut diagnostics = self.empty_diagnostics();
+                    diagnostics.keyframe_created = false;
+                    return Ok(self.output_with_diagnostics(
+                        self.last_pose_world,
+                        0,
+                        None,
+                        None,
+                        frame_id,
+                        TrackingHealth::Degraded,
+                        diagnostics,
+                    ));
+                }
+                Err(err) => {
+                    if self.trace_transitions {
+                        eprintln!(
+                            "keyframe bootstrap rejected frame={} error={err}",
+                            frame_id.as_u64()
+                        );
+                    }
+                    return Err(err);
+                }
+            };
         let keyframe = output.keyframe.clone().expect("keyframe");
         self.state = TrackerState::Tracking {
             keyframe,
@@ -2483,6 +2606,14 @@ impl SlamTracker {
         let triangulation_stats = result.stats;
         let landmarks = result.keyframe.landmarks().len();
         if landmarks < self.config.min_keyframe_points {
+            if self.trace_transitions {
+                eprintln!(
+                    "keyframe rejected frame={} landmarks={} min_required={}",
+                    frame_id.as_u64(),
+                    landmarks,
+                    self.config.min_keyframe_points
+                );
+            }
             return Err(TrackerError::KeyframeRejected { landmarks });
         }
 
@@ -2560,10 +2691,13 @@ fn insert_keyframe_into_map(
         }
     }
 
-    // Cull stale singleton landmarks from previous keyframes before adding
-    // new landmarks from this keyframe.
-    if map.num_points() > 0 {
-        let _ = map.cull_points(2);
+    // Keep singleton points by default so active keyframes retain enough
+    // point associations for robust PnP. Enable stronger culling only via env.
+    let cull_min_observations = crate::env::env_usize("KIKO_MAP_CULL_MIN_OBSERVATIONS")
+        .unwrap_or(1)
+        .max(1);
+    if cull_min_observations > 1 && map.num_points() > 0 {
+        let _ = map.cull_points(cull_min_observations);
     }
 
     for (landmark, &det_idx) in keyframe
