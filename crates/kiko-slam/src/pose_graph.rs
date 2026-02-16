@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use crate::Pose64;
@@ -328,30 +328,29 @@ pub fn compute_edge_jacobians(
     let eps = 1e-6_f64;
     let mut j_from = [[0.0_f64; 6]; 6];
     let mut j_to = [[0.0_f64; 6]; 6];
+    let mut poses_perturbed = poses.to_vec();
 
     for axis in 0..6 {
         let delta_plus = perturb_axis(axis, eps, jr);
         let delta_minus = perturb_axis(axis, -eps, jr);
 
-        let mut poses_plus = poses.to_vec();
-        poses_plus[edge.from] = se3_exp_f64(delta_plus).compose(poses_plus[edge.from]);
-        let err_plus = compute_edge_error(edge, &poses_plus);
-
-        let mut poses_minus = poses.to_vec();
-        poses_minus[edge.from] = se3_exp_f64(delta_minus).compose(poses_minus[edge.from]);
-        let err_minus = compute_edge_error(edge, &poses_minus);
+        let from_pose = poses_perturbed[edge.from];
+        poses_perturbed[edge.from] = se3_exp_f64(delta_plus).compose(from_pose);
+        let err_plus = compute_edge_error(edge, &poses_perturbed);
+        poses_perturbed[edge.from] = se3_exp_f64(delta_minus).compose(from_pose);
+        let err_minus = compute_edge_error(edge, &poses_perturbed);
+        poses_perturbed[edge.from] = from_pose;
 
         for row in 0..6 {
             j_from[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
         }
 
-        let mut poses_plus = poses.to_vec();
-        poses_plus[edge.to] = se3_exp_f64(delta_plus).compose(poses_plus[edge.to]);
-        let err_plus = compute_edge_error(edge, &poses_plus);
-
-        let mut poses_minus = poses.to_vec();
-        poses_minus[edge.to] = se3_exp_f64(delta_minus).compose(poses_minus[edge.to]);
-        let err_minus = compute_edge_error(edge, &poses_minus);
+        let to_pose = poses_perturbed[edge.to];
+        poses_perturbed[edge.to] = se3_exp_f64(delta_plus).compose(to_pose);
+        let err_plus = compute_edge_error(edge, &poses_perturbed);
+        poses_perturbed[edge.to] = se3_exp_f64(delta_minus).compose(to_pose);
+        let err_minus = compute_edge_error(edge, &poses_perturbed);
+        poses_perturbed[edge.to] = to_pose;
 
         for row in 0..6 {
             j_to[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
@@ -779,16 +778,17 @@ impl EssentialGraph {
 
     pub fn pose_graph_input(&self) -> PoseGraphInput {
         let mut keyframe_ids = self.order.clone();
+        let mut seen: HashSet<KeyframeId> = keyframe_ids.iter().copied().collect();
         for edge in self
             .spanning_edges
             .iter()
             .chain(self.strong_covis_edges.iter())
             .chain(self.loop_edges.iter())
         {
-            if !keyframe_ids.contains(&edge.a) {
+            if seen.insert(edge.a) {
                 keyframe_ids.push(edge.a);
             }
-            if !keyframe_ids.contains(&edge.b) {
+            if seen.insert(edge.b) {
                 keyframe_ids.push(edge.b);
             }
         }

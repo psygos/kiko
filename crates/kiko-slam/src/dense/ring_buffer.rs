@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::{DepthImage, Timestamp};
 
 /// Fixed-capacity ring buffer of recent depth frames for timestamp association.
@@ -6,7 +8,7 @@ use crate::{DepthImage, Timestamp};
 /// created, the command mapper queries the buffer for the depth frame closest
 /// to the stereo pair timestamp (within a configurable window).
 pub struct DepthRingBuffer {
-    entries: Vec<DepthImage>,
+    entries: VecDeque<DepthImage>,
     capacity: usize,
     /// Track severe reorder events for diagnostics.
     reorder_warnings: u64,
@@ -16,7 +18,7 @@ impl DepthRingBuffer {
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(1);
         Self {
-            entries: Vec::with_capacity(capacity),
+            entries: VecDeque::with_capacity(capacity),
             capacity,
             reorder_warnings: 0,
         }
@@ -24,16 +26,16 @@ impl DepthRingBuffer {
 
     pub fn push(&mut self, depth: DepthImage) {
         // Warn on severe out-of-order delivery but do not reject.
-        if let Some(last) = self.entries.last() {
+        if let Some(last) = self.entries.back() {
             if depth.timestamp().as_nanos() < last.timestamp().as_nanos() {
                 self.reorder_warnings = self.reorder_warnings.saturating_add(1);
             }
         }
 
         if self.entries.len() >= self.capacity {
-            self.entries.remove(0);
+            self.entries.pop_front();
         }
-        self.entries.push(depth);
+        self.entries.push_back(depth);
     }
 
     /// Find the depth frame whose timestamp is closest to `query`, provided
@@ -63,7 +65,7 @@ impl DepthRingBuffer {
 
         let (delta, idx) = best?;
         if delta <= max_window {
-            Some(self.entries[idx].clone())
+            self.entries.get(idx).cloned()
         } else {
             None
         }
