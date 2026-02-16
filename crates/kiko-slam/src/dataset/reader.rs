@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
-    format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
-    FrameInfo, Manifest,
+    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
+    read_meta, scan_frames,
 };
 
 #[derive(Debug)]
@@ -178,11 +178,11 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
             let right_bytes = right_frame.data().len();
 
             let pair_start = Instant::now();
-            let pair = match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window)
-            {
-                Ok(pair) => pair,
-                Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
-            };
+            let pair =
+                match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
+                    Ok(pair) => pair,
+                    Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
+                };
             let pairing = pair_start.elapsed();
 
             let timings = DatasetReadTimings {
@@ -211,7 +211,7 @@ impl DatasetReader {
             None => {
                 return Err(DatasetError::InvalidConfig {
                     msg: "meta.json missing mono config",
-                })
+                });
             }
         };
         let path = self.root.join(&frame_ref.path);

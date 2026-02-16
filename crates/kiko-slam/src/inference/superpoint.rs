@@ -1,8 +1,10 @@
-use super::{build_session, InferenceBackend, InferenceError};
+use super::{InferenceBackend, InferenceError, build_session};
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::Path;
+
+const DESCRIPTOR_DIM: usize = 256;
 
 pub struct SuperPoint {
     session: Session,
@@ -96,9 +98,30 @@ fn run_inference(
 ) -> Result<Detections, InferenceError> {
     let outputs = session.run(ort::inputs!["image" => input_tensor])?;
 
-    let keypoints_value = &outputs["keypoints"];
-    let scores_raw = outputs["scores"].try_extract_tensor::<f32>()?;
-    let descriptors_raw = outputs["descriptors"].try_extract_tensor::<f32>()?;
+    let keypoints_value =
+        outputs
+            .get("keypoints")
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "keypoints".to_string(),
+                expected: "named output tensor".to_string(),
+                actual: "missing output".to_string(),
+            })?;
+    let scores_raw = outputs
+        .get("scores")
+        .ok_or_else(|| InferenceError::UnexpectedOutput {
+            name: "scores".to_string(),
+            expected: "named output tensor".to_string(),
+            actual: "missing output".to_string(),
+        })?
+        .try_extract_tensor::<f32>()?;
+    let descriptors_raw = outputs
+        .get("descriptors")
+        .ok_or_else(|| InferenceError::UnexpectedOutput {
+            name: "descriptors".to_string(),
+            expected: "named output tensor".to_string(),
+            actual: "missing output".to_string(),
+        })?
+        .try_extract_tensor::<f32>()?;
 
     let scores = scores_raw.1.to_vec();
     let keypoints_pairs = if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>() {
@@ -121,11 +144,7 @@ fn run_inference(
             kp.y *= factor;
         }
     }
-    let descriptors = descriptors_raw
-        .1
-        .chunks(256)
-        .map(|chunk| Descriptor(chunk.try_into().unwrap()))
-        .collect();
+    let descriptors = parse_descriptors(descriptors_raw.1, "descriptors")?;
 
     Detections::new(
         frame.sensor_id(),
@@ -137,6 +156,26 @@ fn run_inference(
         descriptors,
     )
     .map_err(|e| InferenceError::Domain(format!("{e:?}")))
+}
+
+fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>, InferenceError> {
+    if data.len() % DESCRIPTOR_DIM != 0 {
+        return Err(InferenceError::UnexpectedOutput {
+            name: output_name.to_string(),
+            expected: format!(
+                "tensor with element count divisible by {DESCRIPTOR_DIM} (descriptor dimension)"
+            ),
+            actual: format!("tensor with {} elements", data.len()),
+        });
+    }
+
+    let mut descriptors = Vec::with_capacity(data.len() / DESCRIPTOR_DIM);
+    for chunk in data.chunks_exact(DESCRIPTOR_DIM) {
+        let mut descriptor = [0.0_f32; DESCRIPTOR_DIM];
+        descriptor.copy_from_slice(chunk);
+        descriptors.push(Descriptor(descriptor));
+    }
+    Ok(descriptors)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -272,5 +311,39 @@ fn scale_coordinate(value: f32, dim: f32, norm: Normalization) -> f32 {
         Normalization::None => value,
         Normalization::ZeroToOne => value * extent,
         Normalization::NegOneToOne => (value + 1.0) * 0.5 * extent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_descriptors_accepts_complete_chunks() {
+        let data: Vec<f32> = (0..(DESCRIPTOR_DIM * 2)).map(|v| v as f32).collect();
+        let descriptors = parse_descriptors(&data, "descriptors").expect("complete chunks");
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].0[0], 0.0);
+        assert_eq!(descriptors[1].0[0], DESCRIPTOR_DIM as f32);
+    }
+
+    #[test]
+    fn parse_descriptors_rejects_partial_chunk() {
+        let data: Vec<f32> = (0..(DESCRIPTOR_DIM + 1)).map(|v| v as f32).collect();
+        let err = parse_descriptors(&data, "descriptors").expect_err("partial chunk");
+
+        match err {
+            InferenceError::UnexpectedOutput {
+                name,
+                expected,
+                actual,
+            } => {
+                assert_eq!(name, "descriptors");
+                assert!(expected.contains("divisible"));
+                assert!(actual.contains(&(DESCRIPTOR_DIM + 1).to_string()));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

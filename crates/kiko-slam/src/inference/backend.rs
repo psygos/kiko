@@ -88,7 +88,7 @@ pub(crate) fn select_backend(
             selected = InferenceBackend::Cpu;
         }
         InferenceBackend::Auto => {
-            unreachable!("auto resolved above");
+            selected = InferenceBackend::Cpu;
         }
     }
 
@@ -103,7 +103,10 @@ pub(crate) fn select_backend(
             .build(),
     );
 
-    Ok(BackendSelection { selected, providers })
+    Ok(BackendSelection {
+        selected,
+        providers,
+    })
 }
 
 fn detect_backend() -> InferenceBackend {
@@ -137,7 +140,8 @@ fn coreml_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError
     {
         use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
 
-        let ep = CoreMLExecutionProvider::default().with_compute_units(CoreMLComputeUnits::CPUAndGPU);
+        let ep =
+            CoreMLExecutionProvider::default().with_compute_units(CoreMLComputeUnits::CPUAndGPU);
         if !ep.supported_by_platform() {
             return Ok(None);
         }

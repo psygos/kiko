@@ -1,4 +1,4 @@
-use super::{build_session, InferenceBackend, InferenceError};
+use super::{InferenceBackend, InferenceError, build_session};
 use crate::Detections;
 use crate::Matches;
 use crate::Raw;
@@ -50,8 +50,22 @@ impl LightGlue {
         let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 256], desc_1))?;
 
         let outputs = self.session.run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])?;
-        let matches_raw = outputs["matches0"].try_extract_tensor::<i64>()?;
-        let scores_raw = outputs["mscores0"].try_extract_tensor::<f32>()?;
+        let matches_raw = outputs
+            .get("matches0")
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "matches0".to_string(),
+                expected: "named output tensor".to_string(),
+                actual: "missing output".to_string(),
+            })?
+            .try_extract_tensor::<i64>()?;
+        let scores_raw = outputs
+            .get("mscores0")
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "mscores0".to_string(),
+                expected: "named output tensor".to_string(),
+                actual: "missing output".to_string(),
+            })?
+            .try_extract_tensor::<f32>()?;
         let matches_data = matches_raw.1;
         let scores_data = scores_raw.1;
 
@@ -59,10 +73,24 @@ impl LightGlue {
         let mut scores = Vec::new();
 
         for (i, &match_idx) in matches_data.iter().enumerate() {
-            if match_idx != -1 {
-                indices.push((i, match_idx as usize));
-                scores.push(scores_data[i]);
+            if match_idx < 0 {
+                continue;
             }
+            let Some(&score) = scores_data.get(i) else {
+                return Err(InferenceError::UnexpectedOutput {
+                    name: "mscores0".to_string(),
+                    expected: format!("at least {} elements", matches_data.len()),
+                    actual: format!("{} elements", scores_data.len()),
+                });
+            };
+            let right_idx =
+                usize::try_from(match_idx).map_err(|_| InferenceError::UnexpectedOutput {
+                    name: "matches0".to_string(),
+                    expected: "non-negative match indices".to_string(),
+                    actual: format!("index {match_idx}"),
+                })?;
+            indices.push((i, right_idx));
+            scores.push(score);
         }
 
         Matches::new(dec_1, dec_2, indices, scores)

@@ -1,5 +1,5 @@
 use crate::dataset::CameraIntrinsics;
-use crate::{math, Keyframe, Keypoint, Matches, Point3, Verified};
+use crate::{Keyframe, Keypoint, Matches, Point3, Verified, math};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {
@@ -577,7 +577,9 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
         return vec![-coeffs[0] / c1];
     }
 
-    let lead = *coeffs.last().unwrap();
+    let Some(&lead) = coeffs.last() else {
+        return Vec::new();
+    };
     if lead.abs() < 1e-12 {
         return Vec::new();
     }
@@ -1179,9 +1181,9 @@ mod tests {
             .collect();
         let errors = reprojection_errors(&pose, &observations, intrinsics);
         let rmse = reprojection_rmse(&errors).expect("rmse");
-        assert!(rmse >= 1.5 && rmse <= 2.5, "rmse={rmse}");
+        assert!((1.5..=2.5).contains(&rmse), "rmse={rmse}");
         let max = reprojection_max(&errors).expect("max");
-        assert!(max >= 1.5 && max <= 2.5, "max={max}");
+        assert!((1.5..=2.5).contains(&max), "max={max}");
     }
 
     #[test]

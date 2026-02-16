@@ -357,7 +357,12 @@ impl DatasetWriter {
         )
     }
 
-    fn write_item(&self, item: SpoolItem, bytes: usize, oversize_msg: &'static str) -> WriteOutcome {
+    fn write_item(
+        &self,
+        item: SpoolItem,
+        bytes: usize,
+        oversize_msg: &'static str,
+    ) -> WriteOutcome {
         if self.state.failed.load(Ordering::Acquire) {
             return WriteOutcome::WriterFailed;
         }
@@ -435,7 +440,11 @@ impl DatasetWriter {
 impl DatasetWriterHandle {
     /// Blocks until the writer thread exits; all DatasetWriter clones must be dropped first.
     pub fn finish(mut self) -> Result<WriterStats, DatasetError> {
-        let handle = self.handle.take().expect("finish called twice");
+        let Some(handle) = self.handle.take() else {
+            return Err(DatasetError::InvalidConfig {
+                msg: "finish called twice",
+            });
+        };
         handle.join().map_err(|err| DatasetError::WorkerJoin {
             message: panic_message(err),
         })?;
@@ -810,8 +819,12 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         msg: "meta.json missing mono config",
     })?;
 
-    let mut frames =
-        scan_frames_with_depth(&state.frames_dir, mono.width, mono.height, meta.depth.as_ref())?;
+    let mut frames = scan_frames_with_depth(
+        &state.frames_dir,
+        mono.width,
+        mono.height,
+        meta.depth.as_ref(),
+    )?;
     let parse_fail = frames.parse_fail;
     let size_mismatch = frames.size_mismatch;
     let mut left = std::mem::take(&mut frames.left);
@@ -974,7 +987,10 @@ fn scan_frames_with_depth(
                         Some(len) => len,
                         None => continue,
                     },
-                    _ => unreachable!(),
+                    _ => {
+                        frames.parse_fail = frames.parse_fail.saturating_add(1);
+                        continue;
+                    }
                 };
                 if metadata.len() != expected_len {
                     frames.size_mismatch += 1;
@@ -984,7 +1000,9 @@ fn scan_frames_with_depth(
                     "mono_left" => frames.left.push(info),
                     "mono_right" => frames.right.push(info),
                     "depth" => frames.depth.push(info),
-                    _ => unreachable!(),
+                    _ => {
+                        frames.parse_fail = frames.parse_fail.saturating_add(1);
+                    }
                 }
             }
             _ => {
@@ -1052,8 +1070,8 @@ fn build_delta_stats(deltas: &[i64]) -> Option<DeltaStats> {
     }
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
-    let min = *sorted.first().unwrap() as u64;
-    let max = *sorted.last().unwrap() as u64;
+    let min = sorted.first().copied().unwrap_or(0) as u64;
+    let max = sorted.last().copied().unwrap_or(0) as u64;
     let median = median_i64(&sorted) as u64;
     let p95 = percentile_i64(&sorted, 0.95) as u64;
     let p99 = percentile_i64(&sorted, 0.99) as u64;
@@ -1080,7 +1098,7 @@ fn compute_pairing_window_ns(
     let mad = median_absolute_deviation(&sorted, median);
     let p99 = stats
         .map(|s| s.p99)
-        .unwrap_or(sorted.last().copied().unwrap() as u64);
+        .unwrap_or_else(|| sorted.last().copied().unwrap_or(0) as u64);
     let mut window = p99.max((median + 6 * mad).max(0) as u64);
     if let Some(period) = left_period {
         if period > 0 {
