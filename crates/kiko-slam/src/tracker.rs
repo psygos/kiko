@@ -783,8 +783,11 @@ impl BackendWorker {
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
     ) -> Self {
-        let (tx_req, rx_req) = crossbeam_channel::bounded::<KeyframeEvent>(config.queue_depth());
-        let (tx_resp, rx_resp) = crossbeam_channel::unbounded::<BackendResponse>();
+        let queue_depth = config.queue_depth();
+        let (tx_req, rx_req) = crossbeam_channel::bounded::<KeyframeEvent>(queue_depth);
+        // Keep backend responses bounded to prevent unbounded memory growth if
+        // the tracking thread falls behind response draining.
+        let (tx_resp, rx_resp) = crossbeam_channel::bounded::<BackendResponse>(queue_depth);
 
         thread::Builder::new()
             .name("kiko-backend".to_string())
@@ -2741,7 +2744,12 @@ fn insert_keyframe_into_map(
         .unwrap_or(1)
         .max(1);
     if cull_min_observations > 1 && map.num_points() > 0 {
-        let _ = map.cull_points(cull_min_observations);
+        let points_before = map.num_points();
+        let culled_points = map.cull_points(cull_min_observations);
+        debug_assert!(
+            culled_points <= points_before,
+            "culled more points than existed"
+        );
     }
 
     for (landmark, &det_idx) in keyframe

@@ -222,12 +222,19 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
             // Commit 2: backend.clear() here, then re-integrate all stored
             // keyframes with their corrected poses.
             //
-            // For now, update stored poses in-place (no TSDF backend yet).
-            for (kf_id, new_pose) in &corrected_poses {
-                // The depth data stays the same; only the pose used for
-                // integration changes. In commit 2 this drives
-                // backend.integrate(new_pose, stored_depth, intrinsics).
-                let _ = (kf_id, new_pose);
+            // For now, we can only rebuild keyframes whose depth snapshots are
+            // still present in the local depth store.
+            let mut rebuildable = 0usize;
+            for (kf_id, _new_pose) in &corrected_poses {
+                if state.store.map.contains_key(kf_id) {
+                    rebuildable = rebuildable.saturating_add(1);
+                }
+            }
+            if rebuildable < corrected_poses.len() {
+                eprintln!(
+                    "dense rebuild missing depth snapshots for {} keyframes",
+                    corrected_poses.len().saturating_sub(rebuildable)
+                );
             }
 
             state.stats.rebuild_count = state.stats.rebuild_count.saturating_add(1);
