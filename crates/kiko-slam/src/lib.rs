@@ -7,6 +7,7 @@ pub use inference::{
     EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
 };
 mod channel;
+mod depth;
 pub mod dataset;
 mod diagnostics;
 pub mod env;
@@ -32,6 +33,7 @@ pub use channel::{
     bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
     DropPolicy, DropReceiver, DropSender, SendOutcome,
 };
+pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
 };
@@ -50,7 +52,7 @@ pub use loop_closure::{
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
 #[cfg(feature = "record")]
-pub use oak::oak_to_frame;
+pub use oak::{oak_to_depth_image, oak_to_frame};
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
