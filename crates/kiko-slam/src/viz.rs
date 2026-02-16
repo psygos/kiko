@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    env::env_f32, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw,
-    Timestamp, VizPacket,
+    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
+    VizPacket, env::env_f32,
 };
 
 use std::collections::HashMap;

@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::{
+    Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
     map::{KeyframeId, KeyframeKeypoint, MapPointId, SlamMap},
-    math, Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
+    math,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -58,7 +59,10 @@ impl std::fmt::Display for LmConfigError {
                 write!(f, "LM max lambda must be > 0 (got {value})")
             }
             LmConfigError::MinLambdaExceedsMax { min, max } => {
-                write!(f, "LM min lambda must be <= max lambda (min={min}, max={max})")
+                write!(
+                    f,
+                    "LM min lambda must be <= max lambda (min={min}, max={max})"
+                )
             }
             LmConfigError::InvalidRhoAccept { value } => {
                 write!(f, "LM rho_accept must be in (0, 1) (got {value})")
@@ -781,7 +785,11 @@ impl LocalBundleAdjuster {
         self.frames.last().map(|frame| frame.pose)
     }
 
-    pub fn optimize_keyframe_window(&mut self, map: &mut SlamMap, window: &[KeyframeId]) -> BaResult {
+    pub fn optimize_keyframe_window(
+        &mut self,
+        map: &mut SlamMap,
+        window: &[KeyframeId],
+    ) -> BaResult {
         let mut problem = match FullBaProblem::try_from_map(
             map,
             window,
@@ -958,7 +966,8 @@ impl LocalBundleAdjuster {
         let mut lm_state = LmState::new(lm_config, final_cost);
 
         for iter in 0..max_iters {
-            let pose_backup: Vec<Pose> = problem.poses.iter().map(|pose_var| pose_var.pose).collect();
+            let pose_backup: Vec<Pose> =
+                problem.poses.iter().map(|pose_var| pose_var.pose).collect();
             let landmark_backup: Vec<Point3> = problem
                 .landmarks
                 .iter()
@@ -1190,7 +1199,8 @@ impl LocalBundleAdjuster {
                     }
                 }
                 LmAction::Reject => {
-                    for (pose_var, pose) in problem.poses.iter_mut().zip(pose_backup.iter().copied())
+                    for (pose_var, pose) in
+                        problem.poses.iter_mut().zip(pose_backup.iter().copied())
                     {
                         pose_var.pose = pose;
                     }
@@ -1520,8 +1530,8 @@ fn accumulate_pose_rhs(
 fn accumulate_landmark_hessian(c: &mut [[f32; 3]; 3], j_landmark: [[f32; 3]; 2]) {
     for (row, c_row) in c.iter_mut().enumerate().take(3) {
         for (col, c_value) in c_row.iter_mut().enumerate().take(3) {
-            *c_value += j_landmark[0][row] * j_landmark[0][col]
-                + j_landmark[1][row] * j_landmark[1][col];
+            *c_value +=
+                j_landmark[0][row] * j_landmark[0][col] + j_landmark[1][row] * j_landmark[1][col];
         }
     }
 }
@@ -1692,7 +1702,7 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{assert_map_invariants, KeyframeId, MapPointId, SlamMap};
+    use crate::map::{KeyframeId, MapPointId, SlamMap, assert_map_invariants};
     use crate::test_helpers::{
         axis_angle_pose, make_detections, make_pinhole_intrinsics, project_world_point,
     };
@@ -2167,7 +2177,10 @@ mod tests {
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
         let result = ba.optimize_full(&mut problem);
         let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
-        assert!(after < before, "cost did not improve: before={before}, after={after}");
+        assert!(
+            after < before,
+            "cost did not improve: before={before}, after={after}"
+        );
         assert!(matches!(
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }

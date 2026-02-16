@@ -4,8 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    inference::InferenceError, DownscaleFactor, LightGlue, Matches, Raw, StereoPair, SuperPoint,
-    VizError, VizPacket,
+    DownscaleFactor, LightGlue, Matches, Raw, StereoPair, SuperPoint, VizError, VizPacket,
+    inference::InferenceError,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,8 +155,9 @@ impl InferencePipeline {
 
         let (left_det, left_time) = left_result
             .map_err(|_| InferenceError::Domain("left superpoint thread panicked".to_string()))??;
-        let (right_det, right_time) = right_result
-            .map_err(|_| InferenceError::Domain("right superpoint thread panicked".to_string()))??;
+        let (right_det, right_time) = right_result.map_err(|_| {
+            InferenceError::Domain("right superpoint thread panicked".to_string())
+        })??;
 
         let left = Arc::new(left_det);
         let right = Arc::new(right_det);

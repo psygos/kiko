@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 
 use crate::{CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
 
@@ -42,11 +42,7 @@ struct KeypointIndex(usize);
 
 impl KeypointIndex {
     fn new(index: usize, len: usize) -> Option<Self> {
-        if index < len {
-            Some(Self(index))
-        } else {
-            None
-        }
+        if index < len { Some(Self(index)) } else { None }
     }
 
     fn as_usize(self) -> usize {

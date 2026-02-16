@@ -3,12 +3,12 @@
     windows_subsystem = "windows"
 )]
 
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Manager, State};
-use log::{info, warn, error, debug};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RobotCommand {
@@ -54,16 +54,19 @@ struct CommandStream {
 }
 
 impl CommandStream {
-    fn new(server_addr: String, http_port: Option<u16>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        server_addr: String,
+        http_port: Option<u16>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         info!("Creating new command stream to {}", server_addr);
-        
+
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         info!("UDP socket bound successfully");
-        
+
         socket.set_read_timeout(Some(Duration::from_millis(50)))?;
         socket.set_nonblocking(false)?;
         debug!("Socket timeouts configured");
-        
+
         // Test connection by sending a ping command
         let test_cmd = RobotCommand {
             left_speed: 0,
@@ -71,11 +74,11 @@ impl CommandStream {
             timeout_ms: 150,
             sequence: 0,
         };
-        
+
         let test_packet = bincode::serialize(&test_cmd)?;
         socket.send_to(&test_packet, &server_addr)?;
         info!("Test packet sent to {}", server_addr);
-        
+
         // Try to receive response to verify connection
         let mut buf = [0u8; 1024];
         match socket.recv_from(&mut buf) {
@@ -83,15 +86,27 @@ impl CommandStream {
                 info!("Received {} bytes from {} - connection verified", len, addr);
             }
             Err(e) => {
-                warn!("No immediate response from server: {} - continuing anyway", e);
+                warn!(
+                    "No immediate response from server: {} - continuing anyway",
+                    e
+                );
             }
         }
-        
+
         // Derive HTTP base URL using provided port or default 3030
-        let udp_host = server_addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(server_addr.as_str());
+        let udp_host = server_addr
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(server_addr.as_str());
         let http_port = http_port.unwrap_or(3030);
-        let base_http_url = format!("http://{}:{}/", udp_host.trim_matches(|c| c == '[' || c == ']'), http_port).trim_end_matches('/').to_string();
-        
+        let base_http_url = format!(
+            "http://{}:{}/",
+            udp_host.trim_matches(|c| c == '[' || c == ']'),
+            http_port
+        )
+        .trim_end_matches('/')
+        .to_string();
+
         Ok(CommandStream {
             socket,
             sequence: 0,
@@ -102,38 +117,45 @@ impl CommandStream {
             base_http_url,
         })
     }
-    
+
     fn send_command(&mut self) -> Result<Option<TelemetryUpdate>, Box<dyn std::error::Error>> {
         self.sequence = (self.sequence + 1) & 0xFFFFFFFF;
-        
+
         let cmd = RobotCommand {
             left_speed: self.left_speed,
             right_speed: self.right_speed,
             timeout_ms: 150, // 150ms timeout for safety
             sequence: self.sequence,
         };
-        
+
         let start_time = Instant::now();
-        
+
         // Send command
         let packet = bincode::serialize(&cmd)?;
         let bytes_sent = self.socket.send_to(&packet, &self.server_addr)?;
-        debug!("Sent {} bytes (seq: {}, L: {}, R: {}) to {}", 
-               bytes_sent, self.sequence, self.left_speed, self.right_speed, self.server_addr);
-        
+        debug!(
+            "Sent {} bytes (seq: {}, L: {}, R: {}) to {}",
+            bytes_sent, self.sequence, self.left_speed, self.right_speed, self.server_addr
+        );
+
         // Try to receive telemetry (non-blocking with timeout)
         let mut buf = [0u8; 1024];
         match self.socket.recv_from(&mut buf) {
             Ok((len, addr)) => {
                 let telemetry: RobotTelemetry = bincode::deserialize(&buf[..len])?;
                 let latency = start_time.elapsed().as_millis() as u32;
-                
-                debug!("Received telemetry from {}: L: {}, R: {}, Battery: {}mV, Latency: {}ms", 
-                       addr, telemetry.left_actual, telemetry.right_actual, 
-                       telemetry.battery_mv, latency);
-                
+
+                debug!(
+                    "Received telemetry from {}: L: {}, R: {}, Battery: {}mV, Latency: {}ms",
+                    addr,
+                    telemetry.left_actual,
+                    telemetry.right_actual,
+                    telemetry.battery_mv,
+                    latency
+                );
+
                 self.last_telemetry = Some(telemetry.clone());
-                
+
                 Ok(Some(TelemetryUpdate {
                     telemetry,
                     latency,
@@ -142,24 +164,27 @@ impl CommandStream {
                 }))
             }
             Err(e) => {
-                if self.sequence % 50 == 0 { // Log every 50th missed response to avoid spam
+                if self.sequence % 50 == 0 {
+                    // Log every 50th missed response to avoid spam
                     warn!("No telemetry response (seq: {}): {}", self.sequence, e);
                 }
                 Ok(None)
             }
         }
     }
-    
+
     fn set_speeds(&mut self, left: i8, right: i8) {
         let old_left = self.left_speed;
         let old_right = self.right_speed;
-        
+
         self.left_speed = left.clamp(-100, 100);
         self.right_speed = right.clamp(-100, 100);
-        
+
         if old_left != self.left_speed || old_right != self.right_speed {
-            info!("Speed changed: L: {} -> {}, R: {} -> {}", 
-                  old_left, self.left_speed, old_right, self.right_speed);
+            info!(
+                "Speed changed: L: {} -> {}, R: {} -> {}",
+                old_left, self.left_speed, old_right, self.right_speed
+            );
         }
     }
 }
@@ -183,35 +208,34 @@ async fn connect(
     {
         *state.lock().unwrap() = None;
     }
-    
+
     info!("Attempting to connect to: {}", address);
-    
+
     // Parse address (add port if not specified)
     let server_addr = if address.contains(':') {
         address.clone()
     } else {
         format!("{}:8080", address)
     };
-    
+
     info!("Parsed server address: {}", server_addr);
-    
+
     // Create new connection
-    let stream = CommandStream::new(server_addr.clone(), http_port)
-        .map_err(|e| {
-            error!("Failed to create command stream: {}", e);
-            format!("Connection failed: {}", e)
-        })?;
-    
+    let stream = CommandStream::new(server_addr.clone(), http_port).map_err(|e| {
+        error!("Failed to create command stream: {}", e);
+        format!("Connection failed: {}", e)
+    })?;
+
     info!("Command stream created successfully");
-    
+
     *state.lock().unwrap() = Some(stream);
-    
+
     // Start command streaming thread
     let state_clone = state.inner().clone();
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(Duration::from_millis(40)); // 25Hz
-            
+
             let should_continue = {
                 let mut state_guard = state_clone.lock().unwrap();
                 if let Some(stream) = state_guard.as_mut() {
@@ -226,7 +250,9 @@ async fn connect(
                         Ok(None) => true, // No telemetry received, but command sent
                         Err(e) => {
                             error!("Command stream error: {}", e);
-                            if let Err(emit_err) = app_handle.emit_all("connection-error", e.to_string()) {
+                            if let Err(emit_err) =
+                                app_handle.emit_all("connection-error", e.to_string())
+                            {
                                 error!("Failed to emit connection error: {}", emit_err);
                             }
                             false
@@ -236,19 +262,19 @@ async fn connect(
                     false // Not connected
                 }
             };
-            
+
             if !should_continue {
                 break;
             }
         }
-        
+
         // Emit disconnection event
         info!("Command stream thread terminated - emitting connection-lost event");
         if let Err(e) = app_handle.emit_all("connection-lost", ()) {
             error!("Failed to emit connection-lost event: {}", e);
         }
     });
-    
+
     Ok(format!("Connected to {}", server_addr))
 }
 
@@ -304,10 +330,11 @@ async fn get_odometry(state: State<'_, StreamState>) -> Result<Option<RobotOdome
             return Err("Not connected".to_string());
         }
     }; // Lock is released here
-    
+
     let url = format!("{}/odometry", url);
     let client = reqwest::Client::new();
-    match client.get(&url)
+    match client
+        .get(&url)
         .timeout(std::time::Duration::from_millis(500))
         .send()
         .await
@@ -344,11 +371,14 @@ fn main() {
     env_logger::Builder::from_default_env()
         .filter_level(log::LevelFilter::Info)
         .init();
-    
-    info!("Starting Robot Control Client v{}", env!("CARGO_PKG_VERSION"));
-    
+
+    info!(
+        "Starting Robot Control Client v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
     let stream_state: StreamState = Arc::new(Mutex::new(None));
-    
+
     tauri::Builder::default()
         .manage(stream_state)
         .invoke_handler(tauri::generate_handler![

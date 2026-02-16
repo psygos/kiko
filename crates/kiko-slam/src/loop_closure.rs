@@ -2,8 +2,8 @@ use std::num::NonZeroUsize;
 
 use crate::map::{KeyframeId, SlamMap};
 use crate::{
-    solve_pnp_ransac, CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics,
-    PnpError, Pose, RansacConfig,
+    CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
+    RansacConfig, solve_pnp_ransac,
 };
 
 const GLOBAL_DESCRIPTOR_DIM: usize = 512;
@@ -1028,10 +1028,10 @@ impl RelocalizationCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource,
-        GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
+        DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
         LoopClosureConfig, LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
-        RelocalizationConfigError, RelocalizationConfigInput,
+        RelocalizationConfigError, RelocalizationConfigInput, aggregate_global_descriptor,
+        match_descriptors_for_loop,
     };
     use crate::map::{ImageSize, KeyframeId, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -1158,9 +1158,11 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(0), 10);
         // Query is the latest keyframe; with gap=2, only the first two are eligible.
         assert_eq!(matches.len(), 2);
-        assert!(matches
-            .iter()
-            .all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
+        assert!(
+            matches
+                .iter()
+                .all(|m| m.candidate == ids[0] || m.candidate == ids[1])
+        );
     }
 
     #[test]
@@ -1211,9 +1213,11 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(4), 10);
         // kf3 is seq distance 1 (filtered), kf1 is distance 3 (kept), kf0 is distance 4 (kept).
         assert_eq!(matches.len(), 2);
-        assert!(matches
-            .iter()
-            .all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
+        assert!(
+            matches
+                .iter()
+                .all(|m| m.candidate == ids[0] || m.candidate == ids[1])
+        );
     }
 
     #[test]
@@ -1322,9 +1326,11 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(4), 10);
         assert!(!matches.is_empty());
         assert!(matches.iter().all(|m| m.query == ids[4]));
-        assert!(matches
-            .iter()
-            .all(|m| m.candidate != ids[1] && m.candidate != ids[3]));
+        assert!(
+            matches
+                .iter()
+                .all(|m| m.candidate != ids[1] && m.candidate != ids[3])
+        );
     }
 
     #[test]

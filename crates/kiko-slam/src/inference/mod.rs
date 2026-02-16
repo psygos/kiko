@@ -1,6 +1,6 @@
-use ort::session::builder::GraphOptimizationLevel;
-use ort::session::Session;
 use ort::Error as OrtError;
+use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use std::path::PathBuf;
 
 mod backend;

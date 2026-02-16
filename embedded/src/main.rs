@@ -7,8 +7,8 @@ use panic_halt as _;
 use stm32f4xx_hal::{
     pac,
     prelude::*,
-    serial::{config::Config, Event, Serial},
-    timer::{pwm::PwmExt, Channel1, Channel2},
+    serial::{Event, Serial, config::Config},
+    timer::{Channel1, Channel2, pwm::PwmExt},
 };
 
 // Ring buffer for incoming UART data
@@ -293,7 +293,8 @@ fn main() -> ! {
 
             // Periodic telemetry (non-blocking)
             telemetry_counter += 1;
-            if telemetry_counter >= 200 {  // 10Hz telemetry
+            if telemetry_counter >= 200 {
+                // 10Hz telemetry
                 telemetry_counter = 0;
                 send_odometry_telemetry();
             }
@@ -317,12 +318,12 @@ fn main() -> ! {
 fn TIM1_UP_TIM10() {
     unsafe {
         let tim1 = &(*pac::TIM1::ptr());
-        
+
         // Check if update interrupt flag is set
         if tim1.sr.read().uif().bit_is_set() {
             // Clear the flag
             tim1.sr.modify(|_, w| w.uif().clear_bit());
-            
+
             // Check direction
             if tim1.cr1.read().dir().bit_is_set() {
                 // Counting down
@@ -340,10 +341,10 @@ fn TIM1_UP_TIM10() {
 fn TIM4() {
     unsafe {
         let tim4 = &(*pac::TIM4::ptr());
-        
+
         if tim4.sr.read().uif().bit_is_set() {
             tim4.sr.modify(|_, w| w.uif().clear_bit());
-            
+
             if tim4.cr1.read().dir().bit_is_set() {
                 RIGHT_OVERFLOW_COUNT -= 1;
             } else {
@@ -500,40 +501,44 @@ where
 fn configure_encoder_tim1(tim1: pac::TIM1) {
     // Enable TIM1 clock
     unsafe {
-        (*pac::RCC::ptr()).apb2enr.modify(|_, w| w.tim1en().set_bit());
+        (*pac::RCC::ptr())
+            .apb2enr
+            .modify(|_, w| w.tim1en().set_bit());
     }
 
     // Configure TIM1 in encoder mode
     unsafe {
         // Reset timer
         tim1.cr1.modify(|_, w| w.cen().clear_bit());
-        
+
         // Configure encoder interface mode 3 (counts on both TI1 and TI2)
         tim1.smcr.modify(|_, w| w.sms().bits(0b011));
-        
+
         // Configure input capture channels
         tim1.ccmr1_input().modify(|_, w| {
-            w.cc1s().bits(0b01)  // IC1 mapped to TI1
-             .ic1f().bits(0b0011) // Input filter (noise reduction)
-             .cc2s().bits(0b01)  // IC2 mapped to TI2
-             .ic2f().bits(0b0011) // Input filter
+            w.cc1s()
+                .bits(0b01) // IC1 mapped to TI1
+                .ic1f()
+                .bits(0b0011) // Input filter (noise reduction)
+                .cc2s()
+                .bits(0b01) // IC2 mapped to TI2
+                .ic2f()
+                .bits(0b0011) // Input filter
         });
-        
+
         // Set polarity (non-inverted)
-        tim1.ccer.modify(|_, w| {
-            w.cc1p().clear_bit()
-             .cc2p().clear_bit()
-        });
-        
+        tim1.ccer
+            .modify(|_, w| w.cc1p().clear_bit().cc2p().clear_bit());
+
         // Set auto-reload to max value for 16-bit timer
         tim1.arr.write(|w| w.arr().bits(0xFFFF));
-        
+
         // Enable update interrupt for overflow detection
         tim1.dier.modify(|_, w| w.uie().set_bit());
-        
+
         // Clear update flag
         tim1.sr.modify(|_, w| w.uif().clear_bit());
-        
+
         // Enable counter
         tim1.cr1.modify(|_, w| w.cen().set_bit());
     }
@@ -543,40 +548,44 @@ fn configure_encoder_tim1(tim1: pac::TIM1) {
 fn configure_encoder_tim4(tim4: pac::TIM4) {
     // Enable TIM4 clock
     unsafe {
-        (*pac::RCC::ptr()).apb1enr.modify(|_, w| w.tim4en().set_bit());
+        (*pac::RCC::ptr())
+            .apb1enr
+            .modify(|_, w| w.tim4en().set_bit());
     }
 
     // Configure TIM4 in encoder mode
     unsafe {
         // Reset timer
         tim4.cr1.modify(|_, w| w.cen().clear_bit());
-        
+
         // Configure encoder interface mode 3
         tim4.smcr.modify(|_, w| w.sms().bits(0b011));
-        
+
         // Configure input capture channels
         tim4.ccmr1_input().modify(|_, w| {
-            w.cc1s().bits(0b01)
-             .ic1f().bits(0b0011)
-             .cc2s().bits(0b01)
-             .ic2f().bits(0b0011)
+            w.cc1s()
+                .bits(0b01)
+                .ic1f()
+                .bits(0b0011)
+                .cc2s()
+                .bits(0b01)
+                .ic2f()
+                .bits(0b0011)
         });
-        
+
         // Set polarity
-        tim4.ccer.modify(|_, w| {
-            w.cc1p().clear_bit()
-             .cc2p().clear_bit()
-        });
-        
+        tim4.ccer
+            .modify(|_, w| w.cc1p().clear_bit().cc2p().clear_bit());
+
         // Set auto-reload to max value
         tim4.arr.write(|w| w.arr().bits(0xFFFF));
-        
+
         // Enable update interrupt
         tim4.dier.modify(|_, w| w.uie().set_bit());
-        
+
         // Clear update flag
         tim4.sr.modify(|_, w| w.uif().clear_bit());
-        
+
         // Enable counter
         tim4.cr1.modify(|_, w| w.cen().set_bit());
     }
@@ -589,21 +598,21 @@ fn update_odometry(timestamp_ms: u32) {
             // Read current encoder counts
             let left_count = (*pac::TIM1::ptr()).cnt.read().cnt().bits();
             let right_count = (*pac::TIM4::ptr()).cnt.read().cnt().bits();
-            
+
             // Calculate delta ticks (handle wraparound)
             let left_delta = left_count.wrapping_sub(LAST_LEFT_COUNT) as i16;
             let right_delta = right_count.wrapping_sub(LAST_RIGHT_COUNT) as i16;
-            
+
             // Update total position
             let left_total = (LEFT_OVERFLOW_COUNT as i64) * 65536 + left_count as i64;
             let right_total = (RIGHT_OVERFLOW_COUNT as i64) * 65536 + right_count as i64;
-            
+
             ODOMETRY.left_ticks = left_total;
             ODOMETRY.right_ticks = right_total;
             ODOMETRY.left_velocity = left_delta;
             ODOMETRY.right_velocity = right_delta;
             ODOMETRY.timestamp = timestamp_ms;
-            
+
             // Debug: Send raw encoder counts every 50 updates (0.5 seconds)
             static mut DEBUG_COUNTER: u32 = 0;
             DEBUG_COUNTER += 1;
@@ -616,7 +625,7 @@ fn update_odometry(timestamp_ms: u32) {
                 send_u32(right_count as u32);
                 queue_tx_string(b"\r\n");
             }
-            
+
             // Store for next iteration
             LAST_LEFT_COUNT = left_count;
             LAST_RIGHT_COUNT = right_count;
@@ -627,13 +636,17 @@ fn update_odometry(timestamp_ms: u32) {
 // Send odometry telemetry
 fn send_odometry_telemetry() {
     unsafe {
-        let (left_ticks, right_ticks, left_vel, right_vel, timestamp) = 
+        let (left_ticks, right_ticks, left_vel, right_vel, timestamp) =
             cortex_m::interrupt::free(|_| {
-                (ODOMETRY.left_ticks, ODOMETRY.right_ticks, 
-                 ODOMETRY.left_velocity, ODOMETRY.right_velocity,
-                 ODOMETRY.timestamp)
+                (
+                    ODOMETRY.left_ticks,
+                    ODOMETRY.right_ticks,
+                    ODOMETRY.left_velocity,
+                    ODOMETRY.right_velocity,
+                    ODOMETRY.timestamp,
+                )
             });
-        
+
         queue_tx_string(b"ODO,");
         send_i64(left_ticks);
         queue_tx(b',');
@@ -660,18 +673,18 @@ fn send_i64(mut n: i64) {
 fn send_u64(mut n: u64) {
     let mut buf = [0u8; 20];
     let mut i = 0;
-    
+
     if n == 0 {
         queue_tx(b'0');
         return;
     }
-    
+
     while n > 0 {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
         i += 1;
     }
-    
+
     while i > 0 {
         i -= 1;
         queue_tx(buf[i]);
@@ -690,18 +703,18 @@ fn send_i16(n: i16) {
 fn send_u32(mut n: u32) {
     let mut buf = [0u8; 10];
     let mut i = 0;
-    
+
     if n == 0 {
         queue_tx(b'0');
         return;
     }
-    
+
     while n > 0 {
         buf[i] = b'0' + (n % 10) as u8;
         n /= 10;
         i += 1;
     }
-    
+
     while i > 0 {
         i -= 1;
         queue_tx(buf[i]);

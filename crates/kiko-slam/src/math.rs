@@ -335,7 +335,11 @@ mod tests {
         let omega = [0.2, -0.05, 0.1];
         let delta = [1e-6, -2e-6, 1.5e-6];
         let jr_delta = mat_mul_vec_f64(so3_right_jacobian_f64(omega), delta);
-        let r_fd = so3_exp_f64([omega[0] + delta[0], omega[1] + delta[1], omega[2] + delta[2]]);
+        let r_fd = so3_exp_f64([
+            omega[0] + delta[0],
+            omega[1] + delta[1],
+            omega[2] + delta[2],
+        ]);
         let r_pred = mat_mul_f64(so3_exp_f64(omega), so3_exp_f64(jr_delta));
         let err = rot_diff_norm(r_fd, r_pred);
         assert!(err < 1e-8, "right jacobian finite-diff error: {err}");

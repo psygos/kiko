@@ -312,9 +312,23 @@ impl DeviceConfig {
     /// All streams enabled at 640x480@30fps
     pub fn all_streams() -> Self {
         Self {
-            rgb: Some(RgbConfig { width: 640, height: 480, fps: 30 }),
-            mono: Some(MonoConfig { width: 640, height: 480, fps: 30, rectified: true }),
-            depth: Some(DepthConfig { width: 640, height: 480, fps: 30, align_to_rgb: true }),
+            rgb: Some(RgbConfig {
+                width: 640,
+                height: 480,
+                fps: 30,
+            }),
+            mono: Some(MonoConfig {
+                width: 640,
+                height: 480,
+                fps: 30,
+                rectified: true,
+            }),
+            depth: Some(DepthConfig {
+                width: 640,
+                height: 480,
+                fps: 30,
+                align_to_rgb: true,
+            }),
             imu: Some(ImuConfig { rate_hz: 400 }),
             queue: QueueConfig::default(),
         }
@@ -528,7 +542,14 @@ pub struct Intrinsics {
 
 impl From<ffi::Intrinsics> for Intrinsics {
     fn from(i: ffi::Intrinsics) -> Self {
-        Self { fx: i.fx, fy: i.fy, cx: i.cx, cy: i.cy, width: i.width, height: i.height }
+        Self {
+            fx: i.fx,
+            fy: i.fy,
+            cx: i.cx,
+            cy: i.cy,
+            width: i.width,
+            height: i.height,
+        }
     }
 }
 
@@ -542,7 +563,11 @@ pub struct DeviceInfo {
 
 impl From<ffi::DeviceInfo> for DeviceInfo {
     fn from(d: ffi::DeviceInfo) -> Self {
-        Self { device_id: d.device_id, name: d.name, state: d.state }
+        Self {
+            device_id: d.device_id,
+            name: d.name,
+            state: d.state,
+        }
     }
 }
 
@@ -559,7 +584,10 @@ pub struct Device {
 impl Device {
     /// List all available OAK devices
     pub fn list() -> Vec<DeviceInfo> {
-        ffi::list_devices().into_iter().map(DeviceInfo::from).collect()
+        ffi::list_devices()
+            .into_iter()
+            .map(DeviceInfo::from)
+            .collect()
     }
 
     /// Connect to a device. Empty selector uses first available.
@@ -585,7 +613,9 @@ impl Device {
     /// Get RGB frame. Returns error if RGB not enabled in config.
     pub fn rgb(&mut self, timeout_ms: u32) -> Result<ImageFrame, ImageError> {
         if self.config.rgb.is_none() {
-            return Err(ImageError::StreamNotEnabled { stream: StreamId::Rgb });
+            return Err(ImageError::StreamNotEnabled {
+                stream: StreamId::Rgb,
+            });
         }
         let result = self.inner.pin_mut().try_get_rgb(timeout_ms);
         parse_image_result(result, timeout_ms)
@@ -594,7 +624,9 @@ impl Device {
     /// Get left mono frame. Returns error if mono not enabled in config.
     pub fn mono_left(&mut self, timeout_ms: u32) -> Result<ImageFrame, ImageError> {
         if self.config.mono.is_none() {
-            return Err(ImageError::StreamNotEnabled { stream: StreamId::MonoLeft });
+            return Err(ImageError::StreamNotEnabled {
+                stream: StreamId::MonoLeft,
+            });
         }
         let result = self.inner.pin_mut().try_get_mono_left(timeout_ms);
         parse_image_result(result, timeout_ms)
@@ -603,7 +635,9 @@ impl Device {
     /// Get right mono frame. Returns error if mono not enabled in config.
     pub fn mono_right(&mut self, timeout_ms: u32) -> Result<ImageFrame, ImageError> {
         if self.config.mono.is_none() {
-            return Err(ImageError::StreamNotEnabled { stream: StreamId::MonoRight });
+            return Err(ImageError::StreamNotEnabled {
+                stream: StreamId::MonoRight,
+            });
         }
         let result = self.inner.pin_mut().try_get_mono_right(timeout_ms);
         parse_image_result(result, timeout_ms)
@@ -629,19 +663,28 @@ impl Device {
 
     /// RGB camera intrinsics. Panics if RGB not enabled (invariant violation).
     pub fn rgb_intrinsics(&self) -> Intrinsics {
-        assert!(self.config.rgb.is_some(), "rgb_intrinsics called but RGB not enabled");
+        assert!(
+            self.config.rgb.is_some(),
+            "rgb_intrinsics called but RGB not enabled"
+        );
         self.inner.get_rgb_intrinsics().into()
     }
 
     /// Left mono camera intrinsics. Panics if mono not enabled.
     pub fn left_intrinsics(&self) -> Intrinsics {
-        assert!(self.config.mono.is_some(), "left_intrinsics called but mono not enabled");
+        assert!(
+            self.config.mono.is_some(),
+            "left_intrinsics called but mono not enabled"
+        );
         self.inner.get_left_intrinsics().into()
     }
 
     /// Right mono camera intrinsics. Panics if mono not enabled.
     pub fn right_intrinsics(&self) -> Intrinsics {
-        assert!(self.config.mono.is_some(), "right_intrinsics called but mono not enabled");
+        assert!(
+            self.config.mono.is_some(),
+            "right_intrinsics called but mono not enabled"
+        );
         self.inner.get_right_intrinsics().into()
     }
 
@@ -654,7 +697,6 @@ impl Device {
     pub fn close(mut self) {
         self.inner.pin_mut().close();
     }
-
 }
 
 // ============================================================================
@@ -722,9 +764,17 @@ fn parse_imu_result(result: ffi::ImuBatchResult) -> Result<Vec<ImuSample>, ImuEr
                 .map(|s| ImuSample {
                     timestamp: s.timestamp.into(),
                     sequence: s.sequence,
-                    accel: Vec3 { x: s.accel_x, y: s.accel_y, z: s.accel_z },
+                    accel: Vec3 {
+                        x: s.accel_x,
+                        y: s.accel_y,
+                        z: s.accel_z,
+                    },
                     accel_accuracy: s.accel_accuracy,
-                    gyro: Vec3 { x: s.gyro_x, y: s.gyro_y, z: s.gyro_z },
+                    gyro: Vec3 {
+                        x: s.gyro_x,
+                        y: s.gyro_y,
+                        z: s.gyro_z,
+                    },
                     gyro_accuracy: s.gyro_accuracy,
                 })
                 .collect();
