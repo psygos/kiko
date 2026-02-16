@@ -430,16 +430,32 @@ impl PoseGraphOptimizer {
         let mut poses = initial_poses.to_vec();
         let mut converged = false;
         let mut iters_run = 0;
+        let mut valid_edges = Vec::with_capacity(edges.len());
+        let mut invalid_edges = 0usize;
+        for edge in edges {
+            if edge.from < nposes && edge.to < nposes {
+                valid_edges.push(edge);
+            } else {
+                invalid_edges = invalid_edges.saturating_add(1);
+            }
+        }
+        if invalid_edges > 0 {
+            eprintln!("pose graph skipped {invalid_edges} invalid edges (nposes={nposes})");
+        }
+        if valid_edges.is_empty() {
+            return PoseGraphResult {
+                corrected_poses: poses,
+                iterations: 0,
+                converged: true,
+            };
+        }
 
         for iter in 0..self.config.max_iterations {
             iters_run = iter + 1;
             let mut h = BlockCsr6x6::new(nposes);
             let mut b = vec![0.0_f64; nposes * 6];
 
-            for edge in edges {
-                if edge.from >= nposes || edge.to >= nposes {
-                    continue;
-                }
+            for edge in &valid_edges {
                 let error = compute_edge_error(edge, &poses);
                 let (j_from, j_to) = compute_edge_jacobians(edge, &poses);
                 let e_norm = error.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -476,13 +492,22 @@ impl PoseGraphOptimizer {
 
             let rhs: Vec<f64> = b.into_iter().map(|v| -v).collect();
             let mut delta = vec![0.0_f64; nposes * 6];
-            let _pcg = solve_pcg(
+            let pcg = solve_pcg(
                 &h,
                 &rhs,
                 &mut delta,
                 self.config.pcg_max_iters,
                 self.config.pcg_tol,
             );
+            if !pcg.converged && iter + 1 == self.config.max_iterations {
+                eprintln!(
+                    "pose graph PCG did not converge (iters={}, residual_norm={:.3e})",
+                    pcg.iterations, pcg.residual_norm
+                );
+            }
+            if !pcg.residual_norm.is_finite() {
+                break;
+            }
 
             let mut max_step = 0.0_f64;
             for (pose_idx, pose) in poses.iter_mut().enumerate().skip(1) {

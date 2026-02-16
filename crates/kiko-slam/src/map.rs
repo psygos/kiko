@@ -703,7 +703,11 @@ impl SlamMap {
             }
         }
         for point_id in to_remove {
-            let _ = self.points.remove(point_id);
+            let removed = self.points.remove(point_id);
+            debug_assert!(
+                removed.is_some(),
+                "point scheduled for removal was missing from map"
+            );
         }
         self.bump_generation();
         Ok(())

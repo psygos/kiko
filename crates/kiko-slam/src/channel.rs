@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crossbeam_channel::{Receiver, Sender, TrySendError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropPolicy {
@@ -115,8 +115,19 @@ impl<T> DropSender<T> {
                     SendOutcome::DroppedNewest
                 }
                 DropPolicy::DropOldest => {
-                    let _ = self.drop_rx.try_recv();
-                    self.stats.dropped_oldest.fetch_add(1, Ordering::Relaxed);
+                    match self.drop_rx.try_recv() {
+                        Ok(_) => {
+                            self.stats.dropped_oldest.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            // A racing receiver may have drained between `Full` and this
+                            // eviction attempt. Fall through and retry the send.
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+                            return SendOutcome::Disconnected;
+                        }
+                    }
                     match self.tx.try_send(value) {
                         Ok(()) => {
                             self.stats.enqueued.fetch_add(1, Ordering::Relaxed);

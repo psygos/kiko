@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::map::{KeyframeId, SlamMap};
+use crate::map::{KeyframeId, MapError, SlamMap};
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
     RansacConfig, solve_pnp_ransac,
@@ -567,20 +567,33 @@ pub fn match_descriptors_for_loop(
     map: &SlamMap,
     similarity_threshold: f32,
 ) -> Vec<(usize, usize)> {
+    match try_match_descriptors_for_loop(query_descriptors, candidate_kf, map, similarity_threshold)
+    {
+        Ok(correspondences) => correspondences,
+        Err(err) => {
+            eprintln!("loop descriptor matching skipped for candidate {candidate_kf:?}: {err}");
+            Vec::new()
+        }
+    }
+}
+
+pub fn try_match_descriptors_for_loop(
+    query_descriptors: &[Descriptor],
+    candidate_kf: KeyframeId,
+    map: &SlamMap,
+    similarity_threshold: f32,
+) -> Result<Vec<(usize, usize)>, MapError> {
     if query_descriptors.is_empty()
         || !similarity_threshold.is_finite()
         || similarity_threshold <= 0.0
         || similarity_threshold > 1.0
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let candidate_descriptors = match map.keyframe_point_descriptors(candidate_kf) {
-        Ok(values) => values,
-        Err(_) => return Vec::new(),
-    };
+    let candidate_descriptors = map.keyframe_point_descriptors(candidate_kf)?;
     if candidate_descriptors.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let query_quantized: Vec<CompactDescriptor> =
@@ -626,7 +639,7 @@ pub fn match_descriptors_for_loop(
             correspondences.push((query_idx, candidate_descriptors[*candidate_pos].0.index()));
         }
     }
-    correspondences
+    Ok(correspondences)
 }
 
 #[derive(Clone, Debug)]
@@ -1031,9 +1044,9 @@ mod tests {
         DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
         LoopClosureConfig, LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
         RelocalizationConfigError, RelocalizationConfigInput, aggregate_global_descriptor,
-        match_descriptors_for_loop,
+        match_descriptors_for_loop, try_match_descriptors_for_loop,
     };
-    use crate::map::{ImageSize, KeyframeId, SlamMap};
+    use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
     use crate::{
         CompactDescriptor, Descriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
@@ -1599,6 +1612,17 @@ mod tests {
 
         let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
         assert_eq!(matches, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn try_match_descriptors_propagates_map_error() {
+        let map = SlamMap::new();
+        let mut query = [0.0_f32; 256];
+        query[7] = 1.0;
+        let err =
+            try_match_descriptors_for_loop(&[Descriptor(query)], KeyframeId::default(), &map, 0.95)
+                .expect_err("missing keyframe should return map error");
+        assert!(matches!(err, MapError::KeyframeNotFound(_)));
     }
 
     #[test]
