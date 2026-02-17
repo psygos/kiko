@@ -6,14 +6,23 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+/// Minimum 3D-2D correspondences needed for PnP pose estimation.
+const MIN_PNP_CORRESPONDENCES: usize = 4;
+/// Default maximum respawn attempts for backend and descriptor workers.
+const DEFAULT_MAX_RESPAWNS: u32 = 3;
+/// Minimum keyframes required for multi-frame optimization (BA or pose graph).
+const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
+/// Default minimum observations per map point to survive culling.
+const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
+
 use crate::loop_closure::{
-    DescriptorSource, KeyframeDatabase, LoopCandidate, LoopClosureConfig, LoopDetectError,
-    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
+    DescriptorSource, KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig,
+    LoopDetectError, PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
     aggregate_global_descriptor, match_descriptors_for_loop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
-    PoseGraphOptimizer,
+    PoseGraphError, PoseGraphOptimizer,
 };
 use crate::{
     BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor, EigenPlaces, Frame,
@@ -40,14 +49,75 @@ pub struct TrackerConfig {
     pub ba: LocalBaConfig,
     pub redundancy: Option<RedundancyPolicy>,
     pub backend: Option<BackendConfig>,
-    pub loop_closure: Option<LoopClosureConfig>,
-    pub global_descriptor: Option<GlobalDescriptorConfig>,
-    pub relocalization: Option<RelocalizationConfig>,
+    pub loop_subsystem: LoopSubsystemConfig,
 }
 
 impl TrackerConfig {
     pub fn max_keypoints(&self) -> usize {
         self.max_keypoints.get()
+    }
+
+    fn loop_closure_config(&self) -> Option<LoopClosureConfig> {
+        self.loop_subsystem.loop_closure()
+    }
+
+    fn global_descriptor_config(&self) -> Option<GlobalDescriptorConfig> {
+        self.loop_subsystem.global_descriptor()
+    }
+
+    fn relocalization_config(&self) -> Option<RelocalizationConfig> {
+        self.loop_subsystem.relocalization()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum LoopSubsystemConfig {
+    Disabled,
+    Enabled {
+        loop_closure: LoopClosureConfig,
+        global_descriptor: GlobalDescriptorConfig,
+        relocalization: Option<RelocalizationConfig>,
+    },
+}
+
+impl LoopSubsystemConfig {
+    pub fn enabled(
+        loop_closure: LoopClosureConfig,
+        global_descriptor: GlobalDescriptorConfig,
+        relocalization: Option<RelocalizationConfig>,
+    ) -> Self {
+        Self::Enabled {
+            loop_closure,
+            global_descriptor,
+            relocalization,
+        }
+    }
+
+    pub fn loop_closure(self) -> Option<LoopClosureConfig> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { loop_closure, .. } => Some(loop_closure),
+        }
+    }
+
+    pub fn global_descriptor(self) -> Option<GlobalDescriptorConfig> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled {
+                global_descriptor, ..
+            } => Some(global_descriptor),
+        }
+    }
+
+    pub fn relocalization(self) -> Option<RelocalizationConfig> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled { relocalization, .. } => relocalization,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
     }
 }
 
@@ -88,7 +158,7 @@ impl GlobalDescriptorConfig {
 impl Default for GlobalDescriptorConfig {
     fn default() -> Self {
         Self {
-            queue_depth: NonZeroUsize::new(2).expect("non-zero"),
+            queue_depth: NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
         }
     }
 }
@@ -130,7 +200,7 @@ impl BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            queue_depth: NonZeroUsize::new(2).expect("non-zero"),
+            queue_depth: NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
         }
     }
 }
@@ -158,12 +228,12 @@ struct MapVersion(NonZeroU64);
 
 impl MapVersion {
     fn initial() -> Self {
-        Self(NonZeroU64::new(1).expect("non-zero"))
+        Self(NonZeroU64::MIN)
     }
 
     fn next(self) -> Self {
         let next = self.0.get().saturating_add(1).max(1);
-        Self(NonZeroU64::new(next).expect("non-zero"))
+        Self(NonZeroU64::new(next).unwrap_or(NonZeroU64::MIN))
     }
 
     fn as_u64(self) -> u64 {
@@ -177,7 +247,7 @@ struct BackendRequestId(NonZeroU64);
 impl BackendRequestId {
     fn from_counter(counter: &mut u64) -> Self {
         *counter = counter.saturating_add(1).max(1);
-        Self(NonZeroU64::new(*counter).expect("non-zero"))
+        Self(NonZeroU64::new(*counter).unwrap_or(NonZeroU64::MIN))
     }
 
     fn as_u64(self) -> u64 {
@@ -214,9 +284,9 @@ impl std::error::Error for BackendWindowError {}
 
 impl BackendWindow {
     fn try_new(keyframes: Vec<KeyframeId>) -> Result<Self, BackendWindowError> {
-        if keyframes.len() < 2 {
+        if keyframes.len() < MIN_OPTIMIZATION_KEYFRAMES {
             return Err(BackendWindowError::TooFewKeyframes {
-                required: 2,
+                required: MIN_OPTIMIZATION_KEYFRAMES,
                 actual: keyframes.len(),
             });
         }
@@ -291,7 +361,7 @@ impl DescriptorWorker {
     fn spawn(
         config: GlobalDescriptorConfig,
         mut extractor: Box<dyn PlaceDescriptorExtractor>,
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         let (tx, req_rx) = crossbeam_channel::bounded::<DescriptorRequest>(config.queue_depth());
         let (resp_tx, rx) =
             crossbeam_channel::bounded::<DescriptorWorkerResponse>(config.queue_depth());
@@ -330,20 +400,19 @@ impl DescriptorWorker {
                         break;
                     }
                 }
-            })
-            .expect("descriptor worker thread");
-        Self {
+            })?;
+        Ok(Self {
             tx,
             rx,
             _thread: thread,
-        }
+        })
     }
 
     #[cfg(test)]
     fn spawn_with_extractor(
         config: GlobalDescriptorConfig,
         extractor: Box<dyn PlaceDescriptorExtractor>,
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         Self::spawn(config, extractor)
     }
 
@@ -422,7 +491,13 @@ impl DescriptorSupervisor {
         factory: &DescriptorExtractorFactory,
     ) -> Option<DescriptorWorker> {
         let extractor = factory()?;
-        Some(DescriptorWorker::spawn(config, extractor))
+        match DescriptorWorker::spawn(config, extractor) {
+            Ok(worker) => Some(worker),
+            Err(err) => {
+                eprintln!("failed to spawn descriptor worker thread: {err}");
+                None
+            }
+        }
     }
 
     fn check_health(&mut self) {
@@ -772,7 +847,7 @@ impl BackendWorker {
         config: BackendConfig,
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
-    ) -> Self {
+    ) -> Result<Self, std::io::Error> {
         let queue_depth = config.queue_depth();
         let (tx_req, rx_req) = crossbeam_channel::bounded::<KeyframeEvent>(queue_depth);
         // Keep backend responses bounded to prevent unbounded memory growth if
@@ -841,14 +916,13 @@ impl BackendWorker {
                         }
                     }
                 }
-            })
-            .expect("spawn backend worker");
+            })?;
 
-        Self {
+        Ok(Self {
             tx: tx_req,
             rx: rx_resp,
             next_request_id: 0,
-        }
+        })
     }
 
     fn next_request_id(&mut self) -> BackendRequestId {
@@ -880,22 +954,43 @@ struct BackendSupervisor {
     ba_config: LocalBaConfig,
     respawn_count: u32,
     max_respawns: u32,
+    spawn_exhausted: bool,
 }
 
 impl BackendSupervisor {
+    fn spawn_worker(
+        config: BackendConfig,
+        intrinsics: PinholeIntrinsics,
+        ba_config: LocalBaConfig,
+    ) -> Option<BackendWorker> {
+        match BackendWorker::spawn(config, intrinsics, ba_config) {
+            Ok(worker) => Some(worker),
+            Err(err) => {
+                eprintln!("failed to spawn backend worker thread: {err}");
+                None
+            }
+        }
+    }
+
     fn spawn_with_max_respawns(
         config: BackendConfig,
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
         max_respawns: u32,
     ) -> Self {
+        let worker = Self::spawn_worker(config, intrinsics, ba_config);
+        let spawn_exhausted = worker.is_none() && max_respawns == 0;
+        if worker.is_none() {
+            eprintln!("backend worker unavailable at startup; backend optimization disabled");
+        }
         Self {
-            worker: Some(BackendWorker::spawn(config, intrinsics, ba_config)),
+            worker,
             config,
             intrinsics,
             ba_config,
             respawn_count: 0,
             max_respawns,
+            spawn_exhausted,
         }
     }
 
@@ -910,12 +1005,16 @@ impl BackendSupervisor {
     }
 
     fn check_health(&mut self) {
-        if self.worker.is_none() {
+        if self.worker.is_some() || self.spawn_exhausted {
             return;
         }
 
         if self.respawn_count >= self.max_respawns {
-            self.worker = None;
+            self.spawn_exhausted = true;
+            eprintln!(
+                "backend worker reached max respawns ({}) ; disabling backend optimization",
+                self.max_respawns
+            );
             return;
         }
 
@@ -924,30 +1023,52 @@ impl BackendSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        self.worker = Some(BackendWorker::spawn(
-            self.config,
-            self.intrinsics,
-            self.ba_config,
-        ));
+        self.worker = Self::spawn_worker(self.config, self.intrinsics, self.ba_config);
         self.respawn_count = self.respawn_count.saturating_add(1);
+        if self.worker.is_none() && self.respawn_count >= self.max_respawns {
+            self.spawn_exhausted = true;
+            eprintln!(
+                "backend worker respawn exhausted after {} attempts",
+                self.max_respawns
+            );
+        }
     }
 
     fn submit(&mut self, event: KeyframeEvent) -> Result<(), SubmitEventError> {
+        if self.worker.is_none() {
+            self.check_health();
+        }
         let Some(worker) = self.worker.as_ref() else {
             return Err(SubmitEventError::Disconnected);
         };
         let result = worker.try_submit(event);
         if matches!(result, Err(SubmitEventError::Disconnected)) {
+            self.worker = None;
             self.check_health();
         }
         result
     }
 
     fn try_recv(&mut self) -> Option<BackendResponse> {
-        let worker = self.worker.as_ref()?;
-        match worker.try_recv() {
+        let response = {
+            let worker = self.worker.as_ref()?;
+            worker.try_recv()
+        };
+        match response {
+            Ok(Some(BackendResponse::WorkerPanic {
+                request_id,
+                map_version,
+            })) => {
+                self.worker = None;
+                self.check_health();
+                Some(BackendResponse::WorkerPanic {
+                    request_id,
+                    map_version,
+                })
+            }
             Ok(response) => response,
             Err(()) => {
+                self.worker = None;
                 self.check_health();
                 None
             }
@@ -955,12 +1076,16 @@ impl BackendSupervisor {
     }
 
     fn next_request_id(&mut self) -> Option<BackendRequestId> {
+        if self.worker.is_none() {
+            self.check_health();
+        }
         self.worker.as_mut().map(BackendWorker::next_request_id)
     }
 
     #[cfg(test)]
     fn shutdown(&mut self) {
         self.worker = None;
+        self.spawn_exhausted = true;
     }
 
     fn respawn_count(&self) -> u32 {
@@ -1092,7 +1217,9 @@ pub enum TrackerError {
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
+    PoseGraph(PoseGraphError),
     KeyframeRejected { landmarks: usize },
+    InvariantViolation(&'static str),
 }
 
 impl std::fmt::Display for TrackerError {
@@ -1103,8 +1230,12 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
+            TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
+            }
+            TrackerError::InvariantViolation(message) => {
+                write!(f, "tracker invariant violation: {message}")
             }
         }
     }
@@ -1142,6 +1273,12 @@ impl From<EssentialGraphError> for TrackerError {
     }
 }
 
+impl From<PoseGraphError> for TrackerError {
+    fn from(err: PoseGraphError) -> Self {
+        TrackerError::PoseGraph(err)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackingHealth {
     Good,
@@ -1174,11 +1311,34 @@ impl DegradationLevel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentHealth {
+    Disabled,
+    Alive,
+    Down,
+}
+
+impl ComponentHealth {
+    fn from_expected_and_alive(expected: bool, alive: bool) -> Self {
+        if !expected {
+            Self::Disabled
+        } else if alive {
+            Self::Alive
+        } else {
+            Self::Down
+        }
+    }
+
+    pub fn is_alive(self) -> bool {
+        matches!(self, Self::Alive)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SystemHealth {
     pub tracking: TrackingHealth,
-    pub backend_alive: bool,
-    pub descriptor_alive: bool,
+    pub backend: ComponentHealth,
+    pub descriptor: ComponentHealth,
     pub backend_stats: BackendStats,
     pub degradation: DegradationLevel,
 }
@@ -1197,12 +1357,15 @@ impl SystemHealth {
             TrackingHealth::Degraded => DegradationLevel::TrackingDegraded,
             TrackingHealth::Lost => DegradationLevel::Lost,
         };
-        let descriptor_degradation = if descriptor_expected && !descriptor_alive {
+        let descriptor =
+            ComponentHealth::from_expected_and_alive(descriptor_expected, descriptor_alive);
+        let descriptor_degradation = if descriptor == ComponentHealth::Down {
             DegradationLevel::DescriptorDown
         } else {
             DegradationLevel::Nominal
         };
-        let backend_degradation = if backend_expected && !backend_alive {
+        let backend = ComponentHealth::from_expected_and_alive(backend_expected, backend_alive);
+        let backend_degradation = if backend == ComponentHealth::Down {
             DegradationLevel::BackendDown
         } else {
             DegradationLevel::Nominal
@@ -1213,8 +1376,8 @@ impl SystemHealth {
         );
         Self {
             tracking,
-            backend_alive,
-            descriptor_alive,
+            backend,
+            descriptor,
             backend_stats,
             degradation,
         }
@@ -1323,7 +1486,7 @@ impl SlamTracker {
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(3);
+            .unwrap_or(DEFAULT_MAX_RESPAWNS);
         let backend = config.backend.map(|backend_cfg| {
             BackendSupervisor::spawn_with_max_respawns(
                 backend_cfg,
@@ -1332,13 +1495,13 @@ impl SlamTracker {
                 backend_max_respawns,
             )
         });
-        let loop_config = config.loop_closure;
+        let loop_config = config.loop_closure_config();
         let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
         let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(3);
+            .unwrap_or(DEFAULT_MAX_RESPAWNS);
         let descriptor_worker = if loop_config.is_some() {
-            config.global_descriptor.map(|cfg| {
+            config.global_descriptor_config().map(|cfg| {
                 DescriptorSupervisor::spawn_with_max_respawns(cfg, descriptor_max_respawns)
             })
         } else {
@@ -1545,6 +1708,24 @@ impl SlamTracker {
         }
     }
 
+    /// Build a `TrackerOutput` for a tracking failure (no pose, no keyframe, no matches).
+    fn tracking_failure_output(
+        &mut self,
+        frame_id: FrameId,
+        health: TrackingHealth,
+        diagnostics: FrameDiagnostics,
+    ) -> TrackerOutput {
+        self.output_with_diagnostics(
+            self.last_pose_world,
+            0,
+            None,
+            None,
+            frame_id,
+            health,
+            diagnostics,
+        )
+    }
+
     fn enqueue_loop_candidates(&mut self, keyframe_id: KeyframeId, detections: &Arc<Detections>) {
         let (Some(config), Some(loop_db)) = (self.loop_config, self.loop_db.as_mut()) else {
             return;
@@ -1712,7 +1893,7 @@ impl SlamTracker {
                 config.descriptor_match_threshold(),
             );
 
-            if correspondences.len() < 4 {
+            if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 if first_error.is_none() {
                     first_error = Some(LoopDetectError::TooFewCorrespondences {
                         count: correspondences.len(),
@@ -1759,7 +1940,7 @@ impl SlamTracker {
             }
 
             if let Err(err) = self.apply_loop_closure(verified.clone()) {
-                let detect_err = LoopDetectError::ApplyFailed(err.to_string());
+                let detect_err = LoopDetectError::ApplyFailed(loop_apply_error_kind(&err));
                 self.emit_event(DiagnosticEvent::LoopClosureRejected {
                     reason: loop_reject_reason(&detect_err),
                 });
@@ -1926,7 +2107,7 @@ impl SlamTracker {
     ) {
         if let Some(session) = Self::initial_relocalization_session(
             tracking_health,
-            self.config.relocalization.is_some(),
+            self.config.relocalization_config().is_some(),
             detections,
         ) {
             self.emit_event(DiagnosticEvent::RelocalizationStarted);
@@ -2036,7 +2217,7 @@ impl SlamTracker {
                 &self.map,
                 cfg.descriptor_match_threshold(),
             );
-            if correspondences.len() < 4 {
+            if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 continue;
             }
             let relocalization_candidate = RelocalizationCandidate {
@@ -2082,7 +2263,8 @@ impl SlamTracker {
                     attempts: session.attempts,
                     phase: RelocalizationPhase::Confirming {
                         candidate,
-                        confirmations: NonZeroUsize::new(next_confirmations).expect("non-zero"),
+                        confirmations: NonZeroUsize::new(next_confirmations)
+                            .unwrap_or(NonZeroUsize::MIN),
                         pose_world,
                     },
                     last_detections: session.last_detections,
@@ -2093,7 +2275,7 @@ impl SlamTracker {
                 attempts: session.attempts,
                 phase: RelocalizationPhase::Confirming {
                     candidate: candidate_id,
-                    confirmations: NonZeroUsize::new(1).expect("non-zero"),
+                    confirmations: NonZeroUsize::MIN,
                     pose_world,
                 },
                 last_detections: session.last_detections,
@@ -2106,9 +2288,9 @@ impl SlamTracker {
         pair: StereoPair,
         mut session: RelocalizationSession,
     ) -> Result<TrackerOutput, TrackerError> {
-        let StereoPair { left, right } = pair;
+        let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
-        let Some(cfg) = self.config.relocalization else {
+        let Some(cfg) = self.config.relocalization_config() else {
             self.state = TrackerState::NeedKeyframe;
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
         };
@@ -2157,7 +2339,7 @@ impl SlamTracker {
                         frame_id.as_u64()
                     );
                 }
-                return self.create_keyframe(StereoPair { left, right }, pose_world);
+                return self.create_keyframe(StereoPair::from_parts(left, right), pose_world);
             }
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
@@ -2179,7 +2361,7 @@ impl SlamTracker {
         keyframe_id: KeyframeId,
     ) -> Result<TrackerOutput, TrackerError> {
         let tracking_start = Instant::now();
-        let StereoPair { left, right } = pair;
+        let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
 
         let current = self
@@ -2203,23 +2385,7 @@ impl SlamTracker {
             diagnostics.features_detected = Some(current.len());
             diagnostics.features_matched = Some(0);
             diagnostics.tracking_time = Some(tracking_start.elapsed());
-            diagnostics.loop_candidate_count = self
-                .pending_loop
-                .as_ref()
-                .map_or(0, |pending| pending.candidates.len());
-            diagnostics.loop_closure_applied = self
-                .pending_events
-                .iter()
-                .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
-            return Ok(self.output_with_diagnostics(
-                self.last_pose_world,
-                0,
-                None,
-                None,
-                frame_id,
-                tracking_health,
-                diagnostics,
-            ));
+            return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
         } else {
             self.lightglue
                 .match_these(current.clone(), keyframe.detections().clone())?
@@ -2228,9 +2394,7 @@ impl SlamTracker {
         let verified = match matches.with_landmarks(keyframe) {
             Ok(verified) => verified,
             Err(err) => {
-                return Err(TrackerError::Inference(InferenceError::Domain(format!(
-                    "{err:?}"
-                ))));
+                return Err(TrackerError::Inference(InferenceError::Match(err)));
             }
         };
 
@@ -2258,23 +2422,7 @@ impl SlamTracker {
                 diagnostics.features_detected = Some(current.len());
                 diagnostics.features_matched = Some(matches.len());
                 diagnostics.tracking_time = Some(tracking_start.elapsed());
-                diagnostics.loop_candidate_count = self
-                    .pending_loop
-                    .as_ref()
-                    .map_or(0, |pending| pending.candidates.len());
-                diagnostics.loop_closure_applied = self
-                    .pending_events
-                    .iter()
-                    .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
-                return Ok(self.output_with_diagnostics(
-                    self.last_pose_world,
-                    0,
-                    None,
-                    None,
-                    frame_id,
-                    tracking_health,
-                    diagnostics,
-                ));
+                return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
@@ -2298,39 +2446,23 @@ impl SlamTracker {
                 diagnostics.features_matched = Some(matches.len());
                 diagnostics.pnp_observations = Some(observations.len());
                 diagnostics.tracking_time = Some(tracking_start.elapsed());
-                diagnostics.loop_candidate_count = self
-                    .pending_loop
-                    .as_ref()
-                    .map_or(0, |pending| pending.candidates.len());
-                diagnostics.loop_closure_applied = self
-                    .pending_events
-                    .iter()
-                    .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
-                return Ok(self.output_with_diagnostics(
-                    self.last_pose_world,
-                    0,
-                    None,
-                    None,
-                    frame_id,
-                    tracking_health,
-                    diagnostics,
-                ));
+                return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
         let mut map_observations = Vec::with_capacity(result.inliers.len());
         for &idx in &result.inliers {
-            let (ci, ki) = *verified.indices().get(idx).ok_or_else(|| {
-                TrackerError::Inference(InferenceError::Domain(
-                    "verified match index out of bounds".to_string(),
-                ))
-            })?;
-            let pixel = *current.keypoints().get(ci).ok_or_else(|| {
-                TrackerError::Inference(InferenceError::Domain(
-                    "current keypoint index out of bounds".to_string(),
-                ))
-            })?;
+            let (ci, ki) = *verified.indices().get(idx).ok_or(TrackerError::Inference(
+                InferenceError::InvariantViolation {
+                    context: "verified match index out of bounds",
+                },
+            ))?;
+            let pixel = *current.keypoints().get(ci).ok_or(TrackerError::Inference(
+                InferenceError::InvariantViolation {
+                    context: "current keypoint index out of bounds",
+                },
+            ))?;
             let keypoint_ref = self.map.keyframe_keypoint(keyframe_id, ki)?;
             map_observations.push(MapObservation::new(keypoint_ref, pixel));
         }
@@ -2506,14 +2638,6 @@ impl SlamTracker {
         diagnostics.keyframe_created = keyframe_created;
         diagnostics.triangulation = triangulation_stats;
         diagnostics.ba_result = ba_result;
-        diagnostics.loop_candidate_count = self
-            .pending_loop
-            .as_ref()
-            .map_or(0, |pending| pending.candidates.len());
-        diagnostics.loop_closure_applied = self
-            .pending_events
-            .iter()
-            .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
         diagnostics.tracking_time = Some(tracking_start.elapsed());
         diagnostics.features_detected = Some(current.len());
         diagnostics.features_matched = Some(matches.len());
@@ -2534,7 +2658,7 @@ impl SlamTracker {
         pair: StereoPair,
         pose_world: Pose,
     ) -> Result<TrackerOutput, TrackerError> {
-        let StereoPair { left, right } = pair;
+        let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
         let (output, keyframe_id) = match self
             .create_keyframe_internal(left, right, pose_world, None, None)
@@ -2550,11 +2674,7 @@ impl SlamTracker {
                 }
                 let mut diagnostics = self.empty_diagnostics();
                 diagnostics.keyframe_created = false;
-                return Ok(self.output_with_diagnostics(
-                    self.last_pose_world,
-                    0,
-                    None,
-                    None,
+                return Ok(self.tracking_failure_output(
                     frame_id,
                     TrackingHealth::Degraded,
                     diagnostics,
@@ -2570,7 +2690,11 @@ impl SlamTracker {
                 return Err(err);
             }
         };
-        let keyframe = output.keyframe.clone().expect("keyframe");
+        let Some(keyframe) = output.keyframe.clone() else {
+            return Err(TrackerError::InvariantViolation(
+                "create_keyframe_internal returned TrackerOutput without keyframe",
+            ));
+        };
         self.state = TrackerState::Tracking {
             keyframe,
             keyframe_id,
@@ -2630,11 +2754,11 @@ impl SlamTracker {
                     (left_handle.join(), right_handle.join())
                 });
 
-                let left_det = left_det.map_err(|_| {
-                    InferenceError::Domain("left superpoint thread panicked".to_string())
+                let left_det = left_det.map_err(|_| InferenceError::ThreadPanic {
+                    stage: "left superpoint",
                 })??;
-                let right_det = right_det.map_err(|_| {
-                    InferenceError::Domain("right superpoint thread panicked".to_string())
+                let right_det = right_det.map_err(|_| InferenceError::ThreadPanic {
+                    stage: "right superpoint",
                 })??;
 
                 (Arc::new(left_det), Arc::new(right_det))
@@ -2689,14 +2813,6 @@ impl SlamTracker {
         diagnostics.triangulation = Some(triangulation_stats);
         diagnostics.features_detected = Some(left_arc.len());
         diagnostics.features_matched = Some(matches.len());
-        diagnostics.loop_candidate_count = self
-            .pending_loop
-            .as_ref()
-            .map_or(0, |pending| pending.candidates.len());
-        diagnostics.loop_closure_applied = self
-            .pending_events
-            .iter()
-            .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
 
         Ok((
             TrackerOutput {
@@ -2740,8 +2856,8 @@ fn insert_keyframe_into_map(
     // Keep singleton points by default so active keyframes retain enough
     // point associations for robust PnP. Enable stronger culling only via env.
     let cull_min_observations = crate::env::env_usize("KIKO_MAP_CULL_MIN_OBSERVATIONS")
-        .unwrap_or(1)
-        .max(1);
+        .unwrap_or(DEFAULT_CULL_MIN_OBSERVATIONS)
+        .max(DEFAULT_CULL_MIN_OBSERVATIONS);
     if cull_min_observations > 1 && map.num_points() > 0 {
         let points_before = map.num_points();
         let culled_points = map.cull_points(cull_min_observations);
@@ -2933,7 +3049,7 @@ fn apply_loop_closure_correction(
     });
 
     let input = essential_graph.pose_graph_input();
-    if input.keyframe_ids.len() < 2 || input.edges.is_empty() {
+    if input.keyframe_ids.len() < MIN_OPTIMIZATION_KEYFRAMES || input.edges.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -2950,7 +3066,7 @@ fn apply_loop_closure_correction(
         initial_poses.push(crate::Pose64::from_pose32(pose));
     }
 
-    let result = optimizer.optimize(&input.edges, &mut initial_poses);
+    let result = optimizer.optimize(&input.edges, &mut initial_poses)?;
     let corrected_poses: HashMap<KeyframeId, Pose> = input
         .keyframe_ids
         .iter()
@@ -3027,6 +3143,20 @@ fn loop_translation_norm(pose: Pose) -> f32 {
     (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
 }
 
+fn loop_apply_error_kind(error: &TrackerError) -> LoopApplyError {
+    match error {
+        TrackerError::Map(crate::map::MapError::KeyframeNotFound(_)) => {
+            LoopApplyError::MissingKeyframe
+        }
+        TrackerError::Map(crate::map::MapError::MapPointNotFound(_)) => {
+            LoopApplyError::MissingMapPoint
+        }
+        TrackerError::Map(_) => LoopApplyError::MapMutation,
+        TrackerError::InvariantViolation(_) => LoopApplyError::InvariantViolation,
+        _ => LoopApplyError::MapMutation,
+    }
+}
+
 fn loop_reject_reason(error: &LoopDetectError) -> LoopClosureRejectReason {
     match error {
         LoopDetectError::TooFewCorrespondences { count } => {
@@ -3094,9 +3224,9 @@ fn build_map_observations(
         observations.push(obs);
     }
 
-    if observations.len() < 4 {
+    if observations.len() < MIN_PNP_CORRESPONDENCES {
         return Err(crate::PnpError::NotEnoughPoints {
-            required: 4,
+            required: MIN_PNP_CORRESPONDENCES,
             actual: observations.len(),
         });
     }
@@ -3492,7 +3622,8 @@ mod tests {
                 .expect("intrinsics");
         let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
             .expect("ba config");
-        let mut worker = BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg);
+        let mut worker =
+            BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
         let event = KeyframeEvent::try_new(
@@ -3762,7 +3893,8 @@ mod tests {
                 descriptor: descriptor.clone(),
                 calls: Arc::clone(&calls),
             }),
-        );
+        )
+        .expect("spawn descriptor worker");
 
         let frame = Frame::new(
             SensorId::StereoLeft,
@@ -4132,8 +4264,8 @@ mod tests {
         let nominal =
             SystemHealth::from_components(TrackingHealth::Good, true, true, true, true, stats);
         assert_eq!(nominal.degradation, DegradationLevel::Nominal);
-        assert!(nominal.backend_alive);
-        assert!(nominal.descriptor_alive);
+        assert_eq!(nominal.backend, ComponentHealth::Alive);
+        assert_eq!(nominal.descriptor, ComponentHealth::Alive);
         assert_eq!(nominal.backend_stats.submitted, 7);
 
         let degraded =
@@ -4146,12 +4278,12 @@ mod tests {
             descriptor_down.degradation,
             DegradationLevel::DescriptorDown
         );
-        assert!(!descriptor_down.descriptor_alive);
+        assert_eq!(descriptor_down.descriptor, ComponentHealth::Down);
 
         let backend_down =
             SystemHealth::from_components(TrackingHealth::Good, true, false, true, true, stats);
         assert_eq!(backend_down.degradation, DegradationLevel::BackendDown);
-        assert!(!backend_down.backend_alive);
+        assert_eq!(backend_down.backend, ComponentHealth::Down);
 
         let lost =
             SystemHealth::from_components(TrackingHealth::Lost, true, false, true, false, stats);
@@ -4160,6 +4292,8 @@ mod tests {
         let backend_optional =
             SystemHealth::from_components(TrackingHealth::Good, false, true, false, true, stats);
         assert_eq!(backend_optional.degradation, DegradationLevel::Nominal);
+        assert_eq!(backend_optional.backend, ComponentHealth::Disabled);
+        assert_eq!(backend_optional.descriptor, ComponentHealth::Disabled);
     }
 
     #[test]

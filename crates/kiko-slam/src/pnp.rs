@@ -130,7 +130,7 @@ impl Pose {
     }
 
     pub fn inverse(&self) -> Pose {
-        let r_t = mat_transpose(self.rotation);
+        let r_t = math::mat_transpose(self.rotation);
         let t = self.translation;
         let t_inv = [
             -(r_t[0][0] * t[0] + r_t[0][1] * t[1] + r_t[0][2] * t[2]),
@@ -245,9 +245,9 @@ pub fn build_observations(
         });
     }
 
-    if matches.len() < 4 {
+    if matches.len() < MIN_PNP_POINTS {
         return Err(PnpError::NotEnoughPoints {
-            required: 4,
+            required: MIN_PNP_POINTS,
             actual: matches.len(),
         });
     }
@@ -286,9 +286,9 @@ pub fn solve_pnp_ransac(
     intrinsics: PinholeIntrinsics,
     config: RansacConfig,
 ) -> Result<PnpResult, PnpError> {
-    if observations.len() < 4 {
+    if observations.len() < MIN_PNP_POINTS {
         return Err(PnpError::NotEnoughPoints {
-            required: 4,
+            required: MIN_PNP_POINTS,
             actual: observations.len(),
         });
     }
@@ -450,7 +450,7 @@ fn find_roots(
             let Some(fx) = f_equation(xf, sign, &coeffs_meta) else {
                 continue;
             };
-            if fx.abs() < 1e-3 {
+            if fx.abs() < P3P_ROOT_TOLERANCE {
                 push_unique_root(roots, (xf, y));
             }
         }
@@ -560,9 +560,29 @@ fn add_scaled(dst: &mut [f64], src: &[f64], scale: f64) {
     }
 }
 
+/// Minimum number of point correspondences required for PnP solving (geometric minimum for P3P).
+pub(crate) const MIN_PNP_POINTS: usize = 4;
+
+/// Tolerance for treating polynomial coefficients as zero during trimming.
+const POLY_COEFFICIENT_TOLERANCE: f64 = 1e-12;
+/// Maximum imaginary component for a root to be considered real.
+const IMAGINARY_TOLERANCE: f64 = 1e-6;
+/// Convergence threshold for the Durand-Kerner root-finding iterations.
+const ROOT_CONVERGENCE_THRESHOLD: f64 = 1e-10;
+/// Denominator magnitude below which a Durand-Kerner correction is skipped.
+const ROOT_DENOMINATOR_TOLERANCE: f64 = 1e-12;
+/// Maximum iterations for the Durand-Kerner root-finding algorithm.
+const MAX_ROOT_ITERATIONS: usize = 64;
+/// Tolerance for detecting duplicate P3P root solutions.
+const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
+/// Tolerance for accepting a P3P equation evaluation as a valid root.
+const P3P_ROOT_TOLERANCE: f32 = 1e-3;
+
 fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let mut coeffs: Vec<f64> = coeffs.into();
-    while coeffs.len() > 1 && coeffs.last().copied().unwrap_or(0.0).abs() < 1e-12 {
+    while coeffs.len() > 1
+        && coeffs.last().copied().unwrap_or(0.0).abs() < POLY_COEFFICIENT_TOLERANCE
+    {
         coeffs.pop();
     }
     let degree = coeffs.len().saturating_sub(1);
@@ -571,7 +591,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     }
     if degree == 1 {
         let c1 = coeffs[1];
-        if c1.abs() < 1e-12 {
+        if c1.abs() < POLY_COEFFICIENT_TOLERANCE {
             return Vec::new();
         }
         return vec![-coeffs[0] / c1];
@@ -580,7 +600,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let Some(&lead) = coeffs.last() else {
         return Vec::new();
     };
-    if lead.abs() < 1e-12 {
+    if lead.abs() < POLY_COEFFICIENT_TOLERANCE {
         return Vec::new();
     }
     for c in &mut coeffs {
@@ -590,7 +610,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let roots = durand_kerner(&coeffs);
     let mut real = Vec::new();
     for r in roots {
-        if r.im.abs() < 1e-6 {
+        if r.im.abs() < IMAGINARY_TOLERANCE {
             real.push(r.re);
         }
     }
@@ -673,7 +693,7 @@ fn durand_kerner(coeffs: &[f64]) -> Vec<Complex> {
         roots.push(Complex::from_polar(radius, theta));
     }
 
-    for _ in 0..64 {
+    for _ in 0..MAX_ROOT_ITERATIONS {
         let mut max_delta = 0.0_f64;
         for i in 0..degree {
             let mut denom = Complex::new(1.0, 0.0);
@@ -682,7 +702,7 @@ fn durand_kerner(coeffs: &[f64]) -> Vec<Complex> {
                     denom = denom * (roots[i] - roots[j]);
                 }
             }
-            if denom.abs() < 1e-12 {
+            if denom.abs() < ROOT_DENOMINATOR_TOLERANCE {
                 continue;
             }
             let p = poly_eval(coeffs, roots[i]);
@@ -690,7 +710,7 @@ fn durand_kerner(coeffs: &[f64]) -> Vec<Complex> {
             roots[i] = roots[i] - delta;
             max_delta = max_delta.max(delta.abs());
         }
-        if max_delta < 1e-10 {
+        if max_delta < ROOT_CONVERGENCE_THRESHOLD {
             break;
         }
     }
@@ -700,7 +720,7 @@ fn durand_kerner(coeffs: &[f64]) -> Vec<Complex> {
 
 fn push_unique_root(roots: &mut Vec<(f32, f32)>, candidate: (f32, f32)) {
     let (x, y) = candidate;
-    let tol = 1e-3_f32;
+    let tol = ROOT_UNIQUENESS_TOLERANCE;
     if roots
         .iter()
         .any(|(rx, ry)| (rx - x).abs() < tol && (ry - y).abs() < tol)
@@ -802,14 +822,6 @@ fn mat_from_cols(
         r[i][2] = xc[i] * xw[2] + yc[i] * yw[2] + zc[i] * zw[2];
     }
     r
-}
-
-fn mat_transpose(r: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    [
-        [r[0][0], r[1][0], r[2][0]],
-        [r[0][1], r[1][1], r[2][1]],
-        [r[0][2], r[1][2], r[2][2]],
-    ]
 }
 
 fn det(r: [[f32; 3]; 3]) -> f32 {

@@ -1,12 +1,19 @@
 use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
-use crate::{Detections, FrameId, Keypoint, Matches, Raw, SensorId};
+use crate::{Detections, FrameDimensions, FrameId, Keypoint, Matches, Raw, SensorId};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RectificationMode {
+    #[default]
+    RequireRectified,
+    AllowUnrectified,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RectifiedStereoConfig {
     pub max_principal_delta_px: Option<f32>,
-    pub allow_unrectified: bool,
+    pub rectification: RectificationMode,
 }
 
 #[derive(Clone, Debug)]
@@ -22,8 +29,8 @@ pub enum RectifiedStereoError {
         baseline_m: f32,
     },
     DimensionMismatch {
-        left: (u32, u32),
-        right: (u32, u32),
+        left: FrameDimensions,
+        right: FrameDimensions,
     },
     InvalidFocal {
         fx: f32,
@@ -47,7 +54,10 @@ impl std::fmt::Display for RectifiedStereoError {
                 write!(
                     f,
                     "rectified stereo requires same dimensions: left={}x{}, right={}x{}",
-                    left.0, left.1, right.0, right.1
+                    left.width(),
+                    left.height(),
+                    right.width(),
+                    right.height()
                 )
             }
             RectifiedStereoError::InvalidFocal { fx, fy } => {
@@ -95,8 +105,8 @@ impl RectifiedStereo {
 
         if left.width != right.width || left.height != right.height {
             return Err(RectifiedStereoError::DimensionMismatch {
-                left: (left.width, left.height),
-                right: (right.width, right.height),
+                left: FrameDimensions::new(left.width, left.height),
+                right: FrameDimensions::new(right.width, right.height),
             });
         }
 
@@ -107,7 +117,7 @@ impl RectifiedStereo {
             });
         }
 
-        if !calibration.rectified && !config.allow_unrectified {
+        if !calibration.rectified && config.rectification == RectificationMode::RequireRectified {
             return Err(RectifiedStereoError::NotRectified);
         }
 

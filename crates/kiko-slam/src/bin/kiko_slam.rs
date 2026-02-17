@@ -8,10 +8,10 @@ use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRing
 use kiko_slam::{
     BackendConfig, DenseCommand, DepthImage, DownscaleFactor, GlobalDescriptorConfig,
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
-    LocalBaConfig, LoopClosureConfig, PinholeIntrinsics, RansacConfig, RectifiedStereo,
-    RectifiedStereoConfig, RedundancyPolicy, RelocalizationConfig, RerunSink, SlamTracker,
-    SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
-    VizDecimation, VizPacket,
+    LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, RansacConfig,
+    RectificationMode, RectifiedStereo, RectifiedStereoConfig, RedundancyPolicy,
+    RelocalizationConfig, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
+    TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
@@ -26,8 +26,8 @@ use kiko_slam::dataset::{
 #[cfg(feature = "record")]
 use kiko_slam::{
     ChannelCapacity, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
-    PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer, SystemHealth,
-    bounded_channel, oak_to_depth_image, oak_to_frame,
+    PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
+    SystemHealth, bounded_channel, oak_to_depth_image, oak_to_frame,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -41,6 +41,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 const DEFAULT_MAX_KEYPOINTS: usize = 1024;
+
+// BA defaults (overridable via KIKO_BA_* / KIKO_LM_* env vars)
+const DEFAULT_BA_WINDOW: usize = 10;
+const DEFAULT_BA_ITERS: usize = 6;
+const DEFAULT_BA_MIN_OBS: usize = 8;
+const DEFAULT_BA_HUBER_PX: f32 = 3.0;
+const DEFAULT_BA_DAMPING: f32 = 1e-3;
+const DEFAULT_LM_FACTOR: f32 = 10.0;
+const DEFAULT_LM_MIN: f32 = 1e-8;
+const DEFAULT_LM_MAX: f32 = 1e4;
+const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
+
+// Keyframe policy defaults (overridable via KIKO_KEYFRAME_* env vars)
+const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
+const DEFAULT_KEYFRAME_COVISIBILITY: f32 = 0.6;
+const DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY: f32 = 0.9;
 
 #[derive(Parser, Debug)]
 #[command(name = "kiko-slam", about = "Kiko SLAM tools")]
@@ -210,7 +226,9 @@ struct KeypointLimitArg(KeypointLimit);
 
 impl Default for KeypointLimitArg {
     fn default() -> Self {
-        Self(KeypointLimit::try_from(DEFAULT_MAX_KEYPOINTS).expect("default max keypoints"))
+        Self(
+            KeypointLimit::try_from(DEFAULT_MAX_KEYPOINTS).unwrap_or_else(|_| KeypointLimit::min()),
+        )
     }
 }
 
@@ -338,24 +356,6 @@ impl InferenceConfig {
         )
         .with_downscale(self.downscale)
     }
-
-    fn into_models(
-        self,
-    ) -> (
-        SuperPoint,
-        SuperPoint,
-        LightGlue,
-        KeypointLimit,
-        DownscaleFactor,
-    ) {
-        (
-            self.superpoint_left,
-            self.superpoint_right,
-            self.lightglue,
-            self.key_limit,
-            self.downscale,
-        )
-    }
 }
 
 fn resolve_model_path(
@@ -415,6 +415,17 @@ fn build_recording(
     }
 }
 
+fn build_rectified_stereo_config(args: &VizArgs) -> RectifiedStereoConfig {
+    RectifiedStereoConfig {
+        max_principal_delta_px: args.rectify_tolerance,
+        rectification: if args.allow_unrectified {
+            RectificationMode::AllowUnrectified
+        } else {
+            RectificationMode::RequireRectified
+        },
+    }
+}
+
 fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats()?;
@@ -430,10 +441,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let rectified = RectifiedStereo::from_calibration_with_config(
         reader.calibration(),
-        RectifiedStereoConfig {
-            max_principal_delta_px: args.rectify_tolerance,
-            allow_unrectified: args.allow_unrectified,
-        },
+        build_rectified_stereo_config(args),
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
@@ -613,16 +621,95 @@ fn read_depth_image_file(
         ));
     }
 
-    let mut depth_m = Vec::with_capacity(pixel_count);
-    for chunk in bytes.chunks_exact(4) {
-        depth_m.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
+    let depth_m: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
 
     DepthImage::new(frame_id, timestamp, width, height, depth_m).map_err(|err| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid depth image at {}: {err}", path.display()),
         )
+    })
+}
+
+struct TrackerDefaults {
+    min_keyframe_points: usize,
+    refresh_inliers: usize,
+    min_inliers: usize,
+}
+
+fn build_tracker_config(
+    defaults: TrackerDefaults,
+    key_limit: KeypointLimit,
+    downscale: DownscaleFactor,
+) -> Result<TrackerConfig, Box<dyn std::error::Error>> {
+    let min_keyframe_points =
+        env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(defaults.min_keyframe_points);
+    let refresh_inliers =
+        env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(defaults.refresh_inliers);
+    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(DEFAULT_KEYFRAME_PARALLAX_PX);
+    let min_covisibility =
+        env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(DEFAULT_KEYFRAME_COVISIBILITY);
+    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY")
+        .unwrap_or(DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY);
+    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(defaults.min_inliers);
+    let ransac = RansacConfig {
+        min_inliers,
+        ..RansacConfig::default()
+    };
+    let ba_config = build_ba_config()?;
+    let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
+    let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
+    let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
+        Some(BackendConfig::new(
+            env_usize("KIKO_BACKEND_QUEUE_DEPTH").unwrap_or(2),
+        )?)
+    } else {
+        None
+    };
+    let loop_closure_enabled = env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true);
+    let learned_descriptors_enabled = env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true);
+    let relocalization_enabled = env_bool("KIKO_RELOCALIZATION").unwrap_or(true);
+    let loop_subsystem = if loop_closure_enabled {
+        if !learned_descriptors_enabled {
+            return Err("invalid tracker config: loop closure requires learned descriptors".into());
+        }
+        let loop_cfg = LoopClosureConfig::default();
+        let descriptor_cfg =
+            GlobalDescriptorConfig::new(env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2))?;
+        let relocalization = relocalization_enabled.then_some(RelocalizationConfig::default());
+        LoopSubsystemConfig::enabled(loop_cfg, descriptor_cfg, relocalization)
+    } else {
+        if relocalization_enabled {
+            eprintln!(
+                "relocalization requested but loop closure is disabled; disabling relocalization"
+            );
+        }
+        LoopSubsystemConfig::Disabled
+    };
+
+    eprintln!(
+        "tracker: keyframe_min_points={min_keyframe_points} refresh_inliers={refresh_inliers} parallax_px={parallax_px:.1} min_covisibility={min_covisibility:.2} redundant_covisibility={redundant_covisibility:.2} min_inliers={min_inliers} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={}",
+        downscale.get(),
+        key_limit.get(),
+        loop_closure_enabled,
+        learned_descriptors_enabled && loop_closure_enabled,
+        relocalization_enabled && loop_closure_enabled,
+    );
+
+    Ok(TrackerConfig {
+        max_keypoints: key_limit,
+        downscale,
+        min_keyframe_points,
+        ransac,
+        triangulation: TriangulationConfig::default(),
+        keyframe_policy,
+        ba: ba_config,
+        redundancy,
+        backend,
+        loop_subsystem,
     })
 }
 
@@ -641,85 +728,27 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let rectified = RectifiedStereo::from_calibration_with_config(
         reader.calibration(),
-        RectifiedStereoConfig {
-            max_principal_delta_px: args.rectify_tolerance,
-            allow_unrectified: args.allow_unrectified,
-        },
+        build_rectified_stereo_config(args),
     )?;
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
 
-    let (superpoint_left, superpoint_right, lightglue, key_limit, downscale) =
-        inference.into_models();
-
-    let min_keyframe_points = env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(12);
-    let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(12);
-    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
-    let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
-    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY").unwrap_or(0.9);
-    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(8);
-    let ransac = RansacConfig {
-        min_inliers,
-        ..RansacConfig::default()
-    };
-    let ba_config = build_ba_config()?;
-    let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
-    let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
-    let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
-        Some(BackendConfig::new(
-            env_usize("KIKO_BACKEND_QUEUE_DEPTH").unwrap_or(2),
-        )?)
-    } else {
-        None
-    };
-    let loop_closure = if env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true) {
-        Some(LoopClosureConfig::default())
-    } else {
-        None
-    };
-    let global_descriptor = if env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true) {
-        Some(GlobalDescriptorConfig::new(
-            env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2),
-        )?)
-    } else {
-        None
-    };
-    let relocalization = if env_bool("KIKO_RELOCALIZATION").unwrap_or(true) {
-        Some(RelocalizationConfig::default())
-    } else {
-        None
-    };
-    let loop_closure_enabled = loop_closure.is_some();
-    let learned_descriptors_enabled = global_descriptor.is_some();
-    let relocalization_enabled = relocalization.is_some();
-    let tracker_config = TrackerConfig {
-        max_keypoints: key_limit,
+    let InferenceConfig {
+        superpoint_left,
+        superpoint_right,
+        lightglue,
+        key_limit,
         downscale,
-        min_keyframe_points,
-        ransac,
-        triangulation: TriangulationConfig::default(),
-        keyframe_policy,
-        ba: ba_config,
-        redundancy,
-        backend,
-        loop_closure,
-        global_descriptor,
-        relocalization,
-    };
+    } = inference;
 
-    eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={}",
-        min_keyframe_points,
-        refresh_inliers,
-        parallax_px,
-        min_covisibility,
-        redundant_covisibility,
-        min_inliers,
-        downscale.get(),
-        key_limit.get(),
-        loop_closure_enabled,
-        learned_descriptors_enabled,
-        relocalization_enabled
-    );
+    let tracker_config = build_tracker_config(
+        TrackerDefaults {
+            min_keyframe_points: 12,
+            refresh_inliers: 12,
+            min_inliers: 8,
+        },
+        key_limit,
+        downscale,
+    )?;
 
     let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, decimation);
@@ -774,8 +803,8 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let left = pair.left.clone();
-        let right = pair.right.clone();
+        let left = pair.left().clone();
+        let right = pair.right().clone();
         if let Some(cursor) = depth_cursor.as_mut() {
             if let Err(err) = cursor.push_until(left.timestamp(), &mut depth_ring) {
                 eprintln!("offline depth decode failed; disabling dense: {err}");
@@ -785,8 +814,11 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         match tracker.process(pair) {
-            Ok(output) => {
+            Ok(mut output) => {
                 let timestamp = left.timestamp();
+                if dense_enabled {
+                    output.diagnostics.depth_reorder_warnings = Some(depth_ring.reorder_warnings());
+                }
                 let dense_stats = if let Some(state) = dense_state.as_mut() {
                     let correction = tracker.take_pending_loop_correction();
                     let cmds = command_mapper::map_output_to_dense_commands(
@@ -796,11 +828,9 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                         timestamp,
                         &mut dense_generation,
                     );
-                    let mut latest = None;
-                    for cmd in cmds {
-                        latest = Some(dense::process_dense_command(state, cmd));
-                    }
-                    latest
+                    cmds.into_iter()
+                        .map(|cmd| dense::process_dense_command(state, cmd))
+                        .last()
                 } else {
                     None
                 };
@@ -1091,7 +1121,7 @@ const DEFAULT_PAIRING_WINDOW_NS: i64 = 5_000_000;
 const DEFAULT_PAIRER_MAX_PENDING_PER_SIDE: usize = 64;
 
 #[cfg(feature = "record")]
-fn load_pairing_window() -> PairingWindowNs {
+fn load_pairing_window() -> Result<PairingWindowNs, PairingConfigError> {
     let window_ns = match env_usize("KIKO_PAIRING_WINDOW_NS") {
         Some(raw) => match i64::try_from(raw) {
             Ok(value) => value,
@@ -1104,10 +1134,13 @@ fn load_pairing_window() -> PairingWindowNs {
         },
         None => DEFAULT_PAIRING_WINDOW_NS,
     };
-    PairingWindowNs::new(window_ns).unwrap_or_else(|err| {
-        eprintln!("invalid pairing window from env ({err}); using default");
-        PairingWindowNs::new(DEFAULT_PAIRING_WINDOW_NS).expect("default pairing window is valid")
-    })
+    match PairingWindowNs::new(window_ns) {
+        Ok(window) => Ok(window),
+        Err(err) => {
+            eprintln!("invalid pairing window from env ({err}); using default");
+            PairingWindowNs::new(DEFAULT_PAIRING_WINDOW_NS)
+        }
+    }
 }
 
 #[cfg(feature = "record")]
@@ -1169,7 +1202,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut depth_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
-    let pairing_window = load_pairing_window();
+    let pairing_window = load_pairing_window()?;
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
     let start = Instant::now();
@@ -1240,8 +1273,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         while let Some(pair) = pairer.next_pair()? {
-            writer.write_frame(&pair.left);
-            writer.write_frame(&pair.right);
+            writer.write_frame(pair.left());
+            writer.write_frame(pair.right());
             pair_count += 1;
 
             if pair_count % 30 == 0 {
@@ -1298,16 +1331,34 @@ struct LiveVizMsg {
 }
 
 #[cfg(feature = "record")]
-fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
-    let mut depths = Vec::new();
-    loop {
-        match rx.try_recv() {
-            Ok(depth) => depths.push(depth),
-            Err(crossbeam_channel::TryRecvError::Empty) => break,
-            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+#[derive(Debug)]
+enum LiveThreadError {
+    VizChannelDisconnected,
+    RerunConnect { detail: String },
+    FrameProcessingPanic { detail: String },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveThreadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
+            LiveThreadError::RerunConnect { detail } => {
+                write!(f, "failed to connect to rerun viewer: {detail}")
+            }
+            LiveThreadError::FrameProcessingPanic { detail } => {
+                write!(f, "inference panic while processing frame: {detail}")
+            }
         }
     }
-    depths
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveThreadError {}
+
+#[cfg(feature = "record")]
+fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
 }
 
 #[cfg(feature = "record")]
@@ -1370,81 +1421,30 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let inference = InferenceConfig::from_args(&args.inference)?;
-    let (superpoint_left, superpoint_right, lightglue, key_limit, downscale) =
-        inference.into_models();
+    let InferenceConfig {
+        superpoint_left,
+        superpoint_right,
+        lightglue,
+        key_limit,
+        downscale,
+    } = inference;
 
     let calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config);
     let rectified = RectifiedStereo::from_calibration(&calibration)?;
     let intrinsics = PinholeIntrinsics::try_from(&calibration.left)?;
 
-    let min_keyframe_points = env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(80);
-    let refresh_inliers = env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(20);
-    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(40.0);
-    let min_covisibility = env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(0.6);
-    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY").unwrap_or(0.9);
-    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(15);
-    let ransac = RansacConfig {
-        min_inliers,
-        ..RansacConfig::default()
-    };
-    let ba_config = build_ba_config()?;
-    let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
-    let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
-    let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
-        Some(BackendConfig::new(
-            env_usize("KIKO_BACKEND_QUEUE_DEPTH").unwrap_or(2),
-        )?)
-    } else {
-        None
-    };
-    let loop_closure = if env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true) {
-        Some(LoopClosureConfig::default())
-    } else {
-        None
-    };
-    let global_descriptor = if env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true) {
-        Some(GlobalDescriptorConfig::new(
-            env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2),
-        )?)
-    } else {
-        None
-    };
-    let relocalization = if env_bool("KIKO_RELOCALIZATION").unwrap_or(true) {
-        Some(RelocalizationConfig::default())
-    } else {
-        None
-    };
-    let loop_closure_enabled = loop_closure.is_some();
-    let learned_descriptors_enabled = global_descriptor.is_some();
-    let relocalization_enabled = relocalization.is_some();
-    let tracker_config = TrackerConfig {
-        max_keypoints: key_limit,
+    let tracker_config = build_tracker_config(
+        TrackerDefaults {
+            min_keyframe_points: 80,
+            refresh_inliers: 20,
+            min_inliers: 15,
+        },
+        key_limit,
         downscale,
-        min_keyframe_points,
-        ransac,
-        triangulation: TriangulationConfig::default(),
-        keyframe_policy,
-        ba: ba_config,
-        redundancy,
-        backend,
-        loop_closure,
-        global_descriptor,
-        relocalization,
-    };
+    )?;
 
     eprintln!(
-        "tracker: keyframe_min_points={} refresh_inliers={} parallax_px={:.1} min_covisibility={:.2} redundant_covisibility={:.2} min_inliers={} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={} pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
-        min_keyframe_points,
-        refresh_inliers,
-        parallax_px,
-        min_covisibility,
-        redundant_covisibility,
-        min_inliers,
-        downscale.get(),
-        key_limit.get(),
-        loop_closure_enabled,
-        learned_descriptors_enabled,
-        relocalization_enabled,
+        "live: pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
         pair_queue_depth,
         viz_queue_depth,
         depth_enabled,
@@ -1506,7 +1506,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let inference_handle = thread::spawn(move || -> Result<(), String> {
+    let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut tracker = SlamTracker::new(
             superpoint_left,
             superpoint_right,
@@ -1516,6 +1516,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             tracker_config,
         );
         let depth_rx = depth_rx;
+        let depth_enabled_for_diagnostics = depth_rx.is_some();
         let mut depth_ring = DepthRingBuffer::new(depth_ring_capacity);
         let mut dense_generation: u64 = 0;
         let mut dense_ctrl_tx = dense_ctrl_tx;
@@ -1526,8 +1527,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut depth_reorder_warnings_seen: u64 = 0;
 
         for pair in pair_rx.iter() {
-            let left = pair.left.clone();
-            let right = pair.right.clone();
+            let left = pair.left().clone();
+            let right = pair.right().clone();
             let timestamp = left.timestamp();
             let depth_batch = depth_rx.as_ref().map(drain_depth_batch).unwrap_or_default();
             let depth = depth_batch.last().cloned();
@@ -1544,7 +1545,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             let process_result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.process(pair)));
             match process_result {
-                Ok(Ok(output)) => {
+                Ok(Ok(mut output)) => {
                     // Map tracker output to dense commands.
                     let correction = tracker.take_pending_loop_correction();
                     let dense_stats = if dense_active {
@@ -1602,13 +1603,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         // Drain latest dense stats for viz.
-                        dense_stats_rx.as_ref().and_then(|rx| {
-                            let mut latest = None;
-                            while let Ok(s) = rx.try_recv() {
-                                latest = Some(s);
-                            }
-                            latest
-                        })
+                        dense_stats_rx
+                            .as_ref()
+                            .and_then(|rx| std::iter::from_fn(|| rx.try_recv().ok()).last())
                     } else {
                         None
                     };
@@ -1622,6 +1619,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let health = output.health.clone();
+                    if depth_enabled_for_diagnostics {
+                        output.diagnostics.depth_reorder_warnings =
+                            Some(depth_reorder_warnings_seen);
+                    }
                     let mut packet = None;
                     let mut points = None;
                     if let Some(matches) = output.stereo_matches {
@@ -1647,7 +1648,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         dense_stats,
                     };
                     if matches!(viz_tx.try_send(msg), SendOutcome::Disconnected) {
-                        return Err("viz channel disconnected".to_string());
+                        return Err(LiveThreadError::VizChannelDisconnected);
                     }
                 }
                 Ok(Err(err)) => {
@@ -1684,10 +1685,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("tracker error: {err}");
                 }
                 Err(payload) => {
-                    return Err(format!(
-                        "inference panic while processing frame: {}",
-                        kiko_slam::panic_payload_to_string(payload.as_ref())
-                    ));
+                    return Err(LiveThreadError::FrameProcessingPanic {
+                        detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+                    });
                 }
             }
         }
@@ -1702,13 +1702,15 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let decimation = args.rerun_decimation.get();
     let viz_running = Arc::clone(&running);
-    let viz_handle = thread::spawn(move || -> Result<(), String> {
+    let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let rec = match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc() {
             Ok(rec) => rec,
             Err(err) => {
                 viz_running.store(false, Ordering::SeqCst);
                 eprintln!("failed to connect to rerun viewer: {err}");
-                return Err(format!("failed to connect to rerun viewer: {err}"));
+                return Err(LiveThreadError::RerunConnect {
+                    detail: err.to_string(),
+                });
             }
         };
 
@@ -1965,15 +1967,15 @@ fn build_calibration(device: &Device, baseline_m: f32, config: &MonoConfig) -> C
 }
 
 fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
-    let window = env_usize("KIKO_BA_WINDOW").unwrap_or(10);
-    let iters = env_usize("KIKO_BA_ITERS").unwrap_or(6);
-    let min_obs = env_usize("KIKO_BA_MIN_OBS").unwrap_or(8);
-    let huber = env_f32("KIKO_BA_HUBER_PX").unwrap_or(3.0);
-    let initial_lambda = env_f32("KIKO_BA_DAMPING").unwrap_or(1e-3);
-    let lambda_factor = env_f32("KIKO_LM_FACTOR").unwrap_or(10.0);
-    let min_lambda = env_f32("KIKO_LM_MIN").unwrap_or(1e-8);
-    let max_lambda = env_f32("KIKO_LM_MAX").unwrap_or(1e4);
-    let motion = env_f32("KIKO_BA_MOTION_WEIGHT").unwrap_or(0.0);
+    let window = env_usize("KIKO_BA_WINDOW").unwrap_or(DEFAULT_BA_WINDOW);
+    let iters = env_usize("KIKO_BA_ITERS").unwrap_or(DEFAULT_BA_ITERS);
+    let min_obs = env_usize("KIKO_BA_MIN_OBS").unwrap_or(DEFAULT_BA_MIN_OBS);
+    let huber = env_f32("KIKO_BA_HUBER_PX").unwrap_or(DEFAULT_BA_HUBER_PX);
+    let initial_lambda = env_f32("KIKO_BA_DAMPING").unwrap_or(DEFAULT_BA_DAMPING);
+    let lambda_factor = env_f32("KIKO_LM_FACTOR").unwrap_or(DEFAULT_LM_FACTOR);
+    let min_lambda = env_f32("KIKO_LM_MIN").unwrap_or(DEFAULT_LM_MIN);
+    let max_lambda = env_f32("KIKO_LM_MAX").unwrap_or(DEFAULT_LM_MAX);
+    let motion = env_f32("KIKO_BA_MOTION_WEIGHT").unwrap_or(DEFAULT_BA_MOTION_WEIGHT);
     let default_lm = LmConfig::default();
     let lm = LmConfig::new(
         initial_lambda,
@@ -2023,6 +2025,8 @@ impl CpuTime {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn process_usage() -> Option<CpuSnapshot> {
+    // SAFETY: `libc::rusage` is a plain-old-data C struct; zeroed is a valid
+    // representation. `getrusage` writes into the provided pointer.
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
         if libc::getrusage(libc::RUSAGE_SELF, &mut usage) != 0 {

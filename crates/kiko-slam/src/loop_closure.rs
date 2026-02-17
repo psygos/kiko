@@ -1,12 +1,13 @@
 use std::num::NonZeroUsize;
 
 use crate::map::{KeyframeId, MapError, SlamMap};
+use crate::pnp::MIN_PNP_POINTS;
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
     RansacConfig, solve_pnp_ransac,
 };
 
-const GLOBAL_DESCRIPTOR_DIM: usize = 512;
+pub(crate) const GLOBAL_DESCRIPTOR_DIM: usize = crate::DESCRIPTOR_DIM * 2;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LoopClosureConfig {
@@ -156,10 +157,10 @@ impl RelocalizationConfig {
             .ok_or(RelocalizationConfigError::ZeroMaxCandidates)?;
         let min_confirmations = NonZeroUsize::new(min_confirmations)
             .ok_or(RelocalizationConfigError::ZeroMinConfirmations)?;
-        if min_inliers.get() < 4 {
+        if min_inliers.get() < MIN_PNP_POINTS {
             return Err(RelocalizationConfigError::TooFewMinInliers {
                 value: min_inliers.get(),
-                min: 4,
+                min: MIN_PNP_POINTS,
             });
         }
         if !descriptor_match_threshold.is_finite()
@@ -228,7 +229,29 @@ impl RelocalizationConfig {
 
 impl Default for RelocalizationConfig {
     fn default() -> Self {
-        Self::new(RelocalizationConfigInput::default()).expect("valid relocalization defaults")
+        let defaults = RelocalizationConfigInput::default();
+        debug_assert!(defaults.min_inliers >= MIN_PNP_POINTS);
+        debug_assert!(defaults.max_attempts > 0);
+        debug_assert!(defaults.max_candidates > 0);
+        debug_assert!(defaults.min_confirmations > 0);
+        debug_assert!(defaults.descriptor_match_threshold > 0.0);
+        debug_assert!(defaults.descriptor_match_threshold <= 1.0);
+        debug_assert!(defaults.max_translation_delta_m > 0.0);
+        debug_assert!(defaults.max_rotation_delta_deg > 0.0);
+        debug_assert!(defaults.max_rotation_delta_deg <= 180.0);
+
+        Self {
+            max_attempts: NonZeroUsize::new(defaults.max_attempts).unwrap_or(NonZeroUsize::MIN),
+            min_inliers: NonZeroUsize::new(defaults.min_inliers).unwrap_or(NonZeroUsize::MIN),
+            max_candidates: NonZeroUsize::new(defaults.max_candidates).unwrap_or(NonZeroUsize::MIN),
+            descriptor_match_threshold: defaults.descriptor_match_threshold,
+            min_confirmations: NonZeroUsize::new(defaults.min_confirmations)
+                .unwrap_or(NonZeroUsize::MIN),
+            max_translation_delta_m: defaults.max_translation_delta_m.max(f32::MIN_POSITIVE),
+            max_rotation_delta_deg: defaults
+                .max_rotation_delta_deg
+                .clamp(f32::MIN_POSITIVE, 180.0),
+        }
     }
 }
 
@@ -333,10 +356,10 @@ impl LoopClosureConfig {
             NonZeroUsize::new(temporal_gap).ok_or(LoopClosureConfigError::ZeroTemporalGap)?;
         let min_streak =
             NonZeroUsize::new(min_streak).ok_or(LoopClosureConfigError::ZeroMinStreak)?;
-        if min_inliers.get() < 4 {
+        if min_inliers.get() < MIN_PNP_POINTS {
             return Err(LoopClosureConfigError::TooFewMinInliers {
                 value: min_inliers.get(),
-                min: 4,
+                min: MIN_PNP_POINTS,
             });
         }
         if !max_correction_translation.is_finite() || max_correction_translation <= 0.0 {
@@ -416,8 +439,65 @@ impl LoopClosureConfig {
 
 impl Default for LoopClosureConfig {
     fn default() -> Self {
-        Self::new(LoopClosureConfigInput::default())
-            .expect("default loop closure config should be valid")
+        let defaults = LoopClosureConfigInput::default();
+        debug_assert!(defaults.min_inliers >= MIN_PNP_POINTS);
+        debug_assert!(defaults.max_candidates > 0);
+        debug_assert!(defaults.temporal_gap > 0);
+        debug_assert!(defaults.min_streak > 0);
+        debug_assert!(defaults.similarity_threshold > 0.0);
+        debug_assert!(defaults.similarity_threshold <= 1.0);
+        debug_assert!(defaults.descriptor_match_threshold > 0.0);
+        debug_assert!(defaults.descriptor_match_threshold <= 1.0);
+        debug_assert!(defaults.max_correction_translation > 0.0);
+        debug_assert!(defaults.max_correction_rotation_deg > 0.0);
+        debug_assert!(defaults.max_correction_rotation_deg <= 180.0);
+        debug_assert!(defaults.ransac.max_iterations > 0);
+        debug_assert!(defaults.ransac.reprojection_threshold_px > 0.0);
+
+        Self {
+            similarity_threshold: defaults.similarity_threshold.clamp(f32::MIN_POSITIVE, 1.0),
+            descriptor_match_threshold: defaults
+                .descriptor_match_threshold
+                .clamp(f32::MIN_POSITIVE, 1.0),
+            min_inliers: NonZeroUsize::new(defaults.min_inliers).unwrap_or(NonZeroUsize::MIN),
+            max_candidates: NonZeroUsize::new(defaults.max_candidates).unwrap_or(NonZeroUsize::MIN),
+            temporal_gap: NonZeroUsize::new(defaults.temporal_gap).unwrap_or(NonZeroUsize::MIN),
+            min_streak: NonZeroUsize::new(defaults.min_streak).unwrap_or(NonZeroUsize::MIN),
+            max_correction_translation: defaults.max_correction_translation.max(f32::MIN_POSITIVE),
+            max_correction_rotation_deg: defaults
+                .max_correction_rotation_deg
+                .clamp(f32::MIN_POSITIVE, 180.0),
+            ransac: RansacConfig {
+                max_iterations: defaults.ransac.max_iterations.max(1),
+                reprojection_threshold_px: defaults
+                    .ransac
+                    .reprojection_threshold_px
+                    .max(f32::MIN_POSITIVE),
+                min_inliers: defaults.ransac.min_inliers,
+                seed: defaults.ransac.seed,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum LoopApplyError {
+    StaleCorrection,
+    MissingKeyframe,
+    MissingMapPoint,
+    MapMutation,
+    InvariantViolation,
+}
+
+impl std::fmt::Display for LoopApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoopApplyError::StaleCorrection => write!(f, "stale correction"),
+            LoopApplyError::MissingKeyframe => write!(f, "missing keyframe"),
+            LoopApplyError::MissingMapPoint => write!(f, "missing map point"),
+            LoopApplyError::MapMutation => write!(f, "map mutation failed"),
+            LoopApplyError::InvariantViolation => write!(f, "invariant violation"),
+        }
     }
 }
 
@@ -426,7 +506,7 @@ pub enum LoopDetectError {
     TooFewCorrespondences { count: usize },
     VerificationFailed(LoopVerificationError),
     CorrectionTooLarge { translation: f32, rotation_deg: f32 },
-    ApplyFailed(String),
+    ApplyFailed(LoopApplyError),
 }
 
 impl std::fmt::Display for LoopDetectError {
@@ -501,9 +581,9 @@ impl GlobalDescriptor {
         }
 
         let inv_norm = 1.0 / norm_sq.sqrt();
-        let mut normalized = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
-        for (idx, value) in values.into_iter().enumerate() {
-            normalized[idx] = value * inv_norm;
+        let mut normalized = values;
+        for v in &mut normalized {
+            *v *= inv_norm;
         }
         Ok(Self(normalized))
     }
@@ -513,16 +593,14 @@ impl GlobalDescriptor {
     }
 
     pub fn cosine_similarity(&self, other: &Self) -> f32 {
-        let mut dot = 0.0_f64;
-        let mut norm_a = 0.0_f64;
-        let mut norm_b = 0.0_f64;
-        for i in 0..GLOBAL_DESCRIPTOR_DIM {
-            let a = self.0[i] as f64;
-            let b = other.0[i] as f64;
-            dot += a * b;
-            norm_a += a * a;
-            norm_b += b * b;
-        }
+        let (dot, norm_a, norm_b) = self.0.iter().zip(other.0.iter()).fold(
+            (0.0_f64, 0.0_f64, 0.0_f64),
+            |(dot, na, nb), (&a, &b)| {
+                let a = a as f64;
+                let b = b as f64;
+                (dot + a * b, na + a * a, nb + b * b)
+            },
+        );
         if norm_a <= 0.0 || norm_b <= 0.0 {
             return 0.0;
         }
@@ -541,13 +619,13 @@ impl GlobalDescriptor {
         for d in descriptors {
             for (idx, value) in d.0.iter().copied().enumerate() {
                 out[idx] += value;
-                let max_slot = &mut out[256 + idx];
+                let max_slot = &mut out[crate::DESCRIPTOR_DIM + idx];
                 if value > *max_slot {
                     *max_slot = value;
                 }
             }
         }
-        for value in &mut out[..256] {
+        for value in &mut out[..crate::DESCRIPTOR_DIM] {
             *value /= count;
         }
 
@@ -577,6 +655,28 @@ pub fn match_descriptors_for_loop(
     }
 }
 
+fn brute_force_best_match(
+    source_len: usize,
+    target_len: usize,
+    similarity_fn: impl Fn(usize, usize) -> f32,
+    threshold: f32,
+) -> Vec<Option<(usize, f32)>> {
+    (0..source_len)
+        .map(|src| {
+            let mut best = threshold;
+            let mut best_target = None;
+            for tgt in 0..target_len {
+                let sim = similarity_fn(src, tgt);
+                if sim >= best {
+                    best = sim;
+                    best_target = Some((tgt, sim));
+                }
+            }
+            best_target
+        })
+        .collect()
+}
+
 pub fn try_match_descriptors_for_loop(
     query_descriptors: &[Descriptor],
     candidate_kf: KeyframeId,
@@ -599,33 +699,19 @@ pub fn try_match_descriptors_for_loop(
     let query_quantized: Vec<CompactDescriptor> =
         query_descriptors.iter().map(Descriptor::quantize).collect();
 
-    let mut query_best = vec![None::<(usize, f32)>; query_quantized.len()];
-    for (query_idx, query_desc) in query_quantized.iter().enumerate() {
-        let mut best = similarity_threshold;
-        let mut best_candidate = None;
-        for (candidate_pos, (_, candidate_desc)) in candidate_descriptors.iter().enumerate() {
-            let sim = query_desc.cosine_similarity(candidate_desc);
-            if sim >= best {
-                best = sim;
-                best_candidate = Some((candidate_pos, sim));
-            }
-        }
-        query_best[query_idx] = best_candidate;
-    }
+    let query_best = brute_force_best_match(
+        query_quantized.len(),
+        candidate_descriptors.len(),
+        |qi, ci| query_quantized[qi].cosine_similarity(&candidate_descriptors[ci].1),
+        similarity_threshold,
+    );
 
-    let mut candidate_best = vec![None::<(usize, f32)>; candidate_descriptors.len()];
-    for (candidate_pos, (_, candidate_desc)) in candidate_descriptors.iter().enumerate() {
-        let mut best = similarity_threshold;
-        let mut best_query = None;
-        for (query_idx, query_desc) in query_quantized.iter().enumerate() {
-            let sim = query_desc.cosine_similarity(candidate_desc);
-            if sim >= best {
-                best = sim;
-                best_query = Some((query_idx, sim));
-            }
-        }
-        candidate_best[candidate_pos] = best_query;
-    }
+    let candidate_best = brute_force_best_match(
+        candidate_descriptors.len(),
+        query_quantized.len(),
+        |ci, qi| query_quantized[qi].cosine_similarity(&candidate_descriptors[ci].1),
+        similarity_threshold,
+    );
 
     let mut correspondences = Vec::new();
     for (query_idx, best) in query_best.iter().enumerate() {
@@ -668,6 +754,8 @@ struct KeyframeDescriptorEntry {
     source: DescriptorSource,
     seq: u64,
 }
+
+const DEFAULT_TEMPORAL_GAP: usize = 30;
 
 #[derive(Clone, Debug)]
 pub struct KeyframeDatabase {
@@ -761,7 +849,9 @@ impl KeyframeDatabase {
         if top_k == 0 || self.entries.is_empty() {
             return Vec::new();
         }
-        let query_entry = self.entries.last().expect("non-empty checked");
+        let Some(query_entry) = self.entries.last() else {
+            return Vec::new();
+        };
         let query_id = query_entry.keyframe_id;
         let query_seq = query_entry.seq;
         let mut matches = Vec::new();
@@ -815,7 +905,7 @@ impl KeyframeDatabase {
 
 impl Default for KeyframeDatabase {
     fn default() -> Self {
-        Self::new(30)
+        Self::new(DEFAULT_TEMPORAL_GAP)
     }
 }
 
@@ -929,9 +1019,9 @@ fn verify_pose_from_keyframe(
     ransac_config: RansacConfig,
     min_inliers: usize,
 ) -> Result<(Pose, usize), LoopVerificationError> {
-    let required_inliers = min_inliers.max(4);
+    let required_inliers = min_inliers.max(MIN_PNP_POINTS);
 
-    if correspondences.len() < 4 {
+    if correspondences.len() < MIN_PNP_POINTS {
         return Err(LoopVerificationError::TooFewMatches {
             count: correspondences.len(),
         });
@@ -956,7 +1046,7 @@ fn verify_pose_from_keyframe(
         observations.push(obs);
     }
 
-    if observations.len() < 4 {
+    if observations.len() < MIN_PNP_POINTS {
         return Err(LoopVerificationError::TooFewMatches {
             count: observations.len(),
         });
@@ -966,7 +1056,7 @@ fn verify_pose_from_keyframe(
         .min_inliers
         .min(required_inliers)
         .min(observations.len())
-        .max(4);
+        .max(MIN_PNP_POINTS);
     let pnp_config = RansacConfig {
         min_inliers: pnp_min_inliers,
         ..ransac_config

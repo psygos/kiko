@@ -30,14 +30,46 @@ pub enum InferenceError {
         expected: String,
         actual: String,
     },
-
-    Domain(String),
+    Downscale(crate::DownscaleError),
+    Detection(crate::DetectionError),
+    Match(crate::MatchError),
+    GlobalDescriptor(crate::loop_closure::GlobalDescriptorError),
+    ThreadPanic {
+        stage: &'static str,
+    },
+    InvariantViolation {
+        context: &'static str,
+    },
 }
 impl std::error::Error for InferenceError {}
 
 impl From<OrtError> for InferenceError {
     fn from(e: OrtError) -> Self {
         InferenceError::Execution(e)
+    }
+}
+
+impl From<crate::DownscaleError> for InferenceError {
+    fn from(err: crate::DownscaleError) -> Self {
+        InferenceError::Downscale(err)
+    }
+}
+
+impl From<crate::DetectionError> for InferenceError {
+    fn from(err: crate::DetectionError) -> Self {
+        InferenceError::Detection(err)
+    }
+}
+
+impl From<crate::MatchError> for InferenceError {
+    fn from(err: crate::MatchError) -> Self {
+        InferenceError::Match(err)
+    }
+}
+
+impl From<crate::loop_closure::GlobalDescriptorError> for InferenceError {
+    fn from(err: crate::loop_closure::GlobalDescriptorError) -> Self {
+        InferenceError::GlobalDescriptor(err)
     }
 }
 
@@ -58,7 +90,18 @@ impl std::fmt::Display for InferenceError {
                     "unexpected output '{name}': expected {expected}, got {actual}"
                 )
             }
-            InferenceError::Domain(msg) => write!(f, "domain error: {msg}"),
+            InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
+            InferenceError::Detection(err) => write!(f, "detection error: {err}"),
+            InferenceError::Match(err) => write!(f, "match error: {err}"),
+            InferenceError::GlobalDescriptor(err) => {
+                write!(f, "global descriptor error: {err}")
+            }
+            InferenceError::ThreadPanic { stage } => {
+                write!(f, "inference worker thread panicked ({stage})")
+            }
+            InferenceError::InvariantViolation { context } => {
+                write!(f, "inference invariant violated: {context}")
+            }
         }
     }
 }

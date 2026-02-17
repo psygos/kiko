@@ -4,7 +4,7 @@ use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::Path;
 
-const DESCRIPTOR_DIM: usize = 256;
+use crate::DESCRIPTOR_DIM;
 
 pub struct SuperPoint {
     session: Session,
@@ -63,17 +63,22 @@ impl SuperPoint {
             return self.detect(frame);
         }
 
-        let (width, height) = crate::preprocess::normalise_downscale_into(
+        let dimensions = crate::preprocess::normalise_downscale_into(
             frame.data(),
             frame.width(),
             frame.height(),
             downscale,
             &mut self.scratch,
         )
-        .map_err(|e| InferenceError::Domain(format!("{e}")))?;
+        .map_err(InferenceError::Downscale)?;
 
         let input_tensor = TensorRef::from_array_view((
-            [1, 1, height as usize, width as usize],
+            [
+                1,
+                1,
+                dimensions.height() as usize,
+                dimensions.width() as usize,
+            ],
             self.scratch.as_slice(),
         ))?;
 
@@ -81,8 +86,8 @@ impl SuperPoint {
             &mut self.session,
             frame,
             input_tensor,
-            width,
-            height,
+            dimensions.width(),
+            dimensions.height(),
             Some(downscale),
         )
     }
@@ -159,7 +164,7 @@ fn run_inference(
         scores,
         descriptors,
     )
-    .map_err(|e| InferenceError::Domain(format!("{e:?}")))
+    .map_err(InferenceError::Detection)
 }
 
 fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>, InferenceError> {
@@ -237,6 +242,26 @@ fn parse_keypoint_pairs(
     })
 }
 
+fn extract_xy(
+    pair: &[f32; 2],
+    width: f32,
+    height: f32,
+    norm: Normalization,
+    swap: bool,
+) -> (f32, f32) {
+    if swap {
+        (
+            scale_coordinate(pair[1], width, norm),
+            scale_coordinate(pair[0], height, norm),
+        )
+    } else {
+        (
+            scale_coordinate(pair[0], width, norm),
+            scale_coordinate(pair[1], height, norm),
+        )
+    }
+}
+
 fn to_keypoints(pairs: &[[f32; 2]], width: f32, height: f32) -> Vec<Keypoint> {
     let norm = detect_normalization(pairs);
     let score_xy = count_in_bounds(pairs, width, height, norm, false);
@@ -246,17 +271,7 @@ fn to_keypoints(pairs: &[[f32; 2]], width: f32, height: f32) -> Vec<Keypoint> {
     pairs
         .iter()
         .map(|pair| {
-            let (x, y) = if swap {
-                (
-                    scale_coordinate(pair[1], width, norm),
-                    scale_coordinate(pair[0], height, norm),
-                )
-            } else {
-                (
-                    scale_coordinate(pair[0], width, norm),
-                    scale_coordinate(pair[1], height, norm),
-                )
-            };
+            let (x, y) = extract_xy(pair, width, height, norm, swap);
             Keypoint { x, y }
         })
         .collect()
@@ -289,24 +304,13 @@ fn count_in_bounds(
     norm: Normalization,
     swap: bool,
 ) -> usize {
-    let mut count = 0;
-    for pair in pairs {
-        let (x, y) = if swap {
-            (
-                scale_coordinate(pair[1], width, norm),
-                scale_coordinate(pair[0], height, norm),
-            )
-        } else {
-            (
-                scale_coordinate(pair[0], width, norm),
-                scale_coordinate(pair[1], height, norm),
-            )
-        };
-        if x >= 0.0 && x < width && y >= 0.0 && y < height {
-            count += 1;
-        }
-    }
-    count
+    pairs
+        .iter()
+        .filter(|pair| {
+            let (x, y) = extract_xy(pair, width, height, norm, swap);
+            x >= 0.0 && x < width && y >= 0.0 && y < height
+        })
+        .count()
 }
 
 fn scale_coordinate(value: f32, dim: f32, norm: Normalization) -> f32 {

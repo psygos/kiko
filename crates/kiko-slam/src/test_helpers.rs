@@ -262,31 +262,7 @@ pub(crate) fn make_raw_matches(
 }
 
 pub(crate) fn axis_angle_pose(translation: [f32; 3], axis_angle: [f32; 3]) -> Pose {
-    Pose::from_rt(so3_exp(axis_angle), translation)
-}
-
-fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
-    let theta = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
-    if theta < 1e-6 {
-        return [[1.0, -w[2], w[1]], [w[2], 1.0, -w[0]], [-w[1], w[0], 1.0]];
-    }
-    let k = [w[0] / theta, w[1] / theta, w[2] / theta];
-    let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
-    let sin_t = theta.sin();
-    let cos_t = theta.cos();
-    let mut kx2 = [[0.0_f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            kx2[i][j] = kx[i][0] * kx[0][j] + kx[i][1] * kx[1][j] + kx[i][2] * kx[2][j];
-        }
-    }
-    let mut r = [[0.0_f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            r[i][j] = if i == j { 1.0 } else { 0.0 } + sin_t * kx[i][j] + (1.0 - cos_t) * kx2[i][j];
-        }
-    }
-    r
+    Pose::from_rt(math::so3_exp(axis_angle), translation)
 }
 
 pub(crate) fn make_depth_image(
@@ -303,7 +279,7 @@ pub(crate) fn make_depth_image(
 }
 
 fn indexed_descriptor(index: usize) -> Descriptor {
-    let mut data = [0.0_f32; 256];
-    data[index % 256] = 1.0;
+    let mut data = [0.0_f32; crate::DESCRIPTOR_DIM];
+    data[index % crate::DESCRIPTOR_DIM] = 1.0;
     Descriptor(data)
 }

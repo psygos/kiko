@@ -33,6 +33,9 @@ pub use channel::{
     ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
     DropReceiver, DropSender, SendOutcome, bounded_channel,
 };
+pub use dense::backend::{
+    Mesh, TsdfBackend, TsdfBackendFactory, TsdfConfig, TsdfConfigError, TsdfError,
+};
 pub use dense::{DenseCommand, DenseConfig, DenseStats, ReconState};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
@@ -44,11 +47,12 @@ pub use local_ba::{
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
-    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
-    LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError,
-    LoopVerificationError, PlaceMatch, RelocalizationCandidate, RelocalizationConfig,
-    RelocalizationConfigError, RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop,
-    VerifiedRelocalization, aggregate_global_descriptor, match_descriptors_for_loop,
+    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopApplyError,
+    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput,
+    LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
+    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+    RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
+    match_descriptors_for_loop,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
@@ -63,14 +67,16 @@ pub use pnp::{
     build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use tracker::{
-    BackendConfig, BackendConfigError, BackendStats, CovisibilityRatio, DegradationLevel,
-    DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframePolicy,
-    KeyframePolicyError, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
-    SystemHealth, TrackerConfig, TrackerError, TrackerOutput, TrackingHealth,
+    BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
+    DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
+    KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, RedundancyPolicy,
+    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError, TrackerOutput,
+    TrackingHealth,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, Point3, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
-    TriangulationConfig, TriangulationError, TriangulationResult, TriangulationStats, Triangulator,
+    Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
+    RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
+    TriangulationStats, Triangulator,
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 
@@ -116,6 +122,30 @@ impl Timestamp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameDimensions {
+    width: u32,
+    height: u32,
+}
+
+impl FrameDimensions {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self { width, height }
+    }
+
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    pub fn height(self) -> u32 {
+        self.height
+    }
+
+    pub fn area(self) -> usize {
+        (self.width as usize).saturating_mul(self.height as usize)
+    }
+}
+
 // Define these much more concretely
 #[derive(Debug)]
 pub enum FrameError {
@@ -135,9 +165,18 @@ impl std::error::Error for FrameError {}
 
 #[derive(Debug)]
 pub enum PairError {
-    DimensionMismatch { left: (u32, u32), right: (u32, u32) },
-    TimestampDelta { delta_ns: i64, max_delta_ns: i64 },
-    SensorMismatch { left: SensorId, right: SensorId },
+    DimensionMismatch {
+        left: FrameDimensions,
+        right: FrameDimensions,
+    },
+    TimestampDelta {
+        delta_ns: i64,
+        max_delta_ns: i64,
+    },
+    SensorMismatch {
+        left: SensorId,
+        right: SensorId,
+    },
 }
 
 impl std::fmt::Display for PairError {
@@ -147,7 +186,10 @@ impl std::fmt::Display for PairError {
                 write!(
                     f,
                     "stereo dimension mismatch: left={}x{}, right={}x{}",
-                    left.0, left.1, right.0, right.1
+                    left.width(),
+                    left.height(),
+                    right.width(),
+                    right.height()
                 )
             }
             PairError::TimestampDelta {
@@ -181,7 +223,7 @@ impl DownscaleFactor {
     }
 
     pub fn identity() -> Self {
-        Self(NonZeroUsize::new(1).expect("nonzero"))
+        Self(NonZeroUsize::MIN)
     }
 }
 
@@ -267,6 +309,10 @@ impl Frame {
     pub fn height(&self) -> u32 {
         self.height
     }
+
+    pub fn dimensions(&self) -> FrameDimensions {
+        FrameDimensions::new(self.width, self.height)
+    }
     pub fn data(&self) -> &[u8] {
         self.data.as_ref()
     }
@@ -291,9 +337,12 @@ pub struct Keypoint {
     pub y: f32,
 }
 
+pub const DESCRIPTOR_DIM: usize = 256;
+const U8_SCALE: f32 = 255.0;
+
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Descriptor(pub [f32; 256]);
+pub struct Descriptor(pub [f32; DESCRIPTOR_DIM]);
 
 impl Descriptor {
     pub fn as_slice(&self) -> &[f32] {
@@ -301,10 +350,10 @@ impl Descriptor {
     }
 
     pub fn quantize(&self) -> CompactDescriptor {
-        let mut out = [0_u8; 256];
+        let mut out = [0_u8; DESCRIPTOR_DIM];
         for (idx, value) in self.0.iter().enumerate() {
             let clamped = value.clamp(0.0, 1.0);
-            out[idx] = (clamped * 255.0).round() as u8;
+            out[idx] = (clamped * U8_SCALE).round() as u8;
         }
         CompactDescriptor(out)
     }
@@ -312,20 +361,22 @@ impl Descriptor {
 
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompactDescriptor(pub [u8; 256]);
+pub struct CompactDescriptor(pub [u8; DESCRIPTOR_DIM]);
 
 impl CompactDescriptor {
     pub fn cosine_similarity(&self, other: &Self) -> f32 {
-        let mut dot = 0_u32;
-        let mut norm_a = 0_u32;
-        let mut norm_b = 0_u32;
-        for i in 0..256 {
-            let a = self.0[i] as u32;
-            let b = other.0[i] as u32;
-            dot = dot.saturating_add(a.saturating_mul(b));
-            norm_a = norm_a.saturating_add(a.saturating_mul(a));
-            norm_b = norm_b.saturating_add(b.saturating_mul(b));
-        }
+        let (dot, norm_a, norm_b) = self.0.iter().zip(other.0.iter()).fold(
+            (0_u32, 0_u32, 0_u32),
+            |(dot, na, nb), (&a, &b)| {
+                let a = a as u32;
+                let b = b as u32;
+                (
+                    dot.saturating_add(a.saturating_mul(b)),
+                    na.saturating_add(a.saturating_mul(a)),
+                    nb.saturating_add(b.saturating_mul(b)),
+                )
+            },
+        );
         if norm_a == 0 || norm_b == 0 {
             return 0.0;
         }
@@ -359,7 +410,6 @@ impl std::fmt::Display for DetectionError {
 
 impl std::error::Error for DetectionError {}
 
-// i need to create invariant of descriptors.len() and keypoint.len() remain the same
 #[derive(Debug, Clone)]
 pub struct Detections {
     sensor_id: SensorId,
@@ -461,17 +511,10 @@ impl Detections {
 
         let mut order: Vec<usize> = (0..descriptors.len()).collect();
         let kth = max.saturating_sub(1);
-        order.select_nth_unstable_by(kth, |&a, &b| {
-            scores[b]
-                .partial_cmp(&scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let cmp_desc = |&a: &usize, &b: &usize| scores[b].total_cmp(&scores[a]);
+        order.select_nth_unstable_by(kth, cmp_desc);
         order.truncate(max);
-        order.sort_unstable_by(|&a, &b| {
-            scores[b]
-                .partial_cmp(&scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        order.sort_unstable_by(cmp_desc);
 
         let mut new_keypoints = Vec::with_capacity(order.len());
         let mut new_scores = Vec::with_capacity(order.len());
@@ -526,8 +569,8 @@ impl<S: FrameSource> Iterator for Frames<S> {
 
 #[derive(Debug)]
 pub struct StereoPair {
-    pub left: Frame,
-    pub right: Frame,
+    left: Frame,
+    right: Frame,
 }
 
 impl StereoPair {
@@ -541,8 +584,8 @@ impl StereoPair {
 
         if left.width() != right.width() || left.height() != right.height() {
             return Err(PairError::DimensionMismatch {
-                left: (left.width(), left.height()),
-                right: (right.width(), right.height()),
+                left: left.dimensions(),
+                right: right.dimensions(),
             });
         }
 
@@ -557,6 +600,24 @@ impl StereoPair {
         Ok(Self { left, right })
     }
 
+    /// Construct a pair without validation. Use when frames are known to be
+    /// correctly paired (e.g. from a pre-validated dataset manifest).
+    pub(crate) fn from_parts(left: Frame, right: Frame) -> Self {
+        Self { left, right }
+    }
+
+    pub fn left(&self) -> &Frame {
+        &self.left
+    }
+
+    pub fn right(&self) -> &Frame {
+        &self.right
+    }
+
+    pub fn into_parts(self) -> (Frame, Frame) {
+        (self.left, self.right)
+    }
+
     pub fn timestamp_delta_ns(&self) -> i64 {
         (self.left.timestamp().as_nanos() - self.right.timestamp().as_nanos()).abs()
     }
@@ -567,10 +628,7 @@ pub trait StereoSource {
     fn right(&mut self) -> Option<Frame>;
 
     fn stereo_pair(&mut self) -> Option<StereoPair> {
-        Some(StereoPair {
-            left: self.left()?,
-            right: self.right()?,
-        })
+        Some(StereoPair::from_parts(self.left()?, self.right()?))
     }
 
     fn stereo_pairs(self) -> StereoPairs<Self>
@@ -649,7 +707,7 @@ impl<S: StereoSource> Iterator for RightFrames<S> {
     }
 }
 
-// Typesstates for Matches
+// Typestates for Matches
 #[derive(Debug)]
 pub struct Raw;
 #[derive(Debug)]
@@ -661,21 +719,12 @@ pub enum MatchError {
         score_len: usize,
         indices_len: usize,
     },
-    #[doc(hidden)]
-    MissMatch {
-        score_len: usize,
-        indices_len: usize,
-    },
 }
 
 impl std::fmt::Display for MatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MatchError::Mismatch {
-                score_len,
-                indices_len,
-            }
-            | MatchError::MissMatch {
                 score_len,
                 indices_len,
             } => write!(
@@ -886,13 +935,13 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDescriptor, Descriptor};
+    use super::{CompactDescriptor, DESCRIPTOR_DIM, Descriptor, U8_SCALE};
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;
         let mut norm_a = 0.0_f32;
         let mut norm_b = 0.0_f32;
-        for i in 0..256 {
+        for i in 0..DESCRIPTOR_DIM {
             let x = a.0[i];
             let y = b.0[i];
             dot += x * y;
@@ -907,11 +956,11 @@ mod tests {
 
     #[test]
     fn quantize_preserves_similarity_ordering() {
-        let mut base = [0.0_f32; 256];
-        let mut close = [0.0_f32; 256];
-        let mut far = [0.0_f32; 256];
-        for i in 0..256 {
-            let t = i as f32 / 255.0;
+        let mut base = [0.0_f32; DESCRIPTOR_DIM];
+        let mut close = [0.0_f32; DESCRIPTOR_DIM];
+        let mut far = [0.0_f32; DESCRIPTOR_DIM];
+        for i in 0..DESCRIPTOR_DIM {
+            let t = i as f32 / U8_SCALE;
             base[i] = t;
             close[i] = (t + 0.02).clamp(0.0, 1.0);
             far[i] = if i < 128 { 1.0 } else { 0.0 };
@@ -934,7 +983,7 @@ mod tests {
 
     #[test]
     fn compact_descriptor_cosine_identical_is_one() {
-        let mut data = [0_u8; 256];
+        let mut data = [0_u8; DESCRIPTOR_DIM];
         for (idx, value) in data.iter_mut().enumerate() {
             *value = ((idx * 7) % 251) as u8;
         }
@@ -946,8 +995,8 @@ mod tests {
 
     #[test]
     fn compact_descriptor_cosine_orthogonal_is_zeroish() {
-        let mut a = [0_u8; 256];
-        let mut b = [0_u8; 256];
+        let mut a = [0_u8; DESCRIPTOR_DIM];
+        let mut b = [0_u8; DESCRIPTOR_DIM];
         for value in a.iter_mut().take(128) {
             *value = 255;
         }

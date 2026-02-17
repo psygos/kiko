@@ -16,6 +16,10 @@ impl KeypointLimit {
         Self(limit)
     }
 
+    pub fn min() -> Self {
+        Self(NonZeroUsize::MIN)
+    }
+
     pub fn get(self) -> usize {
         self.0.get()
     }
@@ -122,9 +126,7 @@ impl InferencePipeline {
         pair: StereoPair,
     ) -> Result<(VizPacket<Raw>, PipelineTimings), PipelineError> {
         let total_start = Instant::now();
-        let StereoPair { left, right } = pair;
-        let left_frame = left;
-        let right_frame = right;
+        let (left_frame, right_frame) = pair.into_parts();
         let downscale = self.downscale;
         let max_keypoints = self.max_keypoints.get();
 
@@ -153,10 +155,11 @@ impl InferencePipeline {
             (left_handle.join(), right_handle.join())
         });
 
-        let (left_det, left_time) = left_result
-            .map_err(|_| InferenceError::Domain("left superpoint thread panicked".to_string()))??;
-        let (right_det, right_time) = right_result.map_err(|_| {
-            InferenceError::Domain("right superpoint thread panicked".to_string())
+        let (left_det, left_time) = left_result.map_err(|_| InferenceError::ThreadPanic {
+            stage: "left superpoint",
+        })??;
+        let (right_det, right_time) = right_result.map_err(|_| InferenceError::ThreadPanic {
+            stage: "right superpoint",
         })??;
 
         let left = Arc::new(left_det);
@@ -165,7 +168,7 @@ impl InferencePipeline {
         let match_start = Instant::now();
         let matches = if left.is_empty() || right.is_empty() {
             Matches::new(left.clone(), right.clone(), Vec::new(), Vec::new())
-                .map_err(|e| InferenceError::Domain(format!("{e:?}")))?
+                .map_err(InferenceError::Match)?
         } else {
             self.lightglue.match_these(left.clone(), right.clone())?
         };

@@ -93,7 +93,9 @@ mod tests {
     use crate::diagnostics::KeyframeRemovalReason;
     use crate::test_helpers::make_depth_image;
     use crate::tracker::BackendStats;
-    use crate::{DegradationLevel, FrameDiagnostics, FrameId, SystemHealth, TrackerOutput};
+    use crate::{
+        ComponentHealth, DegradationLevel, FrameDiagnostics, FrameId, SystemHealth, TrackerOutput,
+    };
 
     fn ts(ns: i64) -> Timestamp {
         Timestamp::from_nanos(ns)
@@ -112,8 +114,8 @@ mod tests {
     fn healthy() -> SystemHealth {
         SystemHealth {
             tracking: TrackingHealth::Good,
-            backend_alive: true,
-            descriptor_alive: true,
+            backend: ComponentHealth::Alive,
+            descriptor: ComponentHealth::Alive,
             backend_stats: BackendStats::default(),
             degradation: DegradationLevel::Nominal,
         }
@@ -122,8 +124,8 @@ mod tests {
     fn lost_health() -> SystemHealth {
         SystemHealth {
             tracking: TrackingHealth::Lost,
-            backend_alive: true,
-            descriptor_alive: true,
+            backend: ComponentHealth::Alive,
+            descriptor: ComponentHealth::Alive,
             backend_stats: BackendStats::default(),
             degradation: DegradationLevel::Lost,
         }

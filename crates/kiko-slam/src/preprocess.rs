@@ -1,3 +1,5 @@
+const U8_SCALE: f32 = 255.0;
+
 // since camera outputs a u8, we can just precompute all the float conversion and static it into
 // the binary
 const fn build_float_lut() -> [f32; 256] {
@@ -5,7 +7,7 @@ const fn build_float_lut() -> [f32; 256] {
     let mut i: usize = 0;
 
     while i < 256 {
-        table[i] = i as f32 / 255.0;
+        table[i] = i as f32 / U8_SCALE;
         i += 1
     }
     table
@@ -26,7 +28,7 @@ pub fn normalise_downscale_into(
     height: u32,
     factor: crate::DownscaleFactor,
     out: &mut Vec<f32>,
-) -> Result<(u32, u32), crate::DownscaleError> {
+) -> Result<crate::FrameDimensions, crate::DownscaleError> {
     let factor_u32 = factor.get() as u32;
     if width % factor_u32 != 0 || height % factor_u32 != 0 {
         return Err(crate::DownscaleError::NonDivisible {
@@ -38,7 +40,8 @@ pub fn normalise_downscale_into(
 
     let out_width = width / factor_u32;
     let out_height = height / factor_u32;
-    let out_len = (out_width * out_height) as usize;
+    let out_dims = crate::FrameDimensions::new(out_width, out_height);
+    let out_len = out_dims.area();
     out.resize(out_len, 0.0);
 
     let stride = width as usize;
@@ -56,5 +59,5 @@ pub fn normalise_downscale_into(
         }
     }
 
-    Ok((out_width, out_height))
+    Ok(out_dims)
 }

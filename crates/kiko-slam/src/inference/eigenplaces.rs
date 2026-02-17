@@ -4,13 +4,13 @@ use ort::session::Session;
 use ort::value::TensorRef;
 
 use crate::Frame;
-use crate::loop_closure::GlobalDescriptor;
+use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
 
 use super::{InferenceBackend, InferenceError, PlaceDescriptorExtractor, build_session};
 
 const INPUT_SIZE: usize = 224;
 const INPUT_CHANNELS: usize = 3;
-const OUTPUT_DIM: usize = 512;
+const U8_SCALE: f32 = 255.0;
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
@@ -44,7 +44,16 @@ impl EigenPlaces {
         if !path_ref.exists() {
             return None;
         }
-        Self::new_with_backend(path_ref, backend).ok()
+        match Self::new_with_backend(path_ref, backend) {
+            Ok(model) => Some(model),
+            Err(e) => {
+                eprintln!(
+                    "eigenplaces: failed to load model at {}: {e}",
+                    path_ref.display()
+                );
+                None
+            }
+        }
     }
 
     pub fn backend(&self) -> InferenceBackend {
@@ -102,7 +111,7 @@ fn preprocess_frame_to_nchw(frame: &Frame, out: &mut Vec<f32>) {
         for x in 0..INPUT_SIZE {
             let src_x = x * src_width / INPUT_SIZE;
             let src_idx = src_y * src_width + src_x;
-            let value = src.get(src_idx).copied().unwrap_or(0) as f32 / 255.0;
+            let value = src.get(src_idx).copied().unwrap_or(0) as f32 / U8_SCALE;
             for channel in 0..INPUT_CHANNELS {
                 let dst_idx = channel * INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x;
                 out[dst_idx] = (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
@@ -112,16 +121,22 @@ fn preprocess_frame_to_nchw(frame: &Frame, out: &mut Vec<f32>) {
 }
 
 fn parse_descriptor_output(raw_descriptor: &[f32]) -> Result<GlobalDescriptor, InferenceError> {
-    if raw_descriptor.len() != OUTPUT_DIM {
+    if raw_descriptor.len() != GLOBAL_DESCRIPTOR_DIM {
         return Err(InferenceError::UnexpectedOutput {
             name: "eigenplaces-output".to_string(),
-            expected: format!("descriptor length {OUTPUT_DIM}"),
+            expected: format!("descriptor length {GLOBAL_DESCRIPTOR_DIM}"),
             actual: format!("descriptor length {}", raw_descriptor.len()),
         });
     }
-    let descriptor_array: [f32; OUTPUT_DIM] = raw_descriptor.try_into().expect("length checked");
-    GlobalDescriptor::try_new(descriptor_array)
-        .map_err(|err| InferenceError::Domain(format!("invalid global descriptor: {err}")))
+    let descriptor_array: [f32; GLOBAL_DESCRIPTOR_DIM] =
+        raw_descriptor
+            .try_into()
+            .map_err(|_| InferenceError::UnexpectedOutput {
+                name: "eigenplaces-output".to_string(),
+                expected: format!("descriptor length {GLOBAL_DESCRIPTOR_DIM}"),
+                actual: format!("descriptor length {}", raw_descriptor.len()),
+            })?;
+    GlobalDescriptor::try_new(descriptor_array).map_err(InferenceError::GlobalDescriptor)
 }
 
 #[cfg(test)]
@@ -129,7 +144,9 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{EigenPlaces, parse_descriptor_output, preprocess_frame_to_nchw};
+    use super::{
+        EigenPlaces, GLOBAL_DESCRIPTOR_DIM, parse_descriptor_output, preprocess_frame_to_nchw,
+    };
     use crate::inference::InferenceError;
     use crate::{Frame, FrameId, InferenceBackend, SensorId, Timestamp};
 
@@ -214,11 +231,11 @@ mod tests {
 
     #[test]
     fn parse_descriptor_output_rejects_non_finite_descriptor() {
-        let mut raw = [0.0_f32; 512];
+        let mut raw = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
         raw[0] = f32::NAN;
         let err = parse_descriptor_output(&raw).expect_err("non-finite descriptor should fail");
         match err {
-            InferenceError::Domain(msg) => assert!(msg.contains("non-finite")),
+            InferenceError::GlobalDescriptor(_) => {}
             other => panic!("expected domain error, got {other:?}"),
         }
     }

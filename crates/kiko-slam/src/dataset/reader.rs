@@ -116,13 +116,9 @@ impl<'a> Iterator for DatasetPairs<'a> {
             let entry = self.reader.manifest.entries[self.index].clone();
             self.index += 1;
 
-            if !matches!(entry.status, super::PairStatus::Paired) {
-                continue;
-            }
-
-            let right = match entry.right {
-                Some(right) => right,
-                None => continue,
+            let right = match entry.pairing {
+                super::ManifestPairing::Paired { right, .. } => right,
+                super::ManifestPairing::MissingRight { .. } => continue,
             };
 
             let left_frame = match self.reader.read_frame(&entry.left, SensorId::StereoLeft) {
@@ -152,13 +148,9 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
             let entry = self.reader.manifest.entries[self.index].clone();
             self.index += 1;
 
-            if !matches!(entry.status, super::PairStatus::Paired) {
-                continue;
-            }
-
-            let right = match entry.right {
-                Some(right) => right,
-                None => continue,
+            let right = match entry.pairing {
+                super::ManifestPairing::Paired { right, .. } => right,
+                super::ManifestPairing::MissingRight { .. } => continue,
             };
 
             let left_start = Instant::now();

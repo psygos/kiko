@@ -1,10 +1,12 @@
+pub mod backend;
 pub mod command_mapper;
 pub mod ring_buffer;
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::dense::backend::{TsdfBackend, TsdfConfig};
 use crate::map::KeyframeId;
-use crate::{DepthImage, Pose};
+use crate::{DepthImage, PinholeIntrinsics, Pose};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,6 +47,34 @@ pub enum ReconState {
     Down,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RebuildPolicy {
+    /// Rebuild only when every corrected keyframe still has a stored depth image.
+    Strict,
+    /// Rebuild when enough corrected keyframes have depth coverage.
+    BestEffort { min_coverage_percent: u8 },
+}
+
+impl Default for RebuildPolicy {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TsdfModeConfig {
+    pub config: TsdfConfig,
+    pub intrinsics: PinholeIntrinsics,
+    pub rebuild_policy: RebuildPolicy,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum DenseMode {
+    #[default]
+    DepthStoreOnly,
+    Tsdf(TsdfModeConfig),
+}
+
 #[derive(Clone, Debug)]
 pub struct DenseStats {
     pub integrated_count: u64,
@@ -72,12 +102,15 @@ pub struct DenseConfig {
     /// when this limit is reached (safety net for exploration trajectories
     /// where the tracker never culls keyframes).
     pub max_stored_keyframes: usize,
+    /// Dense reconstruction mode.
+    pub mode: DenseMode,
 }
 
 impl Default for DenseConfig {
     fn default() -> Self {
         Self {
             max_stored_keyframes: 300,
+            mode: DenseMode::DepthStoreOnly,
         }
     }
 }
@@ -136,9 +169,12 @@ impl DepthStore {
         }
     }
 
-    #[cfg(test)]
     pub fn get(&self, keyframe_id: KeyframeId) -> Option<&DepthImage> {
         self.map.get(&keyframe_id)
+    }
+
+    pub fn contains(&self, keyframe_id: KeyframeId) -> bool {
+        self.map.contains_key(&keyframe_id)
     }
 
     pub fn len(&self) -> usize {
@@ -156,6 +192,8 @@ pub struct DenseState {
     generation: u64,
     stats: DenseStats,
     consecutive_panics: u32,
+    mode: DenseMode,
+    backend: Option<Box<dyn TsdfBackend>>,
 }
 
 impl DenseState {
@@ -166,7 +204,26 @@ impl DenseState {
             generation: 0,
             stats: DenseStats::default(),
             consecutive_panics: 0,
+            mode: config.mode.clone(),
+            backend: None,
         }
+    }
+
+    /// Attach a TSDF backend. Called from the worker thread after factory
+    /// construction succeeds.
+    pub fn set_backend(&mut self, backend: Box<dyn TsdfBackend>) {
+        match self.mode {
+            DenseMode::DepthStoreOnly => {
+                eprintln!("dense: ignoring backend attachment in DepthStoreOnly mode");
+            }
+            DenseMode::Tsdf(_) => {
+                self.backend = Some(backend);
+            }
+        }
+    }
+
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
     }
 
     pub fn stats(&self) -> DenseStats {
@@ -184,6 +241,21 @@ impl DenseState {
     }
 }
 
+fn rebuild_allowed(policy: RebuildPolicy, rebuildable: usize, total: usize) -> bool {
+    if total == 0 {
+        return true;
+    }
+    match policy {
+        RebuildPolicy::Strict => rebuildable == total,
+        RebuildPolicy::BestEffort {
+            min_coverage_percent,
+        } => {
+            let threshold = usize::from(min_coverage_percent.min(100));
+            rebuildable.saturating_mul(100) >= total.saturating_mul(threshold)
+        }
+    }
+}
+
 /// Process a single dense command. Returns updated stats.
 ///
 /// This is a pure function (no thread, no I/O) so that tests can exercise
@@ -197,12 +269,17 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
     match cmd {
         DenseCommand::IntegrateKeyframe {
             keyframe_id,
-            pose: _,
+            pose,
             depth,
         } => {
-            state.store.insert(keyframe_id, depth);
+            state.store.insert(keyframe_id, depth.clone());
             state.stats.integrated_count = state.stats.integrated_count.saturating_add(1);
-            // Commit 2: call backend.integrate(pose, depth, intrinsics) here.
+
+            if let (DenseMode::Tsdf(tsdf), Some(backend)) = (&state.mode, state.backend.as_mut()) {
+                if let Err(e) = backend.integrate(pose, &depth, tsdf.intrinsics) {
+                    eprintln!("dense: tsdf integration error: {e}");
+                }
+            }
         }
         DenseCommand::RemoveKeyframe { keyframe_id } => {
             state.store.remove(keyframe_id);
@@ -219,14 +296,10 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
             state.generation = generation;
             state.state = ReconState::Rebuilding { generation };
 
-            // Commit 2: backend.clear() here, then re-integrate all stored
-            // keyframes with their corrected poses.
-            //
-            // For now, we can only rebuild keyframes whose depth snapshots are
-            // still present in the local depth store.
+            // Count how many corrected keyframes still have depth snapshots.
             let mut rebuildable = 0usize;
             for (kf_id, _new_pose) in &corrected_poses {
-                if state.store.map.contains_key(kf_id) {
+                if state.store.contains(*kf_id) {
                     rebuildable = rebuildable.saturating_add(1);
                 }
             }
@@ -235,6 +308,30 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
                     "dense rebuild missing depth snapshots for {} keyframes",
                     corrected_poses.len().saturating_sub(rebuildable)
                 );
+            }
+
+            // Clear and re-integrate the backend if available.
+            if let (DenseMode::Tsdf(tsdf), Some(backend)) = (&state.mode, state.backend.as_mut()) {
+                let total = corrected_poses.len();
+                if rebuild_allowed(tsdf.rebuild_policy, rebuildable, total) {
+                    if let Err(e) = backend.clear() {
+                        eprintln!("dense: tsdf clear error: {e}");
+                    } else {
+                        for (kf_id, new_pose) in &corrected_poses {
+                            if let Some(depth) = state.store.get(*kf_id) {
+                                if let Err(e) = backend.integrate(*new_pose, depth, tsdf.intrinsics)
+                                {
+                                    eprintln!("dense: tsdf rebuild integration error: {e}");
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "dense: skipping tsdf rebuild due to policy {:?} (coverage={rebuildable}/{total})",
+                        tsdf.rebuild_policy
+                    );
+                }
             }
 
             state.stats.rebuild_count = state.stats.rebuild_count.saturating_add(1);
@@ -347,6 +444,7 @@ mod tests {
     fn make_config(cap: usize) -> DenseConfig {
         DenseConfig {
             max_stored_keyframes: cap,
+            mode: DenseMode::DepthStoreOnly,
         }
     }
 

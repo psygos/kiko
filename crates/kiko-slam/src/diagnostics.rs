@@ -39,6 +39,7 @@ pub struct FrameDiagnostics {
     pub tracking_time: Option<Duration>,
     pub map_keyframes: usize,
     pub map_points: usize,
+    pub depth_reorder_warnings: Option<u64>,
     pub features_detected: Option<usize>,
     pub features_matched: Option<usize>,
 }
@@ -61,6 +62,7 @@ impl FrameDiagnostics {
             tracking_time: None,
             map_keyframes,
             map_points,
+            depth_reorder_warnings: None,
             features_detected: None,
             features_matched: None,
         }
@@ -131,6 +133,7 @@ mod tests {
         assert_eq!(diag.loop_candidate_count, 0);
         assert!(!diag.loop_closure_applied);
         assert!(diag.tracking_time.is_none());
+        assert!(diag.depth_reorder_warnings.is_none());
         assert!(diag.features_detected.is_none());
         assert!(diag.features_matched.is_none());
     }

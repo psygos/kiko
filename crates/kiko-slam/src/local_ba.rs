@@ -7,6 +7,31 @@ use crate::{
     math,
 };
 
+/// Maximum SE3 parameter step for convergence detection.
+const STEP_CONVERGENCE_THRESHOLD: f32 = 1e-4;
+/// Relative cost tolerance for LM convergence.
+const RELATIVE_COST_TOLERANCE: f64 = 1e-6;
+/// Floor for cost magnitude to avoid division-near-zero in relative convergence.
+const COST_FLOOR: f64 = 1e-12;
+/// Minimum projected depth for valid reprojection.
+const MIN_PROJECTION_DEPTH: f32 = 1e-6;
+/// Minimum landmark Schur complement damping.
+const MIN_LANDMARK_DAMPING: f32 = 1e-6;
+/// Minimum pose damping floor for simple BA (`optimize()`).
+const MIN_POSE_DAMPING: f32 = 1e-9;
+/// Pivot magnitude threshold below which the linear system is treated as singular.
+const PIVOT_TOLERANCE: f32 = 1e-9;
+/// Elimination factor threshold below which row reduction is skipped.
+const ELIMINATION_TOLERANCE: f32 = 1e-12;
+/// Minimum determinant magnitude for 3x3 matrix inversion.
+const MIN_DETERMINANT: f64 = 1e-18;
+/// Minimum number of poses required for bundle adjustment.
+const MIN_BA_POSES: usize = 2;
+/// Minimum observations per landmark for inclusion in full BA.
+const MIN_LANDMARK_OBSERVATIONS: usize = 2;
+/// Absolute minimum observation count for BA config (PnP geometric minimum).
+const ABSOLUTE_MIN_OBSERVATIONS: usize = 4;
+
 #[derive(Clone, Copy, Debug)]
 pub struct LocalBaConfig {
     window: NonZeroUsize,
@@ -274,8 +299,10 @@ impl LocalBaConfig {
             NonZeroUsize::new(max_iterations).ok_or(LocalBaConfigError::ZeroIterations)?;
         let min_observations =
             NonZeroUsize::new(min_observations).ok_or(LocalBaConfigError::ZeroObservations)?;
-        if min_observations.get() < 4 {
-            return Err(LocalBaConfigError::TooFewObservations { min: 4 });
+        if min_observations.get() < ABSOLUTE_MIN_OBSERVATIONS {
+            return Err(LocalBaConfigError::TooFewObservations {
+                min: ABSOLUTE_MIN_OBSERVATIONS,
+            });
         }
         if huber_delta_px <= 0.0 || !huber_delta_px.is_finite() {
             return Err(LocalBaConfigError::NonPositiveHuber {
@@ -603,9 +630,9 @@ impl FullBaProblem {
             });
         }
 
-        if poses.len() < 2 {
+        if poses.len() < MIN_BA_POSES {
             return Err(FullBaBuildError::TooFewKeyframes {
-                required: 2,
+                required: MIN_BA_POSES,
                 actual: poses.len(),
             });
         }
@@ -639,7 +666,7 @@ impl FullBaProblem {
                 local_observations.push((pose_idx, pixel));
             }
 
-            if local_observations.len() < 2 {
+            if local_observations.len() < MIN_LANDMARK_OBSERVATIONS {
                 continue;
             }
 
@@ -827,7 +854,7 @@ impl LocalBundleAdjuster {
         let dim = frame_count * 6;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
-        let damping = self.config.lm().initial_lambda().max(1e-9);
+        let damping = self.config.lm().initial_lambda().max(MIN_POSE_DAMPING);
         let motion_weight = self.config.motion_prior_weight();
 
         for _ in 0..max_iters {
@@ -851,15 +878,11 @@ impl LocalBundleAdjuster {
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
                     {
                         let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                        let weight = if r_norm <= huber { 1.0 } else { huber / r_norm };
+                        let weight = huber_weight(r_norm, huber);
                         let scale = weight.sqrt();
                         let r0 = residual[0] * scale;
                         let r1 = residual[1] * scale;
-                        let mut j = [[0.0_f32; 6]; 2];
-                        for c in 0..6 {
-                            j[0][c] = jac[0][c] * scale;
-                            j[1][c] = jac[1][c] * scale;
-                        }
+                        let j = jac.map(|row| row.map(|v| v * scale));
 
                         for c in 0..6 {
                             let jr = j[0][c] * r0 + j[1][c] * r1;
@@ -874,30 +897,17 @@ impl LocalBundleAdjuster {
             }
 
             if motion_weight > 0.0 && frame_count >= 2 {
-                let weight = motion_weight;
                 for i in 1..frame_count {
-                    let prev = &self.frames[i - 1].pose;
-                    let curr = &self.frames[i].pose;
-                    let r_prev = pose_to_vec(*prev);
-                    let r_curr = pose_to_vec(*curr);
-                    let mut residual = [0.0_f32; 6];
-                    for k in 0..6 {
-                        residual[k] = r_curr[k] - r_prev[k];
-                    }
-                    let base_prev = (i - 1) * 6;
-                    let base_curr = i * 6;
-
-                    for k in 0..6 {
-                        let r = residual[k] * weight;
-                        b[base_prev + k] += r;
-                        b[base_curr + k] -= r;
-
-                        let w = weight * weight;
-                        a[(base_prev + k) * dim + (base_prev + k)] += w;
-                        a[(base_curr + k) * dim + (base_curr + k)] += w;
-                        a[(base_prev + k) * dim + (base_curr + k)] -= w;
-                        a[(base_curr + k) * dim + (base_prev + k)] -= w;
-                    }
+                    accumulate_motion_prior(
+                        a,
+                        b,
+                        dim,
+                        self.frames[i - 1].pose,
+                        self.frames[i].pose,
+                        (i - 1) * 6,
+                        i * 6,
+                        motion_weight,
+                    );
                 }
             }
 
@@ -911,16 +921,8 @@ impl LocalBundleAdjuster {
 
             let mut max_step = 0.0_f32;
             for i in 0..frame_count {
-                let base = i * 6;
-                let step = [
-                    b[base],
-                    b[base + 1],
-                    b[base + 2],
-                    b[base + 3],
-                    b[base + 4],
-                    b[base + 5],
-                ];
-                let step_norm = (step.iter().map(|v| v * v).sum::<f32>()).sqrt();
+                let step = extract_se3_delta(b, i * 6);
+                let step_norm = norm6(step);
                 if step_norm > max_step {
                     max_step = step_norm;
                 }
@@ -928,7 +930,7 @@ impl LocalBundleAdjuster {
                 self.frames[i].pose = apply_se3_delta(pose, step);
             }
 
-            if max_step < 1e-4 {
+            if max_step < STEP_CONVERGENCE_THRESHOLD {
                 break;
             }
         }
@@ -939,7 +941,7 @@ impl LocalBundleAdjuster {
     fn optimize_full(&mut self, problem: &mut FullBaProblem) -> BaResult {
         let pose_count = problem.poses.len();
         let landmark_count = problem.landmarks.len();
-        if pose_count < 2 {
+        if pose_count < MIN_BA_POSES {
             return BaResult::Degenerate {
                 reason: DegenerateReason::TooFewPoses { count: pose_count },
             };
@@ -965,14 +967,17 @@ impl LocalBundleAdjuster {
         let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
         let mut lm_state = LmState::new(lm_config, final_cost);
 
+        let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
+        let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
+        let mut landmark_accumulators: Vec<LandmarkAccumulator> =
+            Vec::with_capacity(landmark_count);
+        let mut rhs_before_solve: Vec<f32> = vec![0.0; pose_dim];
+
         for iter in 0..max_iters {
-            let pose_backup: Vec<Pose> =
-                problem.poses.iter().map(|pose_var| pose_var.pose).collect();
-            let landmark_backup: Vec<Point3> = problem
-                .landmarks
-                .iter()
-                .map(|landmark_var| landmark_var.position)
-                .collect();
+            pose_backup.clear();
+            pose_backup.extend(problem.poses.iter().map(|pv| pv.pose));
+            landmark_backup.clear();
+            landmark_backup.extend(problem.landmarks.iter().map(|lv| lv.position));
 
             let s = &mut self.a_buf[..pose_dim * pose_dim];
             let rhs = &mut self.b_buf[..pose_dim];
@@ -980,11 +985,11 @@ impl LocalBundleAdjuster {
             rhs.fill(0.0);
 
             let pose_damping = lm_state.lambda().max(lm_config.min_lambda());
-            let landmark_damping = pose_damping.max(1e-6);
+            let landmark_damping = pose_damping.max(MIN_LANDMARK_DAMPING);
 
-            let mut landmark_accumulators = (0..landmark_count)
-                .map(|_| LandmarkAccumulator::default())
-                .collect::<Vec<_>>();
+            landmark_accumulators.clear();
+            landmark_accumulators
+                .extend((0..landmark_count).map(|_| LandmarkAccumulator::default()));
 
             for factor in &problem.factors {
                 let pose_idx = factor.pose;
@@ -999,40 +1004,12 @@ impl LocalBundleAdjuster {
                 };
 
                 let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                let weight = if r_norm <= huber { 1.0 } else { huber / r_norm };
+                let weight = huber_weight(r_norm, huber);
                 let scale = weight.sqrt();
 
                 let r_scaled = [residual[0] * scale, residual[1] * scale];
-                let j_pose_scaled = [
-                    [
-                        j_pose[0][0] * scale,
-                        j_pose[0][1] * scale,
-                        j_pose[0][2] * scale,
-                        j_pose[0][3] * scale,
-                        j_pose[0][4] * scale,
-                        j_pose[0][5] * scale,
-                    ],
-                    [
-                        j_pose[1][0] * scale,
-                        j_pose[1][1] * scale,
-                        j_pose[1][2] * scale,
-                        j_pose[1][3] * scale,
-                        j_pose[1][4] * scale,
-                        j_pose[1][5] * scale,
-                    ],
-                ];
-                let j_landmark_scaled = [
-                    [
-                        j_landmark[0][0] * scale,
-                        j_landmark[0][1] * scale,
-                        j_landmark[0][2] * scale,
-                    ],
-                    [
-                        j_landmark[1][0] * scale,
-                        j_landmark[1][1] * scale,
-                        j_landmark[1][2] * scale,
-                    ],
-                ];
+                let j_pose_scaled = j_pose.map(|row| row.map(|v| v * scale));
+                let j_landmark_scaled = j_landmark.map(|row| row.map(|v| v * scale));
 
                 accumulate_pose_hessian(s, pose_dim, pose_idx, j_pose_scaled);
                 accumulate_pose_rhs(rhs, pose_idx, j_pose_scaled, r_scaled);
@@ -1048,28 +1025,16 @@ impl LocalBundleAdjuster {
 
             if motion_weight > 0.0 && pose_count >= 2 {
                 for i in 1..pose_count {
-                    let prev = &problem.poses[i - 1].pose;
-                    let curr = &problem.poses[i].pose;
-                    let r_prev = pose_to_vec(*prev);
-                    let r_curr = pose_to_vec(*curr);
-                    let mut residual = [0.0_f32; 6];
-                    for k in 0..6 {
-                        residual[k] = r_curr[k] - r_prev[k];
-                    }
-                    let base_prev = (i - 1) * 6;
-                    let base_curr = i * 6;
-
-                    for k in 0..6 {
-                        let r = residual[k] * motion_weight;
-                        rhs[base_prev + k] += r;
-                        rhs[base_curr + k] -= r;
-
-                        let w = motion_weight * motion_weight;
-                        s[(base_prev + k) * pose_dim + (base_prev + k)] += w;
-                        s[(base_curr + k) * pose_dim + (base_curr + k)] += w;
-                        s[(base_prev + k) * pose_dim + (base_curr + k)] -= w;
-                        s[(base_curr + k) * pose_dim + (base_prev + k)] -= w;
-                    }
+                    accumulate_motion_prior(
+                        s,
+                        rhs,
+                        pose_dim,
+                        problem.poses[i - 1].pose,
+                        problem.poses[i].pose,
+                        (i - 1) * 6,
+                        i * 6,
+                        motion_weight,
+                    );
                 }
             }
 
@@ -1078,7 +1043,7 @@ impl LocalBundleAdjuster {
             }
 
             let mut schur_landmarks = Vec::with_capacity(landmark_count);
-            for acc in landmark_accumulators.into_iter() {
+            for acc in landmark_accumulators.drain(..) {
                 let mut c = acc.c;
                 for (i, c_row) in c.iter_mut().enumerate() {
                     c_row[i] += landmark_damping;
@@ -1090,7 +1055,7 @@ impl LocalBundleAdjuster {
                     };
                 };
 
-                let inv_c_b = mat3_mul_vec3(inv_c, acc.b);
+                let inv_c_b = math::mat_mul_vec(inv_c, acc.b);
                 for link_i in &acc.links {
                     let base_i = link_i.pose.offset6();
                     let rhs_contrib = mat63_mul_vec3(link_i.b, inv_c_b);
@@ -1117,7 +1082,7 @@ impl LocalBundleAdjuster {
             }
 
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
-            let rhs_before_solve = rhs.to_vec();
+            rhs_before_solve.copy_from_slice(rhs);
 
             if !solve_linear_system(s, rhs, pose_dim) {
                 return BaResult::MaxIterations {
@@ -1130,14 +1095,7 @@ impl LocalBundleAdjuster {
             let mut max_step = 0.0_f32;
             for (pose_i, pose_var) in problem.poses.iter_mut().enumerate() {
                 let base = pose_i * 6;
-                let delta = [
-                    rhs[base],
-                    rhs[base + 1],
-                    rhs[base + 2],
-                    rhs[base + 3],
-                    rhs[base + 4],
-                    rhs[base + 5],
-                ];
+                let delta = extract_se3_delta(rhs, base);
                 max_step = max_step.max(norm6(delta));
                 for k in 0..6 {
                     let d = delta[k] as f64;
@@ -1151,15 +1109,7 @@ impl LocalBundleAdjuster {
                 let schur = &schur_landmarks[landmark_i];
                 let mut coupling = [0.0_f32; 3];
                 for link in &schur.links {
-                    let base = link.pose.offset6();
-                    let pose_delta = [
-                        rhs[base],
-                        rhs[base + 1],
-                        rhs[base + 2],
-                        rhs[base + 3],
-                        rhs[base + 4],
-                        rhs[base + 5],
-                    ];
+                    let pose_delta = extract_se3_delta(rhs, link.pose.offset6());
                     for (row, pose_delta_value) in pose_delta.iter().enumerate() {
                         for (col, link_value) in link.b[row].iter().enumerate() {
                             coupling[col] += *link_value * *pose_delta_value;
@@ -1172,7 +1122,7 @@ impl LocalBundleAdjuster {
                     schur.b[1] - coupling[1],
                     schur.b[2] - coupling[2],
                 ];
-                let delta_landmark = mat3_mul_vec3(schur.inv_c, rhs_landmark);
+                let delta_landmark = math::mat_mul_vec(schur.inv_c, rhs_landmark);
                 max_step = max_step.max(norm3(delta_landmark));
                 for (axis, d) in delta_landmark.iter().enumerate() {
                     let d = *d as f64;
@@ -1190,8 +1140,10 @@ impl LocalBundleAdjuster {
             match lm_state.step(candidate_cost, predicted_decrease, lm_config) {
                 LmAction::Accept => {
                     final_cost = candidate_cost;
-                    let threshold = 1e-6_f64 * prev_cost.abs().max(1e-12);
-                    if max_step < 1e-4 || (prev_cost - candidate_cost).abs() <= threshold {
+                    let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
+                    if max_step < STEP_CONVERGENCE_THRESHOLD
+                        || (prev_cost - candidate_cost).abs() <= threshold
+                    {
                         return BaResult::Converged {
                             iterations: iter + 1,
                             final_cost,
@@ -1289,7 +1241,7 @@ fn reprojection_residual_and_jacobians(
     let x = pc[0];
     let y = pc[1];
     let z = pc[2];
-    if z <= 1e-6 {
+    if z <= MIN_PROJECTION_DEPTH {
         return None;
     }
 
@@ -1357,7 +1309,7 @@ fn reprojection_residual_and_jacobians(
 pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
     let v = [delta[0], delta[1], delta[2]];
     let w = [delta[3], delta[4], delta[5]];
-    let r_delta = so3_exp(w);
+    let r_delta = math::so3_exp(w);
     let r = math::mat_mul(r_delta, pose.rotation());
     let t = math::mat_mul_vec(r_delta, pose.translation());
     Pose::from_rt(r, [t[0] + v[0], t[1] + v[1], t[2] + v[2]])
@@ -1373,7 +1325,7 @@ pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
     }
 
     let r_delta = math::mat_mul(to.rotation(), from_rot_t);
-    let w = so3_log(r_delta);
+    let w = math::so3_log(r_delta);
     let rotated_from_t = math::mat_mul_vec(r_delta, from.translation());
     let to_t = to.translation();
     let v = [
@@ -1386,118 +1338,8 @@ pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
 
 fn pose_to_vec(pose: Pose) -> [f32; 6] {
     let t = pose.translation();
-    let w = so3_log(pose.rotation());
+    let w = math::so3_log(pose.rotation());
     [t[0], t[1], t[2], w[0], w[1], w[2]]
-}
-
-fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
-    let theta = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
-    let mut r = [[0.0_f32; 3]; 3];
-    if theta < 1e-6 {
-        r[0][0] = 1.0;
-        r[1][1] = 1.0;
-        r[2][2] = 1.0;
-        r[0][1] = -w[2];
-        r[0][2] = w[1];
-        r[1][0] = w[2];
-        r[1][2] = -w[0];
-        r[2][0] = -w[1];
-        r[2][1] = w[0];
-        return r;
-    }
-
-    let k = [w[0] / theta, w[1] / theta, w[2] / theta];
-    let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
-
-    let sin_t = theta.sin();
-    let cos_t = theta.cos();
-    let mut kx2 = [[0.0_f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            kx2[i][j] = kx[i][0] * kx[0][j] + kx[i][1] * kx[1][j] + kx[i][2] * kx[2][j];
-        }
-    }
-
-    for i in 0..3 {
-        for j in 0..3 {
-            r[i][j] = if i == j { 1.0 } else { 0.0 } + sin_t * kx[i][j] + (1.0 - cos_t) * kx2[i][j];
-        }
-    }
-    r
-}
-
-fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
-    let trace = r[0][0] + r[1][1] + r[2][2];
-    let mut cos_theta = (trace - 1.0) * 0.5;
-    cos_theta = cos_theta.clamp(-1.0, 1.0);
-    let theta = cos_theta.acos();
-    if theta < 1e-6 {
-        return [
-            0.5 * (r[2][1] - r[1][2]),
-            0.5 * (r[0][2] - r[2][0]),
-            0.5 * (r[1][0] - r[0][1]),
-        ];
-    }
-
-    // Near pi, theta/sin(theta) becomes numerically unstable. Recover the
-    // axis from the diagonal of R (equivalently from R + I) and align the
-    // sign with the skew-symmetric part.
-    if std::f32::consts::PI - theta < 1e-3 {
-        let xx = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
-        let yy = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
-        let zz = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
-
-        let mut axis = if xx >= yy && xx >= zz && xx > 1e-6 {
-            [
-                xx,
-                (r[0][1] + r[1][0]) / (4.0 * xx),
-                (r[0][2] + r[2][0]) / (4.0 * xx),
-            ]
-        } else if yy >= zz && yy > 1e-6 {
-            [
-                (r[0][1] + r[1][0]) / (4.0 * yy),
-                yy,
-                (r[1][2] + r[2][1]) / (4.0 * yy),
-            ]
-        } else if zz > 1e-6 {
-            [
-                (r[0][2] + r[2][0]) / (4.0 * zz),
-                (r[1][2] + r[2][1]) / (4.0 * zz),
-                zz,
-            ]
-        } else {
-            [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]]
-        };
-
-        let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-        if norm > 1e-8 {
-            axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
-        } else {
-            axis = [1.0, 0.0, 0.0];
-        }
-
-        let skew = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
-        let sign = axis[0] * skew[0] + axis[1] * skew[1] + axis[2] * skew[2];
-        if sign < 0.0 {
-            axis = [-axis[0], -axis[1], -axis[2]];
-        }
-        return [axis[0] * theta, axis[1] * theta, axis[2] * theta];
-    }
-
-    let sin_theta = theta.sin();
-    if sin_theta.abs() < 1e-6 {
-        return [
-            0.5 * (r[2][1] - r[1][2]),
-            0.5 * (r[0][2] - r[2][0]),
-            0.5 * (r[1][0] - r[0][1]),
-        ];
-    }
-    let factor = theta / (2.0 * sin_theta);
-    [
-        factor * (r[2][1] - r[1][2]),
-        factor * (r[0][2] - r[2][0]),
-        factor * (r[1][0] - r[0][1]),
-    ]
 }
 
 fn accumulate_pose_hessian(
@@ -1552,12 +1394,52 @@ fn pose_landmark_cross(j_pose: [[f32; 6]; 2], j_landmark: [[f32; 3]; 2]) -> [[f3
     cross
 }
 
-fn mat3_mul_vec3(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+/// Accumulate motion-prior terms for a consecutive pair of poses into the
+/// normal equations (Hessian `hessian` and right-hand side `rhs`).
+/// Extract a 6-element SE3 delta from a solution vector at the given offset.
+fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
     [
-        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        rhs[base],
+        rhs[base + 1],
+        rhs[base + 2],
+        rhs[base + 3],
+        rhs[base + 4],
+        rhs[base + 5],
     ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accumulate_motion_prior(
+    hessian: &mut [f32],
+    rhs: &mut [f32],
+    dim: usize,
+    prev_pose: Pose,
+    curr_pose: Pose,
+    base_prev: usize,
+    base_curr: usize,
+    weight: f32,
+) {
+    let r_prev = pose_to_vec(prev_pose);
+    let r_curr = pose_to_vec(curr_pose);
+    let mut residual = [0.0_f32; 6];
+    for k in 0..6 {
+        residual[k] = r_curr[k] - r_prev[k];
+    }
+    let w2 = weight * weight;
+    for k in 0..6 {
+        let r = residual[k] * weight;
+        rhs[base_prev + k] += r;
+        rhs[base_curr + k] -= r;
+
+        hessian[(base_prev + k) * dim + (base_prev + k)] += w2;
+        hessian[(base_curr + k) * dim + (base_curr + k)] += w2;
+        hessian[(base_prev + k) * dim + (base_curr + k)] -= w2;
+        hessian[(base_curr + k) * dim + (base_prev + k)] -= w2;
+    }
+}
+
+fn huber_weight(r_norm: f32, delta: f32) -> f32 {
+    if r_norm <= delta { 1.0 } else { delta / r_norm }
 }
 
 fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
@@ -1569,16 +1451,19 @@ fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
 }
 
 fn schur_block(b_i: [[f32; 3]; 6], inv_c: [[f32; 3]; 3], b_j: [[f32; 3]; 6]) -> [[f32; 6]; 6] {
+    // Precompute b_i_inv_c = b_i * inv_c (6x3 matrix) to avoid redundant inner-loop work.
+    let mut b_i_inv_c = [[0.0_f32; 3]; 6];
+    for (row, bi_row) in b_i.iter().enumerate() {
+        for (l, val) in b_i_inv_c[row].iter_mut().enumerate() {
+            *val = bi_row[0] * inv_c[0][l] + bi_row[1] * inv_c[1][l] + bi_row[2] * inv_c[2][l];
+        }
+    }
+    // Now block[row][col] = dot(b_i_inv_c[row], b_j[col]).
     let mut block = [[0.0_f32; 6]; 6];
     for (row, block_row) in block.iter_mut().enumerate() {
+        let bic = &b_i_inv_c[row];
         for (col, block_value) in block_row.iter_mut().enumerate() {
-            let mut sum = 0.0_f32;
-            for (k, inv_c_row) in inv_c.iter().enumerate() {
-                for (l, inv_c_value) in inv_c_row.iter().enumerate() {
-                    sum += b_i[row][k] * *inv_c_value * b_j[col][l];
-                }
-            }
-            *block_value = sum;
+            *block_value = bic[0] * b_j[col][0] + bic[1] * b_j[col][1] + bic[2] * b_j[col][2];
         }
     }
     block
@@ -1609,7 +1494,7 @@ fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     let i = m[2][2] as f64;
 
     let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if !det.is_finite() || det.abs() < 1e-18 {
+    if !det.is_finite() || det.abs() < MIN_DETERMINANT {
         return None;
     }
     let inv_det = 1.0 / det;
@@ -1664,7 +1549,7 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
             }
         }
 
-        if max_val < 1e-9 {
+        if max_val < PIVOT_TOLERANCE {
             return false;
         }
 
@@ -1686,7 +1571,7 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
                 continue;
             }
             let factor = a[r * n + i];
-            if factor.abs() < 1e-12 {
+            if factor.abs() < ELIMINATION_TOLERANCE {
                 continue;
             }
             for c in i..n {
@@ -1998,8 +1883,8 @@ mod tests {
     #[test]
     fn so3_exp_log_round_trip_for_small_rotation() {
         let w = [0.18, -0.06, 0.11];
-        let r = so3_exp(w);
-        let recovered = so3_log(r);
+        let r = math::so3_exp(w);
+        let recovered = math::so3_log(r);
         assert!(
             l2_3(w, recovered) < 2e-4,
             "round-trip mismatch: {recovered:?}"
@@ -2010,8 +1895,8 @@ mod tests {
     fn so3_log_is_finite_near_pi() {
         let theta = std::f32::consts::PI - 1e-4;
         let w = [0.0, theta, 0.0];
-        let r = so3_exp(w);
-        let recovered = so3_log(r);
+        let r = math::so3_exp(w);
+        let recovered = math::so3_log(r);
         assert!(recovered.iter().all(|v| v.is_finite()));
 
         let recovered_norm = (recovered[0] * recovered[0]

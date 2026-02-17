@@ -771,10 +771,8 @@ struct DeltaStats {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ManifestEntry {
     left: ManifestFrameRef,
-    right: Option<ManifestFrameRef>,
-    delta_ns: Option<u64>,
-    status: PairStatus,
-    reason: Option<PairReason>,
+    #[serde(flatten)]
+    pairing: ManifestPairing,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -783,11 +781,21 @@ struct ManifestFrameRef {
     path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-enum PairStatus {
-    Paired,
-    MissingRight,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ManifestPairing {
+    Paired {
+        right: ManifestFrameRef,
+        delta_ns: u64,
+    },
+    MissingRight {
+        #[serde(default = "default_missing_right_reason")]
+        reason: PairReason,
+    },
+}
+
+fn default_missing_right_reason() -> PairReason {
+    PairReason::NoRightFrames
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
@@ -1167,10 +1175,9 @@ fn pair_entries(
                         timestamp_ns: left_frame.timestamp_ns,
                         path: left_frame.path.clone(),
                     },
-                    right: None,
-                    delta_ns: None,
-                    status: PairStatus::MissingRight,
-                    reason: Some(PairReason::OutsideWindow),
+                    pairing: ManifestPairing::MissingRight {
+                        reason: PairReason::OutsideWindow,
+                    },
                 }
             } else {
                 right_used[idx] = true;
@@ -1180,13 +1187,13 @@ fn pair_entries(
                         timestamp_ns: left_frame.timestamp_ns,
                         path: left_frame.path.clone(),
                     },
-                    right: Some(ManifestFrameRef {
-                        timestamp_ns: right[idx].timestamp_ns,
-                        path: right[idx].path.clone(),
-                    }),
-                    delta_ns: Some(delta),
-                    status: PairStatus::Paired,
-                    reason: None,
+                    pairing: ManifestPairing::Paired {
+                        right: ManifestFrameRef {
+                            timestamp_ns: right[idx].timestamp_ns,
+                            path: right[idx].path.clone(),
+                        },
+                        delta_ns: delta,
+                    },
                 }
             }
         } else {
@@ -1201,10 +1208,7 @@ fn pair_entries(
                     timestamp_ns: left_frame.timestamp_ns,
                     path: left_frame.path.clone(),
                 },
-                right: None,
-                delta_ns: None,
-                status: PairStatus::MissingRight,
-                reason: Some(reason),
+                pairing: ManifestPairing::MissingRight { reason },
             }
         };
 

@@ -1,17 +1,49 @@
 use crate::Pose;
 
+/// Small-angle threshold for first-order Taylor expansion of SO(3) exponential/log maps.
+const SO3_SMALL_ANGLE: f64 = 1e-12;
+/// Threshold for detecting near-pi rotations in SO(3) log map.
+const SO3_NEAR_PI: f64 = 1e-6;
+/// Minimum axis norm for valid axis extraction in near-pi log map.
+const SO3_AXIS_NORM_MIN: f64 = 1e-12;
+/// Small-angle threshold for f32 SO(3) operations.
+const SO3_SMALL_ANGLE_F32: f32 = 1e-6;
+/// Near-pi threshold for f32 SO(3) log map.
+const SO3_NEAR_PI_F32: f32 = 1e-3;
+/// Minimum axis component magnitude for f32 near-pi axis extraction.
+const SO3_AXIS_COMPONENT_MIN_F32: f32 = 1e-6;
+/// Minimum axis norm for valid f32 axis normalization.
+const SO3_AXIS_NORM_MIN_F32: f32 = 1e-8;
+/// Small-angle threshold for f64 Jacobian expansions (tighter than SO3_SMALL_ANGLE).
+const JACOBIAN_SMALL_ANGLE: f64 = 1e-9;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Pose64 {
-    pub rotation: [[f64; 3]; 3],
-    pub translation: [f64; 3],
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
 }
 
 impl Pose64 {
+    pub fn from_rt(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Self {
+        Self {
+            rotation,
+            translation,
+        }
+    }
+
     pub fn identity() -> Self {
         Self {
             rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             translation: [0.0, 0.0, 0.0],
         }
+    }
+
+    pub fn rotation(&self) -> [[f64; 3]; 3] {
+        self.rotation
+    }
+
+    pub fn translation(&self) -> [f64; 3] {
+        self.translation
     }
 
     pub fn compose(self, other: Self) -> Self {
@@ -104,9 +136,126 @@ pub(crate) fn mat_mul_vec_f64(r: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+pub(crate) fn mat_transpose(r: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    [
+        [r[0][0], r[1][0], r[2][0]],
+        [r[0][1], r[1][1], r[2][1]],
+        [r[0][2], r[1][2], r[2][2]],
+    ]
+}
+
 pub(crate) fn transform_point(r: [[f32; 3]; 3], t: [f32; 3], v: [f32; 3]) -> [f32; 3] {
     let rv = mat_mul_vec(r, v);
     [rv[0] + t[0], rv[1] + t[1], rv[2] + t[2]]
+}
+
+pub(crate) fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
+    let theta = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
+    let mut r = [[0.0_f32; 3]; 3];
+    if theta < SO3_SMALL_ANGLE_F32 {
+        r[0][0] = 1.0;
+        r[1][1] = 1.0;
+        r[2][2] = 1.0;
+        r[0][1] = -w[2];
+        r[0][2] = w[1];
+        r[1][0] = w[2];
+        r[1][2] = -w[0];
+        r[2][0] = -w[1];
+        r[2][1] = w[0];
+        return r;
+    }
+
+    let k = [w[0] / theta, w[1] / theta, w[2] / theta];
+    let kx = [[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]];
+
+    let sin_t = theta.sin();
+    let cos_t = theta.cos();
+    let mut kx2 = [[0.0_f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            kx2[i][j] = kx[i][0] * kx[0][j] + kx[i][1] * kx[1][j] + kx[i][2] * kx[2][j];
+        }
+    }
+
+    for i in 0..3 {
+        for j in 0..3 {
+            r[i][j] = if i == j { 1.0 } else { 0.0 } + sin_t * kx[i][j] + (1.0 - cos_t) * kx2[i][j];
+        }
+    }
+    r
+}
+
+pub(crate) fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
+    let trace = r[0][0] + r[1][1] + r[2][2];
+    let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
+    let theta = cos_theta.acos();
+    if theta < SO3_SMALL_ANGLE_F32 {
+        return [
+            0.5 * (r[2][1] - r[1][2]),
+            0.5 * (r[0][2] - r[2][0]),
+            0.5 * (r[1][0] - r[0][1]),
+        ];
+    }
+
+    // Near pi, theta/sin(theta) becomes numerically unstable. Recover the
+    // axis from the diagonal of R (equivalently from R + I) and align the
+    // sign with the skew-symmetric part.
+    if std::f32::consts::PI - theta < SO3_NEAR_PI_F32 {
+        let xx = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
+        let yy = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
+        let zz = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
+
+        let mut axis = if xx >= yy && xx >= zz && xx > SO3_AXIS_COMPONENT_MIN_F32 {
+            [
+                xx,
+                (r[0][1] + r[1][0]) / (4.0 * xx),
+                (r[0][2] + r[2][0]) / (4.0 * xx),
+            ]
+        } else if yy >= zz && yy > SO3_AXIS_COMPONENT_MIN_F32 {
+            [
+                (r[0][1] + r[1][0]) / (4.0 * yy),
+                yy,
+                (r[1][2] + r[2][1]) / (4.0 * yy),
+            ]
+        } else if zz > SO3_AXIS_COMPONENT_MIN_F32 {
+            [
+                (r[0][2] + r[2][0]) / (4.0 * zz),
+                (r[1][2] + r[2][1]) / (4.0 * zz),
+                zz,
+            ]
+        } else {
+            [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]]
+        };
+
+        let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+        if norm > SO3_AXIS_NORM_MIN_F32 {
+            axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+        } else {
+            axis = [1.0, 0.0, 0.0];
+        }
+
+        let skew = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
+        let sign = axis[0] * skew[0] + axis[1] * skew[1] + axis[2] * skew[2];
+        if sign < 0.0 {
+            axis = [-axis[0], -axis[1], -axis[2]];
+        }
+        return [axis[0] * theta, axis[1] * theta, axis[2] * theta];
+    }
+
+    let sin_theta = theta.sin();
+    if sin_theta.abs() < SO3_SMALL_ANGLE_F32 {
+        return [
+            0.5 * (r[2][1] - r[1][2]),
+            0.5 * (r[0][2] - r[2][0]),
+            0.5 * (r[1][0] - r[0][1]),
+        ];
+    }
+    let factor = theta / (2.0 * sin_theta);
+    [
+        factor * (r[2][1] - r[1][2]),
+        factor * (r[0][2] - r[2][0]),
+        factor * (r[1][0] - r[0][1]),
+    ]
 }
 
 pub(crate) fn so3_exp_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
@@ -115,7 +264,7 @@ pub(crate) fn so3_exp_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
     let omega_hat2 = mat_mul_f64(omega_hat, omega_hat);
     let i = identity3_f64();
 
-    if theta < 1e-12 {
+    if theta < SO3_SMALL_ANGLE {
         let mut r = i;
         for row in 0..3 {
             for col in 0..3 {
@@ -141,7 +290,7 @@ pub(crate) fn so3_log_f64(r: [[f64; 3]; 3]) -> [f64; 3] {
     let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
     let theta = cos_theta.acos();
 
-    if theta < 1e-12 {
+    if theta < SO3_SMALL_ANGLE {
         return [
             0.5 * (r[2][1] - r[1][2]),
             0.5 * (r[0][2] - r[2][0]),
@@ -149,7 +298,7 @@ pub(crate) fn so3_log_f64(r: [[f64; 3]; 3]) -> [f64; 3] {
         ];
     }
 
-    if (std::f64::consts::PI - theta).abs() < 1e-6 {
+    if (std::f64::consts::PI - theta).abs() < SO3_NEAR_PI {
         let x = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
         let y = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
         let z = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
@@ -164,7 +313,7 @@ pub(crate) fn so3_log_f64(r: [[f64; 3]; 3]) -> [f64; 3] {
             axis[2] = -axis[2];
         }
         let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
-        if norm > 1e-12 {
+        if norm > SO3_AXIS_NORM_MIN {
             return [
                 theta * axis[0] / norm,
                 theta * axis[1] / norm,
@@ -188,7 +337,7 @@ pub(crate) fn so3_right_jacobian_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
     let omega_hat2 = mat_mul_f64(omega_hat, omega_hat);
     let mut jr = identity3_f64();
 
-    if theta < 1e-9 {
+    if theta < JACOBIAN_SMALL_ANGLE {
         for row in 0..3 {
             for col in 0..3 {
                 jr[row][col] += -0.5 * omega_hat[row][col] + (1.0 / 6.0) * omega_hat2[row][col];
@@ -216,7 +365,7 @@ pub(crate) fn se3_exp_f64(xi: [f64; 6]) -> Pose64 {
     let omega_hat = skew_f64(omega);
     let omega_hat2 = mat_mul_f64(omega_hat, omega_hat);
     let mut v = identity3_f64();
-    if theta < 1e-9 {
+    if theta < JACOBIAN_SMALL_ANGLE {
         for row in 0..3 {
             for col in 0..3 {
                 v[row][col] += 0.5 * omega_hat[row][col] + (1.0 / 6.0) * omega_hat2[row][col];
@@ -245,7 +394,7 @@ pub(crate) fn se3_log_f64(pose: Pose64) -> [f64; 6] {
     let omega_hat = skew_f64(omega);
     let omega_hat2 = mat_mul_f64(omega_hat, omega_hat);
     let mut v_inv = identity3_f64();
-    if theta < 1e-9 {
+    if theta < JACOBIAN_SMALL_ANGLE {
         for row in 0..3 {
             for col in 0..3 {
                 v_inv[row][col] += -0.5 * omega_hat[row][col] + (1.0 / 12.0) * omega_hat2[row][col];

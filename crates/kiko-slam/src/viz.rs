@@ -27,7 +27,7 @@ impl VizDecimation {
 
 impl Default for VizDecimation {
     fn default() -> Self {
-        Self(NonZeroUsize::new(1).expect("1 is non-zero"))
+        Self(NonZeroUsize::MIN)
     }
 }
 

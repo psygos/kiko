@@ -5,6 +5,11 @@ use slotmap::{SlotMap, new_key_type};
 
 use crate::{CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
 
+/// Fixed-point scale factor for descriptor blending (8-bit precision).
+const BLEND_SCALE: u16 = 256;
+/// Rounding bias for fixed-point descriptor blending (half of BLEND_SCALE).
+const BLEND_ROUND: u32 = (BLEND_SCALE / 2) as u32;
+
 new_key_type! {
     pub struct MapPointId;
     pub struct KeyframeId;
@@ -143,13 +148,14 @@ impl MapPoint {
 
     fn update_descriptor(&mut self, new_desc: &CompactDescriptor, blend: DescriptorBlend) {
         // Use fixed-point blending so descriptor updates stay bounded and deterministic.
-        let alpha_scaled = (blend.alpha() * 256.0).round().clamp(1.0, 256.0) as u16;
-        let inv_scaled = 256u16.saturating_sub(alpha_scaled);
-        for i in 0..256 {
-            let prev = self.descriptor.0[i] as u32;
-            let next = new_desc.0[i] as u32;
+        let scale = BLEND_SCALE as f32;
+        let alpha_scaled = (blend.alpha() * scale).round().clamp(1.0, scale) as u16;
+        let inv_scaled = BLEND_SCALE.saturating_sub(alpha_scaled);
+        for (dst, &src) in self.descriptor.0.iter_mut().zip(new_desc.0.iter()) {
+            let prev = *dst as u32;
+            let next = src as u32;
             let mixed = prev * inv_scaled as u32 + next * alpha_scaled as u32;
-            self.descriptor.0[i] = ((mixed + 128) / 256) as u8;
+            *dst = ((mixed + BLEND_ROUND) / BLEND_SCALE as u32) as u8;
         }
     }
 
@@ -239,12 +245,7 @@ impl CovisibilityGraph {
     fn increment_one(&mut self, a: KeyframeId, b: KeyframeId) {
         let entry = self.edges.entry(a).or_default();
         if let Some(weight) = entry.get_mut(&b) {
-            let next = weight.get() + 1;
-            if let Some(next_non_zero) = NonZeroU32::new(next) {
-                *weight = next_non_zero;
-            } else {
-                debug_assert!(false, "covisibility weight overflowed to zero");
-            }
+            *weight = weight.saturating_add(1);
         } else {
             entry.insert(b, NonZeroU32::MIN);
         }
@@ -261,13 +262,13 @@ impl CovisibilityGraph {
     fn decrement_one(&mut self, a: KeyframeId, b: KeyframeId) {
         let remove_edge = if let Some(neighbors) = self.edges.get_mut(&a) {
             if let Some(weight) = neighbors.get(&b).copied() {
-                let next = weight.get().saturating_sub(1);
-                if next == 0 {
-                    neighbors.remove(&b);
-                } else if let Some(next_non_zero) = NonZeroU32::new(next) {
-                    neighbors.insert(b, next_non_zero);
-                } else {
-                    debug_assert!(false, "covisibility decrement produced zero");
+                match NonZeroU32::new(weight.get().saturating_sub(1)) {
+                    Some(next) => {
+                        neighbors.insert(b, next);
+                    }
+                    None => {
+                        neighbors.remove(&b);
+                    }
                 }
             }
             neighbors.is_empty()
@@ -281,9 +282,9 @@ impl CovisibilityGraph {
     }
 
     fn remove_point_observations(&mut self, observations: &[KeyframeKeypoint]) {
-        for i in 0..observations.len() {
-            for j in (i + 1)..observations.len() {
-                self.decrement_pair(observations[i].keyframe_id, observations[j].keyframe_id);
+        for (i, obs_a) in observations.iter().enumerate() {
+            for obs_b in &observations[i + 1..] {
+                self.decrement_pair(obs_a.keyframe_id, obs_b.keyframe_id);
             }
         }
     }
@@ -573,7 +574,7 @@ impl SlamMap {
         let entry = self
             .keyframes
             .get_mut(first_obs.keyframe_id)
-            .expect("keyframe exists");
+            .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         entry.set_point_ref(first_obs.index, point_id);
         self.bump_generation();
         Ok(point_id)
@@ -619,13 +620,16 @@ impl SlamMap {
             self.covisibility.increment_pair(obs.keyframe_id, other);
         }
 
-        let point = self.points.get_mut(point_id).expect("map point exists");
+        let point = self
+            .points
+            .get_mut(point_id)
+            .ok_or(MapError::MapPointNotFound(point_id))?;
         point.add_observation(obs);
 
         let entry = self
             .keyframes
             .get_mut(obs.keyframe_id)
-            .expect("keyframe exists");
+            .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         entry.set_point_ref(obs.index, point_id);
         self.bump_generation();
         Ok(())
@@ -746,9 +750,12 @@ impl SlamMap {
             .keyframes
             .get(keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
-        let mut observations = Vec::new();
-        for (idx, point_id) in entry.point_refs.iter().enumerate() {
-            if point_id.is_some() {
+        entry
+            .point_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, pid)| pid.map(|_| idx))
+            .map(|idx| {
                 let index = KeypointIndex::new(idx, entry.len()).ok_or(
                     MapError::KeypointIndexOutOfBounds {
                         index: idx,
@@ -756,10 +763,9 @@ impl SlamMap {
                     },
                 )?;
                 let keypoint_ref = KeyframeKeypoint { keyframe_id, index };
-                observations.push((keypoint_ref, entry.keypoints[idx]));
-            }
-        }
-        Ok(observations)
+                Ok((keypoint_ref, entry.keypoints[idx]))
+            })
+            .collect()
     }
 
     pub fn keyframe_point_descriptors(
@@ -808,7 +814,7 @@ impl SlamMap {
         if !self.keyframes.contains_key(seed) {
             return Err(MapError::KeyframeNotFound(seed));
         }
-        let mut window = Vec::new();
+        let mut window = Vec::with_capacity(max.get());
         window.push(seed);
 
         let neighbors = match self.covisibility.neighbors(seed) {
@@ -1243,12 +1249,14 @@ pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantErr
             }
         }
 
-        for i in 0..point.observations.len() {
-            for j in (i + 1)..point.observations.len() {
-                let a = point.observations[i].keyframe_id;
-                let b = point.observations[j].keyframe_id;
-                *expected_covisibility.entry((a, b)).or_insert(0) += 1;
-                *expected_covisibility.entry((b, a)).or_insert(0) += 1;
+        for (i, obs_a) in point.observations.iter().enumerate() {
+            for obs_b in &point.observations[i + 1..] {
+                *expected_covisibility
+                    .entry((obs_a.keyframe_id, obs_b.keyframe_id))
+                    .or_insert(0) += 1;
+                *expected_covisibility
+                    .entry((obs_b.keyframe_id, obs_a.keyframe_id))
+                    .or_insert(0) += 1;
             }
         }
     }

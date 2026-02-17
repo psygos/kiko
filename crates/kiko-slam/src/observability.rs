@@ -1,7 +1,7 @@
 use crate::dense::{DenseStats, ReconState};
 use crate::{
-    BaResult, DegradationLevel, DiagnosticEvent, FrameDiagnostics, LoopClosureRejectReason,
-    RerunSink, SystemHealth, Timestamp, TrackingHealth, VizLogError,
+    BaResult, ComponentHealth, DegradationLevel, DiagnosticEvent, FrameDiagnostics,
+    LoopClosureRejectReason, RerunSink, SystemHealth, Timestamp, TrackingHealth, VizLogError,
 };
 
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
@@ -11,6 +11,8 @@ const PATH_HEALTH_REPROJECTION_RMSE: &str = "diagnostics/health/reprojection_rms
 const PATH_HEALTH_REPROJECTION_MAX: &str = "diagnostics/health/reprojection_max_px";
 const PATH_HEALTH_TRACKING_STATE: &str = "diagnostics/health/tracking_state";
 const PATH_HEALTH_DEGRADATION_LEVEL: &str = "diagnostics/health/degradation_level";
+const PATH_HEALTH_BACKEND_STATE: &str = "diagnostics/health/backend_state";
+const PATH_HEALTH_DESCRIPTOR_STATE: &str = "diagnostics/health/descriptor_state";
 const PATH_HEALTH_BACKEND_ALIVE: &str = "diagnostics/health/backend_alive";
 const PATH_HEALTH_DESCRIPTOR_ALIVE: &str = "diagnostics/health/descriptor_alive";
 const PATH_HEALTH_BACKEND_SUBMITTED: &str = "diagnostics/health/backend_submitted";
@@ -36,6 +38,7 @@ const PATH_TIMING_TRACKING_MS: &str = "diagnostics/timing/tracking_ms";
 
 const PATH_MAP_KEYFRAMES: &str = "diagnostics/map/keyframes";
 const PATH_MAP_POINTS: &str = "diagnostics/map/points";
+const PATH_DEPTH_REORDER_WARNINGS: &str = "diagnostics/depth/reorder_warnings";
 
 const PATH_TRI_CANDIDATES: &str = "diagnostics/triangulation/candidates";
 const PATH_TRI_KEPT: &str = "diagnostics/triangulation/kept";
@@ -69,6 +72,9 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     let mut scalars = Vec::new();
     scalars.push((PATH_MAP_KEYFRAMES, diag.map_keyframes as f64));
     scalars.push((PATH_MAP_POINTS, diag.map_points as f64));
+    if let Some(v) = diag.depth_reorder_warnings {
+        scalars.push((PATH_DEPTH_REORDER_WARNINGS, v as f64));
+    }
     scalars.push((PATH_LOOP_CANDIDATES, diag.loop_candidate_count as f64));
     scalars.push((
         PATH_TRACKING_KEYFRAME_CREATED,
@@ -237,6 +243,14 @@ fn degradation_scalar(level: DegradationLevel) -> f64 {
     }
 }
 
+fn component_state_scalar(state: ComponentHealth) -> f64 {
+    match state {
+        ComponentHealth::Disabled => 0.0,
+        ComponentHealth::Alive => 1.0,
+        ComponentHealth::Down => 2.0,
+    }
+}
+
 impl RerunSink {
     /// Recommended Rerun dashboard:
     /// 1) `diagnostics/health/*` and `diagnostics/timing/*` as top time-series plots.
@@ -284,12 +298,24 @@ impl RerunSink {
             &rerun::Scalars::single(degradation_scalar(health.degradation)),
         )?;
         rec.log(
+            PATH_HEALTH_BACKEND_STATE,
+            &rerun::Scalars::single(component_state_scalar(health.backend)),
+        )?;
+        rec.log(
+            PATH_HEALTH_DESCRIPTOR_STATE,
+            &rerun::Scalars::single(component_state_scalar(health.descriptor)),
+        )?;
+        rec.log(
             PATH_HEALTH_BACKEND_ALIVE,
-            &rerun::Scalars::single(if health.backend_alive { 1.0 } else { 0.0 }),
+            &rerun::Scalars::single(if health.backend.is_alive() { 1.0 } else { 0.0 }),
         )?;
         rec.log(
             PATH_HEALTH_DESCRIPTOR_ALIVE,
-            &rerun::Scalars::single(if health.descriptor_alive { 1.0 } else { 0.0 }),
+            &rerun::Scalars::single(if health.descriptor.is_alive() {
+                1.0
+            } else {
+                0.0
+            }),
         )?;
         rec.log(
             PATH_HEALTH_BACKEND_SUBMITTED,
@@ -394,6 +420,7 @@ mod tests {
     fn diagnostics_scalars_include_present_fields() {
         let mut diag = FrameDiagnostics::empty(1, 2);
         diag.inlier_ratio = Some(0.75);
+        diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
         diag.triangulation = Some(TriangulationStats {
             candidate_matches: 10,
@@ -415,6 +442,10 @@ mod tests {
                 .iter()
                 .any(|(path, _)| *path == "diagnostics/tracking/features_detected")
         );
+        assert!(scalars.iter().any(
+            |(path, value)| *path == "diagnostics/depth/reorder_warnings"
+                && (*value - 3.0).abs() < 1e-6
+        ));
         assert!(
             scalars
                 .iter()

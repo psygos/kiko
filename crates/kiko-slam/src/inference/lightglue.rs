@@ -1,4 +1,5 @@
 use super::{InferenceBackend, InferenceError, build_session};
+use crate::DESCRIPTOR_DIM;
 use crate::Detections;
 use crate::Matches;
 use crate::Raw;
@@ -46,8 +47,8 @@ impl LightGlue {
 
         let kpts_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), 2], kpts_0.as_slice()))?;
         let kpts_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 2], kpts_1.as_slice()))?;
-        let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), 256], desc_0))?;
-        let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 256], desc_1))?;
+        let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), DESCRIPTOR_DIM], desc_0))?;
+        let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), DESCRIPTOR_DIM], desc_1))?;
 
         let outputs = super::run_with_watchdog("lightglue", || {
             self.session
@@ -97,8 +98,7 @@ impl LightGlue {
             scores.push(score);
         }
 
-        Matches::new(dec_1, dec_2, indices, scores)
-            .map_err(|e| InferenceError::Domain(format!("{e:?}")))
+        Matches::new(dec_1, dec_2, indices, scores).map_err(InferenceError::Match)
     }
 }
 
