@@ -1,7 +1,8 @@
-use super::{InferenceBackend, InferenceError, build_session};
+use super::{build_session, InferenceBackend, InferenceError};
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::TensorRef;
+use ort::value::ValueType;
 use std::path::Path;
 
 use crate::DESCRIPTOR_DIM;
@@ -37,7 +38,7 @@ impl SuperPoint {
     pub fn detect(&mut self, frame: &Frame) -> Result<Detections, InferenceError> {
         let expected = (frame.width() as usize) * (frame.height() as usize);
         self.scratch.resize(expected, 0.0);
-        crate::preprocess::normalise_into(frame.data(), &mut self.scratch);
+        crate::preprocess::normalise_into(frame.data(), &mut self.scratch)?;
 
         let input_tensor = TensorRef::from_array_view((
             [1, 1, frame.height() as usize, frame.width() as usize],
@@ -70,7 +71,7 @@ impl SuperPoint {
             downscale,
             &mut self.scratch,
         )
-        .map_err(InferenceError::Downscale)?;
+        .map_err(InferenceError::from)?;
 
         let input_tensor = TensorRef::from_array_view((
             [
@@ -115,35 +116,43 @@ fn run_inference(
                 expected: "named output tensor".to_string(),
                 actual: "missing output".to_string(),
             })?;
-    let scores_raw = outputs
+    let scores_value = outputs
         .get("scores")
         .ok_or_else(|| InferenceError::UnexpectedOutput {
             name: "scores".to_string(),
             expected: "named output tensor".to_string(),
             actual: "missing output".to_string(),
-        })?
-        .try_extract_tensor::<f32>()?;
-    let descriptors_raw = outputs
-        .get("descriptors")
-        .ok_or_else(|| InferenceError::UnexpectedOutput {
-            name: "descriptors".to_string(),
-            expected: "named output tensor".to_string(),
-            actual: "missing output".to_string(),
-        })?
-        .try_extract_tensor::<f32>()?;
+        })?;
+    let descriptors_value =
+        outputs
+            .get("descriptors")
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "descriptors".to_string(),
+                expected: "named output tensor".to_string(),
+                actual: "missing output".to_string(),
+            })?;
 
-    let scores = scores_raw.1.to_vec();
-    let keypoints_pairs = if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>() {
-        parse_keypoint_pairs(shape, data, "keypoints")?
-    } else if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<i64>() {
-        let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
-        parse_keypoint_pairs(shape, &data_f32, "keypoints")?
-    } else {
-        return Err(InferenceError::UnexpectedOutput {
-            name: "keypoints".to_string(),
-            expected: "tensor of f32 or i64".to_string(),
-            actual: format!("{:?}", keypoints_value.dtype()),
-        });
+    // `ort` may return a null backing pointer for empty tensors; avoid raw extraction in that case.
+    let scores = match tensor_num_elements(scores_value, "scores")? {
+        0 => Vec::new(),
+        _ => scores_value.try_extract_tensor::<f32>()?.1.to_vec(),
+    };
+    let keypoints_pairs = match tensor_num_elements(keypoints_value, "keypoints")? {
+        0 => Vec::new(),
+        _ => {
+            if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>() {
+                parse_keypoint_pairs(shape, data, "keypoints")?
+            } else if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<i64>() {
+                let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+                parse_keypoint_pairs(shape, &data_f32, "keypoints")?
+            } else {
+                return Err(InferenceError::UnexpectedOutput {
+                    name: "keypoints".to_string(),
+                    expected: "tensor of f32 or i64".to_string(),
+                    actual: format!("{:?}", keypoints_value.dtype()),
+                });
+            }
+        }
     };
     let mut keypoints = to_keypoints(&keypoints_pairs, width as f32, height as f32);
     if let Some(scale) = downscale {
@@ -153,7 +162,13 @@ fn run_inference(
             kp.y *= factor;
         }
     }
-    let descriptors = parse_descriptors(descriptors_raw.1, "descriptors")?;
+    let descriptors = match tensor_num_elements(descriptors_value, "descriptors")? {
+        0 => Vec::new(),
+        _ => {
+            let descriptors_raw = descriptors_value.try_extract_tensor::<f32>()?;
+            parse_descriptors(descriptors_raw.1, "descriptors")?
+        }
+    };
 
     Detections::new(
         frame.sensor_id(),
@@ -165,6 +180,20 @@ fn run_inference(
         descriptors,
     )
     .map_err(InferenceError::Detection)
+}
+
+fn tensor_num_elements(
+    value: &ort::value::Value<ort::value::DynValueTypeMarker>,
+    output_name: &str,
+) -> Result<usize, InferenceError> {
+    match value.dtype() {
+        ValueType::Tensor { shape, .. } => Ok(shape.num_elements()),
+        dtype => Err(InferenceError::UnexpectedOutput {
+            name: output_name.to_string(),
+            expected: "tensor output".to_string(),
+            actual: format!("{dtype:?}"),
+        }),
+    }
 }
 
 fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>, InferenceError> {

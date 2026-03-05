@@ -1,6 +1,6 @@
-use ort::Error as OrtError;
-use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::Session;
+use ort::Error as OrtError;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ pub enum InferenceError {
         expected: String,
         actual: String,
     },
+    Frame(crate::FrameError),
     Downscale(crate::DownscaleError),
     Detection(crate::DetectionError),
     Match(crate::MatchError),
@@ -52,6 +53,12 @@ impl From<OrtError> for InferenceError {
 impl From<crate::DownscaleError> for InferenceError {
     fn from(err: crate::DownscaleError) -> Self {
         InferenceError::Downscale(err)
+    }
+}
+
+impl From<crate::FrameError> for InferenceError {
+    fn from(err: crate::FrameError) -> Self {
+        InferenceError::Frame(err)
     }
 }
 
@@ -90,6 +97,7 @@ impl std::fmt::Display for InferenceError {
                     "unexpected output '{name}': expected {expected}, got {actual}"
                 )
             }
+            InferenceError::Frame(err) => write!(f, "frame error: {err}"),
             InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
             InferenceError::Detection(err) => write!(f, "detection error: {err}"),
             InferenceError::Match(err) => write!(f, "match error: {err}"),

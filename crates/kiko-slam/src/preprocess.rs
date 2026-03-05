@@ -15,11 +15,17 @@ const fn build_float_lut() -> [f32; 256] {
 
 static LUT: [f32; 256] = build_float_lut();
 
-pub fn normalise_into(data: &[u8], out: &mut [f32]) {
-    debug_assert_eq!(data.len(), out.len());
+pub fn normalise_into(data: &[u8], out: &mut [f32]) -> Result<(), crate::FrameError> {
+    if data.len() != out.len() {
+        return Err(crate::FrameError::DimensionMismatch {
+            expected: out.len(),
+            actual: data.len(),
+        });
+    }
     for (dst, &src) in out.iter_mut().zip(data.iter()) {
         *dst = LUT[src as usize];
     }
+    Ok(())
 }
 
 pub fn normalise_downscale_into(
@@ -29,6 +35,14 @@ pub fn normalise_downscale_into(
     factor: crate::DownscaleFactor,
     out: &mut Vec<f32>,
 ) -> Result<crate::FrameDimensions, crate::DownscaleError> {
+    let expected_len = (width as usize).saturating_mul(height as usize);
+    if data.len() != expected_len {
+        return Err(crate::DownscaleError::InputLenMismatch {
+            expected: expected_len,
+            actual: data.len(),
+        });
+    }
+
     let factor_u32 = factor.get() as u32;
     if width % factor_u32 != 0 || height % factor_u32 != 0 {
         return Err(crate::DownscaleError::NonDivisible {
@@ -60,4 +74,41 @@ pub fn normalise_downscale_into(
     }
 
     Ok(out_dims)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalise_into_rejects_length_mismatch() {
+        let mut out = [0.0_f32; 3];
+        let err = normalise_into(&[0, 1, 2, 3], &mut out).expect_err("length mismatch");
+        assert!(matches!(
+            err,
+            crate::FrameError::DimensionMismatch {
+                expected: 3,
+                actual: 4
+            }
+        ));
+    }
+
+    #[test]
+    fn normalise_downscale_into_rejects_input_length_mismatch() {
+        let err = normalise_downscale_into(
+            &[0; 3],
+            2,
+            2,
+            crate::DownscaleFactor::try_from(1).expect("factor"),
+            &mut Vec::new(),
+        )
+        .expect_err("length mismatch");
+        assert!(matches!(
+            err,
+            crate::DownscaleError::InputLenMismatch {
+                expected: 4,
+                actual: 3
+            }
+        ));
+    }
 }

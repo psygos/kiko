@@ -14,6 +14,7 @@ pub struct DepthImage {
 #[derive(Debug)]
 pub enum DepthImageError {
     DimensionMismatch { expected: usize, actual: usize },
+    InvalidSample { index: usize, value: f32 },
 }
 
 impl std::fmt::Display for DepthImageError {
@@ -24,6 +25,9 @@ impl std::fmt::Display for DepthImageError {
                     f,
                     "depth image dimension mismatch: expected {expected} values, got {actual}"
                 )
+            }
+            DepthImageError::InvalidSample { index, value } => {
+                write!(f, "invalid depth sample at index {index}: {value}")
             }
         }
     }
@@ -45,6 +49,14 @@ impl DepthImage {
                 expected,
                 actual: depth_m.len(),
             });
+        }
+        if let Some((index, value)) = depth_m
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            return Err(DepthImageError::InvalidSample { index, value });
         }
         Ok(Self {
             frame_id,
@@ -142,5 +154,34 @@ mod tests {
         assert_eq!(depth.depth_m_at(1, 0), Some(1.0));
         assert_eq!(depth.depth_m_at(0, 1), Some(2.5));
         assert!(depth.depth_m_at(1, 1).is_some());
+    }
+
+    #[test]
+    fn depth_image_rejects_negative_sample() {
+        let err = DepthImage::new(
+            FrameId::new(3),
+            Timestamp::from_nanos(1),
+            1,
+            1,
+            vec![-0.5],
+        )
+        .expect_err("negative depth should fail");
+        assert!(matches!(
+            err,
+            DepthImageError::InvalidSample { index: 0, value } if (value + 0.5).abs() < 1e-6
+        ));
+    }
+
+    #[test]
+    fn depth_image_rejects_non_finite_sample() {
+        let err = DepthImage::new(
+            FrameId::new(4),
+            Timestamp::from_nanos(1),
+            1,
+            1,
+            vec![f32::NAN],
+        )
+        .expect_err("nan depth should fail");
+        assert!(matches!(err, DepthImageError::InvalidSample { index: 0, .. }));
     }
 }

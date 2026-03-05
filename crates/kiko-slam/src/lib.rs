@@ -224,6 +224,10 @@ impl DownscaleFactor {
 #[derive(Debug)]
 pub enum DownscaleError {
     Zero,
+    InputLenMismatch {
+        expected: usize,
+        actual: usize,
+    },
     NonDivisible {
         width: u32,
         height: u32,
@@ -235,6 +239,12 @@ impl std::fmt::Display for DownscaleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
+            DownscaleError::InputLenMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "downscale input length mismatch: expected {expected}, got {actual}"
+                )
+            }
             DownscaleError::NonDivisible {
                 width,
                 height,
