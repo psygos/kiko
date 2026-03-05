@@ -1940,8 +1940,16 @@ impl SlamTracker {
                 }
             };
 
-            let translation = loop_translation_norm(verified.relative_pose());
-            let rotation_deg = loop_rotation_angle_deg(verified.relative_pose());
+            let Some(match_pose) = self.map.keyframe(candidate.candidate).map(|entry| entry.pose())
+            else {
+                if first_error.is_none() {
+                    first_error = Some(LoopDetectError::ApplyFailed(LoopApplyError::MissingKeyframe));
+                }
+                continue;
+            };
+            let loop_relative = loop_relative_pose(match_pose, verified.query_pose_world());
+            let translation = loop_translation_norm(loop_relative);
+            let rotation_deg = loop_rotation_angle_deg(loop_relative);
             if translation > config.max_correction_translation()
                 || rotation_deg > config.max_correction_rotation_deg()
             {
@@ -3050,10 +3058,10 @@ fn apply_loop_closure_correction(
             match_kf,
         )))?
         .pose();
-    let query_pose_estimate = verified.relative_pose();
-    let loop_relative = crate::Pose64::from_pose32(match_pose)
-        .inverse()
-        .compose(crate::Pose64::from_pose32(query_pose_estimate));
+    let loop_relative = crate::Pose64::from_pose32(loop_relative_pose(
+        match_pose,
+        verified.query_pose_world(),
+    ));
 
     essential_graph.add_loop_edge(EssentialEdge {
         a: match_kf,
@@ -3156,6 +3164,13 @@ fn apply_loop_closure_correction(
 fn loop_translation_norm(pose: Pose) -> f32 {
     let t = pose.translation();
     (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
+}
+
+fn loop_relative_pose(match_pose: Pose, query_pose_world: Pose) -> Pose {
+    crate::Pose64::from_pose32(match_pose)
+        .inverse()
+        .compose(crate::Pose64::from_pose32(query_pose_world))
+        .to_pose32()
 }
 
 fn loop_apply_error_kind(error: &TrackerError) -> LoopApplyError {

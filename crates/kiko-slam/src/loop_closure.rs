@@ -3,8 +3,8 @@ use std::num::NonZeroUsize;
 use crate::map::{KeyframeId, MapError, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
 use crate::{
-    CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
-    RansacConfig, solve_pnp_ransac,
+    solve_pnp_ransac, CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics,
+    PnpError, Pose, RansacConfig,
 };
 
 pub(crate) const GLOBAL_DESCRIPTOR_DIM: usize = crate::DESCRIPTOR_DIM * 2;
@@ -926,7 +926,7 @@ pub struct RelocalizationCandidate {
 pub struct VerifiedLoop {
     query_kf: KeyframeId,
     match_kf: KeyframeId,
-    relative_pose: Pose,
+    query_pose_world: Pose,
     inlier_count: usize,
 }
 
@@ -939,8 +939,8 @@ impl VerifiedLoop {
         self.match_kf
     }
 
-    pub fn relative_pose(&self) -> Pose {
-        self.relative_pose
+    pub fn query_pose_world(&self) -> Pose {
+        self.query_pose_world
     }
 
     pub fn inlier_count(&self) -> usize {
@@ -951,13 +951,13 @@ impl VerifiedLoop {
     pub(crate) fn from_parts(
         query_kf: KeyframeId,
         match_kf: KeyframeId,
-        relative_pose: Pose,
+        query_pose_world: Pose,
         inlier_count: usize,
     ) -> Self {
         Self {
             query_kf,
             match_kf,
-            relative_pose,
+            query_pose_world,
             inlier_count,
         }
     }
@@ -1052,13 +1052,11 @@ fn verify_pose_from_keyframe(
         });
     }
 
-    let pnp_min_inliers = ransac_config
-        .min_inliers
-        .min(required_inliers)
-        .min(observations.len())
-        .max(MIN_PNP_POINTS);
+    // Use a relaxed inlier threshold for the RANSAC solver itself so it can
+    // find a valid pose even with some outlier correspondences.  The actual
+    // quality gate is the post-PnP inlier check below.
     let pnp_config = RansacConfig {
-        min_inliers: pnp_min_inliers,
+        min_inliers: MIN_PNP_POINTS,
         ..ransac_config
     };
 
@@ -1083,7 +1081,7 @@ impl LoopCandidate {
         ransac_config: RansacConfig,
         min_inliers: usize,
     ) -> Result<VerifiedLoop, LoopVerificationError> {
-        let (relative_pose, inlier_count) = verify_pose_from_keyframe(
+        let (query_pose_world, inlier_count) = verify_pose_from_keyframe(
             query_keypoints,
             correspondences,
             map,
@@ -1095,7 +1093,7 @@ impl LoopCandidate {
         Ok(VerifiedLoop {
             query_kf: self.query_kf,
             match_kf: self.match_kf,
-            relative_pose,
+            query_pose_world,
             inlier_count,
         })
     }
@@ -1131,10 +1129,10 @@ impl RelocalizationCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
+        aggregate_global_descriptor, match_descriptors_for_loop, try_match_descriptors_for_loop,
         DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
         LoopClosureConfig, LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
-        RelocalizationConfigError, RelocalizationConfigInput, aggregate_global_descriptor,
-        match_descriptors_for_loop, try_match_descriptors_for_loop,
+        RelocalizationConfigError, RelocalizationConfigInput,
     };
     use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -1173,11 +1171,15 @@ mod tests {
         Vec<Keypoint>,
         Vec<(usize, usize)>,
         crate::PinholeIntrinsics,
+        Pose,
     ) {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let match_pose = Pose::identity();
-        let query_pose = Pose::identity();
+        let query_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.18, -0.04, 0.06],
+        );
 
         let world_points = vec![
             Point3 {
@@ -1240,7 +1242,14 @@ mod tests {
         }
 
         let correspondences = (0..world_points.len()).map(|i| (i, i)).collect::<Vec<_>>();
-        (map, match_kf, query_keypoints, correspondences, intrinsics)
+        (
+            map,
+            match_kf,
+            query_keypoints,
+            correspondences,
+            intrinsics,
+            query_pose,
+        )
     }
 
     #[test]
@@ -1261,11 +1270,9 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(0), 10);
         // Query is the latest keyframe; with gap=2, only the first two are eligible.
         assert_eq!(matches.len(), 2);
-        assert!(
-            matches
-                .iter()
-                .all(|m| m.candidate == ids[0] || m.candidate == ids[1])
-        );
+        assert!(matches
+            .iter()
+            .all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
     }
 
     #[test]
@@ -1316,11 +1323,9 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(4), 10);
         // kf3 is seq distance 1 (filtered), kf1 is distance 3 (kept), kf0 is distance 4 (kept).
         assert_eq!(matches.len(), 2);
-        assert!(
-            matches
-                .iter()
-                .all(|m| m.candidate == ids[0] || m.candidate == ids[1])
-        );
+        assert!(matches
+            .iter()
+            .all(|m| m.candidate == ids[0] || m.candidate == ids[1]));
     }
 
     #[test]
@@ -1429,11 +1434,9 @@ mod tests {
         let matches = db.query(&descriptor_with_basis(4), 10);
         assert!(!matches.is_empty());
         assert!(matches.iter().all(|m| m.query == ids[4]));
-        assert!(
-            matches
-                .iter()
-                .all(|m| m.candidate != ids[1] && m.candidate != ids[3])
-        );
+        assert!(matches
+            .iter()
+            .all(|m| m.candidate != ids[1] && m.candidate != ids[3]));
     }
 
     #[test]
@@ -1492,9 +1495,11 @@ mod tests {
 
     #[test]
     fn loop_candidate_verify_succeeds_on_synthetic_geometry() {
-        let (map, match_kf, query_keypoints, correspondences, intrinsics) = make_loop_fixture();
+        let (map, match_kf, query_keypoints, correspondences, intrinsics, query_pose_world) =
+            make_loop_fixture();
+        let query_kf = make_keyframe_ids(1)[0];
         let candidate = LoopCandidate {
-            query_kf: match_kf,
+            query_kf,
             match_kf,
             similarity: 0.95,
         };
@@ -1509,14 +1514,25 @@ mod tests {
             )
             .expect("verified loop");
         assert_eq!(verified.match_kf(), match_kf);
+        assert_eq!(verified.query_kf(), query_kf);
         assert!(verified.inlier_count() >= 4);
+        let actual = verified.query_pose_world().translation();
+        let expected = query_pose_world.translation();
+        for axis in 0..3 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < 1e-3,
+                "translation mismatch on axis {axis}: actual={}, expected={}",
+                actual[axis],
+                expected[axis]
+            );
+        }
     }
 
     #[test]
     fn loop_candidate_verify_rejects_insufficient_inliers() {
-        let (map, match_kf, query_keypoints, correspondences, intrinsics) = make_loop_fixture();
+        let (map, match_kf, query_keypoints, correspondences, intrinsics, _) = make_loop_fixture();
         let candidate = LoopCandidate {
-            query_kf: match_kf,
+            query_kf: make_keyframe_ids(1)[0],
             match_kf,
             similarity: 0.95,
         };
@@ -1567,7 +1583,8 @@ mod tests {
 
     #[test]
     fn relocalization_candidate_verify_succeeds_without_map_mutation() {
-        let (map, match_kf, query_keypoints, correspondences, intrinsics) = make_loop_fixture();
+        let (map, match_kf, query_keypoints, correspondences, intrinsics, query_pose_world) =
+            make_loop_fixture();
         let before_generation = map.generation();
         let candidate = RelocalizationCandidate {
             match_kf,
@@ -1585,6 +1602,16 @@ mod tests {
             .expect("relocalization should verify");
         assert_eq!(verified.match_kf(), match_kf);
         assert!(verified.inlier_count() >= 4);
+        let actual = verified.pose_world().translation();
+        let expected = query_pose_world.translation();
+        for axis in 0..3 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < 1e-3,
+                "translation mismatch on axis {axis}: actual={}, expected={}",
+                actual[axis],
+                expected[axis]
+            );
+        }
         assert_eq!(map.generation(), before_generation);
     }
 
