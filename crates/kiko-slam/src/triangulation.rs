@@ -469,8 +469,9 @@ impl Triangulator {
         let height = self.stereo.height() as f32;
         let fx = self.stereo.fx();
         let fy = self.stereo.fy();
-        let cx = self.stereo.cx();
-        let cy = self.stereo.cy();
+        let left_cx = self.stereo.left().cx;
+        let right_cx = self.stereo.right().cx;
+        let left_cy = self.stereo.left().cy;
         let baseline = self.stereo.baseline_m();
 
         let mut landmarks = Vec::new();
@@ -489,7 +490,7 @@ impl Triangulator {
                 continue;
             }
 
-            let disparity = left_kp.x - right_kp.x;
+            let disparity = (left_kp.x - left_cx) - (right_kp.x - right_cx);
             if disparity <= self.config.min_disparity_px {
                 stats.dropped_disparity += 1;
                 continue;
@@ -503,8 +504,8 @@ impl Triangulator {
                 }
             }
 
-            let x = (left_kp.x - cx) * z / fx;
-            let y = (left_kp.y - cy) * z / fy;
+            let x = (left_kp.x - left_cx) * z / fx;
+            let y = (left_kp.y - left_cy) * z / fy;
 
             landmarks.push(Point3 { x, y, z });
             landmark_indices.push(li);
@@ -532,6 +533,7 @@ fn in_bounds(kp: Keypoint, width: f32, height: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::{Calibration, CameraIntrinsics};
     use crate::test_helpers::{
         make_detections, make_pinhole_intrinsics, make_rectified_stereo,
         rectified_stereo_keypoints_from_points,
@@ -608,6 +610,74 @@ mod tests {
             assert!((landmark.y - expected.y).abs() < 1e-4);
             assert!((landmark.z - expected.z).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn triangulate_accounts_for_principal_point_offset_in_disparity() {
+        let stereo = RectifiedStereo::from_calibration_with_config(
+            &Calibration {
+                left: CameraIntrinsics {
+                    fx: 400.0,
+                    fy: 400.0,
+                    cx: 320.0,
+                    cy: 240.0,
+                    width: 640,
+                    height: 480,
+                },
+                right: CameraIntrinsics {
+                    fx: 400.0,
+                    fy: 400.0,
+                    cx: 316.0,
+                    cy: 240.0,
+                    width: 640,
+                    height: 480,
+                },
+                baseline_m: 0.075,
+                rectified: true,
+            },
+            RectifiedStereoConfig::default(),
+        )
+        .expect("stereo");
+        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
+
+        let point = Point3 {
+            x: 0.15,
+            y: -0.05,
+            z: 2.8,
+        };
+        let left_kp = Keypoint {
+            x: 400.0 * point.x / point.z + 320.0,
+            y: 400.0 * point.y / point.z + 240.0,
+        };
+        let right_x = 400.0 * (point.x - 0.075) / point.z + 316.0;
+        let right_kp = Keypoint {
+            x: right_x,
+            y: 400.0 * point.y / point.z + 240.0,
+        };
+
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(12),
+            640,
+            480,
+            vec![left_kp],
+        )
+        .expect("left detections");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(13),
+            640,
+            480,
+            vec![right_kp],
+        )
+        .expect("right detections");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let result = triangulator.triangulate(&matches).expect("triangulation");
+        let recovered = result.keyframe.landmarks()[0];
+        assert!((recovered.x - point.x).abs() < 1e-4);
+        assert!((recovered.y - point.y).abs() < 1e-4);
+        assert!((recovered.z - point.z).abs() < 1e-4);
     }
 
     #[test]
