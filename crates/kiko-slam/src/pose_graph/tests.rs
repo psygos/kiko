@@ -407,6 +407,47 @@ fn pose_graph_optimizer_keeps_anchor_pose_fixed() {
 }
 
 #[test]
+fn pose_graph_optimizer_rejects_invalid_edges() {
+    let poses = vec![Pose64::identity()];
+    let mut initial = poses.clone();
+    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+    let err = optimizer
+        .optimize(
+            &[PoseGraphEdge {
+                from: 0,
+                to: 1,
+                measurement: Pose64::identity(),
+                information: scalar_block(1.0),
+            }],
+            &mut initial,
+        )
+        .expect_err("invalid edge should fail");
+    assert!(matches!(
+        err,
+        super::PoseGraphError::InvalidEdgeSet {
+            invalid_edges: 1,
+            pose_count: 1
+        }
+    ));
+}
+
+#[test]
+fn pose_graph_optimizer_reports_non_convergence() {
+    let gt = [Pose64::identity(), se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])];
+    let edges = vec![edge(0, 1, gt[0], gt[1])];
+    let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
+    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
+        max_iterations: 0,
+        ..PoseGraphConfig::default()
+    });
+    let result = optimizer
+        .optimize(&edges, &mut initial)
+        .expect("optimizer should return non-converged result");
+    assert!(!result.converged);
+    assert_eq!(result.iterations, 0);
+}
+
+#[test]
 fn essential_graph_builds_spanning_tree_connectivity() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);

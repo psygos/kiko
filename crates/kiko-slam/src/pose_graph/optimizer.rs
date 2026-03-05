@@ -1,9 +1,9 @@
-use crate::Pose64;
 use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
+use crate::Pose64;
 
 use super::{
-    ANCHOR_REGULARIZATION, BlockCsr6x6, HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS,
-    POSE_GRAPH_CONVERGENCE, PoseGraphError, scaled_identity6, solve_pcg,
+    scaled_identity6, solve_pcg, BlockCsr6x6, PoseGraphError, ANCHOR_REGULARIZATION,
+    HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS, POSE_GRAPH_CONVERGENCE,
 };
 
 type Jacobian6 = [[f64; 6]; 6];
@@ -143,6 +143,7 @@ pub struct PoseGraphResult {
     pub corrected_poses: Vec<Pose64>,
     pub iterations: usize,
     pub converged: bool,
+    pub residual_norm: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -166,12 +167,14 @@ impl PoseGraphOptimizer {
                 corrected_poses: Vec::new(),
                 iterations: 0,
                 converged: true,
+                residual_norm: 0.0,
             });
         }
 
         let mut poses = initial_poses.to_vec();
         let mut converged = false;
         let mut iters_run = 0;
+        let mut last_residual_norm = 0.0_f64;
         let mut valid_edges = Vec::with_capacity(edges.len());
         let mut invalid_edges = 0usize;
         for edge in edges {
@@ -182,13 +185,17 @@ impl PoseGraphOptimizer {
             }
         }
         if invalid_edges > 0 {
-            eprintln!("pose graph skipped {invalid_edges} invalid edges (nposes={nposes})");
+            return Err(PoseGraphError::InvalidEdgeSet {
+                invalid_edges,
+                pose_count: nposes,
+            });
         }
         if valid_edges.is_empty() {
             return Ok(PoseGraphResult {
                 corrected_poses: poses,
                 iterations: 0,
                 converged: true,
+                residual_norm: 0.0,
             });
         }
 
@@ -241,6 +248,7 @@ impl PoseGraphOptimizer {
                 self.config.pcg_max_iters,
                 self.config.pcg_tol,
             )?;
+            last_residual_norm = pcg.residual_norm;
             if !pcg.converged && iter + 1 == self.config.max_iterations {
                 eprintln!(
                     "pose graph PCG did not converge (iters={}, residual_norm={:.3e})",
@@ -291,6 +299,7 @@ impl PoseGraphOptimizer {
             corrected_poses: poses,
             iterations: iters_run,
             converged,
+            residual_norm: last_residual_norm,
         })
     }
 }

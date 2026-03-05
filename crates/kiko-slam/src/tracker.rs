@@ -3103,6 +3103,12 @@ fn apply_loop_closure_correction(
     }
 
     let result = optimizer.optimize(&input.edges, &mut initial_poses)?;
+    if !result.converged {
+        return Err(TrackerError::PoseGraph(PoseGraphError::NotConverged {
+            iterations: result.iterations,
+            residual_norm: result.residual_norm,
+        }));
+    }
     let corrected_poses: HashMap<KeyframeId, Pose> = input
         .keyframe_ids
         .iter()

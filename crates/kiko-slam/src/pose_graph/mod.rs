@@ -11,7 +11,7 @@ const POSE_GRAPH_CONVERGENCE: f64 = 1e-6;
 /// Near-zero threshold in Huber weight to avoid division by zero.
 const HUBER_NEAR_ZERO: f64 = 1e-12;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PoseGraphError {
     CsrIndexOutOfBounds {
         row: usize,
@@ -41,6 +41,17 @@ pub enum PoseGraphError {
     EdgeToOutOfBounds {
         to: usize,
         pose_count: usize,
+    },
+    InvalidEdgeSet {
+        invalid_edges: usize,
+        pose_count: usize,
+    },
+    NonFiniteResidual {
+        iteration: usize,
+    },
+    NotConverged {
+        iterations: usize,
+        residual_norm: f64,
     },
 }
 
@@ -89,6 +100,23 @@ impl std::fmt::Display for PoseGraphError {
                     "pose graph edge.to out of bounds: to={to}, pose_count={pose_count}"
                 )
             }
+            PoseGraphError::InvalidEdgeSet {
+                invalid_edges,
+                pose_count,
+            } => write!(
+                f,
+                "pose graph contains {invalid_edges} invalid edges for pose_count={pose_count}"
+            ),
+            PoseGraphError::NonFiniteResidual { iteration } => {
+                write!(f, "pose graph residual became non-finite at iteration {iteration}")
+            }
+            PoseGraphError::NotConverged {
+                iterations,
+                residual_norm,
+            } => write!(
+                f,
+                "pose graph did not converge after {iterations} iterations (residual_norm={residual_norm:.3e})"
+            ),
         }
     }
 }
@@ -113,10 +141,10 @@ pub use essential::{
     PoseGraphInput,
 };
 pub use optimizer::{
-    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult, compute_edge_error,
-    compute_edge_jacobians,
+    compute_edge_error, compute_edge_jacobians, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer,
+    PoseGraphResult,
 };
-pub use solver::{PcgResult, solve_pcg};
+pub use solver::{solve_pcg, PcgResult};
 pub use sparse::BlockCsr6x6;
 
 #[cfg(test)]
