@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
-    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
-    read_meta, scan_frames,
+    format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
+    FrameInfo, Manifest,
 };
 
 #[derive(Debug)]
@@ -68,7 +68,10 @@ impl DatasetReader {
             msg: "meta.json missing mono config",
         })?;
         let frames = scan_frames(&self.root.join(format::FRAMES_DIR), mono.width, mono.height)?;
-        Ok(DatasetStats::from_frames(&frames))
+        Ok(DatasetStats::from_frames_and_manifest(
+            &frames,
+            &self.manifest,
+        ))
     }
 
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
@@ -241,14 +244,19 @@ pub struct DatasetStats {
 }
 
 impl DatasetStats {
-    fn from_frames(frames: &super::FrameSet) -> Self {
+    fn from_frames_and_manifest(frames: &super::FrameSet, manifest: &Manifest) -> Self {
         let left_fps = fps_from_frames(&frames.left);
         let right_fps = fps_from_frames(&frames.right);
-        let paired_fps = fps_from_pairs(&frames.left, &frames.right);
+        let paired_count = manifest
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.pairing, super::ManifestPairing::Paired { .. }))
+            .count();
+        let paired_fps = fps_from_manifest_pairs(&manifest.entries);
         Self {
             left_count: frames.left.len(),
             right_count: frames.right.len(),
-            paired_count: frames.left.len().min(frames.right.len()),
+            paired_count,
             left_fps,
             right_fps,
             paired_fps,
@@ -266,21 +274,33 @@ fn fps_from_frames(frames: &[FrameInfo]) -> Option<f64> {
         return None;
     }
     let span_s = span_ns / 1_000_000_000.0;
-    Some(frames.len() as f64 / span_s)
+    Some((frames.len().saturating_sub(1)) as f64 / span_s)
 }
 
-fn fps_from_pairs(left: &[FrameInfo], right: &[FrameInfo]) -> Option<f64> {
-    if left.is_empty() || right.is_empty() {
+fn fps_from_manifest_pairs(entries: &[super::ManifestEntry]) -> Option<f64> {
+    let paired: Vec<&super::ManifestEntry> = entries
+        .iter()
+        .filter(|entry| matches!(entry.pairing, super::ManifestPairing::Paired { .. }))
+        .collect();
+    if paired.len() < 2 {
         return None;
     }
-    let (left_min, left_max) = min_max_ts(left);
-    let (right_min, right_max) = min_max_ts(right);
-    let span_ns = (left_max.max(right_max) - left_min.min(right_min)).abs() as f64;
+    let mut min_ts = i64::MAX;
+    let mut max_ts = i64::MIN;
+    for entry in paired.iter().copied() {
+        min_ts = min_ts.min(entry.left.timestamp_ns);
+        max_ts = max_ts.max(entry.left.timestamp_ns);
+        if let super::ManifestPairing::Paired { right, .. } = &entry.pairing {
+            min_ts = min_ts.min(right.timestamp_ns);
+            max_ts = max_ts.max(right.timestamp_ns);
+        }
+    }
+    let span_ns = (max_ts - min_ts).abs() as f64;
     if span_ns <= 0.0 {
         return None;
     }
     let span_s = span_ns / 1_000_000_000.0;
-    Some(left.len().min(right.len()) as f64 / span_s)
+    Some((paired.len().saturating_sub(1)) as f64 / span_s)
 }
 
 fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
@@ -291,4 +311,110 @@ fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
         max_ts = max_ts.max(frame.timestamp_ns);
     }
     (min_ts, max_ts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fps_from_frames_uses_intervals_not_sample_count() {
+        let frames = vec![
+            FrameInfo {
+                timestamp_ns: 0,
+                path: "a.raw".to_string(),
+            },
+            FrameInfo {
+                timestamp_ns: 1_000_000_000,
+                path: "b.raw".to_string(),
+            },
+            FrameInfo {
+                timestamp_ns: 2_000_000_000,
+                path: "c.raw".to_string(),
+            },
+        ];
+        let fps = fps_from_frames(&frames).expect("fps");
+        assert!((fps - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn paired_stats_count_only_manifest_pairs() {
+        let frames = super::super::FrameSet {
+            left: vec![
+                FrameInfo {
+                    timestamp_ns: 0,
+                    path: "left0.raw".to_string(),
+                },
+                FrameInfo {
+                    timestamp_ns: 1_000_000_000,
+                    path: "left1.raw".to_string(),
+                },
+            ],
+            right: vec![FrameInfo {
+                timestamp_ns: 1_000_000_010,
+                path: "right1.raw".to_string(),
+            }],
+            depth: Vec::new(),
+            parse_fail: 0,
+            size_mismatch: 0,
+        };
+        let manifest = Manifest {
+            header: super::super::ManifestHeader {
+                dataset_id: "dataset".to_string(),
+                created_at: "now".to_string(),
+                device: "oak".to_string(),
+                format: "raw".to_string(),
+                width: 640,
+                height: 480,
+                fps: 30,
+                timebase: "ns".to_string(),
+                pairing_policy: "nearest".to_string(),
+                pairing_window_ns: 20_000_000,
+            },
+            stats: super::super::ManifestStats {
+                total_left: 2,
+                total_right: 1,
+                paired_count: 1,
+                left_orphans: 1,
+                right_orphans: 0,
+                drops_by_reason: super::super::DropStats {
+                    spool_full: 0,
+                    write_fail: 0,
+                    parse_fail: 0,
+                    size_mismatch: 0,
+                    outside_window: 0,
+                },
+                delta_stats: None,
+            },
+            entries: vec![
+                super::super::ManifestEntry {
+                    left: super::super::ManifestFrameRef {
+                        timestamp_ns: 0,
+                        path: "left0.raw".to_string(),
+                    },
+                    pairing: super::super::ManifestPairing::MissingRight {
+                        reason: super::super::PairReason::NoRightFrames,
+                    },
+                },
+                super::super::ManifestEntry {
+                    left: super::super::ManifestFrameRef {
+                        timestamp_ns: 1_000_000_000,
+                        path: "left1.raw".to_string(),
+                    },
+                    pairing: super::super::ManifestPairing::Paired {
+                        right: super::super::ManifestFrameRef {
+                            timestamp_ns: 1_000_000_010,
+                            path: "right1.raw".to_string(),
+                        },
+                        delta_ns: 10,
+                    },
+                },
+            ],
+        };
+        let stats = DatasetStats::from_frames_and_manifest(&frames, &manifest);
+        assert_eq!(stats.left_count, 2);
+        assert_eq!(stats.right_count, 1);
+        assert_eq!(stats.paired_count, 1);
+        assert_eq!(stats.paired_fps, None);
+    }
 }
