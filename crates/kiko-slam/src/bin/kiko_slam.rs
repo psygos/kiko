@@ -293,8 +293,7 @@ impl std::fmt::Display for VizDecimationArg {
 }
 
 struct InferenceConfig {
-    superpoint_left: SuperPoint,
-    superpoint_right: SuperPoint,
+    superpoint: SuperPoint,
     lightglue: LightGlue,
     key_limit: KeypointLimit,
     downscale: DownscaleFactor,
@@ -324,13 +323,12 @@ impl InferenceConfig {
             lg_path.display()
         );
 
-        let superpoint_left = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
-        let superpoint_right = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
+        let superpoint = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
         let lightglue = LightGlue::new_with_backend(&lg_path, lightglue_backend)?;
 
         eprintln!(
             "inference backend: superpoint={:?}, lightglue={:?}",
-            superpoint_left.backend(),
+            superpoint.backend(),
             lightglue.backend()
         );
 
@@ -340,8 +338,7 @@ impl InferenceConfig {
         eprintln!("max_keypoints: {}", args.max_keypoints.value());
 
         Ok(Self {
-            superpoint_left,
-            superpoint_right,
+            superpoint,
             lightglue,
             key_limit,
             downscale,
@@ -350,8 +347,7 @@ impl InferenceConfig {
 
     fn into_pipeline(self) -> InferencePipeline {
         InferencePipeline::new(
-            self.superpoint_left,
-            self.superpoint_right,
+            self.superpoint,
             self.lightglue,
             self.key_limit,
         )
@@ -687,8 +683,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
 
     let InferenceConfig {
-        superpoint_left,
-        superpoint_right,
+        superpoint,
         lightglue,
         key_limit,
         downscale,
@@ -707,8 +702,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, decimation);
     let mut tracker = SlamTracker::try_new(
-        superpoint_left,
-        superpoint_right,
+        superpoint,
         lightglue,
         rectified,
         intrinsics,
@@ -1326,8 +1320,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let inference = InferenceConfig::from_args(&args.inference)?;
     let InferenceConfig {
-        superpoint_left,
-        superpoint_right,
+        superpoint,
         lightglue,
         key_limit,
         downscale,
@@ -1359,8 +1352,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut tracker = SlamTracker::try_new(
-            superpoint_left,
-            superpoint_right,
+            superpoint,
             lightglue,
             rectified,
             intrinsics,

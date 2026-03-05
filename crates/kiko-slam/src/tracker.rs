@@ -1471,8 +1471,7 @@ struct PendingLoopCandidate {
 }
 
 pub struct SlamTracker {
-    superpoint_left: SuperPoint,
-    superpoint_right: SuperPoint,
+    superpoint: SuperPoint,
     lightglue: LightGlue,
     triangulator: Triangulator,
     intrinsics: PinholeIntrinsics,
@@ -1502,8 +1501,7 @@ impl SlamTracker {
     const DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD: u32 = 15;
 
     pub fn try_new(
-        superpoint_left: SuperPoint,
-        superpoint_right: SuperPoint,
+        superpoint: SuperPoint,
         lightglue: LightGlue,
         stereo: RectifiedStereo,
         intrinsics: PinholeIntrinsics,
@@ -1545,8 +1543,7 @@ impl SlamTracker {
         }
         let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
         Ok(Self {
-            superpoint_left,
-            superpoint_right,
+            superpoint,
             lightglue,
             triangulator,
             intrinsics,
@@ -2325,7 +2322,7 @@ impl SlamTracker {
         };
 
         let current = self
-            .superpoint_left
+            .superpoint
             .detect_with_downscale(&left, self.config.downscale)?
             .top_k(self.config.max_keypoints());
         let current = Arc::new(current);
@@ -2394,7 +2391,7 @@ impl SlamTracker {
         let frame_id = left.frame_id();
 
         let current = self
-            .superpoint_left
+            .superpoint
             .detect_with_downscale(&left, self.config.downscale)?
             .top_k(self.config.max_keypoints());
         let current = Arc::new(current);
@@ -2778,18 +2775,18 @@ impl SlamTracker {
         let (left_arc, right_arc) = match left_det {
             Some(left_arc) => {
                 let right_det = self
-                    .superpoint_right
+                    .superpoint
                     .detect_with_downscale(&right, self.config.downscale)?
                     .top_k(max_keypoints);
                 (left_arc, Arc::new(right_det))
             }
             None => {
                 let left_det = self
-                    .superpoint_left
+                    .superpoint
                     .detect_with_downscale(&left, self.config.downscale)?
                     .top_k(max_keypoints);
                 let right_det = self
-                    .superpoint_right
+                    .superpoint
                     .detect_with_downscale(&right, self.config.downscale)?
                     .top_k(max_keypoints);
 

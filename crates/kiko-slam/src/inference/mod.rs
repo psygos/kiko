@@ -30,6 +30,10 @@ pub enum InferenceError {
         expected: String,
         actual: String,
     },
+    BackendUnavailable {
+        requested: InferenceBackend,
+        selected: InferenceBackend,
+    },
     Frame(crate::FrameError),
     Downscale(crate::DownscaleError),
     Detection(crate::DetectionError),
@@ -97,6 +101,10 @@ impl std::fmt::Display for InferenceError {
                     "unexpected output '{name}': expected {expected}, got {actual}"
                 )
             }
+            InferenceError::BackendUnavailable { requested, selected } => write!(
+                f,
+                "requested inference backend {requested:?} but selected {selected:?}"
+            ),
             InferenceError::Frame(err) => write!(f, "frame error: {err}"),
             InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
             InferenceError::Detection(err) => write!(f, "detection error: {err}"),

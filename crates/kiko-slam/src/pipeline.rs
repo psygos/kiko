@@ -79,8 +79,7 @@ impl From<VizError> for PipelineError {
 }
 
 pub struct InferencePipeline {
-    superpoint_left: SuperPoint,
-    superpoint_right: SuperPoint,
+    superpoint: SuperPoint,
     lightglue: LightGlue,
     max_keypoints: KeypointLimit,
     downscale: DownscaleFactor,
@@ -88,14 +87,12 @@ pub struct InferencePipeline {
 
 impl InferencePipeline {
     pub fn new(
-        superpoint_left: SuperPoint,
-        superpoint_right: SuperPoint,
+        superpoint: SuperPoint,
         lightglue: LightGlue,
         max_keypoints: KeypointLimit,
     ) -> Self {
         Self {
-            superpoint_left,
-            superpoint_right,
+            superpoint,
             lightglue,
             max_keypoints,
             downscale: DownscaleFactor::identity(),
@@ -131,14 +128,14 @@ impl InferencePipeline {
 
         let left_start = Instant::now();
         let left_det = self
-            .superpoint_left
+            .superpoint
             .detect_with_downscale(&left_frame, downscale)?
             .top_k(max_keypoints);
         let left_time = left_start.elapsed();
 
         let right_start = Instant::now();
         let right_det = self
-            .superpoint_right
+            .superpoint
             .detect_with_downscale(&right_frame, downscale)?
             .top_k(max_keypoints);
         let right_time = right_start.elapsed();

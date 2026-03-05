@@ -2,10 +2,10 @@ use std::fs;
 
 use crate::env::env_bool;
 
+use ort::execution_providers::cpu::CPUExecutionProvider;
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::execution_providers::ExecutionProvider;
 use ort::execution_providers::ExecutionProviderDispatch;
-use ort::execution_providers::cpu::CPUExecutionProvider;
 
 use super::InferenceError;
 
@@ -103,10 +103,52 @@ pub(crate) fn select_backend(
             .build(),
     );
 
+    let allow_fallback = env_bool("KIKO_ALLOW_BACKEND_FALLBACK").unwrap_or(false);
+    validate_backend_selection(
+        requested,
+        desired,
+        selected,
+        allow_fallback,
+        is_jetson(),
+    )?;
+
     Ok(BackendSelection {
         selected,
         providers,
     })
+}
+
+fn validate_backend_selection(
+    requested: InferenceBackend,
+    desired: InferenceBackend,
+    selected: InferenceBackend,
+    allow_fallback: bool,
+    jetson: bool,
+) -> Result<(), InferenceError> {
+    if allow_fallback || selected == InferenceBackend::Cpu && desired == InferenceBackend::Cpu {
+        return Ok(());
+    }
+
+    let explicit_accelerator = matches!(
+        requested,
+        InferenceBackend::CoreMLGpu | InferenceBackend::Cuda | InferenceBackend::TensorRT
+    );
+    let auto_jetson_accelerator = requested == InferenceBackend::Auto
+        && jetson
+        && desired != InferenceBackend::Cpu;
+
+    if explicit_accelerator && selected != requested {
+        return Err(InferenceError::BackendUnavailable { requested, selected });
+    }
+
+    if auto_jetson_accelerator && selected == InferenceBackend::Cpu {
+        return Err(InferenceError::BackendUnavailable {
+            requested: desired,
+            selected,
+        });
+    }
+
+    Ok(())
 }
 
 fn detect_backend() -> InferenceBackend {
@@ -196,5 +238,61 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
     #[cfg(not(feature = "ort-tensorrt"))]
     {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_backend_selection, InferenceBackend};
+    use crate::inference::InferenceError;
+
+    #[test]
+    fn explicit_accelerator_request_rejects_fallback_without_opt_in() {
+        let err = validate_backend_selection(
+            InferenceBackend::TensorRT,
+            InferenceBackend::TensorRT,
+            InferenceBackend::Cpu,
+            false,
+            true,
+        )
+        .expect_err("fallback should fail");
+        assert!(matches!(
+            err,
+            InferenceError::BackendUnavailable {
+                requested: InferenceBackend::TensorRT,
+                selected: InferenceBackend::Cpu,
+            }
+        ));
+    }
+
+    #[test]
+    fn jetson_auto_rejects_cpu_fallback_without_opt_in() {
+        let err = validate_backend_selection(
+            InferenceBackend::Auto,
+            InferenceBackend::TensorRT,
+            InferenceBackend::Cpu,
+            false,
+            true,
+        )
+        .expect_err("cpu fallback should fail on jetson auto");
+        assert!(matches!(
+            err,
+            InferenceError::BackendUnavailable {
+                requested: InferenceBackend::TensorRT,
+                selected: InferenceBackend::Cpu,
+            }
+        ));
+    }
+
+    #[test]
+    fn fallback_opt_in_allows_backend_downgrade() {
+        validate_backend_selection(
+            InferenceBackend::TensorRT,
+            InferenceBackend::TensorRT,
+            InferenceBackend::Cpu,
+            true,
+            true,
+        )
+        .expect("fallback opt-in should allow downgrade");
     }
 }
