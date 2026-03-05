@@ -1090,6 +1090,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pairing_window = load_pairing_window()?;
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
+    let read_timeout_ms = load_oak_read_timeout_ms();
+    let read_timeout_ms = load_oak_read_timeout_ms();
     let start = Instant::now();
 
     eprintln!("recording... press ctrl+c to stop");
@@ -1097,7 +1099,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     while running.load(Ordering::Relaxed) {
         let mut got_any = false;
 
-        match device.mono_left(0) {
+        match device.mono_left(read_timeout_ms) {
             Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
                 Ok(frame) => {
                     pairer.push_left(frame);
@@ -1116,7 +1118,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        match device.mono_right(0) {
+        match device.mono_right(read_timeout_ms) {
             Ok(frame) => {
                 match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
                     Ok(frame) => {
@@ -1138,7 +1140,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if depth_enabled {
-            match device.depth(0) {
+            match device.depth(read_timeout_ms) {
                 Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
                     Ok(depth) => {
                         writer.write_depth(&depth);
@@ -1220,7 +1222,6 @@ struct LiveVizMsg {
 enum LiveThreadError {
     TrackerInit { detail: String },
     VizChannelDisconnected,
-    RerunConnect { detail: String },
     FrameProcessingPanic { detail: String },
 }
 
@@ -1232,9 +1233,6 @@ impl std::fmt::Display for LiveThreadError {
                 write!(f, "failed to initialize tracker: {detail}")
             }
             LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
-            LiveThreadError::RerunConnect { detail } => {
-                write!(f, "failed to connect to rerun viewer: {detail}")
-            }
             LiveThreadError::FrameProcessingPanic { detail } => {
                 write!(f, "inference panic while processing frame: {detail}")
             }
@@ -1259,6 +1257,13 @@ fn loop_closure_applied(events: &[DiagnosticEvent]) -> bool {
     events
         .iter()
         .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }))
+}
+
+#[cfg(feature = "record")]
+fn load_oak_read_timeout_ms() -> u32 {
+    env_usize("KIKO_OAK_READ_TIMEOUT_MS")
+        .unwrap_or(2)
+        .min(u32::MAX as usize) as u32
 }
 
 #[cfg(feature = "record")]
@@ -1424,53 +1429,55 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let decimation = args.rerun_decimation.get();
-    let viz_running = Arc::clone(&running);
+    let live_viz_enabled = env_bool("KIKO_LIVE_VIZ").unwrap_or(true);
     let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
-        let rec = match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc() {
-            Ok(rec) => rec,
-            Err(err) => {
-                viz_running.store(false, Ordering::SeqCst);
-                eprintln!("failed to connect to rerun viewer: {err}");
-                return Err(LiveThreadError::RerunConnect {
-                    detail: err.to_string(),
-                });
+        let mut sink = if live_viz_enabled {
+            match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc() {
+                Ok(rec) => Some(RerunSink::new(rec, decimation)),
+                Err(err) => {
+                    eprintln!("failed to connect to rerun viewer; continuing headless: {err}");
+                    None
+                }
             }
+        } else {
+            eprintln!("live viz disabled; continuing headless");
+            None
         };
-
-        let mut sink = RerunSink::new(rec, decimation);
         for msg in viz_rx.iter() {
-            if let Some(packet) = msg.packet.as_ref() {
-                if let Err(err) = sink.log_with_points(packet, msg.points.as_deref()) {
+            if let Some(sink) = sink.as_mut() {
+                if let Some(packet) = msg.packet.as_ref() {
+                    if let Err(err) = sink.log_with_points(packet, msg.points.as_deref()) {
+                        eprintln!("rerun log error: {err}");
+                    }
+                } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
                     eprintln!("rerun log error: {err}");
                 }
-            } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
-                eprintln!("rerun log error: {err}");
-            }
-            if let Some(depth) = msg.depth.as_ref() {
-                if let Err(err) = sink.log_depth(depth) {
-                    eprintln!("rerun log error: {err}");
+                if let Some(depth) = msg.depth.as_ref() {
+                    if let Err(err) = sink.log_depth(depth) {
+                        eprintln!("rerun log error: {err}");
+                    }
                 }
-            }
 
-            if let Some(pose) = msg.pose.as_ref() {
-                if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
-                    eprintln!("rerun log error: {err}");
+                if let Some(pose) = msg.pose.as_ref() {
+                    if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
+                        eprintln!("rerun log error: {err}");
+                    }
                 }
-            }
-            if let Some(snapshot) = msg.covisibility_snapshot.as_ref() {
-                if let Err(err) = sink.log_covisibility_graph(msg.left.timestamp(), snapshot) {
-                    eprintln!("rerun log error: {err}");
+                if let Some(snapshot) = msg.covisibility_snapshot.as_ref() {
+                    if let Err(err) = sink.log_covisibility_graph(msg.left.timestamp(), snapshot) {
+                        eprintln!("rerun log error: {err}");
+                    }
                 }
-            }
-            if let Err(err) = sink.log_system_health(msg.left.timestamp(), &msg.health) {
-                eprintln!("rerun health error: {err}");
-            }
-            if let Err(err) = sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics) {
-                eprintln!("rerun diagnostics error: {err}");
-            }
-            for event in &msg.events {
-                if let Err(err) = sink.log_event(msg.left.timestamp(), event) {
-                    eprintln!("rerun event error: {err}");
+                if let Err(err) = sink.log_system_health(msg.left.timestamp(), &msg.health) {
+                    eprintln!("rerun health error: {err}");
+                }
+                if let Err(err) = sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics) {
+                    eprintln!("rerun diagnostics error: {err}");
+                }
+                for event in &msg.events {
+                    if let Err(err) = sink.log_event(msg.left.timestamp(), event) {
+                        eprintln!("rerun event error: {err}");
+                    }
                 }
             }
         }
@@ -1485,7 +1492,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     'capture: while running.load(Ordering::Relaxed) {
         let mut got_any = false;
 
-        match device.mono_left(0) {
+        match device.mono_left(read_timeout_ms) {
             Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
                 Ok(frame) => {
                     pairer.push_left(frame);
@@ -1503,7 +1510,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        match device.mono_right(0) {
+        match device.mono_right(read_timeout_ms) {
             Ok(frame) => {
                 match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
                     Ok(frame) => {
@@ -1524,7 +1531,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if depth_enabled {
-            match device.depth(0) {
+            match device.depth(read_timeout_ms) {
                 Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
                     Ok(depth_image) => {
                         got_any = true;

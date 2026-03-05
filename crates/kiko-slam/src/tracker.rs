@@ -2784,33 +2784,14 @@ impl SlamTracker {
                 (left_arc, Arc::new(right_det))
             }
             None => {
-                let (left_det, right_det) = std::thread::scope(|scope| {
-                    let left_sp = &mut self.superpoint_left;
-                    let right_sp = &mut self.superpoint_right;
-                    let left_ref = &left;
-                    let right_ref = &right;
-                    let downscale = self.config.downscale;
-
-                    let left_handle = scope.spawn(move || {
-                        left_sp
-                            .detect_with_downscale(left_ref, downscale)
-                            .map(|d| d.top_k(max_keypoints))
-                    });
-                    let right_handle = scope.spawn(move || {
-                        right_sp
-                            .detect_with_downscale(right_ref, downscale)
-                            .map(|d| d.top_k(max_keypoints))
-                    });
-
-                    (left_handle.join(), right_handle.join())
-                });
-
-                let left_det = left_det.map_err(|_| InferenceError::ThreadPanic {
-                    stage: "left superpoint",
-                })??;
-                let right_det = right_det.map_err(|_| InferenceError::ThreadPanic {
-                    stage: "right superpoint",
-                })??;
+                let left_det = self
+                    .superpoint_left
+                    .detect_with_downscale(&left, self.config.downscale)?
+                    .top_k(max_keypoints);
+                let right_det = self
+                    .superpoint_right
+                    .detect_with_downscale(&right, self.config.downscale)?
+                    .top_k(max_keypoints);
 
                 (Arc::new(left_det), Arc::new(right_det))
             }

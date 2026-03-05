@@ -1,11 +1,10 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    DownscaleFactor, LightGlue, Matches, Raw, StereoPair, SuperPoint, VizError, VizPacket,
-    inference::InferenceError,
+    inference::InferenceError, DownscaleFactor, LightGlue, Matches, Raw, StereoPair, SuperPoint,
+    VizError, VizPacket,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,37 +129,19 @@ impl InferencePipeline {
         let downscale = self.downscale;
         let max_keypoints = self.max_keypoints.get();
 
-        let (left_result, right_result) = thread::scope(|scope| {
-            let left_sp = &mut self.superpoint_left;
-            let right_sp = &mut self.superpoint_right;
-            let left_ref = &left_frame;
-            let right_ref = &right_frame;
+        let left_start = Instant::now();
+        let left_det = self
+            .superpoint_left
+            .detect_with_downscale(&left_frame, downscale)?
+            .top_k(max_keypoints);
+        let left_time = left_start.elapsed();
 
-            let left_handle = scope.spawn(move || {
-                let start = Instant::now();
-                let det = left_sp
-                    .detect_with_downscale(left_ref, downscale)?
-                    .top_k(max_keypoints);
-                Ok::<_, InferenceError>((det, start.elapsed()))
-            });
-
-            let right_handle = scope.spawn(move || {
-                let start = Instant::now();
-                let det = right_sp
-                    .detect_with_downscale(right_ref, downscale)?
-                    .top_k(max_keypoints);
-                Ok::<_, InferenceError>((det, start.elapsed()))
-            });
-
-            (left_handle.join(), right_handle.join())
-        });
-
-        let (left_det, left_time) = left_result.map_err(|_| InferenceError::ThreadPanic {
-            stage: "left superpoint",
-        })??;
-        let (right_det, right_time) = right_result.map_err(|_| InferenceError::ThreadPanic {
-            stage: "right superpoint",
-        })??;
+        let right_start = Instant::now();
+        let right_det = self
+            .superpoint_right
+            .detect_with_downscale(&right_frame, downscale)?
+            .top_k(max_keypoints);
+        let right_time = right_start.elapsed();
 
         let left = Arc::new(left_det);
         let right = Arc::new(right_det);
