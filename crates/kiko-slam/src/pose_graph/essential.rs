@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
-use crate::Pose64;
 use crate::map::{KeyframeId, SlamMap};
+use crate::Pose64;
 
-use super::{PoseGraphEdge, scaled_identity6};
+use super::{scaled_identity6, PoseGraphEdge};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EssentialEdgeKind {
@@ -97,6 +97,7 @@ impl EssentialGraph {
         if self.parent.contains_key(&keyframe_id) {
             return;
         }
+        let fallback_parent = self.order.last().copied();
         self.order.push(keyframe_id);
         if self.parent.is_empty() {
             self.parent.insert(keyframe_id, keyframe_id);
@@ -104,11 +105,15 @@ impl EssentialGraph {
         }
 
         let Some(neighbors) = covisibility else {
-            self.parent.insert(keyframe_id, keyframe_id);
+            if let Some(parent) = fallback_parent {
+                self.attach_parent(keyframe_id, parent, 1.0, map);
+            }
             return;
         };
         if neighbors.is_empty() {
-            self.parent.insert(keyframe_id, keyframe_id);
+            if let Some(parent) = fallback_parent {
+                self.attach_parent(keyframe_id, parent, 1.0, map);
+            }
             return;
         }
 
@@ -136,9 +141,36 @@ impl EssentialGraph {
         }
 
         let Some((parent, weight)) = strongest else {
-            self.parent.insert(keyframe_id, keyframe_id);
+            if let Some(parent) = fallback_parent {
+                self.attach_parent(keyframe_id, parent, 1.0, map);
+            }
             return;
         };
+        self.attach_parent(keyframe_id, parent, weight as f64, map);
+    }
+
+    pub fn add_loop_edge(&mut self, edge: EssentialEdge) {
+        let root = self.order.first().copied();
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.a) {
+            entry.insert(root.unwrap_or(edge.a));
+            self.order.push(edge.a);
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.b) {
+            entry.insert(root.unwrap_or(edge.a));
+            self.order.push(edge.b);
+        }
+        self.loop_edges
+            .retain(|existing| !same_endpoints(existing.a, existing.b, edge.a, edge.b));
+        self.loop_edges.push(edge);
+    }
+
+    fn attach_parent(
+        &mut self,
+        keyframe_id: KeyframeId,
+        parent: KeyframeId,
+        information_scale: f64,
+        map: &SlamMap,
+    ) {
         self.parent.insert(keyframe_id, parent);
         if let Some(relative_pose) = relative_pose(map, parent, keyframe_id) {
             self.spanning_edges.push(EssentialEdge {
@@ -146,21 +178,9 @@ impl EssentialGraph {
                 b: keyframe_id,
                 kind: EssentialEdgeKind::SpanningTree,
                 relative_pose,
-                information: scaled_identity6(weight as f64),
+                information: scaled_identity6(information_scale),
             });
         }
-    }
-
-    pub fn add_loop_edge(&mut self, edge: EssentialEdge) {
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.a) {
-            entry.insert(edge.a);
-            self.order.push(edge.a);
-        }
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.b) {
-            entry.insert(edge.b);
-            self.order.push(edge.b);
-        }
-        self.loop_edges.push(edge);
     }
 
     pub fn remove_keyframe(
@@ -285,6 +305,10 @@ fn contains_edge(edges: &[EssentialEdge], a: KeyframeId, b: KeyframeId) -> bool 
     edges
         .iter()
         .any(|edge| (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a))
+}
+
+fn same_endpoints(a0: KeyframeId, b0: KeyframeId, a1: KeyframeId, b1: KeyframeId) -> bool {
+    (a0 == a1 && b0 == b1) || (a0 == b1 && b0 == a1)
 }
 
 fn relative_pose(map: &SlamMap, from: KeyframeId, to: KeyframeId) -> Option<Pose64> {

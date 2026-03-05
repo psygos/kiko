@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use super::{
-    BlockCsr6x6, EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
-    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, compute_edge_error, compute_edge_jacobians,
-    solve_pcg,
+    compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, EssentialEdge,
+    EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig, PoseGraphEdge,
+    PoseGraphOptimizer,
 };
-use crate::Pose64;
 use crate::map::{ImageSize, SlamMap};
 use crate::math::se3_exp_f64;
+use crate::Pose64;
 use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
 
 #[derive(Clone, Debug)]
@@ -454,6 +454,46 @@ fn essential_graph_snapshot_is_independent_copy() {
 }
 
 #[test]
+fn essential_graph_without_covisibility_attaches_to_previous_keyframe() {
+    let (map, ids) = make_chain_keyframes(2);
+    let mut graph = EssentialGraph::new(10);
+    graph.add_keyframe(ids[0], None, &map);
+    graph.add_keyframe(ids[1], None, &map);
+
+    assert_eq!(graph.parent_of(ids[0]), Some(ids[0]));
+    assert_eq!(graph.parent_of(ids[1]), Some(ids[0]));
+    assert_eq!(graph.snapshot().spanning_edges.len(), 1);
+}
+
+#[test]
+fn essential_graph_deduplicates_loop_edges_by_keyframe_pair() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+
+    graph.add_loop_edge(EssentialEdge {
+        a: kf2,
+        b: kf0,
+        kind: EssentialEdgeKind::Loop,
+        relative_pose: Pose64::identity(),
+        information: scalar_block(1.0),
+    });
+    graph.add_loop_edge(EssentialEdge {
+        a: kf2,
+        b: kf0,
+        kind: EssentialEdgeKind::Loop,
+        relative_pose: Pose64::identity(),
+        information: scalar_block(3.0),
+    });
+
+    let snapshot = graph.snapshot();
+    assert_eq!(snapshot.loop_edges.len(), 1);
+    assert_eq!(snapshot.loop_edges[0].information, scalar_block(3.0));
+}
+
+#[test]
 fn essential_graph_remove_keyframe_reparents_children() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
@@ -469,12 +509,10 @@ fn essential_graph_remove_keyframe_reparents_children() {
     assert_eq!(graph.parent_of(kf1), None);
     let snapshot = graph.snapshot();
     assert!(snapshot.order.iter().all(|&id| id != kf1));
-    assert!(
-        snapshot
-            .spanning_edges
-            .iter()
-            .all(|edge| edge.a != kf1 && edge.b != kf1)
-    );
+    assert!(snapshot
+        .spanning_edges
+        .iter()
+        .all(|edge| edge.a != kf1 && edge.b != kf1));
     let input = graph.pose_graph_input();
     assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
 }
@@ -531,18 +569,14 @@ fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
         .expect("remove keyframe with loop edge");
     let snapshot = graph.snapshot();
     assert_eq!(snapshot.loop_edges.len(), 0);
-    assert!(
-        snapshot
-            .strong_covis_edges
-            .iter()
-            .all(|e| e.a != kf2 && e.b != kf2)
-    );
-    assert!(
-        snapshot
-            .spanning_edges
-            .iter()
-            .all(|e| e.a != kf2 && e.b != kf2)
-    );
+    assert!(snapshot
+        .strong_covis_edges
+        .iter()
+        .all(|e| e.a != kf2 && e.b != kf2));
+    assert!(snapshot
+        .spanning_edges
+        .iter()
+        .all(|e| e.a != kf2 && e.b != kf2));
 }
 
 #[test]
