@@ -471,7 +471,7 @@ impl DescriptorSupervisor {
         max_respawns: u32,
     ) -> Self {
         let worker = Self::spawn_worker(config, &factory);
-        let spawn_exhausted = worker.is_none();
+        let spawn_exhausted = worker.is_none() && max_respawns == 0;
         if worker.is_none() {
             eprintln!("descriptor model unavailable; using bootstrap descriptors only");
         }
@@ -517,13 +517,19 @@ impl DescriptorSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        let Some(worker) = Self::spawn_worker(self.config, &self.factory) else {
-            self.spawn_exhausted = true;
-            eprintln!("descriptor worker respawn failed; using bootstrap descriptors");
-            return;
-        };
-        self.worker = Some(worker);
+        self.worker = Self::spawn_worker(self.config, &self.factory);
         self.respawn_count = self.respawn_count.saturating_add(1);
+        if self.worker.is_none() {
+            if self.respawn_count >= self.max_respawns {
+                self.spawn_exhausted = true;
+                eprintln!(
+                    "descriptor worker respawn exhausted after {} attempts",
+                    self.max_respawns
+                );
+            } else {
+                eprintln!("descriptor worker respawn failed; will retry");
+            }
+        }
     }
 
     fn submit(&mut self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
@@ -4213,6 +4219,72 @@ mod tests {
 
         let recovered = recovered.expect("descriptor response after respawn");
         assert_eq!(recovered.descriptor, descriptor);
+        assert_eq!(*calls.lock().expect("calls lock"), 1);
+    }
+
+    #[test]
+    fn descriptor_supervisor_retries_after_transient_spawn_failure() {
+        let config = GlobalDescriptorConfig::new(2).expect("config");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(0_usize));
+        let descriptor = make_global_descriptor_basis(23);
+
+        let factory: DescriptorExtractorFactory = {
+            let spawn_count = Arc::clone(&spawn_count);
+            let calls = Arc::clone(&calls);
+            let descriptor = descriptor.clone();
+            Arc::new(move || {
+                let spawn_idx = spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
+                if spawn_idx == 0 {
+                    None
+                } else {
+                    Some(Box::new(StubDescriptorExtractor {
+                        descriptor: descriptor.clone(),
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn PlaceDescriptorExtractor>)
+                }
+            })
+        };
+
+        let mut supervisor =
+            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
+        assert!(!supervisor.has_worker(), "initial worker should be absent");
+
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(79),
+            Timestamp::from_nanos(79),
+            16,
+            12,
+            vec![64_u8; 16 * 12],
+        )
+        .expect("frame");
+
+        supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                map_version: MapVersion::initial(),
+                frame,
+            })
+            .expect("submit should trigger retry and succeed");
+
+        let mut recovered = None;
+        for _ in 0..50 {
+            match supervisor.try_recv() {
+                Some(DescriptorWorkerResponse::Descriptor(value)) => {
+                    recovered = Some(value);
+                    break;
+                }
+                Some(other) => panic!("unexpected descriptor response: {other:?}"),
+                None => {}
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let recovered = recovered.expect("descriptor response after retry");
+        assert_eq!(recovered.descriptor, descriptor);
+        assert_eq!(supervisor.respawn_count(), 1);
+        assert!(supervisor.has_worker());
         assert_eq!(*calls.lock().expect("calls lock"), 1);
     }
 
