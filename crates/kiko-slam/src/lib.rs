@@ -7,7 +7,6 @@ pub use inference::{
 };
 mod channel;
 pub mod dataset;
-pub mod dense;
 mod depth;
 mod diagnostics;
 pub mod env;
@@ -30,13 +29,9 @@ mod tracker;
 mod triangulation;
 mod viz;
 pub use channel::{
-    ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
-    DropReceiver, DropSender, SendOutcome, bounded_channel,
+    bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
+    DropPolicy, DropReceiver, DropSender, SendOutcome,
 };
-pub use dense::backend::{
-    Mesh, TsdfBackend, TsdfBackendFactory, TsdfConfig, TsdfConfigError, TsdfError,
-};
-pub use dense::{DenseCommand, DenseConfig, DenseStats, ReconState};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
@@ -47,12 +42,11 @@ pub use local_ba::{
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
-    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopApplyError,
-    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput,
-    LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
-    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
-    RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
-    match_descriptors_for_loop,
+    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, GlobalDescriptor,
+    GlobalDescriptorError, KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig,
+    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
+    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
+    RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
@@ -63,15 +57,15 @@ pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
 pub use pnp::{
-    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
-    build_observations, solve_pnp, solve_pnp_ransac,
+    build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation,
+    PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
     KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, RedundancyPolicy,
-    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError, TrackerOutput,
-    TrackingHealth,
+    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError,
+    TrackerInitError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
@@ -935,7 +929,7 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDescriptor, DESCRIPTOR_DIM, Descriptor, U8_SCALE};
+    use super::{CompactDescriptor, Descriptor, DESCRIPTOR_DIM, U8_SCALE};
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;

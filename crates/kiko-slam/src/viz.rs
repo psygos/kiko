@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
-    VizPacket, env::env_f32,
+    env::env_f32, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose,
+    Raw, Timestamp, VizPacket,
 };
 
 use std::collections::HashMap;
@@ -143,15 +143,22 @@ impl RerunSink {
         }
 
         self.set_time(depth.timestamp());
-        let mut bytes = Vec::with_capacity(depth.depth_m().len().saturating_mul(4));
-        for sample in depth.depth_m() {
-            bytes.extend_from_slice(&sample.to_le_bytes());
+        // Normalize depth to 0-255 u8 for reliable rendering.
+        let max_depth: f32 = 10.0;
+        let mut pixels = Vec::with_capacity(depth.depth_m().len());
+        for &sample in depth.depth_m() {
+            let clamped = if sample.is_finite() && sample > 0.0 {
+                ((sample / max_depth).min(1.0) * 255.0) as u8
+            } else {
+                0
+            };
+            pixels.push(clamped);
         }
         let depth_image = rerun::Image::from_color_model_and_bytes(
-            bytes,
+            pixels,
             [depth.width(), depth.height()],
             rerun::ColorModel::L,
-            rerun::ChannelDatatype::F32,
+            rerun::ChannelDatatype::U8,
         )
         .with_draw_order(0.0);
         self.rec.log("view/depth", &depth_image)?;

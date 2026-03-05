@@ -16,23 +16,22 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
 use crate::loop_closure::{
-    DescriptorSource, KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig,
-    LoopDetectError, PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
-    aggregate_global_descriptor, match_descriptors_for_loop,
+    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
+    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch,
+    RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
     PoseGraphError, PoseGraphOptimizer,
 };
 use crate::{
-    BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor, EigenPlaces, Frame,
-    FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit, LightGlue,
-    LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation, Matches,
-    ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw,
-    RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
-    Triangulator, Verified,
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac,
+    solve_pnp_ransac, BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor,
+    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit,
+    LightGlue, LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
+    Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose,
+    RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
+    TriangulationError, Triangulator, Verified,
 };
 
 use crate::inference::InferenceError;
@@ -1211,6 +1210,25 @@ impl RedundancyPolicy {
 }
 
 #[derive(Debug)]
+pub enum TrackerInitError {
+    DescriptorUnavailable { model_path: PathBuf },
+}
+
+impl std::fmt::Display for TrackerInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackerInitError::DescriptorUnavailable { model_path } => write!(
+                f,
+                "loop closure requires learned descriptors but descriptor worker failed to start (model: {})",
+                model_path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrackerInitError {}
+
+#[derive(Debug)]
 pub enum TrackerError {
     Inference(InferenceError),
     Triangulation(TriangulationError),
@@ -1307,7 +1325,11 @@ impl DegradationLevel {
     }
 
     pub fn worst(a: Self, b: Self) -> Self {
-        if a.rank() >= b.rank() { a } else { b }
+        if a.rank() >= b.rank() {
+            a
+        } else {
+            b
+        }
     }
 }
 
@@ -1464,7 +1486,6 @@ pub struct SlamTracker {
     pending_loop: Option<PendingLoopCandidate>,
     loop_streak: HashMap<KeyframeId, usize>,
     pending_events: Vec<DiagnosticEvent>,
-    pending_loop_correction: Option<Vec<(KeyframeId, Pose)>>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
@@ -1474,14 +1495,14 @@ pub struct SlamTracker {
 impl SlamTracker {
     const DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD: u32 = 15;
 
-    pub fn new(
+    pub fn try_new(
         superpoint_left: SuperPoint,
         superpoint_right: SuperPoint,
         lightglue: LightGlue,
         stereo: RectifiedStereo,
         intrinsics: PinholeIntrinsics,
         config: TrackerConfig,
-    ) -> Self {
+    ) -> Result<Self, TrackerInitError> {
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
@@ -1507,8 +1528,17 @@ impl SlamTracker {
         } else {
             None
         };
+        if loop_config.is_some()
+            && !descriptor_worker
+                .as_ref()
+                .is_some_and(DescriptorSupervisor::has_worker)
+        {
+            return Err(TrackerInitError::DescriptorUnavailable {
+                model_path: DescriptorWorker::model_path(),
+            });
+        }
         let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
-        Self {
+        Ok(Self {
             superpoint_left,
             superpoint_right,
             lightglue,
@@ -1530,12 +1560,11 @@ impl SlamTracker {
             pending_loop: None,
             loop_streak: HashMap::new(),
             pending_events: Vec::new(),
-            pending_loop_correction: None,
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
             trace_transitions,
-        }
+        })
     }
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
@@ -1623,28 +1652,14 @@ impl SlamTracker {
     }
 
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
-        let corrected = apply_loop_closure_correction(
+        let _ = apply_loop_closure_correction(
             &mut self.map,
             &mut self.essential_graph,
             &self.pose_graph_optimizer,
             &verified,
         )?;
-        self.pending_loop_correction = if corrected.is_empty() {
-            None
-        } else {
-            Some(corrected)
-        };
         self.bump_map_version();
         Ok(())
-    }
-
-    /// Take the pending loop closure correction, if any.
-    ///
-    /// Returns the corrected poses produced by the most recent
-    /// `apply_loop_closure` call. The caller (pipeline) uses this to
-    /// send a `RebuildFromSnapshot` command to the dense worker.
-    pub fn take_pending_loop_correction(&mut self) -> Option<Vec<(KeyframeId, Pose)>> {
-        self.pending_loop_correction.take()
     }
 
     fn bump_map_version(&mut self) {
@@ -3278,8 +3293,8 @@ mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
     use crate::{CompactDescriptor, Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     fn make_descriptor() -> Descriptor {
@@ -4299,22 +4314,18 @@ mod tests {
     #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
         let detections = make_test_detections(900);
-        assert!(
-            SlamTracker::initial_relocalization_session(
-                TrackingHealth::Good,
-                true,
-                Arc::clone(&detections)
-            )
-            .is_none()
-        );
-        assert!(
-            SlamTracker::initial_relocalization_session(
-                TrackingHealth::Lost,
-                false,
-                Arc::clone(&detections)
-            )
-            .is_none()
-        );
+        assert!(SlamTracker::initial_relocalization_session(
+            TrackingHealth::Good,
+            true,
+            Arc::clone(&detections)
+        )
+        .is_none());
+        assert!(SlamTracker::initial_relocalization_session(
+            TrackingHealth::Lost,
+            false,
+            Arc::clone(&detections)
+        )
+        .is_none());
 
         let session = SlamTracker::initial_relocalization_session(
             TrackingHealth::Lost,
