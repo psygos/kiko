@@ -1,4 +1,4 @@
-use super::{BlockCsr6x6, NEAR_ZERO, PoseGraphError};
+use super::{BlockCsr6x6, PoseGraphError, NEAR_ZERO};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PcgResult {

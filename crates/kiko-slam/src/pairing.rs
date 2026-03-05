@@ -201,11 +201,9 @@ mod tests {
         let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
         let mut pairer = StereoPairer::new_with_max_pending(window, 1);
         pairer.push_left(frame(SensorId::StereoLeft, 10, 1));
-        assert!(
-            pairer
-                .next_pair()
-                .expect("pairing should not fail")
-                .is_none()
-        );
+        assert!(pairer
+            .next_pair()
+            .expect("pairing should not fail")
+            .is_none());
     }
 }

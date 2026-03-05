@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
-    Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint, MatchError,
+    math, Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint, MatchError,
     Matches, Observation, PinholeIntrinsics, PnpError, Point3, Pose, Raw, RectifiedStereo,
-    RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp, math,
+    RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp,
 };
 
 #[derive(Debug)]

@@ -3,10 +3,10 @@ use std::path::Path;
 use ort::session::Session;
 use ort::value::TensorRef;
 
+use crate::loop_closure::{GlobalDescriptor, GLOBAL_DESCRIPTOR_DIM};
 use crate::Frame;
-use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
 
-use super::{InferenceBackend, InferenceError, PlaceDescriptorExtractor, build_session};
+use super::{build_session, InferenceBackend, InferenceError, PlaceDescriptorExtractor};
 
 const INPUT_SIZE: usize = 224;
 const INPUT_CHANNELS: usize = 3;
@@ -145,7 +145,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        EigenPlaces, GLOBAL_DESCRIPTOR_DIM, parse_descriptor_output, preprocess_frame_to_nchw,
+        parse_descriptor_output, preprocess_frame_to_nchw, EigenPlaces, GLOBAL_DESCRIPTOR_DIM,
     };
     use crate::inference::InferenceError;
     use crate::{Frame, FrameId, InferenceBackend, SensorId, Timestamp};

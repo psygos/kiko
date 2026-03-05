@@ -1,5 +1,5 @@
 use crate::dataset::CameraIntrinsics;
-use crate::{Keyframe, Keypoint, Matches, Point3, Verified, math};
+use crate::{math, Keyframe, Keypoint, Matches, Point3, Verified};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {

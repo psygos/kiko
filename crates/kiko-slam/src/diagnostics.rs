@@ -114,8 +114,8 @@ mod tests {
     use super::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
     };
-    use crate::DegenerateReason;
     use crate::map::KeyframeId;
+    use crate::DegenerateReason;
 
     #[test]
     fn empty_diagnostics_has_all_none() {

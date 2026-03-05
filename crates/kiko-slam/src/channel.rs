@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
