@@ -2,9 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::{
-    Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
     map::{KeyframeId, KeyframeKeypoint, MapPointId, SlamMap},
-    math,
+    math, Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
 };
 
 /// Maximum SE3 parameter step for convergence detection.
@@ -1205,10 +1204,9 @@ fn full_problem_cost(
     if motion_weight > 0.0 {
         let w2 = (motion_weight as f64) * (motion_weight as f64);
         for i in 1..problem.poses.len() {
-            let prev = pose_to_vec(problem.poses[i - 1].pose);
-            let curr = pose_to_vec(problem.poses[i].pose);
-            for k in 0..6 {
-                let d = (curr[k] - prev[k]) as f64;
+            let delta = se3_delta_between(problem.poses[i - 1].pose, problem.poses[i].pose);
+            for &value in &delta {
+                let d = value as f64;
                 cost += 0.5 * w2 * d * d;
             }
         }
@@ -1307,39 +1305,16 @@ fn reprojection_residual_and_jacobians(
 }
 
 pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
-    let v = [delta[0], delta[1], delta[2]];
-    let w = [delta[3], delta[4], delta[5]];
-    let r_delta = math::so3_exp(w);
-    let r = math::mat_mul(r_delta, pose.rotation());
-    let t = math::mat_mul_vec(r_delta, pose.translation());
-    Pose::from_rt(r, [t[0] + v[0], t[1] + v[1], t[2] + v[2]])
+    crate::math::se3_exp_f64(delta.map(f64::from))
+        .compose(crate::Pose64::from_pose32(pose))
+        .to_pose32()
 }
 
 pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
-    let from_rot = from.rotation();
-    let mut from_rot_t = [[0.0_f32; 3]; 3];
-    for (row, row_values) in from_rot_t.iter_mut().enumerate() {
-        for (col, value) in row_values.iter_mut().enumerate() {
-            *value = from_rot[col][row];
-        }
-    }
-
-    let r_delta = math::mat_mul(to.rotation(), from_rot_t);
-    let w = math::so3_log(r_delta);
-    let rotated_from_t = math::mat_mul_vec(r_delta, from.translation());
-    let to_t = to.translation();
-    let v = [
-        to_t[0] - rotated_from_t[0],
-        to_t[1] - rotated_from_t[1],
-        to_t[2] - rotated_from_t[2],
-    ];
-    [v[0], v[1], v[2], w[0], w[1], w[2]]
-}
-
-fn pose_to_vec(pose: Pose) -> [f32; 6] {
-    let t = pose.translation();
-    let w = math::so3_log(pose.rotation());
-    [t[0], t[1], t[2], w[0], w[1], w[2]]
+    crate::math::se3_log_f64(
+        crate::Pose64::from_pose32(to).compose(crate::Pose64::from_pose32(from).inverse()),
+    )
+    .map(|value| value as f32)
 }
 
 fn accumulate_pose_hessian(
@@ -1419,12 +1394,7 @@ fn accumulate_motion_prior(
     base_curr: usize,
     weight: f32,
 ) {
-    let r_prev = pose_to_vec(prev_pose);
-    let r_curr = pose_to_vec(curr_pose);
-    let mut residual = [0.0_f32; 6];
-    for k in 0..6 {
-        residual[k] = r_curr[k] - r_prev[k];
-    }
+    let residual = se3_delta_between(prev_pose, curr_pose);
     let w2 = weight * weight;
     for k in 0..6 {
         let r = residual[k] * weight;
@@ -1439,7 +1409,11 @@ fn accumulate_motion_prior(
 }
 
 fn huber_weight(r_norm: f32, delta: f32) -> f32 {
-    if r_norm <= delta { 1.0 } else { delta / r_norm }
+    if r_norm <= delta {
+        1.0
+    } else {
+        delta / r_norm
+    }
 }
 
 fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
@@ -1587,7 +1561,7 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{KeyframeId, MapPointId, SlamMap, assert_map_invariants};
+    use crate::map::{assert_map_invariants, KeyframeId, MapPointId, SlamMap};
     use crate::test_helpers::{
         axis_angle_pose, make_detections, make_pinhole_intrinsics, project_world_point,
     };
@@ -1914,6 +1888,36 @@ mod tests {
         let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
         let out = apply_se3_delta(pose, [0.0; 6]);
         assert!(pose_close(pose, out, 1e-7));
+    }
+
+    #[test]
+    fn apply_se3_delta_matches_pose64_reference_update() {
+        let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
+        let delta = [0.12, -0.07, 0.05, 0.18, -0.09, 0.11];
+        let actual = apply_se3_delta(pose, delta);
+        let expected = crate::math::se3_exp_f64(delta.map(f64::from))
+            .compose(crate::Pose64::from_pose32(pose))
+            .to_pose32();
+        assert!(pose_close(actual, expected, 1e-5));
+    }
+
+    #[test]
+    fn se3_delta_between_matches_pose64_reference_log() {
+        let from = axis_angle_pose([0.2, -0.3, 0.4], [0.05, -0.03, 0.02]);
+        let to = axis_angle_pose([0.5, -0.1, 0.2], [0.18, -0.07, 0.11]);
+        let actual = se3_delta_between(from, to);
+        let expected = crate::math::se3_log_f64(
+            crate::Pose64::from_pose32(to).compose(crate::Pose64::from_pose32(from).inverse()),
+        )
+        .map(|value| value as f32);
+        for axis in 0..6 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < 1e-5,
+                "delta mismatch on axis {axis}: actual={}, expected={}",
+                actual[axis],
+                expected[axis]
+            );
+        }
     }
 
     #[test]

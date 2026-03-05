@@ -7,12 +7,16 @@ const SO3_NEAR_PI: f64 = 1e-6;
 /// Minimum axis norm for valid axis extraction in near-pi log map.
 const SO3_AXIS_NORM_MIN: f64 = 1e-12;
 /// Small-angle threshold for f32 SO(3) operations.
+#[cfg(test)]
 const SO3_SMALL_ANGLE_F32: f32 = 1e-6;
 /// Near-pi threshold for f32 SO(3) log map.
+#[cfg(test)]
 const SO3_NEAR_PI_F32: f32 = 1e-3;
 /// Minimum axis component magnitude for f32 near-pi axis extraction.
+#[cfg(test)]
 const SO3_AXIS_COMPONENT_MIN_F32: f32 = 1e-6;
 /// Minimum axis norm for valid f32 axis normalization.
+#[cfg(test)]
 const SO3_AXIS_NORM_MIN_F32: f32 = 1e-8;
 /// Small-angle threshold for f64 Jacobian expansions (tighter than SO3_SMALL_ANGLE).
 const JACOBIAN_SMALL_ANGLE: f64 = 1e-9;
@@ -149,6 +153,7 @@ pub(crate) fn transform_point(r: [[f32; 3]; 3], t: [f32; 3], v: [f32; 3]) -> [f3
     [rv[0] + t[0], rv[1] + t[1], rv[2] + t[2]]
 }
 
+#[cfg(test)]
 pub(crate) fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
     let theta = (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]).sqrt();
     let mut r = [[0.0_f32; 3]; 3];
@@ -185,6 +190,7 @@ pub(crate) fn so3_exp(w: [f32; 3]) -> [[f32; 3]; 3] {
     r
 }
 
+#[cfg(test)]
 pub(crate) fn so3_log(r: [[f32; 3]; 3]) -> [f32; 3] {
     let trace = r[0][0] + r[1][1] + r[2][2];
     let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
