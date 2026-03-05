@@ -21,12 +21,29 @@ pub struct ImageSize {
     height: u32,
 }
 
-impl ImageSize {
-    pub fn try_new(width: u32, height: u32) -> Option<Self> {
-        if width == 0 || height == 0 {
-            return None;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSizeError {
+    ZeroDimension { width: u32, height: u32 },
+}
+
+impl std::fmt::Display for ImageSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImageSizeError::ZeroDimension { width, height } => {
+                write!(f, "image size must be positive, got {width}x{height}")
+            }
         }
-        Some(Self { width, height })
+    }
+}
+
+impl std::error::Error for ImageSizeError {}
+
+impl ImageSize {
+    pub fn try_new(width: u32, height: u32) -> Result<Self, ImageSizeError> {
+        if width == 0 || height == 0 {
+            return Err(ImageSizeError::ZeroDimension { width, height });
+        }
+        Ok(Self { width, height })
     }
 
     pub fn width(self) -> u32 {
@@ -45,12 +62,17 @@ impl ImageSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct KeypointIndex(usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeypointIndexError {
+    OutOfBounds { index: usize, len: usize },
+}
+
 impl KeypointIndex {
-    fn new(index: usize, len: usize) -> Option<Self> {
+    fn new(index: usize, len: usize) -> Result<Self, KeypointIndexError> {
         if index < len {
-            Some(Self(index))
+            Ok(Self(index))
         } else {
-            None
+            Err(KeypointIndexError::OutOfBounds { index, len })
         }
     }
 
@@ -468,12 +490,13 @@ impl SlamMap {
             });
         }
 
-        let image_size = ImageSize::try_new(detections.width(), detections.height()).ok_or(
-            MapError::InvalidImageSize {
-                width: detections.width(),
-                height: detections.height(),
-            },
-        )?;
+        let image_size =
+            ImageSize::try_new(detections.width(), detections.height()).map_err(|_| {
+                MapError::InvalidImageSize {
+                    width: detections.width(),
+                    height: detections.height(),
+                }
+            })?;
 
         let keypoints = detections.keypoints().to_vec();
         self.add_keyframe(
@@ -528,7 +551,7 @@ impl SlamMap {
             .get(keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
         let idx =
-            KeypointIndex::new(index, entry.len()).ok_or(MapError::KeypointIndexOutOfBounds {
+            KeypointIndex::new(index, entry.len()).map_err(|_| MapError::KeypointIndexOutOfBounds {
                 index,
                 len: entry.len(),
             })?;
@@ -760,7 +783,7 @@ impl SlamMap {
             .enumerate()
             .filter_map(|(idx, pid)| pid.map(|_| idx))
             .map(|idx| {
-                let index = KeypointIndex::new(idx, entry.len()).ok_or(
+                let index = KeypointIndex::new(idx, entry.len()).map_err(|_| 
                     MapError::KeypointIndexOutOfBounds {
                         index: idx,
                         len: entry.len(),
@@ -772,15 +795,15 @@ impl SlamMap {
             .collect()
     }
 
-    pub fn keyframe_point_descriptors(
+    pub fn for_each_keyframe_point_descriptor(
         &self,
         keyframe_id: KeyframeId,
-    ) -> Result<Vec<(KeyframeKeypoint, CompactDescriptor)>, MapError> {
+        mut visit: impl FnMut(KeyframeKeypoint, &CompactDescriptor),
+    ) -> Result<(), MapError> {
         let entry = self
             .keyframes
             .get(keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
-        let mut descriptors = Vec::new();
         for (idx, point_ref) in entry.point_refs.iter().enumerate() {
             let Some(point_id) = point_ref else {
                 continue;
@@ -790,16 +813,13 @@ impl SlamMap {
                 .get(*point_id)
                 .ok_or(MapError::MapPointNotFound(*point_id))?;
             let index =
-                KeypointIndex::new(idx, entry.len()).ok_or(MapError::KeypointIndexOutOfBounds {
+                KeypointIndex::new(idx, entry.len()).map_err(|_| MapError::KeypointIndexOutOfBounds {
                     index: idx,
                     len: entry.len(),
                 })?;
-            descriptors.push((
-                KeyframeKeypoint { keyframe_id, index },
-                point.descriptor().clone(),
-            ));
+            visit(KeyframeKeypoint { keyframe_id, index }, point.descriptor());
         }
-        Ok(descriptors)
+        Ok(())
     }
 
     pub fn keyframe_point_count(&self, keyframe_id: KeyframeId) -> Result<usize, MapError> {

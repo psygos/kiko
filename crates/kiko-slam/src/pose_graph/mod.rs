@@ -144,7 +144,7 @@ pub use optimizer::{
     compute_edge_error, compute_edge_jacobians, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer,
     PoseGraphResult,
 };
-pub use solver::{solve_pcg, PcgResult};
+pub use solver::{solve_pcg, PcgResult, PcgStopReason};
 pub use sparse::BlockCsr6x6;
 
 #[cfg(test)]

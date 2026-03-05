@@ -220,7 +220,7 @@ fn pcg_solves_identity_in_one_iteration() {
     ];
     let mut x = vec![0.0; b.len()];
     let result = solve_pcg(&h, &b, &mut x, 20, 1e-12).expect("pcg");
-    assert!(result.converged);
+    assert!(result.converged());
     assert_eq!(result.iterations, 1);
     for i in 0..x.len() {
         assert!((x[i] - b[i]).abs() < 1e-12);
@@ -243,7 +243,7 @@ fn pcg_converges_on_small_spd_system() {
 
     let mut x = vec![0.0; x_true.len()];
     let result = solve_pcg(&h, &b, &mut x, 50, 1e-10).expect("pcg");
-    assert!(result.converged, "pcg did not converge: {result:?}");
+    assert!(result.converged(), "pcg did not converge: {result:?}");
     for i in 0..x.len() {
         assert!(
             (x[i] - x_true[i]).abs() < 1e-8,
@@ -262,7 +262,7 @@ fn pcg_zero_rhs_returns_zero_solution() {
     let b = vec![0.0; 12];
     let mut x = vec![0.0; 12];
     let result = solve_pcg(&h, &b, &mut x, 10, 1e-12).expect("pcg");
-    assert!(result.converged);
+    assert!(result.converged());
     assert_eq!(result.iterations, 0);
     assert!(x.iter().all(|v| v.abs() < 1e-15));
 }

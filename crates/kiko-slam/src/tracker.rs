@@ -27,11 +27,12 @@ use crate::pose_graph::{
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
     solve_pnp_ransac, BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor,
-    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit,
-    LightGlue, LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
-    Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose,
-    RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
-    TriangulationError, Triangulator, Verified,
+    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
+    KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
+    LoopClosureRejectReason, LoopClosureStatus, MapObservation, Matches, ObservationSet,
+    PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw,
+    RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
+    Triangulator, Verified,
 };
 
 use crate::inference::InferenceError;
@@ -72,20 +73,34 @@ impl TrackerConfig {
 #[derive(Clone, Copy, Debug)]
 pub enum LoopSubsystemConfig {
     Disabled,
-    Enabled {
+    LoopClosureOnly {
         loop_closure: LoopClosureConfig,
         global_descriptor: GlobalDescriptorConfig,
-        relocalization: Option<RelocalizationConfig>,
+    },
+    LoopClosureAndRelocalization {
+        loop_closure: LoopClosureConfig,
+        global_descriptor: GlobalDescriptorConfig,
+        relocalization: RelocalizationConfig,
     },
 }
 
 impl LoopSubsystemConfig {
-    pub fn enabled(
+    pub fn loop_closure_only(
         loop_closure: LoopClosureConfig,
         global_descriptor: GlobalDescriptorConfig,
-        relocalization: Option<RelocalizationConfig>,
     ) -> Self {
-        Self::Enabled {
+        Self::LoopClosureOnly {
+            loop_closure,
+            global_descriptor,
+        }
+    }
+
+    pub fn with_relocalization(
+        loop_closure: LoopClosureConfig,
+        global_descriptor: GlobalDescriptorConfig,
+        relocalization: RelocalizationConfig,
+    ) -> Self {
+        Self::LoopClosureAndRelocalization {
             loop_closure,
             global_descriptor,
             relocalization,
@@ -95,14 +110,18 @@ impl LoopSubsystemConfig {
     pub fn loop_closure(self) -> Option<LoopClosureConfig> {
         match self {
             Self::Disabled => None,
-            Self::Enabled { loop_closure, .. } => Some(loop_closure),
+            Self::LoopClosureOnly { loop_closure, .. }
+            | Self::LoopClosureAndRelocalization { loop_closure, .. } => Some(loop_closure),
         }
     }
 
     pub fn global_descriptor(self) -> Option<GlobalDescriptorConfig> {
         match self {
             Self::Disabled => None,
-            Self::Enabled {
+            Self::LoopClosureOnly {
+                global_descriptor, ..
+            }
+            | Self::LoopClosureAndRelocalization {
                 global_descriptor, ..
             } => Some(global_descriptor),
         }
@@ -111,12 +130,13 @@ impl LoopSubsystemConfig {
     pub fn relocalization(self) -> Option<RelocalizationConfig> {
         match self {
             Self::Disabled => None,
-            Self::Enabled { relocalization, .. } => relocalization,
+            Self::LoopClosureOnly { .. } => None,
+            Self::LoopClosureAndRelocalization { relocalization, .. } => Some(relocalization),
         }
     }
 
     pub fn is_enabled(self) -> bool {
-        matches!(self, Self::Enabled { .. })
+        !matches!(self, Self::Disabled)
     }
 }
 
@@ -209,6 +229,28 @@ pub struct KeyframePolicy {
     min_inliers: NonZeroUsize,
     parallax_px: ParallaxPx,
     min_covisibility: CovisibilityRatio,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyframeInsertReason {
+    TooFewInliers {
+        inliers: usize,
+        min_required: usize,
+    },
+    HighParallax {
+        parallax_px: f32,
+        threshold_px: f32,
+    },
+    LowCovisibility {
+        covisibility: f32,
+        threshold: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyframeDecision {
+    KeepTracking,
+    Insert(KeyframeInsertReason),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -456,8 +498,14 @@ impl DescriptorSupervisor {
     fn default_factory() -> DescriptorExtractorFactory {
         Arc::new(|| {
             let path = DescriptorWorker::model_path();
-            EigenPlaces::try_load(path, crate::InferenceBackend::auto())
-                .map(|extractor| Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>)
+            match EigenPlaces::try_load(path, crate::InferenceBackend::auto()) {
+                Ok(Some(extractor)) => Some(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>),
+                Ok(None) => None,
+                Err(err) => {
+                    eprintln!("failed to initialize eigenplaces descriptor extractor: {err}");
+                    None
+                }
+            }
         })
     }
 
@@ -1177,24 +1225,33 @@ impl KeyframePolicy {
         self.min_covisibility.0
     }
 
-    pub fn should_refresh(
+    pub fn decide(
         &self,
         inliers: usize,
         parallax_px: Option<f32>,
         covisibility: f32,
-    ) -> bool {
+    ) -> KeyframeDecision {
         if inliers < self.min_inliers.get() {
-            return true;
+            return KeyframeDecision::Insert(KeyframeInsertReason::TooFewInliers {
+                inliers,
+                min_required: self.min_inliers.get(),
+            });
         }
         if let Some(parallax) = parallax_px {
             if parallax > self.parallax_px.0 {
-                return true;
+                return KeyframeDecision::Insert(KeyframeInsertReason::HighParallax {
+                    parallax_px: parallax,
+                    threshold_px: self.parallax_px.0,
+                });
             }
         }
         if covisibility < self.min_covisibility.0 {
-            return true;
+            return KeyframeDecision::Insert(KeyframeInsertReason::LowCovisibility {
+                covisibility,
+                threshold: self.min_covisibility.0,
+            });
         }
-        false
+        KeyframeDecision::KeepTracking
     }
 }
 
@@ -1693,10 +1750,10 @@ impl SlamTracker {
             .pending_loop
             .as_ref()
             .map_or(0, |pending| pending.candidates.len());
-        diagnostics.loop_closure_applied = self
-            .pending_events
-            .iter()
-            .any(|event| matches!(event, DiagnosticEvent::LoopClosureDetected { .. }));
+        diagnostics.loop_closure_status = self.pending_events.iter().find_map(|event| {
+            matches!(event, DiagnosticEvent::LoopClosureDetected { .. })
+                .then_some(LoopClosureStatus::Applied)
+        });
         diagnostics
     }
 
@@ -2554,17 +2611,17 @@ impl SlamTracker {
         self.consecutive_tracking_failures = 0;
         let mut output_keyframe = None;
         let mut output_matches = None;
-        let mut keyframe_created = false;
+        let mut keyframe_status = None;
         let mut triangulation_stats = None;
         let mut ba_result = None;
 
-        let should_refresh = self.config.keyframe_policy.should_refresh(
+        let keyframe_decision = self.config.keyframe_policy.decide(
             result.inliers.len(),
             parallax_px,
             covisibility,
         );
 
-        if should_refresh {
+        if matches!(keyframe_decision, KeyframeDecision::Insert(_)) {
             let new_pose = pose_world;
             let shared = build_shared_matches(
                 keyframe_id,
@@ -2579,7 +2636,7 @@ impl SlamTracker {
                 Some(current.clone()),
                 Some(shared),
             ) {
-                keyframe_created = true;
+                keyframe_status = Some(KeyframeStatus::Created);
                 triangulation_stats = keyframe_output.diagnostics.triangulation;
                 ba_result = keyframe_output.diagnostics.ba_result.clone();
                 if let Some(keyframe) = keyframe_output.keyframe {
@@ -2708,7 +2765,7 @@ impl SlamTracker {
         diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors);
         diagnostics.parallax_px = parallax_px;
         diagnostics.covisibility = Some(covisibility);
-        diagnostics.keyframe_created = keyframe_created;
+        diagnostics.keyframe_status = keyframe_status;
         diagnostics.triangulation = triangulation_stats;
         diagnostics.ba_result = ba_result;
         diagnostics.tracking_time = Some(tracking_start.elapsed());
@@ -2746,7 +2803,7 @@ impl SlamTracker {
                     );
                 }
                 let mut diagnostics = self.empty_diagnostics();
-                diagnostics.keyframe_created = false;
+                diagnostics.keyframe_status = Some(KeyframeStatus::Rejected);
                 return Ok(self.tracking_failure_output(
                     frame_id,
                     TrackingHealth::Degraded,
@@ -2863,7 +2920,7 @@ impl SlamTracker {
         self.enqueue_descriptor_request(keyframe_id, &left);
 
         let mut diagnostics = self.empty_diagnostics();
-        diagnostics.keyframe_created = true;
+        diagnostics.keyframe_status = Some(KeyframeStatus::Created);
         diagnostics.triangulation = Some(triangulation_stats);
         diagnostics.features_detected = Some(left_arc.len());
         diagnostics.features_matched = Some(matches.len());
@@ -3404,10 +3461,6 @@ mod tests {
     }
 
     impl PlaceDescriptorExtractor for StubDescriptorExtractor {
-        fn backend_name(&self) -> &'static str {
-            "stub"
-        }
-
         fn compute_descriptor(
             &mut self,
             _frame: &Frame,
@@ -3421,10 +3474,6 @@ mod tests {
     struct PanicDescriptorExtractor;
 
     impl PlaceDescriptorExtractor for PanicDescriptorExtractor {
-        fn backend_name(&self) -> &'static str {
-            "panic"
-        }
-
         fn compute_descriptor(
             &mut self,
             _frame: &Frame,

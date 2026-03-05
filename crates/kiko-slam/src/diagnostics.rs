@@ -9,6 +9,17 @@ pub enum KeyframeRemovalReason {
     Redundant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyframeStatus {
+    Created,
+    Rejected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopClosureStatus {
+    Applied,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LoopClosureRejectReason {
     TooFewCorrespondences {
@@ -31,11 +42,11 @@ pub struct FrameDiagnostics {
     pub reprojection_max_px: Option<f32>,
     pub parallax_px: Option<f32>,
     pub covisibility: Option<f32>,
-    pub keyframe_created: bool,
+    pub keyframe_status: Option<KeyframeStatus>,
     pub triangulation: Option<TriangulationStats>,
     pub ba_result: Option<BaResult>,
     pub loop_candidate_count: usize,
-    pub loop_closure_applied: bool,
+    pub loop_closure_status: Option<LoopClosureStatus>,
     pub tracking_time: Option<Duration>,
     pub map_keyframes: usize,
     pub map_points: usize,
@@ -54,11 +65,11 @@ impl FrameDiagnostics {
             reprojection_max_px: None,
             parallax_px: None,
             covisibility: None,
-            keyframe_created: false,
+            keyframe_status: None,
             triangulation: None,
             ba_result: None,
             loop_candidate_count: 0,
-            loop_closure_applied: false,
+            loop_closure_status: None,
             tracking_time: None,
             map_keyframes,
             map_points,
@@ -127,11 +138,11 @@ mod tests {
         assert!(diag.reprojection_max_px.is_none());
         assert!(diag.parallax_px.is_none());
         assert!(diag.covisibility.is_none());
-        assert!(!diag.keyframe_created);
+        assert_eq!(diag.keyframe_status, None);
         assert!(diag.triangulation.is_none());
         assert!(diag.ba_result.is_none());
         assert_eq!(diag.loop_candidate_count, 0);
-        assert!(!diag.loop_closure_applied);
+        assert_eq!(diag.loop_closure_status, None);
         assert!(diag.tracking_time.is_none());
         assert!(diag.depth_reorder_warnings.is_none());
         assert!(diag.features_detected.is_none());
@@ -143,6 +154,8 @@ mod tests {
         let diag = FrameDiagnostics::empty(11, 42);
         assert_eq!(diag.map_keyframes, 11);
         assert_eq!(diag.map_points, 42);
+        assert_eq!(diag.keyframe_status, None);
+        assert_eq!(diag.loop_closure_status, None);
     }
 
     #[test]

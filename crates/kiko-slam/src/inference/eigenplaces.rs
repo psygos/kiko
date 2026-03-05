@@ -39,21 +39,15 @@ impl EigenPlaces {
         })
     }
 
-    pub fn try_load(path: impl AsRef<Path>, backend: InferenceBackend) -> Option<Self> {
+    pub fn try_load(
+        path: impl AsRef<Path>,
+        backend: InferenceBackend,
+    ) -> Result<Option<Self>, InferenceError> {
         let path_ref = path.as_ref();
         if !path_ref.exists() {
-            return None;
+            return Ok(None);
         }
-        match Self::new_with_backend(path_ref, backend) {
-            Ok(model) => Some(model),
-            Err(e) => {
-                eprintln!(
-                    "eigenplaces: failed to load model at {}: {e}",
-                    path_ref.display()
-                );
-                None
-            }
-        }
+        Self::new_with_backend(path_ref, backend).map(Some)
     }
 
     pub fn backend(&self) -> InferenceBackend {
@@ -74,27 +68,12 @@ impl EigenPlaces {
                 .map_err(InferenceError::Execution)
         })?;
 
-        let mut raw_descriptor: Option<Vec<f32>> = None;
-        for (_, value) in outputs.iter() {
-            if let Ok((_, data)) = value.try_extract_tensor::<f32>() {
-                raw_descriptor = Some(data.to_vec());
-                break;
-            }
-        }
-        let raw_descriptor = raw_descriptor.ok_or_else(|| InferenceError::UnexpectedOutput {
-            name: "eigenplaces-output".to_string(),
-            expected: "at least one f32 tensor output".to_string(),
-            actual: "no f32 tensor output".to_string(),
-        })?;
-        parse_descriptor_output(raw_descriptor.as_slice())
+        let raw_descriptor = extract_single_f32_output(&outputs)?;
+        parse_descriptor_output(&raw_descriptor)
     }
 }
 
 impl PlaceDescriptorExtractor for EigenPlaces {
-    fn backend_name(&self) -> &'static str {
-        "eigenplaces"
-    }
-
     fn compute_descriptor(&mut self, frame: &Frame) -> Result<GlobalDescriptor, InferenceError> {
         self.compute(frame)
     }
@@ -111,13 +90,39 @@ fn preprocess_frame_to_nchw(frame: &Frame, out: &mut Vec<f32>) {
         for x in 0..INPUT_SIZE {
             let src_x = x * src_width / INPUT_SIZE;
             let src_idx = src_y * src_width + src_x;
-            let value = src.get(src_idx).copied().unwrap_or(0) as f32 / U8_SCALE;
+            let value = src[src_idx] as f32 / U8_SCALE;
             for channel in 0..INPUT_CHANNELS {
                 let dst_idx = channel * INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x;
                 out[dst_idx] = (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
             }
         }
     }
+}
+
+fn extract_single_f32_output(
+    outputs: &ort::session::SessionOutputs<'_>,
+) -> Result<Vec<f32>, InferenceError> {
+    let mut found: Option<(String, Vec<f32>)> = None;
+    for (name, value) in outputs.iter() {
+        let Ok((_, data)) = value.try_extract_tensor::<f32>() else {
+            continue;
+        };
+        if let Some((previous, _)) = &found {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "eigenplaces-output".to_string(),
+                expected: "exactly one f32 tensor output".to_string(),
+                actual: format!("multiple f32 outputs: {previous}, {name}"),
+            });
+        }
+        found = Some((name.to_string(), data.to_vec()));
+    }
+    found
+        .map(|(_, data)| data)
+        .ok_or_else(|| InferenceError::UnexpectedOutput {
+            name: "eigenplaces-output".to_string(),
+            expected: "exactly one f32 tensor output".to_string(),
+            actual: "no f32 tensor output".to_string(),
+        })
 }
 
 fn parse_descriptor_output(raw_descriptor: &[f32]) -> Result<GlobalDescriptor, InferenceError> {
@@ -218,14 +223,16 @@ mod tests {
     fn try_load_nonexistent_returns_none() {
         let missing = unique_temp_file("missing");
         assert!(!missing.exists());
-        assert!(EigenPlaces::try_load(&missing, InferenceBackend::Cpu).is_none());
+        assert!(EigenPlaces::try_load(&missing, InferenceBackend::Cpu)
+            .expect("missing model should not error")
+            .is_none());
     }
 
     #[test]
-    fn try_load_invalid_model_returns_none() {
+    fn try_load_invalid_model_returns_error() {
         let invalid = unique_temp_file("invalid");
         fs::write(&invalid, b"not-an-onnx-model").expect("write invalid model");
-        assert!(EigenPlaces::try_load(&invalid, InferenceBackend::Cpu).is_none());
+        assert!(EigenPlaces::try_load(&invalid, InferenceBackend::Cpu).is_err());
         fs::remove_file(&invalid).expect("cleanup invalid model");
     }
 

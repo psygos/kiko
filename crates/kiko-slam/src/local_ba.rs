@@ -1215,7 +1215,7 @@ fn full_problem_cost(
     cost
 }
 
-fn reprojection_residual_and_jacobian(
+pub(crate) fn reprojection_residual_and_jacobian(
     pose: Pose,
     obs: &Observation,
     intrinsics: PinholeIntrinsics,
@@ -1511,7 +1511,7 @@ fn norm6(v: [f32; 6]) -> f32 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3] + v[4] * v[4] + v[5] * v[5]).sqrt()
 }
 
-fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
+pub(crate) fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
     for i in 0..n {
         let mut max_row = i;
         let mut max_val = a[i * n + i].abs();

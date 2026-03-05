@@ -1,6 +1,7 @@
+use std::num::NonZeroUsize;
 use std::collections::VecDeque;
 
-use crate::{Frame, PairError, StereoPair};
+use crate::{Frame, PairError, SensorId, StereoPair};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PairingWindowNs(i64);
@@ -43,81 +44,168 @@ pub struct PairingStats {
     pub outside_window: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingFramesCapacity(NonZeroUsize);
+
+impl PendingFramesCapacity {
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingFramesCapacityError {
+    Zero,
+}
+
+impl std::fmt::Display for PendingFramesCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PendingFramesCapacityError::Zero => write!(f, "pending frame capacity must be > 0"),
+        }
+    }
+}
+
+impl std::error::Error for PendingFramesCapacityError {}
+
+impl TryFrom<usize> for PendingFramesCapacity {
+    type Error = PendingFramesCapacityError;
+
+    fn try_from(value: usize) -> Result<Self, Self::Error> {
+        NonZeroUsize::new(value)
+            .map(PendingFramesCapacity)
+            .ok_or(PendingFramesCapacityError::Zero)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingDropReason {
+    PendingCapacity,
+    OutsideWindow,
+}
+
+#[derive(Debug)]
+pub enum PairingOutcome {
+    Produced(StereoPair),
+    Dropped {
+        sensor: SensorId,
+        reason: PairingDropReason,
+    },
+    Waiting,
+}
+
 #[derive(Debug)]
 pub struct StereoPairer {
     window: PairingWindowNs,
     left: VecDeque<Frame>,
     right: VecDeque<Frame>,
-    max_pending_per_side: usize,
+    max_pending_per_side: PendingFramesCapacity,
     stats: PairingStats,
 }
 
 impl StereoPairer {
     pub fn new(window: PairingWindowNs) -> Self {
-        Self::new_with_max_pending(window, 64)
+        Self::new_with_max_pending(
+            window,
+            PendingFramesCapacity::try_from(64).expect("non-zero default capacity"),
+        )
     }
 
-    pub fn new_with_max_pending(window: PairingWindowNs, max_pending_per_side: usize) -> Self {
+    pub fn new_with_max_pending(
+        window: PairingWindowNs,
+        max_pending_per_side: PendingFramesCapacity,
+    ) -> Self {
         Self {
             window,
             left: VecDeque::new(),
             right: VecDeque::new(),
-            max_pending_per_side: max_pending_per_side.max(1),
+            max_pending_per_side,
             stats: PairingStats::default(),
         }
     }
 
-    pub fn push_left(&mut self, frame: Frame) {
-        if self.left.len() >= self.max_pending_per_side {
+    pub fn push_left(&mut self, frame: Frame) -> Option<PairingOutcome> {
+        if self.left.len() >= self.max_pending_per_side.get() {
             self.left.pop_front();
             self.stats.dropped_left = self.stats.dropped_left.saturating_add(1);
+            self.left.push_back(frame);
+            return Some(PairingOutcome::Dropped {
+                sensor: SensorId::StereoLeft,
+                reason: PairingDropReason::PendingCapacity,
+            });
         }
         self.left.push_back(frame);
+        None
     }
 
-    pub fn push_right(&mut self, frame: Frame) {
-        if self.right.len() >= self.max_pending_per_side {
+    pub fn push_right(&mut self, frame: Frame) -> Option<PairingOutcome> {
+        if self.right.len() >= self.max_pending_per_side.get() {
             self.right.pop_front();
             self.stats.dropped_right = self.stats.dropped_right.saturating_add(1);
+            self.right.push_back(frame);
+            return Some(PairingOutcome::Dropped {
+                sensor: SensorId::StereoRight,
+                reason: PairingDropReason::PendingCapacity,
+            });
         }
         self.right.push_back(frame);
+        None
     }
 
     pub fn next_pair(&mut self) -> Result<Option<StereoPair>, PairError> {
         loop {
+            match self.next_outcome()? {
+                PairingOutcome::Produced(pair) => return Ok(Some(pair)),
+                PairingOutcome::Dropped { .. } => continue,
+                PairingOutcome::Waiting => return Ok(None),
+            }
+        }
+    }
+
+    pub fn next_outcome(&mut self) -> Result<PairingOutcome, PairError> {
+        loop {
             let left = match self.left.front() {
                 Some(frame) => frame,
-                None => return Ok(None),
+                None => return Ok(PairingOutcome::Waiting),
             };
             let left_ts = left.timestamp().as_nanos();
 
             let (best_idx, best_delta, best_ts) = match self.best_right(left_ts) {
                 Some(best) => best,
-                None => return Ok(None),
+                None => return Ok(PairingOutcome::Waiting),
             };
 
             if best_delta <= self.window.as_ns() {
                 let Some(left) = self.left.pop_front() else {
-                    return Ok(None);
+                    return Ok(PairingOutcome::Waiting);
                 };
                 let Some(right) = self.right.remove(best_idx) else {
                     self.left.push_front(left);
-                    return Ok(None);
+                    return Ok(PairingOutcome::Waiting);
                 };
                 let pair = StereoPair::try_new(left, right, self.window)?;
                 self.stats.paired += 1;
-                return Ok(Some(pair));
+                return Ok(PairingOutcome::Produced(pair));
             }
 
             // No match in window: drop the older frame to advance.
             if best_ts < left_ts {
                 self.right.remove(best_idx);
                 self.stats.dropped_right += 1;
+                self.stats.outside_window += 1;
+                return Ok(PairingOutcome::Dropped {
+                    sensor: SensorId::StereoRight,
+                    reason: PairingDropReason::OutsideWindow,
+                });
             } else {
                 self.left.pop_front();
                 self.stats.dropped_left += 1;
+                self.stats.outside_window += 1;
+                return Ok(PairingOutcome::Dropped {
+                    sensor: SensorId::StereoLeft,
+                    reason: PairingDropReason::OutsideWindow,
+                });
             }
-            self.stats.outside_window += 1;
         }
     }
 
@@ -129,7 +217,7 @@ impl StereoPairer {
         self.window
     }
 
-    pub fn max_pending_per_side(&self) -> usize {
+    pub fn max_pending_per_side(&self) -> PendingFramesCapacity {
         self.max_pending_per_side
     }
 
@@ -176,19 +264,25 @@ mod tests {
     #[test]
     fn pending_left_is_capped() {
         let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
-        let mut pairer = StereoPairer::new_with_max_pending(window, 2);
+        let mut pairer = StereoPairer::new_with_max_pending(
+            window,
+            PendingFramesCapacity::try_from(2).expect("capacity"),
+        );
         pairer.push_left(frame(SensorId::StereoLeft, 1, 1));
         pairer.push_left(frame(SensorId::StereoLeft, 2, 2));
         pairer.push_left(frame(SensorId::StereoLeft, 3, 3));
 
         assert_eq!(pairer.stats().dropped_left, 1);
-        assert_eq!(pairer.max_pending_per_side(), 2);
+        assert_eq!(pairer.max_pending_per_side().get(), 2);
     }
 
     #[test]
     fn pending_right_is_capped() {
         let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
-        let mut pairer = StereoPairer::new_with_max_pending(window, 2);
+        let mut pairer = StereoPairer::new_with_max_pending(
+            window,
+            PendingFramesCapacity::try_from(2).expect("capacity"),
+        );
         pairer.push_right(frame(SensorId::StereoRight, 1, 1));
         pairer.push_right(frame(SensorId::StereoRight, 2, 2));
         pairer.push_right(frame(SensorId::StereoRight, 3, 3));
@@ -199,11 +293,34 @@ mod tests {
     #[test]
     fn next_pair_returns_none_when_side_becomes_empty() {
         let window = PairingWindowNs::new(5_000_000).expect("valid pairing window");
-        let mut pairer = StereoPairer::new_with_max_pending(window, 1);
+        let mut pairer = StereoPairer::new_with_max_pending(
+            window,
+            PendingFramesCapacity::try_from(1).expect("capacity"),
+        );
         pairer.push_left(frame(SensorId::StereoLeft, 10, 1));
         assert!(pairer
             .next_pair()
             .expect("pairing should not fail")
             .is_none());
+    }
+
+    #[test]
+    fn next_outcome_reports_outside_window_drop() {
+        let window = PairingWindowNs::new(5).expect("valid pairing window");
+        let mut pairer = StereoPairer::new_with_max_pending(
+            window,
+            PendingFramesCapacity::try_from(2).expect("capacity"),
+        );
+        pairer.push_left(frame(SensorId::StereoLeft, 100, 1));
+        pairer.push_right(frame(SensorId::StereoRight, 200, 2));
+
+        let outcome = pairer.next_outcome().expect("pairing should not fail");
+        assert!(matches!(
+            outcome,
+            PairingOutcome::Dropped {
+                sensor: SensorId::StereoLeft,
+                reason: PairingDropReason::OutsideWindow,
+            }
+        ));
     }
 }

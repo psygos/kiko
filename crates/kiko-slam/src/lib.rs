@@ -34,7 +34,8 @@ pub use channel::{
 };
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
-    DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
+    DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, KeyframeStatus,
+    LoopClosureRejectReason, LoopClosureStatus,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use local_ba::{
@@ -52,7 +53,10 @@ pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
 #[cfg(feature = "record")]
 pub use oak::{oak_to_depth_image, oak_to_frame};
-pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
+pub use pairing::{
+    PairingConfigError, PairingDropReason, PairingOutcome, PairingStats, PairingWindowNs,
+    PendingFramesCapacity, PendingFramesCapacityError, StereoPairer,
+};
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
@@ -63,9 +67,9 @@ pub use pnp::{
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
-    KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, RedundancyPolicy,
-    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError,
-    TrackerInitError, TrackerOutput, TrackingHealth,
+    KeyframeDecision, KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
+    LoopSubsystemConfig, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
+    SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,

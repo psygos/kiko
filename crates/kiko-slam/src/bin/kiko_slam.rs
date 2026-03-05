@@ -27,8 +27,9 @@ use kiko_slam::dataset::{
 #[cfg(feature = "record")]
 use kiko_slam::{
     bounded_channel, oak_to_depth_image, oak_to_frame, ChannelCapacity, DiagnosticEvent,
-    DropPolicy, DropReceiver, FrameDiagnostics, FrameId, PairingConfigError, PairingWindowNs,
-    SendOutcome, SensorId, StereoPair, StereoPairer, SystemHealth,
+    DropPolicy, DropReceiver, FrameDiagnostics, FrameId, PairingConfigError, PairingOutcome,
+    PairingWindowNs, PendingFramesCapacity, SendOutcome, SensorId, StereoPair, StereoPairer,
+    SystemHealth,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -573,7 +574,6 @@ fn build_tracker_config(
         let loop_cfg = build_loop_closure_config_from_env()?;
         let descriptor_cfg =
             GlobalDescriptorConfig::new(env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2))?;
-        let relocalization = relocalization_enabled.then_some(RelocalizationConfig::default());
         eprintln!(
             "loop config: similarity={:.3} descriptor_match={:.3} min_inliers={} max_candidates={} temporal_gap={} min_streak={} max_translation_m={:.3} max_rotation_deg={:.3} ransac_iters={} ransac_px={:.3} ransac_min_inliers={}",
             loop_cfg.similarity_threshold(),
@@ -588,7 +588,15 @@ fn build_tracker_config(
             loop_cfg.ransac().reprojection_threshold_px,
             loop_cfg.ransac().min_inliers,
         );
-        LoopSubsystemConfig::enabled(loop_cfg, descriptor_cfg, relocalization)
+        if relocalization_enabled {
+            LoopSubsystemConfig::with_relocalization(
+                loop_cfg,
+                descriptor_cfg,
+                RelocalizationConfig::default(),
+            )
+        } else {
+            LoopSubsystemConfig::loop_closure_only(loop_cfg, descriptor_cfg)
+        }
     } else {
         if relocalization_enabled {
             eprintln!(
@@ -809,6 +817,165 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Default)]
+struct BenchAccum {
+    read_samples: usize,
+    processed: usize,
+    matches_nonzero: usize,
+    total_matches: usize,
+    read_errors: usize,
+    pairing_errors: usize,
+    inference_errors: usize,
+    sum_read_left: Duration,
+    sum_read_right: Duration,
+    sum_pairing: Duration,
+    sum_read_bytes: usize,
+    sum_sp_left: Duration,
+    sum_sp_right: Duration,
+    sum_lightglue: Duration,
+    sum_total_success: Duration,
+    sum_inference_attempt: Duration,
+}
+
+struct BenchSummary {
+    read_samples: usize,
+    processed: usize,
+    wall_seconds: f64,
+    wall_fps: f64,
+    reader_stage_seconds: f64,
+    reader_stage_fps: f64,
+    reader_throughput_mb_s: f64,
+    inference_attempt_seconds: f64,
+    inference_attempt_fps: f64,
+    successful_inference_seconds: f64,
+    successful_inference_fps: f64,
+    match_rate: f64,
+    avg_matches_per_processed_pair: f64,
+    avg_matches_per_nonzero_pair: f64,
+    avg_sp_left_ms: f64,
+    avg_sp_right_ms: f64,
+    avg_lightglue_ms: f64,
+    avg_total_success_ms: f64,
+    avg_overhead_ms: f64,
+    pct_sp_left: f64,
+    pct_sp_right: f64,
+    pct_lightglue: f64,
+    pct_overhead: f64,
+}
+
+fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSummary {
+    let wall_seconds = elapsed.as_secs_f64();
+    let wall_fps = if wall_seconds > 0.0 {
+        accum.processed as f64 / wall_seconds
+    } else {
+        0.0
+    };
+
+    let reader_stage = accum.sum_read_left + accum.sum_read_right + accum.sum_pairing;
+    let reader_stage_seconds = reader_stage.as_secs_f64();
+    let reader_stage_fps = if reader_stage_seconds > 0.0 {
+        accum.read_samples as f64 / reader_stage_seconds
+    } else {
+        0.0
+    };
+    let reader_throughput_mb_s = if reader_stage_seconds > 0.0 {
+        (accum.sum_read_bytes as f64 / (1024.0 * 1024.0)) / reader_stage_seconds
+    } else {
+        0.0
+    };
+
+    let inference_attempt_seconds = accum.sum_inference_attempt.as_secs_f64();
+    let inference_attempt_fps = if inference_attempt_seconds > 0.0 {
+        accum.read_samples as f64 / inference_attempt_seconds
+    } else {
+        0.0
+    };
+
+    let successful_inference_seconds = accum.sum_total_success.as_secs_f64();
+    let successful_inference_fps = if successful_inference_seconds > 0.0 {
+        accum.processed as f64 / successful_inference_seconds
+    } else {
+        0.0
+    };
+
+    let match_rate = if accum.processed > 0 {
+        accum.matches_nonzero as f64 / accum.processed as f64
+    } else {
+        0.0
+    };
+    let avg_matches_per_processed_pair = if accum.processed > 0 {
+        accum.total_matches as f64 / accum.processed as f64
+    } else {
+        0.0
+    };
+    let avg_matches_per_nonzero_pair = if accum.matches_nonzero > 0 {
+        accum.total_matches as f64 / accum.matches_nonzero as f64
+    } else {
+        0.0
+    };
+
+    let denom = accum.processed as f64;
+    let avg_sp_left_ms = if accum.processed > 0 {
+        (accum.sum_sp_left.as_secs_f64() * 1000.0) / denom
+    } else {
+        0.0
+    };
+    let avg_sp_right_ms = if accum.processed > 0 {
+        (accum.sum_sp_right.as_secs_f64() * 1000.0) / denom
+    } else {
+        0.0
+    };
+    let avg_lightglue_ms = if accum.processed > 0 {
+        (accum.sum_lightglue.as_secs_f64() * 1000.0) / denom
+    } else {
+        0.0
+    };
+    let avg_total_success_ms = if accum.processed > 0 {
+        (accum.sum_total_success.as_secs_f64() * 1000.0) / denom
+    } else {
+        0.0
+    };
+    let overhead = accum
+        .sum_total_success
+        .saturating_sub(accum.sum_sp_left + accum.sum_sp_right + accum.sum_lightglue);
+    let avg_overhead_ms = if accum.processed > 0 {
+        (overhead.as_secs_f64() * 1000.0) / denom
+    } else {
+        0.0
+    };
+    let total_ms = accum.sum_total_success.as_secs_f64().max(1e-9);
+    let pct_sp_left = (accum.sum_sp_left.as_secs_f64() / total_ms) * 100.0;
+    let pct_sp_right = (accum.sum_sp_right.as_secs_f64() / total_ms) * 100.0;
+    let pct_lightglue = (accum.sum_lightglue.as_secs_f64() / total_ms) * 100.0;
+    let pct_overhead = (overhead.as_secs_f64() / total_ms) * 100.0;
+
+    BenchSummary {
+        read_samples: accum.read_samples,
+        processed: accum.processed,
+        wall_seconds,
+        wall_fps,
+        reader_stage_seconds,
+        reader_stage_fps,
+        reader_throughput_mb_s,
+        inference_attempt_seconds,
+        inference_attempt_fps,
+        successful_inference_seconds,
+        successful_inference_fps,
+        match_rate,
+        avg_matches_per_processed_pair,
+        avg_matches_per_nonzero_pair,
+        avg_sp_left_ms,
+        avg_sp_right_ms,
+        avg_lightglue_ms,
+        avg_total_success_ms,
+        avg_overhead_ms,
+        pct_sp_left,
+        pct_sp_right,
+        pct_lightglue,
+        pct_overhead,
+    }
+}
+
 fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let dataset_path = &args.dataset.path;
     let open_start = Instant::now();
@@ -831,20 +998,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut pipeline = inference.into_pipeline();
 
     let cpu_start = process_usage();
-    let mut processed = 0usize;
-    let mut matches_nonzero = 0usize;
-    let mut total_matches = 0usize;
-    let mut read_errors = 0usize;
-    let mut pairing_errors = 0usize;
-    let mut inference_errors = 0usize;
-    let mut sum_read_left = Duration::ZERO;
-    let mut sum_read_right = Duration::ZERO;
-    let mut sum_pairing = Duration::ZERO;
-    let mut sum_read_bytes = 0usize;
-    let mut sum_sp_left = Duration::ZERO;
-    let mut sum_sp_right = Duration::ZERO;
-    let mut sum_lightglue = Duration::ZERO;
-    let mut sum_total = Duration::ZERO;
+    let mut accum = BenchAccum::default();
 
     let start = Instant::now();
     for sample in reader.timed_pairs() {
@@ -853,141 +1007,137 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             Err(err) => {
                 match err {
                     kiko_slam::dataset::DatasetError::PairingFailed { .. } => {
-                        pairing_errors += 1;
+                        accum.pairing_errors += 1;
                     }
-                    _ => read_errors += 1,
+                    _ => accum.read_errors += 1,
                 }
                 eprintln!("read error: {err}");
                 continue;
             }
         };
+        accum.read_samples += 1;
         let pair = sample.pair;
-        sum_read_left += sample.timings.left_read;
-        sum_read_right += sample.timings.right_read;
-        sum_pairing += sample.timings.pairing;
-        sum_read_bytes += sample.timings.left_bytes + sample.timings.right_bytes;
+        accum.sum_read_left += sample.timings.left_read;
+        accum.sum_read_right += sample.timings.right_read;
+        accum.sum_pairing += sample.timings.pairing;
+        accum.sum_read_bytes += sample.timings.left_bytes + sample.timings.right_bytes;
 
+        let inference_attempt_start = Instant::now();
         match pipeline.process_pair_timed(pair) {
             Ok((packet, timings)) => {
                 let matches = packet.matches();
+                accum.total_matches += matches.len();
                 if !matches.is_empty() {
-                    matches_nonzero += 1;
-                    total_matches += matches.len();
+                    accum.matches_nonzero += 1;
                 }
-                sum_sp_left += timings.superpoint_left;
-                sum_sp_right += timings.superpoint_right;
-                sum_lightglue += timings.lightglue;
-                sum_total += timings.total;
-                processed += 1;
+                accum.sum_sp_left += timings.superpoint_left;
+                accum.sum_sp_right += timings.superpoint_right;
+                accum.sum_lightglue += timings.lightglue;
+                accum.sum_total_success += timings.total;
+                accum.processed += 1;
             }
             Err(err) => {
-                inference_errors += 1;
+                accum.inference_errors += 1;
                 eprintln!("inference error: {err}");
             }
         }
+        accum.sum_inference_attempt += inference_attempt_start.elapsed();
 
         if let Some(limit) = args.dataset.max_pairs {
-            if processed >= limit {
+            if accum.read_samples >= limit {
                 break;
             }
         }
     }
     let elapsed = start.elapsed();
     let cpu_end = process_usage();
-    let elapsed_s = elapsed.as_secs_f64();
-    let fps = if elapsed_s > 0.0 {
-        processed as f64 / elapsed_s
-    } else {
-        0.0
-    };
-    let infer_s = sum_total.as_secs_f64();
-    let infer_fps = if infer_s > 0.0 {
-        processed as f64 / infer_s
-    } else {
-        0.0
-    };
+    let summary = summarize_bench(&accum, elapsed);
 
-    let match_rate = if processed > 0 {
-        matches_nonzero as f64 / processed as f64
-    } else {
-        0.0
-    };
-    let avg_matches = if matches_nonzero > 0 {
-        total_matches as f64 / matches_nonzero as f64
-    } else {
-        0.0
-    };
-
-    let read_total = sum_read_left + sum_read_right + sum_pairing;
-    let read_s = read_total.as_secs_f64();
-    let read_fps = if read_s > 0.0 {
-        processed as f64 / read_s
-    } else {
-        0.0
-    };
-    let read_mb_s = if read_s > 0.0 {
-        (sum_read_bytes as f64 / (1024.0 * 1024.0)) / read_s
-    } else {
-        0.0
-    };
-
-    eprintln!("pipeline fps: {fps:.2} (processed={processed}, elapsed={elapsed_s:.2}s)");
-    eprintln!("reader fps: {read_fps:.2} (read_time={read_s:.2}s, throughput={read_mb_s:.2} MB/s)");
-    eprintln!("inference fps: {infer_fps:.2} (sum_infer_time={infer_s:.2}s)");
     eprintln!(
-        "matching: nonzero_pairs={matches_nonzero}, match_rate={match_rate:.2} avg_matches={avg_matches:.1}"
+        "pipeline wall fps: {:.2} (processed={}, elapsed={:.2}s)",
+        summary.wall_fps,
+        summary.processed,
+        summary.wall_seconds
     );
-    eprintln!("errors: read={read_errors} pairing={pairing_errors} inference={inference_errors}");
+    eprintln!(
+        "reader stage fps: {:.2} (read_samples={}, read_stage_time={:.2}s, throughput={:.2} MB/s)",
+        summary.reader_stage_fps,
+        summary.read_samples,
+        summary.reader_stage_seconds,
+        summary.reader_throughput_mb_s
+    );
+    eprintln!(
+        "inference attempt fps: {:.2} (attempts={}, attempt_time={:.2}s)",
+        summary.inference_attempt_fps,
+        summary.read_samples,
+        summary.inference_attempt_seconds
+    );
+    eprintln!(
+        "successful inference fps: {:.2} (processed={}, successful_infer_time={:.2}s)",
+        summary.successful_inference_fps,
+        summary.processed,
+        summary.successful_inference_seconds
+    );
+    eprintln!(
+        "matching: nonzero_pairs={}, match_rate={:.2} avg_matches_processed={:.1} avg_matches_nonzero={:.1}",
+        accum.matches_nonzero,
+        summary.match_rate,
+        summary.avg_matches_per_processed_pair,
+        summary.avg_matches_per_nonzero_pair
+    );
+    eprintln!(
+        "errors: read={} pairing={} inference={}",
+        accum.read_errors,
+        accum.pairing_errors,
+        accum.inference_errors
+    );
 
-    if processed > 0 {
-        let denom = processed as f64;
-        let avg_sp_left_ms = (sum_sp_left.as_secs_f64() * 1000.0) / denom;
-        let avg_sp_right_ms = (sum_sp_right.as_secs_f64() * 1000.0) / denom;
-        let avg_lightglue_ms = (sum_lightglue.as_secs_f64() * 1000.0) / denom;
-        let avg_total_ms = (sum_total.as_secs_f64() * 1000.0) / denom;
-        let overhead = sum_total.saturating_sub(sum_sp_left + sum_sp_right + sum_lightglue);
-        let avg_overhead_ms = (overhead.as_secs_f64() * 1000.0) / denom;
-        let total_ms = sum_total.as_secs_f64().max(1e-9);
-        let pct_sp_left = (sum_sp_left.as_secs_f64() / total_ms) * 100.0;
-        let pct_sp_right = (sum_sp_right.as_secs_f64() / total_ms) * 100.0;
-        let pct_lightglue = (sum_lightglue.as_secs_f64() / total_ms) * 100.0;
-        let pct_overhead = (overhead.as_secs_f64() / total_ms) * 100.0;
-
+    if accum.processed > 0 {
         eprintln!(
-            "timings avg ms: sp_left={avg_sp_left_ms:.2} sp_right={avg_sp_right_ms:.2} lightglue={avg_lightglue_ms:.2} overhead={avg_overhead_ms:.2} total={avg_total_ms:.2}"
+            "timings avg ms: sp_left={:.2} sp_right={:.2} lightglue={:.2} overhead={:.2} total_success={:.2}",
+            summary.avg_sp_left_ms,
+            summary.avg_sp_right_ms,
+            summary.avg_lightglue_ms,
+            summary.avg_overhead_ms,
+            summary.avg_total_success_ms
         );
         eprintln!(
-            "timings pct: sp_left={pct_sp_left:.1}% sp_right={pct_sp_right:.1}% lightglue={pct_lightglue:.1}% overhead={pct_overhead:.1}%"
+            "timings pct of successful inference time: sp_left={:.1}% sp_right={:.1}% lightglue={:.1}% overhead={:.1}%",
+            summary.pct_sp_left,
+            summary.pct_sp_right,
+            summary.pct_lightglue,
+            summary.pct_overhead
         );
     }
 
     if let (Some(start_usage), Some(end_usage)) = (cpu_start, cpu_end) {
         let cpu_time = end_usage.cpu_time.saturating_sub(start_usage.cpu_time);
         let cpu_s = cpu_time.user.as_secs_f64() + cpu_time.sys.as_secs_f64();
-        let cpu_pct = if elapsed_s > 0.0 {
-            (cpu_s / elapsed_s) * 100.0
+        let core_equiv = if summary.wall_seconds > 0.0 {
+            cpu_s / summary.wall_seconds
         } else {
             0.0
         };
         eprintln!(
-            "cpu: user={:.2}ms sys={:.2}ms total={:.2}ms cpu%={:.1}",
+            "cpu: user={:.2}ms sys={:.2}ms total={:.2}ms cpu_time_over_wall_pct={:.1} core_equiv={:.2}",
             cpu_time.user.as_secs_f64() * 1000.0,
             cpu_time.sys.as_secs_f64() * 1000.0,
             cpu_s * 1000.0,
-            cpu_pct
+            core_equiv * 100.0,
+            core_equiv
         );
         if let Some(rss) = end_usage.max_rss_bytes {
             eprintln!("memory: max_rss={:.2} MB", (rss as f64) / (1024.0 * 1024.0));
         }
     }
 
-    if processed == 0 {
+    if accum.processed == 0 {
         return Err("no paired frames processed".into());
     }
-    if matches_nonzero == 0 {
+    if accum.matches_nonzero == 0 {
         return Err("no nonzero matches; check models/data".into());
     }
-    if inference_errors > 0 {
+    if accum.inference_errors > 0 {
         return Err("inference errors encountered during run".into());
     }
 
@@ -1023,10 +1173,17 @@ fn load_pairing_window() -> Result<PairingWindowNs, PairingConfigError> {
 }
 
 #[cfg(feature = "record")]
-fn load_pairer_max_pending_per_side() -> usize {
-    env_usize("KIKO_PAIRER_MAX_PENDING_PER_SIDE")
-        .unwrap_or(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE)
-        .max(1)
+fn load_pairer_max_pending_per_side() -> PendingFramesCapacity {
+    let raw = env_usize("KIKO_PAIRER_MAX_PENDING_PER_SIDE")
+        .unwrap_or(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE);
+    match PendingFramesCapacity::try_from(raw) {
+        Ok(capacity) => capacity,
+        Err(err) => {
+            eprintln!("invalid pairer capacity from env ({err}); using default");
+            PendingFramesCapacity::try_from(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE)
+                .expect("default pairer capacity")
+        }
+    }
 }
 
 #[cfg(feature = "record")]
@@ -1084,7 +1241,6 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pairing_window = load_pairing_window()?;
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
-    let read_timeout_ms = load_oak_read_timeout_ms();
     let read_timeout_ms = load_oak_read_timeout_ms();
     let start = Instant::now();
 
@@ -1153,13 +1309,19 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        while let Some(pair) = pairer.next_pair()? {
-            writer.write_frame(pair.left());
-            writer.write_frame(pair.right());
-            pair_count += 1;
+        loop {
+            match pairer.next_outcome()? {
+                PairingOutcome::Produced(pair) => {
+                    writer.write_frame(pair.left());
+                    writer.write_frame(pair.right());
+                    pair_count += 1;
 
-            if pair_count % 30 == 0 {
-                eprintln!("captured {pair_count} stereo pairs");
+                    if pair_count % 30 == 0 {
+                        eprintln!("captured {pair_count} stereo pairs");
+                    }
+                }
+                PairingOutcome::Dropped { .. } => continue,
+                PairingOutcome::Waiting => break,
             }
         }
 
@@ -1188,7 +1350,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "pairer stats: window_ns={} max_pending_per_side={} paired={} dropped_left={} dropped_right={} outside_window={}",
         pairer.window().as_ns(),
-        pairer.max_pending_per_side(),
+        pairer.max_pending_per_side().get(),
         pairer_stats.paired,
         pairer_stats.dropped_left,
         pairer_stats.dropped_right,
@@ -1300,6 +1462,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pairing_window = load_pairing_window()?;
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
+    let read_timeout_ms = load_oak_read_timeout_ms();
 
     let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH").unwrap_or(12);
     let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
@@ -1347,7 +1510,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         depth_enabled,
         depth_queue_depth,
         pairer.window().as_ns(),
-        pairer.max_pending_per_side()
+        pairer.max_pending_per_side().get()
     );
 
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
@@ -1545,10 +1708,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        while let Some(pair) = pairer.next_pair()? {
-            if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
-                running.store(false, Ordering::SeqCst);
-                break 'capture;
+        loop {
+            match pairer.next_outcome()? {
+                PairingOutcome::Produced(pair) => {
+                    if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
+                        running.store(false, Ordering::SeqCst);
+                        break 'capture;
+                    }
+                }
+                PairingOutcome::Dropped { .. } => continue,
+                PairingOutcome::Waiting => break,
             }
         }
 
@@ -1582,27 +1751,33 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pair_snapshot = pair_stats.snapshot();
     let viz_snapshot = viz_stats.snapshot();
     eprintln!(
-        "pair queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+        "pair queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}, current_depth={}, max_depth={}",
         pair_snapshot.enqueued,
         pair_snapshot.dropped_oldest,
         pair_snapshot.dropped_newest,
-        pair_snapshot.disconnected
+        pair_snapshot.disconnected,
+        pair_snapshot.current_depth,
+        pair_snapshot.max_depth
     );
     eprintln!(
-        "viz queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+        "viz queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}, current_depth={}, max_depth={}",
         viz_snapshot.enqueued,
         viz_snapshot.dropped_oldest,
         viz_snapshot.dropped_newest,
-        viz_snapshot.disconnected
+        viz_snapshot.disconnected,
+        viz_snapshot.current_depth,
+        viz_snapshot.max_depth
     );
     if let Some(depth_stats_handle) = depth_stats_handle {
         let depth_snapshot = depth_stats_handle.snapshot();
         eprintln!(
-            "depth queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+            "depth queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}, current_depth={}, max_depth={}",
             depth_snapshot.enqueued,
             depth_snapshot.dropped_oldest,
             depth_snapshot.dropped_newest,
-            depth_snapshot.disconnected
+            depth_snapshot.disconnected,
+            depth_snapshot.current_depth,
+            depth_snapshot.max_depth
         );
     }
     let pairer_stats = pairer.stats();
@@ -1771,10 +1946,11 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_ba_config, build_tracker_config, TrackerDefaults};
+    use super::{build_ba_config, build_tracker_config, summarize_bench, BenchAccum, TrackerDefaults};
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1890,7 +2066,10 @@ mod tests {
         .expect("tracker config");
 
         let loop_cfg = match config.loop_subsystem {
-            LoopSubsystemConfig::Enabled { loop_closure, .. } => loop_closure,
+            LoopSubsystemConfig::LoopClosureOnly { loop_closure, .. }
+            | LoopSubsystemConfig::LoopClosureAndRelocalization { loop_closure, .. } => {
+                loop_closure
+            }
             LoopSubsystemConfig::Disabled => panic!("loop subsystem should be enabled"),
         };
         assert!((loop_cfg.similarity_threshold() - 0.80).abs() < 1e-6);
@@ -1932,5 +2111,34 @@ mod tests {
         );
 
         restore_env(key, saved);
+    }
+
+    #[test]
+    fn summarize_bench_reports_exact_stage_metrics() {
+        let accum = BenchAccum {
+            read_samples: 4,
+            processed: 3,
+            matches_nonzero: 2,
+            total_matches: 12,
+            sum_read_left: Duration::from_millis(20),
+            sum_read_right: Duration::from_millis(20),
+            sum_pairing: Duration::from_millis(10),
+            sum_read_bytes: 8 * 1024 * 1024,
+            sum_sp_left: Duration::from_millis(9),
+            sum_sp_right: Duration::from_millis(12),
+            sum_lightglue: Duration::from_millis(15),
+            sum_total_success: Duration::from_millis(45),
+            sum_inference_attempt: Duration::from_millis(60),
+            ..BenchAccum::default()
+        };
+        let summary = summarize_bench(&accum, Duration::from_secs(2));
+
+        assert!((summary.wall_fps - 1.5).abs() < 1e-9);
+        assert!((summary.reader_stage_fps - 80.0).abs() < 1e-9);
+        assert!((summary.inference_attempt_fps - (4.0 / 0.06)).abs() < 1e-9);
+        assert!((summary.successful_inference_fps - (3.0 / 0.045)).abs() < 1e-9);
+        assert!((summary.match_rate - (2.0 / 3.0)).abs() < 1e-9);
+        assert!((summary.avg_matches_per_processed_pair - 4.0).abs() < 1e-9);
+        assert!((summary.avg_matches_per_nonzero_pair - 6.0).abs() < 1e-9);
     }
 }

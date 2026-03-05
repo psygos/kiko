@@ -1,6 +1,7 @@
 use crate::{
     BaResult, ComponentHealth, DegradationLevel, DiagnosticEvent, FrameDiagnostics,
-    LoopClosureRejectReason, RerunSink, SystemHealth, Timestamp, TrackingHealth, VizLogError,
+    KeyframeStatus, LoopClosureRejectReason, LoopClosureStatus, RerunSink, SystemHealth,
+    Timestamp, TrackingHealth, VizLogError,
 };
 
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
@@ -71,11 +72,19 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     scalars.push((PATH_LOOP_CANDIDATES, diag.loop_candidate_count as f64));
     scalars.push((
         PATH_TRACKING_KEYFRAME_CREATED,
-        if diag.keyframe_created { 1.0 } else { 0.0 },
+        if diag.keyframe_status == Some(KeyframeStatus::Created) {
+            1.0
+        } else {
+            0.0
+        },
     ));
     scalars.push((
         PATH_LOOP_APPLIED,
-        if diag.loop_closure_applied { 1.0 } else { 0.0 },
+        if diag.loop_closure_status == Some(LoopClosureStatus::Applied) {
+            1.0
+        } else {
+            0.0
+        },
     ));
 
     if let Some(v) = diag.inlier_ratio {

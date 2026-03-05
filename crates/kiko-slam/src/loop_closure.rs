@@ -661,28 +661,6 @@ pub fn match_descriptors_for_loop(
     }
 }
 
-fn brute_force_best_match(
-    source_len: usize,
-    target_len: usize,
-    similarity_fn: impl Fn(usize, usize) -> f32,
-    threshold: f32,
-) -> Vec<Option<(usize, f32)>> {
-    (0..source_len)
-        .map(|src| {
-            let mut best = threshold;
-            let mut best_target = None;
-            for tgt in 0..target_len {
-                let sim = similarity_fn(src, tgt);
-                if sim >= best {
-                    best = sim;
-                    best_target = Some((tgt, sim));
-                }
-            }
-            best_target
-        })
-        .collect()
-}
-
 pub fn try_match_descriptors_for_loop(
     query_descriptors: &[Descriptor],
     candidate_kf: KeyframeId,
@@ -708,37 +686,53 @@ pub(crate) fn match_quantized_descriptors_for_loop(
         return Ok(Vec::new());
     }
 
-    let candidate_descriptors = map.keyframe_point_descriptors(candidate_kf)?;
-    if candidate_descriptors.is_empty() {
+    let mut candidate_count = 0usize;
+    map.for_each_keyframe_point_descriptor(candidate_kf, |_, _| {
+        candidate_count = candidate_count.saturating_add(1);
+    })?;
+    if candidate_count == 0 {
         return Ok(Vec::new());
     }
 
-    let query_best = brute_force_best_match(
-        query_quantized.len(),
-        candidate_descriptors.len(),
-        |qi, ci| query_quantized[qi].cosine_similarity(&candidate_descriptors[ci].1),
-        similarity_threshold,
-    );
-
-    let candidate_best = brute_force_best_match(
-        candidate_descriptors.len(),
-        query_quantized.len(),
-        |ci, qi| query_quantized[qi].cosine_similarity(&candidate_descriptors[ci].1),
-        similarity_threshold,
-    );
+    let mut query_best: Vec<Option<(usize, f32)>> = vec![None; query_quantized.len()];
+    map.for_each_keyframe_point_descriptor(candidate_kf, |keypoint, descriptor| {
+        for (query_idx, query_descriptor) in query_quantized.iter().enumerate() {
+            let similarity = query_descriptor.cosine_similarity(descriptor);
+            if similarity < similarity_threshold {
+                continue;
+            }
+            match &mut query_best[query_idx] {
+                Some((_, best_similarity)) if *best_similarity >= similarity => {}
+                slot => {
+                    *slot = Some((keypoint.index(), similarity));
+                }
+            }
+        }
+    })?;
 
     let mut correspondences = Vec::new();
-    for (query_idx, best) in query_best.iter().enumerate() {
-        let Some((candidate_pos, _)) = best else {
-            continue;
-        };
-        let Some((back_query_idx, _)) = candidate_best[*candidate_pos] else {
-            continue;
-        };
-        if back_query_idx == query_idx {
-            correspondences.push((query_idx, candidate_descriptors[*candidate_pos].0.index()));
+    map.for_each_keyframe_point_descriptor(candidate_kf, |keypoint, descriptor| {
+        let mut best_query: Option<(usize, f32)> = None;
+        for (query_idx, query_descriptor) in query_quantized.iter().enumerate() {
+            let similarity = query_descriptor.cosine_similarity(descriptor);
+            if similarity < similarity_threshold {
+                continue;
+            }
+            match best_query {
+                Some((_, best_similarity)) if best_similarity >= similarity => {}
+                _ => best_query = Some((query_idx, similarity)),
+            }
         }
-    }
+        let Some((query_idx, _)) = best_query else {
+            return;
+        };
+        let Some((best_candidate_index, _)) = query_best[query_idx] else {
+            return;
+        };
+        if best_candidate_index == keypoint.index() {
+            correspondences.push((query_idx, keypoint.index()));
+        }
+    })?;
     Ok(correspondences)
 }
 

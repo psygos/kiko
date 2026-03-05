@@ -296,12 +296,14 @@ pub fn solve_pnp_ransac(
     let mut rng = XorShift64::new(config.seed);
     let mut best_pose = None;
     let mut best_inliers: Vec<usize> = Vec::new();
+    let mut candidate_inliers = Vec::with_capacity(observations.len());
 
     let mut iterations = 0usize;
     let total = observations.len();
+    let mut target_iterations = config.max_iterations.max(1);
 
     let threshold_sq = config.reprojection_threshold_px * config.reprojection_threshold_px;
-    while iterations < config.max_iterations {
+    while iterations < target_iterations {
         iterations += 1;
         let sample = sample_three(&mut rng, total);
         let Some([a, b, c]) = sample else { continue };
@@ -313,18 +315,27 @@ pub fn solve_pnp_ransac(
         }
 
         for pose in candidates {
-            let mut inliers = Vec::new();
+            candidate_inliers.clear();
             for (idx, obs) in observations.iter().enumerate() {
                 if let Some(err_sq) = reprojection_error_sq_px(pose, obs, intrinsics) {
                     if err_sq <= threshold_sq {
-                        inliers.push(idx);
+                        candidate_inliers.push(idx);
                     }
                 }
             }
 
-            if inliers.len() > best_inliers.len() {
-                best_inliers = inliers;
+            if candidate_inliers.len() > best_inliers.len() {
+                best_inliers.clear();
+                best_inliers.extend(candidate_inliers.iter().copied());
                 best_pose = Some(pose);
+                target_iterations = target_iterations.min(adaptive_ransac_iterations(
+                    best_inliers.len(),
+                    total,
+                    RANSAC_CONFIDENCE,
+                ));
+                if best_inliers.len() == total {
+                    break;
+                }
             }
         }
     }
@@ -334,9 +345,17 @@ pub fn solve_pnp_ransac(
         return Err(PnpError::NoSolution);
     }
 
+    let refined_pose = refine_pose_on_inliers(pose, observations, intrinsics, &best_inliers);
+    let refined_inliers = collect_inliers(refined_pose, observations, intrinsics, threshold_sq);
+    let (pose, inliers) = if refined_inliers.len() >= config.min_inliers {
+        (refined_pose, refined_inliers)
+    } else {
+        (pose, best_inliers)
+    };
+
     Ok(PnpResult {
         pose,
-        inliers: best_inliers,
+        inliers,
         iterations,
     })
 }
@@ -349,6 +368,107 @@ pub fn solve_pnp(
 ) -> Result<PnpResult, PnpError> {
     let observations = build_observations(keyframe, matches, intrinsics)?;
     solve_pnp_ransac(&observations, intrinsics, config)
+}
+
+fn adaptive_ransac_iterations(inlier_count: usize, total: usize, confidence: f32) -> usize {
+    if inlier_count == 0 || total == 0 {
+        return usize::MAX;
+    }
+    let inlier_ratio = (inlier_count as f32 / total as f32).clamp(0.0, 1.0);
+    let sample_success = inlier_ratio.powi(3);
+    if sample_success >= 1.0 {
+        return 1;
+    }
+    if sample_success <= 0.0 {
+        return usize::MAX;
+    }
+    let numerator = (1.0 - confidence).ln();
+    let denominator = (1.0 - sample_success).ln();
+    if !numerator.is_finite() || !denominator.is_finite() || denominator >= 0.0 {
+        return usize::MAX;
+    }
+    (numerator / denominator).ceil().max(1.0) as usize
+}
+
+fn collect_inliers(
+    pose: Pose,
+    observations: &[Observation],
+    intrinsics: PinholeIntrinsics,
+    threshold_sq: f32,
+) -> Vec<usize> {
+    let mut inliers = Vec::with_capacity(observations.len());
+    for (idx, obs) in observations.iter().enumerate() {
+        if let Some(err_sq) = reprojection_error_sq_px(pose, obs, intrinsics) {
+            if err_sq <= threshold_sq {
+                inliers.push(idx);
+            }
+        }
+    }
+    inliers
+}
+
+fn refine_pose_on_inliers(
+    initial_pose: Pose,
+    observations: &[Observation],
+    intrinsics: PinholeIntrinsics,
+    inlier_indices: &[usize],
+) -> Pose {
+    let mut pose = initial_pose;
+    let mut hessian = [0.0_f32; 36];
+    let mut rhs = [0.0_f32; 6];
+
+    for _ in 0..PNP_REFINEMENT_ITERS {
+        hessian.fill(0.0);
+        rhs.fill(0.0);
+
+        for &idx in inlier_indices {
+            let Some(obs) = observations.get(idx) else {
+                continue;
+            };
+            let Some((residual, jacobian)) =
+                crate::local_ba::reprojection_residual_and_jacobian(pose, obs, intrinsics)
+            else {
+                continue;
+            };
+
+            for row in 0..6 {
+                rhs[row] -= jacobian[0][row] * residual[0] + jacobian[1][row] * residual[1];
+                for col in 0..6 {
+                    hessian[row * 6 + col] +=
+                        jacobian[0][row] * jacobian[0][col]
+                            + jacobian[1][row] * jacobian[1][col];
+                }
+            }
+        }
+
+        for axis in 0..6 {
+            hessian[axis * 6 + axis] += PNP_REFINEMENT_DAMPING;
+        }
+
+        let mut hessian_vec = hessian.to_vec();
+        let mut rhs_vec = rhs.to_vec();
+        if !crate::local_ba::solve_linear_system(&mut hessian_vec, &mut rhs_vec, 6) {
+            break;
+        }
+
+        let delta = [
+            rhs_vec[0], rhs_vec[1], rhs_vec[2], rhs_vec[3], rhs_vec[4], rhs_vec[5],
+        ];
+        let step_norm =
+            (delta[0] * delta[0]
+                + delta[1] * delta[1]
+                + delta[2] * delta[2]
+                + delta[3] * delta[3]
+                + delta[4] * delta[4]
+                + delta[5] * delta[5])
+                .sqrt();
+        pose = crate::local_ba::apply_se3_delta(pose, delta);
+        if step_norm < PNP_REFINEMENT_STEP_EPS {
+            break;
+        }
+    }
+
+    pose
 }
 
 fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
@@ -577,6 +697,14 @@ const MAX_ROOT_ITERATIONS: usize = 64;
 const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
 /// Tolerance for accepting a P3P equation evaluation as a valid root.
 const P3P_ROOT_TOLERANCE: f32 = 1e-3;
+/// Target confidence used to adaptively shorten RANSAC once a strong model exists.
+const RANSAC_CONFIDENCE: f32 = 0.99;
+/// Number of nonlinear pose-only refinement steps on the best inlier set.
+const PNP_REFINEMENT_ITERS: usize = 8;
+/// Damping added to the normal equations during PnP pose refinement.
+const PNP_REFINEMENT_DAMPING: f32 = 1e-4;
+/// Convergence threshold for PnP pose refinement.
+const PNP_REFINEMENT_STEP_EPS: f32 = 1e-5;
 
 fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let mut coeffs: Vec<f64> = coeffs.into();
@@ -1051,6 +1179,29 @@ mod tests {
         assert!(
             trans_err < 0.18,
             "translation error too high with outliers: {trans_err}"
+        );
+    }
+
+    #[test]
+    fn refine_pose_on_inliers_reduces_reprojection_rmse() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let world = synthetic_world_points();
+        let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
+        let observations =
+            observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
+        let inlier_indices: Vec<usize> = (0..observations.len()).collect();
+
+        let initial = axis_angle_pose([0.23, -0.08, 0.33], [0.10, -0.04, 0.02]);
+        let initial_errors = reprojection_errors(&initial, &observations, intrinsics);
+        let refined = refine_pose_on_inliers(initial, &observations, intrinsics, &inlier_indices);
+        let refined_errors = reprojection_errors(&refined, &observations, intrinsics);
+
+        let initial_rmse = reprojection_rmse(&initial_errors).expect("initial rmse");
+        let refined_rmse = reprojection_rmse(&refined_errors).expect("refined rmse");
+        assert!(
+            refined_rmse < initial_rmse,
+            "expected refinement to improve reprojection error: initial={initial_rmse}, refined={refined_rmse}"
         );
     }
 

@@ -249,7 +249,7 @@ impl PoseGraphOptimizer {
                 self.config.pcg_tol,
             )?;
             last_residual_norm = pcg.residual_norm;
-            if !pcg.converged && iter + 1 == self.config.max_iterations {
+            if !pcg.converged() && iter + 1 == self.config.max_iterations {
                 eprintln!(
                     "pose graph PCG did not converge (iters={}, residual_norm={:.3e})",
                     pcg.iterations, pcg.residual_norm

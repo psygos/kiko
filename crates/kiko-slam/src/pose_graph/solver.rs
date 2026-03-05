@@ -1,10 +1,24 @@
 use super::{BlockCsr6x6, PoseGraphError, NEAR_ZERO};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcgStopReason {
+    Converged,
+    NearZeroDenominator,
+    NearZeroPreconditionedResidual,
+    IterationLimit,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PcgResult {
     pub iterations: usize,
     pub residual_norm: f64,
-    pub converged: bool,
+    pub stop_reason: PcgStopReason,
+}
+
+impl PcgResult {
+    pub fn converged(self) -> bool {
+        matches!(self.stop_reason, PcgStopReason::Converged)
+    }
 }
 
 pub fn solve_pcg(
@@ -45,7 +59,7 @@ pub fn solve_pcg(
         return Ok(PcgResult {
             iterations: 0,
             residual_norm,
-            converged: true,
+            stop_reason: PcgStopReason::Converged,
         });
     }
 
@@ -57,7 +71,7 @@ pub fn solve_pcg(
             return Ok(PcgResult {
                 iterations: iter,
                 residual_norm,
-                converged: false,
+                stop_reason: PcgStopReason::NearZeroDenominator,
             });
         }
 
@@ -73,7 +87,7 @@ pub fn solve_pcg(
             return Ok(PcgResult {
                 iterations: iter + 1,
                 residual_norm,
-                converged: true,
+                stop_reason: PcgStopReason::Converged,
             });
         }
 
@@ -83,7 +97,7 @@ pub fn solve_pcg(
             return Ok(PcgResult {
                 iterations: iter + 1,
                 residual_norm,
-                converged: false,
+                stop_reason: PcgStopReason::NearZeroPreconditionedResidual,
             });
         }
         let beta = rz_new / rz_old;
@@ -96,7 +110,7 @@ pub fn solve_pcg(
     Ok(PcgResult {
         iterations: max_iters,
         residual_norm,
-        converged: false,
+        stop_reason: PcgStopReason::IterationLimit,
     })
 }
 
