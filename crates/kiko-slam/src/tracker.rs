@@ -2421,7 +2421,7 @@ impl SlamTracker {
             }
         };
 
-        let observations = match build_map_observations(
+        let tracked_observations = match build_map_observations(
             &self.map,
             keyframe_id,
             &verified,
@@ -2450,14 +2450,18 @@ impl SlamTracker {
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
-        let result = match solve_pnp_ransac(&observations, self.intrinsics, self.config.ransac) {
+        let result = match solve_pnp_ransac(
+            &tracked_observations.observations,
+            self.intrinsics,
+            self.config.ransac,
+        ) {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
                 if self.trace_transitions {
                     eprintln!(
                         "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={}",
                         frame_id.as_u64(),
-                        observations.len(),
+                        tracked_observations.len(),
                         matches.len(),
                         verified.len()
                     );
@@ -2467,7 +2471,7 @@ impl SlamTracker {
                 let mut diagnostics = self.empty_diagnostics();
                 diagnostics.features_detected = Some(current.len());
                 diagnostics.features_matched = Some(matches.len());
-                diagnostics.pnp_observations = Some(observations.len());
+                diagnostics.pnp_observations = Some(tracked_observations.len());
                 diagnostics.tracking_time = Some(tracking_start.elapsed());
                 return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
             }
@@ -2476,11 +2480,19 @@ impl SlamTracker {
 
         let mut map_observations = Vec::with_capacity(result.inliers.len());
         for &idx in &result.inliers {
-            let (ci, ki) = *verified.indices().get(idx).ok_or(TrackerError::Inference(
-                InferenceError::InvariantViolation {
-                    context: "verified match index out of bounds",
-                },
-            ))?;
+            let verified_idx = *tracked_observations
+                .verified_match_indices
+                .get(idx)
+                .ok_or(TrackerError::Inference(InferenceError::InvariantViolation {
+                    context: "tracked observation index out of bounds",
+                }))?;
+            let (ci, ki) =
+                *verified
+                    .indices()
+                    .get(verified_idx)
+                    .ok_or(TrackerError::Inference(InferenceError::InvariantViolation {
+                        context: "verified match index out of bounds",
+                    }))?;
             let pixel = *current.keypoints().get(ci).ok_or(TrackerError::Inference(
                 InferenceError::InvariantViolation {
                     context: "current keypoint index out of bounds",
@@ -2490,7 +2502,12 @@ impl SlamTracker {
             map_observations.push(MapObservation::new(keypoint_ref, pixel));
         }
 
-        let parallax_px = median_parallax_px(&verified, &result.inliers, keyframe);
+        let parallax_px = median_parallax_px(
+            &verified,
+            &tracked_observations.verified_match_indices,
+            &result.inliers,
+            keyframe,
+        );
         let covisibility = if keyframe.landmarks().is_empty() {
             0.0
         } else {
@@ -2521,7 +2538,12 @@ impl SlamTracker {
 
         if should_refresh {
             let new_pose = pose_world;
-            let shared = build_shared_matches(keyframe_id, &verified, &result.inliers);
+            let shared = build_shared_matches(
+                keyframe_id,
+                &verified,
+                &tracked_observations.verified_match_indices,
+                &result.inliers,
+            );
             if let Ok((keyframe_output, keyframe_id)) = self.create_keyframe_internal(
                 left,
                 right,
@@ -2644,15 +2666,15 @@ impl SlamTracker {
         let inlier_observations: Vec<_> = result
             .inliers
             .iter()
-            .filter_map(|&idx| observations.get(idx).copied())
+            .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
             .collect();
         let inlier_errors =
             crate::pnp::reprojection_errors(&pose_world, &inlier_observations, self.intrinsics);
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.inlier_ratio =
-            Some(result.inliers.len() as f32 / observations.len().max(1) as f32);
-        diagnostics.pnp_observations = Some(observations.len());
+            Some(result.inliers.len() as f32 / tracked_observations.len().max(1) as f32);
+        diagnostics.pnp_observations = Some(tracked_observations.len());
         diagnostics.ransac_iterations = Some(result.iterations);
         diagnostics.reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors);
         diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors);
@@ -2937,11 +2959,15 @@ fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
 fn build_shared_matches(
     keyframe_id: KeyframeId,
     matches: &Matches<Verified>,
+    verified_match_indices: &[usize],
     inliers: &[usize],
 ) -> SharedMatches {
     let mut pairs = Vec::with_capacity(inliers.len());
     for &idx in inliers {
-        if let Some(&(ci, ki)) = matches.indices().get(idx) {
+        let Some(&verified_idx) = verified_match_indices.get(idx) else {
+            continue;
+        };
+        if let Some(&(ci, ki)) = matches.indices().get(verified_idx) {
             pairs.push((ci, ki));
         }
     }
@@ -3220,17 +3246,29 @@ fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
     info
 }
 
+struct TrackedMapObservations {
+    observations: Vec<crate::Observation>,
+    verified_match_indices: Vec<usize>,
+}
+
+impl TrackedMapObservations {
+    fn len(&self) -> usize {
+        self.observations.len()
+    }
+}
+
 fn build_map_observations(
     map: &SlamMap,
     keyframe_id: KeyframeId,
     matches: &Matches<Verified>,
     current: &Detections,
     intrinsics: PinholeIntrinsics,
-) -> Result<Vec<crate::Observation>, crate::PnpError> {
+) -> Result<TrackedMapObservations, crate::PnpError> {
     let mut observations = Vec::with_capacity(matches.len());
+    let mut verified_match_indices = Vec::with_capacity(matches.len());
     let current_len = current.len();
 
-    for &(ci, ki) in matches.indices() {
+    for (verified_match_idx, &(ci, ki)) in matches.indices().iter().enumerate() {
         if ci >= current_len {
             return Err(crate::PnpError::IndexOutOfBounds {
                 current_len,
@@ -3252,6 +3290,7 @@ fn build_map_observations(
         let pixel = current.keypoints()[ci];
         let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
         observations.push(obs);
+        verified_match_indices.push(verified_match_idx);
     }
 
     if observations.len() < MIN_PNP_CORRESPONDENCES {
@@ -3260,11 +3299,15 @@ fn build_map_observations(
             actual: observations.len(),
         });
     }
-    Ok(observations)
+    Ok(TrackedMapObservations {
+        observations,
+        verified_match_indices,
+    })
 }
 
 fn median_parallax_px(
     matches: &Matches<Verified>,
+    verified_match_indices: &[usize],
     inliers: &[usize],
     keyframe: &Keyframe,
 ) -> Option<f32> {
@@ -3277,7 +3320,10 @@ fn median_parallax_px(
     let mut parallax = Vec::with_capacity(inliers.len());
 
     for &idx in inliers {
-        let Some(&(li, ki)) = matches.indices().get(idx) else {
+        let Some(&verified_idx) = verified_match_indices.get(idx) else {
+            continue;
+        };
+        let Some(&(li, ki)) = matches.indices().get(verified_idx) else {
             continue;
         };
         let (Some(left), Some(key)) = (left_kps.get(li), key_kps.get(ki)) else {
@@ -3400,6 +3446,123 @@ mod tests {
             )
             .expect("map point");
         (map, keyframe_id, point_id)
+    }
+
+    #[test]
+    fn build_map_observations_preserves_verified_match_indices_after_filtering() {
+        let keypoints = vec![
+            Keypoint { x: 80.0, y: 70.0 },
+            Keypoint { x: 95.0, y: 72.0 },
+            Keypoint { x: 110.0, y: 75.0 },
+            Keypoint { x: 125.0, y: 78.0 },
+            Keypoint { x: 140.0, y: 82.0 },
+        ];
+        let scores = vec![1.0; keypoints.len()];
+        let descriptors = vec![make_descriptor(); keypoints.len()];
+        let keyframe_detections = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(40),
+                320,
+                240,
+                keypoints.clone(),
+                scores.clone(),
+                descriptors.clone(),
+            )
+            .expect("keyframe detections"),
+        );
+        let keyframe = Keyframe::from_arc(
+            Arc::clone(&keyframe_detections),
+            vec![
+                Point3 {
+                    x: -0.2,
+                    y: -0.1,
+                    z: 3.0,
+                },
+                Point3 {
+                    x: -0.1,
+                    y: -0.1,
+                    z: 3.1,
+                },
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 3.2,
+                },
+                Point3 {
+                    x: 0.1,
+                    y: 0.1,
+                    z: 3.3,
+                },
+                Point3 {
+                    x: 0.2,
+                    y: 0.2,
+                    z: 3.4,
+                },
+            ],
+            vec![0, 1, 2, 3, 4],
+        )
+        .expect("keyframe");
+
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe_from_detections(
+                keyframe.detections().as_ref(),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+            )
+            .expect("map keyframe");
+
+        for &det_idx in &[0_usize, 2, 3, 4] {
+            let keypoint_ref = map
+                .keyframe_keypoint(keyframe_id, det_idx)
+                .expect("keypoint ref");
+            map.add_map_point(
+                keyframe
+                    .landmark_for_detection(det_idx)
+                    .expect("landmark for detection"),
+                make_descriptor().quantize(),
+                keypoint_ref,
+            )
+            .expect("map point");
+        }
+
+        let current = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(41),
+                320,
+                240,
+                keypoints,
+                scores,
+                descriptors,
+            )
+            .expect("current detections"),
+        );
+        let matches = Matches::new(
+            Arc::clone(&current),
+            Arc::clone(&keyframe_detections),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
+            vec![1.0; 5],
+        )
+        .expect("matches");
+        let verified = matches.with_landmarks(&keyframe).expect("verified matches");
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
+            320, 240, 300.0, 300.0, 160.0, 120.0,
+        )
+        .expect("intrinsics");
+
+        let tracked = build_map_observations(
+            &map,
+            keyframe_id,
+            &verified,
+            current.as_ref(),
+            intrinsics,
+        )
+        .expect("tracked observations");
+
+        assert_eq!(tracked.observations.len(), 4);
+        assert_eq!(tracked.verified_match_indices, vec![0, 2, 3, 4]);
     }
 
     fn make_map_with_two_keyframes_one_shared_point() -> (SlamMap, KeyframeId, KeyframeId) {
