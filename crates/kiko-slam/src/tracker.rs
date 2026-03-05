@@ -16,9 +16,9 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
 use crate::loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, KeyframeDatabase,
-    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, PlaceMatch,
-    RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
+    aggregate_global_descriptor, match_quantized_descriptors_for_loop, DescriptorSource,
+    KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError,
+    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
@@ -1901,15 +1901,28 @@ impl SlamTracker {
         let Some(pending) = self.pending_loop.take() else {
             return Ok(None);
         };
+        let query_quantized: Vec<_> = pending
+            .detections
+            .descriptors()
+            .iter()
+            .map(crate::Descriptor::quantize)
+            .collect();
 
         let mut first_error: Option<LoopDetectError> = None;
         for candidate in pending.candidates {
-            let correspondences = match_descriptors_for_loop(
-                pending.detections.descriptors(),
+            let correspondences = match_quantized_descriptors_for_loop(
+                &query_quantized,
                 candidate.candidate,
                 &self.map,
                 config.descriptor_match_threshold(),
-            );
+            )
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "loop descriptor matching skipped for candidate {:?}: {err}",
+                    candidate.candidate
+                );
+                Vec::new()
+            });
 
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 if first_error.is_none() {
@@ -2236,13 +2249,25 @@ impl SlamTracker {
     ) -> Option<crate::loop_closure::VerifiedRelocalization> {
         let global_descriptor = aggregate_global_descriptor(current.descriptors()).ok()?;
         let candidates = loop_db.query_for_relocalization(&global_descriptor, cfg.max_candidates());
+        let query_quantized: Vec<_> = current
+            .descriptors()
+            .iter()
+            .map(crate::Descriptor::quantize)
+            .collect();
         for candidate in candidates {
-            let correspondences = match_descriptors_for_loop(
-                current.descriptors(),
+            let correspondences = match_quantized_descriptors_for_loop(
+                &query_quantized,
                 candidate.candidate,
                 &self.map,
                 cfg.descriptor_match_threshold(),
-            );
+            )
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "relocalization descriptor matching skipped for candidate {:?}: {err}",
+                    candidate.candidate
+                );
+                Vec::new()
+            });
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 continue;
             }

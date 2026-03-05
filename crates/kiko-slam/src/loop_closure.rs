@@ -645,8 +645,14 @@ pub fn match_descriptors_for_loop(
     map: &SlamMap,
     similarity_threshold: f32,
 ) -> Vec<(usize, usize)> {
-    match try_match_descriptors_for_loop(query_descriptors, candidate_kf, map, similarity_threshold)
-    {
+    let query_quantized: Vec<CompactDescriptor> =
+        query_descriptors.iter().map(Descriptor::quantize).collect();
+    match match_quantized_descriptors_for_loop(
+        &query_quantized,
+        candidate_kf,
+        map,
+        similarity_threshold,
+    ) {
         Ok(correspondences) => correspondences,
         Err(err) => {
             eprintln!("loop descriptor matching skipped for candidate {candidate_kf:?}: {err}");
@@ -683,7 +689,18 @@ pub fn try_match_descriptors_for_loop(
     map: &SlamMap,
     similarity_threshold: f32,
 ) -> Result<Vec<(usize, usize)>, MapError> {
-    if query_descriptors.is_empty()
+    let query_quantized: Vec<CompactDescriptor> =
+        query_descriptors.iter().map(Descriptor::quantize).collect();
+    match_quantized_descriptors_for_loop(&query_quantized, candidate_kf, map, similarity_threshold)
+}
+
+pub(crate) fn match_quantized_descriptors_for_loop(
+    query_quantized: &[CompactDescriptor],
+    candidate_kf: KeyframeId,
+    map: &SlamMap,
+    similarity_threshold: f32,
+) -> Result<Vec<(usize, usize)>, MapError> {
+    if query_quantized.is_empty()
         || !similarity_threshold.is_finite()
         || similarity_threshold <= 0.0
         || similarity_threshold > 1.0
@@ -695,9 +712,6 @@ pub fn try_match_descriptors_for_loop(
     if candidate_descriptors.is_empty() {
         return Ok(Vec::new());
     }
-
-    let query_quantized: Vec<CompactDescriptor> =
-        query_descriptors.iter().map(Descriptor::quantize).collect();
 
     let query_best = brute_force_best_match(
         query_quantized.len(),
