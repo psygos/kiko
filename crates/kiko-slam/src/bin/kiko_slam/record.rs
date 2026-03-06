@@ -10,11 +10,13 @@ use kiko_slam::dataset::{
 };
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    oak_to_depth_image, oak_to_frame, FrameId, PairingConfigError, PairingOutcome,
+    oak_to_depth_image, oak_to_frame, oak_to_imu_batch, FrameId, PairingConfigError,
+    PairingOutcome,
     PairingDropReason, PairingWindowNs, PendingFramesCapacity, SensorId, StereoPairer,
 };
 use oak_sys::{
-    DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig,
+    DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig,
+    QueueConfig,
 };
 
 use crate::args::CameraArgs;
@@ -49,18 +51,23 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         rectified: args.camera.rectified(),
     };
     let depth_enabled = env_bool("KIKO_RECORD_DEPTH").unwrap_or(false);
+    let imu_enabled = env_bool("KIKO_RECORD_IMU").unwrap_or(false);
     let depth_config = depth_enabled.then_some(DepthConfig {
         width: mono_config.width,
         height: mono_config.height,
         fps: mono_config.fps,
         align_to_rgb: false,
     });
+    let imu_config = imu_enabled.then_some(ImuConfig {
+        rate_hz: u32::try_from(env_usize("KIKO_RECORD_IMU_RATE_HZ").unwrap_or(400))
+            .unwrap_or(400),
+    });
 
     let config = DeviceConfig {
         rgb: None,
         mono: Some(mono_config),
         depth: depth_config,
-        imu: None,
+        imu: imu_config,
         queue: QueueConfig {
             size: 8,
             blocking: false,
@@ -71,7 +78,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut device = Device::connect("", config)?;
     let baseline_m = device.stereo_baseline_m();
 
-    let meta = build_meta(&mono_config, depth_config.as_ref(), None);
+    let meta = build_meta(&mono_config, depth_config.as_ref(), imu_config.as_ref());
     let calibration = build_calibration(&device, baseline_m, &mono_config);
 
     eprintln!("creating dataset at {}", output_path.display());
@@ -81,6 +88,8 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut left_count = 0u64;
     let mut right_count = 0u64;
     let mut depth_count = 0u64;
+    let mut imu_batch_count = 0u64;
+    let mut imu_sample_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
     let mut pending_capacity_left_drops = 0u64;
@@ -170,6 +179,30 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if imu_enabled {
+            match device.imu() {
+                Ok(samples) => match oak_to_imu_batch(samples) {
+                    Ok(batch) => {
+                        imu_sample_count = imu_sample_count.saturating_add(batch.len() as u64);
+                        imu_batch_count = imu_batch_count.saturating_add(1);
+                        writer.write_imu(&batch);
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("imu batch dropped (invalid values): {err}");
+                    }
+                },
+                Err(ImuError::Empty) => {}
+                Err(ImuError::Overflow { dropped }) => {
+                    eprintln!("imu overflow: dropped {dropped} samples");
+                }
+                Err(ImuError::Disconnected) => {
+                    eprintln!("imu error: disconnected");
+                    break;
+                }
+            }
+        }
+
         loop {
             match pairer.next_outcome()? {
                 PairingOutcome::Produced(pair) => {
@@ -196,7 +229,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     drop(writer);
     let stats = writer_handle.finish()?;
     eprintln!(
-        "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), written={}, dropped={}",
+        "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), imu_batches={} imu_samples={}, written={}, dropped={}",
         elapsed,
         pair_count,
         left_count,
@@ -205,6 +238,8 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         right_count as f64 / elapsed,
         depth_count,
         depth_count as f64 / elapsed,
+        imu_batch_count,
+        imu_sample_count,
         stats.frames_written,
         stats.frames_dropped
     );

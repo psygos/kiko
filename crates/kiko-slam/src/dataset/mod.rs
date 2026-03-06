@@ -5,13 +5,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, PairError, SensorId};
+use crate::{DepthImage, Frame, ImuBatch, PairError, SensorId};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
     pub const META_FILE: &str = "meta.json";
     pub const CALIBRATION_FILE: &str = "calibration.json";
     pub const MANIFEST_FILE: &str = "manifest.json";
+    pub const IMU_FILE: &str = "imu.bin";
     pub const FRAME_SUFFIX: &str = ".raw";
 
     pub fn frame_name(timestamp_ns: i64, sensor: &str) -> String {
@@ -176,6 +177,10 @@ pub enum DatasetError {
     PairingFailed {
         source: PairError,
     },
+    MissingImuSamples {
+        start_ns: Option<i64>,
+        end_ns: i64,
+    },
 }
 
 impl std::fmt::Display for DatasetError {
@@ -215,6 +220,12 @@ impl std::fmt::Display for DatasetError {
             }
             DatasetError::PairingFailed { source } => {
                 write!(f, "dataset pairing failed: {source}")
+            }
+            DatasetError::MissingImuSamples { start_ns, end_ns } => {
+                write!(
+                    f,
+                    "dataset missing imu samples for interval ({start_ns:?}, {end_ns}]"
+                )
             }
         }
     }
@@ -319,7 +330,7 @@ impl DatasetWriter {
 
         let handle = thread::Builder::new()
             .name("dataset-writer".to_string())
-            .spawn(move || writer_loop(frames_dir, state_for_thread))
+            .spawn(move || writer_loop(state_for_thread))
             .map_err(|e| DatasetError::ThreadSpawn { source: e })?;
 
         let writer = Self {
@@ -354,6 +365,18 @@ impl DatasetWriter {
             SpoolItem::Depth(depth.clone()),
             bytes,
             "depth image exceeds max_spool_bytes",
+        )
+    }
+
+    /// Enqueue a validated IMU batch according to the configured backpressure policy.
+    pub fn write_imu(&self, batch: &ImuBatch) -> WriteOutcome {
+        let bytes = batch
+            .len()
+            .saturating_mul(IMU_RECORD_BYTES);
+        self.write_item(
+            SpoolItem::Imu(batch.clone()),
+            bytes,
+            "imu batch exceeds max_spool_bytes",
         )
     }
 
@@ -468,6 +491,7 @@ impl DatasetWriterHandle {
 enum SpoolItem {
     Mono(Frame),
     Depth(DepthImage),
+    Imu(ImuBatch),
 }
 
 impl SpoolItem {
@@ -478,6 +502,7 @@ impl SpoolItem {
                 .depth_m()
                 .len()
                 .saturating_mul(std::mem::size_of::<f32>()),
+            SpoolItem::Imu(batch) => batch.len().saturating_mul(IMU_RECORD_BYTES),
         }
     }
 }
@@ -595,7 +620,9 @@ impl WriterState {
     }
 }
 
-fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
+const IMU_RECORD_BYTES: usize = std::mem::size_of::<i64>() + 6 * std::mem::size_of::<f64>();
+
+fn writer_loop(state: Arc<WriterState>) {
     loop {
         let batch = {
             let mut spool = state.spool.lock().unwrap_or_else(|err| err.into_inner());
@@ -633,7 +660,7 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
 
         for item in batch {
             let bytes = item.bytes_len() as u64;
-            if let Err(err) = write_item_to_dir(&frames_dir, item) {
+            if let Err(err) = write_item_to_dir(&state.frames_dir, &state.dataset_dir, item) {
                 state.write_failed.fetch_add(1, Ordering::Relaxed);
                 state.fail(err);
                 return;
@@ -644,10 +671,15 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
     }
 }
 
-fn write_item_to_dir(frames_dir: &Path, item: SpoolItem) -> Result<(), DatasetError> {
+fn write_item_to_dir(
+    frames_dir: &Path,
+    dataset_dir: &Path,
+    item: SpoolItem,
+) -> Result<(), DatasetError> {
     match item {
         SpoolItem::Mono(frame) => write_frame_to_dir(frames_dir, frame),
         SpoolItem::Depth(depth) => write_depth_to_dir(frames_dir, depth),
+        SpoolItem::Imu(batch) => write_imu_to_file(dataset_dir, &batch),
     }
 }
 
@@ -699,6 +731,32 @@ fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), Datase
     }
     std::fs::write(&path, bytes).map_err(|e| DatasetError::WriteFile { path, source: e })?;
     Ok(())
+}
+
+fn write_imu_to_file(dataset_dir: &Path, batch: &ImuBatch) -> Result<(), DatasetError> {
+    let path = dataset_dir.join(format::IMU_FILE);
+    let mut bytes = Vec::with_capacity(batch.len().saturating_mul(IMU_RECORD_BYTES));
+    for sample in batch.samples() {
+        bytes.extend_from_slice(&sample.timestamp().as_nanos().to_le_bytes());
+        for value in sample.accel_mps2() {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in sample.gyro_radps() {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| DatasetError::WriteFile {
+            path: path.clone(),
+            source,
+        })?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(|source| DatasetError::WriteFile {
+        path,
+        source,
+    })
 }
 
 fn sensor_to_str(id: SensorId) -> &'static str {

@@ -61,7 +61,7 @@ pub use loop_closure::{
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
 #[cfg(feature = "record")]
-pub use oak::{oak_to_depth_image, oak_to_frame};
+pub use oak::{oak_to_depth_image, oak_to_frame, oak_to_imu_batch, OakImuError};
 pub use pairing::{
     PairingConfigError, PairingDropReason, PairingOutcome, PairingStats, PairingWindowNs,
     PendingFramesCapacity, PendingFramesCapacityError, StereoPairer,

@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
+use crate::{
+    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, Frame, FrameError, FrameId, ImuBatch,
+    ImuSample, PairingWindowNs, SensorId, StereoPair, Timestamp,
+};
 
 use super::{
     format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
@@ -17,6 +20,7 @@ pub struct DatasetReader {
     pairing_window: PairingWindowNs,
     left_seq: u64,
     right_seq: u64,
+    imu_samples: Option<Box<[ImuSample]>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -40,6 +44,7 @@ impl DatasetReader {
         let meta = read_meta(&root)?;
         let calibration = read_calibration(&root)?;
         let manifest = read_manifest(&root)?;
+        let imu_samples = read_imu_samples(&root, &meta)?;
         let pairing_window = PairingWindowNs::new(manifest.header.pairing_window_ns as i64)
             .map_err(|_| DatasetError::InvalidConfig {
                 msg: "manifest pairing_window_ns must be > 0",
@@ -52,6 +57,7 @@ impl DatasetReader {
             pairing_window,
             left_seq: 0,
             right_seq: 0,
+            imu_samples,
         })
     }
 
@@ -88,6 +94,15 @@ impl DatasetReader {
         }
     }
 
+    pub fn bundles(&mut self) -> DatasetBundles<'_> {
+        DatasetBundles {
+            reader: self,
+            index: 0,
+            capture_seq: 0,
+            previous_capture_time: None,
+        }
+    }
+
     fn next_left_id(&mut self) -> FrameId {
         let id = self.left_seq;
         self.left_seq = self.left_seq.saturating_add(1);
@@ -99,6 +114,40 @@ impl DatasetReader {
         self.right_seq = self.right_seq.saturating_add(1);
         FrameId::new(id)
     }
+
+    fn imu_for_interval(&self, interval: CaptureInterval) -> Result<CaptureImu, DatasetError> {
+        let Some(samples) = self.imu_samples.as_deref() else {
+            return Ok(CaptureImu::Absent);
+        };
+
+        let start_idx = match interval.start_exclusive() {
+            Some(start) => {
+                samples.partition_point(|sample| sample.timestamp().as_nanos() <= start.as_nanos())
+            }
+            None => 0,
+        };
+        let end_idx = samples
+            .partition_point(|sample| sample.timestamp().as_nanos() <= interval.end_inclusive().as_nanos());
+
+        if start_idx == end_idx {
+            return Err(DatasetError::MissingImuSamples {
+                start_ns: interval
+                    .start_exclusive()
+                    .map(|timestamp| timestamp.as_nanos()),
+                end_ns: interval.end_inclusive().as_nanos(),
+            });
+        }
+
+        let batch = ImuBatch::new(samples[start_idx..end_idx].to_vec()).map_err(|_| {
+            DatasetError::MissingImuSamples {
+                start_ns: interval
+                    .start_exclusive()
+                    .map(|timestamp| timestamp.as_nanos()),
+                end_ns: interval.end_inclusive().as_nanos(),
+            }
+        })?;
+        Ok(CaptureImu::present(batch))
+    }
 }
 
 pub struct DatasetPairs<'a> {
@@ -109,6 +158,13 @@ pub struct DatasetPairs<'a> {
 pub struct DatasetTimedPairs<'a> {
     reader: &'a mut DatasetReader,
     index: usize,
+}
+
+pub struct DatasetBundles<'a> {
+    reader: &'a mut DatasetReader,
+    index: usize,
+    capture_seq: u64,
+    previous_capture_time: Option<Timestamp>,
 }
 
 impl<'a> Iterator for DatasetPairs<'a> {
@@ -191,6 +247,59 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
             return Some(Ok(TimedPair { pair, timings }));
         }
 
+        None
+    }
+}
+
+impl<'a> Iterator for DatasetBundles<'a> {
+    type Item = Result<CaptureBundle, DatasetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.reader.manifest.entries.len() {
+            let entry = self.reader.manifest.entries[self.index].clone();
+            self.index += 1;
+
+            let right = match entry.pairing {
+                super::ManifestPairing::Paired { right, .. } => right,
+                super::ManifestPairing::MissingRight { .. } => continue,
+            };
+
+            let left_frame = match self.reader.read_frame(&entry.left, SensorId::StereoLeft) {
+                Ok(frame) => frame,
+                Err(err) => return Some(Err(err)),
+            };
+            let right_frame = match self.reader.read_frame(&right, SensorId::StereoRight) {
+                Ok(frame) => frame,
+                Err(err) => return Some(Err(err)),
+            };
+
+            let pair =
+                match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
+                    Ok(pair) => pair,
+                    Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
+                };
+            let interval = match CaptureInterval::new(self.previous_capture_time, pair.capture_time())
+            {
+                Ok(interval) => interval,
+                Err(_) => {
+                    return Some(Err(DatasetError::InvalidConfig {
+                        msg: "capture bundle interval must be strictly increasing",
+                    }))
+                }
+            };
+            let imu = match self.reader.imu_for_interval(interval) {
+                Ok(imu) => imu,
+                Err(err) => return Some(Err(err)),
+            };
+            let capture_id = CaptureId::new(self.capture_seq);
+            self.capture_seq = self.capture_seq.saturating_add(1);
+            self.previous_capture_time = Some(interval.end_inclusive());
+            return Some(CaptureBundle::new(capture_id, pair, interval, imu).map_err(|_| {
+                DatasetError::InvalidConfig {
+                    msg: "capture bundle interval must match pair capture time",
+                }
+            }));
+        }
         None
     }
 }
@@ -313,9 +422,73 @@ fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
     (min_ts, max_ts)
 }
 
+fn read_imu_samples(root: &PathBuf, meta: &super::Meta) -> Result<Option<Box<[ImuSample]>>, DatasetError> {
+    if meta.imu.is_none() {
+        return Ok(None);
+    }
+    let path = root.join(format::IMU_FILE);
+    let bytes = std::fs::read(&path).map_err(|source| DatasetError::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    if bytes.is_empty() {
+        return Err(DatasetError::MissingImuSamples {
+            start_ns: None,
+            end_ns: 0,
+        });
+    }
+    const RECORD_BYTES: usize = std::mem::size_of::<i64>() + 6 * std::mem::size_of::<f64>();
+    let chunks = bytes.chunks_exact(RECORD_BYTES);
+    if !chunks.remainder().is_empty() {
+        return Err(DatasetError::ReadFile {
+            path,
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "imu.bin length is not a whole number of imu records",
+            ),
+        });
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / RECORD_BYTES);
+    for chunk in chunks {
+        let timestamp = i64::from_le_bytes(chunk[0..8].try_into().expect("timestamp bytes"));
+        let mut offset = 8usize;
+        let read_f64 = |chunk: &[u8], offset: &mut usize| -> f64 {
+            let end = *offset + 8;
+            let value = f64::from_le_bytes(chunk[*offset..end].try_into().expect("f64 bytes"));
+            *offset = end;
+            value
+        };
+        let accel = [
+            read_f64(chunk, &mut offset),
+            read_f64(chunk, &mut offset),
+            read_f64(chunk, &mut offset),
+        ];
+        let gyro = [
+            read_f64(chunk, &mut offset),
+            read_f64(chunk, &mut offset),
+            read_f64(chunk, &mut offset),
+        ];
+        let sample = ImuSample::new(Timestamp::from_nanos(timestamp), accel, gyro).map_err(
+            |source| DatasetError::ReadFile {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid imu sample: {source}"),
+                ),
+            },
+        )?;
+        samples.push(sample);
+    }
+    Ok(Some(samples.into_boxed_slice()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
+    use crate::{ImuBatch, ImuSample, SensorId};
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn fps_from_frames_uses_intervals_not_sample_count() {
@@ -416,5 +589,160 @@ mod tests {
         assert_eq!(stats.right_count, 1);
         assert_eq!(stats.paired_count, 1);
         assert_eq!(stats.paired_fps, None);
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("kiko-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn mono_frame(sensor: SensorId, frame_id: u64, timestamp_ns: i64) -> Frame {
+        Frame::new(
+            sensor,
+            FrameId::new(frame_id),
+            Timestamp::from_nanos(timestamp_ns),
+            2,
+            2,
+            vec![frame_id as u8; 4],
+        )
+        .expect("frame")
+    }
+
+    fn calibration() -> Calibration {
+        Calibration {
+            left: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 1.0,
+                cy: 1.0,
+                width: 2,
+                height: 2,
+            },
+            right: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 1.0,
+                cy: 1.0,
+                width: 2,
+                height: 2,
+            },
+            baseline_m: 0.1,
+            rectified: true,
+        }
+    }
+
+    fn meta_with_imu() -> Meta {
+        Meta {
+            created: "now".to_string(),
+            device: "test".to_string(),
+            mono: Some(MonoMeta {
+                width: 2,
+                height: 2,
+                fps: 10,
+            }),
+            depth: None,
+            imu: Some(ImuMeta { rate_hz: 200 }),
+        }
+    }
+
+    #[test]
+    fn bundles_round_trip_imu_batches_per_capture() {
+        let dataset_dir = unique_temp_dir("reader-imu-round-trip");
+        let (writer, handle) = DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration())
+            .expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(90), [0.0; 3], [0.0; 3]).expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(102), [1.0; 3], [2.0; 3]).expect("imu 1"),
+            ])
+            .expect("imu batch 0"),
+        );
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 2, 200));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 3, 204));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(103), [3.0; 3], [4.0; 3]).expect("imu 2"),
+                ImuSample::new(Timestamp::from_nanos(202), [5.0; 3], [6.0; 3]).expect("imu 3"),
+            ])
+            .expect("imu batch 1"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let mut bundles = reader.bundles();
+
+        let first = bundles.next().expect("first bundle").expect("first ok");
+        assert_eq!(first.capture_id().as_u64(), 0);
+        assert_eq!(first.capture_time().as_nanos(), 102);
+        let first_imu = first
+            .imu()
+            .batch()
+            .expect("first bundle should carry imu samples");
+        assert_eq!(first_imu.len(), 2);
+        assert_eq!(first_imu.start_time().as_nanos(), 90);
+        assert_eq!(first_imu.end_time().as_nanos(), 102);
+
+        let second = bundles.next().expect("second bundle").expect("second ok");
+        assert_eq!(second.capture_id().as_u64(), 1);
+        assert_eq!(second.capture_time().as_nanos(), 202);
+        let second_imu = second
+            .imu()
+            .batch()
+            .expect("second bundle should carry imu samples");
+        assert_eq!(second_imu.len(), 2);
+        assert_eq!(second_imu.start_time().as_nanos(), 103);
+        assert_eq!(second_imu.end_time().as_nanos(), 202);
+
+        assert!(bundles.next().is_none());
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn bundles_fail_when_imu_interval_is_empty() {
+        let dataset_dir = unique_temp_dir("reader-imu-gap");
+        let (writer, handle) = DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration())
+            .expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(101), [0.0; 3], [0.0; 3]).expect("imu 0"),
+            ])
+            .expect("imu batch"),
+        );
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 2, 200));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 3, 204));
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let mut bundles = reader.bundles();
+        let _first = bundles.next().expect("first bundle").expect("first ok");
+        let err = bundles
+            .next()
+            .expect("second bundle result")
+            .expect_err("second bundle should fail for imu gap");
+        assert!(matches!(
+            err,
+            DatasetError::MissingImuSamples {
+                start_ns: Some(102),
+                end_ns: 202
+            }
+        ));
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
     }
 }
