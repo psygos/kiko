@@ -171,7 +171,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Some(pose) = output.pose.as_ref() {
-                    if let Err(err) = sink.log_pose(timestamp, pose) {
+                    let pose_map = pose.cam_from_map_pose32();
+                    if let Err(err) = sink.log_pose(timestamp, &pose_map) {
                         eprintln!("rerun log error: {err}");
                     } else {
                         poses_logged += 1;

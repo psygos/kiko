@@ -10,8 +10,8 @@ use kiko_slam::{
     bounded_channel, oak_to_depth_image, oak_to_frame, CalibrationBundle, ChannelCapacity,
     DepthImage,
     DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId, PairingOutcome,
-    PairingDropReason, Point3, Pose, Raw, RerunSink, SendOutcome, SensorId, SlamTracker,
-    StereoPair, StereoPairer, SystemHealth, VizPacket,
+    PairingDropReason, Point3, Raw, RerunSink, SendOutcome, SensorId, SlamTracker, StereoPair,
+    StereoPairer, SystemHealth, TrackingPose, VizPacket,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
 use oak_sys::{DepthConfig, DepthError, DeviceConfig, ImageError, MonoConfig, QueueConfig};
@@ -38,7 +38,7 @@ struct LiveVizMsg {
     left: Frame,
     right: Frame,
     depth: Option<DepthImage>,
-    pose: Option<Pose>,
+    pose: Option<TrackingPose>,
     packet: Option<VizPacket<Raw>>,
     points: Option<Vec<Point3>>,
     covisibility_snapshot: Option<kiko_slam::CovisibilitySnapshot>,
@@ -269,7 +269,8 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Some(pose) = msg.pose.as_ref() {
-                    if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
+                    let pose_map = pose.cam_from_map_pose32();
+                    if let Err(err) = sink.log_pose(msg.left.timestamp(), &pose_map) {
                         eprintln!("rerun log error: {err}");
                     }
                 }

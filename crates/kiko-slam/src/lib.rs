@@ -16,6 +16,7 @@ mod inference;
 mod imu;
 mod local_ba;
 pub mod loop_closure;
+mod map_from_odom;
 pub mod map;
 mod math;
 #[cfg(feature = "record")]
@@ -60,6 +61,7 @@ pub use loop_closure::{
     PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
     RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
 };
+pub use map_from_odom::MapFromOdom;
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
 pub use math::Pose64;
 #[cfg(feature = "record")]
@@ -81,6 +83,7 @@ pub use tracker::{
     KeyframeDecision, KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
     LoopSubsystemConfig, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
     SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
+    TrackingPose,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,

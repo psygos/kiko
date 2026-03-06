@@ -29,9 +29,9 @@ use crate::{
     solve_pnp_ransac, BaCorrection, BaResult, CalibrationBundle, Detections, DiagnosticEvent,
     DownscaleFactor, EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
     KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
-    LoopClosureRejectReason, LoopClosureStatus, MapObservation, Matches, ObservationSet,
-    PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw, StereoPair,
-    SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
+    LoopClosureRejectReason, LoopClosureStatus, MapFromOdom, MapObservation, Matches,
+    ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, Pose64,
+    RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
 
@@ -1470,8 +1470,39 @@ impl SystemHealth {
 }
 
 #[derive(Debug)]
+pub struct TrackingPose {
+    cam_from_odom: Pose64,
+    cam_from_map: Pose64,
+}
+
+impl TrackingPose {
+    pub fn new(cam_from_odom: Pose64, cam_from_map: Pose64) -> Self {
+        Self {
+            cam_from_odom,
+            cam_from_map,
+        }
+    }
+
+    pub fn cam_from_odom(&self) -> Pose64 {
+        self.cam_from_odom
+    }
+
+    pub fn cam_from_map(&self) -> Pose64 {
+        self.cam_from_map
+    }
+
+    pub fn cam_from_odom_pose32(&self) -> Pose {
+        self.cam_from_odom.to_pose32()
+    }
+
+    pub fn cam_from_map_pose32(&self) -> Pose {
+        self.cam_from_map.to_pose32()
+    }
+}
+
+#[derive(Debug)]
 pub struct TrackerOutput {
-    pub pose: Option<Pose>,
+    pub pose: Option<TrackingPose>,
     pub inliers: usize,
     pub keyframe: Option<Arc<Keyframe>>,
     pub stereo_matches: Option<Matches<Raw>>,
@@ -1551,6 +1582,7 @@ pub struct SlamTracker {
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
+    map_from_odom: MapFromOdom,
     trace_transitions: bool,
 }
 
@@ -1624,6 +1656,7 @@ impl SlamTracker {
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
+            map_from_odom: MapFromOdom::identity(),
             trace_transitions,
         })
     }
@@ -1769,8 +1802,13 @@ impl SlamTracker {
         tracking: TrackingHealth,
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
-        if let Some(pose_world) = pose {
-            self.last_pose_world = Some(pose_world);
+        let pose = pose.map(|pose_world| {
+            let cam_from_odom = Pose64::from_pose32(pose_world);
+            let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
+            TrackingPose::new(cam_from_odom, cam_from_map)
+        });
+        if let Some(pose_world) = pose.as_ref() {
+            self.last_pose_world = Some(pose_world.cam_from_odom_pose32());
         }
         TrackerOutput {
             pose,
