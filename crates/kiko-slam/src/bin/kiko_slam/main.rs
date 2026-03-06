@@ -72,6 +72,8 @@ mod tests {
     use super::bench::{summarize_bench, BenchAccum};
     use super::config::{build_ba_config, build_tracker_config, TrackerDefaults};
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
+    #[cfg(feature = "vio")]
+    use kiko_slam::VioConfig;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
@@ -235,6 +237,42 @@ mod tests {
         );
 
         restore_env(key, saved);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn build_tracker_config_reads_vio_env_settings() {
+        let _guard = env_lock().lock().expect("env lock");
+        let keys = ["KIKO_VIO", "KIKO_VIO_WINDOW", "KIKO_VIO_MAX_ITERS", "KIKO_VIO_POSE_PRIOR_WEIGHT"];
+        let saved: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|&key| (key.to_string(), std::env::var_os(key)))
+            .collect();
+
+        set_env("KIKO_VIO", "true");
+        set_env("KIKO_VIO_WINDOW", "9");
+        set_env("KIKO_VIO_MAX_ITERS", "6");
+        set_env("KIKO_VIO_POSE_PRIOR_WEIGHT", "55.5");
+
+        let config = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect("tracker config");
+
+        let vio = config.vio.expect("vio config should be present");
+        assert_eq!(vio.window_size(), 9);
+        assert_eq!(vio.max_iterations(), 6);
+        assert!((vio.pose_prior_weight() - 55.5).abs() < 1e-9);
+
+        for (key, value) in saved {
+            restore_env(&key, value);
+        }
     }
 
     #[test]
