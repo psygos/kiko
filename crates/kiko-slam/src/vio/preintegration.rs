@@ -127,6 +127,29 @@ impl PreintegratedImu {
             delta_position: core.delta_position,
         })
     }
+
+    pub fn residual_information_diag(&self) -> [f64; 9] {
+        let mut information = [0.0_f64; 9];
+        for (axis, value) in information.iter_mut().enumerate() {
+            let variance = self.covariance[axis][axis].max(1e-12);
+            *value = 1.0 / variance;
+        }
+        information
+    }
+
+    pub fn bias_random_walk_information_diag(&self) -> [f64; 6] {
+        let dt = self.dt_seconds.max(1e-12);
+        let accel_variance = self.noise.accel_random_walk() * self.noise.accel_random_walk() * dt;
+        let gyro_variance = self.noise.gyro_random_walk() * self.noise.gyro_random_walk() * dt;
+        [
+            1.0 / accel_variance.max(1e-12),
+            1.0 / accel_variance.max(1e-12),
+            1.0 / accel_variance.max(1e-12),
+            1.0 / gyro_variance.max(1e-12),
+            1.0 / gyro_variance.max(1e-12),
+            1.0 / gyro_variance.max(1e-12),
+        ]
+    }
 }
 
 struct CorePreintegration {
@@ -347,6 +370,47 @@ mod tests {
                         < 1e-12
                 );
             }
+        }
+    }
+
+    #[test]
+    fn residual_information_diagonal_is_finite_and_positive() {
+        let batch = batch(&[
+            (0, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
+            (10_000_000, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
+            (20_000_000, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
+        ]);
+        let preintegrated =
+            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        for value in preintegrated.residual_information_diag() {
+            assert!(value.is_finite() && value > 0.0);
+        }
+    }
+
+    #[test]
+    fn bias_random_walk_information_decreases_with_longer_dt() {
+        let short = PreintegratedImu::integrate(
+            &batch(&[
+                (0, [0.0; 3], [0.0; 3]),
+                (10_000_000, [0.0; 3], [0.0; 3]),
+            ]),
+            &ImuBias::default(),
+            &noise(),
+        )
+        .expect("short");
+        let long = PreintegratedImu::integrate(
+            &batch(&[
+                (0, [0.0; 3], [0.0; 3]),
+                (20_000_000, [0.0; 3], [0.0; 3]),
+            ]),
+            &ImuBias::default(),
+            &noise(),
+        )
+        .expect("long");
+        let short_info = short.bias_random_walk_information_diag();
+        let long_info = long.bias_random_walk_information_diag();
+        for axis in 0..6 {
+            assert!(short_info[axis] > long_info[axis]);
         }
     }
 

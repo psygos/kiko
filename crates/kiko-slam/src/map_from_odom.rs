@@ -122,6 +122,33 @@ mod tests {
         assert!((recovered_point.y - point_odom.y).abs() < 1e-6);
         assert!((recovered_point.z - point_odom.z).abs() < 1e-6);
     }
+
+    #[test]
+    fn alignment_from_consistent_pose_pairs_is_pose_invariant() {
+        let pose_map_from_odom = Pose64::from_pose32(Pose::from_rt(
+            [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [0.25, -0.75, 1.5],
+        ));
+        let cam0_from_odom = Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+            [1.0, 2.0, 3.0],
+        ));
+        let cam1_from_odom = Pose64::from_pose32(Pose::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [-2.0, 0.5, 4.0],
+        ));
+        let cam0_from_map = cam0_from_odom.compose(pose_map_from_odom.inverse());
+        let cam1_from_map = cam1_from_odom.compose(pose_map_from_odom.inverse());
+
+        let derived0 = MapFromOdom::pose_map_from_odom_for(cam0_from_map, cam0_from_odom);
+        let derived1 = MapFromOdom::pose_map_from_odom_for(cam1_from_map, cam1_from_odom);
+
+        let expected = pose_map_from_odom.to_pose32();
+        assert_eq!(derived0.to_pose32().translation(), expected.translation());
+        assert_eq!(derived0.to_pose32().rotation(), expected.rotation());
+        assert_eq!(derived1.to_pose32().translation(), expected.translation());
+        assert_eq!(derived1.to_pose32().rotation(), expected.rotation());
+    }
 }
 
 fn transform_point(transform: Pose64, point: Point3) -> Point3 {
