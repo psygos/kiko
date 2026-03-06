@@ -4,8 +4,9 @@ use std::num::NonZeroUsize;
 use crate::map::KeyframeId;
 use crate::math::{mat_mul_f64, mat_mul_vec_f64};
 use crate::{
-    Gravity, ImuFactor, NavState, NavTangent, Observation, PinholeIntrinsics, Pose64,
-    PreintegratedImu, bias_random_walk_residual, pose_prior_residual, reprojection_residual,
+    Gravity, ImuFactor, MapFromOdom, NavState, NavTangent, PinholeIntrinsics, Pose64,
+    PreintegratedImu, VioObservation, bias_random_walk_residual, pose_prior_residual,
+    reprojection_residual,
 };
 
 const STATE_DIM: usize = 15;
@@ -157,7 +158,7 @@ struct VioFrame {
     keyframe_id: KeyframeId,
     state: NavState,
     pose_measurement_odom: Pose64,
-    visual_observations: Box<[Observation]>,
+    visual_observations: Box<[VioObservation]>,
     #[allow(dead_code)]
     preintegrated_from_prev: Option<PreintegratedImu>,
 }
@@ -167,6 +168,7 @@ pub struct LocalVio {
     gravity: Gravity,
     camera_from_body: Pose64,
     intrinsics: PinholeIntrinsics,
+    map_from_odom: MapFromOdom,
     frames: VecDeque<VioFrame>,
 }
 
@@ -182,8 +184,13 @@ impl LocalVio {
             gravity,
             camera_from_body,
             intrinsics,
+            map_from_odom: MapFromOdom::identity(),
             frames: VecDeque::new(),
         }
+    }
+
+    pub fn set_map_from_odom(&mut self, map_from_odom: MapFromOdom) {
+        self.map_from_odom = map_from_odom;
     }
 
     pub fn initialize(
@@ -191,7 +198,7 @@ impl LocalVio {
         keyframe_id: KeyframeId,
         state: NavState,
         pose_measurement_odom: Pose64,
-        visual_observations: Vec<Observation>,
+        visual_observations: Vec<VioObservation>,
     ) -> Result<(), LocalVioError> {
         if let Some(existing) = self.frames.front() {
             return Err(LocalVioError::AlreadyInitialized {
@@ -266,7 +273,7 @@ impl LocalVio {
         keyframe_id: KeyframeId,
         preintegrated: PreintegratedImu,
         pose_measurement_odom: Pose64,
-        visual_observations: Vec<Observation>,
+        visual_observations: Vec<VioObservation>,
     ) -> Result<VioEstimate, LocalVioError> {
         let previous = self.frames.back().ok_or(LocalVioError::NotInitialized)?;
         if self
@@ -420,8 +427,8 @@ impl LocalVio {
                     let residual = match reprojection_residual(
                         &frames[frame_idx].state,
                         self.camera_from_body,
-                        observation.world(),
-                        observation.pixel(),
+                        &self.map_from_odom,
+                        observation,
                         self.intrinsics,
                     ) {
                         Ok(residual) => residual,
@@ -431,6 +438,7 @@ impl LocalVio {
                         frames,
                         frame_idx,
                         self.camera_from_body,
+                        &self.map_from_odom,
                         observation,
                         self.intrinsics,
                     );
@@ -638,7 +646,8 @@ fn numerical_reprojection_jacobian(
     frames: &[VioFrame],
     frame_idx: usize,
     camera_from_body: Pose64,
-    observation: Observation,
+    map_from_odom: &MapFromOdom,
+    observation: VioObservation,
     intrinsics: PinholeIntrinsics,
 ) -> [[f64; STATE_DIM]; REPROJECTION_RESIDUAL_DIM] {
     let mut jacobian = [[0.0_f64; STATE_DIM]; REPROJECTION_RESIDUAL_DIM];
@@ -647,16 +656,16 @@ fn numerical_reprojection_jacobian(
         let plus = reprojection_residual(
             &frames[frame_idx].state.retract(&delta),
             camera_from_body,
-            observation.world(),
-            observation.pixel(),
+            map_from_odom,
+            observation,
             intrinsics,
         )
         .unwrap_or([0.0, 0.0]);
         let minus = reprojection_residual(
             &frames[frame_idx].state.retract(&neg_tangent(delta)),
             camera_from_body,
-            observation.world(),
-            observation.pixel(),
+            map_from_odom,
+            observation,
             intrinsics,
         )
         .unwrap_or([0.0, 0.0]);
@@ -775,7 +784,7 @@ mod tests {
     use crate::map::SlamMap;
     use crate::{
         Descriptor, Detections, FrameId, ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Keypoint,
-        Observation, PinholeIntrinsics, Pose, SensorId, Timestamp,
+        PinholeIntrinsics, Pose, SensorId, Timestamp,
     };
 
     fn noise() -> ImuNoiseModel {
@@ -1034,34 +1043,31 @@ mod tests {
             [0.0, 0.0, -0.25],
         );
         let observations = vec![
-            Observation::try_new(
+            VioObservation::new(
                 crate::Point3 {
                     x: 0.2,
                     y: 0.0,
                     z: 1.0,
                 },
                 Keypoint { x: 70.0, y: 40.0 },
-                intrinsics,
             )
             .expect("observation 0"),
-            Observation::try_new(
+            VioObservation::new(
                 crate::Point3 {
                     x: -0.2,
                     y: 0.0,
                     z: 1.0,
                 },
                 Keypoint { x: 30.0, y: 40.0 },
-                intrinsics,
             )
             .expect("observation 1"),
-            Observation::try_new(
+            VioObservation::new(
                 crate::Point3 {
                     x: 0.0,
                     y: 0.2,
                     z: 1.0,
                 },
                 Keypoint { x: 50.0, y: 60.0 },
-                intrinsics,
             )
             .expect("observation 2"),
         ];

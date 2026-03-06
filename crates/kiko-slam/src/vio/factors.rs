@@ -1,9 +1,13 @@
 use crate::math::{mat_mul_f64, mat_mul_vec_f64, so3_log_f64};
-use crate::{Gravity, Keypoint, NavState, PinholeIntrinsics, Point3, Pose64, PreintegratedImu};
+use crate::{
+    Gravity, Keypoint, MapFromOdom, NavState, Observation, PinholeIntrinsics, Point3, Pose64,
+    PreintegratedImu,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VioFactorError {
     PointBehindCamera { depth_m: f64 },
+    NonFinitePoint { axis: usize, value: f32 },
 }
 
 impl std::fmt::Display for VioFactorError {
@@ -12,11 +16,49 @@ impl std::fmt::Display for VioFactorError {
             VioFactorError::PointBehindCamera { depth_m } => {
                 write!(f, "reprojection point lies behind camera (depth={depth_m})")
             }
+            VioFactorError::NonFinitePoint { axis, value } => {
+                write!(
+                    f,
+                    "vio observation point axis {axis} must be finite, got {value}"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for VioFactorError {}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VioObservation {
+    point_map: Point3,
+    pixel: Keypoint,
+}
+
+impl VioObservation {
+    pub fn new(point_map: Point3, pixel: Keypoint) -> Result<Self, VioFactorError> {
+        for (axis, value) in [point_map.x, point_map.y, point_map.z]
+            .into_iter()
+            .enumerate()
+        {
+            if !value.is_finite() {
+                return Err(VioFactorError::NonFinitePoint { axis, value });
+            }
+        }
+        Ok(Self { point_map, pixel })
+    }
+
+    pub fn from_map_observation(observation_map: Observation) -> Result<Self, VioFactorError> {
+        Self::new(observation_map.world(), observation_map.pixel())
+    }
+
+    pub fn point_map(&self) -> Point3 {
+        self.point_map
+    }
+
+    pub fn pixel(&self) -> Keypoint {
+        self.pixel
+    }
+}
 
 pub struct ImuFactor;
 
@@ -99,11 +141,12 @@ pub fn bias_random_walk_residual(state_i: &NavState, state_j: &NavState) -> [f64
 pub fn reprojection_residual(
     state: &NavState,
     camera_from_body: Pose64,
-    point_odom: Point3,
-    pixel: Keypoint,
+    map_from_odom: &MapFromOdom,
+    observation: VioObservation,
     intrinsics: PinholeIntrinsics,
 ) -> Result<[f64; 2], VioFactorError> {
     let camera_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
+    let point_odom = map_from_odom.point_map_to_odom(observation.point_map());
     let point_cam = transform_point(
         camera_from_odom,
         [
@@ -120,7 +163,10 @@ pub fn reprojection_residual(
     }
     let u = f64::from(intrinsics.fx()) * (x / z) + f64::from(intrinsics.cx());
     let v = f64::from(intrinsics.fy()) * (y / z) + f64::from(intrinsics.cy());
-    Ok([f64::from(pixel.x) - u, f64::from(pixel.y) - v])
+    Ok([
+        f64::from(observation.pixel().x) - u,
+        f64::from(observation.pixel().y) - v,
+    ])
 }
 
 fn transform_point(transform: Pose64, point: [f64; 3]) -> [f64; 3] {
@@ -264,15 +310,20 @@ mod tests {
     fn reprojection_residual_is_zero_for_consistent_geometry() {
         let state =
             NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
-        let residual = reprojection_residual(
-            &state,
-            Pose64::identity(),
+        let observation = VioObservation::new(
             Point3 {
                 x: 0.0,
                 y: 0.0,
                 z: 1.0,
             },
             Keypoint { x: 50.0, y: 40.0 },
+        )
+        .expect("vio observation");
+        let residual = reprojection_residual(
+            &state,
+            Pose64::identity(),
+            &MapFromOdom::identity(),
+            observation,
             intrinsics(),
         )
         .expect("reprojection");
@@ -284,18 +335,94 @@ mod tests {
     fn reprojection_residual_rejects_point_behind_camera() {
         let state =
             NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
-        let err = reprojection_residual(
-            &state,
-            Pose64::identity(),
+        let observation = VioObservation::new(
             Point3 {
                 x: 0.0,
                 y: 0.0,
                 z: -1.0,
             },
             Keypoint { x: 50.0, y: 40.0 },
+        )
+        .expect("vio observation");
+        let err = reprojection_residual(
+            &state,
+            Pose64::identity(),
+            &MapFromOdom::identity(),
+            observation,
             intrinsics(),
         )
         .expect_err("point behind camera should fail");
         assert_eq!(err, VioFactorError::PointBehindCamera { depth_m: -1.0 });
+    }
+
+    #[test]
+    fn vio_observation_from_map_observation_reframes_into_odom() {
+        let bridge = {
+            let mut bridge = MapFromOdom::identity();
+            bridge.set_pose_map_from_odom(Pose64::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [1.0, 0.0, 0.0],
+            ));
+            bridge
+        };
+        let observation_map = Observation::try_new(
+            Point3 {
+                x: 1.25,
+                y: -0.5,
+                z: 2.0,
+            },
+            Keypoint { x: 10.0, y: 20.0 },
+            intrinsics(),
+        )
+        .expect("map observation");
+        let observation =
+            VioObservation::from_map_observation(observation_map).expect("vio observation");
+        let point_odom = bridge.point_map_to_odom(observation.point_map());
+        assert!((point_odom.x - 0.25).abs() < 1e-6);
+        assert!((point_odom.y + 0.5).abs() < 1e-6);
+        assert!((point_odom.z - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reprojection_residual_uses_current_bridge_for_map_points() {
+        let state =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
+        let observation = VioObservation::new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            Keypoint { x: 50.0, y: 40.0 },
+        )
+        .expect("vio observation");
+        let identity_residual = reprojection_residual(
+            &state,
+            Pose64::identity(),
+            &MapFromOdom::identity(),
+            observation,
+            intrinsics(),
+        )
+        .expect("identity residual");
+        assert!(identity_residual[0].abs() < 1e-12);
+        assert!(identity_residual[1].abs() < 1e-12);
+
+        let shifted_bridge = {
+            let mut bridge = MapFromOdom::identity();
+            bridge.set_pose_map_from_odom(Pose64::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.5, 0.0, 0.0],
+            ));
+            bridge
+        };
+        let shifted_residual = reprojection_residual(
+            &state,
+            Pose64::identity(),
+            &shifted_bridge,
+            observation,
+            intrinsics(),
+        )
+        .expect("shifted residual");
+        assert!(shifted_residual[0].abs() > 1.0);
     }
 }

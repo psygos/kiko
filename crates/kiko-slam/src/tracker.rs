@@ -38,7 +38,7 @@ use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
-use crate::{Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig};
+use crate::{Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig, VioObservation};
 
 use crate::inference::InferenceError;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -1499,6 +1499,9 @@ impl SlamTracker {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             return Ok(());
         };
+        vio_runtime
+            .local_vio
+            .set_map_from_odom(self.map_from_odom.clone());
         let Some(batch) = vio_runtime
             .pending_imu
             .batch()
@@ -1532,10 +1535,13 @@ impl SlamTracker {
         pose_world: Pose,
         visual_observations: Vec<Observation>,
     ) -> Result<(), TrackerError> {
-        let visual_observations = self.map_observations_to_odom(visual_observations)?;
+        let visual_observations = self.map_observations_for_vio(visual_observations)?;
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             return Ok(());
         };
+        vio_runtime
+            .local_vio
+            .set_map_from_odom(self.map_from_odom.clone());
         if vio_runtime.local_vio.is_empty() {
             let pose_measurement_odom = self
                 .map_from_odom
@@ -1666,20 +1672,15 @@ impl SlamTracker {
     }
 
     #[cfg(feature = "vio")]
-    fn map_observations_to_odom(
+    fn map_observations_for_vio(
         &self,
         observations_map: Vec<Observation>,
-    ) -> Result<Vec<Observation>, TrackerError> {
+    ) -> Result<Vec<VioObservation>, TrackerError> {
         observations_map
             .into_iter()
             .map(|observation_map| {
-                Observation::try_new(
-                    self.map_from_odom
-                        .point_map_to_odom(observation_map.world()),
-                    observation_map.pixel(),
-                    self.frontend.intrinsics(),
-                )
-                .map_err(TrackerError::Pnp)
+                VioObservation::from_map_observation(observation_map)
+                    .map_err(|err| TrackerError::Vio(err.to_string()))
             })
             .collect()
     }
@@ -1691,11 +1692,16 @@ impl SlamTracker {
         };
         self.map_from_odom
             .align_to_pose(Pose64::from_pose32(pose_map), cam_from_odom);
+        if let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator {
+            vio_runtime
+                .local_vio
+                .set_map_from_odom(self.map_from_odom.clone());
+        }
     }
 
     #[cfg(feature = "vio")]
     fn realign_map_from_odom(&mut self, corrected_poses: &[(KeyframeId, Pose)]) {
-        let LocalEstimator::Inertial(vio_runtime) = &self.local_estimator else {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             return;
         };
         for (keyframe_id, corrected_pose_map) in corrected_poses.iter().rev() {
@@ -1706,6 +1712,9 @@ impl SlamTracker {
                 Pose64::from_pose32(*corrected_pose_map),
                 estimate.state().pose_odom_from_body(),
             );
+            vio_runtime
+                .local_vio
+                .set_map_from_odom(self.map_from_odom.clone());
             break;
         }
     }
@@ -1755,16 +1764,11 @@ impl SlamTracker {
     ) -> TrackerOutput {
         #[cfg(feature = "vio")]
         let pose = match (self.current_odom_pose(), pose) {
-            (Some(cam_from_odom), Some(pose_map)) => {
-                let cam_from_map = Pose64::from_pose32(pose_map);
-                self.map_from_odom
-                    .align_to_pose(cam_from_map, cam_from_odom);
-                Some(TrackingPose::new(cam_from_odom, cam_from_map))
-            }
-            (Some(cam_from_odom), None) => {
-                let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
-                Some(TrackingPose::new(cam_from_odom, cam_from_map))
-            }
+            (Some(cam_from_odom), maybe_pose_map) => Some(tracking_pose_from_vio_output(
+                &self.map_from_odom,
+                cam_from_odom,
+                maybe_pose_map,
+            )),
             (None, maybe_pose) => maybe_pose.map(|pose_world| {
                 let cam_from_odom = Pose64::from_pose32(pose_world);
                 let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
@@ -2932,6 +2936,18 @@ fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
         y: v[1],
         z: v[2],
     }
+}
+
+#[cfg(feature = "vio")]
+fn tracking_pose_from_vio_output(
+    map_from_odom: &MapFromOdom,
+    cam_from_odom: Pose64,
+    pose_map_measurement: Option<Pose>,
+) -> TrackingPose {
+    let cam_from_map = pose_map_measurement
+        .map(Pose64::from_pose32)
+        .unwrap_or_else(|| map_from_odom.odom_to_map(cam_from_odom));
+    TrackingPose::new(cam_from_odom, cam_from_map)
 }
 
 fn build_shared_matches(
@@ -4455,5 +4471,45 @@ mod tests {
         let mapped = bridge.odom_to_map(cam_from_odom).to_pose32();
         assert_eq!(mapped.translation(), pose_map.translation());
         assert_eq!(mapped.rotation(), pose_map.rotation());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_output_prefers_map_measurement_without_mutating_bridge() {
+        let cam_from_odom = Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+            [0.3, -0.2, 1.4],
+        ));
+        let bridge_pose = Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 2.0, 3.0],
+        ));
+        let measured_map_pose = Pose::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [2.0, 3.0, -1.0],
+        );
+        let mut bridge = MapFromOdom::identity();
+        bridge.set_pose_map_from_odom(bridge_pose);
+        let expected_bridge_pose = bridge.odom_to_map(cam_from_odom).to_pose32();
+
+        let tracking_pose =
+            tracking_pose_from_vio_output(&bridge, cam_from_odom, Some(measured_map_pose));
+
+        assert_eq!(
+            tracking_pose.cam_from_map_pose32().translation(),
+            measured_map_pose.translation()
+        );
+        assert_eq!(
+            tracking_pose.cam_from_map_pose32().rotation(),
+            measured_map_pose.rotation()
+        );
+        assert_eq!(
+            bridge.odom_to_map(cam_from_odom).to_pose32().translation(),
+            expected_bridge_pose.translation()
+        );
+        assert_eq!(
+            bridge.odom_to_map(cam_from_odom).to_pose32().rotation(),
+            expected_bridge_pose.rotation()
+        );
     }
 }
