@@ -4,7 +4,7 @@
 
 Kiko is a social robot combining custom SLAM and an expression engine. The SLAM implementation is designed for model hot-swap as vision models improve, and Kiko improves with them. Built entirely in Rust.
 
-**Status:** Early development. Stereo visual odometry with local bundle adjustment is working.
+**Status:** Early development. The stereo visual SLAM pipeline is implemented on recorded datasets, with keyframe map management, local bundle adjustment, covisibility graph, place recognition, relocalization, and loop-closure pose-graph correction. Live OAK-D SLAM is also supported behind the `record` feature.
 
 ## Structure
 
@@ -27,9 +27,9 @@ Record a dataset (requires OAK-D):
 cargo run -p kiko-slam --features record -- record recordings/<name>
 ```
 
-Live match visualization (requires OAK-D + Rerun viewer):
+Live SLAM from OAK-D (`Rerun` optional):
 
-```
+```sh
 cargo run -p kiko-slam --features record -- live
 ```
 
@@ -97,15 +97,17 @@ Override with `--sp-model` / `--lg-model` or `KIKO_SUPERPOINT_MODEL` / `KIKO_LIG
 
 - ~~Quick dataset recording~~
 - ~~Live match visualisation in Rerun~~
-- ~~Unified CLI (record/live/viz/bench)~~
+- ~~Unified CLI (`record` / `live` / `viz` / `slam` / `bench`)~~
 - ~~Pipeline benchmarks + per-stage timing~~
 - ~~Stereo triangulation~~
 - ~~Frame-to-keyframe tracking (PnP + RANSAC)~~
 - ~~Local bundle adjustment (sliding window Gauss-Newton)~~
 - ~~Parallax + covisibility keyframe policy~~
-- Keyframe database + map point management
-- Covisibility graph
-- Place recognition (NetVLAD / CosPlace ONNX)
-- Loop closure (Sim3 + pose graph correction)
+- ~~Keyframe database + map point management~~
+- ~~Covisibility graph~~
+- ~~Place recognition (EigenPlaces ONNX)~~
+- ~~Loop closure + relocalization + pose graph correction~~
+- IMU integration for visual-inertial SLAM
+- Stronger PnP / geometric verification refinement
 - Global bundle adjustment
-- Dense mapping via nvblox (TSDF / ESDF on Jetson)
+- Jetson-focused performance tuning and validation
