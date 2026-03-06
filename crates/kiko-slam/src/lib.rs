@@ -5,12 +5,14 @@ use std::sync::Arc;
 pub use inference::{
     EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
 };
+mod capture;
 mod channel;
 pub mod dataset;
 mod depth;
 mod diagnostics;
 pub mod env;
 mod inference;
+mod imu;
 mod local_ba;
 pub mod loop_closure;
 pub mod map;
@@ -32,12 +34,19 @@ pub use channel::{
     bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
     DropPolicy, DropReceiver, DropSender, SendOutcome,
 };
+pub use capture::{
+    CaptureBundle, CaptureBundleError, CaptureId, CaptureImu, CaptureInterval,
+    CaptureIntervalError,
+};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, KeyframeStatus,
     LoopClosureRejectReason, LoopClosureStatus,
 };
 pub use env::{env_bool, env_f32, env_usize};
+pub use imu::{
+    ImuBatch, ImuBatchError, ImuExtrinsics, ImuNoiseModel, ImuSample, ImuSampleError,
+};
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
@@ -117,6 +126,19 @@ impl Timestamp {
 
     pub fn as_nanos(&self) -> i64 {
         self.0
+    }
+
+    pub fn delta_ns(self, earlier: Timestamp) -> i64 {
+        self.0.saturating_sub(earlier.0)
+    }
+
+    pub fn seconds_since(self, earlier: Timestamp) -> f64 {
+        self.delta_ns(earlier) as f64 / 1_000_000_000.0
+    }
+
+    pub fn midpoint(a: Timestamp, b: Timestamp) -> Timestamp {
+        let midpoint = ((a.0 as i128) + (b.0 as i128)) / 2;
+        Timestamp(midpoint.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
     }
 }
 
@@ -590,7 +612,7 @@ impl<S: FrameSource> Iterator for Frames<S> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct StereoPair {
     left: Frame,
     right: Frame,
@@ -643,6 +665,10 @@ impl StereoPair {
 
     pub fn timestamp_delta_ns(&self) -> i64 {
         (self.left.timestamp().as_nanos() - self.right.timestamp().as_nanos()).abs()
+    }
+
+    pub fn capture_time(&self) -> Timestamp {
+        Timestamp::midpoint(self.left.timestamp(), self.right.timestamp())
     }
 }
 
@@ -958,7 +984,7 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDescriptor, Descriptor, DESCRIPTOR_DIM, U8_SCALE};
+    use super::{CompactDescriptor, Descriptor, Timestamp, DESCRIPTOR_DIM, U8_SCALE};
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;
@@ -1028,5 +1054,28 @@ mod tests {
         }
         let sim = CompactDescriptor(a).cosine_similarity(&CompactDescriptor(b));
         assert!(sim.abs() < 1e-6, "sim={sim}");
+    }
+
+    #[test]
+    fn timestamp_delta_ns_preserves_sign() {
+        let earlier = Timestamp::from_nanos(10);
+        let later = Timestamp::from_nanos(25);
+        assert_eq!(later.delta_ns(earlier), 15);
+        assert_eq!(earlier.delta_ns(later), -15);
+    }
+
+    #[test]
+    fn timestamp_seconds_since_converts_nanoseconds() {
+        let earlier = Timestamp::from_nanos(1_500_000_000);
+        let later = Timestamp::from_nanos(2_750_000_000);
+        assert!((later.seconds_since(earlier) - 1.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn timestamp_midpoint_handles_order_and_odd_delta() {
+        let a = Timestamp::from_nanos(10);
+        let b = Timestamp::from_nanos(15);
+        assert_eq!(Timestamp::midpoint(a, b).as_nanos(), 12);
+        assert_eq!(Timestamp::midpoint(b, a).as_nanos(), 12);
     }
 }
