@@ -2465,6 +2465,14 @@ impl SlamTracker {
         };
 
         let pose_world = result.pose;
+        #[cfg(feature = "vio")]
+        let refined_world = match &self.local_estimator {
+            LocalEstimator::VisualOnly => ObservationSet::new(map_observations, self.ba.min_observations())
+                .ok()
+                .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set)),
+            LocalEstimator::Inertial(_) => None,
+        };
+        #[cfg(not(feature = "vio"))]
         let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()
             .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
