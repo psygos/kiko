@@ -363,6 +363,122 @@ pub(crate) fn so3_right_jacobian_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
     jr
 }
 
+#[allow(dead_code)]
+pub(crate) fn so3_left_jacobian_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
+    mat_mul_f64(so3_exp_f64(omega), so3_right_jacobian_f64(omega))
+}
+
+#[allow(dead_code)]
+pub(crate) fn so3_right_jacobian_inv_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
+    let theta = (omega[0] * omega[0] + omega[1] * omega[1] + omega[2] * omega[2]).sqrt();
+    let omega_hat = skew_f64(omega);
+    let omega_hat2 = mat_mul_f64(omega_hat, omega_hat);
+    let mut jr_inv = identity3_f64();
+
+    if theta < JACOBIAN_SMALL_ANGLE {
+        for row in 0..3 {
+            for col in 0..3 {
+                jr_inv[row][col] +=
+                    0.5 * omega_hat[row][col] + (1.0 / 12.0) * omega_hat2[row][col];
+            }
+        }
+        return jr_inv;
+    }
+
+    let theta2 = theta * theta;
+    let sin_theta = theta.sin();
+    let cos_theta = theta.cos();
+    let a = (1.0 / theta2) - (1.0 + cos_theta) / (2.0 * theta * sin_theta);
+    for row in 0..3 {
+        for col in 0..3 {
+            jr_inv[row][col] += 0.5 * omega_hat[row][col] + a * omega_hat2[row][col];
+        }
+    }
+    jr_inv
+}
+
+#[allow(dead_code)]
+pub(crate) fn so3_left_jacobian_inv_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
+    let theta = (omega[0] * omega[0] + omega[1] * omega[1] + omega[2] * omega[2]).sqrt();
+    let omega_hat = skew_f64(omega);
+    let omega_hat2 = mat_mul_f64(omega_hat, omega_hat);
+    let mut jl_inv = identity3_f64();
+
+    if theta < JACOBIAN_SMALL_ANGLE {
+        for row in 0..3 {
+            for col in 0..3 {
+                jl_inv[row][col] +=
+                    -0.5 * omega_hat[row][col] + (1.0 / 12.0) * omega_hat2[row][col];
+            }
+        }
+        return jl_inv;
+    }
+
+    let theta2 = theta * theta;
+    let sin_theta = theta.sin();
+    let cos_theta = theta.cos();
+    let a = (1.0 / theta2) - (1.0 + cos_theta) / (2.0 * theta * sin_theta);
+    for row in 0..3 {
+        for col in 0..3 {
+            jl_inv[row][col] += -0.5 * omega_hat[row][col] + a * omega_hat2[row][col];
+        }
+    }
+    jl_inv
+}
+
+#[allow(dead_code)]
+pub(crate) fn cholesky_6x6(mat: &[[f64; 6]; 6]) -> Option<[[f64; 6]; 6]> {
+    let mut l = [[0.0_f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..=i {
+            let mut sum = mat[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                if !sum.is_finite() || sum <= 0.0 {
+                    return None;
+                }
+                l[i][j] = sum.sqrt();
+            } else {
+                let denom = l[j][j];
+                if !denom.is_finite() || denom <= 0.0 {
+                    return None;
+                }
+                l[i][j] = sum / denom;
+            }
+        }
+    }
+    Some(l)
+}
+
+#[allow(dead_code)]
+pub(crate) fn cholesky_solve_6x6(l: &[[f64; 6]; 6], b: &[f64; 6]) -> [f64; 6] {
+    let mut y = [0.0_f64; 6];
+    for i in 0..6 {
+        let mut sum = b[i];
+        for (k, y_value) in y.iter().enumerate().take(i) {
+            sum -= l[i][k] * *y_value;
+        }
+        y[i] = sum / l[i][i];
+    }
+
+    let mut x = [0.0_f64; 6];
+    for i in (0..6).rev() {
+        let mut sum = y[i];
+        for (k, x_value) in x.iter().enumerate().skip(i + 1) {
+            sum -= l[k][i] * *x_value;
+        }
+        x[i] = sum / l[i][i];
+    }
+    x
+}
+
+#[allow(dead_code)]
+pub(crate) fn symmetric_positive_definite_6x6(mat: &[[f64; 6]; 6]) -> bool {
+    cholesky_6x6(mat).is_some()
+}
+
 pub(crate) fn se3_exp_f64(xi: [f64; 6]) -> Pose64 {
     let rho = [xi[0], xi[1], xi[2]];
     let omega = [xi[3], xi[4], xi[5]];
@@ -440,8 +556,9 @@ fn mat_transpose_f64(r: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        mat_mul_f64, mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_exp_f64, so3_log_f64,
-        so3_right_jacobian_f64,
+        cholesky_6x6, cholesky_solve_6x6, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64,
+        se3_log_f64, so3_exp_f64, so3_left_jacobian_f64, so3_left_jacobian_inv_f64, so3_log_f64,
+        so3_right_jacobian_f64, so3_right_jacobian_inv_f64, symmetric_positive_definite_6x6,
     };
 
     fn rot_diff_norm(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> f64 {
@@ -511,5 +628,93 @@ mod tests {
             (recovered_theta - theta).abs() < 2e-4,
             "near-pi mismatch: recovered={recovered_theta}, expected={theta}"
         );
+    }
+
+    #[test]
+    fn so3_left_jacobian_is_identity_at_zero() {
+        let jl = so3_left_jacobian_f64([0.0, 0.0, 0.0]);
+        assert_eq!(jl, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    }
+
+    #[test]
+    fn so3_right_jacobian_inverse_round_trip() {
+        let omega = [0.17, -0.08, 0.05];
+        let jr = so3_right_jacobian_f64(omega);
+        let jr_inv = so3_right_jacobian_inv_f64(omega);
+        let product = mat_mul_f64(jr, jr_inv);
+        let err = rot_diff_norm(product, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert!(err < 1e-9, "right jacobian inverse error: {err}");
+    }
+
+    #[test]
+    fn so3_left_and_right_jacobians_match_rotation_relation() {
+        let omega = [0.13, -0.04, 0.09];
+        let lhs = so3_left_jacobian_f64(omega);
+        let rhs = mat_mul_f64(so3_exp_f64(omega), so3_right_jacobian_f64(omega));
+        let err = rot_diff_norm(lhs, rhs);
+        assert!(err < 1e-12, "left/right jacobian relation error: {err}");
+    }
+
+    #[test]
+    fn so3_left_jacobian_inverse_round_trip() {
+        let omega = [0.11, 0.06, -0.07];
+        let jl = so3_left_jacobian_f64(omega);
+        let jl_inv = so3_left_jacobian_inv_f64(omega);
+        let product = mat_mul_f64(jl, jl_inv);
+        let err = rot_diff_norm(product, [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert!(err < 1e-9, "left jacobian inverse error: {err}");
+    }
+
+    #[test]
+    fn cholesky_identity_returns_identity() {
+        let l = cholesky_6x6(&[
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ])
+        .expect("identity is SPD");
+        assert_eq!(
+            l,
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn cholesky_solve_known_system() {
+        let a = [
+            [4.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 9.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 16.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 25.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 36.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 49.0],
+        ];
+        let l = cholesky_6x6(&a).expect("diagonal SPD");
+        let x = cholesky_solve_6x6(&l, &[8.0, 18.0, 32.0, 50.0, 72.0, 98.0]);
+        assert_eq!(x, [2.0, 2.0, 2.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn cholesky_rejects_non_positive_definite_matrix() {
+        let matrix = [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        ];
+        assert!(cholesky_6x6(&matrix).is_none());
+        assert!(!symmetric_positive_definite_6x6(&matrix));
     }
 }
