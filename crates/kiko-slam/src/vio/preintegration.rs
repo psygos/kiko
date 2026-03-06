@@ -185,8 +185,8 @@ fn integrate_core(
         delta_rotation = delta_rotation_next;
         dt_total += dt;
 
-        let gyro_var = noise.gyro_noise_density * noise.gyro_noise_density * dt * dt;
-        let accel_var = noise.accel_noise_density * noise.accel_noise_density * dt * dt;
+        let gyro_var = noise.gyro_noise_density() * noise.gyro_noise_density() * dt * dt;
+        let accel_var = noise.accel_noise_density() * noise.accel_noise_density() * dt * dt;
         let pos_var = 0.25 * accel_var * dt * dt;
         for axis in 0..3 {
             covariance[axis][axis] += gyro_var;
@@ -267,12 +267,7 @@ mod tests {
     use super::*;
 
     fn noise() -> ImuNoiseModel {
-        ImuNoiseModel {
-            accel_noise_density: 0.1,
-            gyro_noise_density: 0.01,
-            accel_random_walk: 0.001,
-            gyro_random_walk: 0.0001,
-        }
+        ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise")
     }
 
     fn batch(samples: &[(i64, [f64; 3], [f64; 3])]) -> ImuBatch {

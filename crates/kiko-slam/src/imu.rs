@@ -74,16 +74,185 @@ pub struct ImuBias {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImuNoiseModel {
-    pub accel_noise_density: f64,
-    pub gyro_noise_density: f64,
-    pub accel_random_walk: f64,
-    pub gyro_random_walk: f64,
+    accel_noise_density: f64,
+    gyro_noise_density: f64,
+    accel_random_walk: f64,
+    gyro_random_walk: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImuNoiseModelError {
+    NonFiniteAccelNoiseDensity { value: f64 },
+    NonPositiveAccelNoiseDensity { value: f64 },
+    NonFiniteGyroNoiseDensity { value: f64 },
+    NonPositiveGyroNoiseDensity { value: f64 },
+    NonFiniteAccelRandomWalk { value: f64 },
+    NonPositiveAccelRandomWalk { value: f64 },
+    NonFiniteGyroRandomWalk { value: f64 },
+    NonPositiveGyroRandomWalk { value: f64 },
+}
+
+impl std::fmt::Display for ImuNoiseModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImuNoiseModelError::NonFiniteAccelNoiseDensity { value } => {
+                write!(f, "accelerometer noise density must be finite, got {value}")
+            }
+            ImuNoiseModelError::NonPositiveAccelNoiseDensity { value } => {
+                write!(f, "accelerometer noise density must be > 0, got {value}")
+            }
+            ImuNoiseModelError::NonFiniteGyroNoiseDensity { value } => {
+                write!(f, "gyroscope noise density must be finite, got {value}")
+            }
+            ImuNoiseModelError::NonPositiveGyroNoiseDensity { value } => {
+                write!(f, "gyroscope noise density must be > 0, got {value}")
+            }
+            ImuNoiseModelError::NonFiniteAccelRandomWalk { value } => {
+                write!(f, "accelerometer random walk must be finite, got {value}")
+            }
+            ImuNoiseModelError::NonPositiveAccelRandomWalk { value } => {
+                write!(f, "accelerometer random walk must be > 0, got {value}")
+            }
+            ImuNoiseModelError::NonFiniteGyroRandomWalk { value } => {
+                write!(f, "gyroscope random walk must be finite, got {value}")
+            }
+            ImuNoiseModelError::NonPositiveGyroRandomWalk { value } => {
+                write!(f, "gyroscope random walk must be > 0, got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImuNoiseModelError {}
+
+impl ImuNoiseModel {
+    pub fn new(
+        accel_noise_density: f64,
+        gyro_noise_density: f64,
+        accel_random_walk: f64,
+        gyro_random_walk: f64,
+    ) -> Result<Self, ImuNoiseModelError> {
+        validate_positive_finite(
+            accel_noise_density,
+            ImuNoiseModelError::NonFiniteAccelNoiseDensity {
+                value: accel_noise_density,
+            },
+            ImuNoiseModelError::NonPositiveAccelNoiseDensity {
+                value: accel_noise_density,
+            },
+        )?;
+        validate_positive_finite(
+            gyro_noise_density,
+            ImuNoiseModelError::NonFiniteGyroNoiseDensity {
+                value: gyro_noise_density,
+            },
+            ImuNoiseModelError::NonPositiveGyroNoiseDensity {
+                value: gyro_noise_density,
+            },
+        )?;
+        validate_positive_finite(
+            accel_random_walk,
+            ImuNoiseModelError::NonFiniteAccelRandomWalk {
+                value: accel_random_walk,
+            },
+            ImuNoiseModelError::NonPositiveAccelRandomWalk {
+                value: accel_random_walk,
+            },
+        )?;
+        validate_positive_finite(
+            gyro_random_walk,
+            ImuNoiseModelError::NonFiniteGyroRandomWalk {
+                value: gyro_random_walk,
+            },
+            ImuNoiseModelError::NonPositiveGyroRandomWalk {
+                value: gyro_random_walk,
+            },
+        )?;
+        Ok(Self {
+            accel_noise_density,
+            gyro_noise_density,
+            accel_random_walk,
+            gyro_random_walk,
+        })
+    }
+
+    pub fn accel_noise_density(&self) -> f64 {
+        self.accel_noise_density
+    }
+
+    pub fn gyro_noise_density(&self) -> f64 {
+        self.gyro_noise_density
+    }
+
+    pub fn accel_random_walk(&self) -> f64 {
+        self.accel_random_walk
+    }
+
+    pub fn gyro_random_walk(&self) -> f64 {
+        self.gyro_random_walk
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ImuExtrinsics {
-    pub t_cam_imu: Pose64,
-    pub time_offset_ns: i64,
+    t_cam_imu: Pose64,
+    time_offset_ns: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImuExtrinsicsError {
+    NonFiniteRotation { row: usize, col: usize, value: f64 },
+    NonFiniteTranslation { axis: usize, value: f64 },
+}
+
+impl std::fmt::Display for ImuExtrinsicsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImuExtrinsicsError::NonFiniteRotation { row, col, value } => write!(
+                f,
+                "camera-imu rotation[{row}][{col}] must be finite, got {value}"
+            ),
+            ImuExtrinsicsError::NonFiniteTranslation { axis, value } => {
+                write!(f, "camera-imu translation axis {axis} must be finite, got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImuExtrinsicsError {}
+
+impl ImuExtrinsics {
+    pub fn new(t_cam_imu: Pose64, time_offset_ns: i64) -> Result<Self, ImuExtrinsicsError> {
+        let rotation = t_cam_imu.rotation();
+        for (row_idx, row) in rotation.iter().enumerate() {
+            for (col_idx, value) in row.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    return Err(ImuExtrinsicsError::NonFiniteRotation {
+                        row: row_idx,
+                        col: col_idx,
+                        value,
+                    });
+                }
+            }
+        }
+        for (axis, value) in t_cam_imu.translation().iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(ImuExtrinsicsError::NonFiniteTranslation { axis, value });
+            }
+        }
+        Ok(Self {
+            t_cam_imu,
+            time_offset_ns,
+        })
+    }
+
+    pub fn t_cam_imu(&self) -> Pose64 {
+        self.t_cam_imu
+    }
+
+    pub fn time_offset_ns(&self) -> i64 {
+        self.time_offset_ns
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +279,20 @@ impl std::fmt::Display for ImuBatchError {
 }
 
 impl std::error::Error for ImuBatchError {}
+
+fn validate_positive_finite(
+    value: f64,
+    non_finite: ImuNoiseModelError,
+    non_positive: ImuNoiseModelError,
+) -> Result<(), ImuNoiseModelError> {
+    if !value.is_finite() {
+        return Err(non_finite);
+    }
+    if value <= 0.0 {
+        return Err(non_positive);
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct ImuBatch {

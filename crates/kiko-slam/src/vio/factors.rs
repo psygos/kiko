@@ -145,12 +145,7 @@ mod tests {
     use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Timestamp};
 
     fn noise() -> ImuNoiseModel {
-        ImuNoiseModel {
-            accel_noise_density: 0.1,
-            gyro_noise_density: 0.01,
-            accel_random_walk: 0.001,
-            gyro_random_walk: 0.0001,
-        }
+        ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise")
     }
 
     fn batch(samples: &[(i64, [f64; 3], [f64; 3])]) -> ImuBatch {

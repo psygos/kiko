@@ -152,39 +152,39 @@ impl CalibrationBundle {
 
 fn validate_noise(noise: &ImuNoiseModel) -> Result<(), CalibrationBundleError> {
     validate_positive_finite(
-        noise.accel_noise_density,
+        noise.accel_noise_density(),
         CalibrationBundleError::NonPositiveAccelNoiseDensity {
-            value: noise.accel_noise_density,
+            value: noise.accel_noise_density(),
         },
         CalibrationBundleError::NonFiniteAccelNoiseDensity {
-            value: noise.accel_noise_density,
+            value: noise.accel_noise_density(),
         },
     )?;
     validate_positive_finite(
-        noise.gyro_noise_density,
+        noise.gyro_noise_density(),
         CalibrationBundleError::NonPositiveGyroNoiseDensity {
-            value: noise.gyro_noise_density,
+            value: noise.gyro_noise_density(),
         },
         CalibrationBundleError::NonFiniteGyroNoiseDensity {
-            value: noise.gyro_noise_density,
+            value: noise.gyro_noise_density(),
         },
     )?;
     validate_positive_finite(
-        noise.accel_random_walk,
+        noise.accel_random_walk(),
         CalibrationBundleError::NonPositiveAccelRandomWalk {
-            value: noise.accel_random_walk,
+            value: noise.accel_random_walk(),
         },
         CalibrationBundleError::NonFiniteAccelRandomWalk {
-            value: noise.accel_random_walk,
+            value: noise.accel_random_walk(),
         },
     )?;
     validate_positive_finite(
-        noise.gyro_random_walk,
+        noise.gyro_random_walk(),
         CalibrationBundleError::NonPositiveGyroRandomWalk {
-            value: noise.gyro_random_walk,
+            value: noise.gyro_random_walk(),
         },
         CalibrationBundleError::NonFiniteGyroRandomWalk {
-            value: noise.gyro_random_walk,
+            value: noise.gyro_random_walk(),
         },
     )
 }
@@ -246,19 +246,11 @@ mod tests {
     }
 
     fn imu_noise() -> ImuNoiseModel {
-        ImuNoiseModel {
-            accel_noise_density: 0.1,
-            gyro_noise_density: 0.01,
-            accel_random_walk: 0.001,
-            gyro_random_walk: 0.0001,
-        }
+        ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("imu noise")
     }
 
     fn imu_extrinsics() -> ImuExtrinsics {
-        ImuExtrinsics {
-            t_cam_imu: Pose64::identity(),
-            time_offset_ns: 0,
-        }
+        ImuExtrinsics::new(Pose64::identity(), 0).expect("imu extrinsics")
     }
 
     #[test]
@@ -271,20 +263,11 @@ mod tests {
     }
 
     #[test]
-    fn with_imu_rejects_non_positive_noise() {
-        let mut noise = imu_noise();
-        noise.gyro_noise_density = 0.0;
-        let err = CalibrationBundle::with_imu(
-            intrinsics(),
-            stereo(),
-            noise,
-            imu_extrinsics(),
-            9.81,
-        )
-        .expect_err("zero gyro noise should fail");
+    fn imu_noise_model_rejects_non_positive_noise_at_construction() {
+        let noise = ImuNoiseModel::new(0.1, 0.0, 0.001, 0.0001).expect_err("zero gyro noise");
         assert_eq!(
-            err,
-            CalibrationBundleError::NonPositiveGyroNoiseDensity { value: 0.0 }
+            noise,
+            crate::imu::ImuNoiseModelError::NonPositiveGyroNoiseDensity { value: 0.0 }
         );
     }
 
