@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = []
 record = ["oak-sys", "ctrlc", "chrono"]
+vio = []
 ort-coreml = ["ort/coreml"]
 ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]

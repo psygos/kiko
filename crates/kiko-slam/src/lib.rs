@@ -35,6 +35,8 @@ pub(crate) mod test_helpers;
 mod tracker;
 mod triangulation;
 mod viz;
+#[cfg(feature = "vio")]
+mod vio;
 pub use channel::{
     bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
     DropPolicy, DropReceiver, DropSender, SendOutcome,
@@ -51,7 +53,7 @@ pub use diagnostics::{
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use imu::{
-    ImuBatch, ImuBatchError, ImuExtrinsics, ImuNoiseModel, ImuSample, ImuSampleError,
+    ImuBatch, ImuBatchError, ImuBias, ImuExtrinsics, ImuNoiseModel, ImuSample, ImuSampleError,
 };
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
@@ -95,6 +97,8 @@ pub use triangulation::{
     TriangulationStats, Triangulator,
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
+#[cfg(feature = "vio")]
+pub use vio::{CorrectedPreintegration, Gravity, NavState, PreintegratedImu, PreintegrationError};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {
