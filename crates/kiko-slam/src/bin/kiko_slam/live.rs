@@ -2,19 +2,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::collections::VecDeque;
 
 use clap::Args;
 
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    bounded_channel, oak_to_depth_image, oak_to_frame, CalibrationBundle, ChannelCapacity,
-    DepthImage,
+    bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch, CalibrationBundle,
+    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity, DepthImage, ImuBatch,
+    ImuSample,
     DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId, PairingOutcome,
-    PairingDropReason, Point3, Raw, RerunSink, SendOutcome, SensorId, SlamTracker, StereoPair,
-    StereoPairer, SystemHealth, TrackingPose, VizPacket,
+    PairingDropReason, Point3, Raw, RerunSink, SendOutcome, SensorId, SlamTracker, StereoPairer,
+    SystemHealth, TrackingPose, VizPacket,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
-use oak_sys::{DepthConfig, DepthError, DeviceConfig, ImageError, MonoConfig, QueueConfig};
+use oak_sys::{DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig};
 
 use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, RerunArgs};
 use crate::config::{build_tracker_config, TrackerDefaults};
@@ -78,6 +80,30 @@ fn drain_latest_depth(rx: &DropReceiver<DepthImage>) -> Option<DepthImage> {
     latest
 }
 
+fn drain_imu_until(
+    pending: &mut VecDeque<ImuSample>,
+    start_exclusive: Option<kiko_slam::Timestamp>,
+    end_inclusive: kiko_slam::Timestamp,
+) -> Option<ImuBatch> {
+    let mut samples = Vec::new();
+    while let Some(sample) = pending.front() {
+        if sample.timestamp().as_nanos() > end_inclusive.as_nanos() {
+            break;
+        }
+        let sample = pending.pop_front().expect("front existed");
+        if start_exclusive
+            .is_some_and(|start| sample.timestamp().as_nanos() <= start.as_nanos())
+        {
+            continue;
+        }
+        samples.push(sample);
+    }
+    if samples.len() < 2 {
+        return None;
+    }
+    ImuBatch::new(samples).ok()
+}
+
 pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -93,6 +119,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         rectified: args.camera.rectified(),
     };
     let depth_enabled = env_bool("KIKO_LIVE_DEPTH").unwrap_or(false);
+    let imu_enabled = env_bool("KIKO_LIVE_IMU").unwrap_or(false);
     let depth_queue_depth = env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH").unwrap_or(8);
 
     let config = DeviceConfig {
@@ -104,7 +131,10 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             fps: mono_config.fps,
             align_to_rgb: false,
         }),
-        imu: None,
+        imu: imu_enabled.then_some(ImuConfig {
+            rate_hz: u32::try_from(env_usize("KIKO_LIVE_IMU_RATE_HZ").unwrap_or(400))
+                .unwrap_or(400),
+        }),
         queue: QueueConfig {
             size: 8,
             blocking: false,
@@ -122,7 +152,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH").unwrap_or(12);
     let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
     let (pair_tx, pair_rx, pair_stats) =
-        bounded_channel::<StereoPair>(pair_capacity, DropPolicy::DropOldest);
+        bounded_channel::<CaptureBundle>(pair_capacity, DropPolicy::DropOldest);
 
     let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH").unwrap_or(12);
     let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
@@ -181,12 +211,12 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let depth_rx = depth_rx;
 
-        for pair in pair_rx.iter() {
-            let left = pair.left().clone();
-            let right = pair.right().clone();
+        for capture in pair_rx.iter() {
+            let left = capture.pair().left().clone();
+            let right = capture.pair().right().clone();
             let depth = depth_rx.as_ref().and_then(drain_latest_depth);
             let process_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.process(pair)));
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.process_capture(capture)));
             match process_result {
                 Ok(Ok(output)) => {
                     let health = output.health.clone();
@@ -297,6 +327,9 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
+    let mut capture_seq = 0u64;
+    let mut previous_capture_time = None;
+    let mut pending_imu = VecDeque::new();
     let mut pending_capacity_left_drops = 0u64;
     let mut pending_capacity_right_drops = 0u64;
 
@@ -380,10 +413,57 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        if imu_enabled {
+            match device.imu() {
+                Ok(samples) => match oak_to_imu_batch(samples) {
+                    Ok(batch) => {
+                        pending_imu.extend(batch.samples().iter().cloned());
+                        got_any = true;
+                    }
+                    Err(err) => {
+                        eprintln!("imu batch dropped (invalid values): {err}");
+                    }
+                },
+                Err(ImuError::Empty) => {}
+                Err(ImuError::Overflow { dropped }) => {
+                    eprintln!("imu overflow: dropped {dropped} samples");
+                }
+                Err(ImuError::Disconnected) => {
+                    eprintln!("imu error: disconnected");
+                    break;
+                }
+            }
+        }
+
         loop {
             match pairer.next_outcome()? {
                 PairingOutcome::Produced(pair) => {
-                    if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
+                    let capture_time = pair.capture_time();
+                    let interval = match CaptureInterval::new(previous_capture_time, capture_time) {
+                        Ok(interval) => interval,
+                        Err(err) => {
+                            eprintln!("capture interval error: {err}");
+                            continue;
+                        }
+                    };
+                    let imu = drain_imu_until(&mut pending_imu, previous_capture_time, capture_time)
+                        .map(CaptureImu::present)
+                        .unwrap_or_else(CaptureImu::absent);
+                    let capture = match CaptureBundle::new(
+                        CaptureId::new(capture_seq),
+                        pair,
+                        interval,
+                        imu,
+                    ) {
+                        Ok(capture) => capture,
+                        Err(err) => {
+                            eprintln!("capture bundle error: {err}");
+                            continue;
+                        }
+                    };
+                    capture_seq = capture_seq.saturating_add(1);
+                    previous_capture_time = Some(capture_time);
+                    if matches!(pair_tx.try_send(capture), SendOutcome::Disconnected) {
                         running.store(false, Ordering::SeqCst);
                         break 'capture;
                     }
