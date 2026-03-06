@@ -101,7 +101,7 @@ pub use triangulation::{
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 #[cfg(feature = "vio")]
 pub use vio::{
-    bias_random_walk_residual, reprojection_residual, CorrectedPreintegration, Gravity,
+    bias_random_walk_residual, pose_prior_residual, reprojection_residual, CorrectedPreintegration, Gravity,
     GravityError, ImuFactor, LocalVio, LocalVioError, NavState, NavStateError, NavTangent,
     PreintegratedImu, PreintegrationError, VioConfig, VioConfigError, VioEstimate,
     VioOdometryConstraint,

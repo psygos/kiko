@@ -1539,17 +1539,19 @@ impl SlamTracker {
             return Ok(());
         };
         if vio_runtime.local_vio.is_empty() {
+            let pose_measurement_odom =
+                self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_world));
             let state = crate::NavState::try_new(
-                Pose64::from_pose32(pose_world),
+                pose_measurement_odom,
                 [0.0; 3],
                 crate::ImuBias::default(),
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
             vio_runtime
                 .local_vio
-                .initialize(keyframe_id, state)
+                .initialize(keyframe_id, state, pose_measurement_odom)
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
-            vio_runtime.predicted_pose_odom = Some(Pose64::from_pose32(pose_world));
+            vio_runtime.predicted_pose_odom = Some(pose_measurement_odom);
             vio_runtime.pending_imu.clear();
             return Ok(());
         }
@@ -1574,7 +1576,11 @@ impl SlamTracker {
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let estimate = vio_runtime
             .local_vio
-            .push_preintegrated(keyframe_id, preintegrated)
+            .push_preintegrated(
+                keyframe_id,
+                preintegrated,
+                self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_world)),
+            )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let odom_pose = estimate.state().pose_odom_from_body();
         vio_runtime.predicted_pose_odom = Some(odom_pose);

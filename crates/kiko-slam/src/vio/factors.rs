@@ -76,6 +76,10 @@ impl ImuFactor {
     }
 }
 
+pub fn pose_prior_residual(state: &NavState, pose_measurement_odom: Pose64) -> [f64; 6] {
+    so3_se3_residual(pose_measurement_odom, state.pose_odom_from_body())
+}
+
 pub fn bias_random_walk_residual(state_i: &NavState, state_j: &NavState) -> [f64; 6] {
     let bias_i = state_i.bias();
     let bias_j = state_j.bias();
@@ -136,6 +140,13 @@ fn transpose3(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 
 fn sub_vec3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn so3_se3_residual(target: Pose64, estimate: Pose64) -> [f64; 6] {
+    let delta = target.compose(estimate.inverse());
+    let rot = so3_log_f64(delta.rotation());
+    let t = delta.translation();
+    [t[0], t[1], t[2], rot[0], rot[1], rot[2]]
 }
 
 #[cfg(test)]
