@@ -5,9 +5,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-#[path = "frontend.rs"]
-mod frontend;
-
 /// Minimum 3D-2D correspondences needed for PnP pose estimation.
 const MIN_PNP_CORRESPONDENCES: usize = 4;
 /// Default maximum respawn attempts for backend and descriptor workers.
@@ -3542,7 +3539,7 @@ mod tests {
         )
         .expect("intrinsics");
 
-        let tracked = build_map_observations(
+        let tracked = crate::frontend::build_map_observations(
             &map,
             keyframe_id,
             &verified,
