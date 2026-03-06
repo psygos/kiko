@@ -13,6 +13,7 @@ mod depth;
 mod diagnostics;
 pub mod env;
 mod frontend;
+mod global_map;
 mod inference;
 mod imu;
 mod local_ba;

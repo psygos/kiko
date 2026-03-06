@@ -20,8 +20,8 @@ use crate::loop_closure::{
     PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
 };
 use crate::pose_graph::{
-    EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
-    PoseGraphError, PoseGraphOptimizer,
+    EssentialEdge, EssentialEdgeKind, EssentialGraphError, PoseGraphConfig, PoseGraphError,
+    PoseGraphOptimizer,
 };
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
@@ -34,6 +34,7 @@ use crate::{
     Triangulator, Verified,
 };
 use crate::frontend::{median_parallax_px, StereoFrontend};
+use crate::global_map::GlobalMap;
 
 use crate::inference::InferenceError;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -1563,8 +1564,7 @@ pub struct SlamTracker {
     config: TrackerConfig,
     state: TrackerState,
     ba: LocalBundleAdjuster,
-    map: SlamMap,
-    essential_graph: EssentialGraph,
+    global_map: GlobalMap,
     pose_graph_optimizer: PoseGraphOptimizer,
     map_version: MapVersion,
     backend: Option<BackendSupervisor>,
@@ -1635,8 +1635,7 @@ impl SlamTracker {
             config,
             state: TrackerState::NeedKeyframe,
             ba,
-            map: SlamMap::new(),
-            essential_graph: EssentialGraph::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD),
+            global_map: GlobalMap::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD),
             pose_graph_optimizer: PoseGraphOptimizer::new(PoseGraphConfig::default()),
             map_version: MapVersion::initial(),
             backend,
@@ -1708,7 +1707,7 @@ impl SlamTracker {
     }
 
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
-        self.map.covisibility_snapshot()
+        self.global_map.covisibility_snapshot()
     }
 
     pub fn backend_stats(&self) -> BackendStats {
@@ -1741,12 +1740,7 @@ impl SlamTracker {
     }
 
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
-        let _ = apply_loop_closure_correction(
-            &mut self.map,
-            &mut self.essential_graph,
-            &self.pose_graph_optimizer,
-            &verified,
-        )?;
+        let _ = apply_loop_closure_correction(&mut self.global_map, &self.pose_graph_optimizer, &verified)?;
         self.bump_map_version();
         Ok(())
     }
@@ -1774,7 +1768,10 @@ impl SlamTracker {
 
     fn empty_diagnostics(&self) -> FrameDiagnostics {
         let mut diagnostics =
-            FrameDiagnostics::empty(self.map.num_keyframes(), self.map.num_points());
+            FrameDiagnostics::empty(
+                self.global_map.num_keyframes(),
+                self.global_map.num_points(),
+            );
         diagnostics.loop_candidate_count = self
             .pending_loop
             .as_ref()
@@ -1936,7 +1933,7 @@ impl SlamTracker {
                     if response.map_version.as_u64() > self.map_version.as_u64() {
                         continue;
                     }
-                    if self.map.keyframe(response.keyframe_id).is_none() {
+                    if self.global_map.keyframe(response.keyframe_id).is_none() {
                         continue;
                     }
                     let Some(loop_db) = self.loop_db.as_mut() else {
@@ -2004,7 +2001,7 @@ impl SlamTracker {
             let correspondences = match_quantized_descriptors_for_loop(
                 &query_quantized,
                 candidate.candidate,
-                &self.map,
+                self.global_map.map(),
                 config.descriptor_match_threshold(),
             )
             .unwrap_or_else(|err| {
@@ -2033,7 +2030,7 @@ impl SlamTracker {
             let verified = match loop_candidate.verify(
                 pending.detections.keypoints(),
                 &correspondences,
-                &self.map,
+                self.global_map.map(),
                 self.frontend.intrinsics(),
                 config.ransac(),
                 config.min_inliers(),
@@ -2047,7 +2044,10 @@ impl SlamTracker {
                 }
             };
 
-            let Some(match_pose) = self.map.keyframe(candidate.candidate).map(|entry| entry.pose())
+            let Some(match_pose) = self
+                .global_map
+                .keyframe(candidate.candidate)
+                .map(|entry| entry.pose())
             else {
                 if first_error.is_none() {
                     first_error = Some(LoopDetectError::ApplyFailed(LoopApplyError::MissingKeyframe));
@@ -2113,7 +2113,7 @@ impl SlamTracker {
             self.map_version,
             trigger_keyframe,
             window,
-            self.map.clone(),
+            self.global_map.clone_map(),
         )
         .map_err(SubmitEventError::InvalidEvent)?;
         supervisor.submit(event)?;
@@ -2139,7 +2139,11 @@ impl SlamTracker {
             match response {
                 BackendResponse::Correction(correction) => match &correction.correction.result {
                     BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
-                        match apply_correction_event(&mut self.map, self.map_version, &correction) {
+                        match apply_correction_event(
+                            self.global_map.map_mut(),
+                            self.map_version,
+                            &correction,
+                        ) {
                             Ok(()) => {
                                 self.bump_map_version();
                                 self.backend_stats.applied =
@@ -2349,7 +2353,7 @@ impl SlamTracker {
             let correspondences = match_quantized_descriptors_for_loop(
                 &query_quantized,
                 candidate.candidate,
-                &self.map,
+                self.global_map.map(),
                 cfg.descriptor_match_threshold(),
             )
             .unwrap_or_else(|err| {
@@ -2369,7 +2373,7 @@ impl SlamTracker {
             let verified = match relocalization_candidate.verify(
                 current.keypoints(),
                 &correspondences,
-                &self.map,
+                self.global_map.map(),
                 self.frontend.intrinsics(),
                 self.config.ransac,
                 cfg.min_inliers(),
@@ -2538,7 +2542,7 @@ impl SlamTracker {
 
         let tracked_observations = match self
             .frontend
-            .build_map_observations(&self.map, keyframe_id, &verified, current.as_ref())
+            .build_map_observations(self.global_map.map(), keyframe_id, &verified, current.as_ref())
         {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
@@ -2609,7 +2613,7 @@ impl SlamTracker {
                     context: "current keypoint index out of bounds",
                 },
             ))?;
-            let keypoint_ref = self.map.keyframe_keypoint(keyframe_id, ki)?;
+            let keypoint_ref = self.global_map.keyframe_keypoint(keyframe_id, ki)?;
             map_observations.push(MapObservation::new(keypoint_ref, pixel));
         }
 
@@ -2628,7 +2632,7 @@ impl SlamTracker {
         let pose_world = result.pose;
         let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()
-            .and_then(|set| self.ba.push_frame(&self.map, pose_world, set));
+            .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
 
         let pose_world = refined_world.unwrap_or(pose_world);
         if self.consecutive_tracking_failures > 0 {
@@ -2670,14 +2674,13 @@ impl SlamTracker {
                         .config
                         .redundancy
                         .map(|policy| {
-                            is_redundant(&self.map, keyframe_id, policy.max_covisibility())
+                            is_redundant(self.global_map.map(), keyframe_id, policy.max_covisibility())
                         })
                         .transpose()?
                         .unwrap_or(false);
                     if redundant {
                         if let Err(err) = remove_keyframe_from_graph_and_db(
-                            &mut self.map,
-                            &mut self.essential_graph,
+                            &mut self.global_map,
                             self.loop_db.as_mut(),
                             keyframe_id,
                         ) {
@@ -2704,7 +2707,7 @@ impl SlamTracker {
                         }
                     } else {
                         let window = self
-                            .map
+                            .global_map
                             .covisible_window(keyframe_id, self.ba.window_size())?;
                         if window.len() >= 2 {
                             if self.backend.is_some() {
@@ -2741,7 +2744,10 @@ impl SlamTracker {
                                         "backend submit failed for keyframe {keyframe_id:?}: {err}"
                                     );
                                     let result =
-                                        self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                        self.ba.optimize_keyframe_window(
+                                            self.global_map.map_mut(),
+                                            &window,
+                                        );
                                     ba_result = Some(result.clone());
                                     if matches!(
                                         result,
@@ -2753,7 +2759,10 @@ impl SlamTracker {
                             } else if matches!(
                                 {
                                     let result =
-                                        self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                        self.ba.optimize_keyframe_window(
+                                            self.global_map.map_mut(),
+                                            &window,
+                                        );
                                     ba_result = Some(result.clone());
                                     result
                                 },
@@ -2926,7 +2935,7 @@ impl SlamTracker {
 
         let keyframe = Arc::new(result.keyframe);
         let keyframe_id = insert_keyframe_into_map(
-            &mut self.map,
+            self.global_map.map_mut(),
             &keyframe,
             left.timestamp(),
             pose_world,
@@ -2936,11 +2945,7 @@ impl SlamTracker {
             keyframe_id,
             landmarks,
         });
-        self.essential_graph.add_keyframe(
-            keyframe_id,
-            self.map.covisibility().neighbors(keyframe_id),
-            &self.map,
-        );
+        self.global_map.add_keyframe_to_graph(keyframe_id);
         self.bump_map_version();
         self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
         self.enqueue_descriptor_request(keyframe_id, &left);
@@ -3021,16 +3026,15 @@ fn insert_keyframe_into_map(
 }
 
 fn remove_keyframe_from_graph_and_db(
-    map: &mut SlamMap,
-    essential_graph: &mut EssentialGraph,
+    global_map: &mut GlobalMap,
     loop_db: Option<&mut KeyframeDatabase>,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
-    essential_graph.remove_keyframe(keyframe_id, map)?;
+    global_map.remove_keyframe_from_graph(keyframe_id)?;
     if let Some(loop_db) = loop_db {
         loop_db.remove(keyframe_id);
     }
-    map.remove_keyframe(keyframe_id)?;
+    global_map.remove_keyframe(keyframe_id)?;
     Ok(())
 }
 
@@ -3163,11 +3167,11 @@ fn apply_correction_event(
 }
 
 fn apply_loop_closure_correction(
-    map: &mut SlamMap,
-    essential_graph: &mut EssentialGraph,
+    global_map: &mut GlobalMap,
     optimizer: &PoseGraphOptimizer,
     verified: &VerifiedLoop,
 ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
+    let (map, essential_graph) = global_map.split_mut();
     let query_kf = verified.query_kf();
     let match_kf = verified.match_kf();
     let match_pose = map
@@ -3348,6 +3352,7 @@ fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
 mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
+    use crate::pose_graph::EssentialGraph;
     use crate::{CompactDescriptor, Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
@@ -4377,8 +4382,9 @@ mod tests {
 
     #[test]
     fn loop_closure_correction_reduces_synthetic_drift_ring() {
-        let (mut map, mut essential_graph, verified, query_kf, _) =
+        let (map, essential_graph, verified, query_kf, _) =
             make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map.clone(), essential_graph.clone());
         let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
 
         let before = map
@@ -4389,10 +4395,10 @@ mod tests {
         let before_error =
             ((before[0] - 2.0).powi(2) + (before[1]).powi(2) + (before[2]).powi(2)).sqrt();
 
-        apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+        apply_loop_closure_correction(&mut global_map, &optimizer, &verified)
             .expect("apply loop closure");
 
-        let after = map
+        let after = global_map
             .keyframe(query_kf)
             .expect("corrected query")
             .pose()
@@ -4407,17 +4413,18 @@ mod tests {
 
     #[test]
     fn loop_closure_reprojects_map_points_with_pose_correction() {
-        let (mut map, mut essential_graph, verified, _query_kf, before_points) =
+        let (map, essential_graph, verified, _query_kf, before_points) =
             make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map.clone(), essential_graph.clone());
         let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
 
-        apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+        apply_loop_closure_correction(&mut global_map, &optimizer, &verified)
             .expect("apply loop closure");
 
         let moved_points = before_points
             .iter()
             .filter(|(point_id, before)| {
-                let after = map.point(*point_id).expect("point").position();
+                let after = global_map.point(*point_id).expect("point").position();
                 let dx = after.x - before.x;
                 let dy = after.y - before.y;
                 let dz = after.z - before.z;
@@ -4432,22 +4439,24 @@ mod tests {
 
     #[test]
     fn loop_closure_adds_loop_edge_to_essential_graph() {
-        let (mut map, mut essential_graph, verified, _query_kf, _before_points) =
+        let (map, essential_graph, verified, _query_kf, _before_points) =
             make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map.clone(), essential_graph.clone());
         let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
 
-        assert_eq!(essential_graph.snapshot().loop_edges.len(), 0);
-        apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+        assert_eq!(global_map.essential_graph().snapshot().loop_edges.len(), 0);
+        apply_loop_closure_correction(&mut global_map, &optimizer, &verified)
             .expect("apply loop closure");
-        let snapshot = essential_graph.snapshot();
+        let snapshot = global_map.essential_graph().snapshot();
         assert_eq!(snapshot.loop_edges.len(), 1);
         assert_eq!(snapshot.loop_edges[0].kind, EssentialEdgeKind::Loop);
     }
 
     #[test]
     fn remove_keyframe_from_graph_and_db_cleans_all_structures() {
-        let (mut map, mut essential_graph, _verified, removed_kf, _before_points) =
+        let (map, essential_graph, _verified, removed_kf, _before_points) =
             make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map.clone(), essential_graph.clone());
         let mut loop_db = KeyframeDatabase::new(0);
         for (idx, (keyframe_id, _)) in map.keyframes().enumerate() {
             loop_db.insert_with_source(
@@ -4457,18 +4466,13 @@ mod tests {
             );
         }
 
-        remove_keyframe_from_graph_and_db(
-            &mut map,
-            &mut essential_graph,
-            Some(&mut loop_db),
-            removed_kf,
-        )
-        .expect("remove keyframe");
+        remove_keyframe_from_graph_and_db(&mut global_map, Some(&mut loop_db), removed_kf)
+            .expect("remove keyframe");
 
-        assert!(map.keyframe(removed_kf).is_none());
-        assert!(essential_graph.parent_of(removed_kf).is_none());
+        assert!(global_map.keyframe(removed_kf).is_none());
+        assert!(global_map.essential_graph().parent_of(removed_kf).is_none());
         assert!(loop_db.descriptor_source(removed_kf).is_none());
-        let input = essential_graph.pose_graph_input();
+        let input = global_map.essential_graph().pose_graph_input();
         assert!(input.keyframe_ids.iter().all(|&id| id != removed_kf));
     }
 
