@@ -18,6 +18,7 @@ mod inference;
 mod imu;
 mod local_ba;
 pub mod loop_closure;
+mod loop_manager;
 mod map_from_odom;
 pub mod map;
 mod math;
