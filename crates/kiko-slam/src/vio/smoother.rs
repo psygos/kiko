@@ -5,25 +5,32 @@ use crate::math::{mat_mul_vec_f64, mat_mul_f64};
 use crate::map::KeyframeId;
 use crate::{pose_prior_residual, Gravity, ImuFactor, NavState, NavTangent, Pose64, PreintegratedImu};
 
-const POSE_PRIOR_WEIGHT: f64 = 100.0;
-const IMU_FACTOR_WEIGHT: f64 = 1.0;
-const SOLVER_DAMPING: f64 = 1e-4;
-const MAX_SOLVER_ITERS: usize = 4;
-
 #[derive(Clone, Copy, Debug)]
 pub struct VioConfig {
     window_size: NonZeroUsize,
+    max_iterations: NonZeroUsize,
+    pose_prior_weight: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VioConfigError {
     ZeroWindowSize,
+    ZeroMaxIterations,
+    NonFinitePosePriorWeight,
+    NonPositivePosePriorWeight,
 }
 
 impl std::fmt::Display for VioConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VioConfigError::ZeroWindowSize => write!(f, "vio window size must be > 0"),
+            VioConfigError::ZeroMaxIterations => write!(f, "vio max iterations must be > 0"),
+            VioConfigError::NonFinitePosePriorWeight => {
+                write!(f, "vio pose prior weight must be finite")
+            }
+            VioConfigError::NonPositivePosePriorWeight => {
+                write!(f, "vio pose prior weight must be > 0")
+            }
         }
     }
 }
@@ -33,11 +40,40 @@ impl std::error::Error for VioConfigError {}
 impl VioConfig {
     pub fn new(window_size: usize) -> Result<Self, VioConfigError> {
         let window_size = NonZeroUsize::new(window_size).ok_or(VioConfigError::ZeroWindowSize)?;
-        Ok(Self { window_size })
+        Ok(Self {
+            window_size,
+            max_iterations: NonZeroUsize::new(4).expect("non-zero default"),
+            pose_prior_weight: 100.0,
+        })
     }
 
     pub fn window_size(self) -> usize {
         self.window_size.get()
+    }
+
+    pub fn max_iterations(self) -> usize {
+        self.max_iterations.get()
+    }
+
+    pub fn pose_prior_weight(self) -> f64 {
+        self.pose_prior_weight
+    }
+
+    pub fn with_max_iterations(mut self, max_iterations: usize) -> Result<Self, VioConfigError> {
+        self.max_iterations =
+            NonZeroUsize::new(max_iterations).ok_or(VioConfigError::ZeroMaxIterations)?;
+        Ok(self)
+    }
+
+    pub fn with_pose_prior_weight(mut self, weight: f64) -> Result<Self, VioConfigError> {
+        if !weight.is_finite() {
+            return Err(VioConfigError::NonFinitePosePriorWeight);
+        }
+        if weight <= 0.0 {
+            return Err(VioConfigError::NonPositivePosePriorWeight);
+        }
+        self.pose_prior_weight = weight;
+        Ok(self)
     }
 }
 
@@ -252,7 +288,7 @@ impl LocalVio {
             return;
         }
 
-        for _ in 0..MAX_SOLVER_ITERS {
+        for _ in 0..self.config.max_iterations() {
             let frames = self.frames.make_contiguous();
             let mut h = vec![0.0_f64; dim * dim];
             let mut b = vec![0.0_f64; dim];
@@ -268,7 +304,15 @@ impl LocalVio {
                     frame_idx,
                     measurement,
                 );
-                accumulate_self(&mut h, &mut b, dim, frame_base(frame_idx), &jac, &residual, POSE_PRIOR_WEIGHT);
+                accumulate_self(
+                    &mut h,
+                    &mut b,
+                    dim,
+                    frame_base(frame_idx),
+                    &jac,
+                    &residual,
+                    self.config.pose_prior_weight(),
+                );
 
                 let Some(preintegrated) = frames[frame_idx].preintegrated_from_prev.as_ref() else {
                     continue;
@@ -294,7 +338,7 @@ impl LocalVio {
                         frame_base(frame_idx - 1),
                         &jac_prev,
                         &residual,
-                        IMU_FACTOR_WEIGHT,
+                        1.0,
                     );
                 }
                 accumulate_self(
@@ -304,7 +348,7 @@ impl LocalVio {
                     frame_base(frame_idx),
                     &jac_curr,
                     &residual,
-                    IMU_FACTOR_WEIGHT,
+                    1.0,
                 );
                 if frame_idx > 1 {
                     accumulate_cross(
@@ -314,13 +358,13 @@ impl LocalVio {
                         frame_base(frame_idx),
                         &jac_prev,
                         &jac_curr,
-                        IMU_FACTOR_WEIGHT,
+                        1.0,
                     );
                 }
             }
 
             for idx in 0..dim {
-                h[idx * dim + idx] += SOLVER_DAMPING;
+                h[idx * dim + idx] += 1e-4;
             }
             let Some(delta) = solve_dense(h, b) else {
                 return;
