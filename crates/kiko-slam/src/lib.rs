@@ -26,6 +26,7 @@ mod oak;
 mod observability;
 mod pairing;
 mod pipeline;
+mod place_recognition;
 mod pnp;
 pub mod pose_graph;
 mod preprocess;
@@ -75,14 +76,15 @@ pub use pairing::{
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
+pub use place_recognition::DescriptorStats;
 pub use pnp::{
     build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation,
     PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
-    DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
-    KeyframeDecision, KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
+    DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
+    KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
     LoopSubsystemConfig, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
     SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
     TrackingPose,

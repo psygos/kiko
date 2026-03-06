@@ -15,9 +15,9 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
 use crate::loop_closure::{
-    aggregate_global_descriptor, match_quantized_descriptors_for_loop, DescriptorSource,
-    KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError,
-    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
+    aggregate_global_descriptor, match_quantized_descriptors_for_loop, LoopApplyError,
+    LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
+    RelocalizationConfig, VerifiedLoop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraphError, PoseGraphConfig, PoseGraphError,
@@ -26,15 +26,18 @@ use crate::pose_graph::{
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
     BaCorrection, BaResult, CalibrationBundle, Detections, DiagnosticEvent, DownscaleFactor,
-    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
-    KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
-    LoopClosureRejectReason, LoopClosureStatus, MapFromOdom, MapObservation, Matches,
-    ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, Pose64,
+    Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus,
+    KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason,
+    LoopClosureStatus, MapFromOdom, MapObservation, Matches, ObservationSet, PinholeIntrinsics,
+    Point3, Pose, Pose64,
     RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
 use crate::frontend::{median_parallax_px, StereoFrontend};
 use crate::global_map::GlobalMap;
+use crate::place_recognition::{
+    DescriptorStats, PlaceRecognition, PlaceRecognitionEvent, PlaceRecognitionInitError,
+};
 
 use crate::inference::InferenceError;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -266,7 +269,7 @@ pub struct RedundancyPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct MapVersion(NonZeroU64);
+pub(crate) struct MapVersion(NonZeroU64);
 
 impl MapVersion {
     fn initial() -> Self {
@@ -278,7 +281,7 @@ impl MapVersion {
         Self(NonZeroU64::new(next).unwrap_or(NonZeroU64::MIN))
     }
 
-    fn as_u64(self) -> u64 {
+    pub(crate) fn as_u64(self) -> u64 {
         self.0.get()
     }
 }
@@ -343,284 +346,6 @@ impl BackendWindow {
 
     fn as_slice(&self) -> &[KeyframeId] {
         &self.keyframes
-    }
-}
-
-#[derive(Debug, Clone)]
-struct DescriptorRequest {
-    keyframe_id: KeyframeId,
-    map_version: MapVersion,
-    frame: Frame,
-}
-
-#[derive(Debug, Clone)]
-struct DescriptorResponse {
-    keyframe_id: KeyframeId,
-    map_version: MapVersion,
-    descriptor: crate::loop_closure::GlobalDescriptor,
-}
-
-#[derive(Debug, Clone)]
-enum DescriptorWorkerResponse {
-    Descriptor(Box<DescriptorResponse>),
-    Failure {
-        keyframe_id: KeyframeId,
-        map_version: MapVersion,
-        error: String,
-    },
-    WorkerPanic {
-        keyframe_id: KeyframeId,
-        map_version: MapVersion,
-        message: String,
-    },
-}
-
-#[derive(Debug)]
-enum SubmitDescriptorError {
-    QueueFull,
-    Disconnected,
-}
-
-type DescriptorExtractorFactory =
-    Arc<dyn Fn() -> Option<Box<dyn PlaceDescriptorExtractor>> + Send + Sync>;
-
-struct DescriptorWorker {
-    tx: Sender<DescriptorRequest>,
-    rx: Receiver<DescriptorWorkerResponse>,
-    _thread: thread::JoinHandle<()>,
-}
-
-impl DescriptorWorker {
-    fn model_path() -> PathBuf {
-        if let Ok(path) = std::env::var("KIKO_EIGENPLACES_MODEL") {
-            return PathBuf::from(path);
-        }
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("models")
-            .join("eigenplaces.onnx")
-    }
-
-    fn spawn(
-        config: GlobalDescriptorConfig,
-        mut extractor: Box<dyn PlaceDescriptorExtractor>,
-    ) -> Result<Self, std::io::Error> {
-        let (tx, req_rx) = crossbeam_channel::bounded::<DescriptorRequest>(config.queue_depth());
-        let (resp_tx, rx) =
-            crossbeam_channel::bounded::<DescriptorWorkerResponse>(config.queue_depth());
-        let thread = thread::Builder::new()
-            .name("kiko-descriptor-worker".to_string())
-            .spawn(move || {
-                while let Ok(request) = req_rx.recv() {
-                    let processing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        extractor.compute_descriptor(&request.frame)
-                    }));
-                    let response = match processing {
-                        Ok(Ok(descriptor)) => {
-                            DescriptorWorkerResponse::Descriptor(Box::new(DescriptorResponse {
-                                keyframe_id: request.keyframe_id,
-                                map_version: request.map_version,
-                                descriptor,
-                            }))
-                        }
-                        Ok(Err(err)) => DescriptorWorkerResponse::Failure {
-                            keyframe_id: request.keyframe_id,
-                            map_version: request.map_version,
-                            error: err.to_string(),
-                        },
-                        Err(payload) => DescriptorWorkerResponse::WorkerPanic {
-                            keyframe_id: request.keyframe_id,
-                            map_version: request.map_version,
-                            message: crate::panic_payload_to_string(payload.as_ref()),
-                        },
-                    };
-                    let should_stop =
-                        matches!(response, DescriptorWorkerResponse::WorkerPanic { .. });
-                    if resp_tx.send(response).is_err() {
-                        break;
-                    }
-                    if should_stop {
-                        break;
-                    }
-                }
-            })?;
-        Ok(Self {
-            tx,
-            rx,
-            _thread: thread,
-        })
-    }
-
-    #[cfg(test)]
-    fn spawn_with_extractor(
-        config: GlobalDescriptorConfig,
-        extractor: Box<dyn PlaceDescriptorExtractor>,
-    ) -> Result<Self, std::io::Error> {
-        Self::spawn(config, extractor)
-    }
-
-    fn submit(&self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
-        match self.tx.try_send(request) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SubmitDescriptorError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(SubmitDescriptorError::Disconnected),
-        }
-    }
-
-    fn try_recv(&self) -> Result<Option<DescriptorWorkerResponse>, ()> {
-        match self.rx.try_recv() {
-            Ok(value) => Ok(Some(value)),
-            Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(()),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DescriptorStats {
-    pub submitted: u64,
-    pub dropped_full: u64,
-    pub dropped_disconnected: u64,
-    pub applied: u64,
-    pub worker_failures: u64,
-    pub respawn_count: u32,
-    pub panics: u64,
-}
-
-struct DescriptorSupervisor {
-    worker: Option<DescriptorWorker>,
-    config: GlobalDescriptorConfig,
-    factory: DescriptorExtractorFactory,
-    respawn_count: u32,
-    max_respawns: u32,
-    spawn_exhausted: bool,
-}
-
-impl DescriptorSupervisor {
-    fn default_factory() -> DescriptorExtractorFactory {
-        Arc::new(|| {
-            let path = DescriptorWorker::model_path();
-            match EigenPlaces::try_load(path, crate::InferenceBackend::auto()) {
-                Ok(Some(extractor)) => Some(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>),
-                Ok(None) => None,
-                Err(err) => {
-                    eprintln!("failed to initialize eigenplaces descriptor extractor: {err}");
-                    None
-                }
-            }
-        })
-    }
-
-    fn spawn_with_max_respawns(config: GlobalDescriptorConfig, max_respawns: u32) -> Self {
-        Self::with_factory_and_max_respawns(config, Self::default_factory(), max_respawns)
-    }
-
-    fn with_factory_and_max_respawns(
-        config: GlobalDescriptorConfig,
-        factory: DescriptorExtractorFactory,
-        max_respawns: u32,
-    ) -> Self {
-        let worker = Self::spawn_worker(config, &factory);
-        let spawn_exhausted = worker.is_none() && max_respawns == 0;
-        if worker.is_none() {
-            eprintln!("descriptor model unavailable; using bootstrap descriptors only");
-        }
-        Self {
-            worker,
-            config,
-            factory,
-            respawn_count: 0,
-            max_respawns,
-            spawn_exhausted,
-        }
-    }
-
-    fn spawn_worker(
-        config: GlobalDescriptorConfig,
-        factory: &DescriptorExtractorFactory,
-    ) -> Option<DescriptorWorker> {
-        let extractor = factory()?;
-        match DescriptorWorker::spawn(config, extractor) {
-            Ok(worker) => Some(worker),
-            Err(err) => {
-                eprintln!("failed to spawn descriptor worker thread: {err}");
-                None
-            }
-        }
-    }
-
-    fn check_health(&mut self) {
-        if self.worker.is_some() || self.spawn_exhausted {
-            return;
-        }
-        if self.respawn_count >= self.max_respawns {
-            self.spawn_exhausted = true;
-            eprintln!(
-                "descriptor worker reached max respawns ({}) ; using bootstrap descriptors",
-                self.max_respawns
-            );
-            return;
-        }
-
-        eprintln!(
-            "descriptor worker disconnected; respawning ({}/{})",
-            self.respawn_count + 1,
-            self.max_respawns
-        );
-        self.worker = Self::spawn_worker(self.config, &self.factory);
-        self.respawn_count = self.respawn_count.saturating_add(1);
-        if self.worker.is_none() {
-            if self.respawn_count >= self.max_respawns {
-                self.spawn_exhausted = true;
-                eprintln!(
-                    "descriptor worker respawn exhausted after {} attempts",
-                    self.max_respawns
-                );
-            } else {
-                eprintln!("descriptor worker respawn failed; will retry");
-            }
-        }
-    }
-
-    fn submit(&mut self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
-        if self.worker.is_none() {
-            self.check_health();
-        }
-        let Some(worker) = self.worker.as_ref() else {
-            return Err(SubmitDescriptorError::Disconnected);
-        };
-        let result = worker.submit(request);
-        if matches!(result, Err(SubmitDescriptorError::Disconnected)) {
-            self.worker = None;
-            self.check_health();
-        }
-        result
-    }
-
-    fn try_recv(&mut self) -> Option<DescriptorWorkerResponse> {
-        let worker = self.worker.as_ref()?;
-        match worker.try_recv() {
-            Ok(Some(response)) => {
-                if matches!(response, DescriptorWorkerResponse::WorkerPanic { .. }) {
-                    self.worker = None;
-                    self.check_health();
-                }
-                Some(response)
-            }
-            Ok(None) => None,
-            Err(()) => {
-                self.worker = None;
-                self.check_health();
-                None
-            }
-        }
-    }
-
-    fn respawn_count(&self) -> u32 {
-        self.respawn_count
-    }
-
-    fn has_worker(&self) -> bool {
-        self.worker.is_some()
     }
 }
 
@@ -1552,13 +1277,6 @@ struct SharedMatches {
     pairs: Vec<(usize, usize)>,
 }
 
-#[derive(Debug)]
-struct PendingLoopCandidate {
-    query_kf: KeyframeId,
-    detections: Arc<Detections>,
-    candidates: Vec<PlaceMatch>,
-}
-
 pub struct SlamTracker {
     frontend: StereoFrontend,
     config: TrackerConfig,
@@ -1569,12 +1287,7 @@ pub struct SlamTracker {
     map_version: MapVersion,
     backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
-    descriptor_worker: Option<DescriptorSupervisor>,
-    descriptor_stats: DescriptorStats,
-    loop_db: Option<KeyframeDatabase>,
-    loop_config: Option<LoopClosureConfig>,
-    pending_loop: Option<PendingLoopCandidate>,
-    loop_streak: HashMap<KeyframeId, usize>,
+    place_recognition: Option<PlaceRecognition>,
     pending_events: Vec<DiagnosticEvent>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
@@ -1609,26 +1322,20 @@ impl SlamTracker {
             )
         });
         let loop_config = config.loop_closure_config();
-        let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
         let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(DEFAULT_MAX_RESPAWNS);
-        let descriptor_worker = if loop_config.is_some() {
-            config.global_descriptor_config().map(|cfg| {
-                DescriptorSupervisor::spawn_with_max_respawns(cfg, descriptor_max_respawns)
-            })
-        } else {
-            None
+        let place_recognition = match (loop_config, config.global_descriptor_config()) {
+            (Some(loop_config), Some(descriptor_config)) => Some(
+                PlaceRecognition::new(loop_config, descriptor_config, descriptor_max_respawns)
+                    .map_err(|err| match err {
+                        PlaceRecognitionInitError::DescriptorUnavailable { model_path } => {
+                            TrackerInitError::DescriptorUnavailable { model_path }
+                        }
+                    })?,
+            ),
+            _ => None,
         };
-        if loop_config.is_some()
-            && !descriptor_worker
-                .as_ref()
-                .is_some_and(DescriptorSupervisor::has_worker)
-        {
-            return Err(TrackerInitError::DescriptorUnavailable {
-                model_path: DescriptorWorker::model_path(),
-            });
-        }
         let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
         Ok(Self {
             frontend,
@@ -1640,12 +1347,7 @@ impl SlamTracker {
             map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
-            descriptor_worker,
-            descriptor_stats: DescriptorStats::default(),
-            loop_db,
-            loop_config,
-            pending_loop: None,
-            loop_streak: HashMap::new(),
+            place_recognition,
             pending_events: Vec::new(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
@@ -1715,7 +1417,9 @@ impl SlamTracker {
     }
 
     pub fn descriptor_stats(&self) -> DescriptorStats {
-        self.descriptor_stats
+        self.place_recognition
+            .as_ref()
+            .map_or_else(DescriptorStats::default, PlaceRecognition::descriptor_stats)
     }
 
     pub fn system_health(&self) -> SystemHealth {
@@ -1724,11 +1428,11 @@ impl SlamTracker {
             .backend
             .as_ref()
             .is_none_or(BackendSupervisor::has_worker);
-        let descriptor_expected = self.descriptor_worker.is_some();
+        let descriptor_expected = self.place_recognition.is_some();
         let descriptor_alive = self
-            .descriptor_worker
+            .place_recognition
             .as_ref()
-            .is_none_or(DescriptorSupervisor::has_worker);
+            .is_none_or(PlaceRecognition::has_worker);
         SystemHealth::from_components(
             self.tracking_health,
             backend_expected,
@@ -1773,9 +1477,9 @@ impl SlamTracker {
                 self.global_map.num_points(),
             );
         diagnostics.loop_candidate_count = self
-            .pending_loop
+            .place_recognition
             .as_ref()
-            .map_or(0, |pending| pending.candidates.len());
+            .map_or(0, PlaceRecognition::pending_candidate_count);
         diagnostics.loop_closure_status = self.pending_events.iter().find_map(|event| {
             matches!(event, DiagnosticEvent::LoopClosureDetected { .. })
                 .then_some(LoopClosureStatus::Applied)
@@ -1832,161 +1536,47 @@ impl SlamTracker {
         )
     }
 
-    fn enqueue_loop_candidates(&mut self, keyframe_id: KeyframeId, detections: &Arc<Detections>) {
-        let (Some(config), Some(loop_db)) = (self.loop_config, self.loop_db.as_mut()) else {
-            return;
-        };
-
-        let Ok(global_descriptor) = aggregate_global_descriptor(detections.descriptors()) else {
-            return;
-        };
-        loop_db.insert_with_source(
-            keyframe_id,
-            global_descriptor.clone(),
-            DescriptorSource::Bootstrap,
-        );
-
-        let mut candidates = loop_db.query(&global_descriptor, config.max_candidates());
-        candidates.retain(|candidate| candidate.similarity >= config.similarity_threshold());
-
-        if candidates.is_empty() {
-            self.loop_streak.clear();
-            return;
-        }
-
-        let present: HashSet<KeyframeId> = candidates.iter().map(|m| m.candidate).collect();
-        self.loop_streak
-            .retain(|candidate, _| present.contains(candidate));
-        for candidate in &candidates {
-            let streak = self.loop_streak.entry(candidate.candidate).or_insert(0);
-            *streak = streak.saturating_add(1);
-        }
-
-        if self.pending_loop.is_some() {
-            return;
-        }
-
-        let promoted: Vec<PlaceMatch> = candidates
-            .into_iter()
-            .filter(|candidate| {
-                self.loop_streak
-                    .get(&candidate.candidate)
-                    .copied()
-                    .unwrap_or(0)
-                    >= config.min_streak()
-            })
-            .collect();
-
-        if promoted.is_empty() {
-            return;
-        }
-
-        self.pending_loop = Some(PendingLoopCandidate {
-            query_kf: keyframe_id,
-            detections: Arc::clone(detections),
-            candidates: promoted,
-        });
-    }
-
-    fn enqueue_descriptor_request(&mut self, keyframe_id: KeyframeId, frame: &Frame) {
-        let Some(supervisor) = self.descriptor_worker.as_mut() else {
-            return;
-        };
-        let request = DescriptorRequest {
-            keyframe_id,
-            map_version: self.map_version,
-            frame: frame.clone(),
-        };
-        match supervisor.submit(request) {
-            Ok(()) => {
-                self.descriptor_stats.submitted = self.descriptor_stats.submitted.saturating_add(1);
-            }
-            Err(SubmitDescriptorError::QueueFull) => {
-                self.descriptor_stats.dropped_full =
-                    self.descriptor_stats.dropped_full.saturating_add(1);
-                eprintln!("descriptor worker queue full; keeping bootstrap descriptor");
-            }
-            Err(SubmitDescriptorError::Disconnected) => {
-                self.descriptor_stats.dropped_disconnected =
-                    self.descriptor_stats.dropped_disconnected.saturating_add(1);
-                self.descriptor_stats.respawn_count = supervisor.respawn_count();
-                eprintln!("descriptor worker disconnected; retrying with supervisor");
-            }
-        }
-    }
-
     fn drain_descriptor_responses(&mut self) {
-        loop {
-            let response = {
-                let Some(supervisor) = self.descriptor_worker.as_mut() else {
-                    return;
-                };
-                let response = supervisor.try_recv();
-                self.descriptor_stats.respawn_count = supervisor.respawn_count();
-                response
-            };
-            let Some(response) = response else {
-                break;
-            };
-            match response {
-                DescriptorWorkerResponse::Descriptor(response) => {
-                    if response.map_version.as_u64() > self.map_version.as_u64() {
-                        continue;
-                    }
-                    if self.global_map.keyframe(response.keyframe_id).is_none() {
-                        continue;
-                    }
-                    let Some(loop_db) = self.loop_db.as_mut() else {
-                        continue;
-                    };
-                    if loop_db.replace_descriptor(
-                        response.keyframe_id,
-                        response.descriptor,
-                        DescriptorSource::Learned,
-                    ) {
-                        self.descriptor_stats.applied =
-                            self.descriptor_stats.applied.saturating_add(1);
-                    }
-                }
-                DescriptorWorkerResponse::Failure {
+        let Some(place_recognition) = self.place_recognition.as_mut() else {
+            return;
+        };
+        let events = place_recognition.drain_responses(self.map_version, |keyframe_id| {
+            self.global_map.keyframe(keyframe_id).is_some()
+        });
+        for event in events {
+            match event {
+                PlaceRecognitionEvent::WorkerFailure {
                     keyframe_id,
                     map_version,
                     error,
                 } => {
-                    self.descriptor_stats.worker_failures =
-                        self.descriptor_stats.worker_failures.saturating_add(1);
                     eprintln!(
                         "descriptor worker failure (keyframe={keyframe_id:?}, version={}): {error}",
                         map_version.as_u64()
                     );
                 }
-                DescriptorWorkerResponse::WorkerPanic {
+                PlaceRecognitionEvent::WorkerPanic {
                     keyframe_id,
                     map_version,
                     message,
+                    respawn_count,
                 } => {
-                    self.descriptor_stats.panics = self.descriptor_stats.panics.saturating_add(1);
-                    self.descriptor_stats.worker_failures =
-                        self.descriptor_stats.worker_failures.saturating_add(1);
                     eprintln!(
                         "descriptor worker panic (keyframe={keyframe_id:?}, version={}): {message}",
                         map_version.as_u64()
                     );
-                    self.emit_event(DiagnosticEvent::DescriptorWorkerDied {
-                        respawn_count: self.descriptor_stats.respawn_count,
-                    });
+                    self.emit_event(DiagnosticEvent::DescriptorWorkerDied { respawn_count });
                 }
             }
         }
     }
 
     fn process_pending_loop_closure(&mut self) -> Result<Option<VerifiedLoop>, LoopDetectError> {
-        let Some(config) = self.loop_config else {
-            self.pending_loop = None;
-            self.loop_streak.clear();
+        let Some(place_recognition) = self.place_recognition.as_mut() else {
             return Ok(None);
         };
-        let Some(pending) = self.pending_loop.take() else {
+        let config = place_recognition.loop_config();
+        let Some(pending) = place_recognition.take_pending_loop() else {
             return Ok(None);
         };
         let query_quantized: Vec<_> = pending
@@ -2081,7 +1671,6 @@ impl SlamTracker {
                 match_kf: candidate.candidate,
                 similarity: candidate.similarity,
             });
-            self.loop_streak.remove(&candidate.candidate);
             return Ok(Some(verified));
         }
 
@@ -2245,8 +1834,9 @@ impl SlamTracker {
             detections,
         ) {
             self.emit_event(DiagnosticEvent::RelocalizationStarted);
-            self.pending_loop = None;
-            self.loop_streak.clear();
+            if let Some(place_recognition) = self.place_recognition.as_mut() {
+                place_recognition.clear_pending();
+            }
             self.state = TrackerState::Relocalizing(session);
             if self.trace_transitions {
                 eprintln!("entering relocalization after tracking loss");
@@ -2340,10 +1930,11 @@ impl SlamTracker {
         &self,
         current: &Detections,
         cfg: RelocalizationConfig,
-        loop_db: &KeyframeDatabase,
     ) -> Option<crate::loop_closure::VerifiedRelocalization> {
+        let place_recognition = self.place_recognition.as_ref()?;
         let global_descriptor = aggregate_global_descriptor(current.descriptors()).ok()?;
-        let candidates = loop_db.query_for_relocalization(&global_descriptor, cfg.max_candidates());
+        let candidates =
+            place_recognition.relocalization_matches(&global_descriptor, cfg.max_candidates());
         let query_quantized: Vec<_> = current
             .descriptors()
             .iter()
@@ -2449,12 +2040,12 @@ impl SlamTracker {
             return Ok(self.fail_relocalization(frame_id, cfg, session, Arc::clone(&current)));
         }
 
-        let Some(loop_db) = self.loop_db.as_ref() else {
+        if self.place_recognition.is_none() {
             self.state = TrackerState::NeedKeyframe;
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
-        };
+        }
 
-        let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg, loop_db) else {
+        let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg) else {
             return Ok(self.fail_relocalization(frame_id, cfg, session, current));
         };
         let candidate_id = verified.match_kf();
@@ -2474,8 +2065,9 @@ impl SlamTracker {
                 self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
                     keyframe_id: candidate_id,
                 });
-                self.pending_loop = None;
-                self.loop_streak.clear();
+                if let Some(place_recognition) = self.place_recognition.as_mut() {
+                    place_recognition.clear_pending();
+                }
                 self.state = TrackerState::NeedKeyframe;
                 if self.trace_transitions {
                     eprintln!(
@@ -2679,29 +2271,17 @@ impl SlamTracker {
                         .transpose()?
                         .unwrap_or(false);
                     if redundant {
-                        if let Err(err) = remove_keyframe_from_graph_and_db(
-                            &mut self.global_map,
-                            self.loop_db.as_mut(),
-                            keyframe_id,
-                        ) {
+                        if let Err(err) =
+                            remove_keyframe_from_graph_and_db(&mut self.global_map, keyframe_id)
+                        {
                             eprintln!("failed to remove redundant keyframe {keyframe_id:?}: {err}");
                         } else {
                             self.emit_event(DiagnosticEvent::KeyframeRemoved {
                                 keyframe_id,
                                 reason: KeyframeRemovalReason::Redundant,
                             });
-                            self.loop_streak.remove(&keyframe_id);
-                            if let Some(pending) = self.pending_loop.as_mut() {
-                                if pending.query_kf == keyframe_id {
-                                    self.pending_loop = None;
-                                } else {
-                                    pending
-                                        .candidates
-                                        .retain(|candidate| candidate.candidate != keyframe_id);
-                                    if pending.candidates.is_empty() {
-                                        self.pending_loop = None;
-                                    }
-                                }
+                            if let Some(place_recognition) = self.place_recognition.as_mut() {
+                                place_recognition.remove_keyframe(keyframe_id);
                             }
                             self.bump_map_version();
                         }
@@ -2947,8 +2527,14 @@ impl SlamTracker {
         });
         self.global_map.add_keyframe_to_graph(keyframe_id);
         self.bump_map_version();
-        self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
-        self.enqueue_descriptor_request(keyframe_id, &left);
+        if let Some(place_recognition) = self.place_recognition.as_mut() {
+            place_recognition.on_keyframe(
+                keyframe_id,
+                keyframe.detections(),
+                &left,
+                self.map_version,
+            );
+        }
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.keyframe_status = Some(KeyframeStatus::Created);
@@ -3027,13 +2613,9 @@ fn insert_keyframe_into_map(
 
 fn remove_keyframe_from_graph_and_db(
     global_map: &mut GlobalMap,
-    loop_db: Option<&mut KeyframeDatabase>,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
     global_map.remove_keyframe_from_graph(keyframe_id)?;
-    if let Some(loop_db) = loop_db {
-        loop_db.remove(keyframe_id);
-    }
     global_map.remove_keyframe(keyframe_id)?;
     Ok(())
 }
@@ -3352,8 +2934,16 @@ fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
 mod tests {
     use super::*;
     use crate::map::assert_map_invariants;
+    use crate::loop_closure::KeyframeDatabase;
+    use crate::place_recognition::{
+        DescriptorExtractorFactory, DescriptorRequest, DescriptorSupervisor, DescriptorWorker,
+        DescriptorWorkerResponse,
+    };
     use crate::pose_graph::EssentialGraph;
-    use crate::{CompactDescriptor, Descriptor, Detections, Keypoint, Point3, SensorId, Timestamp};
+    use crate::{
+        CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor,
+        Point3, SensorId, Timestamp,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
     use std::time::Duration;
@@ -4466,8 +4056,9 @@ mod tests {
             );
         }
 
-        remove_keyframe_from_graph_and_db(&mut global_map, Some(&mut loop_db), removed_kf)
+        remove_keyframe_from_graph_and_db(&mut global_map, removed_kf)
             .expect("remove keyframe");
+        loop_db.remove(removed_kf);
 
         assert!(global_map.keyframe(removed_kf).is_none());
         assert!(global_map.essential_graph().parent_of(removed_kf).is_none());
