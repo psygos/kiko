@@ -98,7 +98,11 @@ pub use triangulation::{
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 #[cfg(feature = "vio")]
-pub use vio::{CorrectedPreintegration, Gravity, NavState, PreintegratedImu, PreintegrationError};
+pub use vio::{
+    bias_random_walk_residual, reprojection_residual, CorrectedPreintegration, Gravity,
+    GravityError, ImuFactor, NavState, NavStateError, NavTangent, PreintegratedImu,
+    PreintegrationError, VioFactorError,
+};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {
