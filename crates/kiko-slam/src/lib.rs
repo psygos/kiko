@@ -100,8 +100,9 @@ pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 #[cfg(feature = "vio")]
 pub use vio::{
     bias_random_walk_residual, reprojection_residual, CorrectedPreintegration, Gravity,
-    GravityError, ImuFactor, NavState, NavStateError, NavTangent, PreintegratedImu,
-    PreintegrationError, VioFactorError,
+    GravityError, ImuFactor, LocalVio, LocalVioError, NavState, NavStateError, NavTangent,
+    PreintegratedImu, PreintegrationError, VioConfig, VioConfigError, VioEstimate,
+    VioFactorError,
 };
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
