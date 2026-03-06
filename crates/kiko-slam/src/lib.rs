@@ -12,6 +12,7 @@ pub mod dataset;
 mod depth;
 mod diagnostics;
 pub mod env;
+mod frontend;
 mod inference;
 mod imu;
 mod local_ba;

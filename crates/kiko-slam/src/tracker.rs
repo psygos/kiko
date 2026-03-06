@@ -1,10 +1,12 @@
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
+
+#[path = "frontend.rs"]
+mod frontend;
 
 /// Minimum 3D-2D correspondences needed for PnP pose estimation.
 const MIN_PNP_CORRESPONDENCES: usize = 4;
@@ -26,14 +28,15 @@ use crate::pose_graph::{
 };
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac, BaCorrection, BaResult, CalibrationBundle, Detections, DiagnosticEvent,
-    DownscaleFactor, EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
+    BaCorrection, BaResult, CalibrationBundle, Detections, DiagnosticEvent, DownscaleFactor,
+    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
     KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
     LoopClosureRejectReason, LoopClosureStatus, MapFromOdom, MapObservation, Matches,
     ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, Pose64,
     RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
+use crate::frontend::{median_parallax_px, StereoFrontend};
 
 use crate::inference::InferenceError;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -1559,10 +1562,7 @@ struct PendingLoopCandidate {
 }
 
 pub struct SlamTracker {
-    superpoint: SuperPoint,
-    lightglue: LightGlue,
-    triangulator: Triangulator,
-    intrinsics: PinholeIntrinsics,
+    frontend: StereoFrontend,
     config: TrackerConfig,
     state: TrackerState,
     ba: LocalBundleAdjuster,
@@ -1598,6 +1598,7 @@ impl SlamTracker {
         let stereo = calibration.stereo().clone();
         let intrinsics = calibration.intrinsics();
         let triangulator = Triangulator::new(stereo, config.triangulation);
+        let frontend = StereoFrontend::new(superpoint, lightglue, triangulator, intrinsics);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
@@ -1633,10 +1634,7 @@ impl SlamTracker {
         }
         let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
         Ok(Self {
-            superpoint,
-            lightglue,
-            triangulator,
-            intrinsics,
+            frontend,
             config,
             state: TrackerState::NeedKeyframe,
             ba,
@@ -2039,7 +2037,7 @@ impl SlamTracker {
                 pending.detections.keypoints(),
                 &correspondences,
                 &self.map,
-                self.intrinsics,
+                self.frontend.intrinsics(),
                 config.ransac(),
                 config.min_inliers(),
             ) {
@@ -2375,7 +2373,7 @@ impl SlamTracker {
                 current.keypoints(),
                 &correspondences,
                 &self.map,
-                self.intrinsics,
+                self.frontend.intrinsics(),
                 self.config.ransac,
                 cfg.min_inliers(),
             ) {
@@ -2443,10 +2441,8 @@ impl SlamTracker {
         };
 
         let current = self
-            .superpoint
-            .detect_with_downscale(&left, self.config.downscale)?
-            .top_k(self.config.max_keypoints());
-        let current = Arc::new(current);
+            .frontend
+            .detect(&left, self.config.downscale, self.config.max_keypoints())?;
 
         if current.is_empty() {
             return Ok(self.fail_relocalization(frame_id, cfg, session, Arc::clone(&current)));
@@ -2512,10 +2508,8 @@ impl SlamTracker {
         let frame_id = left.frame_id();
 
         let current = self
-            .superpoint
-            .detect_with_downscale(&left, self.config.downscale)?
-            .top_k(self.config.max_keypoints());
-        let current = Arc::new(current);
+            .frontend
+            .detect(&left, self.config.downscale, self.config.max_keypoints())?;
 
         let matches = if current.is_empty() || keyframe.detections().is_empty() {
             if self.trace_transitions {
@@ -2534,8 +2528,8 @@ impl SlamTracker {
             diagnostics.tracking_time = Some(tracking_start.elapsed());
             return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
         } else {
-            self.lightglue
-                .match_these(current.clone(), keyframe.detections().clone())?
+            self.frontend
+                .match_tracking(current.clone(), keyframe.detections().clone())?
         };
 
         let verified = match matches.with_landmarks(keyframe) {
@@ -2545,13 +2539,10 @@ impl SlamTracker {
             }
         };
 
-        let tracked_observations = match build_map_observations(
-            &self.map,
-            keyframe_id,
-            &verified,
-            current.as_ref(),
-            self.intrinsics,
-        ) {
+        let tracked_observations = match self
+            .frontend
+            .build_map_observations(&self.map, keyframe_id, &verified, current.as_ref())
+        {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
                 if self.trace_transitions {
@@ -2574,11 +2565,10 @@ impl SlamTracker {
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
-        let result = match solve_pnp_ransac(
-            &tracked_observations.observations,
-            self.intrinsics,
-            self.config.ransac,
-        ) {
+        let result = match self
+            .frontend
+            .solve_tracking_pose(&tracked_observations.observations, self.config.ransac)
+        {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
                 if self.trace_transitions {
@@ -2793,7 +2783,11 @@ impl SlamTracker {
             .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
             .collect();
         let inlier_errors =
-            crate::pnp::reprojection_errors(&pose_world, &inlier_observations, self.intrinsics);
+            crate::pnp::reprojection_errors(
+                &pose_world,
+                &inlier_observations,
+                self.frontend.intrinsics(),
+            );
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.inlier_ratio =
@@ -2896,33 +2890,29 @@ impl SlamTracker {
         let (left_arc, right_arc) = match left_det {
             Some(left_arc) => {
                 let right_det = self
-                    .superpoint
-                    .detect_with_downscale(&right, self.config.downscale)?
-                    .top_k(max_keypoints);
-                (left_arc, Arc::new(right_det))
+                    .frontend
+                    .detect(&right, self.config.downscale, max_keypoints)?;
+                (left_arc, right_det)
             }
             None => {
                 let left_det = self
-                    .superpoint
-                    .detect_with_downscale(&left, self.config.downscale)?
-                    .top_k(max_keypoints);
+                    .frontend
+                    .detect(&left, self.config.downscale, max_keypoints)?;
                 let right_det = self
-                    .superpoint
-                    .detect_with_downscale(&right, self.config.downscale)?
-                    .top_k(max_keypoints);
+                    .frontend
+                    .detect(&right, self.config.downscale, max_keypoints)?;
 
-                (Arc::new(left_det), Arc::new(right_det))
+                (left_det, right_det)
             }
         };
 
         let matches = if left_arc.is_empty() || right_arc.is_empty() {
             return Err(TrackerError::KeyframeRejected { landmarks: 0 });
         } else {
-            self.lightglue
-                .match_these(left_arc.clone(), right_arc.clone())?
+            self.frontend.match_stereo(left_arc.clone(), right_arc.clone())?
         };
 
-        let result = self.triangulator.triangulate(&matches)?;
+        let result = self.frontend.triangulate_matches(&matches)?;
         let triangulation_stats = result.stats;
         let landmarks = result.keyframe.landmarks().len();
         if landmarks < self.config.min_keyframe_points {
@@ -3355,109 +3345,6 @@ fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
         row[axis] = weight;
     }
     info
-}
-
-struct TrackedMapObservations {
-    observations: Vec<crate::Observation>,
-    verified_match_indices: Vec<usize>,
-}
-
-impl TrackedMapObservations {
-    fn len(&self) -> usize {
-        self.observations.len()
-    }
-}
-
-fn build_map_observations(
-    map: &SlamMap,
-    keyframe_id: KeyframeId,
-    matches: &Matches<Verified>,
-    current: &Detections,
-    intrinsics: PinholeIntrinsics,
-) -> Result<TrackedMapObservations, crate::PnpError> {
-    let mut observations = Vec::with_capacity(matches.len());
-    let mut verified_match_indices = Vec::with_capacity(matches.len());
-    let current_len = current.len();
-
-    for (verified_match_idx, &(ci, ki)) in matches.indices().iter().enumerate() {
-        if ci >= current_len {
-            return Err(crate::PnpError::IndexOutOfBounds {
-                current_len,
-                keyframe_len: 0,
-                current_index: ci,
-                keyframe_index: ki,
-            });
-        }
-        let keypoint_ref = match map.keyframe_keypoint(keyframe_id, ki) {
-            Ok(kp) => kp,
-            Err(_) => continue,
-        };
-        let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
-            continue;
-        };
-        let Some(point) = map.point(point_id) else {
-            continue;
-        };
-        let pixel = current.keypoints()[ci];
-        let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
-        observations.push(obs);
-        verified_match_indices.push(verified_match_idx);
-    }
-
-    if observations.len() < MIN_PNP_CORRESPONDENCES {
-        return Err(crate::PnpError::NotEnoughPoints {
-            required: MIN_PNP_CORRESPONDENCES,
-            actual: observations.len(),
-        });
-    }
-    Ok(TrackedMapObservations {
-        observations,
-        verified_match_indices,
-    })
-}
-
-fn median_parallax_px(
-    matches: &Matches<Verified>,
-    verified_match_indices: &[usize],
-    inliers: &[usize],
-    keyframe: &Keyframe,
-) -> Option<f32> {
-    if inliers.is_empty() {
-        return None;
-    }
-
-    let left_kps = matches.source_a().keypoints();
-    let key_kps = keyframe.detections().keypoints();
-    let mut parallax = Vec::with_capacity(inliers.len());
-
-    for &idx in inliers {
-        let Some(&verified_idx) = verified_match_indices.get(idx) else {
-            continue;
-        };
-        let Some(&(li, ki)) = matches.indices().get(verified_idx) else {
-            continue;
-        };
-        let (Some(left), Some(key)) = (left_kps.get(li), key_kps.get(ki)) else {
-            continue;
-        };
-        let dx = left.x - key.x;
-        let dy = left.y - key.y;
-        parallax.push((dx * dx + dy * dy).sqrt());
-    }
-
-    if parallax.is_empty() {
-        return None;
-    }
-
-    parallax.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let mid = parallax.len() / 2;
-    let median = if parallax.len() % 2 == 0 {
-        (parallax[mid - 1] + parallax[mid]) * 0.5
-    } else {
-        parallax[mid]
-    };
-
-    Some(median)
 }
 
 #[cfg(test)]
