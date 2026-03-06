@@ -21,7 +21,7 @@ use crate::loop_closure::{
 };
 use crate::loop_manager::LoopManager;
 use crate::pose_graph::{
-    EssentialGraphError, PoseGraphConfig, PoseGraphError,
+    EssentialEdge, EssentialEdgeKind, EssentialGraphError, PoseGraphConfig, PoseGraphError,
 };
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
@@ -1310,6 +1310,7 @@ struct VioRuntime {
     local_vio: LocalVio,
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
+    predicted_pose_odom: Option<Pose64>,
 }
 
 pub struct SlamTracker {
@@ -1360,6 +1361,7 @@ impl SlamTracker {
                     local_vio: LocalVio::new(vio_config, gravity),
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
+                    predicted_pose_odom: None,
                 })
             }
             _ => LocalEstimator::VisualOnly,
@@ -1521,7 +1523,9 @@ impl SlamTracker {
             .local_vio
             .predict_from_latest(&preintegrated)
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        self.last_pose_world = Some(predicted.state().pose_odom_from_body().to_pose32());
+        let predicted_pose = predicted.state().pose_odom_from_body();
+        vio_runtime.predicted_pose_odom = Some(predicted_pose);
+        self.last_pose_world = Some(predicted_pose.to_pose32());
         Ok(())
     }
 
@@ -1545,6 +1549,7 @@ impl SlamTracker {
                 .local_vio
                 .initialize(keyframe_id, state)
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
+            vio_runtime.predicted_pose_odom = Some(Pose64::from_pose32(pose_world));
             vio_runtime.pending_imu.clear();
             return Ok(());
         }
@@ -1571,7 +1576,18 @@ impl SlamTracker {
             .local_vio
             .push_preintegrated(keyframe_id, preintegrated)
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        self.last_pose_world = Some(estimate.state().pose_odom_from_body().to_pose32());
+        let odom_pose = estimate.state().pose_odom_from_body();
+        vio_runtime.predicted_pose_odom = Some(odom_pose);
+        self.last_pose_world = Some(odom_pose.to_pose32());
+        if let Some(odometry) = vio_runtime.local_vio.latest_odometry_constraint() {
+            self.global_map.add_odometry_edge(EssentialEdge {
+                a: odometry.from(),
+                b: odometry.to(),
+                kind: EssentialEdgeKind::Odometry,
+                relative_pose: odometry.relative_pose(),
+                information: odometry.information(),
+            });
+        }
         Ok(())
     }
 
@@ -1611,9 +1627,11 @@ impl SlamTracker {
     }
 
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
-        let _ = self
+        let corrected = self
             .loop_manager
             .apply_verified_loop(&mut self.global_map, &verified)?;
+        #[cfg(feature = "vio")]
+        self.realign_map_from_odom(&corrected);
         self.bump_map_version();
         Ok(())
     }
@@ -1629,6 +1647,30 @@ impl SlamTracker {
 
     fn emit_event(&mut self, event: DiagnosticEvent) {
         self.pending_events.push(event);
+    }
+
+    #[cfg(feature = "vio")]
+    fn realign_map_from_odom(&mut self, corrected_poses: &[(KeyframeId, Pose)]) {
+        let LocalEstimator::Inertial(vio_runtime) = &self.local_estimator else {
+            return;
+        };
+        for (keyframe_id, corrected_pose_map) in corrected_poses.iter().rev() {
+            let Some(estimate) = vio_runtime.local_vio.estimate_for(*keyframe_id) else {
+                continue;
+            };
+            let correction = Pose64::from_pose32(*corrected_pose_map)
+                .compose(estimate.state().pose_odom_from_body().inverse());
+            self.map_from_odom.set_correction(correction);
+            break;
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    fn current_odom_pose(&self) -> Option<Pose64> {
+        match &self.local_estimator {
+            LocalEstimator::VisualOnly => None,
+            LocalEstimator::Inertial(vio_runtime) => vio_runtime.predicted_pose_odom,
+        }
     }
 
     fn drain_events(&mut self) -> Vec<DiagnosticEvent> {
@@ -1667,6 +1709,25 @@ impl SlamTracker {
         tracking: TrackingHealth,
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
+        #[cfg(feature = "vio")]
+        let pose = match (self.current_odom_pose(), pose) {
+            (Some(cam_from_odom), Some(pose_map)) => {
+                let cam_from_map = Pose64::from_pose32(pose_map);
+                self.map_from_odom
+                    .set_correction(cam_from_map.compose(cam_from_odom.inverse()));
+                Some(TrackingPose::new(cam_from_odom, cam_from_map))
+            }
+            (Some(cam_from_odom), None) => {
+                let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
+                Some(TrackingPose::new(cam_from_odom, cam_from_map))
+            }
+            (None, maybe_pose) => maybe_pose.map(|pose_world| {
+                let cam_from_odom = Pose64::from_pose32(pose_world);
+                let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
+                TrackingPose::new(cam_from_odom, cam_from_map)
+            }),
+        };
+        #[cfg(not(feature = "vio"))]
         let pose = pose.map(|pose_world| {
             let cam_from_odom = Pose64::from_pose32(pose_world);
             let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);

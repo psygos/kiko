@@ -77,6 +77,32 @@ impl VioEstimate {
 }
 
 #[derive(Clone, Debug)]
+pub struct VioOdometryConstraint {
+    from: KeyframeId,
+    to: KeyframeId,
+    relative_pose: Pose64,
+    information: [[f64; 6]; 6],
+}
+
+impl VioOdometryConstraint {
+    pub fn from(&self) -> KeyframeId {
+        self.from
+    }
+
+    pub fn to(&self) -> KeyframeId {
+        self.to
+    }
+
+    pub fn relative_pose(&self) -> Pose64 {
+        self.relative_pose
+    }
+
+    pub fn information(&self) -> [[f64; 6]; 6] {
+        self.information
+    }
+}
+
+#[derive(Clone, Debug)]
 struct VioFrame {
     keyframe_id: KeyframeId,
     state: NavState,
@@ -124,6 +150,16 @@ impl LocalVio {
         })
     }
 
+    pub fn estimate_for(&self, keyframe_id: KeyframeId) -> Option<VioEstimate> {
+        self.frames
+            .iter()
+            .find(|frame| frame.keyframe_id == keyframe_id)
+            .map(|frame| VioEstimate {
+                keyframe_id: frame.keyframe_id,
+                state: frame.state.clone(),
+            })
+    }
+
     pub fn predict_from_latest(
         &self,
         preintegrated: &PreintegratedImu,
@@ -132,6 +168,27 @@ impl LocalVio {
         Ok(VioEstimate {
             keyframe_id: previous.keyframe_id,
             state: propagate_state(previous.state(), preintegrated, self.gravity),
+        })
+    }
+
+    pub fn latest_odometry_constraint(&self) -> Option<VioOdometryConstraint> {
+        let current = self.frames.back()?;
+        let preintegrated = current.preintegrated_from_prev.as_ref()?;
+        let previous = self
+            .frames
+            .iter()
+            .rev()
+            .nth(1)?;
+        let relative_pose = previous
+            .state()
+            .pose_odom_from_body()
+            .inverse()
+            .compose(current.state().pose_odom_from_body());
+        Some(VioOdometryConstraint {
+            from: previous.keyframe_id,
+            to: current.keyframe_id,
+            relative_pose,
+            information: pose_information_from_preintegration(preintegrated),
         })
     }
 
@@ -202,6 +259,17 @@ fn propagate_state(state_i: &NavState, preintegrated: &PreintegratedImu, gravity
         state_i.bias().clone(),
     )
     .expect("propagated state must stay finite")
+}
+
+fn pose_information_from_preintegration(preintegrated: &PreintegratedImu) -> [[f64; 6]; 6] {
+    let mut information = [[0.0_f64; 6]; 6];
+    for axis in 0..3 {
+        let pos_var = preintegrated.covariance[6 + axis][6 + axis].max(1e-12);
+        let rot_var = preintegrated.covariance[axis][axis].max(1e-12);
+        information[axis][axis] = 1.0 / pos_var;
+        information[3 + axis][3 + axis] = 1.0 / rot_var;
+    }
+    information
 }
 
 #[cfg(test)]
@@ -335,5 +403,33 @@ mod tests {
         }
         assert_eq!(vio.len(), 2);
         assert_eq!(vio.latest_estimate().expect("latest").keyframe_id(), ids[3]);
+    }
+
+    #[test]
+    fn latest_odometry_constraint_matches_latest_pair() {
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let mut vio = LocalVio::new(VioConfig::new(4).expect("config"), gravity);
+        let ids = keyframe_ids(2);
+        vio.initialize(
+            ids[0],
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state"),
+        )
+        .expect("init");
+        let preintegrated = PreintegratedImu::integrate(
+            &batch(&[
+                (0, [0.0; 3], [0.0; 3]),
+                (10_000_000, [0.0; 3], [0.0; 3]),
+                (20_000_000, [0.0; 3], [0.0; 3]),
+            ]),
+            &ImuBias::default(),
+            &noise(),
+        )
+        .expect("preintegrated");
+        vio.push_preintegrated(ids[1], preintegrated).expect("push");
+        let constraint = vio.latest_odometry_constraint().expect("constraint");
+        assert_eq!(constraint.from(), ids[0]);
+        assert_eq!(constraint.to(), ids[1]);
+        assert!(constraint.information()[0][0].is_finite());
+        assert!(constraint.information()[3][3].is_finite());
     }
 }

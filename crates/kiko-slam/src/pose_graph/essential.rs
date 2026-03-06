@@ -10,6 +10,7 @@ use super::{scaled_identity6, PoseGraphEdge};
 pub enum EssentialEdgeKind {
     SpanningTree,
     StrongCovisibility,
+    Odometry,
     Loop,
 }
 
@@ -28,6 +29,7 @@ pub struct EssentialGraphSnapshot {
     pub order: Vec<KeyframeId>,
     pub spanning_edges: Vec<EssentialEdge>,
     pub strong_covis_edges: Vec<EssentialEdge>,
+    pub odometry_edges: Vec<EssentialEdge>,
     pub loop_edges: Vec<EssentialEdge>,
     pub strong_threshold: u32,
 }
@@ -44,6 +46,7 @@ pub struct EssentialGraph {
     order: Vec<KeyframeId>,
     spanning_edges: Vec<EssentialEdge>,
     strong_covis_edges: Vec<EssentialEdge>,
+    odometry_edges: Vec<EssentialEdge>,
     loop_edges: Vec<EssentialEdge>,
     strong_threshold: u32,
 }
@@ -79,6 +82,7 @@ impl EssentialGraph {
             order: Vec::new(),
             spanning_edges: Vec::new(),
             strong_covis_edges: Vec::new(),
+            odometry_edges: Vec::new(),
             loop_edges: Vec::new(),
             strong_threshold,
         }
@@ -164,6 +168,21 @@ impl EssentialGraph {
         self.loop_edges.push(edge);
     }
 
+    pub fn add_odometry_edge(&mut self, edge: EssentialEdge) {
+        let root = self.order.first().copied();
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.a) {
+            entry.insert(root.unwrap_or(edge.a));
+            self.order.push(edge.a);
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.parent.entry(edge.b) {
+            entry.insert(root.unwrap_or(edge.a));
+            self.order.push(edge.b);
+        }
+        self.odometry_edges
+            .retain(|existing| !same_endpoints(existing.a, existing.b, edge.a, edge.b));
+        self.odometry_edges.push(edge);
+    }
+
     fn attach_parent(
         &mut self,
         keyframe_id: KeyframeId,
@@ -221,6 +240,8 @@ impl EssentialGraph {
             .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
         self.strong_covis_edges
             .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
+        self.odometry_edges
+            .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
         self.loop_edges
             .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
 
@@ -247,6 +268,7 @@ impl EssentialGraph {
         self.spanning_edges
             .iter()
             .chain(self.strong_covis_edges.iter())
+            .chain(self.odometry_edges.iter())
             .chain(self.loop_edges.iter())
     }
 
@@ -256,6 +278,7 @@ impl EssentialGraph {
             order: self.order.clone(),
             spanning_edges: self.spanning_edges.clone(),
             strong_covis_edges: self.strong_covis_edges.clone(),
+            odometry_edges: self.odometry_edges.clone(),
             loop_edges: self.loop_edges.clone(),
             strong_threshold: self.strong_threshold,
         }
