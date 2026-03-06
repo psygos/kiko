@@ -368,6 +368,9 @@ impl LocalVio {
             self.anchor_prior = None;
         }
         self.frames.pop_front();
+        if let Some(new_oldest) = self.frames.front_mut() {
+            new_oldest.preintegrated_from_prev = None;
+        }
     }
 
     fn optimize_predicted_state(
@@ -527,6 +530,9 @@ impl LocalVio {
                 );
 
                 let Some(preintegrated) = frames[frame_idx].preintegrated_from_prev.as_ref() else {
+                    continue;
+                };
+                if frame_idx == 0 {
                     continue;
                 };
                 let residual = ImuFactor::residual(
