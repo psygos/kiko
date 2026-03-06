@@ -28,8 +28,8 @@ use crate::{
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
     KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
-    LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, ObservationSet,
-    PinholeIntrinsics, Point3, Pose, Pose64,
+    LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, Observation,
+    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64,
     RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
@@ -1357,8 +1357,12 @@ impl SlamTracker {
                     .map_err(|err| TrackerInitError::VioInvalidGravity {
                         message: err.to_string(),
                     })?;
+                let camera_from_body = calibration
+                    .imu_extrinsics()
+                    .map(|extrinsics| extrinsics.t_cam_imu())
+                    .unwrap_or_else(Pose64::identity);
                 LocalEstimator::Inertial(VioRuntime {
-                    local_vio: LocalVio::new(vio_config, gravity),
+                    local_vio: LocalVio::new(vio_config, gravity, camera_from_body, intrinsics),
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
                     predicted_pose_odom: None,
@@ -1534,6 +1538,7 @@ impl SlamTracker {
         &mut self,
         keyframe_id: KeyframeId,
         pose_world: Pose,
+        visual_observations: Vec<Observation>,
     ) -> Result<(), TrackerError> {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             return Ok(());
@@ -1549,7 +1554,7 @@ impl SlamTracker {
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
             vio_runtime
                 .local_vio
-                .initialize(keyframe_id, state, pose_measurement_odom)
+                .initialize(keyframe_id, state, pose_measurement_odom, visual_observations)
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
             vio_runtime.predicted_pose_odom = Some(pose_measurement_odom);
             vio_runtime.pending_imu.clear();
@@ -1580,6 +1585,7 @@ impl SlamTracker {
                 keyframe_id,
                 preintegrated,
                 self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_world)),
+                visual_observations,
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let odom_pose = estimate.state().pose_odom_from_body();
@@ -2494,6 +2500,7 @@ impl SlamTracker {
                 new_pose,
                 Some(current.clone()),
                 Some(shared),
+                Some(tracked_observations.observations.clone()),
             ) {
                 keyframe_status = Some(KeyframeStatus::Created);
                 triangulation_stats = keyframe_output.diagnostics.triangulation;
@@ -2647,7 +2654,7 @@ impl SlamTracker {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
         let (output, keyframe_id) = match self
-            .create_keyframe_internal(left, right, pose_world, None, None)
+            .create_keyframe_internal(left, right, pose_world, None, None, None)
         {
             Ok(value) => value,
             Err(TrackerError::KeyframeRejected { landmarks }) => {
@@ -2706,6 +2713,7 @@ impl SlamTracker {
         pose_world: Pose,
         left_det: Option<Arc<Detections>>,
         shared: Option<SharedMatches>,
+        visual_observations: Option<Vec<Observation>>,
     ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
@@ -2773,7 +2781,11 @@ impl SlamTracker {
             );
         }
         #[cfg(feature = "vio")]
-        self.on_keyframe_for_vio(keyframe_id, pose_world)?;
+        self.on_keyframe_for_vio(
+            keyframe_id,
+            pose_world,
+            visual_observations.unwrap_or_default(),
+        )?;
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.keyframe_status = Some(KeyframeStatus::Created);
