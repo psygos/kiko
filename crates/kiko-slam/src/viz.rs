@@ -56,6 +56,21 @@ impl TryFrom<usize> for VizDecimation {
     }
 }
 
+impl std::fmt::Display for VizDecimation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.get())
+    }
+}
+
+impl std::str::FromStr for VizDecimation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value: usize = s.trim().parse().map_err(|_| format!("invalid decimation: {s}"))?;
+        Self::try_from(value).map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Debug)]
 pub enum VizLogError {
     Rerun(rerun::RecordingStreamError),

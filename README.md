@@ -35,19 +35,19 @@ cargo run -p kiko-slam --features record -- live
 
 Visualize stereo matches on a dataset:
 
-```
+```sh
 cargo run -p kiko-slam -- viz recordings/<name>
 ```
 
-Run visual odometry on a dataset (Rerun viewer):
+Run full SLAM on a dataset (Rerun viewer):
 
-```
-cargo run -p kiko-slam -- viz --odometry recordings/<name>
+```sh
+cargo run -p kiko-slam -- slam recordings/<name>
 ```
 
 Benchmark a dataset:
 
-```
+```sh
 cargo run -p kiko-slam -- bench recordings/<name>
 ```
 
@@ -66,8 +66,8 @@ cargo run -p kiko-slam -- bench recordings/<name>
 **Visualization:**
 
 - `--rerun-decimation` / `KIKO_RERUN_DECIMATION` — image decimation for Rerun
-- `--odometry` / `KIKO_VIZ_ODOMETRY` — enable visual odometry in viz mode
 - `--allow-unrectified` / `KIKO_ALLOW_UNRECTIFIED` — skip rectification check
+- `--max-pairs` / `KIKO_MAX_PAIRS` — maximum stereo pairs to attempt from a dataset
 
 **Bundle adjustment:**
 

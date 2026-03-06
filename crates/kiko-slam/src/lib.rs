@@ -273,6 +273,21 @@ impl TryFrom<usize> for DownscaleFactor {
     }
 }
 
+impl std::fmt::Display for DownscaleFactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.get())
+    }
+}
+
+impl std::str::FromStr for DownscaleFactor {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value: usize = s.trim().parse().map_err(|_| format!("invalid downscale factor: {s}"))?;
+        Self::try_from(value).map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Frame {
     sensor_id: SensorId,

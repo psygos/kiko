@@ -49,6 +49,21 @@ impl TryFrom<usize> for KeypointLimit {
     }
 }
 
+impl std::fmt::Display for KeypointLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.get())
+    }
+}
+
+impl std::str::FromStr for KeypointLimit {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let value: usize = s.trim().parse().map_err(|_| format!("invalid keypoint limit: {s}"))?;
+        Self::try_from(value).map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Debug)]
 pub enum PipelineError {
     Inference(InferenceError),
