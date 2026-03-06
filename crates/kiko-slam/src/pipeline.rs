@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    inference::InferenceError, DownscaleFactor, LightGlue, Matches, Raw, StereoPair, SuperPoint,
-    VizError, VizPacket,
+    DownscaleFactor, LightGlue, Matches, Raw, StereoPair, SuperPoint, VizError, VizPacket,
+    inference::InferenceError,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +59,10 @@ impl std::str::FromStr for KeypointLimit {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: usize = s.trim().parse().map_err(|_| format!("invalid keypoint limit: {s}"))?;
+        let value: usize = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid keypoint limit: {s}"))?;
         Self::try_from(value).map_err(|e| e.to_string())
     }
 }
@@ -101,11 +104,7 @@ pub struct InferencePipeline {
 }
 
 impl InferencePipeline {
-    pub fn new(
-        superpoint: SuperPoint,
-        lightglue: LightGlue,
-        max_keypoints: KeypointLimit,
-    ) -> Self {
+    pub fn new(superpoint: SuperPoint, lightglue: LightGlue, max_keypoints: KeypointLimit) -> Self {
         Self {
             superpoint,
             lightglue,

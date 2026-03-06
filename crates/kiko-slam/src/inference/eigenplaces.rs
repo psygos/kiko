@@ -3,10 +3,10 @@ use std::path::Path;
 use ort::session::Session;
 use ort::value::TensorRef;
 
-use crate::loop_closure::{GlobalDescriptor, GLOBAL_DESCRIPTOR_DIM};
 use crate::Frame;
+use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
 
-use super::{build_session, InferenceBackend, InferenceError, PlaceDescriptorExtractor};
+use super::{InferenceBackend, InferenceError, PlaceDescriptorExtractor, build_session};
 
 const INPUT_SIZE: usize = 224;
 const INPUT_CHANNELS: usize = 3;
@@ -150,7 +150,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        parse_descriptor_output, preprocess_frame_to_nchw, EigenPlaces, GLOBAL_DESCRIPTOR_DIM,
+        EigenPlaces, GLOBAL_DESCRIPTOR_DIM, parse_descriptor_output, preprocess_frame_to_nchw,
     };
     use crate::inference::InferenceError;
     use crate::{Frame, FrameId, InferenceBackend, SensorId, Timestamp};
@@ -223,9 +223,11 @@ mod tests {
     fn try_load_nonexistent_returns_none() {
         let missing = unique_temp_file("missing");
         assert!(!missing.exists());
-        assert!(EigenPlaces::try_load(&missing, InferenceBackend::Cpu)
-            .expect("missing model should not error")
-            .is_none());
+        assert!(
+            EigenPlaces::try_load(&missing, InferenceBackend::Cpu)
+                .expect("missing model should not error")
+                .is_none()
+        );
     }
 
     #[test]

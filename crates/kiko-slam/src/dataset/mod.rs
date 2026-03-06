@@ -370,9 +370,7 @@ impl DatasetWriter {
 
     /// Enqueue a validated IMU batch according to the configured backpressure policy.
     pub fn write_imu(&self, batch: &ImuBatch) -> WriteOutcome {
-        let bytes = batch
-            .len()
-            .saturating_mul(IMU_RECORD_BYTES);
+        let bytes = batch.len().saturating_mul(IMU_RECORD_BYTES);
         self.write_item(
             SpoolItem::Imu(batch.clone()),
             bytes,
@@ -753,10 +751,8 @@ fn write_imu_to_file(dataset_dir: &Path, batch: &ImuBatch) -> Result<(), Dataset
             path: path.clone(),
             source,
         })?;
-    std::io::Write::write_all(&mut file, &bytes).map_err(|source| DatasetError::WriteFile {
-        path,
-        source,
-    })
+    std::io::Write::write_all(&mut file, &bytes)
+        .map_err(|source| DatasetError::WriteFile { path, source })
 }
 
 fn sensor_to_str(id: SensorId) -> &'static str {

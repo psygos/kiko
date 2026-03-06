@@ -2,10 +2,10 @@ use std::fs;
 
 use crate::env::env_bool;
 
-use ort::execution_providers::cpu::CPUExecutionProvider;
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::execution_providers::ExecutionProvider;
 use ort::execution_providers::ExecutionProviderDispatch;
+use ort::execution_providers::cpu::CPUExecutionProvider;
 
 use super::InferenceError;
 
@@ -104,13 +104,7 @@ pub(crate) fn select_backend(
     );
 
     let allow_fallback = env_bool("KIKO_ALLOW_BACKEND_FALLBACK").unwrap_or(false);
-    validate_backend_selection(
-        requested,
-        desired,
-        selected,
-        allow_fallback,
-        is_jetson(),
-    )?;
+    validate_backend_selection(requested, desired, selected, allow_fallback, is_jetson())?;
 
     Ok(BackendSelection {
         selected,
@@ -133,12 +127,14 @@ fn validate_backend_selection(
         requested,
         InferenceBackend::CoreMLGpu | InferenceBackend::Cuda | InferenceBackend::TensorRT
     );
-    let auto_jetson_accelerator = requested == InferenceBackend::Auto
-        && jetson
-        && desired != InferenceBackend::Cpu;
+    let auto_jetson_accelerator =
+        requested == InferenceBackend::Auto && jetson && desired != InferenceBackend::Cpu;
 
     if explicit_accelerator && selected != requested {
-        return Err(InferenceError::BackendUnavailable { requested, selected });
+        return Err(InferenceError::BackendUnavailable {
+            requested,
+            selected,
+        });
     }
 
     if auto_jetson_accelerator && selected == InferenceBackend::Cpu {
@@ -243,7 +239,7 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_backend_selection, InferenceBackend};
+    use super::{InferenceBackend, validate_backend_selection};
     use crate::inference::InferenceError;
 
     #[test]

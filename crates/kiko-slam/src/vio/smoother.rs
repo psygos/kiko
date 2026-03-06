@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 
-use crate::math::{mat_mul_vec_f64, mat_mul_f64};
 use crate::map::KeyframeId;
+use crate::math::{mat_mul_f64, mat_mul_vec_f64};
 use crate::{
-    bias_random_walk_residual, pose_prior_residual, reprojection_residual, Gravity, ImuFactor,
-    NavState, NavTangent, Observation, PinholeIntrinsics, Pose64, PreintegratedImu,
+    Gravity, ImuFactor, NavState, NavTangent, Observation, PinholeIntrinsics, Pose64,
+    PreintegratedImu, bias_random_walk_residual, pose_prior_residual, reprojection_residual,
 };
 
 const STATE_DIM: usize = 15;
@@ -239,11 +239,7 @@ impl LocalVio {
     pub fn latest_odometry_constraint(&self) -> Option<VioOdometryConstraint> {
         let current = self.frames.back()?;
         let preintegrated = current.preintegrated_from_prev.as_ref()?;
-        let previous = self
-            .frames
-            .iter()
-            .rev()
-            .nth(1)?;
+        let previous = self.frames.iter().rev().nth(1)?;
         let relative_pose = previous
             .state()
             .pose_odom_from_body()
@@ -273,7 +269,11 @@ impl LocalVio {
         visual_observations: Vec<Observation>,
     ) -> Result<VioEstimate, LocalVioError> {
         let previous = self.frames.back().ok_or(LocalVioError::NotInitialized)?;
-        if self.frames.iter().any(|frame| frame.keyframe_id == keyframe_id) {
+        if self
+            .frames
+            .iter()
+            .any(|frame| frame.keyframe_id == keyframe_id)
+        {
             return Err(LocalVioError::DuplicateKeyframe { keyframe_id });
         }
         let propagated = propagate_state(previous.state(), &preintegrated, self.gravity);
@@ -295,10 +295,7 @@ impl LocalVio {
             .back()
             .map(|frame| frame.state.clone())
             .unwrap_or(propagated);
-        Ok(VioEstimate {
-            keyframe_id,
-            state,
-        })
+        Ok(VioEstimate { keyframe_id, state })
     }
 
     fn optimize_window(&mut self) {
@@ -380,8 +377,10 @@ impl LocalVio {
                     );
                 }
 
-                let bias_residual =
-                    bias_random_walk_residual(&frames[frame_idx - 1].state, &frames[frame_idx].state);
+                let bias_residual = bias_random_walk_residual(
+                    &frames[frame_idx - 1].state,
+                    &frames[frame_idx].state,
+                );
                 let (bias_jac_prev, bias_jac_curr) =
                     numerical_bias_random_walk_jacobians(frames, frame_idx - 1, frame_idx);
                 let bias_weights = preintegrated.bias_random_walk_information_diag();
@@ -474,7 +473,11 @@ impl VioFrame {
     }
 }
 
-fn propagate_state(state_i: &NavState, preintegrated: &PreintegratedImu, gravity: Gravity) -> NavState {
+fn propagate_state(
+    state_i: &NavState,
+    preintegrated: &PreintegratedImu,
+    gravity: Gravity,
+) -> NavState {
     let pose_i = state_i.pose_odom_from_body();
     let r_i = pose_i.rotation();
     let p_i = pose_i.translation();
@@ -528,7 +531,10 @@ fn numerical_pose_prior_jacobian(
     for axis in 0..STATE_DIM {
         let delta = tangent_axis(axis, 1e-6);
         let plus = pose_prior_residual(&frames[frame_idx].state.retract(&delta), measurement);
-        let minus = pose_prior_residual(&frames[frame_idx].state.retract(&neg_tangent(delta)), measurement);
+        let minus = pose_prior_residual(
+            &frames[frame_idx].state.retract(&neg_tangent(delta)),
+            measurement,
+        );
         for row in 0..POSE_PRIOR_RESIDUAL_DIM {
             jacobian[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
         }
@@ -542,7 +548,10 @@ fn numerical_imu_jacobians(
     curr_idx: usize,
     preintegrated: &PreintegratedImu,
     gravity: Gravity,
-) -> ([[f64; STATE_DIM]; IMU_RESIDUAL_DIM], [[f64; STATE_DIM]; IMU_RESIDUAL_DIM]) {
+) -> (
+    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
+    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
+) {
     let mut jac_prev = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
     let mut jac_curr = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
     for axis in 0..STATE_DIM {
@@ -765,7 +774,7 @@ mod tests {
     use super::*;
     use crate::map::SlamMap;
     use crate::{
-        Detections, Descriptor, FrameId, ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Keypoint,
+        Descriptor, Detections, FrameId, ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Keypoint,
         Observation, PinholeIntrinsics, Pose, SensorId, Timestamp,
     };
 
@@ -833,10 +842,7 @@ mod tests {
         );
         let ids = keyframe_ids(2);
         let preintegrated = PreintegratedImu::integrate(
-            &batch(&[
-                (0, [0.0; 3], [0.0; 3]),
-                (10_000_000, [0.0; 3], [0.0; 3]),
-            ]),
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
             &ImuBias::default(),
             &noise(),
         )
@@ -850,8 +856,12 @@ mod tests {
     #[test]
     fn local_vio_propagates_free_fall_state() {
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let mut vio =
-            LocalVio::new(VioConfig::new(4).expect("config"), gravity, Pose64::identity(), intrinsics());
+        let mut vio = LocalVio::new(
+            VioConfig::new(4).expect("config"),
+            gravity,
+            Pose64::identity(),
+            intrinsics(),
+        );
         let ids = keyframe_ids(2);
         vio.initialize(
             ids[0],
@@ -886,8 +896,12 @@ mod tests {
     #[test]
     fn local_vio_caps_window_size() {
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let mut vio =
-            LocalVio::new(VioConfig::new(2).expect("config"), gravity, Pose64::identity(), intrinsics());
+        let mut vio = LocalVio::new(
+            VioConfig::new(2).expect("config"),
+            gravity,
+            Pose64::identity(),
+            intrinsics(),
+        );
         let ids = keyframe_ids(4);
         vio.initialize(
             ids[0],
@@ -898,10 +912,7 @@ mod tests {
         .expect("init");
         for idx in 1..=3 {
             let preintegrated = PreintegratedImu::integrate(
-                &batch(&[
-                    (0, [0.0; 3], [0.0; 3]),
-                    (10_000_000, [0.0; 3], [0.0; 3]),
-                ]),
+                &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
                 &ImuBias::default(),
                 &noise(),
             )
@@ -916,8 +927,12 @@ mod tests {
     #[test]
     fn latest_odometry_constraint_matches_latest_pair() {
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let mut vio =
-            LocalVio::new(VioConfig::new(4).expect("config"), gravity, Pose64::identity(), intrinsics());
+        let mut vio = LocalVio::new(
+            VioConfig::new(4).expect("config"),
+            gravity,
+            Pose64::identity(),
+            intrinsics(),
+        );
         let ids = keyframe_ids(2);
         vio.initialize(
             ids[0],
@@ -950,7 +965,7 @@ mod tests {
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
         let config = VioConfig::new(4)
             .expect("config")
-            .with_pose_prior_weight(1.0e9)
+            .with_pose_prior_weight(1.0e12)
             .expect("pose prior weight");
         let mut vio = LocalVio::new(config, gravity, Pose64::identity(), intrinsics());
         let ids = keyframe_ids(2);
@@ -962,10 +977,7 @@ mod tests {
         )
         .expect("init");
         let preintegrated = PreintegratedImu::integrate(
-            &batch(&[
-                (0, [0.0; 3], [0.0; 3]),
-                (10_000_000, [0.0; 3], [0.0; 3]),
-            ]),
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
             &ImuBias::default(),
             &noise(),
         )
@@ -978,54 +990,110 @@ mod tests {
             .push_preintegrated(ids[1], preintegrated, measurement, Vec::new())
             .expect("push");
         let x = estimate.state().pose_odom_from_body().translation()[0];
-        assert!(x > 0.01, "optimized x should move toward measurement, got {x}");
+        assert!(
+            x > 0.95,
+            "optimized x should follow strong pose prior, got {x}"
+        );
     }
 
     #[test]
     fn local_vio_solver_uses_visual_observations() {
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
         let intrinsics = intrinsics();
-        let mut vio =
-            LocalVio::new(VioConfig::new(4).expect("config"), gravity, Pose64::identity(), intrinsics);
+        let config = VioConfig::new(4)
+            .expect("config")
+            .with_pose_prior_weight(1.0e9)
+            .expect("pose prior weight");
+        let mut with_visual = LocalVio::new(config, gravity, Pose64::identity(), intrinsics);
+        let mut without_visual = LocalVio::new(config, gravity, Pose64::identity(), intrinsics);
         let ids = keyframe_ids(2);
-        vio.initialize(
-            ids[0],
-            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state"),
-            Pose64::identity(),
-            Vec::new(),
-        )
-        .expect("init");
+        with_visual
+            .initialize(
+                ids[0],
+                NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state"),
+                Pose64::identity(),
+                Vec::new(),
+            )
+            .expect("init");
+        without_visual
+            .initialize(
+                ids[0],
+                NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state"),
+                Pose64::identity(),
+                Vec::new(),
+            )
+            .expect("init");
         let preintegrated = PreintegratedImu::integrate(
-            &batch(&[
-                (0, [0.0; 3], [0.0; 3]),
-                (10_000_000, [0.0; 3], [0.0; 3]),
-            ]),
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
             &ImuBias::default(),
             &noise(),
         )
         .expect("preintegrated");
-        let observation = Observation::try_new(
-            crate::Point3 {
-                x: 0.0,
-                y: 0.0,
-                z: 1.0,
-            },
-            Keypoint { x: 50.0, y: 40.0 },
-            intrinsics,
-        )
-        .expect("observation");
-        let estimate = vio
-            .push_preintegrated(ids[1], preintegrated, Pose64::identity(), vec![observation])
-            .expect("push");
-        let z = estimate.state().pose_odom_from_body().translation()[2];
-        assert!(z.abs() < 1e-3, "visual observation should keep translation near origin, got {z}");
+        let measurement = Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 0.0, -0.25],
+        );
+        let observations = vec![
+            Observation::try_new(
+                crate::Point3 {
+                    x: 0.2,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Keypoint { x: 70.0, y: 40.0 },
+                intrinsics,
+            )
+            .expect("observation 0"),
+            Observation::try_new(
+                crate::Point3 {
+                    x: -0.2,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Keypoint { x: 30.0, y: 40.0 },
+                intrinsics,
+            )
+            .expect("observation 1"),
+            Observation::try_new(
+                crate::Point3 {
+                    x: 0.0,
+                    y: 0.2,
+                    z: 1.0,
+                },
+                Keypoint { x: 50.0, y: 60.0 },
+                intrinsics,
+            )
+            .expect("observation 2"),
+        ];
+        let with_visual_estimate = with_visual
+            .push_preintegrated(ids[1], preintegrated.clone(), measurement, observations)
+            .expect("push with visual");
+        let without_visual_estimate = without_visual
+            .push_preintegrated(ids[1], preintegrated, measurement, Vec::new())
+            .expect("push without visual");
+        let z_with_visual = with_visual_estimate
+            .state()
+            .pose_odom_from_body()
+            .translation()[2];
+        let z_without_visual = without_visual_estimate
+            .state()
+            .pose_odom_from_body()
+            .translation()[2];
+        assert!(
+            z_with_visual.abs() < z_without_visual.abs(),
+            "visual observations should pull depth toward reprojection-consistent geometry: with={z_with_visual} without={z_without_visual}"
+        );
     }
 
     #[test]
     fn local_vio_solver_preserves_bias_state_through_window_updates() {
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let mut vio =
-            LocalVio::new(VioConfig::new(4).expect("config"), gravity, Pose64::identity(), intrinsics());
+        let mut vio = LocalVio::new(
+            VioConfig::new(4).expect("config"),
+            gravity,
+            Pose64::identity(),
+            intrinsics(),
+        );
         let ids = keyframe_ids(3);
         let bias = ImuBias {
             accel: [0.02, -0.01, 0.005],

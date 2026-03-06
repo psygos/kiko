@@ -1,25 +1,26 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use std::collections::VecDeque;
 
 use clap::Args;
 
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch, CalibrationBundle,
-    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity, DepthImage, ImuBatch,
-    ImuSample,
-    DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId, PairingOutcome,
-    PairingDropReason, Point3, Raw, RerunSink, SendOutcome, SensorId, SlamTracker, StereoPairer,
-    SystemHealth, TrackingPose, VizPacket,
+    CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
+    DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
+    ImuBatch, ImuSample, PairingDropReason, PairingOutcome, Point3, Raw, RerunSink, SendOutcome,
+    SensorId, SlamTracker, StereoPairer, SystemHealth, TrackingPose, VizPacket, bounded_channel,
+    oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
-use oak_sys::{DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig};
+use oak_sys::{
+    DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig,
+};
 
 use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, RerunArgs};
-use crate::config::{build_tracker_config, TrackerDefaults};
+use crate::config::{TrackerDefaults, build_tracker_config};
 use crate::record::{
     build_calibration, load_oak_read_timeout_ms, load_pairer_max_pending_per_side,
     load_pairing_window,
@@ -91,9 +92,7 @@ fn drain_imu_until(
             break;
         }
         let sample = pending.pop_front().expect("front existed");
-        if start_exclusive
-            .is_some_and(|start| sample.timestamp().as_nanos() <= start.as_nanos())
-        {
+        if start_exclusive.is_some_and(|start| sample.timestamp().as_nanos() <= start.as_nanos()) {
             continue;
         }
         samples.push(sample);
@@ -200,30 +199,26 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
-        let mut tracker = SlamTracker::try_new(
-            superpoint,
-            lightglue,
-            calibration,
-            tracker_config,
-        )
-        .map_err(|err| LiveThreadError::TrackerInit {
-            detail: err.to_string(),
-        })?;
+        let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)
+            .map_err(|err| LiveThreadError::TrackerInit {
+                detail: err.to_string(),
+            })?;
         let depth_rx = depth_rx;
 
         for capture in pair_rx.iter() {
             let left = capture.pair().left().clone();
             let right = capture.pair().right().clone();
             let depth = depth_rx.as_ref().and_then(drain_latest_depth);
-            let process_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.process_capture(capture)));
+            let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tracker.process_capture(capture)
+            }));
             match process_result {
                 Ok(Ok(output)) => {
                     let health = output.health.clone();
                     let mut packet = None;
                     let mut points = None;
-                    let log_covisibility =
-                        output.keyframe.is_some() || output.diagnostics.loop_closure_status.is_some();
+                    let log_covisibility = output.keyframe.is_some()
+                        || output.diagnostics.loop_closure_status.is_some();
                     let covisibility_snapshot = if log_covisibility {
                         Some(tracker.covisibility_snapshot())
                     } else {
@@ -346,8 +341,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         reason: PairingDropReason::PendingCapacity,
                     }) = pairer.push_left(frame)
                     {
-                        pending_capacity_left_drops =
-                            pending_capacity_left_drops.saturating_add(1);
+                        pending_capacity_left_drops = pending_capacity_left_drops.saturating_add(1);
                     }
                     left_seq += 1;
                     got_any = true;
@@ -446,9 +440,10 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     };
-                    let imu = drain_imu_until(&mut pending_imu, previous_capture_time, capture_time)
-                        .map(CaptureImu::present)
-                        .unwrap_or_else(CaptureImu::absent);
+                    let imu =
+                        drain_imu_until(&mut pending_imu, previous_capture_time, capture_time)
+                            .map(CaptureImu::present)
+                            .unwrap_or_else(CaptureImu::absent);
                     let capture = match CaptureBundle::new(
                         CaptureId::new(capture_seq),
                         pair,
@@ -543,8 +538,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     if pending_capacity_left_drops > 0 || pending_capacity_right_drops > 0 {
         eprintln!(
             "pairer pending-capacity drops: left={} right={}",
-            pending_capacity_left_drops,
-            pending_capacity_right_drops
+            pending_capacity_left_drops, pending_capacity_right_drops
         );
     }
 

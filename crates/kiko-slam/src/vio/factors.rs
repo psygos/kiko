@@ -40,8 +40,10 @@ impl ImuFactor {
         let dt = preintegrated.dt_seconds;
 
         let r_i_t = transpose3(r_i);
-        let rotation_error =
-            so3_log_f64(mat_mul_f64(corrected.delta_rotation, mat_mul_f64(r_i_t, r_j)));
+        let rotation_error = so3_log_f64(mat_mul_f64(
+            corrected.delta_rotation,
+            mat_mul_f64(r_i_t, r_j),
+        ));
 
         let delta_position_odom = [
             p_j[0] - p_i[0] - v_i[0] * dt - 0.5 * g[0] * dt * dt,
@@ -192,22 +194,30 @@ mod tests {
             (10_000_000, [0.0; 3], [0.0; 3]),
             (20_000_000, [0.0; 3], [0.0; 3]),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default())
-            .expect("state i");
+        let state_i =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state i");
         let state_j = NavState::try_new(
             Pose64::from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                [0.0, 0.0, -0.5 * 9.81 * preintegrated.dt_seconds * preintegrated.dt_seconds],
+                [
+                    0.0,
+                    0.0,
+                    -0.5 * 9.81 * preintegrated.dt_seconds * preintegrated.dt_seconds,
+                ],
             ),
             [0.0, 0.0, -9.81 * preintegrated.dt_seconds],
             ImuBias::default(),
         )
         .expect("state j");
         let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
-        let norm = residual.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let norm = residual
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
         assert!(norm < 1e-9, "imu residual norm={norm}");
     }
 
@@ -217,7 +227,8 @@ mod tests {
             accel: [0.1, -0.2, 0.3],
             gyro: [0.01, -0.02, 0.03],
         };
-        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state i");
+        let state_i =
+            NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
         assert_eq!(bias_random_walk_residual(&state_i, &state_j), [0.0; 6]);
     }
@@ -229,23 +240,23 @@ mod tests {
             gyro: [0.01, -0.015, 0.005],
         };
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let accel_measurement = [
-            bias.accel[0],
-            bias.accel[1],
-            9.81 + bias.accel[2],
-        ];
+        let accel_measurement = [bias.accel[0], bias.accel[1], 9.81 + bias.accel[2]];
         let batch = batch(&[
             (0, accel_measurement, bias.gyro),
             (10_000_000, accel_measurement, bias.gyro),
             (20_000_000, accel_measurement, bias.gyro),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
-        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone())
-            .expect("state i");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
+        let state_i =
+            NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
         let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
-        let norm = residual.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let norm = residual
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
         assert!(norm < 1e-5, "bias-corrected imu residual norm={norm}");
     }
 

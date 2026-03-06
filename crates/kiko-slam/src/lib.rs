@@ -5,8 +5,8 @@ use std::sync::Arc;
 pub use inference::{
     EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
 };
-mod capture;
 mod calibration;
+mod capture;
 mod channel;
 pub mod dataset;
 mod depth;
@@ -14,13 +14,13 @@ mod diagnostics;
 pub mod env;
 mod frontend;
 mod global_map;
-mod inference;
 mod imu;
+mod inference;
 mod local_ba;
 pub mod loop_closure;
 mod loop_manager;
-mod map_from_odom;
 pub mod map;
+mod map_from_odom;
 mod math;
 #[cfg(feature = "record")]
 mod oak;
@@ -35,18 +35,17 @@ mod preprocess;
 pub(crate) mod test_helpers;
 mod tracker;
 mod triangulation;
-mod viz;
 #[cfg(feature = "vio")]
 mod vio;
-pub use channel::{
-    bounded_channel, ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle,
-    DropPolicy, DropReceiver, DropSender, SendOutcome,
-};
-pub use capture::{
-    CaptureBundle, CaptureBundleError, CaptureId, CaptureImu, CaptureInterval,
-    CaptureIntervalError,
-};
+mod viz;
 pub use calibration::{CalibrationBundle, CalibrationBundleError};
+pub use capture::{
+    CaptureBundle, CaptureBundleError, CaptureId, CaptureImu, CaptureInterval, CaptureIntervalError,
+};
+pub use channel::{
+    ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
+    DropReceiver, DropSender, SendOutcome, bounded_channel,
+};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, KeyframeStatus,
@@ -62,17 +61,18 @@ pub use local_ba::{
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
-    aggregate_global_descriptor, match_descriptors_for_loop, DescriptorSource, GlobalDescriptor,
-    GlobalDescriptorError, KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig,
-    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
-    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
-    RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
+    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopApplyError,
+    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput,
+    LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
+    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+    RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
+    match_descriptors_for_loop,
 };
-pub use map_from_odom::MapFromOdom;
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
+pub use map_from_odom::MapFromOdom;
 pub use math::Pose64;
 #[cfg(feature = "record")]
-pub use oak::{oak_to_depth_image, oak_to_frame, oak_to_imu_batch, OakImuError};
+pub use oak::{OakImuError, oak_to_depth_image, oak_to_frame, oak_to_imu_batch};
 pub use pairing::{
     PairingConfigError, PairingDropReason, PairingOutcome, PairingStats, PairingWindowNs,
     PendingFramesCapacity, PendingFramesCapacityError, StereoPairer,
@@ -82,31 +82,29 @@ pub use pipeline::{
 };
 pub use place_recognition::DescriptorStats;
 pub use pnp::{
-    build_observations, solve_pnp, solve_pnp_ransac, IntrinsicsError, Observation,
-    PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
+    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
+    build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
-    KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
-    LoopSubsystemConfig, ParallaxPx, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
-    SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
-    TrackingPose,
+    KeyframeInsertReason, KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx,
+    RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
+    TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
     RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
     TriangulationStats, Triangulator,
 };
-pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 #[cfg(feature = "vio")]
 pub use vio::{
-    bias_random_walk_residual, pose_prior_residual, reprojection_residual, CorrectedPreintegration, Gravity,
-    GravityError, ImuFactor, LocalVio, LocalVioError, NavState, NavStateError, NavTangent,
-    PreintegratedImu, PreintegrationError, VioConfig, VioConfigError, VioEstimate,
-    VioOdometryConstraint,
-    VioFactorError,
+    CorrectedPreintegration, Gravity, GravityError, ImuFactor, LocalVio, LocalVioError, NavState,
+    NavStateError, NavTangent, PreintegratedImu, PreintegrationError, VioConfig, VioConfigError,
+    VioEstimate, VioFactorError, VioOdometryConstraint, bias_random_walk_residual,
+    pose_prior_residual, reprojection_residual,
 };
+pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {
@@ -326,7 +324,10 @@ impl std::str::FromStr for DownscaleFactor {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: usize = s.trim().parse().map_err(|_| format!("invalid downscale factor: {s}"))?;
+        let value: usize = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid downscale factor: {s}"))?;
         Self::try_from(value).map_err(|e| e.to_string())
     }
 }
@@ -1005,7 +1006,7 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDescriptor, Descriptor, Timestamp, DESCRIPTOR_DIM, U8_SCALE};
+    use super::{CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Timestamp, U8_SCALE};
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;

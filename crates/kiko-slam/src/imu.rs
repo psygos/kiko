@@ -213,7 +213,10 @@ impl std::fmt::Display for ImuExtrinsicsError {
                 "camera-imu rotation[{row}][{col}] must be finite, got {value}"
             ),
             ImuExtrinsicsError::NonFiniteTranslation { axis, value } => {
-                write!(f, "camera-imu translation axis {axis} must be finite, got {value}")
+                write!(
+                    f,
+                    "camera-imu translation axis {axis} must be finite, got {value}"
+                )
             }
         }
     }

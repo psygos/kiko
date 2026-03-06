@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::{
+    Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
     map::{KeyframeId, KeyframeKeypoint, MapPointId, SlamMap},
-    math, Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
+    math,
 };
 
 /// Maximum SE3 parameter step for convergence detection.
@@ -1409,11 +1410,7 @@ fn accumulate_motion_prior(
 }
 
 fn huber_weight(r_norm: f32, delta: f32) -> f32 {
-    if r_norm <= delta {
-        1.0
-    } else {
-        delta / r_norm
-    }
+    if r_norm <= delta { 1.0 } else { delta / r_norm }
 }
 
 fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
@@ -1561,7 +1558,7 @@ pub(crate) fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{assert_map_invariants, KeyframeId, MapPointId, SlamMap};
+    use crate::map::{KeyframeId, MapPointId, SlamMap, assert_map_invariants};
     use crate::test_helpers::{
         axis_angle_pose, make_detections, make_pinhole_intrinsics, project_world_point,
     };

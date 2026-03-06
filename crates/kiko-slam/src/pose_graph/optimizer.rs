@@ -1,9 +1,9 @@
-use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
 use crate::Pose64;
+use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
 
 use super::{
-    scaled_identity6, solve_pcg, BlockCsr6x6, PoseGraphError, ANCHOR_REGULARIZATION,
-    HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS, POSE_GRAPH_CONVERGENCE,
+    ANCHOR_REGULARIZATION, BlockCsr6x6, HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS,
+    POSE_GRAPH_CONVERGENCE, PoseGraphError, scaled_identity6, solve_pcg,
 };
 
 type Jacobian6 = [[f64; 6]; 6];

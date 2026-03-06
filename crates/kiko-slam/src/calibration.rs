@@ -117,9 +117,13 @@ impl CalibrationBundle {
     ) -> Result<Self, CalibrationBundleError> {
         match (imu_noise, imu_extrinsics) {
             (None, None) => Ok(Self::visual_only(intrinsics, stereo)),
-            (Some(imu_noise), Some(imu_extrinsics)) => {
-                Self::with_imu(intrinsics, stereo, imu_noise, imu_extrinsics, gravity_magnitude_mps2)
-            }
+            (Some(imu_noise), Some(imu_extrinsics)) => Self::with_imu(
+                intrinsics,
+                stereo,
+                imu_noise,
+                imu_extrinsics,
+                gravity_magnitude_mps2,
+            ),
             (None, Some(_)) => Err(CalibrationBundleError::MissingImuNoise),
             (Some(_), None) => Err(CalibrationBundleError::MissingImuExtrinsics),
         }
@@ -206,8 +210,8 @@ fn validate_positive_finite(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::CameraIntrinsics;
     use crate::Pose64;
+    use crate::dataset::CameraIntrinsics;
 
     fn intrinsics() -> PinholeIntrinsics {
         PinholeIntrinsics::try_from(&CameraIntrinsics {

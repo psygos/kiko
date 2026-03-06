@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    env::env_f32, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose,
-    Raw, Timestamp, VizPacket,
+    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
+    VizPacket, env::env_f32,
 };
 
 use std::collections::HashMap;
@@ -66,7 +66,10 @@ impl std::str::FromStr for VizDecimation {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: usize = s.trim().parse().map_err(|_| format!("invalid decimation: {s}"))?;
+        let value: usize = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid decimation: {s}"))?;
         Self::try_from(value).map_err(|e| e.to_string())
     }
 }

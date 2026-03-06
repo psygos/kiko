@@ -1,8 +1,8 @@
-use super::{build_session, InferenceBackend, InferenceError};
+use super::{InferenceBackend, InferenceError, build_session};
+use crate::DESCRIPTOR_DIM;
 use crate::Detections;
 use crate::Matches;
 use crate::Raw;
-use crate::DESCRIPTOR_DIM;
 use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::Path;

@@ -1,6 +1,6 @@
-use ort::session::builder::GraphOptimizationLevel;
-use ort::session::Session;
 use ort::Error as OrtError;
+use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -101,7 +101,10 @@ impl std::fmt::Display for InferenceError {
                     "unexpected output '{name}': expected {expected}, got {actual}"
                 )
             }
-            InferenceError::BackendUnavailable { requested, selected } => write!(
+            InferenceError::BackendUnavailable {
+                requested,
+                selected,
+            } => write!(
                 f,
                 "requested inference backend {requested:?} but selected {selected:?}"
             ),

@@ -1,5 +1,5 @@
-use std::num::NonZeroUsize;
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use crate::{Frame, PairError, SensorId, StereoPair};
 
@@ -298,10 +298,12 @@ mod tests {
             PendingFramesCapacity::try_from(1).expect("capacity"),
         );
         pairer.push_left(frame(SensorId::StereoLeft, 10, 1));
-        assert!(pairer
-            .next_pair()
-            .expect("pairing should not fail")
-            .is_none());
+        assert!(
+            pairer
+                .next_pair()
+                .expect("pairing should not fail")
+                .is_none()
+        );
     }
 
     #[test]

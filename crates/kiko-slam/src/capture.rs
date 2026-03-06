@@ -145,7 +145,9 @@ impl std::fmt::Display for CaptureBundleError {
                 f,
                 "imu sample {} lies outside capture interval ({:?}, {}]",
                 sample_time.as_nanos(),
-                interval.start_exclusive().map(|timestamp| timestamp.as_nanos()),
+                interval
+                    .start_exclusive()
+                    .map(|timestamp| timestamp.as_nanos()),
                 interval.end_inclusive().as_nanos()
             ),
         }
@@ -290,11 +292,8 @@ mod tests {
 
     #[test]
     fn capture_interval_rejects_non_increasing_bounds() {
-        let err = CaptureInterval::new(
-            Some(Timestamp::from_nanos(10)),
-            Timestamp::from_nanos(10),
-        )
-        .expect_err("equal bounds should be rejected");
+        let err = CaptureInterval::new(Some(Timestamp::from_nanos(10)), Timestamp::from_nanos(10))
+            .expect_err("equal bounds should be rejected");
         assert_eq!(
             err,
             CaptureIntervalError::NonIncreasing {
@@ -313,8 +312,9 @@ mod tests {
     #[test]
     fn capture_bundle_accepts_visual_only_interval() {
         let pair = stereo_pair(100, 104);
-        let bundle = CaptureBundle::visual_only(CaptureId::new(7), pair, Some(Timestamp::from_nanos(90)))
-            .expect("visual-only bundle");
+        let bundle =
+            CaptureBundle::visual_only(CaptureId::new(7), pair, Some(Timestamp::from_nanos(90)))
+                .expect("visual-only bundle");
         assert_eq!(bundle.capture_id(), CaptureId::new(7));
         assert_eq!(bundle.capture_time(), Timestamp::from_nanos(102));
         assert!(matches!(bundle.imu(), CaptureImu::Absent));
@@ -323,8 +323,9 @@ mod tests {
     #[test]
     fn capture_bundle_rejects_interval_end_mismatch() {
         let pair = stereo_pair(100, 104);
-        let interval = CaptureInterval::new(Some(Timestamp::from_nanos(90)), Timestamp::from_nanos(101))
-            .expect("interval");
+        let interval =
+            CaptureInterval::new(Some(Timestamp::from_nanos(90)), Timestamp::from_nanos(101))
+                .expect("interval");
         let err = CaptureBundle::new(CaptureId::new(1), pair, interval, CaptureImu::Absent)
             .expect_err("bundle should reject wrong interval end");
         assert_eq!(
@@ -339,8 +340,8 @@ mod tests {
     #[test]
     fn capture_bundle_rejects_imu_sample_at_interval_start() {
         let pair = stereo_pair(100, 104);
-        let interval =
-            CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time()).expect("interval");
+        let interval = CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time())
+            .expect("interval");
         let batch = ImuBatch::new(vec![
             crate::ImuSample::new(Timestamp::from_nanos(90), [0.0; 3], [0.0; 3]).expect("sample"),
         ])
@@ -364,8 +365,8 @@ mod tests {
     #[test]
     fn capture_bundle_rejects_imu_sample_after_interval_end() {
         let pair = stereo_pair(100, 104);
-        let interval =
-            CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time()).expect("interval");
+        let interval = CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time())
+            .expect("interval");
         let batch = ImuBatch::new(vec![
             crate::ImuSample::new(Timestamp::from_nanos(103), [0.0; 3], [0.0; 3]).expect("sample"),
         ])
@@ -389,11 +390,12 @@ mod tests {
     #[test]
     fn capture_bundle_accepts_imu_samples_inside_interval() {
         let pair = stereo_pair(100, 104);
-        let interval =
-            CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time()).expect("interval");
+        let interval = CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time())
+            .expect("interval");
         let batch = ImuBatch::new(vec![
             crate::ImuSample::new(Timestamp::from_nanos(91), [0.0; 3], [0.0; 3]).expect("sample 0"),
-            crate::ImuSample::new(Timestamp::from_nanos(102), [1.0; 3], [2.0; 3]).expect("sample 1"),
+            crate::ImuSample::new(Timestamp::from_nanos(102), [1.0; 3], [2.0; 3])
+                .expect("sample 1"),
         ])
         .expect("batch");
         let bundle = CaptureBundle::new(
@@ -421,8 +423,7 @@ mod tests {
     #[test]
     fn capture_source_iterator_yields_captures_in_order() {
         let pair = stereo_pair(100, 104);
-        let bundle =
-            CaptureBundle::visual_only(CaptureId::new(9), pair, None).expect("bundle");
+        let bundle = CaptureBundle::visual_only(CaptureId::new(9), pair, None).expect("bundle");
         let source = SingleCaptureSource {
             capture: Some(bundle),
         };

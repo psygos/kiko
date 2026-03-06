@@ -69,8 +69,8 @@ pub fn rerun_recording(
 
 #[cfg(test)]
 mod tests {
-    use super::bench::{summarize_bench, BenchAccum};
-    use super::config::{build_ba_config, build_tracker_config, TrackerDefaults};
+    use super::bench::{BenchAccum, summarize_bench};
+    use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
@@ -241,7 +241,12 @@ mod tests {
     #[test]
     fn build_tracker_config_reads_vio_env_settings() {
         let _guard = env_lock().lock().expect("env lock");
-        let keys = ["KIKO_VIO", "KIKO_VIO_WINDOW", "KIKO_VIO_MAX_ITERS", "KIKO_VIO_POSE_PRIOR_WEIGHT"];
+        let keys = [
+            "KIKO_VIO",
+            "KIKO_VIO_WINDOW",
+            "KIKO_VIO_MAX_ITERS",
+            "KIKO_VIO_POSE_PRIOR_WEIGHT",
+        ];
         let saved: Vec<(String, Option<OsString>)> = keys
             .iter()
             .map(|&key| (key.to_string(), std::env::var_os(key)))

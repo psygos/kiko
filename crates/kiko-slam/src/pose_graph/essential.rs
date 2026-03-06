@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
-use crate::map::{KeyframeId, SlamMap};
 use crate::Pose64;
+use crate::map::{KeyframeId, SlamMap};
 
-use super::{scaled_identity6, PoseGraphEdge};
+use super::{PoseGraphEdge, scaled_identity6};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EssentialEdgeKind {

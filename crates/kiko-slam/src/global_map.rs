@@ -1,10 +1,10 @@
 use crate::map::{
-    CovisibilityGraph, CovisibilitySnapshot, KeyframeEntry, KeyframeId, KeyframeKeypoint,
-    MapError, MapPoint, MapPointId, SlamMap,
+    CovisibilityGraph, CovisibilitySnapshot, KeyframeEntry, KeyframeId, KeyframeKeypoint, MapError,
+    MapPoint, MapPointId, SlamMap,
 };
-use crate::pose_graph::{EssentialGraph, EssentialGraphError};
 #[cfg(feature = "vio")]
 use crate::pose_graph::EssentialEdge;
+use crate::pose_graph::{EssentialGraph, EssentialGraphError};
 use crate::{Point3, Pose};
 use std::num::NonZeroUsize;
 
@@ -150,6 +150,9 @@ impl GlobalMap {
 
     #[cfg(test)]
     pub(crate) fn from_parts(map: SlamMap, essential_graph: EssentialGraph) -> Self {
-        Self { map, essential_graph }
+        Self {
+            map,
+            essential_graph,
+        }
     }
 }

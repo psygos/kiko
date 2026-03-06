@@ -4,9 +4,9 @@ use std::sync::Arc;
 use crate::inference::InferenceError;
 use crate::map::{KeyframeId, SlamMap};
 use crate::{
-    solve_pnp_ransac, Detections, DownscaleFactor, Frame, Keyframe, LightGlue, Matches,
-    Observation, PinholeIntrinsics, PnpError, PnpResult, Raw, RansacConfig, SuperPoint,
-    TriangulationResult, Triangulator, Verified,
+    Detections, DownscaleFactor, Frame, Keyframe, LightGlue, Matches, Observation,
+    PinholeIntrinsics, PnpError, PnpResult, RansacConfig, Raw, SuperPoint, TriangulationResult,
+    Triangulator, Verified, solve_pnp_ransac,
 };
 
 pub(crate) struct StereoFrontend {

@@ -2,13 +2,13 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use super::{
-    compute_edge_error, compute_edge_jacobians, solve_pcg, BlockCsr6x6, EssentialEdge,
-    EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig, PoseGraphEdge,
-    PoseGraphOptimizer,
+    BlockCsr6x6, EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
+    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, compute_edge_error, compute_edge_jacobians,
+    solve_pcg,
 };
+use crate::Pose64;
 use crate::map::{ImageSize, SlamMap};
 use crate::math::se3_exp_f64;
-use crate::Pose64;
 use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
 
 #[derive(Clone, Debug)]
@@ -433,7 +433,10 @@ fn pose_graph_optimizer_rejects_invalid_edges() {
 
 #[test]
 fn pose_graph_optimizer_reports_non_convergence() {
-    let gt = [Pose64::identity(), se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])];
+    let gt = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
     let edges = vec![edge(0, 1, gt[0], gt[1])];
     let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
     let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
@@ -550,10 +553,12 @@ fn essential_graph_remove_keyframe_reparents_children() {
     assert_eq!(graph.parent_of(kf1), None);
     let snapshot = graph.snapshot();
     assert!(snapshot.order.iter().all(|&id| id != kf1));
-    assert!(snapshot
-        .spanning_edges
-        .iter()
-        .all(|edge| edge.a != kf1 && edge.b != kf1));
+    assert!(
+        snapshot
+            .spanning_edges
+            .iter()
+            .all(|edge| edge.a != kf1 && edge.b != kf1)
+    );
     let input = graph.pose_graph_input();
     assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
 }
@@ -610,14 +615,18 @@ fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
         .expect("remove keyframe with loop edge");
     let snapshot = graph.snapshot();
     assert_eq!(snapshot.loop_edges.len(), 0);
-    assert!(snapshot
-        .strong_covis_edges
-        .iter()
-        .all(|e| e.a != kf2 && e.b != kf2));
-    assert!(snapshot
-        .spanning_edges
-        .iter()
-        .all(|e| e.a != kf2 && e.b != kf2));
+    assert!(
+        snapshot
+            .strong_covis_edges
+            .iter()
+            .all(|e| e.a != kf2 && e.b != kf2)
+    );
+    assert!(
+        snapshot
+            .spanning_edges
+            .iter()
+            .all(|e| e.a != kf2 && e.b != kf2)
+    );
 }
 
 #[test]

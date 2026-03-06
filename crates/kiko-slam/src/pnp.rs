@@ -1,5 +1,5 @@
 use crate::dataset::CameraIntrinsics;
-use crate::{math, Keyframe, Keypoint, Matches, Point3, Verified};
+use crate::{Keyframe, Keypoint, Matches, Point3, Verified, math};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {
@@ -435,8 +435,7 @@ fn refine_pose_on_inliers(
                 rhs[row] -= jacobian[0][row] * residual[0] + jacobian[1][row] * residual[1];
                 for col in 0..6 {
                     hessian[row * 6 + col] +=
-                        jacobian[0][row] * jacobian[0][col]
-                            + jacobian[1][row] * jacobian[1][col];
+                        jacobian[0][row] * jacobian[0][col] + jacobian[1][row] * jacobian[1][col];
                 }
             }
         }
@@ -454,14 +453,13 @@ fn refine_pose_on_inliers(
         let delta = [
             rhs_vec[0], rhs_vec[1], rhs_vec[2], rhs_vec[3], rhs_vec[4], rhs_vec[5],
         ];
-        let step_norm =
-            (delta[0] * delta[0]
-                + delta[1] * delta[1]
-                + delta[2] * delta[2]
-                + delta[3] * delta[3]
-                + delta[4] * delta[4]
-                + delta[5] * delta[5])
-                .sqrt();
+        let step_norm = (delta[0] * delta[0]
+            + delta[1] * delta[1]
+            + delta[2] * delta[2]
+            + delta[3] * delta[3]
+            + delta[4] * delta[4]
+            + delta[5] * delta[5])
+            .sqrt();
         pose = crate::local_ba::apply_se3_delta(pose, delta);
         if step_norm < PNP_REFINEMENT_STEP_EPS {
             break;

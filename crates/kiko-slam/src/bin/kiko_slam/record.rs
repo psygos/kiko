@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,9 +10,9 @@ use kiko_slam::dataset::{
 };
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    oak_to_depth_image, oak_to_frame, oak_to_imu_batch, FrameId, PairingConfigError,
-    PairingOutcome,
-    PairingDropReason, PairingWindowNs, PendingFramesCapacity, SensorId, StereoPairer,
+    FrameId, PairingConfigError, PairingDropReason, PairingOutcome, PairingWindowNs,
+    PendingFramesCapacity, SensorId, StereoPairer, oak_to_depth_image, oak_to_frame,
+    oak_to_imu_batch,
 };
 use oak_sys::{
     DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig,
@@ -59,8 +59,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         align_to_rgb: false,
     });
     let imu_config = imu_enabled.then_some(ImuConfig {
-        rate_hz: u32::try_from(env_usize("KIKO_RECORD_IMU_RATE_HZ").unwrap_or(400))
-            .unwrap_or(400),
+        rate_hz: u32::try_from(env_usize("KIKO_RECORD_IMU_RATE_HZ").unwrap_or(400)).unwrap_or(400),
     });
 
     let config = DeviceConfig {
@@ -113,8 +112,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                         reason: PairingDropReason::PendingCapacity,
                     }) = pairer.push_left(frame)
                     {
-                        pending_capacity_left_drops =
-                            pending_capacity_left_drops.saturating_add(1);
+                        pending_capacity_left_drops = pending_capacity_left_drops.saturating_add(1);
                     }
                     left_count += 1;
                     left_seq += 1;
@@ -255,8 +253,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     if pending_capacity_left_drops > 0 || pending_capacity_right_drops > 0 {
         eprintln!(
             "pairer pending-capacity drops: left={} right={}",
-            pending_capacity_left_drops,
-            pending_capacity_right_drops
+            pending_capacity_left_drops, pending_capacity_right_drops
         );
     }
     Ok(())

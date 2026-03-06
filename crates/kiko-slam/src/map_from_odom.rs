@@ -33,7 +33,8 @@ impl MapFromOdom {
     }
 
     pub fn align_to_pose(&mut self, pose_cam_from_map: Pose64, pose_cam_from_odom: Pose64) {
-        self.pose_map_from_odom = Self::pose_map_from_odom_for(pose_cam_from_map, pose_cam_from_odom);
+        self.pose_map_from_odom =
+            Self::pose_map_from_odom_for(pose_cam_from_map, pose_cam_from_odom);
     }
 
     pub fn pose_map_from_odom_for(pose_cam_from_map: Pose64, pose_cam_from_odom: Pose64) -> Pose64 {
@@ -108,8 +109,14 @@ mod tests {
         bridge.align_to_pose(pose_cam_from_map, pose_cam_from_odom);
 
         let recovered_pose = bridge.odom_to_map(pose_cam_from_odom);
-        assert_eq!(recovered_pose.to_pose32().translation(), pose_cam_from_map.to_pose32().translation());
-        assert_eq!(recovered_pose.to_pose32().rotation(), pose_cam_from_map.to_pose32().rotation());
+        assert_eq!(
+            recovered_pose.to_pose32().translation(),
+            pose_cam_from_map.to_pose32().translation()
+        );
+        assert_eq!(
+            recovered_pose.to_pose32().rotation(),
+            pose_cam_from_map.to_pose32().rotation()
+        );
 
         let point_odom = Point3 {
             x: 0.2,

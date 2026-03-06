@@ -4,8 +4,8 @@ mod smoother;
 mod state;
 
 pub use factors::{
-    bias_random_walk_residual, pose_prior_residual, reprojection_residual, ImuFactor,
-    VioFactorError,
+    ImuFactor, VioFactorError, bias_random_walk_residual, pose_prior_residual,
+    reprojection_residual,
 };
 pub use preintegration::{CorrectedPreintegration, PreintegratedImu, PreintegrationError};
 pub use smoother::{

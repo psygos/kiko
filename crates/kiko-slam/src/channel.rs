@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
@@ -257,7 +257,7 @@ pub fn bounded_channel<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_channel, ChannelCapacity, DropPolicy, SendOutcome};
+    use super::{ChannelCapacity, DropPolicy, SendOutcome, bounded_channel};
 
     #[test]
     fn channel_stats_track_depth_and_high_water_mark() {

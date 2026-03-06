@@ -1,4 +1,4 @@
-use super::{build_session, InferenceBackend, InferenceError};
+use super::{InferenceBackend, InferenceError, build_session};
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::TensorRef;

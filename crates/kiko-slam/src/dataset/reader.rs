@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
-    FrameInfo, Manifest,
+    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
+    read_meta, scan_frames,
 };
 
 #[derive(Debug)]
@@ -126,8 +126,9 @@ impl DatasetReader {
             }
             None => 0,
         };
-        let end_idx = samples
-            .partition_point(|sample| sample.timestamp().as_nanos() <= interval.end_inclusive().as_nanos());
+        let end_idx = samples.partition_point(|sample| {
+            sample.timestamp().as_nanos() <= interval.end_inclusive().as_nanos()
+        });
 
         if start_idx == end_idx {
             return Err(DatasetError::MissingImuSamples {
@@ -278,15 +279,15 @@ impl<'a> Iterator for DatasetBundles<'a> {
                     Ok(pair) => pair,
                     Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
                 };
-            let interval = match CaptureInterval::new(self.previous_capture_time, pair.capture_time())
-            {
-                Ok(interval) => interval,
-                Err(_) => {
-                    return Some(Err(DatasetError::InvalidConfig {
-                        msg: "capture bundle interval must be strictly increasing",
-                    }))
-                }
-            };
+            let interval =
+                match CaptureInterval::new(self.previous_capture_time, pair.capture_time()) {
+                    Ok(interval) => interval,
+                    Err(_) => {
+                        return Some(Err(DatasetError::InvalidConfig {
+                            msg: "capture bundle interval must be strictly increasing",
+                        }));
+                    }
+                };
             let imu = match self.reader.imu_for_interval(interval) {
                 Ok(imu) => imu,
                 Err(err) => return Some(Err(err)),
@@ -294,11 +295,13 @@ impl<'a> Iterator for DatasetBundles<'a> {
             let capture_id = CaptureId::new(self.capture_seq);
             self.capture_seq = self.capture_seq.saturating_add(1);
             self.previous_capture_time = Some(interval.end_inclusive());
-            return Some(CaptureBundle::new(capture_id, pair, interval, imu).map_err(|_| {
-                DatasetError::InvalidConfig {
-                    msg: "capture bundle interval must match pair capture time",
-                }
-            }));
+            return Some(
+                CaptureBundle::new(capture_id, pair, interval, imu).map_err(|_| {
+                    DatasetError::InvalidConfig {
+                        msg: "capture bundle interval must match pair capture time",
+                    }
+                }),
+            );
         }
         None
     }
@@ -422,7 +425,10 @@ fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
     (min_ts, max_ts)
 }
 
-fn read_imu_samples(root: &PathBuf, meta: &super::Meta) -> Result<Option<Box<[ImuSample]>>, DatasetError> {
+fn read_imu_samples(
+    root: &PathBuf,
+    meta: &super::Meta,
+) -> Result<Option<Box<[ImuSample]>>, DatasetError> {
     if meta.imu.is_none() {
         return Ok(None);
     }
@@ -468,15 +474,16 @@ fn read_imu_samples(root: &PathBuf, meta: &super::Meta) -> Result<Option<Box<[Im
             read_f64(chunk, &mut offset),
             read_f64(chunk, &mut offset),
         ];
-        let sample = ImuSample::new(Timestamp::from_nanos(timestamp), accel, gyro).map_err(
-            |source| DatasetError::ReadFile {
-                path: path.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid imu sample: {source}"),
-                ),
-            },
-        )?;
+        let sample =
+            ImuSample::new(Timestamp::from_nanos(timestamp), accel, gyro).map_err(|source| {
+                DatasetError::ReadFile {
+                    path: path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid imu sample: {source}"),
+                    ),
+                }
+            })?;
         samples.push(sample);
     }
     Ok(Some(samples.into_boxed_slice()))
@@ -651,8 +658,8 @@ mod tests {
     #[test]
     fn bundles_round_trip_imu_batches_per_capture() {
         let dataset_dir = unique_temp_dir("reader-imu-round-trip");
-        let (writer, handle) = DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration())
-            .expect("writer");
+        let (writer, handle) =
+            DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration()).expect("writer");
 
         writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
         writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
@@ -710,8 +717,8 @@ mod tests {
     #[test]
     fn bundles_fail_when_imu_interval_is_empty() {
         let dataset_dir = unique_temp_dir("reader-imu-gap");
-        let (writer, handle) = DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration())
-            .expect("writer");
+        let (writer, handle) =
+            DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration()).expect("writer");
 
         writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
         writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));

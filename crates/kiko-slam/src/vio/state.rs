@@ -17,7 +17,10 @@ impl std::fmt::Display for NavStateError {
                 write!(f, "velocity axis {axis} must be finite, got {value}")
             }
             NavStateError::NonFiniteBiasAccel { axis, value } => {
-                write!(f, "accelerometer bias axis {axis} must be finite, got {value}")
+                write!(
+                    f,
+                    "accelerometer bias axis {axis} must be finite, got {value}"
+                )
             }
             NavStateError::NonFiniteBiasGyro { axis, value } => {
                 write!(f, "gyroscope bias axis {axis} must be finite, got {value}")
@@ -105,8 +108,11 @@ impl NavState {
 
     pub fn local_coordinates(&self, other: &Self) -> NavTangent {
         let mut tangent = [0.0_f64; 15];
-        let pose_delta =
-            se3_log_f64(other.pose_odom_from_body.compose(self.pose_odom_from_body.inverse()));
+        let pose_delta = se3_log_f64(
+            other
+                .pose_odom_from_body
+                .compose(self.pose_odom_from_body.inverse()),
+        );
         tangent[..6].copy_from_slice(&pose_delta);
         tangent[6] = other.velocity_odom_mps[0] - self.velocity_odom_mps[0];
         tangent[7] = other.velocity_odom_mps[1] - self.velocity_odom_mps[1];
@@ -207,8 +213,8 @@ mod tests {
         )
         .expect("nav state");
         let delta: NavTangent = [
-            0.01, -0.02, 0.03, 0.001, -0.002, 0.003, 0.1, -0.2, 0.3, 0.001, 0.002, -0.001,
-            -0.0005, 0.0007, -0.0009,
+            0.01, -0.02, 0.03, 0.001, -0.002, 0.003, 0.1, -0.2, 0.3, 0.001, 0.002, -0.001, -0.0005,
+            0.0007, -0.0009,
         ];
         let moved = state.retract(&delta);
         let recovered = state.local_coordinates(&moved);

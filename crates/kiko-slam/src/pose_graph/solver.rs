@@ -1,4 +1,4 @@
-use super::{BlockCsr6x6, PoseGraphError, NEAR_ZERO};
+use super::{BlockCsr6x6, NEAR_ZERO, PoseGraphError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PcgStopReason {

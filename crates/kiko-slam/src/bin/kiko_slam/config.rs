@@ -1,11 +1,11 @@
+#[cfg(feature = "vio")]
+use kiko_slam::VioConfig;
 use kiko_slam::{
     BackendConfig, DownscaleFactor, GlobalDescriptorConfig, KeyframePolicy, KeypointLimit,
     LmConfig, LocalBaConfig, LoopClosureConfig, LoopClosureConfigInput, LoopSubsystemConfig,
     RansacConfig, RectificationMode, RectifiedStereoConfig, RedundancyPolicy, RelocalizationConfig,
     TriangulationConfig,
 };
-#[cfg(feature = "vio")]
-use kiko_slam::VioConfig;
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
 

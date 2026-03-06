@@ -14,32 +14,31 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
+use crate::frontend::{StereoFrontend, median_parallax_px};
+use crate::global_map::GlobalMap;
 use crate::loop_closure::{
-    aggregate_global_descriptor, match_quantized_descriptors_for_loop, LoopApplyError,
-    LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
-    RelocalizationConfig, VerifiedLoop,
+    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
+    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
+    match_quantized_descriptors_for_loop,
 };
 use crate::loop_manager::LoopManager;
-use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
+use crate::place_recognition::{
+    DescriptorStats, PlaceRecognition, PlaceRecognitionEvent, PlaceRecognitionInitError,
+};
 #[cfg(feature = "vio")]
 use crate::pose_graph::{EssentialEdge, EssentialEdgeKind};
+use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
 use crate::{
-    map::{KeyframeId, MapPointId, SlamMap},
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
     KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
     LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, Observation,
-    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64,
-    RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
-    Triangulator, Verified,
+    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, Raw, StereoPair,
+    SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator, Verified,
+    map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
 use crate::{Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig};
-use crate::frontend::{median_parallax_px, StereoFrontend};
-use crate::global_map::GlobalMap;
-use crate::place_recognition::{
-    DescriptorStats, PlaceRecognition, PlaceRecognitionEvent, PlaceRecognitionInitError,
-};
 
 use crate::inference::InferenceError;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
@@ -241,18 +240,9 @@ pub struct KeyframePolicy {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum KeyframeInsertReason {
-    TooFewInliers {
-        inliers: usize,
-        min_required: usize,
-    },
-    HighParallax {
-        parallax_px: f32,
-        threshold_px: f32,
-    },
-    LowCovisibility {
-        covisibility: f32,
-        threshold: f32,
-    },
+    TooFewInliers { inliers: usize, min_required: usize },
+    HighParallax { parallax_px: f32, threshold_px: f32 },
+    LowCovisibility { covisibility: f32, threshold: f32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1004,9 +994,13 @@ impl RedundancyPolicy {
 
 #[derive(Debug)]
 pub enum TrackerInitError {
-    DescriptorUnavailable { model_path: PathBuf },
+    DescriptorUnavailable {
+        model_path: PathBuf,
+    },
     #[cfg(feature = "vio")]
-    VioInvalidGravity { message: String },
+    VioInvalidGravity {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for TrackerInitError {
@@ -1038,7 +1032,9 @@ pub enum TrackerError {
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
-    KeyframeRejected { landmarks: usize },
+    KeyframeRejected {
+        landmarks: usize,
+    },
     InvariantViolation(&'static str),
 }
 
@@ -1136,11 +1132,7 @@ impl DegradationLevel {
     }
 
     pub fn worst(a: Self, b: Self) -> Self {
-        if a.rank() >= b.rank() {
-            a
-        } else {
-            b
-        }
+        if a.rank() >= b.rank() { a } else { b }
     }
 }
 
@@ -1355,8 +1347,8 @@ impl SlamTracker {
             (Some(vio_config), Some(noise), true) => {
                 let gravity = Gravity::try_new([0.0, 0.0, -calibration.gravity_magnitude_mps2()])
                     .map_err(|err| TrackerInitError::VioInvalidGravity {
-                        message: err.to_string(),
-                    })?;
+                    message: err.to_string(),
+                })?;
                 let camera_from_body = calibration
                     .imu_extrinsics()
                     .map(|extrinsics| extrinsics.t_cam_imu())
@@ -1424,8 +1416,7 @@ impl SlamTracker {
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
         let capture_id = CaptureId::new(self.next_capture_id);
         self.next_capture_id = self.next_capture_id.saturating_add(1);
-        let capture =
-            CaptureBundle::visual_only(capture_id, pair, self.previous_capture_time)?;
+        let capture = CaptureBundle::visual_only(capture_id, pair, self.previous_capture_time)?;
         self.process_capture(capture)
     }
 
@@ -1521,8 +1512,9 @@ impl SlamTracker {
         let Some(latest) = vio_runtime.local_vio.latest_estimate() else {
             return Ok(());
         };
-        let preintegrated = PreintegratedImu::integrate(&batch, latest.state().bias(), &vio_runtime.noise)
-            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        let preintegrated =
+            PreintegratedImu::integrate(&batch, latest.state().bias(), &vio_runtime.noise)
+                .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let predicted = vio_runtime
             .local_vio
             .predict_from_latest(&preintegrated)
@@ -1545,8 +1537,9 @@ impl SlamTracker {
             return Ok(());
         };
         if vio_runtime.local_vio.is_empty() {
-            let pose_measurement_odom =
-                self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_world));
+            let pose_measurement_odom = self
+                .map_from_odom
+                .map_to_odom(Pose64::from_pose32(pose_world));
             let state = crate::NavState::try_new(
                 pose_measurement_odom,
                 [0.0; 3],
@@ -1555,7 +1548,12 @@ impl SlamTracker {
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
             vio_runtime
                 .local_vio
-                .initialize(keyframe_id, state, pose_measurement_odom, visual_observations)
+                .initialize(
+                    keyframe_id,
+                    state,
+                    pose_measurement_odom,
+                    visual_observations,
+                )
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
             vio_runtime.predicted_pose_odom = Some(pose_measurement_odom);
             vio_runtime.pending_imu.clear();
@@ -1585,7 +1583,8 @@ impl SlamTracker {
             .push_preintegrated(
                 keyframe_id,
                 preintegrated,
-                self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_world)),
+                self.map_from_odom
+                    .map_to_odom(Pose64::from_pose32(pose_world)),
                 visual_observations,
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
@@ -1675,7 +1674,8 @@ impl SlamTracker {
             .into_iter()
             .map(|observation_map| {
                 Observation::try_new(
-                    self.map_from_odom.point_map_to_odom(observation_map.world()),
+                    self.map_from_odom
+                        .point_map_to_odom(observation_map.world()),
                     observation_map.pixel(),
                     self.frontend.intrinsics(),
                 )
@@ -1727,11 +1727,10 @@ impl SlamTracker {
     }
 
     fn empty_diagnostics(&self) -> FrameDiagnostics {
-        let mut diagnostics =
-            FrameDiagnostics::empty(
-                self.global_map.num_keyframes(),
-                self.global_map.num_points(),
-            );
+        let mut diagnostics = FrameDiagnostics::empty(
+            self.global_map.num_keyframes(),
+            self.global_map.num_points(),
+        );
         diagnostics.loop_candidate_count = self
             .place_recognition
             .as_ref()
@@ -1915,14 +1914,14 @@ impl SlamTracker {
                 .map(|entry| entry.pose())
             else {
                 if first_error.is_none() {
-                    first_error = Some(LoopDetectError::ApplyFailed(LoopApplyError::MissingKeyframe));
+                    first_error = Some(LoopDetectError::ApplyFailed(
+                        LoopApplyError::MissingKeyframe,
+                    ));
                 }
                 continue;
             };
-            let (translation, rotation_deg) = LoopManager::correction_magnitude(
-                match_pose,
-                verified.query_pose_world(),
-            );
+            let (translation, rotation_deg) =
+                LoopManager::correction_magnitude(match_pose, verified.query_pose_world());
             if translation > config.max_correction_translation()
                 || rotation_deg > config.max_correction_rotation_deg()
             {
@@ -2308,9 +2307,9 @@ impl SlamTracker {
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
         };
 
-        let current = self
-            .frontend
-            .detect(&left, self.config.downscale, self.config.max_keypoints())?;
+        let current =
+            self.frontend
+                .detect(&left, self.config.downscale, self.config.max_keypoints())?;
 
         if current.is_empty() {
             return Ok(self.fail_relocalization(frame_id, cfg, session, Arc::clone(&current)));
@@ -2378,9 +2377,9 @@ impl SlamTracker {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
 
-        let current = self
-            .frontend
-            .detect(&left, self.config.downscale, self.config.max_keypoints())?;
+        let current =
+            self.frontend
+                .detect(&left, self.config.downscale, self.config.max_keypoints())?;
 
         let matches = if current.is_empty() || keyframe.detections().is_empty() {
             if self.trace_transitions {
@@ -2410,10 +2409,12 @@ impl SlamTracker {
             }
         };
 
-        let tracked_observations = match self
-            .frontend
-            .build_map_observations(self.global_map.map(), keyframe_id, &verified, current.as_ref())
-        {
+        let tracked_observations = match self.frontend.build_map_observations(
+            self.global_map.map(),
+            keyframe_id,
+            &verified,
+            current.as_ref(),
+        ) {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
                 if self.trace_transitions {
@@ -2465,19 +2466,19 @@ impl SlamTracker {
 
         let mut map_observations = Vec::with_capacity(result.inliers.len());
         for &idx in &result.inliers {
-            let verified_idx = *tracked_observations
-                .verified_match_indices
-                .get(idx)
-                .ok_or(TrackerError::Inference(InferenceError::InvariantViolation {
+            let verified_idx = *tracked_observations.verified_match_indices.get(idx).ok_or(
+                TrackerError::Inference(InferenceError::InvariantViolation {
                     context: "tracked observation index out of bounds",
-                }))?;
-            let (ci, ki) =
-                *verified
-                    .indices()
-                    .get(verified_idx)
-                    .ok_or(TrackerError::Inference(InferenceError::InvariantViolation {
+                }),
+            )?;
+            let (ci, ki) = *verified
+                .indices()
+                .get(verified_idx)
+                .ok_or(TrackerError::Inference(
+                    InferenceError::InvariantViolation {
                         context: "verified match index out of bounds",
-                    }))?;
+                    },
+                ))?;
             let pixel = *current.keypoints().get(ci).ok_or(TrackerError::Inference(
                 InferenceError::InvariantViolation {
                     context: "current keypoint index out of bounds",
@@ -2502,9 +2503,11 @@ impl SlamTracker {
         let pose_world = result.pose;
         #[cfg(feature = "vio")]
         let refined_world = match &self.local_estimator {
-            LocalEstimator::VisualOnly => ObservationSet::new(map_observations, self.ba.min_observations())
-                .ok()
-                .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set)),
+            LocalEstimator::VisualOnly => {
+                ObservationSet::new(map_observations, self.ba.min_observations())
+                    .ok()
+                    .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set))
+            }
             LocalEstimator::Inertial(_) => None,
         };
         #[cfg(not(feature = "vio"))]
@@ -2523,11 +2526,10 @@ impl SlamTracker {
         let mut triangulation_stats = None;
         let mut ba_result = None;
 
-        let keyframe_decision = self.config.keyframe_policy.decide(
-            result.inliers.len(),
-            parallax_px,
-            covisibility,
-        );
+        let keyframe_decision =
+            self.config
+                .keyframe_policy
+                .decide(result.inliers.len(), parallax_px, covisibility);
 
         if matches!(keyframe_decision, KeyframeDecision::Insert(_)) {
             let new_pose = pose_world;
@@ -2553,7 +2555,11 @@ impl SlamTracker {
                         .config
                         .redundancy
                         .map(|policy| {
-                            is_redundant(self.global_map.map(), keyframe_id, policy.max_covisibility())
+                            is_redundant(
+                                self.global_map.map(),
+                                keyframe_id,
+                                policy.max_covisibility(),
+                            )
                         })
                         .transpose()?
                         .unwrap_or(false);
@@ -2610,11 +2616,10 @@ impl SlamTracker {
                                     eprintln!(
                                         "backend submit failed for keyframe {keyframe_id:?}: {err}"
                                     );
-                                    let result =
-                                        self.ba.optimize_keyframe_window(
-                                            self.global_map.map_mut(),
-                                            &window,
-                                        );
+                                    let result = self.ba.optimize_keyframe_window(
+                                        self.global_map.map_mut(),
+                                        &window,
+                                    );
                                     ba_result = Some(result.clone());
                                     if matches!(
                                         result,
@@ -2625,11 +2630,10 @@ impl SlamTracker {
                                 }
                             } else if matches!(
                                 {
-                                    let result =
-                                        self.ba.optimize_keyframe_window(
-                                            self.global_map.map_mut(),
-                                            &window,
-                                        );
+                                    let result = self.ba.optimize_keyframe_window(
+                                        self.global_map.map_mut(),
+                                        &window,
+                                    );
                                     ba_result = Some(result.clone());
                                     result
                                 },
@@ -2655,12 +2659,11 @@ impl SlamTracker {
             .iter()
             .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
             .collect();
-        let inlier_errors =
-            crate::pnp::reprojection_errors(
-                &pose_world,
-                &inlier_observations,
-                self.frontend.intrinsics(),
-            );
+        let inlier_errors = crate::pnp::reprojection_errors(
+            &pose_world,
+            &inlier_observations,
+            self.frontend.intrinsics(),
+        );
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.inlier_ratio =
@@ -2763,18 +2766,18 @@ impl SlamTracker {
 
         let (left_arc, right_arc) = match left_det {
             Some(left_arc) => {
-                let right_det = self
-                    .frontend
-                    .detect(&right, self.config.downscale, max_keypoints)?;
+                let right_det =
+                    self.frontend
+                        .detect(&right, self.config.downscale, max_keypoints)?;
                 (left_arc, right_det)
             }
             None => {
                 let left_det = self
                     .frontend
                     .detect(&left, self.config.downscale, max_keypoints)?;
-                let right_det = self
-                    .frontend
-                    .detect(&right, self.config.downscale, max_keypoints)?;
+                let right_det =
+                    self.frontend
+                        .detect(&right, self.config.downscale, max_keypoints)?;
 
                 (left_det, right_det)
             }
@@ -2783,7 +2786,8 @@ impl SlamTracker {
         let matches = if left_arc.is_empty() || right_arc.is_empty() {
             return Err(TrackerError::KeyframeRejected { landmarks: 0 });
         } else {
-            self.frontend.match_stereo(left_arc.clone(), right_arc.clone())?
+            self.frontend
+                .match_stereo(left_arc.clone(), right_arc.clone())?
         };
 
         let result = self.frontend.triangulate_matches(&matches)?;
@@ -3047,20 +3051,20 @@ fn apply_correction_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::assert_map_invariants;
-    use crate::loop_manager::LoopManager;
     use crate::loop_closure::KeyframeDatabase;
+    use crate::loop_manager::LoopManager;
+    use crate::map::assert_map_invariants;
     use crate::place_recognition::{
         DescriptorExtractorFactory, DescriptorRequest, DescriptorSupervisor, DescriptorWorker,
         DescriptorWorkerResponse,
     };
     use crate::pose_graph::{EssentialEdgeKind, EssentialGraph, PoseGraphConfig};
     use crate::{
-        CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor,
-        Point3, SensorId, Timestamp,
+        CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
+        SensorId, Timestamp,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     #[cfg(feature = "vio")]
@@ -3247,10 +3251,9 @@ mod tests {
         )
         .expect("matches");
         let verified = matches.with_landmarks(&keyframe).expect("verified matches");
-        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(
-            320, 240, 300.0, 300.0, 160.0, 120.0,
-        )
-        .expect("intrinsics");
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 300.0, 300.0, 160.0, 120.0)
+                .expect("intrinsics");
 
         let tracked = crate::frontend::build_map_observations(
             &map,
@@ -4090,8 +4093,7 @@ mod tests {
 
     #[test]
     fn loop_closure_correction_reduces_synthetic_drift_ring() {
-        let (map, essential_graph, verified, query_kf, _) =
-            make_loop_closure_apply_fixture();
+        let (map, essential_graph, verified, query_kf, _) = make_loop_closure_apply_fixture();
         let mut global_map = GlobalMap::from_parts(map.clone(), essential_graph.clone());
         let loop_manager = LoopManager::new(PoseGraphConfig::default());
 
@@ -4177,8 +4179,7 @@ mod tests {
             );
         }
 
-        remove_keyframe_from_graph_and_db(&mut global_map, removed_kf)
-            .expect("remove keyframe");
+        remove_keyframe_from_graph_and_db(&mut global_map, removed_kf).expect("remove keyframe");
         loop_db.remove(removed_kf);
 
         assert!(global_map.keyframe(removed_kf).is_none());
@@ -4261,18 +4262,22 @@ mod tests {
     #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
         let detections = make_test_detections(900);
-        assert!(SlamTracker::initial_relocalization_session(
-            TrackingHealth::Good,
-            true,
-            Arc::clone(&detections)
-        )
-        .is_none());
-        assert!(SlamTracker::initial_relocalization_session(
-            TrackingHealth::Lost,
-            false,
-            Arc::clone(&detections)
-        )
-        .is_none());
+        assert!(
+            SlamTracker::initial_relocalization_session(
+                TrackingHealth::Good,
+                true,
+                Arc::clone(&detections)
+            )
+            .is_none()
+        );
+        assert!(
+            SlamTracker::initial_relocalization_session(
+                TrackingHealth::Lost,
+                false,
+                Arc::clone(&detections)
+            )
+            .is_none()
+        );
 
         let session = SlamTracker::initial_relocalization_session(
             TrackingHealth::Lost,

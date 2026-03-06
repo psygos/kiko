@@ -108,7 +108,10 @@ impl std::fmt::Display for PoseGraphError {
                 "pose graph contains {invalid_edges} invalid edges for pose_count={pose_count}"
             ),
             PoseGraphError::NonFiniteResidual { iteration } => {
-                write!(f, "pose graph residual became non-finite at iteration {iteration}")
+                write!(
+                    f,
+                    "pose graph residual became non-finite at iteration {iteration}"
+                )
             }
             PoseGraphError::NotConverged {
                 iterations,
@@ -141,10 +144,10 @@ pub use essential::{
     PoseGraphInput,
 };
 pub use optimizer::{
-    compute_edge_error, compute_edge_jacobians, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer,
-    PoseGraphResult,
+    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult, compute_edge_error,
+    compute_edge_jacobians,
 };
-pub use solver::{solve_pcg, PcgResult, PcgStopReason};
+pub use solver::{PcgResult, PcgStopReason, solve_pcg};
 pub use sparse::BlockCsr6x6;
 
 #[cfg(test)]

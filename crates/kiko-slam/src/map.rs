@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use slotmap::{new_key_type, SlotMap};
+use slotmap::{SlotMap, new_key_type};
 
 use crate::{CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
 
@@ -550,11 +550,12 @@ impl SlamMap {
             .keyframes
             .get(keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
-        let idx =
-            KeypointIndex::new(index, entry.len()).map_err(|_| MapError::KeypointIndexOutOfBounds {
+        let idx = KeypointIndex::new(index, entry.len()).map_err(|_| {
+            MapError::KeypointIndexOutOfBounds {
                 index,
                 len: entry.len(),
-            })?;
+            }
+        })?;
         Ok(KeyframeKeypoint {
             keyframe_id,
             index: idx,
@@ -783,12 +784,12 @@ impl SlamMap {
             .enumerate()
             .filter_map(|(idx, pid)| pid.map(|_| idx))
             .map(|idx| {
-                let index = KeypointIndex::new(idx, entry.len()).map_err(|_| 
+                let index = KeypointIndex::new(idx, entry.len()).map_err(|_| {
                     MapError::KeypointIndexOutOfBounds {
                         index: idx,
                         len: entry.len(),
-                    },
-                )?;
+                    }
+                })?;
                 let keypoint_ref = KeyframeKeypoint { keyframe_id, index };
                 Ok((keypoint_ref, entry.keypoints[idx]))
             })
@@ -812,11 +813,12 @@ impl SlamMap {
                 .points
                 .get(*point_id)
                 .ok_or(MapError::MapPointNotFound(*point_id))?;
-            let index =
-                KeypointIndex::new(idx, entry.len()).map_err(|_| MapError::KeypointIndexOutOfBounds {
+            let index = KeypointIndex::new(idx, entry.len()).map_err(|_| {
+                MapError::KeypointIndexOutOfBounds {
                     index: idx,
                     len: entry.len(),
-                })?;
+                }
+            })?;
             visit(KeyframeKeypoint { keyframe_id, index }, point.descriptor());
         }
         Ok(())

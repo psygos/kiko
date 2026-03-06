@@ -1,5 +1,5 @@
-use crate::loop_closure::GlobalDescriptor;
 use crate::Frame;
+use crate::loop_closure::GlobalDescriptor;
 
 use super::InferenceError;
 

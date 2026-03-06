@@ -253,9 +253,7 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "pipeline wall fps: {:.2} (processed={}, elapsed={:.2}s)",
-        summary.wall_fps,
-        summary.processed,
-        summary.wall_seconds
+        summary.wall_fps, summary.processed, summary.wall_seconds
     );
     eprintln!(
         "reader stage fps: {:.2} (read_samples={}, read_stage_time={:.2}s, throughput={:.2} MB/s)",
@@ -266,15 +264,11 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!(
         "inference attempt fps: {:.2} (attempts={}, attempt_time={:.2}s)",
-        summary.inference_attempt_fps,
-        summary.read_samples,
-        summary.inference_attempt_seconds
+        summary.inference_attempt_fps, summary.read_samples, summary.inference_attempt_seconds
     );
     eprintln!(
         "successful inference fps: {:.2} (processed={}, successful_infer_time={:.2}s)",
-        summary.successful_inference_fps,
-        summary.processed,
-        summary.successful_inference_seconds
+        summary.successful_inference_fps, summary.processed, summary.successful_inference_seconds
     );
     eprintln!(
         "matching: nonzero_pairs={}, match_rate={:.2} avg_matches_processed={:.1} avg_matches_nonzero={:.1}",
@@ -285,9 +279,7 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!(
         "errors: read={} pairing={} inference={}",
-        accum.read_errors,
-        accum.pairing_errors,
-        accum.inference_errors
+        accum.read_errors, accum.pairing_errors, accum.inference_errors
     );
 
     if accum.processed > 0 {
@@ -301,10 +293,7 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!(
             "timings pct of successful inference time: sp_left={:.1}% sp_right={:.1}% lightglue={:.1}% overhead={:.1}%",
-            summary.pct_sp_left,
-            summary.pct_sp_right,
-            summary.pct_lightglue,
-            summary.pct_overhead
+            summary.pct_sp_left, summary.pct_sp_right, summary.pct_lightglue, summary.pct_overhead
         );
     }
 

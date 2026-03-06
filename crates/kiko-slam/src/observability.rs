@@ -1,7 +1,7 @@
 use crate::{
-    BaResult, ComponentHealth, DegradationLevel, DiagnosticEvent, FrameDiagnostics,
-    KeyframeStatus, LoopClosureRejectReason, LoopClosureStatus, RerunSink, SystemHealth,
-    Timestamp, TrackingHealth, VizLogError,
+    BaResult, ComponentHealth, DegradationLevel, DiagnosticEvent, FrameDiagnostics, KeyframeStatus,
+    LoopClosureRejectReason, LoopClosureStatus, RerunSink, SystemHealth, Timestamp, TrackingHealth,
+    VizLogError,
 };
 
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
@@ -362,8 +362,8 @@ impl RerunSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        diagnostics_scalars, format_event, PATH_HEALTH_INLIER_RATIO, PATH_MAP_KEYFRAMES,
-        PATH_MAP_POINTS,
+        PATH_HEALTH_INLIER_RATIO, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS, diagnostics_scalars,
+        format_event,
     };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
@@ -374,12 +374,16 @@ mod tests {
     fn diagnostics_scalars_empty_has_baselines() {
         let diag = FrameDiagnostics::empty(5, 13);
         let scalars = diagnostics_scalars(&diag);
-        assert!(scalars
-            .iter()
-            .any(|(path, value)| *path == PATH_MAP_KEYFRAMES && *value == 5.0));
-        assert!(scalars
-            .iter()
-            .any(|(path, value)| *path == PATH_MAP_POINTS && *value == 13.0));
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, value)| *path == PATH_MAP_KEYFRAMES && *value == 5.0)
+        );
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, value)| *path == PATH_MAP_POINTS && *value == 13.0)
+        );
     }
 
     #[test]
@@ -403,16 +407,20 @@ mod tests {
                 .any(|(path, value)| *path == PATH_HEALTH_INLIER_RATIO
                     && (*value - 0.75).abs() < 1e-6)
         );
-        assert!(scalars
-            .iter()
-            .any(|(path, _)| *path == "diagnostics/tracking/features_detected"));
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, _)| *path == "diagnostics/tracking/features_detected")
+        );
         assert!(scalars.iter().any(
             |(path, value)| *path == "diagnostics/depth/reorder_warnings"
                 && (*value - 3.0).abs() < 1e-6
         ));
-        assert!(scalars
-            .iter()
-            .any(|(path, _)| *path == "diagnostics/triangulation/candidates"));
+        assert!(
+            scalars
+                .iter()
+                .any(|(path, _)| *path == "diagnostics/triangulation/candidates")
+        );
     }
 
     #[test]

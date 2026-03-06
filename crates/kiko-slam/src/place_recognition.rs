@@ -4,13 +4,11 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::loop_closure::{
-    aggregate_global_descriptor, DescriptorSource, GlobalDescriptor, KeyframeDatabase,
-    LoopClosureConfig, PlaceMatch, RelocalizationMatch,
+    DescriptorSource, GlobalDescriptor, KeyframeDatabase, LoopClosureConfig, PlaceMatch,
+    RelocalizationMatch, aggregate_global_descriptor,
 };
 use crate::map::KeyframeId;
-use crate::{
-    Detections, EigenPlaces, Frame, GlobalDescriptorConfig, PlaceDescriptorExtractor,
-};
+use crate::{Detections, EigenPlaces, Frame, GlobalDescriptorConfig, PlaceDescriptorExtractor};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::tracker::MapVersion;
@@ -176,7 +174,9 @@ impl DescriptorSupervisor {
         Arc::new(|| {
             let path = DescriptorWorker::model_path();
             match EigenPlaces::try_load(path, crate::InferenceBackend::auto()) {
-                Ok(Some(extractor)) => Some(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>),
+                Ok(Some(extractor)) => {
+                    Some(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>)
+                }
                 Ok(None) => None,
                 Err(err) => {
                     eprintln!("failed to initialize eigenplaces descriptor extractor: {err}");
@@ -257,7 +257,10 @@ impl DescriptorSupervisor {
         }
     }
 
-    pub(crate) fn submit(&mut self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
+    pub(crate) fn submit(
+        &mut self,
+        request: DescriptorRequest,
+    ) -> Result<(), SubmitDescriptorError> {
         if self.worker.is_none() {
             self.check_health();
         }
@@ -504,7 +507,8 @@ impl PlaceRecognition {
         let mut candidates = self
             .database
             .query(&global_descriptor, self.loop_config.max_candidates());
-        candidates.retain(|candidate| candidate.similarity >= self.loop_config.similarity_threshold());
+        candidates
+            .retain(|candidate| candidate.similarity >= self.loop_config.similarity_threshold());
 
         if candidates.is_empty() {
             self.loop_streak.clear();

@@ -378,8 +378,7 @@ pub(crate) fn so3_right_jacobian_inv_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
     if theta < JACOBIAN_SMALL_ANGLE {
         for row in 0..3 {
             for col in 0..3 {
-                jr_inv[row][col] +=
-                    0.5 * omega_hat[row][col] + (1.0 / 12.0) * omega_hat2[row][col];
+                jr_inv[row][col] += 0.5 * omega_hat[row][col] + (1.0 / 12.0) * omega_hat2[row][col];
             }
         }
         return jr_inv;
@@ -556,8 +555,8 @@ fn mat_transpose_f64(r: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        cholesky_6x6, cholesky_solve_6x6, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64,
-        se3_log_f64, so3_exp_f64, so3_left_jacobian_f64, so3_left_jacobian_inv_f64, so3_log_f64,
+        cholesky_6x6, cholesky_solve_6x6, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64, se3_log_f64,
+        so3_exp_f64, so3_left_jacobian_f64, so3_left_jacobian_inv_f64, so3_log_f64,
         so3_right_jacobian_f64, so3_right_jacobian_inv_f64, symmetric_positive_definite_6x6,
     };
 

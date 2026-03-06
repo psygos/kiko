@@ -158,14 +158,8 @@ mod tests {
 
     #[test]
     fn depth_image_rejects_negative_sample() {
-        let err = DepthImage::new(
-            FrameId::new(3),
-            Timestamp::from_nanos(1),
-            1,
-            1,
-            vec![-0.5],
-        )
-        .expect_err("negative depth should fail");
+        let err = DepthImage::new(FrameId::new(3), Timestamp::from_nanos(1), 1, 1, vec![-0.5])
+            .expect_err("negative depth should fail");
         assert!(matches!(
             err,
             DepthImageError::InvalidSample { index: 0, value } if (value + 0.5).abs() < 1e-6
@@ -182,6 +176,9 @@ mod tests {
             vec![f32::NAN],
         )
         .expect_err("nan depth should fail");
-        assert!(matches!(err, DepthImageError::InvalidSample { index: 0, .. }));
+        assert!(matches!(
+            err,
+            DepthImageError::InvalidSample { index: 0, .. }
+        ));
     }
 }

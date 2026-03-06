@@ -8,7 +8,7 @@ use kiko_slam::{
 };
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs};
-use crate::config::{build_rectified_stereo_config, build_tracker_config, TrackerDefaults};
+use crate::config::{TrackerDefaults, build_rectified_stereo_config, build_tracker_config};
 use crate::rerun_recording;
 
 const SLAM_ENV_HELP: &str = "\
@@ -108,12 +108,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let rec = rerun_recording(&args.rerun, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
-    let mut tracker = SlamTracker::try_new(
-        superpoint,
-        lightglue,
-        calibration,
-        tracker_config,
-    )?;
+    let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
 
     let start = Instant::now();
     let mut attempted = 0usize;

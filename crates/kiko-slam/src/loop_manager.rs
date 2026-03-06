@@ -1,6 +1,10 @@
 use crate::global_map::GlobalMap;
-use crate::pose_graph::{EssentialEdge, EssentialEdgeKind, PoseGraphConfig, PoseGraphError, PoseGraphOptimizer};
-use crate::{LoopApplyError, LoopClosureRejectReason, LoopDetectError, Point3, Pose, Pose64, VerifiedLoop};
+use crate::pose_graph::{
+    EssentialEdge, EssentialEdgeKind, PoseGraphConfig, PoseGraphError, PoseGraphOptimizer,
+};
+use crate::{
+    LoopApplyError, LoopClosureRejectReason, LoopDetectError, Point3, Pose, Pose64, VerifiedLoop,
+};
 use crate::{map::KeyframeId, tracker::TrackerError};
 use std::collections::HashMap;
 
@@ -31,8 +35,10 @@ impl LoopManager {
                 match_kf,
             )))?
             .pose();
-        let loop_relative =
-            Pose64::from_pose32(Self::loop_relative_pose(match_pose, verified.query_pose_world()));
+        let loop_relative = Pose64::from_pose32(Self::loop_relative_pose(
+            match_pose,
+            verified.query_pose_world(),
+        ));
 
         essential_graph.add_loop_edge(EssentialEdge {
             a: match_kf,
@@ -71,7 +77,12 @@ impl LoopManager {
             .keyframe_ids
             .iter()
             .copied()
-            .zip(result.corrected_poses.into_iter().map(|pose| pose.to_pose32()))
+            .zip(
+                result
+                    .corrected_poses
+                    .into_iter()
+                    .map(|pose| pose.to_pose32()),
+            )
             .collect();
 
         for (keyframe_id, corrected_pose) in &corrected_poses {

@@ -13,7 +13,10 @@ impl std::fmt::Display for PreintegrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PreintegrationError::TooFewSamples { len } => {
-                write!(f, "imu preintegration requires at least 2 samples, got {len}")
+                write!(
+                    f,
+                    "imu preintegration requires at least 2 samples, got {len}"
+                )
             }
             PreintegrationError::NonPositiveDeltaTime { dt_seconds } => {
                 write!(f, "imu sample dt must be > 0, got {dt_seconds}")
@@ -56,10 +59,9 @@ impl PreintegratedImu {
     ) -> Result<Self, PreintegrationError> {
         let core = integrate_core(batch.samples(), bias, noise)?;
 
-        let d_rotation_d_gyro_bias =
-            finite_difference_gyro_jacobian(batch, bias, noise, |core| {
-                so3_log_f64(core.delta_rotation)
-            })?;
+        let d_rotation_d_gyro_bias = finite_difference_gyro_jacobian(batch, bias, noise, |core| {
+            so3_log_f64(core.delta_rotation)
+        })?;
         let d_velocity_d_gyro_bias =
             finite_difference_gyro_jacobian(batch, bias, noise, |core| core.delta_velocity)?;
         let d_position_d_gyro_bias =
@@ -202,7 +204,10 @@ fn integrate_core(
 
         delta_position = add_vec3(
             delta_position,
-            add_vec3(scale_vec3(delta_velocity, dt), scale_vec3(accel_mid, 0.5 * dt * dt)),
+            add_vec3(
+                scale_vec3(delta_velocity, dt),
+                scale_vec3(accel_mid, 0.5 * dt * dt),
+            ),
         );
         delta_velocity = add_vec3(delta_velocity, scale_vec3(accel_mid, dt));
         delta_rotation = delta_rotation_next;
@@ -242,7 +247,8 @@ fn finite_difference_gyro_jacobian(
         let plus_projected = project(integrate_core(batch.samples(), &plus, noise)?);
         let minus_projected = project(integrate_core(batch.samples(), &minus, noise)?);
         for row in 0..3 {
-            jacobian[row][axis] = (plus_projected[row] - minus_projected[row]) / (2.0 * BIAS_FD_EPS);
+            jacobian[row][axis] =
+                (plus_projected[row] - minus_projected[row]) / (2.0 * BIAS_FD_EPS);
         }
     }
     Ok(jacobian)
@@ -263,7 +269,8 @@ fn finite_difference_accel_jacobian(
         let plus_projected = project(integrate_core(batch.samples(), &plus, noise)?);
         let minus_projected = project(integrate_core(batch.samples(), &minus, noise)?);
         for row in 0..3 {
-            jacobian[row][axis] = (plus_projected[row] - minus_projected[row]) / (2.0 * BIAS_FD_EPS);
+            jacobian[row][axis] =
+                (plus_projected[row] - minus_projected[row]) / (2.0 * BIAS_FD_EPS);
         }
     }
     Ok(jacobian)
@@ -298,12 +305,8 @@ mod tests {
             samples
                 .iter()
                 .map(|(timestamp, accel, gyro)| {
-                    ImuSample::new(
-                        crate::Timestamp::from_nanos(*timestamp),
-                        *accel,
-                        *gyro,
-                    )
-                    .expect("imu sample")
+                    ImuSample::new(crate::Timestamp::from_nanos(*timestamp), *accel, *gyro)
+                        .expect("imu sample")
                 })
                 .collect(),
         )
@@ -329,8 +332,8 @@ mod tests {
             (10_000_000, [0.0; 3], [0.0; 3]),
             (20_000_000, [0.0; 3], [0.0; 3]),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
         assert_eq!(preintegrated.delta_rotation, identity3());
         assert_eq!(preintegrated.delta_velocity, [0.0; 3]);
         assert_eq!(preintegrated.delta_position, [0.0; 3]);
@@ -344,11 +347,13 @@ mod tests {
             (10_000_000, [0.0; 3], [0.0, 0.0, 0.5]),
             (20_000_000, [0.0; 3], [0.0, 0.0, 0.5]),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
         let expected = so3_exp_f64([0.0, 0.0, 0.01]);
-        let error =
-            so3_log_f64(mat_mul_f64(preintegrated.delta_rotation, mat_transpose(expected)));
+        let error = so3_log_f64(mat_mul_f64(
+            preintegrated.delta_rotation,
+            mat_transpose(expected),
+        ));
         let norm = (error[0] * error[0] + error[1] * error[1] + error[2] * error[2]).sqrt();
         assert!(norm < 1e-9, "rotation error={norm}");
     }
@@ -360,8 +365,8 @@ mod tests {
             (10_000_000, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
             (20_000_000, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
         for row in 0..9 {
             assert!(preintegrated.covariance[row][row] >= 0.0);
             for col in 0..9 {
@@ -380,8 +385,8 @@ mod tests {
             (10_000_000, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
             (20_000_000, [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
         for value in preintegrated.residual_information_diag() {
             assert!(value.is_finite() && value > 0.0);
         }
@@ -390,19 +395,13 @@ mod tests {
     #[test]
     fn bias_random_walk_information_decreases_with_longer_dt() {
         let short = PreintegratedImu::integrate(
-            &batch(&[
-                (0, [0.0; 3], [0.0; 3]),
-                (10_000_000, [0.0; 3], [0.0; 3]),
-            ]),
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
             &ImuBias::default(),
             &noise(),
         )
         .expect("short");
         let long = PreintegratedImu::integrate(
-            &batch(&[
-                (0, [0.0; 3], [0.0; 3]),
-                (20_000_000, [0.0; 3], [0.0; 3]),
-            ]),
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (20_000_000, [0.0; 3], [0.0; 3])]),
             &ImuBias::default(),
             &noise(),
         )
@@ -422,7 +421,8 @@ mod tests {
             (20_000_000, [0.2, 0.1, 0.0], [0.0, 0.0, 0.5]),
         ]);
         let base_bias = ImuBias::default();
-        let preintegrated = PreintegratedImu::integrate(&batch, &base_bias, &noise()).expect("preintegrated");
+        let preintegrated =
+            PreintegratedImu::integrate(&batch, &base_bias, &noise()).expect("preintegrated");
         let new_bias = ImuBias {
             accel: [1e-4, -2e-4, 3e-4],
             gyro: [-1e-4, 2e-4, -1e-4],
@@ -432,10 +432,14 @@ mod tests {
             .reintegrate_exact(&new_bias)
             .expect("exact reintegration");
 
-        let rot_error =
-            so3_log_f64(mat_mul_f64(corrected.delta_rotation, mat_transpose(exact.delta_rotation)));
-        let rot_norm =
-            (rot_error[0] * rot_error[0] + rot_error[1] * rot_error[1] + rot_error[2] * rot_error[2]).sqrt();
+        let rot_error = so3_log_f64(mat_mul_f64(
+            corrected.delta_rotation,
+            mat_transpose(exact.delta_rotation),
+        ));
+        let rot_norm = (rot_error[0] * rot_error[0]
+            + rot_error[1] * rot_error[1]
+            + rot_error[2] * rot_error[2])
+            .sqrt();
         let vel_error = sub_vec3(corrected.delta_velocity, exact.delta_velocity);
         let pos_error = sub_vec3(corrected.delta_position, exact.delta_position);
         let vel_norm = (vel_error[0] * vel_error[0]
@@ -458,8 +462,8 @@ mod tests {
             (10_000_000, [0.0; 3], [0.1, -0.2, 0.3]),
             (20_000_000, [0.0; 3], [0.1, -0.2, 0.3]),
         ]);
-        let preintegrated =
-            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
         let rot = preintegrated.delta_rotation;
         let rt_r = mat_mul_f64(mat_transpose(rot), rot);
         let identity = identity3();
