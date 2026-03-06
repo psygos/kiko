@@ -6,6 +6,7 @@ pub use inference::{
     EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
 };
 mod capture;
+mod calibration;
 mod channel;
 pub mod dataset;
 mod depth;
@@ -38,6 +39,7 @@ pub use capture::{
     CaptureBundle, CaptureBundleError, CaptureId, CaptureImu, CaptureInterval,
     CaptureIntervalError,
 };
+pub use calibration::{CalibrationBundle, CalibrationBundleError};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, KeyframeStatus,

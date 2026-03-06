@@ -26,12 +26,12 @@ use crate::pose_graph::{
 };
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
-    solve_pnp_ransac, BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor,
-    EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
+    solve_pnp_ransac, BaCorrection, BaResult, CalibrationBundle, Detections, DiagnosticEvent,
+    DownscaleFactor, EigenPlaces, Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason,
     KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster,
     LoopClosureRejectReason, LoopClosureStatus, MapObservation, Matches, ObservationSet,
-    PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw,
-    RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
+    PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw, StereoPair,
+    SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
 
@@ -1560,10 +1560,11 @@ impl SlamTracker {
     pub fn try_new(
         superpoint: SuperPoint,
         lightglue: LightGlue,
-        stereo: RectifiedStereo,
-        intrinsics: PinholeIntrinsics,
+        calibration: CalibrationBundle,
         config: TrackerConfig,
     ) -> Result<Self, TrackerInitError> {
+        let stereo = calibration.stereo().clone();
+        let intrinsics = calibration.intrinsics();
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")

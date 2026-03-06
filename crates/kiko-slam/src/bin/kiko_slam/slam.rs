@@ -4,7 +4,7 @@ use clap::Args;
 
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
-    PinholeIntrinsics, RectifiedStereo, RerunSink, SlamTracker, VizPacket,
+    CalibrationBundle, PinholeIntrinsics, RectifiedStereo, RerunSink, SlamTracker, VizPacket,
 };
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs};
@@ -87,6 +87,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         build_rectified_stereo_config(&args.rectify),
     )?;
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
+    let calibration = CalibrationBundle::visual_only(intrinsics, rectified);
 
     let InferenceConfig {
         superpoint,
@@ -110,8 +111,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut tracker = SlamTracker::try_new(
         superpoint,
         lightglue,
-        rectified,
-        intrinsics,
+        calibration,
         tracker_config,
     )?;
 

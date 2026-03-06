@@ -7,7 +7,8 @@ use clap::Args;
 
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    bounded_channel, oak_to_depth_image, oak_to_frame, ChannelCapacity, DepthImage,
+    bounded_channel, oak_to_depth_image, oak_to_frame, CalibrationBundle, ChannelCapacity,
+    DepthImage,
     DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId, PairingOutcome,
     PairingDropReason, Point3, Pose, Raw, RerunSink, SendOutcome, SensorId, SlamTracker,
     StereoPair, StereoPairer, SystemHealth, VizPacket,
@@ -146,6 +147,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config);
     let rectified = RectifiedStereo::from_calibration(&calibration)?;
     let intrinsics = PinholeIntrinsics::try_from(&calibration.left)?;
+    let calibration = CalibrationBundle::visual_only(intrinsics, rectified);
 
     let tracker_config = build_tracker_config(
         TrackerDefaults {
@@ -171,8 +173,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut tracker = SlamTracker::try_new(
             superpoint,
             lightglue,
-            rectified,
-            intrinsics,
+            calibration,
             tracker_config,
         )
         .map_err(|err| LiveThreadError::TrackerInit {
