@@ -54,7 +54,7 @@ pub use diagnostics::{
 pub use env::{env_bool, env_f32, env_usize};
 pub use imu::{
     ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBias, ImuExtrinsics,
-    ImuNoiseModel, ImuSample, ImuSampleError,
+    ImuNoiseModel, ImuSample, ImuSampleError, ImuTimestampShiftError,
 };
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,

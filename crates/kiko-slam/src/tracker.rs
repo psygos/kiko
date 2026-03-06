@@ -1302,6 +1302,7 @@ struct VioRuntime {
     local_vio: LocalVio,
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
+    predicted_preintegration: Option<PreintegratedImu>,
     predicted_pose_odom: Option<Pose64>,
 }
 
@@ -1357,6 +1358,7 @@ impl SlamTracker {
                     local_vio: LocalVio::new(vio_config, gravity, camera_from_body, intrinsics),
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
+                    predicted_preintegration: None,
                     predicted_pose_odom: None,
                 })
             }
@@ -1507,9 +1509,11 @@ impl SlamTracker {
             .batch()
             .map_err(|err| TrackerError::Vio(err.to_string()))?
         else {
+            vio_runtime.predicted_preintegration = None;
             return Ok(());
         };
         if batch.len() < 2 {
+            vio_runtime.predicted_preintegration = None;
             return Ok(());
         }
         let Some(latest) = vio_runtime.local_vio.latest_estimate() else {
@@ -1523,6 +1527,7 @@ impl SlamTracker {
             .predict_from_latest(&preintegrated)
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let predicted_pose = predicted.state().pose_odom_from_body();
+        vio_runtime.predicted_preintegration = Some(preintegrated);
         vio_runtime.predicted_pose_odom = Some(predicted_pose);
         self.last_pose_world = Some(self.map_from_odom.odom_to_map(predicted_pose).to_pose32());
         Ok(())
@@ -1562,6 +1567,7 @@ impl SlamTracker {
                 )
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
             vio_runtime.predicted_pose_odom = Some(pose_measurement_odom);
+            vio_runtime.predicted_preintegration = None;
             vio_runtime.pending_imu.clear();
             return Ok(());
         }
@@ -1595,6 +1601,7 @@ impl SlamTracker {
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let odom_pose = estimate.state().pose_odom_from_body();
+        vio_runtime.predicted_preintegration = None;
         vio_runtime.predicted_pose_odom = Some(odom_pose);
         self.last_pose_world = Some(self.map_from_odom.odom_to_map(odom_pose).to_pose32());
         if let Some(odometry) = vio_runtime.local_vio.latest_odometry_constraint() {
@@ -1725,6 +1732,34 @@ impl SlamTracker {
             LocalEstimator::VisualOnly => None,
             LocalEstimator::Inertial(vio_runtime) => vio_runtime.predicted_pose_odom,
         }
+    }
+
+    #[cfg(feature = "vio")]
+    fn correct_tracking_pose_from_vio(
+        &mut self,
+        pose_map: Pose,
+        inlier_observations_map: Vec<Observation>,
+    ) -> Result<(), TrackerError> {
+        let visual_observations = self.map_observations_for_vio(inlier_observations_map)?;
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            return Ok(());
+        };
+        vio_runtime
+            .local_vio
+            .set_map_from_odom(self.map_from_odom.clone());
+        let Some(preintegrated) = vio_runtime.predicted_preintegration.as_ref() else {
+            return Ok(());
+        };
+        let estimate = vio_runtime
+            .local_vio
+            .correct_prediction(
+                preintegrated,
+                self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_map)),
+                visual_observations,
+            )
+            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        vio_runtime.predicted_pose_odom = Some(estimate.state().pose_odom_from_body());
+        Ok(())
     }
 
     fn drain_events(&mut self) -> Vec<DiagnosticEvent> {
@@ -2524,6 +2559,11 @@ impl SlamTracker {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
         self.consecutive_tracking_failures = 0;
+        let inlier_observations: Vec<_> = result
+            .inliers
+            .iter()
+            .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
+            .collect();
         let mut output_keyframe = None;
         let mut output_matches = None;
         let mut keyframe_status = None;
@@ -2534,6 +2574,11 @@ impl SlamTracker {
             self.config
                 .keyframe_policy
                 .decide(result.inliers.len(), parallax_px, covisibility);
+
+        #[cfg(feature = "vio")]
+        if !matches!(keyframe_decision, KeyframeDecision::Insert(_)) {
+            self.correct_tracking_pose_from_vio(pose_world, inlier_observations.clone())?;
+        }
 
         if matches!(keyframe_decision, KeyframeDecision::Insert(_)) {
             let new_pose = pose_world;
@@ -2658,11 +2703,6 @@ impl SlamTracker {
             }
         }
 
-        let inlier_observations: Vec<_> = result
-            .inliers
-            .iter()
-            .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
-            .collect();
         let inlier_errors = crate::pnp::reprojection_errors(
             &pose_world,
             &inlier_observations,

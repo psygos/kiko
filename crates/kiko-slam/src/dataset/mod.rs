@@ -69,6 +69,31 @@ pub struct Calibration {
     pub baseline_m: f32,
     #[serde(default)]
     pub rectified: bool,
+    #[serde(default)]
+    pub imu: Option<ImuCalibration>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImuCalibration {
+    pub noise: ImuNoiseMeta,
+    pub extrinsics: ImuExtrinsicsMeta,
+    pub gravity_magnitude_mps2: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImuNoiseMeta {
+    pub accel_noise_density: f64,
+    pub gyro_noise_density: f64,
+    pub accel_random_walk: f64,
+    pub gyro_random_walk: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImuExtrinsicsMeta {
+    pub rotation: [[f64; 3]; 3],
+    pub translation: [f64; 3],
+    #[serde(default)]
+    pub time_offset_ns: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

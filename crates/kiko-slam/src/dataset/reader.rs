@@ -44,7 +44,12 @@ impl DatasetReader {
         let meta = read_meta(&root)?;
         let calibration = read_calibration(&root)?;
         let manifest = read_manifest(&root)?;
-        let imu_samples = read_imu_samples(&root, &meta)?;
+        let imu_time_offset_ns = calibration
+            .imu
+            .as_ref()
+            .map(|imu| imu.extrinsics.time_offset_ns)
+            .unwrap_or(0);
+        let imu_samples = read_imu_samples(&root, &meta, imu_time_offset_ns)?;
         let pairing_window = PairingWindowNs::new(manifest.header.pairing_window_ns as i64)
             .map_err(|_| DatasetError::InvalidConfig {
                 msg: "manifest pairing_window_ns must be > 0",
@@ -428,6 +433,7 @@ fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
 fn read_imu_samples(
     root: &PathBuf,
     meta: &super::Meta,
+    time_offset_ns: i64,
 ) -> Result<Option<Box<[ImuSample]>>, DatasetError> {
     if meta.imu.is_none() {
         return Ok(None);
@@ -474,15 +480,21 @@ fn read_imu_samples(
             read_f64(chunk, &mut offset),
             read_f64(chunk, &mut offset),
         ];
-        let sample =
-            ImuSample::new(Timestamp::from_nanos(timestamp), accel, gyro).map_err(|source| {
-                DatasetError::ReadFile {
-                    path: path.clone(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("invalid imu sample: {source}"),
-                    ),
-                }
+        let sample = ImuSample::new(Timestamp::from_nanos(timestamp), accel, gyro)
+            .map_err(|source| DatasetError::ReadFile {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid imu sample: {source}"),
+                ),
+            })?
+            .shifted_timestamp_ns(time_offset_ns)
+            .map_err(|source| DatasetError::ReadFile {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid imu timestamp shift: {source}"),
+                ),
             })?;
         samples.push(sample);
     }
@@ -492,7 +504,10 @@ fn read_imu_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::{Calibration, CameraIntrinsics, DatasetWriter, ImuMeta, Meta, MonoMeta};
+    use crate::dataset::{
+        Calibration, CameraIntrinsics, DatasetWriter, ImuCalibration, ImuExtrinsicsMeta, ImuMeta,
+        ImuNoiseMeta, Meta, MonoMeta,
+    };
     use crate::{ImuBatch, ImuSample, SensorId};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -638,6 +653,27 @@ mod tests {
             },
             baseline_m: 0.1,
             rectified: true,
+            imu: None,
+        }
+    }
+
+    fn calibration_with_time_offset_ns(time_offset_ns: i64) -> Calibration {
+        Calibration {
+            imu: Some(ImuCalibration {
+                noise: ImuNoiseMeta {
+                    accel_noise_density: 0.1,
+                    gyro_noise_density: 0.01,
+                    accel_random_walk: 0.001,
+                    gyro_random_walk: 0.0001,
+                },
+                extrinsics: ImuExtrinsicsMeta {
+                    rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    translation: [0.0, 0.0, 0.0],
+                    time_offset_ns,
+                },
+                gravity_magnitude_mps2: 9.81,
+            }),
+            ..calibration()
         }
     }
 
@@ -749,6 +785,42 @@ mod tests {
                 end_ns: 202
             }
         ));
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn bundles_apply_imu_time_offset_before_interval_selection() {
+        let dataset_dir = unique_temp_dir("reader-imu-time-offset");
+        let (writer, handle) = DatasetWriter::create(
+            &dataset_dir,
+            &meta_with_imu(),
+            &calibration_with_time_offset_ns(10),
+        )
+        .expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(80), [0.0; 3], [0.0; 3]).expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(92), [1.0; 3], [2.0; 3]).expect("imu 1"),
+            ])
+            .expect("imu batch"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let bundle = reader
+            .bundles()
+            .next()
+            .expect("bundle")
+            .expect("bundle should apply time offset");
+        let imu = bundle.imu().batch().expect("imu batch");
+        assert_eq!(imu.start_time().as_nanos(), 90);
+        assert_eq!(imu.end_time().as_nanos(), 102);
 
         let _ = std::fs::remove_dir_all(&dataset_dir);
     }

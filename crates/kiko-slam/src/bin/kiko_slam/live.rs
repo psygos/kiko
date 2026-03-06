@@ -119,6 +119,10 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let depth_enabled = env_bool("KIKO_LIVE_DEPTH").unwrap_or(false);
     let imu_enabled = env_bool("KIKO_LIVE_IMU").unwrap_or(false);
+    #[cfg(feature = "vio")]
+    if env_bool("KIKO_VIO").unwrap_or(false) && !imu_enabled {
+        return Err("KIKO_VIO=true requires KIKO_LIVE_IMU=true".into());
+    }
     let depth_queue_depth = env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH").unwrap_or(8);
 
     let config = DeviceConfig {
@@ -173,10 +177,23 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     } = inference;
 
-    let calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config);
-    let rectified = RectifiedStereo::from_calibration(&calibration)?;
-    let intrinsics = PinholeIntrinsics::try_from(&calibration.left)?;
-    let calibration = CalibrationBundle::visual_only(intrinsics, rectified);
+    let dataset_calibration =
+        build_calibration(&device, device.stereo_baseline_m(), &mono_config)?;
+    let rectified = RectifiedStereo::from_calibration(&dataset_calibration)?;
+    let intrinsics = PinholeIntrinsics::try_from(&dataset_calibration.left)?;
+    let calibration =
+        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, &dataset_calibration)?;
+    #[cfg(feature = "vio")]
+    if env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
+        return Err(
+            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env"
+                .into(),
+        );
+    }
+    let imu_time_offset_ns = calibration
+        .imu_extrinsics()
+        .map(|extrinsics| extrinsics.time_offset_ns())
+        .unwrap_or(0);
 
     let tracker_config = build_tracker_config(
         TrackerDefaults {
@@ -410,10 +427,15 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         if imu_enabled {
             match device.imu() {
                 Ok(samples) => match oak_to_imu_batch(samples) {
-                    Ok(batch) => {
-                        pending_imu.extend(batch.samples().iter().cloned());
-                        got_any = true;
-                    }
+                    Ok(batch) => match batch.shifted_timestamp_ns(imu_time_offset_ns) {
+                        Ok(batch) => {
+                            pending_imu.extend(batch.samples().iter().cloned());
+                            got_any = true;
+                        }
+                        Err(err) => {
+                            eprintln!("imu batch dropped (invalid timing): {err}");
+                        }
+                    },
                     Err(err) => {
                         eprintln!("imu batch dropped (invalid values): {err}");
                     }

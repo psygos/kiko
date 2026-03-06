@@ -634,6 +634,7 @@ mod tests {
                 },
                 baseline_m: 0.075,
                 rectified: true,
+                imu: None,
             },
             RectifiedStereoConfig::default(),
         )

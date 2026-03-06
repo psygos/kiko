@@ -72,6 +72,10 @@ pub struct SlamArgs {
 
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
+    #[cfg(feature = "vio")]
+    if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && reader.meta().imu.is_none() {
+        return Err("KIKO_VIO=true requires IMU data in the dataset".into());
+    }
     let stats = reader.stats()?;
 
     eprintln!("dataset: {}", args.dataset.path.display());
@@ -87,7 +91,15 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         build_rectified_stereo_config(&args.rectify),
     )?;
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
-    let calibration = CalibrationBundle::visual_only(intrinsics, rectified);
+    let calibration =
+        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
+    #[cfg(feature = "vio")]
+    if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
+        return Err(
+            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env"
+                .into(),
+        );
+    }
 
     let InferenceConfig {
         superpoint,

@@ -1,4 +1,4 @@
-use crate::{ImuExtrinsics, ImuNoiseModel, PinholeIntrinsics, RectifiedStereo};
+use crate::{ImuExtrinsics, ImuNoiseModel, PinholeIntrinsics, Pose64, RectifiedStereo};
 
 #[derive(Clone, Debug)]
 pub struct CalibrationBundle {
@@ -9,7 +9,7 @@ pub struct CalibrationBundle {
     gravity_magnitude_mps2: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CalibrationBundleError {
     MissingImuNoise,
     MissingImuExtrinsics,
@@ -23,6 +23,7 @@ pub enum CalibrationBundleError {
     NonFiniteAccelRandomWalk { value: f64 },
     NonPositiveGyroRandomWalk { value: f64 },
     NonFiniteGyroRandomWalk { value: f64 },
+    InvalidImuExtrinsics { message: String },
 }
 
 impl std::fmt::Display for CalibrationBundleError {
@@ -63,6 +64,9 @@ impl std::fmt::Display for CalibrationBundleError {
             }
             CalibrationBundleError::NonFiniteGyroRandomWalk { value } => {
                 write!(f, "gyroscope random walk must be finite, got {value}")
+            }
+            CalibrationBundleError::InvalidImuExtrinsics { message } => {
+                write!(f, "invalid imu extrinsics: {message}")
             }
         }
     }
@@ -129,6 +133,35 @@ impl CalibrationBundle {
         }
     }
 
+    pub fn from_dataset_calibration(
+        intrinsics: PinholeIntrinsics,
+        stereo: RectifiedStereo,
+        calibration: &crate::dataset::Calibration,
+    ) -> Result<Self, CalibrationBundleError> {
+        let Some(imu) = calibration.imu.as_ref() else {
+            return Ok(Self::visual_only(intrinsics, stereo));
+        };
+        let noise = ImuNoiseModel::new(
+            imu.noise.accel_noise_density,
+            imu.noise.gyro_noise_density,
+            imu.noise.accel_random_walk,
+            imu.noise.gyro_random_walk,
+        )
+        .map_err(map_noise_error)?;
+        let t_cam_imu = Pose64::from_rt(imu.extrinsics.rotation, imu.extrinsics.translation);
+        let extrinsics = ImuExtrinsics::new(t_cam_imu, imu.extrinsics.time_offset_ns)
+            .map_err(|err| CalibrationBundleError::InvalidImuExtrinsics {
+                message: err.to_string(),
+            })?;
+        Self::with_imu(
+            intrinsics,
+            stereo,
+            noise,
+            extrinsics,
+            imu.gravity_magnitude_mps2,
+        )
+    }
+
     pub fn intrinsics(&self) -> PinholeIntrinsics {
         self.intrinsics
     }
@@ -193,6 +226,35 @@ fn validate_noise(noise: &ImuNoiseModel) -> Result<(), CalibrationBundleError> {
     )
 }
 
+fn map_noise_error(err: crate::imu::ImuNoiseModelError) -> CalibrationBundleError {
+    match err {
+        crate::imu::ImuNoiseModelError::NonFiniteAccelNoiseDensity { value } => {
+            CalibrationBundleError::NonFiniteAccelNoiseDensity { value }
+        }
+        crate::imu::ImuNoiseModelError::NonPositiveAccelNoiseDensity { value } => {
+            CalibrationBundleError::NonPositiveAccelNoiseDensity { value }
+        }
+        crate::imu::ImuNoiseModelError::NonFiniteGyroNoiseDensity { value } => {
+            CalibrationBundleError::NonFiniteGyroNoiseDensity { value }
+        }
+        crate::imu::ImuNoiseModelError::NonPositiveGyroNoiseDensity { value } => {
+            CalibrationBundleError::NonPositiveGyroNoiseDensity { value }
+        }
+        crate::imu::ImuNoiseModelError::NonFiniteAccelRandomWalk { value } => {
+            CalibrationBundleError::NonFiniteAccelRandomWalk { value }
+        }
+        crate::imu::ImuNoiseModelError::NonPositiveAccelRandomWalk { value } => {
+            CalibrationBundleError::NonPositiveAccelRandomWalk { value }
+        }
+        crate::imu::ImuNoiseModelError::NonFiniteGyroRandomWalk { value } => {
+            CalibrationBundleError::NonFiniteGyroRandomWalk { value }
+        }
+        crate::imu::ImuNoiseModelError::NonPositiveGyroRandomWalk { value } => {
+            CalibrationBundleError::NonPositiveGyroRandomWalk { value }
+        }
+    }
+}
+
 fn validate_positive_finite(
     value: f64,
     non_positive: CalibrationBundleError,
@@ -245,6 +307,7 @@ mod tests {
             },
             baseline_m: 0.1,
             rectified: true,
+            imu: None,
         })
         .expect("stereo")
     }
@@ -288,6 +351,51 @@ mod tests {
         assert!(bundle.has_imu());
         assert!(bundle.imu_noise().is_some());
         assert!(bundle.imu_extrinsics().is_some());
+    }
+
+    #[test]
+    fn from_dataset_calibration_preserves_imu_block() {
+        let dataset_calibration = crate::dataset::Calibration {
+            left: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 50.0,
+                cy: 40.0,
+                width: 100,
+                height: 80,
+            },
+            right: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 50.0,
+                cy: 40.0,
+                width: 100,
+                height: 80,
+            },
+            baseline_m: 0.1,
+            rectified: true,
+            imu: Some(crate::dataset::ImuCalibration {
+                noise: crate::dataset::ImuNoiseMeta {
+                    accel_noise_density: 0.1,
+                    gyro_noise_density: 0.01,
+                    accel_random_walk: 0.001,
+                    gyro_random_walk: 0.0001,
+                },
+                extrinsics: crate::dataset::ImuExtrinsicsMeta {
+                    rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    translation: [0.1, -0.2, 0.3],
+                    time_offset_ns: 42,
+                },
+                gravity_magnitude_mps2: 9.81,
+            }),
+        };
+        let bundle =
+            CalibrationBundle::from_dataset_calibration(intrinsics(), stereo(), &dataset_calibration)
+                .expect("bundle");
+        let imu_extrinsics = bundle.imu_extrinsics().expect("imu extrinsics");
+        assert!(bundle.has_imu());
+        assert_eq!(imu_extrinsics.time_offset_ns(), 42);
+        assert_eq!(imu_extrinsics.t_cam_imu().translation(), [0.1, -0.2, 0.3]);
     }
 
     #[test]

@@ -23,6 +23,26 @@ impl std::fmt::Display for ImuSampleError {
 
 impl std::error::Error for ImuSampleError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImuTimestampShiftError {
+    Overflow { timestamp: Timestamp, delta_ns: i64 },
+}
+
+impl std::fmt::Display for ImuTimestampShiftError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImuTimestampShiftError::Overflow { timestamp, delta_ns } => write!(
+                f,
+                "shifting imu timestamp {} by {}ns overflowed i64 range",
+                timestamp.as_nanos(),
+                delta_ns
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ImuTimestampShiftError {}
+
 #[derive(Clone, Debug)]
 pub struct ImuSample {
     timestamp: Timestamp,
@@ -63,6 +83,21 @@ impl ImuSample {
 
     pub fn gyro_radps(&self) -> [f64; 3] {
         self.gyro_radps
+    }
+
+    pub fn shifted_timestamp_ns(&self, delta_ns: i64) -> Result<Self, ImuTimestampShiftError> {
+        let shifted = (self.timestamp.as_nanos() as i128) + (delta_ns as i128);
+        if !(i64::MIN as i128..=i64::MAX as i128).contains(&shifted) {
+            return Err(ImuTimestampShiftError::Overflow {
+                timestamp: self.timestamp,
+                delta_ns,
+            });
+        }
+        Ok(Self {
+            timestamp: Timestamp::from_nanos(shifted as i64),
+            accel_mps2: self.accel_mps2,
+            gyro_radps: self.gyro_radps,
+        })
     }
 }
 
@@ -419,6 +454,24 @@ impl ImuBatch {
     pub fn dt_seconds(&self) -> f64 {
         self.end_time().seconds_since(self.start_time()).max(0.0)
     }
+
+    pub fn shifted_timestamp_ns(
+        &self,
+        delta_ns: i64,
+    ) -> Result<Self, ImuTimestampShiftError> {
+        if delta_ns == 0 {
+            return Ok(self.clone());
+        }
+        let shifted = self
+            .samples()
+            .iter()
+            .map(|sample| sample.shifted_timestamp_ns(delta_ns))
+            .collect::<Result<Vec<_>, _>>()?;
+        ImuBatch::new(shifted).map_err(|_| ImuTimestampShiftError::Overflow {
+            timestamp: self.end_time(),
+            delta_ns,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -490,6 +543,20 @@ mod tests {
         assert_eq!(batch.start_time(), Timestamp::from_nanos(10));
         assert_eq!(batch.end_time(), Timestamp::from_nanos(70));
         assert!((batch.dt_seconds() - 60e-9).abs() < 1e-15);
+    }
+
+    #[test]
+    fn imu_batch_timestamp_shift_preserves_order_and_span() {
+        let samples = vec![
+            ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3]).expect("sample 0"),
+            ImuSample::new(Timestamp::from_nanos(30), [1.0; 3], [2.0; 3]).expect("sample 1"),
+            ImuSample::new(Timestamp::from_nanos(70), [3.0; 3], [4.0; 3]).expect("sample 2"),
+        ];
+        let batch = ImuBatch::new(samples).expect("batch");
+        let shifted = batch.shifted_timestamp_ns(25).expect("shifted batch");
+        assert_eq!(shifted.start_time(), Timestamp::from_nanos(35));
+        assert_eq!(shifted.end_time(), Timestamp::from_nanos(95));
+        assert!((shifted.dt_seconds() - batch.dt_seconds()).abs() < 1e-15);
     }
 
     #[test]

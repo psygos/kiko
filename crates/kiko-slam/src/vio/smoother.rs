@@ -243,6 +243,27 @@ impl LocalVio {
         })
     }
 
+    pub fn correct_prediction(
+        &self,
+        preintegrated: &PreintegratedImu,
+        pose_measurement_odom: Pose64,
+        visual_observations: Vec<VioObservation>,
+    ) -> Result<VioEstimate, LocalVioError> {
+        let previous = self.frames.back().ok_or(LocalVioError::NotInitialized)?;
+        let predicted = propagate_state(previous.state(), preintegrated, self.gravity);
+        let corrected = self.optimize_predicted_state(
+            previous,
+            predicted,
+            pose_measurement_odom,
+            visual_observations.into_boxed_slice(),
+            preintegrated,
+        );
+        Ok(VioEstimate {
+            keyframe_id: previous.keyframe_id,
+            state: corrected,
+        })
+    }
+
     pub fn latest_odometry_constraint(&self) -> Option<VioOdometryConstraint> {
         let current = self.frames.back()?;
         let preintegrated = current.preintegrated_from_prev.as_ref()?;
@@ -256,7 +277,17 @@ impl LocalVio {
             from: previous.keyframe_id,
             to: current.keyframe_id,
             relative_pose,
-            information: pose_information_from_preintegration(preintegrated),
+            information: pair_pose_information(
+                previous,
+                current,
+                preintegrated,
+                self.gravity,
+                self.camera_from_body,
+                self.intrinsics,
+                &self.map_from_odom,
+                self.config.pose_prior_weight(),
+            )
+            .unwrap_or_else(|| pose_information_from_preintegration(preintegrated)),
         })
     }
 
@@ -303,6 +334,118 @@ impl LocalVio {
             .map(|frame| frame.state.clone())
             .unwrap_or(propagated);
         Ok(VioEstimate { keyframe_id, state })
+    }
+
+    fn optimize_predicted_state(
+        &self,
+        previous: &VioFrame,
+        mut state: NavState,
+        pose_measurement_odom: Pose64,
+        visual_observations: Box<[VioObservation]>,
+        preintegrated: &PreintegratedImu,
+    ) -> NavState {
+        let pose_prior_weights = [self.config.pose_prior_weight(); POSE_PRIOR_RESIDUAL_DIM];
+        let imu_weights = preintegrated.residual_information_diag();
+        let bias_weights = preintegrated.bias_random_walk_information_diag();
+        let reprojection_weights = [1.0; REPROJECTION_RESIDUAL_DIM];
+
+        for _ in 0..self.config.max_iterations() {
+            let frames = [
+                previous.clone(),
+                VioFrame {
+                    keyframe_id: previous.keyframe_id,
+                    state: state.clone(),
+                    pose_measurement_odom,
+                    visual_observations: visual_observations.clone(),
+                    preintegrated_from_prev: Some(preintegrated.clone()),
+                },
+            ];
+            let mut h = vec![0.0_f64; STATE_DIM * STATE_DIM];
+            let mut b = vec![0.0_f64; STATE_DIM];
+
+            let pose_residual = pose_prior_residual(&frames[1].state, pose_measurement_odom);
+            let pose_jac = numerical_pose_prior_jacobian(&frames, 1, pose_measurement_odom);
+            accumulate_self(
+                &mut h,
+                &mut b,
+                STATE_DIM,
+                0,
+                &pose_jac,
+                &pose_residual,
+                &pose_prior_weights,
+            );
+
+            let imu_residual =
+                ImuFactor::residual(&frames[0].state, &frames[1].state, preintegrated, &self.gravity);
+            let (_, imu_jac_curr) =
+                numerical_imu_jacobians(&frames, 0, 1, preintegrated, self.gravity);
+            accumulate_self(
+                &mut h,
+                &mut b,
+                STATE_DIM,
+                0,
+                &imu_jac_curr,
+                &imu_residual,
+                &imu_weights,
+            );
+
+            let bias_residual = bias_random_walk_residual(&frames[0].state, &frames[1].state);
+            let (_, bias_jac_curr) = numerical_bias_random_walk_jacobians(&frames, 0, 1);
+            accumulate_self(
+                &mut h,
+                &mut b,
+                STATE_DIM,
+                0,
+                &bias_jac_curr,
+                &bias_residual,
+                &bias_weights,
+            );
+
+            for observation in frames[1].visual_observations.iter().copied() {
+                let residual = match reprojection_residual(
+                    &frames[1].state,
+                    self.camera_from_body,
+                    &self.map_from_odom,
+                    observation,
+                    self.intrinsics,
+                ) {
+                    Ok(residual) => residual,
+                    Err(_) => continue,
+                };
+                let jac = numerical_reprojection_jacobian(
+                    &frames,
+                    1,
+                    self.camera_from_body,
+                    &self.map_from_odom,
+                    observation,
+                    self.intrinsics,
+                );
+                accumulate_self(
+                    &mut h,
+                    &mut b,
+                    STATE_DIM,
+                    0,
+                    &jac,
+                    &residual,
+                    &reprojection_weights,
+                );
+            }
+
+            for idx in 0..STATE_DIM {
+                h[idx * STATE_DIM + idx] += 1e-4;
+            }
+            let Some(delta) = solve_dense(h, b) else {
+                return state;
+            };
+            let step_norm = delta.iter().map(|value| value * value).sum::<f64>().sqrt();
+            let mut tangent = [0.0_f64; STATE_DIM];
+            tangent.copy_from_slice(&delta[..STATE_DIM]);
+            state = state.retract(&tangent);
+            if step_norm < 1e-8 {
+                break;
+            }
+        }
+        state
     }
 
     fn optimize_window(&mut self) {
@@ -524,6 +667,291 @@ fn pose_information_from_preintegration(preintegrated: &PreintegratedImu) -> [[f
         information[3 + axis][3 + axis] = 1.0 / rot_var;
     }
     information
+}
+
+fn pair_pose_information(
+    previous: &VioFrame,
+    current: &VioFrame,
+    preintegrated: &PreintegratedImu,
+    gravity: Gravity,
+    camera_from_body: Pose64,
+    intrinsics: PinholeIntrinsics,
+    map_from_odom: &MapFromOdom,
+    pose_prior_weight: f64,
+) -> Option<[[f64; 6]; 6]> {
+    let (h, _) = prediction_normal_equations(
+        previous,
+        &current.state,
+        current.pose_measurement_odom,
+        &current.visual_observations,
+        preintegrated,
+        gravity,
+        camera_from_body,
+        intrinsics,
+        map_from_odom,
+        pose_prior_weight,
+        0.0,
+    );
+    let covariance_state = invert_dense_15x15(h)?;
+    let jacobian = relative_pose_jacobian_current(previous.state(), &current.state);
+    let covariance_pose = matmul_rect(
+        &jacobian,
+        &covariance_state,
+        &transpose_rect::<6, STATE_DIM>(&jacobian),
+    );
+    invert_dense_6x6(covariance_pose)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prediction_normal_equations(
+    previous: &VioFrame,
+    state: &NavState,
+    pose_measurement_odom: Pose64,
+    visual_observations: &[VioObservation],
+    preintegrated: &PreintegratedImu,
+    gravity: Gravity,
+    camera_from_body: Pose64,
+    intrinsics: PinholeIntrinsics,
+    map_from_odom: &MapFromOdom,
+    pose_prior_weight: f64,
+    damping: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    let frames = [
+        previous.clone(),
+        VioFrame {
+            keyframe_id: previous.keyframe_id,
+            state: state.clone(),
+            pose_measurement_odom,
+            visual_observations: visual_observations.to_vec().into_boxed_slice(),
+            preintegrated_from_prev: Some(preintegrated.clone()),
+        },
+    ];
+    let mut h = vec![0.0_f64; STATE_DIM * STATE_DIM];
+    let mut b = vec![0.0_f64; STATE_DIM];
+
+    let pose_prior_weights = [pose_prior_weight; POSE_PRIOR_RESIDUAL_DIM];
+    let pose_residual = pose_prior_residual(&frames[1].state, pose_measurement_odom);
+    let pose_jac = numerical_pose_prior_jacobian(&frames, 1, pose_measurement_odom);
+    accumulate_self(
+        &mut h,
+        &mut b,
+        STATE_DIM,
+        0,
+        &pose_jac,
+        &pose_residual,
+        &pose_prior_weights,
+    );
+
+    let imu_weights = preintegrated.residual_information_diag();
+    let imu_residual = ImuFactor::residual(&frames[0].state, &frames[1].state, preintegrated, &gravity);
+    let (_, imu_jac_curr) = numerical_imu_jacobians(&frames, 0, 1, preintegrated, gravity);
+    accumulate_self(
+        &mut h,
+        &mut b,
+        STATE_DIM,
+        0,
+        &imu_jac_curr,
+        &imu_residual,
+        &imu_weights,
+    );
+
+    let bias_weights = preintegrated.bias_random_walk_information_diag();
+    let bias_residual = bias_random_walk_residual(&frames[0].state, &frames[1].state);
+    let (_, bias_jac_curr) = numerical_bias_random_walk_jacobians(&frames, 0, 1);
+    accumulate_self(
+        &mut h,
+        &mut b,
+        STATE_DIM,
+        0,
+        &bias_jac_curr,
+        &bias_residual,
+        &bias_weights,
+    );
+
+    let reprojection_weights = [1.0; REPROJECTION_RESIDUAL_DIM];
+    for observation in visual_observations.iter().copied() {
+        let residual = match reprojection_residual(
+            &frames[1].state,
+            camera_from_body,
+            map_from_odom,
+            observation,
+            intrinsics,
+        ) {
+            Ok(residual) => residual,
+            Err(_) => continue,
+        };
+        let jac = numerical_reprojection_jacobian(
+            &frames,
+            1,
+            camera_from_body,
+            map_from_odom,
+            observation,
+            intrinsics,
+        );
+        accumulate_self(
+            &mut h,
+            &mut b,
+            STATE_DIM,
+            0,
+            &jac,
+            &residual,
+            &reprojection_weights,
+        );
+    }
+
+    for idx in 0..STATE_DIM {
+        h[idx * STATE_DIM + idx] += damping.max(1e-4);
+    }
+    (h, b)
+}
+
+fn relative_pose_jacobian_current(
+    previous: &NavState,
+    current: &NavState,
+) -> [[f64; STATE_DIM]; 6] {
+    let nominal = previous
+        .pose_odom_from_body()
+        .inverse()
+        .compose(current.pose_odom_from_body());
+    let mut jacobian = [[0.0_f64; STATE_DIM]; 6];
+    for axis in 0..STATE_DIM {
+        let delta = tangent_axis(axis, 1e-6);
+        let plus_pose = previous
+            .pose_odom_from_body()
+            .inverse()
+            .compose(current.retract(&delta).pose_odom_from_body());
+        let minus_pose = previous
+            .pose_odom_from_body()
+            .inverse()
+            .compose(current.retract(&neg_tangent(delta)).pose_odom_from_body());
+        let plus = relative_pose_residual(nominal, plus_pose);
+        let minus = relative_pose_residual(nominal, minus_pose);
+        for row in 0..6 {
+            jacobian[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
+        }
+    }
+    jacobian
+}
+
+fn relative_pose_residual(target: Pose64, estimate: Pose64) -> [f64; 6] {
+    let delta = target.inverse().compose(estimate);
+    let rot = crate::math::so3_log_f64(delta.rotation());
+    let t = delta.translation();
+    [t[0], t[1], t[2], rot[0], rot[1], rot[2]]
+}
+
+fn transpose_rect<const ROWS: usize, const COLS: usize>(
+    matrix: &[[f64; COLS]; ROWS],
+) -> [[f64; ROWS]; COLS] {
+    let mut out = [[0.0_f64; ROWS]; COLS];
+    for (row_idx, row) in matrix.iter().enumerate() {
+        for (col_idx, value) in row.iter().copied().enumerate() {
+            out[col_idx][row_idx] = value;
+        }
+    }
+    out
+}
+
+fn matmul_rect<const M: usize, const N: usize, const K: usize>(
+    a: &[[f64; N]; M],
+    b: &[[f64; K]; N],
+    c: &[[f64; M]; K],
+) -> [[f64; M]; M] {
+    let mut temp = [[0.0_f64; K]; M];
+    for i in 0..M {
+        for j in 0..K {
+            let mut value = 0.0_f64;
+            for k in 0..N {
+                value += a[i][k] * b[k][j];
+            }
+            temp[i][j] = value;
+        }
+    }
+    let mut out = [[0.0_f64; M]; M];
+    for i in 0..M {
+        for j in 0..M {
+            let mut value = 0.0_f64;
+            for k in 0..K {
+                value += temp[i][k] * c[k][j];
+            }
+            out[i][j] = value;
+        }
+    }
+    out
+}
+
+fn invert_dense_square(matrix: Vec<f64>, n: usize) -> Option<Vec<f64>> {
+    let mut a = matrix;
+    let mut inv = vec![0.0_f64; n * n];
+    for idx in 0..n {
+        inv[idx * n + idx] = 1.0;
+    }
+
+    for pivot in 0..n {
+        let mut pivot_row = pivot;
+        let mut pivot_abs = a[pivot * n + pivot].abs();
+        for row in (pivot + 1)..n {
+            let value = a[row * n + pivot].abs();
+            if value > pivot_abs {
+                pivot_abs = value;
+                pivot_row = row;
+            }
+        }
+        if !pivot_abs.is_finite() || pivot_abs < 1e-12 {
+            return None;
+        }
+        if pivot_row != pivot {
+            for col in 0..n {
+                a.swap(pivot * n + col, pivot_row * n + col);
+                inv.swap(pivot * n + col, pivot_row * n + col);
+            }
+        }
+        let diag = a[pivot * n + pivot];
+        for col in 0..n {
+            a[pivot * n + col] /= diag;
+            inv[pivot * n + col] /= diag;
+        }
+        for row in 0..n {
+            if row == pivot {
+                continue;
+            }
+            let factor = a[row * n + pivot];
+            if factor == 0.0 {
+                continue;
+            }
+            for col in 0..n {
+                a[row * n + col] -= factor * a[pivot * n + col];
+                inv[row * n + col] -= factor * inv[pivot * n + col];
+            }
+        }
+    }
+    Some(inv)
+}
+
+fn invert_dense_6x6(matrix: [[f64; 6]; 6]) -> Option<[[f64; 6]; 6]> {
+    let flat = matrix
+        .iter()
+        .flat_map(|row| row.iter().copied())
+        .collect::<Vec<_>>();
+    let inverse = invert_dense_square(flat, 6)?;
+    let mut out = [[0.0_f64; 6]; 6];
+    for row in 0..6 {
+        for col in 0..6 {
+            out[row][col] = inverse[row * 6 + col];
+        }
+    }
+    Some(out)
+}
+
+fn invert_dense_15x15(matrix: Vec<f64>) -> Option<[[f64; STATE_DIM]; STATE_DIM]> {
+    let inverse = invert_dense_square(matrix, STATE_DIM)?;
+    let mut out = [[0.0_f64; STATE_DIM]; STATE_DIM];
+    for row in 0..STATE_DIM {
+        for col in 0..STATE_DIM {
+            out[row][col] = inverse[row * STATE_DIM + col];
+        }
+    }
+    Some(out)
 }
 
 fn frame_base(frame_idx: usize) -> usize {
@@ -860,6 +1288,45 @@ mod tests {
             .push_preintegrated(ids[1], preintegrated, Pose64::identity(), Vec::new())
             .expect_err("push without init should fail");
         assert_eq!(err, LocalVioError::NotInitialized);
+    }
+
+    #[test]
+    fn correct_prediction_updates_pose_without_extending_window() {
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let config = VioConfig::new(4)
+            .expect("config")
+            .with_pose_prior_weight(1.0e12)
+            .expect("pose prior weight");
+        let mut vio = LocalVio::new(config, gravity, Pose64::identity(), intrinsics());
+        let ids = keyframe_ids(1);
+        vio.initialize(
+            ids[0],
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state"),
+            Pose64::identity(),
+            Vec::new(),
+        )
+        .expect("init");
+        let preintegrated = PreintegratedImu::integrate(
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
+            &ImuBias::default(),
+            &noise(),
+        )
+        .expect("preintegrated");
+        let estimate = vio
+            .correct_prediction(
+                &preintegrated,
+                Pose64::from_rt(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [1.0, 0.0, 0.0],
+                ),
+                Vec::new(),
+            )
+            .expect("correct prediction");
+        assert_eq!(vio.len(), 1);
+        assert!(
+            estimate.state().pose_odom_from_body().translation()[0] > 0.95,
+            "predicted state should follow strong pose prior"
+        );
     }
 
     #[test]

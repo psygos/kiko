@@ -20,6 +20,14 @@ pub fn env_f32(key: &str) -> Option<f32> {
     env_parse(key)
 }
 
+pub fn env_f64(key: &str) -> Option<f64> {
+    env_parse(key)
+}
+
+pub fn env_i64(key: &str) -> Option<i64> {
+    env_parse(key)
+}
+
 pub fn env_bool(key: &str) -> Option<bool> {
     let raw = std::env::var(key).ok()?;
     match raw.trim().to_lowercase().as_str() {
