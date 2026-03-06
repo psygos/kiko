@@ -1604,7 +1604,7 @@ impl SlamTracker {
         vio_runtime.predicted_preintegration = None;
         vio_runtime.predicted_pose_odom = Some(odom_pose);
         self.last_pose_world = Some(self.map_from_odom.odom_to_map(odom_pose).to_pose32());
-        if let Some(odometry) = vio_runtime.local_vio.latest_odometry_constraint() {
+        for odometry in vio_runtime.local_vio.drain_exported_odometry() {
             self.global_map.add_odometry_edge(EssentialEdge {
                 a: odometry.from(),
                 b: odometry.to(),
