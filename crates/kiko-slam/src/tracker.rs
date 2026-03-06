@@ -25,11 +25,11 @@ use crate::pose_graph::{
 };
 use crate::{
     map::{KeyframeId, MapPointId, SlamMap},
-    BaCorrection, BaResult, CalibrationBundle, Detections, DiagnosticEvent, DownscaleFactor,
-    Frame, FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus,
-    KeypointLimit, LightGlue, LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason,
-    LoopClosureStatus, MapFromOdom, MapObservation, Matches, ObservationSet, PinholeIntrinsics,
-    Point3, Pose, Pose64,
+    BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
+    Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
+    KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
+    LocalBundleAdjuster, LoopClosureRejectReason, LoopClosureStatus, MapFromOdom, MapObservation,
+    Matches, ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64,
     RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
@@ -1019,6 +1019,7 @@ impl std::error::Error for TrackerInitError {}
 
 #[derive(Debug)]
 pub enum TrackerError {
+    Capture(CaptureBundleError),
     Inference(InferenceError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
@@ -1032,6 +1033,7 @@ pub enum TrackerError {
 impl std::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TrackerError::Capture(err) => write!(f, "capture error: {err}"),
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
@@ -1049,6 +1051,12 @@ impl std::fmt::Display for TrackerError {
 }
 
 impl std::error::Error for TrackerError {}
+
+impl From<CaptureBundleError> for TrackerError {
+    fn from(err: CaptureBundleError) -> Self {
+        TrackerError::Capture(err)
+    }
+}
 
 impl From<InferenceError> for TrackerError {
     fn from(err: InferenceError) -> Self {
@@ -1292,6 +1300,8 @@ pub struct SlamTracker {
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
+    next_capture_id: u64,
+    previous_capture_time: Option<Timestamp>,
     map_from_odom: MapFromOdom,
     trace_transitions: bool,
 }
@@ -1352,12 +1362,27 @@ impl SlamTracker {
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
+            next_capture_id: 0,
+            previous_capture_time: None,
             map_from_odom: MapFromOdom::identity(),
             trace_transitions,
         })
     }
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
+        let capture_id = CaptureId::new(self.next_capture_id);
+        self.next_capture_id = self.next_capture_id.saturating_add(1);
+        let capture =
+            CaptureBundle::visual_only(capture_id, pair, self.previous_capture_time)?;
+        self.process_capture(capture)
+    }
+
+    pub fn process_capture(
+        &mut self,
+        capture: CaptureBundle,
+    ) -> Result<TrackerOutput, TrackerError> {
+        self.previous_capture_time = Some(capture.capture_time());
+        let (_, pair, _, _) = capture.into_parts();
         self.drain_backend_responses();
         self.drain_descriptor_responses();
         if let Err(err) = self.process_pending_loop_closure() {

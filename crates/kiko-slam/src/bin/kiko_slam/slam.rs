@@ -123,9 +123,9 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
 
-    for pair in reader.pairs() {
-        let pair = match pair {
-            Ok(pair) => pair,
+    for bundle in reader.bundles() {
+        let bundle = match bundle {
+            Ok(bundle) => bundle,
             Err(err) => {
                 read_errors += 1;
                 eprintln!("read error: {err}");
@@ -134,10 +134,10 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
         attempted += 1;
 
-        let left = pair.left().clone();
-        let right = pair.right().clone();
+        let left = bundle.pair().left().clone();
+        let right = bundle.pair().right().clone();
 
-        match tracker.process(pair) {
+        match tracker.process_capture(bundle) {
             Ok(output) => {
                 let timestamp = left.timestamp();
                 let loop_applied = output.events.iter().any(|event| {
