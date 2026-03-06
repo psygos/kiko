@@ -2,7 +2,9 @@ use crate::map::{
     CovisibilityGraph, CovisibilitySnapshot, KeyframeEntry, KeyframeId, KeyframeKeypoint,
     MapError, MapPoint, MapPointId, SlamMap,
 };
-use crate::pose_graph::{EssentialEdge, EssentialGraph, EssentialGraphError};
+use crate::pose_graph::{EssentialGraph, EssentialGraphError};
+#[cfg(feature = "vio")]
+use crate::pose_graph::EssentialEdge;
 use crate::{Point3, Pose};
 use std::num::NonZeroUsize;
 
@@ -130,6 +132,7 @@ impl GlobalMap {
             .add_keyframe(keyframe_id, neighbors.as_ref(), &self.map);
     }
 
+    #[cfg(feature = "vio")]
     pub(crate) fn add_odometry_edge(&mut self, edge: EssentialEdge) {
         self.essential_graph.add_odometry_edge(edge);
     }

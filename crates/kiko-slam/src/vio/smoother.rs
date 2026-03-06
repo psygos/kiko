@@ -4,9 +4,15 @@ use std::num::NonZeroUsize;
 use crate::math::{mat_mul_vec_f64, mat_mul_f64};
 use crate::map::KeyframeId;
 use crate::{
-    pose_prior_residual, reprojection_residual, Gravity, ImuFactor, NavState, NavTangent,
-    Observation, PinholeIntrinsics, Pose64, PreintegratedImu,
+    bias_random_walk_residual, pose_prior_residual, reprojection_residual, Gravity, ImuFactor,
+    NavState, NavTangent, Observation, PinholeIntrinsics, Pose64, PreintegratedImu,
 };
+
+const STATE_DIM: usize = 15;
+const IMU_RESIDUAL_DIM: usize = 9;
+const POSE_PRIOR_RESIDUAL_DIM: usize = 6;
+const REPROJECTION_RESIDUAL_DIM: usize = 2;
+const BIAS_RW_RESIDUAL_DIM: usize = 6;
 
 #[derive(Clone, Copy, Debug)]
 pub struct VioConfig {
@@ -300,7 +306,7 @@ impl LocalVio {
         if frame_count < 2 {
             return;
         }
-        let dim = (frame_count - 1) * 9;
+        let dim = (frame_count - 1) * STATE_DIM;
         if dim == 0 {
             return;
         }
@@ -312,15 +318,8 @@ impl LocalVio {
 
             for frame_idx in 1..frame_count {
                 let measurement = frames[frame_idx].pose_measurement_odom;
-                let residual = pose_prior_residual(
-                    &frames[frame_idx].state,
-                    measurement,
-                );
-                let jac = numerical_pose_prior_jacobian(
-                    frames,
-                    frame_idx,
-                    measurement,
-                );
+                let residual = pose_prior_residual(&frames[frame_idx].state, measurement);
+                let jac = numerical_pose_prior_jacobian(frames, frame_idx, measurement);
                 accumulate_self(
                     &mut h,
                     &mut b,
@@ -379,6 +378,42 @@ impl LocalVio {
                     );
                 }
 
+                let bias_residual =
+                    bias_random_walk_residual(&frames[frame_idx - 1].state, &frames[frame_idx].state);
+                let (bias_jac_prev, bias_jac_curr) =
+                    numerical_bias_random_walk_jacobians(frames, frame_idx - 1, frame_idx);
+                if frame_idx > 1 {
+                    accumulate_self(
+                        &mut h,
+                        &mut b,
+                        dim,
+                        frame_base(frame_idx - 1),
+                        &bias_jac_prev,
+                        &bias_residual,
+                        1.0,
+                    );
+                }
+                accumulate_self(
+                    &mut h,
+                    &mut b,
+                    dim,
+                    frame_base(frame_idx),
+                    &bias_jac_curr,
+                    &bias_residual,
+                    1.0,
+                );
+                if frame_idx > 1 {
+                    accumulate_cross(
+                        &mut h,
+                        dim,
+                        frame_base(frame_idx - 1),
+                        frame_base(frame_idx),
+                        &bias_jac_prev,
+                        &bias_jac_curr,
+                        1.0,
+                    );
+                }
+
                 for observation in frames[frame_idx].visual_observations.iter().copied() {
                     let residual = match reprojection_residual(
                         &frames[frame_idx].state,
@@ -420,7 +455,7 @@ impl LocalVio {
             for frame_idx in 1..frame_count {
                 let base = frame_base(frame_idx);
                 let mut tangent = [0.0_f64; 15];
-                tangent[..9].copy_from_slice(&delta[base..base + 9]);
+                tangent.copy_from_slice(&delta[base..base + STATE_DIM]);
                 frames[frame_idx].state = frames[frame_idx].state.retract(&tangent);
             }
             if step_norm < 1e-8 {
@@ -478,20 +513,20 @@ fn pose_information_from_preintegration(preintegrated: &PreintegratedImu) -> [[f
 }
 
 fn frame_base(frame_idx: usize) -> usize {
-    (frame_idx - 1) * 9
+    (frame_idx - 1) * STATE_DIM
 }
 
 fn numerical_pose_prior_jacobian(
     frames: &[VioFrame],
     frame_idx: usize,
     measurement: Pose64,
-) -> [[f64; 9]; 6] {
-    let mut jacobian = [[0.0_f64; 9]; 6];
-    for axis in 0..9 {
+) -> [[f64; STATE_DIM]; POSE_PRIOR_RESIDUAL_DIM] {
+    let mut jacobian = [[0.0_f64; STATE_DIM]; POSE_PRIOR_RESIDUAL_DIM];
+    for axis in 0..STATE_DIM {
         let delta = tangent_axis(axis, 1e-6);
         let plus = pose_prior_residual(&frames[frame_idx].state.retract(&delta), measurement);
         let minus = pose_prior_residual(&frames[frame_idx].state.retract(&neg_tangent(delta)), measurement);
-        for row in 0..6 {
+        for row in 0..POSE_PRIOR_RESIDUAL_DIM {
             jacobian[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
         }
     }
@@ -504,10 +539,10 @@ fn numerical_imu_jacobians(
     curr_idx: usize,
     preintegrated: &PreintegratedImu,
     gravity: Gravity,
-) -> ([[f64; 9]; 9], [[f64; 9]; 9]) {
-    let mut jac_prev = [[0.0_f64; 9]; 9];
-    let mut jac_curr = [[0.0_f64; 9]; 9];
-    for axis in 0..9 {
+) -> ([[f64; STATE_DIM]; IMU_RESIDUAL_DIM], [[f64; STATE_DIM]; IMU_RESIDUAL_DIM]) {
+    let mut jac_prev = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
+    let mut jac_curr = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
+    for axis in 0..STATE_DIM {
         let delta = tangent_axis(axis, 1e-6);
         let plus = ImuFactor::residual(
             &frames[prev_idx].state.retract(&delta),
@@ -521,11 +556,11 @@ fn numerical_imu_jacobians(
             preintegrated,
             &gravity,
         );
-        for row in 0..9 {
+        for row in 0..IMU_RESIDUAL_DIM {
             jac_prev[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
         }
     }
-    for axis in 0..9 {
+    for axis in 0..STATE_DIM {
         let delta = tangent_axis(axis, 1e-6);
         let plus = ImuFactor::residual(
             &frames[prev_idx].state,
@@ -539,7 +574,48 @@ fn numerical_imu_jacobians(
             preintegrated,
             &gravity,
         );
-        for row in 0..9 {
+        for row in 0..IMU_RESIDUAL_DIM {
+            jac_curr[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
+        }
+    }
+    (jac_prev, jac_curr)
+}
+
+fn numerical_bias_random_walk_jacobians(
+    frames: &[VioFrame],
+    prev_idx: usize,
+    curr_idx: usize,
+) -> (
+    [[f64; STATE_DIM]; BIAS_RW_RESIDUAL_DIM],
+    [[f64; STATE_DIM]; BIAS_RW_RESIDUAL_DIM],
+) {
+    let mut jac_prev = [[0.0_f64; STATE_DIM]; BIAS_RW_RESIDUAL_DIM];
+    let mut jac_curr = [[0.0_f64; STATE_DIM]; BIAS_RW_RESIDUAL_DIM];
+    for axis in 0..STATE_DIM {
+        let delta = tangent_axis(axis, 1e-6);
+        let plus = bias_random_walk_residual(
+            &frames[prev_idx].state.retract(&delta),
+            &frames[curr_idx].state,
+        );
+        let minus = bias_random_walk_residual(
+            &frames[prev_idx].state.retract(&neg_tangent(delta)),
+            &frames[curr_idx].state,
+        );
+        for row in 0..BIAS_RW_RESIDUAL_DIM {
+            jac_prev[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
+        }
+    }
+    for axis in 0..STATE_DIM {
+        let delta = tangent_axis(axis, 1e-6);
+        let plus = bias_random_walk_residual(
+            &frames[prev_idx].state,
+            &frames[curr_idx].state.retract(&delta),
+        );
+        let minus = bias_random_walk_residual(
+            &frames[prev_idx].state,
+            &frames[curr_idx].state.retract(&neg_tangent(delta)),
+        );
+        for row in 0..BIAS_RW_RESIDUAL_DIM {
             jac_curr[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
         }
     }
@@ -552,9 +628,9 @@ fn numerical_reprojection_jacobian(
     camera_from_body: Pose64,
     observation: Observation,
     intrinsics: PinholeIntrinsics,
-) -> [[f64; 9]; 2] {
-    let mut jacobian = [[0.0_f64; 9]; 2];
-    for axis in 0..9 {
+) -> [[f64; STATE_DIM]; REPROJECTION_RESIDUAL_DIM] {
+    let mut jacobian = [[0.0_f64; STATE_DIM]; REPROJECTION_RESIDUAL_DIM];
+    for axis in 0..STATE_DIM {
         let delta = tangent_axis(axis, 1e-6);
         let plus = reprojection_residual(
             &frames[frame_idx].state.retract(&delta),
@@ -572,7 +648,7 @@ fn numerical_reprojection_jacobian(
             intrinsics,
         )
         .unwrap_or([0.0, 0.0]);
-        for row in 0..2 {
+        for row in 0..REPROJECTION_RESIDUAL_DIM {
             jacobian[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
         }
     }
@@ -597,12 +673,12 @@ fn accumulate_self(
     b: &mut [f64],
     dim: usize,
     base: usize,
-    jacobian: &[[f64; 9]],
+    jacobian: &[[f64; STATE_DIM]],
     residual: &[f64],
     weight: f64,
 ) {
-    for i in 0..9 {
-        for j in 0..9 {
+    for i in 0..STATE_DIM {
+        for j in 0..STATE_DIM {
             let mut value = 0.0_f64;
             for row in 0..residual.len() {
                 value += jacobian[row][i] * jacobian[row][j] * weight;
@@ -622,13 +698,13 @@ fn accumulate_cross(
     dim: usize,
     base_a: usize,
     base_b: usize,
-    jac_a: &[[f64; 9]],
-    jac_b: &[[f64; 9]],
+    jac_a: &[[f64; STATE_DIM]],
+    jac_b: &[[f64; STATE_DIM]],
     weight: f64,
 ) {
     let rows = jac_a.len().min(jac_b.len());
-    for i in 0..9 {
-        for j in 0..9 {
+    for i in 0..STATE_DIM {
+        for j in 0..STATE_DIM {
             let mut value = 0.0_f64;
             for row in 0..rows {
                 value += jac_a[row][i] * jac_b[row][j] * weight;
@@ -937,5 +1013,54 @@ mod tests {
             .expect("push");
         let z = estimate.state().pose_odom_from_body().translation()[2];
         assert!(z.abs() < 1e-4, "visual observation should keep translation near origin, got {z}");
+    }
+
+    #[test]
+    fn local_vio_solver_preserves_bias_state_through_window_updates() {
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let mut vio =
+            LocalVio::new(VioConfig::new(4).expect("config"), gravity, Pose64::identity(), intrinsics());
+        let ids = keyframe_ids(3);
+        let bias = ImuBias {
+            accel: [0.02, -0.01, 0.005],
+            gyro: [0.001, -0.002, 0.003],
+        };
+        vio.initialize(
+            ids[0],
+            NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state"),
+            Pose64::identity(),
+            Vec::new(),
+        )
+        .expect("init");
+        for keyframe_id in [ids[1], ids[2]] {
+            let preintegrated = PreintegratedImu::integrate(
+                &batch(&[
+                    (0, bias.accel, bias.gyro),
+                    (10_000_000, bias.accel, bias.gyro),
+                    (20_000_000, bias.accel, bias.gyro),
+                ]),
+                &bias,
+                &noise(),
+            )
+            .expect("preintegrated");
+            vio.push_preintegrated(keyframe_id, preintegrated, Pose64::identity(), Vec::new())
+                .expect("push");
+        }
+        let latest = vio.latest_estimate().expect("latest");
+        let latest_bias = latest.state().bias();
+        for axis in 0..3 {
+            assert!(
+                (latest_bias.accel[axis] - bias.accel[axis]).abs() < 1e-5,
+                "accel bias axis {axis} drifted: {} vs {}",
+                latest_bias.accel[axis],
+                bias.accel[axis]
+            );
+            assert!(
+                (latest_bias.gyro[axis] - bias.gyro[axis]).abs() < 1e-6,
+                "gyro bias axis {axis} drifted: {} vs {}",
+                latest_bias.gyro[axis],
+                bias.gyro[axis]
+            );
+        }
     }
 }

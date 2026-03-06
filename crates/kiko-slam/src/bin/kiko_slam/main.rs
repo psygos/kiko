@@ -72,8 +72,6 @@ mod tests {
     use super::bench::{summarize_bench, BenchAccum};
     use super::config::{build_ba_config, build_tracker_config, TrackerDefaults};
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
-    #[cfg(feature = "vio")]
-    use kiko_slam::VioConfig;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;

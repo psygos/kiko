@@ -27,6 +27,7 @@ impl ImuFactor {
         preintegrated: &PreintegratedImu,
         gravity: &Gravity,
     ) -> [f64; 9] {
+        let corrected = preintegrated.corrected_first_order(state_i.bias());
         let pose_i = state_i.pose_odom_from_body();
         let pose_j = state_j.pose_odom_from_body();
         let r_i = pose_i.rotation();
@@ -40,7 +41,7 @@ impl ImuFactor {
 
         let r_i_t = transpose3(r_i);
         let rotation_error =
-            so3_log_f64(mat_mul_f64(preintegrated.delta_rotation, mat_mul_f64(r_i_t, r_j)));
+            so3_log_f64(mat_mul_f64(corrected.delta_rotation, mat_mul_f64(r_i_t, r_j)));
 
         let delta_position_odom = [
             p_j[0] - p_i[0] - v_i[0] * dt - 0.5 * g[0] * dt * dt,
@@ -55,11 +56,11 @@ impl ImuFactor {
 
         let position_error = sub_vec3(
             mat_mul_vec_f64(r_i_t, delta_position_odom),
-            preintegrated.delta_position,
+            corrected.delta_position,
         );
         let velocity_error = sub_vec3(
             mat_mul_vec_f64(r_i_t, delta_velocity_odom),
-            preintegrated.delta_velocity,
+            corrected.delta_velocity,
         );
 
         [
@@ -219,6 +220,33 @@ mod tests {
         let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
         assert_eq!(bias_random_walk_residual(&state_i, &state_j), [0.0; 6]);
+    }
+
+    #[test]
+    fn imu_factor_applies_first_order_bias_correction() {
+        let bias = ImuBias {
+            accel: [0.1, -0.05, 0.02],
+            gyro: [0.01, -0.015, 0.005],
+        };
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let accel_measurement = [
+            bias.accel[0],
+            bias.accel[1],
+            9.81 + bias.accel[2],
+        ];
+        let batch = batch(&[
+            (0, accel_measurement, bias.gyro),
+            (10_000_000, accel_measurement, bias.gyro),
+            (20_000_000, accel_measurement, bias.gyro),
+        ]);
+        let preintegrated =
+            PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise()).expect("preintegrated");
+        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone())
+            .expect("state i");
+        let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
+        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
+        let norm = residual.iter().map(|value| value * value).sum::<f64>().sqrt();
+        assert!(norm < 1e-5, "bias-corrected imu residual norm={norm}");
     }
 
     #[test]
