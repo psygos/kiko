@@ -280,6 +280,29 @@ impl std::fmt::Display for ImuBatchError {
 
 impl std::error::Error for ImuBatchError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImuAccumulatorError {
+    NonIncreasingTimestamps {
+        previous: Timestamp,
+        current: Timestamp,
+    },
+}
+
+impl std::fmt::Display for ImuAccumulatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImuAccumulatorError::NonIncreasingTimestamps { previous, current } => write!(
+                f,
+                "imu accumulator timestamps must be strictly increasing: previous={} current={}",
+                previous.as_nanos(),
+                current.as_nanos()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ImuAccumulatorError {}
+
 fn validate_positive_finite(
     value: f64,
     non_finite: ImuNoiseModelError,
@@ -292,6 +315,59 @@ fn validate_positive_finite(
         return Err(non_positive);
     }
     Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImuAccumulator {
+    samples: Vec<ImuSample>,
+}
+
+impl ImuAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+
+    pub fn extend_batch(&mut self, batch: &ImuBatch) -> Result<(), ImuAccumulatorError> {
+        for sample in batch.samples() {
+            if let Some(previous) = self.samples.last().map(ImuSample::timestamp)
+                && sample.timestamp().as_nanos() <= previous.as_nanos()
+            {
+                return Err(ImuAccumulatorError::NonIncreasingTimestamps {
+                    previous,
+                    current: sample.timestamp(),
+                });
+            }
+            self.samples.push(sample.clone());
+        }
+        Ok(())
+    }
+
+    pub fn drain_batch(&mut self) -> Result<Option<ImuBatch>, ImuBatchError> {
+        if self.samples.is_empty() {
+            return Ok(None);
+        }
+        let samples = std::mem::take(&mut self.samples);
+        ImuBatch::new(samples).map(Some)
+    }
+
+    pub fn batch(&self) -> Result<Option<ImuBatch>, ImuBatchError> {
+        if self.samples.is_empty() {
+            return Ok(None);
+        }
+        ImuBatch::new(self.samples.clone()).map(Some)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -418,5 +494,55 @@ mod tests {
         let bias = ImuBias::default();
         assert_eq!(bias.accel, [0.0; 3]);
         assert_eq!(bias.gyro, [0.0; 3]);
+    }
+
+    #[test]
+    fn imu_accumulator_preserves_strict_ordering() {
+        let mut accumulator = ImuAccumulator::new();
+        let first = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3]).expect("sample 0"),
+            ImuSample::new(Timestamp::from_nanos(20), [0.0; 3], [0.0; 3]).expect("sample 1"),
+        ])
+        .expect("batch");
+        accumulator.extend_batch(&first).expect("extend 1");
+        let second = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(30), [0.0; 3], [0.0; 3]).expect("sample 2"),
+        ])
+        .expect("batch");
+        accumulator.extend_batch(&second).expect("extend 2");
+        assert_eq!(accumulator.len(), 3);
+        let drained = accumulator
+            .drain_batch()
+            .expect("drain")
+            .expect("batch should exist");
+        assert_eq!(drained.start_time(), Timestamp::from_nanos(10));
+        assert_eq!(drained.end_time(), Timestamp::from_nanos(30));
+        assert!(accumulator.is_empty());
+    }
+
+    #[test]
+    fn imu_accumulator_rejects_out_of_order_extension() {
+        let mut accumulator = ImuAccumulator::new();
+        let batch = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(20), [0.0; 3], [0.0; 3]).expect("sample 0"),
+        ])
+        .expect("batch");
+        accumulator.extend_batch(&batch).expect("first extend");
+        let err = accumulator
+            .extend_batch(
+                &ImuBatch::new(vec![
+                    ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3])
+                        .expect("sample 1"),
+                ])
+                .expect("batch"),
+            )
+            .expect_err("out-of-order extension should fail");
+        assert_eq!(
+            err,
+            ImuAccumulatorError::NonIncreasingTimestamps {
+                previous: Timestamp::from_nanos(20),
+                current: Timestamp::from_nanos(10),
+            }
+        );
     }
 }

@@ -4,6 +4,8 @@ use kiko_slam::{
     RansacConfig, RectificationMode, RectifiedStereoConfig, RedundancyPolicy, RelocalizationConfig,
     TriangulationConfig,
 };
+#[cfg(feature = "vio")]
+use kiko_slam::VioConfig;
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
 
@@ -119,6 +121,11 @@ pub fn build_tracker_config(
         redundancy,
         backend,
         loop_subsystem,
+        #[cfg(feature = "vio")]
+        vio: env_bool("KIKO_VIO")
+            .unwrap_or(false)
+            .then(|| VioConfig::new(env_usize("KIKO_VIO_WINDOW").unwrap_or(7)))
+            .transpose()?,
     })
 }
 

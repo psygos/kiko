@@ -124,6 +124,17 @@ impl LocalVio {
         })
     }
 
+    pub fn predict_from_latest(
+        &self,
+        preintegrated: &PreintegratedImu,
+    ) -> Result<VioEstimate, LocalVioError> {
+        let previous = self.frames.back().ok_or(LocalVioError::NotInitialized)?;
+        Ok(VioEstimate {
+            keyframe_id: previous.keyframe_id,
+            state: propagate_state(previous.state(), preintegrated, self.gravity),
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }

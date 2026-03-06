@@ -28,11 +28,13 @@ use crate::{
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
     KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
-    LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation,
-    Matches, ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64,
+    LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, ObservationSet,
+    PinholeIntrinsics, Point3, Pose, Pose64,
     RansacConfig, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
 };
+#[cfg(feature = "vio")]
+use crate::{Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig};
 use crate::frontend::{median_parallax_px, StereoFrontend};
 use crate::global_map::GlobalMap;
 use crate::place_recognition::{
@@ -54,6 +56,8 @@ pub struct TrackerConfig {
     pub redundancy: Option<RedundancyPolicy>,
     pub backend: Option<BackendConfig>,
     pub loop_subsystem: LoopSubsystemConfig,
+    #[cfg(feature = "vio")]
+    pub vio: Option<VioConfig>,
 }
 
 impl TrackerConfig {
@@ -1001,6 +1005,8 @@ impl RedundancyPolicy {
 #[derive(Debug)]
 pub enum TrackerInitError {
     DescriptorUnavailable { model_path: PathBuf },
+    #[cfg(feature = "vio")]
+    VioInvalidGravity { message: String },
 }
 
 impl std::fmt::Display for TrackerInitError {
@@ -1011,6 +1017,10 @@ impl std::fmt::Display for TrackerInitError {
                 "loop closure requires learned descriptors but descriptor worker failed to start (model: {})",
                 model_path.display()
             ),
+            #[cfg(feature = "vio")]
+            TrackerInitError::VioInvalidGravity { message } => {
+                write!(f, "invalid vio gravity configuration: {message}")
+            }
         }
     }
 }
@@ -1020,6 +1030,8 @@ impl std::error::Error for TrackerInitError {}
 #[derive(Debug)]
 pub enum TrackerError {
     Capture(CaptureBundleError),
+    #[cfg(feature = "vio")]
+    Vio(String),
     Inference(InferenceError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
@@ -1034,6 +1046,8 @@ impl std::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TrackerError::Capture(err) => write!(f, "capture error: {err}"),
+            #[cfg(feature = "vio")]
+            TrackerError::Vio(err) => write!(f, "vio error: {err}"),
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
@@ -1285,10 +1299,25 @@ struct SharedMatches {
     pairs: Vec<(usize, usize)>,
 }
 
+#[cfg(feature = "vio")]
+enum LocalEstimator {
+    VisualOnly,
+    Inertial(VioRuntime),
+}
+
+#[cfg(feature = "vio")]
+struct VioRuntime {
+    local_vio: LocalVio,
+    noise: crate::ImuNoiseModel,
+    pending_imu: ImuAccumulator,
+}
+
 pub struct SlamTracker {
     frontend: StereoFrontend,
     config: TrackerConfig,
     state: TrackerState,
+    #[cfg(feature = "vio")]
+    local_estimator: LocalEstimator,
     ba: LocalBundleAdjuster,
     global_map: GlobalMap,
     loop_manager: LoopManager,
@@ -1320,6 +1349,21 @@ impl SlamTracker {
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let frontend = StereoFrontend::new(superpoint, lightglue, triangulator, intrinsics);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
+        #[cfg(feature = "vio")]
+        let local_estimator = match (config.vio, calibration.imu_noise(), calibration.has_imu()) {
+            (Some(vio_config), Some(noise), true) => {
+                let gravity = Gravity::try_new([0.0, 0.0, -calibration.gravity_magnitude_mps2()])
+                    .map_err(|err| TrackerInitError::VioInvalidGravity {
+                        message: err.to_string(),
+                    })?;
+                LocalEstimator::Inertial(VioRuntime {
+                    local_vio: LocalVio::new(vio_config, gravity),
+                    noise: noise.clone(),
+                    pending_imu: ImuAccumulator::new(),
+                })
+            }
+            _ => LocalEstimator::VisualOnly,
+        };
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(DEFAULT_MAX_RESPAWNS);
@@ -1351,6 +1395,8 @@ impl SlamTracker {
             frontend,
             config,
             state: TrackerState::NeedKeyframe,
+            #[cfg(feature = "vio")]
+            local_estimator,
             ba,
             global_map: GlobalMap::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD),
             loop_manager: LoopManager::new(PoseGraphConfig::default()),
@@ -1381,6 +1427,13 @@ impl SlamTracker {
         &mut self,
         capture: CaptureBundle,
     ) -> Result<TrackerOutput, TrackerError> {
+        #[cfg(feature = "vio")]
+        {
+            if let Some(batch) = capture.imu().batch() {
+                self.ingest_imu_batch(batch)?;
+            }
+            self.refresh_predicted_pose_from_vio()?;
+        }
         self.previous_capture_time = Some(capture.capture_time());
         let (_, pair, _, _) = capture.into_parts();
         self.drain_backend_responses();
@@ -1431,6 +1484,95 @@ impl SlamTracker {
             self.clear_events();
         }
         result
+    }
+
+    #[cfg(feature = "vio")]
+    fn ingest_imu_batch(&mut self, batch: &crate::ImuBatch) -> Result<(), TrackerError> {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            return Ok(());
+        };
+        vio_runtime
+            .pending_imu
+            .extend_batch(batch)
+            .map_err(|err| TrackerError::Vio(err.to_string()))
+    }
+
+    #[cfg(feature = "vio")]
+    fn refresh_predicted_pose_from_vio(&mut self) -> Result<(), TrackerError> {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            return Ok(());
+        };
+        let Some(batch) = vio_runtime
+            .pending_imu
+            .batch()
+            .map_err(|err| TrackerError::Vio(err.to_string()))?
+        else {
+            return Ok(());
+        };
+        if batch.len() < 2 {
+            return Ok(());
+        }
+        let Some(latest) = vio_runtime.local_vio.latest_estimate() else {
+            return Ok(());
+        };
+        let preintegrated = PreintegratedImu::integrate(&batch, latest.state().bias(), &vio_runtime.noise)
+            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        let predicted = vio_runtime
+            .local_vio
+            .predict_from_latest(&preintegrated)
+            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        self.last_pose_world = Some(predicted.state().pose_odom_from_body().to_pose32());
+        Ok(())
+    }
+
+    #[cfg(feature = "vio")]
+    fn on_keyframe_for_vio(
+        &mut self,
+        keyframe_id: KeyframeId,
+        pose_world: Pose,
+    ) -> Result<(), TrackerError> {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            return Ok(());
+        };
+        if vio_runtime.local_vio.is_empty() {
+            let state = crate::NavState::try_new(
+                Pose64::from_pose32(pose_world),
+                [0.0; 3],
+                crate::ImuBias::default(),
+            )
+            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+            vio_runtime
+                .local_vio
+                .initialize(keyframe_id, state)
+                .map_err(|err| TrackerError::Vio(err.to_string()))?;
+            vio_runtime.pending_imu.clear();
+            return Ok(());
+        }
+
+        let Some(batch) = vio_runtime
+            .pending_imu
+            .drain_batch()
+            .map_err(|err| TrackerError::Vio(err.to_string()))?
+        else {
+            return Ok(());
+        };
+        if batch.len() < 2 {
+            return Ok(());
+        }
+
+        let latest = vio_runtime
+            .local_vio
+            .latest_estimate()
+            .ok_or_else(|| TrackerError::Vio("local vio lost latest state".to_string()))?;
+        let preintegrated =
+            PreintegratedImu::integrate(&batch, latest.state().bias(), &vio_runtime.noise)
+                .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        let estimate = vio_runtime
+            .local_vio
+            .push_preintegrated(keyframe_id, preintegrated)
+            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        self.last_pose_world = Some(estimate.state().pose_odom_from_body().to_pose32());
+        Ok(())
     }
 
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
@@ -2563,6 +2705,8 @@ impl SlamTracker {
                 self.map_version,
             );
         }
+        #[cfg(feature = "vio")]
+        self.on_keyframe_for_vio(keyframe_id, pose_world)?;
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.keyframe_status = Some(KeyframeStatus::Created);

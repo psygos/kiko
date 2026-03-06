@@ -125,7 +125,7 @@ impl CalibrationBundle {
         }
     }
 
-    pub fn intrinsics(self) -> PinholeIntrinsics {
+    pub fn intrinsics(&self) -> PinholeIntrinsics {
         self.intrinsics
     }
 
