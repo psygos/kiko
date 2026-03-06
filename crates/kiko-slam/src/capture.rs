@@ -236,6 +236,32 @@ impl CaptureBundle {
     }
 }
 
+pub trait CaptureSource {
+    type Error;
+
+    fn next_capture(&mut self) -> Option<Result<CaptureBundle, Self::Error>>;
+
+    #[allow(dead_code)]
+    fn captures(self) -> Captures<Self>
+    where
+        Self: Sized,
+    {
+        Captures { source: self }
+    }
+}
+
+pub struct Captures<S> {
+    source: S,
+}
+
+impl<S: CaptureSource> Iterator for Captures<S> {
+    type Item = Result<CaptureBundle, S::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.source.next_capture()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +404,31 @@ mod tests {
         )
         .expect("bundle");
         assert_eq!(bundle.imu().sample_count(), 2);
+    }
+
+    struct SingleCaptureSource {
+        capture: Option<CaptureBundle>,
+    }
+
+    impl CaptureSource for SingleCaptureSource {
+        type Error = ();
+
+        fn next_capture(&mut self) -> Option<Result<CaptureBundle, Self::Error>> {
+            self.capture.take().map(Ok)
+        }
+    }
+
+    #[test]
+    fn capture_source_iterator_yields_captures_in_order() {
+        let pair = stereo_pair(100, 104);
+        let bundle =
+            CaptureBundle::visual_only(CaptureId::new(9), pair, None).expect("bundle");
+        let source = SingleCaptureSource {
+            capture: Some(bundle),
+        };
+        let captures: Vec<_> = source.captures().collect();
+        assert_eq!(captures.len(), 1);
+        let capture = captures[0].as_ref().expect("capture ok");
+        assert_eq!(capture.capture_id(), CaptureId::new(9));
     }
 }
