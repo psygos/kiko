@@ -178,11 +178,15 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Some(pose) = output.pose.as_ref() {
-                    let pose_map = pose.cam_from_map_pose32();
-                    if let Err(err) = sink.log_pose(timestamp, &pose_map) {
+                    if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
                         eprintln!("rerun log error: {err}");
                     } else {
                         poses_logged += 1;
+                    }
+                }
+                if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
+                    if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
+                        eprintln!("rerun imu log error: {err}");
                     }
                 }
                 if let Err(err) = sink.log_system_health(timestamp, &output.health) {

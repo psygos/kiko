@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
-    VizPacket, env::env_f32,
+    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw,
+    Timestamp, TrackingPose, VioTelemetry, VizPacket, env::env_f32,
 };
 
 use std::collections::HashMap;
@@ -102,7 +102,9 @@ pub struct RerunSink {
     frame_index: u64,
     depth_index: u64,
     tracks: TrackState,
-    trajectory: Vec<[f32; 3]>,
+    odom_trajectory: TrajectoryLog,
+    corrected_trajectory: TrajectoryLog,
+    visual_measurement_trajectory: TrajectoryLog,
     logged_world: bool,
 }
 
@@ -114,7 +116,9 @@ impl RerunSink {
             frame_index: 0,
             depth_index: 0,
             tracks: TrackState::new(),
-            trajectory: Vec::new(),
+            odom_trajectory: TrajectoryLog::default(),
+            corrected_trajectory: TrajectoryLog::default(),
+            visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
         }
     }
@@ -241,7 +245,11 @@ impl RerunSink {
         Ok(())
     }
 
-    pub fn log_pose(&mut self, timestamp: Timestamp, pose: &Pose) -> Result<(), VizLogError> {
+    pub fn log_tracking_pose(
+        &mut self,
+        timestamp: Timestamp,
+        pose: &TrackingPose,
+    ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
 
         if !self.logged_world {
@@ -250,21 +258,75 @@ impl RerunSink {
             self.logged_world = true;
         }
 
-        let camera_pose = pose.inverse();
-        let position = camera_pose.translation();
-        let rotation = camera_pose.rotation();
-        let quat = quat_from_rotation(rotation);
+        log_pose_variant(
+            &self.rec,
+            "odom",
+            &pose.cam_from_odom_pose32(),
+            rerun::Color::from_rgb(80, 180, 255),
+            &mut self.odom_trajectory,
+        )?;
+        log_pose_variant(
+            &self.rec,
+            "map_corrected",
+            &pose.cam_from_map_pose32(),
+            rerun::Color::from_rgb(90, 220, 130),
+            &mut self.corrected_trajectory,
+        )?;
+        match pose.cam_from_map_visual_measurement_pose32() {
+            Some(measurement) => log_pose_variant(
+                &self.rec,
+                "visual_measurement",
+                &measurement,
+                rerun::Color::from_rgb(255, 170, 60),
+                &mut self.visual_measurement_trajectory,
+            )?,
+            None => self.visual_measurement_trajectory.break_strip(),
+        }
 
-        let transform = rerun::Transform3D::update_fields()
-            .with_translation(position)
-            .with_quaternion(rerun::Quaternion::from_xyzw(quat));
-        self.rec.log("world/camera", &transform)?;
+        Ok(())
+    }
 
-        self.trajectory.push(position);
-        let strips = vec![self.trajectory.clone()];
-        self.rec
-            .log("world/trajectory", &rerun::LineStrips3D::new(strips))?;
+    pub fn log_vio_telemetry(
+        &self,
+        timestamp: Timestamp,
+        telemetry: &VioTelemetry,
+    ) -> Result<(), VizLogError> {
+        self.set_time(timestamp);
+        let velocity = telemetry.velocity_odom_mps();
+        let accel_bias = telemetry.accel_bias_mps2();
+        let gyro_bias = telemetry.gyro_bias_radps();
+        let speed =
+            (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
+                .sqrt();
 
+        self.rec.log("imu_state/velocity/x", &rerun::Scalars::single(velocity[0]))?;
+        self.rec.log("imu_state/velocity/y", &rerun::Scalars::single(velocity[1]))?;
+        self.rec.log("imu_state/velocity/z", &rerun::Scalars::single(velocity[2]))?;
+        self.rec.log("imu_state/velocity/speed", &rerun::Scalars::single(speed))?;
+        self.rec.log(
+            "imu_state/bias/accel/x",
+            &rerun::Scalars::single(accel_bias[0]),
+        )?;
+        self.rec.log(
+            "imu_state/bias/accel/y",
+            &rerun::Scalars::single(accel_bias[1]),
+        )?;
+        self.rec.log(
+            "imu_state/bias/accel/z",
+            &rerun::Scalars::single(accel_bias[2]),
+        )?;
+        self.rec.log(
+            "imu_state/bias/gyro/x",
+            &rerun::Scalars::single(gyro_bias[0]),
+        )?;
+        self.rec.log(
+            "imu_state/bias/gyro/y",
+            &rerun::Scalars::single(gyro_bias[1]),
+        )?;
+        self.rec.log(
+            "imu_state/bias/gyro/z",
+            &rerun::Scalars::single(gyro_bias[2]),
+        )?;
         Ok(())
     }
 
@@ -321,6 +383,73 @@ impl RerunSink {
 fn pose_position(pose: Pose) -> [f32; 3] {
     let camera_pose = pose.inverse();
     camera_pose.translation()
+}
+
+#[derive(Debug, Default)]
+struct TrajectoryLog {
+    strips: Vec<Vec<[f32; 3]>>,
+}
+
+impl TrajectoryLog {
+    fn push(&mut self, position: [f32; 3]) {
+        if self.strips.last().is_none_or(Vec::is_empty) {
+            self.strips.push(Vec::new());
+        }
+        self.strips
+            .last_mut()
+            .expect("trajectory strip exists")
+            .push(position);
+    }
+
+    fn break_strip(&mut self) {
+        if self.strips.last().is_some_and(|strip| !strip.is_empty()) {
+            self.strips.push(Vec::new());
+        }
+    }
+
+    fn strips(&self) -> Vec<Vec<[f32; 3]>> {
+        self.strips
+            .iter()
+            .filter(|strip| !strip.is_empty())
+            .cloned()
+            .collect()
+    }
+}
+
+fn log_pose_variant(
+    rec: &rerun::RecordingStream,
+    name: &str,
+    pose: &Pose,
+    color: rerun::Color,
+    trajectory: &mut TrajectoryLog,
+) -> Result<(), VizLogError> {
+    let camera_pose = pose.inverse();
+    let position = camera_pose.translation();
+    let rotation = camera_pose.rotation();
+    let quat = quat_from_rotation(rotation);
+
+    let transform = rerun::Transform3D::update_fields()
+        .with_translation(position)
+        .with_quaternion(rerun::Quaternion::from_xyzw(quat));
+    rec.log(format!("world/camera/{name}"), &transform)?;
+
+    rec.log(
+        format!("world/pose/{name}"),
+        &rerun::Points3D::new([position])
+            .with_colors([color])
+            .with_radii([rerun::Radius::new_ui_points(5.0)]),
+    )?;
+
+    trajectory.push(position);
+    let strips = trajectory.strips();
+    if !strips.is_empty() {
+        rec.log(
+            format!("world/trajectory/{name}"),
+            &rerun::LineStrips3D::new(strips).with_colors([color]),
+        )?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

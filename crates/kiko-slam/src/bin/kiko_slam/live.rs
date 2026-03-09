@@ -42,6 +42,7 @@ struct LiveVizMsg {
     right: Frame,
     depth: Option<DepthImage>,
     pose: Option<TrackingPose>,
+    vio_telemetry: Option<kiko_slam::VioTelemetry>,
     packet: Option<VizPacket<Raw>>,
     points: Option<Vec<Point3>>,
     covisibility_snapshot: Option<kiko_slam::CovisibilitySnapshot>,
@@ -254,6 +255,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         right,
                         depth,
                         pose: output.pose,
+                        vio_telemetry: output.vio_telemetry,
                         packet,
                         points,
                         covisibility_snapshot,
@@ -309,9 +311,13 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if let Some(pose) = msg.pose.as_ref() {
-                    let pose_map = pose.cam_from_map_pose32();
-                    if let Err(err) = sink.log_pose(msg.left.timestamp(), &pose_map) {
+                    if let Err(err) = sink.log_tracking_pose(msg.left.timestamp(), pose) {
                         eprintln!("rerun log error: {err}");
+                    }
+                }
+                if let Some(vio_telemetry) = msg.vio_telemetry.as_ref() {
+                    if let Err(err) = sink.log_vio_telemetry(msg.left.timestamp(), vio_telemetry) {
+                        eprintln!("rerun imu log error: {err}");
                     }
                 }
                 if let Some(snapshot) = msg.covisibility_snapshot.as_ref() {

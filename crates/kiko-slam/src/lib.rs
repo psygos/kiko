@@ -90,7 +90,7 @@ pub use tracker::{
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
     KeyframeInsertReason, KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx,
     RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
-    TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose,
+    TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,

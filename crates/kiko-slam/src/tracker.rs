@@ -1212,14 +1212,20 @@ impl SystemHealth {
 #[derive(Debug)]
 pub struct TrackingPose {
     cam_from_odom: Pose64,
-    cam_from_map: Pose64,
+    cam_from_map_corrected: Pose64,
+    cam_from_map_visual_measurement: Option<Pose64>,
 }
 
 impl TrackingPose {
-    pub fn new(cam_from_odom: Pose64, cam_from_map: Pose64) -> Self {
+    pub fn new(
+        cam_from_odom: Pose64,
+        cam_from_map_corrected: Pose64,
+        cam_from_map_visual_measurement: Option<Pose64>,
+    ) -> Self {
         Self {
             cam_from_odom,
-            cam_from_map,
+            cam_from_map_corrected,
+            cam_from_map_visual_measurement,
         }
     }
 
@@ -1228,7 +1234,11 @@ impl TrackingPose {
     }
 
     pub fn cam_from_map(&self) -> Pose64 {
-        self.cam_from_map
+        self.cam_from_map_corrected
+    }
+
+    pub fn cam_from_map_visual_measurement(&self) -> Option<Pose64> {
+        self.cam_from_map_visual_measurement
     }
 
     pub fn cam_from_odom_pose32(&self) -> Pose {
@@ -1236,7 +1246,41 @@ impl TrackingPose {
     }
 
     pub fn cam_from_map_pose32(&self) -> Pose {
-        self.cam_from_map.to_pose32()
+        self.cam_from_map_corrected.to_pose32()
+    }
+
+    pub fn cam_from_map_visual_measurement_pose32(&self) -> Option<Pose> {
+        self.cam_from_map_visual_measurement.map(Pose64::to_pose32)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VioTelemetry {
+    velocity_odom_mps: [f64; 3],
+    accel_bias_mps2: [f64; 3],
+    gyro_bias_radps: [f64; 3],
+}
+
+impl VioTelemetry {
+    fn from_nav_state(state: &crate::NavState) -> Self {
+        let bias = state.bias();
+        Self {
+            velocity_odom_mps: state.velocity_odom_mps(),
+            accel_bias_mps2: bias.accel,
+            gyro_bias_radps: bias.gyro,
+        }
+    }
+
+    pub fn velocity_odom_mps(&self) -> [f64; 3] {
+        self.velocity_odom_mps
+    }
+
+    pub fn accel_bias_mps2(&self) -> [f64; 3] {
+        self.accel_bias_mps2
+    }
+
+    pub fn gyro_bias_radps(&self) -> [f64; 3] {
+        self.gyro_bias_radps
     }
 }
 
@@ -1250,6 +1294,7 @@ pub struct TrackerOutput {
     pub health: SystemHealth,
     pub diagnostics: FrameDiagnostics,
     pub events: Vec<DiagnosticEvent>,
+    pub vio_telemetry: Option<VioTelemetry>,
 }
 
 #[derive(Debug)]
@@ -1303,7 +1348,7 @@ struct VioRuntime {
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
     predicted_preintegration: Option<PreintegratedImu>,
-    predicted_pose_odom: Option<Pose64>,
+    predicted_state: Option<crate::NavState>,
 }
 
 pub struct SlamTracker {
@@ -1359,7 +1404,7 @@ impl SlamTracker {
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
                     predicted_preintegration: None,
-                    predicted_pose_odom: None,
+                    predicted_state: None,
                 }))
             }
             _ => LocalEstimator::VisualOnly,
@@ -1526,10 +1571,13 @@ impl SlamTracker {
             .local_vio
             .predict_from_latest(&preintegrated)
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        let predicted_pose = predicted.state().pose_odom_from_body();
         vio_runtime.predicted_preintegration = Some(preintegrated);
-        vio_runtime.predicted_pose_odom = Some(predicted_pose);
-        self.last_pose_world = Some(self.map_from_odom.odom_to_map(predicted_pose).to_pose32());
+        vio_runtime.predicted_state = Some(predicted.state().clone());
+        self.last_pose_world = Some(
+            self.map_from_odom
+                .odom_to_map(predicted.state().pose_odom_from_body())
+                .to_pose32(),
+        );
         Ok(())
     }
 
@@ -1557,6 +1605,7 @@ impl SlamTracker {
                 crate::ImuBias::default(),
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
+            let predicted_state = state.clone();
             vio_runtime
                 .local_vio
                 .initialize(
@@ -1566,7 +1615,7 @@ impl SlamTracker {
                     visual_observations,
                 )
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
-            vio_runtime.predicted_pose_odom = Some(pose_measurement_odom);
+            vio_runtime.predicted_state = Some(predicted_state);
             vio_runtime.predicted_preintegration = None;
             vio_runtime.pending_imu.clear();
             return Ok(());
@@ -1600,10 +1649,13 @@ impl SlamTracker {
                 visual_observations,
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        let odom_pose = estimate.state().pose_odom_from_body();
         vio_runtime.predicted_preintegration = None;
-        vio_runtime.predicted_pose_odom = Some(odom_pose);
-        self.last_pose_world = Some(self.map_from_odom.odom_to_map(odom_pose).to_pose32());
+        vio_runtime.predicted_state = Some(estimate.state().clone());
+        self.last_pose_world = Some(
+            self.map_from_odom
+                .odom_to_map(estimate.state().pose_odom_from_body())
+                .to_pose32(),
+        );
         for odometry in vio_runtime.local_vio.drain_exported_odometry() {
             self.global_map.add_odometry_edge(EssentialEdge {
                 a: odometry.from(),
@@ -1730,7 +1782,20 @@ impl SlamTracker {
     fn current_odom_pose(&self) -> Option<Pose64> {
         match &self.local_estimator {
             LocalEstimator::VisualOnly => None,
-            LocalEstimator::Inertial(vio_runtime) => vio_runtime.predicted_pose_odom,
+            LocalEstimator::Inertial(vio_runtime) => vio_runtime
+                .predicted_state
+                .as_ref()
+                .map(crate::NavState::pose_odom_from_body),
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    fn current_vio_telemetry(&self) -> Option<VioTelemetry> {
+        match &self.local_estimator {
+            LocalEstimator::VisualOnly => None,
+            LocalEstimator::Inertial(vio_runtime) => {
+                vio_runtime.predicted_state.as_ref().map(VioTelemetry::from_nav_state)
+            }
         }
     }
 
@@ -1759,7 +1824,7 @@ impl SlamTracker {
                 visual_observations,
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        vio_runtime.predicted_pose_odom = Some(estimate.state().pose_odom_from_body());
+        vio_runtime.predicted_state = Some(estimate.state().clone());
         Ok(())
     }
 
@@ -1808,15 +1873,19 @@ impl SlamTracker {
             (None, maybe_pose) => maybe_pose.map(|pose_world| {
                 let cam_from_odom = Pose64::from_pose32(pose_world);
                 let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
-                TrackingPose::new(cam_from_odom, cam_from_map)
+                TrackingPose::new(cam_from_odom, cam_from_map, None)
             }),
         };
         #[cfg(not(feature = "vio"))]
         let pose = pose.map(|pose_world| {
             let cam_from_odom = Pose64::from_pose32(pose_world);
             let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
-            TrackingPose::new(cam_from_odom, cam_from_map)
+            TrackingPose::new(cam_from_odom, cam_from_map, None)
         });
+        #[cfg(feature = "vio")]
+        let vio_telemetry = self.current_vio_telemetry();
+        #[cfg(not(feature = "vio"))]
+        let vio_telemetry = None;
         if let Some(pose_world) = pose.as_ref() {
             self.last_pose_world = Some(pose_world.cam_from_map_pose32());
         }
@@ -1829,6 +1898,7 @@ impl SlamTracker {
             health: self.emit_health(tracking),
             diagnostics,
             events: self.drain_events(),
+            vio_telemetry,
         }
     }
 
@@ -2895,12 +2965,13 @@ impl SlamTracker {
                 stereo_matches: Some(matches),
                 frame_id,
                 health: self.system_health(),
-                diagnostics,
-                events: Vec::new(),
-            },
-            keyframe_id,
-        ))
-    }
+            diagnostics,
+            events: Vec::new(),
+            vio_telemetry: None,
+        },
+        keyframe_id,
+    ))
+}
 }
 
 fn insert_keyframe_into_map(
@@ -2985,10 +3056,13 @@ fn tracking_pose_from_vio_output(
     cam_from_odom: Pose64,
     pose_map_measurement: Option<Pose>,
 ) -> TrackingPose {
-    let cam_from_map = pose_map_measurement
-        .map(Pose64::from_pose32)
-        .unwrap_or_else(|| map_from_odom.odom_to_map(cam_from_odom));
-    TrackingPose::new(cam_from_odom, cam_from_map)
+    let cam_from_map_corrected = map_from_odom.odom_to_map(cam_from_odom);
+    let cam_from_map_visual_measurement = pose_map_measurement.map(Pose64::from_pose32);
+    TrackingPose::new(
+        cam_from_odom,
+        cam_from_map_corrected,
+        cam_from_map_visual_measurement,
+    )
 }
 
 fn build_shared_matches(
@@ -4538,19 +4612,25 @@ mod tests {
 
         assert_eq!(
             tracking_pose.cam_from_map_pose32().translation(),
-            measured_map_pose.translation()
-        );
-        assert_eq!(
-            tracking_pose.cam_from_map_pose32().rotation(),
-            measured_map_pose.rotation()
-        );
-        assert_eq!(
-            bridge.odom_to_map(cam_from_odom).to_pose32().translation(),
             expected_bridge_pose.translation()
         );
         assert_eq!(
-            bridge.odom_to_map(cam_from_odom).to_pose32().rotation(),
+            tracking_pose.cam_from_map_pose32().rotation(),
             expected_bridge_pose.rotation()
+        );
+        assert_eq!(
+            tracking_pose
+                .cam_from_map_visual_measurement_pose32()
+                .expect("visual measurement")
+                .translation(),
+            measured_map_pose.translation()
+        );
+        assert_eq!(
+            tracking_pose
+                .cam_from_map_visual_measurement_pose32()
+                .expect("visual measurement")
+                .rotation(),
+            measured_map_pose.rotation()
         );
     }
 }
