@@ -14,6 +14,8 @@ const IMU_RESIDUAL_DIM: usize = 9;
 const POSE_PRIOR_RESIDUAL_DIM: usize = 6;
 const REPROJECTION_RESIDUAL_DIM: usize = 2;
 const BIAS_RW_RESIDUAL_DIM: usize = 6;
+type StateMatrix = [[f64; STATE_DIM]; STATE_DIM];
+type BoundaryHessianBlocks = (StateMatrix, StateMatrix, StateMatrix, StateMatrix);
 
 #[derive(Clone, Copy, Debug)]
 pub struct VioConfig {
@@ -225,7 +227,10 @@ impl LocalVio {
             visual_observations: visual_observations.into_boxed_slice(),
             preintegrated_from_prev: None,
         });
-        self.anchor_prior = Some(MarginalPrior::anchor(keyframe_id, self.frames[0].state.clone()));
+        self.anchor_prior = Some(MarginalPrior::anchor(
+            keyframe_id,
+            self.frames[0].state.clone(),
+        ));
         self.marginal_prior = None;
         self.pending_exported_odometry.clear();
         Ok(())
@@ -330,7 +335,9 @@ impl LocalVio {
     }
 
     fn rollover_oldest(&mut self) {
-        let (Some(oldest), Some(next)) = (self.frames.front().cloned(), self.frames.get(1).cloned()) else {
+        let (Some(oldest), Some(next)) =
+            (self.frames.front().cloned(), self.frames.get(1).cloned())
+        else {
             return;
         };
         let Some(preintegrated) = next.preintegrated_from_prev.as_ref() else {
@@ -412,8 +419,12 @@ impl LocalVio {
                 &pose_prior_weights,
             );
 
-            let imu_residual =
-                ImuFactor::residual(&frames[0].state, &frames[1].state, preintegrated, &self.gravity);
+            let imu_residual = ImuFactor::residual(
+                &frames[0].state,
+                &frames[1].state,
+                preintegrated,
+                &self.gravity,
+            );
             let (_, imu_jac_curr) =
                 numerical_imu_jacobians(&frames, 0, 1, preintegrated, self.gravity);
             accumulate_self(
@@ -659,11 +670,11 @@ impl LocalVio {
             };
             let step_norm = delta.iter().map(|value| value * value).sum::<f64>().sqrt();
             let frames = self.frames.make_contiguous();
-            for frame_idx in 0..frame_count {
+            for (frame_idx, frame) in frames.iter_mut().enumerate().take(frame_count) {
                 let base = frame_base(frame_idx);
                 let mut tangent = [0.0_f64; 15];
                 tangent.copy_from_slice(&delta[base..base + STATE_DIM]);
-                frames[frame_idx].state = frames[frame_idx].state.retract(&tangent);
+                frame.state = frame.state.retract(&tangent);
             }
             if step_norm < 1e-8 {
                 break;
@@ -695,8 +706,8 @@ impl VioFrame {
 impl MarginalPrior {
     fn anchor(applies_to: KeyframeId, reference: NavState) -> Self {
         let mut information = [[0.0_f64; STATE_DIM]; STATE_DIM];
-        for axis in 0..STATE_DIM {
-            information[axis][axis] = 1.0e6;
+        for (axis, row) in information.iter_mut().enumerate().take(STATE_DIM) {
+            row[axis] = 1.0e6;
         }
         Self {
             applies_to,
@@ -751,10 +762,7 @@ fn pose_information_from_preintegration(preintegrated: &PreintegratedImu) -> [[f
     information
 }
 
-fn relative_pose_jacobian_pair(
-    previous: &NavState,
-    current: &NavState,
-) -> [[f64; 30]; 6] {
+fn relative_pose_jacobian_pair(previous: &NavState, current: &NavState) -> [[f64; 30]; 6] {
     let nominal = previous
         .pose_odom_from_body()
         .inverse()
@@ -817,8 +825,8 @@ fn matmul_rect<const M: usize, const N: usize, const K: usize>(
     for i in 0..M {
         for j in 0..K {
             let mut value = 0.0_f64;
-            for k in 0..N {
-                value += a[i][k] * b[k][j];
+            for (k, row) in b.iter().enumerate().take(N) {
+                value += a[i][k] * row[j];
             }
             temp[i][j] = value;
         }
@@ -827,8 +835,8 @@ fn matmul_rect<const M: usize, const N: usize, const K: usize>(
     for i in 0..M {
         for j in 0..M {
             let mut value = 0.0_f64;
-            for k in 0..K {
-                value += temp[i][k] * c[k][j];
+            for (k, row) in c.iter().enumerate().take(K) {
+                value += temp[i][k] * row[j];
             }
             out[i][j] = value;
         }
@@ -921,14 +929,7 @@ fn invert_dense_30x30(matrix: Vec<f64>) -> Option<[[f64; 30]; 30]> {
     Some(out)
 }
 
-fn split_boundary_hessian(
-    h: [[f64; 30]; 30],
-) -> (
-    [[f64; STATE_DIM]; STATE_DIM],
-    [[f64; STATE_DIM]; STATE_DIM],
-    [[f64; STATE_DIM]; STATE_DIM],
-    [[f64; STATE_DIM]; STATE_DIM],
-) {
+fn split_boundary_hessian(h: [[f64; 30]; 30]) -> BoundaryHessianBlocks {
     let mut h00 = [[0.0_f64; STATE_DIM]; STATE_DIM];
     let mut h01 = [[0.0_f64; STATE_DIM]; STATE_DIM];
     let mut h10 = [[0.0_f64; STATE_DIM]; STATE_DIM];
@@ -952,8 +953,8 @@ fn matmul_15x15(
     for i in 0..STATE_DIM {
         for j in 0..STATE_DIM {
             let mut value = 0.0_f64;
-            for k in 0..STATE_DIM {
-                value += a[i][k] * b[k][j];
+            for (k, row) in b.iter().enumerate().take(STATE_DIM) {
+                value += a[i][k] * row[j];
             }
             out[i][j] = value;
         }
@@ -994,7 +995,8 @@ fn numerical_state_prior_jacobian(
     for axis in 0..STATE_DIM {
         let delta = tangent_axis(axis, 1e-6);
         let plus = reference.local_coordinates(&frames[frame_idx].state.retract(&delta));
-        let minus = reference.local_coordinates(&frames[frame_idx].state.retract(&neg_tangent(delta)));
+        let minus =
+            reference.local_coordinates(&frames[frame_idx].state.retract(&neg_tangent(delta)));
         for row in 0..STATE_DIM {
             jacobian[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
         }
@@ -1207,8 +1209,8 @@ fn accumulate_self_information<const RESIDUAL_DIM: usize>(
         }
         let mut rhs = 0.0_f64;
         for row in 0..RESIDUAL_DIM {
-            for col in 0..RESIDUAL_DIM {
-                rhs += jacobian[row][i] * information[row][col] * residual[col];
+            for (col, residual_value) in residual.iter().enumerate().take(RESIDUAL_DIM) {
+                rhs += jacobian[row][i] * information[row][col] * *residual_value;
             }
         }
         b[base + i] += rhs;
@@ -1352,8 +1354,10 @@ fn boundary_normal_equations(
         );
     }
 
-    let imu_residual = ImuFactor::residual(&frames[0].state, &frames[1].state, preintegrated, &gravity);
-    let (imu_jac_prev, imu_jac_curr) = numerical_imu_jacobians(&frames, 0, 1, preintegrated, gravity);
+    let imu_residual =
+        ImuFactor::residual(&frames[0].state, &frames[1].state, preintegrated, &gravity);
+    let (imu_jac_prev, imu_jac_curr) =
+        numerical_imu_jacobians(&frames, 0, 1, preintegrated, gravity);
     let imu_weights = preintegrated.residual_information_diag();
     accumulate_self(
         &mut h,
@@ -1423,6 +1427,7 @@ fn boundary_normal_equations(
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn marginalize_oldest_to_next(
     oldest: &VioFrame,
     next: &VioFrame,
@@ -1453,6 +1458,7 @@ fn marginalize_oldest_to_next(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exported_odometry_constraint(
     oldest: &VioFrame,
     next: &VioFrame,
@@ -1475,11 +1481,7 @@ fn exported_odometry_constraint(
     );
     let covariance = invert_dense_30x30(flatten_square::<30>(h))?;
     let jacobian = relative_pose_jacobian_pair(oldest.state(), next.state());
-    let covariance_pose = matmul_rect(
-        &jacobian,
-        &covariance,
-        &transpose_rect::<6, 30>(&jacobian),
-    );
+    let covariance_pose = matmul_rect(&jacobian, &covariance, &transpose_rect::<6, 30>(&jacobian));
     Some(VioOdometryConstraint {
         from: oldest.keyframe_id,
         to: next.keyframe_id,
@@ -1673,14 +1675,14 @@ mod tests {
             Vec::new(),
         )
         .expect("init");
-        for idx in 1..=3 {
+        for keyframe_id in ids.iter().skip(1) {
             let preintegrated = PreintegratedImu::integrate(
                 &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
                 &ImuBias::default(),
                 &noise(),
             )
             .expect("preintegrated");
-            vio.push_preintegrated(ids[idx], preintegrated, Pose64::identity(), Vec::new())
+            vio.push_preintegrated(*keyframe_id, preintegrated, Pose64::identity(), Vec::new())
                 .expect("push");
         }
         assert_eq!(vio.len(), 2);

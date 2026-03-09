@@ -153,59 +153,55 @@ impl StereoPairer {
     }
 
     pub fn next_pair(&mut self) -> Result<Option<StereoPair>, PairError> {
-        loop {
-            match self.next_outcome()? {
-                PairingOutcome::Produced(pair) => return Ok(Some(pair)),
-                PairingOutcome::Dropped { .. } => continue,
-                PairingOutcome::Waiting => return Ok(None),
-            }
+        match self.next_outcome()? {
+            PairingOutcome::Produced(pair) => Ok(Some(pair)),
+            PairingOutcome::Dropped { .. } => self.next_pair(),
+            PairingOutcome::Waiting => Ok(None),
         }
     }
 
     pub fn next_outcome(&mut self) -> Result<PairingOutcome, PairError> {
-        loop {
-            let left = match self.left.front() {
-                Some(frame) => frame,
-                None => return Ok(PairingOutcome::Waiting),
+        let left = match self.left.front() {
+            Some(frame) => frame,
+            None => return Ok(PairingOutcome::Waiting),
+        };
+        let left_ts = left.timestamp().as_nanos();
+
+        let (best_idx, best_delta, best_ts) = match self.best_right(left_ts) {
+            Some(best) => best,
+            None => return Ok(PairingOutcome::Waiting),
+        };
+
+        if best_delta <= self.window.as_ns() {
+            let Some(left) = self.left.pop_front() else {
+                return Ok(PairingOutcome::Waiting);
             };
-            let left_ts = left.timestamp().as_nanos();
-
-            let (best_idx, best_delta, best_ts) = match self.best_right(left_ts) {
-                Some(best) => best,
-                None => return Ok(PairingOutcome::Waiting),
+            let Some(right) = self.right.remove(best_idx) else {
+                self.left.push_front(left);
+                return Ok(PairingOutcome::Waiting);
             };
+            let pair = StereoPair::try_new(left, right, self.window)?;
+            self.stats.paired += 1;
+            return Ok(PairingOutcome::Produced(pair));
+        }
 
-            if best_delta <= self.window.as_ns() {
-                let Some(left) = self.left.pop_front() else {
-                    return Ok(PairingOutcome::Waiting);
-                };
-                let Some(right) = self.right.remove(best_idx) else {
-                    self.left.push_front(left);
-                    return Ok(PairingOutcome::Waiting);
-                };
-                let pair = StereoPair::try_new(left, right, self.window)?;
-                self.stats.paired += 1;
-                return Ok(PairingOutcome::Produced(pair));
-            }
-
-            // No match in window: drop the older frame to advance.
-            if best_ts < left_ts {
-                self.right.remove(best_idx);
-                self.stats.dropped_right += 1;
-                self.stats.outside_window += 1;
-                return Ok(PairingOutcome::Dropped {
-                    sensor: SensorId::StereoRight,
-                    reason: PairingDropReason::OutsideWindow,
-                });
-            } else {
-                self.left.pop_front();
-                self.stats.dropped_left += 1;
-                self.stats.outside_window += 1;
-                return Ok(PairingOutcome::Dropped {
-                    sensor: SensorId::StereoLeft,
-                    reason: PairingDropReason::OutsideWindow,
-                });
-            }
+        // No match in window: drop the older frame to advance.
+        if best_ts < left_ts {
+            self.right.remove(best_idx);
+            self.stats.dropped_right += 1;
+            self.stats.outside_window += 1;
+            Ok(PairingOutcome::Dropped {
+                sensor: SensorId::StereoRight,
+                reason: PairingDropReason::OutsideWindow,
+            })
+        } else {
+            self.left.pop_front();
+            self.stats.dropped_left += 1;
+            self.stats.outside_window += 1;
+            Ok(PairingOutcome::Dropped {
+                sensor: SensorId::StereoLeft,
+                reason: PairingDropReason::OutsideWindow,
+            })
         }
     }
 

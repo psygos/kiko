@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -431,7 +431,7 @@ fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
 }
 
 fn read_imu_samples(
-    root: &PathBuf,
+    root: &Path,
     meta: &super::Meta,
     time_offset_ns: i64,
 ) -> Result<Option<Box<[ImuSample]>>, DatasetError> {

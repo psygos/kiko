@@ -1148,6 +1148,15 @@ mod tests {
         CompactDescriptor, Descriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
     };
 
+    type LoopFixture = (
+        SlamMap,
+        KeyframeId,
+        Vec<Keypoint>,
+        Vec<(usize, usize)>,
+        crate::PinholeIntrinsics,
+        Pose,
+    );
+
     fn descriptor_with_basis(idx: usize) -> GlobalDescriptor {
         let mut d = [0.0_f32; 512];
         d[idx] = 1.0;
@@ -1173,14 +1182,7 @@ mod tests {
         ids
     }
 
-    fn make_loop_fixture() -> (
-        SlamMap,
-        KeyframeId,
-        Vec<Keypoint>,
-        Vec<(usize, usize)>,
-        crate::PinholeIntrinsics,
-        Pose,
-    ) {
+    fn make_loop_fixture() -> LoopFixture {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let match_pose = Pose::identity();

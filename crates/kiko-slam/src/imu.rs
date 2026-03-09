@@ -31,7 +31,10 @@ pub enum ImuTimestampShiftError {
 impl std::fmt::Display for ImuTimestampShiftError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImuTimestampShiftError::Overflow { timestamp, delta_ns } => write!(
+            ImuTimestampShiftError::Overflow {
+                timestamp,
+                delta_ns,
+            } => write!(
                 f,
                 "shifting imu timestamp {} by {}ns overflowed i64 range",
                 timestamp.as_nanos(),
@@ -117,41 +120,41 @@ pub struct ImuNoiseModel {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImuNoiseModelError {
-    NonFiniteAccelNoiseDensity { value: f64 },
-    NonPositiveAccelNoiseDensity { value: f64 },
-    NonFiniteGyroNoiseDensity { value: f64 },
-    NonPositiveGyroNoiseDensity { value: f64 },
-    NonFiniteAccelRandomWalk { value: f64 },
-    NonPositiveAccelRandomWalk { value: f64 },
-    NonFiniteGyroRandomWalk { value: f64 },
-    NonPositiveGyroRandomWalk { value: f64 },
+    AccelNoiseDensityNonFinite { value: f64 },
+    AccelNoiseDensityNonPositive { value: f64 },
+    GyroNoiseDensityNonFinite { value: f64 },
+    GyroNoiseDensityNonPositive { value: f64 },
+    AccelRandomWalkNonFinite { value: f64 },
+    AccelRandomWalkNonPositive { value: f64 },
+    GyroRandomWalkNonFinite { value: f64 },
+    GyroRandomWalkNonPositive { value: f64 },
 }
 
 impl std::fmt::Display for ImuNoiseModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImuNoiseModelError::NonFiniteAccelNoiseDensity { value } => {
+            ImuNoiseModelError::AccelNoiseDensityNonFinite { value } => {
                 write!(f, "accelerometer noise density must be finite, got {value}")
             }
-            ImuNoiseModelError::NonPositiveAccelNoiseDensity { value } => {
+            ImuNoiseModelError::AccelNoiseDensityNonPositive { value } => {
                 write!(f, "accelerometer noise density must be > 0, got {value}")
             }
-            ImuNoiseModelError::NonFiniteGyroNoiseDensity { value } => {
+            ImuNoiseModelError::GyroNoiseDensityNonFinite { value } => {
                 write!(f, "gyroscope noise density must be finite, got {value}")
             }
-            ImuNoiseModelError::NonPositiveGyroNoiseDensity { value } => {
+            ImuNoiseModelError::GyroNoiseDensityNonPositive { value } => {
                 write!(f, "gyroscope noise density must be > 0, got {value}")
             }
-            ImuNoiseModelError::NonFiniteAccelRandomWalk { value } => {
+            ImuNoiseModelError::AccelRandomWalkNonFinite { value } => {
                 write!(f, "accelerometer random walk must be finite, got {value}")
             }
-            ImuNoiseModelError::NonPositiveAccelRandomWalk { value } => {
+            ImuNoiseModelError::AccelRandomWalkNonPositive { value } => {
                 write!(f, "accelerometer random walk must be > 0, got {value}")
             }
-            ImuNoiseModelError::NonFiniteGyroRandomWalk { value } => {
+            ImuNoiseModelError::GyroRandomWalkNonFinite { value } => {
                 write!(f, "gyroscope random walk must be finite, got {value}")
             }
-            ImuNoiseModelError::NonPositiveGyroRandomWalk { value } => {
+            ImuNoiseModelError::GyroRandomWalkNonPositive { value } => {
                 write!(f, "gyroscope random walk must be > 0, got {value}")
             }
         }
@@ -169,37 +172,37 @@ impl ImuNoiseModel {
     ) -> Result<Self, ImuNoiseModelError> {
         validate_positive_finite(
             accel_noise_density,
-            ImuNoiseModelError::NonFiniteAccelNoiseDensity {
+            ImuNoiseModelError::AccelNoiseDensityNonFinite {
                 value: accel_noise_density,
             },
-            ImuNoiseModelError::NonPositiveAccelNoiseDensity {
+            ImuNoiseModelError::AccelNoiseDensityNonPositive {
                 value: accel_noise_density,
             },
         )?;
         validate_positive_finite(
             gyro_noise_density,
-            ImuNoiseModelError::NonFiniteGyroNoiseDensity {
+            ImuNoiseModelError::GyroNoiseDensityNonFinite {
                 value: gyro_noise_density,
             },
-            ImuNoiseModelError::NonPositiveGyroNoiseDensity {
+            ImuNoiseModelError::GyroNoiseDensityNonPositive {
                 value: gyro_noise_density,
             },
         )?;
         validate_positive_finite(
             accel_random_walk,
-            ImuNoiseModelError::NonFiniteAccelRandomWalk {
+            ImuNoiseModelError::AccelRandomWalkNonFinite {
                 value: accel_random_walk,
             },
-            ImuNoiseModelError::NonPositiveAccelRandomWalk {
+            ImuNoiseModelError::AccelRandomWalkNonPositive {
                 value: accel_random_walk,
             },
         )?;
         validate_positive_finite(
             gyro_random_walk,
-            ImuNoiseModelError::NonFiniteGyroRandomWalk {
+            ImuNoiseModelError::GyroRandomWalkNonFinite {
                 value: gyro_random_walk,
             },
-            ImuNoiseModelError::NonPositiveGyroRandomWalk {
+            ImuNoiseModelError::GyroRandomWalkNonPositive {
                 value: gyro_random_walk,
             },
         )?;
@@ -455,10 +458,7 @@ impl ImuBatch {
         self.end_time().seconds_since(self.start_time()).max(0.0)
     }
 
-    pub fn shifted_timestamp_ns(
-        &self,
-        delta_ns: i64,
-    ) -> Result<Self, ImuTimestampShiftError> {
+    pub fn shifted_timestamp_ns(&self, delta_ns: i64) -> Result<Self, ImuTimestampShiftError> {
         if delta_ns == 0 {
             return Ok(self.clone());
         }

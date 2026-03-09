@@ -253,8 +253,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     if pending_capacity_left_drops > 0 || pending_capacity_right_drops > 0 {
         eprintln!(
-            "pairer pending-capacity drops: left={} right={}",
-            pending_capacity_left_drops, pending_capacity_right_drops
+            "pairer pending-capacity drops: left={pending_capacity_left_drops} right={pending_capacity_right_drops}"
         );
     }
     Ok(())
@@ -340,7 +339,8 @@ fn load_imu_calibration_from_env() -> Result<Option<ImuCalibration>, Box<dyn std
         return Ok(None);
     }
 
-    let rotation = rotation.ok_or("KIKO_IMU_ROTATION is required when IMU calibration is configured")?;
+    let rotation =
+        rotation.ok_or("KIKO_IMU_ROTATION is required when IMU calibration is configured")?;
     let translation =
         translation.ok_or("KIKO_IMU_TRANSLATION is required when IMU calibration is configured")?;
     let accel_noise_density = accel_noise_density

@@ -177,8 +177,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     } = inference;
 
-    let dataset_calibration =
-        build_calibration(&device, device.stereo_baseline_m(), &mono_config)?;
+    let dataset_calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config)?;
     let rectified = RectifiedStereo::from_calibration(&dataset_calibration)?;
     let intrinsics = PinholeIntrinsics::try_from(&dataset_calibration.left)?;
     let calibration =
@@ -186,8 +185,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "vio")]
     if env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
         return Err(
-            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env"
-                .into(),
+            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env".into(),
         );
     }
     let imu_time_offset_ns = calibration
@@ -559,8 +557,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     if pending_capacity_left_drops > 0 || pending_capacity_right_drops > 0 {
         eprintln!(
-            "pairer pending-capacity drops: left={} right={}",
-            pending_capacity_left_drops, pending_capacity_right_drops
+            "pairer pending-capacity drops: left={pending_capacity_left_drops} right={pending_capacity_right_drops}"
         );
     }
 

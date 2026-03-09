@@ -56,6 +56,19 @@ impl Default for MapFromOdom {
     }
 }
 
+fn transform_point(transform: Pose64, point: Point3) -> Point3 {
+    let rotated = crate::math::mat_mul_vec_f64(
+        transform.rotation(),
+        [f64::from(point.x), f64::from(point.y), f64::from(point.z)],
+    );
+    let translation = transform.translation();
+    Point3 {
+        x: (rotated[0] + translation[0]) as f32,
+        y: (rotated[1] + translation[1]) as f32,
+        z: (rotated[2] + translation[2]) as f32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,18 +168,5 @@ mod tests {
         assert_eq!(derived0.to_pose32().rotation(), expected.rotation());
         assert_eq!(derived1.to_pose32().translation(), expected.translation());
         assert_eq!(derived1.to_pose32().rotation(), expected.rotation());
-    }
-}
-
-fn transform_point(transform: Pose64, point: Point3) -> Point3 {
-    let rotated = crate::math::mat_mul_vec_f64(
-        transform.rotation(),
-        [f64::from(point.x), f64::from(point.y), f64::from(point.z)],
-    );
-    let translation = transform.translation();
-    Point3 {
-        x: (rotated[0] + translation[0]) as f32,
-        y: (rotated[1] + translation[1]) as f32,
-        z: (rotated[2] + translation[2]) as f32,
     }
 }

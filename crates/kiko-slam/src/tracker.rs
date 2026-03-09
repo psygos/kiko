@@ -1294,7 +1294,7 @@ struct SharedMatches {
 #[cfg(feature = "vio")]
 enum LocalEstimator {
     VisualOnly,
-    Inertial(VioRuntime),
+    Inertial(Box<VioRuntime>),
 }
 
 #[cfg(feature = "vio")]
@@ -1354,13 +1354,13 @@ impl SlamTracker {
                     .imu_extrinsics()
                     .map(|extrinsics| extrinsics.t_cam_imu())
                     .unwrap_or_else(Pose64::identity);
-                LocalEstimator::Inertial(VioRuntime {
+                LocalEstimator::Inertial(Box::new(VioRuntime {
                     local_vio: LocalVio::new(vio_config, gravity, camera_from_body, intrinsics),
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
                     predicted_preintegration: None,
                     predicted_pose_odom: None,
-                })
+                }))
             }
             _ => LocalEstimator::VisualOnly,
         };
@@ -1754,7 +1754,8 @@ impl SlamTracker {
             .local_vio
             .correct_prediction(
                 preintegrated,
-                self.map_from_odom.map_to_odom(Pose64::from_pose32(pose_map)),
+                self.map_from_odom
+                    .map_to_odom(Pose64::from_pose32(pose_map)),
                 visual_observations,
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;

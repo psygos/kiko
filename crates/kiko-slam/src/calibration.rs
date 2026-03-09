@@ -149,9 +149,11 @@ impl CalibrationBundle {
         )
         .map_err(map_noise_error)?;
         let t_cam_imu = Pose64::from_rt(imu.extrinsics.rotation, imu.extrinsics.translation);
-        let extrinsics = ImuExtrinsics::new(t_cam_imu, imu.extrinsics.time_offset_ns)
-            .map_err(|err| CalibrationBundleError::InvalidImuExtrinsics {
-                message: err.to_string(),
+        let extrinsics =
+            ImuExtrinsics::new(t_cam_imu, imu.extrinsics.time_offset_ns).map_err(|err| {
+                CalibrationBundleError::InvalidImuExtrinsics {
+                    message: err.to_string(),
+                }
             })?;
         Self::with_imu(
             intrinsics,
@@ -228,28 +230,28 @@ fn validate_noise(noise: &ImuNoiseModel) -> Result<(), CalibrationBundleError> {
 
 fn map_noise_error(err: crate::imu::ImuNoiseModelError) -> CalibrationBundleError {
     match err {
-        crate::imu::ImuNoiseModelError::NonFiniteAccelNoiseDensity { value } => {
+        crate::imu::ImuNoiseModelError::AccelNoiseDensityNonFinite { value } => {
             CalibrationBundleError::NonFiniteAccelNoiseDensity { value }
         }
-        crate::imu::ImuNoiseModelError::NonPositiveAccelNoiseDensity { value } => {
+        crate::imu::ImuNoiseModelError::AccelNoiseDensityNonPositive { value } => {
             CalibrationBundleError::NonPositiveAccelNoiseDensity { value }
         }
-        crate::imu::ImuNoiseModelError::NonFiniteGyroNoiseDensity { value } => {
+        crate::imu::ImuNoiseModelError::GyroNoiseDensityNonFinite { value } => {
             CalibrationBundleError::NonFiniteGyroNoiseDensity { value }
         }
-        crate::imu::ImuNoiseModelError::NonPositiveGyroNoiseDensity { value } => {
+        crate::imu::ImuNoiseModelError::GyroNoiseDensityNonPositive { value } => {
             CalibrationBundleError::NonPositiveGyroNoiseDensity { value }
         }
-        crate::imu::ImuNoiseModelError::NonFiniteAccelRandomWalk { value } => {
+        crate::imu::ImuNoiseModelError::AccelRandomWalkNonFinite { value } => {
             CalibrationBundleError::NonFiniteAccelRandomWalk { value }
         }
-        crate::imu::ImuNoiseModelError::NonPositiveAccelRandomWalk { value } => {
+        crate::imu::ImuNoiseModelError::AccelRandomWalkNonPositive { value } => {
             CalibrationBundleError::NonPositiveAccelRandomWalk { value }
         }
-        crate::imu::ImuNoiseModelError::NonFiniteGyroRandomWalk { value } => {
+        crate::imu::ImuNoiseModelError::GyroRandomWalkNonFinite { value } => {
             CalibrationBundleError::NonFiniteGyroRandomWalk { value }
         }
-        crate::imu::ImuNoiseModelError::NonPositiveGyroRandomWalk { value } => {
+        crate::imu::ImuNoiseModelError::GyroRandomWalkNonPositive { value } => {
             CalibrationBundleError::NonPositiveGyroRandomWalk { value }
         }
     }
@@ -334,7 +336,7 @@ mod tests {
         let noise = ImuNoiseModel::new(0.1, 0.0, 0.001, 0.0001).expect_err("zero gyro noise");
         assert_eq!(
             noise,
-            crate::imu::ImuNoiseModelError::NonPositiveGyroNoiseDensity { value: 0.0 }
+            crate::imu::ImuNoiseModelError::GyroNoiseDensityNonPositive { value: 0.0 }
         );
     }
 
@@ -389,9 +391,12 @@ mod tests {
                 gravity_magnitude_mps2: 9.81,
             }),
         };
-        let bundle =
-            CalibrationBundle::from_dataset_calibration(intrinsics(), stereo(), &dataset_calibration)
-                .expect("bundle");
+        let bundle = CalibrationBundle::from_dataset_calibration(
+            intrinsics(),
+            stereo(),
+            &dataset_calibration,
+        )
+        .expect("bundle");
         let imu_extrinsics = bundle.imu_extrinsics().expect("imu extrinsics");
         assert!(bundle.has_imu());
         assert_eq!(imu_extrinsics.time_offset_ns(), 42);
