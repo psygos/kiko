@@ -124,6 +124,7 @@ impl DatasetReader {
         let Some(samples) = self.imu_samples.as_deref() else {
             return Ok(CaptureImu::Absent);
         };
+        let startup_interval = interval.start_exclusive().is_none();
 
         let start_idx = match interval.start_exclusive() {
             Some(start) => {
@@ -136,6 +137,9 @@ impl DatasetReader {
         });
 
         if start_idx == end_idx {
+            if startup_interval {
+                return Ok(CaptureImu::Absent);
+            }
             return Err(DatasetError::MissingImuSamples {
                 start_ns: interval
                     .start_exclusive()
@@ -144,14 +148,18 @@ impl DatasetReader {
             });
         }
 
-        let batch = ImuBatch::new(samples[start_idx..end_idx].to_vec()).map_err(|_| {
-            DatasetError::MissingImuSamples {
-                start_ns: interval
-                    .start_exclusive()
-                    .map(|timestamp| timestamp.as_nanos()),
-                end_ns: interval.end_inclusive().as_nanos(),
+        let batch = match ImuBatch::new(samples[start_idx..end_idx].to_vec()) {
+            Ok(batch) => batch,
+            Err(_) if startup_interval => return Ok(CaptureImu::Absent),
+            Err(_) => {
+                return Err(DatasetError::MissingImuSamples {
+                    start_ns: interval
+                        .start_exclusive()
+                        .map(|timestamp| timestamp.as_nanos()),
+                    end_ns: interval.end_inclusive().as_nanos(),
+                });
             }
-        })?;
+        };
         Ok(CaptureImu::present(batch))
     }
 }
@@ -821,6 +829,36 @@ mod tests {
         let imu = bundle.imu().batch().expect("imu batch");
         assert_eq!(imu.start_time().as_nanos(), 90);
         assert_eq!(imu.end_time().as_nanos(), 102);
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn startup_bundle_allows_missing_imu_until_first_sample() {
+        let dataset_dir = unique_temp_dir("reader-imu-startup-gap");
+        let (writer, handle) =
+            DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration()).expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(150), [0.0; 3], [0.0; 3]).expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(180), [1.0; 3], [2.0; 3]).expect("imu 1"),
+            ])
+            .expect("imu batch"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let bundle = reader
+            .bundles()
+            .next()
+            .expect("bundle")
+            .expect("startup bundle should succeed without imu");
+        assert!(matches!(bundle.imu(), CaptureImu::Absent));
 
         let _ = std::fs::remove_dir_all(&dataset_dir);
     }

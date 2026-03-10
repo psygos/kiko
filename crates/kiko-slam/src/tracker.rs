@@ -1262,6 +1262,7 @@ pub struct VioTelemetry {
 }
 
 impl VioTelemetry {
+    #[cfg(feature = "vio")]
     fn from_nav_state(state: &crate::NavState) -> Self {
         let bias = state.bias();
         Self {

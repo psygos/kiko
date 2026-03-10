@@ -10,6 +10,8 @@ use kiko_slam::{
 use std::path::Path;
 
 pub const DEFAULT_MAX_KEYPOINTS: usize = 1024;
+const DEFAULT_MAC_CPU_MAX_KEYPOINTS: usize = 512;
+const DEFAULT_MAC_CPU_DOWNSCALE: usize = 2;
 
 #[derive(Args, Clone, Debug)]
 pub struct InferenceArgs {
@@ -153,8 +155,8 @@ impl InferenceConfig {
             lightglue.backend()
         );
 
-        let downscale = args.downscale;
-        let key_limit = args.max_keypoints;
+        let (downscale, key_limit) =
+            tuned_mac_inference_settings(args, superpoint.backend(), lightglue.backend())?;
         eprintln!("downscale: {downscale}");
         eprintln!("max_keypoints: {key_limit}");
 
@@ -170,6 +172,58 @@ impl InferenceConfig {
         InferencePipeline::new(self.superpoint, self.lightglue, self.key_limit)
             .with_downscale(self.downscale)
     }
+}
+
+fn tuned_mac_inference_settings(
+    args: &InferenceArgs,
+    superpoint_backend: InferenceBackend,
+    lightglue_backend: InferenceBackend,
+) -> Result<(DownscaleFactor, KeypointLimit), Box<dyn std::error::Error>> {
+    let mut downscale = args.downscale;
+    let mut key_limit = args.max_keypoints;
+    if !cfg!(target_vendor = "apple") {
+        return Ok((downscale, key_limit));
+    }
+
+    let cpu_fallback =
+        superpoint_backend == InferenceBackend::Cpu || lightglue_backend == InferenceBackend::Cpu;
+    if !cpu_fallback {
+        return Ok((downscale, key_limit));
+    }
+
+    eprintln!(
+        "warning: Apple inference backend fell back to CPU (superpoint={superpoint_backend:?}, lightglue={lightglue_backend:?})"
+    );
+
+    let downscale_explicit =
+        setting_explicit("--downscale", "KIKO_DOWNSCALE") || args.downscale != DownscaleFactor::identity();
+    let key_limit_explicit = setting_explicit("--max-keypoints", "KIKO_MAX_KEYPOINTS")
+        || args.max_keypoints != KeypointLimit::try_from(DEFAULT_MAX_KEYPOINTS).expect("default");
+
+    if !downscale_explicit {
+        downscale = DownscaleFactor::try_from(DEFAULT_MAC_CPU_DOWNSCALE)?;
+    }
+    if !key_limit_explicit {
+        key_limit = KeypointLimit::try_from(DEFAULT_MAC_CPU_MAX_KEYPOINTS)?;
+    }
+
+    if downscale != args.downscale || key_limit != args.max_keypoints {
+        eprintln!(
+            "mac CPU fallback: adjusting defaults to downscale={downscale} max_keypoints={key_limit}"
+        );
+    }
+
+    Ok((downscale, key_limit))
+}
+
+fn setting_explicit(flag: &str, env_key: &str) -> bool {
+    if std::env::var_os(env_key).is_some() {
+        return true;
+    }
+    std::env::args_os().any(|arg| {
+        let value = arg.to_string_lossy();
+        value == flag || value.starts_with(&format!("{flag}="))
+    })
 }
 
 /// Resolve the default model directory deterministically.
