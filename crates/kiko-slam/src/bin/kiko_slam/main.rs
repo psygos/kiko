@@ -237,6 +237,41 @@ mod tests {
         restore_env(key, saved);
     }
 
+    #[test]
+    fn build_tracker_config_disables_loop_closure_without_descriptors() {
+        let _guard = env_lock().lock().expect("env lock");
+        let keys = [
+            "KIKO_LOOP_CLOSURE",
+            "KIKO_LEARNED_DESCRIPTORS",
+            "KIKO_RELOCALIZATION",
+        ];
+        let saved: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|&key| (key.to_string(), std::env::var_os(key)))
+            .collect();
+
+        set_env("KIKO_LOOP_CLOSURE", "true");
+        set_env("KIKO_LEARNED_DESCRIPTORS", "false");
+        set_env("KIKO_RELOCALIZATION", "true");
+
+        let config = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect("tracker config");
+
+        assert!(matches!(config.loop_subsystem, LoopSubsystemConfig::Disabled));
+
+        for (key, value) in saved {
+            restore_env(&key, value);
+        }
+    }
+
     #[cfg(feature = "vio")]
     #[test]
     fn build_tracker_config_reads_vio_env_settings() {

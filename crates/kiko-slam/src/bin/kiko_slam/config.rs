@@ -68,13 +68,11 @@ pub fn build_tracker_config(
     } else {
         None
     };
-    let loop_closure_enabled = env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true);
+    let loop_closure_requested = env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true);
     let learned_descriptors_enabled = env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true);
+    let loop_closure_enabled = loop_closure_requested && learned_descriptors_enabled;
     let relocalization_enabled = env_bool("KIKO_RELOCALIZATION").unwrap_or(true);
     let loop_subsystem = if loop_closure_enabled {
-        if !learned_descriptors_enabled {
-            return Err("invalid tracker config: loop closure requires learned descriptors".into());
-        }
         let loop_cfg = build_loop_closure_config_from_env()?;
         let descriptor_cfg =
             GlobalDescriptorConfig::new(env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2))?;
@@ -102,6 +100,11 @@ pub fn build_tracker_config(
             LoopSubsystemConfig::loop_closure_only(loop_cfg, descriptor_cfg)
         }
     } else {
+        if loop_closure_requested && !learned_descriptors_enabled {
+            eprintln!(
+                "learned descriptors disabled; disabling loop closure"
+            );
+        }
         if relocalization_enabled {
             eprintln!(
                 "relocalization requested but loop closure is disabled; disabling relocalization"
