@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -8,11 +8,11 @@ use clap::Args;
 
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
-    DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
-    ImuBatch, ImuSample, PairingDropReason, PairingOutcome, Point3, Raw, RerunSink, SendOutcome,
-    SensorId, SlamTracker, StereoPairer, SystemHealth, TrackingPose, VizPacket, bounded_channel,
-    oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
+    bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch, CalibrationBundle,
+    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity, DepthImage,
+    DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId, ImuBatch,
+    ImuSample, PairingDropReason, PairingOutcome, Point3, Raw, RerunSink, SendOutcome, SensorId,
+    SlamTracker, StereoPairer, SystemHealth, TrackingPose, VizPacket,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
 use oak_sys::{
@@ -20,7 +20,7 @@ use oak_sys::{
 };
 
 use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, RerunArgs};
-use crate::config::{TrackerDefaults, build_tracker_config};
+use crate::config::{build_tracker_config, TrackerDefaults};
 use crate::record::{
     build_calibration, load_oak_read_timeout_ms, load_pairer_max_pending_per_side,
     load_pairing_window,
@@ -41,6 +41,7 @@ struct LiveVizMsg {
     left: Frame,
     right: Frame,
     depth: Option<DepthImage>,
+    imu: Option<ImuBatch>,
     pose: Option<TrackingPose>,
     vio_telemetry: Option<kiko_slam::VioTelemetry>,
     packet: Option<VizPacket<Raw>>,
@@ -222,6 +223,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let depth_rx = depth_rx;
 
         for capture in pair_rx.iter() {
+            let imu = capture.imu().batch().cloned();
             let left = capture.pair().left().clone();
             let right = capture.pair().right().clone();
             let depth = depth_rx.as_ref().and_then(drain_latest_depth);
@@ -254,6 +256,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         left,
                         right,
                         depth,
+                        imu,
                         pose: output.pose,
                         vio_telemetry: output.vio_telemetry,
                         packet,
@@ -307,6 +310,11 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(depth) = msg.depth.as_ref() {
                     if let Err(err) = sink.log_depth(depth) {
                         eprintln!("rerun log error: {err}");
+                    }
+                }
+                if let Some(imu) = msg.imu.as_ref() {
+                    if let Err(err) = sink.log_imu_batch(imu) {
+                        eprintln!("rerun imu log error: {err}");
                     }
                 }
 

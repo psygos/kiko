@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw,
-    Timestamp, TrackingPose, VioTelemetry, VizPacket, env::env_f32,
+    env::env_f32, CovisibilitySnapshot, DepthImage, Detections, Frame, ImuBatch, Keypoint, Point3,
+    Pose, Raw, Timestamp, TrackingPose, VioTelemetry, VizPacket,
 };
 
 use std::collections::HashMap;
@@ -299,10 +299,14 @@ impl RerunSink {
             (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2])
                 .sqrt();
 
-        self.rec.log("imu_state/velocity/x", &rerun::Scalars::single(velocity[0]))?;
-        self.rec.log("imu_state/velocity/y", &rerun::Scalars::single(velocity[1]))?;
-        self.rec.log("imu_state/velocity/z", &rerun::Scalars::single(velocity[2]))?;
-        self.rec.log("imu_state/velocity/speed", &rerun::Scalars::single(speed))?;
+        self.rec
+            .log("imu_state/velocity/x", &rerun::Scalars::single(velocity[0]))?;
+        self.rec
+            .log("imu_state/velocity/y", &rerun::Scalars::single(velocity[1]))?;
+        self.rec
+            .log("imu_state/velocity/z", &rerun::Scalars::single(velocity[2]))?;
+        self.rec
+            .log("imu_state/velocity/speed", &rerun::Scalars::single(speed))?;
         self.rec.log(
             "imu_state/bias/accel/x",
             &rerun::Scalars::single(accel_bias[0]),
@@ -327,6 +331,35 @@ impl RerunSink {
             "imu_state/bias/gyro/z",
             &rerun::Scalars::single(gyro_bias[2]),
         )?;
+        Ok(())
+    }
+
+    pub fn log_imu_batch(&self, batch: &ImuBatch) -> Result<(), VizLogError> {
+        for sample in batch.samples() {
+            self.set_time(sample.timestamp());
+            let accel = sample.accel_mps2();
+            let gyro = sample.gyro_radps();
+            let accel_norm =
+                (accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]).sqrt();
+            let gyro_norm = (gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2]).sqrt();
+
+            self.rec
+                .log("imu/raw/accel/x", &rerun::Scalars::single(accel[0]))?;
+            self.rec
+                .log("imu/raw/accel/y", &rerun::Scalars::single(accel[1]))?;
+            self.rec
+                .log("imu/raw/accel/z", &rerun::Scalars::single(accel[2]))?;
+            self.rec
+                .log("imu/raw/accel/norm", &rerun::Scalars::single(accel_norm))?;
+            self.rec
+                .log("imu/raw/gyro/x", &rerun::Scalars::single(gyro[0]))?;
+            self.rec
+                .log("imu/raw/gyro/y", &rerun::Scalars::single(gyro[1]))?;
+            self.rec
+                .log("imu/raw/gyro/z", &rerun::Scalars::single(gyro[2]))?;
+            self.rec
+                .log("imu/raw/gyro/norm", &rerun::Scalars::single(gyro_norm))?;
+        }
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use kiko_slam::{
 };
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs};
-use crate::config::{TrackerDefaults, build_rectified_stereo_config, build_tracker_config};
+use crate::config::{build_rectified_stereo_config, build_tracker_config, TrackerDefaults};
 use crate::rerun_recording;
 
 const SLAM_ENV_HELP: &str = "\
@@ -96,8 +96,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
         return Err(
-            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env"
-                .into(),
+            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env".into(),
         );
     }
 
@@ -143,6 +142,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let left = bundle.pair().left().clone();
         let right = bundle.pair().right().clone();
+        let imu = bundle.imu().batch().cloned();
 
         match tracker.process_capture(bundle) {
             Ok(output) => {
@@ -177,6 +177,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("rerun log error: {err}");
                 }
 
+                if let Some(batch) = imu.as_ref() {
+                    if let Err(err) = sink.log_imu_batch(batch) {
+                        eprintln!("rerun imu log error: {err}");
+                    }
+                }
                 if let Some(pose) = output.pose.as_ref() {
                     if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
                         eprintln!("rerun log error: {err}");

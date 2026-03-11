@@ -7,6 +7,12 @@ use std::time::Instant;
 
 /// Minimum 3D-2D correspondences needed for PnP pose estimation.
 const MIN_PNP_CORRESPONDENCES: usize = 4;
+/// During bootstrap and sparse-map tracking, accept a smaller inlier set instead
+/// of requiring the fully-configured mature-map threshold immediately.
+const MIN_TRACKING_RANSAC_INLIERS: usize = MIN_PNP_CORRESPONDENCES;
+/// Target roughly 25% of tracked observations as the adaptive inlier gate until
+/// the configured mature-map threshold becomes achievable.
+const TRACKING_RANSAC_INLIER_DIVISOR: usize = 4;
 /// Default maximum respawn attempts for backend and descriptor workers.
 const DEFAULT_MAX_RESPAWNS: u32 = 3;
 /// Minimum keyframes required for multi-frame optimization (BA or pose graph).
@@ -14,12 +20,12 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
-use crate::frontend::{StereoFrontend, median_parallax_px};
+use crate::frontend::{median_parallax_px, StereoFrontend};
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
-    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
-    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
-    match_quantized_descriptors_for_loop,
+    aggregate_global_descriptor, match_quantized_descriptors_for_loop, LoopApplyError,
+    LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
+    RelocalizationConfig, VerifiedLoop,
 };
 use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
@@ -29,13 +35,13 @@ use crate::place_recognition::{
 use crate::pose_graph::{EssentialEdge, EssentialEdgeKind};
 use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
 use crate::{
+    map::{KeyframeId, MapPointId, SlamMap},
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
     KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
     LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, Observation,
     ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, Raw, StereoPair,
     SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator, Verified,
-    map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
 use crate::{Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig, VioObservation};
@@ -975,6 +981,31 @@ impl KeyframePolicy {
     }
 }
 
+impl KeyframeInsertReason {
+    fn trace_label(self) -> String {
+        match self {
+            KeyframeInsertReason::TooFewInliers {
+                inliers,
+                min_required,
+            } => {
+                format!("too_few_inliers inliers={inliers} min_required={min_required}")
+            }
+            KeyframeInsertReason::HighParallax {
+                parallax_px,
+                threshold_px,
+            } => {
+                format!("high_parallax parallax_px={parallax_px:.2} threshold_px={threshold_px:.2}")
+            }
+            KeyframeInsertReason::LowCovisibility {
+                covisibility,
+                threshold,
+            } => {
+                format!("low_covisibility covisibility={covisibility:.3} threshold={threshold:.3}")
+            }
+        }
+    }
+}
+
 impl RedundancyPolicy {
     pub fn new(max_covisibility: f32) -> Result<Self, RedundancyPolicyError> {
         if !max_covisibility.is_finite() || !(0.0..=1.0).contains(&max_covisibility) {
@@ -1132,7 +1163,11 @@ impl DegradationLevel {
     }
 
     pub fn worst(a: Self, b: Self) -> Self {
-        if a.rank() >= b.rank() { a } else { b }
+        if a.rank() >= b.rank() {
+            a
+        } else {
+            b
+        }
     }
 }
 
@@ -1337,6 +1372,102 @@ struct SharedMatches {
     pairs: Vec<(usize, usize)>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DepthSummary {
+    min_m: f32,
+    median_m: f32,
+    max_m: f32,
+}
+
+fn summarize_depths(points: &[Point3]) -> Option<DepthSummary> {
+    if points.is_empty() {
+        return None;
+    }
+    let mut depths: Vec<f32> = points.iter().map(|point| point.z).collect();
+    depths.sort_by(|a, b| a.total_cmp(b));
+    let len = depths.len();
+    let median_m = if len % 2 == 1 {
+        depths[len / 2]
+    } else {
+        (depths[len / 2 - 1] + depths[len / 2]) * 0.5
+    };
+    Some(DepthSummary {
+        min_m: depths[0],
+        median_m,
+        max_m: depths[len - 1],
+    })
+}
+
+fn adaptive_tracking_ransac_config(base: RansacConfig, observation_count: usize) -> RansacConfig {
+    let target_min_inliers = observation_count.saturating_add(TRACKING_RANSAC_INLIER_DIVISOR - 1)
+        / TRACKING_RANSAC_INLIER_DIVISOR;
+    let max_configured = base.min_inliers.max(MIN_TRACKING_RANSAC_INLIERS);
+    RansacConfig {
+        min_inliers: target_min_inliers.clamp(MIN_TRACKING_RANSAC_INLIERS, max_configured),
+        ..base
+    }
+}
+
+#[cfg(feature = "vio")]
+fn pose_odom_from_body_from_camera_pose(
+    camera_from_odom: Pose64,
+    camera_from_body: Pose64,
+) -> Pose64 {
+    camera_from_odom.inverse().compose(camera_from_body)
+}
+
+#[cfg(feature = "vio")]
+fn camera_from_odom_from_pose_odom_from_body(
+    pose_odom_from_body: Pose64,
+    camera_from_body: Pose64,
+) -> Pose64 {
+    camera_from_body.compose(pose_odom_from_body.inverse())
+}
+
+#[cfg(feature = "vio")]
+fn estimate_gravity_from_imu_batch(
+    batch: &crate::ImuBatch,
+    pose_odom_from_body: Pose64,
+    gravity_magnitude_mps2: f64,
+) -> Result<Option<Gravity>, TrackerError> {
+    if batch.is_empty() {
+        return Ok(None);
+    }
+    let mut mean_accel_body = [0.0_f64; 3];
+    for sample in batch.samples() {
+        let accel = sample.accel_mps2();
+        mean_accel_body[0] += accel[0];
+        mean_accel_body[1] += accel[1];
+        mean_accel_body[2] += accel[2];
+    }
+    let sample_count = batch.len() as f64;
+    for axis in &mut mean_accel_body {
+        *axis /= sample_count;
+    }
+    let norm = (mean_accel_body[0] * mean_accel_body[0]
+        + mean_accel_body[1] * mean_accel_body[1]
+        + mean_accel_body[2] * mean_accel_body[2])
+        .sqrt();
+    if !norm.is_finite() || norm <= 1e-9 {
+        return Ok(None);
+    }
+    let specific_force_body = [
+        mean_accel_body[0] / norm,
+        mean_accel_body[1] / norm,
+        mean_accel_body[2] / norm,
+    ];
+    let gravity_odom_unit =
+        crate::math::mat_mul_vec_f64(pose_odom_from_body.rotation(), specific_force_body);
+    let gravity_odom = [
+        -gravity_magnitude_mps2 * gravity_odom_unit[0],
+        -gravity_magnitude_mps2 * gravity_odom_unit[1],
+        -gravity_magnitude_mps2 * gravity_odom_unit[2],
+    ];
+    let gravity =
+        Gravity::try_new(gravity_odom).map_err(|err| TrackerError::Vio(err.to_string()))?;
+    Ok(Some(gravity))
+}
+
 #[cfg(feature = "vio")]
 enum LocalEstimator {
     VisualOnly,
@@ -1346,6 +1477,9 @@ enum LocalEstimator {
 #[cfg(feature = "vio")]
 struct VioRuntime {
     local_vio: LocalVio,
+    camera_from_body: Pose64,
+    gravity_magnitude_mps2: f64,
+    gravity_aligned: bool,
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
     predicted_preintegration: Option<PreintegratedImu>,
@@ -1396,12 +1530,16 @@ impl SlamTracker {
                     .map_err(|err| TrackerInitError::VioInvalidGravity {
                     message: err.to_string(),
                 })?;
+                let gravity_magnitude_mps2 = calibration.gravity_magnitude_mps2();
                 let camera_from_body = calibration
                     .imu_extrinsics()
                     .map(|extrinsics| extrinsics.t_cam_imu())
                     .unwrap_or_else(Pose64::identity);
                 LocalEstimator::Inertial(Box::new(VioRuntime {
                     local_vio: LocalVio::new(vio_config, gravity, camera_from_body, intrinsics),
+                    camera_from_body,
+                    gravity_magnitude_mps2,
+                    gravity_aligned: false,
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
                     predicted_preintegration: None,
@@ -1565,6 +1703,23 @@ impl SlamTracker {
         let Some(latest) = vio_runtime.local_vio.latest_estimate() else {
             return Ok(());
         };
+        if !vio_runtime.gravity_aligned {
+            if let Some(gravity) = estimate_gravity_from_imu_batch(
+                &batch,
+                latest.state().pose_odom_from_body(),
+                vio_runtime.gravity_magnitude_mps2,
+            )? {
+                if self.trace_transitions {
+                    let gravity_vec = gravity.vector_odom_mps2();
+                    eprintln!(
+                        "vio gravity aligned gx={:.3} gy={:.3} gz={:.3}",
+                        gravity_vec[0], gravity_vec[1], gravity_vec[2]
+                    );
+                }
+                vio_runtime.local_vio.set_gravity(gravity);
+                vio_runtime.gravity_aligned = true;
+            }
+        }
         let preintegrated =
             PreintegratedImu::integrate(&batch, latest.state().bias(), &vio_runtime.noise)
                 .map_err(|err| TrackerError::Vio(err.to_string()))?;
@@ -1574,11 +1729,11 @@ impl SlamTracker {
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         vio_runtime.predicted_preintegration = Some(preintegrated);
         vio_runtime.predicted_state = Some(predicted.state().clone());
-        self.last_pose_world = Some(
-            self.map_from_odom
-                .odom_to_map(predicted.state().pose_odom_from_body())
-                .to_pose32(),
+        let camera_from_odom = camera_from_odom_from_pose_odom_from_body(
+            predicted.state().pose_odom_from_body(),
+            vio_runtime.camera_from_body,
         );
+        self.last_pose_world = Some(self.map_from_odom.odom_to_map(camera_from_odom).to_pose32());
         Ok(())
     }
 
@@ -1596,10 +1751,30 @@ impl SlamTracker {
         vio_runtime
             .local_vio
             .set_map_from_odom(self.map_from_odom.clone());
+        let camera_measurement_odom = self
+            .map_from_odom
+            .map_to_odom(Pose64::from_pose32(pose_world));
+        let pose_measurement_odom = pose_odom_from_body_from_camera_pose(
+            camera_measurement_odom,
+            vio_runtime.camera_from_body,
+        );
         if vio_runtime.local_vio.is_empty() {
-            let pose_measurement_odom = self
-                .map_from_odom
-                .map_to_odom(Pose64::from_pose32(pose_world));
+            if !vio_runtime.gravity_aligned {
+                if let Some(batch) = vio_runtime
+                    .pending_imu
+                    .batch()
+                    .map_err(|err| TrackerError::Vio(err.to_string()))?
+                {
+                    if let Some(gravity) = estimate_gravity_from_imu_batch(
+                        &batch,
+                        pose_measurement_odom,
+                        vio_runtime.gravity_magnitude_mps2,
+                    )? {
+                        vio_runtime.local_vio.set_gravity(gravity);
+                        vio_runtime.gravity_aligned = true;
+                    }
+                }
+            }
             let state = crate::NavState::try_new(
                 pose_measurement_odom,
                 [0.0; 3],
@@ -1645,18 +1820,17 @@ impl SlamTracker {
             .push_preintegrated(
                 keyframe_id,
                 preintegrated,
-                self.map_from_odom
-                    .map_to_odom(Pose64::from_pose32(pose_world)),
+                pose_measurement_odom,
                 visual_observations,
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         vio_runtime.predicted_preintegration = None;
         vio_runtime.predicted_state = Some(estimate.state().clone());
-        self.last_pose_world = Some(
-            self.map_from_odom
-                .odom_to_map(estimate.state().pose_odom_from_body())
-                .to_pose32(),
+        let camera_from_odom = camera_from_odom_from_pose_odom_from_body(
+            estimate.state().pose_odom_from_body(),
+            vio_runtime.camera_from_body,
         );
+        self.last_pose_world = Some(self.map_from_odom.odom_to_map(camera_from_odom).to_pose32());
         for odometry in vio_runtime.local_vio.drain_exported_odometry() {
             self.global_map.add_odometry_edge(EssentialEdge {
                 a: odometry.from(),
@@ -1768,10 +1942,12 @@ impl SlamTracker {
             let Some(estimate) = vio_runtime.local_vio.estimate_for(*keyframe_id) else {
                 continue;
             };
-            self.map_from_odom.align_to_pose(
-                Pose64::from_pose32(*corrected_pose_map),
+            let camera_from_odom = camera_from_odom_from_pose_odom_from_body(
                 estimate.state().pose_odom_from_body(),
+                vio_runtime.camera_from_body,
             );
+            self.map_from_odom
+                .align_to_pose(Pose64::from_pose32(*corrected_pose_map), camera_from_odom);
             vio_runtime
                 .local_vio
                 .set_map_from_odom(self.map_from_odom.clone());
@@ -1783,10 +1959,14 @@ impl SlamTracker {
     fn current_odom_pose(&self) -> Option<Pose64> {
         match &self.local_estimator {
             LocalEstimator::VisualOnly => None,
-            LocalEstimator::Inertial(vio_runtime) => vio_runtime
-                .predicted_state
-                .as_ref()
-                .map(crate::NavState::pose_odom_from_body),
+            LocalEstimator::Inertial(vio_runtime) => {
+                vio_runtime.predicted_state.as_ref().map(|state| {
+                    camera_from_odom_from_pose_odom_from_body(
+                        state.pose_odom_from_body(),
+                        vio_runtime.camera_from_body,
+                    )
+                })
+            }
         }
     }
 
@@ -1794,9 +1974,10 @@ impl SlamTracker {
     fn current_vio_telemetry(&self) -> Option<VioTelemetry> {
         match &self.local_estimator {
             LocalEstimator::VisualOnly => None,
-            LocalEstimator::Inertial(vio_runtime) => {
-                vio_runtime.predicted_state.as_ref().map(VioTelemetry::from_nav_state)
-            }
+            LocalEstimator::Inertial(vio_runtime) => vio_runtime
+                .predicted_state
+                .as_ref()
+                .map(VioTelemetry::from_nav_state),
         }
     }
 
@@ -1816,14 +1997,16 @@ impl SlamTracker {
         let Some(preintegrated) = vio_runtime.predicted_preintegration.as_ref() else {
             return Ok(());
         };
+        let camera_measurement_odom = self
+            .map_from_odom
+            .map_to_odom(Pose64::from_pose32(pose_map));
+        let pose_measurement_odom = pose_odom_from_body_from_camera_pose(
+            camera_measurement_odom,
+            vio_runtime.camera_from_body,
+        );
         let estimate = vio_runtime
             .local_vio
-            .correct_prediction(
-                preintegrated,
-                self.map_from_odom
-                    .map_to_odom(Pose64::from_pose32(pose_map)),
-                visual_observations,
-            )
+            .correct_prediction(preintegrated, pose_measurement_odom, visual_observations)
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         vio_runtime.predicted_state = Some(estimate.state().clone());
         Ok(())
@@ -1889,6 +2072,24 @@ impl SlamTracker {
         let vio_telemetry = None;
         if let Some(pose_world) = pose.as_ref() {
             self.last_pose_world = Some(pose_world.cam_from_map_pose32());
+            #[cfg(feature = "vio")]
+            if self.trace_transitions {
+                if let Some(measurement) = pose_world.cam_from_map_visual_measurement_pose32() {
+                    let delta = crate::local_ba::se3_delta_between(
+                        pose_world.cam_from_map_pose32(),
+                        measurement,
+                    );
+                    let translation_m =
+                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                    let rotation_deg =
+                        (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
+                            .sqrt()
+                            .to_degrees();
+                    eprintln!(
+                        "vio pose delta translation_m={translation_m:.3} rotation_deg={rotation_deg:.3}"
+                    );
+                }
+            }
         }
         TrackerOutput {
             pose,
@@ -2547,20 +2748,23 @@ impl SlamTracker {
             }
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
+        let tracking_ransac =
+            adaptive_tracking_ransac_config(self.config.ransac, tracked_observations.len());
 
         let result = match self
             .frontend
-            .solve_tracking_pose(&tracked_observations.observations, self.config.ransac)
+            .solve_tracking_pose(&tracked_observations.observations, tracking_ransac)
         {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
                 if self.trace_transitions {
                     eprintln!(
-                        "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={}",
+                        "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={} required_inliers={}",
                         frame_id.as_u64(),
                         tracked_observations.len(),
                         matches.len(),
-                        verified.len()
+                        verified.len(),
+                        tracking_ransac.min_inliers,
                     );
                 }
                 let tracking_health = self.tracking_failure_health();
@@ -2646,13 +2850,29 @@ impl SlamTracker {
             self.config
                 .keyframe_policy
                 .decide(result.inliers.len(), parallax_px, covisibility);
+        if self.trace_transitions {
+            eprintln!(
+                "tracking success frame={} observations={} inliers={} required_inliers={} matches={} verified={} parallax_px={} covisibility={:.3} decision={:?}",
+                frame_id.as_u64(),
+                tracked_observations.len(),
+                result.inliers.len(),
+                tracking_ransac.min_inliers,
+                matches.len(),
+                verified.len(),
+                parallax_px
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "none".to_string()),
+                covisibility,
+                keyframe_decision,
+            );
+        }
 
         #[cfg(feature = "vio")]
         if !matches!(keyframe_decision, KeyframeDecision::Insert(_)) {
             self.correct_tracking_pose_from_vio(pose_world, inlier_observations.clone())?;
         }
 
-        if matches!(keyframe_decision, KeyframeDecision::Insert(_)) {
+        if let KeyframeDecision::Insert(reason) = keyframe_decision {
             let new_pose = pose_world;
             let shared = build_shared_matches(
                 keyframe_id,
@@ -2660,6 +2880,15 @@ impl SlamTracker {
                 &tracked_observations.verified_match_indices,
                 &result.inliers,
             );
+            let shared_pairs = shared.pairs.len();
+            if self.trace_transitions {
+                eprintln!(
+                    "keyframe insertion frame={} reason={} shared_pairs={}",
+                    frame_id.as_u64(),
+                    reason.trace_label(),
+                    shared_pairs
+                );
+            }
             if let Ok((keyframe_output, keyframe_id)) = self.create_keyframe_internal(
                 left,
                 right,
@@ -2772,6 +3001,13 @@ impl SlamTracker {
                         output_matches = keyframe_output.stereo_matches;
                     }
                 }
+            } else if self.trace_transitions {
+                eprintln!(
+                    "keyframe insertion rejected frame={} reason={} shared_pairs={}",
+                    frame_id.as_u64(),
+                    reason.trace_label(),
+                    shared_pairs
+                );
             }
         }
 
@@ -2909,6 +3145,7 @@ impl SlamTracker {
         let result = self.frontend.triangulate_matches(&matches)?;
         let triangulation_stats = result.stats;
         let landmarks = result.keyframe.landmarks().len();
+        let depth_summary = summarize_depths(result.keyframe.landmarks());
         if landmarks < self.config.min_keyframe_points {
             if self.trace_transitions {
                 eprintln!(
@@ -2922,6 +3159,36 @@ impl SlamTracker {
         }
 
         let keyframe = Arc::new(result.keyframe);
+        if self.trace_transitions {
+            let shared_pairs = shared.as_ref().map_or(0, |shared| shared.pairs.len());
+            match depth_summary {
+                Some(depths) => eprintln!(
+                    "keyframe created frame={} landmarks={} shared_pairs={} matches={} tri_kept={} tri_dropped_disparity={} tri_dropped_depth={} tri_dropped_duplicate={} depth_min_m={:.2} depth_median_m={:.2} depth_max_m={:.2}",
+                    frame_id.as_u64(),
+                    landmarks,
+                    shared_pairs,
+                    matches.len(),
+                    triangulation_stats.kept,
+                    triangulation_stats.dropped_disparity,
+                    triangulation_stats.dropped_depth,
+                    triangulation_stats.dropped_duplicate,
+                    depths.min_m,
+                    depths.median_m,
+                    depths.max_m,
+                ),
+                None => eprintln!(
+                    "keyframe created frame={} landmarks={} shared_pairs={} matches={} tri_kept={} tri_dropped_disparity={} tri_dropped_depth={} tri_dropped_duplicate={}",
+                    frame_id.as_u64(),
+                    landmarks,
+                    shared_pairs,
+                    matches.len(),
+                    triangulation_stats.kept,
+                    triangulation_stats.dropped_disparity,
+                    triangulation_stats.dropped_depth,
+                    triangulation_stats.dropped_duplicate,
+                ),
+            }
+        }
         let keyframe_id = insert_keyframe_into_map(
             self.global_map.map_mut(),
             &keyframe,
@@ -2966,13 +3233,13 @@ impl SlamTracker {
                 stereo_matches: Some(matches),
                 frame_id,
                 health: self.system_health(),
-            diagnostics,
-            events: Vec::new(),
-            vio_telemetry: None,
-        },
-        keyframe_id,
-    ))
-}
+                diagnostics,
+                events: Vec::new(),
+                vio_telemetry: None,
+            },
+            keyframe_id,
+        ))
+    }
 }
 
 fn insert_keyframe_into_map(
@@ -3195,8 +3462,8 @@ mod tests {
         CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
         SensorId, Timestamp,
     };
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     #[cfg(feature = "vio")]
@@ -4392,24 +4659,34 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_tracking_ransac_relaxes_sparse_observation_sets() {
+        let base = RansacConfig {
+            min_inliers: 8,
+            ..RansacConfig::default()
+        };
+
+        assert_eq!(adaptive_tracking_ransac_config(base, 4).min_inliers, 4);
+        assert_eq!(adaptive_tracking_ransac_config(base, 14).min_inliers, 4);
+        assert_eq!(adaptive_tracking_ransac_config(base, 19).min_inliers, 5);
+        assert_eq!(adaptive_tracking_ransac_config(base, 32).min_inliers, 8);
+        assert_eq!(adaptive_tracking_ransac_config(base, 200).min_inliers, 8);
+    }
+
+    #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
         let detections = make_test_detections(900);
-        assert!(
-            SlamTracker::initial_relocalization_session(
-                TrackingHealth::Good,
-                true,
-                Arc::clone(&detections)
-            )
-            .is_none()
-        );
-        assert!(
-            SlamTracker::initial_relocalization_session(
-                TrackingHealth::Lost,
-                false,
-                Arc::clone(&detections)
-            )
-            .is_none()
-        );
+        assert!(SlamTracker::initial_relocalization_session(
+            TrackingHealth::Good,
+            true,
+            Arc::clone(&detections)
+        )
+        .is_none());
+        assert!(SlamTracker::initial_relocalization_session(
+            TrackingHealth::Lost,
+            false,
+            Arc::clone(&detections)
+        )
+        .is_none());
 
         let session = SlamTracker::initial_relocalization_session(
             TrackingHealth::Lost,
@@ -4632,6 +4909,54 @@ mod tests {
                 .expect("visual measurement")
                 .rotation(),
             measured_map_pose.rotation()
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_camera_pose_conversion_round_trips_identity_extrinsics() {
+        let cam_from_odom = Pose64::from_pose32(Pose::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.5, -2.0, 0.3],
+        ));
+        let pose_odom_from_body =
+            pose_odom_from_body_from_camera_pose(cam_from_odom, Pose64::identity());
+        let recovered =
+            camera_from_odom_from_pose_odom_from_body(pose_odom_from_body, Pose64::identity());
+
+        assert_eq!(
+            recovered.to_pose32().translation(),
+            cam_from_odom.to_pose32().translation()
+        );
+        assert_eq!(
+            recovered.to_pose32().rotation(),
+            cam_from_odom.to_pose32().rotation()
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_camera_pose_conversion_round_trips_non_identity_extrinsics() {
+        let cam_from_odom = Pose64::from_pose32(Pose::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.5, -2.0, 0.3],
+        ));
+        let camera_from_body = Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+            [0.04, -0.01, 0.02],
+        ));
+        let pose_odom_from_body =
+            pose_odom_from_body_from_camera_pose(cam_from_odom, camera_from_body);
+        let recovered =
+            camera_from_odom_from_pose_odom_from_body(pose_odom_from_body, camera_from_body);
+
+        assert_eq!(
+            recovered.to_pose32().translation(),
+            cam_from_odom.to_pose32().translation()
+        );
+        assert_eq!(
+            recovered.to_pose32().rotation(),
+            cam_from_odom.to_pose32().rotation()
         );
     }
 }

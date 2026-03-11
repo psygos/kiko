@@ -24,7 +24,7 @@ const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
 
 // Keyframe policy defaults
 const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
-const DEFAULT_KEYFRAME_COVISIBILITY: f32 = 0.6;
+const DEFAULT_KEYFRAME_COVISIBILITY: f32 = 0.3;
 const DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY: f32 = 0.9;
 #[cfg(feature = "vio")]
 const DEFAULT_VIO_WINDOW: usize = 7;
@@ -101,9 +101,7 @@ pub fn build_tracker_config(
         }
     } else {
         if loop_closure_requested && !learned_descriptors_enabled {
-            eprintln!(
-                "learned descriptors disabled; disabling loop closure"
-            );
+            eprintln!("learned descriptors disabled; disabling loop closure");
         }
         if relocalization_enabled {
             eprintln!(

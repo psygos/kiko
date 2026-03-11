@@ -4,9 +4,8 @@ use std::num::NonZeroUsize;
 use crate::map::KeyframeId;
 use crate::math::{mat_mul_f64, mat_mul_vec_f64};
 use crate::{
-    Gravity, ImuFactor, MapFromOdom, NavState, NavTangent, PinholeIntrinsics, Pose64,
-    PreintegratedImu, VioObservation, bias_random_walk_residual, pose_prior_residual,
-    reprojection_residual,
+    bias_random_walk_residual, pose_prior_residual, reprojection_residual, Gravity, ImuFactor,
+    MapFromOdom, NavState, NavTangent, PinholeIntrinsics, Pose64, PreintegratedImu, VioObservation,
 };
 
 const STATE_DIM: usize = 15;
@@ -206,6 +205,10 @@ impl LocalVio {
 
     pub fn set_map_from_odom(&mut self, map_from_odom: MapFromOdom) {
         self.map_from_odom = map_from_odom;
+    }
+
+    pub fn set_gravity(&mut self, gravity: Gravity) {
+        self.gravity = gravity;
     }
 
     pub fn initialize(

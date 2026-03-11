@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
-    read_meta, scan_frames,
+    format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
+    FrameInfo, Manifest,
 };
 
 #[derive(Debug)]
@@ -135,9 +135,10 @@ impl DatasetReader {
         let end_idx = samples.partition_point(|sample| {
             sample.timestamp().as_nanos() <= interval.end_inclusive().as_nanos()
         });
+        let before_first_imu_sample = end_idx == 0;
 
         if start_idx == end_idx {
-            if startup_interval {
+            if startup_interval || before_first_imu_sample {
                 return Ok(CaptureImu::Absent);
             }
             return Err(DatasetError::MissingImuSamples {
@@ -150,7 +151,7 @@ impl DatasetReader {
 
         let batch = match ImuBatch::new(samples[start_idx..end_idx].to_vec()) {
             Ok(batch) => batch,
-            Err(_) if startup_interval => return Ok(CaptureImu::Absent),
+            Err(_) if startup_interval || before_first_imu_sample => return Ok(CaptureImu::Absent),
             Err(_) => {
                 return Err(DatasetError::MissingImuSamples {
                     start_ns: interval
@@ -767,9 +768,12 @@ mod tests {
         writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
         writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
         writer.write_imu(
-            &ImuBatch::new(vec![
-                ImuSample::new(Timestamp::from_nanos(101), [0.0; 3], [0.0; 3]).expect("imu 0"),
-            ])
+            &ImuBatch::new(vec![ImuSample::new(
+                Timestamp::from_nanos(101),
+                [0.0; 3],
+                [0.0; 3],
+            )
+            .expect("imu 0")])
             .expect("imu batch"),
         );
 
@@ -859,6 +863,48 @@ mod tests {
             .expect("bundle")
             .expect("startup bundle should succeed without imu");
         assert!(matches!(bundle.imu(), CaptureImu::Absent));
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn consecutive_startup_bundles_allow_missing_imu_until_first_sample() {
+        let dataset_dir = unique_temp_dir("reader-imu-multi-startup-gap");
+        let (writer, handle) =
+            DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration()).expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 2, 110));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 3, 114));
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 4, 150));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 5, 154));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(150), [0.0; 3], [0.0; 3]).expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(180), [1.0; 3], [2.0; 3]).expect("imu 1"),
+            ])
+            .expect("imu batch"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let mut bundles = reader.bundles();
+
+        let first = bundles.next().expect("first bundle").expect("first ok");
+        assert!(matches!(first.imu(), CaptureImu::Absent));
+
+        let second = bundles.next().expect("second bundle").expect("second ok");
+        assert!(matches!(second.imu(), CaptureImu::Absent));
+
+        let third = bundles.next().expect("third bundle").expect("third ok");
+        let third_imu = third.imu().batch().expect("third bundle imu");
+        assert_eq!(third_imu.start_time().as_nanos(), 150);
+        assert_eq!(third_imu.end_time().as_nanos(), 150);
+
+        assert!(bundles.next().is_none());
 
         let _ = std::fs::remove_dir_all(&dataset_dir);
     }
