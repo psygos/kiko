@@ -5,7 +5,7 @@ use crate::env::env_bool;
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::execution_providers::ExecutionProvider;
 use ort::execution_providers::ExecutionProviderDispatch;
-use ort::execution_providers::cpu::CPUExecutionProvider;
+use ort::execution_providers::CPUExecutionProvider;
 
 use super::InferenceError;
 

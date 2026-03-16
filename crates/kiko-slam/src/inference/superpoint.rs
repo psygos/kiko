@@ -224,7 +224,7 @@ enum Normalization {
 }
 
 fn parse_keypoint_pairs(
-    shape: &ort::tensor::Shape,
+    shape: &ort::value::Shape,
     data: &[f32],
     output_name: &str,
 ) -> Result<Vec<[f32; 2]>, InferenceError> {

@@ -62,6 +62,8 @@ pub fn rerun_recording(
         eprintln!("rerun: saving to {}", path.display());
         let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
         Ok(rec)
+    } else if let Some(url) = &args.rerun_url {
+        Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc_opts(url)?)
     } else {
         Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc()?)
     }

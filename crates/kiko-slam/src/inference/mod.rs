@@ -160,7 +160,7 @@ fn build_session(
     if !selection.providers().is_empty() {
         builder = builder
             .with_execution_providers(selection.providers())
-            .map_err(InferenceError::Execution)?;
+            .map_err(|err| InferenceError::Execution(err.into()))?;
     }
 
     let session = builder
@@ -196,7 +196,7 @@ fn apply_session_config(
         .and_then(|b| b.with_intra_threads(intra))
         .and_then(|b| b.with_inter_threads(inter))
         .and_then(|b| b.with_parallel_execution(parallel_exec))
-        .map_err(InferenceError::Execution)
+        .map_err(|err| InferenceError::Execution(err.into()))
 }
 
 fn env_opt_level(key: &str) -> Option<GraphOptimizationLevel> {

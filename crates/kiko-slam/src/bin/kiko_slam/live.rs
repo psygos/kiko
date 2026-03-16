@@ -21,6 +21,7 @@ use oak_sys::{
 
 use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, RerunArgs};
 use crate::config::{build_tracker_config, TrackerDefaults};
+use crate::rerun_recording;
 use crate::record::{
     build_calibration, load_oak_read_timeout_ms, load_pairer_max_pending_per_side,
     load_pairing_window,
@@ -284,10 +285,11 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let decimation = args.rerun.rerun_decimation;
+    let rerun = args.rerun.clone();
     let live_viz_enabled = env_bool("KIKO_LIVE_VIZ").unwrap_or(true);
     let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut sink = if live_viz_enabled {
-            match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc() {
+            match rerun_recording(&rerun, "kiko-slam-live") {
                 Ok(rec) => Some(RerunSink::new(rec, decimation)),
                 Err(err) => {
                     eprintln!("failed to connect to rerun viewer; continuing headless: {err}");

@@ -33,6 +33,12 @@ Live SLAM from OAK-D (`Rerun` optional):
 cargo run -p kiko-slam --features record -- live
 ```
 
+Live SLAM streamed from the robot to a remote Rerun viewer:
+
+```sh
+cargo run -p kiko-slam --features record -- live --rerun-url rerun+http://<your-laptop-ip>:9876/proxy
+```
+
 Visualize stereo matches on a dataset:
 
 ```sh
@@ -43,6 +49,12 @@ Run full SLAM on a dataset (Rerun viewer):
 
 ```sh
 cargo run -p kiko-slam -- slam recordings/<name>
+```
+
+Run full SLAM on a dataset with a remote Rerun viewer:
+
+```sh
+cargo run -p kiko-slam -- slam --rerun-url rerun+http://<your-laptop-ip>:9876/proxy recordings/<name>
 ```
 
 Benchmark a dataset:
@@ -66,6 +78,7 @@ cargo run -p kiko-slam -- bench recordings/<name>
 **Visualization:**
 
 - `--rerun-decimation` / `KIKO_RERUN_DECIMATION` — image decimation for Rerun
+- `--rerun-url` / `KIKO_RERUN_URL` — remote Rerun gRPC endpoint
 - `--allow-unrectified` / `KIKO_ALLOW_UNRECTIFIED` — skip rectification check
 - `--max-pairs` / `KIKO_MAX_PAIRS` — maximum stereo pairs to attempt from a dataset
 
