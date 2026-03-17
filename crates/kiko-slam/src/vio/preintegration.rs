@@ -131,9 +131,16 @@ impl PreintegratedImu {
     }
 
     pub fn residual_information_diag(&self) -> [f64; 9] {
+        // Cap information to prevent the optimizer from trusting IMU with
+        // unreasonable confidence. The diagonal covariance from white-noise
+        // propagation can be extremely small (especially position, which
+        // scales as dt⁴), but real IMU errors include un-modelled bias drift
+        // that this covariance doesn't capture. A floor of 1e-4 limits
+        // information to ~10,000 so the optimizer can correct from visual.
+        const MIN_VARIANCE: f64 = 1e-2;
         let mut information = [0.0_f64; 9];
         for (axis, value) in information.iter_mut().enumerate() {
-            let variance = self.covariance[axis][axis].max(1e-12);
+            let variance = self.covariance[axis][axis].max(MIN_VARIANCE);
             *value = 1.0 / variance;
         }
         information

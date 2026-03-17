@@ -1428,6 +1428,13 @@ fn camera_from_odom_from_pose_odom_from_body(
 }
 
 #[cfg(feature = "vio")]
+/// Minimum number of stationary IMU samples required to trust a gravity estimate.
+const MIN_STATIONARY_SAMPLES: usize = 40;
+/// Maximum accelerometer magnitude deviation from expected gravity (m/s²).
+const ACCEL_MAGNITUDE_TOLERANCE: f64 = 1.5;
+/// Maximum gyroscope magnitude for a sample to be considered stationary (rad/s).
+const GYRO_STATIONARY_THRESHOLD: f64 = 0.3;
+
 fn estimate_gravity_from_imu_batch(
     batch: &crate::ImuBatch,
     pose_odom_from_body: Pose64,
@@ -1436,16 +1443,30 @@ fn estimate_gravity_from_imu_batch(
     if batch.is_empty() {
         return Ok(None);
     }
+    // Only use samples where the device is stationary: accel magnitude ≈ g
+    // and gyro ≈ 0. The device may be moving/settling at recording start.
     let mut mean_accel_body = [0.0_f64; 3];
+    let mut stationary_count = 0_usize;
     for sample in batch.samples() {
         let accel = sample.accel_mps2();
-        mean_accel_body[0] += accel[0];
-        mean_accel_body[1] += accel[1];
-        mean_accel_body[2] += accel[2];
+        let gyro = sample.gyro_radps();
+        let accel_mag = (accel[0] * accel[0] + accel[1] * accel[1] + accel[2] * accel[2]).sqrt();
+        let gyro_mag = (gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2]).sqrt();
+        if (accel_mag - gravity_magnitude_mps2).abs() < ACCEL_MAGNITUDE_TOLERANCE
+            && gyro_mag < GYRO_STATIONARY_THRESHOLD
+        {
+            mean_accel_body[0] += accel[0];
+            mean_accel_body[1] += accel[1];
+            mean_accel_body[2] += accel[2];
+            stationary_count += 1;
+        }
     }
-    let sample_count = batch.len() as f64;
+    if stationary_count < MIN_STATIONARY_SAMPLES {
+        return Ok(None);
+    }
+    let count = stationary_count as f64;
     for axis in &mut mean_accel_body {
-        *axis /= sample_count;
+        *axis /= count;
     }
     let norm = (mean_accel_body[0] * mean_accel_body[0]
         + mean_accel_body[1] * mean_accel_body[1]
@@ -2071,8 +2092,9 @@ impl SlamTracker {
             // with wrong gravity causes divergence in the very first frames.
             if !vio_runtime.gravity_aligned {
                 if self.trace_transitions {
+                    let pending = vio_runtime.pending_imu.len();
                     eprintln!(
-                        "vio init deferred: gravity not yet aligned (need more IMU samples)"
+                        "vio init deferred: gravity not yet aligned (pending_imu={pending} samples, need {MIN_STATIONARY_SAMPLES} stationary)"
                     );
                 }
                 return Ok(());

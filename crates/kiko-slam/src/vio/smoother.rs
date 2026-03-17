@@ -673,11 +673,25 @@ impl LocalVio {
                 return;
             };
             let step_norm = delta.iter().map(|value| value * value).sum::<f64>().sqrt();
+            // Guard against ill-conditioned systems: if the GN step is unreasonably
+            // large, scale it down. A 1m translation + 10° rotation per iteration is
+            // already aggressive; anything beyond that is numerical runaway.
+            const MAX_STEP_NORM: f64 = 2.0;
+            let scale = if step_norm > MAX_STEP_NORM {
+                MAX_STEP_NORM / step_norm
+            } else {
+                1.0
+            };
             let frames = self.frames.make_contiguous();
             for (frame_idx, frame) in frames.iter_mut().enumerate().take(frame_count) {
                 let base = frame_base(frame_idx);
                 let mut tangent = [0.0_f64; 15];
                 tangent.copy_from_slice(&delta[base..base + STATE_DIM]);
+                if scale < 1.0 {
+                    for t in &mut tangent {
+                        *t *= scale;
+                    }
+                }
                 frame.state = frame.state.retract(&tangent);
             }
             if step_norm < 1e-8 {
