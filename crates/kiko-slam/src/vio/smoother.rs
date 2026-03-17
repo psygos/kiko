@@ -171,6 +171,7 @@ struct VioFrame {
     preintegrated_from_prev: Option<PreintegratedImu>,
 }
 
+#[derive(Clone)]
 pub struct LocalVio {
     config: VioConfig,
     gravity: Gravity,
@@ -265,6 +266,14 @@ impl LocalVio {
             keyframe_id: previous.keyframe_id,
             state: propagate_state(previous.state(), preintegrated, self.gravity),
         })
+    }
+
+    pub fn predict_state(
+        &self,
+        state: &NavState,
+        preintegrated: &PreintegratedImu,
+    ) -> NavState {
+        propagate_state(state, preintegrated, self.gravity)
     }
 
     pub fn correct_prediction(
@@ -563,17 +572,15 @@ impl LocalVio {
                     self.gravity,
                 );
                 let imu_weights = preintegrated.residual_information_diag();
-                if frame_idx > 1 {
-                    accumulate_self(
-                        &mut h,
-                        &mut b,
-                        dim,
-                        frame_base(frame_idx - 1),
-                        &jac_prev,
-                        &residual,
-                        &imu_weights,
-                    );
-                }
+                accumulate_self(
+                    &mut h,
+                    &mut b,
+                    dim,
+                    frame_base(frame_idx - 1),
+                    &jac_prev,
+                    &residual,
+                    &imu_weights,
+                );
                 accumulate_self(
                     &mut h,
                     &mut b,
@@ -583,17 +590,15 @@ impl LocalVio {
                     &residual,
                     &imu_weights,
                 );
-                if frame_idx > 1 {
-                    accumulate_cross(
-                        &mut h,
-                        dim,
-                        frame_base(frame_idx - 1),
-                        frame_base(frame_idx),
-                        &jac_prev,
-                        &jac_curr,
-                        &imu_weights,
-                    );
-                }
+                accumulate_cross(
+                    &mut h,
+                    dim,
+                    frame_base(frame_idx - 1),
+                    frame_base(frame_idx),
+                    &jac_prev,
+                    &jac_curr,
+                    &imu_weights,
+                );
 
                 let bias_residual = bias_random_walk_residual(
                     &frames[frame_idx - 1].state,
@@ -602,17 +607,15 @@ impl LocalVio {
                 let (bias_jac_prev, bias_jac_curr) =
                     numerical_bias_random_walk_jacobians(frames, frame_idx - 1, frame_idx);
                 let bias_weights = preintegrated.bias_random_walk_information_diag();
-                if frame_idx > 1 {
-                    accumulate_self(
-                        &mut h,
-                        &mut b,
-                        dim,
-                        frame_base(frame_idx - 1),
-                        &bias_jac_prev,
-                        &bias_residual,
-                        &bias_weights,
-                    );
-                }
+                accumulate_self(
+                    &mut h,
+                    &mut b,
+                    dim,
+                    frame_base(frame_idx - 1),
+                    &bias_jac_prev,
+                    &bias_residual,
+                    &bias_weights,
+                );
                 accumulate_self(
                     &mut h,
                     &mut b,
@@ -622,17 +625,15 @@ impl LocalVio {
                     &bias_residual,
                     &bias_weights,
                 );
-                if frame_idx > 1 {
-                    accumulate_cross(
-                        &mut h,
-                        dim,
-                        frame_base(frame_idx - 1),
-                        frame_base(frame_idx),
-                        &bias_jac_prev,
-                        &bias_jac_curr,
-                        &bias_weights,
-                    );
-                }
+                accumulate_cross(
+                    &mut h,
+                    dim,
+                    frame_base(frame_idx - 1),
+                    frame_base(frame_idx),
+                    &bias_jac_prev,
+                    &bias_jac_curr,
+                    &bias_weights,
+                );
 
                 for observation in frames[frame_idx].visual_observations.iter().copied() {
                     let residual = match reprojection_residual(

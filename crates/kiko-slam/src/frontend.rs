@@ -11,6 +11,8 @@ use crate::{
 
 pub(crate) struct StereoFrontend {
     superpoint: SuperPoint,
+    /// Optional second SuperPoint session for background prefetch
+    prefetch_sp: Option<SuperPoint>,
     lightglue: LightGlue,
     triangulator: Triangulator,
     intrinsics: PinholeIntrinsics,
@@ -25,14 +27,35 @@ impl StereoFrontend {
     ) -> Self {
         Self {
             superpoint,
+            prefetch_sp: None,
             lightglue,
             triangulator,
             intrinsics,
         }
     }
 
+    pub(crate) fn set_prefetch_sp(&mut self, sp: SuperPoint) {
+        self.prefetch_sp = Some(sp);
+    }
+
     pub(crate) fn intrinsics(&self) -> PinholeIntrinsics {
         self.intrinsics
+    }
+
+    /// Detect with optional prefetched result. If `prefetched` matches this frame, skip SP.
+    pub(crate) fn detect_or_use_prefetched(
+        &mut self,
+        frame: &Frame,
+        downscale: DownscaleFactor,
+        max_keypoints: usize,
+        prefetched: Option<(crate::FrameId, Arc<Detections>)>,
+    ) -> Result<Arc<Detections>, InferenceError> {
+        if let Some((fid, dets)) = prefetched {
+            if fid == frame.frame_id() {
+                return Ok(dets);
+            }
+        }
+        self.detect(frame, downscale, max_keypoints)
     }
 
     pub(crate) fn detect(
@@ -46,6 +69,16 @@ impl StereoFrontend {
             .detect_with_downscale(frame, downscale)?
             .top_k(max_keypoints);
         Ok(Arc::new(detections))
+    }
+
+    /// Take the prefetch SP session out for use on a background thread.
+    /// Call `return_prefetch_sp` to put it back.
+    pub(crate) fn take_prefetch_sp(&mut self) -> Option<SuperPoint> {
+        self.prefetch_sp.take()
+    }
+
+    pub(crate) fn return_prefetch_sp(&mut self, sp: SuperPoint) {
+        self.prefetch_sp = Some(sp);
     }
 
     pub(crate) fn match_tracking(

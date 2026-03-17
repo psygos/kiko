@@ -409,6 +409,16 @@ impl ImuAccumulator {
         }
         ImuBatch::new(self.samples.clone()).map(Some)
     }
+
+    /// Return only the most recent `max_samples` for lightweight prediction.
+    pub fn recent_batch(&self, max_samples: usize) -> Result<Option<ImuBatch>, ImuBatchError> {
+        if self.samples.is_empty() {
+            return Ok(None);
+        }
+        let start = self.samples.len().saturating_sub(max_samples);
+        let tail = self.samples[start..].to_vec();
+        ImuBatch::new(tail).map(Some)
+    }
 }
 
 #[derive(Clone, Debug)]

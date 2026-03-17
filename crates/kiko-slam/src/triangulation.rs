@@ -273,6 +273,8 @@ pub struct Point3 {
 pub struct Keyframe {
     frame_id: FrameId,
     detections: Arc<Detections>,
+    tracking_detections: Arc<Detections>,
+    tracking_detection_indices: Vec<usize>,
     landmarks: Vec<Point3>,
     landmark_indices: Vec<usize>,
     index_to_landmark: Vec<Option<usize>>,
@@ -295,6 +297,9 @@ pub enum KeyframeError {
     SensorMismatch {
         expected: SensorId,
         actual: SensorId,
+    },
+    InvalidTrackingDetections {
+        message: String,
     },
 }
 
@@ -321,6 +326,9 @@ impl std::fmt::Display for KeyframeError {
                     f,
                     "keyframe detections must be from {expected:?}, got {actual:?}"
                 )
+            }
+            KeyframeError::InvalidTrackingDetections { message } => {
+                write!(f, "failed to build tracking detections: {message}")
             }
         }
     }
@@ -372,9 +380,16 @@ impl Keyframe {
             index_to_landmark[det_idx] = Some(landmark_idx);
         }
 
+        let tracking_detections = build_tracking_detections(&detections, &landmark_indices)
+            .map_err(|err| KeyframeError::InvalidTrackingDetections {
+                message: err.to_string(),
+            })?;
+
         Ok(Self {
             frame_id: detections.frame_id(),
             detections,
+            tracking_detections,
+            tracking_detection_indices: landmark_indices.clone(),
             landmarks,
             landmark_indices,
             index_to_landmark,
@@ -389,6 +404,31 @@ impl Keyframe {
         &self.detections
     }
 
+    pub fn tracking_detections(&self) -> &Arc<Detections> {
+        &self.tracking_detections
+    }
+
+    pub fn remap_tracking_matches(
+        &self,
+        matches: &Matches<Raw>,
+    ) -> Result<Matches<Raw>, crate::MatchError> {
+        let mut indices = Vec::with_capacity(matches.len());
+        let mut scores = Vec::with_capacity(matches.len());
+        for (match_idx, &(current_idx, tracking_idx)) in matches.indices().iter().enumerate() {
+            let Some(&keyframe_idx) = self.tracking_detection_indices.get(tracking_idx) else {
+                continue;
+            };
+            indices.push((current_idx, keyframe_idx));
+            scores.push(matches.scores()[match_idx]);
+        }
+        Matches::new(
+            matches.source_a_arc(),
+            Arc::clone(&self.detections),
+            indices,
+            scores,
+        )
+    }
+
     pub fn landmarks(&self) -> &[Point3] {
         &self.landmarks
     }
@@ -401,6 +441,31 @@ impl Keyframe {
         let landmark_idx = *self.index_to_landmark.get(index)?;
         landmark_idx.map(|idx| self.landmarks[idx])
     }
+}
+
+fn build_tracking_detections(
+    detections: &Arc<Detections>,
+    landmark_indices: &[usize],
+) -> Result<Arc<Detections>, crate::DetectionError> {
+    let mut keypoints = Vec::with_capacity(landmark_indices.len());
+    let mut scores = Vec::with_capacity(landmark_indices.len());
+    let mut descriptors = Vec::with_capacity(landmark_indices.len());
+
+    for &idx in landmark_indices {
+        keypoints.push(detections.keypoints()[idx]);
+        scores.push(detections.scores()[idx]);
+        descriptors.push(detections.descriptors()[idx]);
+    }
+
+    Ok(Arc::new(Detections::new(
+        detections.sensor_id(),
+        detections.frame_id(),
+        detections.width(),
+        detections.height(),
+        keypoints,
+        scores,
+        descriptors,
+    )?))
 }
 
 #[derive(Debug)]
@@ -858,5 +923,66 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn keyframe_tracking_detections_only_keep_landmark_entries() {
+        let detections = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(60),
+            640,
+            480,
+            vec![
+                Keypoint { x: 10.0, y: 20.0 },
+                Keypoint { x: 30.0, y: 40.0 },
+                Keypoint { x: 50.0, y: 60.0 },
+            ],
+        )
+        .expect("detections");
+        let keyframe = Keyframe::new(
+            (*detections).clone(),
+            vec![
+                Point3 {
+                    x: 0.1,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Point3 {
+                    x: 0.2,
+                    y: 0.0,
+                    z: 1.5,
+                },
+            ],
+            vec![0, 2],
+        )
+        .expect("keyframe");
+        let current = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(61),
+            640,
+            480,
+            vec![
+                Keypoint { x: 11.0, y: 21.0 },
+                Keypoint { x: 31.0, y: 41.0 },
+            ],
+        )
+        .expect("current");
+
+        let tracking_matches = Matches::new(
+            current.clone(),
+            keyframe.tracking_detections().clone(),
+            vec![(0, 0), (1, 1)],
+            vec![0.9, 0.8],
+        )
+        .expect("tracking matches");
+
+        let remapped = keyframe
+            .remap_tracking_matches(&tracking_matches)
+            .expect("remapped matches");
+
+        assert_eq!(keyframe.tracking_detections().len(), 2);
+        assert_eq!(remapped.indices(), &[(0, 0), (1, 2)]);
+        assert_eq!(remapped.scores(), &[0.9, 0.8]);
+        assert_eq!(remapped.source_b().len(), 3);
     }
 }
