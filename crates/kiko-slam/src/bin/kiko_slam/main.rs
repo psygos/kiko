@@ -62,6 +62,16 @@ pub fn rerun_recording(
         eprintln!("rerun: saving to {}", path.display());
         let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
         Ok(rec)
+    } else if args.rerun_serve {
+        let port = args.rerun_port;
+        eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
+        eprintln!("rerun: on your laptop run:  rerun --connect rerun+http://192.168.50.2:{port}/proxy");
+        let rec = rerun::RecordingStreamBuilder::new(name).serve_grpc_opts(
+            "0.0.0.0",
+            port,
+            Default::default(),
+        )?;
+        Ok(rec)
     } else if let Some(url) = &args.rerun_url {
         Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc_opts(url)?)
     } else {

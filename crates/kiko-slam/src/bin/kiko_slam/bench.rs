@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use kiko_slam::dataset::DatasetReader;
+use kiko_slam::InferencePipeline;
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig};
 
@@ -193,7 +194,18 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let inference = InferenceConfig::from_args(&args.inference)?;
-    let mut pipeline = inference.into_pipeline();
+    let downscale = inference.downscale;
+    let max_keypoints = inference.key_limit.get();
+    let mut end2end_pipeline = inference.end2end;
+    let mut pipeline: Option<InferencePipeline> = if end2end_pipeline.is_none() {
+        Some(
+            InferencePipeline::new(inference.superpoint, inference.lightglue, inference.key_limit)
+                .with_downscale(inference.downscale)
+                .with_stereo_superpoint_opt(inference.superpoint_right),
+        )
+    } else {
+        None
+    };
 
     let cpu_start = process_usage();
     let mut accum = BenchAccum::default();
@@ -221,22 +233,43 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         accum.sum_read_bytes += sample.timings.left_bytes + sample.timings.right_bytes;
 
         let inference_attempt_start = Instant::now();
-        match pipeline.process_pair_timed(pair) {
-            Ok((packet, timings)) => {
-                let matches = packet.matches();
-                accum.total_matches += matches.len();
-                if !matches.is_empty() {
-                    accum.matches_nonzero += 1;
+
+        if let Some(ref mut end2end) = end2end_pipeline {
+            // End-to-end pipeline: single call for SP+LG fused
+            let (left_frame, right_frame) = pair.into_parts();
+            match end2end.match_pair(&left_frame, &right_frame, max_keypoints) {
+                Ok((matches, timings)) => {
+                    accum.total_matches += matches.len();
+                    if !matches.is_empty() {
+                        accum.matches_nonzero += 1;
+                    }
+                    accum.sum_total_success += timings.total;
+                    accum.sum_sp_left += timings.total; // attribute all to "pipeline"
+                    accum.processed += 1;
                 }
-                accum.sum_sp_left += timings.superpoint_left;
-                accum.sum_sp_right += timings.superpoint_right;
-                accum.sum_lightglue += timings.lightglue;
-                accum.sum_total_success += timings.total;
-                accum.processed += 1;
+                Err(err) => {
+                    accum.inference_errors += 1;
+                    eprintln!("inference error: {err}");
+                }
             }
-            Err(err) => {
-                accum.inference_errors += 1;
-                eprintln!("inference error: {err}");
+        } else if let Some(ref mut p) = pipeline {
+            match p.process_pair_timed(pair) {
+                Ok((packet, timings)) => {
+                    let matches = packet.matches();
+                    accum.total_matches += matches.len();
+                    if !matches.is_empty() {
+                        accum.matches_nonzero += 1;
+                    }
+                    accum.sum_sp_left += timings.superpoint_left;
+                    accum.sum_sp_right += timings.superpoint_right;
+                    accum.sum_lightglue += timings.lightglue;
+                    accum.sum_total_success += timings.total;
+                    accum.processed += 1;
+                }
+                Err(err) => {
+                    accum.inference_errors += 1;
+                    eprintln!("inference error: {err}");
+                }
             }
         }
         accum.sum_inference_attempt += inference_attempt_start.elapsed();

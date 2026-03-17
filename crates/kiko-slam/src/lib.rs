@@ -2,8 +2,14 @@ use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+// Compatibility shims for ORT static archive built with GCC 14 / glibc 2.38.
+// The pre-built ORT 1.24.2 binary references symbols not present in Ubuntu 22.04's
+// GCC 11 / glibc 2.35. These stubs are link-time equivalents.
+mod ort_compat;
+
 pub use inference::{
-    EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
+    EigenPlaces, End2EndPipeline, End2EndTimings, InferenceBackend, LightGlue,
+    PlaceDescriptorExtractor, SuperPoint,
 };
 mod calibration;
 mod capture;

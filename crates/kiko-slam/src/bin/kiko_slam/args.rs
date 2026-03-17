@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use clap::{Args, ValueEnum};
 
 use kiko_slam::{
-    DownscaleFactor, InferenceBackend, InferencePipeline, KeypointLimit, LightGlue, SuperPoint,
-    VizDecimation,
+    DownscaleFactor, End2EndPipeline, InferenceBackend, InferencePipeline, KeypointLimit,
+    LightGlue, SuperPoint, VizDecimation,
 };
 
 use std::path::Path;
@@ -36,6 +36,9 @@ pub struct InferenceArgs {
     /// Path to LightGlue ONNX model
     #[arg(long, env = "KIKO_LIGHTGLUE_MODEL")]
     pub lightglue_model: Option<PathBuf>,
+    /// Path to end-to-end pipeline ONNX model (SP+LG fused, replaces separate models)
+    #[arg(long, env = "KIKO_PIPELINE_MODEL")]
+    pub pipeline_model: Option<PathBuf>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -59,6 +62,12 @@ pub struct RerunArgs {
     /// Stream Rerun data to a remote viewer, e.g. rerun+http://192.168.50.1:9876/proxy
     #[arg(long, env = "KIKO_RERUN_URL", value_name = "URL")]
     pub rerun_url: Option<String>,
+    /// Host a gRPC server on 0.0.0.0 so remote Rerun viewers can connect to this machine
+    #[arg(long, env = "KIKO_RERUN_SERVE", default_value_t = false)]
+    pub rerun_serve: bool,
+    /// Port for the gRPC server when using --rerun-serve (default: 9876)
+    #[arg(long, env = "KIKO_RERUN_PORT", default_value_t = 9876)]
+    pub rerun_port: u16,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -120,7 +129,9 @@ impl From<BackendArg> for InferenceBackend {
 
 pub struct InferenceConfig {
     pub superpoint: SuperPoint,
+    pub superpoint_right: Option<SuperPoint>,
     pub lightglue: LightGlue,
+    pub end2end: Option<End2EndPipeline>,
     pub key_limit: KeypointLimit,
     pub downscale: DownscaleFactor,
 }
@@ -141,6 +152,17 @@ impl InferenceConfig {
             .unwrap_or(default_backend);
 
         let model_dir = resolve_model_dir();
+
+        // Check for end-to-end pipeline model
+        let end2end = if let Some(ref pipeline_path) = args.pipeline_model {
+            eprintln!("pipeline model: {}", pipeline_path.display());
+            let pipeline = End2EndPipeline::new(pipeline_path, default_backend)?;
+            eprintln!("pipeline backend: {:?}", pipeline.backend());
+            Some(pipeline)
+        } else {
+            None
+        };
+
         let sp_path = resolve_model_path(&model_dir, args.superpoint_model.as_ref(), "sp.onnx");
         let lg_path = resolve_model_path(&model_dir, args.lightglue_model.as_ref(), "lg.onnx");
         eprintln!(
@@ -150,6 +172,11 @@ impl InferenceConfig {
         );
 
         let superpoint = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
+        let superpoint_right = if end2end.is_none() {
+            SuperPoint::new_with_backend(&sp_path, superpoint_backend).ok()
+        } else {
+            None
+        };
         let lightglue = LightGlue::new_with_backend(&lg_path, lightglue_backend)?;
 
         eprintln!(
@@ -157,6 +184,11 @@ impl InferenceConfig {
             superpoint.backend(),
             lightglue.backend()
         );
+        if end2end.is_some() {
+            eprintln!("end-to-end pipeline: enabled (SP+LG fused, single call)");
+        } else if superpoint_right.is_some() {
+            eprintln!("parallel stereo superpoint: enabled");
+        }
 
         let (downscale, key_limit) =
             tuned_mac_inference_settings(args, superpoint.backend(), lightglue.backend())?;
@@ -165,15 +197,22 @@ impl InferenceConfig {
 
         Ok(Self {
             superpoint,
+            superpoint_right,
             lightglue,
+            end2end,
             key_limit,
             downscale,
         })
     }
 
     pub fn into_pipeline(self) -> InferencePipeline {
-        InferencePipeline::new(self.superpoint, self.lightglue, self.key_limit)
-            .with_downscale(self.downscale)
+        let mut pipeline =
+            InferencePipeline::new(self.superpoint, self.lightglue, self.key_limit)
+                .with_downscale(self.downscale);
+        if let Some(sp_right) = self.superpoint_right {
+            pipeline = pipeline.with_stereo_superpoint(sp_right);
+        }
+        pipeline
     }
 }
 
