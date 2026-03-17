@@ -206,9 +206,8 @@ impl InferenceConfig {
     }
 
     pub fn into_pipeline(self) -> InferencePipeline {
-        let mut pipeline =
-            InferencePipeline::new(self.superpoint, self.lightglue, self.key_limit)
-                .with_downscale(self.downscale);
+        let mut pipeline = InferencePipeline::new(self.superpoint, self.lightglue, self.key_limit)
+            .with_downscale(self.downscale);
         if let Some(sp_right) = self.superpoint_right {
             pipeline = pipeline.with_stereo_superpoint(sp_right);
         }
@@ -237,8 +236,8 @@ fn tuned_mac_inference_settings(
         "warning: Apple inference backend fell back to CPU (superpoint={superpoint_backend:?}, lightglue={lightglue_backend:?})"
     );
 
-    let downscale_explicit =
-        setting_explicit("--downscale", "KIKO_DOWNSCALE") || args.downscale != DownscaleFactor::identity();
+    let downscale_explicit = setting_explicit("--downscale", "KIKO_DOWNSCALE")
+        || args.downscale != DownscaleFactor::identity();
     let key_limit_explicit = setting_explicit("--max-keypoints", "KIKO_MAX_KEYPOINTS")
         || args.max_keypoints != KeypointLimit::try_from(DEFAULT_MAX_KEYPOINTS).expect("default");
 

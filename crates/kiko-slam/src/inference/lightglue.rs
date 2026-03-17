@@ -84,29 +84,27 @@ impl LightGlue {
             let matches_data = matches_raw.1;
             let scores_data = scores_raw.1;
 
-            let is_pair_format = matches_shape.len() >= 2
-                && matches_shape[matches_shape.len() - 1] == 2;
+            let is_pair_format =
+                matches_shape.len() >= 2 && matches_shape[matches_shape.len() - 1] == 2;
 
             if is_pair_format {
                 // Fused/TRT format: matches0 is [N, 2] with (left_idx, right_idx) pairs
                 let num_pairs = matches_data.len() / 2;
                 for i in 0..num_pairs {
-                    let left_idx =
-                        usize::try_from(matches_data[2 * i]).map_err(|_| {
-                            InferenceError::UnexpectedOutput {
-                                name: "matches0".to_string(),
-                                expected: "non-negative index".to_string(),
-                                actual: format!("index {}", matches_data[2 * i]),
-                            }
-                        })?;
-                    let right_idx =
-                        usize::try_from(matches_data[2 * i + 1]).map_err(|_| {
-                            InferenceError::UnexpectedOutput {
-                                name: "matches0".to_string(),
-                                expected: "non-negative index".to_string(),
-                                actual: format!("index {}", matches_data[2 * i + 1]),
-                            }
-                        })?;
+                    let left_idx = usize::try_from(matches_data[2 * i]).map_err(|_| {
+                        InferenceError::UnexpectedOutput {
+                            name: "matches0".to_string(),
+                            expected: "non-negative index".to_string(),
+                            actual: format!("index {}", matches_data[2 * i]),
+                        }
+                    })?;
+                    let right_idx = usize::try_from(matches_data[2 * i + 1]).map_err(|_| {
+                        InferenceError::UnexpectedOutput {
+                            name: "matches0".to_string(),
+                            expected: "non-negative index".to_string(),
+                            actual: format!("index {}", matches_data[2 * i + 1]),
+                        }
+                    })?;
                     let score = scores_data.get(i).copied().unwrap_or(1.0);
                     indices.push((left_idx, right_idx));
                     scores.push(score);

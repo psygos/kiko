@@ -961,10 +961,7 @@ mod tests {
             FrameId::new(61),
             640,
             480,
-            vec![
-                Keypoint { x: 11.0, y: 21.0 },
-                Keypoint { x: 31.0, y: 41.0 },
-            ],
+            vec![Keypoint { x: 11.0, y: 21.0 }, Keypoint { x: 31.0, y: 41.0 }],
         )
         .expect("current");
 

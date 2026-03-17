@@ -45,8 +45,8 @@ use crate::{
 };
 #[cfg(feature = "vio")]
 use crate::{
-    Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig, VioEstimate,
-    VioObservation, VioOdometryConstraint,
+    Gravity, ImuAccumulator, LocalVio, PreintegratedImu, VioConfig, VioEstimate, VioObservation,
+    VioOdometryConstraint,
 };
 
 use crate::inference::InferenceError;
@@ -1428,24 +1428,118 @@ fn camera_from_odom_from_pose_odom_from_body(
 }
 
 #[cfg(feature = "vio")]
+fn predict_preview_state_from_pending_imu(
+    runtime: &mut VioRuntime,
+) -> Result<Option<crate::NavState>, TrackerError> {
+    let Some(base_state) = runtime.state_for_preview() else {
+        return Ok(None);
+    };
+    let preview_batch = runtime
+        .preview_imu_batch()
+        .map_err(|err| TrackerError::Vio(err.to_string()))?;
+    let fallback = base_state.clone();
+    let predicted_state = match preview_batch.as_ref() {
+        Some(batch) if batch.len() >= 2 => {
+            let preintegrated =
+                PreintegratedImu::integrate(&batch, base_state.bias(), &runtime.noise)
+                    .map_err(|err| TrackerError::Vio(err.to_string()))?;
+            runtime.local_vio.predict_state(&base_state, &preintegrated)
+        }
+        _ => base_state,
+    };
+    // Guard against NaN from degenerate preintegration or state propagation.
+    let position = predicted_state.pose_odom_from_body().translation();
+    if !position[0].is_finite() || !position[1].is_finite() || !position[2].is_finite() {
+        return Ok(Some(fallback));
+    }
+    runtime.predicted_state = Some(predicted_state.clone());
+    if let Some(batch) = preview_batch.as_ref() {
+        runtime.preview_imu_end_time = Some(batch.end_time());
+    }
+    Ok(Some(predicted_state))
+}
+
+#[cfg(feature = "vio")]
+fn correct_predicted_state_from_visual_measurement(
+    runtime: &mut VioRuntime,
+    map_from_odom: &MapFromOdom,
+    pose_map_measurement: Pose,
+) -> Result<Option<crate::NavState>, TrackerError> {
+    if runtime.local_vio.is_empty() || !runtime.gravity_aligned {
+        return Ok(None);
+    }
+    let Some(predicted_state) = runtime.predicted_state.clone() else {
+        return Ok(None);
+    };
+    let camera_measurement_odom =
+        map_from_odom.map_to_odom(Pose64::from_pose32(pose_map_measurement));
+    let pose_measurement_odom =
+        pose_odom_from_body_from_camera_pose(camera_measurement_odom, runtime.camera_from_body);
+    // Blend velocity: use the position correction to adjust velocity.
+    // If visual says we're at a different position than IMU predicted,
+    // the velocity must also be wrong by approximately dp/dt.
+    let predicted_pos = predicted_state.pose_odom_from_body().translation();
+    let measured_pos = pose_measurement_odom.translation();
+    let imu_vel = predicted_state.velocity_odom_mps();
+    // Position correction implies a velocity correction. Blend with a
+    // gain < 1 to avoid overshoot (similar to a complementary filter).
+    const VELOCITY_CORRECTION_GAIN: f64 = 0.5;
+    // Use the inter-keyframe dt from the last preintegration if available,
+    // otherwise assume 33ms (one frame at 30fps).
+    let dt = runtime
+        .local_vio
+        .latest_estimate()
+        .and_then(|est| {
+            runtime
+                .pending_imu
+                .batch()
+                .ok()
+                .flatten()
+                .map(|b| b.dt_seconds())
+        })
+        .unwrap_or(0.033)
+        .max(0.001);
+    let corrected_velocity = [
+        imu_vel[0] + VELOCITY_CORRECTION_GAIN * (measured_pos[0] - predicted_pos[0]) / dt,
+        imu_vel[1] + VELOCITY_CORRECTION_GAIN * (measured_pos[1] - predicted_pos[1]) / dt,
+        imu_vel[2] + VELOCITY_CORRECTION_GAIN * (measured_pos[2] - predicted_pos[2]) / dt,
+    ];
+    let corrected_state = crate::NavState::try_new(
+        pose_measurement_odom,
+        corrected_velocity,
+        predicted_state.bias().clone(),
+    )
+    .map_err(|err| TrackerError::Vio(err.to_string()))?;
+    runtime.predicted_state = Some(corrected_state.clone());
+    Ok(Some(corrected_state))
+}
+
+#[cfg(feature = "vio")]
 /// Minimum number of stationary IMU samples required to trust a gravity estimate.
 const MIN_STATIONARY_SAMPLES: usize = 40;
 /// Maximum accelerometer magnitude deviation from expected gravity (m/s²).
 const ACCEL_MAGNITUDE_TOLERANCE: f64 = 1.5;
 /// Maximum gyroscope magnitude for a sample to be considered stationary (rad/s).
 const GYRO_STATIONARY_THRESHOLD: f64 = 0.3;
+/// Reject visual velocity seeds that imply an implausible bootstrap speed.
+const MAX_INITIAL_VISUAL_SPEED_MPS: f64 = 10.0;
 
-fn estimate_gravity_from_imu_batch(
+#[cfg(feature = "vio")]
+struct StationaryImuStats {
+    mean_accel_body: [f64; 3],
+    mean_gyro_body: [f64; 3],
+}
+
+#[cfg(feature = "vio")]
+fn stationary_imu_stats(
     batch: &crate::ImuBatch,
-    pose_odom_from_body: Pose64,
     gravity_magnitude_mps2: f64,
-) -> Result<Option<Gravity>, TrackerError> {
+) -> Option<StationaryImuStats> {
     if batch.is_empty() {
-        return Ok(None);
+        return None;
     }
-    // Only use samples where the device is stationary: accel magnitude ≈ g
-    // and gyro ≈ 0. The device may be moving/settling at recording start.
     let mut mean_accel_body = [0.0_f64; 3];
+    let mut mean_gyro_body = [0.0_f64; 3];
     let mut stationary_count = 0_usize;
     for sample in batch.samples() {
         let accel = sample.accel_mps2();
@@ -1455,30 +1549,44 @@ fn estimate_gravity_from_imu_batch(
         if (accel_mag - gravity_magnitude_mps2).abs() < ACCEL_MAGNITUDE_TOLERANCE
             && gyro_mag < GYRO_STATIONARY_THRESHOLD
         {
-            mean_accel_body[0] += accel[0];
-            mean_accel_body[1] += accel[1];
-            mean_accel_body[2] += accel[2];
+            for axis in 0..3 {
+                mean_accel_body[axis] += accel[axis];
+                mean_gyro_body[axis] += gyro[axis];
+            }
             stationary_count += 1;
         }
     }
     if stationary_count < MIN_STATIONARY_SAMPLES {
-        return Ok(None);
+        return None;
     }
     let count = stationary_count as f64;
-    for axis in &mut mean_accel_body {
-        *axis /= count;
+    for axis in 0..3 {
+        mean_accel_body[axis] /= count;
+        mean_gyro_body[axis] /= count;
     }
-    let norm = (mean_accel_body[0] * mean_accel_body[0]
-        + mean_accel_body[1] * mean_accel_body[1]
-        + mean_accel_body[2] * mean_accel_body[2])
+    Some(StationaryImuStats {
+        mean_accel_body,
+        mean_gyro_body,
+    })
+}
+
+#[cfg(feature = "vio")]
+fn gravity_from_stationary_stats(
+    stats: &StationaryImuStats,
+    pose_odom_from_body: Pose64,
+    gravity_magnitude_mps2: f64,
+) -> Result<Option<Gravity>, TrackerError> {
+    let norm = (stats.mean_accel_body[0] * stats.mean_accel_body[0]
+        + stats.mean_accel_body[1] * stats.mean_accel_body[1]
+        + stats.mean_accel_body[2] * stats.mean_accel_body[2])
         .sqrt();
     if !norm.is_finite() || norm <= 1e-9 {
         return Ok(None);
     }
     let specific_force_body = [
-        mean_accel_body[0] / norm,
-        mean_accel_body[1] / norm,
-        mean_accel_body[2] / norm,
+        stats.mean_accel_body[0] / norm,
+        stats.mean_accel_body[1] / norm,
+        stats.mean_accel_body[2] / norm,
     ];
     let gravity_odom_unit =
         crate::math::mat_mul_vec_f64(pose_odom_from_body.rotation(), specific_force_body);
@@ -1490,6 +1598,56 @@ fn estimate_gravity_from_imu_batch(
     let gravity =
         Gravity::try_new(gravity_odom).map_err(|err| TrackerError::Vio(err.to_string()))?;
     Ok(Some(gravity))
+}
+
+fn estimate_gravity_from_imu_batch(
+    batch: &crate::ImuBatch,
+    pose_odom_from_body: Pose64,
+    gravity_magnitude_mps2: f64,
+) -> Result<Option<Gravity>, TrackerError> {
+    let Some(stats) = stationary_imu_stats(batch, gravity_magnitude_mps2) else {
+        return Ok(None);
+    };
+    gravity_from_stationary_stats(&stats, pose_odom_from_body, gravity_magnitude_mps2)
+}
+
+#[cfg(feature = "vio")]
+fn estimate_initial_velocity_from_visual_keyframes(
+    map: &SlamMap,
+    map_from_odom: &MapFromOdom,
+    current_keyframe_id: KeyframeId,
+    current_pose_odom_from_body: Pose64,
+    camera_from_body: Pose64,
+) -> Option<[f64; 3]> {
+    let current_timestamp = map.keyframe(current_keyframe_id)?.timestamp();
+    let previous = map
+        .keyframes()
+        .filter(|(keyframe_id, entry)| {
+            *keyframe_id != current_keyframe_id && entry.timestamp() < current_timestamp
+        })
+        .max_by_key(|(_, entry)| entry.timestamp())?;
+    let dt_seconds = current_timestamp.seconds_since(previous.1.timestamp());
+    if !dt_seconds.is_finite() || dt_seconds <= 0.0 {
+        return None;
+    }
+
+    let previous_camera_pose_odom =
+        map_from_odom.map_to_odom(Pose64::from_pose32(previous.1.pose()));
+    let previous_pose_odom_from_body =
+        pose_odom_from_body_from_camera_pose(previous_camera_pose_odom, camera_from_body);
+    let current_translation = current_pose_odom_from_body.translation();
+    let previous_translation = previous_pose_odom_from_body.translation();
+    let velocity = [
+        (current_translation[0] - previous_translation[0]) / dt_seconds,
+        (current_translation[1] - previous_translation[1]) / dt_seconds,
+        (current_translation[2] - previous_translation[2]) / dt_seconds,
+    ];
+    let speed_mps =
+        (velocity[0] * velocity[0] + velocity[1] * velocity[1] + velocity[2] * velocity[2]).sqrt();
+    if !speed_mps.is_finite() || speed_mps > MAX_INITIAL_VISUAL_SPEED_MPS {
+        return None;
+    }
+    Some(velocity)
 }
 
 #[cfg(feature = "vio")]
@@ -1534,8 +1692,8 @@ impl VioWorker {
             .spawn(move || {
                 let mut local_vio: Option<LocalVio> = None;
                 while let Ok(request) = rx_req.recv() {
-                    let processing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match request {
+                    let processing =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match request {
                             VioWorkerRequest::ReplaceState(snapshot) => {
                                 local_vio = Some(snapshot);
                                 Ok::<_, String>(None)
@@ -1547,9 +1705,9 @@ impl VioWorker {
                                 visual_observations,
                                 map_from_odom,
                             } => {
-                                let vio = local_vio
-                                    .as_mut()
-                                    .ok_or_else(|| "local VIO worker not initialized".to_string())?;
+                                let vio = local_vio.as_mut().ok_or_else(|| {
+                                    "local VIO worker not initialized".to_string()
+                                })?;
                                 vio.set_map_from_odom(map_from_odom);
                                 let estimate = vio
                                     .push_preintegrated(
@@ -1566,8 +1724,7 @@ impl VioWorker {
                                     exported_odometry,
                                 }))
                             }
-                        }
-                    }));
+                        }));
 
                     match processing {
                         Ok(Ok(Some(response))) => {
@@ -1599,14 +1756,14 @@ impl VioWorker {
         })
     }
 
-    fn try_replace_state(
-        &self,
-        local_vio: LocalVio,
-    ) -> Result<(), TrySendError<VioWorkerRequest>> {
+    fn try_replace_state(&self, local_vio: LocalVio) -> Result<(), TrySendError<VioWorkerRequest>> {
         self.tx.try_send(VioWorkerRequest::ReplaceState(local_vio))
     }
 
-    fn replace_state(&self, local_vio: LocalVio) -> Result<(), crossbeam_channel::SendError<VioWorkerRequest>> {
+    fn replace_state(
+        &self,
+        local_vio: LocalVio,
+    ) -> Result<(), crossbeam_channel::SendError<VioWorkerRequest>> {
         self.tx.send(VioWorkerRequest::ReplaceState(local_vio))
     }
 
@@ -1668,8 +1825,45 @@ struct VioRuntime {
     gravity_aligned: bool,
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
-    predicted_preintegration: Option<PreintegratedImu>,
+    // State at the start of `pending_imu`. This must advance only when the
+    // pending accumulator is drained or when a fresher optimized state arrives.
+    pending_imu_base_state: Option<crate::NavState>,
     predicted_state: Option<crate::NavState>,
+    preview_imu_end_time: Option<Timestamp>,
+}
+
+#[cfg(feature = "vio")]
+impl VioRuntime {
+    fn state_for_pending_imu(&self) -> Option<crate::NavState> {
+        self.pending_imu_base_state.clone().or_else(|| {
+            self.local_vio
+                .latest_estimate()
+                .map(|estimate| estimate.state().clone())
+        })
+    }
+
+    fn state_for_preview(&self) -> Option<crate::NavState> {
+        if self.preview_imu_end_time.is_some() {
+            self.predicted_state
+                .clone()
+                .or_else(|| self.state_for_pending_imu())
+        } else {
+            self.state_for_pending_imu()
+        }
+    }
+
+    fn preview_imu_batch(&self) -> Result<Option<crate::ImuBatch>, crate::ImuBatchError> {
+        match self.preview_imu_end_time {
+            Some(end_time) => self.pending_imu.batch_from(end_time),
+            None => self.pending_imu.batch(),
+        }
+    }
+
+    fn set_pending_imu_base_state(&mut self, state: crate::NavState) {
+        self.pending_imu_base_state = Some(state.clone());
+        self.predicted_state = Some(state);
+        self.preview_imu_end_time = None;
+    }
 }
 
 pub struct SlamTracker {
@@ -1739,8 +1933,9 @@ impl SlamTracker {
                     gravity_aligned: false,
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
-                    predicted_preintegration: None,
+                    pending_imu_base_state: None,
                     predicted_state: None,
+                    preview_imu_end_time: None,
                 }))
             }
             _ => LocalEstimator::VisualOnly,
@@ -1937,8 +2132,7 @@ impl SlamTracker {
                     let cam_from_body = vio_runtime.camera_from_body;
                     let state = estimate.state().clone();
                     vio_runtime.local_vio = local_vio;
-                    vio_runtime.predicted_preintegration = None;
-                    vio_runtime.predicted_state = Some(state.clone());
+                    vio_runtime.set_pending_imu_base_state(state.clone());
                     deferred_pose_updates.push((cam_from_body, state));
                     deferred_odometry.push(exported_odometry);
                 }
@@ -1981,69 +2175,119 @@ impl SlamTracker {
         camera_from_body: Pose64,
         state: &crate::NavState,
     ) {
-        let camera_from_odom =
-            camera_from_odom_from_pose_odom_from_body(state.pose_odom_from_body(), camera_from_body);
+        let camera_from_odom = camera_from_odom_from_pose_odom_from_body(
+            state.pose_odom_from_body(),
+            camera_from_body,
+        );
         self.last_pose_world = Some(self.map_from_odom.odom_to_map(camera_from_odom).to_pose32());
     }
 
     #[cfg(feature = "vio")]
     fn refresh_predicted_pose_from_vio(&mut self) -> Result<(), TrackerError> {
-        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
-            return Ok(());
-        };
-        vio_runtime
-            .local_vio
-            .set_map_from_odom(self.map_from_odom.clone());
-        // Use only recent IMU samples for prediction (bounded cost).
-        // At 400Hz, 30 samples ≈ 75ms of IMU data — plenty for inter-frame prediction.
-        let Some(batch) = vio_runtime
-            .pending_imu
-            .recent_batch(30)
-            .map_err(|err| TrackerError::Vio(err.to_string()))?
-        else {
-            vio_runtime.predicted_preintegration = None;
-            return Ok(());
-        };
-        if batch.len() < 2 {
-            vio_runtime.predicted_preintegration = None;
-            return Ok(());
-        }
-        let base_state = vio_runtime.predicted_state.clone().or_else(|| {
+        let pose_update = {
+            let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+                return Ok(());
+            };
             vio_runtime
                 .local_vio
-                .latest_estimate()
-                .map(|estimate| estimate.state().clone())
-        });
-        let Some(base_state) = base_state else {
-            return Ok(());
-        };
-        if !vio_runtime.gravity_aligned {
-            if let Some(gravity) = estimate_gravity_from_imu_batch(
-                &batch,
-                base_state.pose_odom_from_body(),
-                vio_runtime.gravity_magnitude_mps2,
-            )? {
-                if self.trace_transitions {
-                    let gravity_vec = gravity.vector_odom_mps2();
-                    eprintln!(
-                        "vio gravity aligned gx={:.3} gy={:.3} gz={:.3}",
-                        gravity_vec[0], gravity_vec[1], gravity_vec[2]
-                    );
+                .set_map_from_odom(self.map_from_odom.clone());
+            let Some(base_state) = vio_runtime.state_for_preview() else {
+                return Ok(());
+            };
+            let predicted_state = match vio_runtime
+                .pending_imu
+                .batch()
+                .map_err(|err| TrackerError::Vio(err.to_string()))?
+            {
+                Some(batch) if batch.len() >= 2 => {
+                    if !vio_runtime.gravity_aligned {
+                        if let Some(gravity) = estimate_gravity_from_imu_batch(
+                            &batch,
+                            base_state.pose_odom_from_body(),
+                            vio_runtime.gravity_magnitude_mps2,
+                        )? {
+                            if self.trace_transitions {
+                                let gravity_vec = gravity.vector_odom_mps2();
+                                eprintln!(
+                                    "vio gravity aligned gx={:.3} gy={:.3} gz={:.3}",
+                                    gravity_vec[0], gravity_vec[1], gravity_vec[2]
+                                );
+                            }
+                            vio_runtime.local_vio.set_gravity(gravity);
+                            vio_runtime.gravity_aligned = true;
+                        }
+                    }
+                    predict_preview_state_from_pending_imu(vio_runtime)?.unwrap_or(base_state)
                 }
-                vio_runtime.local_vio.set_gravity(gravity);
-                vio_runtime.gravity_aligned = true;
-            }
+                _ => base_state,
+            };
+            // Compare VIO-predicted position against the last VISUAL pose
+            // (mapped to odom frame). If drift exceeds threshold, the IMU is
+            // unreliable — snap back to the visual-derived state.
+            const MAX_VIO_DRIFT_M: f64 = 1.0;
+            let predicted_pos = predicted_state.pose_odom_from_body().translation();
+            let visual_pos_odom = self
+                .last_pose_world
+                .map(|p| {
+                    let cam_odom = self.map_from_odom.map_to_odom(Pose64::from_pose32(p));
+                    pose_odom_from_body_from_camera_pose(cam_odom, vio_runtime.camera_from_body)
+                        .translation()
+                })
+                .unwrap_or(predicted_pos);
+            let drift = ((predicted_pos[0] - visual_pos_odom[0]).powi(2)
+                + (predicted_pos[1] - visual_pos_odom[1]).powi(2)
+                + (predicted_pos[2] - visual_pos_odom[2]).powi(2))
+            .sqrt();
+            let clamped_state = if drift > MAX_VIO_DRIFT_M || !drift.is_finite() {
+                // Snap to visual pose with dampened velocity
+                let dampened_vel = [
+                    predicted_state.velocity_odom_mps()[0] * 0.5,
+                    predicted_state.velocity_odom_mps()[1] * 0.5,
+                    predicted_state.velocity_odom_mps()[2] * 0.5,
+                ];
+                crate::NavState::try_new(
+                    pose_odom_from_body_from_camera_pose(
+                        self.map_from_odom.map_to_odom(Pose64::from_pose32(
+                            self.last_pose_world.unwrap_or(Pose::identity()),
+                        )),
+                        vio_runtime.camera_from_body,
+                    ),
+                    dampened_vel,
+                    predicted_state.bias().clone(),
+                )
+                .unwrap_or(predicted_state)
+            } else {
+                predicted_state
+            };
+            vio_runtime.predicted_state = Some(clamped_state.clone());
+            Some((vio_runtime.camera_from_body, clamped_state))
+        };
+        if let Some((cam_from_body, predicted_state)) = pose_update {
+            self.update_last_pose_from_vio_state(cam_from_body, &predicted_state);
         }
-        let preintegrated = PreintegratedImu::integrate(&batch, base_state.bias(), &vio_runtime.noise)
-            .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        let predicted_state = vio_runtime
-            .local_vio
-            .predict_state(&base_state, &preintegrated);
-        let cam_from_body = vio_runtime.camera_from_body;
-        vio_runtime.predicted_preintegration = Some(preintegrated);
-        vio_runtime.predicted_state = Some(predicted_state.clone());
-        drop(vio_runtime);
-        self.update_last_pose_from_vio_state(cam_from_body, &predicted_state);
+        Ok(())
+    }
+
+    #[cfg(feature = "vio")]
+    fn correct_predicted_pose_from_visual_measurement(
+        &mut self,
+        pose_world: Pose,
+    ) -> Result<(), TrackerError> {
+        let map_from_odom = self.map_from_odom.clone();
+        let pose_update = {
+            let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+                return Ok(());
+            };
+            correct_predicted_state_from_visual_measurement(
+                vio_runtime,
+                &map_from_odom,
+                pose_world,
+            )?
+            .map(|state| (vio_runtime.camera_from_body, state))
+        };
+        if let Some((cam_from_body, corrected_state)) = pose_update {
+            self.update_last_pose_from_vio_state(cam_from_body, &corrected_state);
+        }
         Ok(())
     }
 
@@ -2099,12 +2343,38 @@ impl SlamTracker {
                 }
                 return Ok(());
             }
-            let state = crate::NavState::try_new(
+            let velocity_odom_mps = estimate_initial_velocity_from_visual_keyframes(
+                self.global_map.map(),
+                &self.map_from_odom,
+                keyframe_id,
                 pose_measurement_odom,
-                [0.0; 3],
-                crate::ImuBias::default(),
+                vio_runtime.camera_from_body,
             )
-            .map_err(|err| TrackerError::Vio(err.to_string()))?;
+            .unwrap_or([0.0; 3]);
+            let initial_bias = vio_runtime
+                .pending_imu
+                .batch()
+                .map_err(|err| TrackerError::Vio(err.to_string()))?
+                .and_then(|batch| stationary_imu_stats(&batch, vio_runtime.gravity_magnitude_mps2))
+                .map(|stats| crate::ImuBias {
+                    accel: [0.0; 3],
+                    gyro: stats.mean_gyro_body,
+                })
+                .unwrap_or_default();
+            if self.trace_transitions {
+                eprintln!(
+                    "vio init state velocity vx={:.3} vy={:.3} vz={:.3} bgx={:.4} bgy={:.4} bgz={:.4}",
+                    velocity_odom_mps[0],
+                    velocity_odom_mps[1],
+                    velocity_odom_mps[2],
+                    initial_bias.gyro[0],
+                    initial_bias.gyro[1],
+                    initial_bias.gyro[2]
+                );
+            }
+            let state =
+                crate::NavState::try_new(pose_measurement_odom, velocity_odom_mps, initial_bias)
+                    .map_err(|err| TrackerError::Vio(err.to_string()))?;
             let predicted_state = state.clone();
             vio_runtime
                 .local_vio
@@ -2122,10 +2392,8 @@ impl SlamTracker {
                 }
             }
             let cam_from_body = vio_runtime.camera_from_body;
-            vio_runtime.predicted_state = Some(predicted_state.clone());
-            vio_runtime.predicted_preintegration = None;
             vio_runtime.pending_imu.clear();
-            drop(vio_runtime);
+            vio_runtime.set_pending_imu_base_state(predicted_state.clone());
             self.update_last_pose_from_vio_state(cam_from_body, &predicted_state);
             // Bridge the gravity-aligned odom frame to the visual map frame so
             // the output pose doesn't jump when switching from visual-only to VIO.
@@ -2144,23 +2412,20 @@ impl SlamTracker {
             return Ok(());
         }
 
-        let base_state = vio_runtime.predicted_state.clone().or_else(|| {
-            vio_runtime
-                .local_vio
-                .latest_estimate()
-                .map(|estimate| estimate.state().clone())
-        });
+        let base_state = vio_runtime.state_for_pending_imu();
         let Some(base_state) = base_state else {
             return Err(TrackerError::Vio(
                 "local vio lost base state for keyframe update".to_string(),
             ));
         };
-        let preintegrated = PreintegratedImu::integrate(&batch, base_state.bias(), &vio_runtime.noise)
-            .map_err(|err| TrackerError::Vio(err.to_string()))?;
-        let preview_state = vio_runtime.local_vio.predict_state(&base_state, &preintegrated);
+        let preintegrated =
+            PreintegratedImu::integrate(&batch, base_state.bias(), &vio_runtime.noise)
+                .map_err(|err| TrackerError::Vio(err.to_string()))?;
+        let preview_state = vio_runtime
+            .local_vio
+            .predict_state(&base_state, &preintegrated);
         let cam_from_body = vio_runtime.camera_from_body;
-        vio_runtime.predicted_preintegration = None;
-        vio_runtime.predicted_state = Some(preview_state.clone());
+        vio_runtime.set_pending_imu_base_state(preview_state.clone());
         // Defer pose update; apply after releasing vio_runtime
         let deferred_preview_state = preview_state;
 
@@ -2173,14 +2438,12 @@ impl SlamTracker {
                 self.map_from_odom.clone(),
             ) {
                 Ok(()) => {
-                    drop(vio_runtime);
                     self.update_last_pose_from_vio_state(cam_from_body, &deferred_preview_state);
                     return Ok(());
                 }
                 Err(TrySendError::Full(_)) => {
                     // Don't block — drop this update, the next keyframe will catch up.
                     // The preview state from prediction is good enough.
-                    drop(vio_runtime);
                     self.update_last_pose_from_vio_state(cam_from_body, &deferred_preview_state);
                     return Ok(());
                 }
@@ -2201,10 +2464,8 @@ impl SlamTracker {
             )
             .map_err(|err| TrackerError::Vio(err.to_string()))?;
         let exported_odometry = vio_runtime.local_vio.drain_exported_odometry();
-        vio_runtime.predicted_preintegration = None;
         let fallback_state = estimate.state().clone();
-        vio_runtime.predicted_state = Some(fallback_state.clone());
-        drop(vio_runtime);
+        vio_runtime.set_pending_imu_base_state(fallback_state.clone());
         self.update_last_pose_from_vio_state(cam_from_body, &fallback_state);
         self.apply_vio_odometry(exported_odometry);
         return Ok(());
@@ -2420,15 +2681,18 @@ impl SlamTracker {
                         pose_world.cam_from_map_pose32(),
                         measurement,
                     );
-                    let translation_m =
-                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-                    let rotation_deg =
-                        (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
-                            .sqrt()
-                            .to_degrees();
-                    eprintln!(
-                        "vio pose delta translation_m={translation_m:.3} rotation_deg={rotation_deg:.3}"
-                    );
+                    if delta.iter().all(|value| value.is_finite()) {
+                        let translation_m =
+                            (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])
+                                .sqrt();
+                        let rotation_deg =
+                            (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
+                                .sqrt()
+                                .to_degrees();
+                        eprintln!(
+                            "vio pose delta translation_m={translation_m:.3} rotation_deg={rotation_deg:.3}"
+                        );
+                    }
                 }
             }
         }
@@ -3203,6 +3467,8 @@ impl SlamTracker {
         let mut keyframe_status = None;
         let mut triangulation_stats = None;
         let mut ba_result = None;
+        #[cfg(feature = "vio")]
+        let mut vio_measurement_consumed = false;
 
         let keyframe_decision =
             self.config
@@ -3250,6 +3516,10 @@ impl SlamTracker {
                 Some(shared),
                 Some(tracked_observations.observations.clone()),
             ) {
+                #[cfg(feature = "vio")]
+                {
+                    vio_measurement_consumed = true;
+                }
                 keyframe_status = Some(KeyframeStatus::Created);
                 triangulation_stats = keyframe_output.diagnostics.triangulation;
                 ba_result = keyframe_output.diagnostics.ba_result.clone();
@@ -3369,6 +3639,10 @@ impl SlamTracker {
             &inlier_observations,
             self.frontend.intrinsics(),
         );
+        #[cfg(feature = "vio")]
+        if !vio_measurement_consumed {
+            self.correct_predicted_pose_from_visual_measurement(pose_world)?;
+        }
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.inlier_ratio =
@@ -3820,7 +4094,10 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "vio")]
-    use crate::MapFromOdom;
+    use crate::{
+        Gravity, ImuAccumulator, ImuBatch, ImuBias, ImuNoiseModel, ImuSample, LocalVio,
+        MapFromOdom, NavState, PreintegratedImu, VioConfig,
+    };
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
@@ -4072,6 +4349,87 @@ mod tests {
         let kp_b = map.keyframe_keypoint(kf_b, 0).expect("kp b");
         map.add_observation(point_id, kp_b).expect("shared obs");
         (map, kf_a, kf_b)
+    }
+
+    #[cfg(feature = "vio")]
+    fn make_test_imu_batch(samples: &[(i64, [f64; 3], [f64; 3])]) -> ImuBatch {
+        ImuBatch::new(
+            samples
+                .iter()
+                .map(|(timestamp, accel, gyro)| {
+                    ImuSample::new(Timestamp::from_nanos(*timestamp), *accel, *gyro)
+                        .expect("imu sample")
+                })
+                .collect(),
+        )
+        .expect("imu batch")
+    }
+
+    #[cfg(feature = "vio")]
+    fn make_test_vio_runtime(gravity: Gravity) -> VioRuntime {
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 300.0, 300.0, 160.0, 120.0)
+                .expect("intrinsics");
+        let noise = ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise");
+        VioRuntime {
+            local_vio: LocalVio::new(
+                VioConfig::new(5).expect("vio config"),
+                gravity,
+                Pose64::identity(),
+                intrinsics,
+            ),
+            worker: None,
+            camera_from_body: Pose64::identity(),
+            gravity_magnitude_mps2: gravity.magnitude_mps2(),
+            gravity_aligned: true,
+            noise,
+            pending_imu: ImuAccumulator::new(),
+            pending_imu_base_state: None,
+            predicted_state: None,
+            preview_imu_end_time: None,
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    fn assert_nav_state_close(actual: &NavState, expected: &NavState) {
+        let actual_pose = actual.pose_odom_from_body().to_pose32();
+        let expected_pose = expected.pose_odom_from_body().to_pose32();
+        for axis in 0..3 {
+            assert!(
+                (actual_pose.translation()[axis] - expected_pose.translation()[axis]).abs() < 1e-6,
+                "translation axis {axis}: actual={} expected={}",
+                actual_pose.translation()[axis],
+                expected_pose.translation()[axis]
+            );
+            assert!(
+                (actual.velocity_odom_mps()[axis] - expected.velocity_odom_mps()[axis]).abs()
+                    < 1e-9,
+                "velocity axis {axis}: actual={} expected={}",
+                actual.velocity_odom_mps()[axis],
+                expected.velocity_odom_mps()[axis]
+            );
+            assert!(
+                (actual.bias().accel[axis] - expected.bias().accel[axis]).abs() < 1e-12,
+                "accel bias axis {axis}: actual={} expected={}",
+                actual.bias().accel[axis],
+                expected.bias().accel[axis]
+            );
+            assert!(
+                (actual.bias().gyro[axis] - expected.bias().gyro[axis]).abs() < 1e-12,
+                "gyro bias axis {axis}: actual={} expected={}",
+                actual.bias().gyro[axis],
+                expected.bias().gyro[axis]
+            );
+            for col in 0..3 {
+                assert!(
+                    (actual_pose.rotation()[axis][col] - expected_pose.rotation()[axis][col]).abs()
+                        < 1e-6,
+                    "rotation[{axis}][{col}]: actual={} expected={}",
+                    actual_pose.rotation()[axis][col],
+                    expected_pose.rotation()[axis][col]
+                );
+            }
+        }
     }
 
     fn make_forced_panic_event(
@@ -5310,6 +5668,257 @@ mod tests {
         assert_eq!(
             recovered.to_pose32().rotation(),
             cam_from_odom.to_pose32().rotation()
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_initial_velocity_seed_uses_latest_visual_keyframe_motion() {
+        let mut map = SlamMap::new();
+        let previous_pose_map = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 0.0, 0.0],
+        );
+        let current_pose_map = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [-2.0, 0.0, 0.0],
+        );
+        let previous_keyframe_id = map
+            .add_keyframe_from_detections(
+                make_test_detections(1).as_ref(),
+                Timestamp::from_nanos(0),
+                previous_pose_map,
+            )
+            .expect("previous keyframe");
+        let current_keyframe_id = map
+            .add_keyframe_from_detections(
+                make_test_detections(2).as_ref(),
+                Timestamp::from_nanos(2_000_000_000),
+                current_pose_map,
+            )
+            .expect("current keyframe");
+        assert_ne!(previous_keyframe_id, current_keyframe_id);
+
+        let current_pose_odom_from_body = pose_odom_from_body_from_camera_pose(
+            Pose64::from_pose32(current_pose_map),
+            Pose64::identity(),
+        );
+        let velocity = estimate_initial_velocity_from_visual_keyframes(
+            &map,
+            &MapFromOdom::identity(),
+            current_keyframe_id,
+            current_pose_odom_from_body,
+            Pose64::identity(),
+        )
+        .expect("velocity seed");
+
+        assert!((velocity[0] - 1.0).abs() < 1e-9, "vx={}", velocity[0]);
+        assert!(velocity[1].abs() < 1e-9, "vy={}", velocity[1]);
+        assert!(velocity[2].abs() < 1e-9, "vz={}", velocity[2]);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn stationary_imu_stats_average_stationary_gyro_bias() {
+        let batch = make_test_imu_batch(&[
+            (0, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (10_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (20_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (30_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (40_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (50_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (60_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (70_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (80_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (90_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (100_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (110_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (120_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (130_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (140_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (150_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (160_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (170_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (180_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (190_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (200_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (210_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (220_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (230_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (240_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (250_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (260_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (270_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (280_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (290_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (300_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (310_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (320_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (330_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (340_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (350_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (360_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (370_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (380_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+            (390_000_000, [0.0, 0.0, 9.81], [0.01, -0.02, 0.03]),
+        ]);
+        let stats = stationary_imu_stats(&batch, 9.81).expect("stationary stats");
+        for axis in 0..3 {
+            assert!((stats.mean_accel_body[axis] - [0.0, 0.0, 9.81][axis]).abs() < 1e-9);
+            assert!((stats.mean_gyro_body[axis] - [0.01, -0.02, 0.03][axis]).abs() < 1e-9);
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_pending_imu_base_state_stays_authoritative_over_preview_state() {
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let mut runtime = make_test_vio_runtime(gravity);
+        let base_state =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
+        runtime.set_pending_imu_base_state(base_state.clone());
+
+        let mut delta = [0.0_f64; 15];
+        delta[2] = -1.0;
+        let preview_state = base_state.retract(&delta);
+        runtime.predicted_state = Some(preview_state);
+
+        let authoritative = runtime
+            .state_for_pending_imu()
+            .expect("pending imu base state");
+        assert_nav_state_close(&authoritative, &base_state);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_preview_prediction_integrates_only_new_imu_since_last_preview() {
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let mut runtime = make_test_vio_runtime(gravity);
+        let base_state =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
+        runtime.set_pending_imu_base_state(base_state.clone());
+
+        // Accelerometer reads gravity plus a constant +1 m/s^2 body-z acceleration.
+        let first_batch = make_test_imu_batch(&[
+            (0, [0.0, 0.0, 10.81], [0.0; 3]),
+            (10_000_000, [0.0, 0.0, 10.81], [0.0; 3]),
+        ]);
+        runtime
+            .pending_imu
+            .extend_batch(&first_batch)
+            .expect("extend batch");
+        let first_preview =
+            predict_preview_state_from_pending_imu(&mut runtime).expect("first preview");
+        assert!(first_preview.is_some());
+
+        runtime
+            .pending_imu
+            .extend_batch(&make_test_imu_batch(&[(
+                20_000_000,
+                [0.0, 0.0, 10.81],
+                [0.0; 3],
+            )]))
+            .expect("extend incremental batch");
+        let second_preview = predict_preview_state_from_pending_imu(&mut runtime)
+            .expect("second preview")
+            .expect("predicted state");
+
+        let pending = runtime
+            .pending_imu
+            .batch()
+            .expect("pending batch")
+            .expect("non-empty pending batch");
+        let full_preintegration =
+            PreintegratedImu::integrate(&pending, base_state.bias(), &runtime.noise)
+                .expect("full preintegration");
+        let expected_preview = runtime
+            .local_vio
+            .predict_state(&base_state, &full_preintegration);
+        assert_nav_state_close(&second_preview, &expected_preview);
+        assert_eq!(
+            runtime.preview_imu_end_time,
+            Some(Timestamp::from_nanos(20_000_000))
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_visual_measurement_correction_updates_preview_without_advancing_pending_base() {
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let mut runtime = make_test_vio_runtime(gravity);
+        let keyframe_id = SlamMap::new()
+            .add_keyframe_from_detections(
+                make_test_detections(1).as_ref(),
+                Timestamp::from_nanos(0),
+                Pose::identity(),
+            )
+            .expect("keyframe");
+        let base_state =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
+        runtime
+            .local_vio
+            .initialize(
+                keyframe_id,
+                base_state.clone(),
+                Pose64::identity(),
+                Vec::new(),
+            )
+            .expect("initialize local vio");
+        runtime.set_pending_imu_base_state(base_state.clone());
+
+        let batch = make_test_imu_batch(&[
+            (0, [1.0, 0.0, 9.81], [0.0; 3]),
+            (100_000_000, [1.0, 0.0, 9.81], [0.0; 3]),
+            (200_000_000, [1.0, 0.0, 9.81], [0.0; 3]),
+        ]);
+        runtime
+            .pending_imu
+            .extend_batch(&batch)
+            .expect("extend batch");
+
+        let pending = runtime
+            .pending_imu
+            .batch()
+            .expect("pending batch")
+            .expect("non-empty pending batch");
+        let preintegrated =
+            PreintegratedImu::integrate(&pending, base_state.bias(), &runtime.noise)
+                .expect("preintegrated");
+        let preview_state = runtime.local_vio.predict_state(&base_state, &preintegrated);
+        runtime.predicted_state = Some(preview_state.clone());
+        runtime.preview_imu_end_time = Some(pending.end_time());
+
+        let corrected_state = correct_predicted_state_from_visual_measurement(
+            &mut runtime,
+            &MapFromOdom::identity(),
+            Pose::identity(),
+        )
+        .expect("correct preview")
+        .expect("corrected state");
+
+        assert!(
+            corrected_state.pose_odom_from_body().translation()[0].abs()
+                < preview_state.pose_odom_from_body().translation()[0].abs(),
+            "corrected_x={} preview_x={}",
+            corrected_state.pose_odom_from_body().translation()[0],
+            preview_state.pose_odom_from_body().translation()[0]
+        );
+        assert_nav_state_close(
+            &runtime
+                .state_for_pending_imu()
+                .expect("authoritative pending base state"),
+            &base_state,
+        );
+        assert_nav_state_close(
+            runtime
+                .predicted_state
+                .as_ref()
+                .expect("updated predicted state"),
+            &corrected_state,
+        );
+        assert_eq!(
+            runtime.preview_imu_end_time,
+            Some(Timestamp::from_nanos(200_000_000))
         );
     }
 }

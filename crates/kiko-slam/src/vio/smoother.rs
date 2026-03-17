@@ -4,8 +4,9 @@ use std::num::NonZeroUsize;
 use crate::map::KeyframeId;
 use crate::math::{mat_mul_f64, mat_mul_vec_f64};
 use crate::{
-    bias_random_walk_residual, pose_prior_residual, reprojection_residual, Gravity, ImuFactor,
-    MapFromOdom, NavState, NavTangent, PinholeIntrinsics, Pose64, PreintegratedImu, VioObservation,
+    Gravity, ImuFactor, MapFromOdom, NavState, NavTangent, PinholeIntrinsics, Pose64,
+    PreintegratedImu, VioObservation, bias_random_walk_residual, pose_prior_residual,
+    reprojection_residual,
 };
 
 const STATE_DIM: usize = 15;
@@ -13,6 +14,9 @@ const IMU_RESIDUAL_DIM: usize = 9;
 const POSE_PRIOR_RESIDUAL_DIM: usize = 6;
 const REPROJECTION_RESIDUAL_DIM: usize = 2;
 const BIAS_RW_RESIDUAL_DIM: usize = 6;
+const ANCHOR_POSE_INFORMATION: f64 = 1.0e6;
+const ANCHOR_VELOCITY_INFORMATION: f64 = 10.0;
+const ANCHOR_BIAS_INFORMATION: f64 = 1.0;
 type StateMatrix = [[f64; STATE_DIM]; STATE_DIM];
 type BoundaryHessianBlocks = (StateMatrix, StateMatrix, StateMatrix, StateMatrix);
 
@@ -21,6 +25,7 @@ pub struct VioConfig {
     window_size: NonZeroUsize,
     max_iterations: NonZeroUsize,
     pose_prior_weight: f64,
+    velocity_prior_weight: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +60,7 @@ impl VioConfig {
             window_size,
             max_iterations: NonZeroUsize::new(4).expect("non-zero default"),
             pose_prior_weight: 100.0,
+            velocity_prior_weight: 0.0,
         })
     }
 
@@ -68,6 +74,15 @@ impl VioConfig {
 
     pub fn pose_prior_weight(self) -> f64 {
         self.pose_prior_weight
+    }
+
+    pub fn velocity_prior_weight(self) -> f64 {
+        self.velocity_prior_weight
+    }
+
+    pub fn with_velocity_prior_weight(mut self, weight: f64) -> Self {
+        self.velocity_prior_weight = weight.max(0.0);
+        self
     }
 
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Result<Self, VioConfigError> {
@@ -268,11 +283,7 @@ impl LocalVio {
         })
     }
 
-    pub fn predict_state(
-        &self,
-        state: &NavState,
-        preintegrated: &PreintegratedImu,
-    ) -> NavState {
+    pub fn predict_state(&self, state: &NavState, preintegrated: &PreintegratedImu) -> NavState {
         propagate_state(state, preintegrated, self.gravity)
     }
 
@@ -461,6 +472,39 @@ impl LocalVio {
                 &bias_weights,
             );
 
+            // Visual velocity prior: constrain velocity from consecutive pose
+            // measurements so velocity doesn't drift unchecked.
+            {
+                let dt = preintegrated.dt_seconds.max(1e-3);
+                let p_prev = frames[0].pose_measurement_odom.translation();
+                let p_curr = frames[1].pose_measurement_odom.translation();
+                let visual_vel = [
+                    (p_curr[0] - p_prev[0]) / dt,
+                    (p_curr[1] - p_prev[1]) / dt,
+                    (p_curr[2] - p_prev[2]) / dt,
+                ];
+                let state_vel = frames[1].state.velocity_odom_mps();
+                let vel_residual = [
+                    state_vel[0] - visual_vel[0],
+                    state_vel[1] - visual_vel[1],
+                    state_vel[2] - visual_vel[2],
+                ];
+                let vel_jac =
+                    numerical_velocity_prior_jacobian(&frames, 1, visual_vel);
+                let vel_weight = self.config.velocity_prior_weight();
+                if vel_weight > 0.0 {
+                    accumulate_self(
+                        &mut h,
+                        &mut b,
+                        STATE_DIM,
+                        0,
+                        &vel_jac,
+                        &vel_residual,
+                        &[vel_weight; 3],
+                    );
+                }
+            }
+
             for observation in frames[1].visual_observations.iter().copied() {
                 let residual = match reprojection_residual(
                     &frames[1].state,
@@ -498,8 +542,19 @@ impl LocalVio {
                 return state;
             };
             let step_norm = delta.iter().map(|value| value * value).sum::<f64>().sqrt();
+            const MAX_STEP_NORM: f64 = 2.0;
+            let scale = if step_norm > MAX_STEP_NORM {
+                MAX_STEP_NORM / step_norm
+            } else {
+                1.0
+            };
             let mut tangent = [0.0_f64; STATE_DIM];
             tangent.copy_from_slice(&delta[..STATE_DIM]);
+            if scale < 1.0 {
+                for t in &mut tangent {
+                    *t *= scale;
+                }
+            }
             state = state.retract(&tangent);
             if step_norm < 1e-8 {
                 break;
@@ -551,6 +606,45 @@ impl LocalVio {
                     &residual,
                     &pose_prior_weights,
                 );
+
+                // Visual velocity prior: estimate velocity from consecutive pose
+                // measurements. This makes velocity observable from visual data,
+                // preventing unbounded drift when IMU biases aren't yet estimated.
+                if frame_idx > 0 {
+                    if let Some(prev_preint) =
+                        frames[frame_idx].preintegrated_from_prev.as_ref()
+                    {
+                        let dt = prev_preint.dt_seconds.max(1e-3);
+                        let p_prev = frames[frame_idx - 1].pose_measurement_odom.translation();
+                        let p_curr = frames[frame_idx].pose_measurement_odom.translation();
+                        let visual_vel = [
+                            (p_curr[0] - p_prev[0]) / dt,
+                            (p_curr[1] - p_prev[1]) / dt,
+                            (p_curr[2] - p_prev[2]) / dt,
+                        ];
+                        let state_vel = frames[frame_idx].state.velocity_odom_mps();
+                        let vel_residual = [
+                            state_vel[0] - visual_vel[0],
+                            state_vel[1] - visual_vel[1],
+                            state_vel[2] - visual_vel[2],
+                        ];
+                        let vel_jac = numerical_velocity_prior_jacobian(
+                            frames, frame_idx, visual_vel,
+                        );
+                        let vel_weight = self.config.velocity_prior_weight();
+                        if vel_weight > 0.0 {
+                            accumulate_self(
+                                &mut h,
+                                &mut b,
+                                dim,
+                                frame_base(frame_idx),
+                                &vel_jac,
+                                &vel_residual,
+                                &[vel_weight; 3],
+                            );
+                        }
+                    }
+                }
 
                 let Some(preintegrated) = frames[frame_idx].preintegrated_from_prev.as_ref() else {
                     continue;
@@ -725,7 +819,11 @@ impl MarginalPrior {
     fn anchor(applies_to: KeyframeId, reference: NavState) -> Self {
         let mut information = [[0.0_f64; STATE_DIM]; STATE_DIM];
         for (axis, row) in information.iter_mut().enumerate().take(STATE_DIM) {
-            row[axis] = 1.0e6;
+            row[axis] = match axis {
+                0..=5 => ANCHOR_POSE_INFORMATION,
+                6..=8 => ANCHOR_VELOCITY_INFORMATION,
+                _ => ANCHOR_BIAS_INFORMATION,
+            };
         }
         Self {
             applies_to,
@@ -1037,6 +1135,26 @@ fn numerical_pose_prior_jacobian(
         );
         for row in 0..POSE_PRIOR_RESIDUAL_DIM {
             jacobian[row][axis] = (plus[row] - minus[row]) / (2.0 * 1e-6);
+        }
+    }
+    jacobian
+}
+
+fn numerical_velocity_prior_jacobian(
+    frames: &[VioFrame],
+    frame_idx: usize,
+    visual_velocity: [f64; 3],
+) -> [[f64; STATE_DIM]; 3] {
+    let mut jacobian = [[0.0_f64; STATE_DIM]; 3];
+    for axis in 0..STATE_DIM {
+        let delta = tangent_axis(axis, 1e-6);
+        let plus_vel = frames[frame_idx].state.retract(&delta).velocity_odom_mps();
+        let minus_vel = frames[frame_idx]
+            .state
+            .retract(&neg_tangent(delta))
+            .velocity_odom_mps();
+        for row in 0..3 {
+            jacobian[row][axis] = (plus_vel[row] - minus_vel[row]) / (2.0 * 1e-6);
         }
     }
     jacobian
@@ -1579,7 +1697,7 @@ mod tests {
     #[test]
     fn local_vio_requires_initialization() {
         let mut vio = LocalVio::new(
-            VioConfig::new(3).expect("config"),
+            VioConfig::new(3).expect("config").with_velocity_prior_weight(0.0),
             Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity"),
             Pose64::identity(),
             intrinsics(),
@@ -1919,17 +2037,34 @@ mod tests {
         let latest_bias = latest.state().bias();
         for axis in 0..3 {
             assert!(
-                (latest_bias.accel[axis] - bias.accel[axis]).abs() < 1e-5,
+                (latest_bias.accel[axis] - bias.accel[axis]).abs() < 5e-4,
                 "accel bias axis {axis} drifted: {} vs {}",
                 latest_bias.accel[axis],
                 bias.accel[axis]
             );
             assert!(
-                (latest_bias.gyro[axis] - bias.gyro[axis]).abs() < 1e-6,
+                (latest_bias.gyro[axis] - bias.gyro[axis]).abs() < 5e-5,
                 "gyro bias axis {axis} drifted: {} vs {}",
                 latest_bias.gyro[axis],
                 bias.gyro[axis]
             );
+        }
+    }
+
+    #[test]
+    fn anchor_prior_is_pose_dominant_without_clamping_dynamic_state() {
+        let prior = MarginalPrior::anchor(
+            keyframe_ids(1)[0],
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state"),
+        );
+        for axis in 0..6 {
+            assert_eq!(prior.information[axis][axis], ANCHOR_POSE_INFORMATION);
+        }
+        for axis in 6..9 {
+            assert_eq!(prior.information[axis][axis], ANCHOR_VELOCITY_INFORMATION);
+        }
+        for axis in 9..STATE_DIM {
+            assert_eq!(prior.information[axis][axis], ANCHOR_BIAS_INFORMATION);
         }
     }
 }

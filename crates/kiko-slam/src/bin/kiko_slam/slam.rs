@@ -8,7 +8,7 @@ use kiko_slam::{
 };
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs};
-use crate::config::{build_rectified_stereo_config, build_tracker_config, TrackerDefaults};
+use crate::config::{TrackerDefaults, build_rectified_stereo_config, build_tracker_config};
 use crate::rerun_recording;
 
 const SLAM_ENV_HELP: &str = "\

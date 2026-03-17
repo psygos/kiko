@@ -65,7 +65,9 @@ pub fn rerun_recording(
     } else if args.rerun_serve {
         let port = args.rerun_port;
         eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
-        eprintln!("rerun: on your laptop run:  rerun --connect rerun+http://192.168.50.2:{port}/proxy");
+        eprintln!(
+            "rerun: on your laptop run:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
+        );
         let rec = rerun::RecordingStreamBuilder::new(name).serve_grpc_opts(
             "0.0.0.0",
             port,
@@ -277,7 +279,10 @@ mod tests {
         )
         .expect("tracker config");
 
-        assert!(matches!(config.loop_subsystem, LoopSubsystemConfig::Disabled));
+        assert!(matches!(
+            config.loop_subsystem,
+            LoopSubsystemConfig::Disabled
+        ));
 
         for (key, value) in saved {
             restore_env(&key, value);

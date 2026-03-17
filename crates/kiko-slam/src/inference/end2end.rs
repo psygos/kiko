@@ -52,8 +52,7 @@ impl End2EndPipeline {
         crate::preprocess::normalise_into(left.data(), &mut self.scratch[..pixels])?;
         crate::preprocess::normalise_into(right.data(), &mut self.scratch[pixels..])?;
 
-        let input_tensor =
-            TensorRef::from_array_view(([2, 1, h, w], self.scratch.as_slice()))?;
+        let input_tensor = TensorRef::from_array_view(([2, 1, h, w], self.scratch.as_slice()))?;
 
         let start = Instant::now();
         let outputs = super::run_with_watchdog("pipeline", || {
@@ -64,33 +63,36 @@ impl End2EndPipeline {
         let total = start.elapsed();
 
         // Parse keypoints: [batch_size, max_keypoints, 2] dtype=i64
-        let kpts_value = outputs
-            .get("keypoints")
-            .ok_or_else(|| InferenceError::UnexpectedOutput {
-                name: "keypoints".to_string(),
-                expected: "named output tensor".to_string(),
-                actual: "missing output".to_string(),
-            })?;
+        let kpts_value =
+            outputs
+                .get("keypoints")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
+                    name: "keypoints".to_string(),
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?;
         let kpts_data = kpts_value.try_extract_tensor::<i64>()?.1.to_vec();
 
         // Parse matches: [N, 3] dtype=i64 — (batch_idx, left_idx, right_idx)
-        let matches_value = outputs
-            .get("matches")
-            .ok_or_else(|| InferenceError::UnexpectedOutput {
-                name: "matches".to_string(),
-                expected: "named output tensor".to_string(),
-                actual: "missing output".to_string(),
-            })?;
+        let matches_value =
+            outputs
+                .get("matches")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
+                    name: "matches".to_string(),
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?;
         let matches_data = matches_value.try_extract_tensor::<i64>()?.1.to_vec();
 
         // Parse scores: [N] dtype=f32
-        let scores_value = outputs
-            .get("mscores")
-            .ok_or_else(|| InferenceError::UnexpectedOutput {
-                name: "mscores".to_string(),
-                expected: "named output tensor".to_string(),
-                actual: "missing output".to_string(),
-            })?;
+        let scores_value =
+            outputs
+                .get("mscores")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
+                    name: "mscores".to_string(),
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?;
         let scores_data = scores_value.try_extract_tensor::<f32>()?.1.to_vec();
 
         // Build keypoints for left (batch=0) and right (batch=1)
@@ -156,8 +158,8 @@ impl End2EndPipeline {
             match_scores.push(score);
         }
 
-        let matches =
-            Matches::new(left_det, right_det, indices, match_scores).map_err(InferenceError::Match)?;
+        let matches = Matches::new(left_det, right_det, indices, match_scores)
+            .map_err(InferenceError::Match)?;
 
         Ok((matches, End2EndTimings { total }))
     }

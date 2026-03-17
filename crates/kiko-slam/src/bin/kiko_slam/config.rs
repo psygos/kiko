@@ -142,9 +142,12 @@ fn build_vio_config_from_env() -> Result<Option<VioConfig>, Box<dyn std::error::
     let max_iterations = env_usize("KIKO_VIO_MAX_ITERS").unwrap_or(DEFAULT_VIO_MAX_ITERS);
     let pose_prior_weight =
         env_f32("KIKO_VIO_POSE_PRIOR_WEIGHT").unwrap_or(DEFAULT_VIO_POSE_PRIOR_WEIGHT as f32);
+    let velocity_prior_weight =
+        env_f32("KIKO_VIO_VELOCITY_PRIOR_WEIGHT").unwrap_or(10.0);
     let config = VioConfig::new(window)?
         .with_max_iterations(max_iterations)?
-        .with_pose_prior_weight(f64::from(pose_prior_weight))?;
+        .with_pose_prior_weight(f64::from(pose_prior_weight))?
+        .with_velocity_prior_weight(f64::from(velocity_prior_weight));
     Ok(Some(config))
 }
 

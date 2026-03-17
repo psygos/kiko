@@ -410,6 +410,24 @@ impl ImuAccumulator {
         ImuBatch::new(self.samples.clone()).map(Some)
     }
 
+    pub fn batch_from(
+        &self,
+        start_inclusive: Timestamp,
+    ) -> Result<Option<ImuBatch>, ImuBatchError> {
+        if self.samples.is_empty() {
+            return Ok(None);
+        }
+        let start = self
+            .samples
+            .iter()
+            .position(|sample| sample.timestamp().as_nanos() >= start_inclusive.as_nanos())
+            .unwrap_or(self.samples.len());
+        if start >= self.samples.len() {
+            return Ok(None);
+        }
+        ImuBatch::new(self.samples[start..].to_vec()).map(Some)
+    }
+
     /// Return only the most recent `max_samples` for lightweight prediction.
     pub fn recent_batch(&self, max_samples: usize) -> Result<Option<ImuBatch>, ImuBatchError> {
         if self.samples.is_empty() {
@@ -585,9 +603,12 @@ mod tests {
         ])
         .expect("batch");
         accumulator.extend_batch(&first).expect("extend 1");
-        let second = ImuBatch::new(vec![
-            ImuSample::new(Timestamp::from_nanos(30), [0.0; 3], [0.0; 3]).expect("sample 2"),
-        ])
+        let second = ImuBatch::new(vec![ImuSample::new(
+            Timestamp::from_nanos(30),
+            [0.0; 3],
+            [0.0; 3],
+        )
+        .expect("sample 2")])
         .expect("batch");
         accumulator.extend_batch(&second).expect("extend 2");
         assert_eq!(accumulator.len(), 3);
@@ -603,17 +624,22 @@ mod tests {
     #[test]
     fn imu_accumulator_rejects_out_of_order_extension() {
         let mut accumulator = ImuAccumulator::new();
-        let batch = ImuBatch::new(vec![
-            ImuSample::new(Timestamp::from_nanos(20), [0.0; 3], [0.0; 3]).expect("sample 0"),
-        ])
+        let batch = ImuBatch::new(vec![ImuSample::new(
+            Timestamp::from_nanos(20),
+            [0.0; 3],
+            [0.0; 3],
+        )
+        .expect("sample 0")])
         .expect("batch");
         accumulator.extend_batch(&batch).expect("first extend");
         let err = accumulator
             .extend_batch(
-                &ImuBatch::new(vec![
-                    ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3])
-                        .expect("sample 1"),
-                ])
+                &ImuBatch::new(vec![ImuSample::new(
+                    Timestamp::from_nanos(10),
+                    [0.0; 3],
+                    [0.0; 3],
+                )
+                .expect("sample 1")])
                 .expect("batch"),
             )
             .expect_err("out-of-order extension should fail");
@@ -624,5 +650,36 @@ mod tests {
                 current: Timestamp::from_nanos(10),
             }
         );
+    }
+
+    #[test]
+    fn imu_accumulator_batch_from_returns_suffix_starting_at_timestamp() {
+        let mut accumulator = ImuAccumulator::new();
+        let batch = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3]).expect("sample 0"),
+            ImuSample::new(Timestamp::from_nanos(20), [0.0; 3], [0.0; 3]).expect("sample 1"),
+            ImuSample::new(Timestamp::from_nanos(30), [0.0; 3], [0.0; 3]).expect("sample 2"),
+        ])
+        .expect("batch");
+        accumulator.extend_batch(&batch).expect("extend");
+
+        let suffix = accumulator
+            .batch_from(Timestamp::from_nanos(20))
+            .expect("suffix batch")
+            .expect("non-empty suffix");
+        assert_eq!(suffix.start_time(), Timestamp::from_nanos(20));
+        assert_eq!(suffix.end_time(), Timestamp::from_nanos(30));
+
+        let tail = accumulator
+            .batch_from(Timestamp::from_nanos(30))
+            .expect("tail batch")
+            .expect("single-sample tail");
+        assert_eq!(tail.start_time(), Timestamp::from_nanos(30));
+        assert_eq!(tail.end_time(), Timestamp::from_nanos(30));
+
+        assert!(accumulator
+            .batch_from(Timestamp::from_nanos(40))
+            .expect("empty suffix")
+            .is_none());
     }
 }

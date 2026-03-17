@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    format, read_calibration, read_manifest, read_meta, scan_frames, Calibration, DatasetError,
-    FrameInfo, Manifest,
+    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
+    read_meta, scan_frames,
 };
 
 #[derive(Debug)]
@@ -768,12 +768,9 @@ mod tests {
         writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
         writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
         writer.write_imu(
-            &ImuBatch::new(vec![ImuSample::new(
-                Timestamp::from_nanos(101),
-                [0.0; 3],
-                [0.0; 3],
-            )
-            .expect("imu 0")])
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(101), [0.0; 3], [0.0; 3]).expect("imu 0"),
+            ])
             .expect("imu batch"),
         );
 

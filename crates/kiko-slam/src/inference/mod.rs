@@ -135,8 +135,11 @@ pub(super) fn run_with_watchdog<T>(
 ) -> Result<T, InferenceError> {
     let start = Instant::now();
     let result = run();
-    let warn_ms = env_usize("KIKO_ORT_RUN_WARN_MS")
-        .unwrap_or(if cfg!(target_vendor = "apple") { 300 } else { 200 });
+    let warn_ms = env_usize("KIKO_ORT_RUN_WARN_MS").unwrap_or(if cfg!(target_vendor = "apple") {
+        300
+    } else {
+        200
+    });
     let warn_after = Duration::from_millis(warn_ms as u64);
     let elapsed = start.elapsed();
     if elapsed > warn_after {

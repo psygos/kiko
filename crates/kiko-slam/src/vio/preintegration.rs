@@ -147,16 +147,20 @@ impl PreintegratedImu {
     }
 
     pub fn bias_random_walk_information_diag(&self) -> [f64; 6] {
+        // Keep bias random-walk regularization comparable to the other VIO terms.
+        // Without this floor, short IMU intervals produce enormous information that
+        // effectively hard-locks the initial bias estimate.
+        const MIN_VARIANCE: f64 = 1e-2;
         let dt = self.dt_seconds.max(1e-12);
         let accel_variance = self.noise.accel_random_walk() * self.noise.accel_random_walk() * dt;
         let gyro_variance = self.noise.gyro_random_walk() * self.noise.gyro_random_walk() * dt;
         [
-            1.0 / accel_variance.max(1e-12),
-            1.0 / accel_variance.max(1e-12),
-            1.0 / accel_variance.max(1e-12),
-            1.0 / gyro_variance.max(1e-12),
-            1.0 / gyro_variance.max(1e-12),
-            1.0 / gyro_variance.max(1e-12),
+            1.0 / accel_variance.max(MIN_VARIANCE),
+            1.0 / accel_variance.max(MIN_VARIANCE),
+            1.0 / accel_variance.max(MIN_VARIANCE),
+            1.0 / gyro_variance.max(MIN_VARIANCE),
+            1.0 / gyro_variance.max(MIN_VARIANCE),
+            1.0 / gyro_variance.max(MIN_VARIANCE),
         ]
     }
 }
@@ -416,7 +420,21 @@ mod tests {
         let short_info = short.bias_random_walk_information_diag();
         let long_info = long.bias_random_walk_information_diag();
         for axis in 0..6 {
-            assert!(short_info[axis] > long_info[axis]);
+            assert!(short_info[axis] >= long_info[axis]);
+        }
+    }
+
+    #[test]
+    fn bias_random_walk_information_is_capped() {
+        let preintegrated = PreintegratedImu::integrate(
+            &batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]),
+            &ImuBias::default(),
+            &noise(),
+        )
+        .expect("preintegrated");
+        for value in preintegrated.bias_random_walk_information_diag() {
+            assert!(value <= 100.0);
+            assert!(value.is_finite() && value > 0.0);
         }
     }
 

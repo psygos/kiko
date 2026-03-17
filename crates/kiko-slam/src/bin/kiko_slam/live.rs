@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -8,11 +8,11 @@ use clap::Args;
 
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
-    bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch, CalibrationBundle,
-    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity, DepthImage,
-    DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId, ImuBatch,
-    ImuSample, PairingDropReason, PairingOutcome, Point3, Raw, RerunSink, SendOutcome, SensorId,
-    SlamTracker, StereoPairer, SystemHealth, TrackingPose, VizPacket,
+    CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
+    DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
+    ImuBatch, ImuSample, PairingDropReason, PairingOutcome, Point3, Raw, RerunSink, SendOutcome,
+    SensorId, SlamTracker, StereoPairer, SystemHealth, TrackingPose, VizPacket, bounded_channel,
+    oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
 use oak_sys::{
@@ -20,12 +20,12 @@ use oak_sys::{
 };
 
 use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, RerunArgs};
-use crate::config::{build_tracker_config, TrackerDefaults};
-use crate::rerun_recording;
+use crate::config::{TrackerDefaults, build_tracker_config};
 use crate::record::{
     build_calibration, load_oak_read_timeout_ms, load_pairer_max_pending_per_side,
     load_pairing_window,
 };
+use crate::rerun_recording;
 
 #[derive(Args, Clone, Debug)]
 #[command(about = "Run live SLAM from OAK-D camera")]

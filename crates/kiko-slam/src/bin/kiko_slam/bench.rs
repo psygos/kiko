@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-use kiko_slam::dataset::DatasetReader;
 use kiko_slam::InferencePipeline;
+use kiko_slam::dataset::DatasetReader;
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig};
 
@@ -199,9 +199,13 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut end2end_pipeline = inference.end2end;
     let mut pipeline: Option<InferencePipeline> = if end2end_pipeline.is_none() {
         Some(
-            InferencePipeline::new(inference.superpoint, inference.lightglue, inference.key_limit)
-                .with_downscale(inference.downscale)
-                .with_stereo_superpoint_opt(inference.superpoint_right),
+            InferencePipeline::new(
+                inference.superpoint,
+                inference.lightglue,
+                inference.key_limit,
+            )
+            .with_downscale(inference.downscale)
+            .with_stereo_superpoint_opt(inference.superpoint_right),
         )
     } else {
         None
