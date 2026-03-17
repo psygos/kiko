@@ -97,7 +97,8 @@ impl From<VizError> for PipelineError {
 }
 
 pub struct InferencePipeline {
-    superpoint: SuperPoint,
+    superpoint_left: SuperPoint,
+    superpoint_right: Option<SuperPoint>,
     lightglue: LightGlue,
     max_keypoints: KeypointLimit,
     downscale: DownscaleFactor,
@@ -106,11 +107,22 @@ pub struct InferencePipeline {
 impl InferencePipeline {
     pub fn new(superpoint: SuperPoint, lightglue: LightGlue, max_keypoints: KeypointLimit) -> Self {
         Self {
-            superpoint,
+            superpoint_left: superpoint,
+            superpoint_right: None,
             lightglue,
             max_keypoints,
             downscale: DownscaleFactor::identity(),
         }
+    }
+
+    pub fn with_stereo_superpoint(mut self, right: SuperPoint) -> Self {
+        self.superpoint_right = Some(right);
+        self
+    }
+
+    pub fn with_stereo_superpoint_opt(mut self, right: Option<SuperPoint>) -> Self {
+        self.superpoint_right = right;
+        self
     }
 
     pub fn max_keypoints(&self) -> KeypointLimit {
@@ -140,19 +152,51 @@ impl InferencePipeline {
         let downscale = self.downscale;
         let max_keypoints = self.max_keypoints.get();
 
-        let left_start = Instant::now();
-        let left_det = self
-            .superpoint
-            .detect_with_downscale(&left_frame, downscale)?
-            .top_k(max_keypoints);
-        let left_time = left_start.elapsed();
+        let (left_det, left_time, right_det, right_time) =
+            if let Some(sp_right) = &mut self.superpoint_right {
+                // Parallel SP: run left and right on separate threads
+                let sp_left = &mut self.superpoint_left;
+                std::thread::scope(|s| {
+                    let left_handle = s.spawn(|| {
+                        let start = Instant::now();
+                        let det = sp_left
+                            .detect_with_downscale(&left_frame, downscale)
+                            .map(|d| d.top_k(max_keypoints));
+                        (det, start.elapsed())
+                    });
+                    let right_handle = s.spawn(|| {
+                        let start = Instant::now();
+                        let det = sp_right
+                            .detect_with_downscale(&right_frame, downscale)
+                            .map(|d| d.top_k(max_keypoints));
+                        (det, start.elapsed())
+                    });
+                    let (left_result, lt) = left_handle
+                        .join()
+                        .map_err(|_| InferenceError::ThreadPanic { stage: "sp_left" })?;
+                    let (right_result, rt) = right_handle
+                        .join()
+                        .map_err(|_| InferenceError::ThreadPanic { stage: "sp_right" })?;
+                    Ok::<_, PipelineError>((left_result?, lt, right_result?, rt))
+                })?
+            } else {
+                // Sequential SP fallback
+                let left_start = Instant::now();
+                let left_det = self
+                    .superpoint_left
+                    .detect_with_downscale(&left_frame, downscale)?
+                    .top_k(max_keypoints);
+                let left_time = left_start.elapsed();
 
-        let right_start = Instant::now();
-        let right_det = self
-            .superpoint
-            .detect_with_downscale(&right_frame, downscale)?
-            .top_k(max_keypoints);
-        let right_time = right_start.elapsed();
+                let right_start = Instant::now();
+                let right_det = self
+                    .superpoint_left
+                    .detect_with_downscale(&right_frame, downscale)?
+                    .top_k(max_keypoints);
+                let right_time = right_start.elapsed();
+
+                (left_det, left_time, right_det, right_time)
+            };
 
         let left = Arc::new(left_det);
         let right = Arc::new(right_det);

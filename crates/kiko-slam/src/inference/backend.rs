@@ -200,7 +200,17 @@ fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> 
     {
         use ort::execution_providers::CUDAExecutionProvider;
 
-        let ep = CUDAExecutionProvider::default();
+        let ep = CUDAExecutionProvider::default()
+            .with_conv_algorithm_search(
+                ort::execution_providers::cuda::ConvAlgorithmSearch::Exhaustive,
+            )
+            .with_conv_max_workspace(true)
+            .with_tf32(true)
+            .with_attention_backend(
+                ort::execution_providers::cuda::AttentionBackend::FLASH_ATTENTION
+                    | ort::execution_providers::cuda::AttentionBackend::EFFICIENT_ATTENTION
+                    | ort::execution_providers::cuda::AttentionBackend::CUDNN_FLASH_ATTENTION,
+            );
         if !ep.supported_by_platform() {
             return Ok(None);
         }
@@ -221,7 +231,47 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
     {
         use ort::execution_providers::TensorRTExecutionProvider;
 
-        let ep = TensorRTExecutionProvider::default();
+        let cache_dir = std::env::var("KIKO_TRT_CACHE_DIR")
+            .unwrap_or_else(|_| "/home/makerspace/.cache/kiko-trt-engines".to_string());
+        let _ = std::fs::create_dir_all(&cache_dir);
+
+        // TRT profiles: only specify inputs that exist in the model being loaded.
+        // SuperPoint: image [1,1,H,W]
+        // LightGlue: kpts0/kpts1/desc0/desc1
+        // TRT ignores profile entries for inputs not in the current model.
+        //
+        // Use narrow ranges for better engine optimization.
+        // For downscale 2 (240×320): set opt to exact size for best kernel selection.
+        let ep = TensorRTExecutionProvider::default()
+            .with_fp16(true)
+            .with_engine_cache(true)
+            .with_engine_cache_path(&cache_dir)
+            .with_timing_cache(true)
+            .with_timing_cache_path(&cache_dir)
+            .with_build_heuristics(true)
+            .with_builder_optimization_level(5)
+            .with_detailed_build_log(true)
+            .with_dump_subgraphs(true)
+            // Profiles for all cross-boundary dynamic tensors in SP model.
+            // SP graph partitions at NonZero/Where/Gather ops (dynamic keypoint extraction).
+            .with_profile_min_shapes(
+                "image:1x1x240x320,\
+                 kpts0:1x1x2,kpts1:1x1x2,desc0:1x1x256,desc1:1x1x256,\
+                 /NonZero_output_0:3x1,/NonZero_1_output_0:1x1,\
+                 /Reshape_3_output_0:1,/Transpose_2_output_0:1x256",
+            )
+            .with_profile_max_shapes(
+                "image:1x1x480x640,\
+                 kpts0:1x256x2,kpts1:1x256x2,desc0:1x256x256,desc1:1x256x256,\
+                 /NonZero_output_0:3x4096,/NonZero_1_output_0:1x2048,\
+                 /Reshape_3_output_0:2048,/Transpose_2_output_0:2048x256",
+            )
+            .with_profile_opt_shapes(
+                "image:1x1x240x320,\
+                 kpts0:1x256x2,kpts1:1x256x2,desc0:1x256x256,desc1:1x256x256,\
+                 /NonZero_output_0:3x512,/NonZero_1_output_0:1x512,\
+                 /Reshape_3_output_0:512,/Transpose_2_output_0:512x256",
+            );
         if !ep.supported_by_platform() {
             return Ok(None);
         }

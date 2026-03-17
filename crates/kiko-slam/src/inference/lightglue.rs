@@ -56,68 +56,89 @@ impl LightGlue {
         let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), DESCRIPTOR_DIM], desc_0))?;
         let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), DESCRIPTOR_DIM], desc_1))?;
 
-        let outputs = super::run_with_watchdog("lightglue", || {
-            self.session
-                .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
-                .map_err(InferenceError::Execution)
-        })?;
-        let parsed = parse_match_outputs(&outputs)?;
-
         let mut indices = Vec::new();
         let mut scores = Vec::new();
-
-        for (i, &match_idx) in parsed.matches0.iter().enumerate() {
-            if match_idx < 0 {
-                continue;
-            }
-            let Some(&score) = parsed.mscores0.get(i) else {
-                return Err(InferenceError::UnexpectedOutput {
-                    name: "mscores0".to_string(),
-                    expected: format!("at least {} elements", parsed.matches0.len()),
-                    actual: format!("{} elements", parsed.mscores0.len()),
-                });
-            };
-            let right_idx =
-                usize::try_from(match_idx).map_err(|_| InferenceError::UnexpectedOutput {
+        {
+            let outputs = super::run_with_watchdog("lightglue", || {
+                self.session
+                    .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
+                    .map_err(InferenceError::Execution)
+            })?;
+            let matches_raw = outputs
+                .get("matches0")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
                     name: "matches0".to_string(),
-                    expected: "non-negative match indices".to_string(),
-                    actual: format!("index {match_idx}"),
-                })?;
-            indices.push((i, right_idx));
-            scores.push(score);
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?
+                .try_extract_tensor::<i64>()?;
+            let scores_raw = outputs
+                .get("mscores0")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
+                    name: "mscores0".to_string(),
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?
+                .try_extract_tensor::<f32>()?;
+            let matches_shape = matches_raw.0;
+            let matches_data = matches_raw.1;
+            let scores_data = scores_raw.1;
+
+            let is_pair_format = matches_shape.len() >= 2
+                && matches_shape[matches_shape.len() - 1] == 2;
+
+            if is_pair_format {
+                // Fused/TRT format: matches0 is [N, 2] with (left_idx, right_idx) pairs
+                let num_pairs = matches_data.len() / 2;
+                for i in 0..num_pairs {
+                    let left_idx =
+                        usize::try_from(matches_data[2 * i]).map_err(|_| {
+                            InferenceError::UnexpectedOutput {
+                                name: "matches0".to_string(),
+                                expected: "non-negative index".to_string(),
+                                actual: format!("index {}", matches_data[2 * i]),
+                            }
+                        })?;
+                    let right_idx =
+                        usize::try_from(matches_data[2 * i + 1]).map_err(|_| {
+                            InferenceError::UnexpectedOutput {
+                                name: "matches0".to_string(),
+                                expected: "non-negative index".to_string(),
+                                actual: format!("index {}", matches_data[2 * i + 1]),
+                            }
+                        })?;
+                    let score = scores_data.get(i).copied().unwrap_or(1.0);
+                    indices.push((left_idx, right_idx));
+                    scores.push(score);
+                }
+            } else {
+                // Standard format: matches0 is [1, num_keypoints] with per-keypoint match index
+                for (i, &match_idx) in matches_data.iter().enumerate() {
+                    if match_idx < 0 {
+                        continue;
+                    }
+                    let Some(&score) = scores_data.get(i) else {
+                        return Err(InferenceError::UnexpectedOutput {
+                            name: "mscores0".to_string(),
+                            expected: format!("at least {} elements", matches_data.len()),
+                            actual: format!("{} elements", scores_data.len()),
+                        });
+                    };
+                    let right_idx = usize::try_from(match_idx).map_err(|_| {
+                        InferenceError::UnexpectedOutput {
+                            name: "matches0".to_string(),
+                            expected: "non-negative match indices".to_string(),
+                            actual: format!("index {match_idx}"),
+                        }
+                    })?;
+                    indices.push((i, right_idx));
+                    scores.push(score);
+                }
+            }
         }
 
         Matches::new(dec_1, dec_2, indices, scores).map_err(InferenceError::Match)
     }
-}
-
-struct ParsedMatchOutputs<'a> {
-    matches0: &'a [i64],
-    mscores0: &'a [f32],
-}
-
-fn parse_match_outputs<'a>(
-    outputs: &'a ort::session::SessionOutputs<'a>,
-) -> Result<ParsedMatchOutputs<'a>, InferenceError> {
-    let matches0 = outputs
-        .get("matches0")
-        .ok_or_else(|| InferenceError::UnexpectedOutput {
-            name: "matches0".to_string(),
-            expected: "named output tensor".to_string(),
-            actual: "missing output".to_string(),
-        })?
-        .try_extract_tensor::<i64>()?
-        .1;
-    let mscores0 = outputs
-        .get("mscores0")
-        .ok_or_else(|| InferenceError::UnexpectedOutput {
-            name: "mscores0".to_string(),
-            expected: "named output tensor".to_string(),
-            actual: "missing output".to_string(),
-        })?
-        .try_extract_tensor::<f32>()?
-        .1;
-    Ok(ParsedMatchOutputs { matches0, mscores0 })
 }
 
 fn normalize_keypoints_into(detections: &Detections, out: &mut Vec<f32>) {

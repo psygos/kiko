@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 mod backend;
 mod eigenplaces;
+mod end2end;
 mod lightglue;
 mod place;
 mod superpoint;
@@ -14,6 +15,7 @@ use crate::env::{env_bool, env_usize};
 
 pub use backend::InferenceBackend;
 pub use eigenplaces::EigenPlaces;
+pub use end2end::{End2EndPipeline, End2EndTimings};
 pub use place::PlaceDescriptorExtractor;
 
 #[derive(Debug)]
