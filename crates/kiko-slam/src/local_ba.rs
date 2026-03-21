@@ -1445,6 +1445,278 @@ impl LocalBundleAdjuster {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tightly-coupled VIO optimizer
+// ---------------------------------------------------------------------------
+
+/// Run Levenberg-Marquardt on a VIO window, jointly optimizing poses,
+/// velocities, and IMU biases using reprojection + IMU + bias factors.
+///
+/// Mutates `window` in-place (states are retracted on accepted steps).
+/// Returns the solve result.
+///
+/// Convention: we assemble gradient `g = J^T Ω r` and solve `H δ = -g`.
+#[cfg(feature = "vio")]
+pub fn optimize_vio(
+    window: &mut VioWindow,
+    config: &VioSolveConfig,
+    map: &SlamMap,
+) -> VioSolveResult {
+    use crate::vio::solve::{
+        accumulate_cross_factor, accumulate_factor, imu_jacobians, solve_dense_f64,
+        BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM,
+    };
+    use crate::{bias_random_walk_residual, ImuFactor};
+
+    let n_frames = window.len();
+    let dim = n_frames * STATE_DIM;
+    if n_frames < 2 {
+        return VioSolveResult {
+            converged: true,
+            iterations: 0,
+            final_cost: 0.0,
+        };
+    }
+
+    // Preallocate Hessian and RHS
+    let mut hessian = vec![0.0_f64; dim * dim];
+    let mut rhs = vec![0.0_f64; dim];
+
+    let max_iters = config.max_iterations.get();
+    let mut lambda = f64::from(config.lm.initial_lambda);
+    let mut prev_cost = f64::MAX;
+
+    for iteration in 0..max_iters {
+        // Clear
+        hessian.fill(0.0);
+        rhs.fill(0.0);
+
+        let mut total_cost = 0.0;
+
+        // --- 1. Reprojection factors ---
+        // Iterate all frames, resolve observations, compute 2×6 Jacobian,
+        // embed into 2×15 by zero-padding, accumulate.
+        for (frame_idx, synced) in window.synced_poses().enumerate() {
+            let obs_set = if frame_idx == 0 {
+                &window.anchor().observations
+            } else {
+                &window.successors[frame_idx - 1].observations
+            };
+            let base = frame_idx * STATE_DIM;
+            let pose = synced.pose();
+            if let Some(resolved) = obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap()) {
+                for obs in resolved.observations() {
+                    let world = obs.world();
+                    let pixel = obs.pixel();
+                    if let Some((residual, j_pose_f32, _j_landmark)) =
+                        reprojection_residual_and_jacobians(pose, world, pixel, config.intrinsics)
+                    {
+                        let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                        let huber_delta = config.huber_delta_px as f32;
+                        let (huber_weight, huber_cost) = if r_norm <= huber_delta {
+                            (1.0_f32, 0.5 * r_norm * r_norm)
+                        } else {
+                            (huber_delta / r_norm, huber_delta * (r_norm - 0.5 * huber_delta))
+                        };
+                        total_cost += f64::from(huber_cost);
+                        let sqrt_w = huber_weight.sqrt();
+
+                        // Embed 2×6 into 2×15 (zero-padded) and promote to f64
+                        let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
+                        let mut r_f64 = [0.0_f64; 2];
+                        for row in 0..2 {
+                            for col in 0..6 {
+                                j_15[row][col] = f64::from(j_pose_f32[row][col] * sqrt_w);
+                            }
+                            r_f64[row] = f64::from(residual[row] * sqrt_w);
+                        }
+
+                        // Accumulate with identity information (Huber already applied)
+                        let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
+                        accumulate_factor(
+                            &mut hessian,
+                            &mut rhs,
+                            dim,
+                            &j_15,
+                            &identity_2,
+                            &r_f64,
+                            base,
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- 2. IMU preintegration factors ---
+        for (succ_idx, successor) in window.successors.iter().enumerate() {
+            let prev_state = if succ_idx == 0 {
+                window.anchor().synced.nav_state()
+            } else {
+                window.successors[succ_idx - 1].synced.nav_state()
+            };
+            let curr_state = successor.synced.nav_state();
+            let preint = &successor.preintegrated;
+            let gravity = config.gravity();
+
+            let residual = ImuFactor::residual(prev_state, curr_state, preint, &gravity);
+            let info = preint.residual_information();
+            let (j_prev, j_curr) = imu_jacobians(prev_state, curr_state, preint, gravity);
+
+            // IMU cost: r^T Ω r
+            let mut imu_cost = 0.0;
+            for i in 0..IMU_RESIDUAL_DIM {
+                for j in 0..IMU_RESIDUAL_DIM {
+                    imu_cost += residual[i] * info[i][j] * residual[j];
+                }
+            }
+            total_cost += 0.5 * imu_cost;
+
+            let base_prev = succ_idx * STATE_DIM; // frame index of predecessor
+            let base_curr = (succ_idx + 1) * STATE_DIM;
+
+            // Self-terms
+            accumulate_factor(&mut hessian, &mut rhs, dim, &j_prev, &info, &residual, base_prev);
+            accumulate_factor(&mut hessian, &mut rhs, dim, &j_curr, &info, &residual, base_curr);
+            // Cross-term
+            accumulate_cross_factor(&mut hessian, dim, &j_prev, &j_curr, &info, base_prev, base_curr);
+        }
+
+        // --- 3. Bias random walk factors ---
+        for (succ_idx, successor) in window.successors.iter().enumerate() {
+            let prev_state = if succ_idx == 0 {
+                window.anchor().synced.nav_state()
+            } else {
+                window.successors[succ_idx - 1].synced.nav_state()
+            };
+            let curr_state = successor.synced.nav_state();
+            let preint = &successor.preintegrated;
+
+            let bias_residual = bias_random_walk_residual(prev_state, curr_state);
+            let bias_info = preint.bias_random_walk_information();
+
+            // Cost
+            let mut bias_cost = 0.0;
+            for i in 0..BIAS_RW_RESIDUAL_DIM {
+                for j in 0..BIAS_RW_RESIDUAL_DIM {
+                    bias_cost += bias_residual[i] * bias_info[i][j] * bias_residual[j];
+                }
+            }
+            total_cost += 0.5 * bias_cost;
+
+            let base_prev = succ_idx * STATE_DIM;
+            let base_curr = (succ_idx + 1) * STATE_DIM;
+
+            // Bias Jacobians: J_prev = -I at [9:15], J_curr = +I at [9:15]
+            for a in 0..BIAS_RW_RESIDUAL_DIM {
+                let mut omega_r = 0.0;
+                for b in 0..BIAS_RW_RESIDUAL_DIM {
+                    let w = bias_info[a][b];
+                    // H_ii += Omega (both +I^T * Omega * +I and -I^T * Omega * -I = Omega)
+                    hessian[(base_prev + 9 + a) * dim + (base_prev + 9 + b)] += w;
+                    hessian[(base_curr + 9 + a) * dim + (base_curr + 9 + b)] += w;
+                    // H_ij = (-I)^T * Omega * (+I) = -Omega
+                    hessian[(base_prev + 9 + a) * dim + (base_curr + 9 + b)] -= w;
+                    hessian[(base_curr + 9 + b) * dim + (base_prev + 9 + a)] -= w;
+                    omega_r += w * bias_residual[b];
+                }
+                // g_prev = J_prev^T * Omega * r = (-I)^T * Omega * r = -Omega*r
+                rhs[base_prev + 9 + a] -= omega_r;
+                // g_curr = J_curr^T * Omega * r = (+I)^T * Omega * r = +Omega*r
+                rhs[base_curr + 9 + a] += omega_r;
+            }
+        }
+
+        // --- 4. Anchor prior on frame 0 ---
+        {
+            let anchor_state = window.anchor().synced.nav_state();
+            let vel = anchor_state.velocity_odom_mps();
+            let bias = anchor_state.bias();
+            let vel_info = config.anchor_velocity_info;
+            let bias_info_w = config.anchor_bias_info;
+
+            // Velocity prior: r_vel = v_0, info = diag(vel_info)
+            for a in 0..3 {
+                hessian[(6 + a) * dim + (6 + a)] += vel_info;
+                rhs[6 + a] += vel_info * vel[a]; // g = info * (state - anchor=0)
+                total_cost += 0.5 * vel_info * vel[a] * vel[a];
+            }
+            // Bias prior: r_bias = bias_0 - calibrated_bias
+            // For simplicity, anchor at the current bias (prior keeps it stable)
+            for a in 0..3 {
+                hessian[(9 + a) * dim + (9 + a)] += bias_info_w;
+                // Accel bias — anchor at zero residual (keep current bias)
+                hessian[(12 + a) * dim + (12 + a)] += bias_info_w;
+            }
+        }
+
+        // --- 5. LM damping ---
+        for i in 0..dim {
+            hessian[i * dim + i] += lambda;
+        }
+
+        // --- 6. Solve H δ = -g ---
+        let mut h_solve = hessian.clone();
+        let mut neg_g: Vec<f64> = rhs.iter().map(|v| -v).collect();
+        if !solve_dense_f64(&mut h_solve, &mut neg_g, dim) {
+            lambda *= f64::from(config.lm.lambda_factor);
+            continue;
+        }
+        let delta = neg_g; // solution is now in neg_g
+
+        // --- 7. Retract candidate ---
+        let mut candidate_synced: Vec<SyncedPose> = Vec::with_capacity(n_frames);
+        let mut retract_ok = true;
+        for (frame_idx, synced) in window.synced_poses().enumerate() {
+            let base = frame_idx * STATE_DIM;
+            let mut tangent = [0.0_f64; STATE_DIM];
+            tangent.copy_from_slice(&delta[base..base + STATE_DIM]);
+            match synced.retract(&tangent) {
+                Ok(new_synced) => candidate_synced.push(new_synced),
+                Err(_) => {
+                    retract_ok = false;
+                    break;
+                }
+            }
+        }
+        if !retract_ok {
+            lambda *= f64::from(config.lm.lambda_factor);
+            continue;
+        }
+
+        // --- 8. Accept/reject ---
+        // For now, simple cost comparison (full gain ratio LM can be added later)
+        if total_cost < prev_cost || iteration == 0 {
+            // Accept: write candidate states into window
+            window.anchor.synced = candidate_synced[0].clone();
+            for (i, succ) in window.successors.iter_mut().enumerate() {
+                succ.synced = candidate_synced[i + 1].clone();
+            }
+            lambda = (lambda * f64::from(config.lm.min_lambda).max(1e-10))
+                .max(f64::from(config.lm.min_lambda));
+
+            let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+            let cost_decrease = (prev_cost - total_cost).abs();
+            prev_cost = total_cost;
+
+            if step_norm < 1e-6 && cost_decrease < 1e-10 * total_cost.max(1e-12) {
+                return VioSolveResult {
+                    converged: true,
+                    iterations: iteration + 1,
+                    final_cost: total_cost,
+                };
+            }
+        } else {
+            lambda *= f64::from(config.lm.lambda_factor);
+        }
+    }
+
+    VioSolveResult {
+        converged: false,
+        iterations: max_iters,
+        final_cost: prev_cost,
+    }
+}
+
 fn full_problem_cost(
     problem: &FullBaProblem,
     intrinsics: PinholeIntrinsics,
