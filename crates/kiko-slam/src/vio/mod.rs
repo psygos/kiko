@@ -1,5 +1,6 @@
 mod factors;
 mod preintegration;
+pub(crate) mod solve;
 mod state;
 
 pub use factors::{
