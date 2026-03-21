@@ -7,6 +7,8 @@ pub struct CalibrationBundle {
     imu_noise: Option<ImuNoiseModel>,
     imu_extrinsics: Option<ImuExtrinsics>,
     gravity_magnitude_mps2: f64,
+    initial_accel_bias: Option<[f64; 3]>,
+    initial_gyro_bias: Option<[f64; 3]>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +84,8 @@ impl CalibrationBundle {
             imu_noise: None,
             imu_extrinsics: None,
             gravity_magnitude_mps2: 9.81,
+            initial_accel_bias: None,
+            initial_gyro_bias: None,
         }
     }
 
@@ -109,6 +113,8 @@ impl CalibrationBundle {
             imu_noise: Some(imu_noise),
             imu_extrinsics: Some(imu_extrinsics),
             gravity_magnitude_mps2,
+            initial_accel_bias: None,
+            initial_gyro_bias: None,
         })
     }
 
@@ -155,13 +161,16 @@ impl CalibrationBundle {
                     message: err.to_string(),
                 }
             })?;
-        Self::with_imu(
+        let mut bundle = Self::with_imu(
             intrinsics,
             stereo,
             noise,
             extrinsics,
             imu.gravity_magnitude_mps2,
-        )
+        )?;
+        bundle.initial_accel_bias = imu.initial_accel_bias;
+        bundle.initial_gyro_bias = imu.initial_gyro_bias;
+        Ok(bundle)
     }
 
     pub fn intrinsics(&self) -> PinholeIntrinsics {
@@ -186,6 +195,14 @@ impl CalibrationBundle {
 
     pub fn has_imu(&self) -> bool {
         self.imu_noise.is_some() && self.imu_extrinsics.is_some()
+    }
+
+    pub fn initial_accel_bias(&self) -> Option<[f64; 3]> {
+        self.initial_accel_bias
+    }
+
+    pub fn initial_gyro_bias(&self) -> Option<[f64; 3]> {
+        self.initial_gyro_bias
     }
 }
 
@@ -389,6 +406,8 @@ mod tests {
                     time_offset_ns: 42,
                 },
                 gravity_magnitude_mps2: 9.81,
+                initial_accel_bias: None,
+                initial_gyro_bias: None,
             }),
         };
         let bundle = CalibrationBundle::from_dataset_calibration(

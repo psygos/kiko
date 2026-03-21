@@ -1,5 +1,3 @@
-#[cfg(feature = "vio")]
-use kiko_slam::VioConfig;
 use kiko_slam::{
     BackendConfig, DownscaleFactor, GlobalDescriptorConfig, KeyframePolicy, KeypointLimit,
     LmConfig, LocalBaConfig, LoopClosureConfig, LoopClosureConfigInput, LoopSubsystemConfig,
@@ -26,12 +24,6 @@ const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
 const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
 const DEFAULT_KEYFRAME_COVISIBILITY: f32 = 0.3;
 const DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY: f32 = 0.9;
-#[cfg(feature = "vio")]
-const DEFAULT_VIO_WINDOW: usize = 7;
-#[cfg(feature = "vio")]
-const DEFAULT_VIO_MAX_ITERS: usize = 4;
-#[cfg(feature = "vio")]
-const DEFAULT_VIO_POSE_PRIOR_WEIGHT: f64 = 100.0;
 
 pub struct TrackerDefaults {
     pub min_keyframe_points: usize,
@@ -128,28 +120,9 @@ pub fn build_tracker_config(
         redundancy,
         backend,
         loop_subsystem,
-        #[cfg(feature = "vio")]
-        vio: build_vio_config_from_env()?,
     })
 }
 
-#[cfg(feature = "vio")]
-fn build_vio_config_from_env() -> Result<Option<VioConfig>, Box<dyn std::error::Error>> {
-    if !env_bool("KIKO_VIO").unwrap_or(false) {
-        return Ok(None);
-    }
-    let window = env_usize("KIKO_VIO_WINDOW").unwrap_or(DEFAULT_VIO_WINDOW);
-    let max_iterations = env_usize("KIKO_VIO_MAX_ITERS").unwrap_or(DEFAULT_VIO_MAX_ITERS);
-    let pose_prior_weight =
-        env_f32("KIKO_VIO_POSE_PRIOR_WEIGHT").unwrap_or(DEFAULT_VIO_POSE_PRIOR_WEIGHT as f32);
-    let velocity_prior_weight =
-        env_f32("KIKO_VIO_VELOCITY_PRIOR_WEIGHT").unwrap_or(10.0);
-    let config = VioConfig::new(window)?
-        .with_max_iterations(max_iterations)?
-        .with_pose_prior_weight(f64::from(pose_prior_weight))?
-        .with_velocity_prior_weight(f64::from(velocity_prior_weight));
-    Ok(Some(config))
-}
 
 fn build_loop_closure_config_from_env() -> Result<LoopClosureConfig, Box<dyn std::error::Error>> {
     let mut input = LoopClosureConfigInput::default();

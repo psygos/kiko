@@ -1,6 +1,5 @@
 mod factors;
 mod preintegration;
-mod smoother;
 mod state;
 
 pub use factors::{
@@ -8,7 +7,4 @@ pub use factors::{
     reprojection_residual,
 };
 pub use preintegration::{CorrectedPreintegration, PreintegratedImu, PreintegrationError};
-pub use smoother::{
-    LocalVio, LocalVioError, VioConfig, VioConfigError, VioEstimate, VioOdometryConstraint,
-};
 pub use state::{Gravity, GravityError, NavState, NavStateError, NavTangent};

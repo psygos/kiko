@@ -131,37 +131,41 @@ impl PreintegratedImu {
     }
 
     pub fn residual_information_diag(&self) -> [f64; 9] {
-        // Cap information to prevent the optimizer from trusting IMU with
-        // unreasonable confidence. The diagonal covariance from white-noise
-        // propagation can be extremely small (especially position, which
-        // scales as dt⁴), but real IMU errors include un-modelled bias drift
-        // that this covariance doesn't capture. A floor of 1e-4 limits
-        // information to ~10,000 so the optimizer can correct from visual.
-        const MIN_VARIANCE: f64 = 1e-2;
-        let mut information = [0.0_f64; 9];
-        for (axis, value) in information.iter_mut().enumerate() {
-            let variance = self.covariance[axis][axis].max(MIN_VARIANCE);
-            *value = 1.0 / variance;
+        let information = self.residual_information();
+        let mut diagonal = [0.0_f64; 9];
+        for axis in 0..9 {
+            diagonal[axis] = information[axis][axis];
         }
-        information
+        diagonal
+    }
+
+    pub fn residual_information(&self) -> [[f64; 9]; 9] {
+        invert_stabilized_covariance::<9>(self.covariance, 1e-6)
     }
 
     pub fn bias_random_walk_information_diag(&self) -> [f64; 6] {
+        let information = self.bias_random_walk_information();
+        let mut diagonal = [0.0_f64; 6];
+        for axis in 0..6 {
+            diagonal[axis] = information[axis][axis];
+        }
+        diagonal
+    }
+
+    pub fn bias_random_walk_information(&self) -> [[f64; 6]; 6] {
         // Keep bias random-walk regularization comparable to the other VIO terms.
         // Without this floor, short IMU intervals produce enormous information that
         // effectively hard-locks the initial bias estimate.
-        const MIN_VARIANCE: f64 = 1e-2;
+        const MIN_VARIANCE: f64 = 1e-6;
         let dt = self.dt_seconds.max(1e-12);
         let accel_variance = self.noise.accel_random_walk() * self.noise.accel_random_walk() * dt;
         let gyro_variance = self.noise.gyro_random_walk() * self.noise.gyro_random_walk() * dt;
-        [
-            1.0 / accel_variance.max(MIN_VARIANCE),
-            1.0 / accel_variance.max(MIN_VARIANCE),
-            1.0 / accel_variance.max(MIN_VARIANCE),
-            1.0 / gyro_variance.max(MIN_VARIANCE),
-            1.0 / gyro_variance.max(MIN_VARIANCE),
-            1.0 / gyro_variance.max(MIN_VARIANCE),
-        ]
+        let mut information = [[0.0_f64; 6]; 6];
+        for axis in 0..3 {
+            information[axis][axis] = 1.0 / accel_variance.max(MIN_VARIANCE);
+            information[3 + axis][3 + axis] = 1.0 / gyro_variance.max(MIN_VARIANCE);
+        }
+        information
     }
 }
 
@@ -224,14 +228,16 @@ fn integrate_core(
         delta_rotation = delta_rotation_next;
         dt_total += dt;
 
-        let gyro_var = noise.gyro_noise_density() * noise.gyro_noise_density() * dt * dt;
-        let accel_var = noise.accel_noise_density() * noise.accel_noise_density() * dt * dt;
-        let pos_var = 0.25 * accel_var * dt * dt;
+        let f = error_state_transition(omega_mid, accel_mid, dt);
+        let g = noise_injection(delta_rotation, dt);
+        let mut q = [[0.0_f64; 6]; 6];
+        let gyro_variance = noise.gyro_noise_density() * noise.gyro_noise_density();
+        let accel_variance = noise.accel_noise_density() * noise.accel_noise_density();
         for axis in 0..3 {
-            covariance[axis][axis] += gyro_var;
-            covariance[3 + axis][3 + axis] += accel_var;
-            covariance[6 + axis][6 + axis] += pos_var;
+            q[axis][axis] = gyro_variance;
+            q[3 + axis][3 + axis] = accel_variance;
         }
+        covariance = propagate_covariance(covariance, f, g, q);
     }
 
     Ok(CorePreintegration {
@@ -301,6 +307,205 @@ fn sub_vec3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 
 fn scale_vec3(v: [f64; 3], scale: f64) -> [f64; 3] {
     [v[0] * scale, v[1] * scale, v[2] * scale]
+}
+
+fn error_state_transition(omega_mid: [f64; 3], accel_mid: [f64; 3], dt: f64) -> [[f64; 9]; 9] {
+    let mut f = identity9();
+    let omega_hat = skew3(omega_mid);
+    let accel_hat = skew3(accel_mid);
+    for row in 0..3 {
+        for col in 0..3 {
+            f[row][col] -= omega_hat[row][col] * dt;
+            f[3 + row][col] -= accel_hat[row][col] * dt;
+            f[6 + row][col] -= accel_hat[row][col] * (0.5 * dt * dt);
+        }
+        f[6 + row][3 + row] = dt;
+    }
+    f
+}
+
+fn noise_injection(delta_rotation: [[f64; 3]; 3], dt: f64) -> [[f64; 6]; 9] {
+    let mut g = [[0.0_f64; 6]; 9];
+    for row in 0..3 {
+        g[row][row] = dt;
+    }
+    for row in 0..3 {
+        for col in 0..3 {
+            g[3 + row][3 + col] = delta_rotation[row][col] * dt;
+            g[6 + row][3 + col] = delta_rotation[row][col] * (0.5 * dt * dt);
+        }
+    }
+    g
+}
+
+fn propagate_covariance(
+    covariance: [[f64; 9]; 9],
+    f: [[f64; 9]; 9],
+    g: [[f64; 6]; 9],
+    q: [[f64; 6]; 6],
+) -> [[f64; 9]; 9] {
+    let ft = transpose9(f);
+    let gt = transpose96(g);
+    let predicted = matmul9(matmul9(f, covariance), ft);
+    let process = matmul9x6_6x9(matmul9x6_6x6(g, q), gt);
+    symmetrize9(add9(predicted, process))
+}
+
+fn invert_stabilized_covariance<const N: usize>(
+    mut covariance: [[f64; N]; N],
+    min_variance: f64,
+) -> [[f64; N]; N] {
+    for axis in 0..N {
+        covariance[axis][axis] = covariance[axis][axis].max(min_variance);
+    }
+    invert_square(covariance).unwrap_or_else(|| {
+        let mut fallback = [[0.0_f64; N]; N];
+        for axis in 0..N {
+            fallback[axis][axis] = 1.0 / covariance[axis][axis].max(min_variance);
+        }
+        fallback
+    })
+}
+
+fn invert_square<const N: usize>(matrix: [[f64; N]; N]) -> Option<[[f64; N]; N]> {
+    let mut a = matrix;
+    let mut inv = [[0.0_f64; N]; N];
+    for idx in 0..N {
+        inv[idx][idx] = 1.0;
+    }
+    for pivot in 0..N {
+        let mut pivot_row = pivot;
+        let mut pivot_abs = a[pivot][pivot].abs();
+        for (row, a_row) in a.iter().enumerate().take(N).skip(pivot + 1) {
+            let value = a_row[pivot].abs();
+            if value > pivot_abs {
+                pivot_abs = value;
+                pivot_row = row;
+            }
+        }
+        if !pivot_abs.is_finite() || pivot_abs < 1e-12 {
+            return None;
+        }
+        if pivot_row != pivot {
+            a.swap(pivot, pivot_row);
+            inv.swap(pivot, pivot_row);
+        }
+        let diag = a[pivot][pivot];
+        for col in 0..N {
+            a[pivot][col] /= diag;
+            inv[pivot][col] /= diag;
+        }
+        for row in 0..N {
+            if row == pivot {
+                continue;
+            }
+            let factor = a[row][pivot];
+            if factor == 0.0 {
+                continue;
+            }
+            for col in 0..N {
+                a[row][col] -= factor * a[pivot][col];
+                inv[row][col] -= factor * inv[pivot][col];
+            }
+        }
+    }
+    Some(inv)
+}
+
+fn add9(a: [[f64; 9]; 9], b: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
+    let mut out = [[0.0_f64; 9]; 9];
+    for row in 0..9 {
+        for col in 0..9 {
+            out[row][col] = a[row][col] + b[row][col];
+        }
+    }
+    out
+}
+
+fn identity9() -> [[f64; 9]; 9] {
+    let mut out = [[0.0_f64; 9]; 9];
+    for (idx, row) in out.iter_mut().enumerate() {
+        row[idx] = 1.0;
+    }
+    out
+}
+
+fn matmul9(a: [[f64; 9]; 9], b: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
+    let mut out = [[0.0_f64; 9]; 9];
+    for i in 0..9 {
+        for j in 0..9 {
+            let mut value = 0.0_f64;
+            for (k, row) in b.iter().enumerate() {
+                value += a[i][k] * row[j];
+            }
+            out[i][j] = value;
+        }
+    }
+    out
+}
+
+fn matmul9x6_6x6(a: [[f64; 6]; 9], b: [[f64; 6]; 6]) -> [[f64; 6]; 9] {
+    let mut out = [[0.0_f64; 6]; 9];
+    for i in 0..9 {
+        for j in 0..6 {
+            let mut value = 0.0_f64;
+            for (k, row) in b.iter().enumerate() {
+                value += a[i][k] * row[j];
+            }
+            out[i][j] = value;
+        }
+    }
+    out
+}
+
+fn matmul9x6_6x9(a: [[f64; 6]; 9], b: [[f64; 9]; 6]) -> [[f64; 9]; 9] {
+    let mut out = [[0.0_f64; 9]; 9];
+    for i in 0..9 {
+        for j in 0..9 {
+            let mut value = 0.0_f64;
+            for (k, row) in b.iter().enumerate() {
+                value += a[i][k] * row[j];
+            }
+            out[i][j] = value;
+        }
+    }
+    out
+}
+
+fn skew3(v: [f64; 3]) -> [[f64; 3]; 3] {
+    [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
+}
+
+fn symmetrize9(matrix: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
+    let mut out = matrix;
+    for row in 0..9 {
+        for col in (row + 1)..9 {
+            let value = 0.5 * (matrix[row][col] + matrix[col][row]);
+            out[row][col] = value;
+            out[col][row] = value;
+        }
+    }
+    out
+}
+
+fn transpose9(matrix: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
+    let mut out = [[0.0_f64; 9]; 9];
+    for row in 0..9 {
+        for col in 0..9 {
+            out[col][row] = matrix[row][col];
+        }
+    }
+    out
+}
+
+fn transpose96(matrix: [[f64; 6]; 9]) -> [[f64; 9]; 6] {
+    let mut out = [[0.0_f64; 9]; 6];
+    for row in 0..9 {
+        for col in 0..6 {
+            out[col][row] = matrix[row][col];
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -433,7 +638,7 @@ mod tests {
         )
         .expect("preintegrated");
         for value in preintegrated.bias_random_walk_information_diag() {
-            assert!(value <= 100.0);
+            assert!(value <= 1.0e6);
             assert!(value.is_finite() && value > 0.0);
         }
     }
@@ -499,6 +704,49 @@ mod tests {
         }
         let trace = matrix_trace(rot);
         assert!(trace.is_finite());
+    }
+
+    #[test]
+    fn coupled_covariance_produces_cross_terms() {
+        let batch = batch(&[
+            (0, [0.2, 0.1, -0.05], [0.1, -0.2, 0.3]),
+            (10_000_000, [0.25, 0.08, -0.04], [0.12, -0.18, 0.28]),
+            (20_000_000, [0.3, 0.05, -0.02], [0.15, -0.15, 0.25]),
+            (30_000_000, [0.28, 0.02, 0.0], [0.17, -0.1, 0.2]),
+        ]);
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
+        let mut max_off_diagonal = 0.0_f64;
+        for row in 0..9 {
+            for col in 0..9 {
+                if row != col {
+                    max_off_diagonal =
+                        max_off_diagonal.max(preintegrated.covariance[row][col].abs());
+                }
+            }
+        }
+        assert!(max_off_diagonal > 0.0, "cross terms should be present");
+    }
+
+    #[test]
+    fn residual_information_matrix_is_symmetric_and_positive_on_diagonal() {
+        let batch = batch(&[
+            (0, [0.1, -0.1, 0.2], [0.0, 0.05, -0.1]),
+            (10_000_000, [0.1, -0.1, 0.2], [0.0, 0.05, -0.1]),
+            (20_000_000, [0.1, -0.1, 0.2], [0.0, 0.05, -0.1]),
+        ]);
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
+        let information = preintegrated.residual_information();
+        for row in 0..9 {
+            assert!(information[row][row].is_finite() && information[row][row] > 0.0);
+            for col in 0..9 {
+                assert!(
+                    (information[row][col] - information[col][row]).abs() < 1e-8,
+                    "row={row} col={col}"
+                );
+            }
+        }
     }
 
     fn mat_transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {

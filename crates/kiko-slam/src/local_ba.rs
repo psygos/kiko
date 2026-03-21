@@ -474,6 +474,276 @@ struct BaFrame {
     observations: ObservationSet,
 }
 
+// ---------------------------------------------------------------------------
+// VIO type system: parse-don't-validate
+//
+// Invariants enforced by structure:
+// 1. All frames in a VIO window carry NavState (no mixing with visual-only)
+// 2. Every frame except the first has a PreintegratedImu from its predecessor
+//    (encoded structurally: VioAnchor has no preintegration, VioSuccessor has one)
+// 3. Gravity is immutable for the window lifetime
+// 4. The Hessian dimension is always N * STATE_DIM (15)
+// 5. f32 Pose and f64 NavState are always in sync (SyncedPose)
+// ---------------------------------------------------------------------------
+
+/// Dimension of the inertial state per frame:
+/// [translation(3), rotation(3), velocity(3), accel_bias(3), gyro_bias(3)]
+#[cfg(feature = "vio")]
+const VIO_STATE_DIM: usize = 15;
+
+/// Pose in both f32 (for reprojection Jacobians) and f64 (for VIO math).
+/// The two representations are always in sync — constructed together,
+/// updated together. There is no public way to set one without the other.
+#[cfg(feature = "vio")]
+#[derive(Clone, Debug)]
+struct SyncedPose {
+    f32_pose: Pose,
+    nav_state: crate::NavState,
+}
+
+#[cfg(feature = "vio")]
+impl SyncedPose {
+    fn new(nav_state: crate::NavState) -> Self {
+        let f32_pose = nav_state.pose_odom_from_body().to_pose32();
+        Self { f32_pose, nav_state }
+    }
+
+    fn pose(&self) -> Pose {
+        self.f32_pose
+    }
+
+    fn nav_state(&self) -> &crate::NavState {
+        &self.nav_state
+    }
+
+    /// Apply a 15D tangent-space retraction. Both representations update together.
+    fn retract(&self, delta: &crate::NavTangent) -> Result<Self, crate::NavStateError> {
+        let nav_state = self.nav_state.retract(delta)?;
+        Ok(Self::new(nav_state))
+    }
+}
+
+/// The first frame in a VIO window. Has no predecessor, hence no preintegration.
+/// Carries an anchor prior on velocity and bias.
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+struct VioAnchor {
+    synced: SyncedPose,
+    observations: ObservationSet,
+}
+
+/// A successor frame in a VIO window. Always has a PreintegratedImu from
+/// its immediate predecessor — this is structural, not optional.
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+struct VioSuccessor {
+    synced: SyncedPose,
+    observations: ObservationSet,
+    preintegrated: crate::PreintegratedImu,
+}
+
+/// Immutable configuration for a VIO solve window. Set once, used for
+/// all iterations. Gravity is a known constant.
+#[cfg(feature = "vio")]
+#[derive(Clone, Debug)]
+pub struct VioSolveConfig {
+    gravity: crate::Gravity,
+    camera_from_body: crate::Pose64,
+    intrinsics: PinholeIntrinsics,
+    lm: LmConfig,
+    max_iterations: NonZeroUsize,
+    huber_delta_px: f64,
+    /// Diagonal information weight for the velocity anchor prior on frame 0.
+    anchor_velocity_info: f64,
+    /// Diagonal information weight for the bias anchor prior on frame 0.
+    anchor_bias_info: f64,
+}
+
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+pub enum VioSolveConfigError {
+    NonFiniteAnchorWeight { field: &'static str, value: f64 },
+    NegativeAnchorWeight { field: &'static str, value: f64 },
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioSolveConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteAnchorWeight { field, value } => {
+                write!(f, "VIO anchor weight `{field}` must be finite, got {value}")
+            }
+            Self::NegativeAnchorWeight { field, value } => {
+                write!(f, "VIO anchor weight `{field}` must be >= 0, got {value}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::error::Error for VioSolveConfigError {}
+
+#[cfg(feature = "vio")]
+impl VioSolveConfig {
+    pub fn new(
+        gravity: crate::Gravity,
+        camera_from_body: crate::Pose64,
+        intrinsics: PinholeIntrinsics,
+        lm: LmConfig,
+        max_iterations: NonZeroUsize,
+        huber_delta_px: f64,
+        anchor_velocity_info: f64,
+        anchor_bias_info: f64,
+    ) -> Result<Self, VioSolveConfigError> {
+        if !anchor_velocity_info.is_finite() {
+            return Err(VioSolveConfigError::NonFiniteAnchorWeight {
+                field: "anchor_velocity_info",
+                value: anchor_velocity_info,
+            });
+        }
+        if anchor_velocity_info < 0.0 {
+            return Err(VioSolveConfigError::NegativeAnchorWeight {
+                field: "anchor_velocity_info",
+                value: anchor_velocity_info,
+            });
+        }
+        if !anchor_bias_info.is_finite() {
+            return Err(VioSolveConfigError::NonFiniteAnchorWeight {
+                field: "anchor_bias_info",
+                value: anchor_bias_info,
+            });
+        }
+        if anchor_bias_info < 0.0 {
+            return Err(VioSolveConfigError::NegativeAnchorWeight {
+                field: "anchor_bias_info",
+                value: anchor_bias_info,
+            });
+        }
+        Ok(Self {
+            gravity,
+            camera_from_body,
+            intrinsics,
+            lm,
+            max_iterations,
+            huber_delta_px,
+            anchor_velocity_info,
+            anchor_bias_info,
+        })
+    }
+
+    pub fn gravity(&self) -> crate::Gravity {
+        self.gravity
+    }
+}
+
+/// A structurally valid VIO optimization window.
+///
+/// Invariants enforced by construction:
+/// - At least one frame (the anchor)
+/// - Every successor has a PreintegratedImu from its predecessor
+/// - All frames carry NavState (no visual-only frames)
+/// - The Hessian dimension is `(1 + successors.len()) * VIO_STATE_DIM`
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+struct VioWindow {
+    anchor: VioAnchor,
+    successors: Vec<VioSuccessor>,
+}
+
+#[cfg(feature = "vio")]
+impl VioWindow {
+    /// Total number of frames in the window (anchor + successors).
+    fn len(&self) -> usize {
+        1 + self.successors.len()
+    }
+
+    /// Dimension of the reduced state (frames only, landmarks eliminated).
+    fn state_dim(&self) -> usize {
+        self.len() * VIO_STATE_DIM
+    }
+
+    /// Access anchor (frame 0).
+    fn anchor(&self) -> &VioAnchor {
+        &self.anchor
+    }
+
+    /// Access successor frame by index (0 = first successor, i.e. frame 1).
+    fn successor(&self, index: usize) -> Option<&VioSuccessor> {
+        self.successors.get(index)
+    }
+
+    /// Iterate all synced poses in window order.
+    fn synced_poses(&self) -> impl Iterator<Item = &SyncedPose> {
+        std::iter::once(&self.anchor.synced)
+            .chain(self.successors.iter().map(|s| &s.synced))
+    }
+}
+
+/// Output from a VIO BA solve. Contains the refined state for all frames.
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+pub struct VioSolveResult {
+    pub converged: bool,
+    pub iterations: usize,
+    pub final_cost: f64,
+}
+
+/// The refined output for a single frame after VIO BA.
+#[cfg(feature = "vio")]
+#[derive(Clone, Debug)]
+pub struct VioFrameEstimate {
+    pub pose: Pose,
+    pub nav_state: crate::NavState,
+}
+
+/// Input for adding an inertial frame to the BA. The preintegration is
+/// mandatory — the type enforces that you cannot add a VIO frame without
+/// the IMU measurement connecting it to its predecessor.
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+pub struct InertialFrameInput {
+    nav_state: crate::NavState,
+    observations: ObservationSet,
+    preintegrated: crate::PreintegratedImu,
+}
+
+#[cfg(feature = "vio")]
+impl InertialFrameInput {
+    pub fn new(
+        nav_state: crate::NavState,
+        observations: ObservationSet,
+        preintegrated: crate::PreintegratedImu,
+    ) -> Self {
+        Self {
+            nav_state,
+            observations,
+            preintegrated,
+        }
+    }
+
+    pub fn nav_state(&self) -> &crate::NavState {
+        &self.nav_state
+    }
+}
+
+/// Input for the anchor frame (first frame in VIO window). No preintegration.
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+pub struct AnchorFrameInput {
+    nav_state: crate::NavState,
+    observations: ObservationSet,
+}
+
+#[cfg(feature = "vio")]
+impl AnchorFrameInput {
+    pub fn new(nav_state: crate::NavState, observations: ObservationSet) -> Self {
+        Self {
+            nav_state,
+            observations,
+        }
+    }
+}
+
 #[derive(Debug)]
 enum FullBaBuildError {
     EmptyWindow,

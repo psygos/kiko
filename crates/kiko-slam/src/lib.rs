@@ -105,10 +105,14 @@ pub use triangulation::{
 };
 #[cfg(feature = "vio")]
 pub use vio::{
-    CorrectedPreintegration, Gravity, GravityError, ImuFactor, LocalVio, LocalVioError, NavState,
-    NavStateError, NavTangent, PreintegratedImu, PreintegrationError, VioConfig, VioConfigError,
-    VioEstimate, VioFactorError, VioObservation, VioOdometryConstraint, bias_random_walk_residual,
-    pose_prior_residual, reprojection_residual,
+    CorrectedPreintegration, Gravity, GravityError, ImuFactor, NavState, NavStateError, NavTangent,
+    PreintegratedImu, PreintegrationError, VioFactorError, VioObservation,
+    bias_random_walk_residual, pose_prior_residual, reprojection_residual,
+};
+#[cfg(feature = "vio")]
+pub use local_ba::{
+    AnchorFrameInput, InertialFrameInput, VioFrameEstimate, VioSolveConfig, VioSolveConfigError,
+    VioSolveResult,
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 

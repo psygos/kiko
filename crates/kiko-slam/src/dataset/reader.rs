@@ -681,6 +681,8 @@ mod tests {
                     time_offset_ns,
                 },
                 gravity_magnitude_mps2: 9.81,
+                initial_accel_bias: None,
+                initial_gyro_bias: None,
             }),
             ..calibration()
         }

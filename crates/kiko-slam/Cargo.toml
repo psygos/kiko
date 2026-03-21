@@ -20,6 +20,8 @@ libc = "0.2.153"
 ndarray = "0.17.1"
 ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
 rerun = "=0.27.2"
+re_arrow_util = "=0.27.3"
+re_log_encoding = "=0.27.3"
 serde = "1.0.228"
 serde_json = "1.0.149"
 slotmap = "1.0"
@@ -30,6 +32,15 @@ chrono = { version = "0.4", optional = true }
 [[bin]]
 name = "kiko-slam"
 path = "src/bin/kiko_slam/main.rs"
+
+[[bin]]
+name = "vio-dump"
+path = "src/bin/vio_dump.rs"
+required-features = ["vio"]
+
+[[bin]]
+name = "rrd-dump"
+path = "src/bin/rrd_dump.rs"
 
 [lints]
 workspace = true
