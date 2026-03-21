@@ -313,8 +313,28 @@ impl RerunSink {
         // Log the full accumulated cloud
         let cloud = rerun::Points3D::new(self.dense_cloud_positions.clone())
             .with_colors(self.dense_cloud_colors.clone())
-            .with_radii([rerun::Radius::new_scene_units(0.003)]);
+            .with_radii([rerun::Radius::new_scene_units(0.008)]);
         self.rec.log_static("world/dense_cloud", &cloud)?;
+        Ok(())
+    }
+
+    /// Log TSDF surface voxels as a point cloud.
+    pub fn log_tsdf_surface(
+        &self,
+        surface: &[([f32; 3], u8)],
+    ) -> Result<(), VizLogError> {
+        if surface.is_empty() {
+            return Ok(());
+        }
+        let positions: Vec<[f32; 3]> = surface.iter().map(|(p, _)| *p).collect();
+        let colors: Vec<rerun::Color> = surface
+            .iter()
+            .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
+            .collect();
+        let cloud = rerun::Points3D::new(positions)
+            .with_colors(colors)
+            .with_radii([rerun::Radius::new_scene_units(0.01)]);
+        self.rec.log_static("world/tsdf_surface", &cloud)?;
         Ok(())
     }
 

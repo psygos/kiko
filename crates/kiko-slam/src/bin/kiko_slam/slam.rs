@@ -129,6 +129,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     )?;
 
+    let tsdf_worker = if dense_cloud_enabled {
+        Some(kiko_slam::TsdfWorker::spawn(kiko_slam::TsdfConfig::default(), 4))
+    } else {
+        None
+    };
     let rec = rerun_recording(&args.rerun, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
@@ -277,6 +282,16 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 ) {
                                     eprintln!("dense cloud: {err}");
                                 }
+                                // Send to TSDF worker (async, non-blocking)
+                                if let Some(ref tsdf) = tsdf_worker {
+                                    let msg = kiko_slam::TsdfIntegrateMsg {
+                                        points: dense.points,
+                                        cam_from_map: pose.cam_from_map_pose32(),
+                                    };
+                                    if !tsdf.try_integrate(msg) {
+                                        eprintln!("tsdf worker queue full");
+                                    }
+                                }
                             }
                         }
                     }
@@ -308,6 +323,14 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
                     if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
                         eprintln!("rerun imu log error: {err}");
+                    }
+                }
+                // Poll TSDF surface from async worker
+                if let Some(ref tsdf) = tsdf_worker {
+                    if let Some(surface) = tsdf.try_recv_surface() {
+                        if let Err(err) = sink.log_tsdf_surface(&surface) {
+                            eprintln!("tsdf surface log: {err}");
+                        }
                     }
                 }
                 if let Err(err) = sink.log_system_health(timestamp, &output.health) {

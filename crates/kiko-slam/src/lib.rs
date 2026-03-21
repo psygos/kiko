@@ -17,6 +17,7 @@ mod channel;
 pub mod dataset;
 mod dense_cloud;
 mod depth;
+mod tsdf;
 mod diagnostics;
 pub mod env;
 mod frontend;
@@ -99,6 +100,7 @@ pub use tracker::{
     RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
 };
+pub use tsdf::{TsdfConfig, TsdfIntegrateMsg, TsdfWorker};
 pub use dense_cloud::{
     DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, generate_dense_cloud,
 };
