@@ -9,7 +9,7 @@ struct NvbloxMapper {
     nvblox::Mapper mapper;
     std::optional<nvblox::Camera> camera;
     NvbloxMapper(float voxel_size)
-        : mapper(voxel_size, nvblox::MemoryType::kDevice) {}
+        : mapper(voxel_size, nvblox::MemoryType::kUnified) {}
 };
 
 struct NvbloxSurface {

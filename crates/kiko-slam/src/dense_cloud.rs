@@ -26,12 +26,12 @@ pub struct DenseCloudConfig {
 impl Default for DenseCloudConfig {
     fn default() -> Self {
         Self {
-            subsample: 4,
-            max_disparity_gradient: 0.3,
+            subsample: 2,
+            max_disparity_gradient: 0.4,
             min_disparity_px: 1.0,
-            max_edge_length_px: 80.0,
-            max_triangle_area_px2: 3000.0,
-            max_points_per_keyframe: 15_000,
+            max_edge_length_px: 200.0,
+            max_triangle_area_px2: 20_000.0,
+            max_points_per_keyframe: 50_000,
         }
     }
 }
@@ -81,6 +81,97 @@ pub struct DenseCloudStats {
 pub struct DenseCloudResult {
     pub points: Vec<DensePoint>,
     pub stats: DenseCloudStats,
+}
+
+/// Generate a dense depth image by interpolating disparity over a Delaunay
+/// triangulation. Every pixel inside a valid triangle gets a depth value.
+/// Pixels outside triangles or in rejected triangles remain 0.0 (invalid).
+/// This is the input format nvblox expects.
+pub fn generate_dense_depth_image(
+    samples: &[SparseStereoSample],
+    fx: f32,
+    baseline_m: f32,
+    image_width: u32,
+    image_height: u32,
+    config: &DenseCloudConfig,
+) -> Vec<f32> {
+    let w = image_width as usize;
+    let h = image_height as usize;
+    let mut depth = vec![0.0_f32; w * h];
+
+    if samples.len() < 3 {
+        eprintln!("dense_depth: too few samples ({})", samples.len());
+        return depth;
+    }
+
+    let pts: Vec<[f32; 2]> = samples.iter().map(|s| [s.u, s.v]).collect();
+    let triangles = delaunay(&pts, image_width as f32, image_height as f32);
+    let mut rejected = 0usize;
+    let mut rasterized = 0usize;
+    let mut filled = 0usize;
+
+    for tri in &triangles {
+        let (a, b, c) = (tri[0], tri[1], tri[2]);
+        let (ax, ay) = (pts[a][0], pts[a][1]);
+        let (bx, by) = (pts[b][0], pts[b][1]);
+        let (cx_, cy_) = (pts[c][0], pts[c][1]);
+        let (da, db, dc) = (samples[a].disparity, samples[b].disparity, samples[c].disparity);
+
+        let area = triangle_area(ax, ay, bx, by, cx_, cy_);
+        if area < 0.5 || area > config.max_triangle_area_px2 {
+            rejected += 1;
+            continue;
+        }
+        let e_ab = edge_length(ax, ay, bx, by);
+        let e_bc = edge_length(bx, by, cx_, cy_);
+        let e_ca = edge_length(cx_, cy_, ax, ay);
+        if e_ab > config.max_edge_length_px
+            || e_bc > config.max_edge_length_px
+            || e_ca > config.max_edge_length_px
+        {
+            rejected += 1;
+            continue;
+        }
+        let d_min = da.min(db).min(dc);
+        let d_max = da.max(db).max(dc);
+        if d_min > 0.0 && (d_max - d_min) / d_min > config.max_disparity_gradient {
+            rejected += 1;
+            continue;
+        }
+        rasterized += 1;
+
+        let min_x = (ax.min(bx).min(cx_).floor() as i32).max(0);
+        let max_x = (ax.max(bx).max(cx_).ceil() as i32).min(w as i32 - 1);
+        let min_y = (ay.min(by).min(cy_).floor() as i32).max(0);
+        let max_y = (ay.max(by).max(cy_).ceil() as i32).min(h as i32 - 1);
+        let inv_area = 1.0 / area;
+
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let fpx = px as f32 + 0.5;
+                let fpy = py as f32 + 0.5;
+                let w0 = cross2d(bx - ax, by - ay, fpx - ax, fpy - ay) * inv_area;
+                let w1 = cross2d(cx_ - bx, cy_ - by, fpx - bx, fpy - by) * inv_area;
+                let w2 = 1.0 - w0 - w1;
+                if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
+                    let d = w0 * dc + w1 * da + w2 * db;
+                    if d >= config.min_disparity_px {
+                        let z = fx * baseline_m / d;
+                        let idx = py as usize * w + px as usize;
+                        if depth[idx] == 0.0 || z < depth[idx] {
+                            depth[idx] = z;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    filled = depth.iter().filter(|&&d| d > 0.0).count();
+    eprintln!(
+        "dense_depth: samples={} triangles={} rejected={} rasterized={} filled={}/{}",
+        samples.len(), triangles.len(), rejected, rasterized, filled, w * h,
+    );
+    depth
 }
 
 /// Generate a dense point cloud by interpolating disparity over a Delaunay

@@ -100,9 +100,10 @@ pub use tracker::{
     RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
 };
-pub use tsdf::{TsdfConfig, TsdfIntegrateMsg, TsdfWorker};
+pub use tsdf::{MeshData, TsdfConfig, TsdfIntegrateMsg, TsdfWorker};
 pub use dense_cloud::{
     DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, generate_dense_cloud,
+    generate_dense_depth_image,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,

@@ -262,16 +262,16 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("rerun log error: {err}");
                         }
                     }
-                    // Generate and log dense cloud at keyframes
+                    // Generate and log dense cloud + TSDF at keyframes
                     if let Some(samples) = dense_samples {
                         if let Some(pose) = output.pose.as_ref() {
+                            let stereo = dense_triangulator.as_ref().unwrap().stereo();
+                            // Dense point cloud for Rerun
                             let dense = kiko_slam::generate_dense_cloud(
                                 &samples,
-                                dense_triangulator.as_ref().unwrap().stereo().fx(),
-                                dense_triangulator.as_ref().unwrap().stereo().fy(),
-                                dense_triangulator.as_ref().unwrap().stereo().left().cx,
-                                dense_triangulator.as_ref().unwrap().stereo().left().cy,
-                                dense_triangulator.as_ref().unwrap().stereo().baseline_m(),
+                                stereo.fx(), stereo.fy(),
+                                stereo.left().cx, stereo.left().cy,
+                                stereo.baseline_m(),
                                 left.data(), left.width(), left.height(),
                                 &dense_config,
                             );
@@ -282,15 +282,30 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 ) {
                                     eprintln!("dense cloud: {err}");
                                 }
-                                // Send to TSDF worker (async, non-blocking)
-                                if let Some(ref tsdf) = tsdf_worker {
-                                    let msg = kiko_slam::TsdfIntegrateMsg {
-                                        points: dense.points,
-                                        cam_from_map: pose.cam_from_map_pose32(),
-                                    };
-                                    if !tsdf.try_integrate(msg) {
-                                        eprintln!("tsdf worker queue full");
-                                    }
+                            }
+                            // Dense depth image for TSDF (independent of point cloud)
+                            if let Some(ref tsdf) = tsdf_worker {
+                                let depth_image = kiko_slam::generate_dense_depth_image(
+                                    &samples,
+                                    stereo.fx(),
+                                    stereo.baseline_m(),
+                                    stereo.width(),
+                                    stereo.height(),
+                                    &dense_config,
+                                );
+                                let msg = kiko_slam::TsdfIntegrateMsg {
+                                    depth_image,
+                                    grayscale: left.data().to_vec(),
+                                    cam_from_map: pose.cam_from_map_pose32(),
+                                    fx: stereo.fx(),
+                                    fy: stereo.fy(),
+                                    cx: stereo.left().cx,
+                                    cy: stereo.left().cy,
+                                    image_width: stereo.width(),
+                                    image_height: stereo.height(),
+                                };
+                                if !tsdf.try_integrate(msg) {
+                                    eprintln!("tsdf worker queue full");
                                 }
                             }
                         }
@@ -325,11 +340,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("rerun imu log error: {err}");
                     }
                 }
-                // Poll TSDF surface from async worker
+                // Poll TSDF mesh from async worker
                 if let Some(ref tsdf) = tsdf_worker {
-                    if let Some(surface) = tsdf.try_recv_surface() {
-                        if let Err(err) = sink.log_tsdf_surface(&surface) {
-                            eprintln!("tsdf surface log: {err}");
+                    if let Some(mesh) = tsdf.try_recv_mesh() {
+                        if let Err(err) = sink.log_tsdf_mesh(&mesh) {
+                            eprintln!("tsdf mesh log: {err}");
                         }
                     }
                 }

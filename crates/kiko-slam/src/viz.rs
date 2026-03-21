@@ -318,23 +318,27 @@ impl RerunSink {
         Ok(())
     }
 
-    /// Log TSDF surface voxels as a point cloud.
-    pub fn log_tsdf_surface(
+    /// Log TSDF mesh as a triangle mesh with vertex colors.
+    pub fn log_tsdf_mesh(
         &self,
-        surface: &[([f32; 3], u8)],
+        mesh: &crate::tsdf::MeshData,
     ) -> Result<(), VizLogError> {
-        if surface.is_empty() {
+        if mesh.positions.is_empty() {
             return Ok(());
         }
-        let positions: Vec<[f32; 3]> = surface.iter().map(|(p, _)| *p).collect();
-        let colors: Vec<rerun::Color> = surface
-            .iter()
-            .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
+        let positions: Vec<rerun::Position3D> = mesh.positions.iter()
+            .map(|p| rerun::Position3D::new(p[0], p[1], p[2]))
             .collect();
-        let cloud = rerun::Points3D::new(positions)
-            .with_colors(colors)
-            .with_radii([rerun::Radius::new_scene_units(0.01)]);
-        self.rec.log_static("world/tsdf_surface", &cloud)?;
+        let indices: Vec<rerun::TriangleIndices> = mesh.indices.iter()
+            .map(|t| rerun::TriangleIndices::from([t[0], t[1], t[2]]))
+            .collect();
+        let colors: Vec<rerun::Color> = mesh.colors.iter()
+            .map(|c| rerun::Color::from_rgb(c[0], c[1], c[2]))
+            .collect();
+        let mesh3d = rerun::Mesh3D::new(positions)
+            .with_triangle_indices(indices)
+            .with_vertex_colors(colors);
+        self.rec.log_static("world/tsdf_mesh", &mesh3d)?;
         Ok(())
     }
 

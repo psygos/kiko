@@ -25,10 +25,17 @@ fn main() {
     println!("cargo:rustc-link-search=native={nvblox_build}/nvblox");
     println!("cargo:rustc-link-lib=dylib=nvblox_lib");
 
+    // Link vendored glog and gflags (static)
+    println!("cargo:rustc-link-search=native={nvblox_build}/_deps/ext_glog-build");
+    println!("cargo:rustc-link-lib=static=glog");
+    println!("cargo:rustc-link-search=native={nvblox_build}/_deps/ext_gflags-build");
+    println!("cargo:rustc-link-lib=static=gflags_nothreads");
+
     // Link CUDA runtime
     println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
     println!("cargo:rustc-link-lib=dylib=cudart");
 
-    // Link C++ stdlib
+    // Link C++ stdlib + unwind
     println!("cargo:rustc-link-lib=dylib=stdc++");
+    println!("cargo:rustc-link-lib=dylib=unwind");
 }
