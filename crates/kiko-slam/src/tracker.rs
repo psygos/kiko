@@ -1816,7 +1816,13 @@ impl SlamTracker {
             );
         }
 
-        Some(optimized.pose())
+        // Convert from NavState (T_odom_from_body) to camera-in-map
+        // (T_cam_from_map) which is what the rest of the tracker expects.
+        // T_cam_map = T_cam_body * inv(T_odom_body)  (map_from_odom = identity)
+        let cam_from_map = vio_runtime.camera_from_body
+            .compose(optimized.nav_state().pose_odom_from_body().inverse())
+            .to_pose32();
+        Some(cam_from_map)
     }
 
     #[cfg(feature = "vio")]

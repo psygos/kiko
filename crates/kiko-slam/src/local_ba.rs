@@ -1502,8 +1502,10 @@ pub fn optimize_vio(
         let mut total_cost = 0.0;
 
         // --- 1. Reprojection factors ---
-        // Iterate all frames, resolve observations, compute 2×6 Jacobian,
-        // embed into 2×15 by zero-padding, accumulate.
+        // Compute T_cam_from_map from NavState for each frame.
+        // T_cam_map = T_cam_body * inv(T_odom_body)  (assuming map_from_odom = identity)
+        // Jacobians computed numerically w.r.t. the 15D NavState tangent to
+        // avoid chain-rule errors through the composition.
         for (frame_idx, synced) in window.synced_poses().enumerate() {
             let obs_set = if frame_idx == 0 {
                 &window.anchor().observations
@@ -1511,46 +1513,61 @@ pub fn optimize_vio(
                 &window.successors[frame_idx - 1].observations
             };
             let base = frame_idx * STATE_DIM;
-            let pose = synced.pose();
+            let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body);
             if let Some(resolved) = obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap()) {
                 for obs in resolved.observations() {
                     let world = obs.world();
                     let pixel = obs.pixel();
-                    if let Some((residual, j_pose_f32, _j_landmark)) =
-                        reprojection_residual_and_jacobians(pose, world, pixel, config.intrinsics)
-                    {
-                        let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                        let huber_delta = config.huber_delta_px as f32;
-                        let (huber_weight, huber_cost) = if r_norm <= huber_delta {
-                            (1.0_f32, 0.5 * r_norm * r_norm)
-                        } else {
-                            (huber_delta / r_norm, huber_delta * (r_norm - 0.5 * huber_delta))
+                    // Compute residual at current state
+                    let Some((residual, _, _)) =
+                        reprojection_residual_and_jacobians(cam_pose, world, pixel, config.intrinsics)
+                    else {
+                        continue;
+                    };
+                    let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                    let huber_delta = config.huber_delta_px as f32;
+                    let (huber_weight, huber_cost) = if r_norm <= huber_delta {
+                        (1.0_f32, 0.5 * r_norm * r_norm)
+                    } else {
+                        (huber_delta / r_norm, huber_delta * (r_norm - 0.5 * huber_delta))
+                    };
+                    total_cost += f64::from(huber_cost);
+                    let sqrt_w = huber_weight.sqrt();
+
+                    // Numerical Jacobian of 2D reprojection w.r.t. 15D NavState.
+                    // The reprojection computation uses f32, so the FD step must
+                    // be large enough to survive f32 quantization (~1e-7 relative).
+                    // At typical depths (1-5m), a 1e-4 pose perturbation produces
+                    // a ~0.04px change, well above f32 noise.
+                    const FD_EPS: f64 = 1e-4;
+                    let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
+                    for axis in 0..6 {
+                        // Only pose (first 6D) affects reprojection
+                        let mut delta_plus = [0.0_f64; STATE_DIM];
+                        let mut delta_minus = [0.0_f64; STATE_DIM];
+                        delta_plus[axis] = FD_EPS;
+                        delta_minus[axis] = -FD_EPS;
+                        let (Ok(s_plus), Ok(s_minus)) = (
+                            synced.nav_state().retract(&delta_plus),
+                            synced.nav_state().retract(&delta_minus),
+                        ) else {
+                            continue;
                         };
-                        total_cost += f64::from(huber_cost);
-                        let sqrt_w = huber_weight.sqrt();
-
-                        // Embed 2×6 into 2×15 (zero-padded) and promote to f64
-                        let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
-                        let mut r_f64 = [0.0_f64; 2];
-                        for row in 0..2 {
-                            for col in 0..6 {
-                                j_15[row][col] = f64::from(j_pose_f32[row][col] * sqrt_w);
+                        let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body);
+                        let p_minus = vio_cam_from_map(&s_minus, config.camera_from_body);
+                        if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
+                            reprojection_residual_and_jacobians(p_plus, world, pixel, config.intrinsics),
+                            reprojection_residual_and_jacobians(p_minus, world, pixel, config.intrinsics),
+                        ) {
+                            for row in 0..2 {
+                                j_15[row][axis] = f64::from(r_plus[row] - r_minus[row]) / (2.0 * FD_EPS)
+                                    * f64::from(sqrt_w);
                             }
-                            r_f64[row] = f64::from(residual[row] * sqrt_w);
                         }
-
-                        // Accumulate with identity information (Huber already applied)
-                        let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
-                        accumulate_factor(
-                            &mut hessian,
-                            &mut rhs,
-                            dim,
-                            &j_15,
-                            &identity_2,
-                            &r_f64,
-                            base,
-                        );
                     }
+                    let r_f64 = [f64::from(residual[0] * sqrt_w), f64::from(residual[1] * sqrt_w)];
+                    let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
+                    accumulate_factor(&mut hessian, &mut rhs, dim, &j_15, &identity_2, &r_f64, base);
                 }
             }
         }
@@ -1742,6 +1759,15 @@ pub fn optimize_vio(
         iterations: max_iters,
         final_cost: prev_cost,
     }
+}
+
+/// Compute camera-from-map pose from NavState (body-in-odom) + extrinsics.
+/// T_cam_map = T_cam_body * inv(T_odom_body) (assumes map_from_odom = identity)
+#[cfg(feature = "vio")]
+fn vio_cam_from_map(state: &crate::NavState, camera_from_body: crate::Pose64) -> Pose {
+    camera_from_body
+        .compose(state.pose_odom_from_body().inverse())
+        .to_pose32()
 }
 
 fn full_problem_cost(

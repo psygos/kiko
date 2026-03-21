@@ -231,8 +231,13 @@ fn integrate_core(
         let f = error_state_transition(omega_mid, accel_mid, dt);
         let g = noise_injection(delta_rotation, dt);
         let mut q = [[0.0_f64; 6]; 6];
-        let gyro_variance = noise.gyro_noise_density() * noise.gyro_noise_density();
-        let accel_variance = noise.accel_noise_density() * noise.accel_noise_density();
+        // Noise density is continuous-time (units: rad/s/√Hz or m/s²/√Hz).
+        // The discrete-time noise covariance per step is Q_d = σ² / dt.
+        // This is because G already contains dt, so G Q_d G^T = dt * σ²
+        // which matches the continuous-time integral ∫σ² dτ = σ² * dt.
+        let inv_dt = 1.0 / dt;
+        let gyro_variance = noise.gyro_noise_density() * noise.gyro_noise_density() * inv_dt;
+        let accel_variance = noise.accel_noise_density() * noise.accel_noise_density() * inv_dt;
         for axis in 0..3 {
             q[axis][axis] = gyro_variance;
             q[3 + axis][3 + axis] = accel_variance;
