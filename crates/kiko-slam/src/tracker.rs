@@ -1498,6 +1498,8 @@ impl SlamTracker {
                     .unwrap_or_else(Pose64::identity);
                 let vio_window_size = crate::env::env_usize("KIKO_VIO_WINDOW").unwrap_or(5);
                 let vio_max_iters = crate::env::env_usize("KIKO_VIO_ITERS").unwrap_or(3);
+                let calib_ab = calibration.initial_accel_bias().unwrap_or([0.0; 3]);
+                let calib_gb = calibration.initial_gyro_bias().unwrap_or([0.0; 3]);
                 let solve_config = crate::VioSolveConfig::new(
                     gravity,
                     camera_from_body,
@@ -1506,7 +1508,9 @@ impl SlamTracker {
                     std::num::NonZeroUsize::new(vio_max_iters).unwrap_or(NonZeroUsize::new(3).unwrap()),
                     f64::from(config.ba.huber_delta_px()),
                     10.0,  // anchor velocity info
-                    10.0,  // anchor bias info
+                    100.0, // bias prior info — strong, pulls toward calibrated
+                    calib_ab,
+                    calib_gb,
                 ).map_err(|err| TrackerInitError::VioInvalidGravity {
                     message: err.to_string(),
                 })?;

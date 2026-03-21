@@ -555,8 +555,12 @@ pub struct VioSolveConfig {
     huber_delta_px: f64,
     /// Diagonal information weight for the velocity anchor prior on frame 0.
     anchor_velocity_info: f64,
-    /// Diagonal information weight for the bias anchor prior on frame 0.
+    /// Diagonal information weight for the bias prior on all frames.
     anchor_bias_info: f64,
+    /// Calibrated accel bias — bias prior pulls toward this.
+    calibrated_accel_bias: [f64; 3],
+    /// Calibrated gyro bias — bias prior pulls toward this.
+    calibrated_gyro_bias: [f64; 3],
 }
 
 #[cfg(feature = "vio")]
@@ -594,6 +598,8 @@ impl VioSolveConfig {
         huber_delta_px: f64,
         anchor_velocity_info: f64,
         anchor_bias_info: f64,
+        calibrated_accel_bias: [f64; 3],
+        calibrated_gyro_bias: [f64; 3],
     ) -> Result<Self, VioSolveConfigError> {
         if !anchor_velocity_info.is_finite() {
             return Err(VioSolveConfigError::NonFiniteAnchorWeight {
@@ -628,6 +634,8 @@ impl VioSolveConfig {
             huber_delta_px,
             anchor_velocity_info,
             anchor_bias_info,
+            calibrated_accel_bias,
+            calibrated_gyro_bias,
         })
     }
 
@@ -1626,26 +1634,36 @@ pub fn optimize_vio(
             }
         }
 
-        // --- 4. Anchor prior on frame 0 ---
+        // --- 4. Bias prior on ALL frames toward calibrated values ---
+        // This prevents bias from diverging. The prior is soft (weight = anchor_bias_info)
+        // and pulls each frame's bias toward the calibrated reference.
+        // Without this, the optimizer uses bias as a free variable to absorb any
+        // residual, which makes it diverge to hundreds of m/s².
         {
-            let anchor_state = window.anchor().synced.nav_state();
-            let vel = anchor_state.velocity_odom_mps();
-            let bias = anchor_state.bias();
-            let vel_info = config.anchor_velocity_info;
             let bias_info_w = config.anchor_bias_info;
+            let calib_accel = config.calibrated_accel_bias;
+            let calib_gyro = config.calibrated_gyro_bias;
+            for frame_idx in 0..n_frames {
+                let base = frame_idx * STATE_DIM;
+                let state = if frame_idx == 0 {
+                    window.anchor().synced.nav_state()
+                } else {
+                    window.successors[frame_idx - 1].synced.nav_state()
+                };
+                let bias = state.bias();
+                // r_bias_accel = bias_accel - calib_accel, info = diag(bias_info_w)
+                // g = info * r, H += info
+                for a in 0..3 {
+                    let r_a = bias.accel[a] - calib_accel[a];
+                    hessian[(base + 9 + a) * dim + (base + 9 + a)] += bias_info_w;
+                    rhs[base + 9 + a] += bias_info_w * r_a;
+                    total_cost += 0.5 * bias_info_w * r_a * r_a;
 
-            // Velocity prior: r_vel = v_0, info = diag(vel_info)
-            for a in 0..3 {
-                hessian[(6 + a) * dim + (6 + a)] += vel_info;
-                rhs[6 + a] += vel_info * vel[a]; // g = info * (state - anchor=0)
-                total_cost += 0.5 * vel_info * vel[a] * vel[a];
-            }
-            // Bias prior: r_bias = bias_0 - calibrated_bias
-            // For simplicity, anchor at the current bias (prior keeps it stable)
-            for a in 0..3 {
-                hessian[(9 + a) * dim + (9 + a)] += bias_info_w;
-                // Accel bias — anchor at zero residual (keep current bias)
-                hessian[(12 + a) * dim + (12 + a)] += bias_info_w;
+                    let r_g = bias.gyro[a] - calib_gyro[a];
+                    hessian[(base + 12 + a) * dim + (base + 12 + a)] += bias_info_w;
+                    rhs[base + 12 + a] += bias_info_w * r_g;
+                    total_cost += 0.5 * bias_info_w * r_g * r_g;
+                }
             }
         }
 
@@ -1684,19 +1702,27 @@ pub fn optimize_vio(
         }
 
         // --- 8. Accept/reject ---
-        // For now, simple cost comparison (full gain ratio LM can be added later)
-        if total_cost < prev_cost || iteration == 0 {
-            // Accept: write candidate states into window
+        // total_cost is the cost at the current linearization point.
+        // On the first iteration, accept unconditionally (no previous cost).
+        // On subsequent iterations, accept only if cost decreased.
+        if iteration == 0 {
+            // First iteration: always accept, record baseline cost
             window.anchor.synced = candidate_synced[0].clone();
             for (i, succ) in window.successors.iter_mut().enumerate() {
                 succ.synced = candidate_synced[i + 1].clone();
             }
-            lambda = (lambda * f64::from(config.lm.min_lambda).max(1e-10))
-                .max(f64::from(config.lm.min_lambda));
-
-            let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
-            let cost_decrease = (prev_cost - total_cost).abs();
             prev_cost = total_cost;
+            lambda *= f64::from(config.lm.lambda_factor).recip().max(0.1);
+        } else if total_cost < prev_cost {
+            // Cost decreased: accept step, decrease damping
+            window.anchor.synced = candidate_synced[0].clone();
+            for (i, succ) in window.successors.iter_mut().enumerate() {
+                succ.synced = candidate_synced[i + 1].clone();
+            }
+            let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
+            let cost_decrease = prev_cost - total_cost;
+            prev_cost = total_cost;
+            lambda = (lambda * 0.3).max(f64::from(config.lm.min_lambda));
 
             if step_norm < 1e-6 && cost_decrease < 1e-10 * total_cost.max(1e-12) {
                 return VioSolveResult {
@@ -1706,6 +1732,7 @@ pub fn optimize_vio(
                 };
             }
         } else {
+            // Cost increased: reject step, increase damping
             lambda *= f64::from(config.lm.lambda_factor);
         }
     }
