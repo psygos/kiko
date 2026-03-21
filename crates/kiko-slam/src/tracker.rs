@@ -1438,6 +1438,14 @@ struct VioRuntime {
     predicted_state: Option<crate::NavState>,
     calibrated_accel_bias: Option<[f64; 3]>,
     calibrated_gyro_bias: Option<[f64; 3]>,
+    /// The last BA-optimized NavState. Used as base for preintegration.
+    last_optimized_state: Option<crate::NavState>,
+    /// VIO solve config (immutable after construction).
+    solve_config: crate::VioSolveConfig,
+    /// Sliding window for tightly-coupled VIO BA.
+    vio_window: Option<crate::local_ba::VioWindow>,
+    /// Max window size before oldest frame rolls off.
+    max_window: usize,
 }
 
 pub struct SlamTracker {
@@ -1488,6 +1496,20 @@ impl SlamTracker {
                     .imu_extrinsics()
                     .map(|extrinsics| extrinsics.t_cam_imu())
                     .unwrap_or_else(Pose64::identity);
+                let vio_window_size = crate::env::env_usize("KIKO_VIO_WINDOW").unwrap_or(5);
+                let vio_max_iters = crate::env::env_usize("KIKO_VIO_ITERS").unwrap_or(3);
+                let solve_config = crate::VioSolveConfig::new(
+                    gravity,
+                    camera_from_body,
+                    intrinsics,
+                    config.ba.lm(),
+                    std::num::NonZeroUsize::new(vio_max_iters).unwrap_or(NonZeroUsize::new(3).unwrap()),
+                    f64::from(config.ba.huber_delta_px()),
+                    10.0,  // anchor velocity info
+                    10.0,  // anchor bias info
+                ).map_err(|err| TrackerInitError::VioInvalidGravity {
+                    message: err.to_string(),
+                })?;
                 LocalEstimator::Inertial(Box::new(VioRuntime {
                     camera_from_body,
                     gravity,
@@ -1496,6 +1518,10 @@ impl SlamTracker {
                     predicted_state: None,
                     calibrated_accel_bias: calibration.initial_accel_bias(),
                     calibrated_gyro_bias: calibration.initial_gyro_bias(),
+                    last_optimized_state: None,
+                    solve_config,
+                    vio_window: None,
+                    max_window: vio_window_size,
                 }))
             }
             _ => LocalEstimator::VisualOnly,
@@ -1655,6 +1681,139 @@ impl SlamTracker {
     // drain_vio_responses, apply_vio_odometry, update_last_pose_from_vio_state,
     // refresh_predicted_pose_from_vio, correct_predicted_pose_from_visual_measurement,
     // on_keyframe_for_vio — all replaced by tightly-coupled BA in M2.
+
+    /// Run tightly-coupled VIO BA if IMU data is available, otherwise
+    /// fall back to visual-only BA.
+    #[cfg(feature = "vio")]
+    fn run_vio_or_visual_ba(
+        &mut self,
+        pose_world: Pose,
+        map_observations: Vec<MapObservation>,
+    ) -> Option<Pose> {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            // Visual-only mode
+            return ObservationSet::new(map_observations, self.ba.min_observations())
+                .ok()
+                .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
+        };
+
+        // Build NavState for this frame from visual pose
+        let camera_odom = self
+            .map_from_odom
+            .map_to_odom(Pose64::from_pose32(pose_world));
+        let body_odom = pose_odom_from_body_from_camera_pose(
+            camera_odom,
+            vio_runtime.camera_from_body,
+        );
+        let prev_vel = vio_runtime
+            .last_optimized_state
+            .as_ref()
+            .map(|s| s.velocity_odom_mps())
+            .unwrap_or([0.0; 3]);
+        let init_bias = crate::ImuBias {
+            accel: vio_runtime.calibrated_accel_bias.unwrap_or([0.0; 3]),
+            gyro: vio_runtime.calibrated_gyro_bias.unwrap_or([0.0; 3]),
+        };
+        let prev_bias = vio_runtime
+            .last_optimized_state
+            .as_ref()
+            .map(|s| s.bias().clone())
+            .unwrap_or(init_bias);
+
+        let nav_state = match crate::NavState::try_new(body_odom, prev_vel, prev_bias.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                return ObservationSet::new(map_observations, self.ba.min_observations())
+                    .ok()
+                    .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
+            }
+        };
+
+        // Preintegrate pending IMU
+        let obs_set = match ObservationSet::new(map_observations, self.ba.min_observations()) {
+            Ok(set) => set,
+            Err(_) => return None,
+        };
+
+        let preintegrated = match vio_runtime.pending_imu.drain_batch() {
+            Ok(Some(batch)) if batch.len() >= 2 => {
+                crate::PreintegratedImu::integrate(&batch, &prev_bias, &vio_runtime.noise).ok()
+            }
+            _ => None,
+        };
+
+        let Some(preintegrated) = preintegrated else {
+            // No IMU data — fall back to visual BA
+            return self.ba.push_frame(self.global_map.map(), pose_world, obs_set);
+        };
+
+        // Build or extend the VIO window
+        use crate::local_ba::{
+            SyncedPose, VioAnchor, VioSuccessor, VioWindow, optimize_vio,
+        };
+
+        if vio_runtime.vio_window.is_none() {
+            // First frame: create anchor
+            let anchor = VioAnchor {
+                synced: SyncedPose::new(nav_state.clone()),
+                observations: obs_set,
+            };
+            vio_runtime.vio_window = Some(VioWindow {
+                anchor,
+                successors: Vec::new(),
+            });
+            vio_runtime.last_optimized_state = Some(nav_state.clone());
+            vio_runtime.predicted_state = Some(nav_state);
+            return Some(pose_world);
+        }
+
+        // Add successor frame
+        let window = vio_runtime.vio_window.as_mut().unwrap();
+        window.successors.push(VioSuccessor {
+            synced: SyncedPose::new(nav_state.clone()),
+            observations: obs_set,
+            preintegrated,
+        });
+
+        // Trim window
+        while window.len() > vio_runtime.max_window {
+            if window.successors.len() <= 1 {
+                break;
+            }
+            // Promote second frame to anchor, drop first successor's preintegration
+            let old_succ = window.successors.remove(0);
+            window.anchor = VioAnchor {
+                synced: old_succ.synced,
+                observations: old_succ.observations,
+            };
+        }
+
+        // Run the VIO optimizer
+        let result = optimize_vio(window, &vio_runtime.solve_config, self.global_map.map());
+
+        // Extract optimized state from the last frame
+        let optimized = window.successors.last()
+            .map(|s| s.synced.clone())
+            .unwrap_or_else(|| window.anchor.synced.clone());
+
+        vio_runtime.last_optimized_state = Some(optimized.nav_state().clone());
+        vio_runtime.predicted_state = Some(optimized.nav_state().clone());
+
+        if self.trace_transitions {
+            let vel = optimized.nav_state().velocity_odom_mps();
+            let bias = optimized.nav_state().bias();
+            eprintln!(
+                "vio ba: frames={} iters={} cost={:.4} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}]",
+                window.len(),
+                result.iterations,
+                result.final_cost,
+                vel[0], vel[1], vel[2],
+                bias.accel[0], bias.accel[1], bias.accel[2],
+            );
+        }
+
+        Some(optimized.pose())
+    }
 
     #[cfg(feature = "vio")]
     fn drain_vio_responses(&mut self) {}
@@ -2602,9 +2761,7 @@ impl SlamTracker {
 
         let pose_world = result.pose;
         #[cfg(feature = "vio")]
-        let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
-            .ok()
-            .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
+        let refined_world = self.run_vio_or_visual_ba(pose_world, map_observations);
         #[cfg(not(feature = "vio"))]
         let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()

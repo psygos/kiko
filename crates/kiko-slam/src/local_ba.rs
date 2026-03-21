@@ -496,28 +496,28 @@ const VIO_STATE_DIM: usize = 15;
 /// updated together. There is no public way to set one without the other.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
-struct SyncedPose {
-    f32_pose: Pose,
-    nav_state: crate::NavState,
+pub(crate) struct SyncedPose {
+    pub(crate) f32_pose: Pose,
+    pub(crate) nav_state: crate::NavState,
 }
 
 #[cfg(feature = "vio")]
 impl SyncedPose {
-    fn new(nav_state: crate::NavState) -> Self {
+    pub(crate) fn new(nav_state: crate::NavState) -> Self {
         let f32_pose = nav_state.pose_odom_from_body().to_pose32();
         Self { f32_pose, nav_state }
     }
 
-    fn pose(&self) -> Pose {
+    pub(crate) fn pose(&self) -> Pose {
         self.f32_pose
     }
 
-    fn nav_state(&self) -> &crate::NavState {
+    pub(crate) fn nav_state(&self) -> &crate::NavState {
         &self.nav_state
     }
 
     /// Apply a 15D tangent-space retraction. Both representations update together.
-    fn retract(&self, delta: &crate::NavTangent) -> Result<Self, crate::NavStateError> {
+    pub(crate) fn retract(&self, delta: &crate::NavTangent) -> Result<Self, crate::NavStateError> {
         let nav_state = self.nav_state.retract(delta)?;
         Ok(Self::new(nav_state))
     }
@@ -527,19 +527,19 @@ impl SyncedPose {
 /// Carries an anchor prior on velocity and bias.
 #[cfg(feature = "vio")]
 #[derive(Debug)]
-struct VioAnchor {
-    synced: SyncedPose,
-    observations: ObservationSet,
+pub(crate) struct VioAnchor {
+    pub(crate) synced: SyncedPose,
+    pub(crate) observations: ObservationSet,
 }
 
 /// A successor frame in a VIO window. Always has a PreintegratedImu from
 /// its immediate predecessor — this is structural, not optional.
 #[cfg(feature = "vio")]
 #[derive(Debug)]
-struct VioSuccessor {
-    synced: SyncedPose,
-    observations: ObservationSet,
-    preintegrated: crate::PreintegratedImu,
+pub(crate) struct VioSuccessor {
+    pub(crate) synced: SyncedPose,
+    pub(crate) observations: ObservationSet,
+    pub(crate) preintegrated: crate::PreintegratedImu,
 }
 
 /// Immutable configuration for a VIO solve window. Set once, used for
@@ -645,15 +645,15 @@ impl VioSolveConfig {
 /// - The Hessian dimension is `(1 + successors.len()) * VIO_STATE_DIM`
 #[cfg(feature = "vio")]
 #[derive(Debug)]
-struct VioWindow {
-    anchor: VioAnchor,
-    successors: Vec<VioSuccessor>,
+pub(crate) struct VioWindow {
+    pub(crate) anchor: VioAnchor,
+    pub(crate) successors: Vec<VioSuccessor>,
 }
 
 #[cfg(feature = "vio")]
 impl VioWindow {
     /// Total number of frames in the window (anchor + successors).
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         1 + self.successors.len()
     }
 
