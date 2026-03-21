@@ -15,6 +15,7 @@ mod calibration;
 mod capture;
 mod channel;
 pub mod dataset;
+mod dense_cloud;
 mod depth;
 mod diagnostics;
 pub mod env;
@@ -98,10 +99,13 @@ pub use tracker::{
     RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
 };
+pub use dense_cloud::{
+    DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, generate_dense_cloud,
+};
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
-    TriangulationStats, Triangulator,
+    RectifiedStereoError, SparseStereoSample, TriangulationConfig, TriangulationError,
+    TriangulationResult, TriangulationStats, Triangulator,
 };
 #[cfg(feature = "vio")]
 pub use vio::{

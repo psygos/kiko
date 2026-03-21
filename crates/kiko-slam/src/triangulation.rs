@@ -262,6 +262,16 @@ impl std::fmt::Display for TriangulationError {
 
 impl std::error::Error for TriangulationError {}
 
+/// A validated sparse stereo sample: left pixel coordinate + disparity.
+/// Produced by the same deduplication and filtering as triangulation.
+#[derive(Clone, Copy, Debug)]
+pub struct SparseStereoSample {
+    pub u: f32,
+    pub v: f32,
+    pub disparity: f32,
+    pub depth_m: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Point3 {
     pub x: f32,
@@ -483,6 +493,68 @@ pub struct Triangulator {
 impl Triangulator {
     pub fn new(stereo: RectifiedStereo, config: TriangulationConfig) -> Self {
         Self { stereo, config }
+    }
+
+    /// Extract deduplicated, filtered stereo samples from matches.
+    /// Uses the same deduplication (best score per left keypoint) and
+    /// filtering (bounds, min disparity, max depth) as `triangulate()`.
+    pub fn extract_stereo_samples(
+        &self,
+        matches: &Matches<Raw>,
+    ) -> Vec<SparseStereoSample> {
+        let left = matches.source_a_arc();
+        let right = matches.source_b();
+        if left.sensor_id() != SensorId::StereoLeft
+            || right.sensor_id() != SensorId::StereoRight
+        {
+            return Vec::new();
+        }
+        let left_len = left.len();
+        let right_len = right.len();
+        let mut best: Vec<Option<(usize, f32)>> = vec![None; left_len];
+        for (&(li, ri), &score) in matches.indices().iter().zip(matches.scores()) {
+            if li >= left_len || ri >= right_len {
+                continue;
+            }
+            match best[li] {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => {
+                    best[li] = Some((ri, score));
+                }
+            }
+        }
+        let width = self.stereo.width() as f32;
+        let height = self.stereo.height() as f32;
+        let fx = self.stereo.fx();
+        let left_cx = self.stereo.left().cx;
+        let right_cx = self.stereo.right().cx;
+        let baseline = self.stereo.baseline_m();
+        let mut samples = Vec::new();
+        for (li, candidate) in best.into_iter().enumerate() {
+            let Some((ri, _)) = candidate else { continue };
+            let left_kp = left.keypoints()[li];
+            let right_kp = right.keypoints()[ri];
+            if !in_bounds(left_kp, width, height) || !in_bounds(right_kp, width, height) {
+                continue;
+            }
+            let disparity = (left_kp.x - left_cx) - (right_kp.x - right_cx);
+            if disparity <= self.config.min_disparity_px {
+                continue;
+            }
+            let z = fx * baseline / disparity;
+            if let Some(max_depth) = self.config.max_depth_m {
+                if z > max_depth {
+                    continue;
+                }
+            }
+            samples.push(SparseStereoSample {
+                u: left_kp.x,
+                v: left_kp.y,
+                disparity,
+                depth_m: z,
+            });
+        }
+        samples
     }
 
     pub fn triangulate(
