@@ -495,6 +495,10 @@ impl Triangulator {
         Self { stereo, config }
     }
 
+    pub fn stereo(&self) -> &RectifiedStereo {
+        &self.stereo
+    }
+
     /// Extract deduplicated, filtered stereo samples from matches.
     /// Uses the same deduplication (best score per left keypoint) and
     /// filtering (bounds, min disparity, max depth) as `triangulate()`.

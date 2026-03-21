@@ -106,6 +106,8 @@ pub struct RerunSink {
     corrected_trajectory: TrajectoryLog,
     visual_measurement_trajectory: TrajectoryLog,
     logged_world: bool,
+    dense_cloud_positions: Vec<[f32; 3]>,
+    dense_cloud_colors: Vec<rerun::Color>,
 }
 
 impl RerunSink {
@@ -120,6 +122,8 @@ impl RerunSink {
             corrected_trajectory: TrajectoryLog::default(),
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
+            dense_cloud_positions: Vec::new(),
+            dense_cloud_colors: Vec::new(),
         }
     }
 
@@ -283,6 +287,34 @@ impl RerunSink {
             None => self.visual_measurement_trajectory.break_strip(),
         }
 
+        Ok(())
+    }
+
+    /// Log a dense point cloud, transformed to map frame and accumulated
+    /// persistently across keyframes.
+    pub fn log_dense_cloud(
+        &mut self,
+        points: &[crate::DensePoint],
+        cam_from_map: Pose,
+    ) -> Result<(), VizLogError> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        // Transform from camera frame to map frame: p_map = inv(cam_from_map) * p_cam
+        let map_from_cam = cam_from_map.inverse();
+        let r = map_from_cam.rotation();
+        let t = map_from_cam.translation();
+        for p in points {
+            let world = crate::math::transform_point(r, t, p.position);
+            self.dense_cloud_positions.push(world);
+            self.dense_cloud_colors
+                .push(rerun::Color::from_rgb(p.intensity, p.intensity, p.intensity));
+        }
+        // Log the full accumulated cloud
+        let cloud = rerun::Points3D::new(self.dense_cloud_positions.clone())
+            .with_colors(self.dense_cloud_colors.clone())
+            .with_radii([rerun::Radius::new_scene_units(0.003)]);
+        self.rec.log_static("world/dense_cloud", &cloud)?;
         Ok(())
     }
 

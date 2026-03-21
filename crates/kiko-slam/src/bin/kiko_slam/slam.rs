@@ -90,6 +90,16 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         reader.calibration(),
         build_rectified_stereo_config(&args.rectify),
     )?;
+    let dense_cloud_enabled = kiko_slam::env::env_bool("KIKO_DENSE_CLOUD").unwrap_or(false);
+    let dense_config = kiko_slam::DenseCloudConfig::from_env();
+    let dense_triangulator = if dense_cloud_enabled {
+        Some(kiko_slam::Triangulator::new(
+            rectified.clone(),
+            kiko_slam::TriangulationConfig::default(),
+        ))
+    } else {
+        None
+    };
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
     let calibration =
         CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
@@ -147,6 +157,14 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let max_kp = inference.key_limit.get();
 
     let mut bundles_iter = reader.bundles();
+    // Skip initial frames (camera white balance + IMU settling)
+    let skip = args.dataset.skip_frames;
+    if skip > 0 {
+        eprintln!("skipping first {skip} frames");
+        for _ in 0..skip {
+            let _ = bundles_iter.next();
+        }
+    }
     // Read-ahead: grab the first bundle
     let mut next_bundle: Option<kiko_slam::CaptureBundle> = loop {
         match bundles_iter.next() {
@@ -222,6 +240,13 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 });
                 if let Some(matches) = output.stereo_matches {
+                    // Extract stereo samples for dense cloud BEFORE matches are consumed
+                    let dense_samples = if output.keyframe.is_some() {
+                        dense_triangulator.as_ref().map(|tri| tri.extract_stereo_samples(&matches))
+                    } else {
+                        None
+                    };
+
                     let points = output
                         .keyframe
                         .as_ref()
@@ -230,6 +255,29 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
                         if let Err(err) = sink.log_with_points(&packet, points) {
                             eprintln!("rerun log error: {err}");
+                        }
+                    }
+                    // Generate and log dense cloud at keyframes
+                    if let Some(samples) = dense_samples {
+                        if let Some(pose) = output.pose.as_ref() {
+                            let dense = kiko_slam::generate_dense_cloud(
+                                &samples,
+                                dense_triangulator.as_ref().unwrap().stereo().fx(),
+                                dense_triangulator.as_ref().unwrap().stereo().fy(),
+                                dense_triangulator.as_ref().unwrap().stereo().left().cx,
+                                dense_triangulator.as_ref().unwrap().stereo().left().cy,
+                                dense_triangulator.as_ref().unwrap().stereo().baseline_m(),
+                                left.data(), left.width(), left.height(),
+                                &dense_config,
+                            );
+                            if !dense.points.is_empty() {
+                                if let Err(err) = sink.log_dense_cloud(
+                                    &dense.points,
+                                    pose.cam_from_map_pose32(),
+                                ) {
+                                    eprintln!("dense cloud: {err}");
+                                }
+                            }
                         }
                     }
                     if output.keyframe.is_some() {
