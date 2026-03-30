@@ -7,7 +7,7 @@
 use crate::triangulation::SparseStereoSample;
 use crate::{DepthImage, FrameId, InterpolatedDepth, Timestamp};
 
-/// Configuration for dense cloud generation.
+/// Configuration for dense visualization and stable surface observation generation.
 #[derive(Clone, Copy, Debug)]
 pub struct DenseCloudConfig {
     /// Generate a point every Nth pixel within each triangle.
@@ -20,7 +20,9 @@ pub struct DenseCloudConfig {
     pub max_edge_length_px: f32,
     /// Reject triangle if area exceeds this in pixels².
     pub max_triangle_area_px2: f32,
-    /// Hard cap on output points per keyframe.
+    /// Reject observations whose conservative positional sigma exceeds this threshold.
+    pub max_observation_std_dev_m: f32,
+    /// Hard cap on output points per keyframe. When exceeded, the most stable points are kept.
     pub max_points_per_keyframe: usize,
 }
 
@@ -32,6 +34,7 @@ impl Default for DenseCloudConfig {
             min_disparity_px: 1.5,
             max_edge_length_px: 120.0,
             max_triangle_area_px2: 8_000.0,
+            max_observation_std_dev_m: 0.05,
             max_points_per_keyframe: 30_000,
         }
     }
@@ -52,6 +55,11 @@ impl DenseCloudConfig {
         if let Some(v) = crate::env::env_f32("KIKO_DENSE_MAX_AREA_PX2") {
             c.max_triangle_area_px2 = v;
         }
+        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_POINT_SIGMA_M")
+            .or_else(|| crate::env::env_f32("KIKO_DENSE_MAX_POINT_SIGMA_M"))
+        {
+            c.max_observation_std_dev_m = v.max(0.0);
+        }
         if let Some(v) = crate::env::env_usize("KIKO_DENSE_MAX_POINTS") {
             c.max_points_per_keyframe = v;
         }
@@ -59,23 +67,44 @@ impl DenseCloudConfig {
     }
 }
 
-/// A dense colored point in camera frame with measurement uncertainty.
+/// An interpolated dense visualization point in camera frame.
 ///
-/// The `depth_variance` is derived from the stereo measurement model:
-///   σ_z = z² / (f · baseline) · σ_d
-/// where σ_d accounts for both matching precision and interpolation.
-/// At measured feature locations, σ_d ≈ 0.5px.
-/// At Delaunay-interpolated points, σ_d is amplified by 1/√(min_bary_weight).
+/// This is a derived artifact produced by Delaunay interpolation over sparse stereo
+/// correspondences. It is useful for visualization, but must not be treated as an
+/// authoritative measured surface observation.
 #[derive(Clone, Copy, Debug)]
 pub struct DensePoint {
     pub position: [f32; 3],
     pub intensity: u8,
-    /// Depth variance in m², computed from the stereo measurement model.
-    /// Carries the dominant uncertainty — depth error grows quadratically with range.
-    pub depth_variance: f32,
+    /// Conservative scalar positional variance in m².
+    pub position_variance: f32,
 }
 
-/// Statistics from dense cloud generation.
+/// A measured sparse stereo surface observation in camera frame.
+///
+/// `position_variance` is a scalar summary of the 3D point covariance induced by
+/// stereo disparity uncertainty. If disparity is the dominant noise source then:
+///
+///   x = (u - cx) z / fx
+///   y = (v - cy) z / fy
+///   z = fx * baseline / disparity
+///
+/// and the trace of the induced 3D covariance is:
+///
+///   trace(Σ_p) = σ_d² ||∂p/∂d||²
+///              = σ_z² * (1 + ((u-cx)/fx)² + ((v-cy)/fy)²)
+///
+/// This naturally downweights far points and off-axis edge points without relying
+/// on ad hoc image-radius heuristics.
+#[derive(Clone, Copy, Debug)]
+pub struct StableSurfacePoint {
+    pub position: [f32; 3],
+    pub intensity: u8,
+    /// Conservative scalar positional variance in m².
+    pub position_variance: f32,
+}
+
+/// Statistics from dense interpolated cloud generation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DenseCloudStats {
     pub input_samples: usize,
@@ -91,6 +120,44 @@ pub struct DenseCloudStats {
 pub struct DenseCloudResult {
     pub points: Vec<DensePoint>,
     pub stats: DenseCloudStats,
+}
+
+/// Statistics from stable sparse surface observation generation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StableSurfaceStats {
+    pub input_samples: usize,
+    pub points_generated: usize,
+    pub dropped_disparity: usize,
+    pub dropped_uncertainty: usize,
+    pub dropped_out_of_bounds: usize,
+    pub points_capped: bool,
+    pub mean_accepted_position_sigma_m: f64,
+    pub max_accepted_position_sigma_m: f32,
+}
+
+/// Result of stable sparse surface observation generation.
+#[derive(Debug)]
+pub struct StableSurfaceResult {
+    pub points: Vec<StableSurfacePoint>,
+    pub stats: StableSurfaceStats,
+}
+
+fn stereo_position_variance_m2(
+    u: f32,
+    v: f32,
+    z: f32,
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    baseline_m: f32,
+    sigma_d_px: f32,
+) -> f32 {
+    let dz_dd = z * z / (fx * baseline_m);
+    let sigma_z_sq = dz_dd * dz_dd * sigma_d_px * sigma_d_px;
+    let ux = (u - cx) / fx;
+    let vy = (v - cy) / fy;
+    sigma_z_sq * (1.0 + ux * ux + vy * vy)
 }
 
 /// Generate an interpolated depth image by rasterizing a Delaunay disparity field.
@@ -208,6 +275,103 @@ pub fn generate_dense_depth_image(
     .expect("dense interpolation produced a lawful interpolated depth image")
 }
 
+/// Generate stable sparse surface observations directly from measured stereo samples.
+///
+/// Unlike `generate_dense_cloud`, this path does not invent new geometry by
+/// interpolating across triangles. Each output point corresponds to a measured
+/// stereo feature, and points are filtered/ranked by propagated positional
+/// uncertainty before entering the voxel belief map.
+pub fn generate_stable_surface_points(
+    samples: &[SparseStereoSample],
+    fx: f32,
+    fy: f32,
+    cx: f32,
+    cy: f32,
+    baseline_m: f32,
+    image_data: &[u8],
+    image_width: u32,
+    image_height: u32,
+    config: &DenseCloudConfig,
+) -> StableSurfaceResult {
+    let mut stats = StableSurfaceStats {
+        input_samples: samples.len(),
+        ..Default::default()
+    };
+    let mut points = Vec::with_capacity(samples.len().min(config.max_points_per_keyframe));
+    let max_position_variance = config.max_observation_std_dev_m * config.max_observation_std_dev_m;
+    // Conservative fixed disparity noise prior until the calibrated stereo
+    // uncertainty model in M7 is wired through this path.
+    let sigma_d_feature_px = 0.5_f32;
+
+    for sample in samples {
+        if sample.disparity < config.min_disparity_px {
+            stats.dropped_disparity = stats.dropped_disparity.saturating_add(1);
+            continue;
+        }
+
+        let px = sample.u.round() as i32;
+        let py = sample.v.round() as i32;
+        if px < 0 || py < 0 || px >= image_width as i32 || py >= image_height as i32 {
+            stats.dropped_out_of_bounds = stats.dropped_out_of_bounds.saturating_add(1);
+            continue;
+        }
+        let idx = py as usize * image_width as usize + px as usize;
+        let Some(&intensity) = image_data.get(idx) else {
+            stats.dropped_out_of_bounds = stats.dropped_out_of_bounds.saturating_add(1);
+            continue;
+        };
+
+        let z = sample.depth_m;
+        let x = (sample.u - cx) * z / fx;
+        let y = (sample.v - cy) * z / fy;
+        let position_variance = stereo_position_variance_m2(
+            sample.u,
+            sample.v,
+            z,
+            fx,
+            fy,
+            cx,
+            cy,
+            baseline_m,
+            sigma_d_feature_px,
+        );
+        if !position_variance.is_finite() || position_variance <= 0.0 {
+            stats.dropped_uncertainty = stats.dropped_uncertainty.saturating_add(1);
+            continue;
+        }
+        if position_variance > max_position_variance {
+            stats.dropped_uncertainty = stats.dropped_uncertainty.saturating_add(1);
+            continue;
+        }
+
+        points.push(StableSurfacePoint {
+            position: [x, y, z],
+            intensity,
+            position_variance,
+        });
+    }
+
+    if points.len() > config.max_points_per_keyframe {
+        points.sort_by(|a, b| a.position_variance.total_cmp(&b.position_variance));
+        points.truncate(config.max_points_per_keyframe);
+        stats.points_capped = true;
+    }
+
+    stats.points_generated = points.len();
+    if stats.points_generated > 0 {
+        let mut sigma_sum_m = 0.0_f64;
+        let mut sigma_max_m = 0.0_f32;
+        for point in &points {
+            let sigma_m = point.position_variance.sqrt();
+            sigma_sum_m += sigma_m as f64;
+            sigma_max_m = sigma_max_m.max(sigma_m);
+        }
+        stats.mean_accepted_position_sigma_m = sigma_sum_m / stats.points_generated as f64;
+        stats.max_accepted_position_sigma_m = sigma_max_m;
+    }
+    StableSurfaceResult { points, stats }
+}
+
 /// Generate a dense point cloud by interpolating disparity over a Delaunay
 /// triangulation of sparse stereo samples.
 pub fn generate_dense_cloud(
@@ -317,18 +481,21 @@ pub fn generate_dense_cloud(
                         } else {
                             128
                         };
-                        // Stereo uncertainty model: σ_z = z²/(f·b) · σ_d
-                        // σ_d increases with distance from triangle vertices
-                        // (barycentric interpolation amplifies noise)
+                        // Propagate disparity uncertainty to a conservative scalar
+                        // positional variance. Interpolation amplifies disparity noise
+                        // through the inverse sqrt of the weakest barycentric support.
                         let min_bary = w0.min(w1).min(w2).max(0.01);
-                        let sigma_d_feature = 0.5_f32; // matching precision in pixels
+                        // Conservative fixed disparity noise prior until the
+                        // calibrated stereo uncertainty model in M7 lands here.
+                        let sigma_d_feature = 0.5_f32;
                         let sigma_d = sigma_d_feature / min_bary.sqrt();
-                        let sigma_z = z * z / (fx * baseline_m) * sigma_d;
-                        let depth_variance = sigma_z * sigma_z;
+                        let position_variance = stereo_position_variance_m2(
+                            fpx, fpy, z, fx, fy, cx, cy, baseline_m, sigma_d,
+                        );
                         points.push(DensePoint {
                             position: [x, y, z],
                             intensity,
-                            depth_variance,
+                            position_variance,
                         });
                         if points.len() >= config.max_points_per_keyframe {
                             stats.points_generated = points.len();
@@ -523,6 +690,7 @@ mod tests {
         let image = vec![128u8; 20 * 20];
         let config = DenseCloudConfig {
             subsample: 1,
+            max_observation_std_dev_m: 1.0,
             max_points_per_keyframe: 10000,
             ..Default::default()
         };
@@ -637,6 +805,7 @@ mod tests {
         let image = vec![128u8; 100 * 100];
         let config = DenseCloudConfig {
             subsample: 1,
+            max_observation_std_dev_m: 1.0,
             max_points_per_keyframe: 100_000,
             ..Default::default()
         };
@@ -681,6 +850,7 @@ mod tests {
         let image = vec![128u8; 100 * 100];
         let config = DenseCloudConfig {
             subsample: 1,
+            max_observation_std_dev_m: 1.0,
             max_points_per_keyframe: 10,
             max_edge_length_px: 200.0,
             max_triangle_area_px2: 10000.0,
@@ -712,5 +882,76 @@ mod tests {
             &DenseCloudConfig::default(),
         );
         assert!(result.points.is_empty());
+    }
+
+    #[test]
+    fn stable_surface_rejects_high_uncertainty_observations() {
+        let fx = 200.0;
+        let fy = 200.0;
+        let cx = 50.0;
+        let cy = 50.0;
+        let baseline = 0.075;
+        let z = 8.0;
+        let d = fx * baseline / z;
+        let samples = vec![SparseStereoSample {
+            u: 50.0,
+            v: 50.0,
+            disparity: d,
+            depth_m: z,
+        }];
+        let image = vec![128u8; 100 * 100];
+        let result = generate_stable_surface_points(
+            &samples,
+            fx,
+            fy,
+            cx,
+            cy,
+            baseline,
+            &image,
+            100,
+            100,
+            &DenseCloudConfig::default(),
+        );
+        assert!(result.points.is_empty());
+        assert_eq!(result.stats.dropped_uncertainty, 1);
+    }
+
+    #[test]
+    fn stable_surface_keeps_most_stable_points_when_capped() {
+        let fx = 200.0;
+        let fy = 200.0;
+        let cx = 50.0;
+        let cy = 50.0;
+        let baseline = 0.075;
+        let z = 2.0;
+        let d = fx * baseline / z;
+        let samples = vec![
+            SparseStereoSample {
+                u: 50.0,
+                v: 50.0,
+                disparity: d,
+                depth_m: z,
+            },
+            SparseStereoSample {
+                u: 95.0,
+                v: 95.0,
+                disparity: d,
+                depth_m: z,
+            },
+        ];
+        let mut image = vec![0u8; 100 * 100];
+        image[50 * 100 + 50] = 11;
+        image[95 * 100 + 95] = 22;
+        let config = DenseCloudConfig {
+            max_observation_std_dev_m: 1.0,
+            max_points_per_keyframe: 1,
+            ..DenseCloudConfig::default()
+        };
+        let result = generate_stable_surface_points(
+            &samples, fx, fy, cx, cy, baseline, &image, 100, 100, &config,
+        );
+        assert_eq!(result.points.len(), 1);
+        assert_eq!(result.points[0].intensity, 11);
+        assert!(result.stats.points_capped);
     }
 }

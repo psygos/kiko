@@ -30,7 +30,6 @@ mod loop_manager;
 pub mod map;
 mod map_from_odom;
 mod math;
-mod surface_map;
 #[cfg(feature = "record")]
 mod oak;
 mod observability;
@@ -40,6 +39,7 @@ mod place_recognition;
 mod pnp;
 pub mod pose_graph;
 mod preprocess;
+mod surface_map;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod tracker;
@@ -57,8 +57,9 @@ pub use channel::{
     DropReceiver, DropSender, SendOutcome, bounded_channel,
 };
 pub use dense_cloud::{
-    DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, generate_dense_cloud,
-    generate_dense_depth_image,
+    DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, StableSurfacePoint,
+    StableSurfaceResult, StableSurfaceStats, generate_dense_cloud, generate_dense_depth_image,
+    generate_stable_surface_points,
 };
 pub use depth::{
     DepthImage, DepthImageError, DepthProvenance, DepthProvenanceKind, InterpolatedDepth,
@@ -67,9 +68,11 @@ pub use depth::{
 pub use diagnostics::{
     AllObservationsSupport, CountMetric, DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics,
     HeldOutObservationsSupport, KeyframeRemovalReason, KeyframeStatus, LoopClosureRejectReason,
-    LoopClosureStatus, ObservationSupport, ObservationSupportMarker, PixelResidualMetric,
-    PnpAcceptedInlierPixelResidualMetric, PnpAcceptedInliersSupport, PnpInlierRatioMetric,
-    PnpTrackedObservationCountMetric, PnpTrackedObservationsSupport, RatioMetric,
+    LoopClosureStatus, MeanSquaredPixelResidualMetric, ObservationSupport,
+    ObservationSupportMarker, PixelResidualMetric, PnpAcceptedInlierPixelResidualMetric,
+    PnpAcceptedInlierReprojectionMsePerAxisPx2Metric, PnpAcceptedInliersSupport,
+    PnpInlierRatioMetric, PnpTrackedObservationCountMetric, PnpTrackedObservationsSupport,
+    RatioMetric,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use geometry::{
@@ -114,6 +117,7 @@ pub use pnp::{
     IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
     build_observations, solve_pnp, solve_pnp_ransac,
 };
+pub use surface_map::{SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapSummary};
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
@@ -126,7 +130,6 @@ pub use triangulation::{
     RectifiedStereoError, SparseStereoSample, TriangulationConfig, TriangulationError,
     TriangulationResult, TriangulationStats, Triangulator,
 };
-pub use surface_map::{SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapSummary};
 pub use tsdf::{
     MeshData, TsdfCameraIntrinsics, TsdfCameraIntrinsicsError, TsdfConfig, TsdfIntegrateMsg,
     TsdfIntegrateMsgError, TsdfWorker,

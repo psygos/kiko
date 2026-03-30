@@ -121,7 +121,7 @@ impl RerunSink {
             corrected_trajectory: TrajectoryLog::default(),
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
-            surface_map: crate::SurfaceBeliefMap::new(crate::SurfaceMapConfig::default()),
+            surface_map: crate::SurfaceBeliefMap::new(crate::SurfaceMapConfig::from_env()),
         }
     }
 
@@ -288,20 +288,81 @@ impl RerunSink {
         Ok(())
     }
 
-    /// Log a dense point cloud, transformed to map frame and accumulated
-    /// persistently across keyframes.
-    pub fn log_dense_cloud(
+    /// Log stable surface observations, fuse them into the surface belief map,
+    /// and emit the confirmed low-resolution voxel surface plus stability metrics.
+    pub fn log_surface_observations(
         &mut self,
-        points: &[crate::DensePoint],
+        timestamp: Timestamp,
+        points: &[crate::StableSurfacePoint],
+        stats: &crate::StableSurfaceStats,
         cam_from_map: Pose,
     ) -> Result<(), VizLogError> {
-        if points.is_empty() {
-            return Ok(());
-        }
-        // Integrate into the surface belief map (information-weighted fusion)
-        self.surface_map.integrate(points, cam_from_map);
+        self.set_time(timestamp);
+        self.rec.log(
+            "diagnostics/surface/input_raw_observations",
+            &rerun::Scalars::single(stats.input_samples as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/accepted_raw_observations",
+            &rerun::Scalars::single(stats.points_generated as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/dropped_disparity",
+            &rerun::Scalars::single(stats.dropped_disparity as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/dropped_uncertainty",
+            &rerun::Scalars::single(stats.dropped_uncertainty as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/dropped_out_of_bounds",
+            &rerun::Scalars::single(stats.dropped_out_of_bounds as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/points_capped",
+            &rerun::Scalars::single(if stats.points_capped { 1.0 } else { 0.0 }),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/accepted_mean_point_sigma_mm",
+            &rerun::Scalars::single(stats.mean_accepted_position_sigma_m * 1000.0),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/accepted_max_point_sigma_mm",
+            &rerun::Scalars::single(stats.max_accepted_position_sigma_m as f64 * 1000.0),
+        )?;
 
-        // Extract only confirmed surface points (count ≥ 3, consistent)
+        let integration = self.surface_map.integrate(points, cam_from_map);
+        self.rec.log(
+            "diagnostics/surface/integrated_support_views",
+            &rerun::Scalars::single(integration.support_views_integrated as f64),
+        )?;
+
+        let summary = self.surface_map.summary();
+        self.rec.log(
+            "diagnostics/surface/total_voxels",
+            &rerun::Scalars::single(summary.total_voxels as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/confirmed_voxels",
+            &rerun::Scalars::single(summary.confirmed_voxels as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/confirmed_ratio",
+            &rerun::Scalars::single(summary.confirmed_ratio),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/mean_confirmed_std_dev_mm",
+            &rerun::Scalars::single(summary.mean_confirmed_std_dev_m * 1000.0),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/mean_confirmed_support_views",
+            &rerun::Scalars::single(summary.mean_confirmed_support_views),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/mean_confirmed_raw_observations",
+            &rerun::Scalars::single(summary.mean_confirmed_raw_observations),
+        )?;
+
         let confirmed = self.surface_map.extract_confirmed();
         if confirmed.is_empty() {
             return Ok(());
@@ -311,17 +372,20 @@ impl RerunSink {
             .iter()
             .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
             .collect();
+        let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
         let cloud = rerun::Points3D::new(positions)
             .with_colors(colors)
-            .with_radii([rerun::Radius::new_scene_units(0.008)]);
-        self.rec.log_static("world/dense_cloud", &cloud)?;
+            .with_radii([rerun::Radius::new_scene_units(voxel_radius)]);
+        self.rec.log("world/stable_surface_voxels", &cloud)?;
 
-        let summary = self.surface_map.summary();
         eprintln!(
-            "surface: total={} confirmed={} mean_σ={:.3}mm",
+            "surface: total={} confirmed={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2}",
             summary.total_voxels,
             summary.confirmed_voxels,
+            summary.confirmed_ratio,
             summary.mean_confirmed_std_dev_m * 1000.0,
+            summary.mean_confirmed_support_views,
+            summary.mean_confirmed_raw_observations,
         );
         Ok(())
     }

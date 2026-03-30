@@ -904,6 +904,20 @@ pub(crate) fn reprojection_max(errors: &[Option<f32>]) -> Option<f32> {
     errors.iter().flatten().copied().reduce(f32::max)
 }
 
+pub(crate) fn reprojection_mse_per_axis_px2(errors: &[Option<f32>]) -> Option<f64> {
+    let mut sum_sq = 0.0_f64;
+    let mut count = 0usize;
+    for &error in errors.iter().flatten() {
+        let error = error as f64;
+        sum_sq += error * error;
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(sum_sq / (2 * count) as f64)
+}
+
 fn pose_from_points(
     w1: [f32; 3],
     w2: [f32; 3],
@@ -1308,6 +1322,14 @@ mod tests {
         let rmse = reprojection_rmse(&errors).expect("rmse");
         let expected = ((3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
         assert!((rmse - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reprojection_mse_per_axis_px2_matches_manual() {
+        let errors = vec![Some(3.0), None, Some(4.0)];
+        let mse = reprojection_mse_per_axis_px2(&errors).expect("mse");
+        let expected = ((3.0_f64 * 3.0 + 4.0 * 4.0) / 2.0) / 2.0;
+        assert!((mse - expected).abs() < 1e-12);
     }
 
     #[test]

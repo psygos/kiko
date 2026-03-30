@@ -214,55 +214,54 @@ pub type PnpInlierRatioMetric = RatioMetric<PnpTrackedObservationsSupport>;
 pub type PnpTrackedObservationCountMetric = CountMetric<PnpTrackedObservationsSupport>;
 pub type PnpAcceptedInlierPixelResidualMetric = PixelResidualMetric<PnpAcceptedInliersSupport>;
 
-/// Normalized Innovation Squared: r^T Σ^{-1} r / dim.
-/// Should be ≈ 1.0 when the noise model matches reality.
-/// >> 1 means the model is overconfident (noise is worse than assumed).
-/// << 1 means the model is conservative (noise is better than assumed).
+/// Mean squared pixel residual per image axis in px².
+///
+/// This is the average squared reprojection error divided by the 2 image residual
+/// axes. It is not a true NIS metric because no measurement covariance model is
+/// applied.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct NormalizedInnovationSquared<S>
+pub struct MeanSquaredPixelResidualMetric<S>
 where
     S: ObservationSupportMarker,
 {
-    value: f64,
-    dim: usize,
+    value_px2: f64,
     support: PhantomData<S>,
 }
 
-impl<S> NormalizedInnovationSquared<S>
+impl<S> MeanSquaredPixelResidualMetric<S>
 where
     S: ObservationSupportMarker,
 {
-    pub fn new(value: f64, dim: usize) -> Result<Self, DiagnosticMetricError> {
-        if !value.is_finite() {
+    pub fn new(value_px2: f64) -> Result<Self, DiagnosticMetricError> {
+        if !value_px2.is_finite() {
             return Err(DiagnosticMetricError::NonFinite {
-                metric: "normalized innovation squared",
-                value: value as f32,
+                metric: "mean squared pixel residual metric",
+                value: value_px2 as f32,
+            });
+        }
+        if value_px2 < 0.0 {
+            return Err(DiagnosticMetricError::Negative {
+                metric: "mean squared pixel residual metric",
+                value: value_px2 as f32,
             });
         }
         Ok(Self {
-            value,
-            dim,
+            value_px2,
             support: PhantomData,
         })
     }
 
-    /// NIS value: should be ≈ 1.0.
-    pub fn value(&self) -> f64 {
-        self.value
+    pub fn value_px2(&self) -> f64 {
+        self.value_px2
     }
 
-    /// Residual dimension used for normalization.
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
-
-    /// Support set this was computed over.
     pub fn support(&self) -> ObservationSupport {
         S::SUPPORT
     }
 }
 
-pub type PnpInlierNis = NormalizedInnovationSquared<PnpAcceptedInliersSupport>;
+pub type PnpAcceptedInlierReprojectionMsePerAxisPx2Metric =
+    MeanSquaredPixelResidualMetric<PnpAcceptedInliersSupport>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyframeRemovalReason {
@@ -300,9 +299,9 @@ pub struct FrameDiagnostics {
     pub ransac_iterations: Option<usize>,
     pub pnp_inlier_reprojection_rmse_px: Option<PnpAcceptedInlierPixelResidualMetric>,
     pub pnp_inlier_reprojection_max_px: Option<PnpAcceptedInlierPixelResidualMetric>,
-    /// Normalized Innovation Squared for PnP inliers: r^T Σ^{-1} r / dim.
-    /// Should be ≈ 1.0 when noise model matches reality.
-    pub pnp_inlier_nis: Option<PnpInlierNis>,
+    /// Mean squared reprojection error per image axis in px² over accepted PnP inliers.
+    pub pnp_inlier_reprojection_mse_per_axis_px2:
+        Option<PnpAcceptedInlierReprojectionMsePerAxisPx2Metric>,
     pub parallax_px: Option<f32>,
     pub covisibility: Option<f32>,
     pub keyframe_status: Option<KeyframeStatus>,
@@ -326,7 +325,7 @@ impl FrameDiagnostics {
             ransac_iterations: None,
             pnp_inlier_reprojection_rmse_px: None,
             pnp_inlier_reprojection_max_px: None,
-            pnp_inlier_nis: None,
+            pnp_inlier_reprojection_mse_per_axis_px2: None,
             parallax_px: None,
             covisibility: None,
             keyframe_status: None,
@@ -387,9 +386,9 @@ mod tests {
     use std::mem::discriminant;
 
     use super::{
-        DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics,
-        LoopClosureRejectReason, ObservationSupport, PnpAcceptedInlierPixelResidualMetric,
-        PnpInlierRatioMetric, PnpTrackedObservationCountMetric,
+        DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics, LoopClosureRejectReason,
+        ObservationSupport, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
+        PnpTrackedObservationCountMetric,
     };
     use crate::DegenerateReason;
 
@@ -438,6 +437,7 @@ mod tests {
         assert!(diag.ransac_iterations.is_none());
         assert!(diag.pnp_inlier_reprojection_rmse_px.is_none());
         assert!(diag.pnp_inlier_reprojection_max_px.is_none());
+        assert!(diag.pnp_inlier_reprojection_mse_per_axis_px2.is_none());
         assert!(diag.parallax_px.is_none());
         assert!(diag.covisibility.is_none());
         assert!(diag.keyframe_status.is_none());

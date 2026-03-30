@@ -52,7 +52,16 @@ ENVIRONMENT VARIABLES (expert tuning):
   Backend:
     KIKO_BACKEND_ASYNC=true       Run BA on a background thread
     KIKO_BACKEND_QUEUE_DEPTH=2    BA work queue depth
-    KIKO_DESCRIPTOR_QUEUE_DEPTH=2 Descriptor extraction queue depth";
+    KIKO_DESCRIPTOR_QUEUE_DEPTH=2 Descriptor extraction queue depth
+
+  Stable Surface Map:
+    KIKO_DENSE_CLOUD=true                 Enable the stable sparse stereo surface map
+    KIKO_SURFACE_VOXEL_SIZE_M=0.05        Voxel size for fused stable surface points
+    KIKO_SURFACE_MIN_SUPPORT_VIEWS=3      Minimum support views to confirm a voxel
+    KIKO_SURFACE_MAX_CONSISTENCY_SCORE=8.0 Max residual consistency score for a confirmed voxel
+    KIKO_SURFACE_MAX_RENDER_POINTS=250000 Max confirmed voxels rendered to Rerun
+    KIKO_SURFACE_MAX_POINT_SIGMA_M=0.05   Max per-observation positional sigma accepted
+    KIKO_DENSE_MAX_POINTS=30000           Max stable surface observations per keyframe";
 
 #[derive(Args, Clone, Debug)]
 #[command(
@@ -100,6 +109,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    if dense_cloud_enabled {
+        eprintln!(
+            "stable surface map: enabled (measured sparse stereo -> surface belief); TSDF remains disabled in stereo-only slam mode"
+        );
+    }
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
     let calibration =
         CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
@@ -128,12 +142,6 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         key_limit,
         downscale,
     )?;
-
-    let tsdf_worker = if dense_cloud_enabled {
-        Some(kiko_slam::TsdfWorker::spawn(kiko_slam::TsdfConfig::default(), 4))
-    } else {
-        None
-    };
     let rec = rerun_recording(&args.rerun, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
@@ -245,8 +253,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     )
                 });
                 if let Some(matches) = output.stereo_matches {
-                    // Extract stereo samples for dense cloud BEFORE matches are consumed
-                    let dense_samples = if output.keyframe.is_some() {
+                    // Extract measured stereo samples before matches are consumed.
+                    let surface_samples = if output.keyframe.is_some() {
                         dense_triangulator
                             .as_ref()
                             .map(|tri| tri.extract_stereo_samples(&matches))
@@ -264,12 +272,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("rerun log error: {err}");
                         }
                     }
-                    // Generate and log dense cloud + TSDF at keyframes
-                    if let Some(samples) = dense_samples {
+                    // Generate stable sparse surface observations for the low-resolution voxel map.
+                    if let Some(samples) = surface_samples {
                         if let Some(pose) = output.pose.as_ref() {
                             let stereo = dense_triangulator.as_ref().unwrap().stereo();
-                            // Dense point cloud for Rerun
-                            let dense = kiko_slam::generate_dense_cloud(
+                            let surface = kiko_slam::generate_stable_surface_points(
                                 &samples,
                                 stereo.fx(),
                                 stereo.fy(),
@@ -281,50 +288,13 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 left.height(),
                                 &dense_config,
                             );
-                            if !dense.points.is_empty() {
-                                if let Err(err) =
-                                    sink.log_dense_cloud(&dense.points, pose.cam_from_map_pose32())
-                                {
-                                    eprintln!("dense cloud: {err}");
-                                }
-                            }
-                            // Feed interpolated depth to TSDF via explicit promotion.
-                            // The promote_to_measured() call is deliberate — it
-                            // acknowledges that interpolated stereo depth has higher
-                            // uncertainty than real sensor depth. The TSDF uses
-                            // equal-weight integration so this is acceptable for
-                            // visualization mesh, not authoritative reconstruction.
-                            if let Some(ref tsdf) = tsdf_worker {
-                                let stereo = dense_triangulator.as_ref().unwrap().stereo();
-                                {
-                                    let interp = kiko_slam::generate_dense_depth_image(
-                                        left.frame_id(),
-                                        left.timestamp(),
-                                        &samples,
-                                        stereo.fx(),
-                                        stereo.baseline_m(),
-                                        stereo.width(),
-                                        stereo.height(),
-                                        &dense_config,
-                                    );
-                                    let promoted = interp.promote_to_measured();
-                                    let intrinsics = kiko_slam::TsdfCameraIntrinsics::try_new(
-                                        stereo.fx(), stereo.fy(),
-                                        stereo.left().cx, stereo.left().cy,
-                                    );
-                                    if let Ok(intrinsics) = intrinsics {
-                                        if let Ok(msg) = kiko_slam::TsdfIntegrateMsg::try_new(
-                                            promoted,
-                                            left.data().to_vec(),
-                                            pose.cam_from_map_pose32(),
-                                            intrinsics,
-                                        ) {
-                                            if !tsdf.try_integrate(msg) {
-                                                eprintln!("tsdf worker queue full");
-                                            }
-                                        }
-                                    }
-                                }
+                            if let Err(err) = sink.log_surface_observations(
+                                left.timestamp(),
+                                &surface.points,
+                                &surface.stats,
+                                pose.cam_from_map_pose32(),
+                            ) {
+                                eprintln!("stable surface: {err}");
                             }
                         }
                     }
@@ -356,14 +326,6 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
                     if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
                         eprintln!("rerun imu log error: {err}");
-                    }
-                }
-                // Poll TSDF mesh from async worker
-                if let Some(ref tsdf) = tsdf_worker {
-                    if let Some(mesh) = tsdf.try_recv_mesh() {
-                        if let Err(err) = sink.log_tsdf_mesh(&mesh) {
-                            eprintln!("tsdf mesh log: {err}");
-                        }
                     }
                 }
                 if let Err(err) = sink.log_system_health(timestamp, &output.health) {

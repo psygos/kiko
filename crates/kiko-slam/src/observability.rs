@@ -11,6 +11,8 @@ const PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE: &str =
     "diagnostics/health/pnp_inlier_reprojection_rmse_px";
 const PATH_HEALTH_PNP_INLIER_REPROJECTION_MAX: &str =
     "diagnostics/health/pnp_inlier_reprojection_max_px";
+const PATH_HEALTH_PNP_INLIER_REPROJECTION_MSE_PER_AXIS: &str =
+    "diagnostics/health/pnp_inlier_reprojection_mse_per_axis_px2";
 const PATH_HEALTH_TRACKING_STATE: &str = "diagnostics/health/tracking_state";
 const PATH_HEALTH_DEGRADATION_LEVEL: &str = "diagnostics/health/degradation_level";
 const PATH_HEALTH_BACKEND_STATE: &str = "diagnostics/health/backend_state";
@@ -101,6 +103,12 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     }
     if let Some(v) = diag.pnp_inlier_reprojection_max_px {
         scalars.push((PATH_HEALTH_PNP_INLIER_REPROJECTION_MAX, v.value_px() as f64));
+    }
+    if let Some(v) = diag.pnp_inlier_reprojection_mse_per_axis_px2 {
+        scalars.push((
+            PATH_HEALTH_PNP_INLIER_REPROJECTION_MSE_PER_AXIS,
+            v.value_px2(),
+        ));
     }
     if let Some(v) = diag.features_detected {
         scalars.push((PATH_TRACKING_FEATURES_DETECTED, v as f64));

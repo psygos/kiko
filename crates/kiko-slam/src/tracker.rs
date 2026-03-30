@@ -3007,6 +3007,11 @@ impl SlamTracker {
                 crate::PnpAcceptedInlierPixelResidualMetric::new(value)
                     .expect("reprojection max must be finite and non-negative")
             });
+        diagnostics.pnp_inlier_reprojection_mse_per_axis_px2 =
+            crate::pnp::reprojection_mse_per_axis_px2(&inlier_errors).map(|value| {
+                crate::PnpAcceptedInlierReprojectionMsePerAxisPx2Metric::new(value)
+                    .expect("PnP inlier reprojection MSE per axis must be finite and non-negative")
+            });
         diagnostics.parallax_px = parallax_px;
         diagnostics.covisibility = Some(covisibility);
         diagnostics.keyframe_status = keyframe_status;
