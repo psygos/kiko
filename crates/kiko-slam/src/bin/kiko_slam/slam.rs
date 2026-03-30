@@ -129,12 +129,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     )?;
 
-    let tsdf_worker: Option<kiko_slam::TsdfWorker> = None;
-    if dense_cloud_enabled {
-        eprintln!(
-            "tsdf: disabled for dataset stereo interpolation; authoritative TSDF integration requires measured depth"
-        );
-    }
+    let tsdf_worker = if dense_cloud_enabled {
+        Some(kiko_slam::TsdfWorker::spawn(kiko_slam::TsdfConfig::default(), 4))
+    } else {
+        None
+    };
     let rec = rerun_recording(&args.rerun, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
