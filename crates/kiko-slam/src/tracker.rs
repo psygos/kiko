@@ -1924,8 +1924,18 @@ impl SlamTracker {
     }
 
     #[cfg(feature = "vio")]
-    fn realign_map_from_odom(&mut self, _corrected_poses: &[(KeyframeId, Pose)]) {
-        // Placeholder — will be implemented when tightly-coupled BA provides odom estimates.
+    fn realign_map_from_odom(&mut self, corrected_poses: &[(KeyframeId, Pose)]) {
+        // After loop closure, corrected_poses contains updated map-frame poses.
+        // Use the most recent one to realign map_from_odom so that the odom
+        // trajectory remains continuous while the map frame absorbs the correction.
+        let Some(cam_from_odom) = self.current_odom_pose() else {
+            return;
+        };
+        // Use the last corrected pose (most recent keyframe) as the alignment target
+        if let Some((_, corrected_map_pose)) = corrected_poses.last() {
+            self.map_from_odom
+                .align_to_pose(Pose64::from_pose32(*corrected_map_pose), cam_from_odom);
+        }
     }
 
     #[cfg(feature = "vio")]
