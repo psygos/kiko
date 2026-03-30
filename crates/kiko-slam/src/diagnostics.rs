@@ -9,6 +9,7 @@ use crate::triangulation::TriangulationStats;
 pub enum ObservationSupport {
     PnpAcceptedInliers,
     PnpTrackedObservations,
+    PnpProjectableTrackedObservations,
     StableSurfaceRetainedRawObservations,
     HeldOutObservations,
     AllObservations,
@@ -19,6 +20,9 @@ impl ObservationSupport {
         match self {
             ObservationSupport::PnpAcceptedInliers => "pnp_accepted_inliers",
             ObservationSupport::PnpTrackedObservations => "pnp_tracked_observations",
+            ObservationSupport::PnpProjectableTrackedObservations => {
+                "pnp_projectable_tracked_observations"
+            }
             ObservationSupport::StableSurfaceRetainedRawObservations => {
                 "stable_surface_retained_raw_observations"
             }
@@ -44,6 +48,13 @@ pub struct PnpTrackedObservationsSupport;
 
 impl ObservationSupportMarker for PnpTrackedObservationsSupport {
     const SUPPORT: ObservationSupport = ObservationSupport::PnpTrackedObservations;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PnpProjectableTrackedObservationsSupport;
+
+impl ObservationSupportMarker for PnpProjectableTrackedObservationsSupport {
+    const SUPPORT: ObservationSupport = ObservationSupport::PnpProjectableTrackedObservations;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,7 +234,11 @@ where
 
 pub type PnpInlierRatioMetric = RatioMetric<PnpTrackedObservationsSupport>;
 pub type PnpTrackedObservationCountMetric = CountMetric<PnpTrackedObservationsSupport>;
+pub type PnpProjectableTrackedObservationCountMetric =
+    CountMetric<PnpProjectableTrackedObservationsSupport>;
 pub type PnpAcceptedInlierPixelResidualMetric = PixelResidualMetric<PnpAcceptedInliersSupport>;
+pub type PnpProjectableTrackedObservationPixelResidualMetric =
+    PixelResidualMetric<PnpProjectableTrackedObservationsSupport>;
 pub type StableSurfaceRetainedRawPixelResidualMetric =
     PixelResidualMetric<StableSurfaceRetainedRawObservationsSupport>;
 
@@ -275,6 +290,8 @@ where
 
 pub type PnpAcceptedInlierReprojectionMsePerAxisPx2Metric =
     MeanSquaredPixelResidualMetric<PnpAcceptedInliersSupport>;
+pub type PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric =
+    MeanSquaredPixelResidualMetric<PnpProjectableTrackedObservationsSupport>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyframeRemovalReason {
@@ -310,6 +327,16 @@ pub struct FrameDiagnostics {
     pub pnp_inlier_ratio: Option<PnpInlierRatioMetric>,
     pub pnp_tracked_observations: Option<PnpTrackedObservationCountMetric>,
     pub ransac_iterations: Option<usize>,
+    pub pnp_projectable_tracked_observations: Option<PnpProjectableTrackedObservationCountMetric>,
+    /// Reprojection RMSE in px over projectable tracked PnP observations under the solved pose.
+    pub pnp_projectable_tracked_observation_reprojection_rmse_px:
+        Option<PnpProjectableTrackedObservationPixelResidualMetric>,
+    /// Maximum reprojection error in px over projectable tracked PnP observations under the solved pose.
+    pub pnp_projectable_tracked_observation_reprojection_max_px:
+        Option<PnpProjectableTrackedObservationPixelResidualMetric>,
+    /// Mean squared reprojection error per image axis in px² over projectable tracked PnP observations.
+    pub pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2:
+        Option<PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric>,
     pub pnp_inlier_reprojection_rmse_px: Option<PnpAcceptedInlierPixelResidualMetric>,
     pub pnp_inlier_reprojection_max_px: Option<PnpAcceptedInlierPixelResidualMetric>,
     /// Mean squared reprojection error per image axis in px² over accepted PnP inliers.
@@ -336,6 +363,10 @@ impl FrameDiagnostics {
             pnp_inlier_ratio: None,
             pnp_tracked_observations: None,
             ransac_iterations: None,
+            pnp_projectable_tracked_observations: None,
+            pnp_projectable_tracked_observation_reprojection_rmse_px: None,
+            pnp_projectable_tracked_observation_reprojection_max_px: None,
+            pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2: None,
             pnp_inlier_reprojection_rmse_px: None,
             pnp_inlier_reprojection_max_px: None,
             pnp_inlier_reprojection_mse_per_axis_px2: None,
@@ -401,7 +432,8 @@ mod tests {
     use super::{
         DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics, LoopClosureRejectReason,
         ObservationSupport, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
-        PnpTrackedObservationCountMetric, StableSurfaceRetainedRawPixelResidualMetric,
+        PnpProjectableTrackedObservationPixelResidualMetric, PnpTrackedObservationCountMetric,
+        StableSurfaceRetainedRawPixelResidualMetric,
     };
     use crate::DegenerateReason;
 
@@ -454,11 +486,35 @@ mod tests {
     }
 
     #[test]
+    fn projectable_tracked_pnp_pixel_residual_metric_preserves_support() {
+        let metric = PnpProjectableTrackedObservationPixelResidualMetric::new(2.0)
+            .expect("tracked px residual");
+        assert_eq!(metric.value_px(), 2.0);
+        assert_eq!(
+            metric.support(),
+            ObservationSupport::PnpProjectableTrackedObservations
+        );
+    }
+
+    #[test]
     fn empty_diagnostics_has_all_none() {
         let diag = FrameDiagnostics::empty(2, 5);
         assert!(diag.pnp_inlier_ratio.is_none());
         assert!(diag.pnp_tracked_observations.is_none());
         assert!(diag.ransac_iterations.is_none());
+        assert!(diag.pnp_projectable_tracked_observations.is_none());
+        assert!(
+            diag.pnp_projectable_tracked_observation_reprojection_rmse_px
+                .is_none()
+        );
+        assert!(
+            diag.pnp_projectable_tracked_observation_reprojection_max_px
+                .is_none()
+        );
+        assert!(
+            diag.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2
+                .is_none()
+        );
         assert!(diag.pnp_inlier_reprojection_rmse_px.is_none());
         assert!(diag.pnp_inlier_reprojection_max_px.is_none());
         assert!(diag.pnp_inlier_reprojection_mse_per_axis_px2.is_none());

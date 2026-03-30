@@ -2979,11 +2979,18 @@ impl SlamTracker {
             }
         }
 
-        let inlier_errors = crate::pnp::reprojection_errors(
+        let intrinsics = self.frontend.intrinsics();
+        let tracked_errors = crate::pnp::reprojection_errors(
             &pose_world,
-            &inlier_observations,
-            self.frontend.intrinsics(),
+            &tracked_observations.observations,
+            intrinsics,
         );
+        let projectable_tracked_observations = tracked_errors
+            .iter()
+            .filter(|error| error.is_some())
+            .count();
+        let inlier_errors =
+            crate::pnp::reprojection_errors(&pose_world, &inlier_observations, intrinsics);
         // VIO visual correction will be handled by tightly-coupled BA (M2).
 
         let mut diagnostics = self.empty_diagnostics();
@@ -2996,7 +3003,28 @@ impl SlamTracker {
         diagnostics.pnp_tracked_observations = Some(crate::PnpTrackedObservationCountMetric::new(
             tracked_observations.len(),
         ));
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(crate::PnpProjectableTrackedObservationCountMetric::new(
+                projectable_tracked_observations,
+            ));
         diagnostics.ransac_iterations = Some(result.iterations);
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            crate::pnp::reprojection_rmse(&tracked_errors).map(|value| {
+                crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
+                    .expect("projectable tracked reprojection RMSE must be finite and non-negative")
+            });
+        diagnostics.pnp_projectable_tracked_observation_reprojection_max_px =
+            crate::pnp::reprojection_max(&tracked_errors).map(|value| {
+                crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
+                    .expect("projectable tracked reprojection max must be finite and non-negative")
+            });
+        diagnostics.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2 =
+            crate::pnp::reprojection_mse_per_axis_px2(&tracked_errors).map(|value| {
+                crate::PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric::new(value)
+                    .expect(
+                        "projectable tracked reprojection MSE per axis must be finite and non-negative",
+                    )
+            });
         diagnostics.pnp_inlier_reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors)
             .map(|value| {
                 crate::PnpAcceptedInlierPixelResidualMetric::new(value)

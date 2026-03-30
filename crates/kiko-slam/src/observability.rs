@@ -7,6 +7,12 @@ use crate::{
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
 
 const PATH_HEALTH_PNP_INLIER_RATIO: &str = "diagnostics/health/pnp_inlier_ratio";
+const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE: &str =
+    "diagnostics/health/pnp_projectable_tracked_observation_reprojection_rmse_px";
+const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX: &str =
+    "diagnostics/health/pnp_projectable_tracked_observation_reprojection_max_px";
+const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS: &str =
+    "diagnostics/health/pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2";
 const PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE: &str =
     "diagnostics/health/pnp_inlier_reprojection_rmse_px";
 const PATH_HEALTH_PNP_INLIER_REPROJECTION_MAX: &str =
@@ -34,6 +40,8 @@ const PATH_TRACKING_FEATURES_DETECTED: &str = "diagnostics/tracking/features_det
 const PATH_TRACKING_FEATURES_MATCHED: &str = "diagnostics/tracking/features_matched";
 const PATH_TRACKING_PNP_TRACKED_OBSERVATIONS: &str =
     "diagnostics/tracking/pnp_tracked_observations";
+const PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
+    "diagnostics/tracking/pnp_projectable_tracked_observations";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
 const PATH_TRACKING_PARALLAX: &str = "diagnostics/tracking/parallax_px";
 const PATH_TRACKING_COVISIBILITY: &str = "diagnostics/tracking/covisibility";
@@ -95,6 +103,24 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     if let Some(v) = diag.pnp_inlier_ratio {
         scalars.push((PATH_HEALTH_PNP_INLIER_RATIO, v.value() as f64));
     }
+    if let Some(v) = diag.pnp_projectable_tracked_observation_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.pnp_projectable_tracked_observation_reprojection_max_px {
+        scalars.push((
+            PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2 {
+        scalars.push((
+            PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
+            v.value_px2(),
+        ));
+    }
     if let Some(v) = diag.pnp_inlier_reprojection_rmse_px {
         scalars.push((
             PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE,
@@ -118,6 +144,12 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     }
     if let Some(v) = diag.pnp_tracked_observations {
         scalars.push((PATH_TRACKING_PNP_TRACKED_OBSERVATIONS, v.count() as f64));
+    }
+    if let Some(v) = diag.pnp_projectable_tracked_observations {
+        scalars.push((
+            PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+            v.count() as f64,
+        ));
     }
     if let Some(v) = diag.ransac_iterations {
         scalars.push((PATH_TRACKING_RANSAC_ITERATIONS, v as f64));
@@ -376,12 +408,16 @@ impl RerunSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        PATH_HEALTH_PNP_INLIER_RATIO, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS, diagnostics_scalars,
-        format_event,
+        PATH_HEALTH_PNP_INLIER_RATIO, PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
+        PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
+        PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS,
+        PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS, diagnostics_scalars, format_event,
     };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
-        PnpInlierRatioMetric, TriangulationStats,
+        PnpInlierRatioMetric, PnpProjectableTrackedObservationCountMetric,
+        PnpProjectableTrackedObservationPixelResidualMetric,
+        PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric, TriangulationStats,
     };
 
     #[test]
@@ -404,6 +440,18 @@ mod tests {
     fn diagnostics_scalars_include_present_fields() {
         let mut diag = FrameDiagnostics::empty(1, 2);
         diag.pnp_inlier_ratio = Some(PnpInlierRatioMetric::new(0.75).expect("ratio"));
+        diag.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(7));
+        diag.pnp_projectable_tracked_observation_reprojection_rmse_px = Some(
+            PnpProjectableTrackedObservationPixelResidualMetric::new(1.5).expect("tracked rmse"),
+        );
+        diag.pnp_projectable_tracked_observation_reprojection_max_px = Some(
+            PnpProjectableTrackedObservationPixelResidualMetric::new(3.0).expect("tracked max"),
+        );
+        diag.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2 = Some(
+            PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric::new(1.125)
+                .expect("tracked mse"),
+        );
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
         diag.triangulation = Some(TriangulationStats {
@@ -421,6 +469,22 @@ mod tests {
                 .any(|(path, value)| *path == PATH_HEALTH_PNP_INLIER_RATIO
                     && (*value - 0.75).abs() < 1e-6)
         );
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE
+                && (*value - 1.5).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX
+                && (*value - 3.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS
+                && (*value - 1.125).abs() < 1e-9
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS
+                && (*value - 7.0).abs() < 1e-6
+        }));
         assert!(
             scalars
                 .iter()

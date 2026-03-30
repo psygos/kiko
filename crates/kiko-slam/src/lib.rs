@@ -71,8 +71,11 @@ pub use diagnostics::{
     LoopClosureStatus, MeanSquaredPixelResidualMetric, ObservationSupport,
     ObservationSupportMarker, PixelResidualMetric, PnpAcceptedInlierPixelResidualMetric,
     PnpAcceptedInlierReprojectionMsePerAxisPx2Metric, PnpAcceptedInliersSupport,
-    PnpInlierRatioMetric, PnpTrackedObservationCountMetric, PnpTrackedObservationsSupport,
-    RatioMetric, StableSurfaceRetainedRawObservationsSupport,
+    PnpInlierRatioMetric, PnpProjectableTrackedObservationCountMetric,
+    PnpProjectableTrackedObservationPixelResidualMetric,
+    PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric,
+    PnpProjectableTrackedObservationsSupport, PnpTrackedObservationCountMetric,
+    PnpTrackedObservationsSupport, RatioMetric, StableSurfaceRetainedRawObservationsSupport,
     StableSurfaceRetainedRawPixelResidualMetric,
 };
 pub use env::{env_bool, env_f32, env_usize};
