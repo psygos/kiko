@@ -106,8 +106,7 @@ pub struct RerunSink {
     corrected_trajectory: TrajectoryLog,
     visual_measurement_trajectory: TrajectoryLog,
     logged_world: bool,
-    dense_cloud_positions: Vec<[f32; 3]>,
-    dense_cloud_colors: Vec<rerun::Color>,
+    surface_map: crate::SurfaceBeliefMap,
 }
 
 impl RerunSink {
@@ -122,8 +121,7 @@ impl RerunSink {
             corrected_trajectory: TrajectoryLog::default(),
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
-            dense_cloud_positions: Vec::new(),
-            dense_cloud_colors: Vec::new(),
+            surface_map: crate::SurfaceBeliefMap::new(crate::SurfaceMapConfig::default()),
         }
     }
 
@@ -300,24 +298,31 @@ impl RerunSink {
         if points.is_empty() {
             return Ok(());
         }
-        // Transform from camera frame to map frame: p_map = inv(cam_from_map) * p_cam
-        let map_from_cam = cam_from_map.inverse();
-        let r = map_from_cam.rotation();
-        let t = map_from_cam.translation();
-        for p in points {
-            let world = crate::math::transform_point(r, t, p.position);
-            self.dense_cloud_positions.push(world);
-            self.dense_cloud_colors.push(rerun::Color::from_rgb(
-                p.intensity,
-                p.intensity,
-                p.intensity,
-            ));
+        // Integrate into the surface belief map (information-weighted fusion)
+        self.surface_map.integrate(points, cam_from_map);
+
+        // Extract only confirmed surface points (count ≥ 3, consistent)
+        let confirmed = self.surface_map.extract_confirmed();
+        if confirmed.is_empty() {
+            return Ok(());
         }
-        // Log the full accumulated cloud
-        let cloud = rerun::Points3D::new(self.dense_cloud_positions.clone())
-            .with_colors(self.dense_cloud_colors.clone())
+        let positions: Vec<[f32; 3]> = confirmed.iter().map(|(p, _)| *p).collect();
+        let colors: Vec<rerun::Color> = confirmed
+            .iter()
+            .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
+            .collect();
+        let cloud = rerun::Points3D::new(positions)
+            .with_colors(colors)
             .with_radii([rerun::Radius::new_scene_units(0.008)]);
         self.rec.log_static("world/dense_cloud", &cloud)?;
+
+        let summary = self.surface_map.summary();
+        eprintln!(
+            "surface: total={} confirmed={} mean_σ={:.3}mm",
+            summary.total_voxels,
+            summary.confirmed_voxels,
+            summary.mean_confirmed_std_dev_m * 1000.0,
+        );
         Ok(())
     }
 

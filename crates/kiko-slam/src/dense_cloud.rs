@@ -59,11 +59,20 @@ impl DenseCloudConfig {
     }
 }
 
-/// A dense colored point in camera frame.
+/// A dense colored point in camera frame with measurement uncertainty.
+///
+/// The `depth_variance` is derived from the stereo measurement model:
+///   σ_z = z² / (f · baseline) · σ_d
+/// where σ_d accounts for both matching precision and interpolation.
+/// At measured feature locations, σ_d ≈ 0.5px.
+/// At Delaunay-interpolated points, σ_d is amplified by 1/√(min_bary_weight).
 #[derive(Clone, Copy, Debug)]
 pub struct DensePoint {
     pub position: [f32; 3],
     pub intensity: u8,
+    /// Depth variance in m², computed from the stereo measurement model.
+    /// Carries the dominant uncertainty — depth error grows quadratically with range.
+    pub depth_variance: f32,
 }
 
 /// Statistics from dense cloud generation.
@@ -308,9 +317,18 @@ pub fn generate_dense_cloud(
                         } else {
                             128
                         };
+                        // Stereo uncertainty model: σ_z = z²/(f·b) · σ_d
+                        // σ_d increases with distance from triangle vertices
+                        // (barycentric interpolation amplifies noise)
+                        let min_bary = w0.min(w1).min(w2).max(0.01);
+                        let sigma_d_feature = 0.5_f32; // matching precision in pixels
+                        let sigma_d = sigma_d_feature / min_bary.sqrt();
+                        let sigma_z = z * z / (fx * baseline_m) * sigma_d;
+                        let depth_variance = sigma_z * sigma_z;
                         points.push(DensePoint {
                             position: [x, y, z],
                             intensity,
+                            depth_variance,
                         });
                         if points.len() >= config.max_points_per_keyframe {
                             stats.points_generated = points.len();

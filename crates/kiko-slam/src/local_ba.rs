@@ -696,6 +696,11 @@ pub struct VioSolveResult {
     pub converged: bool,
     pub iterations: usize,
     pub final_cost: f64,
+    /// Approximate posterior translation standard deviation for the last
+    /// frame, extracted from the Hessian diagonal. In meters.
+    /// This is the local linearization uncertainty — not a full posterior
+    /// covariance, but sufficient for weighting downstream fusion.
+    pub last_frame_translation_sigma: Option<[f64; 3]>,
 }
 
 /// The refined output for a single frame after VIO BA.
@@ -1485,6 +1490,7 @@ pub fn optimize_vio(
             converged: true,
             iterations: 0,
             final_cost: 0.0,
+            last_frame_translation_sigma: None,
         };
     }
 
@@ -1798,10 +1804,12 @@ pub fn optimize_vio(
             lambda = (lambda * 0.3).max(f64::from(config.lm.min_lambda));
 
             if step_norm < 1e-6 && cost_decrease < 1e-10 * total_cost.max(1e-12) {
+                let sigma = extract_last_frame_translation_sigma(&hessian, dim, n_frames);
                 return VioSolveResult {
                     converged: true,
                     iterations: iteration + 1,
                     final_cost: total_cost,
+                    last_frame_translation_sigma: sigma,
                 };
             }
         } else {
@@ -1810,10 +1818,44 @@ pub fn optimize_vio(
         }
     }
 
+    let sigma = extract_last_frame_translation_sigma(&hessian, dim, n_frames);
     VioSolveResult {
         converged: false,
         iterations: max_iters,
         final_cost: prev_cost,
+        last_frame_translation_sigma: sigma,
+    }
+}
+
+/// Extract approximate posterior translation sigma for the last frame.
+/// Uses diagonal of the Hessian: σ_i ≈ 1/√(H[i,i]). This is a lower
+/// bound on the true marginal standard deviation (ignores correlations)
+/// but is cheap and directionally correct for downstream weighting.
+#[cfg(feature = "vio")]
+fn extract_last_frame_translation_sigma(
+    hessian: &[f64],
+    dim: usize,
+    n_frames: usize,
+) -> Option<[f64; 3]> {
+    use crate::vio::solve::STATE_DIM;
+    if n_frames == 0 || dim == 0 {
+        return None;
+    }
+    let base = (n_frames - 1) * STATE_DIM;
+    let mut sigma = [0.0_f64; 3];
+    for i in 0..3 {
+        let h_ii = hessian[(base + i) * dim + (base + i)];
+        if h_ii > 1e-12 {
+            sigma[i] = (1.0 / h_ii).sqrt();
+        } else {
+            return None; // degenerate — can't extract meaningful uncertainty
+        }
+    }
+    // Sanity: sigma should be positive, finite, and reasonable (< 10m)
+    if sigma.iter().all(|s| s.is_finite() && *s > 0.0 && *s < 10.0) {
+        Some(sigma)
+    } else {
+        None
     }
 }
 

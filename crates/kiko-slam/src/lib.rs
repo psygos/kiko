@@ -30,6 +30,7 @@ mod loop_manager;
 pub mod map;
 mod map_from_odom;
 mod math;
+mod surface_map;
 #[cfg(feature = "record")]
 mod oak;
 mod observability;
@@ -125,6 +126,7 @@ pub use triangulation::{
     RectifiedStereoError, SparseStereoSample, TriangulationConfig, TriangulationError,
     TriangulationResult, TriangulationStats, Triangulator,
 };
+pub use surface_map::{SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapSummary};
 pub use tsdf::{
     MeshData, TsdfCameraIntrinsics, TsdfCameraIntrinsicsError, TsdfConfig, TsdfIntegrateMsg,
     TsdfIntegrateMsgError, TsdfWorker,
