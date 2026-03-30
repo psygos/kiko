@@ -289,8 +289,44 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     eprintln!("dense cloud: {err}");
                                 }
                             }
-                            // Interpolated stereo depth remains visualization-only here.
-                            // Authoritative TSDF integration requires measured depth.
+                            // Feed interpolated depth to TSDF via explicit promotion.
+                            // The promote_to_measured() call is deliberate — it
+                            // acknowledges that interpolated stereo depth has higher
+                            // uncertainty than real sensor depth. The TSDF uses
+                            // equal-weight integration so this is acceptable for
+                            // visualization mesh, not authoritative reconstruction.
+                            if let Some(ref tsdf) = tsdf_worker {
+                                let stereo = dense_triangulator.as_ref().unwrap().stereo();
+                                {
+                                    let interp = kiko_slam::generate_dense_depth_image(
+                                        left.frame_id(),
+                                        left.timestamp(),
+                                        &samples,
+                                        stereo.fx(),
+                                        stereo.baseline_m(),
+                                        stereo.width(),
+                                        stereo.height(),
+                                        &dense_config,
+                                    );
+                                    let promoted = interp.promote_to_measured();
+                                    let intrinsics = kiko_slam::TsdfCameraIntrinsics::try_new(
+                                        stereo.fx(), stereo.fy(),
+                                        stereo.left().cx, stereo.left().cy,
+                                    );
+                                    if let Ok(intrinsics) = intrinsics {
+                                        if let Ok(msg) = kiko_slam::TsdfIntegrateMsg::try_new(
+                                            promoted,
+                                            left.data().to_vec(),
+                                            pose.cam_from_map_pose32(),
+                                            intrinsics,
+                                        ) {
+                                            if !tsdf.try_integrate(msg) {
+                                                eprintln!("tsdf worker queue full");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     if output.keyframe.is_some() {

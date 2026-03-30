@@ -146,8 +146,8 @@ impl Default for SurfaceMapConfig {
     fn default() -> Self {
         Self {
             voxel_size: 0.02,
-            min_observations: 3,
-            max_chi_squared: 10.0,
+            min_observations: 2,
+            max_chi_squared: 15.0,
             max_render_points: 500_000,
         }
     }

@@ -180,6 +180,25 @@ impl DepthImage<InterpolatedDepth> {
     ) -> Result<Self, DepthImageError> {
         Self::new_with_provenance(frame_id, timestamp, width, height, depth_m)
     }
+
+    /// Explicit provenance upgrade: promote interpolated depth to measured
+    /// for TSDF consumption. This is a deliberate conversion with documented
+    /// uncertainty inflation — the measurement plan requires this to be
+    /// an opt-in step, never implicit.
+    ///
+    /// The caller acknowledges that interpolated depth has higher uncertainty
+    /// than true measured depth and should use information-weighted TSDF
+    /// integration to handle this correctly.
+    pub fn promote_to_measured(self) -> DepthImage<MeasuredDepth> {
+        DepthImage {
+            frame_id: self.frame_id,
+            timestamp: self.timestamp,
+            width: self.width,
+            height: self.height,
+            depth_m: self.depth_m,
+            provenance: PhantomData,
+        }
+    }
 }
 
 #[cfg(test)]
