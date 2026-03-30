@@ -20,12 +20,12 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
-use crate::frontend::{median_parallax_px, StereoFrontend};
+use crate::frontend::{StereoFrontend, median_parallax_px};
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
-    aggregate_global_descriptor, match_quantized_descriptors_for_loop, LoopApplyError,
-    LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
-    RelocalizationConfig, VerifiedLoop,
+    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
+    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
+    match_quantized_descriptors_for_loop,
 };
 use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
@@ -35,13 +35,13 @@ use crate::place_recognition::{
 use crate::pose_graph::{EssentialEdge, EssentialEdgeKind};
 use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
 use crate::{
-    map::{KeyframeId, MapPointId, SlamMap},
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
     KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
     LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, Observation,
     ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, Raw, StereoPair,
     SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator, Verified,
+    map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
 use crate::{Gravity, ImuAccumulator};
@@ -1161,11 +1161,7 @@ impl DegradationLevel {
     }
 
     pub fn worst(a: Self, b: Self) -> Self {
-        if a.rank() >= b.rank() {
-            a
-        } else {
-            b
-        }
+        if a.rank() >= b.rank() { a } else { b }
     }
 }
 
@@ -1422,7 +1418,6 @@ fn camera_from_odom_from_pose_odom_from_body(
     camera_from_body.compose(pose_odom_from_body.inverse())
 }
 
-
 #[cfg(feature = "vio")]
 enum LocalEstimator {
     VisualOnly,
@@ -1505,13 +1500,15 @@ impl SlamTracker {
                     camera_from_body,
                     intrinsics,
                     config.ba.lm(),
-                    std::num::NonZeroUsize::new(vio_max_iters).unwrap_or(NonZeroUsize::new(3).unwrap()),
+                    std::num::NonZeroUsize::new(vio_max_iters)
+                        .unwrap_or(NonZeroUsize::new(3).unwrap()),
                     f64::from(config.ba.huber_delta_px()),
                     10.0,  // anchor velocity info
                     100.0, // bias prior info — strong, pulls toward calibrated
                     calib_ab,
                     calib_gb,
-                ).map_err(|err| TrackerInitError::VioInvalidGravity {
+                )
+                .map_err(|err| TrackerInitError::VioInvalidGravity {
                     message: err.to_string(),
                 })?;
                 LocalEstimator::Inertial(Box::new(VioRuntime {
@@ -1705,10 +1702,8 @@ impl SlamTracker {
         let camera_odom = self
             .map_from_odom
             .map_to_odom(Pose64::from_pose32(pose_world));
-        let body_odom = pose_odom_from_body_from_camera_pose(
-            camera_odom,
-            vio_runtime.camera_from_body,
-        );
+        let body_odom =
+            pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
         let prev_vel = vio_runtime
             .last_optimized_state
             .as_ref()
@@ -1748,13 +1743,13 @@ impl SlamTracker {
 
         let Some(preintegrated) = preintegrated else {
             // No IMU data — fall back to visual BA
-            return self.ba.push_frame(self.global_map.map(), pose_world, obs_set);
+            return self
+                .ba
+                .push_frame(self.global_map.map(), pose_world, obs_set);
         };
 
         // Build or extend the VIO window
-        use crate::local_ba::{
-            SyncedPose, VioAnchor, VioSuccessor, VioWindow, optimize_vio,
-        };
+        use crate::local_ba::{SyncedPose, VioAnchor, VioSuccessor, VioWindow, optimize_vio};
 
         if vio_runtime.vio_window.is_none() {
             // First frame: create anchor
@@ -1796,32 +1791,45 @@ impl SlamTracker {
         let result = optimize_vio(window, &vio_runtime.solve_config, self.global_map.map());
 
         // Extract optimized state from the last frame
-        let optimized = window.successors.last()
+        let optimized = window
+            .successors
+            .last()
             .map(|s| s.synced.clone())
             .unwrap_or_else(|| window.anchor.synced.clone());
 
         vio_runtime.last_optimized_state = Some(optimized.nav_state().clone());
         vio_runtime.predicted_state = Some(optimized.nav_state().clone());
 
-        if self.trace_transitions {
-            let vel = optimized.nav_state().velocity_odom_mps();
-            let bias = optimized.nav_state().bias();
-            eprintln!(
-                "vio ba: frames={} iters={} cost={:.4} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}]",
-                window.len(),
-                result.iterations,
-                result.final_cost,
-                vel[0], vel[1], vel[2],
-                bias.accel[0], bias.accel[1], bias.accel[2],
-            );
-        }
-
         // Convert from NavState (T_odom_from_body) to camera-in-map
         // (T_cam_from_map) which is what the rest of the tracker expects.
         // T_cam_map = T_cam_body * inv(T_odom_body)  (map_from_odom = identity)
-        let cam_from_map = vio_runtime.camera_from_body
+        let cam_from_map = vio_runtime
+            .camera_from_body
             .compose(optimized.nav_state().pose_odom_from_body().inverse())
             .to_pose32();
+
+        if self.trace_transitions {
+            let vel = optimized.nav_state().velocity_odom_mps();
+            let bias = optimized.nav_state().bias();
+            let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
+            let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+            let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
+            eprintln!(
+                "vio ba: frames={} iters={} cost={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                window.len(),
+                result.iterations,
+                result.final_cost,
+                vel[0],
+                vel[1],
+                vel[2],
+                bias.accel[0],
+                bias.accel[1],
+                bias.accel[2],
+                delta_t * 1000.0,
+                delta_r.to_degrees() * 1000.0,
+            );
+        }
+
         Some(cam_from_map)
     }
 
@@ -2726,7 +2734,9 @@ impl SlamTracker {
                 let mut diagnostics = self.empty_diagnostics();
                 diagnostics.features_detected = Some(current.len());
                 diagnostics.features_matched = Some(matches.len());
-                diagnostics.pnp_observations = Some(tracked_observations.len());
+                diagnostics.pnp_tracked_observations = Some(
+                    crate::PnpTrackedObservationCountMetric::new(tracked_observations.len()),
+                );
                 diagnostics.tracking_time = Some(tracking_start.elapsed());
                 return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
             }
@@ -2967,12 +2977,26 @@ impl SlamTracker {
         // VIO visual correction will be handled by tightly-coupled BA (M2).
 
         let mut diagnostics = self.empty_diagnostics();
-        diagnostics.inlier_ratio =
-            Some(result.inliers.len() as f32 / tracked_observations.len().max(1) as f32);
-        diagnostics.pnp_observations = Some(tracked_observations.len());
+        diagnostics.pnp_inlier_ratio = Some(
+            crate::PnpInlierRatioMetric::new(
+                result.inliers.len() as f32 / tracked_observations.len().max(1) as f32,
+            )
+            .expect("tracker must emit a finite inlier ratio in [0, 1]"),
+        );
+        diagnostics.pnp_tracked_observations = Some(crate::PnpTrackedObservationCountMetric::new(
+            tracked_observations.len(),
+        ));
         diagnostics.ransac_iterations = Some(result.iterations);
-        diagnostics.reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors);
-        diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors);
+        diagnostics.pnp_inlier_reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors)
+            .map(|value| {
+                crate::PnpAcceptedInlierPixelResidualMetric::new(value)
+                    .expect("reprojection RMSE must be finite and non-negative")
+            });
+        diagnostics.pnp_inlier_reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors)
+            .map(|value| {
+                crate::PnpAcceptedInlierPixelResidualMetric::new(value)
+                    .expect("reprojection max must be finite and non-negative")
+            });
         diagnostics.parallax_px = parallax_px;
         diagnostics.covisibility = Some(covisibility);
         diagnostics.keyframe_status = keyframe_status;
@@ -3411,8 +3435,8 @@ mod tests {
         CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
         SensorId, Timestamp,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
     #[cfg(feature = "vio")]
@@ -3669,7 +3693,6 @@ mod tests {
         map.add_observation(point_id, kp_b).expect("shared obs");
         (map, kf_a, kf_b)
     }
-
 
     fn make_forced_panic_event(
         request_id: BackendRequestId,
@@ -4625,18 +4648,22 @@ mod tests {
     #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
         let detections = make_test_detections(900);
-        assert!(SlamTracker::initial_relocalization_session(
-            TrackingHealth::Good,
-            true,
-            Arc::clone(&detections)
-        )
-        .is_none());
-        assert!(SlamTracker::initial_relocalization_session(
-            TrackingHealth::Lost,
-            false,
-            Arc::clone(&detections)
-        )
-        .is_none());
+        assert!(
+            SlamTracker::initial_relocalization_session(
+                TrackingHealth::Good,
+                true,
+                Arc::clone(&detections)
+            )
+            .is_none()
+        );
+        assert!(
+            SlamTracker::initial_relocalization_session(
+                TrackingHealth::Lost,
+                false,
+                Arc::clone(&detections)
+            )
+            .is_none()
+        );
 
         let session = SlamTracker::initial_relocalization_session(
             TrackingHealth::Lost,

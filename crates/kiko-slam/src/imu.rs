@@ -603,12 +603,9 @@ mod tests {
         ])
         .expect("batch");
         accumulator.extend_batch(&first).expect("extend 1");
-        let second = ImuBatch::new(vec![ImuSample::new(
-            Timestamp::from_nanos(30),
-            [0.0; 3],
-            [0.0; 3],
-        )
-        .expect("sample 2")])
+        let second = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(30), [0.0; 3], [0.0; 3]).expect("sample 2"),
+        ])
         .expect("batch");
         accumulator.extend_batch(&second).expect("extend 2");
         assert_eq!(accumulator.len(), 3);
@@ -624,22 +621,17 @@ mod tests {
     #[test]
     fn imu_accumulator_rejects_out_of_order_extension() {
         let mut accumulator = ImuAccumulator::new();
-        let batch = ImuBatch::new(vec![ImuSample::new(
-            Timestamp::from_nanos(20),
-            [0.0; 3],
-            [0.0; 3],
-        )
-        .expect("sample 0")])
+        let batch = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(20), [0.0; 3], [0.0; 3]).expect("sample 0"),
+        ])
         .expect("batch");
         accumulator.extend_batch(&batch).expect("first extend");
         let err = accumulator
             .extend_batch(
-                &ImuBatch::new(vec![ImuSample::new(
-                    Timestamp::from_nanos(10),
-                    [0.0; 3],
-                    [0.0; 3],
-                )
-                .expect("sample 1")])
+                &ImuBatch::new(vec![
+                    ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3])
+                        .expect("sample 1"),
+                ])
                 .expect("batch"),
             )
             .expect_err("out-of-order extension should fail");
@@ -677,9 +669,11 @@ mod tests {
         assert_eq!(tail.start_time(), Timestamp::from_nanos(30));
         assert_eq!(tail.end_time(), Timestamp::from_nanos(30));
 
-        assert!(accumulator
-            .batch_from(Timestamp::from_nanos(40))
-            .expect("empty suffix")
-            .is_none());
+        assert!(
+            accumulator
+                .batch_from(Timestamp::from_nanos(40))
+                .expect("empty suffix")
+                .is_none()
+        );
     }
 }

@@ -6,9 +6,11 @@ use crate::{
 
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
 
-const PATH_HEALTH_INLIER_RATIO: &str = "diagnostics/health/inlier_ratio";
-const PATH_HEALTH_REPROJECTION_RMSE: &str = "diagnostics/health/reprojection_rmse_px";
-const PATH_HEALTH_REPROJECTION_MAX: &str = "diagnostics/health/reprojection_max_px";
+const PATH_HEALTH_PNP_INLIER_RATIO: &str = "diagnostics/health/pnp_inlier_ratio";
+const PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE: &str =
+    "diagnostics/health/pnp_inlier_reprojection_rmse_px";
+const PATH_HEALTH_PNP_INLIER_REPROJECTION_MAX: &str =
+    "diagnostics/health/pnp_inlier_reprojection_max_px";
 const PATH_HEALTH_TRACKING_STATE: &str = "diagnostics/health/tracking_state";
 const PATH_HEALTH_DEGRADATION_LEVEL: &str = "diagnostics/health/degradation_level";
 const PATH_HEALTH_BACKEND_STATE: &str = "diagnostics/health/backend_state";
@@ -28,7 +30,8 @@ const PATH_HEALTH_BACKEND_PANICS: &str = "diagnostics/health/backend_panics";
 
 const PATH_TRACKING_FEATURES_DETECTED: &str = "diagnostics/tracking/features_detected";
 const PATH_TRACKING_FEATURES_MATCHED: &str = "diagnostics/tracking/features_matched";
-const PATH_TRACKING_PNP_OBSERVATIONS: &str = "diagnostics/tracking/pnp_observations";
+const PATH_TRACKING_PNP_TRACKED_OBSERVATIONS: &str =
+    "diagnostics/tracking/pnp_tracked_observations";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
 const PATH_TRACKING_PARALLAX: &str = "diagnostics/tracking/parallax_px";
 const PATH_TRACKING_COVISIBILITY: &str = "diagnostics/tracking/covisibility";
@@ -87,14 +90,17 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         },
     ));
 
-    if let Some(v) = diag.inlier_ratio {
-        scalars.push((PATH_HEALTH_INLIER_RATIO, v as f64));
+    if let Some(v) = diag.pnp_inlier_ratio {
+        scalars.push((PATH_HEALTH_PNP_INLIER_RATIO, v.value() as f64));
     }
-    if let Some(v) = diag.reprojection_rmse_px {
-        scalars.push((PATH_HEALTH_REPROJECTION_RMSE, v as f64));
+    if let Some(v) = diag.pnp_inlier_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
     }
-    if let Some(v) = diag.reprojection_max_px {
-        scalars.push((PATH_HEALTH_REPROJECTION_MAX, v as f64));
+    if let Some(v) = diag.pnp_inlier_reprojection_max_px {
+        scalars.push((PATH_HEALTH_PNP_INLIER_REPROJECTION_MAX, v.value_px() as f64));
     }
     if let Some(v) = diag.features_detected {
         scalars.push((PATH_TRACKING_FEATURES_DETECTED, v as f64));
@@ -102,8 +108,8 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     if let Some(v) = diag.features_matched {
         scalars.push((PATH_TRACKING_FEATURES_MATCHED, v as f64));
     }
-    if let Some(v) = diag.pnp_observations {
-        scalars.push((PATH_TRACKING_PNP_OBSERVATIONS, v as f64));
+    if let Some(v) = diag.pnp_tracked_observations {
+        scalars.push((PATH_TRACKING_PNP_TRACKED_OBSERVATIONS, v.count() as f64));
     }
     if let Some(v) = diag.ransac_iterations {
         scalars.push((PATH_TRACKING_RANSAC_ITERATIONS, v as f64));
@@ -362,12 +368,12 @@ impl RerunSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        PATH_HEALTH_INLIER_RATIO, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS, diagnostics_scalars,
+        PATH_HEALTH_PNP_INLIER_RATIO, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS, diagnostics_scalars,
         format_event,
     };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
-        TriangulationStats,
+        PnpInlierRatioMetric, TriangulationStats,
     };
 
     #[test]
@@ -389,7 +395,7 @@ mod tests {
     #[test]
     fn diagnostics_scalars_include_present_fields() {
         let mut diag = FrameDiagnostics::empty(1, 2);
-        diag.inlier_ratio = Some(0.75);
+        diag.pnp_inlier_ratio = Some(PnpInlierRatioMetric::new(0.75).expect("ratio"));
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
         diag.triangulation = Some(TriangulationStats {
@@ -404,7 +410,7 @@ mod tests {
         assert!(
             scalars
                 .iter()
-                .any(|(path, value)| *path == PATH_HEALTH_INLIER_RATIO
+                .any(|(path, value)| *path == PATH_HEALTH_PNP_INLIER_RATIO
                     && (*value - 0.75).abs() < 1e-6)
         );
         assert!(

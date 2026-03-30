@@ -502,15 +502,10 @@ impl Triangulator {
     /// Extract deduplicated, filtered stereo samples from matches.
     /// Uses the same deduplication (best score per left keypoint) and
     /// filtering (bounds, min disparity, max depth) as `triangulate()`.
-    pub fn extract_stereo_samples(
-        &self,
-        matches: &Matches<Raw>,
-    ) -> Vec<SparseStereoSample> {
+    pub fn extract_stereo_samples(&self, matches: &Matches<Raw>) -> Vec<SparseStereoSample> {
         let left = matches.source_a_arc();
         let right = matches.source_b();
-        if left.sensor_id() != SensorId::StereoLeft
-            || right.sensor_id() != SensorId::StereoRight
-        {
+        if left.sensor_id() != SensorId::StereoLeft || right.sensor_id() != SensorId::StereoRight {
             return Vec::new();
         }
         let left_len = left.len();

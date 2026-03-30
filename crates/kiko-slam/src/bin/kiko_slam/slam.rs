@@ -129,11 +129,12 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     )?;
 
-    let tsdf_worker = if dense_cloud_enabled {
-        Some(kiko_slam::TsdfWorker::spawn(kiko_slam::TsdfConfig::default(), 4))
-    } else {
-        None
-    };
+    let tsdf_worker: Option<kiko_slam::TsdfWorker> = None;
+    if dense_cloud_enabled {
+        eprintln!(
+            "tsdf: disabled for dataset stereo interpolation; authoritative TSDF integration requires measured depth"
+        );
+    }
     let rec = rerun_recording(&args.rerun, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
@@ -247,7 +248,9 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(matches) = output.stereo_matches {
                     // Extract stereo samples for dense cloud BEFORE matches are consumed
                     let dense_samples = if output.keyframe.is_some() {
-                        dense_triangulator.as_ref().map(|tri| tri.extract_stereo_samples(&matches))
+                        dense_triangulator
+                            .as_ref()
+                            .map(|tri| tri.extract_stereo_samples(&matches))
                     } else {
                         None
                     };
@@ -269,45 +272,25 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             // Dense point cloud for Rerun
                             let dense = kiko_slam::generate_dense_cloud(
                                 &samples,
-                                stereo.fx(), stereo.fy(),
-                                stereo.left().cx, stereo.left().cy,
+                                stereo.fx(),
+                                stereo.fy(),
+                                stereo.left().cx,
+                                stereo.left().cy,
                                 stereo.baseline_m(),
-                                left.data(), left.width(), left.height(),
+                                left.data(),
+                                left.width(),
+                                left.height(),
                                 &dense_config,
                             );
                             if !dense.points.is_empty() {
-                                if let Err(err) = sink.log_dense_cloud(
-                                    &dense.points,
-                                    pose.cam_from_map_pose32(),
-                                ) {
+                                if let Err(err) =
+                                    sink.log_dense_cloud(&dense.points, pose.cam_from_map_pose32())
+                                {
                                     eprintln!("dense cloud: {err}");
                                 }
                             }
-                            // Dense depth image for TSDF (independent of point cloud)
-                            if let Some(ref tsdf) = tsdf_worker {
-                                let depth_image = kiko_slam::generate_dense_depth_image(
-                                    &samples,
-                                    stereo.fx(),
-                                    stereo.baseline_m(),
-                                    stereo.width(),
-                                    stereo.height(),
-                                    &dense_config,
-                                );
-                                let msg = kiko_slam::TsdfIntegrateMsg {
-                                    depth_image,
-                                    grayscale: left.data().to_vec(),
-                                    cam_from_map: pose.cam_from_map_pose32(),
-                                    fx: stereo.fx(),
-                                    fy: stereo.fy(),
-                                    cx: stereo.left().cx,
-                                    cy: stereo.left().cy,
-                                    image_width: stereo.width(),
-                                    image_height: stereo.height(),
-                                };
-                                if !tsdf.try_integrate(msg) {
-                                    eprintln!("tsdf worker queue full");
-                                }
-                            }
+                            // Interpolated stereo depth remains visualization-only here.
+                            // Authoritative TSDF integration requires measured depth.
                         }
                     }
                     if output.keyframe.is_some() {

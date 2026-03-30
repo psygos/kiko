@@ -1,14 +1,42 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::{FrameId, Timestamp};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepthProvenanceKind {
+    MeasuredSensor,
+    InterpolatedStereo,
+}
+
+pub trait DepthProvenance: Clone + Copy + std::fmt::Debug + Send + Sync + 'static {
+    const KIND: DepthProvenanceKind;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeasuredDepth;
+
+impl DepthProvenance for MeasuredDepth {
+    const KIND: DepthProvenanceKind = DepthProvenanceKind::MeasuredSensor;
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InterpolatedDepth;
+
+impl DepthProvenance for InterpolatedDepth {
+    const KIND: DepthProvenanceKind = DepthProvenanceKind::InterpolatedStereo;
+}
+
+pub type InterpolatedDepthImage = DepthImage<InterpolatedDepth>;
+
 #[derive(Debug, Clone)]
-pub struct DepthImage {
+pub struct DepthImage<P = MeasuredDepth> {
     frame_id: FrameId,
     timestamp: Timestamp,
     width: u32,
     height: u32,
     depth_m: Arc<[f32]>,
+    provenance: PhantomData<P>,
 }
 
 #[derive(Debug)]
@@ -35,50 +63,45 @@ impl std::fmt::Display for DepthImageError {
 
 impl std::error::Error for DepthImageError {}
 
-impl DepthImage {
-    pub fn new(
+fn validate_depth_samples(width: u32, height: u32, depth_m: &[f32]) -> Result<(), DepthImageError> {
+    let expected = (width as usize).saturating_mul(height as usize);
+    if depth_m.len() != expected {
+        return Err(DepthImageError::DimensionMismatch {
+            expected,
+            actual: depth_m.len(),
+        });
+    }
+    if let Some((index, value)) = depth_m
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || *value < 0.0)
+    {
+        return Err(DepthImageError::InvalidSample { index, value });
+    }
+    Ok(())
+}
+
+impl<P> DepthImage<P>
+where
+    P: DepthProvenance,
+{
+    fn new_with_provenance(
         frame_id: FrameId,
         timestamp: Timestamp,
         width: u32,
         height: u32,
         depth_m: Vec<f32>,
     ) -> Result<Self, DepthImageError> {
-        let expected = (width as usize).saturating_mul(height as usize);
-        if depth_m.len() != expected {
-            return Err(DepthImageError::DimensionMismatch {
-                expected,
-                actual: depth_m.len(),
-            });
-        }
-        if let Some((index, value)) = depth_m
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite() || *value < 0.0)
-        {
-            return Err(DepthImageError::InvalidSample { index, value });
-        }
+        validate_depth_samples(width, height, &depth_m)?;
         Ok(Self {
             frame_id,
             timestamp,
             width,
             height,
             depth_m: Arc::from(depth_m.into_boxed_slice()),
+            provenance: PhantomData,
         })
-    }
-
-    pub fn from_depth_mm(
-        frame_id: FrameId,
-        timestamp: Timestamp,
-        width: u32,
-        height: u32,
-        depth_mm: Vec<u16>,
-    ) -> Result<Self, DepthImageError> {
-        let depth_m = depth_mm
-            .into_iter()
-            .map(|mm| if mm == 0 { 0.0 } else { mm as f32 * 0.001 })
-            .collect();
-        Self::new(frame_id, timestamp, width, height, depth_m)
     }
 
     pub fn frame_id(&self) -> FrameId {
@@ -95,6 +118,10 @@ impl DepthImage {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    pub fn provenance_kind(&self) -> DepthProvenanceKind {
+        P::KIND
     }
 
     pub fn depth_m(&self) -> &[f32] {
@@ -114,6 +141,44 @@ impl DepthImage {
         } else {
             None
         }
+    }
+}
+
+impl DepthImage<MeasuredDepth> {
+    pub fn new(
+        frame_id: FrameId,
+        timestamp: Timestamp,
+        width: u32,
+        height: u32,
+        depth_m: Vec<f32>,
+    ) -> Result<Self, DepthImageError> {
+        Self::new_with_provenance(frame_id, timestamp, width, height, depth_m)
+    }
+
+    pub fn from_depth_mm(
+        frame_id: FrameId,
+        timestamp: Timestamp,
+        width: u32,
+        height: u32,
+        depth_mm: Vec<u16>,
+    ) -> Result<Self, DepthImageError> {
+        let depth_m = depth_mm
+            .into_iter()
+            .map(|mm| if mm == 0 { 0.0 } else { mm as f32 * 0.001 })
+            .collect();
+        Self::new(frame_id, timestamp, width, height, depth_m)
+    }
+}
+
+impl DepthImage<InterpolatedDepth> {
+    pub fn new_interpolated(
+        frame_id: FrameId,
+        timestamp: Timestamp,
+        width: u32,
+        height: u32,
+        depth_m: Vec<f32>,
+    ) -> Result<Self, DepthImageError> {
+        Self::new_with_provenance(frame_id, timestamp, width, height, depth_m)
     }
 }
 
@@ -150,10 +215,28 @@ mod tests {
             vec![0, 1000, 2500, 42],
         )
         .expect("valid depth image");
+        assert_eq!(depth.provenance_kind(), DepthProvenanceKind::MeasuredSensor);
         assert_eq!(depth.depth_m_at(0, 0), None);
         assert_eq!(depth.depth_m_at(1, 0), Some(1.0));
         assert_eq!(depth.depth_m_at(0, 1), Some(2.5));
         assert!(depth.depth_m_at(1, 1).is_some());
+    }
+
+    #[test]
+    fn interpolated_depth_image_preserves_provenance() {
+        let depth = DepthImage::<InterpolatedDepth>::new_interpolated(
+            FrameId::new(8),
+            Timestamp::from_nanos(11),
+            2,
+            1,
+            vec![0.0, 1.25],
+        )
+        .expect("valid interpolated depth image");
+        assert_eq!(
+            depth.provenance_kind(),
+            DepthProvenanceKind::InterpolatedStereo
+        );
+        assert_eq!(depth.depth_m_at(1, 0), Some(1.25));
     }
 
     #[test]

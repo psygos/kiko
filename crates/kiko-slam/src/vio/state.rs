@@ -5,6 +5,8 @@ pub type NavTangent = [f64; 15];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NavStateError {
+    NonFinitePoseTranslation { axis: usize, value: f64 },
+    NonFinitePoseRotation { row: usize, col: usize, value: f64 },
     NonFiniteVelocity { axis: usize, value: f64 },
     NonFiniteBiasAccel { axis: usize, value: f64 },
     NonFiniteBiasGyro { axis: usize, value: f64 },
@@ -13,6 +15,18 @@ pub enum NavStateError {
 impl std::fmt::Display for NavStateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NavStateError::NonFinitePoseTranslation { axis, value } => {
+                write!(
+                    f,
+                    "pose translation axis {axis} must be finite, got {value}"
+                )
+            }
+            NavStateError::NonFinitePoseRotation { row, col, value } => {
+                write!(
+                    f,
+                    "pose rotation entry ({row}, {col}) must be finite, got {value}"
+                )
+            }
             NavStateError::NonFiniteVelocity { axis, value } => {
                 write!(f, "velocity axis {axis} must be finite, got {value}")
             }
@@ -44,6 +58,24 @@ impl NavState {
         velocity_odom_mps: [f64; 3],
         bias: ImuBias,
     ) -> Result<Self, NavStateError> {
+        let translation = pose_odom_from_body.translation();
+        for (axis, value) in translation.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(NavStateError::NonFinitePoseTranslation { axis, value });
+            }
+        }
+        let rotation = pose_odom_from_body.rotation();
+        for (row_idx, row) in rotation.iter().enumerate() {
+            for (col_idx, value) in row.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    return Err(NavStateError::NonFinitePoseRotation {
+                        row: row_idx,
+                        col: col_idx,
+                        value,
+                    });
+                }
+            }
+        }
         for (axis, value) in velocity_odom_mps.iter().copied().enumerate() {
             if !value.is_finite() {
                 return Err(NavStateError::NonFiniteVelocity { axis, value });
@@ -78,7 +110,7 @@ impl NavState {
         &self.bias
     }
 
-    pub fn retract(&self, delta: &NavTangent) -> Self {
+    pub fn retract(&self, delta: &NavTangent) -> Result<Self, NavStateError> {
         let mut pose_delta = [0.0_f64; 6];
         pose_delta.copy_from_slice(&delta[..6]);
         let pose_odom_from_body = se3_exp_f64(pose_delta).compose(self.pose_odom_from_body);
@@ -99,11 +131,7 @@ impl NavState {
                 self.bias.gyro[2] + delta[14],
             ],
         };
-        Self {
-            pose_odom_from_body,
-            velocity_odom_mps,
-            bias,
-        }
+        Self::try_new(pose_odom_from_body, velocity_odom_mps, bias)
     }
 
     pub fn local_coordinates(&self, other: &Self) -> NavTangent {
@@ -216,7 +244,7 @@ mod tests {
             0.01, -0.02, 0.03, 0.001, -0.002, 0.003, 0.1, -0.2, 0.3, 0.001, 0.002, -0.001, -0.0005,
             0.0007, -0.0009,
         ];
-        let moved = state.retract(&delta);
+        let moved = state.retract(&delta).expect("retract");
         let recovered = state.local_coordinates(&moved);
         for i in 0..15 {
             assert!((recovered[i] - delta[i]).abs() < 1e-9, "index {i}");
@@ -237,6 +265,26 @@ mod tests {
             NavStateError::NonFiniteVelocity { axis, value } => {
                 assert_eq!(axis, 0);
                 assert!(value.is_nan());
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nav_state_rejects_non_finite_pose_translation() {
+        let err = NavState::try_new(
+            Pose64::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [f64::INFINITY, 0.0, 0.0],
+            ),
+            [0.0; 3],
+            ImuBias::default(),
+        )
+        .expect_err("non-finite translation should fail");
+        match err {
+            NavStateError::NonFinitePoseTranslation { axis, value } => {
+                assert_eq!(axis, 0);
+                assert!(!value.is_finite());
             }
             other => panic!("unexpected error: {other:?}"),
         }

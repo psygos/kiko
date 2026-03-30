@@ -49,6 +49,9 @@ pub struct DatasetArgs {
     /// Maximum number of stereo pairs to attempt from the dataset
     #[arg(long, env = "KIKO_MAX_PAIRS")]
     pub max_pairs: Option<usize>,
+    /// Skip the first N frames (camera/IMU settling time)
+    #[arg(long, env = "KIKO_SKIP_FRAMES", default_value_t = 0)]
+    pub skip_frames: usize,
 }
 
 #[derive(Args, Clone, Debug)]

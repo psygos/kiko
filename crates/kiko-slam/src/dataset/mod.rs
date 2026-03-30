@@ -78,6 +78,12 @@ pub struct ImuCalibration {
     pub noise: ImuNoiseMeta,
     pub extrinsics: ImuExtrinsicsMeta,
     pub gravity_magnitude_mps2: f64,
+    /// Factory-calibrated accelerometer bias [m/s²] (e.g. from Basalt/kalibr).
+    #[serde(default)]
+    pub initial_accel_bias: Option<[f64; 3]>,
+    /// Factory-calibrated gyroscope bias [rad/s] (e.g. from Basalt/kalibr).
+    #[serde(default)]
+    pub initial_gyro_bias: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -505,7 +505,10 @@ pub(crate) struct SyncedPose {
 impl SyncedPose {
     pub(crate) fn new(nav_state: crate::NavState) -> Self {
         let f32_pose = nav_state.pose_odom_from_body().to_pose32();
-        Self { f32_pose, nav_state }
+        Self {
+            f32_pose,
+            nav_state,
+        }
     }
 
     pub(crate) fn pose(&self) -> Pose {
@@ -682,8 +685,7 @@ impl VioWindow {
 
     /// Iterate all synced poses in window order.
     fn synced_poses(&self) -> impl Iterator<Item = &SyncedPose> {
-        std::iter::once(&self.anchor.synced)
-            .chain(self.successors.iter().map(|s| &s.synced))
+        std::iter::once(&self.anchor.synced).chain(self.successors.iter().map(|s| &s.synced))
     }
 }
 
@@ -1471,10 +1473,10 @@ pub fn optimize_vio(
     map: &SlamMap,
 ) -> VioSolveResult {
     use crate::vio::solve::{
-        accumulate_cross_factor, accumulate_factor, imu_jacobians, solve_dense_f64,
-        BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM,
+        BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor,
+        accumulate_factor, imu_jacobians, solve_dense_f64,
     };
-    use crate::{bias_random_walk_residual, ImuFactor};
+    use crate::{ImuFactor, bias_random_walk_residual};
 
     let n_frames = window.len();
     let dim = n_frames * STATE_DIM;
@@ -1514,14 +1516,19 @@ pub fn optimize_vio(
             };
             let base = frame_idx * STATE_DIM;
             let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body);
-            if let Some(resolved) = obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap()) {
+            if let Some(resolved) =
+                obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap())
+            {
                 for obs in resolved.observations() {
                     let world = obs.world();
                     let pixel = obs.pixel();
                     // Compute residual at current state
-                    let Some((residual, _, _)) =
-                        reprojection_residual_and_jacobians(cam_pose, world, pixel, config.intrinsics)
-                    else {
+                    let Some((residual, _, _)) = reprojection_residual_and_jacobians(
+                        cam_pose,
+                        world,
+                        pixel,
+                        config.intrinsics,
+                    ) else {
                         continue;
                     };
                     let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
@@ -1529,7 +1536,10 @@ pub fn optimize_vio(
                     let (huber_weight, huber_cost) = if r_norm <= huber_delta {
                         (1.0_f32, 0.5 * r_norm * r_norm)
                     } else {
-                        (huber_delta / r_norm, huber_delta * (r_norm - 0.5 * huber_delta))
+                        (
+                            huber_delta / r_norm,
+                            huber_delta * (r_norm - 0.5 * huber_delta),
+                        )
                     };
                     total_cost += f64::from(huber_cost);
                     let sqrt_w = huber_weight.sqrt();
@@ -1556,18 +1566,40 @@ pub fn optimize_vio(
                         let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body);
                         let p_minus = vio_cam_from_map(&s_minus, config.camera_from_body);
                         if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
-                            reprojection_residual_and_jacobians(p_plus, world, pixel, config.intrinsics),
-                            reprojection_residual_and_jacobians(p_minus, world, pixel, config.intrinsics),
+                            reprojection_residual_and_jacobians(
+                                p_plus,
+                                world,
+                                pixel,
+                                config.intrinsics,
+                            ),
+                            reprojection_residual_and_jacobians(
+                                p_minus,
+                                world,
+                                pixel,
+                                config.intrinsics,
+                            ),
                         ) {
                             for row in 0..2 {
-                                j_15[row][axis] = f64::from(r_plus[row] - r_minus[row]) / (2.0 * FD_EPS)
+                                j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
+                                    / (2.0 * FD_EPS)
                                     * f64::from(sqrt_w);
                             }
                         }
                     }
-                    let r_f64 = [f64::from(residual[0] * sqrt_w), f64::from(residual[1] * sqrt_w)];
+                    let r_f64 = [
+                        f64::from(residual[0] * sqrt_w),
+                        f64::from(residual[1] * sqrt_w),
+                    ];
                     let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
-                    accumulate_factor(&mut hessian, &mut rhs, dim, &j_15, &identity_2, &r_f64, base);
+                    accumulate_factor(
+                        &mut hessian,
+                        &mut rhs,
+                        dim,
+                        &j_15,
+                        &identity_2,
+                        &r_f64,
+                        base,
+                    );
                 }
             }
         }
@@ -1600,10 +1632,34 @@ pub fn optimize_vio(
             let base_curr = (succ_idx + 1) * STATE_DIM;
 
             // Self-terms
-            accumulate_factor(&mut hessian, &mut rhs, dim, &j_prev, &info, &residual, base_prev);
-            accumulate_factor(&mut hessian, &mut rhs, dim, &j_curr, &info, &residual, base_curr);
+            accumulate_factor(
+                &mut hessian,
+                &mut rhs,
+                dim,
+                &j_prev,
+                &info,
+                &residual,
+                base_prev,
+            );
+            accumulate_factor(
+                &mut hessian,
+                &mut rhs,
+                dim,
+                &j_curr,
+                &info,
+                &residual,
+                base_curr,
+            );
             // Cross-term
-            accumulate_cross_factor(&mut hessian, dim, &j_prev, &j_curr, &info, base_prev, base_curr);
+            accumulate_cross_factor(
+                &mut hessian,
+                dim,
+                &j_prev,
+                &j_curr,
+                &info,
+                base_prev,
+                base_curr,
+            );
         }
 
         // --- 3. Bias random walk factors ---

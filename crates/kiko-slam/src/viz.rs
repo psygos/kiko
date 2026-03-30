@@ -307,8 +307,11 @@ impl RerunSink {
         for p in points {
             let world = crate::math::transform_point(r, t, p.position);
             self.dense_cloud_positions.push(world);
-            self.dense_cloud_colors
-                .push(rerun::Color::from_rgb(p.intensity, p.intensity, p.intensity));
+            self.dense_cloud_colors.push(rerun::Color::from_rgb(
+                p.intensity,
+                p.intensity,
+                p.intensity,
+            ));
         }
         // Log the full accumulated cloud
         let cloud = rerun::Points3D::new(self.dense_cloud_positions.clone())
@@ -319,20 +322,23 @@ impl RerunSink {
     }
 
     /// Log TSDF mesh as a triangle mesh with vertex colors.
-    pub fn log_tsdf_mesh(
-        &self,
-        mesh: &crate::tsdf::MeshData,
-    ) -> Result<(), VizLogError> {
+    pub fn log_tsdf_mesh(&self, mesh: &crate::tsdf::MeshData) -> Result<(), VizLogError> {
         if mesh.positions.is_empty() {
             return Ok(());
         }
-        let positions: Vec<rerun::Position3D> = mesh.positions.iter()
+        let positions: Vec<rerun::Position3D> = mesh
+            .positions
+            .iter()
             .map(|p| rerun::Position3D::new(p[0], p[1], p[2]))
             .collect();
-        let indices: Vec<rerun::TriangleIndices> = mesh.indices.iter()
+        let indices: Vec<rerun::TriangleIndices> = mesh
+            .indices
+            .iter()
             .map(|t| rerun::TriangleIndices::from([t[0], t[1], t[2]]))
             .collect();
-        let colors: Vec<rerun::Color> = mesh.colors.iter()
+        let colors: Vec<rerun::Color> = mesh
+            .colors
+            .iter()
             .map(|c| rerun::Color::from_rgb(c[0], c[1], c[2]))
             .collect();
         let mesh3d = rerun::Mesh3D::new(positions)

@@ -289,7 +289,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn summarize_bench_reports_exact_stage_metrics() {
         let accum = BenchAccum {

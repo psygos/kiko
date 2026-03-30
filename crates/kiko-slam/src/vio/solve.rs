@@ -68,7 +68,10 @@ pub fn imu_jacobians(
     state_j: &NavState,
     preintegrated: &PreintegratedImu,
     gravity: Gravity,
-) -> ([[f64; STATE_DIM]; IMU_RESIDUAL_DIM], [[f64; STATE_DIM]; IMU_RESIDUAL_DIM]) {
+) -> (
+    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
+    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
+) {
     const EPS: f64 = 1e-7;
     let mut jac_prev = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
     let mut jac_curr = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
@@ -80,10 +83,9 @@ pub fn imu_jacobians(
         delta_minus[axis] = -EPS;
 
         // w.r.t. state_i
-        if let (Ok(si_plus), Ok(si_minus)) = (
-            state_i.retract(&delta_plus),
-            state_i.retract(&delta_minus),
-        ) {
+        if let (Ok(si_plus), Ok(si_minus)) =
+            (state_i.retract(&delta_plus), state_i.retract(&delta_minus))
+        {
             let r_plus = ImuFactor::residual(&si_plus, state_j, preintegrated, &gravity);
             let r_minus = ImuFactor::residual(&si_minus, state_j, preintegrated, &gravity);
             for row in 0..IMU_RESIDUAL_DIM {
@@ -92,10 +94,9 @@ pub fn imu_jacobians(
         }
 
         // w.r.t. state_j
-        if let (Ok(sj_plus), Ok(sj_minus)) = (
-            state_j.retract(&delta_plus),
-            state_j.retract(&delta_minus),
-        ) {
+        if let (Ok(sj_plus), Ok(sj_minus)) =
+            (state_j.retract(&delta_plus), state_j.retract(&delta_minus))
+        {
             let r_plus = ImuFactor::residual(state_i, &sj_plus, preintegrated, &gravity);
             let r_minus = ImuFactor::residual(state_i, &sj_minus, preintegrated, &gravity);
             for row in 0..IMU_RESIDUAL_DIM {
@@ -114,7 +115,10 @@ fn numerical_imu_jacobians_alt(
     state_j: &NavState,
     preintegrated: &PreintegratedImu,
     gravity: Gravity,
-) -> ([[f64; STATE_DIM]; IMU_RESIDUAL_DIM], [[f64; STATE_DIM]; IMU_RESIDUAL_DIM]) {
+) -> (
+    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
+    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
+) {
     const EPS: f64 = 1e-6;
     let mut jac_prev = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
     let mut jac_curr = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
@@ -237,11 +241,7 @@ fn scale3(m: [[f64; 3]; 3], s: f64) -> [[f64; 3]; 3] {
 }
 
 fn skew3(v: [f64; 3]) -> [[f64; 3]; 3] {
-    [
-        [0.0, -v[2], v[1]],
-        [v[2], 0.0, -v[0]],
-        [-v[1], v[0], 0.0],
-    ]
+    [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
 }
 
 // -----------------------------------------------------------------------
@@ -357,7 +357,11 @@ mod tests {
         let gravity = Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity");
         let state_i = NavState::try_new(
             Pose64::from_rt(
-                [[0.98, -0.17, 0.05], [0.18, 0.97, -0.15], [-0.02, 0.16, 0.99]],
+                [
+                    [0.98, -0.17, 0.05],
+                    [0.18, 0.97, -0.15],
+                    [-0.02, 0.16, 0.99],
+                ],
                 [1.0, -0.5, 0.3],
             ),
             [0.5, -0.2, 0.1],
@@ -369,7 +373,11 @@ mod tests {
         .expect("state_i");
         let state_j = NavState::try_new(
             Pose64::from_rt(
-                [[0.95, -0.30, 0.08], [0.31, 0.94, -0.12], [-0.04, 0.14, 0.99]],
+                [
+                    [0.95, -0.30, 0.08],
+                    [0.31, 0.94, -0.12],
+                    [-0.04, 0.14, 0.99],
+                ],
                 [1.5, -0.3, 0.6],
             ),
             [0.8, -0.1, 0.3],
@@ -393,13 +401,22 @@ mod tests {
         let (jp, jc) = imu_jacobians(&state_i, &state_j, &preintegrated, gravity);
         for row in 0..IMU_RESIDUAL_DIM {
             for col in 0..STATE_DIM {
-                assert!(jp[row][col].is_finite(), "jac_prev[{row}][{col}] not finite");
-                assert!(jc[row][col].is_finite(), "jac_curr[{row}][{col}] not finite");
+                assert!(
+                    jp[row][col].is_finite(),
+                    "jac_prev[{row}][{col}] not finite"
+                );
+                assert!(
+                    jc[row][col].is_finite(),
+                    "jac_curr[{row}][{col}] not finite"
+                );
             }
         }
         // At least some non-zero entries (the Jacobian should not be trivially zero)
         let sum: f64 = jp.iter().flat_map(|r| r.iter()).map(|v| v.abs()).sum();
-        assert!(sum > 1.0, "jac_prev is suspiciously close to zero: sum={sum}");
+        assert!(
+            sum > 1.0,
+            "jac_prev is suspiciously close to zero: sum={sum}"
+        );
     }
 
     /// At the ground truth (zero residual), all Jacobians should still
@@ -407,26 +424,30 @@ mod tests {
     #[test]
     fn imu_jacobians_finite_at_ground_truth() {
         let gravity = Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity");
-        let state = NavState::try_new(
-            Pose64::identity(),
-            [0.0; 3],
-            ImuBias::default(),
-        )
-        .expect("state");
+        let state =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
 
         let preintegrated = PreintegratedImu::integrate(
-            &batch(&[(0, [0.0, 9.81, 0.0], [0.0; 3]), (10_000_000, [0.0, 9.81, 0.0], [0.0; 3])]),
+            &batch(&[
+                (0, [0.0, 9.81, 0.0], [0.0; 3]),
+                (10_000_000, [0.0, 9.81, 0.0], [0.0; 3]),
+            ]),
             &ImuBias::default(),
             &noise(),
         )
         .expect("preintegrated");
 
-        let (jac_prev, jac_curr) =
-            imu_jacobians(&state, &state, &preintegrated, gravity);
+        let (jac_prev, jac_curr) = imu_jacobians(&state, &state, &preintegrated, gravity);
         for row in 0..IMU_RESIDUAL_DIM {
             for col in 0..STATE_DIM {
-                assert!(jac_prev[row][col].is_finite(), "jac_prev[{row}][{col}] not finite");
-                assert!(jac_curr[row][col].is_finite(), "jac_curr[{row}][{col}] not finite");
+                assert!(
+                    jac_prev[row][col].is_finite(),
+                    "jac_prev[{row}][{col}] not finite"
+                );
+                assert!(
+                    jac_curr[row][col].is_finite(),
+                    "jac_curr[{row}][{col}] not finite"
+                );
             }
         }
     }

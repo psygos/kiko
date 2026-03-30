@@ -123,7 +123,6 @@ pub fn build_tracker_config(
     })
 }
 
-
 fn build_loop_closure_config_from_env() -> Result<LoopClosureConfig, Box<dyn std::error::Error>> {
     let mut input = LoopClosureConfigInput::default();
     if let Some(v) = env_f32("KIKO_LOOP_SIMILARITY_THRESHOLD") {
