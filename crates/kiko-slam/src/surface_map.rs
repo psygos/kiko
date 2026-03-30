@@ -392,6 +392,7 @@ impl SurfaceBeliefMap {
         }
 
         let mut support_views_integrated = 0usize;
+        let mut redundant_grouped_views_ignored = 0usize;
         for (key, grouped) in batch {
             let Some(evidence) = grouped.finalize() else {
                 continue;
@@ -416,12 +417,14 @@ impl SurfaceBeliefMap {
                 support_views_integrated = support_views_integrated.saturating_add(1);
             } else {
                 belief.note_redundant_observations(evidence.raw_observations);
+                redundant_grouped_views_ignored = redundant_grouped_views_ignored.saturating_add(1);
             }
         }
 
         SurfaceBatchIntegrationSummary {
             raw_observations_integrated,
             support_views_integrated,
+            redundant_grouped_views_ignored,
         }
     }
 
@@ -543,6 +546,7 @@ pub struct SurfaceMapSummary {
 pub struct SurfaceBatchIntegrationSummary {
     pub raw_observations_integrated: usize,
     pub support_views_integrated: usize,
+    pub redundant_grouped_views_ignored: usize,
 }
 
 #[cfg(test)]
@@ -595,6 +599,7 @@ mod tests {
             SurfaceBatchIntegrationSummary {
                 raw_observations_integrated: 1,
                 support_views_integrated: 1,
+                redundant_grouped_views_ignored: 0,
             }
         );
         assert_eq!(map.num_voxels(), 1);
@@ -630,6 +635,7 @@ mod tests {
             SurfaceBatchIntegrationSummary {
                 raw_observations_integrated: 3,
                 support_views_integrated: 1,
+                redundant_grouped_views_ignored: 0,
             }
         );
         assert_eq!(map.num_voxels(), 1);
@@ -641,15 +647,34 @@ mod tests {
         let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
         let pose = Pose::identity();
         let p = stable_surface_point_for_map_point(pose, [0.5, 0.5, 2.0], 200, 0.0025);
-        map.integrate(&[p], pose);
+        let first = map.integrate(&[p], pose);
+        assert_eq!(
+            first,
+            SurfaceBatchIntegrationSummary {
+                raw_observations_integrated: 1,
+                support_views_integrated: 1,
+                redundant_grouped_views_ignored: 0,
+            }
+        );
         let sigma_after_first = map.voxels.values().next().expect("voxel exists").std_dev();
         for _ in 0..3 {
-            map.integrate(&[p], pose);
+            let repeated = map.integrate(&[p], pose);
+            assert_eq!(
+                repeated,
+                SurfaceBatchIntegrationSummary {
+                    raw_observations_integrated: 1,
+                    support_views_integrated: 0,
+                    redundant_grouped_views_ignored: 1,
+                }
+            );
         }
         assert_eq!(map.num_confirmed(), 0);
         assert!(map.extract_confirmed().is_empty());
         let sigma_after_repeats = map.voxels.values().next().expect("voxel exists").std_dev();
         assert_eq!(sigma_after_first, sigma_after_repeats);
+        let belief = map.voxels.values().next().expect("voxel exists");
+        assert_eq!(belief.support_views(), 1);
+        assert_eq!(belief.raw_observations(), 4);
     }
 
     #[test]

@@ -349,10 +349,9 @@ impl RerunSink {
         }
 
         let integration = self.surface_map.integrate(points, cam_from_map);
-        self.rec.log(
-            "diagnostics/surface/integrated_support_views",
-            &rerun::Scalars::single(integration.support_views_integrated as f64),
-        )?;
+        for (path, value) in surface_integration_scalars(&integration) {
+            self.rec.log(path, &rerun::Scalars::single(value))?;
+        }
 
         let summary = self.surface_map.summary();
         self.rec.log(
@@ -564,6 +563,28 @@ impl RerunSink {
             rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
         );
     }
+}
+
+fn surface_integration_scalars(
+    integration: &crate::surface_map::SurfaceBatchIntegrationSummary,
+) -> [(&'static str, f64); 3] {
+    // `integrated_raw_observations` counts accepted raw surface samples before
+    // grouped-view novelty filtering. The other two counters are grouped-view
+    // quantities, so these values are intentionally not additive.
+    [
+        (
+            "diagnostics/surface/integrated_raw_observations",
+            integration.raw_observations_integrated as f64,
+        ),
+        (
+            "diagnostics/surface/integrated_support_views",
+            integration.support_views_integrated as f64,
+        ),
+        (
+            "diagnostics/surface/redundant_grouped_views_ignored",
+            integration.redundant_grouped_views_ignored as f64,
+        ),
+    ]
 }
 
 fn pose_position(pose: Pose) -> [f32; 3] {
@@ -870,4 +891,29 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
     }
 
     (out, out_width, out_height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::surface_integration_scalars;
+    use crate::surface_map::SurfaceBatchIntegrationSummary;
+
+    #[test]
+    fn surface_integration_scalars_export_honest_support_accounting() {
+        let integration = SurfaceBatchIntegrationSummary {
+            raw_observations_integrated: 11,
+            support_views_integrated: 3,
+            redundant_grouped_views_ignored: 2,
+        };
+
+        let scalars = surface_integration_scalars(&integration);
+        assert_eq!(
+            scalars,
+            [
+                ("diagnostics/surface/integrated_raw_observations", 11.0),
+                ("diagnostics/surface/integrated_support_views", 3.0),
+                ("diagnostics/surface/redundant_grouped_views_ignored", 2.0),
+            ]
+        );
+    }
 }
