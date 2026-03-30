@@ -214,6 +214,56 @@ pub type PnpInlierRatioMetric = RatioMetric<PnpTrackedObservationsSupport>;
 pub type PnpTrackedObservationCountMetric = CountMetric<PnpTrackedObservationsSupport>;
 pub type PnpAcceptedInlierPixelResidualMetric = PixelResidualMetric<PnpAcceptedInliersSupport>;
 
+/// Normalized Innovation Squared: r^T Σ^{-1} r / dim.
+/// Should be ≈ 1.0 when the noise model matches reality.
+/// >> 1 means the model is overconfident (noise is worse than assumed).
+/// << 1 means the model is conservative (noise is better than assumed).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NormalizedInnovationSquared<S>
+where
+    S: ObservationSupportMarker,
+{
+    value: f64,
+    dim: usize,
+    support: PhantomData<S>,
+}
+
+impl<S> NormalizedInnovationSquared<S>
+where
+    S: ObservationSupportMarker,
+{
+    pub fn new(value: f64, dim: usize) -> Result<Self, DiagnosticMetricError> {
+        if !value.is_finite() {
+            return Err(DiagnosticMetricError::NonFinite {
+                metric: "normalized innovation squared",
+                value: value as f32,
+            });
+        }
+        Ok(Self {
+            value,
+            dim,
+            support: PhantomData,
+        })
+    }
+
+    /// NIS value: should be ≈ 1.0.
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// Residual dimension used for normalization.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Support set this was computed over.
+    pub fn support(&self) -> ObservationSupport {
+        S::SUPPORT
+    }
+}
+
+pub type PnpInlierNis = NormalizedInnovationSquared<PnpAcceptedInliersSupport>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyframeRemovalReason {
     Redundant,
@@ -250,6 +300,9 @@ pub struct FrameDiagnostics {
     pub ransac_iterations: Option<usize>,
     pub pnp_inlier_reprojection_rmse_px: Option<PnpAcceptedInlierPixelResidualMetric>,
     pub pnp_inlier_reprojection_max_px: Option<PnpAcceptedInlierPixelResidualMetric>,
+    /// Normalized Innovation Squared for PnP inliers: r^T Σ^{-1} r / dim.
+    /// Should be ≈ 1.0 when noise model matches reality.
+    pub pnp_inlier_nis: Option<PnpInlierNis>,
     pub parallax_px: Option<f32>,
     pub covisibility: Option<f32>,
     pub keyframe_status: Option<KeyframeStatus>,
@@ -273,6 +326,7 @@ impl FrameDiagnostics {
             ransac_iterations: None,
             pnp_inlier_reprojection_rmse_px: None,
             pnp_inlier_reprojection_max_px: None,
+            pnp_inlier_nis: None,
             parallax_px: None,
             covisibility: None,
             keyframe_status: None,
