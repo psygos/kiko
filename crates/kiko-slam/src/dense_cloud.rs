@@ -85,19 +85,25 @@ pub struct DensePoint {
 /// A measured sparse stereo surface observation in camera frame.
 ///
 /// `position_variance` is a scalar summary of the 3D point covariance induced by
-/// stereo disparity uncertainty. If disparity is the dominant noise source then:
+/// stereo disparity uncertainty, lateral pixel uncertainty, and rectified row
+/// disagreement between the two matched features. With the usual rectified stereo
+/// model:
 ///
 ///   x = (u - cx) z / fx
 ///   y = (v - cy) z / fy
 ///   z = fx * baseline / disparity
 ///
-/// and the trace of the induced 3D covariance is:
+/// and with conservative per-axis image uncertainty `(σ_u, σ_v, σ_d)`, the trace
+/// of the induced 3D covariance is:
 ///
-///   trace(Σ_p) = σ_d² ||∂p/∂d||²
-///              = σ_z² * (1 + ((u-cx)/fx)² + ((v-cy)/fy)²)
+///   trace(Σ_p) = σ_u² ||∂p/∂u||²
+///              + σ_v² ||∂p/∂v||²
+///              + σ_d² ||∂p/∂d||²
 ///
-/// This naturally downweights far points and off-axis edge points without relying
-/// on ad hoc image-radius heuristics.
+/// The vertical term uses the midpoint row of the stereo match and inflates
+/// uncertainty when the left/right rows disagree after rectification. This
+/// naturally downweights far points, off-axis edge points, and vertically
+/// inconsistent correspondences without relying on ad hoc image-radius heuristics.
 #[derive(Clone, Copy, Debug)]
 pub struct StableSurfacePoint {
     pub position: [f32; 3],
@@ -161,12 +167,20 @@ fn stereo_position_variance_m2(
     cy: f32,
     baseline_m: f32,
     sigma_d_px: f32,
+    sigma_feature_px: f32,
+    row_mismatch_px: f32,
 ) -> f32 {
+    let sigma_u_sq = sigma_feature_px * sigma_feature_px;
+    // If the rectified correspondence disagrees vertically by r pixels, the
+    // shared row is uncertain by at least half that spread.
+    let sigma_v_sq = sigma_u_sq + 0.25 * row_mismatch_px * row_mismatch_px;
     let dz_dd = z * z / (fx * baseline_m);
     let sigma_z_sq = dz_dd * dz_dd * sigma_d_px * sigma_d_px;
     let ux = (u - cx) / fx;
     let vy = (v - cy) / fy;
-    sigma_z_sq * (1.0 + ux * ux + vy * vy)
+    let sigma_x_sq = (z / fx) * (z / fx) * sigma_u_sq;
+    let sigma_y_sq = (z / fy) * (z / fy) * sigma_v_sq;
+    sigma_x_sq + sigma_y_sq + sigma_z_sq * (1.0 + ux * ux + vy * vy)
 }
 
 /// Generate an interpolated depth image by rasterizing a Delaunay disparity field.
@@ -308,9 +322,10 @@ pub fn generate_stable_surface_points(
     };
     let mut points = Vec::with_capacity(samples.len().min(config.max_points_per_keyframe));
     let max_position_variance = config.max_observation_std_dev_m * config.max_observation_std_dev_m;
-    // Conservative fixed disparity noise prior until the calibrated stereo
+    // Conservative feature-level image noise priors until the calibrated stereo
     // uncertainty model in M7 is wired through this path.
     let sigma_d_feature_px = 0.5_f32;
+    let sigma_feature_px = 0.5_f32;
 
     for sample in samples {
         if sample.disparity < config.min_disparity_px {
@@ -332,10 +347,11 @@ pub fn generate_stable_surface_points(
 
         let z = sample.depth_m;
         let x = (sample.u - cx) * z / fx;
-        let y = (sample.v - cy) * z / fy;
+        let v = 0.5 * (sample.v + sample.right_v);
+        let y = (v - cy) * z / fy;
         let position_variance = stereo_position_variance_m2(
             sample.u,
-            sample.v,
+            v,
             z,
             fx,
             fy,
@@ -343,6 +359,8 @@ pub fn generate_stable_surface_points(
             cy,
             baseline_m,
             sigma_d_feature_px,
+            sigma_feature_px,
+            sample.rectified_row_mismatch_px.value_px(),
         );
         if !position_variance.is_finite() || position_variance <= 0.0 {
             stats.dropped_uncertainty = stats.dropped_uncertainty.saturating_add(1);
@@ -514,8 +532,19 @@ pub fn generate_dense_cloud(
                         // calibrated stereo uncertainty model in M7 lands here.
                         let sigma_d_feature = 0.5_f32;
                         let sigma_d = sigma_d_feature / min_bary.sqrt();
+                        let sigma_feature = 0.5_f32;
                         let position_variance = stereo_position_variance_m2(
-                            fpx, fpy, z, fx, fy, cx, cy, baseline_m, sigma_d,
+                            fpx,
+                            fpy,
+                            z,
+                            fx,
+                            fy,
+                            cx,
+                            cy,
+                            baseline_m,
+                            sigma_d,
+                            sigma_feature,
+                            0.0,
                         );
                         points.push(DensePoint {
                             position: [x, y, z],
@@ -1096,5 +1125,110 @@ mod tests {
                 .map(|metric| metric.value_px()),
             Some(0.5)
         );
+    }
+
+    #[test]
+    fn stereo_position_variance_increases_with_rectified_row_mismatch() {
+        let fx = 200.0;
+        let fy = 200.0;
+        let cx = 50.0;
+        let cy = 50.0;
+        let baseline = 0.075;
+        let z = 0.5;
+        let sigma_d_px = 0.5;
+        let sigma_feature_px = 0.5;
+
+        let aligned = stereo_position_variance_m2(
+            50.0,
+            50.0,
+            z,
+            fx,
+            fy,
+            cx,
+            cy,
+            baseline,
+            sigma_d_px,
+            sigma_feature_px,
+            0.0,
+        );
+        let mismatched = stereo_position_variance_m2(
+            50.0,
+            50.0,
+            z,
+            fx,
+            fy,
+            cx,
+            cy,
+            baseline,
+            sigma_d_px,
+            sigma_feature_px,
+            10.0,
+        );
+
+        assert!(mismatched > aligned);
+    }
+
+    #[test]
+    fn stable_surface_rejects_large_row_mismatch_when_uncertainty_exceeds_threshold() {
+        let fx = 200.0;
+        let fy = 200.0;
+        let cx = 50.0;
+        let cy = 50.0;
+        let baseline = 0.075;
+        let z = 0.5;
+        let d = fx * baseline / z;
+        let image = vec![128u8; 100 * 100];
+        let config = DenseCloudConfig {
+            max_observation_std_dev_m: 0.012,
+            ..DenseCloudConfig::default()
+        };
+
+        let low_mismatch = vec![SparseStereoSample {
+            u: 50.0,
+            v: 50.0,
+            right_u: 50.0 - d,
+            right_v: 50.0,
+            disparity: d,
+            depth_m: z,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        }];
+        let high_mismatch = vec![SparseStereoSample {
+            u: 50.0,
+            v: 50.0,
+            right_u: 50.0 - d,
+            right_v: 60.0,
+            disparity: d,
+            depth_m: z,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(10.0).expect("row mismatch"),
+        }];
+
+        let accepted = generate_stable_surface_points(
+            &low_mismatch,
+            fx,
+            fy,
+            cx,
+            cy,
+            baseline,
+            &image,
+            100,
+            100,
+            &config,
+        );
+        let rejected = generate_stable_surface_points(
+            &high_mismatch,
+            fx,
+            fy,
+            cx,
+            cy,
+            baseline,
+            &image,
+            100,
+            100,
+            &config,
+        );
+
+        assert_eq!(accepted.points.len(), 1);
+        assert!(rejected.points.is_empty());
+        assert_eq!(rejected.stats.dropped_uncertainty, 1);
     }
 }
