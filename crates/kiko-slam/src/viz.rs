@@ -615,6 +615,18 @@ impl SurfacePoseQualityGate {
                     .max_projectable_tracked_reprojection_rmse_px,
             };
         }
+        if let Some(crate::BaResult::Degenerate { reason }) = diagnostics.ba_result.as_ref() {
+            return SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+                projectable_tracked_observations,
+                min_required_projectable_tracked_observations: self
+                    .min_projectable_tracked_observations,
+                degenerate_reason: *reason,
+                projectable_tracked_reprojection_rmse_px: diagnostics
+                    .pnp_projectable_tracked_observation_reprojection_rmse_px,
+                max_allowed_projectable_tracked_reprojection_rmse_px: self
+                    .max_projectable_tracked_reprojection_rmse_px,
+            };
+        }
         match diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px {
             Some(projectable_tracked_reprojection_rmse_px)
                 if projectable_tracked_reprojection_rmse_px.value_px()
@@ -668,6 +680,16 @@ enum SurfacePoseQualityDecision {
         max_allowed_projectable_tracked_reprojection_rmse_px:
             crate::PnpProjectableTrackedObservationPixelResidualMetric,
     },
+    RejectDegenerateBundleAdjustment {
+        projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
+        min_required_projectable_tracked_observations:
+            crate::PnpProjectableTrackedObservationCountMetric,
+        degenerate_reason: crate::DegenerateReason,
+        projectable_tracked_reprojection_rmse_px:
+            Option<crate::PnpProjectableTrackedObservationPixelResidualMetric>,
+        max_allowed_projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+    },
     RejectHighProjectableTrackedReprojectionRmse {
         projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
         min_required_projectable_tracked_observations:
@@ -699,13 +721,17 @@ impl SurfacePoseQualityDecision {
 }
 
 fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&'static str, f64)> {
-    let mut scalars = Vec::with_capacity(8);
+    let mut scalars = Vec::with_capacity(12);
     let (
         accepted,
         rejected_low_count,
         rejected_missing_count,
         rejected_missing_rmse,
+        rejected_degenerate_ba_result,
         rejected_high_rmse,
+        ba_degenerate_too_few_poses,
+        ba_degenerate_too_few_landmarks,
+        ba_degenerate_no_factors,
         projectable_tracked_observations,
         min_required_projectable_tracked_observations,
         rmse_px,
@@ -718,6 +744,10 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             max_allowed_projectable_tracked_reprojection_rmse_px,
         } => (
             1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -737,9 +767,46 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             Some(projectable_tracked_observations.count() as f64),
             Some(min_required_projectable_tracked_observations.count() as f64),
             None,
+            Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
+        ),
+        SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            projectable_tracked_observations,
+            min_required_projectable_tracked_observations,
+            degenerate_reason,
+            projectable_tracked_reprojection_rmse_px,
+            max_allowed_projectable_tracked_reprojection_rmse_px,
+        } => (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            match degenerate_reason {
+                crate::DegenerateReason::TooFewPoses { .. } => 1.0,
+                crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
+                crate::DegenerateReason::NoFactors => 0.0,
+            },
+            match degenerate_reason {
+                crate::DegenerateReason::TooFewPoses { .. } => 0.0,
+                crate::DegenerateReason::TooFewLandmarks { .. } => 1.0,
+                crate::DegenerateReason::NoFactors => 0.0,
+            },
+            match degenerate_reason {
+                crate::DegenerateReason::TooFewPoses { .. } => 0.0,
+                crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
+                crate::DegenerateReason::NoFactors => 1.0,
+            },
+            Some(projectable_tracked_observations.count() as f64),
+            Some(min_required_projectable_tracked_observations.count() as f64),
+            projectable_tracked_reprojection_rmse_px.map(|value| value.value_px() as f64),
             Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
         ),
         SurfacePoseQualityDecision::RejectHighProjectableTrackedReprojectionRmse {
@@ -752,7 +819,11 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             0.0,
+            0.0,
             1.0,
+            0.0,
+            0.0,
+            0.0,
             Some(projectable_tracked_observations.count() as f64),
             Some(min_required_projectable_tracked_observations.count() as f64),
             Some(projectable_tracked_reprojection_rmse_px.value_px() as f64),
@@ -768,6 +839,10 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             1.0,
             0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             Some(projectable_tracked_observations.count() as f64),
             Some(min_required_projectable_tracked_observations.count() as f64),
             None,
@@ -780,6 +855,10 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
             0.0,
             0.0,
             None,
@@ -802,8 +881,24 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
         rejected_missing_rmse,
     ));
     scalars.push((
+        "diagnostics/surface/pose_gate/rejected_degenerate_ba_result",
+        rejected_degenerate_ba_result,
+    ));
+    scalars.push((
         "diagnostics/surface/pose_gate/rejected_high_projectable_tracked_reprojection_rmse",
         rejected_high_rmse,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_too_few_poses",
+        ba_degenerate_too_few_poses,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_too_few_landmarks",
+        ba_degenerate_too_few_landmarks,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
+        ba_degenerate_no_factors,
     ));
     if let Some(value) = rmse_px {
         scalars.push((
@@ -1352,6 +1447,26 @@ mod tests {
     }
 
     #[test]
+    fn surface_pose_quality_gate_rejects_degenerate_ba_result() {
+        let gate = SurfacePoseQualityGate::default();
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.ba_result = Some(crate::BaResult::Degenerate {
+            reason: crate::DegenerateReason::TooFewLandmarks { count: 3 },
+        });
+
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+                degenerate_reason: crate::DegenerateReason::TooFewLandmarks { count: 3 },
+                projectable_tracked_reprojection_rmse_px: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn surface_pose_quality_scalars_export_decision_and_threshold() {
         let decision = SurfacePoseQualityDecision::RejectHighProjectableTrackedReprojectionRmse {
             projectable_tracked_observations: PnpProjectableTrackedObservationCountMetric::new(12),
@@ -1378,8 +1493,24 @@ mod tests {
             0.0
         )));
         assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_degenerate_ba_result",
+            0.0
+        )));
+        assert!(scalars.contains(&(
             "diagnostics/surface/pose_gate/rejected_high_projectable_tracked_reprojection_rmse",
             1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_too_few_poses",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_too_few_landmarks",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
+            0.0
         )));
         assert!(scalars.contains(&(
             "diagnostics/surface/pose_gate/projectable_tracked_reprojection_rmse_px",
@@ -1400,12 +1531,87 @@ mod tests {
     }
 
     #[test]
+    fn surface_pose_quality_scalars_export_ba_degenerate_reason() {
+        let decision = SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            projectable_tracked_observations: PnpProjectableTrackedObservationCountMetric::new(12),
+            min_required_projectable_tracked_observations:
+                PnpProjectableTrackedObservationCountMetric::new(8),
+            degenerate_reason: crate::DegenerateReason::NoFactors,
+            projectable_tracked_reprojection_rmse_px: Some(
+                PnpProjectableTrackedObservationPixelResidualMetric::new(1.25).expect("rmse"),
+            ),
+            max_allowed_projectable_tracked_reprojection_rmse_px:
+                PnpProjectableTrackedObservationPixelResidualMetric::new(1.5).expect("rmse"),
+        };
+
+        let scalars = surface_pose_quality_scalars(&decision);
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_degenerate_ba_result",
+            1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_too_few_poses",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_too_few_landmarks",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
+            1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/projectable_tracked_reprojection_rmse_px",
+            1.25
+        )));
+    }
+
+    #[test]
     fn log_surface_observations_reject_path_leaves_surface_map_unchanged() {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
         let mut sink = RerunSink::new(rec, VizDecimation::default());
         let diagnostics = FrameDiagnostics::empty(0, 0);
+        let point = StableSurfacePoint {
+            position: [0.0, 0.0, 2.0],
+            intensity: 180,
+            position_variance: 0.0025,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+        )
+        .expect("surface logging");
+
+        assert_eq!(sink.surface_map.num_voxels(), 0);
+        assert!(storage.num_msgs() > 0);
+    }
+
+    #[test]
+    fn log_surface_observations_degenerate_ba_path_leaves_surface_map_unchanged() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+        diagnostics.ba_result = Some(crate::BaResult::Degenerate {
+            reason: crate::DegenerateReason::NoFactors,
+        });
         let point = StableSurfacePoint {
             position: [0.0, 0.0, 2.0],
             intensity: 180,
