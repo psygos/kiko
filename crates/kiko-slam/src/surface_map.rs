@@ -458,6 +458,7 @@ pub struct SurfaceBatchIntegrationSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RectifiedRowMismatchPx;
 
     #[test]
     fn single_observation_not_confirmed() {
@@ -466,6 +467,7 @@ mod tests {
             position: [0.0, 0.0, 1.0],
             intensity: 128,
             position_variance: 0.001,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         }];
         let summary = map.integrate(&points, Pose::identity());
         assert_eq!(
@@ -487,16 +489,19 @@ mod tests {
                 position: [0.01, 0.01, 2.0],
                 intensity: 200,
                 position_variance: 0.01,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             StableSurfacePoint {
                 position: [0.015, 0.012, 2.0],
                 intensity: 190,
                 position_variance: 0.01,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             StableSurfacePoint {
                 position: [0.012, 0.017, 2.0],
                 intensity: 210,
                 position_variance: 0.01,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
         ];
         let summary = map.integrate(&points, Pose::identity());
@@ -518,6 +523,7 @@ mod tests {
             position: [0.5, 0.5, 2.0],
             intensity: 200,
             position_variance: 0.01, // σ = 0.1m equivalent positional variance
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         };
         for _ in 0..3 {
             map.integrate(&[p], Pose::identity());

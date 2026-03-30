@@ -4,8 +4,10 @@
 //! a piecewise-linear dense disparity map, then back-projects to 3D.
 //! This is a visualization aid, not a dense reconstruction.
 
-use crate::triangulation::SparseStereoSample;
-use crate::{DepthImage, FrameId, InterpolatedDepth, Timestamp};
+use crate::triangulation::{RectifiedRowMismatchPx, SparseStereoSample};
+use crate::{
+    DepthImage, FrameId, InterpolatedDepth, StableSurfaceRetainedRawPixelResidualMetric, Timestamp,
+};
 
 /// Configuration for dense visualization and stable surface observation generation.
 #[derive(Clone, Copy, Debug)]
@@ -102,6 +104,8 @@ pub struct StableSurfacePoint {
     pub intensity: u8,
     /// Conservative scalar positional variance in m².
     pub position_variance: f32,
+    /// Absolute vertical row mismatch on the rectified stereo pair, in pixels.
+    pub rectified_row_mismatch_px: RectifiedRowMismatchPx,
 }
 
 /// Statistics from dense interpolated cloud generation.
@@ -131,8 +135,13 @@ pub struct StableSurfaceStats {
     pub dropped_uncertainty: usize,
     pub dropped_out_of_bounds: usize,
     pub points_capped: bool,
-    pub mean_accepted_position_sigma_m: f64,
-    pub max_accepted_position_sigma_m: f32,
+    /// Metrics over the final retained raw observations after variance filtering
+    /// and capping. `None` means no retained observations existed for this frame.
+    pub mean_accepted_position_sigma_m: Option<f64>,
+    pub max_accepted_position_sigma_m: Option<f32>,
+    pub mean_accepted_rectified_row_mismatch_px:
+        Option<StableSurfaceRetainedRawPixelResidualMetric>,
+    pub max_accepted_rectified_row_mismatch_px: Option<StableSurfaceRetainedRawPixelResidualMetric>,
 }
 
 /// Result of stable sparse surface observation generation.
@@ -348,6 +357,7 @@ pub fn generate_stable_surface_points(
             position: [x, y, z],
             intensity,
             position_variance,
+            rectified_row_mismatch_px: sample.rectified_row_mismatch_px,
         });
     }
 
@@ -361,13 +371,28 @@ pub fn generate_stable_surface_points(
     if stats.points_generated > 0 {
         let mut sigma_sum_m = 0.0_f64;
         let mut sigma_max_m = 0.0_f32;
+        let mut rectified_row_mismatch_sum_px = 0.0_f64;
+        let mut rectified_row_mismatch_max_px = 0.0_f32;
         for point in &points {
             let sigma_m = point.position_variance.sqrt();
             sigma_sum_m += sigma_m as f64;
             sigma_max_m = sigma_max_m.max(sigma_m);
+            let row_mismatch_px = point.rectified_row_mismatch_px.value_px();
+            rectified_row_mismatch_sum_px += row_mismatch_px as f64;
+            rectified_row_mismatch_max_px = rectified_row_mismatch_max_px.max(row_mismatch_px);
         }
-        stats.mean_accepted_position_sigma_m = sigma_sum_m / stats.points_generated as f64;
-        stats.max_accepted_position_sigma_m = sigma_max_m;
+        stats.mean_accepted_position_sigma_m = Some(sigma_sum_m / stats.points_generated as f64);
+        stats.max_accepted_position_sigma_m = Some(sigma_max_m);
+        let mean_rectified_row_mismatch_px =
+            (rectified_row_mismatch_sum_px / stats.points_generated as f64) as f32;
+        stats.mean_accepted_rectified_row_mismatch_px = Some(
+            StableSurfaceRetainedRawPixelResidualMetric::new(mean_rectified_row_mismatch_px)
+                .expect("mean retained row mismatch over lawful points must stay lawful"),
+        );
+        stats.max_accepted_rectified_row_mismatch_px = Some(
+            StableSurfaceRetainedRawPixelResidualMetric::new(rectified_row_mismatch_max_px)
+                .expect("max retained row mismatch over lawful points must stay lawful"),
+        );
     }
     StableSurfaceResult { points, stats }
 }
@@ -671,20 +696,29 @@ mod tests {
             SparseStereoSample {
                 u: 0.0,
                 v: 0.0,
+                right_u: -5.0,
+                right_v: 0.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 10.0,
                 v: 0.0,
+                right_u: 5.0,
+                right_v: 0.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 5.0,
                 v: 10.0,
+                right_u: 0.0,
+                right_v: 10.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
         ];
         let image = vec![128u8; 20 * 20];
@@ -711,20 +745,29 @@ mod tests {
             SparseStereoSample {
                 u: 2.0,
                 v: 2.0,
+                right_u: -3.0,
+                right_v: 2.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 4.0,
                 v: 2.0,
+                right_u: -1.0,
+                right_v: 2.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 3.0,
                 v: 4.0,
+                right_u: -2.0,
+                right_v: 4.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
         ];
         let image = vec![128u8; 100 * 100];
@@ -786,20 +829,29 @@ mod tests {
             SparseStereoSample {
                 u: 20.0,
                 v: 20.0,
+                right_u: 20.0 - d,
+                right_v: 20.0,
                 disparity: d,
                 depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 80.0,
                 v: 20.0,
+                right_u: 80.0 - d,
+                right_v: 20.0,
                 disparity: d,
                 depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 50.0,
                 v: 80.0,
+                right_u: 50.0 - d,
+                right_v: 80.0,
                 disparity: d,
                 depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
         ];
         let image = vec![128u8; 100 * 100];
@@ -831,20 +883,29 @@ mod tests {
             SparseStereoSample {
                 u: 10.0,
                 v: 10.0,
+                right_u: 5.0,
+                right_v: 10.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 40.0,
                 v: 10.0,
+                right_u: 35.0,
+                right_v: 10.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 25.0,
                 v: 40.0,
+                right_u: 20.0,
+                right_v: 40.0,
                 disparity: 5.0,
                 depth_m: 1.0,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
         ];
         let image = vec![128u8; 100 * 100];
@@ -896,8 +957,11 @@ mod tests {
         let samples = vec![SparseStereoSample {
             u: 50.0,
             v: 50.0,
+            right_u: 50.0 - d,
+            right_v: 50.0,
             disparity: d,
             depth_m: z,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         }];
         let image = vec![128u8; 100 * 100];
         let result = generate_stable_surface_points(
@@ -914,6 +978,10 @@ mod tests {
         );
         assert!(result.points.is_empty());
         assert_eq!(result.stats.dropped_uncertainty, 1);
+        assert_eq!(result.stats.mean_accepted_position_sigma_m, None);
+        assert_eq!(result.stats.max_accepted_position_sigma_m, None);
+        assert_eq!(result.stats.mean_accepted_rectified_row_mismatch_px, None);
+        assert_eq!(result.stats.max_accepted_rectified_row_mismatch_px, None);
     }
 
     #[test]
@@ -929,14 +997,20 @@ mod tests {
             SparseStereoSample {
                 u: 50.0,
                 v: 50.0,
+                right_u: 50.0 - d,
+                right_v: 50.0,
                 disparity: d,
                 depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
             SparseStereoSample {
                 u: 95.0,
                 v: 95.0,
+                right_u: 95.0 - d,
+                right_v: 95.0,
                 disparity: d,
                 depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
             },
         ];
         let mut image = vec![0u8; 100 * 100];
@@ -953,5 +1027,74 @@ mod tests {
         assert_eq!(result.points.len(), 1);
         assert_eq!(result.points[0].intensity, 11);
         assert!(result.stats.points_capped);
+        assert!(result.stats.mean_accepted_position_sigma_m.is_some());
+        assert!(result.stats.max_accepted_position_sigma_m.is_some());
+        assert!(
+            result
+                .stats
+                .mean_accepted_rectified_row_mismatch_px
+                .is_some()
+        );
+        assert!(
+            result
+                .stats
+                .max_accepted_rectified_row_mismatch_px
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stable_surface_reports_retained_rectified_row_mismatch_metrics() {
+        let fx = 200.0;
+        let fy = 200.0;
+        let cx = 50.0;
+        let cy = 50.0;
+        let baseline = 0.075;
+        let z = 1.5;
+        let d = fx * baseline / z;
+        let samples = vec![
+            SparseStereoSample {
+                u: 40.0,
+                v: 40.0,
+                right_u: 40.0 - d,
+                right_v: 40.0,
+                disparity: d,
+                depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.25).expect("row mismatch"),
+            },
+            SparseStereoSample {
+                u: 60.0,
+                v: 60.0,
+                right_u: 60.0 - d,
+                right_v: 59.5,
+                disparity: d,
+                depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.5).expect("row mismatch"),
+            },
+        ];
+        let image = vec![128u8; 100 * 100];
+        let config = DenseCloudConfig {
+            max_observation_std_dev_m: 1.0,
+            ..DenseCloudConfig::default()
+        };
+        let result = generate_stable_surface_points(
+            &samples, fx, fy, cx, cy, baseline, &image, 100, 100, &config,
+        );
+        assert_eq!(result.points.len(), 2);
+        assert_eq!(result.stats.points_generated, 2);
+        assert_eq!(
+            result
+                .stats
+                .mean_accepted_rectified_row_mismatch_px
+                .map(|metric| metric.value_px()),
+            Some(0.375)
+        );
+        assert_eq!(
+            result
+                .stats
+                .max_accepted_rectified_row_mismatch_px
+                .map(|metric| metric.value_px()),
+            Some(0.5)
+        );
     }
 }

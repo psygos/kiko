@@ -322,14 +322,31 @@ impl RerunSink {
             "diagnostics/surface/points_capped",
             &rerun::Scalars::single(if stats.points_capped { 1.0 } else { 0.0 }),
         )?;
-        self.rec.log(
-            "diagnostics/surface/accepted_mean_point_sigma_mm",
-            &rerun::Scalars::single(stats.mean_accepted_position_sigma_m * 1000.0),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/accepted_max_point_sigma_mm",
-            &rerun::Scalars::single(stats.max_accepted_position_sigma_m as f64 * 1000.0),
-        )?;
+        if let Some(mean_sigma_m) = stats.mean_accepted_position_sigma_m {
+            self.rec.log(
+                "diagnostics/surface/accepted_mean_point_sigma_mm",
+                &rerun::Scalars::single(mean_sigma_m * 1000.0),
+            )?;
+        }
+        if let Some(max_sigma_m) = stats.max_accepted_position_sigma_m {
+            self.rec.log(
+                "diagnostics/surface/accepted_max_point_sigma_mm",
+                &rerun::Scalars::single(max_sigma_m as f64 * 1000.0),
+            )?;
+        }
+        if let Some(mean_rectified_row_mismatch_px) = stats.mean_accepted_rectified_row_mismatch_px
+        {
+            self.rec.log(
+                "diagnostics/surface/retained_raw_observations/mean_rectified_row_mismatch_px",
+                &rerun::Scalars::single(mean_rectified_row_mismatch_px.value_px() as f64),
+            )?;
+        }
+        if let Some(max_rectified_row_mismatch_px) = stats.max_accepted_rectified_row_mismatch_px {
+            self.rec.log(
+                "diagnostics/surface/retained_raw_observations/max_rectified_row_mismatch_px",
+                &rerun::Scalars::single(max_rectified_row_mismatch_px.value_px() as f64),
+            )?;
+        }
 
         let integration = self.surface_map.integrate(points, cam_from_map);
         self.rec.log(

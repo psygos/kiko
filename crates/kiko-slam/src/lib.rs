@@ -72,7 +72,8 @@ pub use diagnostics::{
     ObservationSupportMarker, PixelResidualMetric, PnpAcceptedInlierPixelResidualMetric,
     PnpAcceptedInlierReprojectionMsePerAxisPx2Metric, PnpAcceptedInliersSupport,
     PnpInlierRatioMetric, PnpTrackedObservationCountMetric, PnpTrackedObservationsSupport,
-    RatioMetric,
+    RatioMetric, StableSurfaceRetainedRawObservationsSupport,
+    StableSurfaceRetainedRawPixelResidualMetric,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use geometry::{
@@ -126,9 +127,10 @@ pub use tracker::{
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoError, SparseStereoSample, TriangulationConfig, TriangulationError,
-    TriangulationResult, TriangulationStats, Triangulator,
+    Keyframe, KeyframeError, Point3, RectificationMode, RectifiedRowMismatchError,
+    RectifiedRowMismatchPx, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
+    SparseStereoSample, TriangulationConfig, TriangulationError, TriangulationResult,
+    TriangulationStats, Triangulator,
 };
 pub use tsdf::{
     MeshData, TsdfCameraIntrinsics, TsdfCameraIntrinsicsError, TsdfConfig, TsdfIntegrateMsg,

@@ -262,14 +262,58 @@ impl std::fmt::Display for TriangulationError {
 
 impl std::error::Error for TriangulationError {}
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RectifiedRowMismatchError {
+    NonFinite { value: f32 },
+    Negative { value: f32 },
+}
+
+impl std::fmt::Display for RectifiedRowMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RectifiedRowMismatchError::NonFinite { value } => {
+                write!(f, "rectified row mismatch must be finite, got {value}")
+            }
+            RectifiedRowMismatchError::Negative { value } => {
+                write!(f, "rectified row mismatch must be >= 0, got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RectifiedRowMismatchError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct RectifiedRowMismatchPx(f32);
+
+impl RectifiedRowMismatchPx {
+    pub fn new(value_px: f32) -> Result<Self, RectifiedRowMismatchError> {
+        if !value_px.is_finite() {
+            return Err(RectifiedRowMismatchError::NonFinite { value: value_px });
+        }
+        if value_px < 0.0 {
+            return Err(RectifiedRowMismatchError::Negative { value: value_px });
+        }
+        Ok(Self(value_px))
+    }
+
+    pub fn value_px(self) -> f32 {
+        self.0
+    }
+}
+
 /// A validated sparse stereo sample: left pixel coordinate + disparity.
 /// Produced by the same deduplication and filtering as triangulation.
 #[derive(Clone, Copy, Debug)]
 pub struct SparseStereoSample {
     pub u: f32,
     pub v: f32,
+    pub right_u: f32,
+    pub right_v: f32,
     pub disparity: f32,
     pub depth_m: f32,
+    /// Absolute vertical row mismatch on the rectified stereo pair, in pixels.
+    pub rectified_row_mismatch_px: RectifiedRowMismatchPx,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -549,8 +593,14 @@ impl Triangulator {
             samples.push(SparseStereoSample {
                 u: left_kp.x,
                 v: left_kp.y,
+                right_u: right_kp.x,
+                right_v: right_kp.y,
                 disparity,
                 depth_m: z,
+                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(
+                    (left_kp.y - right_kp.y).abs(),
+                )
+                .expect("absolute row mismatch from finite keypoints must be lawful"),
             });
         }
         samples
@@ -685,6 +735,20 @@ mod tests {
                 + stats.dropped_duplicate,
             stats.candidate_matches
         );
+    }
+
+    #[test]
+    fn rectified_row_mismatch_rejects_invalid_values() {
+        assert!(matches!(
+            RectifiedRowMismatchPx::new(-0.1),
+            Err(RectifiedRowMismatchError::Negative { .. })
+        ));
+        assert!(matches!(
+            RectifiedRowMismatchPx::new(f32::NAN),
+            Err(RectifiedRowMismatchError::NonFinite { .. })
+        ));
+        let mismatch = RectifiedRowMismatchPx::new(0.25).expect("row mismatch");
+        assert_eq!(mismatch.value_px(), 0.25);
     }
 
     #[test]

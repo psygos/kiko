@@ -9,6 +9,7 @@ use crate::triangulation::TriangulationStats;
 pub enum ObservationSupport {
     PnpAcceptedInliers,
     PnpTrackedObservations,
+    StableSurfaceRetainedRawObservations,
     HeldOutObservations,
     AllObservations,
 }
@@ -18,6 +19,9 @@ impl ObservationSupport {
         match self {
             ObservationSupport::PnpAcceptedInliers => "pnp_accepted_inliers",
             ObservationSupport::PnpTrackedObservations => "pnp_tracked_observations",
+            ObservationSupport::StableSurfaceRetainedRawObservations => {
+                "stable_surface_retained_raw_observations"
+            }
             ObservationSupport::HeldOutObservations => "held_out_observations",
             ObservationSupport::AllObservations => "all_observations",
         }
@@ -40,6 +44,13 @@ pub struct PnpTrackedObservationsSupport;
 
 impl ObservationSupportMarker for PnpTrackedObservationsSupport {
     const SUPPORT: ObservationSupport = ObservationSupport::PnpTrackedObservations;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StableSurfaceRetainedRawObservationsSupport;
+
+impl ObservationSupportMarker for StableSurfaceRetainedRawObservationsSupport {
+    const SUPPORT: ObservationSupport = ObservationSupport::StableSurfaceRetainedRawObservations;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +224,8 @@ where
 pub type PnpInlierRatioMetric = RatioMetric<PnpTrackedObservationsSupport>;
 pub type PnpTrackedObservationCountMetric = CountMetric<PnpTrackedObservationsSupport>;
 pub type PnpAcceptedInlierPixelResidualMetric = PixelResidualMetric<PnpAcceptedInliersSupport>;
+pub type StableSurfaceRetainedRawPixelResidualMetric =
+    PixelResidualMetric<StableSurfaceRetainedRawObservationsSupport>;
 
 /// Mean squared pixel residual per image axis in px².
 ///
@@ -388,7 +401,7 @@ mod tests {
     use super::{
         DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics, LoopClosureRejectReason,
         ObservationSupport, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
-        PnpTrackedObservationCountMetric,
+        PnpTrackedObservationCountMetric, StableSurfaceRetainedRawPixelResidualMetric,
     };
     use crate::DegenerateReason;
 
@@ -427,6 +440,17 @@ mod tests {
         let metric = PnpTrackedObservationCountMetric::new(12);
         assert_eq!(metric.count(), 12);
         assert_eq!(metric.support(), ObservationSupport::PnpTrackedObservations);
+    }
+
+    #[test]
+    fn stable_surface_pixel_residual_metric_preserves_support() {
+        let metric =
+            StableSurfaceRetainedRawPixelResidualMetric::new(0.25).expect("surface px residual");
+        assert_eq!(metric.value_px(), 0.25);
+        assert_eq!(
+            metric.support(),
+            ObservationSupport::StableSurfaceRetainedRawObservations
+        );
     }
 
     #[test]
