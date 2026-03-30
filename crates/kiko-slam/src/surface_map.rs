@@ -191,6 +191,13 @@ impl SurfaceBelief {
         (1.0 / self.total_information).sqrt()
     }
 
+    fn variance(&self) -> Option<f64> {
+        if self.total_information < 1e-15 {
+            return None;
+        }
+        Some(1.0 / self.total_information)
+    }
+
     /// Mean residual energy per excess support view.
     ///
     /// This is intentionally not named chi-squared: the current map path does not
@@ -223,6 +230,34 @@ impl SurfaceBelief {
         self.support_view_directions
             .iter()
             .all(|existing| dot3(*existing, view_direction) < novel_view_cosine_threshold)
+    }
+
+    /// Predictive consistency score for a candidate support view.
+    ///
+    /// This is a scalar normalized squared innovation under the current isotropic
+    /// voxel model:
+    ///
+    ///   ||z - μ||² / (σ_belief² + σ_obs²)
+    ///
+    /// It is intentionally not labeled NIS because the current surface belief map
+    /// does not yet carry a full anisotropic covariance. Still, it is a lawful
+    /// predictive score for rejecting novel views that are inconsistent with the
+    /// existing voxel belief.
+    fn predictive_consistency_score(&self, evidence: &BatchVoxelEvidence) -> Option<f64> {
+        let belief_variance = self.variance()?;
+        let innovation_variance = belief_variance + evidence.position_variance;
+        if !innovation_variance.is_finite() || innovation_variance <= 0.0 {
+            return None;
+        }
+        let current = self.position();
+        let sq_dist = (evidence.position[0] - current[0]).powi(2)
+            + (evidence.position[1] - current[1]).powi(2)
+            + (evidence.position[2] - current[2]).powi(2);
+        let score = sq_dist / innovation_variance;
+        if !score.is_finite() || score < 0.0 {
+            return None;
+        }
+        Some(score)
     }
 
     fn note_redundant_observations(&mut self, raw_observations: u32) {
@@ -275,6 +310,15 @@ pub struct SurfaceMapConfig {
     /// only rendered when its uncertainty is no worse than the map resolution
     /// it claims to represent.
     pub max_confirmed_std_dev_m: f64,
+    /// Maximum predictive consistency score allowed for a novel support view to
+    /// strengthen an existing voxel belief.
+    ///
+    /// This is a policy threshold over the explicitly named predictive score
+    /// `||z - μ||² / (σ_belief² + σ_obs²)`. Under an isotropic 3D Gaussian model,
+    /// values near the state dimensionality are ordinary; much larger values are
+    /// evidence that the new support view disagrees with the voxel's current
+    /// belief and should not be fused into the stable map.
+    pub max_predictive_consistency_score: f64,
     /// Maximum total points to render (prevents Rerun overload).
     pub max_render_points: usize,
 }
@@ -287,6 +331,7 @@ impl Default for SurfaceMapConfig {
             min_support_views: 3,
             max_consistency_score: 8.0,
             max_confirmed_std_dev_m: voxel_size as f64,
+            max_predictive_consistency_score: 12.0,
             max_render_points: 250_000,
         }
     }
@@ -321,6 +366,11 @@ impl SurfaceMapConfig {
             if v.is_finite() && v > 0.0 {
                 config.max_confirmed_std_dev_m = v as f64;
                 confirmed_std_dev_overridden = true;
+            }
+        }
+        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_PREDICTIVE_CONSISTENCY_SCORE") {
+            if v.is_finite() && v > 0.0 {
+                config.max_predictive_consistency_score = v as f64;
             }
         }
         if let Some(v) = crate::env::env_usize("KIKO_SURFACE_MAX_RENDER_POINTS") {
@@ -393,6 +443,9 @@ impl SurfaceBeliefMap {
 
         let mut support_views_integrated = 0usize;
         let mut redundant_grouped_views_ignored = 0usize;
+        let mut predictive_grouped_views_rejected = 0usize;
+        let mut rejected_predictive_consistency_score_sum = 0.0_f64;
+        let mut rejected_predictive_consistency_score_max = 0.0_f64;
         for (key, grouped) in batch {
             let Some(evidence) = grouped.finalize() else {
                 continue;
@@ -413,6 +466,16 @@ impl SurfaceBeliefMap {
                 novel_view_cosine_threshold(view_range_m, self.config.voxel_size);
             let belief = self.voxels.entry(key).or_insert_with(SurfaceBelief::new);
             if belief.is_novel_view(view_direction, novelty_threshold) {
+                if let Some(score) = belief.predictive_consistency_score(&evidence) {
+                    if score > self.config.max_predictive_consistency_score {
+                        predictive_grouped_views_rejected =
+                            predictive_grouped_views_rejected.saturating_add(1);
+                        rejected_predictive_consistency_score_sum += score;
+                        rejected_predictive_consistency_score_max =
+                            rejected_predictive_consistency_score_max.max(score);
+                        continue;
+                    }
+                }
                 belief.integrate_support_view(&evidence, view_direction);
                 support_views_integrated = support_views_integrated.saturating_add(1);
             } else {
@@ -425,6 +488,14 @@ impl SurfaceBeliefMap {
             raw_observations_integrated,
             support_views_integrated,
             redundant_grouped_views_ignored,
+            predictive_grouped_views_rejected,
+            mean_rejected_predictive_consistency_score: (predictive_grouped_views_rejected > 0)
+                .then_some(
+                    rejected_predictive_consistency_score_sum
+                        / predictive_grouped_views_rejected as f64,
+                ),
+            max_rejected_predictive_consistency_score: (predictive_grouped_views_rejected > 0)
+                .then_some(rejected_predictive_consistency_score_max),
         }
     }
 
@@ -515,6 +586,19 @@ impl SurfaceBeliefMap {
         } else {
             0.0
         };
+        let mean_consistency_score = if confirmed > 0 {
+            confirmed_beliefs
+                .iter()
+                .map(|v| v.consistency_score())
+                .sum::<f64>()
+                / confirmed as f64
+        } else {
+            0.0
+        };
+        let max_consistency_score = confirmed_beliefs
+            .iter()
+            .map(|v| v.consistency_score())
+            .fold(0.0_f64, f64::max);
         SurfaceMapSummary {
             total_voxels: total,
             confirmed_voxels: confirmed,
@@ -526,6 +610,8 @@ impl SurfaceBeliefMap {
             mean_confirmed_std_dev_m: mean_std_dev,
             mean_confirmed_support_views: mean_support_views,
             mean_confirmed_raw_observations: mean_raw_observations,
+            mean_confirmed_consistency_score: mean_consistency_score,
+            max_confirmed_consistency_score: max_consistency_score,
         }
     }
 }
@@ -539,14 +625,19 @@ pub struct SurfaceMapSummary {
     pub mean_confirmed_std_dev_m: f64,
     pub mean_confirmed_support_views: f64,
     pub mean_confirmed_raw_observations: f64,
+    pub mean_confirmed_consistency_score: f64,
+    pub max_confirmed_consistency_score: f64,
 }
 
 /// Summary of one integration batch after correlated observations are grouped.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SurfaceBatchIntegrationSummary {
     pub raw_observations_integrated: usize,
     pub support_views_integrated: usize,
     pub redundant_grouped_views_ignored: usize,
+    pub predictive_grouped_views_rejected: usize,
+    pub mean_rejected_predictive_consistency_score: Option<f64>,
+    pub max_rejected_predictive_consistency_score: Option<f64>,
 }
 
 #[cfg(test)]
@@ -600,6 +691,9 @@ mod tests {
                 raw_observations_integrated: 1,
                 support_views_integrated: 1,
                 redundant_grouped_views_ignored: 0,
+                predictive_grouped_views_rejected: 0,
+                mean_rejected_predictive_consistency_score: None,
+                max_rejected_predictive_consistency_score: None,
             }
         );
         assert_eq!(map.num_voxels(), 1);
@@ -636,6 +730,9 @@ mod tests {
                 raw_observations_integrated: 3,
                 support_views_integrated: 1,
                 redundant_grouped_views_ignored: 0,
+                predictive_grouped_views_rejected: 0,
+                mean_rejected_predictive_consistency_score: None,
+                max_rejected_predictive_consistency_score: None,
             }
         );
         assert_eq!(map.num_voxels(), 1);
@@ -654,6 +751,9 @@ mod tests {
                 raw_observations_integrated: 1,
                 support_views_integrated: 1,
                 redundant_grouped_views_ignored: 0,
+                predictive_grouped_views_rejected: 0,
+                mean_rejected_predictive_consistency_score: None,
+                max_rejected_predictive_consistency_score: None,
             }
         );
         let sigma_after_first = map.voxels.values().next().expect("voxel exists").std_dev();
@@ -665,6 +765,9 @@ mod tests {
                     raw_observations_integrated: 1,
                     support_views_integrated: 0,
                     redundant_grouped_views_ignored: 1,
+                    predictive_grouped_views_rejected: 0,
+                    mean_rejected_predictive_consistency_score: None,
+                    max_rejected_predictive_consistency_score: None,
                 }
             );
         }
@@ -694,6 +797,64 @@ mod tests {
         let points = map.extract_confirmed();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].0, map_point);
+    }
+
+    #[test]
+    fn predictive_gate_rejects_novel_outlier_view_without_polluting_belief() {
+        let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
+        let stable_map_point = [0.5, 0.5, 2.0];
+        let support_poses = [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ];
+        for pose in support_poses {
+            let point = stable_surface_point_for_map_point(pose, stable_map_point, 200, 0.0001);
+            let summary = map.integrate(&[point], pose);
+            assert_eq!(summary.predictive_grouped_views_rejected, 0);
+        }
+
+        assert_eq!(map.num_confirmed(), 1);
+        let prior_belief = map.voxels.values().next().expect("voxel exists");
+        let prior_position = prior_belief.position();
+        let prior_std_dev = prior_belief.std_dev();
+        let prior_raw_observations = prior_belief.raw_observations();
+
+        let outlier_pose = translated_cam_from_map(0.2);
+        let outlier_point =
+            stable_surface_point_for_map_point(outlier_pose, [0.5, 0.5, 2.045], 180, 0.0001);
+        let summary = map.integrate(&[outlier_point], outlier_pose);
+        assert_eq!(
+            summary,
+            SurfaceBatchIntegrationSummary {
+                raw_observations_integrated: 1,
+                support_views_integrated: 0,
+                redundant_grouped_views_ignored: 0,
+                predictive_grouped_views_rejected: 1,
+                mean_rejected_predictive_consistency_score: summary
+                    .mean_rejected_predictive_consistency_score,
+                max_rejected_predictive_consistency_score: summary
+                    .max_rejected_predictive_consistency_score,
+            }
+        );
+        let rejected_mean = summary
+            .mean_rejected_predictive_consistency_score
+            .expect("predictive rejection score");
+        let rejected_max = summary
+            .max_rejected_predictive_consistency_score
+            .expect("predictive rejection score");
+        assert!(rejected_mean > map.config.max_predictive_consistency_score);
+        assert_eq!(rejected_mean, rejected_max);
+
+        let belief = map.voxels.values().next().expect("voxel exists");
+        assert_eq!(belief.support_views(), 3);
+        let posterior_position = belief.position();
+        assert_eq!(map.num_confirmed(), 1);
+        assert_eq!(belief.raw_observations(), prior_raw_observations);
+        assert_eq!(belief.std_dev(), prior_std_dev);
+        assert!((posterior_position[0] - prior_position[0]).abs() < 1e-9);
+        assert!((posterior_position[1] - prior_position[1]).abs() < 1e-9);
+        assert!((posterior_position[2] - prior_position[2]).abs() < 1e-9);
     }
 
     #[test]
@@ -831,5 +992,34 @@ mod tests {
             "z={} should be near 1.0 despite outlier",
             pos[2]
         );
+    }
+
+    #[test]
+    fn summary_reports_confirmed_consistency_metrics() {
+        let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
+        let stable_map_point = [0.2, 0.2, 2.0];
+        let poses = [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ];
+        for (idx, pose) in poses.into_iter().enumerate() {
+            let offset = if idx == 1 { 0.002 } else { 0.0 };
+            let point =
+                stable_surface_point_for_map_point(pose, [0.2, 0.2, 2.0 + offset], 150, 0.0004);
+            map.integrate(&[point], pose);
+        }
+
+        let summary = map.summary();
+        assert_eq!(summary.confirmed_voxels, 1);
+        assert!(summary.mean_confirmed_consistency_score >= 0.0);
+        assert!(
+            summary.max_confirmed_consistency_score >= summary.mean_confirmed_consistency_score
+        );
+        let confirmed = map.extract_confirmed();
+        assert_eq!(confirmed.len(), 1);
+        assert!((confirmed[0].0[0] - stable_map_point[0]).abs() < 1e-6);
+        assert!((confirmed[0].0[1] - stable_map_point[1]).abs() < 1e-6);
+        assert!((confirmed[0].0[2] - stable_map_point[2]).abs() < 0.002);
     }
 }

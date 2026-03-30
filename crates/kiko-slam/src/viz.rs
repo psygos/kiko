@@ -524,36 +524,10 @@ impl RerunSink {
 
     fn log_surface_map_state(&mut self) -> Result<(), VizLogError> {
         let summary = self.surface_map.summary();
-        self.rec.log(
-            "diagnostics/surface/total_voxels",
-            &rerun::Scalars::single(summary.total_voxels as f64),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/confirmed_voxels",
-            &rerun::Scalars::single(summary.confirmed_voxels as f64),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/confirmed_ratio",
-            &rerun::Scalars::single(summary.confirmed_ratio),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/mean_confirmed_std_dev_mm",
-            &rerun::Scalars::single(summary.mean_confirmed_std_dev_m * 1000.0),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/mean_confirmed_support_views",
-            &rerun::Scalars::single(summary.mean_confirmed_support_views),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/mean_confirmed_raw_observations",
-            &rerun::Scalars::single(summary.mean_confirmed_raw_observations),
-        )?;
-
         let confirmed = self.surface_map.extract_confirmed();
-        self.rec.log(
-            "diagnostics/surface/rendered_confirmed_voxels",
-            &rerun::Scalars::single(confirmed.len() as f64),
-        )?;
+        for (path, value) in surface_summary_scalars(&summary, confirmed.len()) {
+            self.rec.log(path, &rerun::Scalars::single(value))?;
+        }
         if confirmed.is_empty() {
             return Ok(());
         }
@@ -569,7 +543,7 @@ impl RerunSink {
         self.rec.log("world/stable_surface_voxels", &cloud)?;
 
         eprintln!(
-            "surface: total={} confirmed={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2}",
+            "surface: total={} confirmed={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2} mean_consistency={:.3}",
             summary.total_voxels,
             summary.confirmed_voxels,
             confirmed.len(),
@@ -577,6 +551,7 @@ impl RerunSink {
             summary.mean_confirmed_std_dev_m * 1000.0,
             summary.mean_confirmed_support_views,
             summary.mean_confirmed_raw_observations,
+            summary.mean_confirmed_consistency_score,
         );
         Ok(())
     }
@@ -859,22 +834,82 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
 
 fn surface_integration_scalars(
     integration: &crate::surface_map::SurfaceBatchIntegrationSummary,
-) -> [(&'static str, f64); 3] {
+) -> Vec<(&'static str, f64)> {
     // `integrated_raw_observations` counts accepted raw surface samples before
-    // grouped-view novelty filtering. The other two counters are grouped-view
+    // grouped-view novelty filtering. The remaining counters are grouped-view
     // quantities, so these values are intentionally not additive.
+    let mut scalars = Vec::with_capacity(6);
+    scalars.push((
+        "diagnostics/surface/integrated_raw_observations",
+        integration.raw_observations_integrated as f64,
+    ));
+    scalars.push((
+        "diagnostics/surface/integrated_support_views",
+        integration.support_views_integrated as f64,
+    ));
+    scalars.push((
+        "diagnostics/surface/redundant_grouped_views_ignored",
+        integration.redundant_grouped_views_ignored as f64,
+    ));
+    scalars.push((
+        "diagnostics/surface/predictive_grouped_views_rejected",
+        integration.predictive_grouped_views_rejected as f64,
+    ));
+    if let Some(value) = integration.mean_rejected_predictive_consistency_score {
+        scalars.push((
+            "diagnostics/surface/rejected_predictive_grouped_views_mean_consistency_score",
+            value,
+        ));
+    }
+    if let Some(value) = integration.max_rejected_predictive_consistency_score {
+        scalars.push((
+            "diagnostics/surface/rejected_predictive_grouped_views_max_consistency_score",
+            value,
+        ));
+    }
+    scalars
+}
+
+fn surface_summary_scalars(
+    summary: &crate::surface_map::SurfaceMapSummary,
+    rendered_confirmed_voxels: usize,
+) -> [(&'static str, f64); 9] {
     [
         (
-            "diagnostics/surface/integrated_raw_observations",
-            integration.raw_observations_integrated as f64,
+            "diagnostics/surface/total_voxels",
+            summary.total_voxels as f64,
         ),
         (
-            "diagnostics/surface/integrated_support_views",
-            integration.support_views_integrated as f64,
+            "diagnostics/surface/confirmed_voxels",
+            summary.confirmed_voxels as f64,
         ),
         (
-            "diagnostics/surface/redundant_grouped_views_ignored",
-            integration.redundant_grouped_views_ignored as f64,
+            "diagnostics/surface/confirmed_ratio",
+            summary.confirmed_ratio,
+        ),
+        (
+            "diagnostics/surface/mean_confirmed_std_dev_mm",
+            summary.mean_confirmed_std_dev_m * 1000.0,
+        ),
+        (
+            "diagnostics/surface/mean_confirmed_support_views",
+            summary.mean_confirmed_support_views,
+        ),
+        (
+            "diagnostics/surface/mean_confirmed_raw_observations",
+            summary.mean_confirmed_raw_observations,
+        ),
+        (
+            "diagnostics/surface/mean_confirmed_consistency_score",
+            summary.mean_confirmed_consistency_score,
+        ),
+        (
+            "diagnostics/surface/max_confirmed_consistency_score",
+            summary.max_confirmed_consistency_score,
+        ),
+        (
+            "diagnostics/surface/rendered_confirmed_voxels",
+            rendered_confirmed_voxels as f64,
         ),
     ]
 }
@@ -1189,13 +1224,13 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 mod tests {
     use super::{
         RerunSink, SurfacePoseQualityDecision, SurfacePoseQualityGate, VizDecimation,
-        surface_integration_scalars, surface_pose_quality_scalars,
+        surface_integration_scalars, surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
         FrameDiagnostics, PnpProjectableTrackedObservationCountMetric,
         PnpProjectableTrackedObservationPixelResidualMetric, Pose, RectifiedRowMismatchPx,
         StableSurfacePoint, StableSurfaceStats, Timestamp,
-        surface_map::SurfaceBatchIntegrationSummary,
+        surface_map::{SurfaceBatchIntegrationSummary, SurfaceMapSummary},
     };
 
     #[test]
@@ -1204,17 +1239,49 @@ mod tests {
             raw_observations_integrated: 11,
             support_views_integrated: 3,
             redundant_grouped_views_ignored: 2,
+            predictive_grouped_views_rejected: 1,
+            mean_rejected_predictive_consistency_score: Some(14.5),
+            max_rejected_predictive_consistency_score: Some(14.5),
         };
 
         let scalars = surface_integration_scalars(&integration);
-        assert_eq!(
-            scalars,
-            [
-                ("diagnostics/surface/integrated_raw_observations", 11.0),
-                ("diagnostics/surface/integrated_support_views", 3.0),
-                ("diagnostics/surface/redundant_grouped_views_ignored", 2.0),
-            ]
-        );
+        assert!(scalars.contains(&("diagnostics/surface/integrated_raw_observations", 11.0)));
+        assert!(scalars.contains(&("diagnostics/surface/integrated_support_views", 3.0)));
+        assert!(scalars.contains(&("diagnostics/surface/redundant_grouped_views_ignored", 2.0)));
+        assert!(scalars.contains(&("diagnostics/surface/predictive_grouped_views_rejected", 1.0)));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/rejected_predictive_grouped_views_mean_consistency_score",
+            14.5
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/rejected_predictive_grouped_views_max_consistency_score",
+            14.5
+        )));
+    }
+
+    #[test]
+    fn surface_summary_scalars_export_confirmed_consistency_metrics() {
+        let summary = SurfaceMapSummary {
+            total_voxels: 10,
+            confirmed_voxels: 4,
+            confirmed_ratio: 0.4,
+            mean_confirmed_std_dev_m: 0.012,
+            mean_confirmed_support_views: 3.5,
+            mean_confirmed_raw_observations: 6.0,
+            mean_confirmed_consistency_score: 1.25,
+            max_confirmed_consistency_score: 2.75,
+        };
+
+        let scalars = surface_summary_scalars(&summary, 3);
+        assert!(scalars.contains(&("diagnostics/surface/total_voxels", 10.0)));
+        assert!(scalars.contains(&("diagnostics/surface/confirmed_voxels", 4.0)));
+        assert!(scalars.contains(&("diagnostics/surface/confirmed_ratio", 0.4)));
+        assert!(scalars.contains(&("diagnostics/surface/mean_confirmed_std_dev_mm", 12.0)));
+        assert!(scalars.contains(&("diagnostics/surface/mean_confirmed_support_views", 3.5)));
+        assert!(scalars.contains(&("diagnostics/surface/mean_confirmed_raw_observations", 6.0)));
+        assert!(scalars.contains(&("diagnostics/surface/mean_confirmed_consistency_score", 1.25)));
+        assert!(scalars.contains(&("diagnostics/surface/max_confirmed_consistency_score", 2.75)));
+        assert!(scalars.contains(&("diagnostics/surface/rendered_confirmed_voxels", 3.0)));
     }
 
     #[test]
