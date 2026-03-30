@@ -5,6 +5,15 @@ on:
   pull_request:
 
 jobs:
+  meta-review:
+    name: Meta Review Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate meta-review artifacts
+        run: bash scripts/check_meta_review.sh
+
   kiko-lints:
     name: Kiko Lints
     runs-on: macos-latest
@@ -37,6 +46,9 @@ jobs:
 
       - name: Run host crate tests
         run: cargo test -p kiko-slam
+
+      - name: Run host crate tests with vio feature
+        run: cargo test -p kiko-slam --features vio
 
       - name: Build oak-sys tests
         run: cargo test -p oak-sys --no-run
