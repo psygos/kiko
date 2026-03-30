@@ -231,16 +231,24 @@ pub struct SurfaceMapConfig {
     pub min_support_views: u32,
     /// Maximum allowed residual consistency score for a confirmed voxel.
     pub max_consistency_score: f64,
+    /// Maximum posterior standard deviation allowed for a confirmed voxel.
+    ///
+    /// By default this tracks the voxel size, which means a surface belief is
+    /// only rendered when its uncertainty is no worse than the map resolution
+    /// it claims to represent.
+    pub max_confirmed_std_dev_m: f64,
     /// Maximum total points to render (prevents Rerun overload).
     pub max_render_points: usize,
 }
 
 impl Default for SurfaceMapConfig {
     fn default() -> Self {
+        let voxel_size = 0.05_f32;
         Self {
-            voxel_size: 0.05,
+            voxel_size,
             min_support_views: 3,
             max_consistency_score: 8.0,
+            max_confirmed_std_dev_m: voxel_size as f64,
             max_render_points: 250_000,
         }
     }
@@ -249,6 +257,7 @@ impl Default for SurfaceMapConfig {
 impl SurfaceMapConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
+        let mut confirmed_std_dev_overridden = false;
         if let Some(v) = crate::env::env_f32("KIKO_SURFACE_VOXEL_SIZE_M") {
             if v.is_finite() && v > 0.0 {
                 config.voxel_size = v;
@@ -270,8 +279,17 @@ impl SurfaceMapConfig {
                 config.max_consistency_score = v as f64;
             }
         }
+        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M") {
+            if v.is_finite() && v > 0.0 {
+                config.max_confirmed_std_dev_m = v as f64;
+                confirmed_std_dev_overridden = true;
+            }
+        }
         if let Some(v) = crate::env::env_usize("KIKO_SURFACE_MAX_RENDER_POINTS") {
             config.max_render_points = v.max(1);
+        }
+        if !confirmed_std_dev_overridden {
+            config.max_confirmed_std_dev_m = config.voxel_size as f64;
         }
         config
     }
@@ -301,6 +319,7 @@ impl SurfaceBeliefMap {
     fn is_confirmed_belief(&self, belief: &SurfaceBelief) -> bool {
         belief.support_views() >= self.config.min_support_views
             && belief.consistency_score() <= self.config.max_consistency_score
+            && belief.std_dev() <= self.config.max_confirmed_std_dev_m
     }
 
     /// Integrate a batch of surface observations (camera frame) with a pose.
@@ -365,29 +384,43 @@ impl SurfaceBeliefMap {
     /// Extract confirmed surface points for rendering.
     /// Returns (position, color) tuples in map frame.
     pub fn extract_confirmed(&self) -> Vec<([f32; 3], u8)> {
-        let mut points: Vec<([f32; 3], u8)> = self
+        let mut points: Vec<([f32; 3], u8, f64, u32)> = self
             .voxels
             .values()
             .filter(|v| self.is_confirmed_belief(v))
             .map(|v| {
                 let pos = v.position();
-                ([pos[0] as f32, pos[1] as f32, pos[2] as f32], v.color())
+                (
+                    [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+                    v.color(),
+                    v.std_dev(),
+                    v.support_views(),
+                )
             })
             .collect();
 
-        // Keep extraction deterministic before capping.
-        points.sort_by(|(a, _), (b, _)| {
-            a[0].total_cmp(&b[0])
-                .then(a[1].total_cmp(&b[1]))
-                .then(a[2].total_cmp(&b[2]))
-        });
+        // Prefer the most stable voxels first if output must be capped. Ties are
+        // broken deterministically by support count and position.
+        points.sort_by(
+            |(a_pos, _, a_std_dev, a_support), (b_pos, _, b_std_dev, b_support)| {
+                a_std_dev
+                    .total_cmp(b_std_dev)
+                    .then(b_support.cmp(a_support))
+                    .then(a_pos[0].total_cmp(&b_pos[0]))
+                    .then(a_pos[1].total_cmp(&b_pos[1]))
+                    .then(a_pos[2].total_cmp(&b_pos[2]))
+            },
+        );
 
-        // Cap output to prevent Rerun overload.
+        // Cap output to prevent Rerun overload while preserving the most stable
+        // confirmed voxels.
         if points.len() > self.config.max_render_points {
-            let stride = points.len() / self.config.max_render_points + 1;
-            points = points.into_iter().step_by(stride).collect();
+            points.truncate(self.config.max_render_points);
         }
         points
+            .into_iter()
+            .map(|(position, color, _, _)| (position, color))
+            .collect()
     }
 
     /// Diagnostic summary.
@@ -522,7 +555,7 @@ mod tests {
         let p = StableSurfacePoint {
             position: [0.5, 0.5, 2.0],
             intensity: 200,
-            position_variance: 0.01, // σ = 0.1m equivalent positional variance
+            position_variance: 0.0025, // σ = 0.05m, fused σ ≈ 0.029m after 3 views
             rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         };
         for _ in 0..3 {
@@ -531,6 +564,53 @@ mod tests {
         assert_eq!(map.num_confirmed(), 1);
         let points = map.extract_confirmed();
         assert_eq!(points.len(), 1);
+    }
+
+    #[test]
+    fn high_uncertainty_voxel_stays_unconfirmed_even_with_support() {
+        let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
+        let p = StableSurfacePoint {
+            position: [1.0, 1.0, 2.0],
+            intensity: 180,
+            position_variance: 0.04, // σ = 0.2m, fused σ ≈ 0.115m after 3 views
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+        for _ in 0..3 {
+            map.integrate(&[p], Pose::identity());
+        }
+        assert_eq!(map.num_confirmed(), 0);
+        assert!(map.extract_confirmed().is_empty());
+    }
+
+    #[test]
+    fn extract_confirmed_prefers_lower_std_dev_when_capped() {
+        let mut map = SurfaceBeliefMap::new(SurfaceMapConfig {
+            max_render_points: 1,
+            ..SurfaceMapConfig::default()
+        });
+
+        let low_sigma = StableSurfacePoint {
+            position: [0.1, 0.1, 2.0],
+            intensity: 200,
+            position_variance: 0.0009, // σ = 0.03m, fused σ ≈ 0.017m after 3 views
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+        let high_sigma = StableSurfacePoint {
+            position: [0.4, 0.4, 2.0],
+            intensity: 100,
+            position_variance: 0.0025, // σ = 0.05m, fused σ ≈ 0.029m after 3 views
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        for _ in 0..3 {
+            map.integrate(&[low_sigma], Pose::identity());
+            map.integrate(&[high_sigma], Pose::identity());
+        }
+
+        let points = map.extract_confirmed();
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].0, low_sigma.position);
+        assert_eq!(points[0].1, low_sigma.intensity);
     }
 
     #[test]
