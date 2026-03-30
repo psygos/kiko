@@ -28,11 +28,11 @@ impl Default for DenseCloudConfig {
     fn default() -> Self {
         Self {
             subsample: 2,
-            max_disparity_gradient: 0.4,
-            min_disparity_px: 1.0,
-            max_edge_length_px: 200.0,
-            max_triangle_area_px2: 20_000.0,
-            max_points_per_keyframe: 50_000,
+            max_disparity_gradient: 0.25,
+            min_disparity_px: 1.5,
+            max_edge_length_px: 120.0,
+            max_triangle_area_px2: 8_000.0,
+            max_points_per_keyframe: 30_000,
         }
     }
 }
