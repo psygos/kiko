@@ -381,6 +381,10 @@ impl RerunSink {
         )?;
 
         let confirmed = self.surface_map.extract_confirmed();
+        self.rec.log(
+            "diagnostics/surface/rendered_confirmed_voxels",
+            &rerun::Scalars::single(confirmed.len() as f64),
+        )?;
         if confirmed.is_empty() {
             return Ok(());
         }
@@ -396,9 +400,10 @@ impl RerunSink {
         self.rec.log("world/stable_surface_voxels", &cloud)?;
 
         eprintln!(
-            "surface: total={} confirmed={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2}",
+            "surface: total={} confirmed={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2}",
             summary.total_voxels,
             summary.confirmed_voxels,
+            confirmed.len(),
             summary.confirmed_ratio,
             summary.mean_confirmed_std_dev_m * 1000.0,
             summary.mean_confirmed_support_views,

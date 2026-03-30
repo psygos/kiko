@@ -59,6 +59,7 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_SURFACE_VOXEL_SIZE_M=0.05        Voxel size for fused stable surface points
     KIKO_SURFACE_MIN_SUPPORT_VIEWS=3      Minimum support views to confirm a voxel
     KIKO_SURFACE_MAX_CONSISTENCY_SCORE=8.0 Max residual consistency score for a confirmed voxel
+    KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M=0.05 Max posterior sigma allowed for a confirmed voxel
     KIKO_SURFACE_MAX_RENDER_POINTS=250000 Max confirmed voxels rendered to Rerun
     KIKO_SURFACE_MAX_POINT_SIGMA_M=0.05   Max per-observation positional sigma accepted
     KIKO_DENSE_MAX_POINTS=30000           Max stable surface observations per keyframe";
@@ -368,4 +369,14 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SLAM_ENV_HELP;
+
+    #[test]
+    fn slam_env_help_mentions_confirmed_surface_sigma_env() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M"));
+    }
 }
