@@ -1,8 +1,9 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    CovisibilitySnapshot, DepthImage, Detections, Frame, ImuBatch, Keypoint, Point3, Pose, Raw,
-    Timestamp, TrackingPose, VioTelemetry, VizPacket, env::env_f32,
+    CovisibilitySnapshot, DepthImage, Detections, Frame, FrameDiagnostics, ImuBatch, Keypoint,
+    Point3, Pose, Raw, Timestamp, TrackingPose, VioTelemetry, VizPacket, env::env_f32,
+    env::env_usize,
 };
 
 use std::collections::HashMap;
@@ -106,6 +107,7 @@ pub struct RerunSink {
     corrected_trajectory: TrajectoryLog,
     visual_measurement_trajectory: TrajectoryLog,
     logged_world: bool,
+    surface_pose_quality_gate: SurfacePoseQualityGate,
     surface_map: crate::SurfaceBeliefMap,
 }
 
@@ -121,6 +123,7 @@ impl RerunSink {
             corrected_trajectory: TrajectoryLog::default(),
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
+            surface_pose_quality_gate: SurfacePoseQualityGate::load(),
             surface_map: crate::SurfaceBeliefMap::new(crate::SurfaceMapConfig::from_env()),
         }
     }
@@ -296,6 +299,7 @@ impl RerunSink {
         points: &[crate::StableSurfacePoint],
         stats: &crate::StableSurfaceStats,
         cam_from_map: Pose,
+        diagnostics: &FrameDiagnostics,
     ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
         self.rec.log(
@@ -348,67 +352,21 @@ impl RerunSink {
             )?;
         }
 
-        let integration = self.surface_map.integrate(points, cam_from_map);
+        let gate = self.surface_pose_quality_gate.decide(diagnostics);
+        for (path, value) in surface_pose_quality_scalars(&gate) {
+            self.rec.log(path, &rerun::Scalars::single(value))?;
+        }
+
+        let integration = if gate.accepts_surface_integration() {
+            self.surface_map.integrate(points, cam_from_map)
+        } else {
+            crate::surface_map::SurfaceBatchIntegrationSummary::default()
+        };
         for (path, value) in surface_integration_scalars(&integration) {
             self.rec.log(path, &rerun::Scalars::single(value))?;
         }
 
-        let summary = self.surface_map.summary();
-        self.rec.log(
-            "diagnostics/surface/total_voxels",
-            &rerun::Scalars::single(summary.total_voxels as f64),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/confirmed_voxels",
-            &rerun::Scalars::single(summary.confirmed_voxels as f64),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/confirmed_ratio",
-            &rerun::Scalars::single(summary.confirmed_ratio),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/mean_confirmed_std_dev_mm",
-            &rerun::Scalars::single(summary.mean_confirmed_std_dev_m * 1000.0),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/mean_confirmed_support_views",
-            &rerun::Scalars::single(summary.mean_confirmed_support_views),
-        )?;
-        self.rec.log(
-            "diagnostics/surface/mean_confirmed_raw_observations",
-            &rerun::Scalars::single(summary.mean_confirmed_raw_observations),
-        )?;
-
-        let confirmed = self.surface_map.extract_confirmed();
-        self.rec.log(
-            "diagnostics/surface/rendered_confirmed_voxels",
-            &rerun::Scalars::single(confirmed.len() as f64),
-        )?;
-        if confirmed.is_empty() {
-            return Ok(());
-        }
-        let positions: Vec<[f32; 3]> = confirmed.iter().map(|(p, _)| *p).collect();
-        let colors: Vec<rerun::Color> = confirmed
-            .iter()
-            .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
-            .collect();
-        let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
-        let cloud = rerun::Points3D::new(positions)
-            .with_colors(colors)
-            .with_radii([rerun::Radius::new_scene_units(voxel_radius)]);
-        self.rec.log("world/stable_surface_voxels", &cloud)?;
-
-        eprintln!(
-            "surface: total={} confirmed={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2}",
-            summary.total_voxels,
-            summary.confirmed_voxels,
-            confirmed.len(),
-            summary.confirmed_ratio,
-            summary.mean_confirmed_std_dev_m * 1000.0,
-            summary.mean_confirmed_support_views,
-            summary.mean_confirmed_raw_observations,
-        );
-        Ok(())
+        self.log_surface_map_state()
     }
 
     /// Log TSDF mesh as a triangle mesh with vertex colors.
@@ -563,6 +521,340 @@ impl RerunSink {
             rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
         );
     }
+
+    fn log_surface_map_state(&mut self) -> Result<(), VizLogError> {
+        let summary = self.surface_map.summary();
+        self.rec.log(
+            "diagnostics/surface/total_voxels",
+            &rerun::Scalars::single(summary.total_voxels as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/confirmed_voxels",
+            &rerun::Scalars::single(summary.confirmed_voxels as f64),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/confirmed_ratio",
+            &rerun::Scalars::single(summary.confirmed_ratio),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/mean_confirmed_std_dev_mm",
+            &rerun::Scalars::single(summary.mean_confirmed_std_dev_m * 1000.0),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/mean_confirmed_support_views",
+            &rerun::Scalars::single(summary.mean_confirmed_support_views),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/mean_confirmed_raw_observations",
+            &rerun::Scalars::single(summary.mean_confirmed_raw_observations),
+        )?;
+
+        let confirmed = self.surface_map.extract_confirmed();
+        self.rec.log(
+            "diagnostics/surface/rendered_confirmed_voxels",
+            &rerun::Scalars::single(confirmed.len() as f64),
+        )?;
+        if confirmed.is_empty() {
+            return Ok(());
+        }
+        let positions: Vec<[f32; 3]> = confirmed.iter().map(|(p, _)| *p).collect();
+        let colors: Vec<rerun::Color> = confirmed
+            .iter()
+            .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
+            .collect();
+        let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
+        let cloud = rerun::Points3D::new(positions)
+            .with_colors(colors)
+            .with_radii([rerun::Radius::new_scene_units(voxel_radius)]);
+        self.rec.log("world/stable_surface_voxels", &cloud)?;
+
+        eprintln!(
+            "surface: total={} confirmed={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2}",
+            summary.total_voxels,
+            summary.confirmed_voxels,
+            confirmed.len(),
+            summary.confirmed_ratio,
+            summary.mean_confirmed_std_dev_m * 1000.0,
+            summary.mean_confirmed_support_views,
+            summary.mean_confirmed_raw_observations,
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SurfacePoseQualityGate {
+    min_projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
+    max_projectable_tracked_reprojection_rmse_px:
+        crate::PnpProjectableTrackedObservationPixelResidualMetric,
+}
+
+impl Default for SurfacePoseQualityGate {
+    fn default() -> Self {
+        Self {
+            min_projectable_tracked_observations:
+                crate::PnpProjectableTrackedObservationCountMetric::new(8),
+            max_projectable_tracked_reprojection_rmse_px:
+                crate::PnpProjectableTrackedObservationPixelResidualMetric::new(1.5)
+                    .expect("default tracked reprojection RMSE gate must be lawful"),
+        }
+    }
+}
+
+impl SurfacePoseQualityGate {
+    fn load() -> Self {
+        let mut gate = Self::default();
+        if let Some(count) = env_usize("KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS") {
+            gate.min_projectable_tracked_observations =
+                crate::PnpProjectableTrackedObservationCountMetric::new(count);
+        }
+        if let Some(value_px) = env_f32("KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX") {
+            if let Ok(metric) =
+                crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value_px)
+            {
+                gate.max_projectable_tracked_reprojection_rmse_px = metric;
+            }
+        }
+        gate
+    }
+
+    fn decide(self, diagnostics: &FrameDiagnostics) -> SurfacePoseQualityDecision {
+        let Some(projectable_tracked_observations) =
+            diagnostics.pnp_projectable_tracked_observations
+        else {
+            return SurfacePoseQualityDecision::RejectMissingProjectableTrackedObservations {
+                min_required_projectable_tracked_observations: self
+                    .min_projectable_tracked_observations,
+                max_allowed_projectable_tracked_reprojection_rmse_px: self
+                    .max_projectable_tracked_reprojection_rmse_px,
+            };
+        };
+        if projectable_tracked_observations.count()
+            < self.min_projectable_tracked_observations.count()
+        {
+            return SurfacePoseQualityDecision::RejectLowProjectableTrackedObservations {
+                projectable_tracked_observations,
+                min_required_projectable_tracked_observations: self
+                    .min_projectable_tracked_observations,
+                max_allowed_projectable_tracked_reprojection_rmse_px: self
+                    .max_projectable_tracked_reprojection_rmse_px,
+            };
+        }
+        match diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px {
+            Some(projectable_tracked_reprojection_rmse_px)
+                if projectable_tracked_reprojection_rmse_px.value_px()
+                    <= self.max_projectable_tracked_reprojection_rmse_px.value_px() =>
+            {
+                SurfacePoseQualityDecision::Accept {
+                    projectable_tracked_observations,
+                    min_required_projectable_tracked_observations: self
+                        .min_projectable_tracked_observations,
+                    projectable_tracked_reprojection_rmse_px,
+                    max_allowed_projectable_tracked_reprojection_rmse_px: self
+                        .max_projectable_tracked_reprojection_rmse_px,
+                }
+            }
+            Some(projectable_tracked_reprojection_rmse_px) => {
+                SurfacePoseQualityDecision::RejectHighProjectableTrackedReprojectionRmse {
+                    projectable_tracked_observations,
+                    min_required_projectable_tracked_observations: self
+                        .min_projectable_tracked_observations,
+                    projectable_tracked_reprojection_rmse_px,
+                    max_allowed_projectable_tracked_reprojection_rmse_px: self
+                        .max_projectable_tracked_reprojection_rmse_px,
+                }
+            }
+            None => SurfacePoseQualityDecision::RejectMissingProjectableTrackedReprojectionRmse {
+                projectable_tracked_observations,
+                min_required_projectable_tracked_observations: self
+                    .min_projectable_tracked_observations,
+                max_allowed_projectable_tracked_reprojection_rmse_px: self
+                    .max_projectable_tracked_reprojection_rmse_px,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SurfacePoseQualityDecision {
+    Accept {
+        projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
+        min_required_projectable_tracked_observations:
+            crate::PnpProjectableTrackedObservationCountMetric,
+        projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+        max_allowed_projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+    },
+    RejectLowProjectableTrackedObservations {
+        projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
+        min_required_projectable_tracked_observations:
+            crate::PnpProjectableTrackedObservationCountMetric,
+        max_allowed_projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+    },
+    RejectHighProjectableTrackedReprojectionRmse {
+        projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
+        min_required_projectable_tracked_observations:
+            crate::PnpProjectableTrackedObservationCountMetric,
+        projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+        max_allowed_projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+    },
+    RejectMissingProjectableTrackedReprojectionRmse {
+        projectable_tracked_observations: crate::PnpProjectableTrackedObservationCountMetric,
+        min_required_projectable_tracked_observations:
+            crate::PnpProjectableTrackedObservationCountMetric,
+        max_allowed_projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+    },
+    RejectMissingProjectableTrackedObservations {
+        min_required_projectable_tracked_observations:
+            crate::PnpProjectableTrackedObservationCountMetric,
+        max_allowed_projectable_tracked_reprojection_rmse_px:
+            crate::PnpProjectableTrackedObservationPixelResidualMetric,
+    },
+}
+
+impl SurfacePoseQualityDecision {
+    fn accepts_surface_integration(self) -> bool {
+        matches!(self, Self::Accept { .. })
+    }
+}
+
+fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&'static str, f64)> {
+    let mut scalars = Vec::with_capacity(8);
+    let (
+        accepted,
+        rejected_low_count,
+        rejected_missing_count,
+        rejected_missing_rmse,
+        rejected_high_rmse,
+        projectable_tracked_observations,
+        min_required_projectable_tracked_observations,
+        rmse_px,
+        max_allowed_rmse_px,
+    ) = match *decision {
+        SurfacePoseQualityDecision::Accept {
+            projectable_tracked_observations,
+            min_required_projectable_tracked_observations,
+            projectable_tracked_reprojection_rmse_px,
+            max_allowed_projectable_tracked_reprojection_rmse_px,
+        } => (
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Some(projectable_tracked_observations.count() as f64),
+            Some(min_required_projectable_tracked_observations.count() as f64),
+            Some(projectable_tracked_reprojection_rmse_px.value_px() as f64),
+            Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
+        ),
+        SurfacePoseQualityDecision::RejectLowProjectableTrackedObservations {
+            projectable_tracked_observations,
+            min_required_projectable_tracked_observations,
+            max_allowed_projectable_tracked_reprojection_rmse_px,
+        } => (
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            Some(projectable_tracked_observations.count() as f64),
+            Some(min_required_projectable_tracked_observations.count() as f64),
+            None,
+            Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
+        ),
+        SurfacePoseQualityDecision::RejectHighProjectableTrackedReprojectionRmse {
+            projectable_tracked_observations,
+            min_required_projectable_tracked_observations,
+            projectable_tracked_reprojection_rmse_px,
+            max_allowed_projectable_tracked_reprojection_rmse_px,
+        } => (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            Some(projectable_tracked_observations.count() as f64),
+            Some(min_required_projectable_tracked_observations.count() as f64),
+            Some(projectable_tracked_reprojection_rmse_px.value_px() as f64),
+            Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
+        ),
+        SurfacePoseQualityDecision::RejectMissingProjectableTrackedReprojectionRmse {
+            projectable_tracked_observations,
+            min_required_projectable_tracked_observations,
+            max_allowed_projectable_tracked_reprojection_rmse_px,
+        } => (
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            Some(projectable_tracked_observations.count() as f64),
+            Some(min_required_projectable_tracked_observations.count() as f64),
+            None,
+            Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
+        ),
+        SurfacePoseQualityDecision::RejectMissingProjectableTrackedObservations {
+            min_required_projectable_tracked_observations,
+            max_allowed_projectable_tracked_reprojection_rmse_px,
+        } => (
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            None,
+            Some(min_required_projectable_tracked_observations.count() as f64),
+            None,
+            Some(max_allowed_projectable_tracked_reprojection_rmse_px.value_px() as f64),
+        ),
+    };
+    scalars.push(("diagnostics/surface/pose_gate/accepted", accepted));
+    scalars.push((
+        "diagnostics/surface/pose_gate/rejected_low_projectable_tracked_observations",
+        rejected_low_count,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/rejected_missing_projectable_tracked_observations",
+        rejected_missing_count,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/rejected_missing_projectable_tracked_reprojection_rmse",
+        rejected_missing_rmse,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/rejected_high_projectable_tracked_reprojection_rmse",
+        rejected_high_rmse,
+    ));
+    if let Some(value) = rmse_px {
+        scalars.push((
+            "diagnostics/surface/pose_gate/projectable_tracked_reprojection_rmse_px",
+            value,
+        ));
+    }
+    if let Some(value) = projectable_tracked_observations {
+        scalars.push((
+            "diagnostics/surface/pose_gate/projectable_tracked_observations",
+            value,
+        ));
+    }
+    if let Some(value) = min_required_projectable_tracked_observations {
+        scalars.push((
+            "diagnostics/surface/pose_gate/min_required_projectable_tracked_observations",
+            value,
+        ));
+    }
+    if let Some(value) = max_allowed_rmse_px {
+        scalars.push((
+            "diagnostics/surface/pose_gate/max_allowed_projectable_tracked_reprojection_rmse_px",
+            value,
+        ));
+    }
+    scalars
 }
 
 fn surface_integration_scalars(
@@ -895,8 +1187,15 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::surface_integration_scalars;
-    use crate::surface_map::SurfaceBatchIntegrationSummary;
+    use super::{
+        SurfacePoseQualityDecision, SurfacePoseQualityGate, surface_integration_scalars,
+        surface_pose_quality_scalars,
+    };
+    use crate::{
+        FrameDiagnostics, PnpProjectableTrackedObservationCountMetric,
+        PnpProjectableTrackedObservationPixelResidualMetric,
+        surface_map::SurfaceBatchIntegrationSummary,
+    };
 
     #[test]
     fn surface_integration_scalars_export_honest_support_accounting() {
@@ -915,5 +1214,120 @@ mod tests {
                 ("diagnostics/surface/redundant_grouped_views_ignored", 2.0),
             ]
         );
+    }
+
+    #[test]
+    fn surface_pose_quality_gate_accepts_low_tracked_reprojection_rmse() {
+        let gate = SurfacePoseQualityGate::default();
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::Accept { .. }
+        ));
+    }
+
+    #[test]
+    fn surface_pose_quality_gate_rejects_missing_tracked_reprojection_rmse() {
+        let gate = SurfacePoseQualityGate::default();
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::RejectMissingProjectableTrackedReprojectionRmse { .. }
+        ));
+    }
+
+    #[test]
+    fn surface_pose_quality_gate_rejects_missing_tracked_observation_count() {
+        let gate = SurfacePoseQualityGate::default();
+        let diagnostics = FrameDiagnostics::empty(0, 0);
+
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::RejectMissingProjectableTrackedObservations { .. }
+        ));
+    }
+
+    #[test]
+    fn surface_pose_quality_gate_rejects_low_tracked_observation_count() {
+        let gate = SurfacePoseQualityGate::default();
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(4));
+
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::RejectLowProjectableTrackedObservations { .. }
+        ));
+    }
+
+    #[test]
+    fn surface_pose_quality_gate_rejects_high_tracked_reprojection_rmse() {
+        let gate = SurfacePoseQualityGate::default();
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(2.0).expect("rmse"));
+
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::RejectHighProjectableTrackedReprojectionRmse { .. }
+        ));
+    }
+
+    #[test]
+    fn surface_pose_quality_scalars_export_decision_and_threshold() {
+        let decision = SurfacePoseQualityDecision::RejectHighProjectableTrackedReprojectionRmse {
+            projectable_tracked_observations: PnpProjectableTrackedObservationCountMetric::new(12),
+            min_required_projectable_tracked_observations:
+                PnpProjectableTrackedObservationCountMetric::new(8),
+            projectable_tracked_reprojection_rmse_px:
+                PnpProjectableTrackedObservationPixelResidualMetric::new(2.0).expect("rmse"),
+            max_allowed_projectable_tracked_reprojection_rmse_px:
+                PnpProjectableTrackedObservationPixelResidualMetric::new(1.5).expect("rmse"),
+        };
+
+        let scalars = surface_pose_quality_scalars(&decision);
+        assert!(scalars.contains(&("diagnostics/surface/pose_gate/accepted", 0.0)));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_low_projectable_tracked_observations",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_missing_projectable_tracked_observations",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_missing_projectable_tracked_reprojection_rmse",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_high_projectable_tracked_reprojection_rmse",
+            1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/projectable_tracked_reprojection_rmse_px",
+            2.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/projectable_tracked_observations",
+            12.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/min_required_projectable_tracked_observations",
+            8.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/max_allowed_projectable_tracked_reprojection_rmse_px",
+            1.5
+        )));
     }
 }

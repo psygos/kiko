@@ -62,6 +62,8 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M=0.05 Max posterior sigma allowed for a confirmed voxel
     KIKO_SURFACE_MAX_RENDER_POINTS=250000 Max confirmed voxels rendered to Rerun
     KIKO_SURFACE_MAX_POINT_SIGMA_M=0.05   Max per-observation positional sigma accepted
+    KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS=8 Min projectable tracked observations required before surface fusion
+    KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX=1.5 Max tracked reprojection RMSE allowed to fuse surface observations
     KIKO_DENSE_MAX_POINTS=30000           Max stable surface observations per keyframe";
 
 #[derive(Args, Clone, Debug)]
@@ -294,6 +296,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 &surface.points,
                                 &surface.stats,
                                 pose.cam_from_map_pose32(),
+                                &output.diagnostics,
                             ) {
                                 eprintln!("stable surface: {err}");
                             }
@@ -378,5 +381,15 @@ mod tests {
     #[test]
     fn slam_env_help_mentions_confirmed_surface_sigma_env() {
         assert!(SLAM_ENV_HELP.contains("KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M"));
+    }
+
+    #[test]
+    fn slam_env_help_mentions_surface_pose_quality_gate_env() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX"));
+    }
+
+    #[test]
+    fn slam_env_help_mentions_surface_pose_quality_support_env() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS"));
     }
 }
