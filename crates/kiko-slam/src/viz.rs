@@ -1188,12 +1188,13 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        SurfacePoseQualityDecision, SurfacePoseQualityGate, surface_integration_scalars,
-        surface_pose_quality_scalars,
+        RerunSink, SurfacePoseQualityDecision, SurfacePoseQualityGate, VizDecimation,
+        surface_integration_scalars, surface_pose_quality_scalars,
     };
     use crate::{
         FrameDiagnostics, PnpProjectableTrackedObservationCountMetric,
-        PnpProjectableTrackedObservationPixelResidualMetric,
+        PnpProjectableTrackedObservationPixelResidualMetric, Pose, RectifiedRowMismatchPx,
+        StableSurfacePoint, StableSurfaceStats, Timestamp,
         surface_map::SurfaceBatchIntegrationSummary,
     };
 
@@ -1329,5 +1330,71 @@ mod tests {
             "diagnostics/surface/pose_gate/max_allowed_projectable_tracked_reprojection_rmse_px",
             1.5
         )));
+    }
+
+    #[test]
+    fn log_surface_observations_reject_path_leaves_surface_map_unchanged() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let diagnostics = FrameDiagnostics::empty(0, 0);
+        let point = StableSurfacePoint {
+            position: [0.0, 0.0, 2.0],
+            intensity: 180,
+            position_variance: 0.0025,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+        )
+        .expect("surface logging");
+
+        assert_eq!(sink.surface_map.num_voxels(), 0);
+        assert!(storage.num_msgs() > 0);
+    }
+
+    #[test]
+    fn log_surface_observations_accept_path_mutates_surface_map() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+        let point = StableSurfacePoint {
+            position: [0.0, 0.0, 2.0],
+            intensity: 180,
+            position_variance: 0.0025,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+        )
+        .expect("surface logging");
+
+        assert_eq!(sink.surface_map.num_voxels(), 1);
+        assert!(storage.num_msgs() > 0);
     }
 }
