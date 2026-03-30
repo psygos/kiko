@@ -8,6 +8,8 @@
 //! - Every observation carries conservative positional uncertainty (`position_variance`)
 //! - Within a single integration batch, observations landing in the same voxel are
 //!   grouped into one correlated support view before entering the persistent map
+//! - Support views are counted only when they arrive from a meaningfully distinct
+//!   viewing ray relative to the voxel's claimed spatial resolution
 //! - Fusion across support views uses information-weighted means
 //! - Consistency is tracked via an explicitly named residual energy score
 //! - Only confirmed voxels (enough support views, low residual inconsistency) are rendered
@@ -47,6 +49,28 @@ struct BatchVoxelEvidence {
     position_variance: f64,
     intensity: u8,
     raw_observations: u32,
+}
+
+fn norm3(v: [f64; 3]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn normalize3(v: [f64; 3]) -> Option<[f64; 3]> {
+    let norm = norm3(v);
+    if !norm.is_finite() || norm <= 1e-12 {
+        return None;
+    }
+    Some([v[0] / norm, v[1] / norm, v[2] / norm])
+}
+
+fn novel_view_cosine_threshold(range_m: f64, voxel_size_m: f32) -> f64 {
+    let safe_range = range_m.max(1e-6);
+    let full_angle_rad = 2.0 * ((0.5 * voxel_size_m as f64) / safe_range).atan();
+    full_angle_rad.cos()
 }
 
 #[derive(Clone, Debug)]
@@ -120,8 +144,10 @@ struct SurfaceBelief {
     info_weighted_sum: [f64; 3],
     /// Total information: Σ(1 / σ_i²)
     total_information: f64,
-    /// Number of correlated support views merged into this belief.
+    /// Number of distinct support viewpoints merged into this belief.
     support_views: u32,
+    /// Representative viewing directions that have already counted as support.
+    support_view_directions: Vec<[f64; 3]>,
     /// Number of raw stereo observations collapsed into the support views.
     raw_observations: u32,
     /// Sum of weighted squared residuals for consistency scoring.
@@ -136,6 +162,7 @@ impl SurfaceBelief {
             info_weighted_sum: [0.0; 3],
             total_information: 0.0,
             support_views: 0,
+            support_view_directions: Vec::new(),
             raw_observations: 0,
             residual_energy: 0.0,
             color_sum: 0.0,
@@ -192,8 +219,18 @@ impl SurfaceBelief {
         self.raw_observations
     }
 
+    fn is_novel_view(&self, view_direction: [f64; 3], novel_view_cosine_threshold: f64) -> bool {
+        self.support_view_directions
+            .iter()
+            .all(|existing| dot3(*existing, view_direction) < novel_view_cosine_threshold)
+    }
+
+    fn note_redundant_observations(&mut self, raw_observations: u32) {
+        self.raw_observations = self.raw_observations.saturating_add(raw_observations);
+    }
+
     /// Integrate one correlated support view with conservative positional uncertainty.
-    fn integrate_support_view(&mut self, evidence: &BatchVoxelEvidence) {
+    fn integrate_support_view(&mut self, evidence: &BatchVoxelEvidence, view_direction: [f64; 3]) {
         let info = 1.0 / evidence.position_variance.max(1e-12);
 
         // Track consistency with a weighted online second-moment update. This is
@@ -215,6 +252,7 @@ impl SurfaceBelief {
         }
         self.total_information += info;
         self.support_views = self.support_views.saturating_add(1);
+        self.support_view_directions.push(view_direction);
         self.raw_observations = self
             .raw_observations
             .saturating_add(evidence.raw_observations);
@@ -331,6 +369,7 @@ impl SurfaceBeliefMap {
         let map_from_cam = cam_from_map.inverse();
         let r = map_from_cam.rotation();
         let t = map_from_cam.translation();
+        let camera_center = [t[0] as f64, t[1] as f64, t[2] as f64];
         let mut batch = HashMap::<VoxelKey, BatchVoxelAccumulator>::new();
         let mut raw_observations_integrated = 0usize;
 
@@ -357,9 +396,27 @@ impl SurfaceBeliefMap {
             let Some(evidence) = grouped.finalize() else {
                 continue;
             };
+            let Some(view_direction) = normalize3([
+                evidence.position[0] - camera_center[0],
+                evidence.position[1] - camera_center[1],
+                evidence.position[2] - camera_center[2],
+            ]) else {
+                continue;
+            };
+            let view_range_m = norm3([
+                evidence.position[0] - camera_center[0],
+                evidence.position[1] - camera_center[1],
+                evidence.position[2] - camera_center[2],
+            ]);
+            let novelty_threshold =
+                novel_view_cosine_threshold(view_range_m, self.config.voxel_size);
             let belief = self.voxels.entry(key).or_insert_with(SurfaceBelief::new);
-            belief.integrate_support_view(&evidence);
-            support_views_integrated = support_views_integrated.saturating_add(1);
+            if belief.is_novel_view(view_direction, novelty_threshold) {
+                belief.integrate_support_view(&evidence, view_direction);
+                support_views_integrated = support_views_integrated.saturating_add(1);
+            } else {
+                belief.note_redundant_observations(evidence.raw_observations);
+            }
         }
 
         SurfaceBatchIntegrationSummary {
@@ -493,6 +550,36 @@ mod tests {
     use super::*;
     use crate::RectifiedRowMismatchPx;
 
+    fn stable_surface_point_for_map_point(
+        cam_from_map: Pose,
+        map_point: [f32; 3],
+        intensity: u8,
+        position_variance: f32,
+    ) -> StableSurfacePoint {
+        let cam_point = math::transform_point(
+            cam_from_map.rotation(),
+            cam_from_map.translation(),
+            map_point,
+        );
+        StableSurfacePoint {
+            position: cam_point,
+            intensity,
+            position_variance,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        }
+    }
+
+    fn translated_cam_from_map(tx: f32) -> Pose {
+        Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [-tx, 0.0, 0.0],
+        )
+    }
+
+    fn integrate_as_novel(belief: &mut SurfaceBelief, evidence: BatchVoxelEvidence) {
+        belief.integrate_support_view(&evidence, [1.0, 0.0, 0.0]);
+    }
+
     #[test]
     fn single_observation_not_confirmed() {
         let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
@@ -550,33 +637,52 @@ mod tests {
     }
 
     #[test]
-    fn three_consistent_support_views_confirmed() {
+    fn repeated_same_view_batches_do_not_accumulate_support_views() {
         let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
-        let p = StableSurfacePoint {
-            position: [0.5, 0.5, 2.0],
-            intensity: 200,
-            position_variance: 0.0025, // σ = 0.05m, fused σ ≈ 0.029m after 3 views
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let pose = Pose::identity();
+        let p = stable_surface_point_for_map_point(pose, [0.5, 0.5, 2.0], 200, 0.0025);
+        map.integrate(&[p], pose);
+        let sigma_after_first = map.voxels.values().next().expect("voxel exists").std_dev();
         for _ in 0..3 {
-            map.integrate(&[p], Pose::identity());
+            map.integrate(&[p], pose);
+        }
+        assert_eq!(map.num_confirmed(), 0);
+        assert!(map.extract_confirmed().is_empty());
+        let sigma_after_repeats = map.voxels.values().next().expect("voxel exists").std_dev();
+        assert_eq!(sigma_after_first, sigma_after_repeats);
+    }
+
+    #[test]
+    fn three_consistent_distinct_support_views_confirmed() {
+        let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
+        let map_point = [0.5, 0.5, 2.0];
+        let poses = [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ];
+        for pose in poses {
+            let p = stable_surface_point_for_map_point(pose, map_point, 200, 0.0025);
+            map.integrate(&[p], pose);
         }
         assert_eq!(map.num_confirmed(), 1);
         let points = map.extract_confirmed();
         assert_eq!(points.len(), 1);
+        assert_eq!(points[0].0, map_point);
     }
 
     #[test]
     fn high_uncertainty_voxel_stays_unconfirmed_even_with_support() {
         let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
-        let p = StableSurfacePoint {
-            position: [1.0, 1.0, 2.0],
-            intensity: 180,
-            position_variance: 0.04, // σ = 0.2m, fused σ ≈ 0.115m after 3 views
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
-        for _ in 0..3 {
-            map.integrate(&[p], Pose::identity());
+        let map_point = [1.0, 1.0, 2.0];
+        let poses = [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ];
+        for pose in poses {
+            let p = stable_surface_point_for_map_point(pose, map_point, 180, 0.04);
+            map.integrate(&[p], pose);
         }
         assert_eq!(map.num_confirmed(), 0);
         assert!(map.extract_confirmed().is_empty());
@@ -589,28 +695,26 @@ mod tests {
             ..SurfaceMapConfig::default()
         });
 
-        let low_sigma = StableSurfacePoint {
-            position: [0.1, 0.1, 2.0],
-            intensity: 200,
-            position_variance: 0.0009, // σ = 0.03m, fused σ ≈ 0.017m after 3 views
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
-        let high_sigma = StableSurfacePoint {
-            position: [0.4, 0.4, 2.0],
-            intensity: 100,
-            position_variance: 0.0025, // σ = 0.05m, fused σ ≈ 0.029m after 3 views
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let low_sigma_point = [0.1, 0.1, 2.0];
+        let high_sigma_point = [0.4, 0.4, 2.0];
+        let poses = [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ];
 
-        for _ in 0..3 {
-            map.integrate(&[low_sigma], Pose::identity());
-            map.integrate(&[high_sigma], Pose::identity());
+        for pose in poses {
+            let low_sigma = stable_surface_point_for_map_point(pose, low_sigma_point, 200, 0.0009);
+            let high_sigma =
+                stable_surface_point_for_map_point(pose, high_sigma_point, 100, 0.0025);
+            map.integrate(&[low_sigma], pose);
+            map.integrate(&[high_sigma], pose);
         }
 
         let points = map.extract_confirmed();
         assert_eq!(points.len(), 1);
-        assert_eq!(points[0].0, low_sigma.position);
-        assert_eq!(points[0].1, low_sigma.intensity);
+        assert_eq!(points[0].0, low_sigma_point);
+        assert_eq!(points[0].1, 200);
     }
 
     #[test]
@@ -618,12 +722,15 @@ mod tests {
         let mut belief = SurfaceBelief::new();
         let sigma_single = 0.01_f64; // σ² = 0.01 → σ = 0.1m
         for _ in 0..10 {
-            belief.integrate_support_view(&BatchVoxelEvidence {
-                position: [1.0, 2.0, 3.0],
-                position_variance: sigma_single,
-                intensity: 128,
-                raw_observations: 1,
-            });
+            integrate_as_novel(
+                &mut belief,
+                BatchVoxelEvidence {
+                    position: [1.0, 2.0, 3.0],
+                    position_variance: sigma_single,
+                    intensity: 128,
+                    raw_observations: 1,
+                },
+            );
         }
         // After 10 observations with σ²=0.01 each:
         // total_info = 10/0.01 = 1000
@@ -638,20 +745,26 @@ mod tests {
         let mut belief = SurfaceBelief::new();
         // 5 observations at z=1.0
         for _ in 0..5 {
-            belief.integrate_support_view(&BatchVoxelEvidence {
-                position: [0.0, 0.0, 1.0],
+            integrate_as_novel(
+                &mut belief,
+                BatchVoxelEvidence {
+                    position: [0.0, 0.0, 1.0],
+                    position_variance: 0.001,
+                    intensity: 128,
+                    raw_observations: 1,
+                },
+            );
+        }
+        // 1 outlier at z=2.0 — very different
+        integrate_as_novel(
+            &mut belief,
+            BatchVoxelEvidence {
+                position: [0.0, 0.0, 2.0],
                 position_variance: 0.001,
                 intensity: 128,
                 raw_observations: 1,
-            });
-        }
-        // 1 outlier at z=2.0 — very different
-        belief.integrate_support_view(&BatchVoxelEvidence {
-            position: [0.0, 0.0, 2.0],
-            position_variance: 0.001,
-            intensity: 128,
-            raw_observations: 1,
-        });
+            },
+        );
         // consistency score should be high
         assert!(
             belief.consistency_score() > 10.0,
@@ -665,20 +778,26 @@ mod tests {
         let mut belief = SurfaceBelief::new();
         // 5 precise observations at z=1.0 (small σ²)
         for _ in 0..5 {
-            belief.integrate_support_view(&BatchVoxelEvidence {
-                position: [0.0, 0.0, 1.0],
-                position_variance: 0.0001,
-                intensity: 128,
-                raw_observations: 1,
-            }); // σ=1cm
+            integrate_as_novel(
+                &mut belief,
+                BatchVoxelEvidence {
+                    position: [0.0, 0.0, 1.0],
+                    position_variance: 0.0001,
+                    intensity: 128,
+                    raw_observations: 1,
+                },
+            ); // σ=1cm
         }
         // 1 noisy observation at z=1.5 (large σ²)
-        belief.integrate_support_view(&BatchVoxelEvidence {
-            position: [0.0, 0.0, 1.5],
-            position_variance: 0.1,
-            intensity: 128,
-            raw_observations: 1,
-        }); // σ=31cm
+        integrate_as_novel(
+            &mut belief,
+            BatchVoxelEvidence {
+                position: [0.0, 0.0, 1.5],
+                position_variance: 0.1,
+                intensity: 128,
+                raw_observations: 1,
+            },
+        ); // σ=31cm
 
         let pos = belief.position();
         // Position should be very close to 1.0, barely affected by the noisy obs
