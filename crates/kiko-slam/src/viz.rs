@@ -1322,11 +1322,55 @@ mod tests {
         surface_integration_scalars, surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
-        FrameDiagnostics, PnpProjectableTrackedObservationCountMetric,
+        Frame, FrameDiagnostics, FrameId, PnpProjectableTrackedObservationCountMetric,
         PnpProjectableTrackedObservationPixelResidualMetric, Pose, RectifiedRowMismatchPx,
-        StableSurfacePoint, StableSurfaceStats, Timestamp,
+        SensorId, StableSurfacePoint, StableSurfaceStats, Timestamp,
         surface_map::{SurfaceBatchIntegrationSummary, SurfaceMapSummary},
     };
+
+    #[test]
+    fn log_frames_emits_left_and_right_view_entities() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let left = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![0, 16, 32, 48],
+        )
+        .expect("left frame");
+        let right = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(2),
+            Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![255, 192, 128, 64],
+        )
+        .expect("right frame");
+
+        sink.log_frames(&left, &right).expect("frame logging");
+
+        let entity_paths: Vec<String> = storage
+            .take()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                rerun::external::re_log_types::LogMsg::ArrowMsg(_, arrow_msg) => Some(
+                    rerun::log::Chunk::from_arrow_msg(&arrow_msg)
+                        .expect("valid arrow chunk")
+                        .entity_path()
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(entity_paths.iter().any(|path| path == "/view/left"));
+        assert!(entity_paths.iter().any(|path| path == "/view/right"));
+    }
 
     #[test]
     fn surface_integration_scalars_export_honest_support_accounting() {

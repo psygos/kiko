@@ -42,8 +42,13 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
-    let rec = rerun_recording(&args.rerun, "kiko-slam-dataset")?;
-    let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
+    let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset") {
+        Ok(rec) => Some(RerunSink::new(rec, args.rerun.rerun_decimation)),
+        Err(err) => {
+            eprintln!("failed to initialize rerun; continuing headless: {err}");
+            None
+        }
+    };
 
     let mut pipeline = inference.into_pipeline();
 
@@ -87,8 +92,10 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let points = keyframe.as_ref().map(|kf| kf.landmarks());
-                if let Err(err) = sink.log_with_points(&packet, points) {
-                    eprintln!("rerun log error: {err}");
+                if let Some(sink) = sink.as_mut() {
+                    if let Err(err) = sink.log_with_points(&packet, points) {
+                        eprintln!("rerun log error: {err}");
+                    }
                 }
                 processed += 1;
             }

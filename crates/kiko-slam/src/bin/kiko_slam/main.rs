@@ -75,9 +75,11 @@ pub fn rerun_recording(
         )?;
         Ok(rec)
     } else if let Some(url) = &args.rerun_url {
+        eprintln!("rerun: connecting to {url}");
         Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc_opts(url)?)
     } else {
-        Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc()?)
+        eprintln!("rerun: spawning or reusing a local viewer");
+        Ok(rerun::RecordingStreamBuilder::new(name).spawn()?)
     }
 }
 
@@ -85,8 +87,11 @@ pub fn rerun_recording(
 mod tests {
     use super::bench::{BenchAccum, summarize_bench};
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
+    use super::{Cli, Command};
+    use clap::Parser;
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
     use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
@@ -224,6 +229,28 @@ mod tests {
 
         for (key, value) in saved {
             restore_env(&key, value);
+        }
+    }
+
+    #[test]
+    fn rerun_save_alias_parses_for_viz() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--backend",
+            "cpu",
+            "--rerun-save",
+            "/tmp/debug.rrd",
+            "/tmp/dataset",
+        ])
+        .expect("parse cli");
+
+        match cli.command {
+            Command::Viz(args) => {
+                assert_eq!(args.rerun.save_rrd, Some(PathBuf::from("/tmp/debug.rrd")));
+                assert_eq!(args.dataset.path, PathBuf::from("/tmp/dataset"));
+            }
+            _ => panic!("expected viz command"),
         }
     }
 

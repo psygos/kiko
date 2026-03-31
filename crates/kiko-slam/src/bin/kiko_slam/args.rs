@@ -60,7 +60,7 @@ pub struct RerunArgs {
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value = "1")]
     pub rerun_decimation: VizDecimation,
     /// Save Rerun data to .rrd file instead of streaming
-    #[arg(long, env = "KIKO_RERUN_SAVE")]
+    #[arg(long, env = "KIKO_RERUN_SAVE", visible_alias = "rerun-save")]
     pub save_rrd: Option<PathBuf>,
     /// Stream Rerun data to a remote viewer, e.g. rerun+http://192.168.50.1:9876/proxy
     #[arg(long, env = "KIKO_RERUN_URL", value_name = "URL")]

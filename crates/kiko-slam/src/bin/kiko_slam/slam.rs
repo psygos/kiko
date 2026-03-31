@@ -146,8 +146,13 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         key_limit,
         downscale,
     )?;
-    let rec = rerun_recording(&args.rerun, "kiko-slam-dataset-odometry")?;
-    let mut sink = RerunSink::new(rec, args.rerun.rerun_decimation);
+    let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset-odometry") {
+        Ok(rec) => Some(RerunSink::new(rec, args.rerun.rerun_decimation)),
+        Err(err) => {
+            eprintln!("failed to initialize rerun; continuing headless: {err}");
+            None
+        }
+    };
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
     // Create a second SP session for detection prefetch pipelining
     if let Some(sp_right) = superpoint_right {
@@ -271,77 +276,99 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                         .as_ref()
                         .map(|kf| kf.landmarks())
                         .filter(|pts| !pts.is_empty());
-                    if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
-                        if let Err(err) = sink.log_with_points(&packet, points) {
-                            eprintln!("rerun log error: {err}");
+                    if let Some(sink) = sink.as_mut() {
+                        match VizPacket::try_new(left.clone(), right.clone(), matches) {
+                            Ok(packet) => {
+                                if let Err(err) = sink.log_with_points(&packet, points) {
+                                    eprintln!("rerun log error: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "viz packet error: {err}; falling back to raw stereo views"
+                                );
+                                if let Err(log_err) = sink.log_frames(&left, &right) {
+                                    eprintln!("rerun log error: {log_err}");
+                                }
+                            }
                         }
                     }
                     // Generate stable sparse surface observations for the low-resolution voxel map.
-                    if let Some(samples) = surface_samples {
-                        if let Some(pose) = output.pose.as_ref() {
-                            let stereo = dense_triangulator.as_ref().unwrap().stereo();
-                            let surface = kiko_slam::generate_stable_surface_points(
-                                &samples,
-                                stereo.fx(),
-                                stereo.fy(),
-                                stereo.left().cx,
-                                stereo.left().cy,
-                                stereo.baseline_m(),
-                                left.data(),
-                                left.width(),
-                                left.height(),
-                                &dense_config,
-                            );
-                            if let Err(err) = sink.log_surface_observations(
-                                left.timestamp(),
-                                &surface.points,
-                                &surface.stats,
-                                pose.cam_from_map_pose32(),
-                                &output.diagnostics,
-                            ) {
-                                eprintln!("stable surface: {err}");
+                    if let Some(sink) = sink.as_mut() {
+                        if let Some(samples) = surface_samples {
+                            if let Some(pose) = output.pose.as_ref() {
+                                let stereo = dense_triangulator.as_ref().unwrap().stereo();
+                                let surface = kiko_slam::generate_stable_surface_points(
+                                    &samples,
+                                    stereo.fx(),
+                                    stereo.fy(),
+                                    stereo.left().cx,
+                                    stereo.left().cy,
+                                    stereo.baseline_m(),
+                                    left.data(),
+                                    left.width(),
+                                    left.height(),
+                                    &dense_config,
+                                );
+                                if let Err(err) = sink.log_surface_observations(
+                                    left.timestamp(),
+                                    &surface.points,
+                                    &surface.stats,
+                                    pose.cam_from_map_pose32(),
+                                    &output.diagnostics,
+                                ) {
+                                    eprintln!("stable surface: {err}");
+                                }
                             }
                         }
                     }
                     if output.keyframe.is_some() {
                         keyframes += 1;
                     }
-                    if output.keyframe.is_some() || loop_applied {
-                        let snapshot = tracker.covisibility_snapshot();
-                        if let Err(err) = sink.log_covisibility_graph(left.timestamp(), &snapshot) {
-                            eprintln!("rerun log error: {err}");
+                    if let Some(sink) = sink.as_mut() {
+                        if output.keyframe.is_some() || loop_applied {
+                            let snapshot = tracker.covisibility_snapshot();
+                            if let Err(err) =
+                                sink.log_covisibility_graph(left.timestamp(), &snapshot)
+                            {
+                                eprintln!("rerun log error: {err}");
+                            }
                         }
                     }
-                } else if let Err(err) = sink.log_frames(&left, &right) {
-                    eprintln!("rerun log error: {err}");
+                } else if let Some(sink) = sink.as_mut() {
+                    if let Err(err) = sink.log_frames(&left, &right) {
+                        eprintln!("rerun log error: {err}");
+                    }
                 }
 
-                if let Some(batch) = imu.as_ref() {
-                    if let Err(err) = sink.log_imu_batch(batch) {
-                        eprintln!("rerun imu log error: {err}");
+                if let Some(sink) = sink.as_mut() {
+                    if let Some(batch) = imu.as_ref() {
+                        if let Err(err) = sink.log_imu_batch(batch) {
+                            eprintln!("rerun imu log error: {err}");
+                        }
                     }
-                }
-                if let Some(pose) = output.pose.as_ref() {
-                    if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
-                        eprintln!("rerun log error: {err}");
-                    } else {
-                        poses_logged += 1;
+                    if let Some(pose) = output.pose.as_ref() {
+                        if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
+                            eprintln!("rerun log error: {err}");
+                        } else {
+                            poses_logged += 1;
+                        }
                     }
-                }
-                if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
-                    if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
-                        eprintln!("rerun imu log error: {err}");
+                    if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
+                        if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
+                            eprintln!("rerun imu log error: {err}");
+                        }
                     }
-                }
-                if let Err(err) = sink.log_system_health(timestamp, &output.health) {
-                    eprintln!("rerun health error: {err}");
-                }
-                if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
-                    eprintln!("rerun diagnostics error: {err}");
-                }
-                for event in &output.events {
-                    if let Err(err) = sink.log_event(timestamp, event) {
-                        eprintln!("rerun event error: {err}");
+                    if let Err(err) = sink.log_system_health(timestamp, &output.health) {
+                        eprintln!("rerun health error: {err}");
+                    }
+                    if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
+                        eprintln!("rerun diagnostics error: {err}");
+                    }
+                    for event in &output.events {
+                        if let Err(err) = sink.log_event(timestamp, event) {
+                            eprintln!("rerun event error: {err}");
+                        }
                     }
                 }
                 processed += 1;
