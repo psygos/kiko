@@ -404,12 +404,6 @@ impl SurfaceBeliefMap {
         self.config
     }
 
-    fn is_confirmed_belief(&self, belief: &SurfaceBelief) -> bool {
-        belief.support_views() >= self.config.min_support_views
-            && belief.consistency_score() <= self.config.max_consistency_score
-            && belief.std_dev() <= self.config.max_confirmed_std_dev_m
-    }
-
     /// Integrate a batch of surface observations (camera frame) with a pose.
     pub fn integrate(
         &mut self,
@@ -508,7 +502,7 @@ impl SurfaceBeliefMap {
     pub fn num_confirmed(&self) -> usize {
         self.voxels
             .values()
-            .filter(|v| self.is_confirmed_belief(v))
+            .filter(|belief| self.classify_belief(belief) == SurfaceBeliefRenderClass::Confirmed)
             .count()
     }
 

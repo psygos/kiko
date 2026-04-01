@@ -1459,19 +1459,7 @@ mod tests {
 
         sink.log_frames(&left, &right).expect("frame logging");
 
-        let entity_paths: Vec<String> = storage
-            .take()
-            .into_iter()
-            .filter_map(|msg| match msg {
-                rerun::external::re_log_types::LogMsg::ArrowMsg(_, arrow_msg) => Some(
-                    rerun::log::Chunk::from_arrow_msg(&arrow_msg)
-                        .expect("valid arrow chunk")
-                        .entity_path()
-                        .to_string(),
-                ),
-                _ => None,
-            })
-            .collect();
+        let entity_paths = recorded_entity_paths(storage);
         assert!(entity_paths.iter().any(|path| path == "/view/left"));
         assert!(entity_paths.iter().any(|path| path == "/view/right"));
     }
