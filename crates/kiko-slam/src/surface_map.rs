@@ -512,26 +512,37 @@ impl SurfaceBeliefMap {
             .count()
     }
 
-    /// Extract confirmed surface points for rendering.
-    /// Returns (position, color) tuples in map frame.
-    pub fn extract_confirmed(&self) -> Vec<([f32; 3], u8)> {
-        let mut points: Vec<([f32; 3], u8, f64, u32)> = self
-            .voxels
-            .values()
-            .filter(|v| self.is_confirmed_belief(v))
-            .map(|v| {
-                let pos = v.position();
+    fn classify_belief(&self, belief: &SurfaceBelief) -> SurfaceBeliefRenderClass {
+        if belief.support_views() < self.config.min_support_views {
+            return SurfaceBeliefRenderClass::PendingSupport;
+        }
+
+        let consistency_ok = belief.consistency_score() <= self.config.max_consistency_score;
+        let uncertainty_ok = belief.std_dev() <= self.config.max_confirmed_std_dev_m;
+        match (consistency_ok, uncertainty_ok) {
+            (true, true) => SurfaceBeliefRenderClass::Confirmed,
+            (false, true) => SurfaceBeliefRenderClass::RejectedConsistency,
+            (true, false) => SurfaceBeliefRenderClass::RejectedUncertainty,
+            (false, false) => SurfaceBeliefRenderClass::RejectedConsistencyAndUncertainty,
+        }
+    }
+
+    fn render_points_for_beliefs<'a>(
+        &self,
+        beliefs: impl Iterator<Item = &'a SurfaceBelief>,
+    ) -> Vec<([f32; 3], u8)> {
+        let mut points: Vec<([f32; 3], u8, f64, u32)> = beliefs
+            .map(|belief| {
+                let pos = belief.position();
                 (
                     [pos[0] as f32, pos[1] as f32, pos[2] as f32],
-                    v.color(),
-                    v.std_dev(),
-                    v.support_views(),
+                    belief.color(),
+                    belief.std_dev(),
+                    belief.support_views(),
                 )
             })
             .collect();
 
-        // Prefer the most stable voxels first if output must be capped. Ties are
-        // broken deterministically by support count and position.
         points.sort_by(
             |(a_pos, _, a_std_dev, a_support), (b_pos, _, b_std_dev, b_support)| {
                 a_std_dev
@@ -543,25 +554,90 @@ impl SurfaceBeliefMap {
             },
         );
 
-        // Cap output to prevent Rerun overload while preserving the most stable
-        // confirmed voxels.
         if points.len() > self.config.max_render_points {
             points.truncate(self.config.max_render_points);
         }
+
         points
             .into_iter()
             .map(|(position, color, _, _)| (position, color))
             .collect()
     }
 
+    /// Extract confirmed surface points for rendering.
+    /// Returns (position, color) tuples in map frame.
+    pub fn extract_confirmed(&self) -> Vec<([f32; 3], u8)> {
+        self.render_points_for_beliefs(
+            self.voxels.values().filter(|belief| {
+                self.classify_belief(belief) == SurfaceBeliefRenderClass::Confirmed
+            }),
+        )
+    }
+
+    /// Extract classified surface point sets for debug rendering.
+    pub fn extract_debug_clouds(&self) -> SurfaceDebugClouds {
+        let mut confirmed = Vec::new();
+        let mut pending_support = Vec::new();
+        let mut rejected_consistency = Vec::new();
+        let mut rejected_uncertainty = Vec::new();
+        let mut rejected_consistency_and_uncertainty = Vec::new();
+
+        for belief in self.voxels.values() {
+            match self.classify_belief(belief) {
+                SurfaceBeliefRenderClass::Confirmed => confirmed.push(belief),
+                SurfaceBeliefRenderClass::PendingSupport => pending_support.push(belief),
+                SurfaceBeliefRenderClass::RejectedConsistency => rejected_consistency.push(belief),
+                SurfaceBeliefRenderClass::RejectedUncertainty => rejected_uncertainty.push(belief),
+                SurfaceBeliefRenderClass::RejectedConsistencyAndUncertainty => {
+                    rejected_consistency_and_uncertainty.push(belief);
+                }
+            }
+        }
+
+        SurfaceDebugClouds {
+            confirmed: self.render_points_for_beliefs(confirmed.into_iter()),
+            pending_support: self.render_points_for_beliefs(pending_support.into_iter()),
+            rejected_consistency: self.render_points_for_beliefs(rejected_consistency.into_iter()),
+            rejected_uncertainty: self.render_points_for_beliefs(rejected_uncertainty.into_iter()),
+            rejected_consistency_and_uncertainty: self
+                .render_points_for_beliefs(rejected_consistency_and_uncertainty.into_iter()),
+        }
+    }
+
     /// Diagnostic summary.
     pub fn summary(&self) -> SurfaceMapSummary {
         let total = self.voxels.len();
-        let confirmed = self.num_confirmed();
+        let mut confirmed = 0usize;
+        let mut pending_support = 0usize;
+        let mut rejected_consistency = 0usize;
+        let mut rejected_uncertainty = 0usize;
+        let mut rejected_consistency_and_uncertainty = 0usize;
         let confirmed_beliefs: Vec<&SurfaceBelief> = self
             .voxels
             .values()
-            .filter(|v| self.is_confirmed_belief(v))
+            .filter_map(|belief| match self.classify_belief(belief) {
+                SurfaceBeliefRenderClass::Confirmed => {
+                    confirmed = confirmed.saturating_add(1);
+                    Some(belief)
+                }
+                SurfaceBeliefRenderClass::PendingSupport => {
+                    pending_support = pending_support.saturating_add(1);
+                    None
+                }
+                SurfaceBeliefRenderClass::RejectedConsistency => {
+                    rejected_consistency = rejected_consistency.saturating_add(1);
+                    None
+                }
+                SurfaceBeliefRenderClass::RejectedUncertainty => {
+                    rejected_uncertainty = rejected_uncertainty.saturating_add(1);
+                    None
+                }
+                SurfaceBeliefRenderClass::RejectedConsistencyAndUncertainty => {
+                    rejected_consistency_and_uncertainty =
+                        rejected_consistency_and_uncertainty.saturating_add(1);
+                    None
+                }
+            })
             .collect();
         let mean_std_dev: f64 = if confirmed > 0 {
             confirmed_beliefs.iter().map(|v| v.std_dev()).sum::<f64>() / confirmed as f64
@@ -612,8 +688,30 @@ impl SurfaceBeliefMap {
             mean_confirmed_raw_observations: mean_raw_observations,
             mean_confirmed_consistency_score: mean_consistency_score,
             max_confirmed_consistency_score: max_consistency_score,
+            pending_support_voxels: pending_support,
+            rejected_consistency_voxels: rejected_consistency,
+            rejected_uncertainty_voxels: rejected_uncertainty,
+            rejected_consistency_and_uncertainty_voxels: rejected_consistency_and_uncertainty,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceBeliefRenderClass {
+    Confirmed,
+    PendingSupport,
+    RejectedConsistency,
+    RejectedUncertainty,
+    RejectedConsistencyAndUncertainty,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SurfaceDebugClouds {
+    pub confirmed: Vec<([f32; 3], u8)>,
+    pub pending_support: Vec<([f32; 3], u8)>,
+    pub rejected_consistency: Vec<([f32; 3], u8)>,
+    pub rejected_uncertainty: Vec<([f32; 3], u8)>,
+    pub rejected_consistency_and_uncertainty: Vec<([f32; 3], u8)>,
 }
 
 /// Diagnostic summary for the surface map.
@@ -627,6 +725,10 @@ pub struct SurfaceMapSummary {
     pub mean_confirmed_raw_observations: f64,
     pub mean_confirmed_consistency_score: f64,
     pub max_confirmed_consistency_score: f64,
+    pub pending_support_voxels: usize,
+    pub rejected_consistency_voxels: usize,
+    pub rejected_uncertainty_voxels: usize,
+    pub rejected_consistency_and_uncertainty_voxels: usize,
 }
 
 /// Summary of one integration batch after correlated observations are grouped.
@@ -1021,5 +1123,71 @@ mod tests {
         assert!((confirmed[0].0[0] - stable_map_point[0]).abs() < 1e-6);
         assert!((confirmed[0].0[1] - stable_map_point[1]).abs() < 1e-6);
         assert!((confirmed[0].0[2] - stable_map_point[2]).abs() < 0.002);
+    }
+
+    #[test]
+    fn debug_clouds_and_summary_classify_pending_and_rejected_voxels() {
+        let mut map = SurfaceBeliefMap::new(SurfaceMapConfig {
+            max_consistency_score: 4.0,
+            ..SurfaceMapConfig::default()
+        });
+
+        let confirmed_point = [0.2, 0.2, 2.0];
+        for pose in [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ] {
+            let point = stable_surface_point_for_map_point(pose, confirmed_point, 180, 0.0004);
+            map.integrate(&[point], pose);
+        }
+
+        let pending_pose = Pose::identity();
+        let pending_point =
+            stable_surface_point_for_map_point(pending_pose, [0.5, 0.0, 2.0], 120, 0.0004);
+        map.integrate(&[pending_point], pending_pose);
+
+        let inconsistent_map_point = [1.0, 0.0, 2.0];
+        for (idx, pose) in [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let map_point = if idx == 1 {
+                [1.049, 0.049, 2.049]
+            } else {
+                inconsistent_map_point
+            };
+            let point = stable_surface_point_for_map_point(pose, map_point, 200, 0.0004);
+            map.integrate(&[point], pose);
+        }
+
+        let uncertain_map_point = [1.5, 0.0, 2.0];
+        for pose in [
+            Pose::identity(),
+            translated_cam_from_map(0.1),
+            translated_cam_from_map(-0.1),
+        ] {
+            let point = stable_surface_point_for_map_point(pose, uncertain_map_point, 90, 0.04);
+            map.integrate(&[point], pose);
+        }
+
+        let summary = map.summary();
+        assert_eq!(summary.total_voxels, 4);
+        assert_eq!(summary.confirmed_voxels, 1);
+        assert_eq!(summary.pending_support_voxels, 1);
+        assert_eq!(summary.rejected_consistency_voxels, 1);
+        assert_eq!(summary.rejected_uncertainty_voxels, 1);
+        assert_eq!(summary.rejected_consistency_and_uncertainty_voxels, 0);
+
+        let debug = map.extract_debug_clouds();
+        assert_eq!(debug.confirmed.len(), 1);
+        assert_eq!(debug.pending_support.len(), 1);
+        assert_eq!(debug.rejected_consistency.len(), 1);
+        assert_eq!(debug.rejected_uncertainty.len(), 1);
+        assert!(debug.rejected_consistency_and_uncertainty.is_empty());
     }
 }

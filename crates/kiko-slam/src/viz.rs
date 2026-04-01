@@ -256,12 +256,7 @@ impl RerunSink {
         pose: &TrackingPose,
     ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
-
-        if !self.logged_world {
-            let coords = rerun::archetypes::ViewCoordinates::RDF();
-            self.rec.log("world", &coords)?;
-            self.logged_world = true;
-        }
+        self.ensure_world_logged()?;
 
         log_pose_variant(
             &self.rec,
@@ -302,6 +297,7 @@ impl RerunSink {
         diagnostics: &FrameDiagnostics,
     ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
+        self.ensure_world_logged()?;
         self.rec.log(
             "diagnostics/surface/input_raw_observations",
             &rerun::Scalars::single(stats.input_samples as f64),
@@ -356,6 +352,13 @@ impl RerunSink {
         for (path, value) in surface_pose_quality_scalars(&gate) {
             self.rec.log(path, &rerun::Scalars::single(value))?;
         }
+        let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
+        self.log_surface_frame_candidates(
+            cam_from_map,
+            points,
+            gate.accepts_surface_integration(),
+            voxel_radius,
+        )?;
 
         let integration = if gate.accepts_surface_integration() {
             self.surface_map.integrate(points, cam_from_map)
@@ -515,6 +518,15 @@ impl RerunSink {
         &self.rec
     }
 
+    fn ensure_world_logged(&mut self) -> Result<(), VizLogError> {
+        if !self.logged_world {
+            let coords = rerun::archetypes::ViewCoordinates::RDF();
+            self.rec.log("world", &coords)?;
+            self.logged_world = true;
+        }
+        Ok(())
+    }
+
     fn set_time(&self, timestamp: Timestamp) {
         self.rec.set_time(
             "capture_ns",
@@ -522,31 +534,107 @@ impl RerunSink {
         );
     }
 
+    fn log_surface_points(
+        &self,
+        path: &str,
+        points: &[([f32; 3], u8)],
+        fallback_color: rerun::Color,
+        voxel_radius: f32,
+    ) -> Result<(), VizLogError> {
+        let positions: Vec<[f32; 3]> = points.iter().map(|(position, _)| *position).collect();
+        let colors: Vec<rerun::Color> = points
+            .iter()
+            .map(|(_, intensity)| rerun::Color::from_rgb(*intensity, *intensity, *intensity))
+            .collect();
+        let cloud = if colors.is_empty() {
+            rerun::Points3D::new(positions)
+                .with_colors([fallback_color])
+                .with_radii([rerun::Radius::new_scene_units(voxel_radius)])
+        } else {
+            rerun::Points3D::new(positions)
+                .with_colors(colors)
+                .with_radii([rerun::Radius::new_scene_units(voxel_radius)])
+        };
+        self.rec.log(path, &cloud)?;
+        Ok(())
+    }
+
+    fn log_surface_frame_candidates(
+        &self,
+        cam_from_map: Pose,
+        points: &[crate::StableSurfacePoint],
+        pose_gate_accepted: bool,
+        voxel_radius: f32,
+    ) -> Result<(), VizLogError> {
+        let map_from_cam = cam_from_map.inverse();
+        let rotation = map_from_cam.rotation();
+        let translation = map_from_cam.translation();
+        let positions: Vec<[f32; 3]> = points
+            .iter()
+            .map(|point| crate::math::transform_point(rotation, translation, point.position))
+            .collect();
+        let color = if pose_gate_accepted {
+            rerun::Color::from_rgb(40, 220, 180)
+        } else {
+            rerun::Color::from_rgb(255, 140, 40)
+        };
+        let cloud = rerun::Points3D::new(positions)
+            .with_colors([color])
+            .with_radii([rerun::Radius::new_scene_units(
+                (voxel_radius * 0.6).max(0.003),
+            )]);
+        self.rec
+            .log("world/stable_surface_debug/frame_candidates", &cloud)?;
+        Ok(())
+    }
+
     fn log_surface_map_state(&mut self) -> Result<(), VizLogError> {
         let summary = self.surface_map.summary();
-        let confirmed = self.surface_map.extract_confirmed();
-        for (path, value) in surface_summary_scalars(&summary, confirmed.len()) {
+        let clouds = self.surface_map.extract_debug_clouds();
+        for (path, value) in surface_summary_scalars(&summary, clouds.confirmed.len()) {
             self.rec.log(path, &rerun::Scalars::single(value))?;
         }
-        if confirmed.is_empty() {
-            return Ok(());
-        }
-        let positions: Vec<[f32; 3]> = confirmed.iter().map(|(p, _)| *p).collect();
-        let colors: Vec<rerun::Color> = confirmed
-            .iter()
-            .map(|(_, c)| rerun::Color::from_rgb(*c, *c, *c))
-            .collect();
         let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
-        let cloud = rerun::Points3D::new(positions)
-            .with_colors(colors)
-            .with_radii([rerun::Radius::new_scene_units(voxel_radius)]);
-        self.rec.log("world/stable_surface_voxels", &cloud)?;
+        self.log_surface_points(
+            "world/stable_surface_voxels",
+            &clouds.confirmed,
+            rerun::Color::from_rgb(220, 220, 220),
+            voxel_radius,
+        )?;
+        self.log_surface_points(
+            "world/stable_surface_debug/pending_support_voxels",
+            &clouds.pending_support,
+            rerun::Color::from_rgb(255, 210, 70),
+            voxel_radius,
+        )?;
+        self.log_surface_points(
+            "world/stable_surface_debug/rejected_consistency_voxels",
+            &clouds.rejected_consistency,
+            rerun::Color::from_rgb(255, 80, 80),
+            voxel_radius,
+        )?;
+        self.log_surface_points(
+            "world/stable_surface_debug/rejected_uncertainty_voxels",
+            &clouds.rejected_uncertainty,
+            rerun::Color::from_rgb(80, 170, 255),
+            voxel_radius,
+        )?;
+        self.log_surface_points(
+            "world/stable_surface_debug/rejected_consistency_and_uncertainty_voxels",
+            &clouds.rejected_consistency_and_uncertainty,
+            rerun::Color::from_rgb(220, 90, 220),
+            voxel_radius,
+        )?;
 
         eprintln!(
-            "surface: total={} confirmed={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2} mean_consistency={:.3}",
+            "surface: total={} confirmed={} pending={} rejected_consistency={} rejected_uncertainty={} rejected_both={} rendered={} ratio={:.3} mean_σ={:.3}mm mean_views={:.2} mean_raw_obs={:.2} mean_consistency={:.3}",
             summary.total_voxels,
             summary.confirmed_voxels,
-            confirmed.len(),
+            summary.pending_support_voxels,
+            summary.rejected_consistency_voxels,
+            summary.rejected_uncertainty_voxels,
+            summary.rejected_consistency_and_uncertainty_voxels,
+            clouds.confirmed.len(),
             summary.confirmed_ratio,
             summary.mean_confirmed_std_dev_m * 1000.0,
             summary.mean_confirmed_support_views,
@@ -968,7 +1056,7 @@ fn surface_integration_scalars(
 fn surface_summary_scalars(
     summary: &crate::surface_map::SurfaceMapSummary,
     rendered_confirmed_voxels: usize,
-) -> [(&'static str, f64); 9] {
+) -> [(&'static str, f64); 13] {
     [
         (
             "diagnostics/surface/total_voxels",
@@ -977,6 +1065,22 @@ fn surface_summary_scalars(
         (
             "diagnostics/surface/confirmed_voxels",
             summary.confirmed_voxels as f64,
+        ),
+        (
+            "diagnostics/surface/pending_support_voxels",
+            summary.pending_support_voxels as f64,
+        ),
+        (
+            "diagnostics/surface/rejected_consistency_voxels",
+            summary.rejected_consistency_voxels as f64,
+        ),
+        (
+            "diagnostics/surface/rejected_uncertainty_voxels",
+            summary.rejected_uncertainty_voxels as f64,
+        ),
+        (
+            "diagnostics/surface/rejected_consistency_and_uncertainty_voxels",
+            summary.rejected_consistency_and_uncertainty_voxels as f64,
         ),
         (
             "diagnostics/surface/confirmed_ratio",
@@ -1372,6 +1476,22 @@ mod tests {
         assert!(entity_paths.iter().any(|path| path == "/view/right"));
     }
 
+    fn recorded_entity_paths(storage: rerun::sink::MemorySinkStorage) -> Vec<String> {
+        storage
+            .take()
+            .into_iter()
+            .filter_map(|msg| match msg {
+                rerun::external::re_log_types::LogMsg::ArrowMsg(_, arrow_msg) => Some(
+                    rerun::log::Chunk::from_arrow_msg(&arrow_msg)
+                        .expect("valid arrow chunk")
+                        .entity_path()
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn surface_integration_scalars_export_honest_support_accounting() {
         let integration = SurfaceBatchIntegrationSummary {
@@ -1403,6 +1523,10 @@ mod tests {
         let summary = SurfaceMapSummary {
             total_voxels: 10,
             confirmed_voxels: 4,
+            pending_support_voxels: 3,
+            rejected_consistency_voxels: 2,
+            rejected_uncertainty_voxels: 1,
+            rejected_consistency_and_uncertainty_voxels: 0,
             confirmed_ratio: 0.4,
             mean_confirmed_std_dev_m: 0.012,
             mean_confirmed_support_views: 3.5,
@@ -1414,6 +1538,13 @@ mod tests {
         let scalars = surface_summary_scalars(&summary, 3);
         assert!(scalars.contains(&("diagnostics/surface/total_voxels", 10.0)));
         assert!(scalars.contains(&("diagnostics/surface/confirmed_voxels", 4.0)));
+        assert!(scalars.contains(&("diagnostics/surface/pending_support_voxels", 3.0)));
+        assert!(scalars.contains(&("diagnostics/surface/rejected_consistency_voxels", 2.0)));
+        assert!(scalars.contains(&("diagnostics/surface/rejected_uncertainty_voxels", 1.0)));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/rejected_consistency_and_uncertainty_voxels",
+            0.0
+        )));
         assert!(scalars.contains(&("diagnostics/surface/confirmed_ratio", 0.4)));
         assert!(scalars.contains(&("diagnostics/surface/mean_confirmed_std_dev_mm", 12.0)));
         assert!(scalars.contains(&("diagnostics/surface/mean_confirmed_support_views", 3.5)));
@@ -1713,5 +1844,49 @@ mod tests {
 
         assert_eq!(sink.surface_map.num_voxels(), 1);
         assert!(storage.num_msgs() > 0);
+    }
+
+    #[test]
+    fn log_surface_observations_logs_debug_entities_before_confirmation() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+        let point = StableSurfacePoint {
+            position: [0.0, 0.0, 2.0],
+            intensity: 180,
+            position_variance: 0.0025,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+        )
+        .expect("surface logging");
+
+        let entity_paths = recorded_entity_paths(storage);
+        assert!(
+            entity_paths
+                .iter()
+                .any(|path| path == "/world/stable_surface_debug/frame_candidates")
+        );
+        assert!(
+            entity_paths
+                .iter()
+                .any(|path| path == "/world/stable_surface_debug/pending_support_voxels")
+        );
     }
 }
