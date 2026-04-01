@@ -263,13 +263,9 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 });
                 if let Some(matches) = output.stereo_matches {
                     // Extract measured stereo samples before matches are consumed.
-                    let surface_samples = if output.keyframe.is_some() {
-                        dense_triangulator
-                            .as_ref()
-                            .map(|tri| tri.extract_stereo_samples(&matches))
-                    } else {
-                        None
-                    };
+                    let surface_samples = dense_triangulator
+                        .as_ref()
+                        .map(|tri| tri.extract_stereo_samples(&matches));
 
                     let points = output
                         .keyframe
@@ -298,6 +294,16 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(samples) = surface_samples {
                             if let Some(pose) = output.pose.as_ref() {
                                 let stereo = dense_triangulator.as_ref().unwrap().stereo();
+                                let raw_frame_points: Vec<[f32; 3]> = samples
+                                    .iter()
+                                    .map(|sample| {
+                                        let z = sample.depth_m;
+                                        let x = (sample.u - stereo.left().cx) * z / stereo.fx();
+                                        let v = 0.5 * (sample.v + sample.right_v);
+                                        let y = (v - stereo.left().cy) * z / stereo.fy();
+                                        [x, y, z]
+                                    })
+                                    .collect();
                                 let surface = kiko_slam::generate_stable_surface_points(
                                     &samples,
                                     stereo.fx(),
@@ -312,10 +318,12 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 if let Err(err) = sink.log_surface_observations(
                                     left.timestamp(),
+                                    &raw_frame_points,
                                     &surface.points,
                                     &surface.stats,
                                     pose.cam_from_map_pose32(),
                                     &output.diagnostics,
+                                    output.keyframe.is_some(),
                                 ) {
                                     eprintln!("stable surface: {err}");
                                 }

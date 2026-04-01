@@ -286,15 +286,18 @@ impl RerunSink {
         Ok(())
     }
 
-    /// Log stable surface observations, fuse them into the surface belief map,
-    /// and emit the confirmed low-resolution voxel surface plus stability metrics.
+    /// Log stable surface observations, optionally fuse them into the surface
+    /// belief map, and emit the low-resolution voxel/debug surface plus
+    /// stability metrics.
     pub fn log_surface_observations(
         &mut self,
         timestamp: Timestamp,
+        raw_frame_points: &[[f32; 3]],
         points: &[crate::StableSurfacePoint],
         stats: &crate::StableSurfaceStats,
         cam_from_map: Pose,
         diagnostics: &FrameDiagnostics,
+        surface_integration_requested: bool,
     ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
         self.ensure_world_logged()?;
@@ -321,6 +324,14 @@ impl RerunSink {
         self.rec.log(
             "diagnostics/surface/points_capped",
             &rerun::Scalars::single(if stats.points_capped { 1.0 } else { 0.0 }),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/frame_gate/integration_requested",
+            &rerun::Scalars::single(if surface_integration_requested {
+                1.0
+            } else {
+                0.0
+            }),
         )?;
         if let Some(mean_sigma_m) = stats.mean_accepted_position_sigma_m {
             self.rec.log(
@@ -353,6 +364,7 @@ impl RerunSink {
             self.rec.log(path, &rerun::Scalars::single(value))?;
         }
         let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
+        self.log_surface_raw_frame_observations(cam_from_map, raw_frame_points, voxel_radius)?;
         self.log_surface_frame_candidates(
             cam_from_map,
             points,
@@ -360,7 +372,7 @@ impl RerunSink {
             voxel_radius,
         )?;
 
-        let integration = if gate.accepts_surface_integration() {
+        let integration = if surface_integration_requested && gate.accepts_surface_integration() {
             self.surface_map.integrate(points, cam_from_map)
         } else {
             crate::surface_map::SurfaceBatchIntegrationSummary::default()
@@ -585,6 +597,29 @@ impl RerunSink {
             )]);
         self.rec
             .log("world/stable_surface_debug/frame_candidates", &cloud)?;
+        Ok(())
+    }
+
+    fn log_surface_raw_frame_observations(
+        &self,
+        cam_from_map: Pose,
+        points: &[[f32; 3]],
+        voxel_radius: f32,
+    ) -> Result<(), VizLogError> {
+        let map_from_cam = cam_from_map.inverse();
+        let rotation = map_from_cam.rotation();
+        let translation = map_from_cam.translation();
+        let positions: Vec<[f32; 3]> = points
+            .iter()
+            .map(|point| crate::math::transform_point(rotation, translation, *point))
+            .collect();
+        let cloud = rerun::Points3D::new(positions)
+            .with_colors([rerun::Color::from_rgb(140, 180, 255)])
+            .with_radii([rerun::Radius::new_scene_units(
+                (voxel_radius * 0.45).max(0.0025),
+            )]);
+        self.rec
+            .log("world/stable_surface_debug/frame_raw_observations", &cloud)?;
         Ok(())
     }
 
@@ -1746,6 +1781,7 @@ mod tests {
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
             &[point],
             &StableSurfaceStats {
                 input_samples: 1,
@@ -1754,6 +1790,7 @@ mod tests {
             },
             Pose::identity(),
             &diagnostics,
+            true,
         )
         .expect("surface logging");
 
@@ -1784,6 +1821,7 @@ mod tests {
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
             &[point],
             &StableSurfaceStats {
                 input_samples: 1,
@@ -1792,6 +1830,7 @@ mod tests {
             },
             Pose::identity(),
             &diagnostics,
+            true,
         )
         .expect("surface logging");
 
@@ -1819,6 +1858,7 @@ mod tests {
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
             &[point],
             &StableSurfaceStats {
                 input_samples: 1,
@@ -1827,6 +1867,7 @@ mod tests {
             },
             Pose::identity(),
             &diagnostics,
+            true,
         )
         .expect("surface logging");
 
@@ -1854,6 +1895,7 @@ mod tests {
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
             &[point],
             &StableSurfaceStats {
                 input_samples: 1,
@@ -1862,10 +1904,16 @@ mod tests {
             },
             Pose::identity(),
             &diagnostics,
+            true,
         )
         .expect("surface logging");
 
         let entity_paths = recorded_entity_paths(storage);
+        assert!(
+            entity_paths
+                .iter()
+                .any(|path| path == "/world/stable_surface_debug/frame_raw_observations")
+        );
         assert!(
             entity_paths
                 .iter()
@@ -1875,6 +1923,83 @@ mod tests {
             entity_paths
                 .iter()
                 .any(|path| path == "/world/stable_surface_debug/pending_support_voxels")
+        );
+    }
+
+    #[test]
+    fn log_surface_observations_logs_raw_frame_observations_without_retained_candidates() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
+            &[],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 0,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+            false,
+        )
+        .expect("surface logging");
+
+        let entity_paths = recorded_entity_paths(storage);
+        assert!(
+            entity_paths
+                .iter()
+                .any(|path| path == "/world/stable_surface_debug/frame_raw_observations")
+        );
+    }
+
+    #[test]
+    fn log_surface_observations_visual_only_path_logs_candidates_without_mutating_map() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+        let point = StableSurfacePoint {
+            position: [0.0, 0.0, 2.0],
+            intensity: 180,
+            position_variance: 0.0025,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+            false,
+        )
+        .expect("surface logging");
+
+        assert_eq!(sink.surface_map.num_voxels(), 0);
+        let entity_paths = recorded_entity_paths(storage);
+        assert!(
+            entity_paths
+                .iter()
+                .any(|path| path == "/world/stable_surface_debug/frame_candidates")
         );
     }
 }
