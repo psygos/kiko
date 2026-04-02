@@ -31,8 +31,6 @@ use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
     DescriptorStats, PlaceRecognition, PlaceRecognitionEvent, PlaceRecognitionInitError,
 };
-#[cfg(feature = "vio")]
-use crate::pose_graph::{EssentialEdge, EssentialEdgeKind};
 use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
 use crate::{
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
@@ -1403,6 +1401,51 @@ fn adaptive_tracking_ransac_config(base: RansacConfig, observation_count: usize)
 }
 
 #[cfg(feature = "vio")]
+fn decide_vio_pose_adoption(
+    visual_metrics: &ProjectableTrackedPoseMetrics,
+    vio_metrics: &ProjectableTrackedPoseMetrics,
+) -> crate::VioProposalDisposition {
+    let shared = visual_metrics.shared_with(vio_metrics);
+    if shared.count < MIN_PNP_CORRESPONDENCES {
+        return crate::VioProposalDisposition::RejectedInsufficientSharedProjectableSupport;
+    }
+    if shared.count != visual_metrics.projectable_count()
+        || shared.count != vio_metrics.projectable_count()
+    {
+        return crate::VioProposalDisposition::RejectedChangedProjectableTrackedSupport;
+    }
+    match (shared.lhs_rmse_px, shared.rhs_rmse_px) {
+        (Some(visual_rmse_px), Some(vio_rmse_px)) if vio_rmse_px <= visual_rmse_px => {
+            crate::VioProposalDisposition::Adopted
+        }
+        (Some(_), Some(_)) => {
+            crate::VioProposalDisposition::RejectedHigherSharedProjectableTrackedReprojectionRmse
+        }
+        _ => crate::VioProposalDisposition::RejectedInsufficientSharedProjectableSupport,
+    }
+}
+
+#[cfg(feature = "vio")]
+fn should_adopt_visual_ba_proposal(
+    visual_metrics: &ProjectableTrackedPoseMetrics,
+    visual_ba_metrics: &ProjectableTrackedPoseMetrics,
+) -> bool {
+    let shared = visual_metrics.shared_with(visual_ba_metrics);
+    if shared.count < MIN_PNP_CORRESPONDENCES {
+        return false;
+    }
+    if shared.count != visual_metrics.projectable_count()
+        || shared.count != visual_ba_metrics.projectable_count()
+    {
+        return false;
+    }
+    matches!(
+        (shared.lhs_rmse_px, shared.rhs_rmse_px),
+        (Some(visual_rmse_px), Some(visual_ba_rmse_px)) if visual_ba_rmse_px <= visual_rmse_px
+    )
+}
+
+#[cfg(feature = "vio")]
 fn pose_odom_from_body_from_camera_pose(
     camera_from_odom: Pose64,
     camera_from_body: Pose64,
@@ -1427,7 +1470,6 @@ enum LocalEstimator {
 #[cfg(feature = "vio")]
 struct VioRuntime {
     camera_from_body: Pose64,
-    gravity: Gravity,
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
     predicted_state: Option<crate::NavState>,
@@ -1441,6 +1483,89 @@ struct VioRuntime {
     vio_window: Option<crate::local_ba::VioWindow>,
     /// Max window size before oldest frame rolls off.
     max_window: usize,
+}
+
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+enum PoseRefinementProposal {
+    None,
+    VisualBa(VisualBaPoseProposal),
+    Vio(VioPoseProposal),
+}
+
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+struct VisualBaPoseProposal {
+    pose_world: Pose,
+    optimized_ba: LocalBundleAdjuster,
+}
+
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+struct VioPoseProposal {
+    pose_world: Pose,
+    solve_result: crate::VioSolveResult,
+    optimized_state: crate::NavState,
+    optimized_window: crate::local_ba::VioWindow,
+}
+
+#[derive(Clone, Debug)]
+struct ProjectableTrackedPoseMetrics {
+    errors: Vec<Option<f32>>,
+}
+
+impl ProjectableTrackedPoseMetrics {
+    fn from_pose(pose: &Pose, observations: &[Observation], intrinsics: PinholeIntrinsics) -> Self {
+        Self {
+            errors: crate::pnp::reprojection_errors(pose, observations, intrinsics),
+        }
+    }
+
+    fn projectable_count(&self) -> usize {
+        self.errors.iter().filter(|error| error.is_some()).count()
+    }
+
+    fn rmse_px(&self) -> Option<f32> {
+        crate::pnp::reprojection_rmse(&self.errors)
+    }
+
+    fn max_px(&self) -> Option<f32> {
+        crate::pnp::reprojection_max(&self.errors)
+    }
+
+    fn mse_per_axis_px2(&self) -> Option<f64> {
+        crate::pnp::reprojection_mse_per_axis_px2(&self.errors)
+    }
+
+    #[cfg(all(test, feature = "vio"))]
+    fn from_errors(errors: Vec<Option<f32>>) -> Self {
+        Self { errors }
+    }
+
+    #[cfg(feature = "vio")]
+    fn shared_with(&self, other: &Self) -> SharedProjectableTrackedPoseMetrics {
+        let mut lhs = Vec::new();
+        let mut rhs = Vec::new();
+        for (lhs_error, rhs_error) in self.errors.iter().zip(&other.errors) {
+            if let (Some(lhs_px), Some(rhs_px)) = (lhs_error, rhs_error) {
+                lhs.push(Some(*lhs_px));
+                rhs.push(Some(*rhs_px));
+            }
+        }
+        SharedProjectableTrackedPoseMetrics {
+            count: lhs.len(),
+            lhs_rmse_px: crate::pnp::reprojection_rmse(&lhs),
+            rhs_rmse_px: crate::pnp::reprojection_rmse(&rhs),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug)]
+struct SharedProjectableTrackedPoseMetrics {
+    count: usize,
+    lhs_rmse_px: Option<f32>,
+    rhs_rmse_px: Option<f32>,
 }
 
 pub struct SlamTracker {
@@ -1513,7 +1638,6 @@ impl SlamTracker {
                 })?;
                 LocalEstimator::Inertial(Box::new(VioRuntime {
                     camera_from_body,
-                    gravity,
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
                     predicted_state: None,
@@ -1690,12 +1814,16 @@ impl SlamTracker {
         &mut self,
         pose_world: Pose,
         map_observations: Vec<MapObservation>,
-    ) -> Option<Pose> {
+    ) -> PoseRefinementProposal {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             // Visual-only mode
             return ObservationSet::new(map_observations, self.ba.min_observations())
                 .ok()
-                .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
+                .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
+                .map_or(
+                    PoseRefinementProposal::None,
+                    PoseRefinementProposal::VisualBa,
+                );
         };
 
         // Build NavState for this frame from visual pose
@@ -1724,17 +1852,21 @@ impl SlamTracker {
             Err(_) => {
                 return ObservationSet::new(map_observations, self.ba.min_observations())
                     .ok()
-                    .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
+                    .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
+                    .map_or(
+                        PoseRefinementProposal::None,
+                        PoseRefinementProposal::VisualBa,
+                    );
             }
         };
 
         // Preintegrate pending IMU
         let obs_set = match ObservationSet::new(map_observations, self.ba.min_observations()) {
             Ok(set) => set,
-            Err(_) => return None,
+            Err(_) => return PoseRefinementProposal::None,
         };
 
-        let preintegrated = match vio_runtime.pending_imu.drain_batch() {
+        let preintegrated = match vio_runtime.pending_imu.batch() {
             Ok(Some(batch)) if batch.len() >= 2 => {
                 crate::PreintegratedImu::integrate(&batch, &prev_bias, &vio_runtime.noise).ok()
             }
@@ -1743,9 +1875,10 @@ impl SlamTracker {
 
         let Some(preintegrated) = preintegrated else {
             // No IMU data — fall back to visual BA
-            return self
-                .ba
-                .push_frame(self.global_map.map(), pose_world, obs_set);
+            return self.propose_visual_ba_pose(pose_world, obs_set).map_or(
+                PoseRefinementProposal::None,
+                PoseRefinementProposal::VisualBa,
+            );
         };
 
         // Build or extend the VIO window
@@ -1756,6 +1889,7 @@ impl SlamTracker {
             let anchor = VioAnchor {
                 synced: SyncedPose::new(nav_state.clone()),
                 observations: obs_set,
+                anchor_velocity_odom_mps: nav_state.velocity_odom_mps(),
             };
             vio_runtime.vio_window = Some(VioWindow {
                 anchor,
@@ -1763,62 +1897,72 @@ impl SlamTracker {
             });
             vio_runtime.last_optimized_state = Some(nav_state.clone());
             vio_runtime.predicted_state = Some(nav_state);
-            return Some(pose_world);
+            vio_runtime.pending_imu.clear();
+            return PoseRefinementProposal::None;
         }
 
-        // Add successor frame
-        let window = vio_runtime.vio_window.as_mut().unwrap();
-        window.successors.push(VioSuccessor {
+        // Build a candidate window. It only becomes authoritative if the caller
+        // accepts the proposal against the visual metric on the same support.
+        let mut candidate_window = vio_runtime.vio_window.clone().unwrap();
+        candidate_window.successors.push(VioSuccessor {
             synced: SyncedPose::new(nav_state.clone()),
             observations: obs_set,
             preintegrated,
         });
 
         // Trim window
-        while window.len() > vio_runtime.max_window {
-            if window.successors.len() <= 1 {
+        while candidate_window.len() > vio_runtime.max_window {
+            if candidate_window.successors.len() <= 1 {
                 break;
             }
             // Promote second frame to anchor, drop first successor's preintegration
-            let old_succ = window.successors.remove(0);
-            window.anchor = VioAnchor {
+            let old_succ = candidate_window.successors.remove(0);
+            let anchor_velocity_odom_mps = old_succ.synced.nav_state().velocity_odom_mps();
+            candidate_window.anchor = VioAnchor {
                 synced: old_succ.synced,
                 observations: old_succ.observations,
+                anchor_velocity_odom_mps,
             };
         }
 
         // Run the VIO optimizer
-        let result = optimize_vio(window, &vio_runtime.solve_config, self.global_map.map());
+        let result = optimize_vio(
+            &mut candidate_window,
+            &vio_runtime.solve_config,
+            self.global_map.map(),
+        );
 
         // Extract optimized state from the last frame
-        let optimized = window
+        let optimized = candidate_window
             .successors
             .last()
-            .map(|s| s.synced.clone())
-            .unwrap_or_else(|| window.anchor.synced.clone());
-
-        vio_runtime.last_optimized_state = Some(optimized.nav_state().clone());
-        vio_runtime.predicted_state = Some(optimized.nav_state().clone());
+            .map(|s| s.synced.nav_state().clone())
+            .unwrap_or_else(|| candidate_window.anchor.synced.nav_state().clone());
 
         // Convert from NavState (T_odom_from_body) to camera-in-map
         // (T_cam_from_map) which is what the rest of the tracker expects.
         // T_cam_map = T_cam_body * inv(T_odom_body)  (map_from_odom = identity)
         let cam_from_map = vio_runtime
             .camera_from_body
-            .compose(optimized.nav_state().pose_odom_from_body().inverse())
+            .compose(optimized.pose_odom_from_body().inverse())
             .to_pose32();
 
         if self.trace_transitions {
-            let vel = optimized.nav_state().velocity_odom_mps();
-            let bias = optimized.nav_state().bias();
+            let vel = optimized.velocity_odom_mps();
+            let bias = optimized.bias();
             let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
             let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
             let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
             eprintln!(
-                "vio ba: frames={} iters={} cost={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
-                window.len(),
+                "vio ba: frames={} iters={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                candidate_window.len(),
                 result.iterations,
                 result.final_cost,
+                result.cost_breakdown.reprojection_cost,
+                result.cost_breakdown.imu_cost,
+                result.cost_breakdown.velocity_anchor_cost,
+                result.cost_breakdown.bias_random_walk_cost,
+                result.cost_breakdown.bias_prior_cost,
                 vel[0],
                 vel[1],
                 vel[2],
@@ -1830,7 +1974,43 @@ impl SlamTracker {
             );
         }
 
-        Some(cam_from_map)
+        PoseRefinementProposal::Vio(VioPoseProposal {
+            pose_world: cam_from_map,
+            solve_result: result,
+            optimized_state: optimized,
+            optimized_window: candidate_window,
+        })
+    }
+
+    #[cfg(feature = "vio")]
+    fn propose_visual_ba_pose(
+        &self,
+        pose_world: Pose,
+        observations: ObservationSet,
+    ) -> Option<VisualBaPoseProposal> {
+        let mut candidate_ba = self.ba.clone();
+        candidate_ba
+            .push_frame(self.global_map.map(), pose_world, observations)
+            .map(|refined_pose| VisualBaPoseProposal {
+                pose_world: refined_pose,
+                optimized_ba: candidate_ba,
+            })
+    }
+
+    #[cfg(feature = "vio")]
+    fn commit_visual_ba_proposal(&mut self, proposal: VisualBaPoseProposal) {
+        self.ba = proposal.optimized_ba;
+    }
+
+    #[cfg(feature = "vio")]
+    fn commit_vio_proposal(&mut self, proposal: VioPoseProposal) {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            return;
+        };
+        vio_runtime.last_optimized_state = Some(proposal.optimized_state.clone());
+        vio_runtime.predicted_state = Some(proposal.optimized_state);
+        vio_runtime.vio_window = Some(proposal.optimized_window);
+        vio_runtime.pending_imu.clear();
     }
 
     #[cfg(feature = "vio")]
@@ -2789,15 +2969,98 @@ impl SlamTracker {
             result.inliers.len() as f32 / keyframe.landmarks().len() as f32
         };
 
-        let pose_world = result.pose;
+        let visual_pose_world = result.pose;
         #[cfg(feature = "vio")]
-        let refined_world = self.run_vio_or_visual_ba(pose_world, map_observations);
+        let refinement = self.run_vio_or_visual_ba(visual_pose_world, map_observations);
         #[cfg(not(feature = "vio"))]
         let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()
-            .and_then(|set| self.ba.push_frame(self.global_map.map(), pose_world, set));
-
-        let pose_world = refined_world.unwrap_or(pose_world);
+            .and_then(|set| {
+                self.ba
+                    .push_frame(self.global_map.map(), visual_pose_world, set)
+            });
+        #[cfg(not(feature = "vio"))]
+        let pose_world = refined_world.unwrap_or(visual_pose_world);
+        #[cfg(not(feature = "vio"))]
+        let tracking_pose_source = if refined_world.is_some() {
+            crate::TrackingPoseSource::VisualBundleAdjustment
+        } else {
+            crate::TrackingPoseSource::VisualTracking
+        };
+        #[cfg(feature = "vio")]
+        let intrinsics = self.frontend.intrinsics();
+        #[cfg(feature = "vio")]
+        let visual_proposal_metrics = ProjectableTrackedPoseMetrics::from_pose(
+            &visual_pose_world,
+            &tracked_observations.observations,
+            intrinsics,
+        );
+        #[cfg(feature = "vio")]
+        let (
+            pose_world,
+            tracking_pose_source,
+            vio_proposal_disposition,
+            vio_proposal_metrics,
+            vio_solve_result,
+        ) = match refinement {
+            PoseRefinementProposal::None => (
+                visual_pose_world,
+                crate::TrackingPoseSource::VisualTracking,
+                crate::VioProposalDisposition::NotRun,
+                None,
+                None,
+            ),
+            PoseRefinementProposal::VisualBa(proposal) => {
+                let visual_ba_metrics = ProjectableTrackedPoseMetrics::from_pose(
+                    &proposal.pose_world,
+                    &tracked_observations.observations,
+                    intrinsics,
+                );
+                if should_adopt_visual_ba_proposal(&visual_proposal_metrics, &visual_ba_metrics) {
+                    let adopted_pose = proposal.pose_world;
+                    self.commit_visual_ba_proposal(proposal);
+                    (
+                        adopted_pose,
+                        crate::TrackingPoseSource::VisualBundleAdjustment,
+                        crate::VioProposalDisposition::NotRun,
+                        None,
+                        None,
+                    )
+                } else {
+                    (
+                        visual_pose_world,
+                        crate::TrackingPoseSource::VisualTracking,
+                        crate::VioProposalDisposition::NotRun,
+                        None,
+                        None,
+                    )
+                }
+            }
+            PoseRefinementProposal::Vio(proposal) => {
+                let vio_metrics = ProjectableTrackedPoseMetrics::from_pose(
+                    &proposal.pose_world,
+                    &tracked_observations.observations,
+                    intrinsics,
+                );
+                let disposition = decide_vio_pose_adoption(&visual_proposal_metrics, &vio_metrics);
+                let vio_solve_result = proposal.solve_result.clone();
+                let (adopted_pose, source) =
+                    if disposition == crate::VioProposalDisposition::Adopted {
+                        let adopted_pose = proposal.pose_world;
+                        self.commit_vio_proposal(proposal);
+                        (adopted_pose, crate::TrackingPoseSource::VioRefined)
+                    } else {
+                        (visual_pose_world, crate::TrackingPoseSource::VisualTracking)
+                    };
+                (
+                    adopted_pose,
+                    source,
+                    disposition,
+                    Some(vio_metrics),
+                    Some(vio_solve_result),
+                )
+            }
+        };
         if self.consecutive_tracking_failures > 0 {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
@@ -2812,9 +3075,6 @@ impl SlamTracker {
         let mut keyframe_status = None;
         let mut triangulation_stats = None;
         let mut ba_result = None;
-        #[cfg(feature = "vio")]
-        let mut vio_measurement_consumed = false;
-
         let keyframe_decision =
             self.config
                 .keyframe_policy
@@ -2861,10 +3121,6 @@ impl SlamTracker {
                 Some(shared),
                 Some(tracked_observations.observations.clone()),
             ) {
-                #[cfg(feature = "vio")]
-                {
-                    vio_measurement_consumed = true;
-                }
                 keyframe_status = Some(KeyframeStatus::Created);
                 triangulation_stats = keyframe_output.diagnostics.triangulation;
                 ba_result = keyframe_output.diagnostics.ba_result.clone();
@@ -2979,16 +3235,14 @@ impl SlamTracker {
             }
         }
 
+        #[cfg(not(feature = "vio"))]
         let intrinsics = self.frontend.intrinsics();
-        let tracked_errors = crate::pnp::reprojection_errors(
+        let tracked_metrics = ProjectableTrackedPoseMetrics::from_pose(
             &pose_world,
             &tracked_observations.observations,
             intrinsics,
         );
-        let projectable_tracked_observations = tracked_errors
-            .iter()
-            .filter(|error| error.is_some())
-            .count();
+        let projectable_tracked_observations = tracked_metrics.projectable_count();
         let inlier_errors =
             crate::pnp::reprojection_errors(&pose_world, &inlier_observations, intrinsics);
         // VIO visual correction will be handled by tightly-coupled BA (M2).
@@ -3003,28 +3257,90 @@ impl SlamTracker {
         diagnostics.pnp_tracked_observations = Some(crate::PnpTrackedObservationCountMetric::new(
             tracked_observations.len(),
         ));
+        diagnostics.tracking_pose_source = Some(tracking_pose_source);
         diagnostics.pnp_projectable_tracked_observations =
             Some(crate::PnpProjectableTrackedObservationCountMetric::new(
                 projectable_tracked_observations,
             ));
         diagnostics.ransac_iterations = Some(result.iterations);
         diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
-            crate::pnp::reprojection_rmse(&tracked_errors).map(|value| {
+            tracked_metrics.rmse_px().map(|value| {
                 crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
                     .expect("projectable tracked reprojection RMSE must be finite and non-negative")
             });
         diagnostics.pnp_projectable_tracked_observation_reprojection_max_px =
-            crate::pnp::reprojection_max(&tracked_errors).map(|value| {
+            tracked_metrics.max_px().map(|value| {
                 crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
                     .expect("projectable tracked reprojection max must be finite and non-negative")
             });
         diagnostics.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2 =
-            crate::pnp::reprojection_mse_per_axis_px2(&tracked_errors).map(|value| {
+            tracked_metrics.mse_per_axis_px2().map(|value| {
                 crate::PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric::new(value)
                     .expect(
                         "projectable tracked reprojection MSE per axis must be finite and non-negative",
                     )
             });
+        #[cfg(feature = "vio")]
+        {
+            diagnostics.visual_proposal_projectable_tracked_observations = Some(
+                crate::VisualProposalProjectableTrackedObservationCountMetric::new(
+                    visual_proposal_metrics.projectable_count(),
+                ),
+            );
+            diagnostics.visual_proposal_projectable_tracked_observation_reprojection_rmse_px =
+                visual_proposal_metrics.rmse_px().map(|value| {
+                    crate::VisualProposalProjectableTrackedObservationPixelResidualMetric::new(
+                        value,
+                    )
+                    .expect(
+                        "visual proposal tracked reprojection RMSE must be finite and non-negative",
+                    )
+                });
+            diagnostics.vio_proposal_disposition = Some(vio_proposal_disposition);
+            diagnostics.vio_solve_result = vio_solve_result;
+            if let Some(vio_metrics) = vio_proposal_metrics.as_ref() {
+                let shared_metrics = visual_proposal_metrics.shared_with(vio_metrics);
+                diagnostics.vio_proposal_projectable_tracked_observations = Some(
+                    crate::VioProposalProjectableTrackedObservationCountMetric::new(
+                        vio_metrics.projectable_count(),
+                    ),
+                );
+                diagnostics.vio_proposal_projectable_tracked_observation_reprojection_rmse_px =
+                    vio_metrics.rmse_px().map(|value| {
+                        crate::VioProposalProjectableTrackedObservationPixelResidualMetric::new(
+                            value,
+                        )
+                        .expect(
+                            "VIO proposal tracked reprojection RMSE must be finite and non-negative",
+                        )
+                    });
+                diagnostics.shared_projectable_tracked_observations = Some(
+                    crate::VisualVsVioSharedProjectableTrackedObservationCountMetric::new(
+                        shared_metrics.count,
+                    ),
+                );
+                diagnostics
+                    .visual_proposal_shared_projectable_tracked_observation_reprojection_rmse_px =
+                    shared_metrics.lhs_rmse_px.map(|value| {
+                        crate::VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(
+                            value,
+                        )
+                        .expect(
+                            "visual shared tracked reprojection RMSE must be finite and non-negative",
+                        )
+                    });
+                diagnostics
+                    .vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px =
+                    shared_metrics.rhs_rmse_px.map(|value| {
+                        crate::VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(
+                            value,
+                        )
+                        .expect(
+                            "VIO shared tracked reprojection RMSE must be finite and non-negative",
+                        )
+                    });
+            }
+        }
         diagnostics.pnp_inlier_reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors)
             .map(|value| {
                 crate::PnpAcceptedInlierPixelResidualMetric::new(value)
@@ -3483,7 +3799,7 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "vio")]
-    use crate::{Gravity, ImuBias, MapFromOdom, NavState, Pose64};
+    use crate::{MapFromOdom, Pose64};
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
@@ -4978,5 +5294,52 @@ mod tests {
             recovered.to_pose32().rotation(),
             cam_from_odom.to_pose32().rotation()
         );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_pose_adoption_rejects_changed_projectable_support_even_when_counts_match() {
+        let visual = ProjectableTrackedPoseMetrics::from_errors(vec![
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            None,
+        ]);
+        let vio = ProjectableTrackedPoseMetrics::from_errors(vec![
+            None,
+            Some(0.1),
+            Some(0.1),
+            Some(0.1),
+            Some(0.1),
+            Some(0.1),
+        ]);
+        assert_eq!(
+            decide_vio_pose_adoption(&visual, &vio),
+            crate::VioProposalDisposition::RejectedChangedProjectableTrackedSupport
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn visual_ba_adoption_requires_exact_projectable_support_match() {
+        let visual = ProjectableTrackedPoseMetrics::from_errors(vec![
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            None,
+        ]);
+        let visual_ba = ProjectableTrackedPoseMetrics::from_errors(vec![
+            None,
+            Some(0.1),
+            Some(0.1),
+            Some(0.1),
+            Some(0.1),
+            Some(0.1),
+        ]);
+        assert!(!should_adopt_visual_ba_proposal(&visual, &visual_ba));
     }
 }

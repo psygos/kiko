@@ -411,7 +411,7 @@ impl MapObservation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ObservationSet {
     observations: Vec<MapObservation>,
 }
@@ -468,7 +468,7 @@ impl ResolvedObservationSet {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct BaFrame {
     pose: Pose,
     observations: ObservationSet,
@@ -497,22 +497,13 @@ const VIO_STATE_DIM: usize = 15;
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub(crate) struct SyncedPose {
-    pub(crate) f32_pose: Pose,
     pub(crate) nav_state: crate::NavState,
 }
 
 #[cfg(feature = "vio")]
 impl SyncedPose {
     pub(crate) fn new(nav_state: crate::NavState) -> Self {
-        let f32_pose = nav_state.pose_odom_from_body().to_pose32();
-        Self {
-            f32_pose,
-            nav_state,
-        }
-    }
-
-    pub(crate) fn pose(&self) -> Pose {
-        self.f32_pose
+        Self { nav_state }
     }
 
     pub(crate) fn nav_state(&self) -> &crate::NavState {
@@ -529,16 +520,17 @@ impl SyncedPose {
 /// The first frame in a VIO window. Has no predecessor, hence no preintegration.
 /// Carries an anchor prior on velocity and bias.
 #[cfg(feature = "vio")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VioAnchor {
     pub(crate) synced: SyncedPose,
     pub(crate) observations: ObservationSet,
+    pub(crate) anchor_velocity_odom_mps: [f64; 3],
 }
 
 /// A successor frame in a VIO window. Always has a PreintegratedImu from
 /// its immediate predecessor — this is structural, not optional.
 #[cfg(feature = "vio")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VioSuccessor {
     pub(crate) synced: SyncedPose,
     pub(crate) observations: ObservationSet,
@@ -655,7 +647,7 @@ impl VioSolveConfig {
 /// - All frames carry NavState (no visual-only frames)
 /// - The Hessian dimension is `(1 + successors.len()) * VIO_STATE_DIM`
 #[cfg(feature = "vio")]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VioWindow {
     pub(crate) anchor: VioAnchor,
     pub(crate) successors: Vec<VioSuccessor>,
@@ -668,19 +660,12 @@ impl VioWindow {
         1 + self.successors.len()
     }
 
-    /// Dimension of the reduced state (frames only, landmarks eliminated).
-    fn state_dim(&self) -> usize {
-        self.len() * VIO_STATE_DIM
-    }
-
-    /// Access anchor (frame 0).
-    fn anchor(&self) -> &VioAnchor {
-        &self.anchor
-    }
-
-    /// Access successor frame by index (0 = first successor, i.e. frame 1).
-    fn successor(&self, index: usize) -> Option<&VioSuccessor> {
-        self.successors.get(index)
+    fn observations(&self, frame_idx: usize) -> &ObservationSet {
+        if frame_idx == 0 {
+            &self.anchor.observations
+        } else {
+            &self.successors[frame_idx - 1].observations
+        }
     }
 
     /// Iterate all synced poses in window order.
@@ -691,11 +676,34 @@ impl VioWindow {
 
 /// Output from a VIO BA solve. Contains the refined state for all frames.
 #[cfg(feature = "vio")]
-#[derive(Debug)]
+#[derive(Clone, Debug, Default)]
+pub struct VioCostBreakdown {
+    pub reprojection_cost: f64,
+    pub imu_cost: f64,
+    pub bias_random_walk_cost: f64,
+    pub velocity_anchor_cost: f64,
+    pub bias_prior_cost: f64,
+}
+
+#[cfg(feature = "vio")]
+impl VioCostBreakdown {
+    pub fn total_cost(&self) -> f64 {
+        self.reprojection_cost
+            + self.imu_cost
+            + self.bias_random_walk_cost
+            + self.velocity_anchor_cost
+            + self.bias_prior_cost
+    }
+}
+
+/// Output from a VIO BA solve. Contains the refined state for all frames.
+#[cfg(feature = "vio")]
+#[derive(Clone, Debug)]
 pub struct VioSolveResult {
     pub converged: bool,
     pub iterations: usize,
     pub final_cost: f64,
+    pub cost_breakdown: VioCostBreakdown,
     /// Approximate posterior translation standard deviation for the last
     /// frame, extracted from the Hessian diagonal. In meters.
     /// This is the local linearization uncertainty — not a full posterior
@@ -1044,7 +1052,7 @@ struct LandmarkSchur {
     links: Vec<PoseLandmarkCross>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LocalBundleAdjuster {
     config: LocalBaConfig,
     intrinsics: PinholeIntrinsics,
@@ -1477,297 +1485,49 @@ pub fn optimize_vio(
     config: &VioSolveConfig,
     map: &SlamMap,
 ) -> VioSolveResult {
-    use crate::vio::solve::{
-        BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor,
-        accumulate_factor, imu_jacobians, solve_dense_f64,
-    };
-    use crate::{ImuFactor, bias_random_walk_residual};
+    use crate::vio::solve::solve_dense_f64;
 
     let n_frames = window.len();
-    let dim = n_frames * STATE_DIM;
+    let dim = n_frames * VIO_STATE_DIM;
     if n_frames < 2 {
         return VioSolveResult {
             converged: true,
             iterations: 0,
             final_cost: 0.0,
+            cost_breakdown: VioCostBreakdown::default(),
             last_frame_translation_sigma: None,
         };
     }
 
-    // Preallocate Hessian and RHS
-    let mut hessian = vec![0.0_f64; dim * dim];
-    let mut rhs = vec![0.0_f64; dim];
-
     let max_iters = config.max_iterations.get();
     let mut lambda = f64::from(config.lm.initial_lambda);
-    let mut prev_cost = f64::MAX;
+    let mut synced = window.synced_poses().cloned().collect::<Vec<_>>();
+    let mut linearization = linearize_vio_states(window, &synced, config, map);
+    let mut current_cost = linearization.cost_breakdown.total_cost();
+    let mut converged = false;
+    let mut attempted_iterations = 0;
 
     for iteration in 0..max_iters {
-        // Clear
-        hessian.fill(0.0);
-        rhs.fill(0.0);
+        attempted_iterations = iteration + 1;
 
-        let mut total_cost = 0.0;
-
-        // --- 1. Reprojection factors ---
-        // Compute T_cam_from_map from NavState for each frame.
-        // T_cam_map = T_cam_body * inv(T_odom_body)  (assuming map_from_odom = identity)
-        // Jacobians computed numerically w.r.t. the 15D NavState tangent to
-        // avoid chain-rule errors through the composition.
-        for (frame_idx, synced) in window.synced_poses().enumerate() {
-            let obs_set = if frame_idx == 0 {
-                &window.anchor().observations
-            } else {
-                &window.successors[frame_idx - 1].observations
-            };
-            let base = frame_idx * STATE_DIM;
-            let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body);
-            if let Some(resolved) =
-                obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap())
-            {
-                for obs in resolved.observations() {
-                    let world = obs.world();
-                    let pixel = obs.pixel();
-                    // Compute residual at current state
-                    let Some((residual, _, _)) = reprojection_residual_and_jacobians(
-                        cam_pose,
-                        world,
-                        pixel,
-                        config.intrinsics,
-                    ) else {
-                        continue;
-                    };
-                    let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                    let huber_delta = config.huber_delta_px as f32;
-                    let (huber_weight, huber_cost) = if r_norm <= huber_delta {
-                        (1.0_f32, 0.5 * r_norm * r_norm)
-                    } else {
-                        (
-                            huber_delta / r_norm,
-                            huber_delta * (r_norm - 0.5 * huber_delta),
-                        )
-                    };
-                    total_cost += f64::from(huber_cost);
-                    let sqrt_w = huber_weight.sqrt();
-
-                    // Numerical Jacobian of 2D reprojection w.r.t. 15D NavState.
-                    // The reprojection computation uses f32, so the FD step must
-                    // be large enough to survive f32 quantization (~1e-7 relative).
-                    // At typical depths (1-5m), a 1e-4 pose perturbation produces
-                    // a ~0.04px change, well above f32 noise.
-                    const FD_EPS: f64 = 1e-4;
-                    let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
-                    for axis in 0..6 {
-                        // Only pose (first 6D) affects reprojection
-                        let mut delta_plus = [0.0_f64; STATE_DIM];
-                        let mut delta_minus = [0.0_f64; STATE_DIM];
-                        delta_plus[axis] = FD_EPS;
-                        delta_minus[axis] = -FD_EPS;
-                        let (Ok(s_plus), Ok(s_minus)) = (
-                            synced.nav_state().retract(&delta_plus),
-                            synced.nav_state().retract(&delta_minus),
-                        ) else {
-                            continue;
-                        };
-                        let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body);
-                        let p_minus = vio_cam_from_map(&s_minus, config.camera_from_body);
-                        if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
-                            reprojection_residual_and_jacobians(
-                                p_plus,
-                                world,
-                                pixel,
-                                config.intrinsics,
-                            ),
-                            reprojection_residual_and_jacobians(
-                                p_minus,
-                                world,
-                                pixel,
-                                config.intrinsics,
-                            ),
-                        ) {
-                            for row in 0..2 {
-                                j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
-                                    / (2.0 * FD_EPS)
-                                    * f64::from(sqrt_w);
-                            }
-                        }
-                    }
-                    let r_f64 = [
-                        f64::from(residual[0] * sqrt_w),
-                        f64::from(residual[1] * sqrt_w),
-                    ];
-                    let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
-                    accumulate_factor(
-                        &mut hessian,
-                        &mut rhs,
-                        dim,
-                        &j_15,
-                        &identity_2,
-                        &r_f64,
-                        base,
-                    );
-                }
-            }
-        }
-
-        // --- 2. IMU preintegration factors ---
-        for (succ_idx, successor) in window.successors.iter().enumerate() {
-            let prev_state = if succ_idx == 0 {
-                window.anchor().synced.nav_state()
-            } else {
-                window.successors[succ_idx - 1].synced.nav_state()
-            };
-            let curr_state = successor.synced.nav_state();
-            let preint = &successor.preintegrated;
-            let gravity = config.gravity();
-
-            let residual = ImuFactor::residual(prev_state, curr_state, preint, &gravity);
-            let info = preint.residual_information();
-            let (j_prev, j_curr) = imu_jacobians(prev_state, curr_state, preint, gravity);
-
-            // IMU cost: r^T Ω r
-            let mut imu_cost = 0.0;
-            for i in 0..IMU_RESIDUAL_DIM {
-                for j in 0..IMU_RESIDUAL_DIM {
-                    imu_cost += residual[i] * info[i][j] * residual[j];
-                }
-            }
-            total_cost += 0.5 * imu_cost;
-
-            let base_prev = succ_idx * STATE_DIM; // frame index of predecessor
-            let base_curr = (succ_idx + 1) * STATE_DIM;
-
-            // Self-terms
-            accumulate_factor(
-                &mut hessian,
-                &mut rhs,
-                dim,
-                &j_prev,
-                &info,
-                &residual,
-                base_prev,
-            );
-            accumulate_factor(
-                &mut hessian,
-                &mut rhs,
-                dim,
-                &j_curr,
-                &info,
-                &residual,
-                base_curr,
-            );
-            // Cross-term
-            accumulate_cross_factor(
-                &mut hessian,
-                dim,
-                &j_prev,
-                &j_curr,
-                &info,
-                base_prev,
-                base_curr,
-            );
-        }
-
-        // --- 3. Bias random walk factors ---
-        for (succ_idx, successor) in window.successors.iter().enumerate() {
-            let prev_state = if succ_idx == 0 {
-                window.anchor().synced.nav_state()
-            } else {
-                window.successors[succ_idx - 1].synced.nav_state()
-            };
-            let curr_state = successor.synced.nav_state();
-            let preint = &successor.preintegrated;
-
-            let bias_residual = bias_random_walk_residual(prev_state, curr_state);
-            let bias_info = preint.bias_random_walk_information();
-
-            // Cost
-            let mut bias_cost = 0.0;
-            for i in 0..BIAS_RW_RESIDUAL_DIM {
-                for j in 0..BIAS_RW_RESIDUAL_DIM {
-                    bias_cost += bias_residual[i] * bias_info[i][j] * bias_residual[j];
-                }
-            }
-            total_cost += 0.5 * bias_cost;
-
-            let base_prev = succ_idx * STATE_DIM;
-            let base_curr = (succ_idx + 1) * STATE_DIM;
-
-            // Bias Jacobians: J_prev = -I at [9:15], J_curr = +I at [9:15]
-            for a in 0..BIAS_RW_RESIDUAL_DIM {
-                let mut omega_r = 0.0;
-                for b in 0..BIAS_RW_RESIDUAL_DIM {
-                    let w = bias_info[a][b];
-                    // H_ii += Omega (both +I^T * Omega * +I and -I^T * Omega * -I = Omega)
-                    hessian[(base_prev + 9 + a) * dim + (base_prev + 9 + b)] += w;
-                    hessian[(base_curr + 9 + a) * dim + (base_curr + 9 + b)] += w;
-                    // H_ij = (-I)^T * Omega * (+I) = -Omega
-                    hessian[(base_prev + 9 + a) * dim + (base_curr + 9 + b)] -= w;
-                    hessian[(base_curr + 9 + b) * dim + (base_prev + 9 + a)] -= w;
-                    omega_r += w * bias_residual[b];
-                }
-                // g_prev = J_prev^T * Omega * r = (-I)^T * Omega * r = -Omega*r
-                rhs[base_prev + 9 + a] -= omega_r;
-                // g_curr = J_curr^T * Omega * r = (+I)^T * Omega * r = +Omega*r
-                rhs[base_curr + 9 + a] += omega_r;
-            }
-        }
-
-        // --- 4. Bias prior on ALL frames toward calibrated values ---
-        // This prevents bias from diverging. The prior is soft (weight = anchor_bias_info)
-        // and pulls each frame's bias toward the calibrated reference.
-        // Without this, the optimizer uses bias as a free variable to absorb any
-        // residual, which makes it diverge to hundreds of m/s².
-        {
-            let bias_info_w = config.anchor_bias_info;
-            let calib_accel = config.calibrated_accel_bias;
-            let calib_gyro = config.calibrated_gyro_bias;
-            for frame_idx in 0..n_frames {
-                let base = frame_idx * STATE_DIM;
-                let state = if frame_idx == 0 {
-                    window.anchor().synced.nav_state()
-                } else {
-                    window.successors[frame_idx - 1].synced.nav_state()
-                };
-                let bias = state.bias();
-                // r_bias_accel = bias_accel - calib_accel, info = diag(bias_info_w)
-                // g = info * r, H += info
-                for a in 0..3 {
-                    let r_a = bias.accel[a] - calib_accel[a];
-                    hessian[(base + 9 + a) * dim + (base + 9 + a)] += bias_info_w;
-                    rhs[base + 9 + a] += bias_info_w * r_a;
-                    total_cost += 0.5 * bias_info_w * r_a * r_a;
-
-                    let r_g = bias.gyro[a] - calib_gyro[a];
-                    hessian[(base + 12 + a) * dim + (base + 12 + a)] += bias_info_w;
-                    rhs[base + 12 + a] += bias_info_w * r_g;
-                    total_cost += 0.5 * bias_info_w * r_g * r_g;
-                }
-            }
-        }
-
-        // --- 5. LM damping ---
+        let mut h_solve = linearization.hessian.clone();
         for i in 0..dim {
-            hessian[i * dim + i] += lambda;
+            h_solve[i * dim + i] += lambda;
         }
-
-        // --- 6. Solve H δ = -g ---
-        let mut h_solve = hessian.clone();
-        let mut neg_g: Vec<f64> = rhs.iter().map(|v| -v).collect();
+        let mut neg_g: Vec<f64> = linearization.rhs.iter().map(|v| -v).collect();
         if !solve_dense_f64(&mut h_solve, &mut neg_g, dim) {
             lambda *= f64::from(config.lm.lambda_factor);
             continue;
         }
-        let delta = neg_g; // solution is now in neg_g
+        let delta = neg_g;
 
-        // --- 7. Retract candidate ---
-        let mut candidate_synced: Vec<SyncedPose> = Vec::with_capacity(n_frames);
+        let mut candidate_synced = Vec::with_capacity(n_frames);
         let mut retract_ok = true;
-        for (frame_idx, synced) in window.synced_poses().enumerate() {
-            let base = frame_idx * STATE_DIM;
-            let mut tangent = [0.0_f64; STATE_DIM];
-            tangent.copy_from_slice(&delta[base..base + STATE_DIM]);
-            match synced.retract(&tangent) {
+        for (frame_idx, synced_pose) in synced.iter().enumerate() {
+            let base = frame_idx * VIO_STATE_DIM;
+            let mut tangent = [0.0_f64; VIO_STATE_DIM];
+            tangent.copy_from_slice(&delta[base..base + VIO_STATE_DIM]);
+            match synced_pose.retract(&tangent) {
                 Ok(new_synced) => candidate_synced.push(new_synced),
                 Err(_) => {
                     retract_ok = false;
@@ -1780,50 +1540,269 @@ pub fn optimize_vio(
             continue;
         }
 
-        // --- 8. Accept/reject ---
-        // total_cost is the cost at the current linearization point.
-        // On the first iteration, accept unconditionally (no previous cost).
-        // On subsequent iterations, accept only if cost decreased.
-        if iteration == 0 {
-            // First iteration: always accept, record baseline cost
-            window.anchor.synced = candidate_synced[0].clone();
-            for (i, succ) in window.successors.iter_mut().enumerate() {
-                succ.synced = candidate_synced[i + 1].clone();
-            }
-            prev_cost = total_cost;
-            lambda *= f64::from(config.lm.lambda_factor).recip().max(0.1);
-        } else if total_cost < prev_cost {
-            // Cost decreased: accept step, decrease damping
-            window.anchor.synced = candidate_synced[0].clone();
-            for (i, succ) in window.successors.iter_mut().enumerate() {
-                succ.synced = candidate_synced[i + 1].clone();
-            }
+        let candidate_linearization = linearize_vio_states(window, &candidate_synced, config, map);
+        let candidate_cost = candidate_linearization.cost_breakdown.total_cost();
+        if candidate_cost < current_cost {
             let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
-            let cost_decrease = prev_cost - total_cost;
-            prev_cost = total_cost;
-            lambda = (lambda * 0.3).max(f64::from(config.lm.min_lambda));
-
-            if step_norm < 1e-6 && cost_decrease < 1e-10 * total_cost.max(1e-12) {
-                let sigma = extract_last_frame_translation_sigma(&hessian, dim, n_frames);
-                return VioSolveResult {
-                    converged: true,
-                    iterations: iteration + 1,
-                    final_cost: total_cost,
-                    last_frame_translation_sigma: sigma,
-                };
+            let cost_decrease = current_cost - candidate_cost;
+            synced = candidate_synced;
+            linearization = candidate_linearization;
+            current_cost = candidate_cost;
+            lambda =
+                (lambda / f64::from(config.lm.lambda_factor)).max(f64::from(config.lm.min_lambda));
+            if step_norm < 1e-6 && cost_decrease < 1e-10 * current_cost.max(1e-12) {
+                converged = true;
+                break;
             }
         } else {
-            // Cost increased: reject step, increase damping
             lambda *= f64::from(config.lm.lambda_factor);
         }
     }
 
-    let sigma = extract_last_frame_translation_sigma(&hessian, dim, n_frames);
+    window.anchor.synced = synced[0].clone();
+    for (i, succ) in window.successors.iter_mut().enumerate() {
+        succ.synced = synced[i + 1].clone();
+    }
+
+    let sigma = extract_last_frame_translation_sigma(&linearization.hessian, dim, n_frames);
     VioSolveResult {
-        converged: false,
-        iterations: max_iters,
-        final_cost: prev_cost,
+        converged,
+        iterations: attempted_iterations,
+        final_cost: current_cost,
+        cost_breakdown: linearization.cost_breakdown,
         last_frame_translation_sigma: sigma,
+    }
+}
+
+#[cfg(feature = "vio")]
+struct VioLinearization {
+    hessian: Vec<f64>,
+    rhs: Vec<f64>,
+    cost_breakdown: VioCostBreakdown,
+}
+
+#[cfg(feature = "vio")]
+fn linearize_vio_states(
+    window: &VioWindow,
+    states: &[SyncedPose],
+    config: &VioSolveConfig,
+    map: &SlamMap,
+) -> VioLinearization {
+    use crate::vio::solve::{
+        BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor,
+        accumulate_factor, imu_jacobians,
+    };
+    use crate::{ImuFactor, bias_random_walk_residual};
+
+    debug_assert_eq!(states.len(), window.len());
+    let n_frames = window.len();
+    let dim = n_frames * STATE_DIM;
+    let mut hessian = vec![0.0_f64; dim * dim];
+    let mut rhs = vec![0.0_f64; dim];
+    let mut cost_breakdown = VioCostBreakdown::default();
+
+    for (frame_idx, synced) in states.iter().enumerate() {
+        let obs_set = window.observations(frame_idx);
+        let base = frame_idx * STATE_DIM;
+        let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body);
+        if let Some(resolved) =
+            obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap())
+        {
+            for obs in resolved.observations() {
+                let world = obs.world();
+                let pixel = obs.pixel();
+                let Some((residual, _, _)) =
+                    reprojection_residual_and_jacobians(cam_pose, world, pixel, config.intrinsics)
+                else {
+                    continue;
+                };
+                let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                let huber_delta = config.huber_delta_px as f32;
+                let (huber_weight, huber_cost) = if r_norm <= huber_delta {
+                    (1.0_f32, 0.5 * r_norm * r_norm)
+                } else {
+                    (
+                        huber_delta / r_norm,
+                        huber_delta * (r_norm - 0.5 * huber_delta),
+                    )
+                };
+                cost_breakdown.reprojection_cost += f64::from(huber_cost);
+                let sqrt_w = huber_weight.sqrt();
+
+                const FD_EPS: f64 = 1e-4;
+                let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
+                for axis in 0..6 {
+                    let mut delta_plus = [0.0_f64; STATE_DIM];
+                    let mut delta_minus = [0.0_f64; STATE_DIM];
+                    delta_plus[axis] = FD_EPS;
+                    delta_minus[axis] = -FD_EPS;
+                    let (Ok(s_plus), Ok(s_minus)) = (
+                        synced.nav_state().retract(&delta_plus),
+                        synced.nav_state().retract(&delta_minus),
+                    ) else {
+                        continue;
+                    };
+                    let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body);
+                    let p_minus = vio_cam_from_map(&s_minus, config.camera_from_body);
+                    if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
+                        reprojection_residual_and_jacobians(
+                            p_plus,
+                            world,
+                            pixel,
+                            config.intrinsics,
+                        ),
+                        reprojection_residual_and_jacobians(
+                            p_minus,
+                            world,
+                            pixel,
+                            config.intrinsics,
+                        ),
+                    ) {
+                        for row in 0..2 {
+                            j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
+                                / (2.0 * FD_EPS)
+                                * f64::from(sqrt_w);
+                        }
+                    }
+                }
+                let r_f64 = [
+                    f64::from(residual[0] * sqrt_w),
+                    f64::from(residual[1] * sqrt_w),
+                ];
+                let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
+                accumulate_factor(
+                    &mut hessian,
+                    &mut rhs,
+                    dim,
+                    &j_15,
+                    &identity_2,
+                    &r_f64,
+                    base,
+                );
+            }
+        }
+    }
+
+    for succ_idx in 0..window.successors.len() {
+        let prev_state = states[succ_idx].nav_state();
+        let curr_state = states[succ_idx + 1].nav_state();
+        let preint = &window.successors[succ_idx].preintegrated;
+        let gravity = config.gravity();
+
+        let residual = ImuFactor::residual(prev_state, curr_state, preint, &gravity);
+        let info = preint.residual_information();
+        let (j_prev, j_curr) = imu_jacobians(prev_state, curr_state, preint, gravity);
+
+        let mut imu_cost = 0.0;
+        for i in 0..IMU_RESIDUAL_DIM {
+            for j in 0..IMU_RESIDUAL_DIM {
+                imu_cost += residual[i] * info[i][j] * residual[j];
+            }
+        }
+        cost_breakdown.imu_cost += 0.5 * imu_cost;
+
+        let base_prev = succ_idx * STATE_DIM;
+        let base_curr = (succ_idx + 1) * STATE_DIM;
+        accumulate_factor(
+            &mut hessian,
+            &mut rhs,
+            dim,
+            &j_prev,
+            &info,
+            &residual,
+            base_prev,
+        );
+        accumulate_factor(
+            &mut hessian,
+            &mut rhs,
+            dim,
+            &j_curr,
+            &info,
+            &residual,
+            base_curr,
+        );
+        accumulate_cross_factor(
+            &mut hessian,
+            dim,
+            &j_prev,
+            &j_curr,
+            &info,
+            base_prev,
+            base_curr,
+        );
+    }
+
+    for succ_idx in 0..window.successors.len() {
+        let prev_state = states[succ_idx].nav_state();
+        let curr_state = states[succ_idx + 1].nav_state();
+        let preint = &window.successors[succ_idx].preintegrated;
+        let bias_residual = bias_random_walk_residual(prev_state, curr_state);
+        let bias_info = preint.bias_random_walk_information();
+
+        let mut bias_cost = 0.0;
+        for i in 0..BIAS_RW_RESIDUAL_DIM {
+            for j in 0..BIAS_RW_RESIDUAL_DIM {
+                bias_cost += bias_residual[i] * bias_info[i][j] * bias_residual[j];
+            }
+        }
+        cost_breakdown.bias_random_walk_cost += 0.5 * bias_cost;
+
+        let base_prev = succ_idx * STATE_DIM;
+        let base_curr = (succ_idx + 1) * STATE_DIM;
+        for a in 0..BIAS_RW_RESIDUAL_DIM {
+            let mut omega_r = 0.0;
+            for b in 0..BIAS_RW_RESIDUAL_DIM {
+                let w = bias_info[a][b];
+                hessian[(base_prev + 9 + a) * dim + (base_prev + 9 + b)] += w;
+                hessian[(base_curr + 9 + a) * dim + (base_curr + 9 + b)] += w;
+                hessian[(base_prev + 9 + a) * dim + (base_curr + 9 + b)] -= w;
+                hessian[(base_curr + 9 + b) * dim + (base_prev + 9 + a)] -= w;
+                omega_r += w * bias_residual[b];
+            }
+            rhs[base_prev + 9 + a] -= omega_r;
+            rhs[base_curr + 9 + a] += omega_r;
+        }
+    }
+
+    if config.anchor_velocity_info > 0.0 {
+        let anchor_state = states[0].nav_state();
+        let anchor_velocity = anchor_state.velocity_odom_mps();
+        let base = 0;
+        for axis in 0..3 {
+            let residual = anchor_velocity[axis] - window.anchor.anchor_velocity_odom_mps[axis];
+            hessian[(base + 6 + axis) * dim + (base + 6 + axis)] += config.anchor_velocity_info;
+            rhs[base + 6 + axis] += config.anchor_velocity_info * residual;
+            cost_breakdown.velocity_anchor_cost +=
+                0.5 * config.anchor_velocity_info * residual * residual;
+        }
+    }
+
+    if config.anchor_bias_info > 0.0 {
+        let bias_info_w = config.anchor_bias_info;
+        let calib_accel = config.calibrated_accel_bias;
+        let calib_gyro = config.calibrated_gyro_bias;
+        for (frame_idx, state) in states.iter().map(SyncedPose::nav_state).enumerate() {
+            let base = frame_idx * STATE_DIM;
+            let bias = state.bias();
+            for axis in 0..3 {
+                let accel_residual = bias.accel[axis] - calib_accel[axis];
+                hessian[(base + 9 + axis) * dim + (base + 9 + axis)] += bias_info_w;
+                rhs[base + 9 + axis] += bias_info_w * accel_residual;
+                cost_breakdown.bias_prior_cost +=
+                    0.5 * bias_info_w * accel_residual * accel_residual;
+
+                let gyro_residual = bias.gyro[axis] - calib_gyro[axis];
+                hessian[(base + 12 + axis) * dim + (base + 12 + axis)] += bias_info_w;
+                rhs[base + 12 + axis] += bias_info_w * gyro_residual;
+                cost_breakdown.bias_prior_cost += 0.5 * bias_info_w * gyro_residual * gyro_residual;
+            }
+        }
+    }
+
+    VioLinearization {
+        hessian,
+        rhs,
+        cost_breakdown,
     }
 }
 
@@ -2790,6 +2769,41 @@ mod tests {
         assert!(
             final_cost <= before + 1e-6,
             "final cost should not increase: before={before}, final={final_cost}"
+        );
+    }
+
+    #[test]
+    fn local_bundle_adjuster_clone_supports_transactional_candidate_updates() {
+        let (map, intrinsics, kf_0, _kf_1, _, _) =
+            build_full_ba_fixture([0.12, -0.05, 0.07, 0.03, -0.02, 0.01]);
+        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let observations = ObservationSet::new(
+            (0..4)
+                .map(|idx| {
+                    let keyframe_keypoint = map.keyframe_keypoint(kf_0, idx).expect("keypoint");
+                    let pixel = map.keypoint(keyframe_keypoint).expect("pixel");
+                    MapObservation::new(keyframe_keypoint, pixel)
+                })
+                .collect(),
+            ba.min_observations(),
+        )
+        .expect("observations");
+
+        let _ = ba.push_frame(&map, Pose::identity(), observations.clone());
+        let original_len = ba.frames.len();
+
+        let mut candidate_ba = ba.clone();
+        let _ = candidate_ba.push_frame(&map, Pose::identity(), observations);
+
+        assert_eq!(
+            ba.frames.len(),
+            original_len,
+            "candidate BA updates must not mutate the authoritative window"
+        );
+        assert!(
+            candidate_ba.frames.len() >= ba.frames.len(),
+            "candidate BA should evolve independently from the original"
         );
     }
 

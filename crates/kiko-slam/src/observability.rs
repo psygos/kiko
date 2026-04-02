@@ -13,6 +13,13 @@ const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX: &str =
     "diagnostics/health/pnp_projectable_tracked_observation_reprojection_max_px";
 const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS: &str =
     "diagnostics/health/pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2";
+const PATH_HEALTH_VISUAL_PROPOSAL_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE: &str =
+    "diagnostics/health/visual_proposal_pnp_projectable_tracked_observation_reprojection_rmse_px";
+const PATH_HEALTH_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE: &str =
+    "diagnostics/health/vio_proposal_pnp_projectable_tracked_observation_reprojection_rmse_px";
+const PATH_HEALTH_VISUAL_PROPOSAL_SHARED_TRACKED_REPROJECTION_RMSE: &str = "diagnostics/health/visual_proposal_shared_projectable_tracked_observation_reprojection_rmse_px";
+const PATH_HEALTH_VIO_PROPOSAL_SHARED_TRACKED_REPROJECTION_RMSE: &str =
+    "diagnostics/health/vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px";
 const PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE: &str =
     "diagnostics/health/pnp_inlier_reprojection_rmse_px";
 const PATH_HEALTH_PNP_INLIER_REPROJECTION_MAX: &str =
@@ -42,6 +49,20 @@ const PATH_TRACKING_PNP_TRACKED_OBSERVATIONS: &str =
     "diagnostics/tracking/pnp_tracked_observations";
 const PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
     "diagnostics/tracking/pnp_projectable_tracked_observations";
+const PATH_TRACKING_VISUAL_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
+    "diagnostics/tracking/visual_proposal_pnp_projectable_tracked_observations";
+const PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
+    "diagnostics/tracking/vio_proposal_pnp_projectable_tracked_observations";
+const PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
+    "diagnostics/tracking/shared_projectable_tracked_observations";
+const PATH_TRACKING_POSE_SOURCE: &str = "diagnostics/tracking/pose_source";
+const PATH_TRACKING_VIO_PROPOSAL_RAN: &str = "diagnostics/tracking/vio_proposal_ran";
+const PATH_TRACKING_VIO_PROPOSAL_ADOPTED: &str = "diagnostics/tracking/vio_proposal_adopted";
+const PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_SHARED_SUPPORT: &str =
+    "diagnostics/tracking/vio_proposal_rejected_insufficient_shared_projectable_support";
+const PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT: &str =
+    "diagnostics/tracking/vio_proposal_rejected_changed_projectable_tracked_support";
+const PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE: &str = "diagnostics/tracking/vio_proposal_rejected_higher_shared_projectable_tracked_reprojection_rmse";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
 const PATH_TRACKING_PARALLAX: &str = "diagnostics/tracking/parallax_px";
 const PATH_TRACKING_COVISIBILITY: &str = "diagnostics/tracking/covisibility";
@@ -62,6 +83,22 @@ const PATH_TRI_DROPPED_DUPLICATE: &str = "diagnostics/triangulation/dropped_dupl
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
 const PATH_BA_ITERATIONS: &str = "diagnostics/ba/iterations";
+#[cfg(feature = "vio")]
+const PATH_VIO_FINAL_COST: &str = "diagnostics/vio/final_cost";
+#[cfg(feature = "vio")]
+const PATH_VIO_ITERATIONS: &str = "diagnostics/vio/iterations";
+#[cfg(feature = "vio")]
+const PATH_VIO_CONVERGED: &str = "diagnostics/vio/converged";
+#[cfg(feature = "vio")]
+const PATH_VIO_COST_REPROJECTION: &str = "diagnostics/vio/cost/reprojection";
+#[cfg(feature = "vio")]
+const PATH_VIO_COST_IMU: &str = "diagnostics/vio/cost/imu";
+#[cfg(feature = "vio")]
+const PATH_VIO_COST_BIAS_RANDOM_WALK: &str = "diagnostics/vio/cost/bias_random_walk";
+#[cfg(feature = "vio")]
+const PATH_VIO_COST_VELOCITY_ANCHOR: &str = "diagnostics/vio/cost/velocity_anchor";
+#[cfg(feature = "vio")]
+const PATH_VIO_COST_BIAS_PRIOR: &str = "diagnostics/vio/cost/bias_prior";
 
 const PATH_LOOP_CANDIDATES: &str = "diagnostics/loop/candidates";
 const PATH_LOOP_APPLIED: &str = "diagnostics/loop/applied";
@@ -121,6 +158,32 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
             v.value_px2(),
         ));
     }
+    if let Some(v) = diag.visual_proposal_projectable_tracked_observation_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VISUAL_PROPOSAL_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.vio_proposal_projectable_tracked_observation_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) =
+        diag.visual_proposal_shared_projectable_tracked_observation_reprojection_rmse_px
+    {
+        scalars.push((
+            PATH_HEALTH_VISUAL_PROPOSAL_SHARED_TRACKED_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VIO_PROPOSAL_SHARED_TRACKED_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
     if let Some(v) = diag.pnp_inlier_reprojection_rmse_px {
         scalars.push((
             PATH_HEALTH_PNP_INLIER_REPROJECTION_RMSE,
@@ -149,6 +212,71 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((
             PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
             v.count() as f64,
+        ));
+    }
+    if let Some(v) = diag.visual_proposal_projectable_tracked_observations {
+        scalars.push((
+            PATH_TRACKING_VISUAL_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+            v.count() as f64,
+        ));
+    }
+    if let Some(v) = diag.vio_proposal_projectable_tracked_observations {
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+            v.count() as f64,
+        ));
+    }
+    if let Some(v) = diag.shared_projectable_tracked_observations {
+        scalars.push((
+            PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS,
+            v.count() as f64,
+        ));
+    }
+    if let Some(v) = diag.tracking_pose_source {
+        scalars.push((PATH_TRACKING_POSE_SOURCE, tracking_pose_source_scalar(v)));
+    }
+    if let Some(v) = diag.vio_proposal_disposition {
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_RAN,
+            if v == crate::VioProposalDisposition::NotRun {
+                0.0
+            } else {
+                1.0
+            },
+        ));
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
+            if v == crate::VioProposalDisposition::Adopted {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_SHARED_SUPPORT,
+            if v == crate::VioProposalDisposition::RejectedInsufficientSharedProjectableSupport {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT,
+            if v == crate::VioProposalDisposition::RejectedChangedProjectableTrackedSupport {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE,
+            if v
+                == crate::VioProposalDisposition::RejectedHigherSharedProjectableTrackedReprojectionRmse
+            {
+                1.0
+            } else {
+                0.0
+            },
         ));
     }
     if let Some(v) = diag.ransac_iterations {
@@ -191,6 +319,33 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
             }
             BaResult::Degenerate { .. } => {}
         }
+    }
+
+    #[cfg(feature = "vio")]
+    if let Some(vio_result) = diag.vio_solve_result.as_ref() {
+        scalars.push((PATH_VIO_ITERATIONS, vio_result.iterations as f64));
+        scalars.push((PATH_VIO_FINAL_COST, vio_result.final_cost));
+        scalars.push((
+            PATH_VIO_CONVERGED,
+            if vio_result.converged { 1.0 } else { 0.0 },
+        ));
+        scalars.push((
+            PATH_VIO_COST_REPROJECTION,
+            vio_result.cost_breakdown.reprojection_cost,
+        ));
+        scalars.push((PATH_VIO_COST_IMU, vio_result.cost_breakdown.imu_cost));
+        scalars.push((
+            PATH_VIO_COST_BIAS_RANDOM_WALK,
+            vio_result.cost_breakdown.bias_random_walk_cost,
+        ));
+        scalars.push((
+            PATH_VIO_COST_VELOCITY_ANCHOR,
+            vio_result.cost_breakdown.velocity_anchor_cost,
+        ));
+        scalars.push((
+            PATH_VIO_COST_BIAS_PRIOR,
+            vio_result.cost_breakdown.bias_prior_cost,
+        ));
     }
 
     scalars
@@ -296,6 +451,14 @@ fn component_state_scalar(state: ComponentHealth) -> f64 {
         ComponentHealth::Disabled => 0.0,
         ComponentHealth::Alive => 1.0,
         ComponentHealth::Down => 2.0,
+    }
+}
+
+fn tracking_pose_source_scalar(source: crate::TrackingPoseSource) -> f64 {
+    match source {
+        crate::TrackingPoseSource::VisualTracking => 0.0,
+        crate::TrackingPoseSource::VisualBundleAdjustment => 1.0,
+        crate::TrackingPoseSource::VioRefined => 2.0,
     }
 }
 
@@ -411,13 +574,23 @@ mod tests {
         PATH_HEALTH_PNP_INLIER_RATIO, PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS,
-        PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS, diagnostics_scalars, format_event,
+        PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+        PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS, PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
+        PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS, diagnostics_scalars,
+        format_event,
     };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
         PnpInlierRatioMetric, PnpProjectableTrackedObservationCountMetric,
         PnpProjectableTrackedObservationPixelResidualMetric,
-        PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric, TriangulationStats,
+        PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric, TrackingPoseSource,
+        TriangulationStats, VioProposalDisposition,
+        VioProposalProjectableTrackedObservationCountMetric,
+        VioProposalProjectableTrackedObservationPixelResidualMetric,
+        VisualProposalProjectableTrackedObservationCountMetric,
+        VisualProposalProjectableTrackedObservationPixelResidualMetric,
+        VisualVsVioSharedProjectableTrackedObservationCountMetric,
+        VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
     };
 
     #[test]
@@ -452,6 +625,31 @@ mod tests {
             PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric::new(1.125)
                 .expect("tracked mse"),
         );
+        diag.tracking_pose_source = Some(TrackingPoseSource::VioRefined);
+        diag.visual_proposal_projectable_tracked_observations = Some(
+            VisualProposalProjectableTrackedObservationCountMetric::new(7),
+        );
+        diag.visual_proposal_projectable_tracked_observation_reprojection_rmse_px = Some(
+            VisualProposalProjectableTrackedObservationPixelResidualMetric::new(1.2)
+                .expect("visual proposal rmse"),
+        );
+        diag.vio_proposal_projectable_tracked_observations =
+            Some(VioProposalProjectableTrackedObservationCountMetric::new(8));
+        diag.vio_proposal_projectable_tracked_observation_reprojection_rmse_px = Some(
+            VioProposalProjectableTrackedObservationPixelResidualMetric::new(0.9)
+                .expect("vio proposal rmse"),
+        );
+        diag.shared_projectable_tracked_observations =
+            Some(VisualVsVioSharedProjectableTrackedObservationCountMetric::new(6));
+        diag.visual_proposal_shared_projectable_tracked_observation_reprojection_rmse_px = Some(
+            VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(1.1)
+                .expect("visual shared rmse"),
+        );
+        diag.vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px = Some(
+            VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(0.8)
+                .expect("vio shared rmse"),
+        );
+        diag.vio_proposal_disposition = Some(VioProposalDisposition::Adopted);
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
         diag.triangulation = Some(TriangulationStats {
@@ -484,6 +682,17 @@ mod tests {
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS
                 && (*value - 7.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS
+                && (*value - 8.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS
+                && (*value - 6.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_VIO_PROPOSAL_ADOPTED && (*value - 1.0).abs() < 1e-6
         }));
         assert!(
             scalars

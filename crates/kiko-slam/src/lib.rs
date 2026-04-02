@@ -76,7 +76,17 @@ pub use diagnostics::{
     PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric,
     PnpProjectableTrackedObservationsSupport, PnpTrackedObservationCountMetric,
     PnpTrackedObservationsSupport, RatioMetric, StableSurfaceRetainedRawObservationsSupport,
-    StableSurfaceRetainedRawPixelResidualMetric,
+    StableSurfaceRetainedRawPixelResidualMetric, TrackingPoseSource, VioProposalDisposition,
+    VioProposalProjectableTrackedObservationCountMetric,
+    VioProposalProjectableTrackedObservationPixelResidualMetric,
+    VioProposalProjectableTrackedObservationsSupport,
+    VisualProposalProjectableTrackedObservationCountMetric,
+    VisualProposalProjectableTrackedObservationPixelResidualMetric,
+    VisualProposalProjectableTrackedObservationsSupport,
+    VisualVsVioSharedProjectableTrackedObservationCountMetric,
+    VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
+    VisualVsVioSharedProjectableTrackedObservationReprojectionMsePerAxisPx2Metric,
+    VisualVsVioSharedProjectableTrackedObservationsSupport,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use geometry::{
@@ -89,8 +99,8 @@ pub use imu::{
 };
 #[cfg(feature = "vio")]
 pub use local_ba::{
-    AnchorFrameInput, InertialFrameInput, VioFrameEstimate, VioSolveConfig, VioSolveConfigError,
-    VioSolveResult,
+    AnchorFrameInput, InertialFrameInput, VioCostBreakdown, VioFrameEstimate, VioSolveConfig,
+    VioSolveConfigError, VioSolveResult,
 };
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
