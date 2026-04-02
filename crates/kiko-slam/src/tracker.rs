@@ -1485,6 +1485,20 @@ struct VioRuntime {
 }
 
 #[cfg(feature = "vio")]
+impl VioRuntime {
+    fn commit_authoritative_visual_anchor(&mut self, anchor: crate::local_ba::VioAnchor) {
+        let nav_state = anchor.synced.nav_state().clone();
+        self.last_optimized_state = Some(nav_state.clone());
+        self.predicted_state = Some(nav_state);
+        self.vio_window = Some(crate::local_ba::VioWindow {
+            anchor,
+            successors: Vec::new(),
+        });
+        self.pending_imu.clear();
+    }
+}
+
+#[cfg(feature = "vio")]
 #[derive(Debug)]
 enum PoseRefinementProposal {
     None,
@@ -1506,6 +1520,7 @@ struct VioPoseProposal {
     solve_result: crate::VioSolveResult,
     optimized_state: crate::NavState,
     optimized_window: crate::local_ba::VioWindow,
+    rejected_visual_anchor: crate::local_ba::VioAnchor,
 }
 
 #[derive(Clone, Debug)]
@@ -1887,7 +1902,7 @@ impl SlamTracker {
             // First frame: create anchor
             let anchor = VioAnchor {
                 synced: SyncedPose::new(nav_state.clone()),
-                observations: obs_set,
+                observations: obs_set.clone(),
                 anchor_velocity_odom_mps: nav_state.velocity_odom_mps(),
             };
             vio_runtime.vio_window = Some(VioWindow {
@@ -1905,7 +1920,7 @@ impl SlamTracker {
         let mut candidate_window = vio_runtime.vio_window.clone().unwrap();
         candidate_window.successors.push(VioSuccessor {
             synced: SyncedPose::new(nav_state.clone()),
-            observations: obs_set,
+            observations: obs_set.clone(),
             preintegrated,
         });
 
@@ -1937,6 +1952,24 @@ impl SlamTracker {
             .last()
             .map(|s| s.synced.nav_state().clone())
             .unwrap_or_else(|| candidate_window.anchor.synced.nav_state().clone());
+
+        // If the caller rejects the VIO proposal on visual metrics, we still
+        // need to advance the inertial runtime to the current frame so the next
+        // IMU interval starts at the current visual measurement rather than
+        // silently stretching across multiple rejected frames.
+        let rejected_visual_nav_state = match crate::NavState::try_new(
+            body_odom,
+            optimized.velocity_odom_mps(),
+            optimized.bias().clone(),
+        ) {
+            Ok(state) => state,
+            Err(_) => nav_state.clone(),
+        };
+        let rejected_visual_anchor = VioAnchor {
+            synced: SyncedPose::new(rejected_visual_nav_state.clone()),
+            observations: obs_set.clone(),
+            anchor_velocity_odom_mps: rejected_visual_nav_state.velocity_odom_mps(),
+        };
 
         // Convert from NavState (T_odom_from_body) to camera-in-map
         // (T_cam_from_map) which is what the rest of the tracker expects.
@@ -1978,6 +2011,7 @@ impl SlamTracker {
             solve_result: result,
             optimized_state: optimized,
             optimized_window: candidate_window,
+            rejected_visual_anchor,
         })
     }
 
@@ -2010,6 +2044,14 @@ impl SlamTracker {
         vio_runtime.predicted_state = Some(proposal.optimized_state);
         vio_runtime.vio_window = Some(proposal.optimized_window);
         vio_runtime.pending_imu.clear();
+    }
+
+    #[cfg(feature = "vio")]
+    fn commit_rejected_vio_visual_anchor(&mut self, anchor: crate::local_ba::VioAnchor) {
+        let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
+            return;
+        };
+        vio_runtime.commit_authoritative_visual_anchor(anchor);
     }
 
     #[cfg(feature = "vio")]
@@ -3043,14 +3085,21 @@ impl SlamTracker {
                 );
                 let disposition = decide_vio_pose_adoption(&visual_proposal_metrics, &vio_metrics);
                 let vio_solve_result = proposal.solve_result.clone();
-                let (adopted_pose, source) =
-                    if disposition == crate::VioProposalDisposition::Adopted {
-                        let adopted_pose = proposal.pose_world;
-                        self.commit_vio_proposal(proposal);
-                        (adopted_pose, crate::TrackingPoseSource::VioRefined)
-                    } else {
-                        (visual_pose_world, crate::TrackingPoseSource::VisualTracking)
-                    };
+                let (adopted_pose, source) = if disposition
+                    == crate::VioProposalDisposition::Adopted
+                {
+                    let adopted_pose = proposal.pose_world;
+                    self.commit_vio_proposal(proposal);
+                    (adopted_pose, crate::TrackingPoseSource::VioRefined)
+                } else {
+                    if self.trace_transitions {
+                        eprintln!(
+                            "vio proposal rejected disposition={disposition:?}; reanchoring inertial runtime to current visual pose"
+                        );
+                    }
+                    self.commit_rejected_vio_visual_anchor(proposal.rejected_visual_anchor.clone());
+                    (visual_pose_world, crate::TrackingPoseSource::VisualTracking)
+                };
                 (
                     adopted_pose,
                     source,
@@ -5346,5 +5395,154 @@ mod tests {
             Some(0.1),
         ]);
         assert!(!should_adopt_visual_ba_proposal(&visual, &visual_ba));
+    }
+
+    #[cfg(feature = "vio")]
+    fn make_single_observation_set() -> ObservationSet {
+        let (map, keyframe_id, _) = make_map_with_single_point();
+        let keypoint = map.keyframe_keypoint(keyframe_id, 0).expect("keypoint ref");
+        let pixel = map.keypoint(keypoint).expect("pixel");
+        ObservationSet::new(
+            vec![MapObservation::new(keypoint, pixel)],
+            std::num::NonZeroUsize::new(1).expect("nonzero"),
+        )
+        .expect("observation set")
+    }
+
+    #[cfg(feature = "vio")]
+    fn make_test_vio_intrinsics() -> crate::PinholeIntrinsics {
+        crate::PinholeIntrinsics::try_from(&crate::dataset::CameraIntrinsics {
+            fx: 420.0,
+            fy: 418.0,
+            cx: 320.0,
+            cy: 240.0,
+            width: 640,
+            height: 480,
+        })
+        .expect("intrinsics")
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_runtime_visual_reanchor_replaces_stale_window_and_clears_pending_imu() {
+        let observations = make_single_observation_set();
+        let lm = crate::LmConfig::new(1e-3, 10.0, 1e-6, 1e6, 0.25, 0.75).expect("lm");
+        let gravity = crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity");
+        let solve_config = crate::VioSolveConfig::new(
+            gravity,
+            Pose64::identity(),
+            make_test_vio_intrinsics(),
+            lm,
+            std::num::NonZeroUsize::new(3).expect("iters"),
+            2.0,
+            10.0,
+            None,
+        )
+        .expect("solve config");
+        let noise = crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise");
+
+        let stale_state = crate::NavState::try_new(
+            Pose64::from_pose32(Pose::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.0, 0.0, 0.0],
+            )),
+            [0.1, 0.2, 0.3],
+            crate::ImuBias {
+                accel: [0.01, 0.02, 0.03],
+                gyro: [0.001, 0.002, 0.003],
+            },
+        )
+        .expect("stale nav state");
+        let replacement_state = crate::NavState::try_new(
+            Pose64::from_pose32(Pose::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [1.0, -0.5, 0.25],
+            )),
+            [0.4, 0.5, 0.6],
+            crate::ImuBias {
+                accel: [0.3, -0.1, 0.2],
+                gyro: [0.01, -0.02, 0.03],
+            },
+        )
+        .expect("replacement nav state");
+
+        let stale_anchor = crate::local_ba::VioAnchor {
+            synced: crate::local_ba::SyncedPose::new(stale_state.clone()),
+            observations: observations.clone(),
+            anchor_velocity_odom_mps: stale_state.velocity_odom_mps(),
+        };
+        let replacement_anchor = crate::local_ba::VioAnchor {
+            synced: crate::local_ba::SyncedPose::new(replacement_state.clone()),
+            observations,
+            anchor_velocity_odom_mps: replacement_state.velocity_odom_mps(),
+        };
+
+        let mut pending_imu = crate::ImuAccumulator::new();
+        let pending_batch = crate::ImuBatch::new(vec![
+            crate::ImuSample::new(Timestamp::from_nanos(10), [0.0, 9.81, 0.0], [0.0; 3])
+                .expect("imu sample a"),
+            crate::ImuSample::new(Timestamp::from_nanos(20), [0.0, 9.81, 0.0], [0.0; 3])
+                .expect("imu sample b"),
+        ])
+        .expect("imu batch");
+        pending_imu
+            .extend_batch(&pending_batch)
+            .expect("extend pending imu");
+
+        let mut runtime = VioRuntime {
+            camera_from_body: Pose64::identity(),
+            noise,
+            pending_imu,
+            predicted_state: Some(stale_state.clone()),
+            calibrated_bias: None,
+            last_optimized_state: Some(stale_state.clone()),
+            solve_config,
+            vio_window: Some(crate::local_ba::VioWindow {
+                anchor: stale_anchor,
+                successors: Vec::new(),
+            }),
+            max_window: 5,
+        };
+
+        runtime.commit_authoritative_visual_anchor(replacement_anchor);
+
+        assert!(
+            runtime.pending_imu.is_empty(),
+            "current frame IMU interval must be consumed after visual reanchor"
+        );
+        let committed = runtime
+            .last_optimized_state
+            .as_ref()
+            .expect("last optimized state");
+        assert_eq!(
+            committed.pose_odom_from_body().translation(),
+            replacement_state.pose_odom_from_body().translation()
+        );
+        assert_eq!(
+            committed.velocity_odom_mps(),
+            replacement_state.velocity_odom_mps()
+        );
+        assert_eq!(committed.bias().accel, replacement_state.bias().accel);
+        assert_eq!(committed.bias().gyro, replacement_state.bias().gyro);
+        let predicted = runtime.predicted_state.as_ref().expect("predicted state");
+        assert_eq!(
+            predicted.pose_odom_from_body().translation(),
+            replacement_state.pose_odom_from_body().translation()
+        );
+        let window = runtime.vio_window.as_ref().expect("vio window");
+        assert_eq!(
+            window.len(),
+            1,
+            "visual reanchor must replace the stale multi-frame window with a single authoritative anchor"
+        );
+        assert_eq!(
+            window
+                .anchor
+                .synced
+                .nav_state()
+                .pose_odom_from_body()
+                .translation(),
+            replacement_state.pose_odom_from_body().translation()
+        );
     }
 }
