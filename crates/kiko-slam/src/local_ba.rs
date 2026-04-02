@@ -541,6 +541,40 @@ pub(crate) struct VioSuccessor {
 /// all iterations. Gravity is a known constant.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
+pub struct VioBiasPrior {
+    info: f64,
+    bias: crate::ImuBias,
+}
+
+#[cfg(feature = "vio")]
+impl VioBiasPrior {
+    pub fn new(info: f64, bias: crate::ImuBias) -> Result<Self, VioSolveConfigError> {
+        if !info.is_finite() {
+            return Err(VioSolveConfigError::NonFiniteAnchorWeight {
+                field: "anchor_bias_prior.info",
+                value: info,
+            });
+        }
+        if info < 0.0 {
+            return Err(VioSolveConfigError::NegativeAnchorWeight {
+                field: "anchor_bias_prior.info",
+                value: info,
+            });
+        }
+        Ok(Self { info, bias })
+    }
+
+    pub fn info(&self) -> f64 {
+        self.info
+    }
+
+    pub fn bias(&self) -> &crate::ImuBias {
+        &self.bias
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Debug)]
 pub struct VioSolveConfig {
     gravity: crate::Gravity,
     camera_from_body: crate::Pose64,
@@ -550,12 +584,9 @@ pub struct VioSolveConfig {
     huber_delta_px: f64,
     /// Diagonal information weight for the velocity anchor prior on frame 0.
     anchor_velocity_info: f64,
-    /// Diagonal information weight for the bias prior on all frames.
-    anchor_bias_info: f64,
-    /// Calibrated accel bias — bias prior pulls toward this.
-    calibrated_accel_bias: [f64; 3],
-    /// Calibrated gyro bias — bias prior pulls toward this.
-    calibrated_gyro_bias: [f64; 3],
+    /// Optional calibrated bias prior on all frames. Absent means “no
+    /// calibrated bias prior”, not “prior toward zero”.
+    anchor_bias_prior: Option<VioBiasPrior>,
 }
 
 #[cfg(feature = "vio")]
@@ -592,9 +623,7 @@ impl VioSolveConfig {
         max_iterations: NonZeroUsize,
         huber_delta_px: f64,
         anchor_velocity_info: f64,
-        anchor_bias_info: f64,
-        calibrated_accel_bias: [f64; 3],
-        calibrated_gyro_bias: [f64; 3],
+        anchor_bias_prior: Option<VioBiasPrior>,
     ) -> Result<Self, VioSolveConfigError> {
         if !anchor_velocity_info.is_finite() {
             return Err(VioSolveConfigError::NonFiniteAnchorWeight {
@@ -608,18 +637,6 @@ impl VioSolveConfig {
                 value: anchor_velocity_info,
             });
         }
-        if !anchor_bias_info.is_finite() {
-            return Err(VioSolveConfigError::NonFiniteAnchorWeight {
-                field: "anchor_bias_info",
-                value: anchor_bias_info,
-            });
-        }
-        if anchor_bias_info < 0.0 {
-            return Err(VioSolveConfigError::NegativeAnchorWeight {
-                field: "anchor_bias_info",
-                value: anchor_bias_info,
-            });
-        }
         Ok(Self {
             gravity,
             camera_from_body,
@@ -628,14 +645,16 @@ impl VioSolveConfig {
             max_iterations,
             huber_delta_px,
             anchor_velocity_info,
-            anchor_bias_info,
-            calibrated_accel_bias,
-            calibrated_gyro_bias,
+            anchor_bias_prior,
         })
     }
 
     pub fn gravity(&self) -> crate::Gravity {
         self.gravity
+    }
+
+    pub fn has_anchor_bias_prior(&self) -> bool {
+        self.anchor_bias_prior.is_some()
     }
 }
 
@@ -1777,10 +1796,10 @@ fn linearize_vio_states(
         }
     }
 
-    if config.anchor_bias_info > 0.0 {
-        let bias_info_w = config.anchor_bias_info;
-        let calib_accel = config.calibrated_accel_bias;
-        let calib_gyro = config.calibrated_gyro_bias;
+    if let Some(bias_prior) = config.anchor_bias_prior.as_ref() {
+        let bias_info_w = bias_prior.info();
+        let calib_accel = bias_prior.bias().accel;
+        let calib_gyro = bias_prior.bias().gyro;
         for (frame_idx, state) in states.iter().map(SyncedPose::nav_state).enumerate() {
             let base = frame_idx * STATE_DIM;
             let bias = state.bias();

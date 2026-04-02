@@ -39,6 +39,7 @@ mod place_recognition;
 mod pnp;
 pub mod pose_graph;
 mod preprocess;
+mod runtime_imu;
 mod surface_map;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -99,8 +100,8 @@ pub use imu::{
 };
 #[cfg(feature = "vio")]
 pub use local_ba::{
-    AnchorFrameInput, InertialFrameInput, VioCostBreakdown, VioFrameEstimate, VioSolveConfig,
-    VioSolveConfigError, VioSolveResult,
+    AnchorFrameInput, InertialFrameInput, VioBiasPrior, VioCostBreakdown, VioFrameEstimate,
+    VioSolveConfig, VioSolveConfigError, VioSolveResult,
 };
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
@@ -130,6 +131,10 @@ pub use place_recognition::DescriptorStats;
 pub use pnp::{
     IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
     build_observations, solve_pnp, solve_pnp_ransac,
+};
+pub use runtime_imu::{
+    RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,
+    load_runtime_imu_calibration_from_env,
 };
 pub use surface_map::{SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapSummary};
 pub use tracker::{

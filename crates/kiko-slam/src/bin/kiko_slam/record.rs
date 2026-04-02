@@ -6,14 +6,13 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use kiko_slam::dataset::{
-    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuCalibration, ImuExtrinsicsMeta,
-    ImuMeta, ImuNoiseMeta, Meta, MonoMeta,
+    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta,
 };
-use kiko_slam::env::{env_bool, env_f64, env_i64, env_usize};
+use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
     FrameId, PairingConfigError, PairingDropReason, PairingOutcome, PairingWindowNs,
-    PendingFramesCapacity, SensorId, StereoPairer, oak_to_depth_image, oak_to_frame,
-    oak_to_imu_batch,
+    PendingFramesCapacity, SensorId, StereoPairer, load_runtime_imu_calibration_from_env,
+    oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
 use oak_sys::{
     DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig,
@@ -309,91 +308,8 @@ pub(crate) fn build_calibration(
         },
         baseline_m,
         rectified: config.rectified,
-        imu: load_imu_calibration_from_env()?,
+        imu: load_runtime_imu_calibration_from_env()?,
     })
-}
-
-fn load_imu_calibration_from_env() -> Result<Option<ImuCalibration>, Box<dyn std::error::Error>> {
-    let rotation = match std::env::var("KIKO_IMU_ROTATION").ok() {
-        Some(raw) => Some(parse_matrix3_f64(&raw, "KIKO_IMU_ROTATION")?),
-        None => None,
-    };
-    let translation = match std::env::var("KIKO_IMU_TRANSLATION").ok() {
-        Some(raw) => Some(parse_vec3_f64(&raw, "KIKO_IMU_TRANSLATION")?),
-        None => None,
-    };
-    let accel_noise_density = env_f64("KIKO_IMU_ACCEL_NOISE_DENSITY");
-    let gyro_noise_density = env_f64("KIKO_IMU_GYRO_NOISE_DENSITY");
-    let accel_random_walk = env_f64("KIKO_IMU_ACCEL_RANDOM_WALK");
-    let gyro_random_walk = env_f64("KIKO_IMU_GYRO_RANDOM_WALK");
-
-    let any_present = rotation.is_some()
-        || translation.is_some()
-        || accel_noise_density.is_some()
-        || gyro_noise_density.is_some()
-        || accel_random_walk.is_some()
-        || gyro_random_walk.is_some()
-        || env_i64("KIKO_IMU_TIME_OFFSET_NS").is_some()
-        || env_f64("KIKO_IMU_GRAVITY_MPS2").is_some();
-    if !any_present {
-        return Ok(None);
-    }
-
-    let rotation =
-        rotation.ok_or("KIKO_IMU_ROTATION is required when IMU calibration is configured")?;
-    let translation =
-        translation.ok_or("KIKO_IMU_TRANSLATION is required when IMU calibration is configured")?;
-    let accel_noise_density = accel_noise_density
-        .ok_or("KIKO_IMU_ACCEL_NOISE_DENSITY is required when IMU calibration is configured")?;
-    let gyro_noise_density = gyro_noise_density
-        .ok_or("KIKO_IMU_GYRO_NOISE_DENSITY is required when IMU calibration is configured")?;
-    let accel_random_walk = accel_random_walk
-        .ok_or("KIKO_IMU_ACCEL_RANDOM_WALK is required when IMU calibration is configured")?;
-    let gyro_random_walk = gyro_random_walk
-        .ok_or("KIKO_IMU_GYRO_RANDOM_WALK is required when IMU calibration is configured")?;
-
-    Ok(Some(ImuCalibration {
-        noise: ImuNoiseMeta {
-            accel_noise_density,
-            gyro_noise_density,
-            accel_random_walk,
-            gyro_random_walk,
-        },
-        extrinsics: ImuExtrinsicsMeta {
-            rotation,
-            translation,
-            time_offset_ns: env_i64("KIKO_IMU_TIME_OFFSET_NS").unwrap_or(0),
-        },
-        gravity_magnitude_mps2: env_f64("KIKO_IMU_GRAVITY_MPS2").unwrap_or(9.81),
-    }))
-}
-
-fn parse_vec3_f64(raw: &str, key: &str) -> Result<[f64; 3], Box<dyn std::error::Error>> {
-    let values = raw
-        .split(',')
-        .map(str::trim)
-        .map(str::parse::<f64>)
-        .collect::<Result<Vec<_>, _>>()?;
-    if values.len() != 3 {
-        return Err(format!("{key} must contain 3 comma-separated values").into());
-    }
-    Ok([values[0], values[1], values[2]])
-}
-
-fn parse_matrix3_f64(raw: &str, key: &str) -> Result<[[f64; 3]; 3], Box<dyn std::error::Error>> {
-    let values = raw
-        .split(',')
-        .map(str::trim)
-        .map(str::parse::<f64>)
-        .collect::<Result<Vec<_>, _>>()?;
-    if values.len() != 9 {
-        return Err(format!("{key} must contain 9 comma-separated values").into());
-    }
-    Ok([
-        [values[0], values[1], values[2]],
-        [values[3], values[4], values[5]],
-        [values[6], values[7], values[8]],
-    ])
 }
 
 pub(crate) fn load_pairing_window() -> Result<PairingWindowNs, PairingConfigError> {

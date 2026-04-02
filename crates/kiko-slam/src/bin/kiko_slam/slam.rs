@@ -65,7 +65,20 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_SURFACE_MAX_POINT_SIGMA_M=0.05   Max per-observation positional sigma accepted
     KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS=8 Min projectable tracked observations required before surface fusion
     KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX=1.5 Max tracked reprojection RMSE allowed to fuse surface observations
-    KIKO_DENSE_MAX_POINTS=30000           Max stable surface observations per keyframe";
+    KIKO_DENSE_MAX_POINTS=30000           Max stable surface observations per keyframe
+
+  Runtime IMU Override:
+    KIKO_IMU_CALIBRATION_FILE=/path/to/file.json  Override only the IMU block at runtime
+    KIKO_IMU_ROTATION=...                 3x3 row-major camera-from-imu rotation
+    KIKO_IMU_TRANSLATION=...              3-vector camera-from-imu translation (meters)
+    KIKO_IMU_ACCEL_NOISE_DENSITY=...      Accelerometer noise density
+    KIKO_IMU_GYRO_NOISE_DENSITY=...       Gyroscope noise density
+    KIKO_IMU_ACCEL_RANDOM_WALK=...        Accelerometer random walk
+    KIKO_IMU_GYRO_RANDOM_WALK=...         Gyroscope random walk
+    KIKO_IMU_TIME_OFFSET_NS=...           Camera-IMU time offset in nanoseconds
+    KIKO_IMU_GRAVITY_MPS2=...             Gravity magnitude
+    KIKO_IMU_INITIAL_ACCEL_BIAS=...       3-vector initial accel bias
+    KIKO_IMU_INITIAL_GYRO_BIAS=...        3-vector initial gyro bias";
 
 #[derive(Args, Clone, Debug)]
 #[command(
@@ -119,12 +132,14 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
+    let runtime_calibration =
+        kiko_slam::apply_runtime_imu_calibration_override(reader.calibration())?;
     let calibration =
-        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
+        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, &runtime_calibration)?;
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
         return Err(
-            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env".into(),
+            "KIKO_VIO=true requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );
     }
 
@@ -432,5 +447,10 @@ mod tests {
     #[test]
     fn slam_env_help_mentions_surface_pose_quality_support_env() {
         assert!(SLAM_ENV_HELP.contains("KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS"));
+    }
+
+    #[test]
+    fn slam_env_help_mentions_runtime_imu_override_file_env() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_IMU_CALIBRATION_FILE"));
     }
 }

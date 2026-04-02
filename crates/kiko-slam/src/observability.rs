@@ -90,6 +90,8 @@ const PATH_VIO_ITERATIONS: &str = "diagnostics/vio/iterations";
 #[cfg(feature = "vio")]
 const PATH_VIO_CONVERGED: &str = "diagnostics/vio/converged";
 #[cfg(feature = "vio")]
+const PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE: &str = "diagnostics/vio/calibrated_bias_prior_active";
+#[cfg(feature = "vio")]
 const PATH_VIO_COST_REPROJECTION: &str = "diagnostics/vio/cost/reprojection";
 #[cfg(feature = "vio")]
 const PATH_VIO_COST_IMU: &str = "diagnostics/vio/cost/imu";
@@ -347,6 +349,13 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
             vio_result.cost_breakdown.bias_prior_cost,
         ));
     }
+    #[cfg(feature = "vio")]
+    if let Some(active) = diag.vio_calibrated_bias_prior_active {
+        scalars.push((
+            PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE,
+            if active { 1.0 } else { 0.0 },
+        ));
+    }
 
     scalars
 }
@@ -570,6 +579,8 @@ impl RerunSink {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vio")]
+    use super::PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE;
     use super::{
         PATH_HEALTH_PNP_INLIER_RATIO, PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
@@ -650,6 +661,10 @@ mod tests {
                 .expect("vio shared rmse"),
         );
         diag.vio_proposal_disposition = Some(VioProposalDisposition::Adopted);
+        #[cfg(feature = "vio")]
+        {
+            diag.vio_calibrated_bias_prior_active = Some(true);
+        }
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
         diag.triangulation = Some(TriangulationStats {
@@ -693,6 +708,10 @@ mod tests {
         }));
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_TRACKING_VIO_PROPOSAL_ADOPTED && (*value - 1.0).abs() < 1e-6
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE && (*value - 1.0).abs() < 1e-6
         }));
         assert!(
             scalars

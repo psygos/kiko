@@ -188,7 +188,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "vio")]
     if env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
         return Err(
-            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env".into(),
+            "KIKO_VIO=true requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );
     }
     let imu_time_offset_ns = calibration

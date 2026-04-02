@@ -1473,8 +1473,7 @@ struct VioRuntime {
     noise: crate::ImuNoiseModel,
     pending_imu: ImuAccumulator,
     predicted_state: Option<crate::NavState>,
-    calibrated_accel_bias: Option<[f64; 3]>,
-    calibrated_gyro_bias: Option<[f64; 3]>,
+    calibrated_bias: Option<crate::ImuBias>,
     /// The last BA-optimized NavState. Used as base for preintegration.
     last_optimized_state: Option<crate::NavState>,
     /// VIO solve config (immutable after construction).
@@ -1618,8 +1617,14 @@ impl SlamTracker {
                     .unwrap_or_else(Pose64::identity);
                 let vio_window_size = crate::env::env_usize("KIKO_VIO_WINDOW").unwrap_or(5);
                 let vio_max_iters = crate::env::env_usize("KIKO_VIO_ITERS").unwrap_or(3);
-                let calib_ab = calibration.initial_accel_bias().unwrap_or([0.0; 3]);
-                let calib_gb = calibration.initial_gyro_bias().unwrap_or([0.0; 3]);
+                let calibrated_bias = calibration.initial_bias().cloned();
+                let bias_prior = calibrated_bias
+                    .clone()
+                    .map(|bias| crate::VioBiasPrior::new(100.0, bias))
+                    .transpose()
+                    .map_err(|err| TrackerInitError::VioInvalidGravity {
+                        message: err.to_string(),
+                    })?;
                 let solve_config = crate::VioSolveConfig::new(
                     gravity,
                     camera_from_body,
@@ -1628,10 +1633,8 @@ impl SlamTracker {
                     std::num::NonZeroUsize::new(vio_max_iters)
                         .unwrap_or(NonZeroUsize::new(3).unwrap()),
                     f64::from(config.ba.huber_delta_px()),
-                    10.0,  // anchor velocity info
-                    100.0, // bias prior info — strong, pulls toward calibrated
-                    calib_ab,
-                    calib_gb,
+                    10.0, // anchor velocity info
+                    bias_prior,
                 )
                 .map_err(|err| TrackerInitError::VioInvalidGravity {
                     message: err.to_string(),
@@ -1641,8 +1644,7 @@ impl SlamTracker {
                     noise: noise.clone(),
                     pending_imu: ImuAccumulator::new(),
                     predicted_state: None,
-                    calibrated_accel_bias: calibration.initial_accel_bias(),
-                    calibrated_gyro_bias: calibration.initial_gyro_bias(),
+                    calibrated_bias,
                     last_optimized_state: None,
                     solve_config,
                     vio_window: None,
@@ -1837,10 +1839,7 @@ impl SlamTracker {
             .as_ref()
             .map(|s| s.velocity_odom_mps())
             .unwrap_or([0.0; 3]);
-        let init_bias = crate::ImuBias {
-            accel: vio_runtime.calibrated_accel_bias.unwrap_or([0.0; 3]),
-            gyro: vio_runtime.calibrated_gyro_bias.unwrap_or([0.0; 3]),
-        };
+        let init_bias = vio_runtime.calibrated_bias.clone().unwrap_or_default();
         let prev_bias = vio_runtime
             .last_optimized_state
             .as_ref()
@@ -3298,6 +3297,12 @@ impl SlamTracker {
                 });
             diagnostics.vio_proposal_disposition = Some(vio_proposal_disposition);
             diagnostics.vio_solve_result = vio_solve_result;
+            diagnostics.vio_calibrated_bias_prior_active = match &self.local_estimator {
+                LocalEstimator::VisualOnly => None,
+                LocalEstimator::Inertial(vio_runtime) => {
+                    Some(vio_runtime.solve_config.has_anchor_bias_prior())
+                }
+            };
             if let Some(vio_metrics) = vio_proposal_metrics.as_ref() {
                 let shared_metrics = visual_proposal_metrics.shared_with(vio_metrics);
                 diagnostics.vio_proposal_projectable_tracked_observations = Some(

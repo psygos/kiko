@@ -431,6 +431,8 @@ pub struct FrameDiagnostics {
     pub ba_result: Option<BaResult>,
     #[cfg(feature = "vio")]
     pub vio_solve_result: Option<crate::VioSolveResult>,
+    #[cfg(feature = "vio")]
+    pub vio_calibrated_bias_prior_active: Option<bool>,
     pub loop_candidate_count: usize,
     pub loop_closure_status: Option<LoopClosureStatus>,
     pub tracking_time: Option<Duration>,
@@ -470,6 +472,8 @@ impl FrameDiagnostics {
             ba_result: None,
             #[cfg(feature = "vio")]
             vio_solve_result: None,
+            #[cfg(feature = "vio")]
+            vio_calibrated_bias_prior_active: None,
             loop_candidate_count: 0,
             loop_closure_status: None,
             tracking_time: None,
@@ -656,6 +660,8 @@ mod tests {
         assert!(diag.ba_result.is_none());
         #[cfg(feature = "vio")]
         assert!(diag.vio_solve_result.is_none());
+        #[cfg(feature = "vio")]
+        assert!(diag.vio_calibrated_bias_prior_active.is_none());
         assert_eq!(diag.loop_candidate_count, 0);
         assert!(diag.loop_closure_status.is_none());
         assert!(diag.tracking_time.is_none());
