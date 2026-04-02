@@ -338,6 +338,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     &surface.stats,
                                     pose.cam_from_map_pose32(),
                                     &output.diagnostics,
+                                    true,
                                     output.keyframe.is_some(),
                                 ) {
                                     eprintln!("stable surface: {err}");

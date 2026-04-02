@@ -298,6 +298,7 @@ impl RerunSink {
         cam_from_map: Pose,
         diagnostics: &FrameDiagnostics,
         surface_integration_requested: bool,
+        slam_keyframe: bool,
     ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
         self.ensure_world_logged()?;
@@ -332,6 +333,10 @@ impl RerunSink {
             } else {
                 0.0
             }),
+        )?;
+        self.rec.log(
+            "diagnostics/surface/frame_gate/slam_keyframe",
+            &rerun::Scalars::single(if slam_keyframe { 1.0 } else { 0.0 }),
         )?;
         if let Some(mean_sigma_m) = stats.mean_accepted_position_sigma_m {
             self.rec.log(
@@ -1791,6 +1796,7 @@ mod tests {
             Pose::identity(),
             &diagnostics,
             true,
+            false,
         )
         .expect("surface logging");
 
@@ -1831,6 +1837,7 @@ mod tests {
             Pose::identity(),
             &diagnostics,
             true,
+            false,
         )
         .expect("surface logging");
 
@@ -1868,11 +1875,53 @@ mod tests {
             Pose::identity(),
             &diagnostics,
             true,
+            true,
         )
         .expect("surface logging");
 
         assert_eq!(sink.surface_map.num_voxels(), 1);
         assert!(storage.num_msgs() > 0);
+    }
+
+    #[test]
+    fn log_surface_observations_support_frame_mutates_surface_map_without_slam_keyframe() {
+        let (rec, _storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_projectable_tracked_observations =
+            Some(PnpProjectableTrackedObservationCountMetric::new(12));
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
+            Some(PnpProjectableTrackedObservationPixelResidualMetric::new(1.0).expect("rmse"));
+        let point = StableSurfacePoint {
+            position: [0.0, 0.0, 2.0],
+            intensity: 180,
+            position_variance: 0.0025,
+            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        };
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+            true,
+            false,
+        )
+        .expect("surface logging");
+
+        assert_eq!(
+            sink.surface_map.num_voxels(),
+            1,
+            "support-frame surface integration must not depend on SLAM keyframe creation"
+        );
     }
 
     #[test]
@@ -1905,6 +1954,7 @@ mod tests {
             Pose::identity(),
             &diagnostics,
             true,
+            false,
         )
         .expect("surface logging");
 
@@ -1950,6 +2000,7 @@ mod tests {
             Pose::identity(),
             &diagnostics,
             false,
+            false,
         )
         .expect("surface logging");
 
@@ -1990,6 +2041,7 @@ mod tests {
             },
             Pose::identity(),
             &diagnostics,
+            false,
             false,
         )
         .expect("surface logging");
