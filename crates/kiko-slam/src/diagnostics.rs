@@ -130,6 +130,9 @@ pub enum DiagnosticMetricError {
         min: f32,
         max: f32,
     },
+    ZeroDenominator {
+        metric: &'static str,
+    },
 }
 
 impl std::fmt::Display for DiagnosticMetricError {
@@ -148,6 +151,9 @@ impl std::fmt::Display for DiagnosticMetricError {
                 max,
             } => {
                 write!(f, "{metric} must be in [{min}, {max}], got {value}")
+            }
+            DiagnosticMetricError::ZeroDenominator { metric } => {
+                write!(f, "{metric} denominator must be > 0")
             }
         }
     }
@@ -268,8 +274,60 @@ where
     }
 }
 
-pub type PnpInlierRatioMetric = RatioMetric<PnpTrackedObservationsSupport>;
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PnpInlierRatioMetric {
+    value: f32,
+    accepted_inliers: PnpAcceptedInlierCountMetric,
+    tracked_observations: PnpTrackedObservationCountMetric,
+}
+
+impl PnpInlierRatioMetric {
+    pub fn new(
+        accepted_inliers: PnpAcceptedInlierCountMetric,
+        tracked_observations: PnpTrackedObservationCountMetric,
+    ) -> Result<Self, DiagnosticMetricError> {
+        if tracked_observations.count() == 0 {
+            return Err(DiagnosticMetricError::ZeroDenominator {
+                metric: "pnp inlier ratio",
+            });
+        }
+        let value = accepted_inliers.count() as f32 / tracked_observations.count() as f32;
+        if !value.is_finite() {
+            return Err(DiagnosticMetricError::NonFinite {
+                metric: "pnp inlier ratio",
+                value,
+            });
+        }
+        if !(0.0..=1.0).contains(&value) {
+            return Err(DiagnosticMetricError::OutOfRange {
+                metric: "pnp inlier ratio",
+                value,
+                min: 0.0,
+                max: 1.0,
+            });
+        }
+        Ok(Self {
+            value,
+            accepted_inliers,
+            tracked_observations,
+        })
+    }
+
+    pub fn value(self) -> f32 {
+        self.value
+    }
+
+    pub fn accepted_inliers(self) -> PnpAcceptedInlierCountMetric {
+        self.accepted_inliers
+    }
+
+    pub fn tracked_observations(self) -> PnpTrackedObservationCountMetric {
+        self.tracked_observations
+    }
+}
+
 pub type PnpTrackedObservationCountMetric = CountMetric<PnpTrackedObservationsSupport>;
+pub type PnpAcceptedInlierCountMetric = CountMetric<PnpAcceptedInliersSupport>;
 pub type PnpProjectableTrackedObservationCountMetric =
     CountMetric<PnpProjectableTrackedObservationsSupport>;
 pub type VisualProposalProjectableTrackedObservationCountMetric =
@@ -354,9 +412,9 @@ pub enum TrackingPoseSource {
 pub enum VioProposalDisposition {
     NotRun,
     Adopted,
-    RejectedInsufficientSharedProjectableSupport,
-    RejectedChangedProjectableTrackedSupport,
-    RejectedHigherSharedProjectableTrackedReprojectionRmse,
+    RejectedInsufficientSharedAcceptedInlierSupport,
+    RejectedChangedAcceptedInlierProjectability,
+    RejectedHigherSharedAcceptedInlierReprojectionRmse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -392,6 +450,7 @@ pub enum LoopClosureRejectReason {
 pub struct FrameDiagnostics {
     pub pnp_inlier_ratio: Option<PnpInlierRatioMetric>,
     pub pnp_tracked_observations: Option<PnpTrackedObservationCountMetric>,
+    pub pnp_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
     pub ransac_iterations: Option<usize>,
     pub tracking_pose_source: Option<TrackingPoseSource>,
     pub pnp_projectable_tracked_observations: Option<PnpProjectableTrackedObservationCountMetric>,
@@ -418,6 +477,17 @@ pub struct FrameDiagnostics {
         Option<VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric>,
     pub vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px:
         Option<VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric>,
+    pub visual_proposal_projectable_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
+    pub visual_proposal_accepted_inlier_reprojection_rmse_px:
+        Option<PnpAcceptedInlierPixelResidualMetric>,
+    pub vio_proposal_projectable_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
+    pub vio_proposal_accepted_inlier_reprojection_rmse_px:
+        Option<PnpAcceptedInlierPixelResidualMetric>,
+    pub shared_projectable_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
+    pub visual_proposal_shared_accepted_inlier_reprojection_rmse_px:
+        Option<PnpAcceptedInlierPixelResidualMetric>,
+    pub vio_proposal_shared_accepted_inlier_reprojection_rmse_px:
+        Option<PnpAcceptedInlierPixelResidualMetric>,
     pub vio_proposal_disposition: Option<VioProposalDisposition>,
     pub pnp_inlier_reprojection_rmse_px: Option<PnpAcceptedInlierPixelResidualMetric>,
     pub pnp_inlier_reprojection_max_px: Option<PnpAcceptedInlierPixelResidualMetric>,
@@ -448,6 +518,7 @@ impl FrameDiagnostics {
         Self {
             pnp_inlier_ratio: None,
             pnp_tracked_observations: None,
+            pnp_accepted_inliers: None,
             ransac_iterations: None,
             tracking_pose_source: None,
             pnp_projectable_tracked_observations: None,
@@ -461,6 +532,13 @@ impl FrameDiagnostics {
             shared_projectable_tracked_observations: None,
             visual_proposal_shared_projectable_tracked_observation_reprojection_rmse_px: None,
             vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px: None,
+            visual_proposal_projectable_accepted_inliers: None,
+            visual_proposal_accepted_inlier_reprojection_rmse_px: None,
+            vio_proposal_projectable_accepted_inliers: None,
+            vio_proposal_accepted_inlier_reprojection_rmse_px: None,
+            shared_projectable_accepted_inliers: None,
+            visual_proposal_shared_accepted_inlier_reprojection_rmse_px: None,
+            vio_proposal_shared_accepted_inlier_reprojection_rmse_px: None,
             vio_proposal_disposition: None,
             pnp_inlier_reprojection_rmse_px: None,
             pnp_inlier_reprojection_max_px: None,
@@ -535,21 +613,33 @@ mod tests {
         StableSurfaceRetainedRawPixelResidualMetric,
         VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
     };
-    use crate::DegenerateReason;
+    use crate::{DegenerateReason, PnpAcceptedInlierCountMetric};
 
     #[test]
     fn ratio_metric_enforces_unit_interval() {
+        let accepted = PnpAcceptedInlierCountMetric::new(3);
+        let tracked = PnpTrackedObservationCountMetric::new(4);
         assert!(matches!(
-            PnpInlierRatioMetric::new(1.2),
+            PnpInlierRatioMetric::new(
+                PnpAcceptedInlierCountMetric::new(5),
+                PnpTrackedObservationCountMetric::new(4)
+            ),
             Err(DiagnosticMetricError::OutOfRange { .. })
         ));
         assert!(matches!(
-            PnpInlierRatioMetric::new(f32::NAN),
-            Err(DiagnosticMetricError::NonFinite { .. })
+            PnpInlierRatioMetric::new(accepted, PnpTrackedObservationCountMetric::new(0)),
+            Err(DiagnosticMetricError::ZeroDenominator { .. })
         ));
-        let metric = PnpInlierRatioMetric::new(0.25).expect("ratio metric");
-        assert_eq!(metric.value(), 0.25);
-        assert_eq!(metric.support(), ObservationSupport::PnpTrackedObservations);
+        let metric = PnpInlierRatioMetric::new(accepted, tracked).expect("ratio metric");
+        assert_eq!(metric.value(), 0.75);
+        assert_eq!(
+            metric.accepted_inliers().support(),
+            ObservationSupport::PnpAcceptedInliers
+        );
+        assert_eq!(
+            metric.tracked_observations().support(),
+            ObservationSupport::PnpTrackedObservations
+        );
     }
 
     #[test]
@@ -608,10 +698,18 @@ mod tests {
     }
 
     #[test]
+    fn accepted_inlier_count_metric_preserves_support() {
+        let metric = crate::PnpAcceptedInlierCountMetric::new(6);
+        assert_eq!(metric.count(), 6);
+        assert_eq!(metric.support(), ObservationSupport::PnpAcceptedInliers);
+    }
+
+    #[test]
     fn empty_diagnostics_has_all_none() {
         let diag = FrameDiagnostics::empty(2, 5);
         assert!(diag.pnp_inlier_ratio.is_none());
         assert!(diag.pnp_tracked_observations.is_none());
+        assert!(diag.pnp_accepted_inliers.is_none());
         assert!(diag.ransac_iterations.is_none());
         assert!(diag.tracking_pose_source.is_none());
         assert!(diag.pnp_projectable_tracked_observations.is_none());
@@ -647,6 +745,25 @@ mod tests {
         );
         assert!(
             diag.vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px
+                .is_none()
+        );
+        assert!(diag.visual_proposal_projectable_accepted_inliers.is_none());
+        assert!(
+            diag.visual_proposal_accepted_inlier_reprojection_rmse_px
+                .is_none()
+        );
+        assert!(diag.vio_proposal_projectable_accepted_inliers.is_none());
+        assert!(
+            diag.vio_proposal_accepted_inlier_reprojection_rmse_px
+                .is_none()
+        );
+        assert!(diag.shared_projectable_accepted_inliers.is_none());
+        assert!(
+            diag.visual_proposal_shared_accepted_inlier_reprojection_rmse_px
+                .is_none()
+        );
+        assert!(
+            diag.vio_proposal_shared_accepted_inlier_reprojection_rmse_px
                 .is_none()
         );
         assert!(diag.vio_proposal_disposition.is_none());

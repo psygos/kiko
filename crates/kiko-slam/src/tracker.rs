@@ -1402,33 +1402,33 @@ fn adaptive_tracking_ransac_config(base: RansacConfig, observation_count: usize)
 
 #[cfg(feature = "vio")]
 fn decide_vio_pose_adoption(
-    visual_metrics: &ProjectableTrackedPoseMetrics,
-    vio_metrics: &ProjectableTrackedPoseMetrics,
+    visual_metrics: &PoseReprojectionMetrics,
+    vio_metrics: &PoseReprojectionMetrics,
 ) -> crate::VioProposalDisposition {
     let shared = visual_metrics.shared_with(vio_metrics);
     if shared.count < MIN_PNP_CORRESPONDENCES {
-        return crate::VioProposalDisposition::RejectedInsufficientSharedProjectableSupport;
+        return crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport;
     }
     if shared.count != visual_metrics.projectable_count()
         || shared.count != vio_metrics.projectable_count()
     {
-        return crate::VioProposalDisposition::RejectedChangedProjectableTrackedSupport;
+        return crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability;
     }
     match (shared.lhs_rmse_px, shared.rhs_rmse_px) {
         (Some(visual_rmse_px), Some(vio_rmse_px)) if vio_rmse_px <= visual_rmse_px => {
             crate::VioProposalDisposition::Adopted
         }
         (Some(_), Some(_)) => {
-            crate::VioProposalDisposition::RejectedHigherSharedProjectableTrackedReprojectionRmse
+            crate::VioProposalDisposition::RejectedHigherSharedAcceptedInlierReprojectionRmse
         }
-        _ => crate::VioProposalDisposition::RejectedInsufficientSharedProjectableSupport,
+        _ => crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport,
     }
 }
 
 #[cfg(feature = "vio")]
 fn should_adopt_visual_ba_proposal(
-    visual_metrics: &ProjectableTrackedPoseMetrics,
-    visual_ba_metrics: &ProjectableTrackedPoseMetrics,
+    visual_metrics: &PoseReprojectionMetrics,
+    visual_ba_metrics: &PoseReprojectionMetrics,
 ) -> bool {
     let shared = visual_metrics.shared_with(visual_ba_metrics);
     if shared.count < MIN_PNP_CORRESPONDENCES {
@@ -1600,11 +1600,11 @@ struct VioPoseProposal {
 }
 
 #[derive(Clone, Debug)]
-struct ProjectableTrackedPoseMetrics {
+struct PoseReprojectionMetrics {
     errors: Vec<Option<f32>>,
 }
 
-impl ProjectableTrackedPoseMetrics {
+impl PoseReprojectionMetrics {
     fn from_pose(pose: &Pose, observations: &[Observation], intrinsics: PinholeIntrinsics) -> Self {
         Self {
             errors: crate::pnp::reprojection_errors(pose, observations, intrinsics),
@@ -1633,7 +1633,7 @@ impl ProjectableTrackedPoseMetrics {
     }
 
     #[cfg(feature = "vio")]
-    fn shared_with(&self, other: &Self) -> SharedProjectableTrackedPoseMetrics {
+    fn shared_with(&self, other: &Self) -> SharedPoseReprojectionMetrics {
         let mut lhs = Vec::new();
         let mut rhs = Vec::new();
         for (lhs_error, rhs_error) in self.errors.iter().zip(&other.errors) {
@@ -1642,7 +1642,7 @@ impl ProjectableTrackedPoseMetrics {
                 rhs.push(Some(*rhs_px));
             }
         }
-        SharedProjectableTrackedPoseMetrics {
+        SharedPoseReprojectionMetrics {
             count: lhs.len(),
             lhs_rmse_px: crate::pnp::reprojection_rmse(&lhs),
             rhs_rmse_px: crate::pnp::reprojection_rmse(&rhs),
@@ -1652,7 +1652,7 @@ impl ProjectableTrackedPoseMetrics {
 
 #[cfg(feature = "vio")]
 #[derive(Clone, Copy, Debug)]
-struct SharedProjectableTrackedPoseMetrics {
+struct SharedPoseReprojectionMetrics {
     count: usize,
     lhs_rmse_px: Option<f32>,
     rhs_rmse_px: Option<f32>,
@@ -3183,6 +3183,11 @@ impl SlamTracker {
             let keypoint_ref = self.global_map.keyframe_keypoint(keyframe_id, ki)?;
             map_observations.push(MapObservation::new(keypoint_ref, pixel));
         }
+        let inlier_observations: Vec<_> = result
+            .inliers
+            .iter()
+            .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
+            .collect();
 
         let parallax_px = median_parallax_px(
             &verified,
@@ -3220,9 +3225,15 @@ impl SlamTracker {
         #[cfg(feature = "vio")]
         let intrinsics = self.frontend.intrinsics();
         #[cfg(feature = "vio")]
-        let visual_proposal_metrics = ProjectableTrackedPoseMetrics::from_pose(
+        let visual_proposal_tracked_metrics = PoseReprojectionMetrics::from_pose(
             &visual_pose_world,
             &tracked_observations.observations,
+            intrinsics,
+        );
+        #[cfg(feature = "vio")]
+        let visual_proposal_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
+            &visual_pose_world,
+            &inlier_observations,
             intrinsics,
         );
         #[cfg(feature = "vio")]
@@ -3230,7 +3241,8 @@ impl SlamTracker {
             pose_world,
             tracking_pose_source,
             vio_proposal_disposition,
-            vio_proposal_metrics,
+            vio_proposal_tracked_metrics,
+            vio_proposal_accepted_inlier_metrics,
             vio_solve_result,
         ) = match refinement {
             PoseRefinementProposal::None => {
@@ -3245,15 +3257,19 @@ impl SlamTracker {
                     crate::VioProposalDisposition::NotRun,
                     None,
                     None,
+                    None,
                 )
             }
             PoseRefinementProposal::VisualBa(proposal) => {
-                let visual_ba_metrics = ProjectableTrackedPoseMetrics::from_pose(
+                let visual_ba_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
                     &proposal.pose_world,
-                    &tracked_observations.observations,
+                    &inlier_observations,
                     intrinsics,
                 );
-                if should_adopt_visual_ba_proposal(&visual_proposal_metrics, &visual_ba_metrics) {
+                if should_adopt_visual_ba_proposal(
+                    &visual_proposal_accepted_inlier_metrics,
+                    &visual_ba_accepted_inlier_metrics,
+                ) {
                     let adopted_pose = proposal.pose_world;
                     self.commit_visual_ba_proposal(proposal);
                     self.commit_authoritative_visual_pose(
@@ -3265,6 +3281,7 @@ impl SlamTracker {
                         adopted_pose,
                         crate::TrackingPoseSource::VisualBundleAdjustment,
                         crate::VioProposalDisposition::NotRun,
+                        None,
                         None,
                         None,
                     )
@@ -3280,16 +3297,25 @@ impl SlamTracker {
                         crate::VioProposalDisposition::NotRun,
                         None,
                         None,
+                        None,
                     )
                 }
             }
             PoseRefinementProposal::Vio(proposal) => {
-                let vio_metrics = ProjectableTrackedPoseMetrics::from_pose(
+                let vio_tracked_metrics = PoseReprojectionMetrics::from_pose(
                     &proposal.pose_world,
                     &tracked_observations.observations,
                     intrinsics,
                 );
-                let disposition = decide_vio_pose_adoption(&visual_proposal_metrics, &vio_metrics);
+                let vio_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
+                    &proposal.pose_world,
+                    &inlier_observations,
+                    intrinsics,
+                );
+                let disposition = decide_vio_pose_adoption(
+                    &visual_proposal_accepted_inlier_metrics,
+                    &vio_accepted_inlier_metrics,
+                );
                 let vio_solve_result = proposal.solve_result.clone();
                 let (adopted_pose, source) = if disposition
                     == crate::VioProposalDisposition::Adopted
@@ -3314,7 +3340,8 @@ impl SlamTracker {
                     adopted_pose,
                     source,
                     disposition,
-                    Some(vio_metrics),
+                    Some(vio_tracked_metrics),
+                    Some(vio_accepted_inlier_metrics),
                     Some(vio_solve_result),
                 )
             }
@@ -3323,11 +3350,6 @@ impl SlamTracker {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
         self.consecutive_tracking_failures = 0;
-        let inlier_observations: Vec<_> = result
-            .inliers
-            .iter()
-            .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
-            .collect();
         let mut output_keyframe = None;
         let mut output_matches = None;
         let mut keyframe_status = None;
@@ -3495,25 +3517,29 @@ impl SlamTracker {
 
         #[cfg(not(feature = "vio"))]
         let intrinsics = self.frontend.intrinsics();
-        let tracked_metrics = ProjectableTrackedPoseMetrics::from_pose(
+        let tracked_metrics = PoseReprojectionMetrics::from_pose(
             &pose_world,
             &tracked_observations.observations,
             intrinsics,
         );
         let projectable_tracked_observations = tracked_metrics.projectable_count();
-        let inlier_errors =
-            crate::pnp::reprojection_errors(&pose_world, &inlier_observations, intrinsics);
+        let accepted_inlier_metrics =
+            PoseReprojectionMetrics::from_pose(&pose_world, &inlier_observations, intrinsics);
         // VIO visual correction will be handled by tightly-coupled BA (M2).
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.pnp_inlier_ratio = Some(
             crate::PnpInlierRatioMetric::new(
-                result.inliers.len() as f32 / tracked_observations.len().max(1) as f32,
+                crate::PnpAcceptedInlierCountMetric::new(result.inliers.len()),
+                crate::PnpTrackedObservationCountMetric::new(tracked_observations.len()),
             )
-            .expect("tracker must emit a finite inlier ratio in [0, 1]"),
+            .expect("tracker must emit a finite inlier ratio over non-empty tracked observations"),
         );
         diagnostics.pnp_tracked_observations = Some(crate::PnpTrackedObservationCountMetric::new(
             tracked_observations.len(),
+        ));
+        diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(
+            result.inliers.len(),
         ));
         diagnostics.tracking_pose_source = Some(tracking_pose_source);
         diagnostics.pnp_projectable_tracked_observations =
@@ -3542,16 +3568,26 @@ impl SlamTracker {
         {
             diagnostics.visual_proposal_projectable_tracked_observations = Some(
                 crate::VisualProposalProjectableTrackedObservationCountMetric::new(
-                    visual_proposal_metrics.projectable_count(),
+                    visual_proposal_tracked_metrics.projectable_count(),
                 ),
             );
             diagnostics.visual_proposal_projectable_tracked_observation_reprojection_rmse_px =
-                visual_proposal_metrics.rmse_px().map(|value| {
+                visual_proposal_tracked_metrics.rmse_px().map(|value| {
                     crate::VisualProposalProjectableTrackedObservationPixelResidualMetric::new(
                         value,
                     )
                     .expect(
                         "visual proposal tracked reprojection RMSE must be finite and non-negative",
+                    )
+                });
+            diagnostics.visual_proposal_projectable_accepted_inliers =
+                Some(crate::PnpAcceptedInlierCountMetric::new(
+                    visual_proposal_accepted_inlier_metrics.projectable_count(),
+                ));
+            diagnostics.visual_proposal_accepted_inlier_reprojection_rmse_px =
+                visual_proposal_accepted_inlier_metrics.rmse_px().map(|value| {
+                    crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
+                        "visual proposal accepted-inlier reprojection RMSE must be finite and non-negative",
                     )
                 });
             diagnostics.vio_proposal_disposition = Some(vio_proposal_disposition);
@@ -3562,15 +3598,16 @@ impl SlamTracker {
                     Some(vio_runtime.solve_config.has_anchor_bias_prior())
                 }
             };
-            if let Some(vio_metrics) = vio_proposal_metrics.as_ref() {
-                let shared_metrics = visual_proposal_metrics.shared_with(vio_metrics);
+            if let Some(vio_tracked_metrics) = vio_proposal_tracked_metrics.as_ref() {
+                let shared_metrics =
+                    visual_proposal_tracked_metrics.shared_with(vio_tracked_metrics);
                 diagnostics.vio_proposal_projectable_tracked_observations = Some(
                     crate::VioProposalProjectableTrackedObservationCountMetric::new(
-                        vio_metrics.projectable_count(),
+                        vio_tracked_metrics.projectable_count(),
                     ),
                 );
                 diagnostics.vio_proposal_projectable_tracked_observation_reprojection_rmse_px =
-                    vio_metrics.rmse_px().map(|value| {
+                    vio_tracked_metrics.rmse_px().map(|value| {
                         crate::VioProposalProjectableTrackedObservationPixelResidualMetric::new(
                             value,
                         )
@@ -3604,19 +3641,49 @@ impl SlamTracker {
                         )
                     });
             }
+            if let Some(vio_accepted_inlier_metrics) = vio_proposal_accepted_inlier_metrics.as_ref()
+            {
+                let shared_accepted_inlier_metrics = visual_proposal_accepted_inlier_metrics
+                    .shared_with(vio_accepted_inlier_metrics);
+                diagnostics.vio_proposal_projectable_accepted_inliers =
+                    Some(crate::PnpAcceptedInlierCountMetric::new(
+                        vio_accepted_inlier_metrics.projectable_count(),
+                    ));
+                diagnostics.vio_proposal_accepted_inlier_reprojection_rmse_px =
+                    vio_accepted_inlier_metrics.rmse_px().map(|value| {
+                        crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
+                            "VIO proposal accepted-inlier reprojection RMSE must be finite and non-negative",
+                        )
+                    });
+                diagnostics.shared_projectable_accepted_inliers = Some(
+                    crate::PnpAcceptedInlierCountMetric::new(shared_accepted_inlier_metrics.count),
+                );
+                diagnostics.visual_proposal_shared_accepted_inlier_reprojection_rmse_px =
+                    shared_accepted_inlier_metrics.lhs_rmse_px.map(|value| {
+                        crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
+                            "visual proposal shared accepted-inlier reprojection RMSE must be finite and non-negative",
+                        )
+                    });
+                diagnostics.vio_proposal_shared_accepted_inlier_reprojection_rmse_px =
+                    shared_accepted_inlier_metrics.rhs_rmse_px.map(|value| {
+                        crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
+                            "VIO proposal shared accepted-inlier reprojection RMSE must be finite and non-negative",
+                        )
+                    });
+            }
         }
-        diagnostics.pnp_inlier_reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors)
-            .map(|value| {
+        diagnostics.pnp_inlier_reprojection_rmse_px =
+            accepted_inlier_metrics.rmse_px().map(|value| {
                 crate::PnpAcceptedInlierPixelResidualMetric::new(value)
                     .expect("reprojection RMSE must be finite and non-negative")
             });
-        diagnostics.pnp_inlier_reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors)
-            .map(|value| {
+        diagnostics.pnp_inlier_reprojection_max_px =
+            accepted_inlier_metrics.max_px().map(|value| {
                 crate::PnpAcceptedInlierPixelResidualMetric::new(value)
                     .expect("reprojection max must be finite and non-negative")
             });
         diagnostics.pnp_inlier_reprojection_mse_per_axis_px2 =
-            crate::pnp::reprojection_mse_per_axis_px2(&inlier_errors).map(|value| {
+            accepted_inlier_metrics.mse_per_axis_px2().map(|value| {
                 crate::PnpAcceptedInlierReprojectionMsePerAxisPx2Metric::new(value)
                     .expect("PnP inlier reprojection MSE per axis must be finite and non-negative")
             });
@@ -5568,7 +5635,7 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn vio_pose_adoption_rejects_changed_projectable_support_even_when_counts_match() {
-        let visual = ProjectableTrackedPoseMetrics::from_errors(vec![
+        let visual = PoseReprojectionMetrics::from_errors(vec![
             Some(1.0),
             Some(1.0),
             Some(1.0),
@@ -5576,7 +5643,7 @@ mod tests {
             Some(1.0),
             None,
         ]);
-        let vio = ProjectableTrackedPoseMetrics::from_errors(vec![
+        let vio = PoseReprojectionMetrics::from_errors(vec![
             None,
             Some(0.1),
             Some(0.1),
@@ -5586,14 +5653,14 @@ mod tests {
         ]);
         assert_eq!(
             decide_vio_pose_adoption(&visual, &vio),
-            crate::VioProposalDisposition::RejectedChangedProjectableTrackedSupport
+            crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability
         );
     }
 
     #[cfg(feature = "vio")]
     #[test]
     fn visual_ba_adoption_requires_exact_projectable_support_match() {
-        let visual = ProjectableTrackedPoseMetrics::from_errors(vec![
+        let visual = PoseReprojectionMetrics::from_errors(vec![
             Some(1.0),
             Some(1.0),
             Some(1.0),
@@ -5601,7 +5668,7 @@ mod tests {
             Some(1.0),
             None,
         ]);
-        let visual_ba = ProjectableTrackedPoseMetrics::from_errors(vec![
+        let visual_ba = PoseReprojectionMetrics::from_errors(vec![
             None,
             Some(0.1),
             Some(0.1),

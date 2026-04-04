@@ -7,6 +7,14 @@ use crate::{
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
 
 const PATH_HEALTH_PNP_INLIER_RATIO: &str = "diagnostics/health/pnp_inlier_ratio";
+const PATH_HEALTH_VISUAL_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE: &str =
+    "diagnostics/health/visual_proposal_pnp_accepted_inlier_reprojection_rmse_px";
+const PATH_HEALTH_VIO_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE: &str =
+    "diagnostics/health/vio_proposal_pnp_accepted_inlier_reprojection_rmse_px";
+const PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE: &str =
+    "diagnostics/health/visual_proposal_shared_accepted_inlier_reprojection_rmse_px";
+const PATH_HEALTH_VIO_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE: &str =
+    "diagnostics/health/vio_proposal_shared_accepted_inlier_reprojection_rmse_px";
 const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE: &str =
     "diagnostics/health/pnp_projectable_tracked_observation_reprojection_rmse_px";
 const PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX: &str =
@@ -47,6 +55,13 @@ const PATH_TRACKING_FEATURES_DETECTED: &str = "diagnostics/tracking/features_det
 const PATH_TRACKING_FEATURES_MATCHED: &str = "diagnostics/tracking/features_matched";
 const PATH_TRACKING_PNP_TRACKED_OBSERVATIONS: &str =
     "diagnostics/tracking/pnp_tracked_observations";
+const PATH_TRACKING_PNP_ACCEPTED_INLIERS: &str = "diagnostics/tracking/pnp_accepted_inliers";
+const PATH_TRACKING_VISUAL_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS: &str =
+    "diagnostics/tracking/visual_proposal_projectable_accepted_inliers";
+const PATH_TRACKING_VIO_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS: &str =
+    "diagnostics/tracking/vio_proposal_projectable_accepted_inliers";
+const PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS: &str =
+    "diagnostics/tracking/shared_projectable_accepted_inliers";
 const PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
     "diagnostics/tracking/pnp_projectable_tracked_observations";
 const PATH_TRACKING_VISUAL_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
@@ -59,10 +74,11 @@ const PATH_TRACKING_POSE_SOURCE: &str = "diagnostics/tracking/pose_source";
 const PATH_TRACKING_VIO_PROPOSAL_RAN: &str = "diagnostics/tracking/vio_proposal_ran";
 const PATH_TRACKING_VIO_PROPOSAL_ADOPTED: &str = "diagnostics/tracking/vio_proposal_adopted";
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_SHARED_SUPPORT: &str =
-    "diagnostics/tracking/vio_proposal_rejected_insufficient_shared_projectable_support";
+    "diagnostics/tracking/vio_proposal_rejected_insufficient_shared_accepted_inlier_support";
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT: &str =
-    "diagnostics/tracking/vio_proposal_rejected_changed_projectable_tracked_support";
-const PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE: &str = "diagnostics/tracking/vio_proposal_rejected_higher_shared_projectable_tracked_reprojection_rmse";
+    "diagnostics/tracking/vio_proposal_rejected_changed_accepted_inlier_projectability";
+const PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE: &str =
+    "diagnostics/tracking/vio_proposal_rejected_higher_shared_accepted_inlier_reprojection_rmse";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
 const PATH_TRACKING_PARALLAX: &str = "diagnostics/tracking/parallax_px";
 const PATH_TRACKING_COVISIBILITY: &str = "diagnostics/tracking/covisibility";
@@ -142,6 +158,30 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     if let Some(v) = diag.pnp_inlier_ratio {
         scalars.push((PATH_HEALTH_PNP_INLIER_RATIO, v.value() as f64));
     }
+    if let Some(v) = diag.visual_proposal_accepted_inlier_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VISUAL_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.vio_proposal_accepted_inlier_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VIO_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.visual_proposal_shared_accepted_inlier_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
+    if let Some(v) = diag.vio_proposal_shared_accepted_inlier_reprojection_rmse_px {
+        scalars.push((
+            PATH_HEALTH_VIO_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE,
+            v.value_px() as f64,
+        ));
+    }
     if let Some(v) = diag.pnp_projectable_tracked_observation_reprojection_rmse_px {
         scalars.push((
             PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE,
@@ -210,6 +250,27 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     if let Some(v) = diag.pnp_tracked_observations {
         scalars.push((PATH_TRACKING_PNP_TRACKED_OBSERVATIONS, v.count() as f64));
     }
+    if let Some(v) = diag.pnp_accepted_inliers {
+        scalars.push((PATH_TRACKING_PNP_ACCEPTED_INLIERS, v.count() as f64));
+    }
+    if let Some(v) = diag.visual_proposal_projectable_accepted_inliers {
+        scalars.push((
+            PATH_TRACKING_VISUAL_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS,
+            v.count() as f64,
+        ));
+    }
+    if let Some(v) = diag.vio_proposal_projectable_accepted_inliers {
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS,
+            v.count() as f64,
+        ));
+    }
+    if let Some(v) = diag.shared_projectable_accepted_inliers {
+        scalars.push((
+            PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS,
+            v.count() as f64,
+        ));
+    }
     if let Some(v) = diag.pnp_projectable_tracked_observations {
         scalars.push((
             PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
@@ -256,7 +317,7 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         ));
         scalars.push((
             PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_SHARED_SUPPORT,
-            if v == crate::VioProposalDisposition::RejectedInsufficientSharedProjectableSupport {
+            if v == crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport {
                 1.0
             } else {
                 0.0
@@ -264,7 +325,7 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         ));
         scalars.push((
             PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT,
-            if v == crate::VioProposalDisposition::RejectedChangedProjectableTrackedSupport {
+            if v == crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability {
                 1.0
             } else {
                 0.0
@@ -273,7 +334,7 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((
             PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE,
             if v
-                == crate::VioProposalDisposition::RejectedHigherSharedProjectableTrackedReprojectionRmse
+                == crate::VioProposalDisposition::RejectedHigherSharedAcceptedInlierReprojectionRmse
             {
                 1.0
             } else {
@@ -584,15 +645,24 @@ mod tests {
     use super::{
         PATH_HEALTH_PNP_INLIER_RATIO, PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
-        PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES, PATH_MAP_POINTS,
+        PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE,
+        PATH_HEALTH_VIO_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE,
+        PATH_HEALTH_VIO_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE,
+        PATH_HEALTH_VISUAL_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE,
+        PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES,
+        PATH_MAP_POINTS, PATH_TRACKING_PNP_ACCEPTED_INLIERS,
         PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+        PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS,
         PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS, PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
-        PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS, diagnostics_scalars,
+        PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+        PATH_TRACKING_VIO_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS,
+        PATH_TRACKING_VISUAL_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS, diagnostics_scalars,
         format_event,
     };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
-        PnpInlierRatioMetric, PnpProjectableTrackedObservationCountMetric,
+        PnpAcceptedInlierCountMetric, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
+        PnpProjectableTrackedObservationCountMetric,
         PnpProjectableTrackedObservationPixelResidualMetric,
         PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric, TrackingPoseSource,
         TriangulationStats, VioProposalDisposition,
@@ -623,7 +693,14 @@ mod tests {
     #[test]
     fn diagnostics_scalars_include_present_fields() {
         let mut diag = FrameDiagnostics::empty(1, 2);
-        diag.pnp_inlier_ratio = Some(PnpInlierRatioMetric::new(0.75).expect("ratio"));
+        diag.pnp_inlier_ratio = Some(
+            PnpInlierRatioMetric::new(
+                PnpAcceptedInlierCountMetric::new(3),
+                crate::PnpTrackedObservationCountMetric::new(4),
+            )
+            .expect("ratio"),
+        );
+        diag.pnp_accepted_inliers = Some(PnpAcceptedInlierCountMetric::new(6));
         diag.pnp_projectable_tracked_observations =
             Some(PnpProjectableTrackedObservationCountMetric::new(7));
         diag.pnp_projectable_tracked_observation_reprojection_rmse_px = Some(
@@ -644,11 +721,22 @@ mod tests {
             VisualProposalProjectableTrackedObservationPixelResidualMetric::new(1.2)
                 .expect("visual proposal rmse"),
         );
+        diag.visual_proposal_projectable_accepted_inliers =
+            Some(PnpAcceptedInlierCountMetric::new(6));
+        diag.visual_proposal_accepted_inlier_reprojection_rmse_px = Some(
+            PnpAcceptedInlierPixelResidualMetric::new(1.0)
+                .expect("visual proposal accepted-inlier rmse"),
+        );
         diag.vio_proposal_projectable_tracked_observations =
             Some(VioProposalProjectableTrackedObservationCountMetric::new(8));
         diag.vio_proposal_projectable_tracked_observation_reprojection_rmse_px = Some(
             VioProposalProjectableTrackedObservationPixelResidualMetric::new(0.9)
                 .expect("vio proposal rmse"),
+        );
+        diag.vio_proposal_projectable_accepted_inliers = Some(PnpAcceptedInlierCountMetric::new(6));
+        diag.vio_proposal_accepted_inlier_reprojection_rmse_px = Some(
+            PnpAcceptedInlierPixelResidualMetric::new(0.8)
+                .expect("vio proposal accepted-inlier rmse"),
         );
         diag.shared_projectable_tracked_observations =
             Some(VisualVsVioSharedProjectableTrackedObservationCountMetric::new(6));
@@ -659,6 +747,15 @@ mod tests {
         diag.vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px = Some(
             VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(0.8)
                 .expect("vio shared rmse"),
+        );
+        diag.shared_projectable_accepted_inliers = Some(PnpAcceptedInlierCountMetric::new(6));
+        diag.visual_proposal_shared_accepted_inlier_reprojection_rmse_px = Some(
+            PnpAcceptedInlierPixelResidualMetric::new(1.0)
+                .expect("visual shared accepted-inlier rmse"),
+        );
+        diag.vio_proposal_shared_accepted_inlier_reprojection_rmse_px = Some(
+            PnpAcceptedInlierPixelResidualMetric::new(0.8)
+                .expect("vio shared accepted-inlier rmse"),
         );
         diag.vio_proposal_disposition = Some(VioProposalDisposition::Adopted);
         #[cfg(feature = "vio")]
@@ -685,6 +782,37 @@ mod tests {
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE
                 && (*value - 1.5).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_ACCEPTED_INLIERS && (*value - 6.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_VISUAL_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS
+                && (*value - 6.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_VIO_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS
+                && (*value - 6.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS
+                && (*value - 6.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_VISUAL_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE
+                && (*value - 1.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_VIO_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE
+                && (*value - 0.8).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE
+                && (*value - 1.0).abs() < 1e-6
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_HEALTH_VIO_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE
+                && (*value - 0.8).abs() < 1e-6
         }));
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX
