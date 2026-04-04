@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
-    read_meta, scan_frames,
+    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration_with_imu_override,
+    read_manifest, read_meta, scan_frames,
 };
 
 #[derive(Debug)]
@@ -40,9 +40,24 @@ pub struct TimedPair {
 
 impl DatasetReader {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, DatasetError> {
+        Self::open_with_imu_calibration_override(path, None)
+    }
+
+    pub fn open_with_imu_calibration_override(
+        path: impl Into<PathBuf>,
+        imu_override: Option<super::ImuCalibration>,
+    ) -> Result<Self, DatasetError> {
         let root = path.into();
         let meta = read_meta(&root)?;
-        let calibration = read_calibration(&root)?;
+        if let Some(_)
+            = imu_override.as_ref()
+            && meta.imu.is_none()
+        {
+            return Err(DatasetError::InvalidConfig {
+                msg: "runtime IMU override requires IMU data in dataset meta",
+            });
+        }
+        let calibration = read_calibration_with_imu_override(&root, imu_override.as_ref())?;
         let manifest = read_manifest(&root)?;
         let imu_time_offset_ns = calibration
             .imu
@@ -832,6 +847,176 @@ mod tests {
         let imu = bundle.imu().batch().expect("imu batch");
         assert_eq!(imu.start_time().as_nanos(), 90);
         assert_eq!(imu.end_time().as_nanos(), 102);
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn runtime_imu_override_reshifts_loaded_samples_before_bundle_selection() {
+        let dataset_dir = unique_temp_dir("reader-runtime-imu-override");
+        let (writer, handle) = DatasetWriter::create(
+            &dataset_dir,
+            &meta_with_imu(),
+            &calibration_with_time_offset_ns(0),
+        )
+        .expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 130));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 134));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(100), [0.0; 3], [0.0; 3]).expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(112), [1.0; 3], [2.0; 3]).expect("imu 1"),
+            ])
+            .expect("imu batch"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut reader = DatasetReader::open_with_imu_calibration_override(
+            &dataset_dir,
+            Some(calibration_with_time_offset_ns(10).imu.expect("imu calibration")),
+        )
+        .expect("reader");
+        let bundle = reader
+            .bundles()
+            .next()
+            .expect("bundle")
+            .expect("bundle should reflect runtime override");
+        let imu = bundle.imu().batch().expect("imu batch");
+        assert_eq!(imu.start_time().as_nanos(), 110);
+        assert_eq!(imu.end_time().as_nanos(), 122);
+        assert_eq!(
+            reader
+                .calibration()
+                .imu
+                .as_ref()
+                .expect("stored imu calibration")
+                .extrinsics
+                .time_offset_ns,
+            10
+        );
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn open_with_runtime_imu_override_applies_override_before_loading_samples() {
+        let dataset_dir = unique_temp_dir("reader-runtime-imu-open-order");
+        let (writer, handle) = DatasetWriter::create(
+            &dataset_dir,
+            &meta_with_imu(),
+            &calibration_with_time_offset_ns(10),
+        )
+        .expect("writer");
+
+        let near_max = i64::MAX - 5;
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, near_max - 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, near_max - 96));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(near_max), [0.0; 3], [0.0; 3])
+                    .expect("imu 0"),
+            ])
+            .expect("imu batch"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let open_err = DatasetReader::open(&dataset_dir).expect_err("embedded offset should overflow");
+        assert!(matches!(open_err, DatasetError::ReadFile { .. }));
+
+        let reader = DatasetReader::open_with_imu_calibration_override(
+            &dataset_dir,
+            Some(calibration_with_time_offset_ns(0).imu.expect("imu calibration")),
+        )
+        .expect("runtime override should become authoritative before sample load");
+        assert_eq!(
+            reader
+                .calibration()
+                .imu
+                .as_ref()
+                .expect("stored imu calibration")
+                .extrinsics
+                .time_offset_ns,
+            0
+        );
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn open_with_runtime_imu_override_ignores_non_deserializable_embedded_imu_block() {
+        let dataset_dir = unique_temp_dir("reader-runtime-imu-json-override");
+        let (writer, handle) = DatasetWriter::create(
+            &dataset_dir,
+            &meta_with_imu(),
+            &calibration_with_time_offset_ns(0),
+        )
+        .expect("writer");
+
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 130));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 134));
+        writer.write_imu(
+            &ImuBatch::new(vec![
+                ImuSample::new(Timestamp::from_nanos(100), [0.0; 3], [0.0; 3]).expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(112), [1.0; 3], [2.0; 3]).expect("imu 1"),
+            ])
+            .expect("imu batch"),
+        );
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let calibration_path = dataset_dir.join(crate::dataset::format::CALIBRATION_FILE);
+        std::fs::write(
+            &calibration_path,
+            serde_json::json!({
+                "left": {
+                    "fx": 100.0,
+                    "fy": 100.0,
+                    "cx": 1.0,
+                    "cy": 1.0,
+                    "width": 2,
+                    "height": 2
+                },
+                "right": {
+                    "fx": 100.0,
+                    "fy": 100.0,
+                    "cx": 1.0,
+                    "cy": 1.0,
+                    "width": 2,
+                    "height": 2
+                },
+                "baseline_m": 0.1,
+                "rectified": true,
+                "imu": {
+                    "noise": "invalid embedded imu block"
+                }
+            })
+            .to_string(),
+        )
+        .expect("rewrite calibration");
+
+        let open_err = DatasetReader::open(&dataset_dir)
+            .expect_err("embedded imu block should fail without override");
+        assert!(matches!(open_err, DatasetError::DeserializeJson { .. }));
+
+        let mut reader = DatasetReader::open_with_imu_calibration_override(
+            &dataset_dir,
+            Some(calibration_with_time_offset_ns(10).imu.expect("imu calibration")),
+        )
+        .expect("runtime override should replace embedded imu block before deserialization");
+        let bundle = reader
+            .bundles()
+            .next()
+            .expect("bundle")
+            .expect("bundle should succeed");
+        let imu = bundle.imu().batch().expect("imu batch");
+        assert_eq!(imu.start_time().as_nanos(), 110);
+        assert_eq!(imu.end_time().as_nanos(), 122);
 
         let _ = std::fs::remove_dir_all(&dataset_dir);
     }

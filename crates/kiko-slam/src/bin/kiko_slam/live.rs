@@ -181,6 +181,8 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     } = inference;
 
     let dataset_calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config)?;
+    let dataset_calibration =
+        kiko_slam::apply_runtime_imu_calibration_override(&dataset_calibration)?;
     let rectified = RectifiedStereo::from_calibration(&dataset_calibration)?;
     let intrinsics = PinholeIntrinsics::try_from(&dataset_calibration.left)?;
     let calibration =

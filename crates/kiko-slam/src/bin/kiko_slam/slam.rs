@@ -97,7 +97,9 @@ pub struct SlamArgs {
 }
 
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = DatasetReader::open(&args.dataset.path)?;
+    let runtime_imu_override = kiko_slam::load_runtime_imu_calibration_from_env()?;
+    let mut reader =
+        DatasetReader::open_with_imu_calibration_override(&args.dataset.path, runtime_imu_override)?;
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && reader.meta().imu.is_none() {
         return Err("KIKO_VIO=true requires IMU data in the dataset".into());
@@ -132,10 +134,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
-    let runtime_calibration =
-        kiko_slam::apply_runtime_imu_calibration_override(reader.calibration())?;
     let calibration =
-        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, &runtime_calibration)?;
+        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
         return Err(
