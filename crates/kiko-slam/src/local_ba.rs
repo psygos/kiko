@@ -523,7 +523,8 @@ impl SyncedPose {
 #[derive(Clone, Debug)]
 pub(crate) struct VioAnchor {
     pub(crate) synced: SyncedPose,
-    pub(crate) observations: ObservationSet,
+    /// Visual constraints tied to this anchor, when available.
+    pub(crate) observations: Option<ObservationSet>,
     pub(crate) anchor_velocity_odom_mps: [f64; 3],
 }
 
@@ -533,7 +534,9 @@ pub(crate) struct VioAnchor {
 #[derive(Clone, Debug)]
 pub(crate) struct VioSuccessor {
     pub(crate) synced: SyncedPose,
-    pub(crate) observations: ObservationSet,
+    /// Visual constraints for this frame. Some frames legitimately contribute
+    /// only inertial continuity and carry no lawful visual observations.
+    pub(crate) observations: Option<ObservationSet>,
     pub(crate) preintegrated: crate::PreintegratedImu,
 }
 
@@ -679,11 +682,11 @@ impl VioWindow {
         1 + self.successors.len()
     }
 
-    fn observations(&self, frame_idx: usize) -> &ObservationSet {
+    fn observations(&self, frame_idx: usize) -> Option<&ObservationSet> {
         if frame_idx == 0 {
-            &self.anchor.observations
+            self.anchor.observations.as_ref()
         } else {
-            &self.successors[frame_idx - 1].observations
+            self.successors[frame_idx - 1].observations.as_ref()
         }
     }
 
@@ -1503,6 +1506,7 @@ pub fn optimize_vio(
     window: &mut VioWindow,
     config: &VioSolveConfig,
     map: &SlamMap,
+    map_from_odom: &crate::MapFromOdom,
 ) -> VioSolveResult {
     use crate::vio::solve::solve_dense_f64;
 
@@ -1521,7 +1525,7 @@ pub fn optimize_vio(
     let max_iters = config.max_iterations.get();
     let mut lambda = f64::from(config.lm.initial_lambda);
     let mut synced = window.synced_poses().cloned().collect::<Vec<_>>();
-    let mut linearization = linearize_vio_states(window, &synced, config, map);
+    let mut linearization = linearize_vio_states(window, &synced, config, map, map_from_odom);
     let mut current_cost = linearization.cost_breakdown.total_cost();
     let mut converged = false;
     let mut attempted_iterations = 0;
@@ -1559,7 +1563,8 @@ pub fn optimize_vio(
             continue;
         }
 
-        let candidate_linearization = linearize_vio_states(window, &candidate_synced, config, map);
+        let candidate_linearization =
+            linearize_vio_states(window, &candidate_synced, config, map, map_from_odom);
         let candidate_cost = candidate_linearization.cost_breakdown.total_cost();
         if candidate_cost < current_cost {
             let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
@@ -1606,6 +1611,7 @@ fn linearize_vio_states(
     states: &[SyncedPose],
     config: &VioSolveConfig,
     map: &SlamMap,
+    map_from_odom: &crate::MapFromOdom,
 ) -> VioLinearization {
     use crate::vio::solve::{
         BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor,
@@ -1621,83 +1627,89 @@ fn linearize_vio_states(
     let mut cost_breakdown = VioCostBreakdown::default();
 
     for (frame_idx, synced) in states.iter().enumerate() {
-        let obs_set = window.observations(frame_idx);
         let base = frame_idx * STATE_DIM;
-        let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body);
-        if let Some(resolved) =
-            obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap())
-        {
-            for obs in resolved.observations() {
-                let world = obs.world();
-                let pixel = obs.pixel();
-                let Some((residual, _, _)) =
-                    reprojection_residual_and_jacobians(cam_pose, world, pixel, config.intrinsics)
-                else {
-                    continue;
-                };
-                let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                let huber_delta = config.huber_delta_px as f32;
-                let (huber_weight, huber_cost) = if r_norm <= huber_delta {
-                    (1.0_f32, 0.5 * r_norm * r_norm)
-                } else {
-                    (
-                        huber_delta / r_norm,
-                        huber_delta * (r_norm - 0.5 * huber_delta),
-                    )
-                };
-                cost_breakdown.reprojection_cost += f64::from(huber_cost);
-                let sqrt_w = huber_weight.sqrt();
-
-                const FD_EPS: f64 = 1e-4;
-                let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
-                for axis in 0..6 {
-                    let mut delta_plus = [0.0_f64; STATE_DIM];
-                    let mut delta_minus = [0.0_f64; STATE_DIM];
-                    delta_plus[axis] = FD_EPS;
-                    delta_minus[axis] = -FD_EPS;
-                    let (Ok(s_plus), Ok(s_minus)) = (
-                        synced.nav_state().retract(&delta_plus),
-                        synced.nav_state().retract(&delta_minus),
+        let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body, map_from_odom);
+        if let Some(obs_set) = window.observations(frame_idx) {
+            if let Some(resolved) =
+                obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap())
+            {
+                for obs in resolved.observations() {
+                    let world = obs.world();
+                    let pixel = obs.pixel();
+                    let Some((residual, _, _)) = reprojection_residual_and_jacobians(
+                        cam_pose,
+                        world,
+                        pixel,
+                        config.intrinsics,
                     ) else {
                         continue;
                     };
-                    let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body);
-                    let p_minus = vio_cam_from_map(&s_minus, config.camera_from_body);
-                    if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
-                        reprojection_residual_and_jacobians(
-                            p_plus,
-                            world,
-                            pixel,
-                            config.intrinsics,
-                        ),
-                        reprojection_residual_and_jacobians(
-                            p_minus,
-                            world,
-                            pixel,
-                            config.intrinsics,
-                        ),
-                    ) {
-                        for row in 0..2 {
-                            j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
-                                / (2.0 * FD_EPS)
-                                * f64::from(sqrt_w);
+                    let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                    let huber_delta = config.huber_delta_px as f32;
+                    let (huber_weight, huber_cost) = if r_norm <= huber_delta {
+                        (1.0_f32, 0.5 * r_norm * r_norm)
+                    } else {
+                        (
+                            huber_delta / r_norm,
+                            huber_delta * (r_norm - 0.5 * huber_delta),
+                        )
+                    };
+                    cost_breakdown.reprojection_cost += f64::from(huber_cost);
+                    let sqrt_w = huber_weight.sqrt();
+
+                    const FD_EPS: f64 = 1e-4;
+                    let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
+                    for axis in 0..6 {
+                        let mut delta_plus = [0.0_f64; STATE_DIM];
+                        let mut delta_minus = [0.0_f64; STATE_DIM];
+                        delta_plus[axis] = FD_EPS;
+                        delta_minus[axis] = -FD_EPS;
+                        let (Ok(s_plus), Ok(s_minus)) = (
+                            synced.nav_state().retract(&delta_plus),
+                            synced.nav_state().retract(&delta_minus),
+                        ) else {
+                            continue;
+                        };
+                        let p_plus =
+                            vio_cam_from_map(&s_plus, config.camera_from_body, map_from_odom);
+                        let p_minus =
+                            vio_cam_from_map(&s_minus, config.camera_from_body, map_from_odom);
+                        if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
+                            reprojection_residual_and_jacobians(
+                                p_plus,
+                                world,
+                                pixel,
+                                config.intrinsics,
+                            ),
+                            reprojection_residual_and_jacobians(
+                                p_minus,
+                                world,
+                                pixel,
+                                config.intrinsics,
+                            ),
+                        ) {
+                            for row in 0..2 {
+                                j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
+                                    / (2.0 * FD_EPS)
+                                    * f64::from(sqrt_w);
+                            }
                         }
                     }
+                    let r_f64 = [
+                        f64::from(residual[0] * sqrt_w),
+                        f64::from(residual[1] * sqrt_w),
+                    ];
+                    let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
+                    accumulate_factor(
+                        &mut hessian,
+                        &mut rhs,
+                        dim,
+                        &j_15,
+                        &identity_2,
+                        &r_f64,
+                        base,
+                    );
                 }
-                let r_f64 = [
-                    f64::from(residual[0] * sqrt_w),
-                    f64::from(residual[1] * sqrt_w),
-                ];
-                let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
-                accumulate_factor(
-                    &mut hessian,
-                    &mut rhs,
-                    dim,
-                    &j_15,
-                    &identity_2,
-                    &r_f64,
-                    base,
-                );
             }
         }
     }
@@ -1857,13 +1869,16 @@ fn extract_last_frame_translation_sigma(
     }
 }
 
-/// Compute camera-from-map pose from NavState (body-in-odom) + extrinsics.
-/// T_cam_map = T_cam_body * inv(T_odom_body) (assumes map_from_odom = identity)
+/// Compute camera-from-map pose from NavState (body-in-odom), extrinsics,
+/// and the current map/odom bridge.
 #[cfg(feature = "vio")]
-fn vio_cam_from_map(state: &crate::NavState, camera_from_body: crate::Pose64) -> Pose {
-    camera_from_body
-        .compose(state.pose_odom_from_body().inverse())
-        .to_pose32()
+fn vio_cam_from_map(
+    state: &crate::NavState,
+    camera_from_body: crate::Pose64,
+    map_from_odom: &crate::MapFromOdom,
+) -> Pose {
+    let cam_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
+    map_from_odom.odom_to_map(cam_from_odom).to_pose32()
 }
 
 fn full_problem_cost(
@@ -3018,5 +3033,35 @@ mod tests {
             after_landmark_err < before_landmark_err,
             "landmark error did not improve: before={before_landmark_err}, after={after_landmark_err}"
         );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_cam_from_map_respects_map_from_odom_bridge() {
+        let state = crate::NavState::try_new(
+            crate::Pose64::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [1.0, -2.0, 3.0],
+            ),
+            [0.0; 3],
+            crate::ImuBias::default(),
+        )
+        .expect("state");
+        let camera_from_body = crate::Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+            [0.1, 0.2, 0.3],
+        );
+        let mut bridge = crate::MapFromOdom::identity();
+        bridge.set_pose_map_from_odom(crate::Pose64::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.5, -0.25, 1.5],
+        ));
+
+        let cam_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
+        let expected = bridge.odom_to_map(cam_from_odom).to_pose32();
+        let actual = vio_cam_from_map(&state, camera_from_body, &bridge);
+
+        assert_eq!(actual.translation(), expected.translation());
+        assert_eq!(actual.rotation(), expected.rotation());
     }
 }

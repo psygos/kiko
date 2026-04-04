@@ -1513,6 +1513,7 @@ impl VioRuntime {
             .unwrap_or([0.0; 3])
     }
 
+    #[cfg(test)]
     fn commit_authoritative_visual_anchor(&mut self, anchor: crate::local_ba::VioAnchor) {
         let nav_state = anchor.synced.nav_state().clone();
         self.last_optimized_state = Some(nav_state.clone());
@@ -1543,7 +1544,7 @@ impl VioRuntime {
         self.vio_window = observations.map(|observations| crate::local_ba::VioWindow {
             anchor: crate::local_ba::VioAnchor {
                 synced: crate::local_ba::SyncedPose::new(nav_state.clone()),
-                observations,
+                observations: Some(observations),
                 anchor_velocity_odom_mps: nav_state.velocity_odom_mps(),
             },
             successors: Vec::new(),
@@ -1944,10 +1945,7 @@ impl SlamTracker {
         };
 
         // Preintegrate pending IMU
-        let obs_set = match ObservationSet::new(map_observations, self.ba.min_observations()) {
-            Ok(set) => set,
-            Err(_) => return PoseRefinementProposal::None,
-        };
+        let obs_set = ObservationSet::new(map_observations, self.ba.min_observations()).ok();
 
         let preintegrated = match vio_runtime.pending_imu.batch() {
             Ok(Some(batch)) if batch.len() >= 2 => {
@@ -1958,16 +1956,88 @@ impl SlamTracker {
 
         let Some(preintegrated) = preintegrated else {
             // No IMU data — fall back to visual BA
-            return self.propose_visual_ba_pose(pose_world, obs_set).map_or(
-                PoseRefinementProposal::None,
-                PoseRefinementProposal::VisualBa,
-            );
+            return obs_set
+                .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
+                .map_or(
+                    PoseRefinementProposal::None,
+                    PoseRefinementProposal::VisualBa,
+                );
         };
 
         // Build or extend the VIO window
         use crate::local_ba::{SyncedPose, VioAnchor, VioSuccessor, VioWindow, optimize_vio};
 
         if vio_runtime.vio_window.is_none() {
+            if let (Some(anchor_state), Some(successor_observations)) =
+                (vio_runtime.last_optimized_state.clone(), obs_set.clone())
+            {
+                let mut candidate_window = VioWindow {
+                    anchor: VioAnchor {
+                        synced: SyncedPose::new(anchor_state.clone()),
+                        observations: None,
+                        anchor_velocity_odom_mps: anchor_state.velocity_odom_mps(),
+                    },
+                    successors: vec![VioSuccessor {
+                        synced: SyncedPose::new(nav_state.clone()),
+                        observations: Some(successor_observations),
+                        preintegrated,
+                    }],
+                };
+                let result = optimize_vio(
+                    &mut candidate_window,
+                    &vio_runtime.solve_config,
+                    self.global_map.map(),
+                    &self.map_from_odom,
+                );
+
+                let optimized = candidate_window
+                    .successors
+                    .last()
+                    .map(|s| s.synced.nav_state().clone())
+                    .unwrap_or_else(|| candidate_window.anchor.synced.nav_state().clone());
+                let cam_from_odom = camera_from_odom_from_pose_odom_from_body(
+                    optimized.pose_odom_from_body(),
+                    vio_runtime.camera_from_body,
+                );
+                let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom).to_pose32();
+
+                if self.trace_transitions {
+                    let vel = optimized.velocity_odom_mps();
+                    let bias = optimized.bias();
+                    let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
+                    let delta_t =
+                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
+                    let delta_r =
+                        (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
+                    eprintln!(
+                        "vio ba: frames={} iters={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                        candidate_window.len(),
+                        result.iterations,
+                        result.final_cost,
+                        result.cost_breakdown.reprojection_cost,
+                        result.cost_breakdown.imu_cost,
+                        result.cost_breakdown.velocity_anchor_cost,
+                        result.cost_breakdown.bias_random_walk_cost,
+                        result.cost_breakdown.bias_prior_cost,
+                        vel[0],
+                        vel[1],
+                        vel[2],
+                        bias.accel[0],
+                        bias.accel[1],
+                        bias.accel[2],
+                        delta_t * 1000.0,
+                        delta_r.to_degrees() * 1000.0,
+                    );
+                }
+
+                return PoseRefinementProposal::Vio(VioPoseProposal {
+                    pose_world: cam_from_map,
+                    solve_result: result,
+                    optimized_state: optimized,
+                    optimized_window: candidate_window,
+                });
+            }
+
             if visual_velocity_seed.is_none() {
                 if self.trace_transitions {
                     eprintln!(
@@ -1977,10 +2047,12 @@ impl SlamTracker {
                 vio_runtime.last_optimized_state = Some(nav_state.clone());
                 vio_runtime.predicted_state = Some(nav_state);
                 vio_runtime.pending_imu.clear();
-                return self.propose_visual_ba_pose(pose_world, obs_set).map_or(
-                    PoseRefinementProposal::None,
-                    PoseRefinementProposal::VisualBa,
-                );
+                return obs_set
+                    .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
+                    .map_or(
+                        PoseRefinementProposal::None,
+                        PoseRefinementProposal::VisualBa,
+                    );
             }
             // First frame: create anchor
             let anchor = VioAnchor {
@@ -2027,6 +2099,7 @@ impl SlamTracker {
             &mut candidate_window,
             &vio_runtime.solve_config,
             self.global_map.map(),
+            &self.map_from_odom,
         );
 
         // Extract optimized state from the last frame
@@ -2036,13 +2109,11 @@ impl SlamTracker {
             .map(|s| s.synced.nav_state().clone())
             .unwrap_or_else(|| candidate_window.anchor.synced.nav_state().clone());
 
-        // Convert from NavState (T_odom_from_body) to camera-in-map
-        // (T_cam_from_map) which is what the rest of the tracker expects.
-        // T_cam_map = T_cam_body * inv(T_odom_body)  (map_from_odom = identity)
-        let cam_from_map = vio_runtime
-            .camera_from_body
-            .compose(optimized.pose_odom_from_body().inverse())
-            .to_pose32();
+        let cam_from_odom = camera_from_odom_from_pose_odom_from_body(
+            optimized.pose_odom_from_body(),
+            vio_runtime.camera_from_body,
+        );
+        let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom).to_pose32();
 
         if self.trace_transitions {
             let vel = optimized.velocity_odom_mps();
@@ -2682,6 +2753,9 @@ impl SlamTracker {
         tracking_health: TrackingHealth,
         detections: Arc<Detections>,
     ) {
+        if tracking_health != TrackingHealth::Lost {
+            return;
+        }
         if let Some(session) = Self::initial_relocalization_session(
             tracking_health,
             self.config.relocalization_config().is_some(),
@@ -2696,6 +2770,13 @@ impl SlamTracker {
             self.state = TrackerState::Relocalizing(session);
             if self.trace_transitions {
                 eprintln!("entering relocalization after tracking loss");
+            }
+        } else {
+            #[cfg(feature = "vio")]
+            self.reset_inertial_runtime_continuity();
+            self.state = TrackerState::NeedKeyframe;
+            if self.trace_transitions {
+                eprintln!("tracking lost without relocalization; resetting to NeedKeyframe");
             }
         }
     }
@@ -2763,7 +2844,12 @@ impl SlamTracker {
                 cfg.max_attempts()
             );
         }
-        self.state = Self::next_state_after_relocalization_failure(cfg, session, current);
+        let next_state = Self::next_state_after_relocalization_failure(cfg, session, current);
+        if matches!(next_state, TrackerState::NeedKeyframe) {
+            #[cfg(feature = "vio")]
+            self.reset_inertial_runtime_continuity();
+        }
+        self.state = next_state;
         self.relocalization_output(frame_id, TrackingHealth::Lost)
     }
 
@@ -3574,6 +3660,8 @@ impl SlamTracker {
                         landmarks
                     );
                 }
+                #[cfg(feature = "vio")]
+                self.reset_inertial_runtime_continuity();
                 let mut diagnostics = self.empty_diagnostics();
                 diagnostics.keyframe_status = Some(KeyframeStatus::Rejected);
                 return Ok(self.tracking_failure_output(
@@ -5634,12 +5722,12 @@ mod tests {
 
         let stale_anchor = crate::local_ba::VioAnchor {
             synced: crate::local_ba::SyncedPose::new(stale_state.clone()),
-            observations: observations.clone(),
+            observations: Some(observations.clone()),
             anchor_velocity_odom_mps: stale_state.velocity_odom_mps(),
         };
         let replacement_anchor = crate::local_ba::VioAnchor {
             synced: crate::local_ba::SyncedPose::new(replacement_state.clone()),
-            observations,
+            observations: Some(observations),
             anchor_velocity_odom_mps: replacement_state.velocity_odom_mps(),
         };
 
@@ -5791,6 +5879,69 @@ mod tests {
             window.anchor.synced.nav_state().bias().accel,
             previous_bias.accel
         );
+        assert!(window.anchor.observations.is_some());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_runtime_commit_authoritative_pose_without_observations_keeps_authoritative_state() {
+        let previous_state = crate::NavState::try_new(
+            Pose64::from_pose32(Pose::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.5, -0.5, 1.0],
+            )),
+            [1.0, 2.0, 3.0],
+            crate::ImuBias {
+                accel: [0.3, -0.1, 0.2],
+                gyro: [0.01, -0.02, 0.03],
+            },
+        )
+        .expect("previous nav state");
+        let mut runtime = VioRuntime {
+            camera_from_body: Pose64::identity(),
+            noise: crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise"),
+            pending_imu: crate::ImuAccumulator::new(),
+            predicted_state: Some(previous_state.clone()),
+            last_visual_measurement_body_odom: Some((
+                Timestamp::from_nanos(1_000_000_000),
+                previous_state.pose_odom_from_body(),
+            )),
+            calibrated_bias: None,
+            last_optimized_state: Some(previous_state.clone()),
+            solve_config: make_test_vio_solve_config(),
+            vio_window: Some(crate::local_ba::VioWindow {
+                anchor: crate::local_ba::VioAnchor {
+                    synced: crate::local_ba::SyncedPose::new(previous_state.clone()),
+                    observations: Some(make_single_observation_set()),
+                    anchor_velocity_odom_mps: previous_state.velocity_odom_mps(),
+                },
+                successors: Vec::new(),
+            }),
+            max_window: 5,
+        };
+
+        let body_odom = Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [2.0, 0.0, 5.0],
+        ));
+        runtime.commit_authoritative_pose(Timestamp::from_nanos(2_000_000_000), body_odom, None);
+
+        let committed = runtime
+            .last_optimized_state
+            .as_ref()
+            .expect("committed state");
+        assert_eq!(
+            committed.pose_odom_from_body().translation(),
+            [2.0, 0.0, 5.0]
+        );
+        assert!(runtime.vio_window.is_none());
+        assert_eq!(
+            runtime
+                .last_visual_measurement_body_odom
+                .expect("visual measurement")
+                .0,
+            Timestamp::from_nanos(2_000_000_000)
+        );
     }
 
     #[cfg(feature = "vio")]
@@ -5829,7 +5980,7 @@ mod tests {
             vio_window: Some(crate::local_ba::VioWindow {
                 anchor: crate::local_ba::VioAnchor {
                     synced: crate::local_ba::SyncedPose::new(nav_state),
-                    observations,
+                    observations: Some(observations),
                     anchor_velocity_odom_mps: [0.1, 0.2, 0.3],
                 },
                 successors: Vec::new(),
