@@ -1350,6 +1350,7 @@ struct RelocalizationSession {
     attempts: usize,
     phase: RelocalizationPhase,
     last_detections: Arc<Detections>,
+    reference_cam_from_odom: Option<Pose64>,
 }
 
 #[derive(Debug)]
@@ -2312,16 +2313,6 @@ impl SlamTracker {
     }
 
     #[cfg(feature = "vio")]
-    #[cfg(feature = "vio")]
-    fn align_map_from_odom_to_pose(&mut self, pose_map: Pose) {
-        let Some(cam_from_odom) = self.current_odom_pose() else {
-            return;
-        };
-        self.map_from_odom
-            .align_to_pose(Pose64::from_pose32(pose_map), cam_from_odom);
-    }
-
-    #[cfg(feature = "vio")]
     fn realign_map_from_odom(&mut self, corrected_poses: &[(KeyframeId, Pose)]) {
         // After loop closure, corrected_poses contains updated map-frame poses.
         // Use the most recent one to realign map_from_odom so that the odom
@@ -2775,6 +2766,7 @@ impl SlamTracker {
             tracking_health,
             self.config.relocalization_config().is_some(),
             detections,
+            self.current_odom_pose(),
         ) {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
@@ -2800,6 +2792,7 @@ impl SlamTracker {
         tracking_health: TrackingHealth,
         relocalization_enabled: bool,
         detections: Arc<Detections>,
+        reference_cam_from_odom: Option<Pose64>,
     ) -> Option<RelocalizationSession> {
         if tracking_health != TrackingHealth::Lost || !relocalization_enabled {
             return None;
@@ -2808,6 +2801,7 @@ impl SlamTracker {
             attempts: 0,
             phase: RelocalizationPhase::Searching,
             last_detections: detections,
+            reference_cam_from_odom,
         })
     }
 
@@ -2962,6 +2956,7 @@ impl SlamTracker {
                         pose_world,
                     },
                     last_detections: session.last_detections,
+                    reference_cam_from_odom: session.reference_cam_from_odom,
                 })
             }
             _ if required_confirmations <= 1 => RelocalizationStep::Recovered { pose_world },
@@ -2973,6 +2968,7 @@ impl SlamTracker {
                     pose_world,
                 },
                 last_detections: session.last_detections,
+                reference_cam_from_odom: session.reference_cam_from_odom,
             }),
         }
     }
@@ -3020,6 +3016,7 @@ impl SlamTracker {
         }
 
         session.last_detections = current;
+        let reference_cam_from_odom = session.reference_cam_from_odom;
         match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
             RelocalizationStep::Recovered { pose_world } => {
                 self.last_pose_world = Some(pose_world);
@@ -3028,7 +3025,12 @@ impl SlamTracker {
                 });
                 #[cfg(feature = "vio")]
                 {
-                    self.align_map_from_odom_to_pose(pose_world);
+                    if let Some(reference_cam_from_odom) = reference_cam_from_odom
+                        .or_else(|| self.current_odom_pose())
+                    {
+                        self.map_from_odom
+                            .align_to_pose(Pose64::from_pose32(pose_world), reference_cam_from_odom);
+                    }
                     self.reset_inertial_runtime_continuity();
                 }
                 if let Some(place_recognition) = self.place_recognition.as_mut() {
@@ -5363,7 +5365,8 @@ mod tests {
             SlamTracker::initial_relocalization_session(
                 TrackingHealth::Good,
                 true,
-                Arc::clone(&detections)
+                Arc::clone(&detections),
+                None,
             )
             .is_none()
         );
@@ -5371,7 +5374,8 @@ mod tests {
             SlamTracker::initial_relocalization_session(
                 TrackingHealth::Lost,
                 false,
-                Arc::clone(&detections)
+                Arc::clone(&detections),
+                None,
             )
             .is_none()
         );
@@ -5380,10 +5384,31 @@ mod tests {
             TrackingHealth::Lost,
             true,
             Arc::clone(&detections),
+            None,
         )
         .expect("lost tracking should create relocalization session");
         assert_eq!(session.attempts, 0);
         assert!(matches!(session.phase, RelocalizationPhase::Searching));
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn relocalization_initial_session_preserves_reference_cam_from_odom() {
+        let detections = make_test_detections(9001);
+        let reference = Some(Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.3, -0.2, 1.4],
+        )));
+
+        let session = SlamTracker::initial_relocalization_session(
+            TrackingHealth::Lost,
+            true,
+            detections,
+            reference,
+        )
+        .expect("session");
+
+        assert_eq!(session.reference_cam_from_odom, reference);
     }
 
     #[test]
@@ -5401,6 +5426,7 @@ mod tests {
                 attempts: 0,
                 phase: RelocalizationPhase::Searching,
                 last_detections: Arc::clone(&detections),
+                reference_cam_from_odom: None,
             },
             Arc::clone(&detections),
         );
@@ -5417,10 +5443,35 @@ mod tests {
                 attempts: 1,
                 phase: RelocalizationPhase::Searching,
                 last_detections: Arc::clone(&detections),
+                reference_cam_from_odom: None,
             },
             detections,
         );
         assert!(matches!(give_up, TrackerState::NeedKeyframe));
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn relocalization_reference_cam_from_odom_prefers_session_reference() {
+        let session_reference = Pose64::from_pose32(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 2.0, 3.0],
+        ));
+        let current_reference = Pose64::from_pose32(Pose::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [-1.0, -2.0, -3.0],
+        ));
+        let session = RelocalizationSession {
+            attempts: 0,
+            phase: RelocalizationPhase::Searching,
+            last_detections: make_test_detections(9002),
+            reference_cam_from_odom: Some(session_reference),
+        };
+
+        assert_eq!(
+            session.reference_cam_from_odom.or(Some(current_reference)),
+            Some(session_reference)
+        );
     }
 
     #[test]
@@ -5435,6 +5486,7 @@ mod tests {
                 attempts: 0,
                 phase: RelocalizationPhase::Searching,
                 last_detections: detections,
+                reference_cam_from_odom: None,
             },
             candidate,
             pose,
@@ -5471,6 +5523,7 @@ mod tests {
                     pose_world: pose,
                 },
                 last_detections: detections,
+                reference_cam_from_odom: None,
             },
             candidate,
             pose,
