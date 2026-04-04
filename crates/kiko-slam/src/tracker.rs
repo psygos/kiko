@@ -1487,6 +1487,17 @@ struct VioRuntime {
 
 #[cfg(feature = "vio")]
 impl VioRuntime {
+    fn set_capture_imu_interval(
+        &mut self,
+        batch: Option<&crate::ImuBatch>,
+    ) -> Result<(), crate::ImuAccumulatorError> {
+        self.pending_imu.clear();
+        if let Some(batch) = batch {
+            self.pending_imu.extend_batch(batch)?;
+        }
+        Ok(())
+    }
+
     fn reset_runtime_continuity(&mut self) {
         self.pending_imu.clear();
         self.predicted_state = None;
@@ -1827,9 +1838,7 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         #[cfg(feature = "vio")]
         {
-            if let Some(batch) = capture.imu().batch() {
-                self.ingest_imu_batch(batch)?;
-            }
+            self.set_capture_imu_interval(capture.imu().batch())?;
             self.drain_vio_responses();
             self.refresh_predicted_pose_from_vio()?;
         }
@@ -1886,13 +1895,15 @@ impl SlamTracker {
     }
 
     #[cfg(feature = "vio")]
-    fn ingest_imu_batch(&mut self, batch: &crate::ImuBatch) -> Result<(), TrackerError> {
+    fn set_capture_imu_interval(
+        &mut self,
+        batch: Option<&crate::ImuBatch>,
+    ) -> Result<(), TrackerError> {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             return Ok(());
         };
         vio_runtime
-            .pending_imu
-            .extend_batch(batch)
+            .set_capture_imu_interval(batch)
             .map_err(|err| TrackerError::Vio(err.to_string()))
     }
 
@@ -5754,6 +5765,85 @@ mod tests {
         assert!((velocity[0] - 1.5).abs() < 1e-12);
         assert!((velocity[1] + 1.0).abs() < 1e-12);
         assert!((velocity[2] - 2.0).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_runtime_set_capture_imu_interval_replaces_previous_interval() {
+        let mut runtime = VioRuntime {
+            camera_from_body: Pose64::identity(),
+            noise: crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise"),
+            pending_imu: crate::ImuAccumulator::new(),
+            predicted_state: None,
+            last_visual_measurement_body_odom: None,
+            calibrated_bias: None,
+            last_optimized_state: None,
+            solve_config: make_test_vio_solve_config(),
+            vio_window: None,
+            max_window: 5,
+        };
+
+        let first = crate::ImuBatch::new(vec![
+            crate::ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3]).expect("imu 0"),
+            crate::ImuSample::new(Timestamp::from_nanos(20), [1.0; 3], [2.0; 3]).expect("imu 1"),
+        ])
+        .expect("first batch");
+        let second = crate::ImuBatch::new(vec![
+            crate::ImuSample::new(Timestamp::from_nanos(30), [3.0; 3], [4.0; 3]).expect("imu 2"),
+            crate::ImuSample::new(Timestamp::from_nanos(40), [5.0; 3], [6.0; 3]).expect("imu 3"),
+        ])
+        .expect("second batch");
+
+        runtime
+            .set_capture_imu_interval(Some(&first))
+            .expect("set first interval");
+        runtime
+            .set_capture_imu_interval(Some(&second))
+            .expect("replace with second interval");
+
+        let pending = runtime
+            .pending_imu
+            .batch()
+            .expect("pending batch")
+            .expect("pending interval");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.start_time(), Timestamp::from_nanos(30));
+        assert_eq!(pending.end_time(), Timestamp::from_nanos(40));
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_runtime_set_capture_imu_interval_clears_on_absent_batch() {
+        let mut runtime = VioRuntime {
+            camera_from_body: Pose64::identity(),
+            noise: crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise"),
+            pending_imu: crate::ImuAccumulator::new(),
+            predicted_state: None,
+            last_visual_measurement_body_odom: None,
+            calibrated_bias: None,
+            last_optimized_state: None,
+            solve_config: make_test_vio_solve_config(),
+            vio_window: None,
+            max_window: 5,
+        };
+
+        let batch = crate::ImuBatch::new(vec![
+            crate::ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3]).expect("imu 0"),
+            crate::ImuSample::new(Timestamp::from_nanos(20), [1.0; 3], [2.0; 3]).expect("imu 1"),
+        ])
+        .expect("batch");
+
+        runtime
+            .set_capture_imu_interval(Some(&batch))
+            .expect("set interval");
+        runtime
+            .set_capture_imu_interval(None)
+            .expect("clear interval on absent capture imu");
+
+        assert!(
+            runtime.pending_imu.is_empty(),
+            "absent capture IMU must not inherit the previous frame's interval"
+        );
     }
 
     #[cfg(feature = "vio")]
