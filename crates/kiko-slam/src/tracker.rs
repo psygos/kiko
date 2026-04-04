@@ -1402,9 +1402,13 @@ fn adaptive_tracking_ransac_config(base: RansacConfig, observation_count: usize)
 
 #[cfg(feature = "vio")]
 fn decide_vio_pose_adoption(
+    current_frame_visual_residual_count: usize,
     visual_metrics: &PoseReprojectionMetrics,
     vio_metrics: &PoseReprojectionMetrics,
 ) -> crate::VioProposalDisposition {
+    if current_frame_visual_residual_count == 0 {
+        return crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport;
+    }
     let shared = visual_metrics.shared_with(vio_metrics);
     if shared.count < MIN_PNP_CORRESPONDENCES {
         return crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport;
@@ -3324,6 +3328,7 @@ impl SlamTracker {
                     intrinsics,
                 );
                 let disposition = decide_vio_pose_adoption(
+                    proposal.solve_result.last_frame_visual_residual_count,
                     &visual_proposal_accepted_inlier_metrics,
                     &vio_accepted_inlier_metrics,
                 );
@@ -5663,8 +5668,30 @@ mod tests {
             Some(0.1),
         ]);
         assert_eq!(
-            decide_vio_pose_adoption(&visual, &vio),
+            decide_vio_pose_adoption(5, &visual, &vio),
             crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_pose_adoption_rejects_missing_current_vio_observation_support() {
+        let visual = PoseReprojectionMetrics::from_errors(vec![
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+        ]);
+        let vio = PoseReprojectionMetrics::from_errors(vec![
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+        ]);
+
+        assert_eq!(
+            decide_vio_pose_adoption(0, &visual, &vio),
+            crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport
         );
     }
 

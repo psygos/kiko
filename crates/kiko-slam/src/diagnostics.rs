@@ -412,6 +412,7 @@ pub enum TrackingPoseSource {
 pub enum VioProposalDisposition {
     NotRun,
     Adopted,
+    RejectedInsufficientCurrentVioObservationSupport,
     RejectedInsufficientSharedAcceptedInlierSupport,
     RejectedChangedAcceptedInlierProjectability,
     RejectedHigherSharedAcceptedInlierReprojectionRmse,

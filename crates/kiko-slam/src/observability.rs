@@ -73,6 +73,8 @@ const PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
 const PATH_TRACKING_POSE_SOURCE: &str = "diagnostics/tracking/pose_source";
 const PATH_TRACKING_VIO_PROPOSAL_RAN: &str = "diagnostics/tracking/vio_proposal_ran";
 const PATH_TRACKING_VIO_PROPOSAL_ADOPTED: &str = "diagnostics/tracking/vio_proposal_adopted";
+const PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_CURRENT_VIO_SUPPORT: &str =
+    "diagnostics/tracking/vio_proposal_rejected_insufficient_current_vio_observation_support";
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_SHARED_SUPPORT: &str =
     "diagnostics/tracking/vio_proposal_rejected_insufficient_shared_accepted_inlier_support";
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT: &str =
@@ -310,6 +312,15 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((
             PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
             if v == crate::VioProposalDisposition::Adopted {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+        scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_CURRENT_VIO_SUPPORT,
+            if v == crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport
+            {
                 1.0
             } else {
                 0.0

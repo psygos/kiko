@@ -726,6 +726,7 @@ pub struct VioSolveResult {
     pub iterations: usize,
     pub final_cost: f64,
     pub cost_breakdown: VioCostBreakdown,
+    pub last_frame_visual_residual_count: usize,
     /// Approximate posterior translation standard deviation for the last
     /// frame, extracted from the Hessian diagonal. In meters.
     /// This is the local linearization uncertainty — not a full posterior
@@ -1518,6 +1519,7 @@ pub fn optimize_vio(
             iterations: 0,
             final_cost: 0.0,
             cost_breakdown: VioCostBreakdown::default(),
+            last_frame_visual_residual_count: 0,
             last_frame_translation_sigma: None,
         };
     }
@@ -1594,6 +1596,10 @@ pub fn optimize_vio(
         iterations: attempted_iterations,
         final_cost: current_cost,
         cost_breakdown: linearization.cost_breakdown,
+        last_frame_visual_residual_count: *linearization
+            .reprojection_residual_counts
+            .last()
+            .unwrap_or(&0),
         last_frame_translation_sigma: sigma,
     }
 }
@@ -1603,6 +1609,7 @@ struct VioLinearization {
     hessian: Vec<f64>,
     rhs: Vec<f64>,
     cost_breakdown: VioCostBreakdown,
+    reprojection_residual_counts: Vec<usize>,
 }
 
 #[cfg(feature = "vio")]
@@ -1625,6 +1632,7 @@ fn linearize_vio_states(
     let mut hessian = vec![0.0_f64; dim * dim];
     let mut rhs = vec![0.0_f64; dim];
     let mut cost_breakdown = VioCostBreakdown::default();
+    let mut reprojection_residual_counts = vec![0usize; n_frames];
 
     for (frame_idx, synced) in states.iter().enumerate() {
         let base = frame_idx * STATE_DIM;
@@ -1709,6 +1717,8 @@ fn linearize_vio_states(
                         &r_f64,
                         base,
                     );
+                    reprojection_residual_counts[frame_idx] =
+                        reprojection_residual_counts[frame_idx].saturating_add(1);
                 }
             }
         }
@@ -1834,6 +1844,7 @@ fn linearize_vio_states(
         hessian,
         rhs,
         cost_breakdown,
+        reprojection_residual_counts,
     }
 }
 
