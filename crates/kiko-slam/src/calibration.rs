@@ -7,14 +7,14 @@ pub struct CalibrationBundle {
     imu_noise: Option<ImuNoiseModel>,
     imu_extrinsics: Option<ImuExtrinsics>,
     gravity_magnitude_mps2: f64,
-    initial_accel_bias: Option<[f64; 3]>,
-    initial_gyro_bias: Option<[f64; 3]>,
+    initial_bias: Option<crate::ImuBias>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CalibrationBundleError {
     MissingImuNoise,
     MissingImuExtrinsics,
+    PartialInitialImuBias,
     NonPositiveGravity { value: f64 },
     NonFiniteGravity { value: f64 },
     NonPositiveAccelNoiseDensity { value: f64 },
@@ -36,6 +36,12 @@ impl std::fmt::Display for CalibrationBundleError {
             }
             CalibrationBundleError::MissingImuExtrinsics => {
                 write!(f, "imu calibration requires camera-imu extrinsics")
+            }
+            CalibrationBundleError::PartialInitialImuBias => {
+                write!(
+                    f,
+                    "imu calibration initial bias must include both accel and gyro blocks"
+                )
             }
             CalibrationBundleError::NonPositiveGravity { value } => {
                 write!(f, "gravity magnitude must be > 0, got {value}")
@@ -84,8 +90,7 @@ impl CalibrationBundle {
             imu_noise: None,
             imu_extrinsics: None,
             gravity_magnitude_mps2: 9.81,
-            initial_accel_bias: None,
-            initial_gyro_bias: None,
+            initial_bias: None,
         }
     }
 
@@ -113,8 +118,7 @@ impl CalibrationBundle {
             imu_noise: Some(imu_noise),
             imu_extrinsics: Some(imu_extrinsics),
             gravity_magnitude_mps2,
-            initial_accel_bias: None,
-            initial_gyro_bias: None,
+            initial_bias: None,
         })
     }
 
@@ -168,8 +172,11 @@ impl CalibrationBundle {
             extrinsics,
             imu.gravity_magnitude_mps2,
         )?;
-        bundle.initial_accel_bias = imu.initial_accel_bias;
-        bundle.initial_gyro_bias = imu.initial_gyro_bias;
+        bundle.initial_bias = match (imu.initial_accel_bias, imu.initial_gyro_bias) {
+            (None, None) => None,
+            (Some(accel), Some(gyro)) => Some(crate::ImuBias { accel, gyro }),
+            _ => return Err(CalibrationBundleError::PartialInitialImuBias),
+        };
         Ok(bundle)
     }
 
@@ -197,12 +204,16 @@ impl CalibrationBundle {
         self.imu_noise.is_some() && self.imu_extrinsics.is_some()
     }
 
+    pub fn initial_bias(&self) -> Option<&crate::ImuBias> {
+        self.initial_bias.as_ref()
+    }
+
     pub fn initial_accel_bias(&self) -> Option<[f64; 3]> {
-        self.initial_accel_bias
+        self.initial_bias.as_ref().map(|bias| bias.accel)
     }
 
     pub fn initial_gyro_bias(&self) -> Option<[f64; 3]> {
-        self.initial_gyro_bias
+        self.initial_bias.as_ref().map(|bias| bias.gyro)
     }
 }
 
@@ -420,6 +431,102 @@ mod tests {
         assert!(bundle.has_imu());
         assert_eq!(imu_extrinsics.time_offset_ns(), 42);
         assert_eq!(imu_extrinsics.t_cam_imu().translation(), [0.1, -0.2, 0.3]);
+    }
+
+    #[test]
+    fn from_dataset_calibration_preserves_complete_initial_bias() {
+        let dataset_calibration = crate::dataset::Calibration {
+            left: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 50.0,
+                cy: 40.0,
+                width: 100,
+                height: 80,
+            },
+            right: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 50.0,
+                cy: 40.0,
+                width: 100,
+                height: 80,
+            },
+            baseline_m: 0.1,
+            rectified: true,
+            imu: Some(crate::dataset::ImuCalibration {
+                noise: crate::dataset::ImuNoiseMeta {
+                    accel_noise_density: 0.1,
+                    gyro_noise_density: 0.01,
+                    accel_random_walk: 0.001,
+                    gyro_random_walk: 0.0001,
+                },
+                extrinsics: crate::dataset::ImuExtrinsicsMeta {
+                    rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    translation: [0.1, -0.2, 0.3],
+                    time_offset_ns: 42,
+                },
+                gravity_magnitude_mps2: 9.81,
+                initial_accel_bias: Some([0.01, -0.02, 0.03]),
+                initial_gyro_bias: Some([0.001, -0.002, 0.003]),
+            }),
+        };
+        let bundle = CalibrationBundle::from_dataset_calibration(
+            intrinsics(),
+            stereo(),
+            &dataset_calibration,
+        )
+        .expect("bundle");
+        let bias = bundle.initial_bias().expect("initial bias");
+        assert_eq!(bias.accel, [0.01, -0.02, 0.03]);
+        assert_eq!(bias.gyro, [0.001, -0.002, 0.003]);
+    }
+
+    #[test]
+    fn from_dataset_calibration_rejects_partial_initial_bias() {
+        let dataset_calibration = crate::dataset::Calibration {
+            left: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 50.0,
+                cy: 40.0,
+                width: 100,
+                height: 80,
+            },
+            right: CameraIntrinsics {
+                fx: 100.0,
+                fy: 100.0,
+                cx: 50.0,
+                cy: 40.0,
+                width: 100,
+                height: 80,
+            },
+            baseline_m: 0.1,
+            rectified: true,
+            imu: Some(crate::dataset::ImuCalibration {
+                noise: crate::dataset::ImuNoiseMeta {
+                    accel_noise_density: 0.1,
+                    gyro_noise_density: 0.01,
+                    accel_random_walk: 0.001,
+                    gyro_random_walk: 0.0001,
+                },
+                extrinsics: crate::dataset::ImuExtrinsicsMeta {
+                    rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    translation: [0.1, -0.2, 0.3],
+                    time_offset_ns: 42,
+                },
+                gravity_magnitude_mps2: 9.81,
+                initial_accel_bias: Some([0.01, -0.02, 0.03]),
+                initial_gyro_bias: None,
+            }),
+        };
+        let err = CalibrationBundle::from_dataset_calibration(
+            intrinsics(),
+            stereo(),
+            &dataset_calibration,
+        )
+        .expect_err("partial initial bias must fail");
+        assert_eq!(err, CalibrationBundleError::PartialInitialImuBias);
     }
 
     #[test]

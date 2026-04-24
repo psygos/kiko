@@ -17,7 +17,6 @@ mod channel;
 pub mod dataset;
 mod dense_cloud;
 mod depth;
-mod tsdf;
 mod diagnostics;
 pub mod env;
 mod frontend;
@@ -39,10 +38,12 @@ mod place_recognition;
 mod pnp;
 pub mod pose_graph;
 mod preprocess;
+mod runtime_imu;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod tracker;
 mod triangulation;
+mod tsdf;
 #[cfg(feature = "vio")]
 mod vio;
 mod viz;
@@ -54,15 +55,43 @@ pub use channel::{
     ChannelCapacity, ChannelCapacityError, ChannelStats, ChannelStatsHandle, DropPolicy,
     DropReceiver, DropSender, SendOutcome, bounded_channel,
 };
+pub use dense_cloud::{
+    DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, generate_dense_cloud,
+    generate_dense_depth_image,
+};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
-    DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, KeyframeStatus,
-    LoopClosureRejectReason, LoopClosureStatus,
+    AllObservationsSupport, CountMetric, DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics,
+    HeldOutObservationsSupport, KeyframeRemovalReason, KeyframeStatus, LoopClosureRejectReason,
+    LoopClosureStatus, MeanSquaredPixelResidualMetric, ObservationSupport,
+    ObservationSupportMarker, PixelResidualMetric, PnpAcceptedInlierCountMetric,
+    PnpAcceptedInlierPixelResidualMetric, PnpAcceptedInlierReprojectionMsePerAxisPx2Metric,
+    PnpAcceptedInliersSupport, PnpInlierRatioMetric, PnpProjectableTrackedObservationCountMetric,
+    PnpProjectableTrackedObservationPixelResidualMetric,
+    PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric,
+    PnpProjectableTrackedObservationsSupport, PnpTrackedObservationCountMetric,
+    PnpTrackedObservationsSupport, RatioMetric, StableSurfaceRetainedRawObservationsSupport,
+    StableSurfaceRetainedRawPixelResidualMetric, TrackingPoseSource, VioProposalDisposition,
+    VioProposalProjectableTrackedObservationCountMetric,
+    VioProposalProjectableTrackedObservationPixelResidualMetric,
+    VioProposalProjectableTrackedObservationsSupport,
+    VisualProposalProjectableTrackedObservationCountMetric,
+    VisualProposalProjectableTrackedObservationPixelResidualMetric,
+    VisualProposalProjectableTrackedObservationsSupport,
+    VisualVsVioSharedProjectableTrackedObservationCountMetric,
+    VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
+    VisualVsVioSharedProjectableTrackedObservationReprojectionMsePerAxisPx2Metric,
+    VisualVsVioSharedProjectableTrackedObservationsSupport,
 };
 pub use env::{env_bool, env_f32, env_usize};
 pub use imu::{
     ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBias, ImuExtrinsics,
     ImuNoiseModel, ImuSample, ImuSampleError, ImuTimestampShiftError,
+};
+#[cfg(feature = "vio")]
+pub use local_ba::{
+    AnchorFrameInput, InertialFrameInput, VioBiasPrior, VioCostBreakdown, VioFrameEstimate,
+    VioSolveConfig, VioSolveConfigError, VioSolveResult,
 };
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
@@ -93,6 +122,10 @@ pub use pnp::{
     IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
     build_observations, solve_pnp, solve_pnp_ransac,
 };
+pub use runtime_imu::{
+    RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,
+    load_runtime_imu_calibration_from_env,
+};
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
@@ -100,26 +133,17 @@ pub use tracker::{
     RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
 };
-pub use tsdf::{MeshData, TsdfConfig, TsdfIntegrateMsg, TsdfWorker};
-pub use dense_cloud::{
-    DenseCloudConfig, DenseCloudResult, DenseCloudStats, DensePoint, generate_dense_cloud,
-    generate_dense_depth_image,
-};
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
     RectifiedStereoError, SparseStereoSample, TriangulationConfig, TriangulationError,
     TriangulationResult, TriangulationStats, Triangulator,
 };
+pub use tsdf::{MeshData, TsdfConfig, TsdfIntegrateMsg, TsdfWorker};
 #[cfg(feature = "vio")]
 pub use vio::{
     CorrectedPreintegration, Gravity, GravityError, ImuFactor, NavState, NavStateError, NavTangent,
     PreintegratedImu, PreintegrationError, VioFactorError, VioObservation,
     bias_random_walk_residual, pose_prior_residual, reprojection_residual,
-};
-#[cfg(feature = "vio")]
-pub use local_ba::{
-    AnchorFrameInput, InertialFrameInput, VioFrameEstimate, VioSolveConfig, VioSolveConfigError,
-    VioSolveResult,
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
 

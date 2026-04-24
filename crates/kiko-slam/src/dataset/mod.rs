@@ -78,6 +78,12 @@ pub struct ImuCalibration {
     pub noise: ImuNoiseMeta,
     pub extrinsics: ImuExtrinsicsMeta,
     pub gravity_magnitude_mps2: f64,
+    /// Factory-calibrated accelerometer bias [m/s²] (e.g. from Basalt/kalibr).
+    #[serde(default)]
+    pub initial_accel_bias: Option<[f64; 3]>,
+    /// Factory-calibrated gyroscope bias [rad/s] (e.g. from Basalt/kalibr).
+    #[serde(default)]
+    pub initial_gyro_bias: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -225,9 +231,7 @@ impl std::fmt::Display for DatasetError {
             DatasetError::ReadFile { path, source } => {
                 write!(f, "failed to read file {}: {}", path.display(), source)
             }
-            DatasetError::InvalidConfig { msg } => {
-                write!(f, "invalid dataset writer config: {msg}")
-            }
+            DatasetError::InvalidConfig { msg } => write!(f, "invalid dataset config: {msg}"),
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
             }
@@ -256,7 +260,24 @@ impl std::fmt::Display for DatasetError {
     }
 }
 
-impl std::error::Error for DatasetError {}
+impl std::error::Error for DatasetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DatasetError::CreateDirectory { source, .. }
+            | DatasetError::ReadDirectory { source, .. }
+            | DatasetError::ReadFile { source, .. }
+            | DatasetError::ThreadSpawn { source }
+            | DatasetError::WriteFile { source, .. } => Some(source),
+            DatasetError::SerializeJson { source } | DatasetError::DeserializeJson { source } => {
+                Some(source)
+            }
+            DatasetError::PairingFailed { source } => Some(source),
+            DatasetError::InvalidConfig { .. }
+            | DatasetError::WorkerJoin { .. }
+            | DatasetError::MissingImuSamples { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct DatasetWriter {
@@ -992,15 +1013,36 @@ fn read_manifest(dataset_dir: &Path) -> Result<Manifest, DatasetError> {
     serde_json::from_reader(manifest_file).map_err(|e| DatasetError::DeserializeJson { source: e })
 }
 
-fn read_calibration(dataset_dir: &Path) -> Result<Calibration, DatasetError> {
+fn read_calibration_with_imu_override(
+    dataset_dir: &Path,
+    imu_override: Option<&ImuCalibration>,
+) -> Result<Calibration, DatasetError> {
     let calibration_path = dataset_dir.join(format::CALIBRATION_FILE);
     let calibration_file =
         std::fs::File::open(&calibration_path).map_err(|e| DatasetError::ReadFile {
             path: calibration_path.clone(),
             source: e,
         })?;
-    serde_json::from_reader(calibration_file)
-        .map_err(|e| DatasetError::DeserializeJson { source: e })
+    if let Some(imu_override) = imu_override {
+        let mut calibration_value: serde_json::Value = serde_json::from_reader(calibration_file)
+            .map_err(|e| DatasetError::DeserializeJson { source: e })?;
+        let calibration_object =
+            calibration_value
+                .as_object_mut()
+                .ok_or(DatasetError::InvalidConfig {
+                    msg: "calibration.json must be a JSON object",
+                })?;
+        calibration_object.insert(
+            "imu".to_string(),
+            serde_json::to_value(imu_override)
+                .map_err(|e| DatasetError::SerializeJson { source: e })?,
+        );
+        serde_json::from_value(calibration_value)
+            .map_err(|e| DatasetError::DeserializeJson { source: e })
+    } else {
+        serde_json::from_reader(calibration_file)
+            .map_err(|e| DatasetError::DeserializeJson { source: e })
+    }
 }
 
 fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {

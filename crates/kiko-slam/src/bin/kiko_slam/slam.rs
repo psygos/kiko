@@ -52,7 +52,20 @@ ENVIRONMENT VARIABLES (expert tuning):
   Backend:
     KIKO_BACKEND_ASYNC=true       Run BA on a background thread
     KIKO_BACKEND_QUEUE_DEPTH=2    BA work queue depth
-    KIKO_DESCRIPTOR_QUEUE_DEPTH=2 Descriptor extraction queue depth";
+    KIKO_DESCRIPTOR_QUEUE_DEPTH=2 Descriptor extraction queue depth
+
+  Runtime IMU Override:
+    KIKO_IMU_CALIBRATION_FILE=/path/to/file.json  Override only the IMU block at runtime
+    KIKO_IMU_ROTATION=...                 3x3 row-major camera-from-imu rotation
+    KIKO_IMU_TRANSLATION=...              3-vector camera-from-imu translation (meters)
+    KIKO_IMU_ACCEL_NOISE_DENSITY=...      Accelerometer noise density
+    KIKO_IMU_GYRO_NOISE_DENSITY=...       Gyroscope noise density
+    KIKO_IMU_ACCEL_RANDOM_WALK=...        Accelerometer random walk
+    KIKO_IMU_GYRO_RANDOM_WALK=...         Gyroscope random walk
+    KIKO_IMU_TIME_OFFSET_NS=...           Camera-IMU time offset in nanoseconds
+    KIKO_IMU_GRAVITY_MPS2=...             Gravity magnitude
+    KIKO_IMU_INITIAL_ACCEL_BIAS=...       3-vector initial accel bias
+    KIKO_IMU_INITIAL_GYRO_BIAS=...        3-vector initial gyro bias";
 
 #[derive(Args, Clone, Debug)]
 #[command(
@@ -71,7 +84,11 @@ pub struct SlamArgs {
 }
 
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let mut reader = DatasetReader::open(&args.dataset.path)?;
+    let runtime_imu_override = kiko_slam::load_runtime_imu_calibration_from_env()?;
+    let mut reader = DatasetReader::open_with_imu_calibration_override(
+        &args.dataset.path,
+        runtime_imu_override,
+    )?;
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && reader.meta().imu.is_none() {
         return Err("KIKO_VIO=true requires IMU data in the dataset".into());
@@ -106,7 +123,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
         return Err(
-            "KIKO_VIO=true requires IMU calibration via calibration.json or KIKO_IMU_* env".into(),
+            "KIKO_VIO=true requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );
     }
 
@@ -130,7 +147,10 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let tsdf_worker = if dense_cloud_enabled {
-        Some(kiko_slam::TsdfWorker::spawn(kiko_slam::TsdfConfig::default(), 4))
+        Some(kiko_slam::TsdfWorker::spawn(
+            kiko_slam::TsdfConfig::default(),
+            4,
+        ))
     } else {
         None
     };
@@ -247,7 +267,9 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(matches) = output.stereo_matches {
                     // Extract stereo samples for dense cloud BEFORE matches are consumed
                     let dense_samples = if output.keyframe.is_some() {
-                        dense_triangulator.as_ref().map(|tri| tri.extract_stereo_samples(&matches))
+                        dense_triangulator
+                            .as_ref()
+                            .map(|tri| tri.extract_stereo_samples(&matches))
                     } else {
                         None
                     };
@@ -269,17 +291,20 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             // Dense point cloud for Rerun
                             let dense = kiko_slam::generate_dense_cloud(
                                 &samples,
-                                stereo.fx(), stereo.fy(),
-                                stereo.left().cx, stereo.left().cy,
+                                stereo.fx(),
+                                stereo.fy(),
+                                stereo.left().cx,
+                                stereo.left().cy,
                                 stereo.baseline_m(),
-                                left.data(), left.width(), left.height(),
+                                left.data(),
+                                left.width(),
+                                left.height(),
                                 &dense_config,
                             );
                             if !dense.points.is_empty() {
-                                if let Err(err) = sink.log_dense_cloud(
-                                    &dense.points,
-                                    pose.cam_from_map_pose32(),
-                                ) {
+                                if let Err(err) =
+                                    sink.log_dense_cloud(&dense.points, pose.cam_from_map_pose32())
+                                {
                                     eprintln!("dense cloud: {err}");
                                 }
                             }

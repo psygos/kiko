@@ -83,7 +83,7 @@ impl ImuFactor {
 
         let r_i_t = transpose3(r_i);
         let rotation_error = so3_log_f64(mat_mul_f64(
-            corrected.delta_rotation,
+            transpose3(corrected.delta_rotation),
             mat_mul_f64(r_i_t, r_j),
         ));
 
@@ -248,6 +248,40 @@ mod tests {
         let state_j = NavState::try_new(
             Pose64::from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [
+                    0.0,
+                    0.0,
+                    -0.5 * 9.81 * preintegrated.dt_seconds * preintegrated.dt_seconds,
+                ],
+            ),
+            [0.0, 0.0, -9.81 * preintegrated.dt_seconds],
+            ImuBias::default(),
+        )
+        .expect("state j");
+        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
+        let norm = residual
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        assert!(norm < 1e-9, "imu residual norm={norm}");
+    }
+
+    #[test]
+    fn imu_factor_residual_is_zero_for_consistent_free_fall_with_rotation() {
+        let batch = batch(&[
+            (0, [0.0; 3], [0.0, 0.0, 0.5]),
+            (10_000_000, [0.0; 3], [0.0, 0.0, 0.5]),
+            (20_000_000, [0.0; 3], [0.0, 0.0, 0.5]),
+        ]);
+        let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
+            .expect("preintegrated");
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
+        let state_i =
+            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state i");
+        let state_j = NavState::try_new(
+            Pose64::from_rt(
+                preintegrated.delta_rotation,
                 [
                     0.0,
                     0.0,

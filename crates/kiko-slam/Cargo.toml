@@ -35,14 +35,5 @@ chrono = { version = "0.4", optional = true }
 name = "kiko-slam"
 path = "src/bin/kiko_slam/main.rs"
 
-[[bin]]
-name = "vio-dump"
-path = "src/bin/vio_dump.rs"
-required-features = ["vio"]
-
-[[bin]]
-name = "rrd-dump"
-path = "src/bin/rrd_dump.rs"
-
 [lints]
 workspace = true

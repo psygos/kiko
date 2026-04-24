@@ -21,7 +21,7 @@ const SO3_AXIS_NORM_MIN_F32: f32 = 1e-8;
 /// Small-angle threshold for f64 Jacobian expansions (tighter than SO3_SMALL_ANGLE).
 const JACOBIAN_SMALL_ANGLE: f64 = 1e-9;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose64 {
     rotation: [[f64; 3]; 3],
     translation: [f64; 3],
