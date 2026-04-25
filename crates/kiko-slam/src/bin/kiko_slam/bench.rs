@@ -22,6 +22,8 @@ pub(crate) struct BenchAccum {
     pub processed: usize,
     pub matches_nonzero: usize,
     pub total_matches: usize,
+    pub sum_left_keypoints: usize,
+    pub sum_right_keypoints: usize,
     pub read_errors: usize,
     pub pairing_errors: usize,
     pub inference_errors: usize,
@@ -51,6 +53,8 @@ pub(crate) struct BenchSummary {
     pub match_rate: f64,
     pub avg_matches_per_processed_pair: f64,
     pub avg_matches_per_nonzero_pair: f64,
+    pub avg_left_keypoints: f64,
+    pub avg_right_keypoints: f64,
     pub avg_sp_left_ms: f64,
     pub avg_sp_right_ms: f64,
     pub avg_lightglue_ms: f64,
@@ -112,6 +116,16 @@ pub(crate) fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSum
     } else {
         0.0
     };
+    let avg_left_keypoints = if accum.processed > 0 {
+        accum.sum_left_keypoints as f64 / accum.processed as f64
+    } else {
+        0.0
+    };
+    let avg_right_keypoints = if accum.processed > 0 {
+        accum.sum_right_keypoints as f64 / accum.processed as f64
+    } else {
+        0.0
+    };
 
     let denom = accum.processed as f64;
     let avg_sp_left_ms = if accum.processed > 0 {
@@ -163,6 +177,8 @@ pub(crate) fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSum
         match_rate,
         avg_matches_per_processed_pair,
         avg_matches_per_nonzero_pair,
+        avg_left_keypoints,
+        avg_right_keypoints,
         avg_sp_left_ms,
         avg_sp_right_ms,
         avg_lightglue_ms,
@@ -194,7 +210,6 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let inference = InferenceConfig::from_args(&args.inference)?;
-    let downscale = inference.downscale;
     let max_keypoints = inference.key_limit.get();
     let mut end2end_pipeline = inference.end2end;
     let mut pipeline: Option<InferencePipeline> = if end2end_pipeline.is_none() {
@@ -243,6 +258,8 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let (left_frame, right_frame) = pair.into_parts();
             match end2end.match_pair(&left_frame, &right_frame, max_keypoints) {
                 Ok((matches, timings)) => {
+                    accum.sum_left_keypoints += matches.source_a().len();
+                    accum.sum_right_keypoints += matches.source_b().len();
                     accum.total_matches += matches.len();
                     if !matches.is_empty() {
                         accum.matches_nonzero += 1;
@@ -260,6 +277,8 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             match p.process_pair_timed(pair) {
                 Ok((packet, timings)) => {
                     let matches = packet.matches();
+                    accum.sum_left_keypoints += matches.source_a().len();
+                    accum.sum_right_keypoints += matches.source_b().len();
                     accum.total_matches += matches.len();
                     if !matches.is_empty() {
                         accum.matches_nonzero += 1;
@@ -313,6 +332,10 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         summary.match_rate,
         summary.avg_matches_per_processed_pair,
         summary.avg_matches_per_nonzero_pair
+    );
+    eprintln!(
+        "features: avg_left_keypoints={:.1} avg_right_keypoints={:.1}",
+        summary.avg_left_keypoints, summary.avg_right_keypoints
     );
     eprintln!(
         "errors: read={} pairing={} inference={}",

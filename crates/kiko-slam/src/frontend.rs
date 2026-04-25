@@ -14,6 +14,8 @@ pub(crate) struct StereoFrontend {
     /// Optional second SuperPoint session for background prefetch
     prefetch_sp: Option<SuperPoint>,
     lightglue: LightGlue,
+    /// Optional second LightGlue session for speculative match prefetch
+    prefetch_lg: Option<LightGlue>,
     triangulator: Triangulator,
     intrinsics: PinholeIntrinsics,
 }
@@ -29,13 +31,10 @@ impl StereoFrontend {
             superpoint,
             prefetch_sp: None,
             lightglue,
+            prefetch_lg: None,
             triangulator,
             intrinsics,
         }
-    }
-
-    pub(crate) fn set_prefetch_sp(&mut self, sp: SuperPoint) {
-        self.prefetch_sp = Some(sp);
     }
 
     pub(crate) fn intrinsics(&self) -> PinholeIntrinsics {
@@ -66,7 +65,7 @@ impl StereoFrontend {
     ) -> Result<Arc<Detections>, InferenceError> {
         let detections = self
             .superpoint
-            .detect_with_downscale(frame, downscale)?
+            .detect_with_downscale_limited(frame, downscale, max_keypoints)?
             .top_k(max_keypoints);
         Ok(Arc::new(detections))
     }
@@ -79,6 +78,14 @@ impl StereoFrontend {
 
     pub(crate) fn return_prefetch_sp(&mut self, sp: SuperPoint) {
         self.prefetch_sp = Some(sp);
+    }
+
+    pub(crate) fn take_prefetch_lg(&mut self) -> Option<LightGlue> {
+        self.prefetch_lg.take()
+    }
+
+    pub(crate) fn return_prefetch_lg(&mut self, lg: LightGlue) {
+        self.prefetch_lg = Some(lg);
     }
 
     pub(crate) fn match_tracking(

@@ -26,10 +26,8 @@ cargo build -p kiko-slam --features vio,ort-cuda,ort-tensorrt --release
 ```bash
 LD_LIBRARY_PATH=/home/makerspace/work/onnxruntime/build-jetson/Release \
 ./target/release/kiko-slam slam \
-  --backend cuda \
-  --downscale 2 \
-  --max-keypoints 384 \
-  --lightglue-model crates/kiko-slam/models/superpoint_lightglue_fused_fp16.onnx \
+  --profile jetson \
+  --visual-only \
   --rerun-serve \
   /path/to/dataset
 ```
@@ -46,12 +44,23 @@ The server dies when the process exits. Use `--save-rrd /path/to/file.rrd` for p
 
 | Flag | Effect |
 |------|--------|
-| `--max-keypoints N` | Main FPS lever. 256→24fps, 384→19fps, 512→18fps |
-| `--downscale {1,2}` | 2 = half res (320×240). Don't go below 2. |
-| `--lightglue-model` | Use `superpoint_lightglue_fused_fp16.onnx` for speed |
+| `--profile jetson` | Full-resolution Jetson profile: CUDA inference, `sp_topk2048.onnx`, projected tracking, LightGlue fallback/stereo matching, realtime BA defaults. |
+| `--max-keypoints N` | Feature density lever. Jetson profile uses 2048; lower only for explicit FPS experiments. |
+| `--downscale 1` | Full 640x480 inference. Do not use downscale as the default robot fast path. |
+| `KIKO_TRACKING_MATCHER=projected` | Default Jetson tracker. Projects active map points into the current frame and locally matches descriptors, with synchronous LightGlue fallback when needed. |
+| `KIKO_TRACKING_MATCHER=lightglue` | Legacy global LightGlue tracker for baseline comparison. |
+| `--lightglue-model` | Use `superpoint_lightglue_fused_fp16.onnx` for stereo/keyframe matching and fallback |
+| `KIKO_CUDA_CONV_SEARCH=heuristic` | Jetson default; avoids very slow full-res cuDNN exhaustive startup |
+| `KIKO_CUDA_PREFER_NHWC=false` | Jetson default for this NCHW SuperPoint export |
+| `KIKO_CUDA_FUSE_CONV_BIAS=false` | Jetson default; conv-bias fusion fails on current full-res cuDNN frontend path |
 | `KIKO_BA_WINDOW=6` | Smaller BA window = less compute per keyframe |
 | `KIKO_BA_ITERS=4` | Fewer BA iterations |
 | `KIKO_BA_MIN_OBS=4` | Lower threshold prevents early BA degenerates |
+
+Current full-run visual-only measurements on `/home/makerspace/full_slam_lab`, full `640x480`, `max_keypoints=2048`:
+
+- Projected tracker default: `2084/2084` processed, `19.38 FPS`, `0` tracker errors, `96` keyframes.
+- LightGlue-only baseline (`KIKO_TRACKING_MATCHER=lightglue`): `2084/2084` processed, `6.21 FPS`, `0` tracker errors, `96` keyframes.
 
 ## VIO status
 

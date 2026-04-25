@@ -133,6 +133,7 @@ impl GlobalMap {
     }
 
     #[cfg(feature = "vio")]
+    #[allow(dead_code)]
     pub(crate) fn add_odometry_edge(&mut self, edge: EssentialEdge) {
         self.essential_graph.add_odometry_edge(edge);
     }

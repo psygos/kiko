@@ -55,3 +55,4 @@ comms/desktop-client/src-tauri/target/
 # kiko-slam artifacts
 crates/kiko-slam/dataset/
 *.rrd
+TensorrtExecutionProvider_*.onnx

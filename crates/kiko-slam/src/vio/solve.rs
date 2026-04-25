@@ -219,10 +219,10 @@ pub fn accumulate_cross_factor<const R: usize, const S: usize>(
 ) {
     // Compute Ω · J_b (R × S)
     let mut omega_jb = [[0.0_f64; S]; R];
-    for i in 0..R {
-        for k in 0..R {
+    for (i, omega_row) in omega_jb.iter_mut().enumerate().take(R) {
+        for (k, j_b_row) in j_b.iter().enumerate().take(R) {
             for col in 0..S {
-                omega_jb[i][col] += info[i][k] * j_b[k][col];
+                omega_row[col] += info[i][k] * j_b_row[col];
             }
         }
     }
@@ -230,8 +230,8 @@ pub fn accumulate_cross_factor<const R: usize, const S: usize>(
     for row in 0..S {
         for col in 0..S {
             let mut val = 0.0;
-            for k in 0..R {
-                val += j_a[k][row] * omega_jb[k][col];
+            for (k, omega_row) in omega_jb.iter().enumerate().take(R) {
+                val += j_a[k][row] * omega_row[col];
             }
             hessian[(base_a + row) * dim + (base_b + col)] += val;
             hessian[(base_b + col) * dim + (base_a + row)] += val;
@@ -306,7 +306,7 @@ mod tests {
                 (5_000_000, [0.6, -0.2, 9.6], [0.12, -0.04, 0.03]),
                 (10_000_000, [0.4, -0.1, 9.4], [0.08, -0.06, 0.01]),
             ]),
-            &state_i.bias(),
+            state_i.bias(),
             &noise(),
         )
         .expect("preintegrated");

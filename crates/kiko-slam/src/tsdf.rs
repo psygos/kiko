@@ -1,8 +1,8 @@
 //! Occupancy voxel grid with marching cubes mesh extraction.
 
-use std::collections::HashMap;
-use crate::math;
 use crate::Pose;
+use crate::math;
+use std::collections::HashMap;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
@@ -46,14 +46,18 @@ pub struct TsdfWorker {
 
 #[derive(Clone, Copy)]
 struct Voxel {
-    tsdf: f32,    // signed distance: + outside, - inside, 0 = surface
+    tsdf: f32, // signed distance: + outside, - inside, 0 = surface
     weight: f32,
     color: u8,
 }
 
 impl Default for Voxel {
     fn default() -> Self {
-        Self { tsdf: 1.0, weight: 0.0, color: 128 }
+        Self {
+            tsdf: 1.0,
+            weight: 0.0,
+            color: 128,
+        }
     }
 }
 
@@ -63,7 +67,6 @@ struct BlockIdx(i32, i32, i32);
 struct Layer {
     blocks: HashMap<BlockIdx, Vec<Voxel>>,
     voxel_size: f32,
-    block_edge: f32,
     trunc: f32,
 }
 
@@ -72,7 +75,6 @@ impl Layer {
         Self {
             blocks: HashMap::new(),
             voxel_size,
-            block_edge: voxel_size * BLOCK_SIDE as f32,
             trunc: voxel_size * 3.0,
         }
     }
@@ -80,11 +82,7 @@ impl Layer {
     /// Get voxel at global voxel coordinates. Returns default if not allocated.
     fn get_voxel(&self, gx: i32, gy: i32, gz: i32) -> Voxel {
         let bs = BLOCK_SIDE as i32;
-        let bi = BlockIdx(
-            gx.div_euclid(bs),
-            gy.div_euclid(bs),
-            gz.div_euclid(bs),
-        );
+        let bi = BlockIdx(gx.div_euclid(bs), gy.div_euclid(bs), gz.div_euclid(bs));
         let lx = gx.rem_euclid(bs) as usize;
         let ly = gy.rem_euclid(bs) as usize;
         let lz = gz.rem_euclid(bs) as usize;
@@ -120,13 +118,17 @@ impl Layer {
                     p_map[1] - cam_origin[1],
                     p_map[2] - cam_origin[2],
                 ];
-                let ray_len = (ray[0]*ray[0] + ray[1]*ray[1] + ray[2]*ray[2]).sqrt();
-                if ray_len < 1e-6 { continue; }
-                let rd = [ray[0]/ray_len, ray[1]/ray_len, ray[2]/ray_len];
+                let ray_len = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
+                if ray_len < 1e-6 {
+                    continue;
+                }
+                let rd = [ray[0] / ray_len, ray[1] / ray_len, ray[2] / ray_len];
 
                 let color = if v * w + u < msg.grayscale.len() {
                     msg.grayscale[v * w + u]
-                } else { 128 };
+                } else {
+                    128
+                };
 
                 // Update voxels along ray: -trunc to +trunc around surface
                 let n_steps = ((2.0 * trunc / vs) as i32).max(2);
@@ -148,13 +150,20 @@ impl Layer {
                     let lz = gzi.rem_euclid(bs) as usize;
                     let idx = lx + ly * BLOCK_SIDE + lz * BLOCK_SIDE * BLOCK_SIDE;
 
-                    let block = self.blocks.entry(bi).or_insert_with(|| vec![Voxel::default(); BLOCK_VOL]);
+                    let block = self
+                        .blocks
+                        .entry(bi)
+                        .or_insert_with(|| vec![Voxel::default(); BLOCK_VOL]);
                     let voxel = &mut block[idx];
                     let w_old = voxel.weight;
-                    voxel.tsdf = if w_old == 0.0 { sdf } else {
+                    voxel.tsdf = if w_old == 0.0 {
+                        sdf
+                    } else {
                         (voxel.tsdf * w_old + sdf) / (w_old + 1.0)
                     };
-                    voxel.color = if w_old == 0.0 { color } else {
+                    voxel.color = if w_old == 0.0 {
+                        color
+                    } else {
                         ((voxel.color as f32 * w_old + color as f32) / (w_old + 1.0)) as u8
                     };
                     voxel.weight = (w_old + 1.0).min(20.0);
@@ -184,7 +193,9 @@ impl Layer {
                     for lx in 0..BLOCK_SIDE {
                         let idx = lx + ly * BLOCK_SIDE + lz * BLOCK_SIDE * BLOCK_SIDE;
                         let v0 = block[idx];
-                        if v0.weight < 2.0 { continue; }
+                        if v0.weight < 2.0 {
+                            continue;
+                        }
 
                         let gx = bx + lx as i32;
                         let gy = by + ly as i32;
@@ -197,17 +208,19 @@ impl Layer {
                             let px = (gx as f32 + 0.5 + t) * vs;
                             let py = (gy as f32 + 0.5) * vs;
                             let pz = (gz as f32 + 0.5) * vs;
-                            let c = ((v0.color as f32 * (1.0 - t) + v1.color as f32 * t) as u8);
+                            let c = (v0.color as f32 * (1.0 - t) + v1.color as f32 * t) as u8;
                             let vi = positions.len() as u32;
                             let hs = vs * 0.5;
                             positions.push([px, py - hs, pz - hs]);
                             positions.push([px, py + hs, pz - hs]);
                             positions.push([px, py + hs, pz + hs]);
                             positions.push([px, py - hs, pz + hs]);
-                            colors.push([c, c, c]); colors.push([c, c, c]);
-                            colors.push([c, c, c]); colors.push([c, c, c]);
-                            indices.push([vi, vi+1, vi+2]);
-                            indices.push([vi, vi+2, vi+3]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            indices.push([vi, vi + 1, vi + 2]);
+                            indices.push([vi, vi + 2, vi + 3]);
                         }
 
                         // Check +Y edge
@@ -217,17 +230,19 @@ impl Layer {
                             let px = (gx as f32 + 0.5) * vs;
                             let py = (gy as f32 + 0.5 + t) * vs;
                             let pz = (gz as f32 + 0.5) * vs;
-                            let c = ((v0.color as f32 * (1.0 - t) + v2.color as f32 * t) as u8);
+                            let c = (v0.color as f32 * (1.0 - t) + v2.color as f32 * t) as u8;
                             let vi = positions.len() as u32;
                             let hs = vs * 0.5;
                             positions.push([px - hs, py, pz - hs]);
                             positions.push([px + hs, py, pz - hs]);
                             positions.push([px + hs, py, pz + hs]);
                             positions.push([px - hs, py, pz + hs]);
-                            colors.push([c, c, c]); colors.push([c, c, c]);
-                            colors.push([c, c, c]); colors.push([c, c, c]);
-                            indices.push([vi, vi+1, vi+2]);
-                            indices.push([vi, vi+2, vi+3]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            indices.push([vi, vi + 1, vi + 2]);
+                            indices.push([vi, vi + 2, vi + 3]);
                         }
 
                         // Check +Z edge
@@ -237,23 +252,29 @@ impl Layer {
                             let px = (gx as f32 + 0.5) * vs;
                             let py = (gy as f32 + 0.5) * vs;
                             let pz = (gz as f32 + 0.5 + t) * vs;
-                            let c = ((v0.color as f32 * (1.0 - t) + v3.color as f32 * t) as u8);
+                            let c = (v0.color as f32 * (1.0 - t) + v3.color as f32 * t) as u8;
                             let vi = positions.len() as u32;
                             let hs = vs * 0.5;
                             positions.push([px - hs, py - hs, pz]);
                             positions.push([px + hs, py - hs, pz]);
                             positions.push([px + hs, py + hs, pz]);
                             positions.push([px - hs, py + hs, pz]);
-                            colors.push([c, c, c]); colors.push([c, c, c]);
-                            colors.push([c, c, c]); colors.push([c, c, c]);
-                            indices.push([vi, vi+1, vi+2]);
-                            indices.push([vi, vi+2, vi+3]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            colors.push([c, c, c]);
+                            indices.push([vi, vi + 1, vi + 2]);
+                            indices.push([vi, vi + 2, vi + 3]);
                         }
                     }
                 }
             }
         }
-        MeshData { positions, indices, colors }
+        MeshData {
+            positions,
+            indices,
+            colors,
+        }
     }
 }
 
@@ -274,8 +295,10 @@ impl TsdfWorker {
                         let mesh = layer.extract_mesh();
                         eprintln!(
                             "tsdf: frame {} blocks={} mesh_verts={} mesh_tris={}",
-                            count, layer.blocks.len(),
-                            mesh.positions.len(), mesh.indices.len(),
+                            count,
+                            layer.blocks.len(),
+                            mesh.positions.len(),
+                            mesh.indices.len(),
                         );
                         let _ = mesh_tx.try_send(mesh);
                     }

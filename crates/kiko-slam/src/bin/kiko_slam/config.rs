@@ -1,8 +1,8 @@
 use kiko_slam::{
     BackendConfig, DownscaleFactor, GlobalDescriptorConfig, KeyframePolicy, KeypointLimit,
     LmConfig, LocalBaConfig, LoopClosureConfig, LoopClosureConfigInput, LoopSubsystemConfig,
-    RansacConfig, RectificationMode, RectifiedStereoConfig, RedundancyPolicy, RelocalizationConfig,
-    TriangulationConfig,
+    ProjectedMatcherConfig, RansacConfig, RectificationMode, RectifiedStereoConfig,
+    RedundancyPolicy, RelocalizationConfig, TrackingMatcher, TriangulationConfig,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
@@ -24,6 +24,7 @@ const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
 const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
 const DEFAULT_KEYFRAME_COVISIBILITY: f32 = 0.3;
 const DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY: f32 = 0.9;
+const MIN_PNP_CORRESPONDENCES: usize = 4;
 
 pub struct TrackerDefaults {
     pub min_keyframe_points: usize,
@@ -31,10 +32,33 @@ pub struct TrackerDefaults {
     pub min_inliers: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrackerOverrides {
+    #[allow(dead_code)]
+    pub vio_enabled: Option<bool>,
+    pub ba_window: Option<usize>,
+    pub ba_iters: Option<usize>,
+    pub ba_min_obs: Option<usize>,
+    pub tracking_matcher: Option<TrackingMatcher>,
+    pub loop_closure: Option<bool>,
+    pub learned_descriptors: Option<bool>,
+    pub relocalization: Option<bool>,
+}
+
+#[allow(dead_code)]
 pub fn build_tracker_config(
     defaults: TrackerDefaults,
     key_limit: KeypointLimit,
     downscale: DownscaleFactor,
+) -> Result<kiko_slam::TrackerConfig, Box<dyn std::error::Error>> {
+    build_tracker_config_with_overrides(defaults, key_limit, downscale, TrackerOverrides::default())
+}
+
+pub fn build_tracker_config_with_overrides(
+    defaults: TrackerDefaults,
+    key_limit: KeypointLimit,
+    downscale: DownscaleFactor,
+    overrides: TrackerOverrides,
 ) -> Result<kiko_slam::TrackerConfig, Box<dyn std::error::Error>> {
     let min_keyframe_points =
         env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(defaults.min_keyframe_points);
@@ -50,7 +74,12 @@ pub fn build_tracker_config(
         min_inliers,
         ..RansacConfig::default()
     };
-    let ba_config = build_ba_config()?;
+    let tracking_matcher = tracking_matcher_from_env(
+        overrides
+            .tracking_matcher
+            .unwrap_or(TrackingMatcher::LightGlue),
+    );
+    let ba_config = build_ba_config_with_overrides(overrides)?;
     let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
     let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
     let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
@@ -60,10 +89,16 @@ pub fn build_tracker_config(
     } else {
         None
     };
-    let loop_closure_requested = env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true);
-    let learned_descriptors_enabled = env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true);
+    let loop_closure_requested = overrides
+        .loop_closure
+        .unwrap_or_else(|| env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true));
+    let learned_descriptors_enabled = overrides
+        .learned_descriptors
+        .unwrap_or_else(|| env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true));
     let loop_closure_enabled = loop_closure_requested && learned_descriptors_enabled;
-    let relocalization_enabled = env_bool("KIKO_RELOCALIZATION").unwrap_or(true);
+    let relocalization_enabled = overrides
+        .relocalization
+        .unwrap_or_else(|| env_bool("KIKO_RELOCALIZATION").unwrap_or(true));
     let loop_subsystem = if loop_closure_enabled {
         let loop_cfg = build_loop_closure_config_from_env()?;
         let descriptor_cfg =
@@ -104,7 +139,7 @@ pub fn build_tracker_config(
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={min_keyframe_points} refresh_inliers={refresh_inliers} parallax_px={parallax_px:.1} min_covisibility={min_covisibility:.2} redundant_covisibility={redundant_covisibility:.2} min_inliers={min_inliers} downscale={downscale} max_keypoints={key_limit} loop_closure={loop_closure_enabled} learned_descriptors={} relocalization={}",
+        "tracker: keyframe_min_points={min_keyframe_points} refresh_inliers={refresh_inliers} parallax_px={parallax_px:.1} min_covisibility={min_covisibility:.2} redundant_covisibility={redundant_covisibility:.2} min_inliers={min_inliers} downscale={downscale} max_keypoints={key_limit} tracking_matcher={tracking_matcher:?} loop_closure={loop_closure_enabled} learned_descriptors={} relocalization={}",
         learned_descriptors_enabled && loop_closure_enabled,
         relocalization_enabled && loop_closure_enabled,
     );
@@ -112,6 +147,7 @@ pub fn build_tracker_config(
     Ok(kiko_slam::TrackerConfig {
         max_keypoints: key_limit,
         downscale,
+        tracking_matcher,
         min_keyframe_points,
         ransac,
         triangulation: TriangulationConfig::default(),
@@ -120,9 +156,47 @@ pub fn build_tracker_config(
         redundancy,
         backend,
         loop_subsystem,
+        #[cfg(feature = "vio")]
+        vio_enabled: overrides
+            .vio_enabled
+            .unwrap_or_else(|| env_bool("KIKO_VIO").unwrap_or(false)),
     })
 }
 
+fn tracking_matcher_from_env(default: TrackingMatcher) -> TrackingMatcher {
+    let matcher = std::env::var("KIKO_TRACKING_MATCHER")
+        .or_else(|_| std::env::var("KIKO_TRACK_MATCHER"))
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| match default {
+            TrackingMatcher::LightGlue => "lightglue".to_string(),
+            TrackingMatcher::Projected(_) => "projected".to_string(),
+        });
+
+    match matcher.as_str() {
+        "projected" | "projection" | "local" => {
+            let defaults = match default {
+                TrackingMatcher::Projected(config) => config,
+                TrackingMatcher::LightGlue => ProjectedMatcherConfig::jetson_default(),
+            };
+            TrackingMatcher::Projected(ProjectedMatcherConfig {
+                search_radius_px: env_f32("KIKO_PROJECTED_MATCH_RADIUS_PX")
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .unwrap_or(defaults.search_radius_px),
+                min_similarity: env_f32("KIKO_PROJECTED_MATCH_MIN_SIMILARITY")
+                    .filter(|value| value.is_finite())
+                    .unwrap_or(defaults.min_similarity),
+                min_matches: env_usize("KIKO_PROJECTED_MATCH_MIN_MATCHES")
+                    .unwrap_or(defaults.min_matches)
+                    .max(MIN_PNP_CORRESPONDENCES),
+                min_inliers: env_usize("KIKO_PROJECTED_MATCH_MIN_INLIERS")
+                    .unwrap_or(defaults.min_inliers)
+                    .max(MIN_PNP_CORRESPONDENCES),
+            })
+        }
+        _ => TrackingMatcher::LightGlue,
+    }
+}
 
 fn build_loop_closure_config_from_env() -> Result<LoopClosureConfig, Box<dyn std::error::Error>> {
     let mut input = LoopClosureConfigInput::default();
@@ -166,10 +240,23 @@ fn build_loop_closure_config_from_env() -> Result<LoopClosureConfig, Box<dyn std
     LoopClosureConfig::new(input).map_err(Into::into)
 }
 
+#[allow(dead_code)]
 pub fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
-    let window = env_usize("KIKO_BA_WINDOW").unwrap_or(DEFAULT_BA_WINDOW);
-    let iters = env_usize("KIKO_BA_ITERS").unwrap_or(DEFAULT_BA_ITERS);
-    let min_obs = env_usize("KIKO_BA_MIN_OBS").unwrap_or(DEFAULT_BA_MIN_OBS);
+    build_ba_config_with_overrides(TrackerOverrides::default())
+}
+
+pub fn build_ba_config_with_overrides(
+    overrides: TrackerOverrides,
+) -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
+    let window = overrides
+        .ba_window
+        .unwrap_or_else(|| env_usize("KIKO_BA_WINDOW").unwrap_or(DEFAULT_BA_WINDOW));
+    let iters = overrides
+        .ba_iters
+        .unwrap_or_else(|| env_usize("KIKO_BA_ITERS").unwrap_or(DEFAULT_BA_ITERS));
+    let min_obs = overrides
+        .ba_min_obs
+        .unwrap_or_else(|| env_usize("KIKO_BA_MIN_OBS").unwrap_or(DEFAULT_BA_MIN_OBS));
     let huber = env_f32("KIKO_BA_HUBER_PX").unwrap_or(DEFAULT_BA_HUBER_PX);
     let initial_lambda = env_f32("KIKO_BA_DAMPING").unwrap_or(DEFAULT_BA_DAMPING);
     let lambda_factor = env_f32("KIKO_LM_FACTOR").unwrap_or(DEFAULT_LM_FACTOR);

@@ -105,7 +105,7 @@ pub use loop_closure::{
     RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
     match_descriptors_for_loop,
 };
-pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
+pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId};
 pub use map_from_odom::MapFromOdom;
 pub use math::Pose64;
 #[cfg(feature = "record")]
@@ -130,8 +130,9 @@ pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
     KeyframeInsertReason, KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx,
-    RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
-    TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingPose, VioTelemetry,
+    ProjectedMatcherConfig, RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth,
+    TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackingHealth, TrackingMatcher,
+    TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,

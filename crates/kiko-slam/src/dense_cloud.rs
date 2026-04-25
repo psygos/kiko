@@ -4,7 +4,7 @@
 //! a piecewise-linear dense disparity map, then back-projects to 3D.
 //! This is a visualization aid, not a dense reconstruction.
 
-use crate::triangulation::{Point3, SparseStereoSample};
+use crate::triangulation::SparseStereoSample;
 
 /// Configuration for dense cloud generation.
 #[derive(Clone, Copy, Debug)]
@@ -108,14 +108,16 @@ pub fn generate_dense_depth_image(
     let triangles = delaunay(&pts, image_width as f32, image_height as f32);
     let mut rejected = 0usize;
     let mut rasterized = 0usize;
-    let mut filled = 0usize;
-
     for tri in &triangles {
         let (a, b, c) = (tri[0], tri[1], tri[2]);
         let (ax, ay) = (pts[a][0], pts[a][1]);
         let (bx, by) = (pts[b][0], pts[b][1]);
         let (cx_, cy_) = (pts[c][0], pts[c][1]);
-        let (da, db, dc) = (samples[a].disparity, samples[b].disparity, samples[c].disparity);
+        let (da, db, dc) = (
+            samples[a].disparity,
+            samples[b].disparity,
+            samples[c].disparity,
+        );
 
         let area = triangle_area(ax, ay, bx, by, cx_, cy_);
         if area < 0.5 || area > config.max_triangle_area_px2 {
@@ -166,16 +168,22 @@ pub fn generate_dense_depth_image(
             }
         }
     }
-    filled = depth.iter().filter(|&&d| d > 0.0).count();
+    let filled = depth.iter().filter(|&&d| d > 0.0).count();
     eprintln!(
         "dense_depth: samples={} triangles={} rejected={} rasterized={} filled={}/{}",
-        samples.len(), triangles.len(), rejected, rasterized, filled, w * h,
+        samples.len(),
+        triangles.len(),
+        rejected,
+        rasterized,
+        filled,
+        w * h,
     );
     depth
 }
 
 /// Generate a dense point cloud by interpolating disparity over a Delaunay
 /// triangulation of sparse stereo samples.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_dense_cloud(
     samples: &[SparseStereoSample],
     fx: f32,
@@ -212,7 +220,11 @@ pub fn generate_dense_cloud(
         let (ax, ay) = (pts[a][0], pts[a][1]);
         let (bx, by) = (pts[b][0], pts[b][1]);
         let (cx_, cy_) = (pts[c][0], pts[c][1]);
-        let (da, db, dc) = (samples[a].disparity, samples[b].disparity, samples[c].disparity);
+        let (da, db, dc) = (
+            samples[a].disparity,
+            samples[b].disparity,
+            samples[c].disparity,
+        );
 
         // --- Triangle rejection ---
         // 1. Degenerate area
@@ -330,12 +342,7 @@ fn delaunay(pts: &[[f32; 2]], width: f32, height: f32) -> Vec<[usize; 3]> {
         // Find all triangles whose circumcircle contains p
         let mut bad = Vec::new();
         for (ti, tri) in triangles.iter().enumerate() {
-            if circumcircle_contains(
-                all_pts[tri[0]],
-                all_pts[tri[1]],
-                all_pts[tri[2]],
-                p,
-            ) {
+            if circumcircle_contains(all_pts[tri[0]], all_pts[tri[1]], all_pts[tri[2]], p) {
                 bad.push(ti);
             }
         }
@@ -395,8 +402,7 @@ fn circumcircle_contains(a: [f32; 2], b: [f32; 2], c: [f32; 2], p: [f32; 2]) -> 
     let by = b[1] - p[1];
     let cx = c[0] - p[0];
     let cy = c[1] - p[1];
-    let det = (ax * ax + ay * ay) * (bx * cy - cx * by)
-        - (bx * bx + by * by) * (ax * cy - cx * ay)
+    let det = (ax * ax + ay * ay) * (bx * cy - cx * by) - (bx * bx + by * by) * (ax * cy - cx * ay)
         + (cx * cx + cy * cy) * (ax * by - bx * ay);
     det > 0.0
 }
@@ -460,9 +466,24 @@ mod tests {
         // Test via the generate function: a point at (5,5) inside triangle
         // (0,0)-(10,0)-(5,10) should produce dense points including near (5,5)
         let samples = vec![
-            SparseStereoSample { u: 0.0, v: 0.0, disparity: 5.0, depth_m: 1.0 },
-            SparseStereoSample { u: 10.0, v: 0.0, disparity: 5.0, depth_m: 1.0 },
-            SparseStereoSample { u: 5.0, v: 10.0, disparity: 5.0, depth_m: 1.0 },
+            SparseStereoSample {
+                u: 0.0,
+                v: 0.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
+            SparseStereoSample {
+                u: 10.0,
+                v: 0.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
+            SparseStereoSample {
+                u: 5.0,
+                v: 10.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
         ];
         let image = vec![128u8; 20 * 20];
         let config = DenseCloudConfig {
@@ -473,7 +494,10 @@ mod tests {
         let result = generate_dense_cloud(
             &samples, 200.0, 200.0, 10.0, 10.0, 0.075, &image, 20, 20, &config,
         );
-        assert!(!result.points.is_empty(), "should produce points inside triangle");
+        assert!(
+            !result.points.is_empty(),
+            "should produce points inside triangle"
+        );
     }
 
     #[test]
@@ -481,9 +505,24 @@ mod tests {
         // Single triangle, no points should be generated outside it
         // Triangle covers a small region, image is larger
         let samples = vec![
-            SparseStereoSample { u: 2.0, v: 2.0, disparity: 5.0, depth_m: 1.0 },
-            SparseStereoSample { u: 4.0, v: 2.0, disparity: 5.0, depth_m: 1.0 },
-            SparseStereoSample { u: 3.0, v: 4.0, disparity: 5.0, depth_m: 1.0 },
+            SparseStereoSample {
+                u: 2.0,
+                v: 2.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
+            SparseStereoSample {
+                u: 4.0,
+                v: 2.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
+            SparseStereoSample {
+                u: 3.0,
+                v: 4.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
         ];
         let image = vec![128u8; 100 * 100];
         let config = DenseCloudConfig {
@@ -541,9 +580,24 @@ mod tests {
         let d = fx * baseline / z; // disparity for Z=2m
 
         let samples = vec![
-            SparseStereoSample { u: 20.0, v: 20.0, disparity: d, depth_m: z },
-            SparseStereoSample { u: 80.0, v: 20.0, disparity: d, depth_m: z },
-            SparseStereoSample { u: 50.0, v: 80.0, disparity: d, depth_m: z },
+            SparseStereoSample {
+                u: 20.0,
+                v: 20.0,
+                disparity: d,
+                depth_m: z,
+            },
+            SparseStereoSample {
+                u: 80.0,
+                v: 20.0,
+                disparity: d,
+                depth_m: z,
+            },
+            SparseStereoSample {
+                u: 50.0,
+                v: 80.0,
+                disparity: d,
+                depth_m: z,
+            },
         ];
         let image = vec![128u8; 100 * 100];
         let config = DenseCloudConfig {
@@ -570,9 +624,24 @@ mod tests {
     fn point_cap_enforced() {
         // Small triangle that won't be rejected by area/edge filters
         let samples = vec![
-            SparseStereoSample { u: 10.0, v: 10.0, disparity: 5.0, depth_m: 1.0 },
-            SparseStereoSample { u: 40.0, v: 10.0, disparity: 5.0, depth_m: 1.0 },
-            SparseStereoSample { u: 25.0, v: 40.0, disparity: 5.0, depth_m: 1.0 },
+            SparseStereoSample {
+                u: 10.0,
+                v: 10.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
+            SparseStereoSample {
+                u: 40.0,
+                v: 10.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
+            SparseStereoSample {
+                u: 25.0,
+                v: 40.0,
+                disparity: 5.0,
+                depth_m: 1.0,
+            },
         ];
         let image = vec![128u8; 100 * 100];
         let config = DenseCloudConfig {
@@ -585,14 +654,27 @@ mod tests {
         let result = generate_dense_cloud(
             &samples, 200.0, 200.0, 50.0, 50.0, 0.075, &image, 100, 100, &config,
         );
-        assert!(result.points.len() <= 10, "got {} points", result.points.len());
+        assert!(
+            result.points.len() <= 10,
+            "got {} points",
+            result.points.len()
+        );
         assert!(result.stats.points_capped);
     }
 
     #[test]
     fn empty_input_returns_empty() {
         let result = generate_dense_cloud(
-            &[], 200.0, 200.0, 50.0, 50.0, 0.075, &[], 100, 100, &DenseCloudConfig::default(),
+            &[],
+            200.0,
+            200.0,
+            50.0,
+            50.0,
+            0.075,
+            &[],
+            100,
+            100,
+            &DenseCloudConfig::default(),
         );
         assert!(result.points.is_empty());
     }

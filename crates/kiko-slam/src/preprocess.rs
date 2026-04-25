@@ -76,6 +76,50 @@ pub fn normalise_downscale_into(
     Ok(out_dims)
 }
 
+pub fn downscale_u8_into(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    factor: crate::DownscaleFactor,
+    out: &mut Vec<u8>,
+) -> Result<crate::FrameDimensions, crate::DownscaleError> {
+    let expected_len = (width as usize).saturating_mul(height as usize);
+    if data.len() != expected_len {
+        return Err(crate::DownscaleError::InputLenMismatch {
+            expected: expected_len,
+            actual: data.len(),
+        });
+    }
+
+    let factor_u32 = factor.get() as u32;
+    if width % factor_u32 != 0 || height % factor_u32 != 0 {
+        return Err(crate::DownscaleError::NonDivisible {
+            width,
+            height,
+            factor: factor.get(),
+        });
+    }
+
+    let out_width = width / factor_u32;
+    let out_height = height / factor_u32;
+    let out_dims = crate::FrameDimensions::new(out_width, out_height);
+    out.resize(out_dims.area(), 0);
+
+    let stride = width as usize;
+    let step = factor.get();
+    let mut out_idx = 0usize;
+    for y in 0..out_height as usize {
+        let src_y = y * step;
+        let row = src_y * stride;
+        for x in 0..out_width as usize {
+            out[out_idx] = data[row + x * step];
+            out_idx += 1;
+        }
+    }
+
+    Ok(out_dims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +154,21 @@ mod tests {
                 actual: 3
             }
         ));
+    }
+
+    #[test]
+    fn downscale_u8_into_samples_expected_pixels() {
+        let mut out = Vec::new();
+        let dims = downscale_u8_into(
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+            3,
+            3,
+            crate::DownscaleFactor::try_from(3).expect("factor"),
+            &mut out,
+        )
+        .expect("downscale");
+        assert_eq!(dims.width(), 1);
+        assert_eq!(dims.height(), 1);
+        assert_eq!(out, vec![0]);
     }
 }
