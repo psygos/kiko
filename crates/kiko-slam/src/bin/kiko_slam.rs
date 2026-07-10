@@ -109,6 +109,12 @@ struct VizArgs {
     rerun_decimation: VizDecimationArg,
     #[arg(long, env = "KIKO_RERUN_SAVE")]
     save_rrd: Option<PathBuf>,
+    /// Start a gRPC server on 0.0.0.0:<port> so remote Rerun viewers can connect.
+    #[arg(long, env = "KIKO_RERUN_SERVE", default_value_t = false)]
+    rerun_serve: bool,
+    /// Port for gRPC server (used with --rerun-serve). Default: 9876.
+    #[arg(long, env = "KIKO_RERUN_PORT", default_value_t = 9876)]
+    rerun_port: u16,
     #[arg(long, env = "KIKO_VIZ_ODOMETRY", default_value_t = false)]
     odometry: bool,
     #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
@@ -409,6 +415,18 @@ fn build_recording(
         }
         eprintln!("rerun: saving to {}", path.display());
         let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
+        Ok(rec)
+    } else if args.rerun_serve {
+        let port = args.rerun_port;
+        eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
+        eprintln!(
+            "rerun: connect from laptop with:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
+        );
+        let rec = rerun::RecordingStreamBuilder::new(name).serve_grpc_opts(
+            "0.0.0.0",
+            port,
+            Default::default(),
+        )?;
         Ok(rec)
     } else {
         Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc()?)
