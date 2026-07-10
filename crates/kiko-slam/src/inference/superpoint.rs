@@ -226,6 +226,8 @@ impl SuperPoint {
     }
 }
 
+// Keep the session, frame metadata, tensor, and reusable scratch buffers explicit.
+#[allow(clippy::too_many_arguments)]
 fn run_with_tensor<T>(
     kind: SuperPointModelKind,
     session: &mut Session,
@@ -350,6 +352,8 @@ where
     .map_err(InferenceError::Detection)
 }
 
+// Dense decoding mutates two independent scratch buffers in addition to inference inputs.
+#[allow(clippy::too_many_arguments)]
 fn run_dense_inference<T>(
     session: &mut Session,
     frame: &Frame,

@@ -2,8 +2,10 @@
 **/target/
 *.log
 
-# Rust lock files
+# Rust lock files. Track the root application workspace lockfile while leaving
+# nested standalone/library lockfiles local.
 **/Cargo.lock
+!/Cargo.lock
 
 # Node modules and dependencies
 node_modules/
@@ -55,4 +57,13 @@ comms/desktop-client/src-tauri/target/
 # kiko-slam artifacts
 crates/kiko-slam/dataset/
 *.rrd
-TensorrtExecutionProvider_*.onnx
+
+# ONNX Runtime / TensorRT generated graph dumps and model intermediates
+/TensorrtExecutionProvider_*.onnx
+/crates/kiko-slam/models/sp_backbone*.onnx
+/crates/kiko-slam/models/sp_fp16.onnx
+/crates/kiko-slam/models/sp_fp32_backup.onnx
+/crates/kiko-slam/models/sp_inferred.onnx
+/crates/kiko-slam/models/sp_original.onnx
+/crates/kiko-slam/models/sp_postprocess.onnx
+/crates/kiko-slam/models/superpoint_lightglue_fused_fp16_inferred.onnx
