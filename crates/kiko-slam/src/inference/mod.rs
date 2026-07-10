@@ -135,18 +135,21 @@ pub(super) fn run_with_watchdog<T>(
 ) -> Result<T, InferenceError> {
     let start = Instant::now();
     let result = run();
+    let elapsed = start.elapsed();
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
     let warn_ms = env_usize("KIKO_ORT_RUN_WARN_MS").unwrap_or(if cfg!(target_vendor = "apple") {
         300
     } else {
         200
     });
     let warn_after = Duration::from_millis(warn_ms as u64);
-    let elapsed = start.elapsed();
     if elapsed > warn_after {
         eprintln!(
-            "slow ONNX inference: model={model} elapsed_ms={:.1} threshold_ms={warn_ms}",
-            elapsed.as_secs_f64() * 1000.0
+            "slow ONNX inference: model={model} elapsed_ms={elapsed_ms:.1} threshold_ms={warn_ms}",
         );
+    }
+    if env_bool("KIKO_INFERENCE_TIMING").unwrap_or(false) {
+        eprintln!("inference: model={model} elapsed_ms={elapsed_ms:.1}");
     }
     result
 }

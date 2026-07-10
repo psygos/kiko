@@ -251,27 +251,9 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
             .with_build_heuristics(true)
             .with_builder_optimization_level(5)
             .with_detailed_build_log(true)
-            .with_dump_subgraphs(true)
-            // Profiles for all cross-boundary dynamic tensors in SP model.
-            // SP graph partitions at NonZero/Where/Gather ops (dynamic keypoint extraction).
-            .with_profile_min_shapes(
-                "image:1x1x240x320,\
-                 kpts0:1x1x2,kpts1:1x1x2,desc0:1x1x256,desc1:1x1x256,\
-                 /NonZero_output_0:3x1,/NonZero_1_output_0:1x1,\
-                 /Reshape_3_output_0:1,/Transpose_2_output_0:1x256",
-            )
-            .with_profile_max_shapes(
-                "image:1x1x480x640,\
-                 kpts0:1x256x2,kpts1:1x256x2,desc0:1x256x256,desc1:1x256x256,\
-                 /NonZero_output_0:3x4096,/NonZero_1_output_0:1x2048,\
-                 /Reshape_3_output_0:2048,/Transpose_2_output_0:2048x256",
-            )
-            .with_profile_opt_shapes(
-                "image:1x1x240x320,\
-                 kpts0:1x256x2,kpts1:1x256x2,desc0:1x256x256,desc1:1x256x256,\
-                 /NonZero_output_0:3x512,/NonZero_1_output_0:1x512,\
-                 /Reshape_3_output_0:512,/Transpose_2_output_0:512x256",
-            );
+            .with_dump_subgraphs(env_bool("KIKO_TRT_DUMP_SUBGRAPHS").unwrap_or(false));
+        // No explicit profile shapes: SuperPoint has too many dynamic intermediate
+        // tensors from NonZero/Where/Gather keypoint extraction to enumerate safely.
         if !ep.supported_by_platform() {
             return Ok(None);
         }

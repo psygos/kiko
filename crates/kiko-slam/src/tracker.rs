@@ -1829,17 +1829,40 @@ impl SlamTracker {
         self.frontend.return_prefetch_sp(sp);
     }
 
+    pub fn take_prefetch_lg(&mut self) -> Option<LightGlue> {
+        self.frontend.take_prefetch_lg()
+    }
+
+    pub fn return_prefetch_lg(&mut self, lg: LightGlue) {
+        self.frontend.return_prefetch_lg(lg);
+    }
+
+    /// Return current tracking keyframe info for speculative LG prefetch.
+    /// Returns None if not in tracking state.
+    pub fn current_tracking_keyframe_detections(
+        &self,
+    ) -> Option<(KeyframeId, std::sync::Arc<Detections>)> {
+        match &self.state {
+            TrackerState::Tracking {
+                keyframe,
+                keyframe_id,
+            } => Some((*keyframe_id, keyframe.tracking_detections().clone())),
+            _ => None,
+        }
+    }
+
     pub fn process_capture(
         &mut self,
         capture: CaptureBundle,
     ) -> Result<TrackerOutput, TrackerError> {
-        self.process_capture_with_prefetch(capture, None)
+        self.process_capture_with_prefetch(capture, None, None)
     }
 
     pub fn process_capture_with_prefetch(
         &mut self,
         capture: CaptureBundle,
         prefetched_left: Option<(crate::FrameId, std::sync::Arc<Detections>)>,
+        prefetched_matches: Option<(KeyframeId, Matches<Raw>)>,
     ) -> Result<TrackerOutput, TrackerError> {
         #[cfg(feature = "vio")]
         {
@@ -1875,7 +1898,13 @@ impl SlamTracker {
         }
 
         let result = if let Some((keyframe, keyframe_id)) = tracking {
-            self.track_with_prefetch(pair, &keyframe, keyframe_id, prefetched_left)
+            self.track_with_prefetch(
+                pair,
+                &keyframe,
+                keyframe_id,
+                prefetched_left,
+                prefetched_matches,
+            )
         } else {
             let bootstrap_pose = self.last_pose_world.unwrap_or(Pose::identity());
             if self.trace_transitions {
@@ -3025,11 +3054,13 @@ impl SlamTracker {
                 });
                 #[cfg(feature = "vio")]
                 {
-                    if let Some(reference_cam_from_odom) = reference_cam_from_odom
-                        .or_else(|| self.current_odom_pose())
+                    if let Some(reference_cam_from_odom) =
+                        reference_cam_from_odom.or_else(|| self.current_odom_pose())
                     {
-                        self.map_from_odom
-                            .align_to_pose(Pose64::from_pose32(pose_world), reference_cam_from_odom);
+                        self.map_from_odom.align_to_pose(
+                            Pose64::from_pose32(pose_world),
+                            reference_cam_from_odom,
+                        );
                     }
                     self.reset_inertial_runtime_continuity();
                 }
@@ -3064,7 +3095,7 @@ impl SlamTracker {
         keyframe: &Arc<Keyframe>,
         keyframe_id: KeyframeId,
     ) -> Result<TrackerOutput, TrackerError> {
-        self.track_with_prefetch(pair, keyframe, keyframe_id, None)
+        self.track_with_prefetch(pair, keyframe, keyframe_id, None, None)
     }
 
     fn track_with_prefetch(
@@ -3073,6 +3104,7 @@ impl SlamTracker {
         keyframe: &Arc<Keyframe>,
         keyframe_id: KeyframeId,
         prefetched_left: Option<(crate::FrameId, std::sync::Arc<Detections>)>,
+        prefetched_matches: Option<(KeyframeId, Matches<Raw>)>,
     ) -> Result<TrackerOutput, TrackerError> {
         let tracking_start = Instant::now();
         let (left, right) = pair.into_parts();
@@ -3102,9 +3134,32 @@ impl SlamTracker {
             diagnostics.tracking_time = Some(tracking_start.elapsed());
             return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
         } else {
-            let tracking_matches = self
-                .frontend
-                .match_tracking(current.clone(), keyframe.tracking_detections().clone())?;
+            // Use speculative prefetched matches if they were computed against the
+            // current keyframe. Otherwise fall back to running LG on the main thread.
+            let tracking_matches = if let Some((prefetch_kf_id, prefetch_raw)) = prefetched_matches
+            {
+                if prefetch_kf_id == keyframe_id {
+                    if self.trace_transitions {
+                        eprintln!(
+                            "speculative LG hit: using prefetched matches for frame={}",
+                            frame_id.as_u64()
+                        );
+                    }
+                    prefetch_raw
+                } else {
+                    if self.trace_transitions {
+                        eprintln!(
+                            "speculative LG miss: keyframe changed ({:?} != {:?})",
+                            prefetch_kf_id, keyframe_id
+                        );
+                    }
+                    self.frontend
+                        .match_tracking(current.clone(), keyframe.tracking_detections().clone())?
+                }
+            } else {
+                self.frontend
+                    .match_tracking(current.clone(), keyframe.tracking_detections().clone())?
+            };
             keyframe
                 .remap_tracking_matches(&tracking_matches)
                 .map_err(|err| TrackerError::Inference(InferenceError::Match(err)))?
@@ -5729,18 +5784,10 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn vio_pose_adoption_rejects_missing_current_vio_observation_support() {
-        let visual = PoseReprojectionMetrics::from_errors(vec![
-            Some(1.0),
-            Some(1.0),
-            Some(1.0),
-            Some(1.0),
-        ]);
-        let vio = PoseReprojectionMetrics::from_errors(vec![
-            Some(0.5),
-            Some(0.5),
-            Some(0.5),
-            Some(0.5),
-        ]);
+        let visual =
+            PoseReprojectionMetrics::from_errors(vec![Some(1.0), Some(1.0), Some(1.0), Some(1.0)]);
+        let vio =
+            PoseReprojectionMetrics::from_errors(vec![Some(0.5), Some(0.5), Some(0.5), Some(0.5)]);
 
         assert_eq!(
             decide_vio_pose_adoption(0, &visual, &vio),

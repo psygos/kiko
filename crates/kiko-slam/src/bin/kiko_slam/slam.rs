@@ -98,8 +98,10 @@ pub struct SlamArgs {
 
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let runtime_imu_override = kiko_slam::load_runtime_imu_calibration_from_env()?;
-    let mut reader =
-        DatasetReader::open_with_imu_calibration_override(&args.dataset.path, runtime_imu_override)?;
+    let mut reader = DatasetReader::open_with_imu_calibration_override(
+        &args.dataset.path,
+        runtime_imu_override,
+    )?;
     #[cfg(feature = "vio")]
     if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && reader.meta().imu.is_none() {
         return Err("KIKO_VIO=true requires IMU data in the dataset".into());
@@ -147,6 +149,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         superpoint,
         superpoint_right,
         lightglue,
+        lightglue_prefetch,
         end2end: _,
         key_limit,
         downscale,
@@ -169,11 +172,30 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
-    // Create a second SP session for detection prefetch pipelining
+    let has_prefetch_sp = superpoint_right.is_some();
+    let has_prefetch_lg = lightglue_prefetch.is_some();
     if let Some(sp_right) = superpoint_right {
         tracker.return_prefetch_sp(sp_right);
-        eprintln!("detection prefetch pipeline: enabled");
     }
+    if let Some(lg_prefetch) = lightglue_prefetch {
+        tracker.return_prefetch_lg(lg_prefetch);
+    }
+    eprintln!(
+        "detection prefetch pipeline: {}",
+        if has_prefetch_sp {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    eprintln!(
+        "speculative LG prefetch: {}",
+        if has_prefetch_lg {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
 
     let start = Instant::now();
     let mut attempted = 0usize;
@@ -183,12 +205,14 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
 
-    // SP prefetch pipeline: overlap SP(N+1) with tracker processing of frame N
-    type PrefetchResult = (
-        kiko_slam::SuperPoint,
-        kiko_slam::FrameId,
-        Option<std::sync::Arc<kiko_slam::Detections>>,
-    );
+    // Prefetch pipeline: overlap SP(N+1) + speculative LG(N+1) with tracker processing of frame N
+    struct PrefetchResult {
+        sp: kiko_slam::SuperPoint,
+        lg: Option<kiko_slam::LightGlue>,
+        frame_id: kiko_slam::FrameId,
+        detections: Option<std::sync::Arc<kiko_slam::Detections>>,
+        speculative_matches: Option<(kiko_slam::KeyframeId, kiko_slam::Matches<kiko_slam::Raw>)>,
+    }
     let mut pending_prefetch: Option<std::thread::JoinHandle<PrefetchResult>> = None;
     let ds = inference.downscale;
     let max_kp = inference.key_limit.get();
@@ -221,21 +245,21 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         let right = bundle.pair().right().clone();
         let imu = bundle.imu().batch().cloned();
 
-        // Collect prefetched SP for THIS frame (launched during previous iteration)
-        let prefetched_left = if let Some(handle) = pending_prefetch.take() {
+        // Collect prefetched SP+LG for THIS frame (launched during previous iteration)
+        let (prefetched_left, prefetched_matches) = if let Some(handle) = pending_prefetch.take() {
             match handle.join() {
-                Ok((sp_session, fid, Some(dets))) => {
-                    tracker.return_prefetch_sp(sp_session);
-                    Some((fid, dets))
+                Ok(result) => {
+                    tracker.return_prefetch_sp(result.sp);
+                    if let Some(lg) = result.lg {
+                        tracker.return_prefetch_lg(lg);
+                    }
+                    let dets = result.detections.map(|d| (result.frame_id, d));
+                    (dets, result.speculative_matches)
                 }
-                Ok((sp_session, _fid, None)) => {
-                    tracker.return_prefetch_sp(sp_session);
-                    None
-                }
-                Err(_) => None,
+                Err(_) => (None, None),
             }
         } else {
-            None
+            (None, None)
         };
 
         // Read-ahead: grab the NEXT bundle from the iterator
@@ -251,23 +275,40 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        // Launch SP prefetch for the NEXT frame on a background thread
+        // Launch SP + speculative LG prefetch for the NEXT frame on a background thread
         if let Some(ref next_b) = lookahead_bundle {
             if let Some(mut sp) = tracker.take_prefetch_sp() {
+                let mut lg = tracker.take_prefetch_lg();
+                let kf_info = tracker.current_tracking_keyframe_detections();
                 let next_left = next_b.pair().left().clone();
                 let next_fid = next_left.frame_id();
                 pending_prefetch = Some(std::thread::spawn(move || {
-                    let result = sp
+                    let detections = sp
                         .detect_with_downscale(&next_left, ds)
                         .ok()
                         .map(|d| std::sync::Arc::new(d.top_k(max_kp)));
-                    (sp, next_fid, result)
+                    // Speculative LG: match against current keyframe if we have
+                    // both a LG session and keyframe detections
+                    let speculative_matches = match (&detections, &mut lg, &kf_info) {
+                        (Some(dets), Some(lg_session), Some((kf_id, kf_dets))) => lg_session
+                            .match_these(dets.clone(), kf_dets.clone())
+                            .ok()
+                            .map(|matches| (*kf_id, matches)),
+                        _ => None,
+                    };
+                    PrefetchResult {
+                        sp,
+                        lg,
+                        frame_id: next_fid,
+                        detections,
+                        speculative_matches,
+                    }
                 }));
             }
         }
 
-        // Process THIS frame — SP prefetch for NEXT frame runs in parallel
-        match tracker.process_capture_with_prefetch(bundle, prefetched_left) {
+        // Process THIS frame — SP+LG prefetch for NEXT frame runs in parallel
+        match tracker.process_capture_with_prefetch(bundle, prefetched_left, prefetched_matches) {
             Ok(output) => {
                 let timestamp = left.timestamp();
                 let loop_applied = output.events.iter().any(|event| {

@@ -134,6 +134,7 @@ pub struct InferenceConfig {
     pub superpoint: SuperPoint,
     pub superpoint_right: Option<SuperPoint>,
     pub lightglue: LightGlue,
+    pub lightglue_prefetch: Option<LightGlue>,
     pub end2end: Option<End2EndPipeline>,
     pub key_limit: KeypointLimit,
     pub downscale: DownscaleFactor,
@@ -181,6 +182,11 @@ impl InferenceConfig {
             None
         };
         let lightglue = LightGlue::new_with_backend(&lg_path, lightglue_backend)?;
+        let lightglue_prefetch = if end2end.is_none() {
+            LightGlue::new_with_backend(&lg_path, lightglue_backend).ok()
+        } else {
+            None
+        };
 
         eprintln!(
             "inference backend: superpoint={:?}, lightglue={:?}",
@@ -202,6 +208,7 @@ impl InferenceConfig {
             superpoint,
             superpoint_right,
             lightglue,
+            lightglue_prefetch,
             end2end,
             key_limit,
             downscale,

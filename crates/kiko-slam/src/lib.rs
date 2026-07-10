@@ -115,7 +115,7 @@ pub use loop_closure::{
     RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
     match_descriptors_for_loop,
 };
-pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
+pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId};
 pub use map_from_odom::MapFromOdom;
 pub use math::Pose64;
 #[cfg(feature = "record")]
