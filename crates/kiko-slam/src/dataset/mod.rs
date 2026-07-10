@@ -1034,9 +1034,8 @@ fn read_calibration_with_imu_override(
                 })?;
         calibration_object.insert(
             "imu".to_string(),
-            serde_json::to_value(imu_override).map_err(|e| DatasetError::SerializeJson {
-                source: e,
-            })?,
+            serde_json::to_value(imu_override)
+                .map_err(|e| DatasetError::SerializeJson { source: e })?,
         );
         serde_json::from_value(calibration_value)
             .map_err(|e| DatasetError::DeserializeJson { source: e })

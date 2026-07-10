@@ -49,8 +49,7 @@ impl DatasetReader {
     ) -> Result<Self, DatasetError> {
         let root = path.into();
         let meta = read_meta(&root)?;
-        if let Some(_)
-            = imu_override.as_ref()
+        if let Some(_) = imu_override.as_ref()
             && meta.imu.is_none()
         {
             return Err(DatasetError::InvalidConfig {
@@ -876,7 +875,11 @@ mod tests {
 
         let mut reader = DatasetReader::open_with_imu_calibration_override(
             &dataset_dir,
-            Some(calibration_with_time_offset_ns(10).imu.expect("imu calibration")),
+            Some(
+                calibration_with_time_offset_ns(10)
+                    .imu
+                    .expect("imu calibration"),
+            ),
         )
         .expect("reader");
         let bundle = reader
@@ -916,8 +919,7 @@ mod tests {
         writer.write_frame(&mono_frame(SensorId::StereoRight, 1, near_max - 96));
         writer.write_imu(
             &ImuBatch::new(vec![
-                ImuSample::new(Timestamp::from_nanos(near_max), [0.0; 3], [0.0; 3])
-                    .expect("imu 0"),
+                ImuSample::new(Timestamp::from_nanos(near_max), [0.0; 3], [0.0; 3]).expect("imu 0"),
             ])
             .expect("imu batch"),
         );
@@ -925,12 +927,17 @@ mod tests {
         drop(writer);
         handle.finish().expect("finish dataset");
 
-        let open_err = DatasetReader::open(&dataset_dir).expect_err("embedded offset should overflow");
+        let open_err =
+            DatasetReader::open(&dataset_dir).expect_err("embedded offset should overflow");
         assert!(matches!(open_err, DatasetError::ReadFile { .. }));
 
         let reader = DatasetReader::open_with_imu_calibration_override(
             &dataset_dir,
-            Some(calibration_with_time_offset_ns(0).imu.expect("imu calibration")),
+            Some(
+                calibration_with_time_offset_ns(0)
+                    .imu
+                    .expect("imu calibration"),
+            ),
         )
         .expect("runtime override should become authoritative before sample load");
         assert_eq!(
@@ -1006,7 +1013,11 @@ mod tests {
 
         let mut reader = DatasetReader::open_with_imu_calibration_override(
             &dataset_dir,
-            Some(calibration_with_time_offset_ns(10).imu.expect("imu calibration")),
+            Some(
+                calibration_with_time_offset_ns(10)
+                    .imu
+                    .expect("imu calibration"),
+            ),
         )
         .expect("runtime override should replace embedded imu block before deserialization");
         let bundle = reader
