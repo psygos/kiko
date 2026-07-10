@@ -179,7 +179,14 @@ impl std::fmt::Display for TsdfError {
     }
 }
 
-impl std::error::Error for TsdfError {}
+impl std::error::Error for TsdfError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Config(err) => Some(err),
+            Self::Integration(_) | Self::MeshExtraction(_) | Self::Internal(_) => None,
+        }
+    }
+}
 
 impl From<TsdfConfigError> for TsdfError {
     fn from(err: TsdfConfigError) -> Self {

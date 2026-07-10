@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -142,6 +143,9 @@ impl WriterStats {
 
 #[derive(Debug)]
 pub enum DatasetError {
+    AlreadyExists {
+        path: PathBuf,
+    },
     CreateDirectory {
         path: PathBuf,
         source: std::io::Error,
@@ -181,6 +185,9 @@ pub enum DatasetError {
 impl std::fmt::Display for DatasetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DatasetError::AlreadyExists { path } => {
+                write!(f, "dataset path already exists: {}", path.display())
+            }
             DatasetError::CreateDirectory { path, source } => {
                 write!(
                     f,
@@ -220,7 +227,24 @@ impl std::fmt::Display for DatasetError {
     }
 }
 
-impl std::error::Error for DatasetError {}
+impl std::error::Error for DatasetError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DatasetError::CreateDirectory { source, .. }
+            | DatasetError::ReadDirectory { source, .. }
+            | DatasetError::ReadFile { source, .. }
+            | DatasetError::ThreadSpawn { source }
+            | DatasetError::WriteFile { source, .. } => Some(source),
+            DatasetError::SerializeJson { source } | DatasetError::DeserializeJson { source } => {
+                Some(source)
+            }
+            DatasetError::PairingFailed { source } => Some(source),
+            DatasetError::AlreadyExists { .. }
+            | DatasetError::InvalidConfig { .. }
+            | DatasetError::WorkerJoin { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct DatasetWriter {
@@ -284,10 +308,27 @@ impl DatasetWriter {
         }
 
         let path = path.into();
-        std::fs::create_dir_all(&path).map_err(|e| DatasetError::CreateDirectory {
-            path: path.clone(),
-            source: e,
-        })?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|e| DatasetError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(DatasetError::AlreadyExists { path });
+            }
+            Err(source) => {
+                return Err(DatasetError::CreateDirectory {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
 
         let frames_dir = path.join(format::FRAMES_DIR);
         std::fs::create_dir_all(&frames_dir).map_err(|e| DatasetError::CreateDirectory {
@@ -674,8 +715,7 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
         });
     }
 
-    std::fs::write(&path, data.as_ref())
-        .map_err(|e| DatasetError::WriteFile { path, source: e })?;
+    write_new_file(&path, data.as_ref())?;
 
     Ok(())
 }
@@ -697,8 +737,24 @@ fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), Datase
     for value in depth.depth_m() {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    std::fs::write(&path, bytes).map_err(|e| DatasetError::WriteFile { path, source: e })?;
+    write_new_file(&path, &bytes)?;
     Ok(())
+}
+
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| DatasetError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(bytes)
+        .map_err(|source| DatasetError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn sensor_to_str(id: SensorId) -> &'static str {
@@ -1026,15 +1082,15 @@ fn compute_period_ns(frames: &[FrameInfo]) -> Option<u64> {
     if frames.len() < 2 {
         return None;
     }
-    let mut deltas: Vec<i64> = frames
+    let mut deltas: Vec<u64> = frames
         .windows(2)
-        .map(|pair| pair[1].timestamp_ns - pair[0].timestamp_ns)
+        .map(|pair| pair[1].timestamp_ns.abs_diff(pair[0].timestamp_ns))
         .collect();
     deltas.sort_unstable();
-    Some(median_i64(&deltas).unsigned_abs())
+    Some(median_u64(&deltas))
 }
 
-fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) -> Vec<i64> {
+fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) -> Vec<u64> {
     let mut deltas = Vec::new();
     if right.is_empty() {
         return deltas;
@@ -1047,16 +1103,16 @@ fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) ->
             right_idx += 1;
         }
 
-        let mut best: Option<i64> = None;
+        let mut best: Option<u64> = None;
         let candidates = [Some(right_idx), right_idx.checked_sub(1)];
 
         for idx in candidates.into_iter().flatten() {
             if idx >= right.len() {
                 continue;
             }
-            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).abs();
+            let delta = right[idx].timestamp_ns.abs_diff(left_frame.timestamp_ns);
             if let Some(gate_ns) = gate {
-                if delta as u64 > gate_ns {
+                if delta > gate_ns {
                     continue;
                 }
             }
@@ -1072,17 +1128,17 @@ fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) ->
     deltas
 }
 
-fn build_delta_stats(deltas: &[i64]) -> Option<DeltaStats> {
+fn build_delta_stats(deltas: &[u64]) -> Option<DeltaStats> {
     if deltas.is_empty() {
         return None;
     }
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
-    let min = sorted.first().copied().unwrap_or(0) as u64;
-    let max = sorted.last().copied().unwrap_or(0) as u64;
-    let median = median_i64(&sorted) as u64;
-    let p95 = percentile_i64(&sorted, 0.95) as u64;
-    let p99 = percentile_i64(&sorted, 0.99) as u64;
+    let min = sorted.first().copied().unwrap_or(0);
+    let max = sorted.last().copied().unwrap_or(0);
+    let median = median_u64(&sorted);
+    let p95 = percentile_u64(&sorted, 0.95);
+    let p99 = percentile_u64(&sorted, 0.99);
     Some(DeltaStats {
         min,
         median,
@@ -1093,7 +1149,7 @@ fn build_delta_stats(deltas: &[i64]) -> Option<DeltaStats> {
 }
 
 fn compute_pairing_window_ns(
-    deltas: &[i64],
+    deltas: &[u64],
     stats: Option<&DeltaStats>,
     left_period: Option<u64>,
 ) -> u64 {
@@ -1102,18 +1158,18 @@ fn compute_pairing_window_ns(
     }
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
-    let median = median_i64(&sorted);
+    let median = median_u64(&sorted);
     let mad = median_absolute_deviation(&sorted, median);
     let p99 = stats
         .map(|s| s.p99)
-        .unwrap_or_else(|| sorted.last().copied().unwrap_or(0) as u64);
-    let mut window = p99.max((median + 6 * mad).max(0) as u64);
+        .unwrap_or_else(|| sorted.last().copied().unwrap_or(0));
+    let mut window = p99.max(median.saturating_add(6_u64.saturating_mul(mad)));
     if let Some(period) = left_period {
         if period > 0 {
             window = window.min(period / 4);
         }
     }
-    window
+    window.min(i64::MAX as u64)
 }
 
 fn pair_entries(
@@ -1159,7 +1215,7 @@ fn pair_entries(
         let mut best_delta = None;
 
         for idx in [left_candidate, right_candidate].into_iter().flatten() {
-            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).unsigned_abs();
+            let delta = right[idx].timestamp_ns.abs_diff(left_frame.timestamp_ns);
             if best_delta.is_none_or(|b| delta < b) {
                 best_delta = Some(delta);
                 best_idx = Some(idx);
@@ -1167,7 +1223,7 @@ fn pair_entries(
         }
 
         let entry = if let (Some(idx), Some(delta)) = (best_idx, best_delta) {
-            if window_ns > 0 && delta > window_ns {
+            if delta > window_ns {
                 left_orphans += 1;
                 outside_window += 1;
                 ManifestEntry {
@@ -1225,7 +1281,7 @@ fn pair_entries(
     )
 }
 
-fn median_i64(sorted: &[i64]) -> i64 {
+fn median_u64(sorted: &[u64]) -> u64 {
     let len = sorted.len();
     if len == 0 {
         return 0;
@@ -1235,11 +1291,11 @@ fn median_i64(sorted: &[i64]) -> i64 {
     } else {
         let a = sorted[len / 2 - 1];
         let b = sorted[len / 2];
-        (a + b) / 2
+        a + (b - a) / 2
     }
 }
 
-fn percentile_i64(sorted: &[i64], pct: f64) -> i64 {
+fn percentile_u64(sorted: &[u64], pct: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
@@ -1247,10 +1303,10 @@ fn percentile_i64(sorted: &[i64], pct: f64) -> i64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn median_absolute_deviation(sorted: &[i64], median: i64) -> i64 {
-    let mut deviations: Vec<i64> = sorted.iter().map(|v| (v - median).abs()).collect();
+fn median_absolute_deviation(sorted: &[u64], median: u64) -> u64 {
+    let mut deviations: Vec<u64> = sorted.iter().map(|v| v.abs_diff(median)).collect();
     deviations.sort_unstable();
-    median_i64(&deviations)
+    median_u64(&deviations)
 }
 
 fn dataset_id(dataset_dir: &Path) -> String {
@@ -1259,4 +1315,124 @@ fn dataset_id(dataset_dir: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("dataset")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FrameId, Timestamp};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn unique_dataset_path(test_name: &str) -> PathBuf {
+        let id = NEXT_PATH_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("kiko-slam-{test_name}-{}-{id}", std::process::id()))
+    }
+
+    fn meta() -> Meta {
+        Meta {
+            created: "2026-07-10T00:00:00Z".to_string(),
+            device: "test-device".to_string(),
+            mono: Some(MonoMeta {
+                width: 2,
+                height: 2,
+                fps: 30,
+            }),
+            depth: None,
+            imu: None,
+        }
+    }
+
+    fn calibration() -> Calibration {
+        let intrinsics = CameraIntrinsics {
+            fx: 100.0,
+            fy: 100.0,
+            cx: 1.0,
+            cy: 1.0,
+            width: 2,
+            height: 2,
+        };
+        Calibration {
+            left: intrinsics.clone(),
+            right: intrinsics,
+            baseline_m: 0.1,
+            rectified: true,
+        }
+    }
+
+    fn frame(sensor: SensorId, timestamp_ns: i64, value: u8) -> Frame {
+        Frame::new(
+            sensor,
+            FrameId::new(0),
+            Timestamp::from_nanos(timestamp_ns),
+            2,
+            2,
+            vec![value; 4],
+        )
+        .expect("valid frame")
+    }
+
+    #[test]
+    fn create_rejects_an_existing_dataset_path() {
+        let path = unique_dataset_path("existing-path");
+        std::fs::create_dir(&path).expect("create existing path");
+
+        let result = DatasetWriter::create(&path, &meta(), &calibration());
+
+        assert!(matches!(result, Err(DatasetError::AlreadyExists { .. })));
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn duplicate_timestamp_does_not_overwrite_the_first_frame() {
+        let path = unique_dataset_path("duplicate-timestamp");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        let first = frame(SensorId::StereoLeft, 7, 1);
+        let duplicate = frame(SensorId::StereoLeft, 7, 2);
+
+        assert_eq!(writer.write_frame(&first), WriteOutcome::Enqueued);
+        assert_eq!(writer.write_frame(&duplicate), WriteOutcome::Enqueued);
+        drop(writer);
+
+        let error = handle.finish().expect_err("duplicate filename must fail");
+        assert!(matches!(error, DatasetError::WriteFile { .. }));
+        let stored = std::fs::read(
+            path.join(format::FRAMES_DIR)
+                .join(format::frame_name(7, "mono_left")),
+        )
+        .expect("read first frame");
+        assert_eq!(stored, vec![1; 4]);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn exact_sync_dataset_round_trips_with_zero_pairing_window() {
+        let path = unique_dataset_path("exact-sync");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+
+        assert_eq!(
+            writer.write_frame(&frame(SensorId::StereoLeft, 11, 1)),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            writer.write_frame(&frame(SensorId::StereoRight, 11, 2)),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let manifest = read_manifest(&path).expect("read manifest");
+        assert_eq!(manifest.header.pairing_window_ns, 0);
+        let mut reader = DatasetReader::open(&path).expect("open exact-sync dataset");
+        let pair = reader
+            .pairs()
+            .next()
+            .expect("one pair")
+            .expect("valid pair");
+        assert_eq!(pair.timestamp_delta_ns(), 0);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
 }

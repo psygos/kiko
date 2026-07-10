@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::map::{KeyframeId, MapError, SlamMap};
+use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
@@ -489,6 +489,8 @@ pub enum LoopApplyError {
     InvariantViolation,
 }
 
+impl std::error::Error for LoopApplyError {}
+
 impl std::fmt::Display for LoopApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -535,7 +537,15 @@ impl std::fmt::Display for LoopDetectError {
     }
 }
 
-impl std::error::Error for LoopDetectError {}
+impl std::error::Error for LoopDetectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::VerificationFailed(err) => Some(err),
+            Self::ApplyFailed(err) => Some(err),
+            Self::TooFewCorrespondences { .. } | Self::CorrectionTooLarge { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum GlobalDescriptorError {
@@ -910,23 +920,22 @@ impl Default for KeyframeDatabase {
 }
 
 #[derive(Clone, Debug)]
-pub struct LoopCandidate {
-    pub query_kf: KeyframeId,
-    pub match_kf: KeyframeId,
-    pub similarity: f32,
+pub(crate) struct LoopCandidate {
+    pub(crate) query_kf: KeyframeId,
+    pub(crate) match_kf: KeyframeId,
 }
 
 #[derive(Clone, Debug)]
-pub struct RelocalizationCandidate {
-    pub match_kf: KeyframeId,
-    pub similarity: f32,
+pub(crate) struct RelocalizationCandidate {
+    pub(crate) match_kf: KeyframeId,
 }
 
 #[derive(Clone, Debug)]
 pub struct VerifiedLoop {
     query_kf: KeyframeId,
     match_kf: KeyframeId,
-    relative_pose: Pose,
+    map_snapshot: MapSnapshot,
+    query_pose_world: Pose,
     inlier_count: usize,
 }
 
@@ -939,8 +948,13 @@ impl VerifiedLoop {
         self.match_kf
     }
 
-    pub fn relative_pose(&self) -> Pose {
-        self.relative_pose
+    pub fn map_snapshot(&self) -> MapSnapshot {
+        self.map_snapshot
+    }
+
+    /// Absolute world-to-camera pose estimated for the query keyframe.
+    pub fn query_pose_world(&self) -> Pose {
+        self.query_pose_world
     }
 
     pub fn inlier_count(&self) -> usize {
@@ -951,13 +965,15 @@ impl VerifiedLoop {
     pub(crate) fn from_parts(
         query_kf: KeyframeId,
         match_kf: KeyframeId,
-        relative_pose: Pose,
+        map_snapshot: MapSnapshot,
+        query_pose_world: Pose,
         inlier_count: usize,
     ) -> Self {
         Self {
             query_kf,
             match_kf,
-            relative_pose,
+            map_snapshot,
+            query_pose_world,
             inlier_count,
         }
     }
@@ -1008,7 +1024,14 @@ impl std::fmt::Display for LoopVerificationError {
     }
 }
 
-impl std::error::Error for LoopVerificationError {}
+impl std::error::Error for LoopVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PnpFailed(err) => Some(err),
+            Self::TooFewMatches { .. } | Self::InsufficientInliers { .. } => None,
+        }
+    }
+}
 
 fn verify_pose_from_keyframe(
     query_keypoints: &[Keypoint],
@@ -1070,11 +1093,11 @@ fn verify_pose_from_keyframe(
             required: required_inliers,
         });
     }
-    Ok((result.pose, result.inliers.len()))
+    Ok((result.pose.into_legacy_pose(), result.inliers.len()))
 }
 
 impl LoopCandidate {
-    pub fn verify(
+    pub(crate) fn verify(
         &self,
         query_keypoints: &[Keypoint],
         correspondences: &[(usize, usize)],
@@ -1083,7 +1106,7 @@ impl LoopCandidate {
         ransac_config: RansacConfig,
         min_inliers: usize,
     ) -> Result<VerifiedLoop, LoopVerificationError> {
-        let (relative_pose, inlier_count) = verify_pose_from_keyframe(
+        let (query_pose_world, inlier_count) = verify_pose_from_keyframe(
             query_keypoints,
             correspondences,
             map,
@@ -1095,14 +1118,15 @@ impl LoopCandidate {
         Ok(VerifiedLoop {
             query_kf: self.query_kf,
             match_kf: self.match_kf,
-            relative_pose,
+            map_snapshot: map.snapshot(),
+            query_pose_world,
             inlier_count,
         })
     }
 }
 
 impl RelocalizationCandidate {
-    pub fn verify(
+    pub(crate) fn verify(
         &self,
         query_keypoints: &[Keypoint],
         correspondences: &[(usize, usize)],
@@ -1157,7 +1181,7 @@ mod tests {
                 .add_keyframe(
                     FrameId::new((i + 1) as u64),
                     Timestamp::from_nanos(i as i64 + 1),
-                    Pose::identity(),
+                    crate::WorldToCamera::identity(),
                     size,
                     vec![Keypoint { x: 10.0, y: 10.0 }],
                 )
@@ -1227,7 +1251,7 @@ mod tests {
             .add_keyframe(
                 FrameId::new(10),
                 Timestamp::from_nanos(10),
-                match_pose,
+                crate::WorldToCamera::from_legacy_pose(match_pose),
                 size,
                 match_keypoints,
             )
@@ -1496,7 +1520,6 @@ mod tests {
         let candidate = LoopCandidate {
             query_kf: match_kf,
             match_kf,
-            similarity: 0.95,
         };
         let verified = candidate
             .verify(
@@ -1518,7 +1541,6 @@ mod tests {
         let candidate = LoopCandidate {
             query_kf: match_kf,
             match_kf,
-            similarity: 0.95,
         };
         let err = candidate
             .verify(
@@ -1542,7 +1564,6 @@ mod tests {
         let candidate = LoopCandidate {
             query_kf: ids[0],
             match_kf: ids[0],
-            similarity: 0.5,
         };
         let map = SlamMap::new();
         let query_keypoints = vec![Keypoint { x: 10.0, y: 10.0 }; 4];
@@ -1569,10 +1590,7 @@ mod tests {
     fn relocalization_candidate_verify_succeeds_without_map_mutation() {
         let (map, match_kf, query_keypoints, correspondences, intrinsics) = make_loop_fixture();
         let before_generation = map.generation();
-        let candidate = RelocalizationCandidate {
-            match_kf,
-            similarity: 0.91,
-        };
+        let candidate = RelocalizationCandidate { match_kf };
         let verified = candidate
             .verify(
                 &query_keypoints,
@@ -1620,7 +1638,7 @@ mod tests {
             .add_keyframe(
                 FrameId::new(11),
                 Timestamp::from_nanos(11),
-                Pose::identity(),
+                crate::WorldToCamera::identity(),
                 image_size,
                 keypoints,
             )
@@ -1674,7 +1692,7 @@ mod tests {
             .add_keyframe(
                 FrameId::new(21),
                 Timestamp::from_nanos(21),
-                Pose::identity(),
+                crate::WorldToCamera::identity(),
                 image_size,
                 keypoints,
             )

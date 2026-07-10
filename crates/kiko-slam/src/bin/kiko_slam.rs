@@ -9,7 +9,7 @@ use kiko_slam::{
     BackendConfig, DenseCommand, DepthImage, DownscaleFactor, GlobalDescriptorConfig,
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
     LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, RansacConfig,
-    RectificationMode, RectifiedStereo, RectifiedStereoConfig, RedundancyPolicy,
+    RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy,
     RelocalizationConfig, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
     TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
@@ -17,11 +17,11 @@ use kiko_slam::{
 use kiko_slam::env::{env_bool, env_f32, env_usize};
 
 #[cfg(feature = "record")]
-use kiko_slam::{DenseStats, Frame, Point3, Pose, Raw, ReconState};
+use kiko_slam::{CameraPoint3, DenseStats, Frame, Raw, ReconState, WorldToCamera};
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
-    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta,
+    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta, WriteOutcome,
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
@@ -119,8 +119,6 @@ struct VizArgs {
     odometry: bool,
     #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
     rectify_tolerance: Option<f32>,
-    #[arg(long, env = "KIKO_ALLOW_UNRECTIFIED", default_value_t = false)]
-    allow_unrectified: bool,
     #[command(flatten)]
     dataset: DatasetArgs,
 }
@@ -433,15 +431,15 @@ fn build_recording(
     }
 }
 
-fn build_rectified_stereo_config(args: &VizArgs) -> RectifiedStereoConfig {
-    RectifiedStereoConfig {
-        max_principal_delta_px: args.rectify_tolerance,
-        rectification: if args.allow_unrectified {
-            RectificationMode::AllowUnrectified
-        } else {
-            RectificationMode::RequireRectified
-        },
-    }
+fn build_rectified_stereo_config(
+    args: &VizArgs,
+) -> Result<RectifiedStereoConfig, RectifiedStereoError> {
+    let defaults = RectifiedStereoConfig::default();
+    RectifiedStereoConfig::try_new(
+        args.rectify_tolerance
+            .unwrap_or(defaults.max_principal_delta_px()),
+        defaults.max_focal_delta_px(),
+    )
 }
 
 fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -459,7 +457,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let rectified = RectifiedStereo::from_calibration_with_config(
         reader.calibration(),
-        build_rectified_stereo_config(args),
+        build_rectified_stereo_config(args)?,
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
@@ -673,10 +671,13 @@ fn build_tracker_config(
     let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY")
         .unwrap_or(DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY);
     let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(defaults.min_inliers);
-    let ransac = RansacConfig {
+    let ransac_defaults = RansacConfig::default();
+    let ransac = RansacConfig::try_new(
+        ransac_defaults.max_iterations(),
+        ransac_defaults.reprojection_threshold_px(),
         min_inliers,
-        ..RansacConfig::default()
-    };
+        ransac_defaults.seed(),
+    )?;
     let ba_config = build_ba_config()?;
     let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
     let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
@@ -746,7 +747,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let rectified = RectifiedStereo::from_calibration_with_config(
         reader.calibration(),
-        build_rectified_stereo_config(args),
+        build_rectified_stereo_config(args)?,
     )?;
     let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
 
@@ -835,7 +836,8 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
             Ok(mut output) => {
                 let timestamp = left.timestamp();
                 if dense_enabled {
-                    output.diagnostics.depth_reorder_warnings = Some(depth_ring.reorder_warnings());
+                    output.diagnostics_mut().depth_reorder_warnings =
+                        Some(depth_ring.reorder_warnings());
                 }
                 let dense_stats = if let Some(state) = dense_state.as_mut() {
                     let correction = tracker.take_pending_loop_correction();
@@ -859,10 +861,9 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("rerun depth error: {err}");
                     }
                 }
-                if let Some(matches) = output.stereo_matches {
+                if let Some(matches) = output.take_stereo_matches() {
                     let points = output
-                        .keyframe
-                        .as_ref()
+                        .keyframe()
                         .map(|kf| kf.landmarks())
                         .filter(|pts| !pts.is_empty());
                     if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
@@ -870,7 +871,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("rerun log error: {err}");
                         }
                     }
-                    if output.keyframe.is_some() {
+                    if output.keyframe().is_some() {
                         keyframes += 1;
                         let snapshot = tracker.covisibility_snapshot();
                         if let Err(err) = sink.log_covisibility_graph(left.timestamp(), &snapshot) {
@@ -881,20 +882,20 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("rerun log error: {err}");
                 }
 
-                if let Some(pose) = output.pose.as_ref() {
-                    if let Err(err) = sink.log_pose(timestamp, pose) {
+                if let Some(pose) = output.pose() {
+                    if let Err(err) = sink.log_pose(timestamp, &pose) {
                         eprintln!("rerun log error: {err}");
                     } else {
                         poses_logged += 1;
                     }
                 }
-                if let Err(err) = sink.log_system_health(timestamp, &output.health) {
+                if let Err(err) = sink.log_system_health(timestamp, output.health()) {
                     eprintln!("rerun health error: {err}");
                 }
-                if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
+                if let Err(err) = sink.log_diagnostics(timestamp, output.diagnostics()) {
                     eprintln!("rerun diagnostics error: {err}");
                 }
-                for event in &output.events {
+                for event in output.events() {
                     if let Err(err) = sink.log_event(timestamp, event) {
                         eprintln!("rerun event error: {err}");
                     }
@@ -1169,6 +1170,19 @@ fn load_pairer_max_pending_per_side() -> usize {
 }
 
 #[cfg(feature = "record")]
+fn require_record_write(outcome: WriteOutcome, item: &'static str) -> std::io::Result<()> {
+    match outcome {
+        WriteOutcome::Enqueued => Ok(()),
+        WriteOutcome::Dropped => Err(std::io::Error::other(format!(
+            "dataset writer dropped {item}"
+        ))),
+        WriteOutcome::WriterFailed => Err(std::io::Error::other(format!(
+            "dataset writer failed while enqueueing {item}"
+        ))),
+    }
+}
+
+#[cfg(feature = "record")]
 fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let output_path = &args.output_path;
 
@@ -1224,10 +1238,11 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
     let start = Instant::now();
+    let mut capture_error = None;
 
     eprintln!("recording... press ctrl+c to stop");
 
-    while running.load(Ordering::Relaxed) {
+    'capture: while running.load(Ordering::Relaxed) {
         let mut got_any = false;
 
         match device.mono_left(0) {
@@ -1244,8 +1259,10 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             },
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
-                eprintln!("left error: {e:?}");
-                break;
+                capture_error = Some(std::io::Error::other(format!(
+                    "left camera capture failed: {e:?}"
+                )));
+                break 'capture;
             }
         }
 
@@ -1265,8 +1282,10 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
-                eprintln!("right error: {e:?}");
-                break;
+                capture_error = Some(std::io::Error::other(format!(
+                    "right camera capture failed: {e:?}"
+                )));
+                break 'capture;
             }
         }
 
@@ -1274,7 +1293,12 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             match device.depth(0) {
                 Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
                     Ok(depth) => {
-                        writer.write_depth(&depth);
+                        if let Err(err) =
+                            require_record_write(writer.write_depth(&depth), "depth frame")
+                        {
+                            capture_error = Some(err);
+                            break 'capture;
+                        }
                         depth_count = depth_count.saturating_add(1);
                         got_any = true;
                     }
@@ -1284,15 +1308,34 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
                 Err(e) => {
-                    eprintln!("depth error: {e:?}");
-                    break;
+                    capture_error = Some(std::io::Error::other(format!(
+                        "depth camera capture failed: {e:?}"
+                    )));
+                    break 'capture;
                 }
             }
         }
 
-        while let Some(pair) = pairer.next_pair()? {
-            writer.write_frame(pair.left());
-            writer.write_frame(pair.right());
+        loop {
+            let pair = match pairer.next_pair() {
+                Ok(Some(pair)) => pair,
+                Ok(None) => break,
+                Err(err) => {
+                    capture_error = Some(std::io::Error::other(format!(
+                        "stereo pairing failed: {err}"
+                    )));
+                    break 'capture;
+                }
+            };
+            if let Err(err) = require_record_write(writer.write_frame(pair.left()), "left frame") {
+                capture_error = Some(err);
+                break 'capture;
+            }
+            if let Err(err) = require_record_write(writer.write_frame(pair.right()), "right frame")
+            {
+                capture_error = Some(err);
+                break 'capture;
+            }
             pair_count += 1;
 
             if pair_count % 30 == 0 {
@@ -1331,6 +1374,9 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         pairer_stats.dropped_right,
         pairer_stats.outside_window
     );
+    if let Some(err) = capture_error {
+        return Err(err.into());
+    }
     Ok(())
 }
 
@@ -1339,9 +1385,9 @@ struct LiveVizMsg {
     left: Frame,
     right: Frame,
     depth: Option<DepthImage>,
-    pose: Option<Pose>,
+    pose: Option<WorldToCamera>,
     packet: Option<VizPacket<Raw>>,
-    points: Option<Vec<Point3>>,
+    points: Option<Vec<CameraPoint3>>,
     health: SystemHealth,
     diagnostics: FrameDiagnostics,
     events: Vec<DiagnosticEvent>,
@@ -1353,6 +1399,7 @@ struct LiveVizMsg {
 enum LiveThreadError {
     VizChannelDisconnected,
     RerunConnect { detail: String },
+    InferenceUnavailable { detail: String },
     FrameProcessingPanic { detail: String },
 }
 
@@ -1364,6 +1411,9 @@ impl std::fmt::Display for LiveThreadError {
             LiveThreadError::RerunConnect { detail } => {
                 write!(f, "failed to connect to rerun viewer: {detail}")
             }
+            LiveThreadError::InferenceUnavailable { detail } => {
+                write!(f, "inference pipeline is unavailable: {detail}")
+            }
             LiveThreadError::FrameProcessingPanic { detail } => {
                 write!(f, "inference panic while processing frame: {detail}")
             }
@@ -1373,6 +1423,16 @@ impl std::fmt::Display for LiveThreadError {
 
 #[cfg(feature = "record")]
 impl std::error::Error for LiveThreadError {}
+
+#[cfg(feature = "record")]
+struct LiveThreadExitGuard(Arc<AtomicBool>);
+
+#[cfg(feature = "record")]
+impl Drop for LiveThreadExitGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 #[cfg(feature = "record")]
 fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
@@ -1417,7 +1477,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("connecting to oak-d...");
     let mut device = Device::connect("", config)?;
 
-    let pairing_window = load_pairing_window();
+    let pairing_window = load_pairing_window()?;
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
 
@@ -1517,6 +1577,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &cfg,
                 &ctrl_rx,
                 data_rx.as_receiver(),
+                None,
                 stats_tx.as_ref(),
             );
         }))
@@ -1524,7 +1585,9 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let inference_running = Arc::clone(&running);
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
+        let _exit_guard = LiveThreadExitGuard(inference_running);
         let mut tracker = SlamTracker::new(
             superpoint_left,
             superpoint_right,
@@ -1636,15 +1699,14 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    let health = output.health.clone();
                     if depth_enabled_for_diagnostics {
-                        output.diagnostics.depth_reorder_warnings =
+                        output.diagnostics_mut().depth_reorder_warnings =
                             Some(depth_reorder_warnings_seen);
                     }
                     let mut packet = None;
                     let mut points = None;
-                    if let Some(matches) = output.stereo_matches {
-                        if let Some(keyframe) = output.keyframe.as_ref() {
+                    if let Some(matches) = output.take_stereo_matches() {
+                        if let Some(keyframe) = output.keyframe() {
                             points = Some(keyframe.landmarks().to_vec());
                         }
                         if let Ok(viz_packet) =
@@ -1653,16 +1715,17 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             packet = Some(viz_packet);
                         }
                     }
+                    let (pose, health, diagnostics, events) = output.into_status_parts();
                     let msg = LiveVizMsg {
                         left,
                         right,
                         depth,
-                        pose: output.pose,
+                        pose,
                         packet,
                         points,
                         health,
-                        diagnostics: output.diagnostics,
-                        events: output.events,
+                        diagnostics,
+                        events,
                         dense_stats,
                     };
                     if matches!(viz_tx.try_send(msg), SendOutcome::Disconnected) {
@@ -1670,6 +1733,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(Err(err)) => {
+                    if err.requires_pipeline_shutdown() {
+                        return Err(LiveThreadError::InferenceUnavailable {
+                            detail: err.to_string(),
+                        });
+                    }
                     if dense_active {
                         if let Some(correction) = tracker.take_pending_loop_correction() {
                             dense_generation = dense_generation.saturating_add(1);
@@ -1774,6 +1842,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
+    let mut capture_error = None;
 
     eprintln!("streaming matches... press ctrl+c to stop");
 
@@ -1793,8 +1862,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             },
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
-                eprintln!("left error: {e:?}");
-                break;
+                capture_error = Some(std::io::Error::other(format!(
+                    "left camera capture failed: {e:?}"
+                )));
+                break 'capture;
             }
         }
 
@@ -1813,8 +1884,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
             Err(e) => {
-                eprintln!("right error: {e:?}");
-                break;
+                capture_error = Some(std::io::Error::other(format!(
+                    "right camera capture failed: {e:?}"
+                )));
+                break 'capture;
             }
         }
 
@@ -1835,13 +1908,25 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
                 Err(e) => {
-                    eprintln!("depth error: {e:?}");
-                    break;
+                    capture_error = Some(std::io::Error::other(format!(
+                        "depth camera capture failed: {e:?}"
+                    )));
+                    break 'capture;
                 }
             }
         }
 
-        while let Some(pair) = pairer.next_pair()? {
+        loop {
+            let pair = match pairer.next_pair() {
+                Ok(Some(pair)) => pair,
+                Ok(None) => break,
+                Err(err) => {
+                    capture_error = Some(std::io::Error::other(format!(
+                        "stereo pairing failed: {err}"
+                    )));
+                    break 'capture;
+                }
+            };
             if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
                 running.store(false, Ordering::SeqCst);
                 break 'capture;
@@ -1929,6 +2014,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         pairer_stats.dropped_right,
         pairer_stats.outside_window
     );
+
+    if let Some(err) = capture_error {
+        return Err(err.into());
+    }
 
     Ok(())
 }
@@ -2091,6 +2180,14 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
+    #[cfg(feature = "record")]
+    use super::LiveThreadExitGuard;
+    #[cfg(feature = "record")]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
@@ -2158,5 +2255,16 @@ mod tests {
         for (key, value) in saved {
             restore_env(&key, value);
         }
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_thread_exit_guard_stops_capture() {
+        let running = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = LiveThreadExitGuard(Arc::clone(&running));
+            assert!(running.load(Ordering::SeqCst));
+        }
+        assert!(!running.load(Ordering::SeqCst));
     }
 }

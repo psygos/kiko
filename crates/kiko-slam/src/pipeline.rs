@@ -65,7 +65,14 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
-impl std::error::Error for PipelineError {}
+impl std::error::Error for PipelineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Inference(err) => Some(err),
+            Self::Viz(err) => Some(err),
+        }
+    }
+}
 
 impl From<InferenceError> for PipelineError {
     fn from(err: InferenceError) -> Self {

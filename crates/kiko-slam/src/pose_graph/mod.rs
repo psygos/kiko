@@ -1,4 +1,4 @@
-/// Near-zero threshold for PCG solver denominators and Gauss-Jordan pivot magnitudes.
+/// Near-zero threshold for Gauss-Jordan pivot magnitudes.
 const NEAR_ZERO: f64 = 1e-18;
 /// Step size for numerical Jacobian computation via central differences.
 const NUMERICAL_DIFF_EPS: f64 = 1e-6;
@@ -33,6 +33,16 @@ pub enum PoseGraphError {
     PcgSolutionLength {
         expected: usize,
         actual: usize,
+    },
+    PcgDidNotConverge {
+        iterations: usize,
+    },
+    PcgNonFiniteResidual,
+    PcgNonFiniteStep {
+        pose_index: usize,
+    },
+    OptimizationDidNotConverge {
+        iterations: usize,
     },
     EdgeFromOutOfBounds {
         from: usize,
@@ -77,6 +87,19 @@ impl std::fmt::Display for PoseGraphError {
                     "pcg solution length mismatch: expected {expected}, got {actual}"
                 )
             }
+            PoseGraphError::PcgDidNotConverge { iterations } => {
+                write!(f, "pcg did not converge after {iterations} iterations")
+            }
+            PoseGraphError::PcgNonFiniteResidual => {
+                write!(f, "pcg produced a non-finite residual")
+            }
+            PoseGraphError::PcgNonFiniteStep { pose_index } => {
+                write!(f, "pcg produced a non-finite step for pose {pose_index}")
+            }
+            PoseGraphError::OptimizationDidNotConverge { iterations } => write!(
+                f,
+                "pose graph optimization did not converge after {iterations} iterations"
+            ),
             PoseGraphError::EdgeFromOutOfBounds { from, pose_count } => {
                 write!(
                     f,
@@ -113,8 +136,8 @@ pub use essential::{
     PoseGraphInput,
 };
 pub use optimizer::{
-    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult, compute_edge_error,
-    compute_edge_jacobians,
+    PoseGraphConfig, PoseGraphConfigError, PoseGraphEdge, PoseGraphEdgeError, PoseGraphOptimizer,
+    PoseGraphResult, compute_edge_error, compute_edge_jacobians,
 };
 pub use solver::{PcgResult, solve_pcg};
 pub use sparse::BlockCsr6x6;

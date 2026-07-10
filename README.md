@@ -55,6 +55,7 @@ cargo run -p kiko-slam -- bench recordings/<name>
 
 **Inference:**
 
+- `ORT_DYLIB_PATH` — path to an ONNX Runtime 1.24+ shared library; otherwise the platform loader searches for `libonnxruntime.so`, `onnxruntime.dll`, or `libonnxruntime.dylib`
 - `--downscale` / `KIKO_DOWNSCALE` — input downscale factor (1, 2, or 4)
 - `--max-keypoints` / `KIKO_MAX_KEYPOINTS` — max keypoints per frame (default 1024)
 - `--backend` / `KIKO_BACKEND` — inference backend for both models
@@ -67,7 +68,6 @@ cargo run -p kiko-slam -- bench recordings/<name>
 
 - `--rerun-decimation` / `KIKO_RERUN_DECIMATION` — image decimation for Rerun
 - `--odometry` / `KIKO_VIZ_ODOMETRY` — enable visual odometry in viz mode
-- `--allow-unrectified` / `KIKO_ALLOW_UNRECTIFIED` — skip rectification check
 
 **Bundle adjustment:**
 

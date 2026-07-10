@@ -6,6 +6,8 @@ const SO3_SMALL_ANGLE: f64 = 1e-12;
 const SO3_NEAR_PI: f64 = 1e-6;
 /// Minimum axis norm for valid axis extraction in near-pi log map.
 const SO3_AXIS_NORM_MIN: f64 = 1e-12;
+/// Minimum axis component magnitude for f64 near-pi axis extraction.
+const SO3_AXIS_COMPONENT_MIN: f64 = 1e-12;
 /// Small-angle threshold for f32 SO(3) operations.
 const SO3_SMALL_ANGLE_F32: f32 = 1e-6;
 /// Near-pi threshold for f32 SO(3) log map.
@@ -14,8 +16,37 @@ const SO3_NEAR_PI_F32: f32 = 1e-3;
 const SO3_AXIS_COMPONENT_MIN_F32: f32 = 1e-6;
 /// Minimum axis norm for valid f32 axis normalization.
 const SO3_AXIS_NORM_MIN_F32: f32 = 1e-8;
-/// Small-angle threshold for f64 Jacobian expansions (tighter than SO3_SMALL_ANGLE).
-const JACOBIAN_SMALL_ANGLE: f64 = 1e-9;
+/// Small-angle threshold for stable f64 Jacobian series expansions.
+///
+/// The closed forms contain `1 - cos(theta)` and `theta - sin(theta)`, whose
+/// relative accuracy deteriorates well before `theta` reaches machine epsilon.
+const JACOBIAN_SMALL_ANGLE: f64 = 1e-4;
+const ROTATION_VALIDATION_TOLERANCE: f64 = 1e-6;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pose64Error {
+    NonFinite,
+    NonOrthonormal { max_error: f64 },
+    ImproperRotation { determinant: f64 },
+}
+
+impl std::fmt::Display for Pose64Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite => write!(f, "pose rotation and translation must be finite"),
+            Self::NonOrthonormal { max_error } => write!(
+                f,
+                "pose rotation must be orthonormal (maximum error {max_error})"
+            ),
+            Self::ImproperRotation { determinant } => write!(
+                f,
+                "pose rotation determinant must be +1 (got {determinant})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Pose64Error {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Pose64 {
@@ -24,11 +55,39 @@ pub struct Pose64 {
 }
 
 impl Pose64 {
-    pub fn from_rt(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Self {
-        Self {
+    pub fn from_rt(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Result<Self, Pose64Error> {
+        if rotation.iter().flatten().any(|value| !value.is_finite())
+            || translation.iter().any(|value| !value.is_finite())
+        {
+            return Err(Pose64Error::NonFinite);
+        }
+
+        let mut max_error = 0.0_f64;
+        for row in 0..3 {
+            for col in 0..3 {
+                let dot = (0..3)
+                    .map(|idx| rotation[idx][row] * rotation[idx][col])
+                    .sum::<f64>();
+                let expected = if row == col { 1.0 } else { 0.0 };
+                max_error = max_error.max((dot - expected).abs());
+            }
+        }
+        if max_error > ROTATION_VALIDATION_TOLERANCE {
+            return Err(Pose64Error::NonOrthonormal { max_error });
+        }
+
+        let determinant = rotation[0][0]
+            * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
+            - rotation[0][1] * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
+            + rotation[0][2] * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0]);
+        if (determinant - 1.0).abs() > ROTATION_VALIDATION_TOLERANCE {
+            return Err(Pose64Error::ImproperRotation { determinant });
+        }
+
+        Ok(Self {
             rotation,
             translation,
-        }
+        })
     }
 
     pub fn identity() -> Self {
@@ -46,6 +105,7 @@ impl Pose64 {
         self.translation
     }
 
+    /// Compose two poses: `self ∘ other`.
     pub fn compose(self, other: Self) -> Self {
         let rotation = mat_mul_f64(self.rotation, other.rotation);
         let rt = mat_mul_vec_f64(self.rotation, other.translation);
@@ -302,23 +362,35 @@ pub(crate) fn so3_log_f64(r: [[f64; 3]; 3]) -> [f64; 3] {
         let x = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
         let y = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
         let z = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
-        let mut axis = [x, y, z];
-        if r[2][1] - r[1][2] < 0.0 {
-            axis[0] = -axis[0];
-        }
-        if r[0][2] - r[2][0] < 0.0 {
-            axis[1] = -axis[1];
-        }
-        if r[1][0] - r[0][1] < 0.0 {
-            axis[2] = -axis[2];
-        }
+        let mut axis = if x >= y && x >= z && x > SO3_AXIS_COMPONENT_MIN {
+            [
+                x,
+                (r[0][1] + r[1][0]) / (4.0 * x),
+                (r[0][2] + r[2][0]) / (4.0 * x),
+            ]
+        } else if y >= z && y > SO3_AXIS_COMPONENT_MIN {
+            [
+                (r[0][1] + r[1][0]) / (4.0 * y),
+                y,
+                (r[1][2] + r[2][1]) / (4.0 * y),
+            ]
+        } else if z > SO3_AXIS_COMPONENT_MIN {
+            [
+                (r[0][2] + r[2][0]) / (4.0 * z),
+                (r[1][2] + r[2][1]) / (4.0 * z),
+                z,
+            ]
+        } else {
+            [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]]
+        };
         let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
         if norm > SO3_AXIS_NORM_MIN {
-            return [
-                theta * axis[0] / norm,
-                theta * axis[1] / norm,
-                theta * axis[2] / norm,
-            ];
+            axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+            let skew = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
+            if axis[0] * skew[0] + axis[1] * skew[1] + axis[2] * skew[2] < 0.0 {
+                axis = [-axis[0], -axis[1], -axis[2]];
+            }
+            return [theta * axis[0], theta * axis[1], theta * axis[2]];
         }
     }
 
@@ -331,6 +403,7 @@ pub(crate) fn so3_log_f64(r: [[f64; 3]; 3]) -> [f64; 3] {
     ]
 }
 
+#[cfg(test)]
 pub(crate) fn so3_right_jacobian_f64(omega: [f64; 3]) -> [[f64; 3]; 3] {
     let theta = (omega[0] * omega[0] + omega[1] * omega[1] + omega[2] * omega[2]).sqrt();
     let omega_hat = skew_f64(omega);
@@ -434,8 +507,8 @@ fn mat_transpose_f64(r: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        mat_mul_f64, mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_exp_f64, so3_log_f64,
-        so3_right_jacobian_f64,
+        Pose64, Pose64Error, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_exp_f64,
+        so3_log_f64, so3_right_jacobian_f64,
     };
 
     fn rot_diff_norm(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> f64 {
@@ -480,6 +553,21 @@ mod tests {
     }
 
     #[test]
+    fn se3_exp_log_round_trip_is_stable_for_tiny_rotation() {
+        let xi = [0.7, -0.4, 1.2, 2e-8, -3e-8, 1e-8];
+        let pose = se3_exp_f64(xi);
+        let recovered = se3_log_f64(pose);
+        for i in 0..6 {
+            assert!(
+                (recovered[i] - xi[i]).abs() < 1e-12,
+                "tiny-angle SE3 mismatch at {i}: recovered={}, expected={}",
+                recovered[i],
+                xi[i]
+            );
+        }
+    }
+
+    #[test]
     fn so3_right_jacobian_matches_finite_diff() {
         let omega = [0.2, -0.05, 0.1];
         let delta = [1e-6, -2e-6, 1.5e-6];
@@ -505,5 +593,56 @@ mod tests {
             (recovered_theta - theta).abs() < 2e-4,
             "near-pi mismatch: recovered={recovered_theta}, expected={theta}"
         );
+    }
+
+    #[test]
+    fn so3_log_recovers_mixed_sign_axis_at_pi_f64() {
+        let inv_norm = 1.0_f64 / 14.0_f64.sqrt();
+        let omega = [
+            3.0 * inv_norm * std::f64::consts::PI,
+            -2.0 * inv_norm * std::f64::consts::PI,
+            inv_norm * std::f64::consts::PI,
+        ];
+        let rotation = so3_exp_f64(omega);
+        let recovered = so3_log_f64(rotation);
+        let reconstructed = so3_exp_f64(recovered);
+
+        assert!(recovered[0] * recovered[1] < 0.0);
+        assert!(recovered[0] * recovered[2] > 0.0);
+        let reconstruction_error = rot_diff_norm(reconstructed, rotation);
+        assert!(
+            reconstruction_error < 1e-7,
+            "exact-pi reconstruction changed the rotation: error={reconstruction_error}, recovered={recovered:?}"
+        );
+    }
+
+    #[test]
+    fn pose64_constructor_rejects_nonfinite_values() {
+        let err = Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, f64::NAN, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        )
+        .expect_err("nonfinite rotation must be rejected");
+        assert_eq!(err, Pose64Error::NonFinite);
+    }
+
+    #[test]
+    fn pose64_constructor_rejects_non_orthonormal_rotation() {
+        let err = Pose64::from_rt(
+            [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        )
+        .expect_err("scaled rotation must be rejected");
+        assert!(matches!(err, Pose64Error::NonOrthonormal { .. }));
+    }
+
+    #[test]
+    fn pose64_constructor_rejects_reflection() {
+        let err = Pose64::from_rt(
+            [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        )
+        .expect_err("improper rotation must be rejected");
+        assert!(matches!(err, Pose64Error::ImproperRotation { .. }));
     }
 }

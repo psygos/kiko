@@ -1,5 +1,10 @@
 use crate::dataset::CameraIntrinsics;
-use crate::{Keyframe, Keypoint, Matches, Point3, Verified, math};
+use std::marker::PhantomData;
+
+use crate::{
+    CameraFrame, CoordinateFrame, Keyframe, Keypoint, Matches, Verified, WorldFrame, WorldPoint3,
+    math,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {
@@ -11,18 +16,28 @@ pub struct PinholeIntrinsics {
 
 #[derive(Debug)]
 pub enum IntrinsicsError {
+    NonFinite { fx: f32, fy: f32, cx: f32, cy: f32 },
     NonPositiveFocal { fx: f32, fy: f32 },
+    ZeroDimensions { width: u32, height: u32 },
 }
 
 impl std::fmt::Display for IntrinsicsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            IntrinsicsError::NonFinite { fx, fy, cx, cy } => write!(
+                f,
+                "pinhole intrinsics must be finite (fx={fx}, fy={fy}, cx={cx}, cy={cy})"
+            ),
             IntrinsicsError::NonPositiveFocal { fx, fy } => {
                 write!(
                     f,
                     "pinhole intrinsics require fx, fy > 0 (fx={fx}, fy={fy})"
                 )
             }
+            IntrinsicsError::ZeroDimensions { width, height } => write!(
+                f,
+                "pinhole image dimensions must be nonzero (width={width}, height={height})"
+            ),
         }
     }
 }
@@ -33,10 +48,28 @@ impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
     type Error = IntrinsicsError;
 
     fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
+        if !value.fx.is_finite()
+            || !value.fy.is_finite()
+            || !value.cx.is_finite()
+            || !value.cy.is_finite()
+        {
+            return Err(IntrinsicsError::NonFinite {
+                fx: value.fx,
+                fy: value.fy,
+                cx: value.cx,
+                cy: value.cy,
+            });
+        }
         if value.fx <= 0.0 || value.fy <= 0.0 {
             return Err(IntrinsicsError::NonPositiveFocal {
                 fx: value.fx,
                 fy: value.fy,
+            });
+        }
+        if value.width == 0 || value.height == 0 {
+            return Err(IntrinsicsError::ZeroDimensions {
+                width: value.width,
+                height: value.height,
             });
         }
         Ok(Self {
@@ -68,13 +101,13 @@ impl PinholeIntrinsics {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Observation {
-    world: Point3,
+    world: WorldPoint3,
     pixel: Keypoint,
     bearing: [f32; 3],
 }
 
 impl Observation {
-    pub fn world(&self) -> Point3 {
+    pub fn world(&self) -> WorldPoint3 {
         self.world
     }
 
@@ -87,10 +120,20 @@ impl Observation {
     }
 
     pub fn try_new(
-        world: Point3,
+        world: WorldPoint3,
         pixel: Keypoint,
         intrinsics: PinholeIntrinsics,
     ) -> Result<Self, PnpError> {
+        if !world.x.is_finite()
+            || !world.y.is_finite()
+            || !world.z.is_finite()
+            || !pixel.x.is_finite()
+            || !pixel.y.is_finite()
+        {
+            return Err(PnpError::Degenerate {
+                message: "observation coordinates must be finite",
+            });
+        }
         let bearing = normalize_bearing(pixel, intrinsics)?;
         Ok(Self {
             world,
@@ -143,27 +186,163 @@ impl Pose {
         }
     }
 
-    /// Compose two poses: `next ∘ self`.
-    pub fn compose(self, next: Pose) -> Pose {
-        let r = math::mat_mul(next.rotation, self.rotation);
-        let t = math::mat_mul_vec(next.rotation, self.translation);
+    /// Compose two poses: `self ∘ other`.
+    pub fn compose(self, other: Pose) -> Pose {
+        let r = math::mat_mul(self.rotation, other.rotation);
+        let t = math::mat_mul_vec(self.rotation, other.translation);
         Pose {
             rotation: r,
             translation: [
-                t[0] + next.translation[0],
-                t[1] + next.translation[1],
-                t[2] + next.translation[2],
+                t[0] + self.translation[0],
+                t[1] + self.translation[1],
+                t[2] + self.translation[2],
             ],
         }
     }
 }
 
+/// A rigid transform whose source and destination frames are checked at compile time.
+#[derive(Clone, Copy, Debug)]
+pub struct Transform<From: CoordinateFrame, To: CoordinateFrame> {
+    pose: Pose,
+    frames: PhantomData<fn(From) -> To>,
+}
+
+impl<From, To> Transform<From, To>
+where
+    From: CoordinateFrame<Scalar = f32>,
+    To: CoordinateFrame<Scalar = f32>,
+{
+    /// Wrap an untyped pose at a legacy subsystem boundary.
+    pub(crate) fn from_legacy_pose(pose: Pose) -> Self {
+        Self {
+            pose,
+            frames: PhantomData,
+        }
+    }
+
+    /// Unwrap this transform for a subsystem that has not yet adopted frame types.
+    pub fn into_legacy_pose(self) -> Pose {
+        self.pose
+    }
+
+    pub fn rotation(self) -> [[f32; 3]; 3] {
+        self.pose.rotation()
+    }
+
+    pub fn translation(self) -> [f32; 3] {
+        self.pose.translation()
+    }
+
+    pub fn transform_point(self, point: crate::Point3<From>) -> crate::Point3<To> {
+        crate::Point3::from_array(math::transform_point(
+            self.pose.rotation(),
+            self.pose.translation(),
+            point.to_array(),
+        ))
+    }
+
+    pub fn inverse(self) -> Transform<To, From> {
+        Transform::from_legacy_pose(self.pose.inverse())
+    }
+}
+
+impl<Frame> Transform<Frame, Frame>
+where
+    Frame: CoordinateFrame<Scalar = f32>,
+{
+    pub fn identity() -> Self {
+        Self::from_legacy_pose(Pose::identity())
+    }
+}
+
+pub type WorldToCamera = Transform<WorldFrame, CameraFrame>;
+pub type CameraToWorld = Transform<CameraFrame, WorldFrame>;
+
+impl WorldToCamera {
+    /// The coincident world-to-camera transform used for the initial keyframe.
+    pub fn identity() -> Self {
+        Self::from_legacy_pose(Pose::identity())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RansacConfig {
-    pub max_iterations: usize,
-    pub reprojection_threshold_px: f32,
-    pub min_inliers: usize,
-    pub seed: u64,
+    pub(crate) max_iterations: usize,
+    pub(crate) reprojection_threshold_px: f32,
+    pub(crate) min_inliers: usize,
+    pub(crate) seed: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RansacConfigError {
+    ZeroIterations,
+    InvalidReprojectionThreshold { value: f32 },
+    TooFewInliers { value: usize, minimum: usize },
+}
+
+impl std::fmt::Display for RansacConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroIterations => write!(f, "RANSAC iterations must be greater than zero"),
+            Self::InvalidReprojectionThreshold { value } => write!(
+                f,
+                "RANSAC reprojection threshold must be positive and finite, got {value}"
+            ),
+            Self::TooFewInliers { value, minimum } => write!(
+                f,
+                "RANSAC minimum inliers must be at least {minimum}, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RansacConfigError {}
+
+impl RansacConfig {
+    pub fn try_new(
+        max_iterations: usize,
+        reprojection_threshold_px: f32,
+        min_inliers: usize,
+        seed: u64,
+    ) -> Result<Self, RansacConfigError> {
+        if max_iterations == 0 {
+            return Err(RansacConfigError::ZeroIterations);
+        }
+        if !reprojection_threshold_px.is_finite() || reprojection_threshold_px <= 0.0 {
+            return Err(RansacConfigError::InvalidReprojectionThreshold {
+                value: reprojection_threshold_px,
+            });
+        }
+        if min_inliers < MIN_PNP_POINTS {
+            return Err(RansacConfigError::TooFewInliers {
+                value: min_inliers,
+                minimum: MIN_PNP_POINTS,
+            });
+        }
+        Ok(Self {
+            max_iterations,
+            reprojection_threshold_px,
+            min_inliers,
+            seed,
+        })
+    }
+
+    pub fn max_iterations(self) -> usize {
+        self.max_iterations
+    }
+
+    pub fn reprojection_threshold_px(self) -> f32 {
+        self.reprojection_threshold_px
+    }
+
+    pub fn min_inliers(self) -> usize {
+        self.min_inliers
+    }
+
+    pub fn seed(self) -> u64 {
+        self.seed
+    }
 }
 
 impl Default for RansacConfig {
@@ -179,7 +358,7 @@ impl Default for RansacConfig {
 
 #[derive(Debug)]
 pub struct PnpResult {
-    pub pose: Pose,
+    pub pose: WorldToCamera,
     pub inliers: Vec<usize>,
     pub iterations: usize,
 }
@@ -235,6 +414,7 @@ impl std::error::Error for PnpError {}
 pub fn build_observations(
     keyframe: &Keyframe,
     matches: &Matches<Verified>,
+    keyframe_to_world: CameraToWorld,
     intrinsics: PinholeIntrinsics,
 ) -> Result<Vec<Observation>, PnpError> {
     let current = matches.source_a();
@@ -268,9 +448,10 @@ pub fn build_observations(
 
         let pixel = current.keypoints()[ci];
         let bearing = normalize_bearing(pixel, intrinsics)?;
-        let world = keyframe
+        let camera = keyframe
             .landmark_for_detection(ki)
             .ok_or(PnpError::MissingLandmark { keyframe_index: ki })?;
+        let world = keyframe_to_world.transform_point(camera);
         observations.push(Observation {
             world,
             pixel,
@@ -289,6 +470,27 @@ pub fn solve_pnp_ransac(
     if observations.len() < MIN_PNP_POINTS {
         return Err(PnpError::NotEnoughPoints {
             required: MIN_PNP_POINTS,
+            actual: observations.len(),
+        });
+    }
+    if config.max_iterations == 0 {
+        return Err(PnpError::Degenerate {
+            message: "RANSAC max_iterations must be greater than zero",
+        });
+    }
+    if !config.reprojection_threshold_px.is_finite() || config.reprojection_threshold_px <= 0.0 {
+        return Err(PnpError::Degenerate {
+            message: "RANSAC reprojection threshold must be positive and finite",
+        });
+    }
+    if config.min_inliers < MIN_PNP_POINTS {
+        return Err(PnpError::Degenerate {
+            message: "RANSAC min_inliers must be at least the PnP minimum",
+        });
+    }
+    if config.min_inliers > observations.len() {
+        return Err(PnpError::NotEnoughPoints {
+            required: config.min_inliers,
             actual: observations.len(),
         });
     }
@@ -335,7 +537,7 @@ pub fn solve_pnp_ransac(
     }
 
     Ok(PnpResult {
-        pose,
+        pose: WorldToCamera::from_legacy_pose(pose),
         inliers: best_inliers,
         iterations,
     })
@@ -344,10 +546,11 @@ pub fn solve_pnp_ransac(
 pub fn solve_pnp(
     keyframe: &Keyframe,
     matches: &Matches<Verified>,
+    keyframe_to_world: CameraToWorld,
     intrinsics: PinholeIntrinsics,
     config: RansacConfig,
 ) -> Result<PnpResult, PnpError> {
-    let observations = build_observations(keyframe, matches, intrinsics)?;
+    let observations = build_observations(keyframe, matches, keyframe_to_world, intrinsics)?;
     solve_pnp_ransac(&observations, intrinsics, config)
 }
 
@@ -376,7 +579,7 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
     let b = norm(sub(p1, p3));
     let c = norm(sub(p1, p2));
 
-    if a <= 0.0 || b <= 0.0 || c <= 0.0 {
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() || a <= 0.0 || b <= 0.0 || c <= 0.0 {
         return Vec::new();
     }
 
@@ -421,6 +624,15 @@ fn find_roots(
     c: f32,
     roots: &mut Vec<(f32, f32)>,
 ) {
+    let scene_scale = a.max(b).max(c);
+    if !scene_scale.is_finite() || scene_scale <= 0.0 {
+        return;
+    }
+    // P3P depends only on ratios between the three world-space distances.
+    // Normalize them so polynomial trimming and root validation are unitless.
+    let a = a / scene_scale;
+    let b = b / scene_scale;
+    let c = c / scene_scale;
     let coeffs_meta = P3pCoeffs {
         cos_alpha,
         cos_beta,
@@ -450,7 +662,7 @@ fn find_roots(
             let Some(fx) = f_equation(xf, sign, &coeffs_meta) else {
                 continue;
             };
-            if fx.abs() < P3P_ROOT_TOLERANCE {
+            if fx.abs() <= P3P_ROOT_TOLERANCE {
                 push_unique_root(roots, (xf, y));
             }
         }
@@ -563,8 +775,8 @@ fn add_scaled(dst: &mut [f64], src: &[f64], scale: f64) {
 /// Minimum number of point correspondences required for PnP solving (geometric minimum for P3P).
 pub(crate) const MIN_PNP_POINTS: usize = 4;
 
-/// Tolerance for treating polynomial coefficients as zero during trimming.
-const POLY_COEFFICIENT_TOLERANCE: f64 = 1e-12;
+/// Relative tolerance for treating polynomial coefficients as zero during trimming.
+const POLY_RELATIVE_COEFFICIENT_TOLERANCE: f64 = 1e-12;
 /// Maximum imaginary component for a root to be considered real.
 const IMAGINARY_TOLERANCE: f64 = 1e-6;
 /// Convergence threshold for the Durand-Kerner root-finding iterations.
@@ -575,14 +787,17 @@ const ROOT_DENOMINATOR_TOLERANCE: f64 = 1e-12;
 const MAX_ROOT_ITERATIONS: usize = 64;
 /// Tolerance for detecting duplicate P3P root solutions.
 const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
-/// Tolerance for accepting a P3P equation evaluation as a valid root.
+/// Dimensionless tolerance for accepting a normalized P3P equation root.
 const P3P_ROOT_TOLERANCE: f32 = 1e-3;
 
 fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let mut coeffs: Vec<f64> = coeffs.into();
-    while coeffs.len() > 1
-        && coeffs.last().copied().unwrap_or(0.0).abs() < POLY_COEFFICIENT_TOLERANCE
-    {
+    let coefficient_scale = coeffs.iter().copied().map(f64::abs).fold(0.0, f64::max);
+    if !coefficient_scale.is_finite() || coefficient_scale == 0.0 {
+        return Vec::new();
+    }
+    let trim_tolerance = POLY_RELATIVE_COEFFICIENT_TOLERANCE * coefficient_scale;
+    while coeffs.len() > 1 && coeffs.last().copied().unwrap_or(0.0).abs() <= trim_tolerance {
         coeffs.pop();
     }
     let degree = coeffs.len().saturating_sub(1);
@@ -591,7 +806,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     }
     if degree == 1 {
         let c1 = coeffs[1];
-        if c1.abs() < POLY_COEFFICIENT_TOLERANCE {
+        if !c1.is_finite() || c1 == 0.0 {
             return Vec::new();
         }
         return vec![-coeffs[0] / c1];
@@ -600,7 +815,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let Some(&lead) = coeffs.last() else {
         return Vec::new();
     };
-    if lead.abs() < POLY_COEFFICIENT_TOLERANCE {
+    if !lead.is_finite() || lead == 0.0 {
         return Vec::new();
     }
     for c in &mut coeffs {
@@ -830,7 +1045,7 @@ fn det(r: [[f32; 3]; 3]) -> f32 {
         + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
 }
 
-fn vec3_from_point(p: Point3) -> [f32; 3] {
+fn vec3_from_point(p: WorldPoint3) -> [f32; 3] {
     [p.x, p.y, p.z]
 }
 
@@ -918,6 +1133,7 @@ fn sample_three(rng: &mut XorShift64, max: usize) -> Option<[usize; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Point3;
     use crate::test_helpers::{
         axis_angle_pose, make_pinhole_intrinsics, observations_from_projection,
     };
@@ -984,6 +1200,28 @@ mod tests {
     }
 
     #[test]
+    fn pose_compose_matches_pose64_ordering() {
+        let first = axis_angle_pose([0.3, -0.2, 0.7], [0.1, -0.05, 0.08]);
+        let second = axis_angle_pose([-0.1, 0.4, 0.2], [-0.03, 0.09, 0.02]);
+        let composed = first.compose(second);
+        let composed64 = crate::Pose64::from_pose32(first)
+            .compose(crate::Pose64::from_pose32(second))
+            .to_pose32();
+
+        assert!(rot_frob_norm(composed.rotation(), composed64.rotation()) < 1e-6);
+        assert!(l2(composed.translation(), composed64.translation()) < 1e-6);
+
+        let point = [1.2, -0.4, 3.5];
+        let after_second =
+            crate::math::transform_point(second.rotation(), second.translation(), point);
+        let expected =
+            crate::math::transform_point(first.rotation(), first.translation(), after_second);
+        let actual =
+            crate::math::transform_point(composed.rotation(), composed.translation(), point);
+        assert!(l2(actual, expected) < 1e-5);
+    }
+
+    #[test]
     fn solve_pnp_ransac_recovers_pose_on_synthetic_scene() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
@@ -1007,6 +1245,54 @@ mod tests {
         let trans_err = l2(result.pose.translation(), pose_gt.translation());
         assert!(rot_err < 0.03, "rotation error too high: {rot_err}");
         assert!(trans_err < 0.08, "translation error too high: {trans_err}");
+    }
+
+    #[test]
+    fn p3p_solver_is_invariant_to_scene_scale() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let base_world = synthetic_world_points();
+        let base_translation = [0.2, -0.1, 0.35];
+        let rotation_pose = axis_angle_pose([0.0; 3], [0.08, -0.06, 0.04]);
+        let config = RansacConfig {
+            max_iterations: 700,
+            reprojection_threshold_px: 1.0,
+            min_inliers: 20,
+            seed: 0x51CA1E,
+        };
+
+        for scale in [1e-3_f32, 1.0, 1e3] {
+            let world: Vec<_> = base_world
+                .iter()
+                .map(|point| Point3 {
+                    x: point.x * scale,
+                    y: point.y * scale,
+                    z: point.z * scale,
+                })
+                .collect();
+            let pose = Pose::from_rt(
+                rotation_pose.rotation(),
+                [
+                    base_translation[0] * scale,
+                    base_translation[1] * scale,
+                    base_translation[2] * scale,
+                ],
+            );
+            let observations =
+                observations_from_projection(pose, &world, intrinsics).expect("observations");
+            let result = solve_pnp_ransac(&observations, intrinsics, config)
+                .unwrap_or_else(|err| panic!("P3P failed at scene scale {scale}: {err}"));
+
+            assert!(result.inliers.len() >= 20, "scale={scale}");
+            assert!(
+                rot_frob_norm(result.pose.rotation(), pose.rotation()) < 0.03,
+                "rotation error at scale={scale}"
+            );
+            assert!(
+                l2(result.pose.translation(), pose.translation()) < 0.08 * scale,
+                "translation error at scale={scale}"
+            );
+        }
     }
 
     #[test]
@@ -1100,6 +1386,48 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn ransac_config_rejects_invalid_values() {
+        assert!(matches!(
+            RansacConfig::try_new(0, 1.0, 4, 1),
+            Err(RansacConfigError::ZeroIterations)
+        ));
+        for threshold in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                RansacConfig::try_new(10, threshold, 4, 1),
+                Err(RansacConfigError::InvalidReprojectionThreshold { .. })
+            ));
+        }
+        assert!(matches!(
+            RansacConfig::try_new(10, 1.0, 3, 1),
+            Err(RansacConfigError::TooFewInliers {
+                value: 3,
+                minimum: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn ransac_reports_configured_inlier_requirement_before_solving() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let pose = axis_angle_pose([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let world = synthetic_world_points();
+        let observations =
+            observations_from_projection(pose, &world[..4], intrinsics).expect("observations");
+        let config = RansacConfig::try_new(20, 1.0, 5, 1).expect("config");
+
+        let error = solve_pnp_ransac(&observations, intrinsics, config)
+            .expect_err("five configured inliers require at least five observations");
+        assert!(matches!(
+            error,
+            PnpError::NotEnoughPoints {
+                required: 5,
+                actual: 4
+            }
+        ));
     }
 
     #[test]

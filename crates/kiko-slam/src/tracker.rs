@@ -31,7 +31,7 @@ use crate::{
     ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw,
     RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
     Triangulator, Verified,
-    map::{KeyframeId, MapPointId, SlamMap},
+    map::{KeyframeId, MapPointId, MapSnapshot, SlamMap},
     solve_pnp_ransac,
 };
 
@@ -223,24 +223,6 @@ pub struct RedundancyPolicy {
     max_covisibility: CovisibilityRatio,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct MapVersion(NonZeroU64);
-
-impl MapVersion {
-    fn initial() -> Self {
-        Self(NonZeroU64::MIN)
-    }
-
-    fn next(self) -> Self {
-        let next = self.0.get().saturating_add(1).max(1);
-        Self(NonZeroU64::new(next).unwrap_or(NonZeroU64::MIN))
-    }
-
-    fn as_u64(self) -> u64 {
-        self.0.get()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct BackendRequestId(NonZeroU64);
 
@@ -307,14 +289,14 @@ impl BackendWindow {
 #[derive(Debug, Clone)]
 struct DescriptorRequest {
     keyframe_id: KeyframeId,
-    map_version: MapVersion,
+    source_snapshot: MapSnapshot,
     frame: Frame,
 }
 
 #[derive(Debug, Clone)]
 struct DescriptorResponse {
     keyframe_id: KeyframeId,
-    map_version: MapVersion,
+    source_snapshot: MapSnapshot,
     descriptor: crate::loop_closure::GlobalDescriptor,
 }
 
@@ -323,12 +305,12 @@ enum DescriptorWorkerResponse {
     Descriptor(Box<DescriptorResponse>),
     Failure {
         keyframe_id: KeyframeId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         error: String,
     },
     WorkerPanic {
         keyframe_id: KeyframeId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         message: String,
     },
 }
@@ -376,18 +358,18 @@ impl DescriptorWorker {
                         Ok(Ok(descriptor)) => {
                             DescriptorWorkerResponse::Descriptor(Box::new(DescriptorResponse {
                                 keyframe_id: request.keyframe_id,
-                                map_version: request.map_version,
+                                source_snapshot: request.source_snapshot,
                                 descriptor,
                             }))
                         }
                         Ok(Err(err)) => DescriptorWorkerResponse::Failure {
                             keyframe_id: request.keyframe_id,
-                            map_version: request.map_version,
+                            source_snapshot: request.source_snapshot,
                             error: err.to_string(),
                         },
                         Err(payload) => DescriptorWorkerResponse::WorkerPanic {
                             keyframe_id: request.keyframe_id,
-                            map_version: request.map_version,
+                            source_snapshot: request.source_snapshot,
                             message: crate::panic_payload_to_string(payload.as_ref()),
                         },
                     };
@@ -472,9 +454,13 @@ impl DescriptorSupervisor {
         max_respawns: u32,
     ) -> Self {
         let worker = Self::spawn_worker(config, &factory);
-        let spawn_exhausted = worker.is_none();
+        let spawn_exhausted = worker.is_none() && max_respawns == 0;
         if worker.is_none() {
-            eprintln!("descriptor model unavailable; using bootstrap descriptors only");
+            if spawn_exhausted {
+                eprintln!("descriptor model unavailable; using bootstrap descriptors only");
+            } else {
+                eprintln!("descriptor model unavailable; will retry on demand");
+            }
         }
         Self {
             worker,
@@ -518,13 +504,12 @@ impl DescriptorSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        let Some(worker) = Self::spawn_worker(self.config, &self.factory) else {
-            self.spawn_exhausted = true;
-            eprintln!("descriptor worker respawn failed; using bootstrap descriptors");
-            return;
-        };
-        self.worker = Some(worker);
+        self.worker = Self::spawn_worker(self.config, &self.factory);
         self.respawn_count = self.respawn_count.saturating_add(1);
+        if self.worker.is_none() && self.respawn_count >= self.max_respawns {
+            self.spawn_exhausted = true;
+            eprintln!("descriptor worker respawn exhausted; using bootstrap descriptors");
+        }
     }
 
     fn submit(&mut self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
@@ -573,7 +558,7 @@ impl DescriptorSupervisor {
 #[derive(Debug)]
 struct KeyframeEvent {
     request_id: BackendRequestId,
-    map_version: MapVersion,
+    source_snapshot: MapSnapshot,
     trigger_keyframe: KeyframeId,
     window: BackendWindow,
     map_snapshot: SlamMap,
@@ -607,7 +592,6 @@ impl std::error::Error for KeyframeEventError {}
 impl KeyframeEvent {
     fn try_new(
         request_id: BackendRequestId,
-        map_version: MapVersion,
         trigger_keyframe: KeyframeId,
         window: BackendWindow,
         map_snapshot: SlamMap,
@@ -622,9 +606,10 @@ impl KeyframeEvent {
                 return Err(KeyframeEventError::MissingKeyframeInSnapshot { keyframe_id });
             }
         }
+        let source_snapshot = map_snapshot.snapshot();
         Ok(Self {
             request_id,
-            map_version,
+            source_snapshot,
             trigger_keyframe,
             window,
             map_snapshot,
@@ -637,7 +622,7 @@ impl KeyframeEvent {
 #[derive(Debug)]
 struct CorrectionEvent {
     request_id: BackendRequestId,
-    map_version: MapVersion,
+    source_snapshot: MapSnapshot,
     trigger_keyframe: KeyframeId,
     correction: BaCorrection,
 }
@@ -688,7 +673,10 @@ impl CorrectionEvent {
                 let after = optimized_map
                     .keyframe(keyframe_id)
                     .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
-                let delta = crate::local_ba::se3_delta_between(before.pose(), after.pose());
+                let delta = crate::local_ba::se3_delta_between(
+                    before.pose().into_legacy_pose(),
+                    after.pose().into_legacy_pose(),
+                );
                 correction.pose_deltas.push((keyframe_id, delta));
             }
 
@@ -717,7 +705,7 @@ impl CorrectionEvent {
 
         Ok(Self {
             request_id: event.request_id,
-            map_version: event.map_version,
+            source_snapshot: event.source_snapshot,
             trigger_keyframe: event.trigger_keyframe,
             correction,
         })
@@ -739,18 +727,24 @@ impl std::fmt::Display for BackendWorkerError {
     }
 }
 
-impl std::error::Error for BackendWorkerError {}
+impl std::error::Error for BackendWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BuildCorrection(err) => Some(err),
+        }
+    }
+}
 
 #[derive(Debug)]
 enum BackendResponse {
     Correction(CorrectionEvent),
     WorkerPanic {
         request_id: BackendRequestId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
     },
     Failure {
         request_id: BackendRequestId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         error: BackendWorkerError,
     },
 }
@@ -787,13 +781,21 @@ impl std::fmt::Display for SubmitEventError {
     }
 }
 
-impl std::error::Error for SubmitEventError {}
+impl std::error::Error for SubmitEventError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidWindow(err) => Some(err),
+            Self::InvalidEvent(err) => Some(err),
+            Self::QueueFull | Self::Disconnected => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 enum ApplyCorrectionError {
-    StaleVersion {
-        current: MapVersion,
-        correction: MapVersion,
+    StaleSnapshot {
+        current: MapSnapshot,
+        correction: MapSnapshot,
     },
     MissingKeyframe {
         keyframe_id: KeyframeId,
@@ -807,14 +809,12 @@ enum ApplyCorrectionError {
 impl std::fmt::Display for ApplyCorrectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApplyCorrectionError::StaleVersion {
+            ApplyCorrectionError::StaleSnapshot {
                 current,
                 correction,
             } => write!(
                 f,
-                "stale correction: correction version={}, current version={}",
-                correction.as_u64(),
-                current.as_u64()
+                "stale correction: correction snapshot={correction:?}, current snapshot={current:?}"
             ),
             ApplyCorrectionError::MissingKeyframe { keyframe_id } => {
                 write!(f, "correction references missing keyframe {keyframe_id:?}")
@@ -827,7 +827,16 @@ impl std::fmt::Display for ApplyCorrectionError {
     }
 }
 
-impl std::error::Error for ApplyCorrectionError {}
+impl std::error::Error for ApplyCorrectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map(err) => Some(err),
+            Self::StaleSnapshot { .. }
+            | Self::MissingKeyframe { .. }
+            | Self::MissingMapPoint { .. } => None,
+        }
+    }
+}
 
 impl From<crate::map::MapError> for ApplyCorrectionError {
     fn from(value: crate::map::MapError) -> Self {
@@ -860,7 +869,7 @@ impl BackendWorker {
                 let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
                 while let Ok(event) = rx_req.recv() {
                     let request_id = event.request_id;
-                    let map_version = event.map_version;
+                    let source_snapshot = event.source_snapshot;
                     let processing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         #[cfg(test)]
                         if event.force_panic {
@@ -888,7 +897,7 @@ impl BackendWorker {
                             if tx_resp
                                 .send(BackendResponse::Failure {
                                     request_id,
-                                    map_version,
+                                    source_snapshot,
                                     error: BackendWorkerError::BuildCorrection(err),
                                 })
                                 .is_err()
@@ -903,7 +912,7 @@ impl BackendWorker {
                             if tx_resp
                                 .send(BackendResponse::WorkerPanic {
                                     request_id,
-                                    map_version,
+                                    source_snapshot,
                                 })
                                 .is_err()
                             {
@@ -981,7 +990,11 @@ impl BackendSupervisor {
         let worker = Self::spawn_worker(config, intrinsics, ba_config);
         let spawn_exhausted = worker.is_none() && max_respawns == 0;
         if worker.is_none() {
-            eprintln!("backend worker unavailable at startup; backend optimization disabled");
+            if spawn_exhausted {
+                eprintln!("backend worker unavailable at startup; backend optimization disabled");
+            } else {
+                eprintln!("backend worker unavailable at startup; will retry on demand");
+            }
         }
         Self {
             worker,
@@ -1057,13 +1070,13 @@ impl BackendSupervisor {
         match response {
             Ok(Some(BackendResponse::WorkerPanic {
                 request_id,
-                map_version,
+                source_snapshot,
             })) => {
                 self.worker = None;
                 self.check_health();
                 Some(BackendResponse::WorkerPanic {
                     request_id,
-                    map_version,
+                    source_snapshot,
                 })
             }
             Ok(response) => response,
@@ -1218,7 +1231,13 @@ pub enum TrackerError {
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
-    KeyframeRejected { landmarks: usize },
+    LoopMapSnapshotMismatch {
+        verified: crate::map::MapSnapshot,
+        current: crate::map::MapSnapshot,
+    },
+    KeyframeRejected {
+        landmarks: usize,
+    },
     InvariantViolation(&'static str),
 }
 
@@ -1231,6 +1250,10 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
+            TrackerError::LoopMapSnapshotMismatch { verified, current } => write!(
+                f,
+                "verified loop map snapshot mismatch: verified={verified:?}, current={current:?}"
+            ),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -1241,7 +1264,32 @@ impl std::fmt::Display for TrackerError {
     }
 }
 
-impl std::error::Error for TrackerError {}
+impl std::error::Error for TrackerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Inference(err) => Some(err),
+            Self::Triangulation(err) => Some(err),
+            Self::Pnp(err) => Some(err),
+            Self::Map(err) => Some(err),
+            Self::EssentialGraph(err) => Some(err),
+            Self::PoseGraph(err) => Some(err),
+            Self::LoopMapSnapshotMismatch { .. }
+            | Self::KeyframeRejected { .. }
+            | Self::InvariantViolation(_) => None,
+        }
+    }
+}
+
+impl TrackerError {
+    pub fn requires_pipeline_shutdown(&self) -> bool {
+        matches!(
+            self,
+            Self::Inference(
+                InferenceError::WatchdogTimeout { .. } | InferenceError::SessionQuarantined { .. }
+            )
+        )
+    }
+}
 
 impl From<InferenceError> for TrackerError {
     fn from(err: InferenceError) -> Self {
@@ -1284,6 +1332,22 @@ pub enum TrackingHealth {
     Good,
     Degraded,
     Lost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoseStatus {
+    Current,
+    Stale,
+    Unavailable,
+}
+
+impl PoseStatus {
+    fn is_consistent_with<T>(self, pose: Option<T>) -> bool {
+        match self {
+            Self::Current | Self::Stale => pose.is_some(),
+            Self::Unavailable => pose.is_none(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1386,14 +1450,73 @@ impl SystemHealth {
 
 #[derive(Debug)]
 pub struct TrackerOutput {
-    pub pose: Option<Pose>,
-    pub inliers: usize,
-    pub keyframe: Option<Arc<Keyframe>>,
-    pub stereo_matches: Option<Matches<Raw>>,
-    pub frame_id: FrameId,
-    pub health: SystemHealth,
-    pub diagnostics: FrameDiagnostics,
-    pub events: Vec<DiagnosticEvent>,
+    /// World-to-camera pose; inspect `pose_status` before use.
+    pub(crate) pose: Option<crate::WorldToCamera>,
+    pub(crate) pose_status: PoseStatus,
+    pub(crate) inliers: usize,
+    pub(crate) keyframe: Option<Arc<Keyframe>>,
+    pub(crate) stereo_matches: Option<Matches<Raw>>,
+    pub(crate) frame_id: FrameId,
+    pub(crate) health: SystemHealth,
+    pub(crate) diagnostics: FrameDiagnostics,
+    pub(crate) events: Vec<DiagnosticEvent>,
+}
+
+impl TrackerOutput {
+    pub fn pose(&self) -> Option<crate::WorldToCamera> {
+        self.pose
+    }
+
+    pub fn pose_status(&self) -> PoseStatus {
+        self.pose_status
+    }
+
+    pub fn inliers(&self) -> usize {
+        self.inliers
+    }
+
+    pub fn keyframe(&self) -> Option<&Arc<Keyframe>> {
+        self.keyframe.as_ref()
+    }
+
+    pub fn stereo_matches(&self) -> Option<&Matches<Raw>> {
+        self.stereo_matches.as_ref()
+    }
+
+    pub fn take_stereo_matches(&mut self) -> Option<Matches<Raw>> {
+        self.stereo_matches.take()
+    }
+
+    pub fn frame_id(&self) -> FrameId {
+        self.frame_id
+    }
+
+    pub fn health(&self) -> &SystemHealth {
+        &self.health
+    }
+
+    pub fn diagnostics(&self) -> &FrameDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn diagnostics_mut(&mut self) -> &mut FrameDiagnostics {
+        &mut self.diagnostics
+    }
+
+    pub fn events(&self) -> &[DiagnosticEvent] {
+        &self.events
+    }
+
+    pub fn into_status_parts(
+        self,
+    ) -> (
+        Option<crate::WorldToCamera>,
+        SystemHealth,
+        FrameDiagnostics,
+        Vec<DiagnosticEvent>,
+    ) {
+        (self.pose, self.health, self.diagnostics, self.events)
+    }
 }
 
 #[derive(Debug)]
@@ -1454,7 +1577,6 @@ pub struct SlamTracker {
     map: SlamMap,
     essential_graph: EssentialGraph,
     pose_graph_optimizer: PoseGraphOptimizer,
-    map_version: MapVersion,
     backend: Option<BackendSupervisor>,
     backend_stats: BackendStats,
     descriptor_worker: Option<DescriptorSupervisor>,
@@ -1520,7 +1642,6 @@ impl SlamTracker {
             map: SlamMap::new(),
             essential_graph: EssentialGraph::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD),
             pose_graph_optimizer: PoseGraphOptimizer::new(PoseGraphConfig::default()),
-            map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
             descriptor_worker,
@@ -1539,6 +1660,7 @@ impl SlamTracker {
     }
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
+        // Keep drained diagnostics queued until a TrackerOutput can carry them.
         self.drain_backend_responses();
         self.drain_descriptor_responses();
         if let Err(err) = self.process_pending_loop_closure() {
@@ -1557,14 +1679,10 @@ impl SlamTracker {
             _ => None,
         };
         if let Some(session) = relocalization_session {
-            let result = self.relocalize(pair, session);
-            if result.is_err() {
-                self.clear_events();
-            }
-            return result;
+            return self.relocalize(pair, session);
         }
 
-        let result = if let Some((keyframe, keyframe_id)) = tracking {
+        if let Some((keyframe, keyframe_id)) = tracking {
             self.track(pair, &keyframe, keyframe_id)
         } else {
             let bootstrap_pose = self.last_pose_world.unwrap_or(Pose::identity());
@@ -1582,11 +1700,7 @@ impl SlamTracker {
                 );
             }
             self.create_keyframe(pair, bootstrap_pose)
-        };
-        if result.is_err() {
-            self.clear_events();
         }
-        result
     }
 
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
@@ -1602,16 +1716,16 @@ impl SlamTracker {
     }
 
     pub fn system_health(&self) -> SystemHealth {
-        let backend_expected = self.backend.is_some();
+        let backend_expected = self.config.backend.is_some();
         let backend_alive = self
             .backend
             .as_ref()
-            .is_none_or(BackendSupervisor::has_worker);
-        let descriptor_expected = self.descriptor_worker.is_some();
+            .is_some_and(BackendSupervisor::has_worker);
+        let descriptor_expected = self.config.global_descriptor_config().is_some();
         let descriptor_alive = self
             .descriptor_worker
             .as_ref()
-            .is_none_or(DescriptorSupervisor::has_worker);
+            .is_some_and(DescriptorSupervisor::has_worker);
         SystemHealth::from_components(
             self.tracking_health,
             backend_expected,
@@ -1634,7 +1748,6 @@ impl SlamTracker {
         } else {
             Some(corrected)
         };
-        self.bump_map_version();
         Ok(())
     }
 
@@ -1645,10 +1758,6 @@ impl SlamTracker {
     /// send a `RebuildFromSnapshot` command to the dense worker.
     pub fn take_pending_loop_correction(&mut self) -> Option<Vec<(KeyframeId, Pose)>> {
         self.pending_loop_correction.take()
-    }
-
-    fn bump_map_version(&mut self) {
-        self.map_version = self.map_version.next();
     }
 
     fn emit_health(&mut self, tracking: TrackingHealth) -> SystemHealth {
@@ -1662,10 +1771,6 @@ impl SlamTracker {
 
     fn drain_events(&mut self) -> Vec<DiagnosticEvent> {
         std::mem::take(&mut self.pending_events)
-    }
-
-    fn clear_events(&mut self) {
-        self.pending_events.clear();
     }
 
     fn empty_diagnostics(&self) -> FrameDiagnostics {
@@ -1686,6 +1791,7 @@ impl SlamTracker {
     fn output_with_diagnostics(
         &mut self,
         pose: Option<Pose>,
+        pose_status: PoseStatus,
         inliers: usize,
         keyframe: Option<Arc<Keyframe>>,
         stereo_matches: Option<Matches<Raw>>,
@@ -1693,11 +1799,13 @@ impl SlamTracker {
         tracking: TrackingHealth,
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
+        debug_assert!(pose_status.is_consistent_with(pose));
         if let Some(pose_world) = pose {
             self.last_pose_world = Some(pose_world);
         }
         TrackerOutput {
-            pose,
+            pose: pose.map(crate::WorldToCamera::from_legacy_pose),
+            pose_status,
             inliers,
             keyframe,
             stereo_matches,
@@ -1708,15 +1816,22 @@ impl SlamTracker {
         }
     }
 
-    /// Build a `TrackerOutput` for a tracking failure (no pose, no keyframe, no matches).
+    /// Build a tracking-failure output with an explicitly stale fallback pose when available.
     fn tracking_failure_output(
         &mut self,
         frame_id: FrameId,
         health: TrackingHealth,
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
+        let pose = self.last_pose_world;
+        let pose_status = if pose.is_some() {
+            PoseStatus::Stale
+        } else {
+            PoseStatus::Unavailable
+        };
         self.output_with_diagnostics(
-            self.last_pose_world,
+            pose,
+            pose_status,
             0,
             None,
             None,
@@ -1788,7 +1903,7 @@ impl SlamTracker {
         };
         let request = DescriptorRequest {
             keyframe_id,
-            map_version: self.map_version,
+            source_snapshot: self.map.snapshot(),
             frame: frame.clone(),
         };
         match supervisor.submit(request) {
@@ -1824,47 +1939,35 @@ impl SlamTracker {
             };
             match response {
                 DescriptorWorkerResponse::Descriptor(response) => {
-                    if response.map_version.as_u64() > self.map_version.as_u64() {
-                        continue;
-                    }
-                    if self.map.keyframe(response.keyframe_id).is_none() {
-                        continue;
-                    }
                     let Some(loop_db) = self.loop_db.as_mut() else {
                         continue;
                     };
-                    if loop_db.replace_descriptor(
-                        response.keyframe_id,
-                        response.descriptor,
-                        DescriptorSource::Learned,
-                    ) {
+                    if apply_descriptor_response(&self.map, loop_db, *response) {
                         self.descriptor_stats.applied =
                             self.descriptor_stats.applied.saturating_add(1);
                     }
                 }
                 DescriptorWorkerResponse::Failure {
                     keyframe_id,
-                    map_version,
+                    source_snapshot,
                     error,
                 } => {
                     self.descriptor_stats.worker_failures =
                         self.descriptor_stats.worker_failures.saturating_add(1);
                     eprintln!(
-                        "descriptor worker failure (keyframe={keyframe_id:?}, version={}): {error}",
-                        map_version.as_u64()
+                        "descriptor worker failure (keyframe={keyframe_id:?}, snapshot={source_snapshot:?}): {error}"
                     );
                 }
                 DescriptorWorkerResponse::WorkerPanic {
                     keyframe_id,
-                    map_version,
+                    source_snapshot,
                     message,
                 } => {
                     self.descriptor_stats.panics = self.descriptor_stats.panics.saturating_add(1);
                     self.descriptor_stats.worker_failures =
                         self.descriptor_stats.worker_failures.saturating_add(1);
                     eprintln!(
-                        "descriptor worker panic (keyframe={keyframe_id:?}, version={}): {message}",
-                        map_version.as_u64()
+                        "descriptor worker panic (keyframe={keyframe_id:?}, snapshot={source_snapshot:?}): {message}"
                     );
                     self.emit_event(DiagnosticEvent::DescriptorWorkerDied {
                         respawn_count: self.descriptor_stats.respawn_count,
@@ -1905,7 +2008,6 @@ impl SlamTracker {
             let loop_candidate = LoopCandidate {
                 query_kf: pending.query_kf,
                 match_kf: candidate.candidate,
-                similarity: candidate.similarity,
             };
 
             let verified = match loop_candidate.verify(
@@ -1925,8 +2027,20 @@ impl SlamTracker {
                 }
             };
 
-            let translation = loop_translation_norm(verified.relative_pose());
-            let rotation_deg = loop_rotation_angle_deg(verified.relative_pose());
+            let Some(query_keyframe) = self.map.keyframe(verified.query_kf()) else {
+                if first_error.is_none() {
+                    first_error = Some(LoopDetectError::ApplyFailed(
+                        LoopApplyError::MissingKeyframe,
+                    ));
+                }
+                continue;
+            };
+            let correction = loop_pose_correction(
+                query_keyframe.pose().into_legacy_pose(),
+                verified.query_pose_world(),
+            );
+            let translation = loop_translation_norm(correction);
+            let rotation_deg = loop_rotation_angle_deg(correction);
             if translation > config.max_correction_translation()
                 || rotation_deg > config.max_correction_rotation_deg()
             {
@@ -1978,14 +2092,8 @@ impl SlamTracker {
         let request_id = supervisor
             .next_request_id()
             .ok_or(SubmitEventError::Disconnected)?;
-        let event = KeyframeEvent::try_new(
-            request_id,
-            self.map_version,
-            trigger_keyframe,
-            window,
-            self.map.clone(),
-        )
-        .map_err(SubmitEventError::InvalidEvent)?;
+        let event = KeyframeEvent::try_new(request_id, trigger_keyframe, window, self.map.clone())
+            .map_err(SubmitEventError::InvalidEvent)?;
         supervisor.submit(event)?;
         self.backend_stats.respawn_count = supervisor.respawn_count();
         self.backend_stats.submitted = self.backend_stats.submitted.saturating_add(1);
@@ -2007,60 +2115,64 @@ impl SlamTracker {
                 break;
             };
             match response {
-                BackendResponse::Correction(correction) => match &correction.correction.result {
-                    BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
-                        match apply_correction_event(&mut self.map, self.map_version, &correction) {
-                            Ok(()) => {
-                                self.bump_map_version();
-                                self.backend_stats.applied =
-                                    self.backend_stats.applied.saturating_add(1);
-                            }
-                            Err(ApplyCorrectionError::StaleVersion { .. }) => {
-                                self.backend_stats.stale =
-                                    self.backend_stats.stale.saturating_add(1);
-                            }
-                            Err(err) => {
-                                self.backend_stats.rejected =
-                                    self.backend_stats.rejected.saturating_add(1);
-                                eprintln!(
-                                    "backend correction rejected (req={}, keyframe={:?}): {err}",
-                                    correction.request_id.as_u64(),
-                                    correction.trigger_keyframe
-                                );
+                BackendResponse::Correction(correction) => {
+                    if correction.source_snapshot != self.map.snapshot() {
+                        self.backend_stats.stale = self.backend_stats.stale.saturating_add(1);
+                        continue;
+                    }
+                    match &correction.correction.result {
+                        BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
+                            match apply_correction_event(&mut self.map, &correction) {
+                                Ok(()) => {
+                                    self.backend_stats.applied =
+                                        self.backend_stats.applied.saturating_add(1);
+                                }
+                                Err(ApplyCorrectionError::StaleSnapshot { .. }) => {
+                                    self.backend_stats.stale =
+                                        self.backend_stats.stale.saturating_add(1);
+                                }
+                                Err(err) => {
+                                    self.backend_stats.rejected =
+                                        self.backend_stats.rejected.saturating_add(1);
+                                    eprintln!(
+                                        "backend correction rejected (req={}, keyframe={:?}): {err}",
+                                        correction.request_id.as_u64(),
+                                        correction.trigger_keyframe
+                                    );
+                                }
                             }
                         }
+                        BaResult::Degenerate { reason } => {
+                            self.backend_stats.rejected =
+                                self.backend_stats.rejected.saturating_add(1);
+                            self.emit_event(DiagnosticEvent::BaDegenerate { reason: *reason });
+                            eprintln!(
+                                "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
+                                correction.request_id.as_u64(),
+                                correction.trigger_keyframe
+                            );
+                        }
                     }
-                    BaResult::Degenerate { reason } => {
-                        self.backend_stats.rejected = self.backend_stats.rejected.saturating_add(1);
-                        self.emit_event(DiagnosticEvent::BaDegenerate { reason: *reason });
-                        eprintln!(
-                            "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
-                            correction.request_id.as_u64(),
-                            correction.trigger_keyframe
-                        );
-                    }
-                },
+                }
                 BackendResponse::Failure {
                     request_id,
-                    map_version,
+                    source_snapshot,
                     error,
                 } => {
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
                     eprintln!(
-                        "backend worker failure (req={}, version={}): {error}",
+                        "backend worker failure (req={}, snapshot={source_snapshot:?}): {error}",
                         request_id.as_u64(),
-                        map_version.as_u64()
                     );
                 }
                 BackendResponse::WorkerPanic {
                     request_id,
-                    map_version,
+                    source_snapshot,
                 } => {
                     self.backend_stats.panics = self.backend_stats.panics.saturating_add(1);
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
-                    self.map_version = self.map_version.next();
                     if let Some(supervisor) = self.backend.as_mut() {
                         supervisor.check_health();
                         self.backend_stats.respawn_count = supervisor.respawn_count();
@@ -2069,9 +2181,8 @@ impl SlamTracker {
                         respawn_count: self.backend_stats.respawn_count,
                     });
                     eprintln!(
-                        "backend worker panic (req={}, version={}); map version bumped to invalidate in-flight",
+                        "backend worker panic (req={}, snapshot={source_snapshot:?})",
                         request_id.as_u64(),
-                        map_version.as_u64()
                     );
                 }
             }
@@ -2141,8 +2252,15 @@ impl SlamTracker {
         health: TrackingHealth,
     ) -> TrackerOutput {
         let diagnostics = self.empty_diagnostics();
+        let pose = self.last_pose_world;
+        let pose_status = if pose.is_some() {
+            PoseStatus::Stale
+        } else {
+            PoseStatus::Unavailable
+        };
         self.output_with_diagnostics(
-            self.last_pose_world,
+            pose,
+            pose_status,
             0,
             None,
             None,
@@ -2222,7 +2340,6 @@ impl SlamTracker {
             }
             let relocalization_candidate = RelocalizationCandidate {
                 match_kf: candidate.candidate,
-                similarity: candidate.similarity,
             };
             let verified = match relocalization_candidate.verify(
                 current.keypoints(),
@@ -2398,7 +2515,7 @@ impl SlamTracker {
             }
         };
 
-        let observations = match build_map_observations(
+        let observation_batch = match build_map_observations(
             &self.map,
             keyframe_id,
             &verified,
@@ -2427,7 +2544,8 @@ impl SlamTracker {
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
-        let result = match solve_pnp_ransac(&observations, self.intrinsics, self.config.ransac) {
+        let observations = &observation_batch.observations;
+        let result = match solve_pnp_ransac(observations, self.intrinsics, self.config.ransac) {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
                 if self.trace_transitions {
@@ -2451,13 +2569,30 @@ impl SlamTracker {
             Err(err) => return Err(TrackerError::Pnp(err)),
         };
 
-        let mut map_observations = Vec::with_capacity(result.inliers.len());
-        for &idx in &result.inliers {
-            let (ci, ki) = *verified.indices().get(idx).ok_or(TrackerError::Inference(
-                InferenceError::InvariantViolation {
-                    context: "verified match index out of bounds",
-                },
+        let inlier_match_indices: Vec<usize> = result
+            .inliers
+            .iter()
+            .map(|&observation_idx| {
+                observation_batch
+                    .match_indices
+                    .get(observation_idx)
+                    .copied()
+            })
+            .collect::<Option<_>>()
+            .ok_or(TrackerError::InvariantViolation(
+                "PnP inlier index out of observation batch bounds",
             ))?;
+
+        let mut map_observations = Vec::with_capacity(result.inliers.len());
+        for &match_idx in &inlier_match_indices {
+            let (ci, ki) = *verified
+                .indices()
+                .get(match_idx)
+                .ok_or(TrackerError::Inference(
+                    InferenceError::InvariantViolation {
+                        context: "verified match index out of bounds",
+                    },
+                ))?;
             let pixel = *current.keypoints().get(ci).ok_or(TrackerError::Inference(
                 InferenceError::InvariantViolation {
                     context: "current keypoint index out of bounds",
@@ -2467,7 +2602,7 @@ impl SlamTracker {
             map_observations.push(MapObservation::new(keypoint_ref, pixel));
         }
 
-        let parallax_px = median_parallax_px(&verified, &result.inliers, keyframe);
+        let parallax_px = median_parallax_px(&verified, &inlier_match_indices, keyframe);
         let covisibility = if keyframe.landmarks().is_empty() {
             0.0
         } else {
@@ -2475,11 +2610,13 @@ impl SlamTracker {
         };
 
         let pose_world = result.pose;
+        let pose_world_legacy = pose_world.into_legacy_pose();
         let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
             .ok()
-            .and_then(|set| self.ba.push_frame(&self.map, pose_world, set));
+            .and_then(|set| self.ba.push_frame(&self.map, pose_world_legacy, set));
 
-        let pose_world = refined_world.unwrap_or(pose_world);
+        let pose_world =
+            crate::WorldToCamera::from_legacy_pose(refined_world.unwrap_or(pose_world_legacy));
         if self.consecutive_tracking_failures > 0 {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
@@ -2498,14 +2635,19 @@ impl SlamTracker {
 
         if should_refresh {
             let new_pose = pose_world;
-            let shared = build_shared_matches(keyframe_id, &verified, &result.inliers);
-            if let Ok((keyframe_output, keyframe_id)) = self.create_keyframe_internal(
+            let shared = build_shared_matches(keyframe_id, &verified, &inlier_match_indices);
+            let created = match self.create_keyframe_internal(
                 left,
                 right,
                 new_pose,
                 Some(current.clone()),
                 Some(shared),
             ) {
+                Ok(value) => Some(value),
+                Err(TrackerError::KeyframeRejected { .. }) => None,
+                Err(err) => return Err(err),
+            };
+            if let Some((keyframe_output, keyframe_id)) = created {
                 keyframe_created = true;
                 triangulation_stats = keyframe_output.diagnostics.triangulation;
                 ba_result = keyframe_output.diagnostics.ba_result.clone();
@@ -2519,32 +2661,28 @@ impl SlamTracker {
                         .transpose()?
                         .unwrap_or(false);
                     if redundant {
-                        if let Err(err) = remove_keyframe_from_graph_and_db(
+                        remove_keyframe_from_graph_and_db(
                             &mut self.map,
                             &mut self.essential_graph,
                             self.loop_db.as_mut(),
                             keyframe_id,
-                        ) {
-                            eprintln!("failed to remove redundant keyframe {keyframe_id:?}: {err}");
-                        } else {
-                            self.emit_event(DiagnosticEvent::KeyframeRemoved {
-                                keyframe_id,
-                                reason: KeyframeRemovalReason::Redundant,
-                            });
-                            self.loop_streak.remove(&keyframe_id);
-                            if let Some(pending) = self.pending_loop.as_mut() {
-                                if pending.query_kf == keyframe_id {
+                        )?;
+                        self.emit_event(DiagnosticEvent::KeyframeRemoved {
+                            keyframe_id,
+                            reason: KeyframeRemovalReason::Redundant,
+                        });
+                        self.loop_streak.remove(&keyframe_id);
+                        if let Some(pending) = self.pending_loop.as_mut() {
+                            if pending.query_kf == keyframe_id {
+                                self.pending_loop = None;
+                            } else {
+                                pending
+                                    .candidates
+                                    .retain(|candidate| candidate.candidate != keyframe_id);
+                                if pending.candidates.is_empty() {
                                     self.pending_loop = None;
-                                } else {
-                                    pending
-                                        .candidates
-                                        .retain(|candidate| candidate.candidate != keyframe_id);
-                                    if pending.candidates.is_empty() {
-                                        self.pending_loop = None;
-                                    }
                                 }
                             }
-                            self.bump_map_version();
                         }
                     } else {
                         let window = self
@@ -2568,11 +2706,6 @@ impl SlamTracker {
                                             if let Some(supervisor) = self.backend.as_ref() {
                                                 self.backend_stats.respawn_count =
                                                     supervisor.respawn_count();
-                                                if !supervisor.has_worker() {
-                                                    self.backend = None;
-                                                }
-                                            } else {
-                                                self.backend = None;
                                             }
                                         }
                                         SubmitEventError::InvalidWindow(_)
@@ -2587,23 +2720,11 @@ impl SlamTracker {
                                     let result =
                                         self.ba.optimize_keyframe_window(&mut self.map, &window);
                                     ba_result = Some(result.clone());
-                                    if matches!(
-                                        result,
-                                        BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                                    ) {
-                                        self.bump_map_version();
-                                    }
                                 }
-                            } else if matches!(
-                                {
-                                    let result =
-                                        self.ba.optimize_keyframe_window(&mut self.map, &window);
-                                    ba_result = Some(result.clone());
-                                    result
-                                },
-                                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                            ) {
-                                self.bump_map_version();
+                            } else {
+                                let result =
+                                    self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                ba_result = Some(result);
                             }
                         }
                         self.state = TrackerState::Tracking {
@@ -2623,8 +2744,11 @@ impl SlamTracker {
             .iter()
             .filter_map(|&idx| observations.get(idx).copied())
             .collect();
-        let inlier_errors =
-            crate::pnp::reprojection_errors(&pose_world, &inlier_observations, self.intrinsics);
+        let inlier_errors = crate::pnp::reprojection_errors(
+            &pose_world.into_legacy_pose(),
+            &inlier_observations,
+            self.intrinsics,
+        );
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.inlier_ratio =
@@ -2643,7 +2767,8 @@ impl SlamTracker {
         diagnostics.features_matched = Some(matches.len());
 
         Ok(self.output_with_diagnostics(
-            Some(pose_world),
+            Some(pose_world.into_legacy_pose()),
+            PoseStatus::Current,
             result.inliers.len(),
             output_keyframe,
             output_matches,
@@ -2660,9 +2785,13 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
-        let (output, keyframe_id) = match self
-            .create_keyframe_internal(left, right, pose_world, None, None)
-        {
+        let (output, keyframe_id) = match self.create_keyframe_internal(
+            left,
+            right,
+            crate::WorldToCamera::from_legacy_pose(pose_world),
+            None,
+            None,
+        ) {
             Ok(value) => value,
             Err(TrackerError::KeyframeRejected { landmarks }) => {
                 if self.trace_transitions {
@@ -2704,6 +2833,7 @@ impl SlamTracker {
         let diagnostics = output.diagnostics;
         Ok(self.output_with_diagnostics(
             Some(pose_world),
+            PoseStatus::Current,
             0,
             output.keyframe,
             output.stereo_matches,
@@ -2717,7 +2847,7 @@ impl SlamTracker {
         &mut self,
         left: Frame,
         right: Frame,
-        pose_world: Pose,
+        pose_world: crate::WorldToCamera,
         left_det: Option<Arc<Detections>>,
         shared: Option<SharedMatches>,
     ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
@@ -2804,7 +2934,6 @@ impl SlamTracker {
             self.map.covisibility().neighbors(keyframe_id),
             &self.map,
         );
-        self.bump_map_version();
         self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
         self.enqueue_descriptor_request(keyframe_id, &left);
 
@@ -2817,6 +2946,7 @@ impl SlamTracker {
         Ok((
             TrackerOutput {
                 pose: None,
+                pose_status: PoseStatus::Unavailable,
                 inliers: 0,
                 keyframe: Some(keyframe),
                 stereo_matches: Some(matches),
@@ -2834,21 +2964,25 @@ fn insert_keyframe_into_map(
     map: &mut SlamMap,
     keyframe: &Arc<Keyframe>,
     timestamp: Timestamp,
-    pose_world: Pose,
+    pose_world: crate::WorldToCamera,
     shared: Option<&SharedMatches>,
 ) -> Result<KeyframeId, TrackerError> {
-    let keyframe_id =
-        map.add_keyframe_from_detections(keyframe.detections().as_ref(), timestamp, pose_world)?;
+    let mut staged = map.clone();
+    let keyframe_id = staged.add_keyframe_from_detections(
+        keyframe.detections().as_ref(),
+        timestamp,
+        pose_world,
+    )?;
 
     if let Some(shared) = shared {
         for &(current_idx, old_idx) in &shared.pairs {
-            let old_kp = map.keyframe_keypoint(shared.keyframe_id, old_idx)?;
-            let Some(point_id) = map.map_point_for_keypoint(old_kp)? else {
+            let old_kp = staged.keyframe_keypoint(shared.keyframe_id, old_idx)?;
+            let Some(point_id) = staged.map_point_for_keypoint(old_kp)? else {
                 continue;
             };
-            let new_kp = map.keyframe_keypoint(keyframe_id, current_idx)?;
-            if map.map_point_for_keypoint(new_kp)?.is_none() {
-                map.add_observation(point_id, new_kp)?;
+            let new_kp = staged.keyframe_keypoint(keyframe_id, current_idx)?;
+            if staged.map_point_for_keypoint(new_kp)?.is_none() {
+                staged.add_observation(point_id, new_kp)?;
             }
         }
     }
@@ -2858,9 +2992,9 @@ fn insert_keyframe_into_map(
     let cull_min_observations = crate::env::env_usize("KIKO_MAP_CULL_MIN_OBSERVATIONS")
         .unwrap_or(DEFAULT_CULL_MIN_OBSERVATIONS)
         .max(DEFAULT_CULL_MIN_OBSERVATIONS);
-    if cull_min_observations > 1 && map.num_points() > 0 {
-        let points_before = map.num_points();
-        let culled_points = map.cull_points(cull_min_observations);
+    if cull_min_observations > 1 && staged.num_points() > 0 {
+        let points_before = staged.num_points();
+        let culled_points = staged.cull_points(cull_min_observations);
         debug_assert!(
             culled_points <= points_before,
             "culled more points than existed"
@@ -2872,14 +3006,15 @@ fn insert_keyframe_into_map(
         .iter()
         .zip(keyframe.landmark_indices().iter())
     {
-        let keypoint_ref = map.keyframe_keypoint(keyframe_id, det_idx)?;
-        if map.map_point_for_keypoint(keypoint_ref)?.is_some() {
+        let keypoint_ref = staged.keyframe_keypoint(keyframe_id, det_idx)?;
+        if staged.map_point_for_keypoint(keypoint_ref)?.is_some() {
             continue;
         }
         let descriptor = keyframe.detections().descriptors()[det_idx].quantize();
         let world = camera_to_world(pose_world, *landmark);
-        map.add_map_point(world, descriptor, keypoint_ref)?;
+        staged.add_map_point(world, descriptor, keypoint_ref)?;
     }
+    *map = staged;
     Ok(keyframe_id)
 }
 
@@ -2889,26 +3024,30 @@ fn remove_keyframe_from_graph_and_db(
     loop_db: Option<&mut KeyframeDatabase>,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
-    essential_graph.remove_keyframe(keyframe_id, map)?;
-    if let Some(loop_db) = loop_db {
-        loop_db.remove(keyframe_id);
+    let mut staged_map = map.clone();
+    let mut staged_graph = essential_graph.clone();
+    let staged_db = loop_db.as_deref().map(|database| {
+        let mut staged = database.clone();
+        staged.remove(keyframe_id);
+        staged
+    });
+
+    staged_graph.remove_keyframe(keyframe_id, &staged_map)?;
+    staged_map.remove_keyframe(keyframe_id)?;
+
+    *map = staged_map;
+    *essential_graph = staged_graph;
+    if let (Some(database), Some(staged)) = (loop_db, staged_db) {
+        *database = staged;
     }
-    map.remove_keyframe(keyframe_id)?;
     Ok(())
 }
 
-fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
-    let inv = pose_world.inverse();
-    let v = crate::math::transform_point(
-        inv.rotation(),
-        inv.translation(),
-        [point.x, point.y, point.z],
-    );
-    Point3 {
-        x: v[0],
-        y: v[1],
-        z: v[2],
-    }
+fn camera_to_world(
+    pose_world: crate::WorldToCamera,
+    point: crate::CameraPoint3,
+) -> crate::WorldPoint3 {
+    pose_world.inverse().transform_point(point)
 }
 
 fn build_shared_matches(
@@ -2969,13 +3108,13 @@ fn collect_window_points(
 
 fn apply_correction_event(
     map: &mut SlamMap,
-    current_version: MapVersion,
     correction: &CorrectionEvent,
 ) -> Result<(), ApplyCorrectionError> {
-    if correction.map_version != current_version {
-        return Err(ApplyCorrectionError::StaleVersion {
-            current: current_version,
-            correction: correction.map_version,
+    let current_snapshot = map.snapshot();
+    if correction.source_snapshot != current_snapshot {
+        return Err(ApplyCorrectionError::StaleSnapshot {
+            current: current_snapshot,
+            correction: correction.source_snapshot,
         });
     }
 
@@ -3001,8 +3140,11 @@ fn apply_correction_event(
                 keyframe_id: *keyframe_id,
             })?
             .pose();
-        let corrected = crate::local_ba::apply_se3_delta(current_pose, *delta);
-        map.set_keyframe_pose(*keyframe_id, corrected)?;
+        let corrected = crate::local_ba::apply_se3_delta(current_pose.into_legacy_pose(), *delta);
+        map.set_keyframe_pose(
+            *keyframe_id,
+            crate::WorldToCamera::from_legacy_pose(corrected),
+        )?;
     }
     for (point_id, delta) in &correction.correction.landmark_deltas {
         let current = map
@@ -3021,12 +3163,33 @@ fn apply_correction_event(
     Ok(())
 }
 
+fn apply_descriptor_response(
+    map: &SlamMap,
+    loop_db: &mut KeyframeDatabase,
+    response: DescriptorResponse,
+) -> bool {
+    response.source_snapshot == map.snapshot()
+        && map.keyframe(response.keyframe_id).is_some()
+        && loop_db.replace_descriptor(
+            response.keyframe_id,
+            response.descriptor,
+            DescriptorSource::Learned,
+        )
+}
+
 fn apply_loop_closure_correction(
     map: &mut SlamMap,
     essential_graph: &mut EssentialGraph,
     optimizer: &PoseGraphOptimizer,
     verified: &VerifiedLoop,
 ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
+    let current_snapshot = map.snapshot();
+    if verified.map_snapshot() != current_snapshot {
+        return Err(TrackerError::LoopMapSnapshotMismatch {
+            verified: verified.map_snapshot(),
+            current: current_snapshot,
+        });
+    }
     let query_kf = verified.query_kf();
     let match_kf = verified.match_kf();
     let match_pose = map
@@ -3035,21 +3198,22 @@ fn apply_loop_closure_correction(
             match_kf,
         )))?
         .pose();
-    let query_pose_estimate = verified.relative_pose();
-    let loop_relative = crate::Pose64::from_pose32(match_pose)
-        .inverse()
-        .compose(crate::Pose64::from_pose32(query_pose_estimate));
+    let query_pose_estimate = verified.query_pose_world();
+    let loop_relative = crate::Pose64::from_pose32(query_pose_estimate)
+        .compose(crate::Pose64::from_pose32(match_pose.into_legacy_pose()).inverse());
 
-    essential_graph.add_loop_edge(EssentialEdge {
-        a: match_kf,
-        b: query_kf,
-        kind: EssentialEdgeKind::Loop,
-        relative_pose: loop_relative,
-        information: loop_information_matrix(verified.inlier_count()),
-    });
+    let mut staged_graph = essential_graph.clone();
+    staged_graph.add_loop_edge(EssentialEdge::try_new(
+        match_kf,
+        query_kf,
+        EssentialEdgeKind::Loop,
+        loop_relative,
+        loop_information_matrix(verified.inlier_count()),
+    )?);
 
-    let input = essential_graph.pose_graph_input();
+    let input = staged_graph.pose_graph_input();
     if input.keyframe_ids.len() < MIN_OPTIMIZATION_KEYFRAMES || input.edges.is_empty() {
+        *essential_graph = staged_graph;
         return Ok(Vec::new());
     }
 
@@ -3062,11 +3226,18 @@ fn apply_loop_closure_correction(
                 keyframe_id,
             )))?
             .pose();
-        old_poses.insert(keyframe_id, pose);
-        initial_poses.push(crate::Pose64::from_pose32(pose));
+        let legacy_pose = pose.into_legacy_pose();
+        old_poses.insert(keyframe_id, legacy_pose);
+        initial_poses.push(crate::Pose64::from_pose32(legacy_pose));
     }
 
     let result = optimizer.optimize(&input.edges, &mut initial_poses)?;
+    if !result.converged {
+        return Err(PoseGraphError::OptimizationDidNotConverge {
+            iterations: result.iterations,
+        }
+        .into());
+    }
     let corrected_poses: HashMap<KeyframeId, Pose> = input
         .keyframe_ids
         .iter()
@@ -3079,12 +3250,16 @@ fn apply_loop_closure_correction(
         )
         .collect();
 
+    let mut staged_map = map.clone();
     for (keyframe_id, corrected_pose) in &corrected_poses {
-        map.set_keyframe_pose(*keyframe_id, *corrected_pose)?;
+        staged_map.set_keyframe_pose(
+            *keyframe_id,
+            crate::WorldToCamera::from_legacy_pose(*corrected_pose),
+        )?;
     }
 
     let mut point_updates = Vec::new();
-    for (point_id, point) in map.points() {
+    for (point_id, point) in staged_map.points() {
         let world = point.position();
         let world_vec = [world.x, world.y, world.z];
         let mut accum = [0.0_f32; 3];
@@ -3105,8 +3280,8 @@ fn apply_loop_closure_correction(
                 world_vec,
             );
             let corrected_world = camera_to_world(
-                new_pose,
-                Point3 {
+                crate::WorldToCamera::from_legacy_pose(new_pose),
+                crate::CameraPoint3 {
                     x: camera[0],
                     y: camera[1],
                     z: camera[2],
@@ -3132,10 +3307,16 @@ fn apply_loop_closure_correction(
     }
 
     for (point_id, corrected_world) in point_updates {
-        map.set_map_point_position(point_id, corrected_world)?;
+        staged_map.set_map_point_position(point_id, corrected_world)?;
     }
 
+    *map = staged_map;
+    *essential_graph = staged_graph;
     Ok(corrected_poses.into_iter().collect())
+}
+
+fn loop_pose_correction(current_query_pose: Pose, estimated_query_pose: Pose) -> Pose {
+    estimated_query_pose.compose(current_query_pose.inverse())
 }
 
 fn loop_translation_norm(pose: Pose) -> f32 {
@@ -3145,6 +3326,7 @@ fn loop_translation_norm(pose: Pose) -> f32 {
 
 fn loop_apply_error_kind(error: &TrackerError) -> LoopApplyError {
     match error {
+        TrackerError::LoopMapSnapshotMismatch { .. } => LoopApplyError::StaleCorrection,
         TrackerError::Map(crate::map::MapError::KeyframeNotFound(_)) => {
             LoopApplyError::MissingKeyframe
         }
@@ -3190,17 +3372,23 @@ fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
     info
 }
 
+struct ResolvedMapObservations {
+    observations: Vec<crate::Observation>,
+    match_indices: Vec<usize>,
+}
+
 fn build_map_observations(
     map: &SlamMap,
     keyframe_id: KeyframeId,
     matches: &Matches<Verified>,
     current: &Detections,
     intrinsics: PinholeIntrinsics,
-) -> Result<Vec<crate::Observation>, crate::PnpError> {
+) -> Result<ResolvedMapObservations, crate::PnpError> {
     let mut observations = Vec::with_capacity(matches.len());
+    let mut match_indices = Vec::with_capacity(matches.len());
     let current_len = current.len();
 
-    for &(ci, ki) in matches.indices() {
+    for (match_index, &(ci, ki)) in matches.indices().iter().enumerate() {
         if ci >= current_len {
             return Err(crate::PnpError::IndexOutOfBounds {
                 current_len,
@@ -3222,6 +3410,7 @@ fn build_map_observations(
         let pixel = current.keypoints()[ci];
         let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
         observations.push(obs);
+        match_indices.push(match_index);
     }
 
     if observations.len() < MIN_PNP_CORRESPONDENCES {
@@ -3230,7 +3419,10 @@ fn build_map_observations(
             actual: observations.len(),
         });
     }
-    Ok(observations)
+    Ok(ResolvedMapObservations {
+        observations,
+        match_indices,
+    })
 }
 
 fn median_parallax_px(
@@ -3355,7 +3547,11 @@ mod tests {
         .expect("detections");
         let mut map = SlamMap::new();
         let keyframe_id = map
-            .add_keyframe_from_detections(&detections, Timestamp::from_nanos(1), Pose::identity())
+            .add_keyframe_from_detections(
+                &detections,
+                Timestamp::from_nanos(1),
+                crate::WorldToCamera::identity(),
+            )
             .expect("keyframe");
         let keypoint = map.keyframe_keypoint(keyframe_id, 0).expect("keypoint ref");
         let point_id = map
@@ -3399,14 +3595,14 @@ mod tests {
             .add_keyframe_from_detections(
                 &detections_a,
                 Timestamp::from_nanos(10),
-                Pose::identity(),
+                crate::WorldToCamera::identity(),
             )
             .expect("kf a");
         let kf_b = map
             .add_keyframe_from_detections(
                 &detections_b,
                 Timestamp::from_nanos(11),
-                Pose::identity(),
+                crate::WorldToCamera::identity(),
             )
             .expect("kf b");
         let kp_a = map.keyframe_keypoint(kf_a, 0).expect("kp a");
@@ -3433,9 +3629,7 @@ mod tests {
         kf_b: KeyframeId,
     ) -> KeyframeEvent {
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
-        let mut event =
-            KeyframeEvent::try_new(request_id, MapVersion::initial(), kf_b, window, map)
-                .expect("event");
+        let mut event = KeyframeEvent::try_new(request_id, kf_b, window, map).expect("event");
         event.force_panic = true;
         event
     }
@@ -3485,7 +3679,7 @@ mod tests {
             &mut map,
             &keyframe,
             Timestamp::from_nanos(42),
-            Pose::identity(),
+            crate::WorldToCamera::identity(),
             None,
         )
         .expect("insert keyframe");
@@ -3511,6 +3705,139 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_insertion_rolls_back_after_shared_match_failure() {
+        let detections = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(20),
+                640,
+                480,
+                vec![Keypoint { x: 10.0, y: 20.0 }],
+                vec![1.0],
+                vec![make_descriptor()],
+            )
+            .expect("detections"),
+        );
+        let keyframe = Arc::new(
+            Keyframe::from_arc(
+                detections,
+                vec![Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                }],
+                vec![0],
+            )
+            .expect("keyframe"),
+        );
+        let mut map = SlamMap::new();
+        let generation_before = map.generation();
+        let invalid_shared = SharedMatches {
+            keyframe_id: KeyframeId::default(),
+            pairs: vec![(0, 0)],
+        };
+
+        let error = insert_keyframe_into_map(
+            &mut map,
+            &keyframe,
+            Timestamp::from_nanos(20),
+            crate::WorldToCamera::identity(),
+            Some(&invalid_shared),
+        )
+        .expect_err("invalid shared keyframe must fail insertion");
+
+        assert!(matches!(
+            error,
+            TrackerError::Map(crate::map::MapError::KeyframeNotFound(_))
+        ));
+        assert_eq!(map.num_keyframes(), 0);
+        assert_eq!(map.num_points(), 0);
+        assert_eq!(map.generation(), generation_before);
+        assert_map_invariants(&map).expect("rolled-back map invariants");
+    }
+
+    #[test]
+    fn map_observation_batch_preserves_original_match_indices() {
+        let keypoints: Vec<Keypoint> = (0..5)
+            .map(|idx| Keypoint {
+                x: 100.0 + idx as f32 * 10.0,
+                y: 80.0,
+            })
+            .collect();
+        let reference = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(30),
+                320,
+                240,
+                keypoints.clone(),
+                vec![1.0; 5],
+                vec![make_descriptor(); 5],
+            )
+            .expect("reference detections"),
+        );
+        let current = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(31),
+                320,
+                240,
+                keypoints,
+                vec![1.0; 5],
+                vec![make_descriptor(); 5],
+            )
+            .expect("current detections"),
+        );
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe_from_detections(
+                reference.as_ref(),
+                Timestamp::from_nanos(30),
+                crate::WorldToCamera::identity(),
+            )
+            .expect("map keyframe");
+        for idx in 1..5 {
+            let keypoint = map
+                .keyframe_keypoint(keyframe_id, idx)
+                .expect("keypoint ref");
+            map.add_map_point(
+                Point3 {
+                    x: idx as f32,
+                    y: 0.0,
+                    z: 5.0,
+                },
+                make_descriptor().quantize(),
+                keypoint,
+            )
+            .expect("map point");
+        }
+        let matches = Matches::new_verified(
+            Arc::clone(&current),
+            Arc::clone(&reference),
+            (0..5).map(|idx| (idx, idx)).collect(),
+            vec![1.0; 5],
+        )
+        .expect("verified matches");
+        let intrinsics = PinholeIntrinsics::try_from(&crate::dataset::CameraIntrinsics {
+            fx: 200.0,
+            fy: 200.0,
+            cx: 160.0,
+            cy: 120.0,
+            width: 320,
+            height: 240,
+        })
+        .expect("intrinsics");
+
+        let batch =
+            build_map_observations(&map, keyframe_id, &matches, current.as_ref(), intrinsics)
+                .expect("resolved observations");
+
+        assert_eq!(batch.observations.len(), 4);
+        assert_eq!(batch.match_indices, vec![1, 2, 3, 4]);
+        assert_eq!(batch.observations[0].world().x, 1.0);
+    }
+
+    #[test]
     fn backend_window_enforces_non_empty_unique_keyframes() {
         let duplicate = KeyframeId::default();
         assert!(matches!(
@@ -3524,11 +3851,11 @@ mod tests {
     }
 
     #[test]
-    fn correction_apply_rejects_stale_version() {
+    fn correction_apply_rejects_stale_snapshot() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
-            map_version: MapVersion::initial(),
+            source_snapshot: map.snapshot(),
             trigger_keyframe: keyframe_id,
             correction: BaCorrection {
                 pose_deltas: vec![(keyframe_id, [0.0; 6])],
@@ -3539,10 +3866,36 @@ mod tests {
                 },
             },
         };
-        let stale = MapVersion::initial().next();
+        let position = map.point(point_id).expect("map point").position();
+        map.set_map_point_position(point_id, position)
+            .expect("advance map generation");
         assert!(matches!(
-            apply_correction_event(&mut map, stale, &correction),
-            Err(ApplyCorrectionError::StaleVersion { .. })
+            apply_correction_event(&mut map, &correction),
+            Err(ApplyCorrectionError::StaleSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn correction_apply_rejects_different_map_instance() {
+        let (map, keyframe_id, point_id) = make_map_with_single_point();
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
+            source_snapshot: map.snapshot(),
+            trigger_keyframe: keyframe_id,
+            correction: BaCorrection {
+                pose_deltas: vec![(keyframe_id, [0.0; 6])],
+                landmark_deltas: vec![(point_id, [0.0; 3])],
+                result: BaResult::Converged {
+                    iterations: 1,
+                    final_cost: 0.0,
+                },
+            },
+        };
+        let mut other_map = SlamMap::new();
+
+        assert!(matches!(
+            apply_correction_event(&mut other_map, &correction),
+            Err(ApplyCorrectionError::StaleSnapshot { .. })
         ));
     }
 
@@ -3553,16 +3906,17 @@ mod tests {
             [[1.0, 0.0, 0.0], [0.0, 0.999, -0.01], [0.0, 0.01, 0.999]],
             [0.2, -0.1, 0.05],
         );
-        let corrected_point = Point3 {
+        let corrected_point: crate::WorldPoint3 = Point3 {
             x: 0.4,
             y: -0.3,
             z: 2.1,
         };
         let initial_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
-        let pose_delta = crate::local_ba::se3_delta_between(initial_pose, corrected_pose);
+        let pose_delta =
+            crate::local_ba::se3_delta_between(initial_pose.into_legacy_pose(), corrected_pose);
         let correction = CorrectionEvent {
-            request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
-            map_version: MapVersion::initial(),
+            request_id: BackendRequestId(NonZeroU64::new(3).expect("non-zero")),
+            source_snapshot: map.snapshot(),
             trigger_keyframe: keyframe_id,
             correction: BaCorrection {
                 pose_deltas: vec![(keyframe_id, pose_delta)],
@@ -3581,8 +3935,7 @@ mod tests {
             },
         };
 
-        apply_correction_event(&mut map, MapVersion::initial(), &correction)
-            .expect("correction apply");
+        apply_correction_event(&mut map, &correction).expect("correction apply");
         assert_map_invariants(&map).expect("post-correction invariants");
 
         let stored_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
@@ -3626,14 +3979,9 @@ mod tests {
             BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
-        let event = KeyframeEvent::try_new(
-            worker.next_request_id(),
-            MapVersion::initial(),
-            kf_b,
-            window,
-            map,
-        )
-        .expect("event");
+        let source_snapshot = map.snapshot();
+        let event =
+            KeyframeEvent::try_new(worker.next_request_id(), kf_b, window, map).expect("event");
         worker.try_submit(event).expect("submit");
 
         let mut response = None;
@@ -3654,6 +4002,7 @@ mod tests {
         };
         match response {
             BackendResponse::Correction(correction) => {
+                assert_eq!(correction.source_snapshot, source_snapshot);
                 assert!(matches!(
                     correction.correction.result,
                     BaResult::Degenerate { .. }
@@ -3856,7 +4205,6 @@ mod tests {
         let window = BackendWindow::try_new(vec![kf_a2, kf_b2]).expect("window");
         let ok_event = KeyframeEvent::try_new(
             BackendRequestId::from_counter(&mut req_counter),
-            MapVersion::initial(),
             kf_b2,
             window,
             map_ok,
@@ -3905,10 +4253,11 @@ mod tests {
             vec![128_u8; 16 * 12],
         )
         .expect("frame");
+        let source_snapshot = SlamMap::new().snapshot();
         worker
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot,
                 frame,
             })
             .expect("submit descriptor request");
@@ -3927,9 +4276,59 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let response = response.expect("descriptor response");
-        assert_eq!(response.map_version, MapVersion::initial());
+        assert_eq!(response.source_snapshot, source_snapshot);
         assert_eq!(response.descriptor, descriptor);
         assert_eq!(*calls.lock().expect("calls lock"), 1);
+    }
+
+    #[test]
+    fn descriptor_response_requires_exact_map_snapshot() {
+        let (mut map, keyframe_id, _) = make_map_with_single_point();
+        let bootstrap = make_global_descriptor_basis(1);
+        let learned = make_global_descriptor_basis(2);
+        let mut loop_db = KeyframeDatabase::new(0);
+        loop_db.insert_with_source(
+            keyframe_id,
+            bootstrap.clone(),
+            crate::loop_closure::DescriptorSource::Bootstrap,
+        );
+
+        assert!(apply_descriptor_response(
+            &map,
+            &mut loop_db,
+            DescriptorResponse {
+                keyframe_id,
+                source_snapshot: map.snapshot(),
+                descriptor: learned.clone(),
+            },
+        ));
+        assert_eq!(
+            loop_db.descriptor_source(keyframe_id),
+            Some(crate::loop_closure::DescriptorSource::Learned)
+        );
+
+        loop_db.insert_with_source(
+            keyframe_id,
+            bootstrap,
+            crate::loop_closure::DescriptorSource::Bootstrap,
+        );
+        let stale_snapshot = map.snapshot();
+        let pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        map.set_keyframe_pose(keyframe_id, pose)
+            .expect("advance map generation");
+        assert!(!apply_descriptor_response(
+            &map,
+            &mut loop_db,
+            DescriptorResponse {
+                keyframe_id,
+                source_snapshot: stale_snapshot,
+                descriptor: learned,
+            },
+        ));
+        assert_eq!(
+            loop_db.descriptor_source(keyframe_id),
+            Some(crate::loop_closure::DescriptorSource::Bootstrap)
+        );
     }
 
     #[test]
@@ -3971,7 +4370,7 @@ mod tests {
         supervisor
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot: SlamMap::new().snapshot(),
                 frame: frame.clone(),
             })
             .expect("submit panic request");
@@ -3995,7 +4394,7 @@ mod tests {
         supervisor
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot: SlamMap::new().snapshot(),
                 frame,
             })
             .expect("submit recovered request");
@@ -4023,6 +4422,60 @@ mod tests {
         assert_eq!(*calls.lock().expect("calls lock"), 1);
     }
 
+    #[test]
+    fn descriptor_supervisor_uses_all_configured_respawn_attempts() {
+        let config = GlobalDescriptorConfig::new(2).expect("config");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let descriptor = make_global_descriptor_basis(23);
+        let factory: DescriptorExtractorFactory = {
+            let spawn_count = Arc::clone(&spawn_count);
+            let descriptor = descriptor.clone();
+            Arc::new(move || {
+                let spawn_idx = spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
+                if spawn_idx < 2 {
+                    None
+                } else {
+                    Some(Box::new(StubDescriptorExtractor {
+                        descriptor: descriptor.clone(),
+                        calls: Arc::new(Mutex::new(0)),
+                    }) as Box<dyn PlaceDescriptorExtractor>)
+                }
+            })
+        };
+        let mut supervisor =
+            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(79),
+            Timestamp::from_nanos(79),
+            16,
+            12,
+            vec![128_u8; 16 * 12],
+        )
+        .expect("frame");
+
+        let first = supervisor.submit(DescriptorRequest {
+            keyframe_id: KeyframeId::default(),
+            source_snapshot: SlamMap::new().snapshot(),
+            frame: frame.clone(),
+        });
+        assert!(matches!(first, Err(SubmitDescriptorError::Disconnected)));
+        assert_eq!(supervisor.respawn_count(), 1);
+        assert!(!supervisor.spawn_exhausted);
+
+        supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: SlamMap::new().snapshot(),
+                frame,
+            })
+            .expect("second configured respawn should recover");
+        assert_eq!(supervisor.respawn_count(), 2);
+        assert_eq!(spawn_count.load(AtomicOrdering::SeqCst), 3);
+        assert!(supervisor.has_worker());
+        assert!(!supervisor.spawn_exhausted);
+    }
+
     fn make_loop_closure_apply_fixture() -> (
         SlamMap,
         EssentialGraph,
@@ -4042,7 +4495,7 @@ mod tests {
             .add_keyframe(
                 FrameId::new(100),
                 Timestamp::from_nanos(100),
-                Pose::identity(),
+                crate::WorldToCamera::identity(),
                 image_size,
                 keypoints.clone(),
             )
@@ -4051,10 +4504,10 @@ mod tests {
             .add_keyframe(
                 FrameId::new(101),
                 Timestamp::from_nanos(101),
-                Pose::from_rt(
+                crate::WorldToCamera::from_legacy_pose(Pose::from_rt(
                     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                     [1.0, 0.0, 0.0],
-                ),
+                )),
                 image_size,
                 keypoints.clone(),
             )
@@ -4063,10 +4516,10 @@ mod tests {
             .add_keyframe(
                 FrameId::new(102),
                 Timestamp::from_nanos(102),
-                Pose::from_rt(
+                crate::WorldToCamera::from_legacy_pose(Pose::from_rt(
                     [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                     [2.4, 0.2, 0.0],
-                ),
+                )),
                 image_size,
                 keypoints.clone(),
             )
@@ -4119,6 +4572,7 @@ mod tests {
         let verified = crate::loop_closure::VerifiedLoop::from_parts(
             kf2,
             kf0,
+            map.snapshot(),
             Pose::from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 [2.0, 0.0, 0.0],
@@ -4195,7 +4649,116 @@ mod tests {
             .expect("apply loop closure");
         let snapshot = essential_graph.snapshot();
         assert_eq!(snapshot.loop_edges.len(), 1);
-        assert_eq!(snapshot.loop_edges[0].kind, EssentialEdgeKind::Loop);
+        assert_eq!(snapshot.loop_edges[0].kind(), EssentialEdgeKind::Loop);
+    }
+
+    #[test]
+    fn loop_correction_threshold_uses_pose_delta_not_absolute_pose() {
+        let current = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1_000.0, -500.0, 25.0],
+        );
+        let estimate = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1_000.1, -500.0, 25.0],
+        );
+
+        let correction = loop_pose_correction(current, estimate);
+
+        assert!((loop_translation_norm(correction) - 0.1).abs() < 1e-4);
+        assert!(loop_rotation_angle_deg(correction) < 1e-4);
+    }
+
+    #[test]
+    fn loop_pose_correction_maps_current_camera_point_to_estimated_camera() {
+        let current = crate::math::se3_exp_f64([0.8, -0.3, 0.2, 0.25, -0.15, 0.1]).to_pose32();
+        let estimate = crate::math::se3_exp_f64([-0.4, 0.7, 0.5, -0.2, 0.12, 0.3]).to_pose32();
+        let correction = loop_pose_correction(current, estimate);
+        let world_point = [1.3, -0.6, 4.2];
+        let point_in_current =
+            crate::math::transform_point(current.rotation(), current.translation(), world_point);
+        let expected_in_estimate =
+            crate::math::transform_point(estimate.rotation(), estimate.translation(), world_point);
+        let corrected = crate::math::transform_point(
+            correction.rotation(),
+            correction.translation(),
+            point_in_current,
+        );
+
+        for axis in 0..3 {
+            assert!(
+                (corrected[axis] - expected_in_estimate[axis]).abs() < 2e-5,
+                "camera-point correction mismatch on axis {axis}"
+            );
+        }
+    }
+
+    #[test]
+    fn loop_closure_rolls_back_graph_and_map_on_pcg_failure() {
+        let (mut map, mut essential_graph, verified, query_kf, before_points) =
+            make_loop_closure_apply_fixture();
+        let defaults = PoseGraphConfig::default();
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::new_unchecked_for_test(
+            defaults.max_iterations(),
+            0,
+            defaults.pcg_tol(),
+            defaults.huber_delta(),
+        ));
+        let pose_before = map.keyframe(query_kf).expect("query keyframe").pose();
+        let generation_before = map.generation();
+        let loop_edges_before = essential_graph.snapshot().loop_edges.len();
+
+        let error =
+            apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+                .expect_err("PCG failure must reject loop correction");
+
+        assert!(matches!(
+            error,
+            TrackerError::PoseGraph(PoseGraphError::PcgDidNotConverge { .. })
+        ));
+        assert_eq!(
+            essential_graph.snapshot().loop_edges.len(),
+            loop_edges_before
+        );
+        assert_eq!(map.generation(), generation_before);
+        assert_eq!(
+            map.keyframe(query_kf)
+                .expect("query keyframe")
+                .pose()
+                .translation(),
+            pose_before.translation()
+        );
+        for (point_id, position) in before_points {
+            let actual = map.point(point_id).expect("map point").position();
+            assert_eq!(
+                [actual.x, actual.y, actual.z],
+                [position.x, position.y, position.z]
+            );
+        }
+    }
+
+    #[test]
+    fn loop_closure_rejects_stale_verified_map_snapshot() {
+        let (mut map, mut essential_graph, verified, query_kf, _) =
+            make_loop_closure_apply_fixture();
+        let current_pose = map.keyframe(query_kf).expect("query keyframe").pose();
+        map.set_keyframe_pose(query_kf, current_pose)
+            .expect("advance map generation");
+        let loop_edges_before = essential_graph.snapshot().loop_edges.len();
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+
+        let error =
+            apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+                .expect_err("stale verified loop must be rejected");
+
+        assert!(matches!(
+            error,
+            TrackerError::LoopMapSnapshotMismatch { .. }
+        ));
+        assert_eq!(
+            essential_graph.snapshot().loop_edges.len(),
+            loop_edges_before
+        );
     }
 
     #[test]
@@ -4224,6 +4787,50 @@ mod tests {
         assert!(loop_db.descriptor_source(removed_kf).is_none());
         let input = essential_graph.pose_graph_input();
         assert!(input.keyframe_ids.iter().all(|&id| id != removed_kf));
+    }
+
+    #[test]
+    fn remove_keyframe_rolls_back_graph_and_db_when_map_commit_fails() {
+        let (mut map, mut essential_graph, _verified, removed_kf, _before_points) =
+            make_loop_closure_apply_fixture();
+        let mut loop_db = KeyframeDatabase::new(0);
+        loop_db.insert_with_source(
+            removed_kf,
+            make_global_descriptor_basis(0),
+            crate::loop_closure::DescriptorSource::Bootstrap,
+        );
+        map.remove_keyframe(removed_kf)
+            .expect("remove map entry to inject late failure");
+        let parent_before = essential_graph.parent_of(removed_kf);
+
+        let error = remove_keyframe_from_graph_and_db(
+            &mut map,
+            &mut essential_graph,
+            Some(&mut loop_db),
+            removed_kf,
+        )
+        .expect_err("missing map keyframe must abort staged removal");
+
+        assert!(matches!(
+            error,
+            TrackerError::Map(crate::map::MapError::KeyframeNotFound(id)) if id == removed_kf
+        ));
+        assert_eq!(essential_graph.parent_of(removed_kf), parent_before);
+        assert!(loop_db.descriptor_source(removed_kf).is_some());
+    }
+
+    #[test]
+    fn inference_timeout_and_quarantine_require_pipeline_shutdown() {
+        for error in [
+            TrackerError::Inference(InferenceError::WatchdogTimeout {
+                model: "test",
+                timeout_ms: 1,
+            }),
+            TrackerError::Inference(InferenceError::SessionQuarantined { model: "test" }),
+        ] {
+            assert!(error.requires_pipeline_shutdown());
+        }
+        assert!(!TrackerError::KeyframeRejected { landmarks: 0 }.requires_pipeline_shutdown());
     }
 
     #[test]

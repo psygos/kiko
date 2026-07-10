@@ -3,9 +3,8 @@ use std::fs;
 use crate::env::env_bool;
 
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
-use ort::execution_providers::ExecutionProvider;
-use ort::execution_providers::ExecutionProviderDispatch;
-use ort::execution_providers::cpu::CPUExecutionProvider;
+use ort::ep::ExecutionProvider;
+use ort::ep::{CPU, ExecutionProviderDispatch};
 
 use super::InferenceError;
 
@@ -39,6 +38,7 @@ impl InferenceBackend {
 pub struct BackendSelection {
     selected: InferenceBackend,
     providers: Vec<ExecutionProviderDispatch>,
+    strict_accelerator: bool,
 }
 
 impl BackendSelection {
@@ -49,11 +49,16 @@ impl BackendSelection {
     pub fn providers(&self) -> &[ExecutionProviderDispatch] {
         &self.providers
     }
+
+    pub fn strict_accelerator(&self) -> bool {
+        self.strict_accelerator
+    }
 }
 
 pub(crate) fn select_backend(
     requested: InferenceBackend,
 ) -> Result<BackendSelection, InferenceError> {
+    let explicit = requested != InferenceBackend::Auto;
     let desired = match requested {
         InferenceBackend::Auto => detect_backend(),
         other => other,
@@ -67,18 +72,24 @@ pub(crate) fn select_backend(
             if let Some(ep) = coreml_provider()? {
                 providers.push(ep);
                 selected = InferenceBackend::CoreMLGpu;
+            } else if explicit {
+                return Err(InferenceError::BackendUnavailable { requested });
             }
         }
         InferenceBackend::Cuda => {
             if let Some(ep) = cuda_provider()? {
                 providers.push(ep);
                 selected = InferenceBackend::Cuda;
+            } else if explicit {
+                return Err(InferenceError::BackendUnavailable { requested });
             }
         }
         InferenceBackend::TensorRT => {
             if let Some(ep) = tensorrt_provider()? {
                 providers.push(ep);
                 selected = InferenceBackend::TensorRT;
+            } else if explicit {
+                return Err(InferenceError::BackendUnavailable { requested });
             } else if let Some(ep) = cuda_provider()? {
                 providers.push(ep);
                 selected = InferenceBackend::Cuda;
@@ -96,16 +107,16 @@ pub(crate) fn select_backend(
         selected = InferenceBackend::Cpu;
     }
 
-    let use_cpu_arena = env_bool("KIKO_ORT_CPU_ARENA").unwrap_or(true);
-    providers.push(
-        CPUExecutionProvider::default()
-            .with_arena_allocator(use_cpu_arena)
-            .build(),
-    );
+    let strict_accelerator = explicit && selected != InferenceBackend::Cpu;
+    if !strict_accelerator {
+        let use_cpu_arena = env_bool("KIKO_ORT_CPU_ARENA").unwrap_or(true);
+        providers.push(CPU::default().with_arena_allocator(use_cpu_arena).build());
+    }
 
     Ok(BackendSelection {
         selected,
         providers,
+        strict_accelerator,
     })
 }
 
@@ -138,10 +149,10 @@ fn is_jetson() -> bool {
 fn coreml_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> {
     #[cfg(feature = "ort-coreml")]
     {
-        use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
+        use ort::ep::CoreML;
+        use ort::ep::coreml::ComputeUnits;
 
-        let ep =
-            CoreMLExecutionProvider::default().with_compute_units(CoreMLComputeUnits::CPUAndGPU);
+        let ep = CoreML::default().with_compute_units(ComputeUnits::CPUAndGPU);
         if !ep.supported_by_platform() {
             return Ok(None);
         }
@@ -160,9 +171,9 @@ fn coreml_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError
 fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> {
     #[cfg(feature = "ort-cuda")]
     {
-        use ort::execution_providers::CUDAExecutionProvider;
+        use ort::ep::CUDA;
 
-        let ep = CUDAExecutionProvider::default();
+        let ep = CUDA::default();
         if !ep.supported_by_platform() {
             return Ok(None);
         }
@@ -181,9 +192,9 @@ fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> 
 fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> {
     #[cfg(feature = "ort-tensorrt")]
     {
-        use ort::execution_providers::TensorRTExecutionProvider;
+        use ort::ep::TensorRT;
 
-        let ep = TensorRTExecutionProvider::default();
+        let ep = TensorRT::default();
         if !ep.supported_by_platform() {
             return Ok(None);
         }

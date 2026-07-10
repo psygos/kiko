@@ -1,8 +1,8 @@
 use std::num::NonZeroUsize;
 
 use crate::{
-    CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Point3, Pose, Raw, Timestamp,
-    VizPacket, env::env_f32,
+    CameraPoint3, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Pose, Raw,
+    Timestamp, VizPacket, WorldToCamera, env::env_f32,
 };
 
 use std::collections::HashMap;
@@ -69,7 +69,13 @@ impl std::fmt::Display for VizLogError {
     }
 }
 
-impl std::error::Error for VizLogError {}
+impl std::error::Error for VizLogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rerun(err) => Some(err),
+        }
+    }
+}
 
 impl From<rerun::RecordingStreamError> for VizLogError {
     fn from(err: rerun::RecordingStreamError) -> Self {
@@ -161,7 +167,7 @@ impl RerunSink {
     pub fn log_with_points(
         &mut self,
         packet: &VizPacket<Raw>,
-        points: Option<&[Point3]>,
+        points: Option<&[CameraPoint3]>,
     ) -> Result<(), VizLogError> {
         let index = self.frame_index;
         self.frame_index = self.frame_index.saturating_add(1);
@@ -209,14 +215,18 @@ impl RerunSink {
             if !points.is_empty() {
                 let positions: Vec<[f32; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
                 let cloud = rerun::Points3D::new(positions);
-                self.rec.log("world/points", &cloud)?;
+                self.rec.log("world/camera/points", &cloud)?;
             }
         }
 
         Ok(())
     }
 
-    pub fn log_pose(&mut self, timestamp: Timestamp, pose: &Pose) -> Result<(), VizLogError> {
+    pub fn log_pose(
+        &mut self,
+        timestamp: Timestamp,
+        pose: &WorldToCamera,
+    ) -> Result<(), VizLogError> {
         self.set_time(timestamp);
 
         if !self.logged_world {
@@ -252,7 +262,7 @@ impl RerunSink {
 
         let mut positions: HashMap<crate::map::KeyframeId, [f32; 3]> = HashMap::new();
         for node in &snapshot.nodes {
-            let pos = pose_position(node.pose);
+            let pos = pose_position(node.pose.into_legacy_pose());
             positions.insert(node.id, pos);
         }
 

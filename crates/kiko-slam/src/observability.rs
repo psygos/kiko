@@ -44,8 +44,6 @@ const PATH_TRI_CANDIDATES: &str = "diagnostics/triangulation/candidates";
 const PATH_TRI_KEPT: &str = "diagnostics/triangulation/kept";
 const PATH_TRI_DROPPED_DISPARITY: &str = "diagnostics/triangulation/dropped_disparity";
 const PATH_TRI_DROPPED_DEPTH: &str = "diagnostics/triangulation/dropped_depth";
-const PATH_TRI_DROPPED_OUT_OF_BOUNDS: &str = "diagnostics/triangulation/dropped_out_of_bounds";
-const PATH_TRI_DROPPED_DUPLICATE: &str = "diagnostics/triangulation/dropped_duplicate";
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
 const PATH_BA_ITERATIONS: &str = "diagnostics/ba/iterations";
@@ -121,11 +119,6 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_TRI_KEPT, stats.kept as f64));
         scalars.push((PATH_TRI_DROPPED_DISPARITY, stats.dropped_disparity as f64));
         scalars.push((PATH_TRI_DROPPED_DEPTH, stats.dropped_depth as f64));
-        scalars.push((
-            PATH_TRI_DROPPED_OUT_OF_BOUNDS,
-            stats.dropped_out_of_bounds as f64,
-        ));
-        scalars.push((PATH_TRI_DROPPED_DUPLICATE, stats.dropped_duplicate as f64));
     }
 
     if let Some(ba_result) = diag.ba_result.as_ref() {
@@ -380,9 +373,11 @@ impl RerunSink {
             &rerun::Scalars::single(stats.stored_keyframes as f64),
         )?;
         let state_scalar = match stats.state {
+            ReconState::AwaitingBackend => 0.5,
             ReconState::Nominal => 0.0,
             ReconState::Rebuilding { .. } => 1.0,
-            ReconState::Down => 2.0,
+            ReconState::Degraded { .. } => 2.0,
+            ReconState::Down => 3.0,
         };
         rec.log(PATH_DENSE_STATE, &rerun::Scalars::single(state_scalar))?;
         Ok(())
@@ -426,9 +421,7 @@ mod tests {
             candidate_matches: 10,
             kept: 8,
             dropped_disparity: 1,
-            dropped_out_of_bounds: 0,
             dropped_depth: 1,
-            dropped_duplicate: 0,
         });
         let scalars = diagnostics_scalars(&diag);
         assert!(

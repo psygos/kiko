@@ -9,7 +9,7 @@ use super::{
 use crate::Pose64;
 use crate::map::{ImageSize, SlamMap};
 use crate::math::se3_exp_f64;
-use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
+use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp, WorldToCamera};
 
 #[derive(Clone, Debug)]
 struct Lcg {
@@ -38,6 +38,57 @@ fn scalar_block(diagonal: f64) -> [[f64; 6]; 6] {
     block
 }
 
+fn transform_point(pose: Pose64, point: [f64; 3]) -> [f64; 3] {
+    let rotation = pose.rotation();
+    let translation = pose.translation();
+    [
+        rotation[0][0] * point[0]
+            + rotation[0][1] * point[1]
+            + rotation[0][2] * point[2]
+            + translation[0],
+        rotation[1][0] * point[0]
+            + rotation[1][1] * point[1]
+            + rotation[1][2] * point[2]
+            + translation[1],
+        rotation[2][0] * point[0]
+            + rotation[2][1] * point[1]
+            + rotation[2][2] * point[2]
+            + translation[2],
+    ]
+}
+
+fn point_distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.into_iter()
+        .zip(b)
+        .map(|(lhs, rhs)| (lhs - rhs) * (lhs - rhs))
+        .sum::<f64>()
+        .sqrt()
+}
+
+fn raw_left_increment_central_difference(
+    edge: &PoseGraphEdge,
+    poses: &[Pose64],
+    pose_idx: usize,
+    eps: f64,
+) -> [[f64; 6]; 6] {
+    let mut jacobian = [[0.0_f64; 6]; 6];
+    for axis in 0..6 {
+        let mut plus = poses.to_vec();
+        let mut minus = poses.to_vec();
+        let mut delta = [0.0_f64; 6];
+        delta[axis] = eps;
+        plus[pose_idx] = se3_exp_f64(delta).compose(plus[pose_idx]);
+        delta[axis] = -eps;
+        minus[pose_idx] = se3_exp_f64(delta).compose(minus[pose_idx]);
+        let error_plus = compute_edge_error(edge, &plus).expect("positive perturbation");
+        let error_minus = compute_edge_error(edge, &minus).expect("negative perturbation");
+        for row in 0..6 {
+            jacobian[row][axis] = (error_plus[row] - error_minus[row]) / (2.0 * eps);
+        }
+    }
+    jacobian
+}
+
 fn make_map_for_essential_graph() -> (
     SlamMap,
     crate::map::KeyframeId,
@@ -55,7 +106,7 @@ fn make_map_for_essential_graph() -> (
         .add_keyframe(
             FrameId::new(1),
             Timestamp::from_nanos(1),
-            Pose::identity(),
+            WorldToCamera::identity(),
             size,
             keypoints.clone(),
         )
@@ -64,10 +115,10 @@ fn make_map_for_essential_graph() -> (
         .add_keyframe(
             FrameId::new(2),
             Timestamp::from_nanos(2),
-            Pose::from_rt(
+            WorldToCamera::from_legacy_pose(Pose::from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 [1.0, 0.0, 0.0],
-            ),
+            )),
             size,
             keypoints.clone(),
         )
@@ -76,10 +127,10 @@ fn make_map_for_essential_graph() -> (
         .add_keyframe(
             FrameId::new(3),
             Timestamp::from_nanos(3),
-            Pose::from_rt(
+            WorldToCamera::from_legacy_pose(Pose::from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 [2.0, 0.0, 0.0],
-            ),
+            )),
             size,
             keypoints,
         )
@@ -134,7 +185,7 @@ fn make_chain_keyframes(count: usize) -> (SlamMap, Vec<crate::map::KeyframeId>) 
             .add_keyframe(
                 FrameId::new((idx + 1) as u64),
                 Timestamp::from_nanos((idx + 1) as i64),
-                pose,
+                WorldToCamera::from_legacy_pose(pose),
                 size,
                 keypoints.clone(),
             )
@@ -228,6 +279,25 @@ fn pcg_solves_identity_in_one_iteration() {
 }
 
 #[test]
+fn pcg_handles_tiny_scale_aware_curvature() {
+    let mut h = BlockCsr6x6::new(1);
+    h.insert(0, 0, scalar_block(1e20)).expect("insert");
+    let b = vec![1.0; 6];
+    let mut x = vec![0.0; 6];
+
+    let result = solve_pcg(&h, &b, &mut x, 10, 1e-12).expect("pcg");
+
+    assert!(
+        result.converged,
+        "scaled system did not converge: {result:?}"
+    );
+    assert_eq!(result.iterations, 1);
+    for value in x {
+        assert!((value - 1e-20).abs() < 1e-30);
+    }
+}
+
+#[test]
 fn pcg_converges_on_small_spd_system() {
     let mut h = BlockCsr6x6::new(2);
     h.insert(0, 0, scalar_block(4.0)).expect("insert");
@@ -271,13 +341,8 @@ fn pcg_zero_rhs_returns_zero_solution() {
 fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
     let pose_a = Pose64::identity();
     let pose_b = se3_exp_f64([0.2, -0.1, 0.05, 0.03, -0.02, 0.01]);
-    let measurement = pose_a.inverse().compose(pose_b);
-    let edge = PoseGraphEdge {
-        from: 0,
-        to: 1,
-        measurement,
-        information: scalar_block(1.0),
-    };
+    let measurement = pose_b.compose(pose_a.inverse());
+    let edge = PoseGraphEdge::try_new(0, 1, measurement, scalar_block(1.0)).expect("edge");
     let error = compute_edge_error(&edge, &[pose_a, pose_b]).expect("edge error");
     let norm: f64 = error.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert!(norm < 1e-9, "expected near-zero error, got {norm}");
@@ -287,34 +352,85 @@ fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
 fn pose_graph_edge_jacobians_match_finite_difference() {
     let pose_a = se3_exp_f64([0.1, 0.05, -0.02, 0.02, -0.01, 0.03]);
     let pose_b = se3_exp_f64([0.3, -0.08, 0.12, -0.02, 0.03, -0.01]);
-    let measurement = pose_a
-        .inverse()
-        .compose(pose_b)
-        .compose(se3_exp_f64([0.01, -0.005, 0.002, 0.001, -0.0015, 0.0008]));
-    let edge = PoseGraphEdge {
-        from: 0,
-        to: 1,
-        measurement,
-        information: scalar_block(1.0),
-    };
+    let measurement = pose_b
+        .compose(pose_a.inverse())
+        .compose(se3_exp_f64([0.1, -0.05, 0.02, 0.25, -0.18, 0.12]));
+    let edge = PoseGraphEdge::try_new(0, 1, measurement, scalar_block(1.0)).expect("edge");
     let poses = [pose_a, pose_b];
     let (j_from, j_to) = compute_edge_jacobians(&edge, &poses).expect("jacobians");
+    let expected_from = raw_left_increment_central_difference(&edge, &poses, 0, 1e-6);
+    let expected_to = raw_left_increment_central_difference(&edge, &poses, 1, 1e-6);
     for row in 0..6 {
         for col in 0..6 {
-            assert!(j_from[row][col].is_finite(), "non-finite J_from entry");
-            assert!(j_to[row][col].is_finite(), "non-finite J_to entry");
+            assert!(
+                (j_from[row][col] - expected_from[row][col]).abs() < 1e-9,
+                "J_from mismatch at ({row}, {col}): actual={}, expected={}",
+                j_from[row][col],
+                expected_from[row][col]
+            );
+            assert!(
+                (j_to[row][col] - expected_to[row][col]).abs() < 1e-9,
+                "J_to mismatch at ({row}, {col}): actual={}, expected={}",
+                j_to[row][col],
+                expected_to[row][col]
+            );
         }
     }
 }
 
-fn edge(from: usize, to: usize, from_pose: Pose64, to_pose: Pose64) -> PoseGraphEdge {
-    let measurement = from_pose.inverse().compose(to_pose);
-    PoseGraphEdge {
-        from,
-        to,
-        measurement,
-        information: scalar_block(1.0),
+#[test]
+fn pose_graph_edge_rejects_invalid_information_and_self_edges() {
+    let pose = Pose64::identity();
+    assert!(PoseGraphEdge::try_new(0, 1, pose, scalar_block(1e-20)).is_ok());
+    assert!(matches!(
+        PoseGraphEdge::try_new(0, 0, pose, scalar_block(1.0)),
+        Err(super::PoseGraphEdgeError::SelfEdge { index: 0 })
+    ));
+
+    let mut nonfinite = scalar_block(1.0);
+    nonfinite[2][3] = f64::NAN;
+    assert!(matches!(
+        PoseGraphEdge::try_new(0, 1, pose, nonfinite),
+        Err(super::PoseGraphEdgeError::NonFiniteInformation { row: 2, col: 3 })
+    ));
+
+    let mut asymmetric = scalar_block(1.0);
+    asymmetric[0][1] = 0.5;
+    assert!(matches!(
+        PoseGraphEdge::try_new(0, 1, pose, asymmetric),
+        Err(super::PoseGraphEdgeError::NonSymmetricInformation { .. })
+    ));
+
+    let mut indefinite = scalar_block(1.0);
+    indefinite[4][4] = -1.0;
+    assert!(matches!(
+        PoseGraphEdge::try_new(0, 1, pose, indefinite),
+        Err(super::PoseGraphEdgeError::NonPositiveDefiniteInformation { .. })
+    ));
+}
+
+#[test]
+fn pose_graph_config_rejects_invalid_solver_limits() {
+    assert!(matches!(
+        PoseGraphConfig::try_new(0, 10, 1e-6, 1.0),
+        Err(super::PoseGraphConfigError::ZeroIterations {
+            field: "max_iterations"
+        })
+    ));
+    assert!(matches!(
+        PoseGraphConfig::try_new(10, 0, 1e-6, 1.0),
+        Err(super::PoseGraphConfigError::ZeroIterations {
+            field: "pcg_max_iters"
+        })
+    ));
+    for (tol, huber) in [(0.0, 1.0), (f64::NAN, 1.0), (1e-6, f64::INFINITY)] {
+        assert!(PoseGraphConfig::try_new(10, 10, tol, huber).is_err());
     }
+}
+
+fn edge(from: usize, to: usize, from_pose: Pose64, to_pose: Pose64) -> PoseGraphEdge {
+    let measurement = to_pose.compose(from_pose.inverse());
+    PoseGraphEdge::try_new(from, to, measurement, scalar_block(1.0)).expect("edge")
 }
 
 fn translation_error(poses: &[Pose64], target: &[Pose64]) -> f64 {
@@ -407,6 +523,65 @@ fn pose_graph_optimizer_keeps_anchor_pose_fixed() {
 }
 
 #[test]
+fn pose_graph_optimizer_rejects_unconverged_pcg_step() {
+    let target = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    let edges = vec![edge(0, 1, target[0], target[1])];
+    let mut initial = vec![target[0], se3_exp_f64([2.0, 0.5, 0.0, 0.0, 0.0, 0.0])];
+    let before = initial.clone();
+    let defaults = PoseGraphConfig::default();
+    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::new_unchecked_for_test(
+        defaults.max_iterations(),
+        0,
+        defaults.pcg_tol(),
+        defaults.huber_delta(),
+    ));
+
+    let error = optimizer
+        .optimize(&edges, &mut initial)
+        .expect_err("zero PCG iterations must not be reported as convergence");
+
+    assert!(matches!(
+        error,
+        super::PoseGraphError::PcgDidNotConverge { iterations: 0 }
+    ));
+    for (actual, expected) in initial.iter().zip(before.iter()) {
+        assert_eq!(actual.translation(), expected.translation());
+        assert_eq!(actual.rotation(), expected.rotation());
+    }
+}
+
+#[test]
+fn pose_graph_optimizer_rejects_invalid_edge_endpoints() {
+    let poses = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    let bad_edge = PoseGraphEdge::try_new(
+        0,
+        poses.len(),
+        poses[1].compose(poses[0].inverse()),
+        scalar_block(1.0),
+    )
+    .expect("edge structure is valid independently of pose array bounds");
+    let mut initial = poses.to_vec();
+
+    let error = PoseGraphOptimizer::new(PoseGraphConfig::default())
+        .optimize(&[bad_edge], &mut initial)
+        .expect_err("out-of-range endpoint must not be skipped");
+
+    assert!(matches!(
+        error,
+        super::PoseGraphError::EdgeToOutOfBounds {
+            to: 2,
+            pose_count: 2
+        }
+    ));
+}
+
+#[test]
 fn essential_graph_builds_spanning_tree_connectivity() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
@@ -421,17 +596,84 @@ fn essential_graph_builds_spanning_tree_connectivity() {
 }
 
 #[test]
+fn essential_measurement_maps_from_camera_point_to_to_camera_point() {
+    let (mut map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+    let from_pose = se3_exp_f64([0.8, -0.3, 0.2, 0.25, -0.15, 0.1]);
+    let to_pose = se3_exp_f64([-0.4, 0.7, 0.5, -0.2, 0.12, 0.3]);
+    map.set_keyframe_pose(kf0, WorldToCamera::from_legacy_pose(from_pose.to_pose32()))
+        .expect("from pose");
+    map.set_keyframe_pose(kf1, WorldToCamera::from_legacy_pose(to_pose.to_pose32()))
+        .expect("to pose");
+
+    let mut graph = EssentialGraph::new(2);
+    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+    let input = graph.pose_graph_input();
+    let from_idx = input
+        .keyframe_ids
+        .iter()
+        .position(|&id| id == kf0)
+        .expect("from keyframe index");
+    let to_idx = input
+        .keyframe_ids
+        .iter()
+        .position(|&id| id == kf1)
+        .expect("to keyframe index");
+    let edge = input
+        .edges
+        .iter()
+        .find(|edge| edge.from() == from_idx && edge.to() == to_idx)
+        .expect("directed spanning edge");
+
+    let world_point = [1.3, -0.6, 4.2];
+    let point_in_from_camera = transform_point(from_pose, world_point);
+    let expected_in_to_camera = transform_point(to_pose, world_point);
+    let measured_in_to_camera = transform_point(edge.measurement(), point_in_from_camera);
+
+    assert!(
+        point_distance(measured_in_to_camera, expected_in_to_camera) < 2e-6,
+        "edge measurement must map camera-from coordinates into camera-to coordinates"
+    );
+    let error = compute_edge_error(edge, &[from_pose, to_pose]).expect("edge error");
+    assert!(
+        error.iter().map(|value| value * value).sum::<f64>().sqrt() < 2e-6,
+        "physical relative measurement must have zero graph residual"
+    );
+}
+
+#[test]
 fn essential_graph_respects_strong_edge_threshold() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
-    let mut graph = EssentialGraph::new(2);
+    let mut graph = EssentialGraph::new(1);
+    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+    let mut neighbors = HashMap::new();
+    neighbors.insert(kf0, NonZeroU32::new(1).expect("nonzero"));
+    neighbors.insert(kf1, NonZeroU32::new(2).expect("nonzero"));
+    graph.add_keyframe(kf2, Some(&neighbors), &map);
+    let snapshot = graph.snapshot();
+    assert_eq!(snapshot.strong_covis_edges.len(), 1);
+    let strong = &snapshot.strong_covis_edges[0];
+    assert_eq!(strong.kind(), EssentialEdgeKind::StrongCovisibility);
+    assert!((strong.a() == kf0 && strong.b() == kf2) || (strong.a() == kf2 && strong.b() == kf0));
+    assert_eq!(graph.parent_of(kf2), Some(kf1));
+}
+
+#[test]
+fn essential_graph_does_not_duplicate_spanning_pairs_as_strong_edges() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(1);
     graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
     graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
     graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
     let snapshot = graph.snapshot();
-    assert_eq!(snapshot.strong_covis_edges.len(), 1);
-    let strong = &snapshot.strong_covis_edges[0];
-    assert_eq!(strong.kind, EssentialEdgeKind::StrongCovisibility);
-    assert!((strong.a == kf1 && strong.b == kf0) || (strong.a == kf0 && strong.b == kf1));
+
+    for spanning in &snapshot.spanning_edges {
+        assert!(snapshot.strong_covis_edges.iter().all(|strong| {
+            !((strong.a() == spanning.a() && strong.b() == spanning.b())
+                || (strong.a() == spanning.b() && strong.b() == spanning.a()))
+        }));
+    }
 }
 
 #[test]
@@ -442,13 +684,16 @@ fn essential_graph_snapshot_is_independent_copy() {
     graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
     graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
     let snapshot = graph.snapshot();
-    graph.add_loop_edge(EssentialEdge {
-        a: kf2,
-        b: kf0,
-        kind: EssentialEdgeKind::Loop,
-        relative_pose: Pose64::identity(),
-        information: scalar_block(1.0),
-    });
+    graph.add_loop_edge(
+        EssentialEdge::try_new(
+            kf2,
+            kf0,
+            EssentialEdgeKind::Loop,
+            Pose64::identity(),
+            scalar_block(1.0),
+        )
+        .expect("loop edge"),
+    );
     assert_eq!(snapshot.loop_edges.len(), 0);
     assert_eq!(graph.snapshot().loop_edges.len(), 1);
 }
@@ -473,7 +718,7 @@ fn essential_graph_remove_keyframe_reparents_children() {
         snapshot
             .spanning_edges
             .iter()
-            .all(|edge| edge.a != kf1 && edge.b != kf1)
+            .all(|edge| edge.a() != kf1 && edge.b() != kf1)
     );
     let input = graph.pose_graph_input();
     assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
@@ -517,13 +762,16 @@ fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
     graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
     graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
     graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
-    graph.add_loop_edge(EssentialEdge {
-        a: kf2,
-        b: kf0,
-        kind: EssentialEdgeKind::Loop,
-        relative_pose: Pose64::identity(),
-        information: scalar_block(1.0),
-    });
+    graph.add_loop_edge(
+        EssentialEdge::try_new(
+            kf2,
+            kf0,
+            EssentialEdgeKind::Loop,
+            Pose64::identity(),
+            scalar_block(1.0),
+        )
+        .expect("loop edge"),
+    );
     assert_eq!(graph.snapshot().loop_edges.len(), 1);
 
     graph
@@ -535,13 +783,13 @@ fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
         snapshot
             .strong_covis_edges
             .iter()
-            .all(|e| e.a != kf2 && e.b != kf2)
+            .all(|e| e.a() != kf2 && e.b() != kf2)
     );
     assert!(
         snapshot
             .spanning_edges
             .iter()
-            .all(|e| e.a != kf2 && e.b != kf2)
+            .all(|e| e.a() != kf2 && e.b() != kf2)
     );
 }
 
@@ -592,16 +840,16 @@ fn essential_graph_random_remove_preserves_connectivity_invariants() {
             .chain(snapshot.strong_covis_edges.iter())
             .chain(snapshot.loop_edges.iter())
         {
-            assert!(alive_set.contains(&edge.a));
-            assert!(alive_set.contains(&edge.b));
+            assert!(alive_set.contains(&edge.a()));
+            assert!(alive_set.contains(&edge.b()));
         }
 
         let input = graph.pose_graph_input();
         let input_set: HashSet<_> = input.keyframe_ids.iter().copied().collect();
         assert!(input_set.is_subset(&alive_set));
         for edge in &input.edges {
-            assert!(edge.from < input.keyframe_ids.len());
-            assert!(edge.to < input.keyframe_ids.len());
+            assert!(edge.from() < input.keyframe_ids.len());
+            assert!(edge.to() < input.keyframe_ids.len());
         }
     }
 }

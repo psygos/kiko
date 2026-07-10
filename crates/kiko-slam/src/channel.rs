@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
@@ -98,12 +98,20 @@ impl ChannelStatsHandle {
 pub struct DropSender<T> {
     tx: Sender<T>,
     drop_rx: Receiver<T>,
+    receiver_liveness: Weak<()>,
     policy: DropPolicy,
     stats: Arc<ChannelStatsInner>,
 }
 
 impl<T> DropSender<T> {
     pub fn try_send(&self, value: T) -> SendOutcome {
+        // `drop_rx` exists only to implement DropOldest. It must not make a
+        // dropped consumer appear alive to callers.
+        if self.receiver_liveness.upgrade().is_none() {
+            self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+            return SendOutcome::Disconnected;
+        }
+
         match self.tx.try_send(value) {
             Ok(()) => {
                 self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
@@ -115,6 +123,10 @@ impl<T> DropSender<T> {
                     SendOutcome::DroppedNewest
                 }
                 DropPolicy::DropOldest => {
+                    if self.receiver_liveness.upgrade().is_none() {
+                        self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+                        return SendOutcome::Disconnected;
+                    }
                     match self.drop_rx.try_recv() {
                         Ok(_) => {
                             self.stats.dropped_oldest.fetch_add(1, Ordering::Relaxed);
@@ -155,6 +167,7 @@ impl<T> DropSender<T> {
 #[derive(Debug)]
 pub struct DropReceiver<T> {
     rx: Receiver<T>,
+    _liveness: Arc<()>,
 }
 
 impl<T> DropReceiver<T> {
@@ -188,13 +201,36 @@ pub fn bounded_channel<T>(
         disconnected: AtomicU64::new(0),
     });
     let drop_rx = rx.clone();
+    let receiver_liveness = Arc::new(());
     let sender = DropSender {
         tx,
         drop_rx,
+        receiver_liveness: Arc::downgrade(&receiver_liveness),
         policy,
         stats: stats.clone(),
     };
-    let receiver = DropReceiver { rx };
+    let receiver = DropReceiver {
+        rx,
+        _liveness: receiver_liveness,
+    };
     let handle = ChannelStatsHandle { inner: stats };
     (sender, receiver, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sender_reports_disconnect_after_consumer_is_dropped() {
+        for policy in [DropPolicy::DropNewest, DropPolicy::DropOldest] {
+            let capacity = ChannelCapacity::try_from(1).expect("valid capacity");
+            let (sender, receiver, stats) = bounded_channel(capacity, policy);
+
+            drop(receiver);
+
+            assert_eq!(sender.try_send(1), SendOutcome::Disconnected);
+            assert_eq!(stats.snapshot().disconnected, 1);
+        }
+    }
 }

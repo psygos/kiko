@@ -29,7 +29,10 @@ pub fn normalise_downscale_into(
     factor: crate::DownscaleFactor,
     out: &mut Vec<f32>,
 ) -> Result<crate::FrameDimensions, crate::DownscaleError> {
-    let factor_u32 = factor.get() as u32;
+    if width == 0 || height == 0 {
+        return Err(crate::DownscaleError::ZeroDimensions { width, height });
+    }
+    let factor_u32 = factor.get_u32();
     if width % factor_u32 != 0 || height % factor_u32 != 0 {
         return Err(crate::DownscaleError::NonDivisible {
             width,

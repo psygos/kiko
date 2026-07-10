@@ -1,5 +1,5 @@
 use crate::Pose64;
-use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
+use crate::math::{se3_exp_f64, se3_log_f64};
 
 use super::{
     ANCHOR_REGULARIZATION, BlockCsr6x6, HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS,
@@ -11,10 +11,118 @@ type EdgeJacobians = (Jacobian6, Jacobian6);
 
 #[derive(Clone, Debug)]
 pub struct PoseGraphEdge {
-    pub from: usize,
-    pub to: usize,
-    pub measurement: Pose64,
-    pub information: [[f64; 6]; 6],
+    from: usize,
+    to: usize,
+    /// Camera-`from` to camera-`to` transform for world-to-camera pose variables.
+    measurement: Pose64,
+    information: [[f64; 6]; 6],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoseGraphEdgeError {
+    SelfEdge { index: usize },
+    NonFiniteInformation { row: usize, col: usize },
+    NonSymmetricInformation { row: usize, col: usize },
+    NonPositiveDefiniteInformation { pivot: usize },
+}
+
+impl std::fmt::Display for PoseGraphEdgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfEdge { index } => {
+                write!(
+                    f,
+                    "pose graph edge must connect distinct poses, got {index}"
+                )
+            }
+            Self::NonFiniteInformation { row, col } => write!(
+                f,
+                "pose graph information matrix is non-finite at ({row}, {col})"
+            ),
+            Self::NonSymmetricInformation { row, col } => write!(
+                f,
+                "pose graph information matrix is not symmetric at ({row}, {col})"
+            ),
+            Self::NonPositiveDefiniteInformation { pivot } => write!(
+                f,
+                "pose graph information matrix is not positive definite at pivot {pivot}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PoseGraphEdgeError {}
+
+impl PoseGraphEdge {
+    pub fn try_new(
+        from: usize,
+        to: usize,
+        measurement: Pose64,
+        information: [[f64; 6]; 6],
+    ) -> Result<Self, PoseGraphEdgeError> {
+        if from == to {
+            return Err(PoseGraphEdgeError::SelfEdge { index: from });
+        }
+        validate_information(information)?;
+        Ok(Self {
+            from,
+            to,
+            measurement,
+            information,
+        })
+    }
+
+    pub fn from(&self) -> usize {
+        self.from
+    }
+
+    pub fn to(&self) -> usize {
+        self.to
+    }
+
+    pub fn measurement(&self) -> Pose64 {
+        self.measurement
+    }
+
+    pub fn information(&self) -> [[f64; 6]; 6] {
+        self.information
+    }
+}
+
+fn validate_information(information: [[f64; 6]; 6]) -> Result<(), PoseGraphEdgeError> {
+    const SYMMETRY_TOLERANCE: f64 = 1e-12;
+
+    for row in 0..6 {
+        for col in 0..6 {
+            if !information[row][col].is_finite() {
+                return Err(PoseGraphEdgeError::NonFiniteInformation { row, col });
+            }
+            let scale = information[row][col]
+                .abs()
+                .max(information[col][row].abs())
+                .max(1.0);
+            if (information[row][col] - information[col][row]).abs() > SYMMETRY_TOLERANCE * scale {
+                return Err(PoseGraphEdgeError::NonSymmetricInformation { row, col });
+            }
+        }
+    }
+
+    let mut lower = [[0.0_f64; 6]; 6];
+    for row in 0..6 {
+        for col in 0..=row {
+            let product_sum: f64 = (0..col).map(|k| lower[row][k] * lower[col][k]).sum();
+            if row == col {
+                let pivot = information[row][row] - product_sum;
+                if !pivot.is_finite() || pivot <= 0.0 {
+                    return Err(PoseGraphEdgeError::NonPositiveDefiniteInformation { pivot: row });
+                }
+                lower[row][col] = pivot.sqrt();
+            } else {
+                lower[row][col] = (information[row][col] - product_sum) / lower[col][col];
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn compute_edge_error(
@@ -35,7 +143,7 @@ pub fn compute_edge_error(
     }
     let t_from_inv = poses[edge.from].inverse();
     let t_to = poses[edge.to];
-    let predicted = t_from_inv.compose(t_to);
+    let predicted = t_to.compose(t_from_inv);
     let residual_pose = predicted.compose(edge.measurement.inverse());
     Ok(se3_log_f64(residual_pose))
 }
@@ -67,16 +175,14 @@ pub fn compute_edge_jacobians(
     edge: &PoseGraphEdge,
     poses: &[Pose64],
 ) -> Result<EdgeJacobians, PoseGraphError> {
-    let base_error = compute_edge_error(edge, poses)?;
-    let jr = so3_right_jacobian_f64([base_error[3], base_error[4], base_error[5]]);
     let eps = NUMERICAL_DIFF_EPS;
     let mut j_from = [[0.0_f64; 6]; 6];
     let mut j_to = [[0.0_f64; 6]; 6];
     let mut poses_perturbed = poses.to_vec();
 
     for axis in 0..6 {
-        let delta_plus = perturb_axis(axis, eps, jr);
-        let delta_minus = perturb_axis(axis, -eps, jr);
+        let delta_plus = perturb_axis(axis, eps);
+        let delta_minus = perturb_axis(axis, -eps);
 
         numerical_diff_column(
             edge,
@@ -103,28 +209,18 @@ pub fn compute_edge_jacobians(
     Ok((j_from, j_to))
 }
 
-fn perturb_axis(axis: usize, magnitude: f64, right_jacobian: [[f64; 3]; 3]) -> [f64; 6] {
+fn perturb_axis(axis: usize, magnitude: f64) -> [f64; 6] {
     let mut delta = [0.0_f64; 6];
-    if axis < 3 {
-        delta[axis] = magnitude;
-        return delta;
-    }
-
-    let mut unit_rot = [0.0_f64; 3];
-    unit_rot[axis - 3] = magnitude;
-    let rot = mat_mul_vec_f64(right_jacobian, unit_rot);
-    delta[3] = rot[0];
-    delta[4] = rot[1];
-    delta[5] = rot[2];
+    delta[axis] = magnitude;
     delta
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct PoseGraphConfig {
-    pub max_iterations: usize,
-    pub pcg_max_iters: usize,
-    pub pcg_tol: f64,
-    pub huber_delta: f64,
+    max_iterations: usize,
+    pcg_max_iters: usize,
+    pcg_tol: f64,
+    huber_delta: f64,
 }
 
 impl Default for PoseGraphConfig {
@@ -134,6 +230,87 @@ impl Default for PoseGraphConfig {
             pcg_max_iters: 100,
             pcg_tol: 1e-6,
             huber_delta: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PoseGraphConfigError {
+    ZeroIterations { field: &'static str },
+    InvalidPositiveFinite { field: &'static str, value: f64 },
+}
+
+impl std::fmt::Display for PoseGraphConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroIterations { field } => write!(f, "{field} must be greater than zero"),
+            Self::InvalidPositiveFinite { field, value } => {
+                write!(f, "{field} must be positive and finite, got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PoseGraphConfigError {}
+
+impl PoseGraphConfig {
+    pub fn try_new(
+        max_iterations: usize,
+        pcg_max_iters: usize,
+        pcg_tol: f64,
+        huber_delta: f64,
+    ) -> Result<Self, PoseGraphConfigError> {
+        if max_iterations == 0 {
+            return Err(PoseGraphConfigError::ZeroIterations {
+                field: "max_iterations",
+            });
+        }
+        if pcg_max_iters == 0 {
+            return Err(PoseGraphConfigError::ZeroIterations {
+                field: "pcg_max_iters",
+            });
+        }
+        for (field, value) in [("pcg_tol", pcg_tol), ("huber_delta", huber_delta)] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(PoseGraphConfigError::InvalidPositiveFinite { field, value });
+            }
+        }
+        Ok(Self {
+            max_iterations,
+            pcg_max_iters,
+            pcg_tol,
+            huber_delta,
+        })
+    }
+
+    pub fn max_iterations(self) -> usize {
+        self.max_iterations
+    }
+
+    pub fn pcg_max_iters(self) -> usize {
+        self.pcg_max_iters
+    }
+
+    pub fn pcg_tol(self) -> f64 {
+        self.pcg_tol
+    }
+
+    pub fn huber_delta(self) -> f64 {
+        self.huber_delta
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unchecked_for_test(
+        max_iterations: usize,
+        pcg_max_iters: usize,
+        pcg_tol: f64,
+        huber_delta: f64,
+    ) -> Self {
+        Self {
+            max_iterations,
+            pcg_max_iters,
+            pcg_tol,
+            huber_delta,
         }
     }
 }
@@ -172,19 +349,21 @@ impl PoseGraphOptimizer {
         let mut poses = initial_poses.to_vec();
         let mut converged = false;
         let mut iters_run = 0;
-        let mut valid_edges = Vec::with_capacity(edges.len());
-        let mut invalid_edges = 0usize;
         for edge in edges {
-            if edge.from < nposes && edge.to < nposes {
-                valid_edges.push(edge);
-            } else {
-                invalid_edges = invalid_edges.saturating_add(1);
+            if edge.from >= nposes {
+                return Err(PoseGraphError::EdgeFromOutOfBounds {
+                    from: edge.from,
+                    pose_count: nposes,
+                });
+            }
+            if edge.to >= nposes {
+                return Err(PoseGraphError::EdgeToOutOfBounds {
+                    to: edge.to,
+                    pose_count: nposes,
+                });
             }
         }
-        if invalid_edges > 0 {
-            eprintln!("pose graph skipped {invalid_edges} invalid edges (nposes={nposes})");
-        }
-        if valid_edges.is_empty() {
+        if edges.is_empty() {
             return Ok(PoseGraphResult {
                 corrected_poses: poses,
                 iterations: 0,
@@ -197,7 +376,7 @@ impl PoseGraphOptimizer {
             let mut h = BlockCsr6x6::new(nposes);
             let mut b = vec![0.0_f64; nposes * 6];
 
-            for edge in &valid_edges {
+            for edge in edges {
                 let error = compute_edge_error(edge, &poses)?;
                 let (j_from, j_to) = compute_edge_jacobians(edge, &poses)?;
                 let e_norm = error.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -241,14 +420,13 @@ impl PoseGraphOptimizer {
                 self.config.pcg_max_iters,
                 self.config.pcg_tol,
             )?;
-            if !pcg.converged && iter + 1 == self.config.max_iterations {
-                eprintln!(
-                    "pose graph PCG did not converge (iters={}, residual_norm={:.3e})",
-                    pcg.iterations, pcg.residual_norm
-                );
-            }
             if !pcg.residual_norm.is_finite() {
-                break;
+                return Err(PoseGraphError::PcgNonFiniteResidual);
+            }
+            if !pcg.converged {
+                return Err(PoseGraphError::PcgDidNotConverge {
+                    iterations: pcg.iterations,
+                });
             }
 
             let mut max_step = 0.0_f64;
@@ -267,7 +445,9 @@ impl PoseGraphOptimizer {
                 ];
                 let mut step_norm = xi.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if !step_norm.is_finite() {
-                    continue;
+                    return Err(PoseGraphError::PcgNonFiniteStep {
+                        pose_index: pose_idx,
+                    });
                 }
                 if step_norm > MAX_STEP_NORM {
                     let scale = MAX_STEP_NORM / step_norm;

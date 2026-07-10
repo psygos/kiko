@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::dense::DenseCommand;
 use crate::dense::ring_buffer::DepthRingBuffer;
 use crate::map::KeyframeId;
-use crate::{DiagnosticEvent, Pose, Timestamp, TrackerOutput, TrackingHealth};
+use crate::{DiagnosticEvent, Pose, PoseStatus, Timestamp, TrackerOutput, TrackingHealth};
 
 /// Maximum timestamp distance (nanoseconds) between a depth frame and a
 /// keyframe's stereo pair for valid association. Derived from RIEMANN's
@@ -41,7 +41,8 @@ pub fn map_output_to_dense_commands(
         .collect();
 
     // Gate integration on tracking health — don't integrate when lost.
-    let tracking_ok = output.health.tracking != TrackingHealth::Lost;
+    let tracking_ok =
+        output.health.tracking != TrackingHealth::Lost && output.pose_status == PoseStatus::Current;
 
     for event in &output.events {
         match event {
@@ -53,7 +54,7 @@ pub fn map_output_to_dense_commands(
                     continue;
                 }
                 let pose = match output.pose {
-                    Some(p) => p,
+                    Some(p) => p.into_legacy_pose(),
                     None => continue,
                 };
                 if let Some(depth) = depth_buffer.find_closest(timestamp, MAX_ASSOCIATION_WINDOW_NS)
@@ -94,7 +95,8 @@ mod tests {
     use crate::test_helpers::make_depth_image;
     use crate::tracker::BackendStats;
     use crate::{
-        ComponentHealth, DegradationLevel, FrameDiagnostics, FrameId, SystemHealth, TrackerOutput,
+        ComponentHealth, DegradationLevel, FrameDiagnostics, FrameId, PoseStatus, SystemHealth,
+        TrackerOutput,
     };
 
     fn ts(ns: i64) -> Timestamp {
@@ -106,9 +108,7 @@ mod tests {
     }
 
     fn kf_id() -> KeyframeId {
-        use slotmap::SlotMap;
-        let mut sm = SlotMap::<KeyframeId, ()>::with_key();
-        sm.insert(())
+        KeyframeId::for_test(0)
     }
 
     fn healthy() -> SystemHealth {
@@ -133,7 +133,8 @@ mod tests {
 
     fn base_output(events: Vec<DiagnosticEvent>) -> TrackerOutput {
         TrackerOutput {
-            pose: Some(Pose::identity()),
+            pose: Some(crate::WorldToCamera::identity()),
+            pose_status: PoseStatus::Current,
             inliers: 0,
             keyframe: None,
             stereo_matches: None,
@@ -231,6 +232,23 @@ mod tests {
             cmds.is_empty(),
             "should not integrate when tracking is lost"
         );
+    }
+
+    #[test]
+    fn no_integrate_with_stale_fallback_pose() {
+        let kf = kf_id();
+        let mut buf = DepthRingBuffer::new(4);
+        buf.push(depth_at(100));
+        let mut output = base_output(vec![DiagnosticEvent::KeyframeCreated {
+            keyframe_id: kf,
+            landmarks: 5,
+        }]);
+        output.pose_status = PoseStatus::Stale;
+
+        let mut gen_ = 0;
+        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+
+        assert!(cmds.is_empty(), "stale poses must not be integrated");
     }
 
     #[test]

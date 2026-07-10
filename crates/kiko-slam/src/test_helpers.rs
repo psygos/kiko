@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
-    Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint, MatchError,
-    Matches, Observation, PinholeIntrinsics, PnpError, Point3, Pose, Raw, RectifiedStereo,
-    RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp, math,
+    CameraPoint3, Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint,
+    MatchError, Matches, Observation, PinholeIntrinsics, PnpError, Point3, Pose, Raw,
+    RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp, math,
 };
 
 #[derive(Debug)]
@@ -198,7 +198,7 @@ pub(crate) fn observations_from_projection(
 }
 
 pub(crate) fn rectified_stereo_keypoints_from_points(
-    points_left_camera: &[Point3],
+    points_left_camera: &[CameraPoint3],
     intrinsics: PinholeIntrinsics,
     baseline_m: f32,
 ) -> Vec<(usize, Keypoint, Keypoint)> {

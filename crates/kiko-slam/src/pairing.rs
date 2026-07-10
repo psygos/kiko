@@ -7,8 +7,8 @@ pub struct PairingWindowNs(i64);
 
 impl PairingWindowNs {
     pub fn new(window_ns: i64) -> Result<Self, PairingConfigError> {
-        if window_ns <= 0 {
-            return Err(PairingConfigError::NonPositiveWindow { window_ns });
+        if window_ns < 0 {
+            return Err(PairingConfigError::NegativeWindow { window_ns });
         }
         Ok(Self(window_ns))
     }
@@ -20,14 +20,14 @@ impl PairingWindowNs {
 
 #[derive(Debug)]
 pub enum PairingConfigError {
-    NonPositiveWindow { window_ns: i64 },
+    NegativeWindow { window_ns: i64 },
 }
 
 impl std::fmt::Display for PairingConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PairingConfigError::NonPositiveWindow { window_ns } => {
-                write!(f, "pairing window must be positive, got {window_ns}")
+            PairingConfigError::NegativeWindow { window_ns } => {
+                write!(f, "pairing window must be non-negative, got {window_ns}")
             }
         }
     }
@@ -96,7 +96,7 @@ impl StereoPairer {
                 None => return Ok(None),
             };
 
-            if best_delta <= self.window.as_ns() {
+            if best_delta <= self.window.as_ns() as u64 {
                 let Some(left) = self.left.pop_front() else {
                     return Ok(None);
                 };
@@ -133,18 +133,18 @@ impl StereoPairer {
         self.max_pending_per_side
     }
 
-    fn best_right(&self, left_ts: i64) -> Option<(usize, i64, i64)> {
+    fn best_right(&self, left_ts: i64) -> Option<(usize, u64, i64)> {
         if self.right.is_empty() {
             return None;
         }
 
         let mut best_idx = 0usize;
-        let mut best_delta = i64::MAX;
+        let mut best_delta = u64::MAX;
         let mut best_ts = 0i64;
 
         for (idx, right) in self.right.iter().enumerate() {
             let right_ts = right.timestamp().as_nanos();
-            let delta = (right_ts - left_ts).abs();
+            let delta = right_ts.abs_diff(left_ts);
             if delta < best_delta {
                 best_delta = delta;
                 best_idx = idx;
@@ -159,7 +159,7 @@ impl StereoPairer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FrameId, SensorId, Timestamp};
+    use crate::{FrameId, PairError, SensorId, Timestamp};
 
     fn frame(sensor: SensorId, ts_ns: i64, id: u64) -> Frame {
         Frame::new(
@@ -171,6 +171,44 @@ mod tests {
             vec![0; 4],
         )
         .expect("valid frame")
+    }
+
+    #[test]
+    fn zero_window_accepts_only_exact_timestamps() {
+        let window = PairingWindowNs::new(0).expect("zero is a valid exact-sync window");
+        let exact = StereoPair::try_new(
+            frame(SensorId::StereoLeft, 42, 1),
+            frame(SensorId::StereoRight, 42, 2),
+            window,
+        );
+        assert!(exact.is_ok());
+
+        let offset = StereoPair::try_new(
+            frame(SensorId::StereoLeft, 42, 3),
+            frame(SensorId::StereoRight, 43, 4),
+            window,
+        );
+        assert!(matches!(offset, Err(PairError::TimestampDelta { .. })));
+    }
+
+    #[test]
+    fn timestamp_delta_handles_full_i64_range() {
+        let window = PairingWindowNs::new(i64::MAX).expect("valid window");
+        let result = StereoPair::try_new(
+            frame(SensorId::StereoLeft, i64::MIN, 1),
+            frame(SensorId::StereoRight, i64::MAX, 2),
+            window,
+        );
+
+        let Err(PairError::TimestampDelta {
+            delta_ns,
+            max_delta_ns,
+        }) = result
+        else {
+            panic!("full-range timestamps should exceed the pairing window");
+        };
+        assert_eq!(delta_ns, u64::MAX);
+        assert_eq!(max_delta_ns, i64::MAX as u64);
     }
 
     #[test]

@@ -31,6 +31,8 @@ const MIN_BA_POSES: usize = 2;
 const MIN_LANDMARK_OBSERVATIONS: usize = 2;
 /// Absolute minimum observation count for BA config (PnP geometric minimum).
 const ABSOLUTE_MIN_OBSERVATIONS: usize = 4;
+/// Minimum valid camera-to-landmark distance for the metric scale anchor.
+const MIN_SCALE_ANCHOR_DISTANCE_M: f32 = 1e-6;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalBaConfig {
@@ -361,6 +363,8 @@ pub enum DegenerateReason {
     TooFewPoses { count: usize },
     TooFewLandmarks { count: usize },
     NoFactors,
+    InvalidProjection,
+    InvariantViolation,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -491,6 +495,12 @@ enum FullBaBuildError {
         point_id: MapPointId,
         keyframe_id: KeyframeId,
     },
+    InvalidLandmarkObservation {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+        keypoint_index: usize,
+    },
+    InvalidScaleAnchor,
     NoLandmarks,
     PoseHasTooFewObservations {
         keyframe_id: KeyframeId,
@@ -525,6 +535,20 @@ impl std::fmt::Display for FullBaBuildError {
                 f,
                 "landmark {point_id:?} has duplicate observation in keyframe {keyframe_id:?}"
             ),
+            FullBaBuildError::InvalidLandmarkObservation {
+                point_id,
+                keyframe_id,
+                keypoint_index,
+            } => write!(
+                f,
+                "landmark {point_id:?} has invalid observation at keyframe {keyframe_id:?} keypoint {keypoint_index}"
+            ),
+            FullBaBuildError::InvalidScaleAnchor => {
+                write!(
+                    f,
+                    "full BA could not construct a finite metric scale anchor"
+                )
+            }
             FullBaBuildError::NoLandmarks => {
                 write!(f, "full BA window has no optimizable landmarks")
             }
@@ -552,7 +576,9 @@ fn degenerate_reason_from_build_error(err: &FullBaBuildError) -> DegenerateReaso
         FullBaBuildError::DuplicateKeyframe { .. }
         | FullBaBuildError::MissingKeyframe { .. }
         | FullBaBuildError::DuplicateLandmarkObservation { .. }
-        | FullBaBuildError::PoseHasTooFewObservations { .. } => DegenerateReason::NoFactors,
+        | FullBaBuildError::InvalidLandmarkObservation { .. }
+        | FullBaBuildError::InvalidScaleAnchor => DegenerateReason::InvariantViolation,
+        FullBaBuildError::PoseHasTooFewObservations { .. } => DegenerateReason::NoFactors,
     }
 }
 
@@ -591,10 +617,23 @@ struct LandmarkVariable {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum FactorPose {
+    Variable(PoseVarIndex),
+    Fixed(Pose),
+}
+
+#[derive(Clone, Copy, Debug)]
 struct ReprojectionFactor {
-    pose: PoseVarIndex,
+    pose: FactorPose,
     landmark: LandmarkVarIndex,
     pixel: Keypoint,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScaleAnchor {
+    landmark: LandmarkVarIndex,
+    camera_center: Point3,
+    reference_distance_m: f32,
 }
 
 #[derive(Debug)]
@@ -602,6 +641,7 @@ struct FullBaProblem {
     poses: Vec<PoseVariable>,
     landmarks: Vec<LandmarkVariable>,
     factors: Vec<ReprojectionFactor>,
+    scale_anchor: Option<ScaleAnchor>,
 }
 
 impl FullBaProblem {
@@ -626,7 +666,7 @@ impl FullBaProblem {
                 .ok_or(FullBaBuildError::MissingKeyframe { keyframe_id })?;
             poses.push(PoseVariable {
                 keyframe_id,
-                pose: entry.pose(),
+                pose: entry.pose().into_legacy_pose(),
             });
         }
 
@@ -647,26 +687,39 @@ impl FullBaProblem {
         let mut pose_counts = vec![0_usize; poses.len()];
 
         for (point_id, point) in map.points() {
-            let mut local_observations = Vec::new();
-            let mut seen_local_poses = HashSet::new();
+            let mut observations = Vec::new();
+            let mut seen_observation_poses = HashSet::new();
+            let mut has_local_observation = false;
 
             for &obs in point.observations() {
-                let Some(&pose_idx) = pose_lookup.get(&obs.keyframe_id()) else {
-                    continue;
-                };
-                if !seen_local_poses.insert(pose_idx) {
+                if !seen_observation_poses.insert(obs.keyframe_id()) {
                     return Err(FullBaBuildError::DuplicateLandmarkObservation {
                         point_id,
                         keyframe_id: obs.keyframe_id(),
                     });
                 }
-                let Ok(pixel) = map.keypoint(obs) else {
-                    continue;
+                let pixel = map.keypoint(obs).map_err(|_| {
+                    FullBaBuildError::InvalidLandmarkObservation {
+                        point_id,
+                        keyframe_id: obs.keyframe_id(),
+                        keypoint_index: obs.index(),
+                    }
+                })?;
+                let factor_pose = if let Some(&pose_idx) = pose_lookup.get(&obs.keyframe_id()) {
+                    has_local_observation = true;
+                    FactorPose::Variable(pose_idx)
+                } else {
+                    let entry = map.keyframe(obs.keyframe_id()).ok_or(
+                        FullBaBuildError::MissingKeyframe {
+                            keyframe_id: obs.keyframe_id(),
+                        },
+                    )?;
+                    FactorPose::Fixed(entry.pose().into_legacy_pose())
                 };
-                local_observations.push((pose_idx, pixel));
+                observations.push((factor_pose, pixel));
             }
 
-            if local_observations.len() < MIN_LANDMARK_OBSERVATIONS {
+            if !has_local_observation || observations.len() < MIN_LANDMARK_OBSERVATIONS {
                 continue;
             }
 
@@ -676,10 +729,12 @@ impl FullBaProblem {
                 position: point.position(),
             });
 
-            for (pose_idx, pixel) in local_observations {
-                pose_counts[pose_idx.as_usize()] += 1;
+            for (factor_pose, pixel) in observations {
+                if let FactorPose::Variable(pose_idx) = factor_pose {
+                    pose_counts[pose_idx.as_usize()] += 1;
+                }
                 factors.push(ReprojectionFactor {
-                    pose: pose_idx,
+                    pose: factor_pose,
                     landmark: landmark_idx,
                     pixel,
                 });
@@ -700,16 +755,35 @@ impl FullBaProblem {
             }
         }
 
+        let camera_center = camera_center_world(poses[0].pose);
+        let anchor_position = landmarks[0].position;
+        let reference_distance_m = point_distance(anchor_position, camera_center);
+        if !reference_distance_m.is_finite() || reference_distance_m <= MIN_SCALE_ANCHOR_DISTANCE_M
+        {
+            return Err(FullBaBuildError::InvalidScaleAnchor);
+        }
+
         Ok(Self {
             poses,
             landmarks,
             factors,
+            scale_anchor: Some(ScaleAnchor {
+                landmark: LandmarkVarIndex(0),
+                camera_center,
+                reference_distance_m,
+            }),
         })
     }
 
     fn write_back(self, map: &mut SlamMap) -> bool {
         for pose in &self.poses {
-            if map.set_keyframe_pose(pose.keyframe_id, pose.pose).is_err() {
+            if map
+                .set_keyframe_pose(
+                    pose.keyframe_id,
+                    crate::WorldToCamera::from_legacy_pose(pose.pose),
+                )
+                .is_err()
+            {
                 return false;
             }
         }
@@ -835,11 +909,14 @@ impl LocalBundleAdjuster {
         if matches!(
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-        ) && !problem.write_back(map)
-        {
-            return BaResult::Degenerate {
-                reason: DegenerateReason::NoFactors,
-            };
+        ) {
+            let mut staged_map = map.clone();
+            if !problem.write_back(&mut staged_map) {
+                return BaResult::Degenerate {
+                    reason: DegenerateReason::InvariantViolation,
+                };
+            }
+            *map = staged_map;
         }
 
         result
@@ -965,13 +1042,18 @@ impl LocalBundleAdjuster {
         let motion_weight = self.config.motion_prior_weight();
         let lm_config = self.config.lm();
         let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+        if !final_cost.is_finite() {
+            return BaResult::Degenerate {
+                reason: DegenerateReason::InvalidProjection,
+            };
+        }
         let mut lm_state = LmState::new(lm_config, final_cost);
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
         let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
         let mut landmark_accumulators: Vec<LandmarkAccumulator> =
             Vec::with_capacity(landmark_count);
-        let mut rhs_before_solve: Vec<f32> = vec![0.0; pose_dim];
+        let mut full_pose_rhs: Vec<f32> = vec![0.0; pose_dim];
 
         for iter in 0..max_iters {
             pose_backup.clear();
@@ -992,9 +1074,11 @@ impl LocalBundleAdjuster {
                 .extend((0..landmark_count).map(|_| LandmarkAccumulator::default()));
 
             for factor in &problem.factors {
-                let pose_idx = factor.pose;
                 let landmark_idx = factor.landmark;
-                let pose = problem.poses[pose_idx.as_usize()].pose;
+                let pose = match factor.pose {
+                    FactorPose::Variable(pose_idx) => problem.poses[pose_idx.as_usize()].pose,
+                    FactorPose::Fixed(pose) => pose,
+                };
                 let point = problem.landmarks[landmark_idx.as_usize()].position;
 
                 let Some((residual, j_pose, j_landmark)) =
@@ -1011,16 +1095,30 @@ impl LocalBundleAdjuster {
                 let j_pose_scaled = j_pose.map(|row| row.map(|v| v * scale));
                 let j_landmark_scaled = j_landmark.map(|row| row.map(|v| v * scale));
 
-                accumulate_pose_hessian(s, pose_dim, pose_idx, j_pose_scaled);
-                accumulate_pose_rhs(rhs, pose_idx, j_pose_scaled, r_scaled);
-
                 let acc = &mut landmark_accumulators[landmark_idx.as_usize()];
                 accumulate_landmark_hessian(&mut acc.c, j_landmark_scaled);
                 accumulate_landmark_rhs(&mut acc.b, j_landmark_scaled, r_scaled);
-                acc.add_link(
-                    pose_idx,
-                    pose_landmark_cross(j_pose_scaled, j_landmark_scaled),
-                );
+                if let FactorPose::Variable(pose_idx) = factor.pose {
+                    accumulate_pose_hessian(s, pose_dim, pose_idx, j_pose_scaled);
+                    accumulate_pose_rhs(rhs, pose_idx, j_pose_scaled, r_scaled);
+                    acc.add_link(
+                        pose_idx,
+                        pose_landmark_cross(j_pose_scaled, j_landmark_scaled),
+                    );
+                }
+            }
+
+            if let Some(anchor) = problem.scale_anchor {
+                let point = problem.landmarks[anchor.landmark.as_usize()].position;
+                let Some((residual, jacobian)) =
+                    scale_anchor_residual_and_jacobian(anchor, point, self.intrinsics)
+                else {
+                    return BaResult::Degenerate {
+                        reason: DegenerateReason::InvalidProjection,
+                    };
+                };
+                let acc = &mut landmark_accumulators[anchor.landmark.as_usize()];
+                accumulate_scalar_landmark_factor(&mut acc.c, &mut acc.b, jacobian, residual);
             }
 
             if motion_weight > 0.0 && pose_count >= 2 {
@@ -1037,6 +1135,7 @@ impl LocalBundleAdjuster {
                     );
                 }
             }
+            full_pose_rhs.copy_from_slice(rhs);
 
             for i in 0..pose_dim {
                 s[i * pose_dim + i] += pose_damping;
@@ -1082,7 +1181,6 @@ impl LocalBundleAdjuster {
             }
 
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
-            rhs_before_solve.copy_from_slice(rhs);
 
             if !solve_linear_system(s, rhs, pose_dim) {
                 return BaResult::MaxIterations {
@@ -1099,7 +1197,7 @@ impl LocalBundleAdjuster {
                 max_step = max_step.max(norm6(delta));
                 for k in 0..6 {
                     let d = delta[k] as f64;
-                    let gradient = rhs_before_solve[base + k] as f64;
+                    let gradient = full_pose_rhs[base + k] as f64;
                     predicted_decrease += 0.5 * d * ((pose_damping as f64) * d + gradient);
                 }
                 pose_var.pose = apply_se3_delta(pose_var.pose, delta);
@@ -1185,12 +1283,15 @@ fn full_problem_cost(
     let huber = huber_delta_px as f64;
 
     for factor in &problem.factors {
-        let pose = problem.poses[factor.pose.as_usize()].pose;
+        let pose = match factor.pose {
+            FactorPose::Variable(pose_idx) => problem.poses[pose_idx.as_usize()].pose,
+            FactorPose::Fixed(pose) => pose,
+        };
         let point = problem.landmarks[factor.landmark.as_usize()].position;
         let Some((residual, _, _)) =
             reprojection_residual_and_jacobians(pose, point, factor.pixel, intrinsics)
         else {
-            continue;
+            return f64::INFINITY;
         };
         let r0 = residual[0] as f64;
         let r1 = residual[1] as f64;
@@ -1200,6 +1301,15 @@ fn full_problem_cost(
         } else {
             huber * (r_norm - 0.5 * huber)
         };
+    }
+
+    if let Some(anchor) = problem.scale_anchor {
+        let point = problem.landmarks[anchor.landmark.as_usize()].position;
+        let Some((residual, _)) = scale_anchor_residual_and_jacobian(anchor, point, intrinsics)
+        else {
+            return f64::INFINITY;
+        };
+        cost += 0.5 * (residual as f64) * (residual as f64);
     }
 
     if motion_weight > 0.0 {
@@ -1215,6 +1325,50 @@ fn full_problem_cost(
     }
 
     cost
+}
+
+fn camera_center_world(pose: Pose) -> Point3 {
+    let rotation_t = math::mat_transpose(pose.rotation());
+    let rotated_translation = math::mat_mul_vec(rotation_t, pose.translation());
+    Point3 {
+        x: -rotated_translation[0],
+        y: -rotated_translation[1],
+        z: -rotated_translation[2],
+    }
+}
+
+fn point_distance(a: Point3, b: Point3) -> f32 {
+    norm3([a.x - b.x, a.y - b.y, a.z - b.z])
+}
+
+fn scale_anchor_residual_and_jacobian(
+    anchor: ScaleAnchor,
+    point: Point3,
+    intrinsics: PinholeIntrinsics,
+) -> Option<(f32, [f32; 3])> {
+    if !anchor.reference_distance_m.is_finite()
+        || anchor.reference_distance_m <= MIN_SCALE_ANCHOR_DISTANCE_M
+    {
+        return None;
+    }
+    let delta = [
+        point.x - anchor.camera_center.x,
+        point.y - anchor.camera_center.y,
+        point.z - anchor.camera_center.z,
+    ];
+    let distance = norm3(delta);
+    if !distance.is_finite() || distance <= MIN_SCALE_ANCHOR_DISTANCE_M {
+        return None;
+    }
+
+    let focal_weight = 0.5 * (intrinsics.fx() + intrinsics.fy());
+    let residual = focal_weight * (distance / anchor.reference_distance_m - 1.0);
+    let jacobian_scale = focal_weight / (anchor.reference_distance_m * distance);
+    let jacobian = delta.map(|value| value * jacobian_scale);
+    if !residual.is_finite() || jacobian.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    Some((residual, jacobian))
 }
 
 fn reprojection_residual_and_jacobian(
@@ -1384,6 +1538,20 @@ fn accumulate_landmark_rhs(b: &mut [f32; 3], j_landmark: [[f32; 3]; 2], residual
     }
 }
 
+fn accumulate_scalar_landmark_factor(
+    hessian: &mut [[f32; 3]; 3],
+    rhs: &mut [f32; 3],
+    jacobian: [f32; 3],
+    residual: f32,
+) {
+    for row in 0..3 {
+        rhs[row] -= jacobian[row] * residual;
+        for col in 0..3 {
+            hessian[row][col] += jacobian[row] * jacobian[col];
+        }
+    }
+}
+
 fn pose_landmark_cross(j_pose: [[f32; 6]; 2], j_landmark: [[f32; 3]; 2]) -> [[f32; 3]; 6] {
     let mut cross = [[0.0_f32; 3]; 6];
     for (row, cross_row) in cross.iter_mut().enumerate() {
@@ -1427,7 +1595,7 @@ fn accumulate_motion_prior(
     }
     let w2 = weight * weight;
     for k in 0..6 {
-        let r = residual[k] * weight;
+        let r = residual[k] * w2;
         rhs[base_prev + k] += r;
         rhs[base_curr + k] -= r;
 
@@ -1769,14 +1937,14 @@ mod tests {
             .add_keyframe_from_detections(
                 detections_0.as_ref(),
                 Timestamp::from_nanos(1_000_000),
-                true_pose_0,
+                crate::WorldToCamera::from_legacy_pose(true_pose_0),
             )
             .expect("insert keyframe 0");
         let kf_1 = map
             .add_keyframe_from_detections(
                 detections_1.as_ref(),
                 Timestamp::from_nanos(2_000_000),
-                noisy_pose_1,
+                crate::WorldToCamera::from_legacy_pose(noisy_pose_1),
             )
             .expect("insert keyframe 1");
 
@@ -1943,6 +2111,7 @@ mod tests {
             poses: Vec::new(),
             landmarks: Vec::new(),
             factors: Vec::new(),
+            scale_anchor: None,
         };
         assert!(matches!(
             ba.optimize_full(&mut no_poses),
@@ -1964,6 +2133,7 @@ mod tests {
             ],
             landmarks: Vec::new(),
             factors: Vec::new(),
+            scale_anchor: None,
         };
         assert!(matches!(
             ba.optimize_full(&mut no_landmarks),
@@ -1992,6 +2162,7 @@ mod tests {
                 },
             }],
             factors: Vec::new(),
+            scale_anchor: None,
         };
         assert!(matches!(
             ba.optimize_full(&mut no_factors),
@@ -1999,6 +2170,20 @@ mod tests {
                 reason: DegenerateReason::NoFactors
             }
         ));
+    }
+
+    #[test]
+    fn invalid_landmark_observation_is_an_invariant_violation() {
+        let error = FullBaBuildError::InvalidLandmarkObservation {
+            point_id: MapPointId::default(),
+            keyframe_id: KeyframeId::default(),
+            keypoint_index: 7,
+        };
+
+        assert_eq!(
+            degenerate_reason_from_build_error(&error),
+            DegenerateReason::InvariantViolation
+        );
     }
 
     #[test]
@@ -2097,6 +2282,143 @@ mod tests {
             final_cost <= before + 1e-6,
             "final cost should not increase: before={before}, final={final_cost}"
         );
+    }
+
+    #[test]
+    fn full_problem_cost_rejects_behind_camera_factor() {
+        let (map, intrinsics, kf_0, kf_1, _, _) = build_full_ba_fixture([0.0; 6]);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        problem.landmarks[0].position = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: -10.0,
+        };
+
+        assert!(
+            full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0).is_infinite()
+        );
+    }
+
+    #[test]
+    fn optimize_full_preserves_metric_gauge_anchor_distance() {
+        let (map, intrinsics, kf_0, kf_1, _, _) =
+            build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        let anchor = problem.scale_anchor.expect("metric scale anchor");
+        let anchor_before = problem.landmarks[anchor.landmark.as_usize()].position;
+        let distance_before = point_distance(anchor_before, anchor.camera_center);
+
+        let result = ba.optimize_full(&mut problem);
+
+        assert!(matches!(
+            result,
+            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+        ));
+        let anchor_after = problem.landmarks[anchor.landmark.as_usize()].position;
+        let distance_after = point_distance(anchor_after, anchor.camera_center);
+        assert!(
+            (distance_after - distance_before).abs() < 1e-3,
+            "metric anchor distance changed: before={distance_before}, after={distance_after}"
+        );
+        assert!(
+            point_distance(anchor_after, anchor_before) > 1e-6,
+            "rank-1 anchor should leave tangential landmark corrections available"
+        );
+    }
+
+    #[test]
+    fn full_ba_retains_observations_outside_local_window_as_fixed_factors() {
+        let (mut map, intrinsics, kf_0, kf_1, _, points_true) = build_full_ba_fixture([0.0; 6]);
+        let external_pose = axis_angle_pose([-0.25, 0.03, 0.04], [0.0, -0.02, 0.01]);
+        let external_pixels: Vec<_> = points_true
+            .iter()
+            .map(|&point| {
+                project_world_point(external_pose, point, intrinsics)
+                    .expect("point visible in external keyframe")
+            })
+            .collect();
+        let external_detections = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(502),
+            640,
+            480,
+            external_pixels,
+        )
+        .expect("external detections");
+        let external_kf = map
+            .add_keyframe_from_detections(
+                external_detections.as_ref(),
+                Timestamp::from_nanos(3_000_000),
+                crate::WorldToCamera::from_legacy_pose(external_pose),
+            )
+            .expect("insert external keyframe");
+        for idx in 0..points_true.len() {
+            let local_keypoint = map.keyframe_keypoint(kf_0, idx).expect("local keypoint");
+            let point_id = map
+                .map_point_for_keypoint(local_keypoint)
+                .expect("map lookup")
+                .expect("mapped point");
+            let external_keypoint = map
+                .keyframe_keypoint(external_kf, idx)
+                .expect("external keypoint");
+            map.add_observation(point_id, external_keypoint)
+                .expect("external observation");
+        }
+
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+
+        let fixed_factors = problem
+            .factors
+            .iter()
+            .filter(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
+            .count();
+        assert_eq!(fixed_factors, points_true.len());
+    }
+
+    #[test]
+    fn motion_prior_rhs_scales_with_weight_squared() {
+        let prev = Pose::identity();
+        let curr = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, -2.0, 0.5],
+        );
+        let mut hessian_unit = vec![0.0; 12 * 12];
+        let mut rhs_unit = vec![0.0; 12];
+        accumulate_motion_prior(&mut hessian_unit, &mut rhs_unit, 12, prev, curr, 0, 6, 1.0);
+        let mut hessian_half = vec![0.0; 12 * 12];
+        let mut rhs_half = vec![0.0; 12];
+        accumulate_motion_prior(&mut hessian_half, &mut rhs_half, 12, prev, curr, 0, 6, 0.5);
+
+        for i in 0..12 {
+            assert!((rhs_half[i] - 0.25 * rhs_unit[i]).abs() < 1e-7);
+        }
+        for i in 0..12 * 12 {
+            assert!((hessian_half[i] - 0.25 * hessian_unit[i]).abs() < 1e-7);
+        }
     }
 
     #[test]
@@ -2236,14 +2558,14 @@ mod tests {
             .add_keyframe_from_detections(
                 detections_0.as_ref(),
                 Timestamp::from_nanos(1_000_000),
-                true_pose_0,
+                crate::WorldToCamera::from_legacy_pose(true_pose_0),
             )
             .expect("insert keyframe 0");
         let kf_1 = map
             .add_keyframe_from_detections(
                 detections_1.as_ref(),
                 Timestamp::from_nanos(2_000_000),
-                noisy_pose_1,
+                crate::WorldToCamera::from_legacy_pose(noisy_pose_1),
             )
             .expect("insert keyframe 1");
 
@@ -2265,7 +2587,10 @@ mod tests {
         }
 
         assert_map_invariants(&map).expect("map invariants before BA");
-        let before_pose_err = pose_distance(map.keyframe(kf_1).expect("kf1").pose(), true_pose_1);
+        let before_pose_err = pose_distance(
+            map.keyframe(kf_1).expect("kf1").pose().into_legacy_pose(),
+            true_pose_1,
+        );
         let before_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
 
         let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
@@ -2280,7 +2605,10 @@ mod tests {
         );
         assert_map_invariants(&map).expect("map invariants after BA");
 
-        let after_pose_err = pose_distance(map.keyframe(kf_1).expect("kf1").pose(), true_pose_1);
+        let after_pose_err = pose_distance(
+            map.keyframe(kf_1).expect("kf1").pose().into_legacy_pose(),
+            true_pose_1,
+        );
         let after_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
 
         assert!(

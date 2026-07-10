@@ -40,9 +40,14 @@ impl DatasetReader {
         let meta = read_meta(&root)?;
         let calibration = read_calibration(&root)?;
         let manifest = read_manifest(&root)?;
-        let pairing_window = PairingWindowNs::new(manifest.header.pairing_window_ns as i64)
-            .map_err(|_| DatasetError::InvalidConfig {
-                msg: "manifest pairing_window_ns must be > 0",
+        let pairing_window_ns = i64::try_from(manifest.header.pairing_window_ns).map_err(|_| {
+            DatasetError::InvalidConfig {
+                msg: "manifest pairing_window_ns exceeds i64::MAX",
+            }
+        })?;
+        let pairing_window =
+            PairingWindowNs::new(pairing_window_ns).map_err(|_| DatasetError::InvalidConfig {
+                msg: "manifest pairing_window_ns must be non-negative",
             })?;
         Ok(Self {
             root,
@@ -225,6 +230,7 @@ impl DatasetReader {
         .map_err(|e| DatasetError::InvalidConfig {
             msg: match e {
                 FrameError::DimensionMismatch { .. } => "frame size mismatch",
+                FrameError::ZeroDimensions { .. } => "frame dimensions must be nonzero",
             },
         })
     }
@@ -261,7 +267,7 @@ fn fps_from_frames(frames: &[FrameInfo]) -> Option<f64> {
         return None;
     }
     let (min_ts, max_ts) = min_max_ts(frames);
-    let span_ns = (max_ts - min_ts).abs() as f64;
+    let span_ns = max_ts.abs_diff(min_ts) as f64;
     if span_ns <= 0.0 {
         return None;
     }
@@ -275,7 +281,7 @@ fn fps_from_pairs(left: &[FrameInfo], right: &[FrameInfo]) -> Option<f64> {
     }
     let (left_min, left_max) = min_max_ts(left);
     let (right_min, right_max) = min_max_ts(right);
-    let span_ns = (left_max.max(right_max) - left_min.min(right_min)).abs() as f64;
+    let span_ns = left_max.max(right_max).abs_diff(left_min.min(right_min)) as f64;
     if span_ns <= 0.0 {
         return None;
     }

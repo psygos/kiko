@@ -1,9 +1,9 @@
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 pub use inference::{
-    EigenPlaces, InferenceBackend, LightGlue, PlaceDescriptorExtractor, SuperPoint,
+    EigenPlaces, InferenceBackend, InferenceError, LightGlue, PlaceDescriptorExtractor, SuperPoint,
 };
 mod channel;
 pub mod dataset;
@@ -11,6 +11,7 @@ pub mod dense;
 mod depth;
 mod diagnostics;
 pub mod env;
+mod geometry;
 mod inference;
 mod local_ba;
 pub mod loop_closure;
@@ -42,20 +43,23 @@ pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
 };
 pub use env::{env_bool, env_f32, env_usize};
+pub use geometry::{CameraFrame, CameraPoint3, CoordinateFrame, Point3, WorldFrame, WorldPoint3};
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
     DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopApplyError,
-    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput,
-    LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
-    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
-    RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
-    match_descriptors_for_loop,
+    LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError,
+    LoopVerificationError, PlaceMatch, RelocalizationConfig, RelocalizationConfigError,
+    RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
+    aggregate_global_descriptor, match_descriptors_for_loop,
 };
-pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot};
-pub use math::Pose64;
+pub use map::{
+    CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, MapGeneration, MapInstanceId,
+    MapSnapshot,
+};
+pub use math::{Pose64, Pose64Error};
 #[cfg(feature = "record")]
 pub use oak::{oak_to_depth_image, oak_to_frame};
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
@@ -63,19 +67,20 @@ pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
 pub use pnp::{
-    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
-    build_observations, solve_pnp, solve_pnp_ransac,
+    CameraToWorld, IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose,
+    RansacConfig, RansacConfigError, Transform, WorldToCamera, build_observations, solve_pnp,
+    solve_pnp_ransac,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
-    KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, RedundancyPolicy,
-    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError, TrackerOutput,
-    TrackingHealth,
+    KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, PoseStatus,
+    RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
+    TrackerError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, Point3, RectificationMode, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoError, TriangulationConfig, TriangulationError, TriangulationResult,
+    Keyframe, KeyframeError, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
+    TriangulationConfig, TriangulationConfigError, TriangulationError, TriangulationResult,
     TriangulationStats, Triangulator,
 };
 pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
@@ -124,36 +129,53 @@ impl Timestamp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameDimensions {
-    width: u32,
-    height: u32,
+    width: NonZeroU32,
+    height: NonZeroU32,
 }
 
 impl FrameDimensions {
-    pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+    pub fn try_new(width: u32, height: u32) -> Result<Self, FrameError> {
+        let Some(width_value) = NonZeroU32::new(width) else {
+            return Err(FrameError::ZeroDimensions { width, height });
+        };
+        let Some(height_value) = NonZeroU32::new(height) else {
+            return Err(FrameError::ZeroDimensions { width, height });
+        };
+        Ok(Self {
+            width: width_value,
+            height: height_value,
+        })
+    }
+
+    pub(crate) fn new(width: u32, height: u32) -> Self {
+        Self::try_new(width, height).expect("internally validated frame dimensions")
     }
 
     pub fn width(self) -> u32 {
-        self.width
+        self.width.get()
     }
 
     pub fn height(self) -> u32 {
-        self.height
+        self.height.get()
     }
 
     pub fn area(self) -> usize {
-        (self.width as usize).saturating_mul(self.height as usize)
+        (self.width.get() as usize).saturating_mul(self.height.get() as usize)
     }
 }
 
 // Define these much more concretely
 #[derive(Debug)]
 pub enum FrameError {
+    ZeroDimensions { width: u32, height: u32 },
     DimensionMismatch { expected: usize, actual: usize },
 }
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            FrameError::ZeroDimensions { width, height } => {
+                write!(f, "frame dimensions must be nonzero, got {width}x{height}")
+            }
             FrameError::DimensionMismatch { expected, actual } => {
                 write!(f, "dimension mismatch: expected {expected}, got {actual}")
             }
@@ -170,8 +192,8 @@ pub enum PairError {
         right: FrameDimensions,
     },
     TimestampDelta {
-        delta_ns: i64,
-        max_delta_ns: i64,
+        delta_ns: u64,
+        max_delta_ns: u64,
     },
     SensorMismatch {
         left: SensorId,
@@ -211,25 +233,36 @@ impl std::fmt::Display for PairError {
 impl std::error::Error for PairError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DownscaleFactor(NonZeroUsize);
+pub struct DownscaleFactor(NonZeroU32);
 
 impl DownscaleFactor {
-    pub fn new(value: NonZeroUsize) -> Self {
+    pub fn new(value: NonZeroU32) -> Self {
         Self(value)
     }
 
     pub fn get(self) -> usize {
+        self.0.get() as usize
+    }
+
+    pub fn get_u32(self) -> u32 {
         self.0.get()
     }
 
     pub fn identity() -> Self {
-        Self(NonZeroUsize::MIN)
+        Self(NonZeroU32::MIN)
     }
 }
 
 #[derive(Debug)]
 pub enum DownscaleError {
     Zero,
+    TooLarge {
+        value: usize,
+    },
+    ZeroDimensions {
+        width: u32,
+        height: u32,
+    },
     NonDivisible {
         width: u32,
         height: u32,
@@ -241,6 +274,12 @@ impl std::fmt::Display for DownscaleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
+            DownscaleError::TooLarge { value } => {
+                write!(f, "downscale factor {value} exceeds u32::MAX")
+            }
+            DownscaleError::ZeroDimensions { width, height } => {
+                write!(f, "input dimensions must be nonzero, got {width}x{height}")
+            }
             DownscaleError::NonDivisible {
                 width,
                 height,
@@ -259,7 +298,8 @@ impl TryFrom<usize> for DownscaleFactor {
     type Error = DownscaleError;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        NonZeroUsize::new(value)
+        let value = u32::try_from(value).map_err(|_| DownscaleError::TooLarge { value })?;
+        NonZeroU32::new(value)
             .map(DownscaleFactor)
             .ok_or(DownscaleError::Zero)
     }
@@ -284,6 +324,9 @@ impl Frame {
         height: u32,
         data: Vec<u8>,
     ) -> Result<Self, FrameError> {
+        if width == 0 || height == 0 {
+            return Err(FrameError::ZeroDimensions { width, height });
+        }
         let size = (width as usize) * (height as usize);
 
         if data.len() != size {
@@ -391,6 +434,31 @@ pub enum DetectionError {
         scores_len: usize,
         descriptors_len: usize,
     },
+    ZeroDimensions {
+        width: u32,
+        height: u32,
+    },
+    NonFiniteKeypoint {
+        index: usize,
+        x: f32,
+        y: f32,
+    },
+    KeypointOutOfBounds {
+        index: usize,
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+    },
+    NonFiniteScore {
+        index: usize,
+        score: f32,
+    },
+    NonFiniteDescriptor {
+        detection_index: usize,
+        component_index: usize,
+        value: f32,
+    },
 }
 
 impl std::fmt::Display for DetectionError {
@@ -403,6 +471,36 @@ impl std::fmt::Display for DetectionError {
             } => write!(
                 f,
                 "detections shape mismatch: keypoints={keypoints_len}, scores={scores_len}, descriptors={descriptors_len}"
+            ),
+            DetectionError::ZeroDimensions { width, height } => {
+                write!(
+                    f,
+                    "detection dimensions must be nonzero, got {width}x{height}"
+                )
+            }
+            DetectionError::NonFiniteKeypoint { index, x, y } => {
+                write!(f, "detection keypoint {index} is nonfinite: ({x}, {y})")
+            }
+            DetectionError::KeypointOutOfBounds {
+                index,
+                x,
+                y,
+                width,
+                height,
+            } => write!(
+                f,
+                "detection keypoint {index} ({x}, {y}) is outside {width}x{height}"
+            ),
+            DetectionError::NonFiniteScore { index, score } => {
+                write!(f, "detection score {index} is nonfinite: {score}")
+            }
+            DetectionError::NonFiniteDescriptor {
+                detection_index,
+                component_index,
+                value,
+            } => write!(
+                f,
+                "descriptor {detection_index} component {component_index} is nonfinite: {value}"
             ),
         }
     }
@@ -481,6 +579,48 @@ impl Detections {
                 scores_len: scores.len(),
                 descriptors_len: descriptors.len(),
             });
+        }
+        if width == 0 || height == 0 {
+            return Err(DetectionError::ZeroDimensions { width, height });
+        }
+        let width_f = width as f32;
+        let height_f = height as f32;
+        for (index, point) in keypoints.iter().enumerate() {
+            if !point.x.is_finite() || !point.y.is_finite() {
+                return Err(DetectionError::NonFiniteKeypoint {
+                    index,
+                    x: point.x,
+                    y: point.y,
+                });
+            }
+            if point.x < 0.0 || point.y < 0.0 || point.x >= width_f || point.y >= height_f {
+                return Err(DetectionError::KeypointOutOfBounds {
+                    index,
+                    x: point.x,
+                    y: point.y,
+                    width,
+                    height,
+                });
+            }
+        }
+        for (index, &score) in scores.iter().enumerate() {
+            if !score.is_finite() {
+                return Err(DetectionError::NonFiniteScore { index, score });
+            }
+        }
+        for (detection_index, descriptor) in descriptors.iter().enumerate() {
+            if let Some((component_index, &value)) = descriptor
+                .as_slice()
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(DetectionError::NonFiniteDescriptor {
+                    detection_index,
+                    component_index,
+                    value,
+                });
+            }
         }
 
         Ok(Self {
@@ -589,11 +729,14 @@ impl StereoPair {
             });
         }
 
-        let delta = (left.timestamp().as_nanos() - right.timestamp().as_nanos()).abs();
-        if delta > window.as_ns() {
+        let delta = left
+            .timestamp()
+            .as_nanos()
+            .abs_diff(right.timestamp().as_nanos());
+        if delta > window.as_ns() as u64 {
             return Err(PairError::TimestampDelta {
                 delta_ns: delta,
-                max_delta_ns: window.as_ns(),
+                max_delta_ns: window.as_ns() as u64,
             });
         }
 
@@ -618,8 +761,11 @@ impl StereoPair {
         (self.left, self.right)
     }
 
-    pub fn timestamp_delta_ns(&self) -> i64 {
-        (self.left.timestamp().as_nanos() - self.right.timestamp().as_nanos()).abs()
+    pub fn timestamp_delta_ns(&self) -> u64 {
+        self.left
+            .timestamp()
+            .as_nanos()
+            .abs_diff(self.right.timestamp().as_nanos())
     }
 }
 
@@ -719,6 +865,25 @@ pub enum MatchError {
         score_len: usize,
         indices_len: usize,
     },
+    IndexOutOfBounds {
+        match_index: usize,
+        source_a_index: usize,
+        source_b_index: usize,
+        source_a_len: usize,
+        source_b_len: usize,
+    },
+    DuplicateIndex {
+        source: &'static str,
+        index: usize,
+    },
+    NonFiniteScore {
+        match_index: usize,
+        score: f32,
+    },
+    KeyframeSourceMismatch {
+        matches_frame: FrameId,
+        keyframe_frame: FrameId,
+    },
 }
 
 impl std::fmt::Display for MatchError {
@@ -730,6 +895,31 @@ impl std::fmt::Display for MatchError {
             } => write!(
                 f,
                 "match shape mismatch: scores={score_len}, indices={indices_len}"
+            ),
+            MatchError::IndexOutOfBounds {
+                match_index,
+                source_a_index,
+                source_b_index,
+                source_a_len,
+                source_b_len,
+            } => write!(
+                f,
+                "match {match_index} index out of bounds: ({source_a_index}, {source_b_index}) for lengths ({source_a_len}, {source_b_len})"
+            ),
+            MatchError::DuplicateIndex { source, index } => {
+                write!(f, "match source {source} reuses detection index {index}")
+            }
+            MatchError::NonFiniteScore { match_index, score } => {
+                write!(f, "match {match_index} has nonfinite score {score}")
+            }
+            MatchError::KeyframeSourceMismatch {
+                matches_frame,
+                keyframe_frame,
+            } => write!(
+                f,
+                "verified match source frame {} does not match keyframe frame {}",
+                matches_frame.as_u64(),
+                keyframe_frame.as_u64()
             ),
         }
     }
@@ -756,7 +946,18 @@ impl Matches<Raw> {
         Matches::<Raw>::from_parts(source_a, source_b, indices, scores)
     }
 
-    pub fn with_landmarks(&self, keyframe: &Keyframe) -> Result<Matches<Verified>, MatchError> {
+    pub(crate) fn with_landmarks(
+        &self,
+        keyframe: &Keyframe,
+    ) -> Result<Matches<Verified>, MatchError> {
+        if self.source_b.frame_id() != keyframe.frame_id()
+            || !Arc::ptr_eq(&self.source_b, keyframe.detections())
+        {
+            return Err(MatchError::KeyframeSourceMismatch {
+                matches_frame: self.source_b.frame_id(),
+                keyframe_frame: keyframe.frame_id(),
+            });
+        }
         let mut indices = Vec::new();
         let mut scores = Vec::new();
         for (idx, &(a, b)) in self.indices.iter().enumerate() {
@@ -771,7 +972,7 @@ impl Matches<Raw> {
 }
 
 impl Matches<Verified> {
-    pub fn new_verified(
+    fn new_verified(
         source_a: Arc<Detections>,
         source_b: Arc<Detections>,
         indices: Vec<(usize, usize)>,
@@ -793,6 +994,36 @@ impl<State> Matches<State> {
                 score_len: scores.len(),
                 indices_len: indices.len(),
             });
+        }
+        let mut seen_a = vec![false; source_a.len()];
+        let mut seen_b = vec![false; source_b.len()];
+        for (match_index, (&(a, b), &score)) in indices.iter().zip(&scores).enumerate() {
+            if a >= source_a.len() || b >= source_b.len() {
+                return Err(MatchError::IndexOutOfBounds {
+                    match_index,
+                    source_a_index: a,
+                    source_b_index: b,
+                    source_a_len: source_a.len(),
+                    source_b_len: source_b.len(),
+                });
+            }
+            if seen_a[a] {
+                return Err(MatchError::DuplicateIndex {
+                    source: "a",
+                    index: a,
+                });
+            }
+            if seen_b[b] {
+                return Err(MatchError::DuplicateIndex {
+                    source: "b",
+                    index: b,
+                });
+            }
+            if !score.is_finite() {
+                return Err(MatchError::NonFiniteScore { match_index, score });
+            }
+            seen_a[a] = true;
+            seen_b[b] = true;
         }
         Ok(Self {
             source_a,

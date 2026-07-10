@@ -53,7 +53,7 @@ pub fn solve_pcg(
     for iter in 0..max_iters {
         h.spmv(&p, &mut hp)?;
         let denom = dot(&p, &hp);
-        if denom.abs() < NEAR_ZERO {
+        if !denom.is_finite() || denom <= 0.0 {
             return Ok(PcgResult {
                 iterations: iter,
                 residual_norm,
@@ -62,6 +62,13 @@ pub fn solve_pcg(
         }
 
         let alpha = rz_old / denom;
+        if !alpha.is_finite() {
+            return Ok(PcgResult {
+                iterations: iter,
+                residual_norm,
+                converged: false,
+            });
+        }
         for (xi, pi) in x.iter_mut().zip(p.iter()) {
             *xi += alpha * *pi;
         }
@@ -79,7 +86,7 @@ pub fn solve_pcg(
 
         apply_preconditioner(&diag_inv, &r, &mut z);
         let rz_new = dot(&r, &z);
-        if rz_old.abs() < NEAR_ZERO {
+        if !rz_old.is_finite() || rz_old <= 0.0 || !rz_new.is_finite() {
             return Ok(PcgResult {
                 iterations: iter + 1,
                 residual_norm,
@@ -87,6 +94,13 @@ pub fn solve_pcg(
             });
         }
         let beta = rz_new / rz_old;
+        if !beta.is_finite() {
+            return Ok(PcgResult {
+                iterations: iter + 1,
+                residual_norm,
+                converged: false,
+            });
+        }
         for (pi, zi) in p.iter_mut().zip(z.iter()) {
             *pi = *zi + beta * *pi;
         }

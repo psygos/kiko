@@ -4,7 +4,7 @@ use std::num::NonZeroU32;
 use crate::Pose64;
 use crate::map::{KeyframeId, SlamMap};
 
-use super::{PoseGraphEdge, scaled_identity6};
+use super::{PoseGraphEdge, PoseGraphEdgeError, scaled_identity6};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EssentialEdgeKind {
@@ -15,11 +15,55 @@ pub enum EssentialEdgeKind {
 
 #[derive(Clone, Debug)]
 pub struct EssentialEdge {
-    pub a: KeyframeId,
-    pub b: KeyframeId,
-    pub kind: EssentialEdgeKind,
-    pub relative_pose: Pose64,
-    pub information: [[f64; 6]; 6],
+    a: KeyframeId,
+    b: KeyframeId,
+    kind: EssentialEdgeKind,
+    /// Camera-`a` to camera-`b` transform for world-to-camera keyframe poses.
+    relative_pose: Pose64,
+    information: [[f64; 6]; 6],
+}
+
+impl EssentialEdge {
+    pub fn try_new(
+        a: KeyframeId,
+        b: KeyframeId,
+        kind: EssentialEdgeKind,
+        relative_pose: Pose64,
+        information: [[f64; 6]; 6],
+    ) -> Result<Self, EssentialGraphError> {
+        if a == b {
+            return Err(EssentialGraphError::SelfEdge { keyframe_id: a });
+        }
+        PoseGraphEdge::try_new(0, 1, relative_pose, information)
+            .map_err(EssentialGraphError::InvalidEdge)?;
+        Ok(Self {
+            a,
+            b,
+            kind,
+            relative_pose,
+            information,
+        })
+    }
+
+    pub fn a(&self) -> KeyframeId {
+        self.a
+    }
+
+    pub fn b(&self) -> KeyframeId {
+        self.b
+    }
+
+    pub fn kind(&self) -> EssentialEdgeKind {
+        self.kind
+    }
+
+    pub fn relative_pose(&self) -> Pose64 {
+        self.relative_pose
+    }
+
+    pub fn information(&self) -> [[f64; 6]; 6] {
+        self.information
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +96,8 @@ pub struct EssentialGraph {
 pub enum EssentialGraphError {
     KeyframeNotFound { keyframe_id: KeyframeId },
     RootRemovalDenied { keyframe_id: KeyframeId },
+    SelfEdge { keyframe_id: KeyframeId },
+    InvalidEdge(PoseGraphEdgeError),
 }
 
 impl std::fmt::Display for EssentialGraphError {
@@ -66,11 +112,29 @@ impl std::fmt::Display for EssentialGraphError {
                     "cannot remove essential graph root keyframe: {keyframe_id:?}"
                 )
             }
+            EssentialGraphError::SelfEdge { keyframe_id } => {
+                write!(
+                    f,
+                    "essential graph edge cannot be a self-edge: {keyframe_id:?}"
+                )
+            }
+            EssentialGraphError::InvalidEdge(err) => {
+                write!(f, "invalid essential graph edge: {err}")
+            }
         }
     }
 }
 
-impl std::error::Error for EssentialGraphError {}
+impl std::error::Error for EssentialGraphError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidEdge(err) => Some(err),
+            Self::KeyframeNotFound { .. }
+            | Self::RootRemovalDenied { .. }
+            | Self::SelfEdge { .. } => None,
+        }
+    }
+}
 
 impl EssentialGraph {
     pub fn new(strong_threshold: u32) -> Self {
@@ -114,24 +178,30 @@ impl EssentialGraph {
 
         let mut strongest = None;
         for (&neighbor, &weight) in neighbors {
-            if strongest
-                .as_ref()
-                .is_none_or(|(_, best_w): &(KeyframeId, u32)| weight.get() > *best_w)
+            let neighbor_is_registered = self.parent.contains_key(&neighbor);
+            if neighbor_is_registered
+                && strongest
+                    .as_ref()
+                    .is_none_or(|(_, best_w): &(KeyframeId, u32)| weight.get() > *best_w)
             {
                 strongest = Some((neighbor, weight.get()));
             }
 
-            if weight.get() >= self.strong_threshold
+            if neighbor_is_registered
+                && weight.get() >= self.strong_threshold
                 && !contains_edge(&self.strong_covis_edges, keyframe_id, neighbor)
                 && let Some(relative_pose) = relative_pose(map, keyframe_id, neighbor)
             {
-                self.strong_covis_edges.push(EssentialEdge {
-                    a: keyframe_id,
-                    b: neighbor,
-                    kind: EssentialEdgeKind::StrongCovisibility,
-                    relative_pose,
-                    information: scaled_identity6(weight.get() as f64),
-                });
+                self.strong_covis_edges.push(
+                    EssentialEdge::try_new(
+                        keyframe_id,
+                        neighbor,
+                        EssentialEdgeKind::StrongCovisibility,
+                        relative_pose,
+                        scaled_identity6(weight.get() as f64),
+                    )
+                    .expect("nonzero covisibility weight must produce a valid edge"),
+                );
             }
         }
 
@@ -139,15 +209,22 @@ impl EssentialGraph {
             self.parent.insert(keyframe_id, keyframe_id);
             return;
         };
+        // The parent relationship is already represented by the spanning edge.
+        // Keeping the same pair as a strong-covisibility edge double-weights it.
+        self.strong_covis_edges
+            .retain(|edge| !same_endpoints(edge, parent, keyframe_id));
         self.parent.insert(keyframe_id, parent);
         if let Some(relative_pose) = relative_pose(map, parent, keyframe_id) {
-            self.spanning_edges.push(EssentialEdge {
-                a: parent,
-                b: keyframe_id,
-                kind: EssentialEdgeKind::SpanningTree,
-                relative_pose,
-                information: scaled_identity6(weight as f64),
-            });
+            self.spanning_edges.push(
+                EssentialEdge::try_new(
+                    parent,
+                    keyframe_id,
+                    EssentialEdgeKind::SpanningTree,
+                    relative_pose,
+                    scaled_identity6(weight as f64),
+                )
+                .expect("nonzero spanning weight must produce a valid edge"),
+            );
         }
     }
 
@@ -209,13 +286,13 @@ impl EssentialGraph {
                 continue;
             }
             if let Some(relative_pose) = relative_pose(map, parent, child) {
-                self.spanning_edges.push(EssentialEdge {
-                    a: parent,
-                    b: child,
-                    kind: EssentialEdgeKind::SpanningTree,
+                self.spanning_edges.push(EssentialEdge::try_new(
+                    parent,
+                    child,
+                    EssentialEdgeKind::SpanningTree,
                     relative_pose,
-                    information: scaled_identity6(1.0),
-                });
+                    scaled_identity6(1.0),
+                )?);
             }
         }
 
@@ -260,13 +337,15 @@ impl EssentialGraph {
 
         let edges = self
             .iter_all_edges()
-            .filter_map(|edge| {
-                Some(PoseGraphEdge {
-                    from: *id_to_idx.get(&edge.a)?,
-                    to: *id_to_idx.get(&edge.b)?,
-                    measurement: edge.relative_pose,
-                    information: edge.information,
-                })
+            .map(|edge| {
+                let from = *id_to_idx
+                    .get(&edge.a)
+                    .expect("essential edge endpoint must be indexed");
+                let to = *id_to_idx
+                    .get(&edge.b)
+                    .expect("essential edge endpoint must be indexed");
+                PoseGraphEdge::try_new(from, to, edge.relative_pose, edge.information)
+                    .expect("essential graph must contain validated edge information")
             })
             .collect();
 
@@ -282,15 +361,17 @@ impl EssentialGraph {
 }
 
 fn contains_edge(edges: &[EssentialEdge], a: KeyframeId, b: KeyframeId) -> bool {
-    edges
-        .iter()
-        .any(|edge| (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a))
+    edges.iter().any(|edge| same_endpoints(edge, a, b))
+}
+
+fn same_endpoints(edge: &EssentialEdge, a: KeyframeId, b: KeyframeId) -> bool {
+    (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a)
 }
 
 fn relative_pose(map: &SlamMap, from: KeyframeId, to: KeyframeId) -> Option<Pose64> {
     let from_pose = map.keyframe(from)?.pose();
     let to_pose = map.keyframe(to)?.pose();
-    let from_64 = Pose64::from_pose32(from_pose);
-    let to_64 = Pose64::from_pose32(to_pose);
-    Some(from_64.inverse().compose(to_64))
+    let from_64 = Pose64::from_pose32(from_pose.into_legacy_pose());
+    let to_64 = Pose64::from_pose32(to_pose.into_legacy_pose());
+    Some(to_64.compose(from_64.inverse()))
 }

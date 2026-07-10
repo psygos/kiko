@@ -1,15 +1,15 @@
-use super::{InferenceBackend, InferenceError, build_session};
+use super::{InferenceBackend, InferenceError, ManagedSession, build_session};
 use crate::DESCRIPTOR_DIM;
 use crate::Detections;
 use crate::Matches;
 use crate::Raw;
-use ort::session::Session;
-use ort::value::TensorRef;
+use ort::session::RunOptions;
+use ort::value::Tensor;
 use std::path::Path;
 use std::sync::Arc;
 
 pub struct LightGlue {
-    session: Session,
+    session: ManagedSession,
     backend: InferenceBackend,
 }
 
@@ -42,19 +42,25 @@ impl LightGlue {
     ) -> Result<Matches<Raw>, InferenceError> {
         let kpts_0 = normalize_keypoints(&dec_1);
         let kpts_1 = normalize_keypoints(&dec_2);
-        let desc_0 = dec_1.descriptors_flat();
-        let desc_1 = dec_2.descriptors_flat();
+        let desc_0 = dec_1.descriptors_flat().to_vec();
+        let desc_1 = dec_2.descriptors_flat().to_vec();
 
-        let kpts_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), 2], kpts_0.as_slice()))?;
-        let kpts_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), 2], kpts_1.as_slice()))?;
-        let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), DESCRIPTOR_DIM], desc_0))?;
-        let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), DESCRIPTOR_DIM], desc_1))?;
+        let len_0 = dec_1.len();
+        let len_1 = dec_2.len();
+        let kpts_0_tensor = Tensor::from_array(([1, len_0, 2], kpts_0))?;
+        let kpts_1_tensor = Tensor::from_array(([1, len_1, 2], kpts_1))?;
+        let desc_0_tensor = Tensor::from_array(([1, len_0, DESCRIPTOR_DIM], desc_0))?;
+        let desc_1_tensor = Tensor::from_array(([1, len_1, DESCRIPTOR_DIM], desc_1))?;
 
-        let outputs = super::run_with_watchdog("lightglue", || {
-            self.session
-                .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
-                .map_err(InferenceError::Execution)
-        })?;
+        self.session.run("lightglue", |session| {
+            let run_options = RunOptions::new().map_err(InferenceError::Execution)?;
+            let inference = session
+                .run_async(
+                    ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor],
+                    &run_options,
+                )
+                .map_err(InferenceError::Execution)?;
+            let outputs = super::run_with_watchdog("lightglue", inference)?;
         let matches_raw = outputs
             .get("matches0")
             .ok_or_else(|| InferenceError::UnexpectedOutput {
@@ -98,7 +104,9 @@ impl LightGlue {
             scores.push(score);
         }
 
-        Matches::new(dec_1, dec_2, indices, scores).map_err(InferenceError::Match)
+            drop(outputs);
+            Matches::new(dec_1, dec_2, indices, scores).map_err(InferenceError::Match)
+        })
     }
 }
 

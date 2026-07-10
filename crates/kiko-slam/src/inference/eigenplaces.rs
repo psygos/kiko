@@ -1,12 +1,14 @@
 use std::path::Path;
 
-use ort::session::Session;
-use ort::value::TensorRef;
+use ort::session::RunOptions;
+use ort::value::Tensor;
 
 use crate::Frame;
 use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
 
-use super::{InferenceBackend, InferenceError, PlaceDescriptorExtractor, build_session};
+use super::{
+    InferenceBackend, InferenceError, ManagedSession, PlaceDescriptorExtractor, build_session,
+};
 
 const INPUT_SIZE: usize = 224;
 const INPUT_CHANNELS: usize = 3;
@@ -16,7 +18,7 @@ const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 pub struct EigenPlaces {
-    session: Session,
+    session: ManagedSession,
     backend: InferenceBackend,
     scratch: Vec<f32>,
 }
@@ -62,31 +64,34 @@ impl EigenPlaces {
 
     pub fn compute(&mut self, frame: &Frame) -> Result<GlobalDescriptor, InferenceError> {
         preprocess_frame_to_nchw(frame, &mut self.scratch);
-        let input_tensor = TensorRef::from_array_view((
+        let input_tensor = Tensor::from_array((
             [1, INPUT_CHANNELS, INPUT_SIZE, INPUT_SIZE],
-            self.scratch.as_slice(),
+            self.scratch.clone(),
         ))?;
 
-        // EigenPlaces ONNX exports use `input` for the image tensor.
-        let outputs = super::run_with_watchdog("eigenplaces", || {
-            self.session
-                .run(ort::inputs!["input" => input_tensor])
-                .map_err(InferenceError::Execution)
-        })?;
+        self.session.run("eigenplaces", |session| {
+            // EigenPlaces ONNX exports use `input` for the image tensor.
+            let run_options = RunOptions::new().map_err(InferenceError::Execution)?;
+            let inference = session
+                .run_async(ort::inputs!["input" => input_tensor], &run_options)
+                .map_err(InferenceError::Execution)?;
+            let outputs = super::run_with_watchdog("eigenplaces", inference)?;
 
-        let mut raw_descriptor: Option<Vec<f32>> = None;
-        for (_, value) in outputs.iter() {
-            if let Ok((_, data)) = value.try_extract_tensor::<f32>() {
-                raw_descriptor = Some(data.to_vec());
-                break;
+            let mut raw_descriptor: Option<Vec<f32>> = None;
+            for (_, value) in outputs.iter() {
+                if let Ok((_, data)) = value.try_extract_tensor::<f32>() {
+                    raw_descriptor = Some(data.to_vec());
+                    break;
+                }
             }
-        }
-        let raw_descriptor = raw_descriptor.ok_or_else(|| InferenceError::UnexpectedOutput {
-            name: "eigenplaces-output".to_string(),
-            expected: "at least one f32 tensor output".to_string(),
-            actual: "no f32 tensor output".to_string(),
-        })?;
-        parse_descriptor_output(raw_descriptor.as_slice())
+            let raw_descriptor =
+                raw_descriptor.ok_or_else(|| InferenceError::UnexpectedOutput {
+                    name: "eigenplaces-output".to_string(),
+                    expected: "at least one f32 tensor output".to_string(),
+                    actual: "no f32 tensor output".to_string(),
+                })?;
+            parse_descriptor_output(raw_descriptor.as_slice())
+        })
     }
 }
 
