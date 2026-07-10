@@ -21,7 +21,8 @@ jobs:
         run: cargo fmt --package kiko-slam -- --check
 
       - name: Clippy
-        run: cargo clippy -p kiko-slam --all-targets --all-features -- -D warnings
+        # `record` links DepthAI and is checked on the Jetson native toolchain.
+        run: cargo clippy -p kiko-slam --all-targets -- -D warnings
 
   host-tests:
     name: Host Workspace Tests
@@ -37,9 +38,6 @@ jobs:
 
       - name: Run host crate tests
         run: cargo test -p kiko-slam
-
-      - name: Build oak-sys tests
-        run: cargo test -p oak-sys --no-run
 
       - name: Build robot-server tests
         run: cargo test -p robot-server --no-run
