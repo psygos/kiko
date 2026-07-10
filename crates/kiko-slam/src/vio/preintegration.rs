@@ -331,8 +331,8 @@ fn error_state_transition(omega_mid: [f64; 3], accel_mid: [f64; 3], dt: f64) -> 
 
 fn noise_injection(delta_rotation: [[f64; 3]; 3], dt: f64) -> [[f64; 6]; 9] {
     let mut g = [[0.0_f64; 6]; 9];
-    for row in 0..3 {
-        g[row][row] = dt;
+    for (row, g_row) in g.iter_mut().enumerate().take(3) {
+        g_row[row] = dt;
     }
     for row in 0..3 {
         for col in 0..3 {
@@ -360,13 +360,13 @@ fn invert_stabilized_covariance<const N: usize>(
     mut covariance: [[f64; N]; N],
     min_variance: f64,
 ) -> [[f64; N]; N] {
-    for axis in 0..N {
-        covariance[axis][axis] = covariance[axis][axis].max(min_variance);
+    for (axis, row) in covariance.iter_mut().enumerate().take(N) {
+        row[axis] = row[axis].max(min_variance);
     }
     invert_square(covariance).unwrap_or_else(|| {
         let mut fallback = [[0.0_f64; N]; N];
-        for axis in 0..N {
-            fallback[axis][axis] = 1.0 / covariance[axis][axis].max(min_variance);
+        for (axis, row) in fallback.iter_mut().enumerate().take(N) {
+            row[axis] = 1.0 / covariance[axis][axis].max(min_variance);
         }
         fallback
     })
@@ -375,8 +375,8 @@ fn invert_stabilized_covariance<const N: usize>(
 fn invert_square<const N: usize>(matrix: [[f64; N]; N]) -> Option<[[f64; N]; N]> {
     let mut a = matrix;
     let mut inv = [[0.0_f64; N]; N];
-    for idx in 0..N {
-        inv[idx][idx] = 1.0;
+    for (idx, row) in inv.iter_mut().enumerate().take(N) {
+        row[idx] = 1.0;
     }
     for pivot in 0..N {
         let mut pivot_row = pivot;
@@ -495,9 +495,9 @@ fn symmetrize9(matrix: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
 
 fn transpose9(matrix: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
     let mut out = [[0.0_f64; 9]; 9];
-    for row in 0..9 {
-        for col in 0..9 {
-            out[col][row] = matrix[row][col];
+    for (row, matrix_row) in matrix.iter().enumerate() {
+        for (col, value) in matrix_row.iter().enumerate() {
+            out[col][row] = *value;
         }
     }
     out
@@ -505,9 +505,9 @@ fn transpose9(matrix: [[f64; 9]; 9]) -> [[f64; 9]; 9] {
 
 fn transpose96(matrix: [[f64; 6]; 9]) -> [[f64; 9]; 6] {
     let mut out = [[0.0_f64; 9]; 6];
-    for row in 0..9 {
-        for col in 0..6 {
-            out[col][row] = matrix[row][col];
+    for (row, matrix_row) in matrix.iter().enumerate() {
+        for (col, value) in matrix_row.iter().enumerate() {
+            out[col][row] = *value;
         }
     }
     out

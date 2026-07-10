@@ -1,8 +1,7 @@
 fn main() {
-    let nvblox_root =
-        std::env::var("NVBLOX_ROOT").unwrap_or_else(|_| {
-            "/home/makerspace/work/isaac_ros_nvblox/nvblox_ros/nvblox_core".to_string()
-        });
+    let nvblox_root = std::env::var("NVBLOX_ROOT").unwrap_or_else(|_| {
+        "/home/makerspace/work/isaac_ros_nvblox/nvblox_ros/nvblox_core".to_string()
+    });
     let nvblox_build =
         std::env::var("NVBLOX_BUILD").unwrap_or_else(|_| format!("{nvblox_root}/build"));
 

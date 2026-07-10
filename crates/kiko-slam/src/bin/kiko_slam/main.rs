@@ -20,6 +20,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Run full SLAM pipeline on a recorded dataset
+    #[command(visible_alias = "run")]
     Slam(slam::SlamArgs),
     /// Visualize stereo feature matches on a recorded dataset
     Viz(viz::VizArgs),
@@ -74,7 +75,7 @@ pub fn rerun_recording(
             Default::default(),
         )?;
         Ok(rec)
-    } else if let Some(url) = &args.rerun_url {
+    } else if let Some(url) = args.stream_url() {
         eprintln!("rerun: connecting to {url}");
         Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc_opts(url)?)
     } else {

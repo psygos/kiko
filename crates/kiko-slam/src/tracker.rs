@@ -20,7 +20,7 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
-use crate::frontend::{StereoFrontend, median_parallax_px};
+use crate::frontend::{StereoFrontend, TrackedMapObservations, median_parallax_px};
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
     LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
@@ -51,6 +51,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 pub struct TrackerConfig {
     pub max_keypoints: KeypointLimit,
     pub downscale: DownscaleFactor,
+    pub tracking_matcher: TrackingMatcher,
     pub min_keyframe_points: usize,
     pub ransac: RansacConfig,
     pub triangulation: TriangulationConfig,
@@ -59,6 +60,8 @@ pub struct TrackerConfig {
     pub redundancy: Option<RedundancyPolicy>,
     pub backend: Option<BackendConfig>,
     pub loop_subsystem: LoopSubsystemConfig,
+    #[cfg(feature = "vio")]
+    pub vio_enabled: bool,
 }
 
 impl TrackerConfig {
@@ -76,6 +79,37 @@ impl TrackerConfig {
 
     fn relocalization_config(&self) -> Option<RelocalizationConfig> {
         self.loop_subsystem.relocalization()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrackingMatcher {
+    LightGlue,
+    Projected(ProjectedMatcherConfig),
+}
+
+impl TrackingMatcher {
+    pub fn uses_speculative_lightglue(self) -> bool {
+        matches!(self, Self::LightGlue)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProjectedMatcherConfig {
+    pub search_radius_px: f32,
+    pub min_similarity: f32,
+    pub min_matches: usize,
+    pub min_inliers: usize,
+}
+
+impl ProjectedMatcherConfig {
+    pub fn jetson_default() -> Self {
+        Self {
+            search_radius_px: 32.0,
+            min_similarity: 0.45,
+            min_matches: 32,
+            min_inliers: 24,
+        }
     }
 }
 
@@ -1596,7 +1630,7 @@ impl VioRuntime {
 enum PoseRefinementProposal {
     None,
     VisualBa(VisualBaPoseProposal),
-    Vio(VioPoseProposal),
+    Vio(Box<VioPoseProposal>),
 }
 
 #[cfg(feature = "vio")]
@@ -1674,6 +1708,121 @@ struct SharedPoseReprojectionMetrics {
     rhs_rmse_px: Option<f32>,
 }
 
+struct TrackingAttempt {
+    matches: Matches<Raw>,
+    verified: Matches<Verified>,
+    tracked_observations: TrackedMapObservations,
+    tracking_ransac: RansacConfig,
+    result: crate::PnpResult,
+}
+
+enum TrackingAttemptError {
+    NotEnoughMapPoints {
+        matches: usize,
+        verified: usize,
+    },
+    PnpFailed {
+        matches: usize,
+        verified: usize,
+        observations: usize,
+        required_inliers: usize,
+    },
+    Fatal(TrackerError),
+}
+
+impl TrackingAttemptError {
+    fn trace_label(&self) -> &'static str {
+        match self {
+            Self::NotEnoughMapPoints { .. } => "not_enough_map_points",
+            Self::PnpFailed { .. } => "pnp_failed",
+            Self::Fatal(_) => "fatal",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedMatchCandidate {
+    current_idx: usize,
+    keyframe_idx: usize,
+    score: f32,
+    distance_sq: f32,
+}
+
+struct CurrentKeypointGrid {
+    cell_size: f32,
+    cols: usize,
+    rows: usize,
+    cells: Vec<Vec<usize>>,
+}
+
+impl CurrentKeypointGrid {
+    fn new(detections: &Detections, search_radius_px: f32) -> Self {
+        let cell_size = search_radius_px.max(1.0);
+        let cols = ((detections.width() as f32) / cell_size).ceil().max(1.0) as usize;
+        let rows = ((detections.height() as f32) / cell_size).ceil().max(1.0) as usize;
+        let mut cells = vec![Vec::new(); cols * rows];
+        for (idx, kp) in detections.keypoints().iter().enumerate() {
+            if kp.x < 0.0 || kp.y < 0.0 {
+                continue;
+            }
+            let col = ((kp.x / cell_size).floor() as usize).min(cols.saturating_sub(1));
+            let row = ((kp.y / cell_size).floor() as usize).min(rows.saturating_sub(1));
+            cells[row * cols + col].push(idx);
+        }
+        Self {
+            cell_size,
+            cols,
+            rows,
+            cells,
+        }
+    }
+
+    fn for_each(&self, x: f32, y: f32, radius: f32, mut visit: impl FnMut(usize)) {
+        let min_col = (((x - radius) / self.cell_size).floor() as isize)
+            .clamp(0, self.cols.saturating_sub(1) as isize) as usize;
+        let max_col = (((x + radius) / self.cell_size).floor() as isize)
+            .clamp(0, self.cols.saturating_sub(1) as isize) as usize;
+        let min_row = (((y - radius) / self.cell_size).floor() as isize)
+            .clamp(0, self.rows.saturating_sub(1) as isize) as usize;
+        let max_row = (((y + radius) / self.cell_size).floor() as isize)
+            .clamp(0, self.rows.saturating_sub(1) as isize) as usize;
+        for row in min_row..=max_row {
+            for col in min_col..=max_col {
+                for &idx in &self.cells[row * self.cols + col] {
+                    visit(idx);
+                }
+            }
+        }
+    }
+}
+
+fn descriptor_similarity(a: &crate::Descriptor, b: &crate::Descriptor) -> f32 {
+    a.as_slice()
+        .iter()
+        .zip(b.as_slice())
+        .map(|(lhs, rhs)| lhs * rhs)
+        .sum()
+}
+
+fn project_world_point(
+    pose_world_to_camera: Pose,
+    point: Point3,
+    intrinsics: PinholeIntrinsics,
+) -> Option<(f32, f32)> {
+    let pc = crate::math::transform_point(
+        pose_world_to_camera.rotation(),
+        pose_world_to_camera.translation(),
+        [point.x, point.y, point.z],
+    );
+    if pc[2] <= 0.0 {
+        return None;
+    }
+    Some((
+        intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx(),
+        intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy(),
+    ))
+}
+
 pub struct SlamTracker {
     frontend: StereoFrontend,
     config: TrackerConfig,
@@ -1712,8 +1861,12 @@ impl SlamTracker {
         let frontend = StereoFrontend::new(superpoint, lightglue, triangulator, intrinsics);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         #[cfg(feature = "vio")]
-        let local_estimator = match (calibration.imu_noise(), calibration.has_imu()) {
-            (Some(noise), true) => {
+        let local_estimator = match (
+            config.vio_enabled,
+            calibration.imu_noise(),
+            calibration.has_imu(),
+        ) {
+            (true, Some(noise), true) => {
                 let gravity = Gravity::try_new([0.0, calibration.gravity_magnitude_mps2(), 0.0])
                     .map_err(|err| TrackerInitError::VioInvalidGravity {
                         message: err.to_string(),
@@ -1837,8 +1990,7 @@ impl SlamTracker {
         self.frontend.return_prefetch_lg(lg);
     }
 
-    /// Return current tracking keyframe info for speculative LG prefetch.
-    /// Returns None if not in tracking state.
+    /// Return current tracking keyframe info for speculative LightGlue prefetch.
     pub fn current_tracking_keyframe_detections(
         &self,
     ) -> Option<(KeyframeId, std::sync::Arc<Detections>)> {
@@ -2075,12 +2227,12 @@ impl SlamTracker {
                     );
                 }
 
-                return PoseRefinementProposal::Vio(VioPoseProposal {
+                return PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
                     pose_world: cam_from_map,
                     solve_result: result,
                     optimized_state: optimized,
                     optimized_window: candidate_window,
-                });
+                }));
             }
 
             if visual_velocity_seed.is_none() {
@@ -2187,12 +2339,12 @@ impl SlamTracker {
             );
         }
 
-        PoseRefinementProposal::Vio(VioPoseProposal {
+        PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
             pose_world: cam_from_map,
             solve_result: result,
             optimized_state: optimized,
             optimized_window: candidate_window,
-        })
+        }))
     }
 
     #[cfg(feature = "vio")]
@@ -2791,11 +2943,15 @@ impl SlamTracker {
         if tracking_health != TrackingHealth::Lost {
             return;
         }
+        #[cfg(feature = "vio")]
+        let reference_cam_from_odom = self.current_odom_pose();
+        #[cfg(not(feature = "vio"))]
+        let reference_cam_from_odom = None;
         if let Some(session) = Self::initial_relocalization_session(
             tracking_health,
             self.config.relocalization_config().is_some(),
             detections,
-            self.current_odom_pose(),
+            reference_cam_from_odom,
         ) {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
@@ -3045,6 +3201,7 @@ impl SlamTracker {
         }
 
         session.last_detections = current;
+        #[cfg(feature = "vio")]
         let reference_cam_from_odom = session.reference_cam_from_odom;
         match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
             RelocalizationStep::Recovered { pose_world } => {
@@ -3089,13 +3246,207 @@ impl SlamTracker {
         Ok(self.relocalization_output(frame_id, TrackingHealth::Degraded))
     }
 
-    fn track(
-        &mut self,
-        pair: StereoPair,
-        keyframe: &Arc<Keyframe>,
+    fn build_tracking_attempt(
+        &self,
+        current: &Arc<Detections>,
+        keyframe: &Keyframe,
         keyframe_id: KeyframeId,
-    ) -> Result<TrackerOutput, TrackerError> {
-        self.track_with_prefetch(pair, keyframe, keyframe_id, None, None)
+        matches: Matches<Raw>,
+    ) -> Result<TrackingAttempt, TrackingAttemptError> {
+        let match_count = matches.len();
+        let verified = matches.with_landmarks(keyframe).map_err(|err| {
+            TrackingAttemptError::Fatal(TrackerError::Inference(InferenceError::Match(err)))
+        })?;
+        let verified_count = verified.len();
+
+        let tracked_observations = match self.frontend.build_map_observations(
+            self.global_map.map(),
+            keyframe_id,
+            &verified,
+            current.as_ref(),
+        ) {
+            Ok(obs) => obs,
+            Err(crate::PnpError::NotEnoughPoints { .. }) => {
+                return Err(TrackingAttemptError::NotEnoughMapPoints {
+                    matches: match_count,
+                    verified: verified_count,
+                });
+            }
+            Err(err) => return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err))),
+        };
+        let tracking_ransac =
+            adaptive_tracking_ransac_config(self.config.ransac, tracked_observations.len());
+
+        let result = match self
+            .frontend
+            .solve_tracking_pose(&tracked_observations.observations, tracking_ransac)
+        {
+            Ok(result) => result,
+            Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
+                return Err(TrackingAttemptError::PnpFailed {
+                    matches: match_count,
+                    verified: verified_count,
+                    observations: tracked_observations.len(),
+                    required_inliers: tracking_ransac.min_inliers,
+                });
+            }
+            Err(err) => return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err))),
+        };
+
+        Ok(TrackingAttempt {
+            matches,
+            verified,
+            tracked_observations,
+            tracking_ransac,
+            result,
+        })
+    }
+
+    fn lightglue_tracking_matches(
+        &mut self,
+        current: Arc<Detections>,
+        keyframe: &Keyframe,
+        keyframe_id: KeyframeId,
+        prefetched_matches: Option<(KeyframeId, Matches<Raw>)>,
+        frame_id: FrameId,
+    ) -> Result<Matches<Raw>, TrackerError> {
+        let tracking_matches = if let Some((prefetch_keyframe_id, prefetched_raw)) =
+            prefetched_matches
+        {
+            if prefetch_keyframe_id == keyframe_id {
+                if self.trace_transitions {
+                    eprintln!("speculative LightGlue hit: frame={}", frame_id.as_u64());
+                }
+                prefetched_raw
+            } else {
+                if self.trace_transitions {
+                    eprintln!(
+                        "speculative LightGlue miss: prefetched={prefetch_keyframe_id:?} current={keyframe_id:?}"
+                    );
+                }
+                self.frontend
+                    .match_tracking(current, keyframe.tracking_detections().clone())?
+            }
+        } else {
+            self.frontend
+                .match_tracking(current, keyframe.tracking_detections().clone())?
+        };
+        keyframe
+            .remap_tracking_matches(&tracking_matches)
+            .map_err(|err| TrackerError::Inference(InferenceError::Match(err)))
+    }
+
+    fn predicted_tracking_pose(&self) -> Option<Pose> {
+        #[cfg(feature = "vio")]
+        if let Some(cam_from_odom) = self.current_odom_pose() {
+            return Some(self.map_from_odom.odom_to_map(cam_from_odom).to_pose32());
+        }
+        self.last_pose_world
+    }
+
+    fn projected_tracking_matches(
+        &self,
+        current: Arc<Detections>,
+        keyframe: &Keyframe,
+        keyframe_id: KeyframeId,
+        config: ProjectedMatcherConfig,
+    ) -> Result<Option<Matches<Raw>>, TrackerError> {
+        let Some(predicted_pose) = self.predicted_tracking_pose() else {
+            return Ok(None);
+        };
+        let radius = config.search_radius_px;
+        let radius_sq = radius * radius;
+        let intrinsics = self.frontend.intrinsics();
+        let grid = CurrentKeypointGrid::new(&current, radius);
+        let current_keypoints = current.keypoints();
+        let current_descriptors = current.descriptors();
+        let keyframe_descriptors = keyframe.detections().descriptors();
+        let mut candidates = Vec::with_capacity(keyframe.landmark_indices().len());
+
+        for &keyframe_idx in keyframe.landmark_indices() {
+            let keypoint_ref = self
+                .global_map
+                .keyframe_keypoint(keyframe_id, keyframe_idx)?;
+            let Some(point_id) = self.global_map.map_point_for_keypoint(keypoint_ref)? else {
+                continue;
+            };
+            let Some(point) = self.global_map.point(point_id) else {
+                continue;
+            };
+            let Some((u, v)) = project_world_point(predicted_pose, point.position(), intrinsics)
+            else {
+                continue;
+            };
+            if u < -radius
+                || v < -radius
+                || u >= current.width() as f32 + radius
+                || v >= current.height() as f32 + radius
+            {
+                continue;
+            }
+
+            let key_desc = &keyframe_descriptors[keyframe_idx];
+            let mut best: Option<ProjectedMatchCandidate> = None;
+            grid.for_each(u, v, radius, |current_idx| {
+                let kp = current_keypoints[current_idx];
+                let dx = kp.x - u;
+                let dy = kp.y - v;
+                let distance_sq = dx * dx + dy * dy;
+                if distance_sq > radius_sq {
+                    return;
+                }
+                let similarity = descriptor_similarity(&current_descriptors[current_idx], key_desc);
+                if similarity < config.min_similarity {
+                    return;
+                }
+                let spatial_penalty = 0.05 * (distance_sq / radius_sq);
+                let score = similarity - spatial_penalty;
+                match best {
+                    Some(prev) if prev.score >= score => {}
+                    _ => {
+                        best = Some(ProjectedMatchCandidate {
+                            current_idx,
+                            keyframe_idx,
+                            score,
+                            distance_sq,
+                        });
+                    }
+                }
+            });
+            if let Some(best) = best {
+                candidates.push(best);
+            }
+        }
+
+        if candidates.len() < config.min_matches {
+            return Ok(None);
+        }
+        candidates.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.distance_sq.total_cmp(&b.distance_sq))
+        });
+
+        let mut used_current = vec![false; current.len()];
+        let mut used_keyframe = vec![false; keyframe.detections().len()];
+        let mut indices = Vec::with_capacity(candidates.len());
+        let mut scores = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if used_current[candidate.current_idx] || used_keyframe[candidate.keyframe_idx] {
+                continue;
+            }
+            used_current[candidate.current_idx] = true;
+            used_keyframe[candidate.keyframe_idx] = true;
+            indices.push((candidate.current_idx, candidate.keyframe_idx));
+            scores.push(candidate.score);
+        }
+
+        if indices.len() < config.min_matches {
+            return Ok(None);
+        }
+        Matches::new(current, Arc::clone(keyframe.detections()), indices, scores)
+            .map(Some)
+            .map_err(|err| TrackerError::Inference(InferenceError::Match(err)))
     }
 
     fn track_with_prefetch(
@@ -3117,7 +3468,7 @@ impl SlamTracker {
             prefetched_left,
         )?;
 
-        let matches = if current.is_empty() || keyframe.tracking_detections().is_empty() {
+        let attempt = if current.is_empty() || keyframe.tracking_detections().is_empty() {
             if self.trace_transitions {
                 eprintln!(
                     "tracking failure frame={} reason=empty_features current={} keyframe={}",
@@ -3134,103 +3485,152 @@ impl SlamTracker {
             diagnostics.tracking_time = Some(tracking_start.elapsed());
             return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
         } else {
-            // Use speculative prefetched matches if they were computed against the
-            // current keyframe. Otherwise fall back to running LG on the main thread.
-            let tracking_matches = if let Some((prefetch_kf_id, prefetch_raw)) = prefetched_matches
-            {
-                if prefetch_kf_id == keyframe_id {
-                    if self.trace_transitions {
-                        eprintln!(
-                            "speculative LG hit: using prefetched matches for frame={}",
-                            frame_id.as_u64()
-                        );
+            let mut attempt = None;
+            if let TrackingMatcher::Projected(config) = self.config.tracking_matcher {
+                match self.projected_tracking_matches(
+                    current.clone(),
+                    keyframe,
+                    keyframe_id,
+                    config,
+                )? {
+                    Some(projected_matches) => {
+                        let projected_match_count = projected_matches.len();
+                        match self.build_tracking_attempt(
+                            &current,
+                            keyframe,
+                            keyframe_id,
+                            projected_matches,
+                        ) {
+                            Ok(projected_attempt)
+                                if projected_attempt.result.inliers.len() >= config.min_inliers =>
+                            {
+                                if self.trace_transitions {
+                                    eprintln!(
+                                        "projected tracking accepted frame={} matches={} observations={} inliers={}",
+                                        frame_id.as_u64(),
+                                        projected_match_count,
+                                        projected_attempt.tracked_observations.len(),
+                                        projected_attempt.result.inliers.len(),
+                                    );
+                                }
+                                attempt = Some(projected_attempt);
+                            }
+                            Ok(projected_attempt) => {
+                                if self.trace_transitions {
+                                    eprintln!(
+                                        "projected tracking fallback frame={} reason=low_inliers matches={} observations={} inliers={} min_inliers={}",
+                                        frame_id.as_u64(),
+                                        projected_match_count,
+                                        projected_attempt.tracked_observations.len(),
+                                        projected_attempt.result.inliers.len(),
+                                        config.min_inliers,
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                if self.trace_transitions {
+                                    eprintln!(
+                                        "projected tracking fallback frame={} reason={} matches={}",
+                                        frame_id.as_u64(),
+                                        err.trace_label(),
+                                        projected_match_count,
+                                    );
+                                }
+                            }
+                        }
                     }
-                    prefetch_raw
-                } else {
-                    if self.trace_transitions {
-                        eprintln!(
-                            "speculative LG miss: keyframe changed ({:?} != {:?})",
-                            prefetch_kf_id, keyframe_id
-                        );
+                    None => {
+                        if self.trace_transitions {
+                            eprintln!(
+                                "projected tracking fallback frame={} reason=not_enough_projected_matches",
+                                frame_id.as_u64()
+                            );
+                        }
                     }
-                    self.frontend
-                        .match_tracking(current.clone(), keyframe.tracking_detections().clone())?
                 }
-            } else {
-                self.frontend
-                    .match_tracking(current.clone(), keyframe.tracking_detections().clone())?
-            };
-            keyframe
-                .remap_tracking_matches(&tracking_matches)
-                .map_err(|err| TrackerError::Inference(InferenceError::Match(err)))?
-        };
+            }
 
-        let verified = match matches.with_landmarks(keyframe) {
-            Ok(verified) => verified,
-            Err(err) => {
-                return Err(TrackerError::Inference(InferenceError::Match(err)));
+            match attempt {
+                Some(attempt) => attempt,
+                None => {
+                    let lightglue_matches = self.lightglue_tracking_matches(
+                        current.clone(),
+                        keyframe,
+                        keyframe_id,
+                        prefetched_matches,
+                        frame_id,
+                    )?;
+                    match self.build_tracking_attempt(
+                        &current,
+                        keyframe,
+                        keyframe_id,
+                        lightglue_matches,
+                    ) {
+                        Ok(attempt) => attempt,
+                        Err(TrackingAttemptError::NotEnoughMapPoints { matches, verified }) => {
+                            if self.trace_transitions {
+                                eprintln!(
+                                    "tracking failure frame={} reason=not_enough_map_points matches={} verified={} current={}",
+                                    frame_id.as_u64(),
+                                    matches,
+                                    verified,
+                                    current.len()
+                                );
+                            }
+                            let tracking_health = self.tracking_failure_health();
+                            self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
+                            let mut diagnostics = self.empty_diagnostics();
+                            diagnostics.features_detected = Some(current.len());
+                            diagnostics.features_matched = Some(matches);
+                            diagnostics.tracking_time = Some(tracking_start.elapsed());
+                            return Ok(self.tracking_failure_output(
+                                frame_id,
+                                tracking_health,
+                                diagnostics,
+                            ));
+                        }
+                        Err(TrackingAttemptError::PnpFailed {
+                            matches,
+                            verified,
+                            observations,
+                            required_inliers,
+                        }) => {
+                            if self.trace_transitions {
+                                eprintln!(
+                                    "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={} required_inliers={}",
+                                    frame_id.as_u64(),
+                                    observations,
+                                    matches,
+                                    verified,
+                                    required_inliers,
+                                );
+                            }
+                            let tracking_health = self.tracking_failure_health();
+                            self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
+                            let mut diagnostics = self.empty_diagnostics();
+                            diagnostics.features_detected = Some(current.len());
+                            diagnostics.features_matched = Some(matches);
+                            diagnostics.pnp_tracked_observations =
+                                Some(crate::PnpTrackedObservationCountMetric::new(observations));
+                            diagnostics.tracking_time = Some(tracking_start.elapsed());
+                            return Ok(self.tracking_failure_output(
+                                frame_id,
+                                tracking_health,
+                                diagnostics,
+                            ));
+                        }
+                        Err(TrackingAttemptError::Fatal(err)) => return Err(err),
+                    }
+                }
             }
         };
-
-        let tracked_observations = match self.frontend.build_map_observations(
-            self.global_map.map(),
-            keyframe_id,
-            &verified,
-            current.as_ref(),
-        ) {
-            Ok(obs) => obs,
-            Err(crate::PnpError::NotEnoughPoints { .. }) => {
-                if self.trace_transitions {
-                    eprintln!(
-                        "tracking failure frame={} reason=not_enough_map_points matches={} verified={} current={}",
-                        frame_id.as_u64(),
-                        matches.len(),
-                        verified.len(),
-                        current.len()
-                    );
-                }
-                let tracking_health = self.tracking_failure_health();
-                self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
-                let mut diagnostics = self.empty_diagnostics();
-                diagnostics.features_detected = Some(current.len());
-                diagnostics.features_matched = Some(matches.len());
-                diagnostics.tracking_time = Some(tracking_start.elapsed());
-                return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
-            }
-            Err(err) => return Err(TrackerError::Pnp(err)),
-        };
-        let tracking_ransac =
-            adaptive_tracking_ransac_config(self.config.ransac, tracked_observations.len());
-
-        let result = match self
-            .frontend
-            .solve_tracking_pose(&tracked_observations.observations, tracking_ransac)
-        {
-            Ok(result) => result,
-            Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
-                if self.trace_transitions {
-                    eprintln!(
-                        "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={} required_inliers={}",
-                        frame_id.as_u64(),
-                        tracked_observations.len(),
-                        matches.len(),
-                        verified.len(),
-                        tracking_ransac.min_inliers,
-                    );
-                }
-                let tracking_health = self.tracking_failure_health();
-                self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
-                let mut diagnostics = self.empty_diagnostics();
-                diagnostics.features_detected = Some(current.len());
-                diagnostics.features_matched = Some(matches.len());
-                diagnostics.pnp_tracked_observations = Some(
-                    crate::PnpTrackedObservationCountMetric::new(tracked_observations.len()),
-                );
-                diagnostics.tracking_time = Some(tracking_start.elapsed());
-                return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
-            }
-            Err(err) => return Err(TrackerError::Pnp(err)),
-        };
+        let TrackingAttempt {
+            matches,
+            verified,
+            tracked_observations,
+            tracking_ransac,
+            result,
+        } = attempt;
 
         let mut map_observations = Vec::with_capacity(result.inliers.len());
         for &idx in &result.inliers {
@@ -3374,6 +3774,7 @@ impl SlamTracker {
                 }
             }
             PoseRefinementProposal::Vio(proposal) => {
+                let proposal = *proposal;
                 let vio_tracked_metrics = PoseReprojectionMetrics::from_pose(
                     &proposal.pose_world,
                     &tracked_observations.observations,
@@ -3787,6 +4188,7 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
+        #[cfg(feature = "vio")]
         let capture_time = left.timestamp();
         let (output, keyframe_id) = match self
             .create_keyframe_internal(left, right, pose_world, None, None, None)

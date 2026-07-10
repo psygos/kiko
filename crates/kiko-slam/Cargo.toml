@@ -35,6 +35,5 @@ chrono = { version = "0.4", optional = true }
 name = "kiko-slam"
 path = "src/bin/kiko_slam/main.rs"
 
-
 [lints]
 workspace = true

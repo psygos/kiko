@@ -609,27 +609,27 @@ impl SurfaceBeliefMap {
         let confirmed_beliefs: Vec<&SurfaceBelief> = self
             .voxels
             .values()
-            .filter_map(|belief| match self.classify_belief(belief) {
+            .filter(|belief| match self.classify_belief(belief) {
                 SurfaceBeliefRenderClass::Confirmed => {
                     confirmed = confirmed.saturating_add(1);
-                    Some(belief)
+                    true
                 }
                 SurfaceBeliefRenderClass::PendingSupport => {
                     pending_support = pending_support.saturating_add(1);
-                    None
+                    false
                 }
                 SurfaceBeliefRenderClass::RejectedConsistency => {
                     rejected_consistency = rejected_consistency.saturating_add(1);
-                    None
+                    false
                 }
                 SurfaceBeliefRenderClass::RejectedUncertainty => {
                     rejected_uncertainty = rejected_uncertainty.saturating_add(1);
-                    None
+                    false
                 }
                 SurfaceBeliefRenderClass::RejectedConsistencyAndUncertainty => {
                     rejected_consistency_and_uncertainty =
                         rejected_consistency_and_uncertainty.saturating_add(1);
-                    None
+                    false
                 }
             })
             .collect();

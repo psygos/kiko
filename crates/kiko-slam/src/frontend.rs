@@ -37,10 +37,6 @@ impl StereoFrontend {
         }
     }
 
-    pub(crate) fn set_prefetch_sp(&mut self, sp: SuperPoint) {
-        self.prefetch_sp = Some(sp);
-    }
-
     pub(crate) fn intrinsics(&self) -> PinholeIntrinsics {
         self.intrinsics
     }
@@ -69,7 +65,7 @@ impl StereoFrontend {
     ) -> Result<Arc<Detections>, InferenceError> {
         let detections = self
             .superpoint
-            .detect_with_downscale(frame, downscale)?
+            .detect_with_downscale_limited(frame, downscale, max_keypoints)?
             .top_k(max_keypoints);
         Ok(Arc::new(detections))
     }
@@ -82,10 +78,6 @@ impl StereoFrontend {
 
     pub(crate) fn return_prefetch_sp(&mut self, sp: SuperPoint) {
         self.prefetch_sp = Some(sp);
-    }
-
-    pub(crate) fn set_prefetch_lg(&mut self, lg: LightGlue) {
-        self.prefetch_lg = Some(lg);
     }
 
     pub(crate) fn take_prefetch_lg(&mut self) -> Option<LightGlue> {

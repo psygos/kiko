@@ -160,14 +160,14 @@ impl InferencePipeline {
                     let left_handle = s.spawn(|| {
                         let start = Instant::now();
                         let det = sp_left
-                            .detect_with_downscale(&left_frame, downscale)
+                            .detect_with_downscale_limited(&left_frame, downscale, max_keypoints)
                             .map(|d| d.top_k(max_keypoints));
                         (det, start.elapsed())
                     });
                     let right_handle = s.spawn(|| {
                         let start = Instant::now();
                         let det = sp_right
-                            .detect_with_downscale(&right_frame, downscale)
+                            .detect_with_downscale_limited(&right_frame, downscale, max_keypoints)
                             .map(|d| d.top_k(max_keypoints));
                         (det, start.elapsed())
                     });
@@ -184,14 +184,14 @@ impl InferencePipeline {
                 let left_start = Instant::now();
                 let left_det = self
                     .superpoint_left
-                    .detect_with_downscale(&left_frame, downscale)?
+                    .detect_with_downscale_limited(&left_frame, downscale, max_keypoints)?
                     .top_k(max_keypoints);
                 let left_time = left_start.elapsed();
 
                 let right_start = Instant::now();
                 let right_det = self
                     .superpoint_left
-                    .detect_with_downscale(&right_frame, downscale)?
+                    .detect_with_downscale_limited(&right_frame, downscale, max_keypoints)?
                     .top_k(max_keypoints);
                 let right_time = right_start.elapsed();
 

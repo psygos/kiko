@@ -30,7 +30,8 @@ jobs:
         run: cargo fmt --package kiko-slam -- --check
 
       - name: Clippy
-        run: cargo clippy -p kiko-slam --all-targets --all-features -- -D warnings
+        # Native camera/GPU features are checked on the Jetson toolchain.
+        run: cargo clippy -p kiko-slam --all-targets --features vio -- -D warnings
 
   host-tests:
     name: Host Workspace Tests
@@ -47,11 +48,8 @@ jobs:
       - name: Run host crate tests
         run: cargo test -p kiko-slam
 
-      - name: Run host crate tests with vio feature
+      - name: Run host VIO tests
         run: cargo test -p kiko-slam --features vio
-
-      - name: Build oak-sys tests
-        run: cargo test -p oak-sys --no-run
 
       - name: Build robot-server tests
         run: cargo test -p robot-server --no-run

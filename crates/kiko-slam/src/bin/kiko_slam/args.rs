@@ -13,32 +13,87 @@ pub const DEFAULT_MAX_KEYPOINTS: usize = 1024;
 const DEFAULT_MAC_CPU_MAX_KEYPOINTS: usize = 512;
 const DEFAULT_MAC_CPU_DOWNSCALE: usize = 2;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RunProfileArg {
+    /// Preserve explicit flags and environment defaults.
+    #[value(name = "default")]
+    Default,
+    /// Jetson Orin dataset SLAM: CUDA, FP16 LightGlue, VIO, and realtime BA defaults.
+    #[value(name = "jetson")]
+    Jetson,
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct InferenceArgs {
     /// Downscale factor for input images (1 = full resolution)
     #[arg(long, env = "KIKO_DOWNSCALE", default_value = "1")]
     pub downscale: DownscaleFactor,
     /// Maximum number of keypoints to extract per image
-    #[arg(long, env = "KIKO_MAX_KEYPOINTS", default_value_t = KeypointLimit::try_from(DEFAULT_MAX_KEYPOINTS).unwrap())]
+    #[arg(long, visible_alias = "keypoints", env = "KIKO_MAX_KEYPOINTS", default_value_t = KeypointLimit::try_from(DEFAULT_MAX_KEYPOINTS).unwrap())]
     pub max_keypoints: KeypointLimit,
     /// Inference backend for all models (overridden by per-model flags)
     #[arg(long, env = "KIKO_BACKEND", value_enum)]
     pub backend: Option<BackendArg>,
     /// Override inference backend for SuperPoint only
-    #[arg(long, env = "KIKO_SUPERPOINT_BACKEND", value_enum)]
+    #[arg(
+        long,
+        visible_alias = "sp-backend",
+        env = "KIKO_SUPERPOINT_BACKEND",
+        value_enum
+    )]
     pub superpoint_backend: Option<BackendArg>,
     /// Override inference backend for LightGlue only
-    #[arg(long, env = "KIKO_LIGHTGLUE_BACKEND", value_enum)]
+    #[arg(
+        long,
+        visible_alias = "lg-backend",
+        env = "KIKO_LIGHTGLUE_BACKEND",
+        value_enum
+    )]
     pub lightglue_backend: Option<BackendArg>,
     /// Path to SuperPoint ONNX model
-    #[arg(long, env = "KIKO_SUPERPOINT_MODEL")]
+    #[arg(long, visible_alias = "sp-model", env = "KIKO_SUPERPOINT_MODEL")]
     pub superpoint_model: Option<PathBuf>,
     /// Path to LightGlue ONNX model
-    #[arg(long, env = "KIKO_LIGHTGLUE_MODEL")]
+    #[arg(long, visible_alias = "lg-model", env = "KIKO_LIGHTGLUE_MODEL")]
     pub lightglue_model: Option<PathBuf>,
     /// Path to end-to-end pipeline ONNX model (SP+LG fused, replaces separate models)
-    #[arg(long, env = "KIKO_PIPELINE_MODEL")]
+    #[arg(long, visible_alias = "pipeline", env = "KIKO_PIPELINE_MODEL")]
     pub pipeline_model: Option<PathBuf>,
+}
+
+impl InferenceArgs {
+    pub fn with_profile_defaults(
+        &self,
+        profile: RunProfileArg,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut effective = self.clone();
+        match profile {
+            RunProfileArg::Default => {}
+            RunProfileArg::Jetson => {
+                if !any_setting_explicit(&["--backend"], "KIKO_BACKEND") {
+                    effective.backend = Some(BackendArg::Cuda);
+                }
+                if !any_setting_explicit(&["--max-keypoints", "--keypoints"], "KIKO_MAX_KEYPOINTS")
+                {
+                    effective.max_keypoints = KeypointLimit::try_from(2048)?;
+                }
+                if !any_setting_explicit(
+                    &["--superpoint-model", "--sp-model"],
+                    "KIKO_SUPERPOINT_MODEL",
+                ) {
+                    effective.superpoint_model = Some(PathBuf::from("sp_topk2048.onnx"));
+                }
+                if !any_setting_explicit(
+                    &["--lightglue-model", "--lg-model"],
+                    "KIKO_LIGHTGLUE_MODEL",
+                ) {
+                    effective.lightglue_model =
+                        Some(PathBuf::from("superpoint_lightglue_fused_fp16.onnx"));
+                }
+            }
+        }
+        Ok(effective)
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -65,12 +120,31 @@ pub struct RerunArgs {
     /// Stream Rerun data to a remote viewer, e.g. rerun+http://192.168.50.1:9876/proxy
     #[arg(long, env = "KIKO_RERUN_URL", value_name = "URL")]
     pub rerun_url: Option<String>,
+    /// Stream to the default laptop Rerun viewer endpoint.
+    #[arg(long, env = "KIKO_RERUN_LAPTOP", default_value_t = false)]
+    pub rerun_laptop: bool,
+    /// Default laptop Rerun endpoint used by --rerun-laptop.
+    #[arg(
+        long,
+        env = "KIKO_RERUN_LAPTOP_URL",
+        default_value = "rerun+http://192.168.50.1:9876/proxy",
+        hide = true
+    )]
+    pub rerun_laptop_url: String,
     /// Host a gRPC server on 0.0.0.0 so remote Rerun viewers can connect to this machine
     #[arg(long, env = "KIKO_RERUN_SERVE", default_value_t = false)]
     pub rerun_serve: bool,
     /// Port for the gRPC server when using --rerun-serve (default: 9876)
     #[arg(long, env = "KIKO_RERUN_PORT", default_value_t = 9876)]
     pub rerun_port: u16,
+}
+
+impl RerunArgs {
+    pub fn stream_url(&self) -> Option<&str> {
+        self.rerun_url
+            .as_deref()
+            .or_else(|| self.rerun_laptop.then_some(self.rerun_laptop_url.as_str()))
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -159,8 +233,9 @@ impl InferenceConfig {
 
         // Check for end-to-end pipeline model
         let end2end = if let Some(ref pipeline_path) = args.pipeline_model {
+            let pipeline_path = resolve_model_path(&model_dir, Some(pipeline_path), "");
             eprintln!("pipeline model: {}", pipeline_path.display());
-            let pipeline = End2EndPipeline::new(pipeline_path, default_backend)?;
+            let pipeline = End2EndPipeline::new(&pipeline_path, default_backend)?;
             eprintln!("pipeline backend: {:?}", pipeline.backend());
             Some(pipeline)
         } else {
@@ -268,12 +343,18 @@ fn tuned_mac_inference_settings(
 }
 
 fn setting_explicit(flag: &str, env_key: &str) -> bool {
+    any_setting_explicit(&[flag], env_key)
+}
+
+fn any_setting_explicit(flags: &[&str], env_key: &str) -> bool {
     if std::env::var_os(env_key).is_some() {
         return true;
     }
     std::env::args_os().any(|arg| {
         let value = arg.to_string_lossy();
-        value == flag || value.starts_with(&format!("{flag}="))
+        flags
+            .iter()
+            .any(|flag| value == *flag || value.starts_with(&format!("{flag}=")))
     })
 }
 

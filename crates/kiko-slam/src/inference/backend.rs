@@ -79,6 +79,9 @@ pub(crate) fn select_backend(
             if let Some(ep) = tensorrt_provider()? {
                 providers.push(ep);
                 selected = InferenceBackend::TensorRT;
+                if let Some(ep) = cuda_provider()? {
+                    providers.push(ep);
+                }
             } else if let Some(ep) = cuda_provider()? {
                 providers.push(ep);
                 selected = InferenceBackend::Cuda;
@@ -154,7 +157,7 @@ fn detect_backend() -> InferenceBackend {
 
     if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
         if is_jetson() {
-            return InferenceBackend::TensorRT;
+            return InferenceBackend::Cuda;
         }
         return InferenceBackend::Cuda;
     }
@@ -200,17 +203,32 @@ fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> 
     {
         use ort::execution_providers::CUDAExecutionProvider;
 
+        let default_conv_search = if is_jetson() {
+            "heuristic"
+        } else {
+            "exhaustive"
+        };
+        let conv_search = match std::env::var("KIKO_CUDA_CONV_SEARCH")
+            .unwrap_or_else(|_| default_conv_search.to_string())
+            .trim()
+            .to_lowercase()
+            .as_str()
+        {
+            "heuristic" => ort::execution_providers::cuda::ConvAlgorithmSearch::Heuristic,
+            "default" => ort::execution_providers::cuda::ConvAlgorithmSearch::Default,
+            _ => ort::execution_providers::cuda::ConvAlgorithmSearch::Exhaustive,
+        };
+        let prefer_nhwc = env_bool("KIKO_CUDA_PREFER_NHWC").unwrap_or(false);
+        let fuse_conv_bias = env_bool("KIKO_CUDA_FUSE_CONV_BIAS").unwrap_or(false);
+        let cuda_graph = env_bool("KIKO_CUDA_GRAPH").unwrap_or(false);
         let ep = CUDAExecutionProvider::default()
-            .with_conv_algorithm_search(
-                ort::execution_providers::cuda::ConvAlgorithmSearch::Exhaustive,
-            )
+            .with_conv_algorithm_search(conv_search)
             .with_conv_max_workspace(true)
             .with_tf32(true)
-            .with_attention_backend(
-                ort::execution_providers::cuda::AttentionBackend::FLASH_ATTENTION
-                    | ort::execution_providers::cuda::AttentionBackend::EFFICIENT_ATTENTION
-                    | ort::execution_providers::cuda::AttentionBackend::CUDNN_FLASH_ATTENTION,
-            );
+            .with_prefer_nhwc(prefer_nhwc)
+            .with_fuse_conv_bias(fuse_conv_bias)
+            .with_cuda_graph(cuda_graph)
+            .with_attention_backend(ort::execution_providers::cuda::AttentionBackend::all());
         if !ep.supported_by_platform() {
             return Ok(None);
         }
@@ -234,14 +252,10 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
         let cache_dir = std::env::var("KIKO_TRT_CACHE_DIR")
             .unwrap_or_else(|_| "/home/makerspace/.cache/kiko-trt-engines".to_string());
         let _ = std::fs::create_dir_all(&cache_dir);
+        let dump_subgraphs = env_bool("KIKO_TRT_DUMP_SUBGRAPHS").unwrap_or(false);
+        let detailed_build_log = env_bool("KIKO_TRT_DETAILED_BUILD_LOG").unwrap_or(false);
+        let cuda_graph = env_bool("KIKO_TRT_CUDA_GRAPH").unwrap_or(false);
 
-        // TRT profiles: only specify inputs that exist in the model being loaded.
-        // SuperPoint: image [1,1,H,W]
-        // LightGlue: kpts0/kpts1/desc0/desc1
-        // TRT ignores profile entries for inputs not in the current model.
-        //
-        // Use narrow ranges for better engine optimization.
-        // For downscale 2 (240×320): set opt to exact size for best kernel selection.
         let ep = TensorRTExecutionProvider::default()
             .with_fp16(true)
             .with_engine_cache(true)
@@ -250,10 +264,14 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
             .with_timing_cache_path(&cache_dir)
             .with_build_heuristics(true)
             .with_builder_optimization_level(5)
-            .with_detailed_build_log(true)
-            .with_dump_subgraphs(env_bool("KIKO_TRT_DUMP_SUBGRAPHS").unwrap_or(false));
-        // No explicit profile shapes: SuperPoint has too many dynamic intermediate
-        // tensors from NonZero/Where/Gather keypoint extraction to enumerate safely.
+            .with_cuda_graph(cuda_graph)
+            .with_detailed_build_log(detailed_build_log)
+            .with_dump_subgraphs(dump_subgraphs);
+        // Do not set explicit TRT shape profiles here. SuperPoint partitions at
+        // dynamic NonZero/Where/Gather outputs, and ORT requires profiles for
+        // every dynamic subgraph input once any profile is specified. Let ORT/TRT
+        // infer profiles from the first inference instead of maintaining brittle
+        // intermediate tensor names.
         if !ep.supported_by_platform() {
             return Ok(None);
         }

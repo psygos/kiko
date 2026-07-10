@@ -289,6 +289,7 @@ impl RerunSink {
     /// Log stable surface observations, optionally fuse them into the surface
     /// belief map, and emit the low-resolution voxel/debug surface plus
     /// stability metrics.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_surface_observations(
         &mut self,
         timestamp: Timestamp,

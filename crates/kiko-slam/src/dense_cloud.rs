@@ -157,6 +157,8 @@ pub struct StableSurfaceResult {
     pub stats: StableSurfaceStats,
 }
 
+// Keep calibrated intrinsics and uncertainty terms explicit at this numerical boundary.
+#[allow(clippy::too_many_arguments)]
 fn stereo_position_variance_m2(
     u: f32,
     v: f32,
@@ -187,6 +189,7 @@ fn stereo_position_variance_m2(
 /// Every pixel inside a valid triangle gets a derived depth value.
 /// Pixels outside triangles or in rejected triangles remain 0.0 (invalid).
 /// This is a derived visualization artifact, not authoritative measured depth.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_dense_depth_image(
     frame_id: FrameId,
     timestamp: Timestamp,
@@ -304,6 +307,7 @@ pub fn generate_dense_depth_image(
 /// interpolating across triangles. Each output point corresponds to a measured
 /// stereo feature, and points are filtered/ranked by propagated positional
 /// uncertainty before entering the voxel belief map.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_stable_surface_points(
     samples: &[SparseStereoSample],
     fx: f32,
@@ -417,6 +421,7 @@ pub fn generate_stable_surface_points(
 
 /// Generate a dense point cloud by interpolating disparity over a Delaunay
 /// triangulation of sparse stereo samples.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_dense_cloud(
     samples: &[SparseStereoSample],
     fx: f32,

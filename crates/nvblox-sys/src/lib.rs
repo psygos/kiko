@@ -11,13 +11,18 @@ unsafe extern "C" {
     fn nvblox_mapper_destroy(mapper: *mut std::ffi::c_void);
     fn nvblox_mapper_set_camera(
         mapper: *mut std::ffi::c_void,
-        fx: f32, fy: f32, cx: f32, cy: f32,
-        width: i32, height: i32,
+        fx: f32,
+        fy: f32,
+        cx: f32,
+        cy: f32,
+        width: i32,
+        height: i32,
     );
     fn nvblox_mapper_integrate_depth(
         mapper: *mut std::ffi::c_void,
         depth_data: *const f32,
-        width: i32, height: i32,
+        width: i32,
+        height: i32,
         t_l_c_col_major_4x4: *const f32,
     );
     fn nvblox_mapper_extract_surface(mapper: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
@@ -33,9 +38,15 @@ pub struct VoxelSize(f32);
 
 impl VoxelSize {
     pub fn new(meters: f32) -> Option<Self> {
-        if meters > 0.0 && meters.is_finite() { Some(Self(meters)) } else { None }
+        if meters > 0.0 && meters.is_finite() {
+            Some(Self(meters))
+        } else {
+            None
+        }
     }
-    pub fn meters(self) -> f32 { self.0 }
+    pub fn meters(self) -> f32 {
+        self.0
+    }
 }
 
 /// Camera intrinsics — validated at construction.
@@ -51,11 +62,23 @@ pub struct CameraIntrinsics {
 
 impl CameraIntrinsics {
     pub fn new(fx: f32, fy: f32, cx: f32, cy: f32, width: u32, height: u32) -> Option<Self> {
-        if fx > 0.0 && fy > 0.0 && width > 0 && height > 0
-            && fx.is_finite() && fy.is_finite()
-            && cx.is_finite() && cy.is_finite()
+        if fx > 0.0
+            && fy > 0.0
+            && width > 0
+            && height > 0
+            && fx.is_finite()
+            && fy.is_finite()
+            && cx.is_finite()
+            && cy.is_finite()
         {
-            Some(Self { fx, fy, cx, cy, width, height })
+            Some(Self {
+                fx,
+                fy,
+                cx,
+                cy,
+                width,
+                height,
+            })
         } else {
             None
         }
@@ -99,7 +122,11 @@ impl DepthImage {
     /// Create from raw float data. Length must equal width × height.
     pub fn new(data: Vec<f32>, width: u32, height: u32) -> Option<Self> {
         if data.len() == (width as usize) * (height as usize) && width > 0 && height > 0 {
-            Some(Self { data, width, height })
+            Some(Self {
+                data,
+                width,
+                height,
+            })
         } else {
             None
         }
@@ -120,7 +147,10 @@ impl Mapper {
     /// Create a new Mapper with the given voxel size.
     pub fn new(voxel_size: VoxelSize) -> Option<Self> {
         let ptr = unsafe { nvblox_mapper_create(voxel_size.meters()) };
-        NonNull::new(ptr).map(|ptr| Self { ptr, _not_send: std::marker::PhantomData })
+        NonNull::new(ptr).map(|ptr| Self {
+            ptr,
+            _not_send: std::marker::PhantomData,
+        })
     }
 
     /// Set camera intrinsics. Must be called before `integrate_depth`.
@@ -128,8 +158,12 @@ impl Mapper {
         unsafe {
             nvblox_mapper_set_camera(
                 self.ptr.as_ptr(),
-                cam.fx, cam.fy, cam.cx, cam.cy,
-                cam.width as i32, cam.height as i32,
+                cam.fx,
+                cam.fy,
+                cam.cx,
+                cam.cy,
+                cam.width as i32,
+                cam.height as i32,
             );
         }
     }
@@ -158,7 +192,9 @@ impl Mapper {
 
 impl Drop for Mapper {
     fn drop(&mut self) {
-        unsafe { nvblox_mapper_destroy(self.ptr.as_ptr()); }
+        unsafe {
+            nvblox_mapper_destroy(self.ptr.as_ptr());
+        }
     }
 }
 
@@ -199,6 +235,8 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        unsafe { nvblox_surface_destroy(self.ptr.as_ptr()); }
+        unsafe {
+            nvblox_surface_destroy(self.ptr.as_ptr());
+        }
     }
 }

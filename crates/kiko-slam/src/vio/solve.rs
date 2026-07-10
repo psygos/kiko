@@ -21,10 +21,7 @@
 //! 3. **Bias random walk** (6D): simple difference `bias_j - bias_i`.
 //! 4. **Anchor prior** (9D diagonal): constrains velocity and bias of frame 0.
 
-use crate::math::{
-    mat_mul_f64, mat_mul_vec_f64, so3_left_jacobian_inv_f64, so3_right_jacobian_inv_f64,
-};
-use crate::{Gravity, ImuBias, ImuFactor, NavState, NavTangent, Pose64, PreintegratedImu};
+use crate::{Gravity, ImuFactor, NavState, PreintegratedImu};
 
 /// State dimension per frame.
 pub const STATE_DIM: usize = 15;
@@ -107,50 +104,6 @@ pub fn imu_jacobians(
     (jac_prev, jac_curr)
 }
 
-/// Compute numerical IMU Jacobians via central finite differences (alternate eps).
-/// Used for cross-checking the primary `imu_jacobians` implementation.
-#[cfg(test)]
-fn numerical_imu_jacobians_alt(
-    state_i: &NavState,
-    state_j: &NavState,
-    preintegrated: &PreintegratedImu,
-    gravity: Gravity,
-) -> (
-    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
-    [[f64; STATE_DIM]; IMU_RESIDUAL_DIM],
-) {
-    const EPS: f64 = 1e-6;
-    let mut jac_prev = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
-    let mut jac_curr = [[0.0_f64; STATE_DIM]; IMU_RESIDUAL_DIM];
-    let _r0 = ImuFactor::residual(state_i, state_j, preintegrated, &gravity);
-
-    for axis in 0..STATE_DIM {
-        let mut delta_plus = [0.0_f64; STATE_DIM];
-        let mut delta_minus = [0.0_f64; STATE_DIM];
-        delta_plus[axis] = EPS;
-        delta_minus[axis] = -EPS;
-
-        // Jacobian w.r.t. state_i
-        let si_plus = state_i.retract(&delta_plus).expect("retract");
-        let si_minus = state_i.retract(&delta_minus).expect("retract");
-        let r_plus = ImuFactor::residual(&si_plus, state_j, preintegrated, &gravity);
-        let r_minus = ImuFactor::residual(&si_minus, state_j, preintegrated, &gravity);
-        for row in 0..IMU_RESIDUAL_DIM {
-            jac_prev[row][axis] = (r_plus[row] - r_minus[row]) / (2.0 * EPS);
-        }
-
-        // Jacobian w.r.t. state_j
-        let sj_plus = state_j.retract(&delta_plus).expect("retract");
-        let sj_minus = state_j.retract(&delta_minus).expect("retract");
-        let r_plus = ImuFactor::residual(state_i, &sj_plus, preintegrated, &gravity);
-        let r_minus = ImuFactor::residual(state_i, &sj_minus, preintegrated, &gravity);
-        for row in 0..IMU_RESIDUAL_DIM {
-            jac_curr[row][axis] = (r_plus[row] - r_minus[row]) / (2.0 * EPS);
-        }
-    }
-    (jac_prev, jac_curr)
-}
-
 // -----------------------------------------------------------------------
 // Dense f64 linear solver
 // -----------------------------------------------------------------------
@@ -202,46 +155,6 @@ pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> bool {
         }
     }
     true
-}
-
-// -----------------------------------------------------------------------
-// 3×3 matrix helpers (private)
-// -----------------------------------------------------------------------
-
-fn transpose3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    [
-        [m[0][0], m[1][0], m[2][0]],
-        [m[0][1], m[1][1], m[2][1]],
-        [m[0][2], m[1][2], m[2][2]],
-    ]
-}
-
-fn negate3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    [
-        [-m[0][0], -m[0][1], -m[0][2]],
-        [-m[1][0], -m[1][1], -m[1][2]],
-        [-m[2][0], -m[2][1], -m[2][2]],
-    ]
-}
-
-fn add3(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    [
-        [a[0][0] + b[0][0], a[0][1] + b[0][1], a[0][2] + b[0][2]],
-        [a[1][0] + b[1][0], a[1][1] + b[1][1], a[1][2] + b[1][2]],
-        [a[2][0] + b[2][0], a[2][1] + b[2][1], a[2][2] + b[2][2]],
-    ]
-}
-
-fn scale3(m: [[f64; 3]; 3], s: f64) -> [[f64; 3]; 3] {
-    [
-        [m[0][0] * s, m[0][1] * s, m[0][2] * s],
-        [m[1][0] * s, m[1][1] * s, m[1][2] * s],
-        [m[2][0] * s, m[2][1] * s, m[2][2] * s],
-    ]
-}
-
-fn skew3(v: [f64; 3]) -> [[f64; 3]; 3] {
-    [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
 }
 
 // -----------------------------------------------------------------------
@@ -306,10 +219,10 @@ pub fn accumulate_cross_factor<const R: usize, const S: usize>(
 ) {
     // Compute Ω · J_b (R × S)
     let mut omega_jb = [[0.0_f64; S]; R];
-    for i in 0..R {
-        for k in 0..R {
+    for (i, omega_row) in omega_jb.iter_mut().enumerate().take(R) {
+        for (k, j_b_row) in j_b.iter().enumerate().take(R) {
             for col in 0..S {
-                omega_jb[i][col] += info[i][k] * j_b[k][col];
+                omega_row[col] += info[i][k] * j_b_row[col];
             }
         }
     }
@@ -317,8 +230,8 @@ pub fn accumulate_cross_factor<const R: usize, const S: usize>(
     for row in 0..S {
         for col in 0..S {
             let mut val = 0.0;
-            for k in 0..R {
-                val += j_a[k][row] * omega_jb[k][col];
+            for (k, omega_row) in omega_jb.iter().enumerate().take(R) {
+                val += j_a[k][row] * omega_row[col];
             }
             hessian[(base_a + row) * dim + (base_b + col)] += val;
             hessian[(base_b + col) * dim + (base_a + row)] += val;
@@ -333,7 +246,7 @@ pub fn accumulate_cross_factor<const R: usize, const S: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Timestamp};
+    use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Pose64, Timestamp};
 
     fn noise() -> ImuNoiseModel {
         ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise")
@@ -393,7 +306,7 @@ mod tests {
                 (5_000_000, [0.6, -0.2, 9.6], [0.12, -0.04, 0.03]),
                 (10_000_000, [0.4, -0.1, 9.4], [0.08, -0.06, 0.01]),
             ]),
-            &state_i.bias(),
+            state_i.bias(),
             &noise(),
         )
         .expect("preintegrated");

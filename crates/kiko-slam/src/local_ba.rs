@@ -618,6 +618,7 @@ impl std::error::Error for VioSolveConfigError {}
 
 #[cfg(feature = "vio")]
 impl VioSolveConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gravity: crate::Gravity,
         camera_from_body: crate::Pose64,
@@ -770,6 +771,14 @@ impl InertialFrameInput {
     pub fn nav_state(&self) -> &crate::NavState {
         &self.nav_state
     }
+
+    pub fn observations(&self) -> &ObservationSet {
+        &self.observations
+    }
+
+    pub fn preintegrated(&self) -> &crate::PreintegratedImu {
+        &self.preintegrated
+    }
 }
 
 /// Input for the anchor frame (first frame in VIO window). No preintegration.
@@ -787,6 +796,14 @@ impl AnchorFrameInput {
             nav_state,
             observations,
         }
+    }
+
+    pub fn nav_state(&self) -> &crate::NavState {
+        &self.nav_state
+    }
+
+    pub fn observations(&self) -> &ObservationSet {
+        &self.observations
     }
 }
 

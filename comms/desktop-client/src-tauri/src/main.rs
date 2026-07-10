@@ -343,8 +343,8 @@ async fn get_odometry(state: State<'_, StreamState>) -> Result<Option<RobotOdome
             if response.status().is_success() {
                 match response.json::<RobotOdometry>().await {
                     Ok(odometry) => {
-                        debug!("Fetched odometry: left_ticks={}, right_ticks={}, left_vel={}, right_vel={}", 
-                            odometry.left_ticks, odometry.right_ticks, 
+                        debug!("Fetched odometry: left_ticks={}, right_ticks={}, left_vel={}, right_vel={}",
+                            odometry.left_ticks, odometry.right_ticks,
                             odometry.left_velocity, odometry.right_velocity);
                         Ok(Some(odometry))
                     }

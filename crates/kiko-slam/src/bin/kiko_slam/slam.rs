@@ -6,9 +6,15 @@ use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{
     CalibrationBundle, PinholeIntrinsics, RectifiedStereo, RerunSink, SlamTracker, VizPacket,
 };
+use kiko_slam::{ProjectedMatcherConfig, TrackingMatcher};
 
-use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs};
-use crate::config::{TrackerDefaults, build_rectified_stereo_config, build_tracker_config};
+use crate::args::{
+    DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs, RunProfileArg,
+};
+use crate::config::{
+    TrackerDefaults, TrackerOverrides, build_rectified_stereo_config,
+    build_tracker_config_with_overrides,
+};
 use crate::rerun_recording;
 
 const SLAM_ENV_HELP: &str = "\
@@ -32,6 +38,11 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_KEYFRAME_COVISIBILITY=0.6       Min covisibility ratio for connection
     KIKO_KEYFRAME_REDUNDANT_COVISIBILITY=0.9  Covisibility ratio for redundancy culling
     KIKO_TRACK_MIN_INLIERS=8             Min PnP RANSAC inliers
+    KIKO_TRACKING_MATCHER=projected      projected or lightglue tracking matcher
+    KIKO_PROJECTED_MATCH_RADIUS_PX=32    Projected matcher search radius
+    KIKO_PROJECTED_MATCH_MIN_SIMILARITY=0.45
+    KIKO_PROJECTED_MATCH_MIN_MATCHES=32  Fallback to LightGlue below this match count
+    KIKO_PROJECTED_MATCH_MIN_INLIERS=24  Fallback to LightGlue below this inlier count
 
   Loop Closure:
     KIKO_LOOP_CLOSURE=true                   Enable loop closure detection
@@ -86,6 +97,15 @@ ENVIRONMENT VARIABLES (expert tuning):
     after_long_help = SLAM_ENV_HELP
 )]
 pub struct SlamArgs {
+    /// Apply a named run profile before explicit flags/env overrides.
+    #[arg(long, value_enum, default_value_t = RunProfileArg::Default)]
+    pub profile: RunProfileArg,
+    /// Enable visual-inertial SLAM when built with the `vio` feature.
+    #[arg(long, env = "KIKO_VIO", default_value_t = false)]
+    pub vio: bool,
+    /// Force visual-only tracking even if a profile or env enables VIO.
+    #[arg(long, default_value_t = false)]
+    pub visual_only: bool,
     #[command(flatten)]
     pub inference: InferenceArgs,
     #[command(flatten)]
@@ -96,15 +116,41 @@ pub struct SlamArgs {
     pub dataset: DatasetArgs,
 }
 
+fn vio_enabled(args: &SlamArgs) -> bool {
+    (args.vio || args.profile == RunProfileArg::Jetson) && !args.visual_only
+}
+
+fn tracker_overrides(args: &SlamArgs, vio_enabled: bool) -> TrackerOverrides {
+    match args.profile {
+        RunProfileArg::Default => TrackerOverrides {
+            vio_enabled: Some(vio_enabled),
+            ..TrackerOverrides::default()
+        },
+        RunProfileArg::Jetson => TrackerOverrides {
+            vio_enabled: Some(vio_enabled),
+            ba_window: Some(6),
+            ba_iters: Some(4),
+            ba_min_obs: Some(4),
+            tracking_matcher: Some(TrackingMatcher::Projected(
+                ProjectedMatcherConfig::jetson_default(),
+            )),
+            loop_closure: Some(false),
+            learned_descriptors: Some(false),
+            relocalization: Some(false),
+        },
+    }
+}
+
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let vio_enabled = vio_enabled(args);
     let runtime_imu_override = kiko_slam::load_runtime_imu_calibration_from_env()?;
     let mut reader = DatasetReader::open_with_imu_calibration_override(
         &args.dataset.path,
         runtime_imu_override,
     )?;
     #[cfg(feature = "vio")]
-    if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && reader.meta().imu.is_none() {
-        return Err("KIKO_VIO=true requires IMU data in the dataset".into());
+    if vio_enabled && reader.meta().imu.is_none() {
+        return Err("--vio requires IMU data in the dataset".into());
     }
     let stats = reader.stats()?;
 
@@ -114,7 +160,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count
     );
 
-    let inference = InferenceConfig::from_args(&args.inference)?;
+    let inference_args = args.inference.with_profile_defaults(args.profile)?;
+    let inference = InferenceConfig::from_args(&inference_args)?;
 
     let rectified = RectifiedStereo::from_calibration_with_config(
         reader.calibration(),
@@ -139,9 +186,9 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let calibration =
         CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
     #[cfg(feature = "vio")]
-    if kiko_slam::env::env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
+    if vio_enabled && !calibration.has_imu() {
         return Err(
-            "KIKO_VIO=true requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
+            "VIO requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );
     }
 
@@ -155,7 +202,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     } = inference;
 
-    let tracker_config = build_tracker_config(
+    let tracker_config = build_tracker_config_with_overrides(
         TrackerDefaults {
             min_keyframe_points: 12,
             refresh_inliers: 12,
@@ -163,7 +210,9 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         key_limit,
         downscale,
+        tracker_overrides(args, vio_enabled),
     )?;
+    let use_speculative_lg = tracker_config.tracking_matcher.uses_speculative_lightglue();
     let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset-odometry") {
         Ok(rec) => Some(RerunSink::new(rec, args.rerun.rerun_decimation)),
         Err(err) => {
@@ -173,11 +222,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
     let has_prefetch_sp = superpoint_right.is_some();
-    let has_prefetch_lg = lightglue_prefetch.is_some();
+    let has_prefetch_lg = lightglue_prefetch.is_some() && use_speculative_lg;
     if let Some(sp_right) = superpoint_right {
         tracker.return_prefetch_sp(sp_right);
     }
-    if let Some(lg_prefetch) = lightglue_prefetch {
+    if let Some(lg_prefetch) = lightglue_prefetch.filter(|_| use_speculative_lg) {
         tracker.return_prefetch_lg(lg_prefetch);
     }
     eprintln!(
@@ -189,7 +238,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     );
     eprintln!(
-        "speculative LG prefetch: {}",
+        "speculative LightGlue prefetch: {}",
         if has_prefetch_lg {
             "enabled"
         } else {
@@ -205,7 +254,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
 
-    // Prefetch pipeline: overlap SP(N+1) + speculative LG(N+1) with tracker processing of frame N
+    // Prefetch pipeline: overlap SP(N+1) + speculative LG(N+1) with frame N.
     struct PrefetchResult {
         sp: kiko_slam::SuperPoint,
         lg: Option<kiko_slam::LightGlue>,
@@ -214,8 +263,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         speculative_matches: Option<(kiko_slam::KeyframeId, kiko_slam::Matches<kiko_slam::Raw>)>,
     }
     let mut pending_prefetch: Option<std::thread::JoinHandle<PrefetchResult>> = None;
-    let ds = inference.downscale;
-    let max_kp = inference.key_limit.get();
+    let ds = downscale;
+    let max_kp = key_limit.get();
 
     let mut bundles_iter = reader.bundles();
     // Skip initial frames (camera white balance + IMU settling)
@@ -253,8 +302,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(lg) = result.lg {
                         tracker.return_prefetch_lg(lg);
                     }
-                    let dets = result.detections.map(|d| (result.frame_id, d));
-                    (dets, result.speculative_matches)
+                    let detections = result.detections.map(|dets| (result.frame_id, dets));
+                    (detections, result.speculative_matches)
                 }
                 Err(_) => (None, None),
             }
@@ -278,22 +327,26 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         // Launch SP + speculative LG prefetch for the NEXT frame on a background thread
         if let Some(ref next_b) = lookahead_bundle {
             if let Some(mut sp) = tracker.take_prefetch_sp() {
-                let mut lg = tracker.take_prefetch_lg();
-                let kf_info = tracker.current_tracking_keyframe_detections();
+                let mut lg = if use_speculative_lg {
+                    tracker.take_prefetch_lg()
+                } else {
+                    None
+                };
+                let keyframe_info = tracker.current_tracking_keyframe_detections();
                 let next_left = next_b.pair().left().clone();
                 let next_fid = next_left.frame_id();
                 pending_prefetch = Some(std::thread::spawn(move || {
                     let detections = sp
-                        .detect_with_downscale(&next_left, ds)
+                        .detect_with_downscale_limited(&next_left, ds, max_kp)
                         .ok()
                         .map(|d| std::sync::Arc::new(d.top_k(max_kp)));
-                    // Speculative LG: match against current keyframe if we have
-                    // both a LG session and keyframe detections
-                    let speculative_matches = match (&detections, &mut lg, &kf_info) {
-                        (Some(dets), Some(lg_session), Some((kf_id, kf_dets))) => lg_session
-                            .match_these(dets.clone(), kf_dets.clone())
-                            .ok()
-                            .map(|matches| (*kf_id, matches)),
+                    let speculative_matches = match (&detections, &mut lg, &keyframe_info) {
+                        (Some(dets), Some(lg_session), Some((keyframe_id, keyframe_dets))) => {
+                            lg_session
+                                .match_these(dets.clone(), keyframe_dets.clone())
+                                .ok()
+                                .map(|matches| (*keyframe_id, matches))
+                        }
                         _ => None,
                     };
                     PrefetchResult {
@@ -307,7 +360,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Process THIS frame — SP+LG prefetch for NEXT frame runs in parallel
+        // Process THIS frame while SP+LG prefetch for NEXT frame runs in parallel.
         match tracker.process_capture_with_prefetch(bundle, prefetched_left, prefetched_matches) {
             Ok(output) => {
                 let timestamp = left.timestamp();
