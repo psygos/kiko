@@ -33,6 +33,11 @@ jobs:
         # Native camera/GPU features are checked on the Jetson toolchain.
         run: cargo clippy -p kiko-slam --all-targets --features vio -- -D warnings
 
+      - name: Check camera feature Rust surface
+        env:
+          OAK_SYS_CHECK_ONLY: "1"
+        run: cargo clippy -p kiko-slam --all-targets --features record,vio -- -D warnings
+
   host-tests:
     name: Host Workspace Tests
     runs-on: macos-latest

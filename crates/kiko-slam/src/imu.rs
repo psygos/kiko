@@ -403,6 +403,28 @@ impl ImuAccumulator {
         ImuBatch::new(samples).map(Some)
     }
 
+    pub fn drain_interval(
+        &mut self,
+        start_exclusive: Option<Timestamp>,
+        end_inclusive: Timestamp,
+        min_samples: std::num::NonZeroUsize,
+    ) -> Result<Option<ImuBatch>, ImuBatchError> {
+        let end = self
+            .samples
+            .partition_point(|sample| sample.timestamp().as_nanos() <= end_inclusive.as_nanos());
+        let samples = self
+            .samples
+            .drain(..end)
+            .filter(|sample| {
+                start_exclusive.is_none_or(|start| sample.timestamp().as_nanos() > start.as_nanos())
+            })
+            .collect::<Vec<_>>();
+        if samples.len() < min_samples.get() {
+            return Ok(None);
+        }
+        ImuBatch::new(samples).map(Some)
+    }
+
     pub fn batch(&self) -> Result<Option<ImuBatch>, ImuBatchError> {
         if self.samples.is_empty() {
             return Ok(None);
@@ -642,6 +664,71 @@ mod tests {
                 current: Timestamp::from_nanos(10),
             }
         );
+    }
+
+    #[test]
+    fn imu_accumulator_drains_capture_interval_and_retains_future_samples() {
+        let mut accumulator = ImuAccumulator::new();
+        let batch = ImuBatch::new(
+            [10, 20, 30, 40]
+                .into_iter()
+                .map(|timestamp| {
+                    ImuSample::new(Timestamp::from_nanos(timestamp), [0.0; 3], [0.0; 3])
+                        .expect("sample")
+                })
+                .collect(),
+        )
+        .expect("batch");
+        accumulator.extend_batch(&batch).expect("extend");
+
+        let interval = accumulator
+            .drain_interval(
+                Some(Timestamp::from_nanos(10)),
+                Timestamp::from_nanos(30),
+                std::num::NonZeroUsize::new(2).expect("minimum"),
+            )
+            .expect("drain interval")
+            .expect("supported interval");
+
+        assert_eq!(
+            interval
+                .samples()
+                .iter()
+                .map(|sample| sample.timestamp().as_nanos())
+                .collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+        let remaining = accumulator
+            .batch()
+            .expect("remaining batch")
+            .expect("future sample");
+        assert_eq!(remaining.start_time(), Timestamp::from_nanos(40));
+    }
+
+    #[test]
+    fn imu_accumulator_drains_undersupported_interval_explicitly() {
+        let mut accumulator = ImuAccumulator::new();
+        let batch = ImuBatch::new(vec![
+            ImuSample::new(Timestamp::from_nanos(10), [0.0; 3], [0.0; 3]).expect("sample"),
+            ImuSample::new(Timestamp::from_nanos(30), [0.0; 3], [0.0; 3]).expect("sample"),
+        ])
+        .expect("batch");
+        accumulator.extend_batch(&batch).expect("extend");
+
+        let interval = accumulator
+            .drain_interval(
+                None,
+                Timestamp::from_nanos(10),
+                std::num::NonZeroUsize::new(2).expect("minimum"),
+            )
+            .expect("drain interval");
+
+        assert!(interval.is_none());
+        let remaining = accumulator
+            .batch()
+            .expect("remaining batch")
+            .expect("future sample");
+        assert_eq!(remaining.start_time(), Timestamp::from_nanos(30));
     }
 
     #[test]

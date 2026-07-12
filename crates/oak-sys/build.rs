@@ -1,4 +1,23 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=OAK_SYS_CHECK_ONLY");
+    match std::env::var("OAK_SYS_CHECK_ONLY") {
+        Ok(value) if value == "1" => {
+            println!(
+                "cargo:warning=oak-sys native bridge skipped for compile-only host validation"
+            );
+            return;
+        }
+        Ok(value) => {
+            eprintln!("OAK_SYS_CHECK_ONLY must be exactly `1` when set, got `{value}`");
+            std::process::exit(2);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("OAK_SYS_CHECK_ONLY must contain valid UTF-8");
+            std::process::exit(2);
+        }
+    }
+
     let mut build = cxx_build::bridge("src/lib.rs");
 
     build

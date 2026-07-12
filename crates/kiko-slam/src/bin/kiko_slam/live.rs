@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -10,9 +10,9 @@ use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
     CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
     DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
-    ImuBatch, ImuSample, PairingDropReason, PairingOutcome, Point3, PoseStatus, Raw, RerunSink,
-    SendOutcome, SensorId, SlamTracker, StereoPairer, SystemHealth, VizPacket, bounded_channel,
-    oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
+    ImuAccumulator, ImuBatch, PairingDropReason, PairingOutcome, Point3, PoseStatus, Raw,
+    RerunSink, SendOutcome, SensorId, SlamTracker, StereoPairer, SystemHealth, VizPacket,
+    bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
 use oak_sys::{
@@ -62,6 +62,12 @@ enum LiveThreadError {
         source: kiko_slam::RerunSinkInitError,
     },
     VizChannelDisconnected,
+    Tracker {
+        source: kiko_slam::TrackerError,
+    },
+    VizPacket {
+        source: kiko_slam::VizError,
+    },
     FrameProcessingPanic {
         detail: String,
     },
@@ -77,6 +83,12 @@ impl std::fmt::Display for LiveThreadError {
                 write!(f, "failed to initialize visualization: {source}")
             }
             LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
+            LiveThreadError::Tracker { source } => {
+                write!(f, "tracker frame processing failed: {source}")
+            }
+            LiveThreadError::VizPacket { source } => {
+                write!(f, "visualization packet construction failed: {source}")
+            }
             LiveThreadError::FrameProcessingPanic { detail } => {
                 write!(f, "inference panic while processing frame: {detail}")
             }
@@ -89,9 +101,150 @@ impl std::error::Error for LiveThreadError {
         match self {
             LiveThreadError::TrackerInit { source } => Some(source),
             LiveThreadError::VizInit { source } => Some(source),
+            LiveThreadError::Tracker { source } => Some(source),
+            LiveThreadError::VizPacket { source } => Some(source),
             LiveThreadError::VizChannelDisconnected
             | LiveThreadError::FrameProcessingPanic { .. } => None,
         }
+    }
+}
+
+#[derive(Debug)]
+enum LiveCaptureError {
+    Image {
+        sensor: SensorId,
+        source: ImageError,
+    },
+    Frame {
+        sensor: SensorId,
+        source: kiko_slam::FrameError,
+    },
+    Depth {
+        source: DepthError,
+    },
+    DepthImage {
+        source: kiko_slam::DepthImageError,
+    },
+    Imu {
+        source: ImuError,
+    },
+    OakImu {
+        source: kiko_slam::OakImuError,
+    },
+    ImuTimestampShift {
+        source: kiko_slam::ImuTimestampShiftError,
+    },
+    Pairing {
+        source: kiko_slam::PairError,
+    },
+    ImuBatch {
+        source: kiko_slam::ImuBatchError,
+    },
+    ImuAccumulator {
+        source: kiko_slam::ImuAccumulatorError,
+    },
+    CaptureInterval {
+        source: kiko_slam::CaptureIntervalError,
+    },
+    CaptureBundle {
+        source: kiko_slam::CaptureBundleError,
+    },
+    DepthConsumerDisconnected,
+    InferenceConsumerDisconnected,
+}
+
+impl std::fmt::Display for LiveCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image { sensor, source } => {
+                write!(f, "{sensor:?} image stream failed: {source}")
+            }
+            Self::Frame { sensor, source } => {
+                write!(f, "{sensor:?} frame conversion failed: {source}")
+            }
+            Self::Depth { source } => write!(f, "depth stream failed: {source}"),
+            Self::DepthImage { source } => write!(f, "depth frame conversion failed: {source}"),
+            Self::Imu { source } => write!(f, "IMU stream failed: {source}"),
+            Self::OakImu { source } => write!(f, "IMU sample conversion failed: {source}"),
+            Self::ImuTimestampShift { source } => {
+                write!(f, "IMU timestamp calibration failed: {source}")
+            }
+            Self::Pairing { source } => write!(f, "stereo pairing failed: {source}"),
+            Self::ImuBatch { source } => write!(f, "capture IMU batch is invalid: {source}"),
+            Self::ImuAccumulator { source } => {
+                write!(f, "capture IMU stream ordering is invalid: {source}")
+            }
+            Self::CaptureInterval { source } => {
+                write!(f, "capture interval is invalid: {source}")
+            }
+            Self::CaptureBundle { source } => write!(f, "capture bundle is invalid: {source}"),
+            Self::DepthConsumerDisconnected => write!(f, "depth consumer disconnected"),
+            Self::InferenceConsumerDisconnected => write!(f, "inference consumer disconnected"),
+        }
+    }
+}
+
+impl std::error::Error for LiveCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Image { source, .. } => Some(source),
+            Self::Frame { source, .. } => Some(source),
+            Self::Depth { source } => Some(source),
+            Self::DepthImage { source } => Some(source),
+            Self::Imu { source } => Some(source),
+            Self::OakImu { source } => Some(source),
+            Self::ImuTimestampShift { source } => Some(source),
+            Self::Pairing { source } => Some(source),
+            Self::ImuBatch { source } => Some(source),
+            Self::ImuAccumulator { source } => Some(source),
+            Self::CaptureInterval { source } => Some(source),
+            Self::CaptureBundle { source } => Some(source),
+            Self::DepthConsumerDisconnected | Self::InferenceConsumerDisconnected => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum LiveWorkerError {
+    Failed {
+        worker: &'static str,
+        source: LiveThreadError,
+    },
+    Panicked {
+        worker: &'static str,
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for LiveWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed { worker, source } => write!(f, "{worker} worker failed: {source}"),
+            Self::Panicked { worker, detail } => write!(f, "{worker} worker panicked: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for LiveWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Failed { source, .. } => Some(source),
+            Self::Panicked { .. } => None,
+        }
+    }
+}
+
+fn join_live_worker(
+    worker: &'static str,
+    handle: thread::JoinHandle<Result<(), LiveThreadError>>,
+) -> Result<(), LiveWorkerError> {
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(source)) => Err(LiveWorkerError::Failed { worker, source }),
+        Err(payload) => Err(LiveWorkerError::Panicked {
+            worker,
+            detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+        }),
     }
 }
 
@@ -101,28 +254,6 @@ fn drain_latest_depth(rx: &DropReceiver<DepthImage>) -> Option<DepthImage> {
         latest = Some(depth);
     }
     latest
-}
-
-fn drain_imu_until(
-    pending: &mut VecDeque<ImuSample>,
-    start_exclusive: Option<kiko_slam::Timestamp>,
-    end_inclusive: kiko_slam::Timestamp,
-) -> Option<ImuBatch> {
-    let mut samples = Vec::new();
-    while let Some(sample) = pending.front() {
-        if sample.timestamp().as_nanos() > end_inclusive.as_nanos() {
-            break;
-        }
-        let sample = pending.pop_front().expect("front existed");
-        if start_exclusive.is_some_and(|start| sample.timestamp().as_nanos() <= start.as_nanos()) {
-            continue;
-        }
-        samples.push(sample);
-    }
-    if samples.len() < 2 {
-        return None;
-    }
-    ImuBatch::new(samples).ok()
 }
 
 pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -285,11 +416,10 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(keyframe) = output.keyframe.as_ref() {
                             points = Some(keyframe.landmarks().to_vec());
                         }
-                        if let Ok(viz_packet) =
+                        packet = Some(
                             VizPacket::try_new(left.clone(), right.clone(), matches)
-                        {
-                            packet = Some(viz_packet);
-                        }
+                                .map_err(|source| LiveThreadError::VizPacket { source })?,
+                        );
                     }
                     let msg = LiveVizMsg {
                         left,
@@ -310,7 +440,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Ok(Err(err)) => {
-                    eprintln!("tracker error: {err}");
+                    return Err(LiveThreadError::Tracker { source: err });
                 }
                 Err(payload) => {
                     return Err(LiveThreadError::FrameProcessingPanic {
@@ -396,180 +526,215 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut right_seq = 0u64;
     let mut capture_seq = 0u64;
     let mut previous_capture_time = None;
-    let mut pending_imu = VecDeque::new();
+    let mut pending_imu = ImuAccumulator::new();
     let mut pending_capacity_left_drops = 0u64;
     let mut pending_capacity_right_drops = 0u64;
 
     eprintln!("streaming matches... press ctrl+c to stop");
 
-    'capture: while running.load(Ordering::Relaxed) {
-        let mut got_any = false;
+    let capture_result = (|| -> Result<(), LiveCaptureError> {
+        while running.load(Ordering::Relaxed) {
+            let mut got_any = false;
 
-        match device.mono_left(read_timeout_ms) {
-            Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+            match device.mono_left(read_timeout_ms) {
                 Ok(frame) => {
-                    if let Some(PairingOutcome::Dropped {
-                        sensor: SensorId::StereoLeft,
-                        reason: PairingDropReason::PendingCapacity,
-                    }) = pairer.push_left(frame)
-                    {
-                        pending_capacity_left_drops = pending_capacity_left_drops.saturating_add(1);
-                    }
-                    left_seq += 1;
-                    got_any = true;
-                }
-                Err(err) => {
-                    eprintln!("left frame dropped (invalid dimensions): {err}");
-                }
-            },
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                eprintln!("left error: {e:?}");
-                break;
-            }
-        }
-
-        match device.mono_right(read_timeout_ms) {
-            Ok(frame) => {
-                match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
-                    Ok(frame) => {
-                        if let Some(PairingOutcome::Dropped {
-                            sensor: SensorId::StereoRight,
-                            reason: PairingDropReason::PendingCapacity,
-                        }) = pairer.push_right(frame)
-                        {
-                            pending_capacity_right_drops =
-                                pending_capacity_right_drops.saturating_add(1);
-                        }
-                        right_seq += 1;
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("right frame dropped (invalid dimensions): {err}");
-                    }
-                }
-            }
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                eprintln!("right error: {e:?}");
-                break;
-            }
-        }
-
-        if depth_enabled {
-            match device.depth(read_timeout_ms) {
-                Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
-                    Ok(depth_image) => {
-                        got_any = true;
-                        if let Some(depth_tx) = depth_tx.as_ref() {
-                            if matches!(depth_tx.try_send(depth_image), SendOutcome::Disconnected) {
-                                break;
+                    match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                        Ok(frame) => {
+                            if let Some(PairingOutcome::Dropped {
+                                sensor: SensorId::StereoLeft,
+                                reason: PairingDropReason::PendingCapacity,
+                            }) = pairer.push_left(frame)
+                            {
+                                pending_capacity_left_drops =
+                                    pending_capacity_left_drops.saturating_add(1);
                             }
-                        }
-                    }
-                    Err(err) => {
-                        eprintln!("depth frame dropped (invalid dimensions): {err}");
-                    }
-                },
-                Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
-                Err(e) => {
-                    eprintln!("depth error: {e:?}");
-                    break;
-                }
-            }
-        }
-
-        if imu_enabled {
-            match device.imu() {
-                Ok(samples) => match oak_to_imu_batch(samples) {
-                    Ok(batch) => match batch.shifted_timestamp_ns(imu_time_offset_ns) {
-                        Ok(batch) => {
-                            pending_imu.extend(batch.samples().iter().cloned());
+                            left_seq += 1;
                             got_any = true;
                         }
-                        Err(err) => {
-                            eprintln!("imu batch dropped (invalid timing): {err}");
+                        Err(source) => {
+                            return Err(LiveCaptureError::Frame {
+                                sensor: SensorId::StereoLeft,
+                                source,
+                            });
                         }
-                    },
-                    Err(err) => {
-                        eprintln!("imu batch dropped (invalid values): {err}");
                     }
-                },
-                Err(ImuError::Empty) => {}
-                Err(ImuError::Overflow { dropped }) => {
-                    eprintln!("imu overflow: dropped {dropped} samples");
                 }
-                Err(ImuError::Disconnected) => {
-                    eprintln!("imu error: disconnected");
-                    break;
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    return Err(LiveCaptureError::Image {
+                        sensor: SensorId::StereoLeft,
+                        source,
+                    });
                 }
             }
-        }
 
-        loop {
-            match pairer.next_outcome()? {
-                PairingOutcome::Produced(pair) => {
-                    let capture_time = pair.capture_time();
-                    let interval = match CaptureInterval::new(previous_capture_time, capture_time) {
-                        Ok(interval) => interval,
-                        Err(err) => {
-                            eprintln!("capture interval error: {err}");
-                            continue;
+            match device.mono_right(read_timeout_ms) {
+                Ok(frame) => {
+                    match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
+                        Ok(frame) => {
+                            if let Some(PairingOutcome::Dropped {
+                                sensor: SensorId::StereoRight,
+                                reason: PairingDropReason::PendingCapacity,
+                            }) = pairer.push_right(frame)
+                            {
+                                pending_capacity_right_drops =
+                                    pending_capacity_right_drops.saturating_add(1);
+                            }
+                            right_seq += 1;
+                            got_any = true;
                         }
-                    };
-                    let imu =
-                        drain_imu_until(&mut pending_imu, previous_capture_time, capture_time)
+                        Err(source) => {
+                            return Err(LiveCaptureError::Frame {
+                                sensor: SensorId::StereoRight,
+                                source,
+                            });
+                        }
+                    }
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    return Err(LiveCaptureError::Image {
+                        sensor: SensorId::StereoRight,
+                        source,
+                    });
+                }
+            }
+
+            if depth_enabled {
+                match device.depth(read_timeout_ms) {
+                    Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
+                        Ok(depth_image) => {
+                            got_any = true;
+                            if let Some(depth_tx) = depth_tx.as_ref() {
+                                if matches!(
+                                    depth_tx.try_send(depth_image),
+                                    SendOutcome::Disconnected
+                                ) {
+                                    return Err(LiveCaptureError::DepthConsumerDisconnected);
+                                }
+                            }
+                        }
+                        Err(source) => return Err(LiveCaptureError::DepthImage { source }),
+                    },
+                    Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                    Err(source) => return Err(LiveCaptureError::Depth { source }),
+                }
+            }
+
+            if imu_enabled {
+                match device.imu() {
+                    Ok(samples) => match oak_to_imu_batch(samples) {
+                        Ok(batch) => match batch.shifted_timestamp_ns(imu_time_offset_ns) {
+                            Ok(batch) => {
+                                pending_imu.extend_batch(&batch).map_err(|source| {
+                                    LiveCaptureError::ImuAccumulator { source }
+                                })?;
+                                got_any = true;
+                            }
+                            Err(source) => {
+                                return Err(LiveCaptureError::ImuTimestampShift { source });
+                            }
+                        },
+                        Err(source) => return Err(LiveCaptureError::OakImu { source }),
+                    },
+                    Err(ImuError::Empty) => {}
+                    Err(ImuError::Overflow { dropped }) => {
+                        eprintln!("imu overflow: dropped {dropped} samples");
+                    }
+                    Err(source @ ImuError::Disconnected) => {
+                        return Err(LiveCaptureError::Imu { source });
+                    }
+                }
+            }
+
+            loop {
+                match pairer
+                    .next_outcome()
+                    .map_err(|source| LiveCaptureError::Pairing { source })?
+                {
+                    PairingOutcome::Produced(pair) => {
+                        let capture_time = pair.capture_time();
+                        let interval =
+                            match CaptureInterval::new(previous_capture_time, capture_time) {
+                                Ok(interval) => interval,
+                                Err(source) => {
+                                    return Err(LiveCaptureError::CaptureInterval { source });
+                                }
+                            };
+                        let imu = pending_imu
+                            .drain_interval(
+                                previous_capture_time,
+                                capture_time,
+                                NonZeroUsize::new(2).expect("two is nonzero"),
+                            )
+                            .map_err(|source| LiveCaptureError::ImuBatch { source })?
                             .map(CaptureImu::present)
                             .unwrap_or_else(CaptureImu::absent);
-                    let capture = match CaptureBundle::new(
-                        CaptureId::new(capture_seq),
-                        pair,
-                        interval,
-                        imu,
-                    ) {
-                        Ok(capture) => capture,
-                        Err(err) => {
-                            eprintln!("capture bundle error: {err}");
-                            continue;
+                        let capture = match CaptureBundle::new(
+                            CaptureId::new(capture_seq),
+                            pair,
+                            interval,
+                            imu,
+                        ) {
+                            Ok(capture) => capture,
+                            Err(source) => {
+                                return Err(LiveCaptureError::CaptureBundle { source });
+                            }
+                        };
+                        capture_seq = capture_seq.saturating_add(1);
+                        previous_capture_time = Some(capture_time);
+                        if matches!(pair_tx.try_send(capture), SendOutcome::Disconnected) {
+                            running.store(false, Ordering::SeqCst);
+                            return Err(LiveCaptureError::InferenceConsumerDisconnected);
                         }
-                    };
-                    capture_seq = capture_seq.saturating_add(1);
-                    previous_capture_time = Some(capture_time);
-                    if matches!(pair_tx.try_send(capture), SendOutcome::Disconnected) {
-                        running.store(false, Ordering::SeqCst);
-                        break 'capture;
                     }
+                    PairingOutcome::Dropped { .. } => continue,
+                    PairingOutcome::Waiting => break,
                 }
-                PairingOutcome::Dropped { .. } => continue,
-                PairingOutcome::Waiting => break,
+            }
+
+            if !got_any {
+                thread::sleep(Duration::from_micros(500));
             }
         }
-
-        if !got_any {
-            thread::sleep(Duration::from_micros(500));
-        }
-    }
+        Ok(())
+    })();
 
     drop(pair_tx);
     drop(depth_tx);
-    let inference_result = inference_handle.join().map_err(|payload| {
-        std::io::Error::other(format!(
-            "inference thread panicked: {}",
-            kiko_slam::panic_payload_to_string(payload.as_ref())
-        ))
-    })?;
-    if let Err(err) = inference_result {
-        return Err(std::io::Error::other(err).into());
-    }
+    let inference_result = join_live_worker("inference", inference_handle);
+    let viz_result = join_live_worker("visualization", viz_handle);
 
-    let viz_result = viz_handle.join().map_err(|payload| {
-        std::io::Error::other(format!(
-            "viz thread panicked: {}",
-            kiko_slam::panic_payload_to_string(payload.as_ref())
-        ))
-    })?;
-    if let Err(err) = viz_result {
-        return Err(std::io::Error::other(err).into());
+    let mut capture_error = capture_result.err();
+    let downstream_disconnected = matches!(
+        capture_error.as_ref(),
+        Some(
+            LiveCaptureError::DepthConsumerDisconnected
+                | LiveCaptureError::InferenceConsumerDisconnected
+        )
+    );
+    if !downstream_disconnected {
+        if let Some(error) = capture_error.take() {
+            if let Err(worker_error) = &inference_result {
+                eprintln!("secondary live shutdown error: {worker_error}");
+            }
+            if let Err(worker_error) = &viz_result {
+                eprintln!("secondary live shutdown error: {worker_error}");
+            }
+            return Err(Box::new(error));
+        }
+    }
+    if let Err(error) = inference_result {
+        if let Err(worker_error) = &viz_result {
+            eprintln!("secondary live shutdown error: {worker_error}");
+        }
+        return Err(Box::new(error));
+    }
+    if let Err(error) = viz_result {
+        return Err(Box::new(error));
+    }
+    if let Some(error) = capture_error {
+        return Err(Box::new(error));
     }
 
     let pair_snapshot = pair_stats.snapshot();
