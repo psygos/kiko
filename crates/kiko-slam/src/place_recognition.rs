@@ -11,7 +11,7 @@ use crate::map::KeyframeId;
 use crate::{Detections, EigenPlaces, Frame, GlobalDescriptorConfig, PlaceDescriptorExtractor};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
-use crate::tracker::MapVersion;
+use crate::MapSnapshot;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DescriptorStats {
@@ -34,14 +34,14 @@ pub(crate) struct PendingLoopCandidate {
 #[derive(Debug, Clone)]
 pub(crate) struct DescriptorRequest {
     pub(crate) keyframe_id: KeyframeId,
-    pub(crate) map_version: MapVersion,
+    pub(crate) source_snapshot: MapSnapshot,
     pub(crate) frame: Frame,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct DescriptorResponse {
     pub(crate) keyframe_id: KeyframeId,
-    pub(crate) map_version: MapVersion,
+    pub(crate) source_snapshot: MapSnapshot,
     pub(crate) descriptor: GlobalDescriptor,
 }
 
@@ -50,12 +50,12 @@ pub(crate) enum DescriptorWorkerResponse {
     Descriptor(Box<DescriptorResponse>),
     Failure {
         keyframe_id: KeyframeId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         error: String,
     },
     WorkerPanic {
         keyframe_id: KeyframeId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         message: String,
     },
 }
@@ -103,18 +103,18 @@ impl DescriptorWorker {
                         Ok(Ok(descriptor)) => {
                             DescriptorWorkerResponse::Descriptor(Box::new(DescriptorResponse {
                                 keyframe_id: request.keyframe_id,
-                                map_version: request.map_version,
+                                source_snapshot: request.source_snapshot,
                                 descriptor,
                             }))
                         }
                         Ok(Err(err)) => DescriptorWorkerResponse::Failure {
                             keyframe_id: request.keyframe_id,
-                            map_version: request.map_version,
+                            source_snapshot: request.source_snapshot,
                             error: err.to_string(),
                         },
                         Err(payload) => DescriptorWorkerResponse::WorkerPanic {
                             keyframe_id: request.keyframe_id,
-                            map_version: request.map_version,
+                            source_snapshot: request.source_snapshot,
                             message: crate::panic_payload_to_string(payload.as_ref()),
                         },
                     };
@@ -307,12 +307,12 @@ impl DescriptorSupervisor {
 pub(crate) enum PlaceRecognitionEvent {
     WorkerFailure {
         keyframe_id: KeyframeId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         error: String,
     },
     WorkerPanic {
         keyframe_id: KeyframeId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         message: String,
         respawn_count: u32,
     },
@@ -427,15 +427,15 @@ impl PlaceRecognition {
         keyframe_id: KeyframeId,
         detections: &Arc<Detections>,
         frame: &Frame,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
     ) {
         self.enqueue_loop_candidates(keyframe_id, detections);
-        self.enqueue_descriptor_request(keyframe_id, frame, map_version);
+        self.enqueue_descriptor_request(keyframe_id, frame, source_snapshot);
     }
 
     pub(crate) fn drain_responses(
         &mut self,
-        current_map_version: MapVersion,
+        current_source_snapshot: MapSnapshot,
         keyframe_exists: impl Fn(KeyframeId) -> bool,
     ) -> Vec<PlaceRecognitionEvent> {
         let mut events = Vec::new();
@@ -446,7 +446,10 @@ impl PlaceRecognition {
             self.descriptor_stats.respawn_count = self.descriptor_worker.respawn_count();
             match response {
                 DescriptorWorkerResponse::Descriptor(response) => {
-                    if response.map_version.as_u64() > current_map_version.as_u64() {
+                    if !response
+                        .source_snapshot
+                        .is_same_or_older_than(current_source_snapshot)
+                    {
                         continue;
                     }
                     if !keyframe_exists(response.keyframe_id) {
@@ -463,20 +466,20 @@ impl PlaceRecognition {
                 }
                 DescriptorWorkerResponse::Failure {
                     keyframe_id,
-                    map_version,
+                    source_snapshot,
                     error,
                 } => {
                     self.descriptor_stats.worker_failures =
                         self.descriptor_stats.worker_failures.saturating_add(1);
                     events.push(PlaceRecognitionEvent::WorkerFailure {
                         keyframe_id,
-                        map_version,
+                        source_snapshot,
                         error,
                     });
                 }
                 DescriptorWorkerResponse::WorkerPanic {
                     keyframe_id,
-                    map_version,
+                    source_snapshot,
                     message,
                 } => {
                     self.descriptor_stats.panics = self.descriptor_stats.panics.saturating_add(1);
@@ -484,7 +487,7 @@ impl PlaceRecognition {
                         self.descriptor_stats.worker_failures.saturating_add(1);
                     events.push(PlaceRecognitionEvent::WorkerPanic {
                         keyframe_id,
-                        map_version,
+                        source_snapshot,
                         message,
                         respawn_count: self.descriptor_stats.respawn_count,
                     });
@@ -553,11 +556,11 @@ impl PlaceRecognition {
         &mut self,
         keyframe_id: KeyframeId,
         frame: &Frame,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
     ) {
         let request = DescriptorRequest {
             keyframe_id,
-            map_version,
+            source_snapshot,
             frame: frame.clone(),
         };
         match self.descriptor_worker.submit(request) {

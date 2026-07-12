@@ -530,6 +530,21 @@ impl MapSnapshot {
     pub fn generation(self) -> MapGeneration {
         self.generation
     }
+
+    pub fn is_same_or_older_than(self, current: Self) -> bool {
+        self.instance_id == current.instance_id && self.generation <= current.generation
+    }
+}
+
+impl std::fmt::Display for MapSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}",
+            self.instance_id.as_u64(),
+            self.generation.as_u64()
+        )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1712,6 +1727,26 @@ mod tests {
             map_b.map_point_for_keypoint(keypoint_a),
             Err(MapError::ForeignKeypoint { .. })
         ));
+    }
+
+    #[test]
+    fn map_snapshots_order_generations_only_within_the_same_instance() {
+        let size = ImageSize::try_new(640, 480).expect("image size");
+        let mut map = SlamMap::new();
+        let before = map.snapshot();
+        map.add_keyframe(
+            FrameId::new(1),
+            Timestamp::from_nanos(1),
+            Pose::identity(),
+            size,
+            make_keypoints(1),
+        )
+        .expect("keyframe");
+        let after = map.snapshot();
+
+        assert!(before.is_same_or_older_than(after));
+        assert!(!after.is_same_or_older_than(before));
+        assert!(!before.is_same_or_older_than(SlamMap::new().snapshot()));
     }
 
     #[test]

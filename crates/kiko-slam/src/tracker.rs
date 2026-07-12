@@ -39,9 +39,9 @@ use crate::{
     DescriptorMatchError, Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics,
     FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue,
     LocalBaConfig, LocalBundleAdjuster, LoopClosureStatus, LoopVerificationError, MapFromOdom,
-    MapObservation, Matches, Observation, ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64,
-    RansacConfig, RansacConfigError, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
-    TriangulationError, Triangulator, Verified,
+    MapObservation, MapSnapshot, Matches, Observation, ObservationSet, PinholeIntrinsics, Point3,
+    Pose, Pose64, RansacConfig, RansacConfigError, Raw, StereoPair, SuperPoint, Timestamp,
+    TriangulationConfig, TriangulationError, Triangulator, Verified,
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
@@ -301,24 +301,6 @@ pub struct RedundancyPolicy {
     max_covisibility: CovisibilityRatio,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct MapVersion(NonZeroU64);
-
-impl MapVersion {
-    fn initial() -> Self {
-        Self(NonZeroU64::MIN)
-    }
-
-    fn next(self) -> Self {
-        let next = self.0.get().saturating_add(1).max(1);
-        Self(NonZeroU64::new(next).unwrap_or(NonZeroU64::MIN))
-    }
-
-    pub(crate) fn as_u64(self) -> u64 {
-        self.0.get()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct BackendRequestId(NonZeroU64);
 
@@ -385,7 +367,7 @@ impl BackendWindow {
 #[derive(Debug)]
 struct KeyframeEvent {
     request_id: BackendRequestId,
-    map_version: MapVersion,
+    source_snapshot: MapSnapshot,
     trigger_keyframe: KeyframeId,
     window: BackendWindow,
     map_snapshot: SlamMap,
@@ -395,13 +377,25 @@ struct KeyframeEvent {
 
 #[derive(Debug)]
 enum KeyframeEventError {
-    TriggerMissingFromWindow { keyframe_id: KeyframeId },
-    MissingKeyframeInSnapshot { keyframe_id: KeyframeId },
+    SnapshotMismatch {
+        declared: MapSnapshot,
+        actual: MapSnapshot,
+    },
+    TriggerMissingFromWindow {
+        keyframe_id: KeyframeId,
+    },
+    MissingKeyframeInSnapshot {
+        keyframe_id: KeyframeId,
+    },
 }
 
 impl std::fmt::Display for KeyframeEventError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            KeyframeEventError::SnapshotMismatch { declared, actual } => write!(
+                f,
+                "backend event declares map snapshot {declared}, but cloned map is {actual}"
+            ),
             KeyframeEventError::TriggerMissingFromWindow { keyframe_id } => write!(
                 f,
                 "backend keyframe event window does not contain trigger keyframe {keyframe_id:?}"
@@ -419,11 +413,18 @@ impl std::error::Error for KeyframeEventError {}
 impl KeyframeEvent {
     fn try_new(
         request_id: BackendRequestId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         trigger_keyframe: KeyframeId,
         window: BackendWindow,
         map_snapshot: SlamMap,
     ) -> Result<Self, KeyframeEventError> {
+        let actual_snapshot = map_snapshot.snapshot();
+        if source_snapshot != actual_snapshot {
+            return Err(KeyframeEventError::SnapshotMismatch {
+                declared: source_snapshot,
+                actual: actual_snapshot,
+            });
+        }
         if !window.as_slice().contains(&trigger_keyframe) {
             return Err(KeyframeEventError::TriggerMissingFromWindow {
                 keyframe_id: trigger_keyframe,
@@ -436,7 +437,7 @@ impl KeyframeEvent {
         }
         Ok(Self {
             request_id,
-            map_version,
+            source_snapshot,
             trigger_keyframe,
             window,
             map_snapshot,
@@ -449,7 +450,7 @@ impl KeyframeEvent {
 #[derive(Debug)]
 struct CorrectionEvent {
     request_id: BackendRequestId,
-    map_version: MapVersion,
+    source_snapshot: MapSnapshot,
     trigger_keyframe: KeyframeId,
     correction: BaCorrection,
 }
@@ -529,7 +530,7 @@ impl CorrectionEvent {
 
         Ok(Self {
             request_id: event.request_id,
-            map_version: event.map_version,
+            source_snapshot: event.source_snapshot,
             trigger_keyframe: event.trigger_keyframe,
             correction,
         })
@@ -564,11 +565,11 @@ enum BackendResponse {
     Correction(CorrectionEvent),
     WorkerPanic {
         request_id: BackendRequestId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
     },
     Failure {
         request_id: BackendRequestId,
-        map_version: MapVersion,
+        source_snapshot: MapSnapshot,
         error: BackendWorkerError,
     },
 }
@@ -617,9 +618,9 @@ impl std::error::Error for SubmitEventError {
 
 #[derive(Debug)]
 enum ApplyCorrectionError {
-    StaleVersion {
-        current: MapVersion,
-        correction: MapVersion,
+    StaleSnapshot {
+        current: MapSnapshot,
+        correction: MapSnapshot,
     },
     MissingKeyframe {
         keyframe_id: KeyframeId,
@@ -633,14 +634,12 @@ enum ApplyCorrectionError {
 impl std::fmt::Display for ApplyCorrectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ApplyCorrectionError::StaleVersion {
+            ApplyCorrectionError::StaleSnapshot {
                 current,
                 correction,
             } => write!(
                 f,
-                "stale correction: correction version={}, current version={}",
-                correction.as_u64(),
-                current.as_u64()
+                "stale correction: correction snapshot={correction}, current snapshot={current}"
             ),
             ApplyCorrectionError::MissingKeyframe { keyframe_id } => {
                 write!(f, "correction references missing keyframe {keyframe_id:?}")
@@ -657,7 +656,7 @@ impl std::error::Error for ApplyCorrectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ApplyCorrectionError::Map(source) => Some(source),
-            ApplyCorrectionError::StaleVersion { .. }
+            ApplyCorrectionError::StaleSnapshot { .. }
             | ApplyCorrectionError::MissingKeyframe { .. }
             | ApplyCorrectionError::MissingMapPoint { .. } => None,
         }
@@ -695,7 +694,7 @@ impl BackendWorker {
                 let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
                 while let Ok(event) = rx_req.recv() {
                     let request_id = event.request_id;
-                    let map_version = event.map_version;
+                    let source_snapshot = event.source_snapshot;
                     let processing = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         #[cfg(test)]
                         if event.force_panic {
@@ -723,7 +722,7 @@ impl BackendWorker {
                             if tx_resp
                                 .send(BackendResponse::Failure {
                                     request_id,
-                                    map_version,
+                                    source_snapshot,
                                     error: BackendWorkerError::BuildCorrection(err),
                                 })
                                 .is_err()
@@ -738,7 +737,7 @@ impl BackendWorker {
                             if tx_resp
                                 .send(BackendResponse::WorkerPanic {
                                     request_id,
-                                    map_version,
+                                    source_snapshot,
                                 })
                                 .is_err()
                             {
@@ -892,13 +891,13 @@ impl BackendSupervisor {
         match response {
             Ok(Some(BackendResponse::WorkerPanic {
                 request_id,
-                map_version,
+                source_snapshot,
             })) => {
                 self.worker = None;
                 self.check_health();
                 Some(BackendResponse::WorkerPanic {
                     request_id,
-                    map_version,
+                    source_snapshot,
                 })
             }
             Ok(response) => response,
@@ -2022,7 +2021,6 @@ pub struct SlamTracker {
     ba: LocalBundleAdjuster,
     global_map: GlobalMap,
     loop_manager: LoopManager,
-    map_version: MapVersion,
     backend: BackendSubsystem,
     backend_stats: BackendStats,
     place_recognition: Option<PlaceRecognition>,
@@ -2142,7 +2140,6 @@ impl SlamTracker {
             ba,
             global_map: GlobalMap::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD),
             loop_manager: LoopManager::new(PoseGraphConfig::default()),
-            map_version: MapVersion::initial(),
             backend,
             backend_stats: BackendStats::default(),
             place_recognition,
@@ -2646,12 +2643,7 @@ impl SlamTracker {
             self.realign_map_from_odom(&corrected);
             self.reset_inertial_runtime_continuity();
         }
-        self.bump_map_version();
         Ok(())
-    }
-
-    fn bump_map_version(&mut self) {
-        self.map_version = self.map_version.next();
     }
 
     fn emit_health(&mut self, tracking: TrackingHealth) -> SystemHealth {
@@ -2801,30 +2793,29 @@ impl SlamTracker {
         let Some(place_recognition) = self.place_recognition.as_mut() else {
             return;
         };
-        let events = place_recognition.drain_responses(self.map_version, |keyframe_id| {
-            self.global_map.keyframe(keyframe_id).is_some()
-        });
+        let events = place_recognition
+            .drain_responses(self.global_map.map().snapshot(), |keyframe_id| {
+                self.global_map.keyframe(keyframe_id).is_some()
+            });
         for event in events {
             match event {
                 PlaceRecognitionEvent::WorkerFailure {
                     keyframe_id,
-                    map_version,
+                    source_snapshot,
                     error,
                 } => {
                     eprintln!(
-                        "descriptor worker failure (keyframe={keyframe_id:?}, version={}): {error}",
-                        map_version.as_u64()
+                        "descriptor worker failure (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
                     );
                 }
                 PlaceRecognitionEvent::WorkerPanic {
                     keyframe_id,
-                    map_version,
+                    source_snapshot,
                     message,
                     respawn_count,
                 } => {
                     eprintln!(
-                        "descriptor worker panic (keyframe={keyframe_id:?}, version={}): {message}",
-                        map_version.as_u64()
+                        "descriptor worker panic (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {message}"
                     );
                     self.emit_event(DiagnosticEvent::DescriptorWorkerDied { respawn_count });
                 }
@@ -2962,12 +2953,14 @@ impl SlamTracker {
         let request_id = supervisor
             .next_request_id()
             .ok_or(SubmitEventError::Disconnected)?;
+        let map_snapshot = self.global_map.clone_map();
+        let source_snapshot = map_snapshot.snapshot();
         let event = KeyframeEvent::try_new(
             request_id,
-            self.map_version,
+            source_snapshot,
             trigger_keyframe,
             window,
-            self.global_map.clone_map(),
+            map_snapshot,
         )
         .map_err(SubmitEventError::InvalidEvent)?;
         supervisor.submit(event)?;
@@ -2993,17 +2986,17 @@ impl SlamTracker {
             match response {
                 BackendResponse::Correction(correction) => match &correction.correction.result {
                     BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
+                        let current_snapshot = self.global_map.map().snapshot();
                         match apply_correction_event(
                             self.global_map.map_mut(),
-                            self.map_version,
+                            current_snapshot,
                             &correction,
                         ) {
                             Ok(()) => {
-                                self.bump_map_version();
                                 self.backend_stats.applied =
                                     self.backend_stats.applied.saturating_add(1);
                             }
-                            Err(ApplyCorrectionError::StaleVersion { .. }) => {
+                            Err(ApplyCorrectionError::StaleSnapshot { .. }) => {
                                 self.backend_stats.stale =
                                     self.backend_stats.stale.saturating_add(1);
                             }
@@ -3030,25 +3023,24 @@ impl SlamTracker {
                 },
                 BackendResponse::Failure {
                     request_id,
-                    map_version,
+                    source_snapshot,
                     error,
                 } => {
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
                     eprintln!(
-                        "backend worker failure (req={}, version={}): {error}",
+                        "backend worker failure (req={}, snapshot={}): {error}",
                         request_id.as_u64(),
-                        map_version.as_u64()
+                        source_snapshot
                     );
                 }
                 BackendResponse::WorkerPanic {
                     request_id,
-                    map_version,
+                    source_snapshot,
                 } => {
                     self.backend_stats.panics = self.backend_stats.panics.saturating_add(1);
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
-                    self.map_version = self.map_version.next();
                     if let Some(supervisor) = self.backend.supervisor_mut() {
                         supervisor.check_health();
                         self.backend_stats.respawn_count = supervisor.respawn_count();
@@ -3057,9 +3049,9 @@ impl SlamTracker {
                         respawn_count: self.backend_stats.respawn_count,
                     });
                     eprintln!(
-                        "backend worker panic (req={}, version={}); map version bumped to invalidate in-flight",
+                        "backend worker panic (req={}, snapshot={})",
                         request_id.as_u64(),
-                        map_version.as_u64()
+                        source_snapshot
                     );
                 }
             }
@@ -4055,7 +4047,6 @@ impl SlamTracker {
                         if let Some(place_recognition) = self.place_recognition.as_mut() {
                             place_recognition.remove_keyframe(keyframe_id);
                         }
-                        self.bump_map_version();
                     } else {
                         let window = self
                             .global_map
@@ -4097,9 +4088,7 @@ impl SlamTracker {
                                     if matches!(
                                         result,
                                         BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                                    ) {
-                                        self.bump_map_version();
-                                    }
+                                    ) {}
                                 }
                             } else if matches!(
                                 {
@@ -4112,7 +4101,6 @@ impl SlamTracker {
                                 },
                                 BaResult::Converged { .. } | BaResult::MaxIterations { .. }
                             ) {
-                                self.bump_map_version();
                             }
                         }
                         self.state = TrackerState::Tracking {
@@ -4487,13 +4475,12 @@ impl SlamTracker {
             landmarks,
         });
         self.global_map.add_keyframe_to_graph(keyframe_id);
-        self.bump_map_version();
         if let Some(place_recognition) = self.place_recognition.as_mut() {
             place_recognition.on_keyframe(
                 keyframe_id,
                 keyframe.detections(),
                 &left,
-                self.map_version,
+                self.global_map.map().snapshot(),
             );
         }
 
@@ -4713,13 +4700,13 @@ fn collect_window_points(
 
 fn apply_correction_event(
     map: &mut SlamMap,
-    current_version: MapVersion,
+    current_snapshot: MapSnapshot,
     correction: &CorrectionEvent,
 ) -> Result<(), ApplyCorrectionError> {
-    if correction.map_version != current_version {
-        return Err(ApplyCorrectionError::StaleVersion {
-            current: current_version,
-            correction: correction.map_version,
+    if correction.source_snapshot != current_snapshot {
+        return Err(ApplyCorrectionError::StaleSnapshot {
+            current: current_snapshot,
+            correction: correction.source_snapshot,
         });
     }
 
@@ -4790,6 +4777,10 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
+    }
+
+    fn test_map_snapshot() -> MapSnapshot {
+        SlamMap::new().snapshot()
     }
 
     #[test]
@@ -5125,9 +5116,9 @@ mod tests {
         kf_b: KeyframeId,
     ) -> KeyframeEvent {
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
+        let source_snapshot = map.snapshot();
         let mut event =
-            KeyframeEvent::try_new(request_id, MapVersion::initial(), kf_b, window, map)
-                .expect("event");
+            KeyframeEvent::try_new(request_id, source_snapshot, kf_b, window, map).expect("event");
         event.force_panic = true;
         event
     }
@@ -5260,11 +5251,12 @@ mod tests {
     }
 
     #[test]
-    fn correction_apply_rejects_stale_version() {
+    fn correction_apply_rejects_stale_snapshot() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        let source_snapshot = map.snapshot();
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
-            map_version: MapVersion::initial(),
+            source_snapshot,
             trigger_keyframe: keyframe_id,
             correction: BaCorrection {
                 pose_deltas: vec![(keyframe_id, [0.0; 6])],
@@ -5275,10 +5267,33 @@ mod tests {
                 },
             },
         };
-        let stale = MapVersion::initial().next();
+        let position = map.point(point_id).expect("point").position();
+        map.set_map_point_position(point_id, position)
+            .expect("generation-changing write");
+        let stale = map.snapshot();
         assert!(matches!(
             apply_correction_event(&mut map, stale, &correction),
-            Err(ApplyCorrectionError::StaleVersion { .. })
+            Err(ApplyCorrectionError::StaleSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn backend_event_rejects_snapshot_unrelated_to_cloned_map() {
+        let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let foreign_snapshot = SlamMap::new().snapshot();
+        let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
+        let error = KeyframeEvent::try_new(
+            BackendRequestId(NonZeroU64::MIN),
+            foreign_snapshot,
+            kf_b,
+            window,
+            map,
+        )
+        .expect_err("foreign snapshot must fail");
+        assert!(matches!(
+            error,
+            KeyframeEventError::SnapshotMismatch { declared, actual }
+                if declared == foreign_snapshot && declared != actual
         ));
     }
 
@@ -5296,9 +5311,10 @@ mod tests {
         };
         let initial_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
         let pose_delta = crate::local_ba::se3_delta_between(initial_pose, corrected_pose);
+        let source_snapshot = map.snapshot();
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
-            map_version: MapVersion::initial(),
+            source_snapshot,
             trigger_keyframe: keyframe_id,
             correction: BaCorrection {
                 pose_deltas: vec![(keyframe_id, pose_delta)],
@@ -5317,8 +5333,7 @@ mod tests {
             },
         };
 
-        apply_correction_event(&mut map, MapVersion::initial(), &correction)
-            .expect("correction apply");
+        apply_correction_event(&mut map, source_snapshot, &correction).expect("correction apply");
         assert_map_invariants(&map).expect("post-correction invariants");
 
         let stored_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
@@ -5362,14 +5377,10 @@ mod tests {
             BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
-        let event = KeyframeEvent::try_new(
-            worker.next_request_id(),
-            MapVersion::initial(),
-            kf_b,
-            window,
-            map,
-        )
-        .expect("event");
+        let source_snapshot = map.snapshot();
+        let event =
+            KeyframeEvent::try_new(worker.next_request_id(), source_snapshot, kf_b, window, map)
+                .expect("event");
         worker.try_submit(event).expect("submit");
 
         let mut response = None;
@@ -5601,9 +5612,10 @@ mod tests {
 
         let (map_ok, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
         let window = BackendWindow::try_new(vec![kf_a2, kf_b2]).expect("window");
+        let source_snapshot = map_ok.snapshot();
         let ok_event = KeyframeEvent::try_new(
             BackendRequestId::from_counter(&mut req_counter),
-            MapVersion::initial(),
+            source_snapshot,
             kf_b2,
             window,
             map_ok,
@@ -5652,10 +5664,11 @@ mod tests {
             vec![128_u8; 16 * 12],
         )
         .expect("frame");
+        let source_snapshot = test_map_snapshot();
         worker
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot,
                 frame,
             })
             .expect("submit descriptor request");
@@ -5674,7 +5687,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let response = response.expect("descriptor response");
-        assert_eq!(response.map_version, MapVersion::initial());
+        assert_eq!(response.source_snapshot, source_snapshot);
         assert_eq!(response.descriptor, descriptor);
         assert_eq!(*calls.lock().expect("calls lock"), 1);
     }
@@ -5718,7 +5731,7 @@ mod tests {
         supervisor
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot: test_map_snapshot(),
                 frame: frame.clone(),
             })
             .expect("submit panic request");
@@ -5742,7 +5755,7 @@ mod tests {
         supervisor
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot: test_map_snapshot(),
                 frame,
             })
             .expect("submit recovered request");
@@ -5811,7 +5824,7 @@ mod tests {
         supervisor
             .submit(DescriptorRequest {
                 keyframe_id: KeyframeId::default(),
-                map_version: MapVersion::initial(),
+                source_snapshot: test_map_snapshot(),
                 frame,
             })
             .expect("submit should trigger retry and succeed");
