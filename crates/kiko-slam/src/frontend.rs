@@ -131,6 +131,10 @@ impl StereoFrontend {
 #[derive(Debug)]
 pub enum MapObservationError {
     MissingMatchProvenance,
+    MapInstanceMismatch {
+        expected: crate::MapInstanceId,
+        actual: crate::MapInstanceId,
+    },
     KeyframeProvenanceMismatch {
         matches_frame: crate::FrameId,
         map_frame: crate::FrameId,
@@ -151,6 +155,12 @@ impl std::fmt::Display for MapObservationError {
             MapObservationError::MissingMatchProvenance => {
                 write!(f, "verified matches are missing keyframe provenance")
             }
+            MapObservationError::MapInstanceMismatch { expected, actual } => write!(
+                f,
+                "verified matches belong to map instance {}, not {}",
+                actual.as_u64(),
+                expected.as_u64()
+            ),
             MapObservationError::KeyframeProvenanceMismatch {
                 matches_frame,
                 map_frame,
@@ -182,6 +192,7 @@ impl std::error::Error for MapObservationError {
             MapObservationError::Map(source) => Some(source),
             MapObservationError::Pnp(source) => Some(source),
             MapObservationError::MissingMatchProvenance
+            | MapObservationError::MapInstanceMismatch { .. }
             | MapObservationError::KeyframeProvenanceMismatch { .. }
             | MapObservationError::NotEnoughPoints { .. } => None,
         }
@@ -207,6 +218,15 @@ pub(crate) fn build_map_observations(
     intrinsics: PinholeIntrinsics,
 ) -> Result<TrackedMapObservations, MapObservationError> {
     const MIN_PNP_CORRESPONDENCES: usize = 4;
+    let verified_map_instance_id = matches
+        .map_instance_id()
+        .ok_or(MapObservationError::MissingMatchProvenance)?;
+    if verified_map_instance_id != map.instance_id() {
+        return Err(MapObservationError::MapInstanceMismatch {
+            expected: map.instance_id(),
+            actual: verified_map_instance_id,
+        });
+    }
     let keyframe_id = matches
         .keyframe_id()
         .ok_or(MapObservationError::MissingMatchProvenance)?;

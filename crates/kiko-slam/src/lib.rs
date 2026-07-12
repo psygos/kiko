@@ -116,7 +116,9 @@ pub use loop_closure::{
     RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
     match_descriptors_for_loop,
 };
-pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId};
+pub use map::{
+    CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId, MapInstanceId,
+};
 pub use map_from_odom::MapFromOdom;
 pub use math::{Pose64, Pose64Error};
 #[cfg(feature = "record")]
@@ -1174,6 +1176,7 @@ pub struct Matches<State> {
     source_b: Arc<Detections>,
     indices: Vec<(usize, usize)>,
     scores: Vec<f32>,
+    verified_map_instance_id: Option<MapInstanceId>,
     verified_keyframe_id: Option<KeyframeId>,
     _state: PhantomData<State>,
 }
@@ -1222,6 +1225,7 @@ impl Matches<Raw> {
             source_b,
             indices,
             scores,
+            verified_map_instance_id: None,
             verified_keyframe_id: None,
             _state: PhantomData,
         })
@@ -1229,6 +1233,7 @@ impl Matches<Raw> {
 
     pub(crate) fn with_landmarks(
         &self,
+        map_instance_id: MapInstanceId,
         keyframe_id: KeyframeId,
         keyframe: &Keyframe,
     ) -> Result<Matches<Verified>, MatchError> {
@@ -1247,6 +1252,7 @@ impl Matches<Raw> {
             self.source_b_arc(),
             indices,
             scores,
+            map_instance_id,
             keyframe_id,
         )
     }
@@ -1258,6 +1264,7 @@ impl Matches<Verified> {
         source_b: Arc<Detections>,
         indices: Vec<(usize, usize)>,
         scores: Vec<f32>,
+        map_instance_id: MapInstanceId,
         keyframe_id: KeyframeId,
     ) -> Result<Self, MatchError> {
         if indices.len() < 2 {
@@ -1266,6 +1273,7 @@ impl Matches<Verified> {
                 source_b,
                 indices,
                 scores,
+                verified_map_instance_id: Some(map_instance_id),
                 verified_keyframe_id: Some(keyframe_id),
                 _state: PhantomData,
             });
@@ -1295,6 +1303,7 @@ impl Matches<Verified> {
             source_b,
             indices,
             scores,
+            verified_map_instance_id: Some(map_instance_id),
             verified_keyframe_id: Some(keyframe_id),
             _state: PhantomData,
         })
@@ -1302,6 +1311,10 @@ impl Matches<Verified> {
 
     pub(crate) fn keyframe_id(&self) -> Option<KeyframeId> {
         self.verified_keyframe_id
+    }
+
+    pub(crate) fn map_instance_id(&self) -> Option<MapInstanceId> {
+        self.verified_map_instance_id
     }
 }
 
@@ -1461,8 +1474,8 @@ mod tests {
     use super::{
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, DownscaleError,
         DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError, FrameId,
-        Keyframe, KeyframeId, Keypoint, MatchError, Matches, Point3, Pose, SensorId, Timestamp,
-        U8_SCALE,
+        Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches, Point3, Pose, SensorId,
+        Timestamp, U8_SCALE,
     };
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
@@ -1503,10 +1516,12 @@ mod tests {
         )
     }
 
-    fn keyframe_id(detections: &Detections) -> KeyframeId {
+    fn keyframe_provenance(detections: &Detections) -> (MapInstanceId, KeyframeId) {
         let mut map = SlamMap::new();
-        map.add_keyframe_from_detections(detections, Timestamp::from_nanos(1), Pose::identity())
-            .expect("map keyframe")
+        let keyframe_id = map
+            .add_keyframe_from_detections(detections, Timestamp::from_nanos(1), Pose::identity())
+            .expect("map keyframe");
+        (map.instance_id(), keyframe_id)
     }
 
     #[test]
@@ -1674,7 +1689,7 @@ mod tests {
             vec![1],
         )
         .expect("keyframe");
-        let keyframe_id = keyframe_id(&keyframe_detections);
+        let (map_instance_id, keyframe_id) = keyframe_provenance(&keyframe_detections);
 
         let matches = Matches::new(
             Arc::clone(&current),
@@ -1684,9 +1699,10 @@ mod tests {
         )
         .expect("raw matches");
         let verified = matches
-            .with_landmarks(keyframe_id, &keyframe)
+            .with_landmarks(map_instance_id, keyframe_id, &keyframe)
             .expect("verified matches");
         assert_eq!(verified.indices(), &[(1, 1)]);
+        assert_eq!(verified.map_instance_id(), Some(map_instance_id));
         assert_eq!(verified.keyframe_id(), Some(keyframe_id));
 
         let same_metadata_different_batch = detection_batch(SensorId::StereoLeft, 1, 2);
@@ -1698,7 +1714,7 @@ mod tests {
         )
         .expect("raw matches");
         assert!(matches!(
-            forged.with_landmarks(keyframe_id, &keyframe),
+            forged.with_landmarks(map_instance_id, keyframe_id, &keyframe),
             Err(MatchError::SourceBatchMismatch { .. })
         ));
     }
@@ -1724,7 +1740,7 @@ mod tests {
             vec![0, 1],
         )
         .expect("keyframe");
-        let keyframe_id = keyframe_id(&keyframe_detections);
+        let (map_instance_id, keyframe_id) = keyframe_provenance(&keyframe_detections);
 
         let duplicate_current = Matches::new(
             Arc::clone(&current),
@@ -1734,7 +1750,7 @@ mod tests {
         )
         .expect("duplicates are lawful in raw stereo matches");
         assert!(matches!(
-            duplicate_current.with_landmarks(keyframe_id, &keyframe),
+            duplicate_current.with_landmarks(map_instance_id, keyframe_id, &keyframe),
             Err(MatchError::DuplicateSourceAIndex {
                 first_match: 0,
                 duplicate_match: 1,
@@ -1750,7 +1766,7 @@ mod tests {
         )
         .expect("duplicates are lawful in raw stereo matches");
         assert!(matches!(
-            duplicate_landmark.with_landmarks(keyframe_id, &keyframe),
+            duplicate_landmark.with_landmarks(map_instance_id, keyframe_id, &keyframe),
             Err(MatchError::DuplicateSourceBIndex {
                 first_match: 0,
                 duplicate_match: 1,

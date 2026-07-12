@@ -3305,7 +3305,7 @@ impl SlamTracker {
     ) -> Result<TrackingAttempt, TrackingAttemptError> {
         let match_count = matches.len();
         let verified = matches
-            .with_landmarks(keyframe_id, keyframe)
+            .with_landmarks(self.global_map.map().instance_id(), keyframe_id, keyframe)
             .map_err(|err| {
                 TrackingAttemptError::Fatal(TrackerError::Inference(InferenceError::Match(err)))
             })?;
@@ -4876,7 +4876,7 @@ mod tests {
         )
         .expect("matches");
         let verified = matches
-            .with_landmarks(keyframe_id, &keyframe)
+            .with_landmarks(map.instance_id(), keyframe_id, &keyframe)
             .expect("verified matches");
         let intrinsics =
             crate::test_helpers::make_pinhole_intrinsics(320, 240, 300.0, 300.0, 160.0, 120.0)
@@ -4907,11 +4907,21 @@ mod tests {
             )
             .expect("wrong map keyframe");
         let wrong_provenance = matches
-            .with_landmarks(wrong_keyframe_id, &keyframe)
+            .with_landmarks(map.instance_id(), wrong_keyframe_id, &keyframe)
             .expect("verified matches with wrong map id");
         assert!(matches!(
             crate::frontend::build_map_observations(&map, &wrong_provenance, intrinsics),
             Err(MapObservationError::KeyframeProvenanceMismatch { .. })
+        ));
+
+        let foreign_map = SlamMap::new();
+        let foreign_provenance = matches
+            .with_landmarks(foreign_map.instance_id(), keyframe_id, &keyframe)
+            .expect("verified matches with foreign map id");
+        assert!(matches!(
+            crate::frontend::build_map_observations(&map, &foreign_provenance, intrinsics),
+            Err(MapObservationError::MapInstanceMismatch { expected, actual })
+                if expected == map.instance_id() && actual == foreign_map.instance_id()
         ));
     }
 

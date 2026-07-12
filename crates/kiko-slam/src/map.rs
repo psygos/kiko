@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use slotmap::{SlotMap, new_key_type};
 
@@ -9,10 +10,24 @@ use crate::{CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, Sens
 const BLEND_SCALE: u16 = 256;
 /// Rounding bias for fixed-point descriptor blending (half of BLEND_SCALE).
 const BLEND_ROUND: u32 = (BLEND_SCALE / 2) as u32;
+static NEXT_MAP_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 new_key_type! {
     pub struct MapPointId;
     pub struct KeyframeId;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MapInstanceId(u64);
+
+impl MapInstanceId {
+    fn fresh() -> Self {
+        Self(NEXT_MAP_INSTANCE_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,11 +98,16 @@ impl KeypointIndex {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KeyframeKeypoint {
+    map_instance_id: MapInstanceId,
     keyframe_id: KeyframeId,
     index: KeypointIndex,
 }
 
 impl KeyframeKeypoint {
+    pub fn map_instance_id(self) -> MapInstanceId {
+        self.map_instance_id
+    }
+
     pub fn keyframe_id(self) -> KeyframeId {
         self.keyframe_id
     }
@@ -343,6 +363,10 @@ impl CovisibilityGraph {
 
 #[derive(Debug)]
 pub enum MapError {
+    ForeignKeypoint {
+        expected: MapInstanceId,
+        actual: MapInstanceId,
+    },
     KeyframeNotFound(KeyframeId),
     MapPointNotFound(MapPointId),
     FrameAlreadyKeyframed {
@@ -378,6 +402,12 @@ pub enum MapError {
 impl std::fmt::Display for MapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MapError::ForeignKeypoint { expected, actual } => write!(
+                f,
+                "keypoint belongs to map instance {}, not {}",
+                actual.as_u64(),
+                expected.as_u64()
+            ),
             MapError::KeyframeNotFound(id) => write!(f, "keyframe not found: {id:?}"),
             MapError::MapPointNotFound(id) => write!(f, "map point not found: {id:?}"),
             MapError::FrameAlreadyKeyframed { frame_id, existing } => {
@@ -436,6 +466,7 @@ impl MapGeneration {
 
 #[derive(Clone, Debug)]
 pub struct SlamMap {
+    instance_id: MapInstanceId,
     points: SlotMap<MapPointId, MapPoint>,
     keyframes: SlotMap<KeyframeId, KeyframeEntry>,
     covisibility: CovisibilityGraph,
@@ -465,6 +496,7 @@ pub struct CovisibilitySnapshot {
 impl SlamMap {
     pub fn new() -> Self {
         Self {
+            instance_id: MapInstanceId::fresh(),
             points: SlotMap::with_key(),
             keyframes: SlotMap::with_key(),
             covisibility: CovisibilityGraph::default(),
@@ -475,6 +507,20 @@ impl SlamMap {
 
     fn bump_generation(&mut self) {
         self.generation = self.generation.next();
+    }
+
+    pub fn instance_id(&self) -> MapInstanceId {
+        self.instance_id
+    }
+
+    fn ensure_local_keypoint(&self, keypoint: KeyframeKeypoint) -> Result<(), MapError> {
+        if keypoint.map_instance_id != self.instance_id {
+            return Err(MapError::ForeignKeypoint {
+                expected: self.instance_id,
+                actual: keypoint.map_instance_id,
+            });
+        }
+        Ok(())
     }
 
     pub fn add_keyframe_from_detections(
@@ -557,12 +603,14 @@ impl SlamMap {
             }
         })?;
         Ok(KeyframeKeypoint {
+            map_instance_id: self.instance_id,
             keyframe_id,
             index: idx,
         })
     }
 
     pub fn keypoint(&self, keypoint: KeyframeKeypoint) -> Result<Keypoint, MapError> {
+        self.ensure_local_keypoint(keypoint)?;
         let entry = self
             .keyframes
             .get(keypoint.keyframe_id)
@@ -576,6 +624,7 @@ impl SlamMap {
         descriptor: CompactDescriptor,
         first_obs: KeyframeKeypoint,
     ) -> Result<MapPointId, MapError> {
+        self.ensure_local_keypoint(first_obs)?;
         let entry = self
             .keyframes
             .get(first_obs.keyframe_id)
@@ -613,6 +662,7 @@ impl SlamMap {
         point_id: MapPointId,
         obs: KeyframeKeypoint,
     ) -> Result<(), MapError> {
+        self.ensure_local_keypoint(obs)?;
         let entry = self
             .keyframes
             .get(obs.keyframe_id)
@@ -790,7 +840,11 @@ impl SlamMap {
                         len: entry.len(),
                     }
                 })?;
-                let keypoint_ref = KeyframeKeypoint { keyframe_id, index };
+                let keypoint_ref = KeyframeKeypoint {
+                    map_instance_id: self.instance_id,
+                    keyframe_id,
+                    index,
+                };
                 Ok((keypoint_ref, entry.keypoints[idx]))
             })
             .collect()
@@ -819,7 +873,14 @@ impl SlamMap {
                     len: entry.len(),
                 }
             })?;
-            visit(KeyframeKeypoint { keyframe_id, index }, point.descriptor());
+            visit(
+                KeyframeKeypoint {
+                    map_instance_id: self.instance_id,
+                    keyframe_id,
+                    index,
+                },
+                point.descriptor(),
+            );
         }
         Ok(())
     }
@@ -876,6 +937,7 @@ impl SlamMap {
         &self,
         keypoint: KeyframeKeypoint,
     ) -> Result<Option<MapPointId>, MapError> {
+        self.ensure_local_keypoint(keypoint)?;
         let entry = self
             .keyframes
             .get(keypoint.keyframe_id)
@@ -1351,6 +1413,46 @@ mod tests {
 
     fn make_descriptor() -> CompactDescriptor {
         CompactDescriptor([128; 256])
+    }
+
+    #[test]
+    fn keyframe_keypoints_are_scoped_to_their_map_instance() {
+        let size = ImageSize::try_new(640, 480).expect("image size");
+        let mut map_a = SlamMap::new();
+        let keyframe_a = map_a
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe a");
+        let keypoint_a = map_a.keyframe_keypoint(keyframe_a, 0).expect("keypoint a");
+
+        let mut map_b = SlamMap::new();
+        map_b
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe b");
+
+        assert_ne!(map_a.instance_id(), map_b.instance_id());
+        assert_eq!(map_a.clone().instance_id(), map_a.instance_id());
+        assert_eq!(keypoint_a.map_instance_id(), map_a.instance_id());
+        assert!(matches!(
+            map_b.keypoint(keypoint_a),
+            Err(MapError::ForeignKeypoint { expected, actual })
+                if expected == map_b.instance_id() && actual == map_a.instance_id()
+        ));
+        assert!(matches!(
+            map_b.map_point_for_keypoint(keypoint_a),
+            Err(MapError::ForeignKeypoint { .. })
+        ));
     }
 
     #[test]
