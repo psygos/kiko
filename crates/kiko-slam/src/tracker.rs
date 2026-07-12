@@ -459,6 +459,7 @@ struct CorrectionEvent {
 enum CorrectionBuildError {
     MissingKeyframe { keyframe_id: KeyframeId },
     MissingMapPoint { point_id: MapPointId },
+    MapLookup { source: crate::map::MapError },
 }
 
 impl std::fmt::Display for CorrectionBuildError {
@@ -470,11 +471,21 @@ impl std::fmt::Display for CorrectionBuildError {
             CorrectionBuildError::MissingMapPoint { point_id } => {
                 write!(f, "optimized map missing map point {point_id:?}")
             }
+            CorrectionBuildError::MapLookup { source } => {
+                write!(f, "optimized map lookup failed: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for CorrectionBuildError {}
+impl std::error::Error for CorrectionBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapLookup { source } => Some(source),
+            Self::MissingKeyframe { .. } | Self::MissingMapPoint { .. } => None,
+        }
+    }
+}
 
 impl CorrectionEvent {
     fn from_optimized_map(
@@ -3229,9 +3240,17 @@ impl SlamTracker {
         let Some(place_recognition) = self.place_recognition.as_ref() else {
             return Ok(None);
         };
-        let Some(global_descriptor) = aggregate_global_descriptor(current.descriptors()).ok()
-        else {
-            return Ok(None);
+        let global_descriptor = match aggregate_global_descriptor(current.descriptors()) {
+            Ok(descriptor) => descriptor,
+            Err(
+                crate::loop_closure::GlobalDescriptorError::EmptyInput
+                | crate::loop_closure::GlobalDescriptorError::ZeroNorm,
+            ) => return Ok(None),
+            Err(source @ crate::loop_closure::GlobalDescriptorError::NonFiniteValue { .. }) => {
+                return Err(TrackerError::Inference(InferenceError::GlobalDescriptor(
+                    source,
+                )));
+            }
         };
         let candidates =
             place_recognition.relocalization_matches(&global_descriptor, cfg.max_candidates());
@@ -4709,8 +4728,11 @@ fn collect_window_points(
         for index in 0..keyframe.len() {
             let keypoint_ref = map
                 .keyframe_keypoint(keyframe_id, index)
-                .map_err(|_| CorrectionBuildError::MissingKeyframe { keyframe_id })?;
-            let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
+                .map_err(|source| CorrectionBuildError::MapLookup { source })?;
+            let Some(point_id) = map
+                .map_point_for_keypoint(keypoint_ref)
+                .map_err(|source| CorrectionBuildError::MapLookup { source })?
+            else {
                 continue;
             };
             if seen.insert(point_id) {
@@ -4830,6 +4852,22 @@ mod tests {
         assert_eq!(
             source.to_string(),
             "imu preintegration requires at least 2 samples, got 1"
+        );
+    }
+
+    #[test]
+    fn correction_build_error_preserves_map_lookup_source() {
+        let error = CorrectionBuildError::MapLookup {
+            source: crate::map::MapError::NonFiniteMapPoint {
+                axis: "x",
+                value: f32::NAN,
+            },
+        };
+        let source = error.source().expect("map lookup source");
+        assert!(
+            source
+                .to_string()
+                .contains("map point x coordinate must be finite")
         );
     }
 
