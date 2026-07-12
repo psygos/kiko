@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::{FrameId, Timestamp};
+use crate::{FrameDimensions, FrameDimensionsError, FrameId, Timestamp};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepthProvenanceKind {
@@ -33,14 +33,14 @@ pub type InterpolatedDepthImage = DepthImage<InterpolatedDepth>;
 pub struct DepthImage<P = MeasuredDepth> {
     frame_id: FrameId,
     timestamp: Timestamp,
-    width: u32,
-    height: u32,
+    dimensions: FrameDimensions,
     depth_m: Arc<[f32]>,
     provenance: PhantomData<P>,
 }
 
 #[derive(Debug)]
 pub enum DepthImageError {
+    InvalidDimensions(FrameDimensionsError),
     DimensionMismatch { expected: usize, actual: usize },
     InvalidSample { index: usize, value: f32 },
 }
@@ -48,6 +48,9 @@ pub enum DepthImageError {
 impl std::fmt::Display for DepthImageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DepthImageError::InvalidDimensions(source) => {
+                write!(f, "invalid depth image dimensions: {source}")
+            }
             DepthImageError::DimensionMismatch { expected, actual } => {
                 write!(
                     f,
@@ -61,10 +64,26 @@ impl std::fmt::Display for DepthImageError {
     }
 }
 
-impl std::error::Error for DepthImageError {}
+impl std::error::Error for DepthImageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDimensions(source) => Some(source),
+            Self::DimensionMismatch { .. } | Self::InvalidSample { .. } => None,
+        }
+    }
+}
 
-fn validate_depth_samples(width: u32, height: u32, depth_m: &[f32]) -> Result<(), DepthImageError> {
-    let expected = (width as usize).saturating_mul(height as usize);
+impl From<FrameDimensionsError> for DepthImageError {
+    fn from(source: FrameDimensionsError) -> Self {
+        Self::InvalidDimensions(source)
+    }
+}
+
+fn validate_depth_samples(
+    dimensions: FrameDimensions,
+    depth_m: &[f32],
+) -> Result<(), DepthImageError> {
+    let expected = dimensions.area();
     if depth_m.len() != expected {
         return Err(DepthImageError::DimensionMismatch {
             expected,
@@ -93,12 +112,12 @@ where
         height: u32,
         depth_m: Vec<f32>,
     ) -> Result<Self, DepthImageError> {
-        validate_depth_samples(width, height, &depth_m)?;
+        let dimensions = FrameDimensions::try_new(width, height)?;
+        validate_depth_samples(dimensions, &depth_m)?;
         Ok(Self {
             frame_id,
             timestamp,
-            width,
-            height,
+            dimensions,
             depth_m: Arc::from(depth_m.into_boxed_slice()),
             provenance: PhantomData,
         })
@@ -113,11 +132,15 @@ where
     }
 
     pub fn width(&self) -> u32 {
-        self.width
+        self.dimensions.width()
     }
 
     pub fn height(&self) -> u32 {
-        self.height
+        self.dimensions.height()
+    }
+
+    pub fn dimensions(&self) -> FrameDimensions {
+        self.dimensions
     }
 
     pub fn provenance_kind(&self) -> DepthProvenanceKind {
@@ -129,12 +152,12 @@ where
     }
 
     pub fn depth_m_at(&self, x: u32, y: u32) -> Option<f32> {
-        if x >= self.width || y >= self.height {
+        if x >= self.width() || y >= self.height() {
             return None;
         }
         let idx = (y as usize)
-            .saturating_mul(self.width as usize)
-            .saturating_add(x as usize);
+            .checked_mul(self.width() as usize)?
+            .checked_add(x as usize)?;
         let depth = *self.depth_m.get(idx)?;
         if depth.is_finite() && depth > 0.0 {
             Some(depth)
@@ -185,6 +208,21 @@ impl DepthImage<InterpolatedDepth> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn depth_image_rejects_zero_dimensions_with_source_context() {
+        let error = DepthImage::new(FrameId::new(1), Timestamp::from_nanos(1), 0, 2, Vec::new())
+            .expect_err("zero width must fail");
+        assert!(matches!(
+            error,
+            DepthImageError::InvalidDimensions(FrameDimensionsError::Zero {
+                width: 0,
+                height: 2,
+            })
+        ));
+        assert!(error.source().is_some());
+    }
 
     #[test]
     fn depth_image_rejects_shape_mismatch() {
@@ -216,6 +254,10 @@ mod tests {
         )
         .expect("valid depth image");
         assert_eq!(depth.provenance_kind(), DepthProvenanceKind::MeasuredSensor);
+        assert_eq!(
+            depth.dimensions(),
+            FrameDimensions::try_new(2, 2).expect("dimensions")
+        );
         assert_eq!(depth.depth_m_at(0, 0), None);
         assert_eq!(depth.depth_m_at(1, 0), Some(1.0));
         assert_eq!(depth.depth_m_at(0, 1), Some(2.5));

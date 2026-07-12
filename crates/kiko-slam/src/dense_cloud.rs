@@ -6,7 +6,8 @@
 
 use crate::triangulation::{RectifiedRowMismatchPx, SparseStereoSample};
 use crate::{
-    DepthImage, FrameId, InterpolatedDepth, StableSurfaceRetainedRawPixelResidualMetric, Timestamp,
+    DepthImage, DepthImageError, FrameDimensions, FrameId, InterpolatedDepth,
+    StableSurfaceRetainedRawPixelResidualMetric, Timestamp,
 };
 
 /// Configuration for dense visualization and stable surface observation generation.
@@ -261,13 +262,14 @@ pub fn generate_dense_depth_image(
     samples: &[SparseStereoSample],
     fx: f32,
     baseline_m: f32,
-    image_width: u32,
-    image_height: u32,
+    dimensions: FrameDimensions,
     config: &DenseCloudConfig,
-) -> DepthImage<InterpolatedDepth> {
+) -> Result<DepthImage<InterpolatedDepth>, DepthImageError> {
+    let image_width = dimensions.width();
+    let image_height = dimensions.height();
     let w = image_width as usize;
     let h = image_height as usize;
-    let mut depth = vec![0.0_f32; w * h];
+    let mut depth = vec![0.0_f32; dimensions.area()];
 
     if samples.len() < 3 {
         eprintln!("dense_depth: too few samples ({})", samples.len());
@@ -277,8 +279,7 @@ pub fn generate_dense_depth_image(
             image_width,
             image_height,
             depth,
-        )
-        .expect("dense interpolation produced a lawful empty depth image");
+        );
     }
 
     let pts: Vec<[f32; 2]> = samples.iter().map(|s| [s.u, s.v]).collect();
@@ -363,7 +364,6 @@ pub fn generate_dense_depth_image(
         image_height,
         depth,
     )
-    .expect("dense interpolation produced a lawful interpolated depth image")
 }
 
 /// Generate stable sparse surface observations directly from measured stereo samples.
@@ -797,6 +797,23 @@ mod tests {
         assert_eq!(point.position(), [0.1, -0.2, 2.0]);
         assert_eq!(point.intensity(), 42);
         assert_eq!(point.position_variance(), 0.005);
+    }
+
+    #[test]
+    fn dense_depth_empty_result_is_fallible_without_panicking() {
+        let dimensions = FrameDimensions::try_new(2, 2).expect("dimensions");
+        let depth = generate_dense_depth_image(
+            FrameId::new(1),
+            Timestamp::from_nanos(1),
+            &[],
+            200.0,
+            0.075,
+            dimensions,
+            &DenseCloudConfig::default(),
+        )
+        .expect("valid empty interpolated depth");
+        assert_eq!(depth.dimensions(), dimensions);
+        assert_eq!(depth.depth_m(), &[0.0; 4]);
     }
 
     #[test]
