@@ -55,9 +55,16 @@ struct LiveVizMsg {
 
 #[derive(Debug)]
 enum LiveThreadError {
-    TrackerInit { source: kiko_slam::TrackerInitError },
+    TrackerInit {
+        source: kiko_slam::TrackerInitError,
+    },
+    VizInit {
+        source: kiko_slam::RerunSinkInitError,
+    },
     VizChannelDisconnected,
-    FrameProcessingPanic { detail: String },
+    FrameProcessingPanic {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for LiveThreadError {
@@ -65,6 +72,9 @@ impl std::fmt::Display for LiveThreadError {
         match self {
             LiveThreadError::TrackerInit { source } => {
                 write!(f, "failed to initialize tracker: {source}")
+            }
+            LiveThreadError::VizInit { source } => {
+                write!(f, "failed to initialize visualization: {source}")
             }
             LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
             LiveThreadError::FrameProcessingPanic { detail } => {
@@ -78,6 +88,7 @@ impl std::error::Error for LiveThreadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             LiveThreadError::TrackerInit { source } => Some(source),
+            LiveThreadError::VizInit { source } => Some(source),
             LiveThreadError::VizChannelDisconnected
             | LiveThreadError::FrameProcessingPanic { .. } => None,
         }
@@ -298,7 +309,10 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut sink = if live_viz_enabled {
             match rerun_recording(&rerun, "kiko-slam-live") {
-                Ok(rec) => Some(RerunSink::new(rec, decimation)),
+                Ok(rec) => Some(
+                    RerunSink::try_new(rec, decimation)
+                        .map_err(|source| LiveThreadError::VizInit { source })?,
+                ),
                 Err(err) => {
                     eprintln!("failed to connect to rerun viewer; continuing headless: {err}");
                     None

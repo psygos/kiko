@@ -103,6 +103,31 @@ impl From<rerun::RecordingStreamError> for VizLogError {
 }
 
 #[derive(Debug)]
+pub enum RerunSinkInitError {
+    SurfaceMapConfig {
+        source: crate::SurfaceMapConfigError,
+    },
+}
+
+impl std::fmt::Display for RerunSinkInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SurfaceMapConfig { source } => {
+                write!(f, "failed to configure surface visualization map: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RerunSinkInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SurfaceMapConfig { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct RerunSink {
     rec: rerun::RecordingStream,
     decimation: VizDecimation,
@@ -118,8 +143,13 @@ pub struct RerunSink {
 }
 
 impl RerunSink {
-    pub fn new(rec: rerun::RecordingStream, decimation: VizDecimation) -> Self {
-        Self {
+    pub fn try_new(
+        rec: rerun::RecordingStream,
+        decimation: VizDecimation,
+    ) -> Result<Self, RerunSinkInitError> {
+        let surface_map_config = crate::SurfaceMapConfig::try_from_env()
+            .map_err(|source| RerunSinkInitError::SurfaceMapConfig { source })?;
+        Ok(Self {
             rec,
             decimation,
             frame_index: 0,
@@ -130,8 +160,8 @@ impl RerunSink {
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
             surface_pose_quality_gate: SurfacePoseQualityGate::load(),
-            surface_map: crate::SurfaceBeliefMap::new(crate::SurfaceMapConfig::from_env()),
-        }
+            surface_map: crate::SurfaceBeliefMap::new(surface_map_config),
+        })
     }
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {
@@ -375,7 +405,7 @@ impl RerunSink {
         for (path, value) in surface_pose_quality_scalars(&gate) {
             self.rec.log(path, &rerun::Scalars::single(value))?;
         }
-        let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
+        let voxel_radius = (self.surface_map.config().voxel_size() * 0.45).max(0.005);
         self.log_surface_raw_frame_observations(cam_from_map, raw_frame_points, voxel_radius)?;
         self.log_surface_frame_candidates(
             cam_from_map,
@@ -641,7 +671,7 @@ impl RerunSink {
         for (path, value) in surface_summary_scalars(&summary, clouds.confirmed.len()) {
             self.rec.log(path, &rerun::Scalars::single(value))?;
         }
-        let voxel_radius = (self.surface_map.config().voxel_size * 0.45).max(0.005);
+        let voxel_radius = (self.surface_map.config().voxel_size() * 0.45).max(0.005);
         self.log_surface_points(
             "world/stable_surface_voxels",
             &clouds.confirmed,
@@ -1488,7 +1518,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let left = Frame::new(
             SensorId::StereoLeft,
             FrameId::new(1),
@@ -1807,7 +1838,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let diagnostics = FrameDiagnostics::empty(0, 0);
         let point = stable_surface_point();
 
@@ -1836,7 +1868,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -1871,7 +1904,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -1903,7 +1937,8 @@ mod tests {
         let (rec, _storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -1938,7 +1973,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -1984,7 +2020,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -2019,7 +2056,8 @@ mod tests {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
-        let mut sink = RerunSink::new(rec, VizDecimation::default());
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =

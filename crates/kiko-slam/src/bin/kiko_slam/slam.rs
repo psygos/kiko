@@ -204,7 +204,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let use_speculative_lg = tracker_config.tracking_matcher.uses_speculative_lightglue();
     let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset-odometry") {
-        Ok(rec) => Some(RerunSink::new(rec, args.rerun.rerun_decimation)),
+        Ok(rec) => Some(RerunSink::try_new(rec, args.rerun.rerun_decimation)?),
         Err(err) => {
             eprintln!("failed to initialize rerun; continuing headless: {err}");
             None

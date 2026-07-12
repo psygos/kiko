@@ -76,6 +76,16 @@ pub fn try_env_f32(key: &'static str) -> Result<Option<f32>, EnvError> {
         .map_err(|source| EnvError::InvalidFloat { key, value, source })
 }
 
+pub fn try_env_f64(key: &'static str) -> Result<Option<f64>, EnvError> {
+    let Some(value) = raw_env(key)? else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
+        .map_err(|source| EnvError::InvalidFloat { key, value, source })
+}
+
 pub fn try_env_bool(key: &'static str) -> Result<Option<bool>, EnvError> {
     let Some(value) = raw_env(key)? else {
         return Ok(None);

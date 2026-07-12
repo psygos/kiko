@@ -140,7 +140,9 @@ pub use runtime_imu::{
     RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,
     load_runtime_imu_calibration_from_env,
 };
-pub use surface_map::{SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapSummary};
+pub use surface_map::{
+    SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapConfigError, SurfaceMapSummary,
+};
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
@@ -166,7 +168,7 @@ pub use vio::{
     PreintegratedImu, PreintegrationError, VioFactorError, VioObservation,
     bias_random_walk_residual, pose_prior_residual, reprojection_residual,
 };
-pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
+pub use viz::{RerunSink, RerunSinkInitError, VizDecimation, VizDecimationError, VizLogError};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {

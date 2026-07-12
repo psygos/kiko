@@ -299,17 +299,17 @@ impl SurfaceBelief {
 #[derive(Clone, Copy, Debug)]
 pub struct SurfaceMapConfig {
     /// Voxel size in meters. Points within the same voxel merge.
-    pub voxel_size: f32,
+    voxel_size: f32,
     /// Minimum number of distinct support views required to render.
-    pub min_support_views: u32,
+    min_support_views: u32,
     /// Maximum allowed residual consistency score for a confirmed voxel.
-    pub max_consistency_score: f64,
+    max_consistency_score: f64,
     /// Maximum posterior standard deviation allowed for a confirmed voxel.
     ///
     /// By default this tracks the voxel size, which means a surface belief is
     /// only rendered when its uncertainty is no worse than the map resolution
     /// it claims to represent.
-    pub max_confirmed_std_dev_m: f64,
+    max_confirmed_std_dev_m: f64,
     /// Maximum predictive consistency score allowed for a novel support view to
     /// strengthen an existing voxel belief.
     ///
@@ -318,9 +318,63 @@ pub struct SurfaceMapConfig {
     /// values near the state dimensionality are ordinary; much larger values are
     /// evidence that the new support view disagrees with the voxel's current
     /// belief and should not be fused into the stable map.
-    pub max_predictive_consistency_score: f64,
+    max_predictive_consistency_score: f64,
     /// Maximum total points to render (prevents Rerun overload).
-    pub max_render_points: usize,
+    max_render_points: usize,
+}
+
+#[derive(Debug)]
+pub enum SurfaceMapConfigError {
+    Environment { source: crate::env::EnvError },
+    InvalidPositiveField { field: &'static str, value: f64 },
+    ZeroMinSupportViews,
+    MinSupportViewsOutOfRange { value: usize },
+    ZeroMaxRenderPoints,
+}
+
+impl std::fmt::Display for SurfaceMapConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment { source } => write!(f, "surface map environment error: {source}"),
+            Self::InvalidPositiveField { field, value } => {
+                write!(
+                    f,
+                    "surface map {field} must be positive and finite, got {value}"
+                )
+            }
+            Self::ZeroMinSupportViews => {
+                write!(
+                    f,
+                    "surface map minimum support views must be greater than zero"
+                )
+            }
+            Self::MinSupportViewsOutOfRange { value } => write!(
+                f,
+                "surface map minimum support views {value} exceeds u32 range"
+            ),
+            Self::ZeroMaxRenderPoints => {
+                write!(
+                    f,
+                    "surface map maximum render points must be greater than zero"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for SurfaceMapConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Environment { source } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+fn surface_map_env<T>(
+    result: Result<Option<T>, crate::env::EnvError>,
+) -> Result<Option<T>, SurfaceMapConfigError> {
+    result.map_err(|source| SurfaceMapConfigError::Environment { source })
 }
 
 impl Default for SurfaceMapConfig {
@@ -338,48 +392,120 @@ impl Default for SurfaceMapConfig {
 }
 
 impl SurfaceMapConfig {
-    pub fn from_env() -> Self {
-        let mut config = Self::default();
-        let mut confirmed_std_dev_overridden = false;
-        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_VOXEL_SIZE_M") {
-            if v.is_finite() && v > 0.0 {
-                config.voxel_size = v;
+    pub fn try_new(
+        voxel_size: f32,
+        min_support_views: u32,
+        max_consistency_score: f64,
+        max_confirmed_std_dev_m: f64,
+        max_predictive_consistency_score: f64,
+        max_render_points: usize,
+    ) -> Result<Self, SurfaceMapConfigError> {
+        for (field, value) in [
+            ("voxel size", voxel_size as f64),
+            ("maximum consistency score", max_consistency_score),
+            (
+                "maximum confirmed standard deviation",
+                max_confirmed_std_dev_m,
+            ),
+            (
+                "maximum predictive consistency score",
+                max_predictive_consistency_score,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(SurfaceMapConfigError::InvalidPositiveField { field, value });
             }
         }
-        if let Some(v) = crate::env::env_usize("KIKO_SURFACE_MIN_OBS") {
-            config.min_support_views = v.max(1) as u32;
+        if min_support_views == 0 {
+            return Err(SurfaceMapConfigError::ZeroMinSupportViews);
         }
-        if let Some(v) = crate::env::env_usize("KIKO_SURFACE_MIN_SUPPORT_VIEWS") {
-            config.min_support_views = v.max(1) as u32;
+        if max_render_points == 0 {
+            return Err(SurfaceMapConfigError::ZeroMaxRenderPoints);
         }
-        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_CHI2") {
-            if v.is_finite() && v > 0.0 {
-                config.max_consistency_score = v as f64;
+        Ok(Self {
+            voxel_size,
+            min_support_views,
+            max_consistency_score,
+            max_confirmed_std_dev_m,
+            max_predictive_consistency_score,
+            max_render_points,
+        })
+    }
+
+    pub fn try_from_env() -> Result<Self, SurfaceMapConfigError> {
+        let defaults = Self::default();
+        let voxel_size = surface_map_env(crate::env::try_env_f32("KIKO_SURFACE_VOXEL_SIZE_M"))?
+            .unwrap_or(defaults.voxel_size);
+
+        let mut min_support_views = defaults.min_support_views as usize;
+        if let Some(value) = surface_map_env(crate::env::try_env_usize("KIKO_SURFACE_MIN_OBS"))? {
+            min_support_views = value;
+        }
+        if let Some(value) =
+            surface_map_env(crate::env::try_env_usize("KIKO_SURFACE_MIN_SUPPORT_VIEWS"))?
+        {
+            min_support_views = value;
+        }
+        let min_support_views = u32::try_from(min_support_views).map_err(|_| {
+            SurfaceMapConfigError::MinSupportViewsOutOfRange {
+                value: min_support_views,
             }
+        })?;
+
+        let mut max_consistency_score = defaults.max_consistency_score;
+        if let Some(value) = surface_map_env(crate::env::try_env_f64("KIKO_SURFACE_MAX_CHI2"))? {
+            max_consistency_score = value;
         }
-        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_CONSISTENCY_SCORE") {
-            if v.is_finite() && v > 0.0 {
-                config.max_consistency_score = v as f64;
-            }
+        if let Some(value) = surface_map_env(crate::env::try_env_f64(
+            "KIKO_SURFACE_MAX_CONSISTENCY_SCORE",
+        ))? {
+            max_consistency_score = value;
         }
-        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M") {
-            if v.is_finite() && v > 0.0 {
-                config.max_confirmed_std_dev_m = v as f64;
-                confirmed_std_dev_overridden = true;
-            }
-        }
-        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_PREDICTIVE_CONSISTENCY_SCORE") {
-            if v.is_finite() && v > 0.0 {
-                config.max_predictive_consistency_score = v as f64;
-            }
-        }
-        if let Some(v) = crate::env::env_usize("KIKO_SURFACE_MAX_RENDER_POINTS") {
-            config.max_render_points = v.max(1);
-        }
-        if !confirmed_std_dev_overridden {
-            config.max_confirmed_std_dev_m = config.voxel_size as f64;
-        }
-        config
+
+        let max_confirmed_std_dev_m = surface_map_env(crate::env::try_env_f64(
+            "KIKO_SURFACE_MAX_CONFIRMED_STD_DEV_M",
+        ))?
+        .unwrap_or(voxel_size as f64);
+        let max_predictive_consistency_score = surface_map_env(crate::env::try_env_f64(
+            "KIKO_SURFACE_MAX_PREDICTIVE_CONSISTENCY_SCORE",
+        ))?
+        .unwrap_or(defaults.max_predictive_consistency_score);
+        let max_render_points =
+            surface_map_env(crate::env::try_env_usize("KIKO_SURFACE_MAX_RENDER_POINTS"))?
+                .unwrap_or(defaults.max_render_points);
+
+        Self::try_new(
+            voxel_size,
+            min_support_views,
+            max_consistency_score,
+            max_confirmed_std_dev_m,
+            max_predictive_consistency_score,
+            max_render_points,
+        )
+    }
+
+    pub fn voxel_size(self) -> f32 {
+        self.voxel_size
+    }
+
+    pub fn min_support_views(self) -> u32 {
+        self.min_support_views
+    }
+
+    pub fn max_consistency_score(self) -> f64 {
+        self.max_consistency_score
+    }
+
+    pub fn max_confirmed_std_dev_m(self) -> f64 {
+        self.max_confirmed_std_dev_m
+    }
+
+    pub fn max_predictive_consistency_score(self) -> f64 {
+        self.max_predictive_consistency_score
+    }
+
+    pub fn max_render_points(self) -> usize {
+        self.max_render_points
     }
 }
 
@@ -775,6 +901,35 @@ mod tests {
 
     fn integrate_as_novel(belief: &mut SurfaceBelief, evidence: BatchVoxelEvidence) {
         belief.integrate_support_view(&evidence, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn surface_map_config_rejects_invalid_runtime_values() {
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                SurfaceMapConfig::try_new(invalid, 3, 8.0, 0.05, 12.0, 250_000),
+                Err(SurfaceMapConfigError::InvalidPositiveField {
+                    field: "voxel size",
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            SurfaceMapConfig::try_new(0.05, 0, 8.0, 0.05, 12.0, 250_000),
+            Err(SurfaceMapConfigError::ZeroMinSupportViews)
+        ));
+        assert!(matches!(
+            SurfaceMapConfig::try_new(0.05, 3, 8.0, 0.05, 12.0, 0),
+            Err(SurfaceMapConfigError::ZeroMaxRenderPoints)
+        ));
+
+        let config = SurfaceMapConfig::try_new(0.1, 4, 7.0, 0.08, 11.0, 42).expect("valid config");
+        assert_eq!(config.voxel_size(), 0.1);
+        assert_eq!(config.min_support_views(), 4);
+        assert_eq!(config.max_consistency_score(), 7.0);
+        assert_eq!(config.max_confirmed_std_dev_m(), 0.08);
+        assert_eq!(config.max_predictive_consistency_score(), 11.0);
+        assert_eq!(config.max_render_points(), 42);
     }
 
     #[test]

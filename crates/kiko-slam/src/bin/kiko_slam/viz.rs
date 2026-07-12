@@ -37,7 +37,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset") {
-        Ok(rec) => Some(RerunSink::new(rec, args.rerun.rerun_decimation)),
+        Ok(rec) => Some(RerunSink::try_new(rec, args.rerun.rerun_decimation)?),
         Err(err) => {
             eprintln!("failed to initialize rerun; continuing headless: {err}");
             None
