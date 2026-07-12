@@ -22,66 +22,8 @@ impl Default for TsdfConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TsdfCameraIntrinsics {
-    fx: f32,
-    fy: f32,
-    cx: f32,
-    cy: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum TsdfCameraIntrinsicsError {
-    NonFinite { field: &'static str, value: f32 },
-    NonPositive { field: &'static str, value: f32 },
-}
-
-impl std::fmt::Display for TsdfCameraIntrinsicsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TsdfCameraIntrinsicsError::NonFinite { field, value } => {
-                write!(f, "TSDF intrinsic {field} must be finite, got {value}")
-            }
-            TsdfCameraIntrinsicsError::NonPositive { field, value } => {
-                write!(f, "TSDF intrinsic {field} must be > 0, got {value}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for TsdfCameraIntrinsicsError {}
-
-impl TsdfCameraIntrinsics {
-    pub fn try_new(fx: f32, fy: f32, cx: f32, cy: f32) -> Result<Self, TsdfCameraIntrinsicsError> {
-        for (field, value) in [("fx", fx), ("fy", fy), ("cx", cx), ("cy", cy)] {
-            if !value.is_finite() {
-                return Err(TsdfCameraIntrinsicsError::NonFinite { field, value });
-            }
-        }
-        for (field, value) in [("fx", fx), ("fy", fy)] {
-            if value <= 0.0 {
-                return Err(TsdfCameraIntrinsicsError::NonPositive { field, value });
-            }
-        }
-        Ok(Self { fx, fy, cx, cy })
-    }
-
-    pub fn fx(self) -> f32 {
-        self.fx
-    }
-
-    pub fn fy(self) -> f32 {
-        self.fy
-    }
-
-    pub fn cx(self) -> f32 {
-        self.cx
-    }
-
-    pub fn cy(self) -> f32 {
-        self.cy
-    }
-}
+pub type TsdfCameraIntrinsics = crate::pnp::PinholeIntrinsics;
+pub type TsdfCameraIntrinsicsError = crate::pnp::IntrinsicsError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TsdfIntegrateMsgError {

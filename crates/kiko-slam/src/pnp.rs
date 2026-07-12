@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use crate::dataset::CameraIntrinsics;
 use crate::{Keypoint, Point3, math};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PinholeIntrinsics {
     fx: f32,
     fy: f32,
@@ -11,19 +11,20 @@ pub struct PinholeIntrinsics {
     cy: f32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum IntrinsicsError {
-    NonPositiveFocal { fx: f32, fy: f32 },
+    NonFinite { field: &'static str, value: f32 },
+    NonPositive { field: &'static str, value: f32 },
 }
 
 impl std::fmt::Display for IntrinsicsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IntrinsicsError::NonPositiveFocal { fx, fy } => {
-                write!(
-                    f,
-                    "pinhole intrinsics require fx, fy > 0 (fx={fx}, fy={fy})"
-                )
+            IntrinsicsError::NonFinite { field, value } => {
+                write!(f, "pinhole intrinsic {field} must be finite, got {value}")
+            }
+            IntrinsicsError::NonPositive { field, value } => {
+                write!(f, "pinhole intrinsic {field} must be positive, got {value}")
             }
         }
     }
@@ -35,22 +36,25 @@ impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
     type Error = IntrinsicsError;
 
     fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
-        if value.fx <= 0.0 || value.fy <= 0.0 {
-            return Err(IntrinsicsError::NonPositiveFocal {
-                fx: value.fx,
-                fy: value.fy,
-            });
-        }
-        Ok(Self {
-            fx: value.fx,
-            fy: value.fy,
-            cx: value.cx,
-            cy: value.cy,
-        })
+        Self::try_new(value.fx, value.fy, value.cx, value.cy)
     }
 }
 
 impl PinholeIntrinsics {
+    pub fn try_new(fx: f32, fy: f32, cx: f32, cy: f32) -> Result<Self, IntrinsicsError> {
+        for (field, value) in [("fx", fx), ("fy", fy), ("cx", cx), ("cy", cy)] {
+            if !value.is_finite() {
+                return Err(IntrinsicsError::NonFinite { field, value });
+            }
+        }
+        for (field, value) in [("fx", fx), ("fy", fy)] {
+            if value <= 0.0 {
+                return Err(IntrinsicsError::NonPositive { field, value });
+            }
+        }
+        Ok(Self { fx, fy, cx, cy })
+    }
+
     pub fn fx(&self) -> f32 {
         self.fx
     }
@@ -93,6 +97,17 @@ impl Observation {
         pixel: Keypoint,
         intrinsics: PinholeIntrinsics,
     ) -> Result<Self, PnpError> {
+        for (field, value) in [
+            ("world.x", world.x),
+            ("world.y", world.y),
+            ("world.z", world.z),
+            ("pixel.x", pixel.x),
+            ("pixel.y", pixel.y),
+        ] {
+            if !value.is_finite() {
+                return Err(PnpError::NonFiniteObservation { field, value });
+            }
+        }
         let bearing = normalize_bearing(pixel, intrinsics)?;
         Ok(Self {
             world,
@@ -270,6 +285,7 @@ pub struct PnpResult {
 #[derive(Debug)]
 pub enum PnpError {
     NotEnoughPoints { required: usize, actual: usize },
+    NonFiniteObservation { field: &'static str, value: f32 },
     Degenerate { message: &'static str },
     NoSolution,
 }
@@ -279,6 +295,9 @@ impl std::fmt::Display for PnpError {
         match self {
             PnpError::NotEnoughPoints { required, actual } => {
                 write!(f, "pnp requires at least {required} points, got {actual}")
+            }
+            PnpError::NonFiniteObservation { field, value } => {
+                write!(f, "pnp observation {field} must be finite, got {value}")
             }
             PnpError::Degenerate { message } => write!(f, "pnp degenerate input: {message}"),
             PnpError::NoSolution => write!(f, "pnp failed to find a valid pose"),
@@ -472,9 +491,9 @@ fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[
     let y = (pixel.y - intrinsics.cy()) / intrinsics.fy();
     let v = [x, y, 1.0];
     let n = norm(v);
-    if n <= 0.0 {
+    if !n.is_finite() || n <= 0.0 {
         return Err(PnpError::Degenerate {
-            message: "zero-length bearing",
+            message: "non-finite or zero-length bearing",
         });
     }
     Ok([v[0] / n, v[1] / n, v[2] / n])
@@ -1126,6 +1145,93 @@ mod tests {
                 minimum,
             }) if value == MIN_PNP_POINTS - 1 && minimum == MIN_PNP_POINTS
         ));
+    }
+
+    #[test]
+    fn pinhole_intrinsics_reject_non_finite_and_non_positive_parameters() {
+        for (field, values) in [
+            ("fx", [f32::NAN, 400.0, 320.0, 240.0]),
+            ("fy", [400.0, f32::INFINITY, 320.0, 240.0]),
+            ("cx", [400.0, 400.0, f32::NEG_INFINITY, 240.0]),
+            ("cy", [400.0, 400.0, 320.0, f32::NAN]),
+        ] {
+            assert!(matches!(
+                PinholeIntrinsics::try_new(values[0], values[1], values[2], values[3]),
+                Err(IntrinsicsError::NonFinite { field: actual, .. }) if actual == field
+            ));
+        }
+        for (field, fx, fy) in [("fx", 0.0, 400.0), ("fy", 400.0, -1.0)] {
+            assert!(matches!(
+                PinholeIntrinsics::try_new(fx, fy, 320.0, 240.0),
+                Err(IntrinsicsError::NonPositive { field: actual, .. }) if actual == field
+            ));
+        }
+    }
+
+    #[test]
+    fn observation_rejects_non_finite_world_and_pixel_values() {
+        let intrinsics =
+            PinholeIntrinsics::try_new(400.0, 400.0, 320.0, 240.0).expect("intrinsics");
+        let cases = [
+            (
+                "world.x",
+                Point3 {
+                    x: f32::NAN,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Keypoint { x: 1.0, y: 2.0 },
+            ),
+            (
+                "world.y",
+                Point3 {
+                    x: 0.0,
+                    y: f32::INFINITY,
+                    z: 1.0,
+                },
+                Keypoint { x: 1.0, y: 2.0 },
+            ),
+            (
+                "world.z",
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: f32::NEG_INFINITY,
+                },
+                Keypoint { x: 1.0, y: 2.0 },
+            ),
+            (
+                "pixel.x",
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Keypoint {
+                    x: f32::NAN,
+                    y: 2.0,
+                },
+            ),
+            (
+                "pixel.y",
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Keypoint {
+                    x: 1.0,
+                    y: f32::INFINITY,
+                },
+            ),
+        ];
+
+        for (field, world, pixel) in cases {
+            assert!(matches!(
+                Observation::try_new(world, pixel, intrinsics),
+                Err(PnpError::NonFiniteObservation { field: actual, .. }) if actual == field
+            ));
+        }
     }
 
     fn l2(a: [f32; 3], b: [f32; 3]) -> f32 {
