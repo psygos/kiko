@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
-use crate::{Detections, FrameDimensions, FrameId, Keypoint, Matches, Raw, SensorId};
+use crate::{
+    Detections, FrameDimensions, FrameDimensionsError, FrameId, Keypoint, Matches, Raw, SensorId,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RectificationMode {
@@ -25,6 +27,8 @@ pub struct RectifiedStereo {
 
 #[derive(Debug)]
 pub enum RectifiedStereoError {
+    InvalidLeftDimensions(FrameDimensionsError),
+    InvalidRightDimensions(FrameDimensionsError),
     NonPositiveBaseline {
         baseline_m: f32,
     },
@@ -47,6 +51,12 @@ pub enum RectifiedStereoError {
 impl std::fmt::Display for RectifiedStereoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RectifiedStereoError::InvalidLeftDimensions(source) => {
+                write!(f, "invalid left camera dimensions: {source}")
+            }
+            RectifiedStereoError::InvalidRightDimensions(source) => {
+                write!(f, "invalid right camera dimensions: {source}")
+            }
             RectifiedStereoError::NonPositiveBaseline { baseline_m } => {
                 write!(f, "baseline must be > 0, got {baseline_m}")
             }
@@ -83,7 +93,19 @@ impl std::fmt::Display for RectifiedStereoError {
     }
 }
 
-impl std::error::Error for RectifiedStereoError {}
+impl std::error::Error for RectifiedStereoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RectifiedStereoError::InvalidLeftDimensions(source)
+            | RectifiedStereoError::InvalidRightDimensions(source) => Some(source),
+            RectifiedStereoError::NonPositiveBaseline { .. }
+            | RectifiedStereoError::DimensionMismatch { .. }
+            | RectifiedStereoError::InvalidFocal { .. }
+            | RectifiedStereoError::NotRectified
+            | RectifiedStereoError::PrincipalPointMismatch { .. } => None,
+        }
+    }
+}
 
 impl RectifiedStereo {
     pub fn from_calibration(calibration: &Calibration) -> Result<Self, RectifiedStereoError> {
@@ -96,6 +118,10 @@ impl RectifiedStereo {
     ) -> Result<Self, RectifiedStereoError> {
         let left = calibration.left.clone();
         let right = calibration.right.clone();
+        let left_dimensions = FrameDimensions::try_new(left.width, left.height)
+            .map_err(RectifiedStereoError::InvalidLeftDimensions)?;
+        let right_dimensions = FrameDimensions::try_new(right.width, right.height)
+            .map_err(RectifiedStereoError::InvalidRightDimensions)?;
 
         if calibration.baseline_m <= 0.0 {
             return Err(RectifiedStereoError::NonPositiveBaseline {
@@ -105,8 +131,8 @@ impl RectifiedStereo {
 
         if left.width != right.width || left.height != right.height {
             return Err(RectifiedStereoError::DimensionMismatch {
-                left: FrameDimensions::new(left.width, left.height),
-                right: FrameDimensions::new(right.width, right.height),
+                left: left_dimensions,
+                right: right_dimensions,
             });
         }
 

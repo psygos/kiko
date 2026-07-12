@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, ImuBatch, PairError, SensorId};
+use crate::{DepthImage, Frame, FrameError, ImuBatch, PairError, SensorId};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -189,6 +189,10 @@ pub enum DatasetError {
     InvalidConfig {
         msg: &'static str,
     },
+    InvalidFrame {
+        path: PathBuf,
+        source: FrameError,
+    },
     ThreadSpawn {
         source: std::io::Error,
     },
@@ -232,6 +236,9 @@ impl std::fmt::Display for DatasetError {
                 write!(f, "failed to read file {}: {}", path.display(), source)
             }
             DatasetError::InvalidConfig { msg } => write!(f, "invalid dataset config: {msg}"),
+            DatasetError::InvalidFrame { path, source } => {
+                write!(f, "invalid dataset frame {}: {source}", path.display())
+            }
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
             }
@@ -272,6 +279,7 @@ impl std::error::Error for DatasetError {
                 Some(source)
             }
             DatasetError::PairingFailed { source } => Some(source),
+            DatasetError::InvalidFrame { source, .. } => Some(source),
             DatasetError::InvalidConfig { .. }
             | DatasetError::WorkerJoin { .. }
             | DatasetError::MissingImuSamples { .. } => None,
@@ -732,14 +740,13 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
         sensor_id,
         frame_id: _,
         timestamp,
-        width,
-        height,
+        dimensions,
         data,
     } = frame;
     let filename = format::frame_name(timestamp.as_nanos(), sensor_to_str(sensor_id));
     let path = frames_dir.join(&filename);
 
-    let expected_len = (width as usize).saturating_mul(height as usize);
+    let expected_len = dimensions.area();
     if data.len() != expected_len {
         return Err(DatasetError::WriteFile {
             path,

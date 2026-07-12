@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::{
-    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, Frame, FrameError, FrameId, ImuBatch,
-    ImuSample, PairingWindowNs, SensorId, StereoPair, Timestamp,
+    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, Frame, FrameId, ImuBatch, ImuSample,
+    PairingWindowNs, SensorId, StereoPair, Timestamp,
 };
 
 use super::{
@@ -367,11 +367,7 @@ impl DatasetReader {
             height,
             data,
         )
-        .map_err(|e| DatasetError::InvalidConfig {
-            msg: match e {
-                FrameError::DimensionMismatch { .. } => "frame size mismatch",
-            },
-        })
+        .map_err(|source| DatasetError::InvalidFrame { path, source })
     }
 }
 

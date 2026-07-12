@@ -35,7 +35,9 @@ pub fn normalise_downscale_into(
     factor: crate::DownscaleFactor,
     out: &mut Vec<f32>,
 ) -> Result<crate::FrameDimensions, crate::DownscaleError> {
-    let expected_len = (width as usize).saturating_mul(height as usize);
+    let input_dims = crate::FrameDimensions::try_new(width, height)
+        .map_err(crate::DownscaleError::InvalidDimensions)?;
+    let expected_len = input_dims.area();
     if data.len() != expected_len {
         return Err(crate::DownscaleError::InputLenMismatch {
             expected: expected_len,
@@ -54,7 +56,8 @@ pub fn normalise_downscale_into(
 
     let out_width = width / factor_u32;
     let out_height = height / factor_u32;
-    let out_dims = crate::FrameDimensions::new(out_width, out_height);
+    let out_dims = crate::FrameDimensions::try_new(out_width, out_height)
+        .map_err(crate::DownscaleError::InvalidDimensions)?;
     let out_len = out_dims.area();
     out.resize(out_len, 0.0);
 
@@ -83,7 +86,9 @@ pub fn downscale_u8_into(
     factor: crate::DownscaleFactor,
     out: &mut Vec<u8>,
 ) -> Result<crate::FrameDimensions, crate::DownscaleError> {
-    let expected_len = (width as usize).saturating_mul(height as usize);
+    let input_dims = crate::FrameDimensions::try_new(width, height)
+        .map_err(crate::DownscaleError::InvalidDimensions)?;
+    let expected_len = input_dims.area();
     if data.len() != expected_len {
         return Err(crate::DownscaleError::InputLenMismatch {
             expected: expected_len,
@@ -102,7 +107,8 @@ pub fn downscale_u8_into(
 
     let out_width = width / factor_u32;
     let out_height = height / factor_u32;
-    let out_dims = crate::FrameDimensions::new(out_width, out_height);
+    let out_dims = crate::FrameDimensions::try_new(out_width, out_height)
+        .map_err(crate::DownscaleError::InvalidDimensions)?;
     out.resize(out_dims.area(), 0);
 
     let stride = width as usize;

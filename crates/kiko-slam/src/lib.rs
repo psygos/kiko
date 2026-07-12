@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 // Compatibility shims for ORT static archive built with GCC 14 / glibc 2.38.
@@ -224,36 +224,76 @@ impl Timestamp {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameDimensions {
-    width: u32,
-    height: u32,
+    width: NonZeroU32,
+    height: NonZeroU32,
+    area: NonZeroUsize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameDimensionsError {
+    Zero { width: u32, height: u32 },
+    AreaOverflow { width: u32, height: u32 },
+}
+
+impl std::fmt::Display for FrameDimensionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameDimensionsError::Zero { width, height } => {
+                write!(f, "frame dimensions must be nonzero, got {width}x{height}")
+            }
+            FrameDimensionsError::AreaOverflow { width, height } => write!(
+                f,
+                "frame dimensions {width}x{height} exceed addressable memory"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FrameDimensionsError {}
+
 impl FrameDimensions {
-    pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+    pub fn try_new(width: u32, height: u32) -> Result<Self, FrameDimensionsError> {
+        let width_nonzero =
+            NonZeroU32::new(width).ok_or(FrameDimensionsError::Zero { width, height })?;
+        let height_nonzero =
+            NonZeroU32::new(height).ok_or(FrameDimensionsError::Zero { width, height })?;
+        let area_u64 = u64::from(width) * u64::from(height);
+        let area = usize::try_from(area_u64)
+            .ok()
+            .and_then(NonZeroUsize::new)
+            .ok_or(FrameDimensionsError::AreaOverflow { width, height })?;
+        Ok(Self {
+            width: width_nonzero,
+            height: height_nonzero,
+            area,
+        })
     }
 
     pub fn width(self) -> u32 {
-        self.width
+        self.width.get()
     }
 
     pub fn height(self) -> u32 {
-        self.height
+        self.height.get()
     }
 
     pub fn area(self) -> usize {
-        (self.width as usize).saturating_mul(self.height as usize)
+        self.area.get()
     }
 }
 
 // Define these much more concretely
 #[derive(Debug)]
 pub enum FrameError {
+    InvalidDimensions(FrameDimensionsError),
     DimensionMismatch { expected: usize, actual: usize },
 }
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            FrameError::InvalidDimensions(source) => {
+                write!(f, "invalid frame dimensions: {source}")
+            }
             FrameError::DimensionMismatch { expected, actual } => {
                 write!(f, "dimension mismatch: expected {expected}, got {actual}")
             }
@@ -261,7 +301,20 @@ impl std::fmt::Display for FrameError {
     }
 }
 
-impl std::error::Error for FrameError {}
+impl std::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            FrameError::InvalidDimensions(source) => Some(source),
+            FrameError::DimensionMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<FrameDimensionsError> for FrameError {
+    fn from(source: FrameDimensionsError) -> Self {
+        Self::InvalidDimensions(source)
+    }
+}
 
 #[derive(Debug)]
 pub enum PairError {
@@ -337,6 +390,7 @@ pub enum DownscaleError {
     TooLarge {
         value: usize,
     },
+    InvalidDimensions(FrameDimensionsError),
     InputLenMismatch {
         expected: usize,
         actual: usize,
@@ -354,6 +408,9 @@ impl std::fmt::Display for DownscaleError {
             DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
             DownscaleError::TooLarge { value } => {
                 write!(f, "downscale factor {value} exceeds u32::MAX")
+            }
+            DownscaleError::InvalidDimensions(source) => {
+                write!(f, "invalid downscale dimensions: {source}")
             }
             DownscaleError::InputLenMismatch { expected, actual } => {
                 write!(
@@ -373,7 +430,17 @@ impl std::fmt::Display for DownscaleError {
     }
 }
 
-impl std::error::Error for DownscaleError {}
+impl std::error::Error for DownscaleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DownscaleError::InvalidDimensions(source) => Some(source),
+            DownscaleError::Zero
+            | DownscaleError::TooLarge { .. }
+            | DownscaleError::InputLenMismatch { .. }
+            | DownscaleError::NonDivisible { .. } => None,
+        }
+    }
+}
 
 impl TryFrom<usize> for DownscaleFactor {
     type Error = DownscaleError;
@@ -409,8 +476,7 @@ pub struct Frame {
     sensor_id: SensorId,
     frame_id: FrameId,
     timestamp: Timestamp,
-    width: u32,
-    height: u32,
+    dimensions: FrameDimensions,
     data: Arc<[u8]>,
 }
 
@@ -423,7 +489,8 @@ impl Frame {
         height: u32,
         data: Vec<u8>,
     ) -> Result<Self, FrameError> {
-        let size = (width as usize) * (height as usize);
+        let dimensions = FrameDimensions::try_new(width, height)?;
+        let size = dimensions.area();
 
         if data.len() != size {
             return Err(FrameError::DimensionMismatch {
@@ -436,21 +503,20 @@ impl Frame {
             sensor_id,
             frame_id,
             timestamp,
-            width,
-            height,
+            dimensions,
             data: Arc::from(data.into_boxed_slice()),
         })
     }
 
     pub fn width(&self) -> u32 {
-        self.width
+        self.dimensions.width()
     }
     pub fn height(&self) -> u32 {
-        self.height
+        self.dimensions.height()
     }
 
     pub fn dimensions(&self) -> FrameDimensions {
-        FrameDimensions::new(self.width, self.height)
+        self.dimensions
     }
     pub fn data(&self) -> &[u8] {
         self.data.as_ref()
@@ -525,16 +591,41 @@ impl CompactDescriptor {
 
 #[derive(Debug)]
 pub enum DetectionError {
+    InvalidDimensions(FrameDimensionsError),
     ShapeMismatch {
         keypoints_len: usize,
         scores_len: usize,
         descriptors_len: usize,
+    },
+    NonFiniteKeypoint {
+        index: usize,
+        x: f32,
+        y: f32,
+    },
+    KeypointOutOfBounds {
+        index: usize,
+        x: f32,
+        y: f32,
+        width: u32,
+        height: u32,
+    },
+    NonFiniteScore {
+        index: usize,
+        value: f32,
+    },
+    NonFiniteDescriptor {
+        detection_index: usize,
+        component: usize,
+        value: f32,
     },
 }
 
 impl std::fmt::Display for DetectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DetectionError::InvalidDimensions(source) => {
+                write!(f, "invalid detection dimensions: {source}")
+            }
             DetectionError::ShapeMismatch {
                 keypoints_len,
                 scores_len,
@@ -543,18 +634,52 @@ impl std::fmt::Display for DetectionError {
                 f,
                 "detections shape mismatch: keypoints={keypoints_len}, scores={scores_len}, descriptors={descriptors_len}"
             ),
+            DetectionError::NonFiniteKeypoint { index, x, y } => {
+                write!(f, "detection {index} has non-finite keypoint ({x}, {y})")
+            }
+            DetectionError::KeypointOutOfBounds {
+                index,
+                x,
+                y,
+                width,
+                height,
+            } => write!(
+                f,
+                "detection {index} keypoint ({x}, {y}) lies outside {width}x{height} image"
+            ),
+            DetectionError::NonFiniteScore { index, value } => {
+                write!(f, "detection {index} has non-finite score {value}")
+            }
+            DetectionError::NonFiniteDescriptor {
+                detection_index,
+                component,
+                value,
+            } => write!(
+                f,
+                "detection {detection_index} descriptor component {component} is non-finite: {value}"
+            ),
         }
     }
 }
 
-impl std::error::Error for DetectionError {}
+impl std::error::Error for DetectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            DetectionError::InvalidDimensions(source) => Some(source),
+            DetectionError::ShapeMismatch { .. }
+            | DetectionError::NonFiniteKeypoint { .. }
+            | DetectionError::KeypointOutOfBounds { .. }
+            | DetectionError::NonFiniteScore { .. }
+            | DetectionError::NonFiniteDescriptor { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Detections {
     sensor_id: SensorId,
     frame_id: FrameId,
-    width: u32,
-    height: u32,
+    dimensions: FrameDimensions,
     keypoints: Vec<Keypoint>,
     scores: Vec<f32>,
     descriptors: Vec<Descriptor>,
@@ -570,11 +695,15 @@ impl Detections {
     }
 
     pub fn width(&self) -> u32 {
-        self.width
+        self.dimensions.width()
     }
 
     pub fn height(&self) -> u32 {
-        self.height
+        self.dimensions.height()
+    }
+
+    pub fn dimensions(&self) -> FrameDimensions {
+        self.dimensions
     }
 
     pub fn keypoints(&self) -> &[Keypoint] {
@@ -614,6 +743,8 @@ impl Detections {
         scores: Vec<f32>,
         descriptors: Vec<Descriptor>,
     ) -> Result<Self, DetectionError> {
+        let dimensions =
+            FrameDimensions::try_new(width, height).map_err(DetectionError::InvalidDimensions)?;
         if keypoints.len() != descriptors.len() || descriptors.len() != scores.len() {
             return Err(DetectionError::ShapeMismatch {
                 keypoints_len: keypoints.len(),
@@ -622,11 +753,49 @@ impl Detections {
             });
         }
 
+        for (index, keypoint) in keypoints.iter().enumerate() {
+            if !keypoint.x.is_finite() || !keypoint.y.is_finite() {
+                return Err(DetectionError::NonFiniteKeypoint {
+                    index,
+                    x: keypoint.x,
+                    y: keypoint.y,
+                });
+            }
+            if keypoint.x < 0.0
+                || keypoint.y < 0.0
+                || keypoint.x >= width as f32
+                || keypoint.y >= height as f32
+            {
+                return Err(DetectionError::KeypointOutOfBounds {
+                    index,
+                    x: keypoint.x,
+                    y: keypoint.y,
+                    width,
+                    height,
+                });
+            }
+        }
+        for (index, &value) in scores.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(DetectionError::NonFiniteScore { index, value });
+            }
+        }
+        for (detection_index, descriptor) in descriptors.iter().enumerate() {
+            for (component, &value) in descriptor.0.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(DetectionError::NonFiniteDescriptor {
+                        detection_index,
+                        component,
+                        value,
+                    });
+                }
+            }
+        }
+
         Ok(Self {
             sensor_id,
             frame_id,
-            width,
-            height,
+            dimensions,
             keypoints,
             scores,
             descriptors,
@@ -641,8 +810,7 @@ impl Detections {
         let Detections {
             sensor_id,
             frame_id,
-            width,
-            height,
+            dimensions,
             keypoints,
             scores,
             descriptors,
@@ -668,8 +836,7 @@ impl Detections {
         Self {
             sensor_id,
             frame_id,
-            width,
-            height,
+            dimensions,
             keypoints: new_keypoints,
             scores: new_scores,
             descriptors: new_descriptors,
@@ -1081,8 +1248,9 @@ impl<State> VizPacket<State> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DownscaleError, DownscaleFactor, Timestamp,
-        U8_SCALE,
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, DownscaleError,
+        DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError, FrameId,
+        Keypoint, SensorId, Timestamp, U8_SCALE,
     };
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
@@ -1127,6 +1295,91 @@ mod tests {
         let quant_close = q_base.cosine_similarity(&q_close);
         let quant_far = q_base.cosine_similarity(&q_far);
         assert!(quant_close > quant_far);
+    }
+
+    #[test]
+    fn frame_dimensions_and_frames_reject_zero_sizes() {
+        assert!(matches!(
+            FrameDimensions::try_new(0, 480),
+            Err(FrameDimensionsError::Zero {
+                width: 0,
+                height: 480
+            })
+        ));
+        assert!(matches!(
+            Frame::new(
+                SensorId::StereoLeft,
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                0,
+                480,
+                Vec::new(),
+            ),
+            Err(FrameError::InvalidDimensions(
+                FrameDimensionsError::Zero { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn detections_reject_invalid_external_values() {
+        let make = |keypoint: Keypoint, score: f32, descriptor: Descriptor| {
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(1),
+                10,
+                10,
+                vec![keypoint],
+                vec![score],
+                vec![descriptor],
+            )
+        };
+        let descriptor = Descriptor([0.0; DESCRIPTOR_DIM]);
+
+        assert!(matches!(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(1),
+                0,
+                10,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+            Err(DetectionError::InvalidDimensions(
+                FrameDimensionsError::Zero { .. }
+            ))
+        ));
+        assert!(matches!(
+            make(
+                Keypoint {
+                    x: f32::NAN,
+                    y: 1.0
+                },
+                1.0,
+                descriptor
+            ),
+            Err(DetectionError::NonFiniteKeypoint { index: 0, .. })
+        ));
+        assert!(matches!(
+            make(Keypoint { x: 10.0, y: 1.0 }, 1.0, descriptor),
+            Err(DetectionError::KeypointOutOfBounds { index: 0, .. })
+        ));
+        assert!(matches!(
+            make(Keypoint { x: 1.0, y: 1.0 }, f32::INFINITY, descriptor),
+            Err(DetectionError::NonFiniteScore { index: 0, .. })
+        ));
+
+        let mut values = [0.0; DESCRIPTOR_DIM];
+        values[7] = f32::NAN;
+        assert!(matches!(
+            make(Keypoint { x: 1.0, y: 1.0 }, 1.0, Descriptor(values)),
+            Err(DetectionError::NonFiniteDescriptor {
+                detection_index: 0,
+                component: 7,
+                ..
+            })
+        ));
     }
 
     #[test]
