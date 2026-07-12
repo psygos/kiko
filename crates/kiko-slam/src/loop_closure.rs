@@ -626,32 +626,43 @@ pub fn match_descriptors_for_loop(
     candidate_kf: KeyframeId,
     map: &SlamMap,
     similarity_threshold: f32,
-) -> Vec<(usize, usize)> {
+) -> Result<Vec<(usize, usize)>, DescriptorMatchError> {
     let query_quantized: Vec<CompactDescriptor> =
         query_descriptors.iter().map(Descriptor::quantize).collect();
-    match match_quantized_descriptors_for_loop(
-        &query_quantized,
-        candidate_kf,
-        map,
-        similarity_threshold,
-    ) {
-        Ok(correspondences) => correspondences,
-        Err(err) => {
-            eprintln!("loop descriptor matching skipped for candidate {candidate_kf:?}: {err}");
-            Vec::new()
+    match_quantized_descriptors_for_loop(&query_quantized, candidate_kf, map, similarity_threshold)
+}
+
+#[derive(Debug)]
+pub enum DescriptorMatchError {
+    InvalidSimilarityThreshold { value: f32 },
+    Map(MapError),
+}
+
+impl std::fmt::Display for DescriptorMatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSimilarityThreshold { value } => write!(
+                f,
+                "descriptor similarity threshold must be finite and in (0, 1], got {value}"
+            ),
+            Self::Map(source) => write!(f, "descriptor matching map lookup failed: {source}"),
         }
     }
 }
 
-pub fn try_match_descriptors_for_loop(
-    query_descriptors: &[Descriptor],
-    candidate_kf: KeyframeId,
-    map: &SlamMap,
-    similarity_threshold: f32,
-) -> Result<Vec<(usize, usize)>, MapError> {
-    let query_quantized: Vec<CompactDescriptor> =
-        query_descriptors.iter().map(Descriptor::quantize).collect();
-    match_quantized_descriptors_for_loop(&query_quantized, candidate_kf, map, similarity_threshold)
+impl std::error::Error for DescriptorMatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map(source) => Some(source),
+            Self::InvalidSimilarityThreshold { .. } => None,
+        }
+    }
+}
+
+impl From<MapError> for DescriptorMatchError {
+    fn from(source: MapError) -> Self {
+        Self::Map(source)
+    }
 }
 
 pub(crate) fn match_quantized_descriptors_for_loop(
@@ -659,12 +670,16 @@ pub(crate) fn match_quantized_descriptors_for_loop(
     candidate_kf: KeyframeId,
     map: &SlamMap,
     similarity_threshold: f32,
-) -> Result<Vec<(usize, usize)>, MapError> {
-    if query_quantized.is_empty()
-        || !similarity_threshold.is_finite()
+) -> Result<Vec<(usize, usize)>, DescriptorMatchError> {
+    if !similarity_threshold.is_finite()
         || similarity_threshold <= 0.0
         || similarity_threshold > 1.0
     {
+        return Err(DescriptorMatchError::InvalidSimilarityThreshold {
+            value: similarity_threshold,
+        });
+    }
+    if query_quantized.is_empty() {
         return Ok(Vec::new());
     }
 
@@ -985,6 +1000,7 @@ impl VerifiedRelocalization {
 pub enum LoopVerificationError {
     TooFewMatches { count: usize },
     QueryIndexOutOfBounds { index: usize, len: usize },
+    DescriptorMatch(DescriptorMatchError),
     Map(MapError),
     InvalidRansacConfig { source: RansacConfigError },
     PnpFailed(PnpError),
@@ -1006,6 +1022,9 @@ impl std::fmt::Display for LoopVerificationError {
             LoopVerificationError::Map(source) => {
                 write!(f, "loop verification map lookup failed: {source}")
             }
+            LoopVerificationError::DescriptorMatch(source) => {
+                write!(f, "loop descriptor matching failed: {source}")
+            }
             LoopVerificationError::PnpFailed(err) => {
                 write!(f, "loop verification PnP failed: {err}")
             }
@@ -1023,6 +1042,7 @@ impl std::fmt::Display for LoopVerificationError {
 impl std::error::Error for LoopVerificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            LoopVerificationError::DescriptorMatch(source) => Some(source),
             LoopVerificationError::Map(source) => Some(source),
             LoopVerificationError::InvalidRansacConfig { source } => Some(source),
             LoopVerificationError::PnpFailed(source) => Some(source),
@@ -1168,10 +1188,10 @@ impl RelocalizationCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
-        LoopClosureConfig, LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
-        RelocalizationConfigError, RelocalizationConfigInput, aggregate_global_descriptor,
-        match_descriptors_for_loop, try_match_descriptors_for_loop,
+        DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
+        KeyframeDatabase, LoopCandidate, LoopClosureConfig, LoopVerificationError,
+        RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
+        RelocalizationConfigInput, aggregate_global_descriptor, match_descriptors_for_loop,
     };
     use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -1789,7 +1809,8 @@ mod tests {
         )
         .expect("point1");
 
-        let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
+        let matches =
+            match_descriptors_for_loop(&query, kf, &map, 0.95).expect("descriptor matches");
         assert_eq!(matches.len(), 2);
         assert!(matches.contains(&(0, 0)));
         assert!(matches.contains(&(1, 1)));
@@ -1834,19 +1855,36 @@ mod tests {
         )
         .expect("point");
 
-        let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
+        let matches =
+            match_descriptors_for_loop(&query, kf, &map, 0.95).expect("descriptor matches");
         assert_eq!(matches, vec![(1, 1)]);
     }
 
     #[test]
-    fn try_match_descriptors_propagates_map_error() {
+    fn match_descriptors_propagates_map_error_with_source() {
         let map = SlamMap::new();
         let mut query = [0.0_f32; 256];
         query[7] = 1.0;
         let err =
-            try_match_descriptors_for_loop(&[Descriptor(query)], KeyframeId::default(), &map, 0.95)
+            match_descriptors_for_loop(&[Descriptor(query)], KeyframeId::default(), &map, 0.95)
                 .expect_err("missing keyframe should return map error");
-        assert!(matches!(err, MapError::KeyframeNotFound(_)));
+        assert!(matches!(
+            err,
+            DescriptorMatchError::Map(MapError::KeyframeNotFound(_))
+        ));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn match_descriptors_rejects_invalid_similarity_threshold() {
+        let map = SlamMap::new();
+        for value in [0.0, -0.1, 1.1, f32::NAN] {
+            assert!(matches!(
+                match_descriptors_for_loop(&[], KeyframeId::default(), &map, value),
+                Err(DescriptorMatchError::InvalidSimilarityThreshold { value: actual })
+                    if actual.to_bits() == value.to_bits()
+            ));
+        }
     }
 
     #[test]

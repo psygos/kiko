@@ -36,12 +36,12 @@ use crate::place_recognition::{
 use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
 use crate::{
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
-    Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
-    KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
-    LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, Observation,
-    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, RansacConfigError, Raw,
-    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
-    Verified,
+    DescriptorMatchError, Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics,
+    FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue,
+    LocalBaConfig, LocalBundleAdjuster, LoopClosureStatus, LoopVerificationError, MapFromOdom,
+    MapObservation, Matches, Observation, ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64,
+    RansacConfig, RansacConfigError, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
+    TriangulationError, Triangulator, Verified,
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
@@ -1154,6 +1154,7 @@ pub enum TrackerError {
     PoseGraph(PoseGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
+    DescriptorMatch(DescriptorMatchError),
     StaleLoopProof {
         proof: crate::MapSnapshot,
         current: crate::MapSnapshot,
@@ -1178,6 +1179,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
+            TrackerError::DescriptorMatch(err) => {
+                write!(f, "descriptor matching error: {err}")
+            }
             TrackerError::StaleLoopProof { proof, current } => write!(
                 f,
                 "loop proof belongs to map instance {} generation {}, but current map is instance {} generation {}",
@@ -1208,6 +1212,7 @@ impl std::error::Error for TrackerError {
             TrackerError::PoseGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
+            TrackerError::DescriptorMatch(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::Vio(_) => None,
             TrackerError::KeyframeRejected { .. }
@@ -1268,6 +1273,12 @@ impl From<RansacConfigError> for TrackerError {
 impl From<MapObservationError> for TrackerError {
     fn from(err: MapObservationError) -> Self {
         TrackerError::MapObservation(err)
+    }
+}
+
+impl From<DescriptorMatchError> for TrackerError {
+    fn from(err: DescriptorMatchError) -> Self {
+        TrackerError::DescriptorMatch(err)
     }
 }
 
@@ -2838,19 +2849,22 @@ impl SlamTracker {
 
         let mut first_error: Option<LoopDetectError> = None;
         for candidate in pending.candidates {
-            let correspondences = match_quantized_descriptors_for_loop(
+            let correspondences = match match_quantized_descriptors_for_loop(
                 &query_quantized,
                 candidate.candidate,
                 self.global_map.map(),
                 config.descriptor_match_threshold(),
-            )
-            .unwrap_or_else(|err| {
-                eprintln!(
-                    "loop descriptor matching skipped for candidate {:?}: {err}",
-                    candidate.candidate
-                );
-                Vec::new()
-            });
+            ) {
+                Ok(correspondences) => correspondences,
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(LoopDetectError::VerificationFailed(
+                            LoopVerificationError::DescriptorMatch(err),
+                        ));
+                    }
+                    continue;
+                }
+            };
 
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 if first_error.is_none() {
@@ -3197,9 +3211,14 @@ impl SlamTracker {
         &self,
         current: &Detections,
         cfg: RelocalizationConfig,
-    ) -> Option<crate::loop_closure::VerifiedRelocalization> {
-        let place_recognition = self.place_recognition.as_ref()?;
-        let global_descriptor = aggregate_global_descriptor(current.descriptors()).ok()?;
+    ) -> Result<Option<crate::loop_closure::VerifiedRelocalization>, TrackerError> {
+        let Some(place_recognition) = self.place_recognition.as_ref() else {
+            return Ok(None);
+        };
+        let Some(global_descriptor) = aggregate_global_descriptor(current.descriptors()).ok()
+        else {
+            return Ok(None);
+        };
         let candidates =
             place_recognition.relocalization_matches(&global_descriptor, cfg.max_candidates());
         let query_quantized: Vec<_> = current
@@ -3213,14 +3232,7 @@ impl SlamTracker {
                 candidate.candidate,
                 self.global_map.map(),
                 cfg.descriptor_match_threshold(),
-            )
-            .unwrap_or_else(|err| {
-                eprintln!(
-                    "relocalization descriptor matching skipped for candidate {:?}: {err}",
-                    candidate.candidate
-                );
-                Vec::new()
-            });
+            )?;
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 continue;
             }
@@ -3239,9 +3251,9 @@ impl SlamTracker {
                 Ok(value) => value,
                 Err(_) => continue,
             };
-            return Some(verified);
+            return Ok(Some(verified));
         }
-        None
+        Ok(None)
     }
 
     fn relocalization_step(
@@ -3318,7 +3330,7 @@ impl SlamTracker {
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
         }
 
-        let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg) else {
+        let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg)? else {
             return Ok(self.fail_relocalization(frame_id, cfg, session, current));
         };
         let candidate_id = verified.match_kf();

@@ -109,12 +109,12 @@ pub use local_ba::{
     LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
-    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopApplyError,
-    LoopCandidate, LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput,
-    LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
-    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
-    RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
-    match_descriptors_for_loop,
+    DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
+    KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig, LoopClosureConfigError,
+    LoopClosureConfigInput, LoopDetectError, LoopVerificationError, PlaceMatch,
+    RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
+    RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
+    aggregate_global_descriptor, match_descriptors_for_loop,
 };
 pub use map::{
     CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId, MapGeneration,
