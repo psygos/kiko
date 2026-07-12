@@ -1,4 +1,7 @@
-use crate::{ImuExtrinsics, ImuNoiseModel, PinholeIntrinsics, Pose64, RectifiedStereo};
+use crate::{
+    ImuExtrinsics, ImuExtrinsicsError, ImuNoiseModel, PinholeIntrinsics, Pose64, Pose64Error,
+    RectifiedStereo,
+};
 
 #[derive(Clone, Debug)]
 pub struct CalibrationBundle {
@@ -25,7 +28,8 @@ pub enum CalibrationBundleError {
     NonFiniteAccelRandomWalk { value: f64 },
     NonPositiveGyroRandomWalk { value: f64 },
     NonFiniteGyroRandomWalk { value: f64 },
-    InvalidImuExtrinsics { message: String },
+    InvalidImuPose { source: Pose64Error },
+    InvalidImuExtrinsics { source: ImuExtrinsicsError },
 }
 
 impl std::fmt::Display for CalibrationBundleError {
@@ -73,14 +77,37 @@ impl std::fmt::Display for CalibrationBundleError {
             CalibrationBundleError::NonFiniteGyroRandomWalk { value } => {
                 write!(f, "gyroscope random walk must be finite, got {value}")
             }
-            CalibrationBundleError::InvalidImuExtrinsics { message } => {
-                write!(f, "invalid imu extrinsics: {message}")
+            CalibrationBundleError::InvalidImuPose { source } => {
+                write!(f, "invalid imu pose: {source}")
+            }
+            CalibrationBundleError::InvalidImuExtrinsics { source } => {
+                write!(f, "invalid imu extrinsics: {source}")
             }
         }
     }
 }
 
-impl std::error::Error for CalibrationBundleError {}
+impl std::error::Error for CalibrationBundleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CalibrationBundleError::InvalidImuPose { source } => Some(source),
+            CalibrationBundleError::InvalidImuExtrinsics { source } => Some(source),
+            CalibrationBundleError::MissingImuNoise
+            | CalibrationBundleError::MissingImuExtrinsics
+            | CalibrationBundleError::PartialInitialImuBias
+            | CalibrationBundleError::NonPositiveGravity { .. }
+            | CalibrationBundleError::NonFiniteGravity { .. }
+            | CalibrationBundleError::NonPositiveAccelNoiseDensity { .. }
+            | CalibrationBundleError::NonFiniteAccelNoiseDensity { .. }
+            | CalibrationBundleError::NonPositiveGyroNoiseDensity { .. }
+            | CalibrationBundleError::NonFiniteGyroNoiseDensity { .. }
+            | CalibrationBundleError::NonPositiveAccelRandomWalk { .. }
+            | CalibrationBundleError::NonFiniteAccelRandomWalk { .. }
+            | CalibrationBundleError::NonPositiveGyroRandomWalk { .. }
+            | CalibrationBundleError::NonFiniteGyroRandomWalk { .. } => None,
+        }
+    }
+}
 
 impl CalibrationBundle {
     pub fn visual_only(intrinsics: PinholeIntrinsics, stereo: RectifiedStereo) -> Self {
@@ -158,13 +185,10 @@ impl CalibrationBundle {
             imu.noise.gyro_random_walk,
         )
         .map_err(map_noise_error)?;
-        let t_cam_imu = Pose64::from_rt(imu.extrinsics.rotation, imu.extrinsics.translation);
-        let extrinsics =
-            ImuExtrinsics::new(t_cam_imu, imu.extrinsics.time_offset_ns).map_err(|err| {
-                CalibrationBundleError::InvalidImuExtrinsics {
-                    message: err.to_string(),
-                }
-            })?;
+        let t_cam_imu = Pose64::try_from_rt(imu.extrinsics.rotation, imu.extrinsics.translation)
+            .map_err(|source| CalibrationBundleError::InvalidImuPose { source })?;
+        let extrinsics = ImuExtrinsics::new(t_cam_imu, imu.extrinsics.time_offset_ns)
+            .map_err(|source| CalibrationBundleError::InvalidImuExtrinsics { source })?;
         let mut bundle = Self::with_imu(
             intrinsics,
             stereo,
@@ -540,5 +564,14 @@ mod tests {
         )
         .expect_err("partial imu calibration should fail");
         assert_eq!(err, CalibrationBundleError::MissingImuExtrinsics);
+    }
+
+    #[test]
+    fn calibration_error_preserves_pose_validation_source() {
+        let err = CalibrationBundleError::InvalidImuPose {
+            source: Pose64Error::ImproperRotation { determinant: -1.0 },
+        };
+        let source = std::error::Error::source(&err).expect("pose validation source");
+        assert!(source.to_string().contains("determinant"));
     }
 }

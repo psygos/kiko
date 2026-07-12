@@ -96,7 +96,7 @@ pub use geometry::{
 };
 pub use imu::{
     ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBias, ImuExtrinsics,
-    ImuNoiseModel, ImuSample, ImuSampleError, ImuTimestampShiftError,
+    ImuExtrinsicsError, ImuNoiseModel, ImuSample, ImuSampleError, ImuTimestampShiftError,
 };
 #[cfg(feature = "vio")]
 pub use local_ba::{
@@ -117,7 +117,7 @@ pub use loop_closure::{
 };
 pub use map::{CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId};
 pub use map_from_odom::MapFromOdom;
-pub use math::Pose64;
+pub use math::{Pose64, Pose64Error};
 #[cfg(feature = "record")]
 pub use oak::{OakImuError, oak_to_depth_image, oak_to_frame, oak_to_imu_batch};
 pub use pairing::{

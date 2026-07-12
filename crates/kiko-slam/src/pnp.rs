@@ -145,16 +145,16 @@ impl Pose {
         }
     }
 
-    /// Compose two poses: `next ∘ self`.
-    pub fn compose(self, next: Pose) -> Pose {
-        let r = math::mat_mul(next.rotation, self.rotation);
-        let t = math::mat_mul_vec(next.rotation, self.translation);
+    /// Compose transforms as `self ∘ other`.
+    pub fn compose(self, other: Pose) -> Pose {
+        let r = math::mat_mul(self.rotation, other.rotation);
+        let t = math::mat_mul_vec(self.rotation, other.translation);
         Pose {
             rotation: r,
             translation: [
-                t[0] + next.translation[0],
-                t[1] + next.translation[1],
-                t[2] + next.translation[2],
+                t[0] + self.translation[0],
+                t[1] + self.translation[1],
+                t[2] + self.translation[2],
             ],
         }
     }

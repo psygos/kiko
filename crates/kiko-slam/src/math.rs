@@ -20,6 +20,7 @@ const SO3_AXIS_COMPONENT_MIN_F32: f32 = 1e-6;
 const SO3_AXIS_NORM_MIN_F32: f32 = 1e-8;
 /// Small-angle threshold below which closed-form Jacobian coefficients lose precision.
 const JACOBIAN_SMALL_ANGLE: f64 = 1e-4;
+const ROTATION_VALIDATION_TOLERANCE: f64 = 1e-6;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose64 {
@@ -27,8 +28,92 @@ pub struct Pose64 {
     translation: [f64; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pose64Error {
+    NonFiniteRotation { row: usize, col: usize, value: f64 },
+    NonFiniteTranslation { axis: usize, value: f64 },
+    RotationNotOrthonormal { max_error: f64 },
+    ImproperRotation { determinant: f64 },
+    TranslationOutOfF32Range { axis: usize, value: f64 },
+}
+
+impl std::fmt::Display for Pose64Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Pose64Error::NonFiniteRotation { row, col, value } => {
+                write!(f, "rotation[{row}][{col}] must be finite, got {value}")
+            }
+            Pose64Error::NonFiniteTranslation { axis, value } => {
+                write!(f, "translation axis {axis} must be finite, got {value}")
+            }
+            Pose64Error::RotationNotOrthonormal { max_error } => write!(
+                f,
+                "rotation must be orthonormal within {ROTATION_VALIDATION_TOLERANCE}, max error is {max_error}"
+            ),
+            Pose64Error::ImproperRotation { determinant } => write!(
+                f,
+                "rotation determinant must be +1 within {ROTATION_VALIDATION_TOLERANCE}, got {determinant}"
+            ),
+            Pose64Error::TranslationOutOfF32Range { axis, value } => write!(
+                f,
+                "translation axis {axis} cannot be represented as finite f32, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Pose64Error {}
+
 impl Pose64 {
-    pub fn from_rt(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Self {
+    pub fn try_from_rt(
+        rotation: [[f64; 3]; 3],
+        translation: [f64; 3],
+    ) -> Result<Self, Pose64Error> {
+        for (row_idx, row) in rotation.iter().enumerate() {
+            for (col_idx, value) in row.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    return Err(Pose64Error::NonFiniteRotation {
+                        row: row_idx,
+                        col: col_idx,
+                        value,
+                    });
+                }
+            }
+        }
+        for (axis, value) in translation.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(Pose64Error::NonFiniteTranslation { axis, value });
+            }
+        }
+
+        let mut max_error = 0.0_f64;
+        for row in 0..3 {
+            for col in 0..3 {
+                let dot = rotation[row][0] * rotation[col][0]
+                    + rotation[row][1] * rotation[col][1]
+                    + rotation[row][2] * rotation[col][2];
+                let expected = if row == col { 1.0 } else { 0.0 };
+                max_error = max_error.max((dot - expected).abs());
+            }
+        }
+        if max_error > ROTATION_VALIDATION_TOLERANCE {
+            return Err(Pose64Error::RotationNotOrthonormal { max_error });
+        }
+        let determinant = rotation[0][0]
+            * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
+            - rotation[0][1] * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
+            + rotation[0][2] * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0]);
+        if (determinant - 1.0).abs() > ROTATION_VALIDATION_TOLERANCE {
+            return Err(Pose64Error::ImproperRotation { determinant });
+        }
+        Ok(Self {
+            rotation,
+            translation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_rt(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Self {
         Self {
             rotation,
             translation,
@@ -50,6 +135,7 @@ impl Pose64 {
         self.translation
     }
 
+    /// Compose transforms as `self ∘ other`.
     pub fn compose(self, other: Self) -> Self {
         let rotation = mat_mul_f64(self.rotation, other.rotation);
         let rt = mat_mul_vec_f64(self.rotation, other.translation);
@@ -73,7 +159,12 @@ impl Pose64 {
         }
     }
 
-    pub fn from_pose32(pose: Pose) -> Self {
+    pub fn try_from_pose32(pose: Pose) -> Result<Self, Pose64Error> {
+        let converted = Self::from_pose32(pose);
+        Self::try_from_rt(converted.rotation, converted.translation)
+    }
+
+    pub(crate) fn from_pose32(pose: Pose) -> Self {
         let pose_rotation = pose.rotation();
         let mut rotation = [[0.0_f64; 3]; 3];
         for (row_idx, row) in rotation.iter_mut().enumerate() {
@@ -88,7 +179,18 @@ impl Pose64 {
         }
     }
 
-    pub fn to_pose32(self) -> Pose {
+    pub fn try_to_pose32(self) -> Result<Pose, Pose64Error> {
+        for (axis, value) in self.translation.iter().copied().enumerate() {
+            if !(value as f32).is_finite() {
+                return Err(Pose64Error::TranslationOutOfF32Range { axis, value });
+            }
+        }
+        let pose = self.to_pose32();
+        Self::try_from_pose32(pose)?;
+        Ok(pose)
+    }
+
+    pub(crate) fn to_pose32(self) -> Pose {
         let mut rotation = [[0.0_f32; 3]; 3];
         for (row_idx, row) in rotation.iter_mut().enumerate() {
             for (col_idx, value) in row.iter_mut().enumerate() {
@@ -555,10 +657,12 @@ fn mat_transpose_f64(r: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        cholesky_6x6, cholesky_solve_6x6, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64, se3_log_f64,
-        so3_exp_f64, so3_left_jacobian_f64, so3_left_jacobian_inv_f64, so3_log_f64,
-        so3_right_jacobian_f64, so3_right_jacobian_inv_f64, symmetric_positive_definite_6x6,
+        Pose64, Pose64Error, cholesky_6x6, cholesky_solve_6x6, mat_mul_f64, mat_mul_vec_f64,
+        se3_exp_f64, se3_log_f64, so3_exp_f64, so3_left_jacobian_f64, so3_left_jacobian_inv_f64,
+        so3_log_f64, so3_right_jacobian_f64, so3_right_jacobian_inv_f64,
+        symmetric_positive_definite_6x6,
     };
+    use crate::Pose;
 
     fn rot_diff_norm(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> f64 {
         let mut sum = 0.0;
@@ -573,6 +677,75 @@ mod tests {
 
     fn vec_norm(v: [f64; 3]) -> f64 {
         (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+    }
+
+    #[test]
+    fn pose64_constructor_rejects_invalid_se3_values() {
+        assert!(matches!(
+            Pose64::try_from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [f64::NAN, 0.0, 0.0],
+            ),
+            Err(Pose64Error::NonFiniteTranslation { axis: 0, .. })
+        ));
+        assert!(matches!(
+            Pose64::try_from_rt(
+                [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.0; 3],
+            ),
+            Err(Pose64Error::RotationNotOrthonormal { .. })
+        ));
+        assert!(matches!(
+            Pose64::try_from_rt(
+                [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.0; 3],
+            ),
+            Err(Pose64Error::ImproperRotation { .. })
+        ));
+
+        let invalid_pose32 = Pose::from_rt(
+            [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        );
+        assert!(matches!(
+            Pose64::try_from_pose32(invalid_pose32),
+            Err(Pose64Error::RotationNotOrthonormal { .. })
+        ));
+
+        let large_translation = Pose64::try_from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        )
+        .expect("valid f64 pose");
+        assert!(matches!(
+            large_translation.try_to_pose32(),
+            Err(Pose64Error::TranslationOutOfF32Range { axis: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn pose32_and_pose64_compose_in_the_same_order() {
+        let rotation64 = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let outer64 = Pose64::try_from_rt(rotation64, [1.0, 2.0, 0.0]).expect("outer pose");
+        let inner64 = Pose64::try_from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [3.0, 0.0, 0.0],
+        )
+        .expect("inner pose");
+        let composed64 = outer64.compose(inner64);
+
+        let outer32 = Pose::from_rt(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 2.0, 0.0],
+        );
+        let inner32 = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [3.0, 0.0, 0.0],
+        );
+        let composed32 = Pose64::from_pose32(outer32.compose(inner32));
+        assert_eq!(composed64.translation(), [1.0, 5.0, 0.0]);
+        assert_eq!(composed32.translation(), composed64.translation());
+        assert_eq!(composed32.rotation(), composed64.rotation());
     }
 
     #[test]

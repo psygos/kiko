@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::Pose64;
 use crate::dataset::{Calibration, ImuCalibration, ImuExtrinsicsMeta, ImuNoiseMeta};
+use crate::{Pose64, Pose64Error};
 
 const IMU_CALIBRATION_FILE_ENV: &str = "KIKO_IMU_CALIBRATION_FILE";
 const IMU_ROTATION_ENV: &str = "KIKO_IMU_ROTATION";
@@ -74,6 +74,10 @@ pub enum RuntimeImuCalibrationError {
     BasaltInvalidQuaternion {
         path: PathBuf,
         field: &'static str,
+    },
+    BasaltInvalidPose {
+        path: PathBuf,
+        source: Pose64Error,
     },
     BasaltUnsupportedBiasModel {
         path: PathBuf,
@@ -160,6 +164,11 @@ impl std::fmt::Display for RuntimeImuCalibrationError {
                 "Basalt calibration `{}` has an invalid quaternion in `{field}`",
                 path.display()
             ),
+            Self::BasaltInvalidPose { path, source } => write!(
+                f,
+                "Basalt calibration `{}` has an invalid camera pose: {source}",
+                path.display()
+            ),
             Self::BasaltUnsupportedBiasModel {
                 path,
                 field,
@@ -179,6 +188,7 @@ impl std::error::Error for RuntimeImuCalibrationError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
+            Self::BasaltInvalidPose { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -451,7 +461,11 @@ fn basalt_into_imu_calibration(
         left_camera.qz,
         left_camera.qw,
     )?;
-    let t_imu_cam = Pose64::from_rt(rotation, [left_camera.px, left_camera.py, left_camera.pz]);
+    let t_imu_cam = Pose64::try_from_rt(rotation, [left_camera.px, left_camera.py, left_camera.pz])
+        .map_err(|source| RuntimeImuCalibrationError::BasaltInvalidPose {
+            path: path.to_path_buf(),
+            source,
+        })?;
     let t_cam_imu = t_imu_cam.inverse();
 
     Ok(ImuCalibration {
