@@ -1171,6 +1171,7 @@ pub enum TrackerError {
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
     DescriptorMatch(DescriptorMatchError),
+    BaObservation(crate::ObservationResolveError),
     StaleLoopProof {
         proof: crate::MapSnapshot,
         current: crate::MapSnapshot,
@@ -1208,6 +1209,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
+            TrackerError::BaObservation(err) => {
+                write!(f, "bundle-adjustment observation error: {err}")
+            }
             TrackerError::StaleLoopProof { proof, current } => write!(
                 f,
                 "loop proof belongs to map instance {} generation {}, but current map is instance {} generation {}",
@@ -1239,6 +1243,7 @@ impl std::error::Error for TrackerError {
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
+            TrackerError::BaObservation(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioAccumulator(source) => Some(source),
             #[cfg(feature = "vio")]
@@ -1311,6 +1316,12 @@ impl From<MapObservationError> for TrackerError {
 impl From<DescriptorMatchError> for TrackerError {
     fn from(err: DescriptorMatchError) -> Self {
         TrackerError::DescriptorMatch(err)
+    }
+}
+
+impl From<crate::ObservationResolveError> for TrackerError {
+    fn from(source: crate::ObservationResolveError) -> Self {
+        Self::BaObservation(source)
     }
 }
 
@@ -2325,12 +2336,13 @@ impl SlamTracker {
             // Visual-only mode
             let observations =
                 ObservationSet::when_sufficient(map_observations, self.ba.min_observations());
-            return Ok(observations
-                .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
-                .map_or(
+            return Ok(match observations {
+                Some(set) => self.propose_visual_ba_pose(pose_world, set)?.map_or(
                     PoseRefinementProposal::None,
                     PoseRefinementProposal::VisualBa,
-                ));
+                ),
+                None => PoseRefinementProposal::None,
+            });
         };
 
         // Build NavState for this frame from visual pose
@@ -2363,12 +2375,13 @@ impl SlamTracker {
 
         let Some(preintegrated) = preintegrated else {
             // No IMU data — fall back to visual BA
-            return Ok(obs_set
-                .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
-                .map_or(
+            return Ok(match obs_set {
+                Some(set) => self.propose_visual_ba_pose(pose_world, set)?.map_or(
                     PoseRefinementProposal::None,
                     PoseRefinementProposal::VisualBa,
-                ));
+                ),
+                None => PoseRefinementProposal::None,
+            });
         };
 
         // Build or extend the VIO window
@@ -2395,7 +2408,7 @@ impl SlamTracker {
                     &vio_runtime.solve_config,
                     self.global_map.map(),
                     &self.map_from_odom,
-                );
+                )?;
 
                 let optimized = candidate_window
                     .successors
@@ -2454,12 +2467,13 @@ impl SlamTracker {
                 vio_runtime.last_optimized_state = Some(nav_state.clone());
                 vio_runtime.predicted_state = Some(nav_state);
                 vio_runtime.pending_imu.clear();
-                return Ok(obs_set
-                    .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
-                    .map_or(
+                return Ok(match obs_set {
+                    Some(set) => self.propose_visual_ba_pose(pose_world, set)?.map_or(
                         PoseRefinementProposal::None,
                         PoseRefinementProposal::VisualBa,
-                    ));
+                    ),
+                    None => PoseRefinementProposal::None,
+                });
             }
             // First frame: create anchor
             let anchor = VioAnchor {
@@ -2511,7 +2525,7 @@ impl SlamTracker {
             &vio_runtime.solve_config,
             self.global_map.map(),
             &self.map_from_odom,
-        );
+        )?;
 
         // Extract optimized state from the last frame
         let optimized = candidate_window
@@ -2566,14 +2580,14 @@ impl SlamTracker {
         &self,
         pose_world: Pose,
         observations: ObservationSet,
-    ) -> Option<VisualBaPoseProposal> {
+    ) -> Result<Option<VisualBaPoseProposal>, crate::ObservationResolveError> {
         let mut candidate_ba = self.ba.clone();
-        candidate_ba
-            .push_frame(self.global_map.map(), pose_world, observations)
+        Ok(candidate_ba
+            .push_frame(self.global_map.map(), pose_world, observations)?
             .map(|refined_pose| VisualBaPoseProposal {
                 pose_world: refined_pose,
                 optimized_ba: candidate_ba,
-            })
+            }))
     }
 
     #[cfg(feature = "vio")]
@@ -3863,12 +3877,12 @@ impl SlamTracker {
             self.run_vio_or_visual_ba(left.timestamp(), visual_pose_world, map_observations)?;
         #[cfg(not(feature = "vio"))]
         let refined_world =
-            ObservationSet::when_sufficient(map_observations, self.ba.min_observations()).and_then(
-                |set| {
-                    self.ba
-                        .push_frame(self.global_map.map(), visual_pose_world, set)
-                },
-            );
+            match ObservationSet::when_sufficient(map_observations, self.ba.min_observations()) {
+                Some(set) => self
+                    .ba
+                    .push_frame(self.global_map.map(), visual_pose_world, set)?,
+                None => None,
+            };
         #[cfg(not(feature = "vio"))]
         let pose_world = refined_world.unwrap_or(visual_pose_world);
         #[cfg(not(feature = "vio"))]

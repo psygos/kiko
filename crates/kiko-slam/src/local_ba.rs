@@ -393,6 +393,45 @@ impl std::fmt::Display for ObservationSetError {
 
 impl std::error::Error for ObservationSetError {}
 
+#[derive(Debug)]
+pub enum ObservationResolveError {
+    Map { source: crate::map::MapError },
+    MissingAssociation { keypoint: KeyframeKeypoint },
+    MissingMapPoint { point_id: MapPointId },
+    Pnp { source: crate::PnpError },
+}
+
+impl std::fmt::Display for ObservationResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Map { source } => write!(f, "BA observation map lookup failed: {source}"),
+            Self::MissingAssociation { keypoint } => write!(
+                f,
+                "BA observation keypoint {:?}:{} has no map-point association",
+                keypoint.keyframe_id(),
+                keypoint.index()
+            ),
+            Self::MissingMapPoint { point_id } => {
+                write!(
+                    f,
+                    "BA observation references missing map point {point_id:?}"
+                )
+            }
+            Self::Pnp { source } => write!(f, "BA observation geometry is invalid: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for ObservationResolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map { source } => Some(source),
+            Self::Pnp { source } => Some(source),
+            Self::MissingAssociation { .. } | Self::MissingMapPoint { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MapObservation {
     keyframe_keypoint: KeyframeKeypoint,
@@ -452,21 +491,30 @@ impl ObservationSet {
         map: &SlamMap,
         intrinsics: PinholeIntrinsics,
         min_required: NonZeroUsize,
-    ) -> Option<ResolvedObservationSet> {
+    ) -> Result<Option<ResolvedObservationSet>, ObservationResolveError> {
         let mut resolved = Vec::with_capacity(self.observations.len());
         for obs in &self.observations {
             let keypoint_ref = obs.keyframe_keypoint();
-            let point_id = map.map_point_for_keypoint(keypoint_ref).ok().flatten()?;
-            let world = map.point(point_id)?.position();
-            let observation = Observation::try_new(world, obs.pixel(), intrinsics).ok()?;
+            let point_id = map
+                .map_point_for_keypoint(keypoint_ref)
+                .map_err(|source| ObservationResolveError::Map { source })?
+                .ok_or(ObservationResolveError::MissingAssociation {
+                    keypoint: keypoint_ref,
+                })?;
+            let world = map
+                .point(point_id)
+                .ok_or(ObservationResolveError::MissingMapPoint { point_id })?
+                .position();
+            let observation = Observation::try_new(world, obs.pixel(), intrinsics)
+                .map_err(|source| ObservationResolveError::Pnp { source })?;
             resolved.push(observation);
         }
         if resolved.len() < min_required.get() {
-            return None;
+            return Ok(None);
         }
-        Some(ResolvedObservationSet {
+        Ok(Some(ResolvedObservationSet {
             observations: resolved,
-        })
+        }))
     }
 }
 
@@ -1145,17 +1193,45 @@ impl LocalBundleAdjuster {
         map: &SlamMap,
         pose: Pose,
         observations: ObservationSet,
-    ) -> Option<Pose> {
+    ) -> Result<Option<Pose>, ObservationResolveError> {
+        let retained_start = self
+            .frames
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.config.window());
+        let mut resolved = Vec::with_capacity(
+            self.frames
+                .len()
+                .saturating_add(1)
+                .min(self.config.window()),
+        );
+        for frame in self.frames.iter().skip(retained_start) {
+            let Some(frame_observations) =
+                frame
+                    .observations
+                    .resolve(map, self.intrinsics, self.config.min_observations)?
+            else {
+                return Ok(None);
+            };
+            resolved.push(frame_observations);
+        }
+        let Some(frame_observations) =
+            observations.resolve(map, self.intrinsics, self.config.min_observations)?
+        else {
+            return Ok(None);
+        };
+        resolved.push(frame_observations);
+
         self.frames.push(BaFrame { pose, observations });
         if self.frames.len() > self.config.window() {
             let excess = self.frames.len() - self.config.window();
             self.frames.drain(0..excess);
         }
 
-        if !self.optimize(map) {
-            return None;
+        if !self.optimize(&resolved) {
+            return Ok(None);
         }
-        self.frames.last().map(|frame| frame.pose)
+        Ok(self.frames.last().map(|frame| frame.pose))
     }
 
     pub fn optimize_keyframe_window(
@@ -1191,11 +1267,12 @@ impl LocalBundleAdjuster {
         result
     }
 
-    fn optimize(&mut self, map: &SlamMap) -> bool {
+    fn optimize(&mut self, resolved: &[ResolvedObservationSet]) -> bool {
         let frame_count = self.frames.len();
         if frame_count == 0 {
             return false;
         }
+        debug_assert_eq!(frame_count, resolved.len());
 
         let dim = frame_count * 6;
         let max_iters = self.config.max_iterations();
@@ -1209,17 +1286,9 @@ impl LocalBundleAdjuster {
             a.fill(0.0);
             b.fill(0.0);
 
-            for (idx, frame) in self.frames.iter().enumerate() {
+            for (idx, (frame, observations)) in self.frames.iter().zip(resolved).enumerate() {
                 let base = idx * 6;
-                let resolved = match frame.observations.resolve(
-                    map,
-                    self.intrinsics,
-                    self.config.min_observations,
-                ) {
-                    Some(set) => set,
-                    None => return false,
-                };
-                for obs in resolved.observations() {
+                for obs in observations.observations() {
                     if let Some((residual, jac)) =
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
                     {
@@ -1558,26 +1627,38 @@ pub fn optimize_vio(
     config: &VioSolveConfig,
     map: &SlamMap,
     map_from_odom: &crate::MapFromOdom,
-) -> VioSolveResult {
+) -> Result<VioSolveResult, ObservationResolveError> {
     use crate::vio::solve::solve_dense_f64;
 
     let n_frames = window.len();
     let dim = n_frames * VIO_STATE_DIM;
     if n_frames < 2 {
-        return VioSolveResult {
+        return Ok(VioSolveResult {
             converged: true,
             iterations: 0,
             final_cost: 0.0,
             cost_breakdown: VioCostBreakdown::default(),
             last_frame_visual_residual_count: 0,
             last_frame_translation_sigma: None,
-        };
+        });
     }
 
     let max_iters = config.max_iterations.get();
     let mut lambda = f64::from(config.lm.initial_lambda);
     let mut synced = window.synced_poses().cloned().collect::<Vec<_>>();
-    let mut linearization = linearize_vio_states(window, &synced, config, map, map_from_odom);
+    let resolved_observations = (0..n_frames)
+        .map(|frame_idx| match window.observations(frame_idx) {
+            Some(observations) => observations.resolve(map, config.intrinsics, NonZeroUsize::MIN),
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut linearization = linearize_vio_states(
+        window,
+        &synced,
+        &resolved_observations,
+        config,
+        map_from_odom,
+    );
     let mut current_cost = linearization.cost_breakdown.total_cost();
     let mut converged = false;
     let mut attempted_iterations = 0;
@@ -1615,8 +1696,13 @@ pub fn optimize_vio(
             continue;
         }
 
-        let candidate_linearization =
-            linearize_vio_states(window, &candidate_synced, config, map, map_from_odom);
+        let candidate_linearization = linearize_vio_states(
+            window,
+            &candidate_synced,
+            &resolved_observations,
+            config,
+            map_from_odom,
+        );
         let candidate_cost = candidate_linearization.cost_breakdown.total_cost();
         if candidate_cost < current_cost {
             let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
@@ -1641,7 +1727,7 @@ pub fn optimize_vio(
     }
 
     let sigma = extract_last_frame_translation_sigma(&linearization.hessian, dim, n_frames);
-    VioSolveResult {
+    Ok(VioSolveResult {
         converged,
         iterations: attempted_iterations,
         final_cost: current_cost,
@@ -1651,7 +1737,7 @@ pub fn optimize_vio(
             .last()
             .unwrap_or(&0),
         last_frame_translation_sigma: sigma,
-    }
+    })
 }
 
 #[cfg(feature = "vio")]
@@ -1666,8 +1752,8 @@ struct VioLinearization {
 fn linearize_vio_states(
     window: &VioWindow,
     states: &[SyncedPose],
+    resolved_observations: &[Option<ResolvedObservationSet>],
     config: &VioSolveConfig,
-    map: &SlamMap,
     map_from_odom: &crate::MapFromOdom,
 ) -> VioLinearization {
     use crate::vio::solve::{
@@ -1678,6 +1764,7 @@ fn linearize_vio_states(
 
     debug_assert_eq!(states.len(), window.len());
     let n_frames = window.len();
+    debug_assert_eq!(resolved_observations.len(), n_frames);
     let dim = n_frames * STATE_DIM;
     let mut hessian = vec![0.0_f64; dim * dim];
     let mut rhs = vec![0.0_f64; dim];
@@ -1687,89 +1774,81 @@ fn linearize_vio_states(
     for (frame_idx, synced) in states.iter().enumerate() {
         let base = frame_idx * STATE_DIM;
         let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body, map_from_odom);
-        if let Some(obs_set) = window.observations(frame_idx) {
-            if let Some(resolved) =
-                obs_set.resolve(map, config.intrinsics, NonZeroUsize::new(1).unwrap())
-            {
-                for obs in resolved.observations() {
-                    let world = obs.world();
-                    let pixel = obs.pixel();
-                    let Some((residual, _, _)) = reprojection_residual_and_jacobians(
-                        cam_pose,
-                        world,
-                        pixel,
-                        config.intrinsics,
+        if let Some(resolved) = &resolved_observations[frame_idx] {
+            for obs in resolved.observations() {
+                let world = obs.world();
+                let pixel = obs.pixel();
+                let Some((residual, _, _)) =
+                    reprojection_residual_and_jacobians(cam_pose, world, pixel, config.intrinsics)
+                else {
+                    continue;
+                };
+                let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                let huber_delta = config.huber_delta_px as f32;
+                let (huber_weight, huber_cost) = if r_norm <= huber_delta {
+                    (1.0_f32, 0.5 * r_norm * r_norm)
+                } else {
+                    (
+                        huber_delta / r_norm,
+                        huber_delta * (r_norm - 0.5 * huber_delta),
+                    )
+                };
+                cost_breakdown.reprojection_cost += f64::from(huber_cost);
+                let sqrt_w = huber_weight.sqrt();
+
+                const FD_EPS: f64 = 1e-4;
+                let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
+                for axis in 0..6 {
+                    let mut delta_plus = [0.0_f64; STATE_DIM];
+                    let mut delta_minus = [0.0_f64; STATE_DIM];
+                    delta_plus[axis] = FD_EPS;
+                    delta_minus[axis] = -FD_EPS;
+                    let (Ok(s_plus), Ok(s_minus)) = (
+                        synced.nav_state().retract(&delta_plus),
+                        synced.nav_state().retract(&delta_minus),
                     ) else {
                         continue;
                     };
-                    let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                    let huber_delta = config.huber_delta_px as f32;
-                    let (huber_weight, huber_cost) = if r_norm <= huber_delta {
-                        (1.0_f32, 0.5 * r_norm * r_norm)
-                    } else {
-                        (
-                            huber_delta / r_norm,
-                            huber_delta * (r_norm - 0.5 * huber_delta),
-                        )
-                    };
-                    cost_breakdown.reprojection_cost += f64::from(huber_cost);
-                    let sqrt_w = huber_weight.sqrt();
-
-                    const FD_EPS: f64 = 1e-4;
-                    let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
-                    for axis in 0..6 {
-                        let mut delta_plus = [0.0_f64; STATE_DIM];
-                        let mut delta_minus = [0.0_f64; STATE_DIM];
-                        delta_plus[axis] = FD_EPS;
-                        delta_minus[axis] = -FD_EPS;
-                        let (Ok(s_plus), Ok(s_minus)) = (
-                            synced.nav_state().retract(&delta_plus),
-                            synced.nav_state().retract(&delta_minus),
-                        ) else {
-                            continue;
-                        };
-                        let p_plus =
-                            vio_cam_from_map(&s_plus, config.camera_from_body, map_from_odom);
-                        let p_minus =
-                            vio_cam_from_map(&s_minus, config.camera_from_body, map_from_odom);
-                        if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
-                            reprojection_residual_and_jacobians(
-                                p_plus,
-                                world,
-                                pixel,
-                                config.intrinsics,
-                            ),
-                            reprojection_residual_and_jacobians(
-                                p_minus,
-                                world,
-                                pixel,
-                                config.intrinsics,
-                            ),
-                        ) {
-                            for row in 0..2 {
-                                j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
-                                    / (2.0 * FD_EPS)
-                                    * f64::from(sqrt_w);
-                            }
+                    let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body, map_from_odom);
+                    let p_minus =
+                        vio_cam_from_map(&s_minus, config.camera_from_body, map_from_odom);
+                    if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
+                        reprojection_residual_and_jacobians(
+                            p_plus,
+                            world,
+                            pixel,
+                            config.intrinsics,
+                        ),
+                        reprojection_residual_and_jacobians(
+                            p_minus,
+                            world,
+                            pixel,
+                            config.intrinsics,
+                        ),
+                    ) {
+                        for row in 0..2 {
+                            j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
+                                / (2.0 * FD_EPS)
+                                * f64::from(sqrt_w);
                         }
                     }
-                    let r_f64 = [
-                        f64::from(residual[0] * sqrt_w),
-                        f64::from(residual[1] * sqrt_w),
-                    ];
-                    let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
-                    accumulate_factor(
-                        &mut hessian,
-                        &mut rhs,
-                        dim,
-                        &j_15,
-                        &identity_2,
-                        &r_f64,
-                        base,
-                    );
-                    reprojection_residual_counts[frame_idx] =
-                        reprojection_residual_counts[frame_idx].saturating_add(1);
                 }
+                let r_f64 = [
+                    f64::from(residual[0] * sqrt_w),
+                    f64::from(residual[1] * sqrt_w),
+                ];
+                let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
+                accumulate_factor(
+                    &mut hessian,
+                    &mut rhs,
+                    dim,
+                    &j_15,
+                    &identity_2,
+                    &r_f64,
+                    base,
+                );
+                reprojection_residual_counts[frame_idx] =
+                    reprojection_residual_counts[frame_idx].saturating_add(1);
             }
         }
     }
@@ -2627,6 +2706,93 @@ mod tests {
                 assert_eq!(actual, 0);
             }
         }
+    }
+
+    #[test]
+    fn observation_resolution_reports_removed_association() {
+        let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let keypoint = map
+            .keyframe_keypoint(keyframe_id, 0)
+            .expect("fixture keypoint");
+        let point_id = map
+            .map_point_for_keypoint(keypoint)
+            .expect("fixture lookup")
+            .expect("fixture association");
+        let pixel = map.keypoint(keypoint).expect("fixture pixel");
+        let observations = ObservationSet::new(
+            vec![MapObservation::new(keypoint, pixel)],
+            NonZeroUsize::MIN,
+        )
+        .expect("one observation");
+
+        map.remove_map_point(point_id)
+            .expect("remove fixture point");
+
+        let error = observations
+            .resolve(&map, intrinsics, NonZeroUsize::MIN)
+            .expect_err("removed association must not look like insufficient support");
+        assert!(matches!(
+            error,
+            ObservationResolveError::MissingAssociation { keypoint: actual }
+                if actual == keypoint
+        ));
+    }
+
+    #[test]
+    fn observation_resolution_preserves_foreign_map_error_source() {
+        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let keypoint = map
+            .keyframe_keypoint(keyframe_id, 0)
+            .expect("fixture keypoint");
+        let pixel = map.keypoint(keypoint).expect("fixture pixel");
+        let observations = ObservationSet::new(
+            vec![MapObservation::new(keypoint, pixel)],
+            NonZeroUsize::MIN,
+        )
+        .expect("one observation");
+
+        let error = observations
+            .resolve(&SlamMap::new(), intrinsics, NonZeroUsize::MIN)
+            .expect_err("foreign keypoint must be rejected");
+        assert!(matches!(error, ObservationResolveError::Map { .. }));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn failed_observation_resolution_does_not_advance_ba_window() {
+        let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let observations = (0..4)
+            .map(|index| {
+                let keypoint = map
+                    .keyframe_keypoint(keyframe_id, index)
+                    .expect("fixture keypoint");
+                let pixel = map.keypoint(keypoint).expect("fixture pixel");
+                MapObservation::new(keypoint, pixel)
+            })
+            .collect();
+        let observations =
+            ObservationSet::new(observations, NonZeroUsize::new(4).expect("nonzero minimum"))
+                .expect("fixture observations");
+        let removed_keypoint = observations.observations()[0].keyframe_keypoint();
+        let removed_point = map
+            .map_point_for_keypoint(removed_keypoint)
+            .expect("fixture lookup")
+            .expect("fixture association");
+        map.remove_map_point(removed_point)
+            .expect("remove fixture point");
+        let config = LocalBaConfig::new(5, 10, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+
+        let error = ba
+            .push_frame(&map, Pose::identity(), observations)
+            .expect_err("stale observation must fail");
+
+        assert!(matches!(
+            error,
+            ObservationResolveError::MissingAssociation { keypoint }
+                if keypoint == removed_keypoint
+        ));
+        assert!(ba.frames.is_empty(), "failed push must be transactional");
     }
 
     #[test]
