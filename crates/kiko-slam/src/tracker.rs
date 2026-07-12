@@ -1502,6 +1502,26 @@ struct CreatedKeyframe {
     diagnostics: FrameDiagnostics,
 }
 
+#[derive(Debug, Default)]
+struct PendingDiagnosticEvents(Vec<DiagnosticEvent>);
+
+impl PendingDiagnosticEvents {
+    fn push(&mut self, event: DiagnosticEvent) {
+        self.0.push(event);
+    }
+
+    fn take_all(&mut self) -> Vec<DiagnosticEvent> {
+        std::mem::take(&mut self.0)
+    }
+
+    fn loop_closure_status(&self) -> Option<LoopClosureStatus> {
+        self.0.iter().find_map(|event| {
+            matches!(event, DiagnosticEvent::LoopClosureDetected { .. })
+                .then_some(LoopClosureStatus::Applied)
+        })
+    }
+}
+
 #[derive(Debug)]
 enum TrackerState {
     NeedKeyframe,
@@ -1981,7 +2001,7 @@ pub struct SlamTracker {
     backend: BackendSubsystem,
     backend_stats: BackendStats,
     place_recognition: Option<PlaceRecognition>,
-    pending_events: Vec<DiagnosticEvent>,
+    pending_events: PendingDiagnosticEvents,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_accepted_pose: Option<LastAcceptedPose>,
@@ -2101,7 +2121,7 @@ impl SlamTracker {
             backend,
             backend_stats: BackendStats::default(),
             place_recognition,
-            pending_events: Vec::new(),
+            pending_events: PendingDiagnosticEvents::default(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_accepted_pose: None,
@@ -2189,14 +2209,10 @@ impl SlamTracker {
             _ => None,
         };
         if let Some(session) = relocalization_session {
-            let result = self.relocalize(pair, session);
-            if result.is_err() {
-                self.clear_events();
-            }
-            return result;
+            return self.relocalize(pair, session);
         }
 
-        let result = if let Some((keyframe, keyframe_id)) = tracking {
+        if let Some((keyframe, keyframe_id)) = tracking {
             self.track_with_prefetch(
                 pair,
                 &keyframe,
@@ -2220,11 +2236,7 @@ impl SlamTracker {
                 );
             }
             self.create_keyframe(pair, bootstrap_pose)
-        };
-        if result.is_err() {
-            self.clear_events();
         }
-        result
     }
 
     #[cfg(feature = "vio")]
@@ -2668,11 +2680,7 @@ impl SlamTracker {
     }
 
     fn drain_events(&mut self) -> Vec<DiagnosticEvent> {
-        std::mem::take(&mut self.pending_events)
-    }
-
-    fn clear_events(&mut self) {
-        self.pending_events.clear();
+        self.pending_events.take_all()
     }
 
     fn empty_diagnostics(&self) -> FrameDiagnostics {
@@ -2684,10 +2692,7 @@ impl SlamTracker {
             .place_recognition
             .as_ref()
             .map_or(0, PlaceRecognition::pending_candidate_count);
-        diagnostics.loop_closure_status = self.pending_events.iter().find_map(|event| {
-            matches!(event, DiagnosticEvent::LoopClosureDetected { .. })
-                .then_some(LoopClosureStatus::Applied)
-        });
+        diagnostics.loop_closure_status = self.pending_events.loop_closure_status();
         diagnostics
     }
 
@@ -4774,6 +4779,37 @@ mod tests {
         let frame = inference.source().expect("frame source");
         assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
         assert!(frame.source().is_none());
+    }
+
+    #[test]
+    fn pending_diagnostic_events_survive_until_an_output_takes_them() {
+        let mut events = PendingDiagnosticEvents::default();
+        events.push(DiagnosticEvent::TrackingRecovered);
+
+        let failed_frame: Result<(), ()> = Err(());
+        assert!(failed_frame.is_err());
+        let retained = events.take_all();
+        assert!(matches!(
+            retained.as_slice(),
+            [DiagnosticEvent::TrackingRecovered]
+        ));
+        assert!(events.take_all().is_empty());
+    }
+
+    #[test]
+    fn pending_loop_event_sets_status_without_consuming_the_event() {
+        let mut events = PendingDiagnosticEvents::default();
+        events.push(DiagnosticEvent::LoopClosureDetected {
+            query: KeyframeId::default(),
+            match_kf: KeyframeId::default(),
+            similarity: 0.9,
+        });
+
+        assert_eq!(
+            events.loop_closure_status(),
+            Some(LoopClosureStatus::Applied)
+        );
+        assert_eq!(events.take_all().len(), 1);
     }
 
     fn make_test_detections(frame_id: u64) -> Arc<Detections> {
