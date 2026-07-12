@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, FrameError, ImuBatch, PairError, SensorId};
+use crate::{DepthImage, Frame, FrameError, ImuBatch, PairError, SensorId, StereoPair};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -174,6 +174,9 @@ impl WriterStats {
 
 #[derive(Debug)]
 pub enum DatasetError {
+    OutputAlreadyExists {
+        path: PathBuf,
+    },
     CreateDirectory {
         path: PathBuf,
         source: std::io::Error,
@@ -221,6 +224,9 @@ pub enum DatasetError {
 impl std::fmt::Display for DatasetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            DatasetError::OutputAlreadyExists { path } => {
+                write!(f, "dataset output path already exists: {}", path.display())
+            }
             DatasetError::CreateDirectory { path, source } => {
                 write!(
                     f,
@@ -281,6 +287,7 @@ impl std::error::Error for DatasetError {
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::InvalidFrame { source, .. } => Some(source),
             DatasetError::InvalidConfig { .. }
+            | DatasetError::OutputAlreadyExists { .. }
             | DatasetError::WorkerJoin { .. }
             | DatasetError::MissingImuSamples { .. } => None,
         }
@@ -349,13 +356,30 @@ impl DatasetWriter {
         }
 
         let path = path.into();
-        std::fs::create_dir_all(&path).map_err(|e| DatasetError::CreateDirectory {
-            path: path.clone(),
-            source: e,
-        })?;
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|source| DatasetError::CreateDirectory {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        match std::fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(DatasetError::OutputAlreadyExists { path });
+            }
+            Err(source) => {
+                return Err(DatasetError::CreateDirectory {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
 
         let frames_dir = path.join(format::FRAMES_DIR);
-        std::fs::create_dir_all(&frames_dir).map_err(|e| DatasetError::CreateDirectory {
+        std::fs::create_dir(&frames_dir).map_err(|e| DatasetError::CreateDirectory {
             path: frames_dir.clone(),
             source: e,
         })?;
@@ -405,7 +429,23 @@ impl DatasetWriter {
         self.write_item(
             SpoolItem::Mono(frame.clone()),
             frame.data().len(),
+            1,
             "frame exceeds max_spool_bytes",
+        )
+    }
+
+    /// Enqueue both halves of a validated stereo pair as one backpressure unit.
+    pub fn write_stereo_pair(&self, pair: &StereoPair) -> WriteOutcome {
+        let bytes = pair
+            .left()
+            .data()
+            .len()
+            .saturating_add(pair.right().data().len());
+        self.write_item(
+            SpoolItem::StereoPair(pair.left().clone(), pair.right().clone()),
+            bytes,
+            2,
+            "stereo pair exceeds max_spool_bytes",
         )
     }
 
@@ -418,6 +458,7 @@ impl DatasetWriter {
         self.write_item(
             SpoolItem::Depth(depth.clone()),
             bytes,
+            1,
             "depth image exceeds max_spool_bytes",
         )
     }
@@ -428,6 +469,7 @@ impl DatasetWriter {
         self.write_item(
             SpoolItem::Imu(batch.clone()),
             bytes,
+            1,
             "imu batch exceeds max_spool_bytes",
         )
     }
@@ -436,6 +478,7 @@ impl DatasetWriter {
         &self,
         item: SpoolItem,
         bytes: usize,
+        frame_count: usize,
         oversize_msg: &'static str,
     ) -> WriteOutcome {
         if self.state.failed.load(Ordering::Acquire) {
@@ -459,8 +502,10 @@ impl DatasetWriter {
                 if spool.closed || self.state.failed.load(Ordering::Acquire) {
                     return WriteOutcome::WriterFailed;
                 }
-                if !self.state.can_accept(&spool, bytes) {
-                    self.state.dropped.fetch_add(1, Ordering::Relaxed);
+                if !self.state.can_accept(&spool, frame_count, bytes) {
+                    self.state
+                        .dropped
+                        .fetch_add(frame_count as u64, Ordering::Relaxed);
                     self.state
                         .bytes_dropped
                         .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -468,7 +513,7 @@ impl DatasetWriter {
                 }
             }
             Backpressure::Block => {
-                while !self.state.can_accept(&spool, bytes) {
+                while !self.state.can_accept(&spool, frame_count, bytes) {
                     if spool.closed || self.state.failed.load(Ordering::Acquire) {
                         return WriteOutcome::WriterFailed;
                     }
@@ -485,11 +530,13 @@ impl DatasetWriter {
             return WriteOutcome::WriterFailed;
         }
 
-        spool.frames += 1;
+        spool.frames += frame_count;
         spool.bytes += bytes;
         spool.queue.push_back(item);
 
-        self.state.enqueued.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .enqueued
+            .fetch_add(frame_count as u64, Ordering::Relaxed);
         self.state
             .bytes_enqueued
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -525,12 +572,11 @@ impl DatasetWriterHandle {
         })?;
 
         let writer_error = self.state.take_error();
-        write_manifest(&self.state)?;
-
         if let Some(err) = writer_error {
             return Err(err);
         }
 
+        write_manifest(&self.state)?;
         Ok(self.state.stats())
     }
 
@@ -542,6 +588,7 @@ impl DatasetWriterHandle {
 #[derive(Debug)]
 enum SpoolItem {
     Mono(Frame),
+    StereoPair(Frame, Frame),
     Depth(DepthImage),
     Imu(ImuBatch),
 }
@@ -550,11 +597,21 @@ impl SpoolItem {
     fn bytes_len(&self) -> usize {
         match self {
             SpoolItem::Mono(frame) => frame.data().len(),
+            SpoolItem::StereoPair(left, right) => {
+                left.data().len().saturating_add(right.data().len())
+            }
             SpoolItem::Depth(depth) => depth
                 .depth_m()
                 .len()
                 .saturating_mul(std::mem::size_of::<f32>()),
             SpoolItem::Imu(batch) => batch.len().saturating_mul(IMU_RECORD_BYTES),
+        }
+    }
+
+    fn frame_count(&self) -> usize {
+        match self {
+            Self::StereoPair(_, _) => 2,
+            Self::Mono(_) | Self::Depth(_) | Self::Imu(_) => 1,
         }
     }
 }
@@ -622,8 +679,8 @@ impl WriterState {
         }
     }
 
-    fn can_accept(&self, spool: &Spool, bytes: usize) -> bool {
-        let next_frames = spool.frames.saturating_add(1);
+    fn can_accept(&self, spool: &Spool, frame_count: usize, bytes: usize) -> bool {
+        let next_frames = spool.frames.saturating_add(frame_count);
         let next_bytes = spool.bytes.saturating_add(bytes);
         next_frames <= self.config.max_spool_frames && next_bytes <= self.config.max_spool_bytes
     }
@@ -690,12 +747,15 @@ fn writer_loop(state: Arc<WriterState>) {
             }
 
             let mut batch = Vec::new();
+            let mut batch_frames = 0usize;
             while let Some(item) = spool.queue.pop_front() {
                 let bytes = item.bytes_len();
-                spool.frames = spool.frames.saturating_sub(1);
+                let frame_count = item.frame_count();
+                spool.frames = spool.frames.saturating_sub(frame_count);
                 spool.bytes = spool.bytes.saturating_sub(bytes);
+                batch_frames = batch_frames.saturating_add(frame_count);
                 batch.push(item);
-                if batch.len() >= state.config.flush_batch_frames {
+                if batch_frames >= state.config.flush_batch_frames {
                     break;
                 }
             }
@@ -712,12 +772,13 @@ fn writer_loop(state: Arc<WriterState>) {
 
         for item in batch {
             let bytes = item.bytes_len() as u64;
+            let frame_count = item.frame_count() as u64;
             if let Err(err) = write_item_to_dir(&state.frames_dir, &state.dataset_dir, item) {
-                state.write_failed.fetch_add(1, Ordering::Relaxed);
+                state.write_failed.fetch_add(frame_count, Ordering::Relaxed);
                 state.fail(err);
                 return;
             }
-            state.written.fetch_add(1, Ordering::Relaxed);
+            state.written.fetch_add(frame_count, Ordering::Relaxed);
             state.bytes_written.fetch_add(bytes, Ordering::Relaxed);
         }
     }
@@ -730,6 +791,10 @@ fn write_item_to_dir(
 ) -> Result<(), DatasetError> {
     match item {
         SpoolItem::Mono(frame) => write_frame_to_dir(frames_dir, frame),
+        SpoolItem::StereoPair(left, right) => {
+            write_frame_to_dir(frames_dir, left)?;
+            write_frame_to_dir(frames_dir, right)
+        }
         SpoolItem::Depth(depth) => write_depth_to_dir(frames_dir, depth),
         SpoolItem::Imu(batch) => write_imu_to_file(dataset_dir, &batch),
     }
@@ -757,10 +822,7 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
         });
     }
 
-    std::fs::write(&path, data.as_ref())
-        .map_err(|e| DatasetError::WriteFile { path, source: e })?;
-
-    Ok(())
+    write_new_file(path, data.as_ref())
 }
 
 fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), DatasetError> {
@@ -780,8 +842,20 @@ fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), Datase
     for value in depth.depth_m() {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    std::fs::write(&path, bytes).map_err(|e| DatasetError::WriteFile { path, source: e })?;
-    Ok(())
+    write_new_file(path, &bytes)
+}
+
+fn write_new_file(path: PathBuf, bytes: &[u8]) -> Result<(), DatasetError> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|source| DatasetError::WriteFile {
+            path: path.clone(),
+            source,
+        })?;
+    std::io::Write::write_all(&mut file, bytes)
+        .map_err(|source| DatasetError::WriteFile { path, source })
 }
 
 fn write_imu_to_file(dataset_dir: &Path, batch: &ImuBatch) -> Result<(), DatasetError> {
@@ -1392,8 +1466,76 @@ fn dataset_id(dataset_dir: &Path) -> String {
 }
 
 #[cfg(test)]
-mod timing_tests {
-    use super::{build_delta_stats, compute_pairing_window_ns, median_u64};
+mod tests {
+    use super::*;
+    use crate::{FrameId, PairingWindowNs, Timestamp};
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("kiko-{name}-{}-{nonce}", std::process::id()))
+    }
+
+    fn test_meta() -> Meta {
+        Meta {
+            created: "now".to_string(),
+            device: "test".to_string(),
+            mono: Some(MonoMeta {
+                width: 2,
+                height: 2,
+                fps: 10,
+            }),
+            depth: None,
+            imu: None,
+        }
+    }
+
+    fn test_calibration() -> Calibration {
+        let intrinsics = CameraIntrinsics {
+            fx: 100.0,
+            fy: 100.0,
+            cx: 1.0,
+            cy: 1.0,
+            width: 2,
+            height: 2,
+        };
+        Calibration {
+            left: intrinsics.clone(),
+            right: intrinsics,
+            baseline_m: 0.1,
+            rectified: true,
+            imu: None,
+        }
+    }
+
+    fn test_pair() -> StereoPair {
+        let left = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(100),
+            2,
+            2,
+            vec![1; 4],
+        )
+        .expect("left frame");
+        let right = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(2),
+            Timestamp::from_nanos(104),
+            2,
+            2,
+            vec![2; 4],
+        )
+        .expect("right frame");
+        StereoPair::try_new(
+            left,
+            right,
+            PairingWindowNs::new(10).expect("pairing window"),
+        )
+        .expect("stereo pair")
+    }
 
     #[test]
     fn exact_sync_still_produces_a_readable_nonzero_pairing_window() {
@@ -1405,5 +1547,133 @@ mod timing_tests {
     #[test]
     fn median_does_not_overflow_at_u64_max() {
         assert_eq!(median_u64(&[u64::MAX, u64::MAX]), u64::MAX);
+    }
+
+    #[test]
+    fn dataset_writer_rejects_existing_output_path() {
+        let path = unique_temp_path("writer-existing-output");
+        std::fs::create_dir(&path).expect("create existing output");
+
+        let error = DatasetWriter::create(&path, &test_meta(), &test_calibration())
+            .expect_err("existing output must be rejected");
+
+        assert!(matches!(
+            error,
+            DatasetError::OutputAlreadyExists { path: actual } if actual == path
+        ));
+    }
+
+    #[test]
+    fn stereo_pair_is_dropped_as_one_backpressure_unit() {
+        let path = unique_temp_path("writer-pair-backpressure");
+        let config = DatasetWriterConfig {
+            max_spool_frames: 1,
+            max_spool_bytes: 1024,
+            flush_batch_frames: 1,
+            backpressure: Backpressure::DropNewest,
+        };
+        let (writer, handle) =
+            DatasetWriter::create_with_config(&path, &test_meta(), &test_calibration(), config)
+                .expect("writer");
+
+        assert_eq!(
+            writer.write_stereo_pair(&test_pair()),
+            WriteOutcome::Dropped
+        );
+        let before_finish = writer.stats();
+        assert_eq!(before_finish.frames_enqueued, 0);
+        assert_eq!(before_finish.frames_dropped, 2);
+        drop(writer);
+        let stats = handle.finish().expect("finish writer");
+        assert_eq!(stats.frames_written, 0);
+    }
+
+    #[test]
+    fn stereo_pair_is_written_and_counted_as_two_frames() {
+        let path = unique_temp_path("writer-pair-success");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &test_meta(), &test_calibration()).expect("writer");
+        let pair = test_pair();
+
+        assert_eq!(writer.write_stereo_pair(&pair), WriteOutcome::Enqueued);
+        drop(writer);
+        let stats = handle.finish().expect("finish writer");
+
+        assert_eq!(stats.frames_enqueued, 2);
+        assert_eq!(stats.frames_written, 2);
+        assert_eq!(stats.frames_dropped, 0);
+        assert!(
+            path.join(format::FRAMES_DIR)
+                .join(format::frame_name(100, "mono_left"))
+                .is_file()
+        );
+        assert!(
+            path.join(format::FRAMES_DIR)
+                .join(format::frame_name(104, "mono_right"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn create_new_write_preserves_existing_frame_contents() {
+        let path = unique_temp_path("writer-file-collision");
+        write_new_file(path.clone(), b"first").expect("first write");
+
+        let error = write_new_file(path.clone(), b"second")
+            .expect_err("duplicate filename must be rejected");
+
+        assert!(matches!(
+            error,
+            DatasetError::WriteFile { source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(path).expect("read original"), b"first");
+    }
+
+    #[test]
+    fn writer_reports_duplicate_timestamp_without_publishing_manifest() {
+        let path = unique_temp_path("writer-duplicate-timestamp");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &test_meta(), &test_calibration()).expect("writer");
+        let first = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(100),
+            2,
+            2,
+            vec![1; 4],
+        )
+        .expect("first frame");
+        let duplicate = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(2),
+            Timestamp::from_nanos(100),
+            2,
+            2,
+            vec![2; 4],
+        )
+        .expect("duplicate frame");
+        assert_eq!(writer.write_frame(&first), WriteOutcome::Enqueued);
+        assert_eq!(writer.write_frame(&duplicate), WriteOutcome::Enqueued);
+        drop(writer);
+
+        let error = handle
+            .finish()
+            .expect_err("duplicate timestamp must fail the writer");
+
+        assert!(matches!(
+            error,
+            DatasetError::WriteFile { source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        assert_eq!(
+            std::fs::read(
+                path.join(format::FRAMES_DIR)
+                    .join(format::frame_name(100, "mono_left"))
+            )
+            .expect("original frame"),
+            vec![1; 4]
+        );
     }
 }

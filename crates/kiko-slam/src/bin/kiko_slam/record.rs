@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use kiko_slam::dataset::{
-    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta,
+    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta, WriteOutcome,
 };
 use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
@@ -32,6 +32,84 @@ pub struct RecordArgs {
     pub output_path: std::path::PathBuf,
     #[command(flatten)]
     pub camera: CameraArgs,
+}
+
+#[derive(Debug)]
+enum RecordCaptureError {
+    Image {
+        sensor: SensorId,
+        source: ImageError,
+    },
+    Frame {
+        sensor: SensorId,
+        source: kiko_slam::FrameError,
+    },
+    Depth {
+        source: DepthError,
+    },
+    DepthImage {
+        source: kiko_slam::DepthImageError,
+    },
+    Imu {
+        source: ImuError,
+    },
+    OakImu {
+        source: kiko_slam::OakImuError,
+    },
+    Pairing {
+        source: kiko_slam::PairError,
+    },
+    WriterDropped {
+        item: &'static str,
+    },
+    WriterFailed {
+        item: &'static str,
+    },
+}
+
+impl std::fmt::Display for RecordCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image { sensor, source } => {
+                write!(f, "{sensor:?} image stream failed: {source}")
+            }
+            Self::Frame { sensor, source } => {
+                write!(f, "{sensor:?} frame conversion failed: {source}")
+            }
+            Self::Depth { source } => write!(f, "depth stream failed: {source}"),
+            Self::DepthImage { source } => write!(f, "depth frame conversion failed: {source}"),
+            Self::Imu { source } => write!(f, "IMU stream failed: {source}"),
+            Self::OakImu { source } => write!(f, "IMU sample conversion failed: {source}"),
+            Self::Pairing { source } => write!(f, "stereo pairing failed: {source}"),
+            Self::WriterDropped { item } => {
+                write!(f, "dataset writer dropped {item} due to backpressure")
+            }
+            Self::WriterFailed { item } => write!(f, "dataset writer failed while queuing {item}"),
+        }
+    }
+}
+
+impl std::error::Error for RecordCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Image { source, .. } => Some(source),
+            Self::Frame { source, .. } => Some(source),
+            Self::Depth { source } => Some(source),
+            Self::DepthImage { source } => Some(source),
+            Self::Imu { source } => Some(source),
+            Self::OakImu { source } => Some(source),
+            Self::Pairing { source } => Some(source),
+            Self::WriterDropped { .. } | Self::WriterFailed { .. } => None,
+        }
+    }
+}
+
+fn require_enqueued(outcome: WriteOutcome, item: &'static str) -> Result<(), RecordCaptureError> {
+    match outcome {
+        WriteOutcome::Enqueued => Ok(()),
+        WriteOutcome::Dropped => Err(RecordCaptureError::WriterDropped { item }),
+        WriteOutcome::WriterFailed => Err(RecordCaptureError::WriterFailed { item }),
+    }
 }
 
 pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -101,131 +179,150 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("recording... press ctrl+c to stop");
 
-    while running.load(Ordering::Relaxed) {
-        let mut got_any = false;
+    let capture_result = (|| -> Result<(), RecordCaptureError> {
+        while running.load(Ordering::Relaxed) {
+            let mut got_any = false;
 
-        match device.mono_left(read_timeout_ms) {
-            Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+            match device.mono_left(read_timeout_ms) {
                 Ok(frame) => {
-                    if let Some(PairingOutcome::Dropped {
-                        sensor: SensorId::StereoLeft,
-                        reason: PairingDropReason::PendingCapacity,
-                    }) = pairer.push_left(frame)
-                    {
-                        pending_capacity_left_drops = pending_capacity_left_drops.saturating_add(1);
-                    }
-                    left_count += 1;
-                    left_seq += 1;
-                    got_any = true;
-                }
-                Err(err) => {
-                    eprintln!("left frame dropped (invalid dimensions): {err}");
-                }
-            },
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                eprintln!("left error: {e:?}");
-                break;
-            }
-        }
-
-        match device.mono_right(read_timeout_ms) {
-            Ok(frame) => {
-                match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
-                    Ok(frame) => {
-                        if let Some(PairingOutcome::Dropped {
-                            sensor: SensorId::StereoRight,
-                            reason: PairingDropReason::PendingCapacity,
-                        }) = pairer.push_right(frame)
-                        {
-                            pending_capacity_right_drops =
-                                pending_capacity_right_drops.saturating_add(1);
+                    match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                        Ok(frame) => {
+                            if let Some(PairingOutcome::Dropped {
+                                sensor: SensorId::StereoLeft,
+                                reason: PairingDropReason::PendingCapacity,
+                            }) = pairer.push_left(frame)
+                            {
+                                pending_capacity_left_drops =
+                                    pending_capacity_left_drops.saturating_add(1);
+                            }
+                            left_count += 1;
+                            left_seq += 1;
+                            got_any = true;
                         }
-                        right_count += 1;
-                        right_seq += 1;
-                        got_any = true;
+                        Err(source) => {
+                            return Err(RecordCaptureError::Frame {
+                                sensor: SensorId::StereoLeft,
+                                source,
+                            });
+                        }
                     }
-                    Err(err) => {
-                        eprintln!("right frame dropped (invalid dimensions): {err}");
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    return Err(RecordCaptureError::Image {
+                        sensor: SensorId::StereoLeft,
+                        source,
+                    });
+                }
+            }
+
+            match device.mono_right(read_timeout_ms) {
+                Ok(frame) => {
+                    match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
+                        Ok(frame) => {
+                            if let Some(PairingOutcome::Dropped {
+                                sensor: SensorId::StereoRight,
+                                reason: PairingDropReason::PendingCapacity,
+                            }) = pairer.push_right(frame)
+                            {
+                                pending_capacity_right_drops =
+                                    pending_capacity_right_drops.saturating_add(1);
+                            }
+                            right_count += 1;
+                            right_seq += 1;
+                            got_any = true;
+                        }
+                        Err(source) => {
+                            return Err(RecordCaptureError::Frame {
+                                sensor: SensorId::StereoRight,
+                                source,
+                            });
+                        }
+                    }
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    return Err(RecordCaptureError::Image {
+                        sensor: SensorId::StereoRight,
+                        source,
+                    });
+                }
+            }
+
+            if depth_enabled {
+                match device.depth(read_timeout_ms) {
+                    Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
+                        Ok(depth) => {
+                            require_enqueued(writer.write_depth(&depth), "depth frame")?;
+                            depth_count = depth_count.saturating_add(1);
+                            got_any = true;
+                        }
+                        Err(source) => return Err(RecordCaptureError::DepthImage { source }),
+                    },
+                    Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                    Err(source) => return Err(RecordCaptureError::Depth { source }),
+                }
+            }
+
+            if imu_enabled {
+                match device.imu() {
+                    Ok(samples) => match oak_to_imu_batch(samples) {
+                        Ok(batch) => {
+                            require_enqueued(writer.write_imu(&batch), "IMU batch")?;
+                            imu_sample_count = imu_sample_count.saturating_add(batch.len() as u64);
+                            imu_batch_count = imu_batch_count.saturating_add(1);
+                            got_any = true;
+                        }
+                        Err(source) => return Err(RecordCaptureError::OakImu { source }),
+                    },
+                    Err(ImuError::Empty) => {}
+                    Err(ImuError::Overflow { dropped }) => {
+                        eprintln!("imu overflow: dropped {dropped} samples");
+                    }
+                    Err(source @ ImuError::Disconnected) => {
+                        return Err(RecordCaptureError::Imu { source });
                     }
                 }
             }
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                eprintln!("right error: {e:?}");
-                break;
-            }
-        }
 
-        if depth_enabled {
-            match device.depth(read_timeout_ms) {
-                Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
-                    Ok(depth) => {
-                        writer.write_depth(&depth);
-                        depth_count = depth_count.saturating_add(1);
-                        got_any = true;
+            loop {
+                match pairer
+                    .next_outcome()
+                    .map_err(|source| RecordCaptureError::Pairing { source })?
+                {
+                    PairingOutcome::Produced(pair) => {
+                        require_enqueued(writer.write_stereo_pair(&pair), "stereo pair")?;
+                        pair_count = pair_count.saturating_add(1);
+
+                        if pair_count % 30 == 0 {
+                            eprintln!("captured {pair_count} stereo pairs");
+                        }
                     }
-                    Err(err) => {
-                        eprintln!("depth frame dropped (invalid dimensions): {err}");
-                    }
-                },
-                Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
-                Err(e) => {
-                    eprintln!("depth error: {e:?}");
-                    break;
+                    PairingOutcome::Dropped { .. } => continue,
+                    PairingOutcome::Waiting => break,
                 }
             }
-        }
 
-        if imu_enabled {
-            match device.imu() {
-                Ok(samples) => match oak_to_imu_batch(samples) {
-                    Ok(batch) => {
-                        imu_sample_count = imu_sample_count.saturating_add(batch.len() as u64);
-                        imu_batch_count = imu_batch_count.saturating_add(1);
-                        writer.write_imu(&batch);
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("imu batch dropped (invalid values): {err}");
-                    }
-                },
-                Err(ImuError::Empty) => {}
-                Err(ImuError::Overflow { dropped }) => {
-                    eprintln!("imu overflow: dropped {dropped} samples");
-                }
-                Err(ImuError::Disconnected) => {
-                    eprintln!("imu error: disconnected");
-                    break;
-                }
+            if !got_any {
+                thread::sleep(Duration::from_micros(500));
             }
         }
-
-        loop {
-            match pairer.next_outcome()? {
-                PairingOutcome::Produced(pair) => {
-                    writer.write_frame(pair.left());
-                    writer.write_frame(pair.right());
-                    pair_count += 1;
-
-                    if pair_count % 30 == 0 {
-                        eprintln!("captured {pair_count} stereo pairs");
-                    }
-                }
-                PairingOutcome::Dropped { .. } => continue,
-                PairingOutcome::Waiting => break,
-            }
-        }
-
-        if !got_any {
-            thread::sleep(Duration::from_micros(500));
-        }
-    }
+        Ok(())
+    })();
 
     let elapsed = start.elapsed().as_secs_f64();
     let pairer_stats = pairer.stats();
     drop(writer);
-    let stats = writer_handle.finish()?;
+    let writer_result = writer_handle.finish();
+    let stats = match writer_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            if let Err(capture_error) = capture_result {
+                eprintln!("secondary recording capture error: {capture_error}");
+            }
+            return Err(Box::new(error));
+        }
+    };
     eprintln!(
         "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), imu_batches={} imu_samples={}, written={}, dropped={}",
         elapsed,
@@ -254,6 +351,9 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "pairer pending-capacity drops: left={pending_capacity_left_drops} right={pending_capacity_right_drops}"
         );
+    }
+    if let Err(error) = capture_result {
+        return Err(Box::new(error));
     }
     Ok(())
 }
