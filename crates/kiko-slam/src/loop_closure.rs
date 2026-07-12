@@ -489,6 +489,8 @@ pub enum LoopApplyError {
     InvariantViolation,
 }
 
+impl std::error::Error for LoopApplyError {}
+
 impl std::fmt::Display for LoopApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -535,7 +537,16 @@ impl std::fmt::Display for LoopDetectError {
     }
 }
 
-impl std::error::Error for LoopDetectError {}
+impl std::error::Error for LoopDetectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoopDetectError::VerificationFailed(source) => Some(source),
+            LoopDetectError::ApplyFailed(source) => Some(source),
+            LoopDetectError::TooFewCorrespondences { .. }
+            | LoopDetectError::CorrectionTooLarge { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum GlobalDescriptorError {
@@ -1016,7 +1027,15 @@ impl std::fmt::Display for LoopVerificationError {
     }
 }
 
-impl std::error::Error for LoopVerificationError {}
+impl std::error::Error for LoopVerificationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LoopVerificationError::PnpFailed(source) => Some(source),
+            LoopVerificationError::TooFewMatches { .. }
+            | LoopVerificationError::InsufficientInliers { .. } => None,
+        }
+    }
+}
 
 fn verify_pose_from_keyframe(
     query_keypoints: &[Keypoint],
@@ -1147,6 +1166,7 @@ mod tests {
     use crate::{
         CompactDescriptor, Descriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
     };
+    use std::error::Error as _;
 
     type LoopFixture = (
         SlamMap,
@@ -1267,6 +1287,18 @@ mod tests {
         let d = descriptor_with_basis(3);
         let sim = d.cosine_similarity(&d);
         assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn loop_detection_error_preserves_verification_and_pnp_sources() {
+        let error = super::LoopDetectError::VerificationFailed(
+            super::LoopVerificationError::PnpFailed(crate::PnpError::NoSolution),
+        );
+
+        let verification = error.source().expect("verification source");
+        let pnp = verification.source().expect("pnp source");
+        assert_eq!(pnp.to_string(), "pnp failed to find a valid pose");
+        assert!(pnp.source().is_none());
     }
 
     #[test]

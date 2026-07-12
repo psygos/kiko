@@ -88,7 +88,13 @@ impl std::fmt::Display for VizLogError {
     }
 }
 
-impl std::error::Error for VizLogError {}
+impl std::error::Error for VizLogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            VizLogError::Rerun(source) => Some(source),
+        }
+    }
+}
 
 impl From<rerun::RecordingStreamError> for VizLogError {
     fn from(err: rerun::RecordingStreamError) -> Self {

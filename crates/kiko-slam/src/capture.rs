@@ -154,7 +154,15 @@ impl std::fmt::Display for CaptureBundleError {
     }
 }
 
-impl std::error::Error for CaptureBundleError {}
+impl std::error::Error for CaptureBundleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CaptureBundleError::InvalidInterval(source) => Some(source),
+            CaptureBundleError::IntervalEndMismatch { .. }
+            | CaptureBundleError::ImuOutsideInterval { .. } => None,
+        }
+    }
+}
 
 impl From<CaptureIntervalError> for CaptureBundleError {
     fn from(value: CaptureIntervalError) -> Self {
@@ -268,6 +276,7 @@ impl<S: CaptureSource> Iterator for Captures<S> {
 mod tests {
     use super::*;
     use crate::{Frame, SensorId};
+    use std::error::Error as _;
 
     fn frame(sensor: SensorId, frame_id: u64, timestamp_ns: i64) -> Frame {
         Frame::new(
@@ -300,6 +309,21 @@ mod tests {
                 start_exclusive: Timestamp::from_nanos(10),
                 end_inclusive: Timestamp::from_nanos(10),
             }
+        );
+    }
+
+    #[test]
+    fn capture_bundle_error_exposes_interval_source() {
+        let start = Timestamp::from_nanos(10);
+        let source = CaptureIntervalError::NonIncreasing {
+            start_exclusive: start,
+            end_inclusive: start,
+        };
+        let error = CaptureBundleError::InvalidInterval(source);
+
+        assert_eq!(
+            error.source().expect("interval source").to_string(),
+            source.to_string()
         );
     }
 

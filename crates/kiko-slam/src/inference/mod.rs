@@ -48,7 +48,24 @@ pub enum InferenceError {
         context: &'static str,
     },
 }
-impl std::error::Error for InferenceError {}
+impl std::error::Error for InferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            InferenceError::LoadFailed { source, .. } | InferenceError::Execution(source) => {
+                Some(source)
+            }
+            InferenceError::Frame(source) => Some(source),
+            InferenceError::Downscale(source) => Some(source),
+            InferenceError::Detection(source) => Some(source),
+            InferenceError::Match(source) => Some(source),
+            InferenceError::GlobalDescriptor(source) => Some(source),
+            InferenceError::UnexpectedOutput { .. }
+            | InferenceError::BackendUnavailable { .. }
+            | InferenceError::ThreadPanic { .. }
+            | InferenceError::InvariantViolation { .. } => None,
+        }
+    }
+}
 
 impl From<OrtError> for InferenceError {
     fn from(e: OrtError) -> Self {

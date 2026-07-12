@@ -48,7 +48,14 @@ impl std::fmt::Display for OakImuError {
     }
 }
 
-impl std::error::Error for OakImuError {}
+impl std::error::Error for OakImuError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OakImuError::Sample { source, .. } => Some(source),
+            OakImuError::Batch(source) => Some(source),
+        }
+    }
+}
 
 pub fn oak_to_imu_batch(samples: Vec<oak_sys::ImuSample>) -> Result<ImuBatch, OakImuError> {
     let mut converted = Vec::with_capacity(samples.len());
@@ -70,4 +77,20 @@ pub fn oak_to_imu_batch(samples: Vec<oak_sys::ImuSample>) -> Result<ImuBatch, Oa
         converted.push(converted_sample);
     }
     ImuBatch::new(converted).map_err(OakImuError::Batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OakImuError;
+    use crate::ImuBatchError;
+    use std::error::Error as _;
+
+    #[test]
+    fn oak_imu_error_exposes_batch_source() {
+        let error = OakImuError::Batch(ImuBatchError::Empty);
+        assert_eq!(
+            error.source().expect("batch source").to_string(),
+            "imu batch must contain at least one sample"
+        );
+    }
 }

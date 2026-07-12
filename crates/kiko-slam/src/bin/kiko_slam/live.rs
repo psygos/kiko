@@ -55,7 +55,7 @@ struct LiveVizMsg {
 
 #[derive(Debug)]
 enum LiveThreadError {
-    TrackerInit { detail: String },
+    TrackerInit { source: kiko_slam::TrackerInitError },
     VizChannelDisconnected,
     FrameProcessingPanic { detail: String },
 }
@@ -63,8 +63,8 @@ enum LiveThreadError {
 impl std::fmt::Display for LiveThreadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LiveThreadError::TrackerInit { detail } => {
-                write!(f, "failed to initialize tracker: {detail}")
+            LiveThreadError::TrackerInit { source } => {
+                write!(f, "failed to initialize tracker: {source}")
             }
             LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
             LiveThreadError::FrameProcessingPanic { detail } => {
@@ -74,7 +74,15 @@ impl std::fmt::Display for LiveThreadError {
     }
 }
 
-impl std::error::Error for LiveThreadError {}
+impl std::error::Error for LiveThreadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LiveThreadError::TrackerInit { source } => Some(source),
+            LiveThreadError::VizChannelDisconnected
+            | LiveThreadError::FrameProcessingPanic { .. } => None,
+        }
+    }
+}
 
 fn drain_latest_depth(rx: &DropReceiver<DepthImage>) -> Option<DepthImage> {
     let mut latest = None;
@@ -220,9 +228,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)
-            .map_err(|err| LiveThreadError::TrackerInit {
-                detail: err.to_string(),
-            })?;
+            .map_err(|source| LiveThreadError::TrackerInit { source })?;
         let depth_rx = depth_rx;
 
         for capture in pair_rx.iter() {

@@ -548,7 +548,13 @@ impl std::fmt::Display for BackendWorkerError {
     }
 }
 
-impl std::error::Error for BackendWorkerError {}
+impl std::error::Error for BackendWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            BackendWorkerError::BuildCorrection(source) => Some(source),
+        }
+    }
+}
 
 #[derive(Debug)]
 enum BackendResponse {
@@ -596,7 +602,15 @@ impl std::fmt::Display for SubmitEventError {
     }
 }
 
-impl std::error::Error for SubmitEventError {}
+impl std::error::Error for SubmitEventError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SubmitEventError::InvalidWindow(source) => Some(source),
+            SubmitEventError::InvalidEvent(source) => Some(source),
+            SubmitEventError::QueueFull | SubmitEventError::Disconnected => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 enum ApplyCorrectionError {
@@ -636,7 +650,16 @@ impl std::fmt::Display for ApplyCorrectionError {
     }
 }
 
-impl std::error::Error for ApplyCorrectionError {}
+impl std::error::Error for ApplyCorrectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ApplyCorrectionError::Map(source) => Some(source),
+            ApplyCorrectionError::StaleVersion { .. }
+            | ApplyCorrectionError::MissingKeyframe { .. }
+            | ApplyCorrectionError::MissingMapPoint { .. } => None,
+        }
+    }
+}
 
 impl From<crate::map::MapError> for ApplyCorrectionError {
     fn from(value: crate::map::MapError) -> Self {
@@ -1121,7 +1144,22 @@ impl std::fmt::Display for TrackerError {
     }
 }
 
-impl std::error::Error for TrackerError {}
+impl std::error::Error for TrackerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TrackerError::Capture(source) => Some(source),
+            TrackerError::Inference(source) => Some(source),
+            TrackerError::Triangulation(source) => Some(source),
+            TrackerError::Pnp(source) => Some(source),
+            TrackerError::Map(source) => Some(source),
+            TrackerError::EssentialGraph(source) => Some(source),
+            TrackerError::PoseGraph(source) => Some(source),
+            #[cfg(feature = "vio")]
+            TrackerError::Vio(_) => None,
+            TrackerError::KeyframeRejected { .. } | TrackerError::InvariantViolation(_) => None,
+        }
+    }
+}
 
 impl From<CaptureBundleError> for TrackerError {
     fn from(err: CaptureBundleError) -> Self {
@@ -4607,6 +4645,7 @@ mod tests {
         CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
         SensorId, Timestamp,
     };
+    use std::error::Error as _;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
@@ -4616,6 +4655,21 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
+    }
+
+    #[test]
+    fn tracker_error_preserves_inference_domain_source_chain() {
+        let error = TrackerError::Inference(InferenceError::Frame(
+            crate::FrameError::DimensionMismatch {
+                expected: 4,
+                actual: 3,
+            },
+        ));
+
+        let inference = error.source().expect("inference source");
+        let frame = inference.source().expect("frame source");
+        assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
+        assert!(frame.source().is_none());
     }
 
     fn make_test_detections(frame_id: u64) -> Arc<Detections> {

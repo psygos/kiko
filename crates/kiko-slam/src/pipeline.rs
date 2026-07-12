@@ -82,7 +82,14 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
-impl std::error::Error for PipelineError {}
+impl std::error::Error for PipelineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PipelineError::Inference(source) => Some(source),
+            PipelineError::Viz(source) => Some(source),
+        }
+    }
+}
 
 impl From<InferenceError> for PipelineError {
     fn from(err: InferenceError) -> Self {
@@ -230,4 +237,26 @@ pub struct PipelineTimings {
     pub superpoint_right: Duration,
     pub lightglue: Duration,
     pub total: Duration,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PipelineError;
+    use crate::{FrameError, inference::InferenceError};
+    use std::error::Error as _;
+
+    #[test]
+    fn pipeline_error_exposes_inference_and_domain_sources() {
+        let error =
+            PipelineError::Inference(InferenceError::Frame(FrameError::DimensionMismatch {
+                expected: 4,
+                actual: 3,
+            }));
+
+        let inference = error.source().expect("inference source");
+        assert!(inference.to_string().contains("frame error"));
+        let frame = inference.source().expect("frame source");
+        assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
+        assert!(frame.source().is_none());
+    }
 }
