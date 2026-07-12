@@ -418,19 +418,16 @@ impl SurfaceBeliefMap {
         let mut raw_observations_integrated = 0usize;
 
         for p in points {
-            if p.position_variance <= 0.0 || !p.position_variance.is_finite() {
-                continue;
-            }
             // Transform to map frame
-            let world = math::transform_point(r, t, p.position);
+            let world = math::transform_point(r, t, p.position());
             let key = VoxelKey::from_position(world, self.inv_voxel_size);
             batch
                 .entry(key)
                 .or_insert_with(BatchVoxelAccumulator::new)
                 .add(
                     [world[0] as f64, world[1] as f64, world[2] as f64],
-                    p.position_variance as f64,
-                    p.intensity,
+                    p.position_variance() as f64,
+                    p.intensity(),
                 );
             raw_observations_integrated = raw_observations_integrated.saturating_add(1);
         }
@@ -752,12 +749,21 @@ mod tests {
             cam_from_map.translation(),
             map_point,
         );
-        StableSurfacePoint {
-            position: cam_point,
+        stable_surface_point(cam_point, intensity, position_variance)
+    }
+
+    fn stable_surface_point(
+        position: [f32; 3],
+        intensity: u8,
+        position_variance: f32,
+    ) -> StableSurfacePoint {
+        StableSurfacePoint::try_new(
+            position,
             intensity,
             position_variance,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        }
+            RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        )
+        .expect("valid stable surface point")
     }
 
     fn translated_cam_from_map(tx: f32) -> Pose {
@@ -774,12 +780,7 @@ mod tests {
     #[test]
     fn single_observation_not_confirmed() {
         let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
-        let points = vec![StableSurfacePoint {
-            position: [0.0, 0.0, 1.0],
-            intensity: 128,
-            position_variance: 0.001,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        }];
+        let points = vec![stable_surface_point([0.0, 0.0, 1.0], 128, 0.001)];
         let summary = map.integrate(&points, Pose::identity());
         assert_eq!(
             summary,
@@ -800,24 +801,9 @@ mod tests {
     fn single_batch_duplicate_points_do_not_count_as_multiple_support_views() {
         let mut map = SurfaceBeliefMap::new(SurfaceMapConfig::default());
         let points = vec![
-            StableSurfacePoint {
-                position: [0.01, 0.01, 2.0],
-                intensity: 200,
-                position_variance: 0.01,
-                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-            },
-            StableSurfacePoint {
-                position: [0.015, 0.012, 2.0],
-                intensity: 190,
-                position_variance: 0.01,
-                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-            },
-            StableSurfacePoint {
-                position: [0.012, 0.017, 2.0],
-                intensity: 210,
-                position_variance: 0.01,
-                rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-            },
+            stable_surface_point([0.01, 0.01, 2.0], 200, 0.01),
+            stable_surface_point([0.015, 0.012, 2.0], 190, 0.01),
+            stable_surface_point([0.012, 0.017, 2.0], 210, 0.01),
         ];
         let summary = map.integrate(&points, Pose::identity());
         assert_eq!(

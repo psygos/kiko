@@ -106,12 +106,77 @@ pub struct DensePoint {
 /// inconsistent correspondences without relying on ad hoc image-radius heuristics.
 #[derive(Clone, Copy, Debug)]
 pub struct StableSurfacePoint {
-    pub position: [f32; 3],
-    pub intensity: u8,
+    position: [f32; 3],
+    intensity: u8,
     /// Conservative scalar positional variance in m².
-    pub position_variance: f32,
+    position_variance: f32,
     /// Absolute vertical row mismatch on the rectified stereo pair, in pixels.
-    pub rectified_row_mismatch_px: RectifiedRowMismatchPx,
+    rectified_row_mismatch_px: RectifiedRowMismatchPx,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StableSurfacePointError {
+    NonFinitePosition { axis: usize, value: f32 },
+    InvalidPositionVariance { value: f32 },
+}
+
+impl std::fmt::Display for StableSurfacePointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinitePosition { axis, value } => write!(
+                f,
+                "stable surface position axis {axis} must be finite, got {value}"
+            ),
+            Self::InvalidPositionVariance { value } => write!(
+                f,
+                "stable surface position variance must be positive and finite, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StableSurfacePointError {}
+
+impl StableSurfacePoint {
+    pub fn try_new(
+        position: [f32; 3],
+        intensity: u8,
+        position_variance: f32,
+        rectified_row_mismatch_px: RectifiedRowMismatchPx,
+    ) -> Result<Self, StableSurfacePointError> {
+        for (axis, value) in position.into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(StableSurfacePointError::NonFinitePosition { axis, value });
+            }
+        }
+        if !position_variance.is_finite() || position_variance <= 0.0 {
+            return Err(StableSurfacePointError::InvalidPositionVariance {
+                value: position_variance,
+            });
+        }
+        Ok(Self {
+            position,
+            intensity,
+            position_variance,
+            rectified_row_mismatch_px,
+        })
+    }
+
+    pub fn position(self) -> [f32; 3] {
+        self.position
+    }
+
+    pub fn intensity(self) -> u8 {
+        self.intensity
+    }
+
+    pub fn position_variance(self) -> f32 {
+        self.position_variance
+    }
+
+    pub fn rectified_row_mismatch_px(self) -> RectifiedRowMismatchPx {
+        self.rectified_row_mismatch_px
+    }
 }
 
 /// Statistics from dense interpolated cloud generation.
@@ -375,16 +440,21 @@ pub fn generate_stable_surface_points(
             continue;
         }
 
-        points.push(StableSurfacePoint {
-            position: [x, y, z],
+        match StableSurfacePoint::try_new(
+            [x, y, z],
             intensity,
             position_variance,
-            rectified_row_mismatch_px: sample.rectified_row_mismatch_px,
-        });
+            sample.rectified_row_mismatch_px,
+        ) {
+            Ok(point) => points.push(point),
+            Err(_) => {
+                stats.dropped_uncertainty = stats.dropped_uncertainty.saturating_add(1);
+            }
+        }
     }
 
     if points.len() > config.max_points_per_keyframe {
-        points.sort_by(|a, b| a.position_variance.total_cmp(&b.position_variance));
+        points.sort_by(|a, b| a.position_variance().total_cmp(&b.position_variance()));
         points.truncate(config.max_points_per_keyframe);
         stats.points_capped = true;
     }
@@ -396,10 +466,10 @@ pub fn generate_stable_surface_points(
         let mut rectified_row_mismatch_sum_px = 0.0_f64;
         let mut rectified_row_mismatch_max_px = 0.0_f32;
         for point in &points {
-            let sigma_m = point.position_variance.sqrt();
+            let sigma_m = point.position_variance().sqrt();
             sigma_sum_m += sigma_m as f64;
             sigma_max_m = sigma_max_m.max(sigma_m);
-            let row_mismatch_px = point.rectified_row_mismatch_px.value_px();
+            let row_mismatch_px = point.rectified_row_mismatch_px().value_px();
             rectified_row_mismatch_sum_px += row_mismatch_px as f64;
             rectified_row_mismatch_max_px = rectified_row_mismatch_max_px.max(row_mismatch_px);
         }
@@ -693,6 +763,41 @@ fn edge_length(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zero_row_mismatch() -> RectifiedRowMismatchPx {
+        RectifiedRowMismatchPx::new(0.0).expect("row mismatch")
+    }
+
+    #[test]
+    fn stable_surface_point_enforces_finite_position_and_positive_variance() {
+        for axis in 0..3 {
+            let mut position = [0.0, 0.0, 1.0];
+            position[axis] = f32::NAN;
+            assert!(matches!(
+                StableSurfacePoint::try_new(position, 128, 0.01, zero_row_mismatch()),
+                Err(StableSurfacePointError::NonFinitePosition { axis: actual, .. })
+                    if actual == axis
+            ));
+        }
+        for value in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                StableSurfacePoint::try_new(
+                    [0.0, 0.0, 1.0],
+                    128,
+                    value,
+                    zero_row_mismatch(),
+                ),
+                Err(StableSurfacePointError::InvalidPositionVariance { value: actual })
+                    if actual.to_bits() == value.to_bits()
+            ));
+        }
+
+        let point = StableSurfacePoint::try_new([0.1, -0.2, 2.0], 42, 0.005, zero_row_mismatch())
+            .expect("valid point");
+        assert_eq!(point.position(), [0.1, -0.2, 2.0]);
+        assert_eq!(point.intensity(), 42);
+        assert_eq!(point.position_variance(), 0.005);
+    }
 
     #[test]
     fn delaunay_four_points_two_triangles() {

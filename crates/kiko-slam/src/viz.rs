@@ -595,7 +595,7 @@ impl RerunSink {
         let translation = map_from_cam.translation();
         let positions: Vec<[f32; 3]> = points
             .iter()
-            .map(|point| crate::math::transform_point(rotation, translation, point.position))
+            .map(|point| crate::math::transform_point(rotation, translation, point.position()))
             .collect();
         let color = if pose_gate_accepted {
             rerun::Color::from_rgb(40, 220, 180)
@@ -1473,6 +1473,16 @@ mod tests {
         surface_map::{SurfaceBatchIntegrationSummary, SurfaceMapSummary},
     };
 
+    fn stable_surface_point() -> StableSurfacePoint {
+        StableSurfacePoint::try_new(
+            [0.0, 0.0, 2.0],
+            180,
+            0.0025,
+            RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
+        )
+        .expect("stable surface point")
+    }
+
     #[test]
     fn log_frames_emits_left_and_right_view_entities() {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
@@ -1799,12 +1809,7 @@ mod tests {
             .expect("in-memory rerun stream");
         let mut sink = RerunSink::new(rec, VizDecimation::default());
         let diagnostics = FrameDiagnostics::empty(0, 0);
-        let point = StableSurfacePoint {
-            position: [0.0, 0.0, 2.0],
-            intensity: 180,
-            position_variance: 0.0025,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let point = stable_surface_point();
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
@@ -1839,12 +1844,7 @@ mod tests {
         diagnostics.ba_result = Some(crate::BaResult::Degenerate {
             reason: crate::DegenerateReason::NoFactors,
         });
-        let point = StableSurfacePoint {
-            position: [0.0, 0.0, 2.0],
-            intensity: 180,
-            position_variance: 0.0025,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let point = stable_surface_point();
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
@@ -1876,12 +1876,7 @@ mod tests {
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
             Some(crate::PnpAcceptedInlierPixelResidualMetric::new(1.0).expect("rmse"));
-        let point = StableSurfacePoint {
-            position: [0.0, 0.0, 2.0],
-            intensity: 180,
-            position_variance: 0.0025,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let point = stable_surface_point();
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
@@ -1913,12 +1908,7 @@ mod tests {
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
             Some(crate::PnpAcceptedInlierPixelResidualMetric::new(1.0).expect("rmse"));
-        let point = StableSurfacePoint {
-            position: [0.0, 0.0, 2.0],
-            intensity: 180,
-            position_variance: 0.0025,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let point = stable_surface_point();
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
@@ -1953,12 +1943,7 @@ mod tests {
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
             Some(crate::PnpAcceptedInlierPixelResidualMetric::new(1.0).expect("rmse"));
-        let point = StableSurfacePoint {
-            position: [0.0, 0.0, 2.0],
-            intensity: 180,
-            position_variance: 0.0025,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let point = stable_surface_point();
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
@@ -2039,12 +2024,7 @@ mod tests {
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
             Some(crate::PnpAcceptedInlierPixelResidualMetric::new(1.0).expect("rmse"));
-        let point = StableSurfacePoint {
-            position: [0.0, 0.0, 2.0],
-            intensity: 180,
-            position_variance: 0.0025,
-            rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
-        };
+        let point = stable_surface_point();
 
         sink.log_surface_observations(
             Timestamp::from_nanos(1),
