@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
@@ -76,6 +76,17 @@ struct ChannelStatsInner {
     max_depth: AtomicUsize,
 }
 
+#[derive(Debug)]
+struct ReceiverLease {
+    stats: Arc<ChannelStatsInner>,
+}
+
+impl Drop for ReceiverLease {
+    fn drop(&mut self) {
+        self.stats.current_depth.store(0, Ordering::Relaxed);
+    }
+}
+
 impl ChannelStatsInner {
     fn snapshot(&self) -> ChannelStats {
         ChannelStats {
@@ -128,12 +139,18 @@ impl ChannelStatsHandle {
 pub struct DropSender<T> {
     tx: Sender<T>,
     drop_rx: Receiver<T>,
+    receiver_lease: Weak<ReceiverLease>,
     policy: DropPolicy,
     stats: Arc<ChannelStatsInner>,
 }
 
 impl<T> DropSender<T> {
     pub fn try_send(&self, value: T) -> SendOutcome {
+        let Some(_receiver_lease) = self.receiver_lease.upgrade() else {
+            self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+            return SendOutcome::Disconnected;
+        };
+
         match self.tx.try_send(value) {
             Ok(()) => {
                 self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
@@ -188,6 +205,7 @@ impl<T> DropSender<T> {
 #[derive(Debug)]
 pub struct DropReceiver<T> {
     rx: Receiver<T>,
+    _lease: Arc<ReceiverLease>,
     stats: Arc<ChannelStatsInner>,
 }
 
@@ -240,15 +258,20 @@ pub fn bounded_channel<T>(
         current_depth: AtomicUsize::new(0),
         max_depth: AtomicUsize::new(0),
     });
+    let receiver_lease = Arc::new(ReceiverLease {
+        stats: Arc::clone(&stats),
+    });
     let drop_rx = rx.clone();
     let sender = DropSender {
         tx,
         drop_rx,
+        receiver_lease: Arc::downgrade(&receiver_lease),
         policy,
         stats: stats.clone(),
     };
     let receiver = DropReceiver {
         rx,
+        _lease: receiver_lease,
         stats: Arc::clone(&stats),
     };
     let handle = ChannelStatsHandle { inner: stats };
@@ -276,5 +299,21 @@ mod tests {
         let snapshot = stats.snapshot();
         assert_eq!(snapshot.current_depth, 1);
         assert_eq!(snapshot.max_depth, 2);
+    }
+
+    #[test]
+    fn sender_reports_disconnected_after_consumer_is_dropped() {
+        for policy in [DropPolicy::DropNewest, DropPolicy::DropOldest] {
+            let (tx, rx, stats) =
+                bounded_channel(ChannelCapacity::try_from(1).expect("capacity"), policy);
+            assert!(matches!(tx.try_send(1_u8), SendOutcome::Enqueued));
+
+            drop(rx);
+
+            assert!(matches!(tx.try_send(2_u8), SendOutcome::Disconnected));
+            let snapshot = stats.snapshot();
+            assert_eq!(snapshot.disconnected, 1);
+            assert_eq!(snapshot.current_depth, 0);
+        }
     }
 }
