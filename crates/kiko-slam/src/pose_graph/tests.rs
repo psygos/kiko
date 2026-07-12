@@ -211,6 +211,30 @@ fn block_csr_diagonal_extraction_returns_only_diagonal_blocks() {
 }
 
 #[test]
+fn block_csr_rejects_nonfinite_updates_transactionally() {
+    let mut h = BlockCsr6x6::new(1);
+    h.insert(0, 0, scalar_block(1.0)).expect("insert");
+    let before = h.get(0, 0).expect("existing block");
+
+    let mut nonfinite = scalar_block(1.0);
+    nonfinite[2][3] = f64::NAN;
+    let error = h
+        .add_to(0, 0, nonfinite)
+        .expect_err("non-finite update must fail");
+    assert!(matches!(
+        error,
+        super::PoseGraphError::NonFiniteCsrBlockValue {
+            row: 0,
+            col: 0,
+            block_row: 2,
+            block_col: 3,
+            ..
+        }
+    ));
+    assert_eq!(h.get(0, 0), Some(before));
+}
+
+#[test]
 fn pcg_solves_identity_in_one_iteration() {
     let mut h = BlockCsr6x6::new(2);
     h.insert(0, 0, scalar_block(1.0)).expect("insert");
@@ -225,6 +249,65 @@ fn pcg_solves_identity_in_one_iteration() {
     for i in 0..x.len() {
         assert!((x[i] - b[i]).abs() < 1e-12);
     }
+}
+
+#[test]
+fn pcg_rejects_invalid_tolerance_and_singular_preconditioner() {
+    let mut identity = BlockCsr6x6::new(1);
+    identity.insert(0, 0, scalar_block(1.0)).expect("insert");
+    let b = vec![1.0; 6];
+    let mut x = vec![0.0; 6];
+    assert!(matches!(
+        solve_pcg(&identity, &b, &mut x, 10, f64::NAN),
+        Err(super::PoseGraphError::InvalidPcgTolerance { .. })
+    ));
+    assert!(matches!(
+        solve_pcg(&identity, &b, &mut x, 10, 1.01),
+        Err(super::PoseGraphError::InvalidPcgTolerance { .. })
+    ));
+
+    let singular = BlockCsr6x6::new(1);
+    let before = x.clone();
+    let error =
+        solve_pcg(&singular, &b, &mut x, 10, 1e-6).expect_err("singular diagonal must fail");
+    assert!(matches!(
+        error,
+        super::PoseGraphError::InvalidPcgDiagonalBlock { block_index: 0 }
+    ));
+    assert_eq!(x, before);
+}
+
+#[test]
+fn pcg_rejects_asymmetric_matrix_before_mutating_solution() {
+    let mut h = BlockCsr6x6::new(2);
+    h.insert(0, 0, scalar_block(1.0)).expect("insert");
+    h.insert(1, 1, scalar_block(1.0)).expect("insert");
+    h.insert(0, 1, scalar_block(0.25)).expect("insert");
+    let b = vec![1.0; 12];
+    let mut x = vec![0.0; 12];
+    let before = x.clone();
+
+    let error =
+        solve_pcg(&h, &b, &mut x, 10, 1e-6).expect_err("asymmetric system must be rejected");
+    assert!(matches!(
+        error,
+        super::PoseGraphError::AsymmetricPcgMatrix { row: 0, col: 1, .. }
+    ));
+    assert_eq!(x, before);
+}
+
+#[test]
+fn pcg_reports_nonpositive_curvature_without_mutating_solution() {
+    let mut h = BlockCsr6x6::new(2);
+    h.insert(0, 0, scalar_block(1.0)).expect("insert");
+    h.insert(1, 1, scalar_block(1.0)).expect("insert");
+    h.insert(0, 1, scalar_block(2.0)).expect("insert");
+    h.insert(1, 0, scalar_block(2.0)).expect("insert");
+    let b = [vec![1.0; 6], vec![-1.0; 6]].concat();
+    let mut x = vec![0.0; 12];
+    let result = solve_pcg(&h, &b, &mut x, 10, 1e-6).expect("pcg outcome");
+    assert_eq!(result.stop_reason, PcgStopReason::NonPositiveCurvature);
+    assert_eq!(x, vec![0.0; 12]);
 }
 
 #[test]
@@ -491,6 +574,46 @@ fn pose_graph_optimizer_rejects_pcg_iteration_limit_without_mutating_input() {
         super::PoseGraphError::PcgDidNotConverge {
             outer_iteration: 1,
             iterations: 0,
+            stop_reason: PcgStopReason::IterationLimit,
+            ..
+        }
+    ));
+    assert_eq!(initial, before, "failed optimization mutated caller poses");
+}
+
+#[test]
+fn pose_graph_optimizer_rejects_partial_pcg_step_without_mutating_input() {
+    let gt = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        se3_exp_f64([2.0, 0.2, 0.0, 0.0, 0.03, 0.0]),
+    ];
+    let edges = vec![
+        edge(0, 1, gt[0], gt[1]),
+        edge(1, 2, gt[1], gt[2]),
+        edge(0, 2, gt[0], gt[2]),
+    ];
+    let mut initial = vec![
+        gt[0],
+        se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0]),
+        se3_exp_f64([2.8, -0.4, 0.2, 0.01, -0.04, 0.02]),
+    ];
+    let before = initial.clone();
+    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
+        max_iterations: 1,
+        pcg_max_iters: 1,
+        pcg_tol: 1e-15,
+        ..PoseGraphConfig::default()
+    });
+
+    let error = optimizer
+        .optimize(&edges, &mut initial)
+        .expect_err("partial inner solve must not be applied");
+    assert!(matches!(
+        error,
+        super::PoseGraphError::PcgDidNotConverge {
+            outer_iteration: 1,
+            iterations: 1,
             stop_reason: PcgStopReason::IterationLimit,
             ..
         }

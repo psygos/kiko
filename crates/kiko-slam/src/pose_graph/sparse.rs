@@ -1,5 +1,7 @@
 use super::PoseGraphError;
 
+const SYMMETRY_EPSILON_SCALE: f64 = 128.0;
+
 #[derive(Clone, Debug)]
 pub struct BlockCsr6x6 {
     row_ptr: Vec<usize>,
@@ -29,6 +31,7 @@ impl BlockCsr6x6 {
         block: [[f64; 6]; 6],
     ) -> Result<(), PoseGraphError> {
         self.validate_index(row, col)?;
+        Self::validate_block(row, col, &block)?;
         let Some(idx) = self.find_index(row, col) else {
             self.insert_new(row, col, block);
             return Ok(());
@@ -44,15 +47,27 @@ impl BlockCsr6x6 {
         block: [[f64; 6]; 6],
     ) -> Result<(), PoseGraphError> {
         self.validate_index(row, col)?;
+        Self::validate_block(row, col, &block)?;
         let Some(idx) = self.find_index(row, col) else {
             self.insert_new(row, col, block);
             return Ok(());
         };
+        let mut updated = self.values[idx];
         for (r, block_row) in block.iter().enumerate() {
             for (c, value) in block_row.iter().enumerate() {
-                self.values[idx][r][c] += *value;
+                updated[r][c] += *value;
+                if !updated[r][c].is_finite() {
+                    return Err(PoseGraphError::NonFiniteCsrBlockValue {
+                        row,
+                        col,
+                        block_row: r,
+                        block_col: c,
+                        value: updated[r][c],
+                    });
+                }
             }
         }
+        self.values[idx] = updated;
         Ok(())
     }
 
@@ -106,13 +121,45 @@ impl BlockCsr6x6 {
         diagonal
     }
 
+    pub(super) fn validate_symmetric(&self) -> Result<(), PoseGraphError> {
+        for row in 0..self.nrows {
+            for idx in self.row_ptr[row]..self.row_ptr[row + 1] {
+                let col = self.col_idx[idx];
+                let forward = &self.values[idx];
+                let transpose = self.get(col, row).unwrap_or([[0.0; 6]; 6]);
+                for (block_row, values) in forward.iter().enumerate() {
+                    for (block_col, value) in values.iter().copied().enumerate() {
+                        let transposed_value = transpose[block_col][block_row];
+                        let scale = value.abs().max(transposed_value.abs()).max(1.0);
+                        if (value - transposed_value).abs()
+                            > f64::EPSILON * SYMMETRY_EPSILON_SCALE * scale
+                        {
+                            return Err(PoseGraphError::AsymmetricPcgMatrix {
+                                row,
+                                col,
+                                block_row,
+                                block_col,
+                                forward: value,
+                                transpose: transposed_value,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn find_index(&self, row: usize, col: usize) -> Option<usize> {
         if row >= self.nrows || col >= self.nrows {
             return None;
         }
         let start = self.row_ptr[row];
         let end = self.row_ptr[row + 1];
-        (start..end).find(|&idx| self.col_idx[idx] == col)
+        self.col_idx[start..end]
+            .binary_search(&col)
+            .ok()
+            .map(|offset| start + offset)
     }
 
     fn insert_new(&mut self, row: usize, col: usize, block: [[f64; 6]; 6]) {
@@ -137,5 +184,22 @@ impl BlockCsr6x6 {
                 nrows: self.nrows,
             })
         }
+    }
+
+    fn validate_block(row: usize, col: usize, block: &[[f64; 6]; 6]) -> Result<(), PoseGraphError> {
+        for (block_row, values) in block.iter().enumerate() {
+            for (block_col, value) in values.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    return Err(PoseGraphError::NonFiniteCsrBlockValue {
+                        row,
+                        col,
+                        block_row,
+                        block_col,
+                        value,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 }

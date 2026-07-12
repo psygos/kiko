@@ -1,5 +1,3 @@
-/// Near-zero threshold for PCG solver denominators and Gauss-Jordan pivot magnitudes.
-const NEAR_ZERO: f64 = 1e-18;
 /// Step size for numerical Jacobian computation via central differences.
 const NUMERICAL_DIFF_EPS: f64 = 1e-6;
 /// Anchor regularization weight to remove gauge freedom in pose graph optimization.
@@ -15,6 +13,7 @@ const HUBER_NEAR_ZERO: f64 = 1e-12;
 pub enum PcgStopReason {
     Converged,
     NearZeroDenominator,
+    NonPositiveCurvature,
     NearZeroPreconditionedResidual,
     IterationLimit,
 }
@@ -41,6 +40,37 @@ pub enum PoseGraphError {
     PcgSolutionLength {
         expected: usize,
         actual: usize,
+    },
+    InvalidPcgTolerance {
+        value: f64,
+    },
+    NonFinitePcgInput {
+        input: &'static str,
+        index: usize,
+        value: f64,
+    },
+    NonFinitePcgScalar {
+        scalar: &'static str,
+        iteration: usize,
+        value: f64,
+    },
+    InvalidPcgDiagonalBlock {
+        block_index: usize,
+    },
+    NonFiniteCsrBlockValue {
+        row: usize,
+        col: usize,
+        block_row: usize,
+        block_col: usize,
+        value: f64,
+    },
+    AsymmetricPcgMatrix {
+        row: usize,
+        col: usize,
+        block_row: usize,
+        block_col: usize,
+        forward: f64,
+        transpose: f64,
     },
     EdgeFromOutOfBounds {
         from: usize,
@@ -108,6 +138,47 @@ impl std::fmt::Display for PoseGraphError {
                     "pcg solution length mismatch: expected {expected}, got {actual}"
                 )
             }
+            PoseGraphError::InvalidPcgTolerance { value } => {
+                write!(f, "pcg tolerance must be finite and in (0, 1], got {value}")
+            }
+            PoseGraphError::NonFinitePcgInput {
+                input,
+                index,
+                value,
+            } => write!(f, "pcg {input}[{index}] must be finite, got {value}"),
+            PoseGraphError::NonFinitePcgScalar {
+                scalar,
+                iteration,
+                value,
+            } => write!(
+                f,
+                "pcg {scalar} became non-finite at iteration {iteration}: {value}"
+            ),
+            PoseGraphError::InvalidPcgDiagonalBlock { block_index } => write!(
+                f,
+                "pcg diagonal block {block_index} is not finite symmetric positive definite"
+            ),
+            PoseGraphError::NonFiniteCsrBlockValue {
+                row,
+                col,
+                block_row,
+                block_col,
+                value,
+            } => write!(
+                f,
+                "csr block ({row}, {col}) contains non-finite value at ({block_row}, {block_col}): {value}"
+            ),
+            PoseGraphError::AsymmetricPcgMatrix {
+                row,
+                col,
+                block_row,
+                block_col,
+                forward,
+                transpose,
+            } => write!(
+                f,
+                "pcg matrix is asymmetric at block ({row}, {col}) element ({block_row}, {block_col}): forward={forward}, transpose={transpose}"
+            ),
             PoseGraphError::EdgeFromOutOfBounds { from, pose_count } => {
                 write!(
                     f,

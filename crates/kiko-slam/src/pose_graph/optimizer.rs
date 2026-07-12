@@ -252,7 +252,7 @@ impl PoseGraphOptimizer {
                 });
             }
             let linear_solve_converged = pcg.stop_reason == PcgStopReason::Converged;
-            if !linear_solve_converged && delta.iter().all(|value| *value == 0.0) {
+            if !linear_solve_converged {
                 return Err(PoseGraphError::PcgDidNotConverge {
                     outer_iteration: iter + 1,
                     iterations: pcg.iterations,
