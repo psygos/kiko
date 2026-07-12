@@ -4,7 +4,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use slotmap::{SlotMap, new_key_type};
 
-use crate::{CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, SensorId, Timestamp};
+use crate::{
+    CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, Pose64, Pose64Error, SensorId,
+    Timestamp,
+};
 
 /// Fixed-point scale factor for descriptor blending (8-bit precision).
 const BLEND_SCALE: u16 = 256;
@@ -153,14 +156,14 @@ impl DescriptorBlend {
 
 #[derive(Clone, Debug)]
 pub struct MapPoint {
-    position: Point3,
+    position: FiniteMapPoint,
     descriptor: CompactDescriptor,
     observations: Vec<KeyframeKeypoint>,
 }
 
 impl MapPoint {
     pub fn position(&self) -> Point3 {
-        self.position
+        self.position.get()
     }
 
     pub fn descriptor(&self) -> &CompactDescriptor {
@@ -205,8 +208,26 @@ impl MapPoint {
         }
     }
 
-    fn set_position(&mut self, pos: Point3) {
+    fn set_position(&mut self, pos: FiniteMapPoint) {
         self.position = pos;
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FiniteMapPoint(Point3);
+
+impl FiniteMapPoint {
+    fn try_new(point: Point3) -> Result<Self, MapError> {
+        for (axis, value) in [("x", point.x), ("y", point.y), ("z", point.z)] {
+            if !value.is_finite() {
+                return Err(MapError::NonFiniteMapPoint { axis, value });
+            }
+        }
+        Ok(Self(point))
+    }
+
+    fn get(self) -> Point3 {
+        self.0
     }
 }
 
@@ -393,6 +414,17 @@ pub enum MapError {
     EmptyKeyframe {
         frame_id: FrameId,
     },
+    InvalidKeypoint {
+        index: usize,
+        axis: &'static str,
+        value: f32,
+        upper_bound: u32,
+    },
+    NonFiniteMapPoint {
+        axis: &'static str,
+        value: f32,
+    },
+    InvalidPose(Pose64Error),
     SensorMismatch {
         expected: SensorId,
         actual: SensorId,
@@ -437,6 +469,19 @@ impl std::fmt::Display for MapError {
             MapError::EmptyKeyframe { frame_id } => {
                 write!(f, "keyframe {frame_id:?} has no keypoints")
             }
+            MapError::InvalidKeypoint {
+                index,
+                axis,
+                value,
+                upper_bound,
+            } => write!(
+                f,
+                "keyframe keypoint {index} has invalid {axis} coordinate {value}; expected finite value in [0, {upper_bound})"
+            ),
+            MapError::NonFiniteMapPoint { axis, value } => {
+                write!(f, "map point {axis} coordinate must be finite, got {value}")
+            }
+            MapError::InvalidPose(source) => write!(f, "invalid map pose: {source}"),
             MapError::SensorMismatch { expected, actual } => write!(
                 f,
                 "keyframe detections must be from {expected:?}, got {actual:?}"
@@ -445,7 +490,14 @@ impl std::fmt::Display for MapError {
     }
 }
 
-impl std::error::Error for MapError {}
+impl std::error::Error for MapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPose(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct MapGeneration(u64);
@@ -571,6 +623,8 @@ impl SlamMap {
         if keypoints.is_empty() {
             return Err(MapError::EmptyKeyframe { frame_id });
         }
+        validate_map_pose(pose)?;
+        validate_keypoints(&keypoints, image_size)?;
 
         let entry = KeyframeEntry {
             frame_id,
@@ -641,6 +695,8 @@ impl SlamMap {
                 existing,
             });
         }
+
+        let position = FiniteMapPoint::try_new(position)?;
 
         let point_id = self.points.insert(MapPoint {
             position,
@@ -733,6 +789,7 @@ impl SlamMap {
         point_id: MapPointId,
         position: Point3,
     ) -> Result<(), MapError> {
+        let position = FiniteMapPoint::try_new(position)?;
         let point = self
             .points
             .get_mut(point_id)
@@ -747,6 +804,7 @@ impl SlamMap {
         keyframe_id: KeyframeId,
         pose: Pose,
     ) -> Result<(), MapError> {
+        validate_map_pose(pose)?;
         let entry = self
             .keyframes
             .get_mut(keyframe_id)
@@ -1008,6 +1066,31 @@ impl SlamMap {
     pub fn keyframes(&self) -> impl Iterator<Item = (KeyframeId, &KeyframeEntry)> {
         self.keyframes.iter()
     }
+}
+
+fn validate_map_pose(pose: Pose) -> Result<(), MapError> {
+    Pose64::try_from_pose32(pose)
+        .map(|_| ())
+        .map_err(MapError::InvalidPose)
+}
+
+fn validate_keypoints(keypoints: &[Keypoint], image_size: ImageSize) -> Result<(), MapError> {
+    for (index, keypoint) in keypoints.iter().enumerate() {
+        for (axis, value, upper_bound) in [
+            ("x", keypoint.x, image_size.width()),
+            ("y", keypoint.y, image_size.height()),
+        ] {
+            if !value.is_finite() || value < 0.0 || f64::from(value) >= f64::from(upper_bound) {
+                return Err(MapError::InvalidKeypoint {
+                    index,
+                    axis,
+                    value,
+                    upper_bound,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for SlamMap {
@@ -1413,6 +1496,159 @@ mod tests {
 
     fn make_descriptor() -> CompactDescriptor {
         CompactDescriptor([128; 256])
+    }
+
+    #[test]
+    fn keyframe_construction_rejects_invalid_keypoints_without_mutation() {
+        let size = ImageSize::try_new(640, 480).expect("image size");
+        for (axis, keypoint) in [
+            (
+                "x",
+                Keypoint {
+                    x: f32::NAN,
+                    y: 1.0,
+                },
+            ),
+            ("x", Keypoint { x: 640.0, y: 1.0 }),
+            ("y", Keypoint { x: 1.0, y: -1.0 }),
+            (
+                "y",
+                Keypoint {
+                    x: 1.0,
+                    y: f32::INFINITY,
+                },
+            ),
+        ] {
+            let mut map = SlamMap::new();
+            let generation = map.generation();
+            let error = map
+                .add_keyframe(
+                    FrameId::new(1),
+                    Timestamp::from_nanos(1),
+                    Pose::identity(),
+                    size,
+                    vec![keypoint],
+                )
+                .expect_err("invalid keypoint must be rejected");
+            assert!(matches!(
+                error,
+                MapError::InvalidKeypoint {
+                    index: 0,
+                    axis: actual,
+                    ..
+                } if actual == axis
+            ));
+            assert_eq!(map.num_keyframes(), 0);
+            assert_eq!(map.generation(), generation);
+        }
+    }
+
+    #[test]
+    fn map_point_writes_reject_non_finite_positions_transactionally() {
+        let size = ImageSize::try_new(640, 480).expect("image size");
+        let mut map = SlamMap::new();
+        let keyframe = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                size,
+                make_keypoints(2),
+            )
+            .expect("keyframe");
+        let first = map.keyframe_keypoint(keyframe, 0).expect("first keypoint");
+        let generation = map.generation();
+        assert!(matches!(
+            map.add_map_point(
+                Point3 {
+                    x: f32::NAN,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                first,
+            ),
+            Err(MapError::NonFiniteMapPoint { axis: "x", .. })
+        ));
+        assert_eq!(map.num_points(), 0);
+        assert_eq!(map.generation(), generation);
+        assert_eq!(
+            map.map_point_for_keypoint(first).expect("association"),
+            None
+        );
+
+        let point_id = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                first,
+            )
+            .expect("valid point");
+        let original = map.point(point_id).expect("point").position();
+        let generation = map.generation();
+        assert!(matches!(
+            map.set_map_point_position(
+                point_id,
+                Point3 {
+                    x: 0.0,
+                    y: f32::INFINITY,
+                    z: 1.0,
+                },
+            ),
+            Err(MapError::NonFiniteMapPoint { axis: "y", .. })
+        ));
+        let stored = map.point(point_id).expect("point").position();
+        assert_eq!(
+            [stored.x, stored.y, stored.z],
+            [original.x, original.y, original.z]
+        );
+        assert_eq!(map.generation(), generation);
+    }
+
+    #[test]
+    fn map_pose_writes_reject_invalid_se3_with_source_context() {
+        let size = ImageSize::try_new(640, 480).expect("image size");
+        let invalid = Pose::from_rt(
+            [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        );
+        let mut map = SlamMap::new();
+        let error = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                invalid,
+                size,
+                make_keypoints(1),
+            )
+            .expect_err("invalid pose must be rejected");
+        assert!(matches!(error, MapError::InvalidPose(_)));
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(map.num_keyframes(), 0);
+        assert_eq!(map.generation().as_u64(), 0);
+
+        let keyframe = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                Pose::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("valid keyframe");
+        let generation = map.generation();
+        assert!(matches!(
+            map.set_keyframe_pose(keyframe, invalid),
+            Err(MapError::InvalidPose(_))
+        ));
+        let stored = map.keyframe(keyframe).expect("keyframe").pose();
+        assert_eq!(stored.rotation(), Pose::identity().rotation());
+        assert_eq!(stored.translation(), Pose::identity().translation());
+        assert_eq!(map.generation(), generation);
     }
 
     #[test]
