@@ -205,38 +205,60 @@ pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
 
 pub(super) fn run_with_slow_call_diagnostics<T>(
+    diagnostics: InferenceRunDiagnostics,
     model: &'static str,
     run: impl FnOnce() -> Result<T, InferenceError>,
 ) -> Result<T, InferenceError> {
-    let warn_ms = inference_env(crate::env::try_env_usize("KIKO_ORT_RUN_WARN_MS"))?.unwrap_or(
-        if cfg!(target_vendor = "apple") {
-            300
-        } else {
-            200
-        },
-    );
-    let timing_enabled =
-        inference_env(crate::env::try_env_bool("KIKO_INFERENCE_TIMING"))?.unwrap_or(false);
     let start = Instant::now();
     let result = run();
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    let warn_after = Duration::from_millis(warn_ms as u64);
-    if elapsed > warn_after {
+    if elapsed > diagnostics.warn_after {
         eprintln!(
-            "slow ONNX inference: model={model} elapsed_ms={elapsed_ms:.1} threshold_ms={warn_ms}",
+            "slow ONNX inference: model={model} elapsed_ms={elapsed_ms:.1} threshold_ms={}",
+            diagnostics.warn_after.as_millis(),
         );
     }
-    if timing_enabled {
+    if diagnostics.timing_enabled {
         eprintln!("inference: model={model} elapsed_ms={elapsed_ms:.1}");
     }
     result
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InferenceRunDiagnostics {
+    warn_after: Duration,
+    timing_enabled: bool,
+}
+
+impl InferenceRunDiagnostics {
+    fn try_from_env() -> Result<Self, InferenceError> {
+        let default_warn_ms = if cfg!(target_vendor = "apple") {
+            300
+        } else {
+            200
+        };
+        let warn_ms = inference_env(crate::env::try_env_usize("KIKO_ORT_RUN_WARN_MS"))?
+            .unwrap_or(default_warn_ms);
+        let warn_ms = u64::try_from(warn_ms).map_err(|_| InferenceError::InvalidSetting {
+            key: "KIKO_ORT_RUN_WARN_MS",
+            value: warn_ms.to_string(),
+            expected: "a millisecond duration within u64 range",
+        })?;
+        let timing_enabled =
+            inference_env(crate::env::try_env_bool("KIKO_INFERENCE_TIMING"))?.unwrap_or(false);
+        Ok(Self {
+            warn_after: Duration::from_millis(warn_ms),
+            timing_enabled,
+        })
+    }
+}
+
 fn build_session(
     path: &std::path::Path,
     backend: InferenceBackend,
-) -> Result<(Session, InferenceBackend), InferenceError> {
+) -> Result<(Session, InferenceBackend, InferenceRunDiagnostics), InferenceError> {
+    let diagnostics = InferenceRunDiagnostics::try_from_env()?;
     let mut builder = Session::builder().map_err(|e| InferenceError::LoadFailed {
         path: path.to_path_buf(),
         source: e,
@@ -257,7 +279,7 @@ fn build_session(
             source: e,
         })?;
 
-    Ok((session, selection.selected()))
+    Ok((session, selection.selected(), diagnostics))
 }
 
 fn apply_session_config(

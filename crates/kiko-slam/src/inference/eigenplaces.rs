@@ -6,7 +6,10 @@ use ort::value::TensorRef;
 use crate::Frame;
 use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
 
-use super::{InferenceBackend, InferenceError, PlaceDescriptorExtractor, build_session};
+use super::{
+    InferenceBackend, InferenceError, InferenceRunDiagnostics, PlaceDescriptorExtractor,
+    build_session,
+};
 
 const INPUT_SIZE: usize = 224;
 const INPUT_CHANNELS: usize = 3;
@@ -18,6 +21,7 @@ const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 pub struct EigenPlaces {
     session: Session,
     backend: InferenceBackend,
+    diagnostics: InferenceRunDiagnostics,
     scratch: Vec<f32>,
 }
 
@@ -31,10 +35,11 @@ impl EigenPlaces {
         backend: InferenceBackend,
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
-        let (session, selected) = build_session(path, backend)?;
+        let (session, selected, diagnostics) = build_session(path, backend)?;
         Ok(Self {
             session,
             backend: selected,
+            diagnostics,
             scratch: Vec::new(),
         })
     }
@@ -62,11 +67,12 @@ impl EigenPlaces {
         ))?;
 
         // EigenPlaces ONNX exports use `input` for the image tensor.
-        let outputs = super::run_with_slow_call_diagnostics("eigenplaces", || {
-            self.session
-                .run(ort::inputs!["input" => input_tensor])
-                .map_err(InferenceError::Execution)
-        })?;
+        let outputs =
+            super::run_with_slow_call_diagnostics(self.diagnostics, "eigenplaces", || {
+                self.session
+                    .run(ort::inputs!["input" => input_tensor])
+                    .map_err(InferenceError::Execution)
+            })?;
 
         let raw_descriptor = extract_single_f32_output(&outputs)?;
         parse_descriptor_output(&raw_descriptor)

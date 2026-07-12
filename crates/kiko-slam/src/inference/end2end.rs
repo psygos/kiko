@@ -1,4 +1,4 @@
-use super::{InferenceBackend, InferenceError, build_session};
+use super::{InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session};
 use crate::{Descriptor, Detections, Frame, Keypoint, Matches, Raw};
 use ort::session::Session;
 use ort::value::TensorRef;
@@ -13,6 +13,7 @@ use crate::DESCRIPTOR_DIM;
 pub struct End2EndPipeline {
     session: Session,
     backend: InferenceBackend,
+    diagnostics: InferenceRunDiagnostics,
     scratch: Vec<f32>,
 }
 
@@ -23,10 +24,11 @@ pub struct End2EndTimings {
 impl End2EndPipeline {
     pub fn new(path: impl AsRef<Path>, backend: InferenceBackend) -> Result<Self, InferenceError> {
         let path = path.as_ref();
-        let (session, selected) = build_session(path, backend)?;
+        let (session, selected, diagnostics) = build_session(path, backend)?;
         Ok(Self {
             session,
             backend: selected,
+            diagnostics,
             scratch: Vec::new(),
         })
     }
@@ -55,7 +57,7 @@ impl End2EndPipeline {
         let input_tensor = TensorRef::from_array_view(([2, 1, h, w], self.scratch.as_slice()))?;
 
         let start = Instant::now();
-        let outputs = super::run_with_slow_call_diagnostics("pipeline", || {
+        let outputs = super::run_with_slow_call_diagnostics(self.diagnostics, "pipeline", || {
             self.session
                 .run(ort::inputs!["images" => input_tensor])
                 .map_err(InferenceError::Execution)

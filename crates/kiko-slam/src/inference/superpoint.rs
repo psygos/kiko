@@ -1,4 +1,6 @@
-use super::{InferenceBackend, InferenceError, build_session, inference_env};
+use super::{
+    InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session, inference_env,
+};
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::PrimitiveTensorElementType;
@@ -13,6 +15,7 @@ use crate::DESCRIPTOR_DIM;
 pub struct SuperPoint {
     session: Session,
     backend: InferenceBackend,
+    diagnostics: InferenceRunDiagnostics,
     kind: SuperPointModelKind,
     input_kind: SuperPointInputKind,
     scratch: Vec<f32>,
@@ -51,7 +54,7 @@ impl SuperPoint {
         backend: InferenceBackend,
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
-        let (session, selected) = build_session(path, backend)?;
+        let (session, selected, diagnostics) = build_session(path, backend)?;
         let kind = if session
             .outputs()
             .iter()
@@ -85,6 +88,7 @@ impl SuperPoint {
         Ok(Self {
             session,
             backend: selected,
+            diagnostics,
             kind,
             input_kind,
             scratch: Vec::new(),
@@ -130,6 +134,7 @@ impl SuperPoint {
                     &mut self.dense_score_map,
                     max_keypoints,
                     self.dense_candidate_cap,
+                    self.diagnostics,
                 )
             }
             SuperPointInputKind::Uint8 => {
@@ -149,6 +154,7 @@ impl SuperPoint {
                     &mut self.dense_score_map,
                     max_keypoints,
                     self.dense_candidate_cap,
+                    self.diagnostics,
                 )
             }
         }
@@ -204,6 +210,7 @@ impl SuperPoint {
                     &mut self.dense_score_map,
                     max_keypoints,
                     self.dense_candidate_cap,
+                    self.diagnostics,
                 )
             }
             SuperPointInputKind::Uint8 => {
@@ -237,6 +244,7 @@ impl SuperPoint {
                     &mut self.dense_score_map,
                     max_keypoints,
                     self.dense_candidate_cap,
+                    self.diagnostics,
                 )
             }
         }
@@ -257,14 +265,21 @@ fn run_with_tensor<T>(
     dense_score_map: &mut Vec<f32>,
     max_keypoints: usize,
     dense_candidate_cap: Option<NonZeroUsize>,
+    diagnostics: InferenceRunDiagnostics,
 ) -> Result<Detections, InferenceError>
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
     match kind {
-        SuperPointModelKind::SparseOutputs => {
-            run_sparse_inference(session, frame, input_tensor, width, height, downscale)
-        }
+        SuperPointModelKind::SparseOutputs => run_sparse_inference(
+            session,
+            frame,
+            input_tensor,
+            width,
+            height,
+            downscale,
+            diagnostics,
+        ),
         SuperPointModelKind::DenseHeads => run_dense_inference(
             session,
             frame,
@@ -276,6 +291,7 @@ where
             dense_score_map,
             max_keypoints,
             dense_candidate_cap,
+            diagnostics,
         ),
     }
 }
@@ -287,11 +303,12 @@ fn run_sparse_inference<T>(
     width: u32,
     height: u32,
     downscale: Option<DownscaleFactor>,
+    diagnostics: InferenceRunDiagnostics,
 ) -> Result<Detections, InferenceError>
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
-    let outputs = super::run_with_slow_call_diagnostics("superpoint", || {
+    let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
             .run(ort::inputs!["image" => input_tensor])
             .map_err(InferenceError::Execution)
@@ -384,11 +401,12 @@ fn run_dense_inference<T>(
     dense_score_map: &mut Vec<f32>,
     max_keypoints: usize,
     dense_candidate_cap: Option<NonZeroUsize>,
+    diagnostics: InferenceRunDiagnostics,
 ) -> Result<Detections, InferenceError>
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
-    let outputs = super::run_with_slow_call_diagnostics("superpoint", || {
+    let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
             .run(ort::inputs!["image" => input_tensor])
             .map_err(InferenceError::Execution)

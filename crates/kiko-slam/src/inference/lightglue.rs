@@ -1,4 +1,4 @@
-use super::{InferenceBackend, InferenceError, build_session};
+use super::{InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session};
 use crate::DESCRIPTOR_DIM;
 use crate::Detections;
 use crate::Matches;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 pub struct LightGlue {
     session: Session,
     backend: InferenceBackend,
+    diagnostics: InferenceRunDiagnostics,
     keypoints_0: Vec<f32>,
     keypoints_1: Vec<f32>,
 }
@@ -25,11 +26,12 @@ impl LightGlue {
         backend: InferenceBackend,
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
-        let (session, selected) = build_session(path, backend)?;
+        let (session, selected, diagnostics) = build_session(path, backend)?;
 
         Ok(Self {
             session,
             backend: selected,
+            diagnostics,
             keypoints_0: Vec::new(),
             keypoints_1: Vec::new(),
         })
@@ -59,11 +61,15 @@ impl LightGlue {
         let mut indices = Vec::new();
         let mut scores = Vec::new();
         {
-            let outputs = super::run_with_slow_call_diagnostics("lightglue", || {
-                self.session
+            let outputs = super::run_with_slow_call_diagnostics(
+                self.diagnostics,
+                "lightglue",
+                || {
+                    self.session
                     .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
                     .map_err(InferenceError::Execution)
-            })?;
+                },
+            )?;
             let matches_raw = outputs
                 .get("matches0")
                 .ok_or_else(|| InferenceError::UnexpectedOutput {
