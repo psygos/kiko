@@ -1144,7 +1144,13 @@ impl std::error::Error for TrackerInitError {}
 pub enum TrackerError {
     Capture(CaptureBundleError),
     #[cfg(feature = "vio")]
-    Vio(String),
+    VioAccumulator(crate::ImuAccumulatorError),
+    #[cfg(feature = "vio")]
+    VioBatch(crate::ImuBatchError),
+    #[cfg(feature = "vio")]
+    VioState(crate::NavStateError),
+    #[cfg(feature = "vio")]
+    VioPreintegration(crate::PreintegrationError),
     Inference(InferenceError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
@@ -1169,7 +1175,17 @@ impl std::fmt::Display for TrackerError {
         match self {
             TrackerError::Capture(err) => write!(f, "capture error: {err}"),
             #[cfg(feature = "vio")]
-            TrackerError::Vio(err) => write!(f, "vio error: {err}"),
+            TrackerError::VioAccumulator(err) => {
+                write!(f, "VIO IMU accumulation error: {err}")
+            }
+            #[cfg(feature = "vio")]
+            TrackerError::VioBatch(err) => write!(f, "VIO IMU batch error: {err}"),
+            #[cfg(feature = "vio")]
+            TrackerError::VioState(err) => write!(f, "VIO navigation state error: {err}"),
+            #[cfg(feature = "vio")]
+            TrackerError::VioPreintegration(err) => {
+                write!(f, "VIO preintegration error: {err}")
+            }
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
@@ -1213,7 +1229,13 @@ impl std::error::Error for TrackerError {
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             #[cfg(feature = "vio")]
-            TrackerError::Vio(_) => None,
+            TrackerError::VioAccumulator(source) => Some(source),
+            #[cfg(feature = "vio")]
+            TrackerError::VioBatch(source) => Some(source),
+            #[cfg(feature = "vio")]
+            TrackerError::VioState(source) => Some(source),
+            #[cfg(feature = "vio")]
+            TrackerError::VioPreintegration(source) => Some(source),
             TrackerError::KeyframeRejected { .. }
             | TrackerError::InvariantViolation(_)
             | TrackerError::StaleLoopProof { .. } => None,
@@ -2271,7 +2293,7 @@ impl SlamTracker {
         };
         vio_runtime
             .set_capture_imu_interval(batch)
-            .map_err(|err| TrackerError::Vio(err.to_string()))
+            .map_err(TrackerError::VioAccumulator)
     }
 
     // --- Dead VIO methods deleted (M0 cleanup) ---
@@ -2287,16 +2309,17 @@ impl SlamTracker {
         capture_time: Timestamp,
         pose_world: Pose,
         map_observations: Vec<MapObservation>,
-    ) -> PoseRefinementProposal {
+    ) -> Result<PoseRefinementProposal, TrackerError> {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             // Visual-only mode
-            return ObservationSet::new(map_observations, self.ba.min_observations())
-                .ok()
+            let observations =
+                ObservationSet::when_sufficient(map_observations, self.ba.min_observations());
+            return Ok(observations
                 .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
                 .map_or(
                     PoseRefinementProposal::None,
                     PoseRefinementProposal::VisualBa,
-                );
+                ));
         };
 
         // Build NavState for this frame from visual pose
@@ -2309,37 +2332,32 @@ impl SlamTracker {
         let prev_vel = vio_runtime.velocity_seed(body_odom, capture_time);
         let prev_bias = vio_runtime.bias_seed();
 
-        let nav_state = match crate::NavState::try_new(body_odom, prev_vel, prev_bias.clone()) {
-            Ok(s) => s,
-            Err(_) => {
-                return ObservationSet::new(map_observations, self.ba.min_observations())
-                    .ok()
-                    .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
-                    .map_or(
-                        PoseRefinementProposal::None,
-                        PoseRefinementProposal::VisualBa,
-                    );
-            }
-        };
+        let nav_state = crate::NavState::try_new(body_odom, prev_vel, prev_bias.clone())
+            .map_err(TrackerError::VioState)?;
 
         // Preintegrate pending IMU
-        let obs_set = ObservationSet::new(map_observations, self.ba.min_observations()).ok();
+        let obs_set = ObservationSet::when_sufficient(map_observations, self.ba.min_observations());
 
-        let preintegrated = match vio_runtime.pending_imu.batch() {
-            Ok(Some(batch)) if batch.len() >= 2 => {
-                crate::PreintegratedImu::integrate(&batch, &prev_bias, &vio_runtime.noise).ok()
-            }
+        let pending_batch = vio_runtime
+            .pending_imu
+            .batch()
+            .map_err(TrackerError::VioBatch)?;
+        let preintegrated = match pending_batch {
+            Some(batch) if batch.len() >= 2 => Some(
+                crate::PreintegratedImu::integrate(&batch, &prev_bias, &vio_runtime.noise)
+                    .map_err(TrackerError::VioPreintegration)?,
+            ),
             _ => None,
         };
 
         let Some(preintegrated) = preintegrated else {
             // No IMU data — fall back to visual BA
-            return obs_set
+            return Ok(obs_set
                 .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
                 .map_or(
                     PoseRefinementProposal::None,
                     PoseRefinementProposal::VisualBa,
-                );
+                ));
         };
 
         // Build or extend the VIO window
@@ -2408,12 +2426,12 @@ impl SlamTracker {
                     );
                 }
 
-                return PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
+                return Ok(PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
                     pose_world: cam_from_map,
                     solve_result: result,
                     optimized_state: optimized,
                     optimized_window: candidate_window,
-                }));
+                })));
             }
 
             if visual_velocity_seed.is_none() {
@@ -2425,12 +2443,12 @@ impl SlamTracker {
                 vio_runtime.last_optimized_state = Some(nav_state.clone());
                 vio_runtime.predicted_state = Some(nav_state);
                 vio_runtime.pending_imu.clear();
-                return obs_set
+                return Ok(obs_set
                     .and_then(|set| self.propose_visual_ba_pose(pose_world, set))
                     .map_or(
                         PoseRefinementProposal::None,
                         PoseRefinementProposal::VisualBa,
-                    );
+                    ));
             }
             // First frame: create anchor
             let anchor = VioAnchor {
@@ -2445,12 +2463,16 @@ impl SlamTracker {
             vio_runtime.last_optimized_state = Some(nav_state.clone());
             vio_runtime.predicted_state = Some(nav_state);
             vio_runtime.pending_imu.clear();
-            return PoseRefinementProposal::None;
+            return Ok(PoseRefinementProposal::None);
         }
 
         // Build a candidate window. It only becomes authoritative if the caller
         // accepts the proposal against the visual metric on the same support.
-        let mut candidate_window = vio_runtime.vio_window.clone().unwrap();
+        let Some(mut candidate_window) = vio_runtime.vio_window.clone() else {
+            return Err(TrackerError::InvariantViolation(
+                "VIO window disappeared while building refinement proposal",
+            ));
+        };
         candidate_window.successors.push(VioSuccessor {
             synced: SyncedPose::new(nav_state.clone()),
             observations: obs_set.clone(),
@@ -2520,12 +2542,12 @@ impl SlamTracker {
             );
         }
 
-        PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
+        Ok(PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
             pose_world: cam_from_map,
             solve_result: result,
             optimized_state: optimized,
             optimized_window: candidate_window,
-        }))
+        })))
     }
 
     #[cfg(feature = "vio")]
@@ -2579,7 +2601,7 @@ impl SlamTracker {
         let body_odom =
             pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
         let observations =
-            ObservationSet::new(map_observations.to_vec(), self.ba.min_observations()).ok();
+            ObservationSet::when_sufficient(map_observations.to_vec(), self.ba.min_observations());
         vio_runtime.commit_authoritative_pose(capture_time, body_odom, observations);
     }
 
@@ -3819,14 +3841,15 @@ impl SlamTracker {
         let map_observations_for_authoritative_visual_pose = map_observations.clone();
         #[cfg(feature = "vio")]
         let refinement =
-            self.run_vio_or_visual_ba(left.timestamp(), visual_pose_world, map_observations);
+            self.run_vio_or_visual_ba(left.timestamp(), visual_pose_world, map_observations)?;
         #[cfg(not(feature = "vio"))]
-        let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
-            .ok()
-            .and_then(|set| {
-                self.ba
-                    .push_frame(self.global_map.map(), visual_pose_world, set)
-            });
+        let refined_world =
+            ObservationSet::when_sufficient(map_observations, self.ba.min_observations()).and_then(
+                |set| {
+                    self.ba
+                        .push_frame(self.global_map.map(), visual_pose_world, set)
+                },
+            );
         #[cfg(not(feature = "vio"))]
         let pose_world = refined_world.unwrap_or(visual_pose_world);
         #[cfg(not(feature = "vio"))]
@@ -4796,6 +4819,18 @@ mod tests {
         let frame = inference.source().expect("frame source");
         assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
         assert!(frame.source().is_none());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn tracker_error_preserves_vio_preintegration_source() {
+        let error =
+            TrackerError::VioPreintegration(crate::PreintegrationError::TooFewSamples { len: 1 });
+        let source = error.source().expect("preintegration source");
+        assert_eq!(
+            source.to_string(),
+            "imu preintegration requires at least 2 samples, got 1"
+        );
     }
 
     #[test]

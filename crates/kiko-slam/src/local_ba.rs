@@ -426,13 +426,21 @@ impl ObservationSet {
         observations: Vec<MapObservation>,
         min_required: NonZeroUsize,
     ) -> Result<Self, ObservationSetError> {
+        let actual = observations.len();
+        Self::when_sufficient(observations, min_required).ok_or(ObservationSetError::TooFew {
+            required: min_required.get(),
+            actual,
+        })
+    }
+
+    pub fn when_sufficient(
+        observations: Vec<MapObservation>,
+        min_required: NonZeroUsize,
+    ) -> Option<Self> {
         if observations.len() < min_required.get() {
-            return Err(ObservationSetError::TooFew {
-                required: min_required.get(),
-                actual: observations.len(),
-            });
+            return None;
         }
-        Ok(Self { observations })
+        Some(Self { observations })
     }
 
     pub fn observations(&self) -> &[MapObservation] {
@@ -2611,6 +2619,7 @@ mod tests {
     #[test]
     fn observation_set_rejects_too_few_points() {
         let min_required = NonZeroUsize::new(4).expect("nonzero");
+        assert!(ObservationSet::when_sufficient(Vec::new(), min_required).is_none());
         let err = ObservationSet::new(Vec::new(), min_required).expect_err("must reject");
         match err {
             ObservationSetError::TooFew { required, actual } => {
