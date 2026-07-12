@@ -5708,6 +5708,44 @@ mod tests {
     }
 
     #[test]
+    fn loop_closure_failure_leaves_global_map_unchanged() {
+        let (map, essential_graph, verified, query_kf, before_points) =
+            make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map, essential_graph);
+        let before_generation = global_map.map().generation();
+        let before_query_pose = global_map.keyframe(query_kf).expect("query pose").pose();
+        let before_loop_edges = global_map.essential_graph().snapshot().loop_edges;
+        let loop_manager = LoopManager::new(PoseGraphConfig {
+            max_iterations: 0,
+            ..PoseGraphConfig::default()
+        });
+
+        let error = loop_manager
+            .apply_verified_loop(&mut global_map, &verified)
+            .expect_err("iteration exhaustion must reject the loop");
+
+        assert!(matches!(
+            error,
+            TrackerError::PoseGraph(PoseGraphError::NotConverged { iterations: 0, .. })
+        ));
+        assert_eq!(global_map.map().generation(), before_generation);
+        let after_query_pose = global_map.keyframe(query_kf).expect("query pose").pose();
+        assert_eq!(after_query_pose.rotation(), before_query_pose.rotation());
+        assert_eq!(
+            after_query_pose.translation(),
+            before_query_pose.translation()
+        );
+        assert_eq!(
+            global_map.essential_graph().snapshot().loop_edges.len(),
+            before_loop_edges.len()
+        );
+        for (point_id, before) in before_points {
+            let after = global_map.point(point_id).expect("point").position();
+            assert_eq!([after.x, after.y, after.z], [before.x, before.y, before.z]);
+        }
+    }
+
+    #[test]
     fn remove_keyframe_from_graph_and_db_cleans_all_structures() {
         let (map, essential_graph, _verified, removed_kf, _before_points) =
             make_loop_closure_apply_fixture();

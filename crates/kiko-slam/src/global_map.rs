@@ -9,6 +9,7 @@ use crate::{Point3, Pose};
 use std::num::NonZeroUsize;
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) struct GlobalMap {
     map: SlamMap,
     essential_graph: EssentialGraph,

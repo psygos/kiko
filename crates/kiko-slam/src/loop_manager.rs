@@ -27,6 +27,17 @@ impl LoopManager {
         global_map: &mut GlobalMap,
         verified: &VerifiedLoop,
     ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
+        let mut candidate = global_map.clone();
+        let corrections = self.apply_verified_loop_to_candidate(&mut candidate, verified)?;
+        *global_map = candidate;
+        Ok(corrections)
+    }
+
+    fn apply_verified_loop_to_candidate(
+        &self,
+        global_map: &mut GlobalMap,
+        verified: &VerifiedLoop,
+    ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
         let (map, essential_graph) = global_map.split_mut();
         let query_kf = verified.query_kf();
         let match_kf = verified.match_kf();
