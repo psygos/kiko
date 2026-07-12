@@ -417,6 +417,31 @@ fn edge(from: usize, to: usize, from_pose: Pose64, to_pose: Pose64) -> PoseGraph
     }
 }
 
+fn optimizer_config(max_iterations: usize, pcg_max_iters: usize, pcg_tol: f64) -> PoseGraphConfig {
+    PoseGraphConfig::try_new(max_iterations, pcg_max_iters, pcg_tol, 1.0).expect("optimizer config")
+}
+
+#[test]
+fn pose_graph_config_rejects_invalid_numeric_values() {
+    for invalid in [0.0, -1.0, 1.01, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            PoseGraphConfig::try_new(20, 100, invalid, 1.0),
+            Err(super::PoseGraphConfigError::InvalidPcgTolerance { .. })
+        ));
+    }
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            PoseGraphConfig::try_new(20, 100, 1e-6, invalid),
+            Err(super::PoseGraphConfigError::InvalidHuberDelta { .. })
+        ));
+    }
+    let config = optimizer_config(7, 11, 1e-4);
+    assert_eq!(config.max_iterations(), 7);
+    assert_eq!(config.pcg_max_iters(), 11);
+    assert_eq!(config.pcg_tol(), 1e-4);
+    assert_eq!(config.huber_delta(), 1.0);
+}
+
 fn translation_error(poses: &[Pose64], target: &[Pose64]) -> f64 {
     poses
         .iter()
@@ -539,10 +564,16 @@ fn pose_graph_optimizer_reports_non_convergence() {
     ];
     let edges = vec![edge(0, 1, gt[0], gt[1])];
     let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
-    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
-        max_iterations: 0,
-        ..PoseGraphConfig::default()
-    });
+    let defaults = PoseGraphConfig::default();
+    let optimizer = PoseGraphOptimizer::new(
+        PoseGraphConfig::try_new(
+            0,
+            defaults.pcg_max_iters(),
+            defaults.pcg_tol(),
+            defaults.huber_delta(),
+        )
+        .expect("zero-iteration test config"),
+    );
     let result = optimizer
         .optimize(&edges, &mut initial)
         .expect("optimizer should return non-converged result");
@@ -559,11 +590,11 @@ fn pose_graph_optimizer_rejects_pcg_iteration_limit_without_mutating_input() {
     let edges = vec![edge(0, 1, gt[0], gt[1])];
     let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
     let before = initial.clone();
-    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
-        max_iterations: 1,
-        pcg_max_iters: 0,
-        ..PoseGraphConfig::default()
-    });
+    let defaults = PoseGraphConfig::default();
+    let optimizer = PoseGraphOptimizer::new(
+        PoseGraphConfig::try_new(1, 0, defaults.pcg_tol(), defaults.huber_delta())
+            .expect("zero-PCG-iteration test config"),
+    );
 
     let err = optimizer
         .optimize(&edges, &mut initial)
@@ -599,12 +630,7 @@ fn pose_graph_optimizer_rejects_partial_pcg_step_without_mutating_input() {
         se3_exp_f64([2.8, -0.4, 0.2, 0.01, -0.04, 0.02]),
     ];
     let before = initial.clone();
-    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
-        max_iterations: 1,
-        pcg_max_iters: 1,
-        pcg_tol: 1e-15,
-        ..PoseGraphConfig::default()
-    });
+    let optimizer = PoseGraphOptimizer::new(optimizer_config(1, 1, 1e-15));
 
     let error = optimizer
         .optimize(&edges, &mut initial)

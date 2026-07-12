@@ -6038,10 +6038,16 @@ mod tests {
         let before_generation = global_map.map().generation();
         let before_query_pose = global_map.keyframe(query_kf).expect("query pose").pose();
         let before_loop_edges = global_map.essential_graph().snapshot().loop_edges;
-        let loop_manager = LoopManager::new(PoseGraphConfig {
-            max_iterations: 0,
-            ..PoseGraphConfig::default()
-        });
+        let defaults = PoseGraphConfig::default();
+        let loop_manager = LoopManager::new(
+            PoseGraphConfig::try_new(
+                0,
+                defaults.pcg_max_iters(),
+                defaults.pcg_tol(),
+                defaults.huber_delta(),
+            )
+            .expect("zero-iteration test config"),
+        );
 
         let error = loop_manager
             .apply_verified_loop(&mut global_map, &verified)

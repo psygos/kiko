@@ -110,10 +110,71 @@ fn perturb_axis(axis: usize, magnitude: f64) -> [f64; 6] {
 
 #[derive(Clone, Copy, Debug)]
 pub struct PoseGraphConfig {
-    pub max_iterations: usize,
-    pub pcg_max_iters: usize,
-    pub pcg_tol: f64,
-    pub huber_delta: f64,
+    max_iterations: usize,
+    pcg_max_iters: usize,
+    pcg_tol: f64,
+    huber_delta: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PoseGraphConfigError {
+    InvalidPcgTolerance { value: f64 },
+    InvalidHuberDelta { value: f64 },
+}
+
+impl std::fmt::Display for PoseGraphConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPcgTolerance { value } => write!(
+                f,
+                "pose graph PCG tolerance must be finite and in (0, 1], got {value}"
+            ),
+            Self::InvalidHuberDelta { value } => write!(
+                f,
+                "pose graph Huber delta must be positive and finite, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PoseGraphConfigError {}
+
+impl PoseGraphConfig {
+    pub fn try_new(
+        max_iterations: usize,
+        pcg_max_iters: usize,
+        pcg_tol: f64,
+        huber_delta: f64,
+    ) -> Result<Self, PoseGraphConfigError> {
+        if !pcg_tol.is_finite() || pcg_tol <= 0.0 || pcg_tol > 1.0 {
+            return Err(PoseGraphConfigError::InvalidPcgTolerance { value: pcg_tol });
+        }
+        if !huber_delta.is_finite() || huber_delta <= 0.0 {
+            return Err(PoseGraphConfigError::InvalidHuberDelta { value: huber_delta });
+        }
+        Ok(Self {
+            max_iterations,
+            pcg_max_iters,
+            pcg_tol,
+            huber_delta,
+        })
+    }
+
+    pub fn max_iterations(self) -> usize {
+        self.max_iterations
+    }
+
+    pub fn pcg_max_iters(self) -> usize {
+        self.pcg_max_iters
+    }
+
+    pub fn pcg_tol(self) -> f64 {
+        self.pcg_tol
+    }
+
+    pub fn huber_delta(self) -> f64 {
+        self.huber_delta
+    }
 }
 
 impl Default for PoseGraphConfig {

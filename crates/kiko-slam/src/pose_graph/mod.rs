@@ -253,8 +253,8 @@ pub use essential::{
     PoseGraphInput,
 };
 pub use optimizer::{
-    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult, PoseGraphTermination,
-    compute_edge_error, compute_edge_jacobians,
+    PoseGraphConfig, PoseGraphConfigError, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult,
+    PoseGraphTermination, compute_edge_error, compute_edge_jacobians,
 };
 pub use solver::{PcgResult, solve_pcg};
 pub use sparse::BlockCsr6x6;
