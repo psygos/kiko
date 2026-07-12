@@ -73,6 +73,8 @@ const PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS: &str =
 const PATH_TRACKING_POSE_SOURCE: &str = "diagnostics/tracking/pose_source";
 const PATH_TRACKING_VIO_PROPOSAL_RAN: &str = "diagnostics/tracking/vio_proposal_ran";
 const PATH_TRACKING_VIO_PROPOSAL_ADOPTED: &str = "diagnostics/tracking/vio_proposal_adopted";
+const PATH_TRACKING_VIO_PROPOSAL_REJECTED_UNUSABLE_SOLVE: &str =
+    "diagnostics/tracking/vio_proposal_rejected_unusable_solve";
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_CURRENT_VIO_SUPPORT: &str =
     "diagnostics/tracking/vio_proposal_rejected_insufficient_current_vio_observation_support";
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_SHARED_SUPPORT: &str =
@@ -107,6 +109,12 @@ const PATH_VIO_FINAL_COST: &str = "diagnostics/vio/final_cost";
 const PATH_VIO_ITERATIONS: &str = "diagnostics/vio/iterations";
 #[cfg(feature = "vio")]
 const PATH_VIO_CONVERGED: &str = "diagnostics/vio/converged";
+#[cfg(feature = "vio")]
+const PATH_VIO_TERMINATION: &str = "diagnostics/vio/termination";
+#[cfg(feature = "vio")]
+const PATH_VIO_ACCEPTED_STEPS: &str = "diagnostics/vio/accepted_steps";
+#[cfg(feature = "vio")]
+const PATH_VIO_REJECTED_STEPS: &str = "diagnostics/vio/rejected_steps";
 #[cfg(feature = "vio")]
 const PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE: &str = "diagnostics/vio/calibrated_bias_prior_active";
 #[cfg(feature = "vio")]
@@ -318,6 +326,14 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
             },
         ));
         scalars.push((
+            PATH_TRACKING_VIO_PROPOSAL_REJECTED_UNUSABLE_SOLVE,
+            if v == crate::VioProposalDisposition::RejectedUnusableSolve {
+                1.0
+            } else {
+                0.0
+            },
+        ));
+        scalars.push((
             PATH_TRACKING_VIO_PROPOSAL_REJECTED_INSUFFICIENT_CURRENT_VIO_SUPPORT,
             if v == crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport
             {
@@ -398,8 +414,21 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_VIO_FINAL_COST, vio_result.final_cost));
         scalars.push((
             PATH_VIO_CONVERGED,
-            if vio_result.converged { 1.0 } else { 0.0 },
+            if vio_result.termination.is_converged() {
+                1.0
+            } else {
+                0.0
+            },
         ));
+        let termination = match vio_result.termination {
+            crate::VioSolveTermination::NotRequired => 0.0,
+            crate::VioSolveTermination::Converged { .. } => 1.0,
+            crate::VioSolveTermination::IterationLimit => 2.0,
+            crate::VioSolveTermination::StalledNoCostImprovement => 3.0,
+        };
+        scalars.push((PATH_VIO_TERMINATION, termination));
+        scalars.push((PATH_VIO_ACCEPTED_STEPS, vio_result.accepted_steps as f64));
+        scalars.push((PATH_VIO_REJECTED_STEPS, vio_result.rejected_steps as f64));
         scalars.push((
             PATH_VIO_COST_REPROJECTION,
             vio_result.cost_breakdown.reprojection_cost,
@@ -648,8 +677,6 @@ impl RerunSink {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "vio")]
-    use super::PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE;
     use super::{
         PATH_HEALTH_PNP_INLIER_RATIO, PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
@@ -667,6 +694,11 @@ mod tests {
         PATH_TRACKING_VISUAL_PROPOSAL_PROJECTABLE_ACCEPTED_INLIERS, diagnostics_scalars,
         format_event,
     };
+    #[cfg(feature = "vio")]
+    use super::{
+        PATH_VIO_ACCEPTED_STEPS, PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE, PATH_VIO_REJECTED_STEPS,
+        PATH_VIO_TERMINATION,
+    };
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
         PnpAcceptedInlierCountMetric, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
@@ -681,6 +713,8 @@ mod tests {
         VisualVsVioSharedProjectableTrackedObservationCountMetric,
         VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
     };
+    #[cfg(feature = "vio")]
+    use crate::{VioCostBreakdown, VioSolveResult, VioSolveTermination};
 
     #[test]
     fn diagnostics_scalars_empty_has_baselines() {
@@ -769,6 +803,16 @@ mod tests {
         #[cfg(feature = "vio")]
         {
             diag.vio_calibrated_bias_prior_active = Some(true);
+            diag.vio_solve_result = Some(VioSolveResult {
+                termination: VioSolveTermination::IterationLimit,
+                iterations: 3,
+                accepted_steps: 2,
+                rejected_steps: 1,
+                final_cost: 4.0,
+                cost_breakdown: VioCostBreakdown::default(),
+                last_frame_visual_residual_count: 6,
+                last_frame_translation_sigma: None,
+            });
         }
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
@@ -848,6 +892,20 @@ mod tests {
         #[cfg(feature = "vio")]
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE && (*value - 1.0).abs() < 1e-6
+        }));
+        #[cfg(feature = "vio")]
+        assert!(
+            scalars.iter().any(|(path, value)| {
+                *path == PATH_VIO_TERMINATION && (*value - 2.0).abs() < 1e-6
+            })
+        );
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_ACCEPTED_STEPS && (*value - 2.0).abs() < 1e-6
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_REJECTED_STEPS && (*value - 1.0).abs() < 1e-6
         }));
         assert!(
             scalars

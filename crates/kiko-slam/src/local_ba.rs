@@ -855,10 +855,109 @@ impl VioCostBreakdown {
 
 /// Output from a VIO BA solve. Contains the refined state for all frames.
 #[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioConvergenceCriterion {
+    StepAndRelativeCost,
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioSolveTermination {
+    NotRequired,
+    Converged { criterion: VioConvergenceCriterion },
+    IterationLimit,
+    StalledNoCostImprovement,
+}
+
+#[cfg(feature = "vio")]
+impl VioSolveTermination {
+    pub fn is_converged(self) -> bool {
+        matches!(self, Self::Converged { .. })
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+pub enum VioSolveError {
+    Observation {
+        source: ObservationResolveError,
+    },
+    LinearSolve {
+        iteration: usize,
+        source: crate::vio::solve::DenseSolveError,
+    },
+    StateRetraction {
+        iteration: usize,
+        frame_index: usize,
+        source: crate::NavStateError,
+    },
+    NonFiniteCost {
+        stage: &'static str,
+        iteration: usize,
+        value: f64,
+    },
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioSolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Observation { source } => {
+                write!(f, "VIO observation resolution failed: {source}")
+            }
+            Self::LinearSolve { iteration, source } => {
+                write!(
+                    f,
+                    "VIO linear solve failed at iteration {iteration}: {source}"
+                )
+            }
+            Self::StateRetraction {
+                iteration,
+                frame_index,
+                source,
+            } => write!(
+                f,
+                "VIO state retraction failed at iteration {iteration}, frame {frame_index}: {source}"
+            ),
+            Self::NonFiniteCost {
+                stage,
+                iteration,
+                value,
+            } => write!(
+                f,
+                "VIO {stage} cost at iteration {iteration} must be finite, got {value}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::error::Error for VioSolveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation { source } => Some(source),
+            Self::LinearSolve { source, .. } => Some(source),
+            Self::StateRetraction { source, .. } => Some(source),
+            Self::NonFiniteCost { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl From<ObservationResolveError> for VioSolveError {
+    fn from(source: ObservationResolveError) -> Self {
+        Self::Observation { source }
+    }
+}
+
+/// Output from a VIO BA solve. Contains the refined state for all frames.
+#[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub struct VioSolveResult {
-    pub converged: bool,
+    pub termination: VioSolveTermination,
     pub iterations: usize,
+    pub accepted_steps: usize,
+    pub rejected_steps: usize,
     pub final_cost: f64,
     pub cost_breakdown: VioCostBreakdown,
     pub last_frame_visual_residual_count: usize,
@@ -867,6 +966,13 @@ pub struct VioSolveResult {
     /// This is the local linearization uncertainty — not a full posterior
     /// covariance, but sufficient for weighting downstream fusion.
     pub last_frame_translation_sigma: Option<[f64; 3]>,
+}
+
+#[cfg(feature = "vio")]
+impl VioSolveResult {
+    pub fn has_improved_estimate(&self) -> bool {
+        self.accepted_steps > 0
+    }
 }
 
 /// The refined output for a single frame after VIO BA.
@@ -1744,15 +1850,17 @@ pub fn optimize_vio(
     config: &VioSolveConfig,
     map: &SlamMap,
     map_from_odom: &crate::MapFromOdom,
-) -> Result<VioSolveResult, ObservationResolveError> {
+) -> Result<VioSolveResult, VioSolveError> {
     use crate::vio::solve::solve_dense_f64;
 
     let n_frames = window.len();
     let dim = n_frames * VIO_STATE_DIM;
     if n_frames < 2 {
         return Ok(VioSolveResult {
-            converged: true,
+            termination: VioSolveTermination::NotRequired,
             iterations: 0,
+            accepted_steps: 0,
+            rejected_steps: 0,
             final_cost: 0.0,
             cost_breakdown: VioCostBreakdown::default(),
             last_frame_visual_residual_count: 0,
@@ -1777,8 +1885,17 @@ pub fn optimize_vio(
         map_from_odom,
     );
     let mut current_cost = linearization.cost_breakdown.total_cost();
-    let mut converged = false;
+    if !current_cost.is_finite() {
+        return Err(VioSolveError::NonFiniteCost {
+            stage: "initial",
+            iteration: 0,
+            value: current_cost,
+        });
+    }
+    let mut termination = None;
     let mut attempted_iterations = 0;
+    let mut accepted_steps = 0;
+    let mut rejected_steps = 0;
 
     for iteration in 0..max_iters {
         attempted_iterations = iteration + 1;
@@ -1788,29 +1905,28 @@ pub fn optimize_vio(
             h_solve[i * dim + i] += lambda;
         }
         let mut neg_g: Vec<f64> = linearization.rhs.iter().map(|v| -v).collect();
-        if !solve_dense_f64(&mut h_solve, &mut neg_g, dim) {
-            lambda *= f64::from(config.lm.lambda_factor);
-            continue;
-        }
+        solve_dense_f64(&mut h_solve, &mut neg_g, dim).map_err(|source| {
+            VioSolveError::LinearSolve {
+                iteration: attempted_iterations,
+                source,
+            }
+        })?;
         let delta = neg_g;
 
         let mut candidate_synced = Vec::with_capacity(n_frames);
-        let mut retract_ok = true;
         for (frame_idx, synced_pose) in synced.iter().enumerate() {
             let base = frame_idx * VIO_STATE_DIM;
             let mut tangent = [0.0_f64; VIO_STATE_DIM];
             tangent.copy_from_slice(&delta[base..base + VIO_STATE_DIM]);
-            match synced_pose.retract(&tangent) {
-                Ok(new_synced) => candidate_synced.push(new_synced),
-                Err(_) => {
-                    retract_ok = false;
-                    break;
-                }
-            }
-        }
-        if !retract_ok {
-            lambda *= f64::from(config.lm.lambda_factor);
-            continue;
+            let new_synced =
+                synced_pose
+                    .retract(&tangent)
+                    .map_err(|source| VioSolveError::StateRetraction {
+                        iteration: attempted_iterations,
+                        frame_index: frame_idx,
+                        source,
+                    })?;
+            candidate_synced.push(new_synced);
         }
 
         let candidate_linearization = linearize_vio_states(
@@ -1821,19 +1937,30 @@ pub fn optimize_vio(
             map_from_odom,
         );
         let candidate_cost = candidate_linearization.cost_breakdown.total_cost();
+        if !candidate_cost.is_finite() {
+            return Err(VioSolveError::NonFiniteCost {
+                stage: "candidate",
+                iteration: attempted_iterations,
+                value: candidate_cost,
+            });
+        }
         if candidate_cost < current_cost {
             let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
             let cost_decrease = current_cost - candidate_cost;
             synced = candidate_synced;
             linearization = candidate_linearization;
             current_cost = candidate_cost;
+            accepted_steps += 1;
             lambda =
                 (lambda / f64::from(config.lm.lambda_factor)).max(f64::from(config.lm.min_lambda));
             if step_norm < 1e-6 && cost_decrease < 1e-10 * current_cost.max(1e-12) {
-                converged = true;
+                termination = Some(VioSolveTermination::Converged {
+                    criterion: VioConvergenceCriterion::StepAndRelativeCost,
+                });
                 break;
             }
         } else {
+            rejected_steps += 1;
             lambda *= f64::from(config.lm.lambda_factor);
         }
     }
@@ -1845,8 +1972,14 @@ pub fn optimize_vio(
 
     let sigma = extract_last_frame_translation_sigma(&linearization.hessian, dim, n_frames);
     Ok(VioSolveResult {
-        converged,
+        termination: termination.unwrap_or(if accepted_steps == 0 && rejected_steps > 0 {
+            VioSolveTermination::StalledNoCostImprovement
+        } else {
+            VioSolveTermination::IterationLimit
+        }),
         iterations: attempted_iterations,
+        accepted_steps,
+        rejected_steps,
         final_cost: current_cost,
         cost_breakdown: linearization.cost_breakdown,
         last_frame_visual_residual_count: *linearization

@@ -1169,6 +1169,8 @@ pub enum TrackerError {
     VioState(crate::NavStateError),
     #[cfg(feature = "vio")]
     VioPreintegration(crate::PreintegrationError),
+    #[cfg(feature = "vio")]
+    VioSolve(crate::VioSolveError),
     Inference(InferenceError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
@@ -1206,6 +1208,8 @@ impl std::fmt::Display for TrackerError {
             TrackerError::VioPreintegration(err) => {
                 write!(f, "VIO preintegration error: {err}")
             }
+            #[cfg(feature = "vio")]
+            TrackerError::VioSolve(err) => write!(f, "VIO solve error: {err}"),
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
@@ -1264,6 +1268,8 @@ impl std::error::Error for TrackerError {
             TrackerError::VioState(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioPreintegration(source) => Some(source),
+            #[cfg(feature = "vio")]
+            TrackerError::VioSolve(source) => Some(source),
             TrackerError::KeyframeRejected { .. }
             | TrackerError::InvariantViolation(_)
             | TrackerError::StaleLoopProof { .. } => None,
@@ -1340,6 +1346,13 @@ impl From<crate::ObservationResolveError> for TrackerError {
 impl From<crate::BaExecutionError> for TrackerError {
     fn from(source: crate::BaExecutionError) -> Self {
         Self::BaExecution(source)
+    }
+}
+
+#[cfg(feature = "vio")]
+impl From<crate::VioSolveError> for TrackerError {
+    fn from(source: crate::VioSolveError) -> Self {
+        Self::VioSolve(source)
     }
 }
 
@@ -1686,11 +1699,14 @@ fn adaptive_tracking_ransac_config(
 
 #[cfg(feature = "vio")]
 fn decide_vio_pose_adoption(
-    current_frame_visual_residual_count: usize,
+    solve_result: &crate::VioSolveResult,
     visual_metrics: &PoseReprojectionMetrics,
     vio_metrics: &PoseReprojectionMetrics,
 ) -> crate::VioProposalDisposition {
-    if current_frame_visual_residual_count == 0 {
+    if !solve_result.has_improved_estimate() {
+        return crate::VioProposalDisposition::RejectedUnusableSolve;
+    }
+    if solve_result.last_frame_visual_residual_count == 0 {
         return crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport;
     }
     let shared = visual_metrics.shared_with(vio_metrics);
@@ -2448,9 +2464,12 @@ impl SlamTracker {
                     let delta_r =
                         (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
                     eprintln!(
-                        "vio ba: frames={} iters={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                        "vio ba: frames={} termination={:?} iters={} accepted={} rejected={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
                         candidate_window.len(),
+                        result.termination,
                         result.iterations,
+                        result.accepted_steps,
+                        result.rejected_steps,
                         result.final_cost,
                         result.cost_breakdown.reprojection_cost,
                         result.cost_breakdown.imu_cost,
@@ -2565,9 +2584,12 @@ impl SlamTracker {
             let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
             let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
             eprintln!(
-                "vio ba: frames={} iters={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                "vio ba: frames={} termination={:?} iters={} accepted={} rejected={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
                 candidate_window.len(),
+                result.termination,
                 result.iterations,
+                result.accepted_steps,
+                result.rejected_steps,
                 result.final_cost,
                 result.cost_breakdown.reprojection_cost,
                 result.cost_breakdown.imu_cost,
@@ -4001,7 +4023,7 @@ impl SlamTracker {
                     intrinsics,
                 );
                 let disposition = decide_vio_pose_adoption(
-                    proposal.solve_result.last_frame_visual_residual_count,
+                    &proposal.solve_result,
                     &visual_proposal_accepted_inlier_metrics,
                     &vio_accepted_inlier_metrics,
                 );
@@ -4885,6 +4907,22 @@ mod tests {
             source.to_string(),
             "imu preintegration requires at least 2 samples, got 1"
         );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn tracker_error_preserves_vio_linear_solve_source() {
+        let error = TrackerError::VioSolve(crate::VioSolveError::LinearSolve {
+            iteration: 2,
+            source: crate::vio::solve::DenseSolveError::Singular {
+                column: 3,
+                pivot_magnitude: 0.0,
+            },
+        });
+
+        let solve = error.source().expect("VIO solve source");
+        let linear = solve.source().expect("dense linear solver source");
+        assert!(linear.to_string().contains("singular at column 3"));
     }
 
     #[test]
@@ -6806,6 +6844,23 @@ mod tests {
     }
 
     #[cfg(feature = "vio")]
+    fn make_test_vio_solve_result(
+        last_frame_visual_residual_count: usize,
+        accepted_steps: usize,
+    ) -> crate::VioSolveResult {
+        crate::VioSolveResult {
+            termination: crate::VioSolveTermination::IterationLimit,
+            iterations: accepted_steps,
+            accepted_steps,
+            rejected_steps: 0,
+            final_cost: 1.0,
+            cost_breakdown: crate::VioCostBreakdown::default(),
+            last_frame_visual_residual_count,
+            last_frame_translation_sigma: None,
+        }
+    }
+
+    #[cfg(feature = "vio")]
     #[test]
     fn vio_pose_adoption_rejects_changed_projectable_support_even_when_counts_match() {
         let visual = PoseReprojectionMetrics::from_errors(vec![
@@ -6824,8 +6879,9 @@ mod tests {
             Some(0.1),
             Some(0.1),
         ]);
+        let solve_result = make_test_vio_solve_result(5, 1);
         assert_eq!(
-            decide_vio_pose_adoption(5, &visual, &vio),
+            decide_vio_pose_adoption(&solve_result, &visual, &vio),
             crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability
         );
     }
@@ -6837,10 +6893,26 @@ mod tests {
             PoseReprojectionMetrics::from_errors(vec![Some(1.0), Some(1.0), Some(1.0), Some(1.0)]);
         let vio =
             PoseReprojectionMetrics::from_errors(vec![Some(0.5), Some(0.5), Some(0.5), Some(0.5)]);
+        let solve_result = make_test_vio_solve_result(0, 1);
 
         assert_eq!(
-            decide_vio_pose_adoption(0, &visual, &vio),
+            decide_vio_pose_adoption(&solve_result, &visual, &vio),
             crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_pose_adoption_rejects_solve_without_an_accepted_step() {
+        let visual =
+            PoseReprojectionMetrics::from_errors(vec![Some(1.0), Some(1.0), Some(1.0), Some(1.0)]);
+        let vio =
+            PoseReprojectionMetrics::from_errors(vec![Some(0.5), Some(0.5), Some(0.5), Some(0.5)]);
+        let solve_result = make_test_vio_solve_result(4, 0);
+
+        assert_eq!(
+            decide_vio_pose_adoption(&solve_result, &visual, &vio),
+            crate::VioProposalDisposition::RejectedUnusableSolve
         );
     }
 

@@ -110,8 +110,100 @@ pub fn imu_jacobians(
 
 /// Solve a dense linear system `A x = b` via Gaussian elimination with
 /// partial pivoting. Operates in-place on `a` (row-major, `dim × dim`)
-/// and `b` (`dim`). Returns `false` if singular.
-pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> bool {
+/// and `b` (`dim`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DenseSolveError {
+    DimensionOverflow {
+        dim: usize,
+    },
+    DimensionMismatch {
+        dim: usize,
+        matrix_len: usize,
+        rhs_len: usize,
+    },
+    NonFiniteInput {
+        input: &'static str,
+        index: usize,
+        value: f64,
+    },
+    Singular {
+        column: usize,
+        pivot_magnitude: f64,
+    },
+    NonFiniteSolution {
+        index: usize,
+        value: f64,
+    },
+}
+
+impl std::fmt::Display for DenseSolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DimensionOverflow { dim } => {
+                write!(f, "dense solver dimension {dim} overflows matrix size")
+            }
+            Self::DimensionMismatch {
+                dim,
+                matrix_len,
+                rhs_len,
+            } => write!(
+                f,
+                "dense solver expected a {dim}x{dim} matrix and RHS length {dim}, got matrix length {matrix_len} and RHS length {rhs_len}"
+            ),
+            Self::NonFiniteInput {
+                input,
+                index,
+                value,
+            } => write!(
+                f,
+                "dense solver {input}[{index}] must be finite, got {value}"
+            ),
+            Self::Singular {
+                column,
+                pivot_magnitude,
+            } => write!(
+                f,
+                "dense solver is singular at column {column} (pivot magnitude {pivot_magnitude})"
+            ),
+            Self::NonFiniteSolution { index, value } => {
+                write!(f, "dense solver solution[{index}] is non-finite: {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DenseSolveError {}
+
+pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> Result<(), DenseSolveError> {
+    let matrix_len = dim
+        .checked_mul(dim)
+        .ok_or(DenseSolveError::DimensionOverflow { dim })?;
+    if a.len() != matrix_len || b.len() != dim {
+        return Err(DenseSolveError::DimensionMismatch {
+            dim,
+            matrix_len: a.len(),
+            rhs_len: b.len(),
+        });
+    }
+    for (index, &value) in a.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DenseSolveError::NonFiniteInput {
+                input: "matrix",
+                index,
+                value,
+            });
+        }
+    }
+    for (index, &value) in b.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DenseSolveError::NonFiniteInput {
+                input: "rhs",
+                index,
+                value,
+            });
+        }
+    }
+
     for col in 0..dim {
         // Partial pivoting: find max in column
         let mut max_val = a[col * dim + col].abs();
@@ -124,7 +216,10 @@ pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> bool {
             }
         }
         if max_val < 1e-15 {
-            return false;
+            return Err(DenseSolveError::Singular {
+                column: col,
+                pivot_magnitude: max_val,
+            });
         }
         // Swap rows
         if max_row != col {
@@ -154,7 +249,12 @@ pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> bool {
             b[row] -= factor * b[col];
         }
     }
-    true
+    for (index, &value) in b.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(DenseSolveError::NonFiniteSolution { index, value });
+        }
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------
@@ -373,7 +473,7 @@ mod tests {
         // => x = 1, y = 2
         let mut a = vec![2.0, 3.0, 1.0, 1.0];
         let mut b = vec![8.0, 3.0];
-        assert!(solve_dense_f64(&mut a, &mut b, 2));
+        solve_dense_f64(&mut a, &mut b, 2).expect("nonsingular system");
         assert!((b[0] - 1.0).abs() < 1e-12);
         assert!((b[1] - 2.0).abs() < 1e-12);
     }
@@ -383,6 +483,25 @@ mod tests {
     fn dense_solver_singular() {
         let mut a = vec![1.0, 2.0, 2.0, 4.0];
         let mut b = vec![3.0, 6.0];
-        assert!(!solve_dense_f64(&mut a, &mut b, 2));
+        assert!(matches!(
+            solve_dense_f64(&mut a, &mut b, 2),
+            Err(DenseSolveError::Singular { column: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn dense_solver_rejects_shape_and_nonfinite_inputs() {
+        assert!(matches!(
+            solve_dense_f64(&mut [1.0, 0.0, 1.0], &mut [1.0, 2.0], 2),
+            Err(DenseSolveError::DimensionMismatch { .. })
+        ));
+        assert!(matches!(
+            solve_dense_f64(&mut [1.0, 0.0, 0.0, f64::NAN], &mut [1.0, 2.0], 2,),
+            Err(DenseSolveError::NonFiniteInput {
+                input: "matrix",
+                index: 3,
+                ..
+            })
+        ));
     }
 }
