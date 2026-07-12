@@ -105,9 +105,9 @@ pub use local_ba::{
     VioSolveConfig, VioSolveConfigError, VioSolveResult,
 };
 pub use local_ba::{
-    BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
-    LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationResolveError,
-    ObservationSet, ObservationSetError,
+    BaCorrection, BaExecutionError, BaResult, DegenerateReason, LmConfig, LmConfigError,
+    LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation,
+    ObservationResolveError, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
     DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,

@@ -852,6 +852,47 @@ impl SlamMap {
         Ok(())
     }
 
+    pub(crate) fn apply_geometry_updates(
+        &mut self,
+        pose_updates: &[(KeyframeId, Pose)],
+        point_updates: &[(MapPointId, Point3)],
+    ) -> Result<(), MapError> {
+        for &(keyframe_id, pose) in pose_updates {
+            validate_map_pose(pose)?;
+            if !self.keyframes.contains_key(keyframe_id) {
+                return Err(MapError::KeyframeNotFound(keyframe_id));
+            }
+        }
+
+        let mut validated_points = Vec::with_capacity(point_updates.len());
+        for &(point_id, position) in point_updates {
+            let position = FiniteMapPoint::try_new(position)?;
+            if !self.points.contains_key(point_id) {
+                return Err(MapError::MapPointNotFound(point_id));
+            }
+            validated_points.push((point_id, position));
+        }
+
+        // Every fallible condition is checked above while the map is unchanged.
+        for &(keyframe_id, pose) in pose_updates {
+            let Some(entry) = self.keyframes.get_mut(keyframe_id) else {
+                return Err(MapError::KeyframeNotFound(keyframe_id));
+            };
+            entry.set_pose(pose);
+        }
+        for (point_id, position) in validated_points {
+            let Some(point) = self.points.get_mut(point_id) else {
+                return Err(MapError::MapPointNotFound(point_id));
+            };
+            point.set_position(position);
+        }
+
+        if !pose_updates.is_empty() || !point_updates.is_empty() {
+            self.bump_generation();
+        }
+        Ok(())
+    }
+
     pub fn remove_map_point(&mut self, point_id: MapPointId) -> Result<(), MapError> {
         let point = self
             .points
@@ -1686,6 +1727,65 @@ mod tests {
         let stored = map.keyframe(keyframe).expect("keyframe").pose();
         assert_eq!(stored.rotation(), Pose::identity().rotation());
         assert_eq!(stored.translation(), Pose::identity().translation());
+        assert_eq!(map.generation(), generation);
+    }
+
+    #[test]
+    fn geometry_batch_preflights_every_update_before_mutation() {
+        let size = ImageSize::try_new(640, 480).expect("image size");
+        let mut map = SlamMap::new();
+        let keyframe = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("keyframe");
+        let keypoint = map
+            .keyframe_keypoint(keyframe, 0)
+            .expect("keypoint reference");
+        let point = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                keypoint,
+            )
+            .expect("map point");
+        let generation = map.generation();
+        let updated_pose = Pose::from_rt(Pose::identity().rotation(), [1.0, 2.0, 3.0]);
+
+        let error = map
+            .apply_geometry_updates(
+                &[(keyframe, updated_pose)],
+                &[(
+                    point,
+                    Point3 {
+                        x: f32::NAN,
+                        y: 0.0,
+                        z: 1.0,
+                    },
+                )],
+            )
+            .expect_err("invalid point must reject the complete batch");
+
+        assert!(matches!(
+            error,
+            MapError::NonFiniteMapPoint { axis: "x", .. }
+        ));
+        let stored_pose = map.keyframe(keyframe).expect("keyframe").pose();
+        assert_eq!(stored_pose.rotation(), Pose::identity().rotation());
+        assert_eq!(stored_pose.translation(), Pose::identity().translation());
+        let stored_point = map.point(point).expect("point").position();
+        assert_eq!(
+            [stored_point.x, stored_point.y, stored_point.z],
+            [0.0, 0.0, 1.0]
+        );
         assert_eq!(map.generation(), generation);
     }
 

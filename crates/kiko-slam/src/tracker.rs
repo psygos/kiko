@@ -550,12 +550,16 @@ impl CorrectionEvent {
 
 #[derive(Debug)]
 enum BackendWorkerError {
+    BundleAdjustment(crate::BaExecutionError),
     BuildCorrection(CorrectionBuildError),
 }
 
 impl std::fmt::Display for BackendWorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BackendWorkerError::BundleAdjustment(err) => {
+                write!(f, "backend bundle adjustment failed: {err}")
+            }
             BackendWorkerError::BuildCorrection(err) => {
                 write!(f, "backend correction build failed: {err}")
             }
@@ -566,6 +570,7 @@ impl std::fmt::Display for BackendWorkerError {
 impl std::error::Error for BackendWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            BackendWorkerError::BundleAdjustment(source) => Some(source),
             BackendWorkerError::BuildCorrection(source) => Some(source),
         }
     }
@@ -713,8 +718,10 @@ impl BackendWorker {
                         }
                         let mut optimized_map = event.map_snapshot.clone();
                         let result = ba
-                            .optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
+                            .optimize_keyframe_window(&mut optimized_map, event.window.as_slice())
+                            .map_err(BackendWorkerError::BundleAdjustment)?;
                         CorrectionEvent::from_optimized_map(&event, &optimized_map, result)
+                            .map_err(BackendWorkerError::BuildCorrection)
                     }));
 
                     match processing {
@@ -729,12 +736,12 @@ impl BackendWorker {
                                 break;
                             }
                         }
-                        Ok(Err(err)) => {
+                        Ok(Err(error)) => {
                             if tx_resp
                                 .send(BackendResponse::Failure {
                                     request_id,
                                     source_snapshot,
-                                    error: BackendWorkerError::BuildCorrection(err),
+                                    error,
                                 })
                                 .is_err()
                             {
@@ -1172,6 +1179,7 @@ pub enum TrackerError {
     MapObservation(MapObservationError),
     DescriptorMatch(DescriptorMatchError),
     BaObservation(crate::ObservationResolveError),
+    BaExecution(crate::BaExecutionError),
     StaleLoopProof {
         proof: crate::MapSnapshot,
         current: crate::MapSnapshot,
@@ -1212,6 +1220,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::BaObservation(err) => {
                 write!(f, "bundle-adjustment observation error: {err}")
             }
+            TrackerError::BaExecution(err) => {
+                write!(f, "bundle-adjustment execution error: {err}")
+            }
             TrackerError::StaleLoopProof { proof, current } => write!(
                 f,
                 "loop proof belongs to map instance {} generation {}, but current map is instance {} generation {}",
@@ -1244,6 +1255,7 @@ impl std::error::Error for TrackerError {
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::BaObservation(source) => Some(source),
+            TrackerError::BaExecution(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioAccumulator(source) => Some(source),
             #[cfg(feature = "vio")]
@@ -1322,6 +1334,12 @@ impl From<DescriptorMatchError> for TrackerError {
 impl From<crate::ObservationResolveError> for TrackerError {
     fn from(source: crate::ObservationResolveError) -> Self {
         Self::BaObservation(source)
+    }
+}
+
+impl From<crate::BaExecutionError> for TrackerError {
+    fn from(source: crate::BaExecutionError) -> Self {
+        Self::BaExecution(source)
     }
 }
 
@@ -4139,7 +4157,7 @@ impl SlamTracker {
                                     let result = self.ba.optimize_keyframe_window(
                                         self.global_map.map_mut(),
                                         &window,
-                                    );
+                                    )?;
                                     ba_result = Some(result.clone());
                                     if matches!(
                                         result,
@@ -4151,7 +4169,7 @@ impl SlamTracker {
                                     let result = self.ba.optimize_keyframe_window(
                                         self.global_map.map_mut(),
                                         &window,
-                                    );
+                                    )?;
                                     ba_result = Some(result.clone());
                                     result
                                 },

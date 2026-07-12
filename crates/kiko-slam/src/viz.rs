@@ -1016,24 +1016,28 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. } => 1.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
+                crate::DegenerateReason::TooFewObservations { .. } => 0.0,
                 crate::DegenerateReason::NoFactors => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. } => 0.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 1.0,
+                crate::DegenerateReason::TooFewObservations { .. } => 0.0,
                 crate::DegenerateReason::NoFactors => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. } => 0.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
-                crate::DegenerateReason::NoFactors => 1.0,
+                crate::DegenerateReason::TooFewObservations { .. }
+                | crate::DegenerateReason::NoFactors => 1.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. }
                 | crate::DegenerateReason::TooFewLandmarks { .. }
+                | crate::DegenerateReason::TooFewObservations { .. }
                 | crate::DegenerateReason::NoFactors => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 1.0,
             },

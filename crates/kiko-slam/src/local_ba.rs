@@ -362,10 +362,83 @@ pub enum BaResult {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DegenerateReason {
-    TooFewPoses { count: usize },
-    TooFewLandmarks { count: usize },
+    TooFewPoses {
+        count: usize,
+    },
+    TooFewLandmarks {
+        count: usize,
+    },
+    TooFewObservations {
+        keyframe_id: KeyframeId,
+        required: usize,
+        actual: usize,
+    },
     NoFactors,
-    NonProjectableFactors { count: usize },
+    NonProjectableFactors {
+        count: usize,
+    },
+}
+
+#[derive(Debug)]
+pub enum BaExecutionError {
+    DuplicateKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    MissingKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    DuplicateLandmarkObservation {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+    },
+    MapLookup {
+        keypoint: KeyframeKeypoint,
+        source: crate::map::MapError,
+    },
+    WriteBack {
+        source: crate::map::MapError,
+    },
+}
+
+impl std::fmt::Display for BaExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DuplicateKeyframe { keyframe_id } => {
+                write!(f, "full BA window has duplicate keyframe {keyframe_id:?}")
+            }
+            Self::MissingKeyframe { keyframe_id } => {
+                write!(
+                    f,
+                    "full BA window references missing keyframe {keyframe_id:?}"
+                )
+            }
+            Self::DuplicateLandmarkObservation {
+                point_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "landmark {point_id:?} has duplicate observation in keyframe {keyframe_id:?}"
+            ),
+            Self::MapLookup { keypoint, source } => write!(
+                f,
+                "full BA failed to read keypoint {:?}:{}: {source}",
+                keypoint.keyframe_id(),
+                keypoint.index()
+            ),
+            Self::WriteBack { source } => write!(f, "full BA writeback failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for BaExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapLookup { source, .. } | Self::WriteBack { source } => Some(source),
+            Self::DuplicateKeyframe { .. }
+            | Self::MissingKeyframe { .. }
+            | Self::DuplicateLandmarkObservation { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -885,6 +958,10 @@ enum FullBaBuildError {
         point_id: MapPointId,
         keyframe_id: KeyframeId,
     },
+    MapLookup {
+        keypoint: KeyframeKeypoint,
+        source: crate::map::MapError,
+    },
     NoLandmarks,
     PoseHasTooFewObservations {
         keyframe_id: KeyframeId,
@@ -919,6 +996,12 @@ impl std::fmt::Display for FullBaBuildError {
                 f,
                 "landmark {point_id:?} has duplicate observation in keyframe {keyframe_id:?}"
             ),
+            FullBaBuildError::MapLookup { keypoint, source } => write!(
+                f,
+                "full BA failed to read keypoint {:?}:{}: {source}",
+                keypoint.keyframe_id(),
+                keypoint.index()
+            ),
             FullBaBuildError::NoLandmarks => {
                 write!(f, "full BA window has no optimizable landmarks")
             }
@@ -934,19 +1017,55 @@ impl std::fmt::Display for FullBaBuildError {
     }
 }
 
-impl std::error::Error for FullBaBuildError {}
-
-fn degenerate_reason_from_build_error(err: &FullBaBuildError) -> DegenerateReason {
-    match err {
-        FullBaBuildError::EmptyWindow => DegenerateReason::TooFewPoses { count: 0 },
-        FullBaBuildError::TooFewKeyframes { actual, .. } => {
-            DegenerateReason::TooFewPoses { count: *actual }
+impl std::error::Error for FullBaBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapLookup { source, .. } => Some(source),
+            Self::EmptyWindow
+            | Self::DuplicateKeyframe { .. }
+            | Self::MissingKeyframe { .. }
+            | Self::TooFewKeyframes { .. }
+            | Self::DuplicateLandmarkObservation { .. }
+            | Self::NoLandmarks
+            | Self::PoseHasTooFewObservations { .. } => None,
         }
-        FullBaBuildError::NoLandmarks => DegenerateReason::TooFewLandmarks { count: 0 },
-        FullBaBuildError::DuplicateKeyframe { .. }
-        | FullBaBuildError::MissingKeyframe { .. }
-        | FullBaBuildError::DuplicateLandmarkObservation { .. }
-        | FullBaBuildError::PoseHasTooFewObservations { .. } => DegenerateReason::NoFactors,
+    }
+}
+
+fn classify_full_ba_build_error(
+    err: FullBaBuildError,
+) -> Result<DegenerateReason, BaExecutionError> {
+    match err {
+        FullBaBuildError::EmptyWindow => Ok(DegenerateReason::TooFewPoses { count: 0 }),
+        FullBaBuildError::TooFewKeyframes { actual, .. } => {
+            Ok(DegenerateReason::TooFewPoses { count: actual })
+        }
+        FullBaBuildError::NoLandmarks => Ok(DegenerateReason::TooFewLandmarks { count: 0 }),
+        FullBaBuildError::PoseHasTooFewObservations {
+            keyframe_id,
+            required,
+            actual,
+        } => Ok(DegenerateReason::TooFewObservations {
+            keyframe_id,
+            required,
+            actual,
+        }),
+        FullBaBuildError::DuplicateKeyframe { keyframe_id } => {
+            Err(BaExecutionError::DuplicateKeyframe { keyframe_id })
+        }
+        FullBaBuildError::MissingKeyframe { keyframe_id } => {
+            Err(BaExecutionError::MissingKeyframe { keyframe_id })
+        }
+        FullBaBuildError::DuplicateLandmarkObservation {
+            point_id,
+            keyframe_id,
+        } => Err(BaExecutionError::DuplicateLandmarkObservation {
+            point_id,
+            keyframe_id,
+        }),
+        FullBaBuildError::MapLookup { keypoint, source } => {
+            Err(BaExecutionError::MapLookup { keypoint, source })
+        }
     }
 }
 
@@ -1054,9 +1173,12 @@ impl FullBaProblem {
                         keyframe_id: obs.keyframe_id(),
                     });
                 }
-                let Ok(pixel) = map.keypoint(obs) else {
-                    continue;
-                };
+                let pixel = map
+                    .keypoint(obs)
+                    .map_err(|source| FullBaBuildError::MapLookup {
+                        keypoint: obs,
+                        source,
+                    })?;
                 local_observations.push((pose_idx, pixel));
             }
 
@@ -1101,21 +1223,18 @@ impl FullBaProblem {
         })
     }
 
-    fn write_back(self, map: &mut SlamMap) -> bool {
-        for pose in &self.poses {
-            if map.set_keyframe_pose(pose.keyframe_id, pose.pose).is_err() {
-                return false;
-            }
-        }
-        for landmark in &self.landmarks {
-            if map
-                .set_map_point_position(landmark.point_id, landmark.position)
-                .is_err()
-            {
-                return false;
-            }
-        }
-        true
+    fn write_back(&self, map: &mut SlamMap) -> Result<(), crate::map::MapError> {
+        let pose_updates = self
+            .poses
+            .iter()
+            .map(|pose| (pose.keyframe_id, pose.pose))
+            .collect::<Vec<_>>();
+        let point_updates = self
+            .landmarks
+            .iter()
+            .map(|landmark| (landmark.point_id, landmark.position))
+            .collect::<Vec<_>>();
+        map.apply_geometry_updates(&pose_updates, &point_updates)
     }
 }
 
@@ -1238,7 +1357,7 @@ impl LocalBundleAdjuster {
         &mut self,
         map: &mut SlamMap,
         window: &[KeyframeId],
-    ) -> BaResult {
+    ) -> Result<BaResult, BaExecutionError> {
         let mut problem = match FullBaProblem::try_from_map(
             map,
             window,
@@ -1247,9 +1366,8 @@ impl LocalBundleAdjuster {
         ) {
             Ok(problem) => problem,
             Err(err) => {
-                return BaResult::Degenerate {
-                    reason: degenerate_reason_from_build_error(&err),
-                };
+                return classify_full_ba_build_error(err)
+                    .map(|reason| BaResult::Degenerate { reason });
             }
         };
 
@@ -1257,14 +1375,13 @@ impl LocalBundleAdjuster {
         if matches!(
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-        ) && !problem.write_back(map)
-        {
-            return BaResult::Degenerate {
-                reason: DegenerateReason::NoFactors,
-            };
+        ) {
+            problem
+                .write_back(map)
+                .map_err(|source| BaExecutionError::WriteBack { source })?;
         }
 
-        result
+        Ok(result)
     }
 
     fn optimize(&mut self, resolved: &[ResolvedObservationSet]) -> bool {
@@ -3317,7 +3434,9 @@ mod tests {
 
         let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
-        let result = ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]);
+        let result = ba
+            .optimize_keyframe_window(&mut map, &[kf_0, kf_1])
+            .expect("full local BA execution");
         assert!(
             matches!(
                 result,
@@ -3338,6 +3457,25 @@ mod tests {
             after_landmark_err < before_landmark_err,
             "landmark error did not improve: before={before_landmark_err}, after={after_landmark_err}"
         );
+    }
+
+    #[test]
+    fn optimize_keyframe_window_reports_duplicate_ids_as_execution_error() {
+        let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let before = map.snapshot();
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+
+        let error = ba
+            .optimize_keyframe_window(&mut map, &[keyframe_id, keyframe_id])
+            .expect_err("duplicate keyframes are structural errors");
+
+        assert!(matches!(
+            error,
+            BaExecutionError::DuplicateKeyframe { keyframe_id: actual }
+                if actual == keyframe_id
+        ));
+        assert_eq!(map.snapshot(), before);
     }
 
     #[cfg(feature = "vio")]
