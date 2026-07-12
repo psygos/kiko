@@ -86,6 +86,7 @@ pub fn rerun_recording(
 
 #[cfg(test)]
 mod tests {
+    use super::args::PrefetchSession;
     use super::bench::{BenchAccum, summarize_bench};
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
     use super::{Cli, Command};
@@ -99,6 +100,17 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn prefetch_session_distinguishes_ready_from_not_applicable() {
+        let ready = PrefetchSession::Ready(42_u8);
+        assert!(ready.is_ready());
+        assert_eq!(ready.into_option(), Some(42));
+
+        let not_applicable = PrefetchSession::<u8>::NotApplicable;
+        assert!(!not_applicable.is_ready());
+        assert_eq!(not_applicable.into_option(), None);
     }
 
     fn set_env(key: &str, value: &str) {

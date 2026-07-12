@@ -5,7 +5,7 @@ use clap::Args;
 use kiko_slam::InferencePipeline;
 use kiko_slam::dataset::DatasetReader;
 
-use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig};
+use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose};
 
 #[derive(Args, Clone, Debug)]
 #[command(about = "Benchmark inference pipeline throughput")]
@@ -209,7 +209,7 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count
     );
 
-    let inference = InferenceConfig::from_args(&args.inference)?;
+    let inference = InferenceConfig::from_args(&args.inference, InferencePurpose::Benchmark)?;
     let max_keypoints = inference.key_limit.get();
     let mut end2end_pipeline = inference.end2end;
     let mut pipeline: Option<InferencePipeline> = if end2end_pipeline.is_none() {
@@ -220,7 +220,7 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 inference.key_limit,
             )
             .with_downscale(inference.downscale)
-            .with_stereo_superpoint_opt(inference.superpoint_right),
+            .with_stereo_superpoint_opt(inference.superpoint_right.into_option()),
         )
     } else {
         None

@@ -8,7 +8,9 @@ use kiko_slam::{
 };
 use kiko_slam::{ProjectedMatcherConfig, TrackingMatcher};
 
-use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RerunArgs, RunProfileArg};
+use crate::args::{
+    DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RunProfileArg,
+};
 use crate::config::{TrackerDefaults, TrackerOverrides, build_tracker_config_with_overrides};
 use crate::rerun_recording;
 
@@ -154,7 +156,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let inference_args = args.inference.with_profile_defaults(args.profile)?;
-    let inference = InferenceConfig::from_args(&inference_args)?;
+    let inference = InferenceConfig::from_args(&inference_args, InferencePurpose::Slam)?;
 
     let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
     let dense_cloud_enabled = kiko_slam::env::env_bool("KIKO_DENSE_CLOUD").unwrap_or(false);
@@ -191,6 +193,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         key_limit,
         downscale,
     } = inference;
+    let superpoint_right = superpoint_right.into_option();
+    let lightglue_prefetch = lightglue_prefetch.into_option();
 
     let tracker_config = build_tracker_config_with_overrides(
         TrackerDefaults {

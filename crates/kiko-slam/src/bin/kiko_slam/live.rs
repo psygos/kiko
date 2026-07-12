@@ -19,7 +19,7 @@ use oak_sys::{
     DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig,
 };
 
-use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, RerunArgs};
+use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs};
 use crate::config::{TrackerDefaults, build_tracker_config};
 use crate::record::{
     build_calibration, load_oak_read_timeout_ms, load_pairer_max_pending_per_side,
@@ -191,13 +191,25 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         (None, None, None)
     };
 
-    let inference = InferenceConfig::from_args(&args.inference)?;
+    let inference = InferenceConfig::from_args(&args.inference, InferencePurpose::Slam)?;
     let InferenceConfig {
         superpoint,
+        superpoint_right,
         lightglue,
+        lightglue_prefetch,
+        end2end,
         key_limit,
         downscale,
     } = inference;
+    if end2end.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--pipeline-model is not supported by live SLAM",
+        )
+        .into());
+    }
+    let superpoint_right = superpoint_right.into_option();
+    let lightglue_prefetch = lightglue_prefetch.into_option();
 
     let dataset_calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config)?;
     let dataset_calibration =
@@ -226,6 +238,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         key_limit,
         downscale,
     )?;
+    let use_speculative_lg = tracker_config.tracking_matcher.uses_speculative_lightglue();
 
     eprintln!(
         "live: pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
@@ -240,6 +253,12 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)
             .map_err(|source| LiveThreadError::TrackerInit { source })?;
+        if let Some(sp_right) = superpoint_right {
+            tracker.return_prefetch_sp(sp_right);
+        }
+        if let Some(lg_prefetch) = lightglue_prefetch.filter(|_| use_speculative_lg) {
+            tracker.return_prefetch_lg(lg_prefetch);
+        }
         let depth_rx = depth_rx;
 
         for capture in pair_rx.iter() {

@@ -8,7 +8,7 @@ use std::sync::Arc;
 mod ort_compat;
 
 pub use inference::{
-    EigenPlaces, End2EndPipeline, End2EndTimings, InferenceBackend, LightGlue,
+    EigenPlaces, End2EndPipeline, End2EndTimings, InferenceBackend, InferenceError, LightGlue,
     PlaceDescriptorExtractor, SuperPoint,
 };
 mod calibration;

@@ -196,16 +196,83 @@ impl From<BackendArg> for InferenceBackend {
 
 pub struct InferenceConfig {
     pub superpoint: SuperPoint,
-    pub superpoint_right: Option<SuperPoint>,
+    pub superpoint_right: PrefetchSession<SuperPoint>,
     pub lightglue: LightGlue,
-    pub lightglue_prefetch: Option<LightGlue>,
+    pub lightglue_prefetch: PrefetchSession<LightGlue>,
     pub end2end: Option<End2EndPipeline>,
     pub key_limit: KeypointLimit,
     pub downscale: DownscaleFactor,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferencePurpose {
+    Benchmark,
+    Slam,
+    Visualization,
+}
+
+impl InferencePurpose {
+    fn allows_end_to_end(self) -> bool {
+        matches!(self, Self::Benchmark)
+    }
+
+    fn uses_speculative_lightglue(self) -> bool {
+        matches!(self, Self::Slam)
+    }
+}
+
+pub enum PrefetchSession<T> {
+    Ready(T),
+    NotApplicable,
+    Unavailable {
+        component: &'static str,
+        source: kiko_slam::InferenceError,
+    },
+}
+
+impl<T> PrefetchSession<T> {
+    fn from_result(component: &'static str, result: Result<T, kiko_slam::InferenceError>) -> Self {
+        match result {
+            Ok(session) => Self::Ready(session),
+            Err(source) => Self::Unavailable { component, source },
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    pub fn into_option(self) -> Option<T> {
+        match self {
+            Self::Ready(session) => Some(session),
+            Self::NotApplicable => None,
+            Self::Unavailable { component, source } => {
+                eprintln!(
+                    "inference prefetch unavailable: component={component}; continuing sequentially: {source}"
+                );
+                let mut nested = std::error::Error::source(&source);
+                while let Some(cause) = nested {
+                    eprintln!("  caused by: {cause}");
+                    nested = cause.source();
+                }
+                None
+            }
+        }
+    }
+}
+
 impl InferenceConfig {
-    pub fn from_args(args: &InferenceArgs) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_args(
+        args: &InferenceArgs,
+        purpose: InferencePurpose,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if args.pipeline_model.is_some() && !purpose.allows_end_to_end() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--pipeline-model is supported only by the benchmark command",
+            )
+            .into());
+        }
         let default_backend = args
             .backend
             .map(InferenceBackend::from)
@@ -242,15 +309,21 @@ impl InferenceConfig {
 
         let superpoint = SuperPoint::new_with_backend(&sp_path, superpoint_backend)?;
         let superpoint_right = if end2end.is_none() {
-            SuperPoint::new_with_backend(&sp_path, superpoint_backend).ok()
+            PrefetchSession::from_result(
+                "stereo_superpoint",
+                SuperPoint::new_with_backend(&sp_path, superpoint_backend),
+            )
         } else {
-            None
+            PrefetchSession::NotApplicable
         };
         let lightglue = LightGlue::new_with_backend(&lg_path, lightglue_backend)?;
-        let lightglue_prefetch = if end2end.is_none() {
-            LightGlue::new_with_backend(&lg_path, lightglue_backend).ok()
+        let lightglue_prefetch = if end2end.is_none() && purpose.uses_speculative_lightglue() {
+            PrefetchSession::from_result(
+                "speculative_lightglue",
+                LightGlue::new_with_backend(&lg_path, lightglue_backend),
+            )
         } else {
-            None
+            PrefetchSession::NotApplicable
         };
 
         eprintln!(
@@ -260,7 +333,7 @@ impl InferenceConfig {
         );
         if end2end.is_some() {
             eprintln!("end-to-end pipeline: enabled (SP+LG fused, single call)");
-        } else if superpoint_right.is_some() {
+        } else if superpoint_right.is_ready() {
             eprintln!("parallel stereo superpoint: enabled");
         }
 
@@ -280,13 +353,20 @@ impl InferenceConfig {
         })
     }
 
-    pub fn into_pipeline(self) -> InferencePipeline {
+    pub fn into_pipeline(self) -> Result<InferencePipeline, Box<dyn std::error::Error>> {
+        if self.end2end.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "end-to-end inference cannot be converted to the standard inference pipeline",
+            )
+            .into());
+        }
         let mut pipeline = InferencePipeline::new(self.superpoint, self.lightglue, self.key_limit)
             .with_downscale(self.downscale);
-        if let Some(sp_right) = self.superpoint_right {
+        if let Some(sp_right) = self.superpoint_right.into_option() {
             pipeline = pipeline.with_stereo_superpoint(sp_right);
         }
-        pipeline
+        Ok(pipeline)
     }
 }
 

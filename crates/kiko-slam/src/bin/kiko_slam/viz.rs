@@ -7,7 +7,7 @@ use kiko_slam::{
     RectifiedStereo, RerunSink, TriangulationConfig, TriangulationError, Triangulator,
 };
 
-use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RerunArgs};
+use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs};
 use crate::rerun_recording;
 
 #[derive(Args, Clone, Debug)]
@@ -31,7 +31,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count
     );
 
-    let inference = InferenceConfig::from_args(&args.inference)?;
+    let inference = InferenceConfig::from_args(&args.inference, InferencePurpose::Visualization)?;
 
     let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
@@ -44,7 +44,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut pipeline = inference.into_pipeline();
+    let mut pipeline = inference.into_pipeline()?;
 
     let start = Instant::now();
     let mut attempted = 0usize;
