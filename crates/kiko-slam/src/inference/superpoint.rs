@@ -1,10 +1,11 @@
-use super::{InferenceBackend, InferenceError, build_session};
+use super::{InferenceBackend, InferenceError, build_session, inference_env};
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
 use ort::session::Session;
 use ort::value::PrimitiveTensorElementType;
 use ort::value::TensorElementType;
 use ort::value::TensorRef;
 use ort::value::ValueType;
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 use crate::DESCRIPTOR_DIM;
@@ -18,6 +19,7 @@ pub struct SuperPoint {
     scratch_u8: Vec<u8>,
     candidates: Vec<DenseCandidate>,
     dense_score_map: Vec<f32>,
+    dense_candidate_cap: Option<NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +72,16 @@ impl SuperPoint {
             }) => SuperPointInputKind::Uint8,
             _ => SuperPointInputKind::Float32,
         };
+        let dense_candidate_cap =
+            inference_env(crate::env::try_env_usize("KIKO_SUPERPOINT_DENSE_CAP"))?
+                .map(|value| {
+                    NonZeroUsize::new(value).ok_or_else(|| InferenceError::InvalidSetting {
+                        key: "KIKO_SUPERPOINT_DENSE_CAP",
+                        value: value.to_string(),
+                        expected: "an integer greater than zero",
+                    })
+                })
+                .transpose()?;
         Ok(Self {
             session,
             backend: selected,
@@ -79,6 +91,7 @@ impl SuperPoint {
             scratch_u8: Vec::new(),
             candidates: Vec::new(),
             dense_score_map: Vec::new(),
+            dense_candidate_cap,
         })
     }
 
@@ -116,6 +129,7 @@ impl SuperPoint {
                     &mut self.candidates,
                     &mut self.dense_score_map,
                     max_keypoints,
+                    self.dense_candidate_cap,
                 )
             }
             SuperPointInputKind::Uint8 => {
@@ -134,6 +148,7 @@ impl SuperPoint {
                     &mut self.candidates,
                     &mut self.dense_score_map,
                     max_keypoints,
+                    self.dense_candidate_cap,
                 )
             }
         }
@@ -188,6 +203,7 @@ impl SuperPoint {
                     &mut self.candidates,
                     &mut self.dense_score_map,
                     max_keypoints,
+                    self.dense_candidate_cap,
                 )
             }
             SuperPointInputKind::Uint8 => {
@@ -220,6 +236,7 @@ impl SuperPoint {
                     &mut self.candidates,
                     &mut self.dense_score_map,
                     max_keypoints,
+                    self.dense_candidate_cap,
                 )
             }
         }
@@ -239,6 +256,7 @@ fn run_with_tensor<T>(
     candidates: &mut Vec<DenseCandidate>,
     dense_score_map: &mut Vec<f32>,
     max_keypoints: usize,
+    dense_candidate_cap: Option<NonZeroUsize>,
 ) -> Result<Detections, InferenceError>
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
@@ -257,6 +275,7 @@ where
             candidates,
             dense_score_map,
             max_keypoints,
+            dense_candidate_cap,
         ),
     }
 }
@@ -272,7 +291,7 @@ fn run_sparse_inference<T>(
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
-    let outputs = super::run_with_watchdog("superpoint", || {
+    let outputs = super::run_with_slow_call_diagnostics("superpoint", || {
         session
             .run(ort::inputs!["image" => input_tensor])
             .map_err(InferenceError::Execution)
@@ -364,11 +383,12 @@ fn run_dense_inference<T>(
     candidates: &mut Vec<DenseCandidate>,
     dense_score_map: &mut Vec<f32>,
     max_keypoints: usize,
+    dense_candidate_cap: Option<NonZeroUsize>,
 ) -> Result<Detections, InferenceError>
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
-    let outputs = super::run_with_watchdog("superpoint", || {
+    let outputs = super::run_with_slow_call_diagnostics("superpoint", || {
         session
             .run(ort::inputs!["image" => input_tensor])
             .map_err(InferenceError::Execution)
@@ -410,8 +430,10 @@ where
     } else {
         max_keypoints
     };
-    let cap = crate::env::env_usize("KIKO_SUPERPOINT_DENSE_CAP").unwrap_or(default_cap);
-    let cap = cap.min(default_cap);
+    let cap = dense_candidate_cap
+        .map(NonZeroUsize::get)
+        .unwrap_or(default_cap)
+        .min(default_cap);
     sort_and_cap_candidates(candidates, cap);
 
     let mut keypoints = Vec::with_capacity(candidates.len());

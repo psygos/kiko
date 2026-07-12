@@ -11,8 +11,6 @@ mod lightglue;
 mod place;
 mod superpoint;
 
-use crate::env::{env_bool, env_usize};
-
 pub use backend::InferenceBackend;
 pub use eigenplaces::EigenPlaces;
 pub use end2end::{End2EndPipeline, End2EndTimings};
@@ -35,6 +33,16 @@ pub enum InferenceError {
     BackendUnavailable {
         requested: InferenceBackend,
         selected: InferenceBackend,
+    },
+    Environment(crate::env::EnvError),
+    InvalidSetting {
+        key: &'static str,
+        value: String,
+        expected: &'static str,
+    },
+    CacheDirectory {
+        path: PathBuf,
+        source: std::io::Error,
     },
     Frame(crate::FrameError),
     Downscale(crate::DownscaleError),
@@ -59,8 +67,11 @@ impl std::error::Error for InferenceError {
             InferenceError::Detection(source) => Some(source),
             InferenceError::Match(source) => Some(source),
             InferenceError::GlobalDescriptor(source) => Some(source),
+            InferenceError::Environment(source) => Some(source),
+            InferenceError::CacheDirectory { source, .. } => Some(source),
             InferenceError::UnexpectedOutput { .. }
             | InferenceError::BackendUnavailable { .. }
+            | InferenceError::InvalidSetting { .. }
             | InferenceError::ThreadPanic { .. }
             | InferenceError::InvariantViolation { .. } => None,
         }
@@ -127,6 +138,22 @@ impl std::fmt::Display for InferenceError {
                 f,
                 "requested inference backend {requested:?} but selected {selected:?}"
             ),
+            InferenceError::Environment(err) => {
+                write!(f, "inference environment error: {err}")
+            }
+            InferenceError::InvalidSetting {
+                key,
+                value,
+                expected,
+            } => write!(
+                f,
+                "invalid inference setting {key}={value:?}; expected {expected}"
+            ),
+            InferenceError::CacheDirectory { path, source } => write!(
+                f,
+                "failed to create TensorRT cache directory {}: {source}",
+                path.display()
+            ),
             InferenceError::Frame(err) => write!(f, "frame error: {err}"),
             InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
             InferenceError::Detection(err) => write!(f, "detection error: {err}"),
@@ -177,26 +204,30 @@ pub(super) fn output_record_count(
 pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
 
-pub(super) fn run_with_watchdog<T>(
+pub(super) fn run_with_slow_call_diagnostics<T>(
     model: &'static str,
     run: impl FnOnce() -> Result<T, InferenceError>,
 ) -> Result<T, InferenceError> {
+    let warn_ms = inference_env(crate::env::try_env_usize("KIKO_ORT_RUN_WARN_MS"))?.unwrap_or(
+        if cfg!(target_vendor = "apple") {
+            300
+        } else {
+            200
+        },
+    );
+    let timing_enabled =
+        inference_env(crate::env::try_env_bool("KIKO_INFERENCE_TIMING"))?.unwrap_or(false);
     let start = Instant::now();
     let result = run();
     let elapsed = start.elapsed();
     let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
-    let warn_ms = env_usize("KIKO_ORT_RUN_WARN_MS").unwrap_or(if cfg!(target_vendor = "apple") {
-        300
-    } else {
-        200
-    });
     let warn_after = Duration::from_millis(warn_ms as u64);
     if elapsed > warn_after {
         eprintln!(
             "slow ONNX inference: model={model} elapsed_ms={elapsed_ms:.1} threshold_ms={warn_ms}",
         );
     }
-    if env_bool("KIKO_INFERENCE_TIMING").unwrap_or(false) {
+    if timing_enabled {
         eprintln!("inference: model={model} elapsed_ms={elapsed_ms:.1}");
     }
     result
@@ -240,11 +271,28 @@ fn apply_session_config(
         InferenceBackend::Cpu => (cores / 2).max(1),
         _ => 1,
     };
-    let intra = env_usize("KIKO_ORT_INTRA_THREADS").unwrap_or(default_intra);
-    let inter = env_usize("KIKO_ORT_INTER_THREADS").unwrap_or(1);
-    let opt_level = env_opt_level("KIKO_ORT_OPT_LEVEL").unwrap_or(GraphOptimizationLevel::Level3);
-    let mem_pattern = env_bool("KIKO_ORT_MEM_PATTERN").unwrap_or(true);
-    let parallel_exec = env_bool("KIKO_ORT_PARALLEL_EXEC").unwrap_or(false);
+    let intra = inference_env(crate::env::try_env_usize("KIKO_ORT_INTRA_THREADS"))?
+        .unwrap_or(default_intra);
+    let inter = inference_env(crate::env::try_env_usize("KIKO_ORT_INTER_THREADS"))?.unwrap_or(1);
+    if intra == 0 {
+        return Err(invalid_setting(
+            "KIKO_ORT_INTRA_THREADS",
+            intra,
+            "an integer greater than zero",
+        ));
+    }
+    if inter == 0 {
+        return Err(invalid_setting(
+            "KIKO_ORT_INTER_THREADS",
+            inter,
+            "an integer greater than zero",
+        ));
+    }
+    let opt_level = env_opt_level("KIKO_ORT_OPT_LEVEL")?.unwrap_or(GraphOptimizationLevel::Level3);
+    let mem_pattern =
+        inference_env(crate::env::try_env_bool("KIKO_ORT_MEM_PATTERN"))?.unwrap_or(true);
+    let parallel_exec =
+        inference_env(crate::env::try_env_bool("KIKO_ORT_PARALLEL_EXEC"))?.unwrap_or(false);
 
     builder
         .with_optimization_level(opt_level)
@@ -255,23 +303,51 @@ fn apply_session_config(
         .map_err(|err| InferenceError::Execution(err.into()))
 }
 
-fn env_opt_level(key: &str) -> Option<GraphOptimizationLevel> {
-    let raw = std::env::var(key).ok()?;
+fn env_opt_level(key: &'static str) -> Result<Option<GraphOptimizationLevel>, InferenceError> {
+    let Some(raw) = inference_env(crate::env::try_env_string(key))? else {
+        return Ok(None);
+    };
+    parse_opt_level(key, raw).map(Some)
+}
+
+fn parse_opt_level(
+    key: &'static str,
+    raw: String,
+) -> Result<GraphOptimizationLevel, InferenceError> {
     match raw.trim().to_lowercase().as_str() {
-        "disable" | "0" => Some(GraphOptimizationLevel::Disable),
-        "1" | "level1" | "basic" => Some(GraphOptimizationLevel::Level1),
-        "2" | "level2" | "extended" => Some(GraphOptimizationLevel::Level2),
-        "3" | "level3" | "all" => Some(GraphOptimizationLevel::Level3),
-        _ => {
-            eprintln!("invalid {key}={raw}, ignoring");
-            None
-        }
+        "disable" | "0" => Ok(GraphOptimizationLevel::Disable),
+        "1" | "level1" | "basic" => Ok(GraphOptimizationLevel::Level1),
+        "2" | "level2" | "extended" => Ok(GraphOptimizationLevel::Level2),
+        "3" | "level3" | "all" => Ok(GraphOptimizationLevel::Level3),
+        _ => Err(InferenceError::InvalidSetting {
+            key,
+            value: raw,
+            expected: "disable, 0, 1/level1/basic, 2/level2/extended, or 3/level3/all",
+        }),
+    }
+}
+
+pub(super) fn inference_env<T>(
+    result: Result<Option<T>, crate::env::EnvError>,
+) -> Result<Option<T>, InferenceError> {
+    result.map_err(InferenceError::Environment)
+}
+
+fn invalid_setting(
+    key: &'static str,
+    value: impl ToString,
+    expected: &'static str,
+) -> InferenceError {
+    InferenceError::InvalidSetting {
+        key,
+        value: value.to_string(),
+        expected,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InferenceError, output_record_count, require_output_elements};
+    use super::{InferenceError, output_record_count, parse_opt_level, require_output_elements};
 
     #[test]
     fn required_output_elements_rejects_truncated_tensors() {
@@ -286,6 +362,18 @@ mod tests {
                 && actual == "1 elements"
         ));
         assert!(require_output_elements("mscores0", 2, 2).is_ok());
+    }
+
+    #[test]
+    fn optimization_level_parser_rejects_unknown_values() {
+        assert!(matches!(
+            parse_opt_level("KIKO_ORT_OPT_LEVEL", "fastest".to_string()),
+            Err(InferenceError::InvalidSetting {
+                key: "KIKO_ORT_OPT_LEVEL",
+                value,
+                ..
+            }) if value == "fastest"
+        ));
     }
 
     #[test]

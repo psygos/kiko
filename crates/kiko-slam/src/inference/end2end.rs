@@ -55,7 +55,7 @@ impl End2EndPipeline {
         let input_tensor = TensorRef::from_array_view(([2, 1, h, w], self.scratch.as_slice()))?;
 
         let start = Instant::now();
-        let outputs = super::run_with_watchdog("pipeline", || {
+        let outputs = super::run_with_slow_call_diagnostics("pipeline", || {
             self.session
                 .run(ort::inputs!["images" => input_tensor])
                 .map_err(InferenceError::Execution)

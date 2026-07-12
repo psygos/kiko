@@ -1,13 +1,13 @@
 use std::fs;
-
-use crate::env::env_bool;
+#[cfg(feature = "ort-tensorrt")]
+use std::path::PathBuf;
 
 use ort::execution_providers::CPUExecutionProvider;
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::execution_providers::ExecutionProvider;
 use ort::execution_providers::ExecutionProviderDispatch;
 
-use super::InferenceError;
+use super::{InferenceError, inference_env};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InferenceBackend {
@@ -99,14 +99,16 @@ pub(crate) fn select_backend(
         selected = InferenceBackend::Cpu;
     }
 
-    let use_cpu_arena = env_bool("KIKO_ORT_CPU_ARENA").unwrap_or(true);
+    let use_cpu_arena =
+        inference_env(crate::env::try_env_bool("KIKO_ORT_CPU_ARENA"))?.unwrap_or(true);
     providers.push(
         CPUExecutionProvider::default()
             .with_arena_allocator(use_cpu_arena)
             .build(),
     );
 
-    let allow_fallback = env_bool("KIKO_ALLOW_BACKEND_FALLBACK").unwrap_or(false);
+    let allow_fallback =
+        inference_env(crate::env::try_env_bool("KIKO_ALLOW_BACKEND_FALLBACK"))?.unwrap_or(false);
     validate_backend_selection(requested, desired, selected, allow_fallback, is_jetson())?;
 
     Ok(BackendSelection {
@@ -208,19 +210,26 @@ fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> 
         } else {
             "exhaustive"
         };
-        let conv_search = match std::env::var("KIKO_CUDA_CONV_SEARCH")
-            .unwrap_or_else(|_| default_conv_search.to_string())
-            .trim()
-            .to_lowercase()
-            .as_str()
-        {
+        let conv_search_raw = inference_env(crate::env::try_env_string("KIKO_CUDA_CONV_SEARCH"))?
+            .unwrap_or_else(|| default_conv_search.to_string());
+        let conv_search = match conv_search_raw.trim().to_lowercase().as_str() {
             "heuristic" => ort::execution_providers::cuda::ConvAlgorithmSearch::Heuristic,
             "default" => ort::execution_providers::cuda::ConvAlgorithmSearch::Default,
-            _ => ort::execution_providers::cuda::ConvAlgorithmSearch::Exhaustive,
+            "exhaustive" => ort::execution_providers::cuda::ConvAlgorithmSearch::Exhaustive,
+            _ => {
+                return Err(InferenceError::InvalidSetting {
+                    key: "KIKO_CUDA_CONV_SEARCH",
+                    value: conv_search_raw,
+                    expected: "heuristic, default, or exhaustive",
+                });
+            }
         };
-        let prefer_nhwc = env_bool("KIKO_CUDA_PREFER_NHWC").unwrap_or(false);
-        let fuse_conv_bias = env_bool("KIKO_CUDA_FUSE_CONV_BIAS").unwrap_or(false);
-        let cuda_graph = env_bool("KIKO_CUDA_GRAPH").unwrap_or(false);
+        let prefer_nhwc =
+            inference_env(crate::env::try_env_bool("KIKO_CUDA_PREFER_NHWC"))?.unwrap_or(false);
+        let fuse_conv_bias =
+            inference_env(crate::env::try_env_bool("KIKO_CUDA_FUSE_CONV_BIAS"))?.unwrap_or(false);
+        let cuda_graph =
+            inference_env(crate::env::try_env_bool("KIKO_CUDA_GRAPH"))?.unwrap_or(false);
         let ep = CUDAExecutionProvider::default()
             .with_conv_algorithm_search(conv_search)
             .with_conv_max_workspace(true)
@@ -249,12 +258,21 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
     {
         use ort::execution_providers::TensorRTExecutionProvider;
 
-        let cache_dir = std::env::var("KIKO_TRT_CACHE_DIR")
-            .unwrap_or_else(|_| "/home/makerspace/.cache/kiko-trt-engines".to_string());
-        let _ = std::fs::create_dir_all(&cache_dir);
-        let dump_subgraphs = env_bool("KIKO_TRT_DUMP_SUBGRAPHS").unwrap_or(false);
-        let detailed_build_log = env_bool("KIKO_TRT_DETAILED_BUILD_LOG").unwrap_or(false);
-        let cuda_graph = env_bool("KIKO_TRT_CUDA_GRAPH").unwrap_or(false);
+        let cache_dir = PathBuf::from(
+            inference_env(crate::env::try_env_string("KIKO_TRT_CACHE_DIR"))?
+                .unwrap_or_else(|| "/home/makerspace/.cache/kiko-trt-engines".to_string()),
+        );
+        std::fs::create_dir_all(&cache_dir).map_err(|source| InferenceError::CacheDirectory {
+            path: cache_dir.clone(),
+            source,
+        })?;
+        let dump_subgraphs =
+            inference_env(crate::env::try_env_bool("KIKO_TRT_DUMP_SUBGRAPHS"))?.unwrap_or(false);
+        let detailed_build_log =
+            inference_env(crate::env::try_env_bool("KIKO_TRT_DETAILED_BUILD_LOG"))?
+                .unwrap_or(false);
+        let cuda_graph =
+            inference_env(crate::env::try_env_bool("KIKO_TRT_CUDA_GRAPH"))?.unwrap_or(false);
 
         let ep = TensorRTExecutionProvider::default()
             .with_fp16(true)

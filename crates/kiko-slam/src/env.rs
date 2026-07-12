@@ -56,6 +56,10 @@ fn raw_env(key: &'static str) -> Result<Option<String>, EnvError> {
     }
 }
 
+pub fn try_env_string(key: &'static str) -> Result<Option<String>, EnvError> {
+    raw_env(key)
+}
+
 pub fn try_env_usize(key: &'static str) -> Result<Option<usize>, EnvError> {
     let Some(value) = raw_env(key)? else {
         return Ok(None);

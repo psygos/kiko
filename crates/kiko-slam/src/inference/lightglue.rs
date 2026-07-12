@@ -59,7 +59,7 @@ impl LightGlue {
         let mut indices = Vec::new();
         let mut scores = Vec::new();
         {
-            let outputs = super::run_with_watchdog("lightglue", || {
+            let outputs = super::run_with_slow_call_diagnostics("lightglue", || {
                 self.session
                     .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
                     .map_err(InferenceError::Execution)
