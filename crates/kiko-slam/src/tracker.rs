@@ -933,6 +933,39 @@ impl BackendSupervisor {
 }
 
 #[derive(Debug)]
+enum BackendSubsystem {
+    Disabled,
+    Configured(BackendSupervisor),
+}
+
+impl BackendSubsystem {
+    fn supervisor(&self) -> Option<&BackendSupervisor> {
+        match self {
+            Self::Configured(supervisor) => Some(supervisor),
+            Self::Disabled => None,
+        }
+    }
+
+    fn supervisor_mut(&mut self) -> Option<&mut BackendSupervisor> {
+        match self {
+            Self::Configured(supervisor) => Some(supervisor),
+            Self::Disabled => None,
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        matches!(self, Self::Configured(_))
+    }
+
+    fn health_flags(&self) -> (bool, bool) {
+        match self {
+            Self::Disabled => (false, false),
+            Self::Configured(supervisor) => (true, supervisor.has_worker()),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum KeyframePolicyError {
     ZeroInliers,
     NonPositiveParallax { value: f32 },
@@ -1945,7 +1978,7 @@ pub struct SlamTracker {
     global_map: GlobalMap,
     loop_manager: LoopManager,
     map_version: MapVersion,
-    backend: Option<BackendSupervisor>,
+    backend: BackendSubsystem,
     backend_stats: BackendStats,
     place_recognition: Option<PlaceRecognition>,
     pending_events: Vec<DiagnosticEvent>,
@@ -2029,14 +2062,16 @@ impl SlamTracker {
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(DEFAULT_MAX_RESPAWNS);
-        let backend = config.backend.map(|backend_cfg| {
-            BackendSupervisor::spawn_with_max_respawns(
-                backend_cfg,
-                intrinsics,
-                config.ba,
-                backend_max_respawns,
-            )
-        });
+        let backend = config
+            .backend
+            .map_or(BackendSubsystem::Disabled, |backend_cfg| {
+                BackendSubsystem::Configured(BackendSupervisor::spawn_with_max_respawns(
+                    backend_cfg,
+                    intrinsics,
+                    config.ba,
+                    backend_max_respawns,
+                ))
+            });
         let loop_config = config.loop_closure_config();
         let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
@@ -2545,11 +2580,7 @@ impl SlamTracker {
     }
 
     pub fn system_health(&self) -> SystemHealth {
-        let backend_expected = self.backend.is_some();
-        let backend_alive = self
-            .backend
-            .as_ref()
-            .is_none_or(BackendSupervisor::has_worker);
+        let (backend_expected, backend_alive) = self.backend.health_flags();
         let descriptor_expected = self.place_recognition.is_some();
         let descriptor_alive = self
             .place_recognition
@@ -2890,7 +2921,7 @@ impl SlamTracker {
         trigger_keyframe: KeyframeId,
         window_ids: Vec<KeyframeId>,
     ) -> Result<(), SubmitEventError> {
-        let Some(supervisor) = self.backend.as_mut() else {
+        let Some(supervisor) = self.backend.supervisor_mut() else {
             return Err(SubmitEventError::Disconnected);
         };
 
@@ -2915,7 +2946,7 @@ impl SlamTracker {
     fn drain_backend_responses(&mut self) {
         loop {
             let response = {
-                let Some(supervisor) = self.backend.as_mut() else {
+                let Some(supervisor) = self.backend.supervisor_mut() else {
                     return;
                 };
                 let response = supervisor.try_recv();
@@ -2985,7 +3016,7 @@ impl SlamTracker {
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
                     self.map_version = self.map_version.next();
-                    if let Some(supervisor) = self.backend.as_mut() {
+                    if let Some(supervisor) = self.backend.supervisor_mut() {
                         supervisor.check_health();
                         self.backend_stats.respawn_count = supervisor.respawn_count();
                     }
@@ -3999,7 +4030,7 @@ impl SlamTracker {
                             .global_map
                             .covisible_window(keyframe_id, self.ba.window_size())?;
                         if window.len() >= 2 {
-                            if self.backend.is_some() {
+                            if self.backend.is_configured() {
                                 if let Err(err) =
                                     self.submit_backend_event(keyframe_id, window.clone())
                                 {
@@ -4013,14 +4044,9 @@ impl SlamTracker {
                                                 .backend_stats
                                                 .dropped_disconnected
                                                 .saturating_add(1);
-                                            if let Some(supervisor) = self.backend.as_ref() {
+                                            if let Some(supervisor) = self.backend.supervisor() {
                                                 self.backend_stats.respawn_count =
                                                     supervisor.respawn_count();
-                                                if !supervisor.has_worker() {
-                                                    self.backend = None;
-                                                }
-                                            } else {
-                                                self.backend = None;
                                             }
                                         }
                                         SubmitEventError::InvalidWindow(_)
@@ -5435,6 +5461,17 @@ mod tests {
 
         assert_eq!(supervisor.respawn_count(), 1);
         assert!(!supervisor.has_worker());
+
+        let backend = BackendSubsystem::Configured(supervisor);
+        assert_eq!(backend.health_flags(), (true, false));
+        assert!(backend.is_configured());
+    }
+
+    #[test]
+    fn disabled_backend_remains_distinct_from_configured_failure() {
+        let backend = BackendSubsystem::Disabled;
+        assert_eq!(backend.health_flags(), (false, false));
+        assert!(!backend.is_configured());
     }
 
     #[test]
