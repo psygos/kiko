@@ -14,19 +14,56 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub struct DenseCloudConfig {
     /// Generate a point every Nth pixel within each triangle.
-    pub subsample: u32,
+    subsample: u32,
     /// Reject triangle if `(max_d - min_d) / min_d > this`.
-    pub max_disparity_gradient: f32,
+    max_disparity_gradient: f32,
     /// Minimum disparity for valid back-projection.
-    pub min_disparity_px: f32,
+    min_disparity_px: f32,
     /// Reject triangle if any edge exceeds this length in pixels.
-    pub max_edge_length_px: f32,
+    max_edge_length_px: f32,
     /// Reject triangle if area exceeds this in pixels².
-    pub max_triangle_area_px2: f32,
+    max_triangle_area_px2: f32,
     /// Reject observations whose conservative positional sigma exceeds this threshold.
-    pub max_observation_std_dev_m: f32,
+    max_observation_std_dev_m: f32,
     /// Hard cap on output points per keyframe. When exceeded, the most stable points are kept.
-    pub max_points_per_keyframe: usize,
+    max_points_per_keyframe: usize,
+}
+
+#[derive(Debug)]
+pub enum DenseCloudConfigError {
+    Environment { source: crate::env::EnvError },
+    ZeroSubsample,
+    SubsampleOutOfRange { value: usize },
+    InvalidPositiveField { field: &'static str, value: f32 },
+    ZeroMaxPoints,
+}
+
+impl std::fmt::Display for DenseCloudConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment { source } => write!(f, "dense cloud environment error: {source}"),
+            Self::ZeroSubsample => write!(f, "dense cloud subsample must be greater than zero"),
+            Self::SubsampleOutOfRange { value } => {
+                write!(f, "dense cloud subsample {value} exceeds u32 range")
+            }
+            Self::InvalidPositiveField { field, value } => write!(
+                f,
+                "dense cloud {field} must be positive and finite, got {value}"
+            ),
+            Self::ZeroMaxPoints => {
+                write!(f, "dense cloud maximum points must be greater than zero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DenseCloudConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Environment { source } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 impl Default for DenseCloudConfig {
@@ -44,29 +81,102 @@ impl Default for DenseCloudConfig {
 }
 
 impl DenseCloudConfig {
-    pub fn from_env() -> Self {
-        let mut c = Self::default();
-        if let Some(v) = crate::env::env_usize("KIKO_DENSE_SUBSAMPLE") {
-            c.subsample = v.max(1) as u32;
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        subsample: u32,
+        max_disparity_gradient: f32,
+        min_disparity_px: f32,
+        max_edge_length_px: f32,
+        max_triangle_area_px2: f32,
+        max_observation_std_dev_m: f32,
+        max_points_per_keyframe: usize,
+    ) -> Result<Self, DenseCloudConfigError> {
+        if subsample == 0 {
+            return Err(DenseCloudConfigError::ZeroSubsample);
         }
-        if let Some(v) = crate::env::env_f32("KIKO_DENSE_MAX_GRADIENT") {
-            c.max_disparity_gradient = v;
+        for (field, value) in [
+            ("maximum disparity gradient", max_disparity_gradient),
+            ("minimum disparity", min_disparity_px),
+            ("maximum edge length", max_edge_length_px),
+            ("maximum triangle area", max_triangle_area_px2),
+            (
+                "maximum observation standard deviation",
+                max_observation_std_dev_m,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(DenseCloudConfigError::InvalidPositiveField { field, value });
+            }
         }
-        if let Some(v) = crate::env::env_f32("KIKO_DENSE_MAX_EDGE_PX") {
-            c.max_edge_length_px = v;
+        if max_points_per_keyframe == 0 {
+            return Err(DenseCloudConfigError::ZeroMaxPoints);
         }
-        if let Some(v) = crate::env::env_f32("KIKO_DENSE_MAX_AREA_PX2") {
-            c.max_triangle_area_px2 = v;
-        }
-        if let Some(v) = crate::env::env_f32("KIKO_SURFACE_MAX_POINT_SIGMA_M")
-            .or_else(|| crate::env::env_f32("KIKO_DENSE_MAX_POINT_SIGMA_M"))
-        {
-            c.max_observation_std_dev_m = v.max(0.0);
-        }
-        if let Some(v) = crate::env::env_usize("KIKO_DENSE_MAX_POINTS") {
-            c.max_points_per_keyframe = v;
-        }
-        c
+        Ok(Self {
+            subsample,
+            max_disparity_gradient,
+            min_disparity_px,
+            max_edge_length_px,
+            max_triangle_area_px2,
+            max_observation_std_dev_m,
+            max_points_per_keyframe,
+        })
+    }
+
+    pub fn try_from_env() -> Result<Self, DenseCloudConfigError> {
+        let defaults = Self::default();
+        let subsample = crate::env::try_env_usize("KIKO_DENSE_SUBSAMPLE")
+            .map_err(|source| DenseCloudConfigError::Environment { source })?
+            .unwrap_or(defaults.subsample as usize);
+        let subsample = u32::try_from(subsample)
+            .map_err(|_| DenseCloudConfigError::SubsampleOutOfRange { value: subsample })?;
+        let env_f32 = |key| {
+            crate::env::try_env_f32(key)
+                .map_err(|source| DenseCloudConfigError::Environment { source })
+        };
+        let max_observation_std_dev_m = match env_f32("KIKO_SURFACE_MAX_POINT_SIGMA_M")? {
+            Some(value) => value,
+            None => env_f32("KIKO_DENSE_MAX_POINT_SIGMA_M")?
+                .unwrap_or(defaults.max_observation_std_dev_m),
+        };
+        Self::try_new(
+            subsample,
+            env_f32("KIKO_DENSE_MAX_GRADIENT")?.unwrap_or(defaults.max_disparity_gradient),
+            defaults.min_disparity_px,
+            env_f32("KIKO_DENSE_MAX_EDGE_PX")?.unwrap_or(defaults.max_edge_length_px),
+            env_f32("KIKO_DENSE_MAX_AREA_PX2")?.unwrap_or(defaults.max_triangle_area_px2),
+            max_observation_std_dev_m,
+            crate::env::try_env_usize("KIKO_DENSE_MAX_POINTS")
+                .map_err(|source| DenseCloudConfigError::Environment { source })?
+                .unwrap_or(defaults.max_points_per_keyframe),
+        )
+    }
+
+    pub fn subsample(self) -> u32 {
+        self.subsample
+    }
+
+    pub fn max_disparity_gradient(self) -> f32 {
+        self.max_disparity_gradient
+    }
+
+    pub fn min_disparity_px(self) -> f32 {
+        self.min_disparity_px
+    }
+
+    pub fn max_edge_length_px(self) -> f32 {
+        self.max_edge_length_px
+    }
+
+    pub fn max_triangle_area_px2(self) -> f32 {
+        self.max_triangle_area_px2
+    }
+
+    pub fn max_observation_std_dev_m(self) -> f32 {
+        self.max_observation_std_dev_m
+    }
+
+    pub fn max_points_per_keyframe(self) -> usize {
+        self.max_points_per_keyframe
     }
 }
 
@@ -797,6 +907,35 @@ mod tests {
         assert_eq!(point.position(), [0.1, -0.2, 2.0]);
         assert_eq!(point.intensity(), 42);
         assert_eq!(point.position_variance(), 0.005);
+    }
+
+    #[test]
+    fn dense_cloud_config_rejects_invalid_runtime_values() {
+        assert!(matches!(
+            DenseCloudConfig::try_new(0, 0.25, 1.5, 120.0, 8_000.0, 0.05, 30_000),
+            Err(DenseCloudConfigError::ZeroSubsample)
+        ));
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                DenseCloudConfig::try_new(2, invalid, 1.5, 120.0, 8_000.0, 0.05, 30_000),
+                Err(DenseCloudConfigError::InvalidPositiveField { value, .. })
+                    if value.to_bits() == invalid.to_bits()
+            ));
+        }
+        assert!(matches!(
+            DenseCloudConfig::try_new(2, 0.25, 1.5, 120.0, 8_000.0, 0.05, 0),
+            Err(DenseCloudConfigError::ZeroMaxPoints)
+        ));
+
+        let config = DenseCloudConfig::try_new(3, 0.25, 1.5, 120.0, 8_000.0, 0.05, 42)
+            .expect("valid config");
+        assert_eq!(config.subsample(), 3);
+        assert_eq!(config.max_disparity_gradient(), 0.25);
+        assert_eq!(config.min_disparity_px(), 1.5);
+        assert_eq!(config.max_edge_length_px(), 120.0);
+        assert_eq!(config.max_triangle_area_px2(), 8_000.0);
+        assert_eq!(config.max_observation_std_dev_m(), 0.05);
+        assert_eq!(config.max_points_per_keyframe(), 42);
     }
 
     #[test]
