@@ -232,9 +232,13 @@ impl LmState {
         self.prev_cost
     }
 
+    fn reject(&mut self, config: LmConfig) {
+        self.lambda = (self.lambda * config.lambda_factor()).min(config.max_lambda());
+    }
+
     fn step(&mut self, cost: f64, predicted_decrease: f64, config: LmConfig) -> LmAction {
         if !cost.is_finite() || !predicted_decrease.is_finite() || predicted_decrease <= 0.0 {
-            self.lambda = (self.lambda * config.lambda_factor()).min(config.max_lambda());
+            self.reject(config);
             return LmAction::Reject;
         }
 
@@ -246,7 +250,7 @@ impl LmState {
             }
             LmAction::Accept
         } else {
-            self.lambda = (self.lambda * config.lambda_factor()).min(config.max_lambda());
+            self.reject(config);
             LmAction::Reject
         }
     }
@@ -361,6 +365,7 @@ pub enum DegenerateReason {
     TooFewPoses { count: usize },
     TooFewLandmarks { count: usize },
     NoFactors,
+    NonProjectableFactors { count: usize },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1297,14 +1302,24 @@ impl LocalBundleAdjuster {
         let huber = self.config.huber_delta_px();
         let motion_weight = self.config.motion_prior_weight();
         let lm_config = self.config.lm();
-        let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+        let mut final_cost = match full_problem_cost(problem, self.intrinsics, huber, motion_weight)
+        {
+            Ok(cost) => cost,
+            Err(nonprojectable) => {
+                return BaResult::Degenerate {
+                    reason: DegenerateReason::NonProjectableFactors {
+                        count: nonprojectable.count.get(),
+                    },
+                };
+            }
+        };
         let mut lm_state = LmState::new(lm_config, final_cost);
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
         let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
         let mut landmark_accumulators: Vec<LandmarkAccumulator> =
             Vec::with_capacity(landmark_count);
-        let mut rhs_before_solve: Vec<f32> = vec![0.0; pose_dim];
+        let mut pose_rhs_before_schur: Vec<f32> = vec![0.0; pose_dim];
 
         for iter in 0..max_iters {
             pose_backup.clear();
@@ -1333,7 +1348,9 @@ impl LocalBundleAdjuster {
                 let Some((residual, j_pose, j_landmark)) =
                     reprojection_residual_and_jacobians(pose, point, factor.pixel, self.intrinsics)
                 else {
-                    continue;
+                    return BaResult::Degenerate {
+                        reason: DegenerateReason::NonProjectableFactors { count: 1 },
+                    };
                 };
 
                 let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
@@ -1370,6 +1387,8 @@ impl LocalBundleAdjuster {
                     );
                 }
             }
+
+            pose_rhs_before_schur.copy_from_slice(rhs);
 
             for i in 0..pose_dim {
                 s[i * pose_dim + i] += pose_damping;
@@ -1415,7 +1434,6 @@ impl LocalBundleAdjuster {
             }
 
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
-            rhs_before_solve.copy_from_slice(rhs);
 
             if !solve_linear_system(s, rhs, pose_dim) {
                 return BaResult::MaxIterations {
@@ -1432,7 +1450,7 @@ impl LocalBundleAdjuster {
                 max_step = max_step.max(norm6(delta));
                 for k in 0..6 {
                     let d = delta[k] as f64;
-                    let gradient = rhs_before_solve[base + k] as f64;
+                    let gradient = pose_rhs_before_schur[base + k] as f64;
                     predicted_decrease += 0.5 * d * ((pose_damping as f64) * d + gradient);
                 }
                 pose_var.pose = apply_se3_delta(pose_var.pose, delta);
@@ -1468,9 +1486,16 @@ impl LocalBundleAdjuster {
                 landmark_var.position.z += delta_landmark[2];
             }
 
-            let candidate_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
             let prev_cost = lm_state.prev_cost();
-            match lm_state.step(candidate_cost, predicted_decrease, lm_config) {
+            let (action, candidate_cost) =
+                match full_problem_cost(problem, self.intrinsics, huber, motion_weight) {
+                    Ok(cost) => (lm_state.step(cost, predicted_decrease, lm_config), cost),
+                    Err(_) => {
+                        lm_state.reject(lm_config);
+                        (LmAction::Reject, prev_cost)
+                    }
+                };
+            match action {
                 LmAction::Accept => {
                     final_cost = candidate_cost;
                     let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
@@ -1909,14 +1934,20 @@ fn vio_cam_from_map(
     map_from_odom.odom_to_map(cam_from_odom).to_pose32()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NonProjectableFactors {
+    count: NonZeroUsize,
+}
+
 fn full_problem_cost(
     problem: &FullBaProblem,
     intrinsics: PinholeIntrinsics,
     huber_delta_px: f32,
     motion_weight: f32,
-) -> f64 {
+) -> Result<f64, NonProjectableFactors> {
     let mut cost = 0.0_f64;
     let huber = huber_delta_px as f64;
+    let mut nonprojectable_count = 0_usize;
 
     for factor in &problem.factors {
         let pose = problem.poses[factor.pose.as_usize()].pose;
@@ -1924,6 +1955,7 @@ fn full_problem_cost(
         let Some((residual, _, _)) =
             reprojection_residual_and_jacobians(pose, point, factor.pixel, intrinsics)
         else {
+            nonprojectable_count = nonprojectable_count.saturating_add(1);
             continue;
         };
         let r0 = residual[0] as f64;
@@ -1947,7 +1979,10 @@ fn full_problem_cost(
         }
     }
 
-    cost
+    match NonZeroUsize::new(nonprojectable_count) {
+        Some(count) => Err(NonProjectableFactors { count }),
+        None => Ok(cost),
+    }
 }
 
 pub(crate) fn reprojection_residual_and_jacobian(
@@ -2132,7 +2167,7 @@ fn accumulate_motion_prior(
     let residual = se3_delta_between(prev_pose, curr_pose);
     let w2 = weight * weight;
     for k in 0..6 {
-        let r = residual[k] * weight;
+        let r = residual[k] * w2;
         rhs[base_prev + k] += r;
         rhs[base_curr + k] -= r;
 
@@ -2668,6 +2703,70 @@ mod tests {
     }
 
     #[test]
+    fn motion_prior_rhs_uses_the_same_squared_weight_as_cost_and_hessian() {
+        let previous = Pose::identity();
+        let current = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 0.0, 0.0],
+        );
+
+        for (weight, expected) in [(0.5_f32, 0.25_f32), (2.0_f32, 4.0_f32)] {
+            let mut hessian = vec![0.0_f32; 12 * 12];
+            let mut rhs = vec![0.0_f32; 12];
+            accumulate_motion_prior(&mut hessian, &mut rhs, 12, previous, current, 0, 6, weight);
+
+            assert!((rhs[0] - expected).abs() < 1e-6);
+            assert!((rhs[6] + expected).abs() < 1e-6);
+            assert!((hessian[0] - expected).abs() < 1e-6);
+            assert!((hessian[6 * 12 + 6] - expected).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn full_problem_cost_rejects_nonprojectable_factors() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: -1.0,
+                },
+            }],
+            factors: vec![ReprojectionFactor {
+                pose: PoseVarIndex(0),
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 320.0, y: 240.0 },
+            }],
+        };
+
+        let error = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+            .expect_err("a behind-camera factor cannot disappear from cost");
+        assert_eq!(error.count.get(), 1);
+
+        let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        assert_eq!(
+            ba.optimize_full(&mut problem),
+            BaResult::Degenerate {
+                reason: DegenerateReason::NonProjectableFactors { count: 1 }
+            }
+        );
+    }
+
+    #[test]
     fn optimize_full_reports_degenerate_variants() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
@@ -2794,9 +2893,11 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("initial factors are projectable");
         let result = ba.optimize_full(&mut problem);
-        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("optimized factors remain projectable");
         assert!(
             after < before,
             "cost did not improve: before={before}, after={after}"
@@ -2820,7 +2921,8 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("initial factors are projectable");
         let result = ba.optimize_full(&mut problem);
         let final_cost = match result {
             BaResult::Converged { final_cost, .. } | BaResult::MaxIterations { final_cost, .. } => {

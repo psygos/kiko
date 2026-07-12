@@ -829,7 +829,7 @@ impl SurfacePoseQualityDecision {
 }
 
 fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&'static str, f64)> {
-    let mut scalars = Vec::with_capacity(12);
+    let mut scalars = Vec::with_capacity(14);
     let (
         accepted,
         rejected_low_count,
@@ -840,6 +840,7 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
         ba_degenerate_too_few_poses,
         ba_degenerate_too_few_landmarks,
         ba_degenerate_no_factors,
+        ba_degenerate_nonprojectable_factors,
         accepted_inliers,
         min_required_accepted_inliers,
         rmse_px,
@@ -860,6 +861,7 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             0.0,
+            0.0,
             Some(accepted_inliers.count() as f64),
             Some(min_required_accepted_inliers.count() as f64),
             Some(accepted_inlier_reprojection_rmse_px.value_px() as f64),
@@ -872,6 +874,7 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
         } => (
             0.0,
             1.0,
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -901,16 +904,25 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
                 crate::DegenerateReason::TooFewPoses { .. } => 1.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
                 crate::DegenerateReason::NoFactors => 0.0,
+                crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. } => 0.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 1.0,
                 crate::DegenerateReason::NoFactors => 0.0,
+                crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. } => 0.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
                 crate::DegenerateReason::NoFactors => 1.0,
+                crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
+            },
+            match degenerate_reason {
+                crate::DegenerateReason::TooFewPoses { .. }
+                | crate::DegenerateReason::TooFewLandmarks { .. }
+                | crate::DegenerateReason::NoFactors => 0.0,
+                crate::DegenerateReason::NonProjectableFactors { .. } => 1.0,
             },
             Some(accepted_inliers.count() as f64),
             Some(min_required_accepted_inliers.count() as f64),
@@ -929,6 +941,7 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             1.0,
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -951,6 +964,7 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             0.0,
+            0.0,
             Some(accepted_inliers.count() as f64),
             Some(min_required_accepted_inliers.count() as f64),
             None,
@@ -963,6 +977,7 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             0.0,
             0.0,
             1.0,
+            0.0,
             0.0,
             0.0,
             0.0,
@@ -1007,6 +1022,10 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
     scalars.push((
         "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
         ba_degenerate_no_factors,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
+        ba_degenerate_nonprojectable_factors,
     ));
     if let Some(value) = rmse_px {
         scalars.push((
@@ -1687,6 +1706,10 @@ mod tests {
             0.0
         )));
         assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
+            0.0
+        )));
+        assert!(scalars.contains(&(
             "diagnostics/surface/pose_gate/accepted_inlier_reprojection_rmse_px",
             2.0
         )));
@@ -1732,8 +1755,34 @@ mod tests {
             1.0
         )));
         assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
+            0.0
+        )));
+        assert!(scalars.contains(&(
             "diagnostics/surface/pose_gate/accepted_inlier_reprojection_rmse_px",
             1.25
+        )));
+    }
+
+    #[test]
+    fn surface_pose_quality_scalars_export_nonprojectable_ba_factors() {
+        let decision = SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(12),
+            min_required_accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(8),
+            degenerate_reason: crate::DegenerateReason::NonProjectableFactors { count: 3 },
+            accepted_inlier_reprojection_rmse_px: None,
+            max_allowed_accepted_inlier_reprojection_rmse_px:
+                crate::PnpAcceptedInlierPixelResidualMetric::new(1.5).expect("rmse"),
+        };
+
+        let scalars = surface_pose_quality_scalars(&decision);
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
+            1.0
         )));
     }
 
