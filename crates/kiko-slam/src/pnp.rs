@@ -492,9 +492,13 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
     let b = norm(sub(p1, p3));
     let c = norm(sub(p1, p2));
 
-    if a <= 0.0 || b <= 0.0 || c <= 0.0 {
+    let scene_scale = a.max(b).max(c);
+    if !scene_scale.is_finite() || scene_scale <= 0.0 {
         return Vec::new();
     }
+    let normalized_a = a / scene_scale;
+    let normalized_b = b / scene_scale;
+    let normalized_c = c / scene_scale;
 
     let cos_alpha = dot(f2, f3);
     let cos_beta = dot(f1, f3);
@@ -502,7 +506,15 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
 
     let mut solutions = Vec::new();
     let mut roots = Vec::new();
-    find_roots(cos_alpha, cos_beta, cos_gamma, a, b, c, &mut roots);
+    find_roots(
+        cos_alpha,
+        cos_beta,
+        cos_gamma,
+        normalized_a,
+        normalized_b,
+        normalized_c,
+        &mut roots,
+    );
 
     for (x, y) in roots {
         let denom = 1.0 + x * x - 2.0 * x * cos_gamma;
@@ -679,8 +691,8 @@ fn add_scaled(dst: &mut [f64], src: &[f64], scale: f64) {
 /// Minimum number of point correspondences required for PnP solving (geometric minimum for P3P).
 pub(crate) const MIN_PNP_POINTS: usize = 4;
 
-/// Tolerance for treating polynomial coefficients as zero during trimming.
-const POLY_COEFFICIENT_TOLERANCE: f64 = 1e-12;
+/// Relative tolerance for treating normalized polynomial coefficients as zero.
+const POLY_RELATIVE_COEFFICIENT_TOLERANCE: f64 = 1e-12;
 /// Maximum imaginary component for a root to be considered real.
 const IMAGINARY_TOLERANCE: f64 = 1e-6;
 /// Convergence threshold for the Durand-Kerner root-finding iterations.
@@ -691,7 +703,7 @@ const ROOT_DENOMINATOR_TOLERANCE: f64 = 1e-12;
 const MAX_ROOT_ITERATIONS: usize = 64;
 /// Tolerance for detecting duplicate P3P root solutions.
 const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
-/// Tolerance for accepting a P3P equation evaluation as a valid root.
+/// Tolerance for accepting the dimensionless P3P equation evaluation as a valid root.
 const P3P_ROOT_TOLERANCE: f32 = 1e-3;
 /// Target confidence used to adaptively shorten RANSAC once a strong model exists.
 const RANSAC_CONFIDENCE: f32 = 0.99;
@@ -703,9 +715,22 @@ const PNP_REFINEMENT_DAMPING: f32 = 1e-4;
 const PNP_REFINEMENT_STEP_EPS: f32 = 1e-5;
 
 fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
-    let mut coeffs: Vec<f64> = coeffs.into();
+    if coeffs.iter().any(|coefficient| !coefficient.is_finite()) {
+        return Vec::new();
+    }
+    let scale = coeffs
+        .iter()
+        .map(|coefficient| coefficient.abs())
+        .fold(0.0, f64::max);
+    if scale == 0.0 {
+        return Vec::new();
+    }
+    let mut coeffs: Vec<f64> = coeffs
+        .into_iter()
+        .map(|coefficient| coefficient / scale)
+        .collect();
     while coeffs.len() > 1
-        && coeffs.last().copied().unwrap_or(0.0).abs() < POLY_COEFFICIENT_TOLERANCE
+        && coeffs.last().copied().unwrap_or(0.0).abs() <= POLY_RELATIVE_COEFFICIENT_TOLERANCE
     {
         coeffs.pop();
     }
@@ -715,7 +740,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     }
     if degree == 1 {
         let c1 = coeffs[1];
-        if c1.abs() < POLY_COEFFICIENT_TOLERANCE {
+        if c1.abs() <= POLY_RELATIVE_COEFFICIENT_TOLERANCE {
             return Vec::new();
         }
         return vec![-coeffs[0] / c1];
@@ -724,7 +749,7 @@ fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     let Some(&lead) = coeffs.last() else {
         return Vec::new();
     };
-    if lead.abs() < POLY_COEFFICIENT_TOLERANCE {
+    if lead.abs() <= POLY_RELATIVE_COEFFICIENT_TOLERANCE {
         return Vec::new();
     }
     for c in &mut coeffs {
@@ -1118,6 +1143,71 @@ mod tests {
         let b = normalize_bearing(pixel, intrinsics).expect("bearing");
         let n = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
         assert!((n - 1.0).abs() < 1e-6, "bearing norm must be 1, got {n}");
+    }
+
+    #[test]
+    fn polynomial_roots_are_invariant_to_coefficient_scale() {
+        let base = [-6.0, 11.0, -6.0, 1.0, 0.0];
+        for scale in [1e-18, 1.0, 1e18] {
+            let mut roots = solve_real_roots(base.map(|coefficient| coefficient * scale));
+            roots.sort_by(f64::total_cmp);
+            assert_eq!(roots.len(), 3, "scale={scale:e}, roots={roots:?}");
+            for (actual, expected) in roots.into_iter().zip([1.0, 2.0, 3.0]) {
+                assert!(
+                    (actual - expected).abs() < 1e-8,
+                    "scale={scale:e}, actual={actual:e}, expected={expected:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p3p_is_invariant_to_scene_scale() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let base_world = [
+            Point3 {
+                x: -0.4,
+                y: -0.3,
+                z: 4.0,
+            },
+            Point3 {
+                x: 0.7,
+                y: -0.2,
+                z: 4.5,
+            },
+            Point3 {
+                x: 0.1,
+                y: 0.8,
+                z: 5.2,
+            },
+        ];
+        let base_translation = [0.2, -0.1, 0.3];
+        let axis_angle = [0.05, -0.03, 0.02];
+
+        for scale in [1e-3_f32, 1.0, 1e3] {
+            let world = base_world.map(|point| Point3 {
+                x: point.x * scale,
+                y: point.y * scale,
+                z: point.z * scale,
+            });
+            let expected = axis_angle_pose(
+                base_translation.map(|component| component * scale),
+                axis_angle,
+            );
+            let observations =
+                observations_from_projection(expected, &world, intrinsics).expect("observations");
+            assert_eq!(observations.len(), 3);
+            let solutions = p3p_solutions([&observations[0], &observations[1], &observations[2]]);
+            let matched = solutions.iter().any(|solution| {
+                rot_frob_norm(solution.rotation(), expected.rotation()) < 2e-3
+                    && l2(solution.translation(), expected.translation()) / scale < 2e-2
+            });
+            assert!(
+                matched,
+                "no correct P3P solution at scene scale {scale:e}; candidates={solutions:?}"
+            );
+        }
     }
 
     #[test]

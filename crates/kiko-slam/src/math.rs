@@ -4,6 +4,8 @@ use crate::Pose;
 const SO3_SMALL_ANGLE: f64 = 1e-12;
 /// Threshold for detecting near-pi rotations in SO(3) log map.
 const SO3_NEAR_PI: f64 = 1e-6;
+/// Minimum dominant-axis component for stable near-pi axis extraction.
+const SO3_AXIS_COMPONENT_MIN: f64 = 1e-12;
 /// Minimum axis norm for valid axis extraction in near-pi log map.
 const SO3_AXIS_NORM_MIN: f64 = 1e-12;
 /// Small-angle threshold for f32 SO(3) operations.
@@ -407,26 +409,38 @@ pub(crate) fn so3_log_f64(r: [[f64; 3]; 3]) -> [f64; 3] {
     }
 
     if (std::f64::consts::PI - theta).abs() < SO3_NEAR_PI {
-        let x = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
-        let y = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
-        let z = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
-        let mut axis = [x, y, z];
-        if r[2][1] - r[1][2] < 0.0 {
-            axis[0] = -axis[0];
-        }
-        if r[0][2] - r[2][0] < 0.0 {
-            axis[1] = -axis[1];
-        }
-        if r[1][0] - r[0][1] < 0.0 {
-            axis[2] = -axis[2];
-        }
+        let xx = ((r[0][0] + 1.0) * 0.5).max(0.0).sqrt();
+        let yy = ((r[1][1] + 1.0) * 0.5).max(0.0).sqrt();
+        let zz = ((r[2][2] + 1.0) * 0.5).max(0.0).sqrt();
+        let mut axis = if xx >= yy && xx >= zz && xx > SO3_AXIS_COMPONENT_MIN {
+            [
+                xx,
+                (r[0][1] + r[1][0]) / (4.0 * xx),
+                (r[0][2] + r[2][0]) / (4.0 * xx),
+            ]
+        } else if yy >= zz && yy > SO3_AXIS_COMPONENT_MIN {
+            [
+                (r[0][1] + r[1][0]) / (4.0 * yy),
+                yy,
+                (r[1][2] + r[2][1]) / (4.0 * yy),
+            ]
+        } else if zz > SO3_AXIS_COMPONENT_MIN {
+            [
+                (r[0][2] + r[2][0]) / (4.0 * zz),
+                (r[1][2] + r[2][1]) / (4.0 * zz),
+                zz,
+            ]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
         let norm = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
         if norm > SO3_AXIS_NORM_MIN {
-            return [
-                theta * axis[0] / norm,
-                theta * axis[1] / norm,
-                theta * axis[2] / norm,
-            ];
+            axis = [axis[0] / norm, axis[1] / norm, axis[2] / norm];
+            let skew = [r[2][1] - r[1][2], r[0][2] - r[2][0], r[1][0] - r[0][1]];
+            if axis[0] * skew[0] + axis[1] * skew[1] + axis[2] * skew[2] < 0.0 {
+                axis = [-axis[0], -axis[1], -axis[2]];
+            }
+            return [theta * axis[0], theta * axis[1], theta * axis[2]];
         }
     }
 
@@ -818,6 +832,21 @@ mod tests {
             (recovered_theta - theta).abs() < 2e-4,
             "near-pi mismatch: recovered={recovered_theta}, expected={theta}"
         );
+    }
+
+    #[test]
+    fn so3_log_reconstructs_exact_pi_rotation_with_mixed_axis_signs() {
+        let inv_norm = 1.0_f64 / 14.0_f64.sqrt();
+        let omega = [
+            inv_norm * std::f64::consts::PI,
+            -2.0 * inv_norm * std::f64::consts::PI,
+            3.0 * inv_norm * std::f64::consts::PI,
+        ];
+        let rotation = so3_exp_f64(omega);
+        let recovered = so3_log_f64(rotation);
+        let reconstructed = so3_exp_f64(recovered);
+        let error = rot_diff_norm(reconstructed, rotation);
+        assert!(error < 1e-12, "exact-pi reconstruction error: {error:e}");
     }
 
     #[test]
