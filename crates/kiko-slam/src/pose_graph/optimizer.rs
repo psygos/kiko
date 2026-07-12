@@ -1,9 +1,9 @@
 use crate::Pose64;
-use crate::math::{mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_right_jacobian_f64};
+use crate::math::{se3_exp_f64, se3_log_f64};
 
 use super::{
     ANCHOR_REGULARIZATION, BlockCsr6x6, HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS,
-    POSE_GRAPH_CONVERGENCE, PoseGraphError, scaled_identity6, solve_pcg,
+    POSE_GRAPH_CONVERGENCE, PcgStopReason, PoseGraphError, scaled_identity6, solve_pcg,
 };
 
 type Jacobian6 = [[f64; 6]; 6];
@@ -67,16 +67,15 @@ pub fn compute_edge_jacobians(
     edge: &PoseGraphEdge,
     poses: &[Pose64],
 ) -> Result<EdgeJacobians, PoseGraphError> {
-    let base_error = compute_edge_error(edge, poses)?;
-    let jr = so3_right_jacobian_f64([base_error[3], base_error[4], base_error[5]]);
+    compute_edge_error(edge, poses)?;
     let eps = NUMERICAL_DIFF_EPS;
     let mut j_from = [[0.0_f64; 6]; 6];
     let mut j_to = [[0.0_f64; 6]; 6];
     let mut poses_perturbed = poses.to_vec();
 
     for axis in 0..6 {
-        let delta_plus = perturb_axis(axis, eps, jr);
-        let delta_minus = perturb_axis(axis, -eps, jr);
+        let delta_plus = perturb_axis(axis, eps);
+        let delta_minus = perturb_axis(axis, -eps);
 
         numerical_diff_column(
             edge,
@@ -103,19 +102,9 @@ pub fn compute_edge_jacobians(
     Ok((j_from, j_to))
 }
 
-fn perturb_axis(axis: usize, magnitude: f64, right_jacobian: [[f64; 3]; 3]) -> [f64; 6] {
+fn perturb_axis(axis: usize, magnitude: f64) -> [f64; 6] {
     let mut delta = [0.0_f64; 6];
-    if axis < 3 {
-        delta[axis] = magnitude;
-        return delta;
-    }
-
-    let mut unit_rot = [0.0_f64; 3];
-    unit_rot[axis - 3] = magnitude;
-    let rot = mat_mul_vec_f64(right_jacobian, unit_rot);
-    delta[3] = rot[0];
-    delta[4] = rot[1];
-    delta[5] = rot[2];
+    delta[axis] = magnitude;
     delta
 }
 
@@ -142,8 +131,16 @@ impl Default for PoseGraphConfig {
 pub struct PoseGraphResult {
     pub corrected_poses: Vec<Pose64>,
     pub iterations: usize,
-    pub converged: bool,
+    pub termination: PoseGraphTermination,
     pub residual_norm: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoseGraphTermination {
+    NoPoses,
+    NoConstraints,
+    Converged,
+    IterationLimit,
 }
 
 #[derive(Clone, Debug)]
@@ -166,13 +163,13 @@ impl PoseGraphOptimizer {
             return Ok(PoseGraphResult {
                 corrected_poses: Vec::new(),
                 iterations: 0,
-                converged: true,
+                termination: PoseGraphTermination::NoPoses,
                 residual_norm: 0.0,
             });
         }
 
         let mut poses = initial_poses.to_vec();
-        let mut converged = false;
+        let mut termination = PoseGraphTermination::IterationLimit;
         let mut iters_run = 0;
         let mut last_residual_norm = 0.0_f64;
         let mut valid_edges = Vec::with_capacity(edges.len());
@@ -194,7 +191,7 @@ impl PoseGraphOptimizer {
             return Ok(PoseGraphResult {
                 corrected_poses: poses,
                 iterations: 0,
-                converged: true,
+                termination: PoseGraphTermination::NoConstraints,
                 residual_norm: 0.0,
             });
         }
@@ -249,14 +246,21 @@ impl PoseGraphOptimizer {
                 self.config.pcg_tol,
             )?;
             last_residual_norm = pcg.residual_norm;
-            if !pcg.converged() && iter + 1 == self.config.max_iterations {
-                eprintln!(
-                    "pose graph PCG did not converge (iters={}, residual_norm={:.3e})",
-                    pcg.iterations, pcg.residual_norm
-                );
-            }
             if !pcg.residual_norm.is_finite() {
-                break;
+                return Err(PoseGraphError::NonFiniteResidual {
+                    iteration: iter + 1,
+                });
+            }
+            let linear_solve_converged = pcg.stop_reason == PcgStopReason::Converged;
+            if !linear_solve_converged && delta.iter().all(|value| *value == 0.0) {
+                return Err(PoseGraphError::PcgDidNotConverge {
+                    outer_iteration: iter + 1,
+                    iterations: pcg.iterations,
+                    initial_residual_norm: pcg.initial_residual_norm,
+                    residual_norm: pcg.residual_norm,
+                    target_residual_norm: pcg.target_residual_norm,
+                    stop_reason: pcg.stop_reason,
+                });
             }
 
             let mut max_step = 0.0_f64;
@@ -275,7 +279,10 @@ impl PoseGraphOptimizer {
                 ];
                 let mut step_norm = xi.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if !step_norm.is_finite() {
-                    continue;
+                    return Err(PoseGraphError::NonFiniteStep {
+                        iteration: iter + 1,
+                        pose_index: pose_idx,
+                    });
                 }
                 if step_norm > MAX_STEP_NORM {
                     let scale = MAX_STEP_NORM / step_norm;
@@ -288,8 +295,8 @@ impl PoseGraphOptimizer {
                 *pose = se3_exp_f64(xi).compose(*pose);
             }
 
-            if max_step < POSE_GRAPH_CONVERGENCE {
-                converged = true;
+            if linear_solve_converged && max_step < POSE_GRAPH_CONVERGENCE {
+                termination = PoseGraphTermination::Converged;
                 break;
             }
         }
@@ -298,7 +305,7 @@ impl PoseGraphOptimizer {
         Ok(PoseGraphResult {
             corrected_poses: poses,
             iterations: iters_run,
-            converged,
+            termination,
             residual_norm: last_residual_norm,
         })
     }

@@ -3,8 +3,8 @@ use std::num::NonZeroU32;
 
 use super::{
     BlockCsr6x6, EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
-    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, compute_edge_error, compute_edge_jacobians,
-    solve_pcg,
+    PcgStopReason, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphTermination,
+    compute_edge_error, compute_edge_jacobians, solve_pcg,
 };
 use crate::Pose64;
 use crate::map::{ImageSize, SlamMap};
@@ -299,10 +299,27 @@ fn pose_graph_edge_jacobians_match_finite_difference() {
     };
     let poses = [pose_a, pose_b];
     let (j_from, j_to) = compute_edge_jacobians(&edge, &poses).expect("jacobians");
-    for row in 0..6 {
+    let eps = 1e-6;
+    for (pose_idx, jacobian) in [(edge.from, j_from), (edge.to, j_to)] {
         for col in 0..6 {
-            assert!(j_from[row][col].is_finite(), "non-finite J_from entry");
-            assert!(j_to[row][col].is_finite(), "non-finite J_to entry");
+            let mut plus = poses;
+            let mut minus = poses;
+            let mut delta = [0.0_f64; 6];
+            delta[col] = eps;
+            plus[pose_idx] = se3_exp_f64(delta).compose(poses[pose_idx]);
+            delta[col] = -eps;
+            minus[pose_idx] = se3_exp_f64(delta).compose(poses[pose_idx]);
+            let error_plus = compute_edge_error(&edge, &plus).expect("positive perturbation");
+            let error_minus = compute_edge_error(&edge, &minus).expect("negative perturbation");
+
+            for row in 0..6 {
+                let expected = (error_plus[row] - error_minus[row]) / (2.0 * eps);
+                assert!(
+                    (jacobian[row][col] - expected).abs() < 1e-9,
+                    "jacobian mismatch at pose={pose_idx}, row={row}, col={col}: actual={}, expected={expected}",
+                    jacobian[row][col]
+                );
+            }
         }
     }
 }
@@ -355,7 +372,7 @@ fn pose_graph_optimizer_ring_graph_converges() {
     let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
     let result = optimizer.optimize(&edges, &mut initial).expect("optimize");
     let after = translation_error(&result.corrected_poses, &gt);
-    assert!(result.converged || result.iterations > 0);
+    assert_eq!(result.termination, PoseGraphTermination::Converged);
     assert!(
         after < before,
         "ring graph did not improve: before={before}, after={after}"
@@ -446,8 +463,39 @@ fn pose_graph_optimizer_reports_non_convergence() {
     let result = optimizer
         .optimize(&edges, &mut initial)
         .expect("optimizer should return non-converged result");
-    assert!(!result.converged);
+    assert_eq!(result.termination, PoseGraphTermination::IterationLimit);
     assert_eq!(result.iterations, 0);
+}
+
+#[test]
+fn pose_graph_optimizer_rejects_pcg_iteration_limit_without_mutating_input() {
+    let gt = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    let edges = vec![edge(0, 1, gt[0], gt[1])];
+    let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
+    let before = initial.clone();
+    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig {
+        max_iterations: 1,
+        pcg_max_iters: 0,
+        ..PoseGraphConfig::default()
+    });
+
+    let err = optimizer
+        .optimize(&edges, &mut initial)
+        .expect_err("an exhausted inner solve must fail");
+
+    assert!(matches!(
+        err,
+        super::PoseGraphError::PcgDidNotConverge {
+            outer_iteration: 1,
+            iterations: 0,
+            stop_reason: PcgStopReason::IterationLimit,
+            ..
+        }
+    ));
+    assert_eq!(initial, before, "failed optimization mutated caller poses");
 }
 
 #[test]

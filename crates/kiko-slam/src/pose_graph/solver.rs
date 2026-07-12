@@ -1,17 +1,11 @@
-use super::{BlockCsr6x6, NEAR_ZERO, PoseGraphError};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PcgStopReason {
-    Converged,
-    NearZeroDenominator,
-    NearZeroPreconditionedResidual,
-    IterationLimit,
-}
+use super::{BlockCsr6x6, NEAR_ZERO, PcgStopReason, PoseGraphError};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PcgResult {
     pub iterations: usize,
+    pub initial_residual_norm: f64,
     pub residual_norm: f64,
+    pub target_residual_norm: f64,
     pub stop_reason: PcgStopReason,
 }
 
@@ -55,10 +49,14 @@ pub fn solve_pcg(
     let mut p = z.clone();
     let mut rz_old = dot(&r, &z);
     let mut residual_norm = norm(&r);
-    if residual_norm <= tol {
+    let initial_residual_norm = residual_norm;
+    let target_residual_norm = tol * initial_residual_norm.max(1.0);
+    if residual_norm <= target_residual_norm {
         return Ok(PcgResult {
             iterations: 0,
+            initial_residual_norm,
             residual_norm,
+            target_residual_norm,
             stop_reason: PcgStopReason::Converged,
         });
     }
@@ -70,7 +68,9 @@ pub fn solve_pcg(
         if denom.abs() < NEAR_ZERO {
             return Ok(PcgResult {
                 iterations: iter,
+                initial_residual_norm,
                 residual_norm,
+                target_residual_norm,
                 stop_reason: PcgStopReason::NearZeroDenominator,
             });
         }
@@ -83,10 +83,12 @@ pub fn solve_pcg(
             *ri -= alpha * *hi;
         }
         residual_norm = norm(&r);
-        if residual_norm <= tol {
+        if residual_norm <= target_residual_norm {
             return Ok(PcgResult {
                 iterations: iter + 1,
+                initial_residual_norm,
                 residual_norm,
+                target_residual_norm,
                 stop_reason: PcgStopReason::Converged,
             });
         }
@@ -96,7 +98,9 @@ pub fn solve_pcg(
         if rz_old.abs() < NEAR_ZERO {
             return Ok(PcgResult {
                 iterations: iter + 1,
+                initial_residual_norm,
                 residual_norm,
+                target_residual_norm,
                 stop_reason: PcgStopReason::NearZeroPreconditionedResidual,
             });
         }
@@ -109,7 +113,9 @@ pub fn solve_pcg(
 
     Ok(PcgResult {
         iterations: max_iters,
+        initial_residual_norm,
         residual_norm,
+        target_residual_norm,
         stop_reason: PcgStopReason::IterationLimit,
     })
 }

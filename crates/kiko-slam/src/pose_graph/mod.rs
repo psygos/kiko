@@ -11,6 +11,14 @@ const POSE_GRAPH_CONVERGENCE: f64 = 1e-6;
 /// Near-zero threshold in Huber weight to avoid division by zero.
 const HUBER_NEAR_ZERO: f64 = 1e-12;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcgStopReason {
+    Converged,
+    NearZeroDenominator,
+    NearZeroPreconditionedResidual,
+    IterationLimit,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PoseGraphError {
     CsrIndexOutOfBounds {
@@ -48,6 +56,18 @@ pub enum PoseGraphError {
     },
     NonFiniteResidual {
         iteration: usize,
+    },
+    NonFiniteStep {
+        iteration: usize,
+        pose_index: usize,
+    },
+    PcgDidNotConverge {
+        outer_iteration: usize,
+        iterations: usize,
+        initial_residual_norm: f64,
+        residual_norm: f64,
+        target_residual_norm: f64,
+        stop_reason: PcgStopReason,
     },
     NotConverged {
         iterations: usize,
@@ -113,6 +133,24 @@ impl std::fmt::Display for PoseGraphError {
                     "pose graph residual became non-finite at iteration {iteration}"
                 )
             }
+            PoseGraphError::NonFiniteStep {
+                iteration,
+                pose_index,
+            } => write!(
+                f,
+                "pose graph step became non-finite at iteration {iteration} for pose {pose_index}"
+            ),
+            PoseGraphError::PcgDidNotConverge {
+                outer_iteration,
+                iterations,
+                initial_residual_norm,
+                residual_norm,
+                target_residual_norm,
+                stop_reason,
+            } => write!(
+                f,
+                "pose graph PCG stopped without convergence at outer iteration {outer_iteration} after {iterations} inner iterations ({stop_reason:?}, residual_norm={residual_norm:.3e}, initial_residual_norm={initial_residual_norm:.3e}, target_residual_norm={target_residual_norm:.3e})"
+            ),
             PoseGraphError::NotConverged {
                 iterations,
                 residual_norm,
@@ -144,10 +182,10 @@ pub use essential::{
     PoseGraphInput,
 };
 pub use optimizer::{
-    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult, compute_edge_error,
-    compute_edge_jacobians,
+    PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult, PoseGraphTermination,
+    compute_edge_error, compute_edge_jacobians,
 };
-pub use solver::{PcgResult, PcgStopReason, solve_pcg};
+pub use solver::{PcgResult, solve_pcg};
 pub use sparse::BlockCsr6x6;
 
 #[cfg(test)]

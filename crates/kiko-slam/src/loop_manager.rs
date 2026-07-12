@@ -1,6 +1,7 @@
 use crate::global_map::GlobalMap;
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, PoseGraphConfig, PoseGraphError, PoseGraphOptimizer,
+    PoseGraphTermination,
 };
 use crate::{
     LoopApplyError, LoopClosureRejectReason, LoopDetectError, Point3, Pose, Pose64, VerifiedLoop,
@@ -67,7 +68,7 @@ impl LoopManager {
         }
 
         let result = self.optimizer.optimize(&input.edges, &mut initial_poses)?;
-        if !result.converged {
+        if result.termination != PoseGraphTermination::Converged {
             return Err(TrackerError::PoseGraph(PoseGraphError::NotConverged {
                 iterations: result.iterations,
                 residual_norm: result.residual_norm,

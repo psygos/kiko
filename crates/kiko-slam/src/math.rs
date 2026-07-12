@@ -18,8 +18,8 @@ const SO3_AXIS_COMPONENT_MIN_F32: f32 = 1e-6;
 /// Minimum axis norm for valid f32 axis normalization.
 #[cfg(test)]
 const SO3_AXIS_NORM_MIN_F32: f32 = 1e-8;
-/// Small-angle threshold for f64 Jacobian expansions (tighter than SO3_SMALL_ANGLE).
-const JACOBIAN_SMALL_ANGLE: f64 = 1e-9;
+/// Small-angle threshold below which closed-form Jacobian coefficients lose precision.
+const JACOBIAN_SMALL_ANGLE: f64 = 1e-4;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pose64 {
@@ -599,6 +599,24 @@ mod tests {
             err += d * d;
         }
         assert!(err.sqrt() < 1e-9, "se3 round-trip error: {}", err.sqrt());
+    }
+
+    #[test]
+    fn se3_exp_log_round_trip_is_stable_for_tiny_rotations() {
+        for theta in [0.0, 1e-12, 2e-8, 1e-6, 5e-5] {
+            let xi = [0.8, -0.4, 0.2, theta, -0.5 * theta, 0.25 * theta];
+            let recovered = se3_log_f64(se3_exp_f64(xi));
+            assert!(
+                recovered.iter().all(|value| value.is_finite()),
+                "non-finite SE(3) logarithm at theta={theta:e}: {recovered:?}"
+            );
+            for (axis, (actual, expected)) in recovered.iter().zip(xi).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-9,
+                    "SE(3) round-trip mismatch at theta={theta:e}, axis={axis}: actual={actual:e}, expected={expected:e}"
+                );
+            }
+        }
     }
 
     #[test]
