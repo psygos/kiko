@@ -20,7 +20,9 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
-use crate::frontend::{StereoFrontend, TrackedMapObservations, median_parallax_px};
+use crate::frontend::{
+    MapObservationError, StereoFrontend, TrackedMapObservations, median_parallax_px,
+};
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
     LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
@@ -1118,6 +1120,7 @@ pub enum TrackerError {
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
     RansacConfig(RansacConfigError),
+    MapObservation(MapObservationError),
     KeyframeRejected {
         landmarks: usize,
     },
@@ -1137,6 +1140,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
+            TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -1158,6 +1162,7 @@ impl std::error::Error for TrackerError {
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::PoseGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
+            TrackerError::MapObservation(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::Vio(_) => None,
             TrackerError::KeyframeRejected { .. } | TrackerError::InvariantViolation(_) => None,
@@ -1210,6 +1215,12 @@ impl From<PoseGraphError> for TrackerError {
 impl From<RansacConfigError> for TrackerError {
     fn from(err: RansacConfigError) -> Self {
         TrackerError::RansacConfig(err)
+    }
+}
+
+impl From<MapObservationError> for TrackerError {
+    fn from(err: MapObservationError) -> Self {
+        TrackerError::MapObservation(err)
     }
 }
 
@@ -1768,6 +1779,8 @@ enum TrackingAttemptError {
     NotEnoughMapPoints {
         matches: usize,
         verified: usize,
+        observations: usize,
+        required_observations: usize,
     },
     PnpFailed {
         matches: usize,
@@ -3286,31 +3299,36 @@ impl SlamTracker {
 
     fn build_tracking_attempt(
         &self,
-        current: &Arc<Detections>,
         keyframe: &Keyframe,
         keyframe_id: KeyframeId,
         matches: Matches<Raw>,
     ) -> Result<TrackingAttempt, TrackingAttemptError> {
         let match_count = matches.len();
-        let verified = matches.with_landmarks(keyframe).map_err(|err| {
-            TrackingAttemptError::Fatal(TrackerError::Inference(InferenceError::Match(err)))
-        })?;
+        let verified = matches
+            .with_landmarks(keyframe_id, keyframe)
+            .map_err(|err| {
+                TrackingAttemptError::Fatal(TrackerError::Inference(InferenceError::Match(err)))
+            })?;
         let verified_count = verified.len();
 
-        let tracked_observations = match self.frontend.build_map_observations(
-            self.global_map.map(),
-            keyframe_id,
-            &verified,
-            current.as_ref(),
-        ) {
+        let tracked_observations = match self
+            .frontend
+            .build_map_observations(self.global_map.map(), &verified)
+        {
             Ok(obs) => obs,
-            Err(crate::PnpError::NotEnoughPoints { .. }) => {
+            Err(MapObservationError::NotEnoughPoints { required, actual }) => {
                 return Err(TrackingAttemptError::NotEnoughMapPoints {
                     matches: match_count,
                     verified: verified_count,
+                    observations: actual,
+                    required_observations: required,
                 });
             }
-            Err(err) => return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err))),
+            Err(err) => {
+                return Err(TrackingAttemptError::Fatal(TrackerError::MapObservation(
+                    err,
+                )));
+            }
         };
         let tracking_ransac =
             adaptive_tracking_ransac_config(self.config.ransac, tracked_observations.len())
@@ -3534,12 +3552,8 @@ impl SlamTracker {
                 )? {
                     Some(projected_matches) => {
                         let projected_match_count = projected_matches.len();
-                        match self.build_tracking_attempt(
-                            &current,
-                            keyframe,
-                            keyframe_id,
-                            projected_matches,
-                        ) {
+                        match self.build_tracking_attempt(keyframe, keyframe_id, projected_matches)
+                        {
                             Ok(projected_attempt)
                                 if projected_attempt.result.inliers.len() >= config.min_inliers =>
                             {
@@ -3599,20 +3613,22 @@ impl SlamTracker {
                         prefetched_matches,
                         frame_id,
                     )?;
-                    match self.build_tracking_attempt(
-                        &current,
-                        keyframe,
-                        keyframe_id,
-                        lightglue_matches,
-                    ) {
+                    match self.build_tracking_attempt(keyframe, keyframe_id, lightglue_matches) {
                         Ok(attempt) => attempt,
-                        Err(TrackingAttemptError::NotEnoughMapPoints { matches, verified }) => {
+                        Err(TrackingAttemptError::NotEnoughMapPoints {
+                            matches,
+                            verified,
+                            observations,
+                            required_observations,
+                        }) => {
                             if self.trace_transitions {
                                 eprintln!(
-                                    "tracking failure frame={} reason=not_enough_map_points matches={} verified={} current={}",
+                                    "tracking failure frame={} reason=not_enough_map_points matches={} verified={} observations={} required_observations={} current={}",
                                     frame_id.as_u64(),
                                     matches,
                                     verified,
+                                    observations,
+                                    required_observations,
                                     current.len()
                                 );
                             }
@@ -3704,7 +3720,6 @@ impl SlamTracker {
             &verified,
             &tracked_observations.verified_match_indices,
             &result.inliers,
-            keyframe,
         );
         let covisibility = if keyframe.landmarks().is_empty() {
             0.0
@@ -3874,9 +3889,10 @@ impl SlamTracker {
                 .decide(result.inliers.len(), parallax_px, covisibility);
         if self.trace_transitions {
             eprintln!(
-                "tracking success frame={} observations={} inliers={} required_inliers={} matches={} verified={} parallax_px={} covisibility={:.3} decision={:?}",
+                "tracking success frame={} observations={} missing_associations={} inliers={} required_inliers={} matches={} verified={} parallax_px={} covisibility={:.3} decision={:?}",
                 frame_id.as_u64(),
                 tracked_observations.len(),
+                tracked_observations.missing_map_point_associations,
                 result.inliers.len(),
                 tracking_ransac.min_inliers(),
                 matches.len(),
@@ -4859,22 +4875,44 @@ mod tests {
             vec![1.0; 5],
         )
         .expect("matches");
-        let verified = matches.with_landmarks(&keyframe).expect("verified matches");
+        let verified = matches
+            .with_landmarks(keyframe_id, &keyframe)
+            .expect("verified matches");
         let intrinsics =
             crate::test_helpers::make_pinhole_intrinsics(320, 240, 300.0, 300.0, 160.0, 120.0)
                 .expect("intrinsics");
 
-        let tracked = crate::frontend::build_map_observations(
-            &map,
-            keyframe_id,
-            &verified,
-            current.as_ref(),
-            intrinsics,
-        )
-        .expect("tracked observations");
+        let tracked = crate::frontend::build_map_observations(&map, &verified, intrinsics)
+            .expect("tracked observations");
 
         assert_eq!(tracked.observations.len(), 4);
         assert_eq!(tracked.verified_match_indices, vec![0, 2, 3, 4]);
+        assert_eq!(tracked.missing_map_point_associations, 1);
+
+        let wrong_detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(42),
+            320,
+            240,
+            vec![Keypoint { x: 10.0, y: 10.0 }],
+            vec![1.0],
+            vec![make_descriptor()],
+        )
+        .expect("wrong detections");
+        let wrong_keyframe_id = map
+            .add_keyframe_from_detections(
+                &wrong_detections,
+                Timestamp::from_nanos(2),
+                Pose::identity(),
+            )
+            .expect("wrong map keyframe");
+        let wrong_provenance = matches
+            .with_landmarks(wrong_keyframe_id, &keyframe)
+            .expect("verified matches with wrong map id");
+        assert!(matches!(
+            crate::frontend::build_map_observations(&map, &wrong_provenance, intrinsics),
+            Err(MapObservationError::KeyframeProvenanceMismatch { .. })
+        ));
     }
 
     fn make_map_with_two_keyframes_one_shared_point() -> (SlamMap, KeyframeId, KeyframeId) {

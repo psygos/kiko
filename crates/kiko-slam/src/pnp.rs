@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 
 use crate::dataset::CameraIntrinsics;
-use crate::{Keyframe, Keypoint, Matches, Point3, Verified, math};
+use crate::{Keypoint, Point3, math};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {
@@ -269,22 +269,8 @@ pub struct PnpResult {
 
 #[derive(Debug)]
 pub enum PnpError {
-    NotEnoughPoints {
-        required: usize,
-        actual: usize,
-    },
-    IndexOutOfBounds {
-        current_len: usize,
-        keyframe_len: usize,
-        current_index: usize,
-        keyframe_index: usize,
-    },
-    MissingLandmark {
-        keyframe_index: usize,
-    },
-    Degenerate {
-        message: &'static str,
-    },
+    NotEnoughPoints { required: usize, actual: usize },
+    Degenerate { message: &'static str },
     NoSolution,
 }
 
@@ -294,19 +280,6 @@ impl std::fmt::Display for PnpError {
             PnpError::NotEnoughPoints { required, actual } => {
                 write!(f, "pnp requires at least {required} points, got {actual}")
             }
-            PnpError::IndexOutOfBounds {
-                current_len,
-                keyframe_len,
-                current_index,
-                keyframe_index,
-            } => write!(
-                f,
-                "pnp match index out of bounds: current_index={current_index} (len={current_len}), keyframe_index={keyframe_index} (len={keyframe_len})"
-            ),
-            PnpError::MissingLandmark { keyframe_index } => write!(
-                f,
-                "pnp match references missing landmark for keyframe index {keyframe_index}"
-            ),
             PnpError::Degenerate { message } => write!(f, "pnp degenerate input: {message}"),
             PnpError::NoSolution => write!(f, "pnp failed to find a valid pose"),
         }
@@ -314,55 +287,6 @@ impl std::fmt::Display for PnpError {
 }
 
 impl std::error::Error for PnpError {}
-
-pub fn build_observations(
-    keyframe: &Keyframe,
-    matches: &Matches<Verified>,
-    intrinsics: PinholeIntrinsics,
-) -> Result<Vec<Observation>, PnpError> {
-    let current = matches.source_a();
-    if current.is_empty() || keyframe.landmarks().is_empty() {
-        return Err(PnpError::NotEnoughPoints {
-            required: 4,
-            actual: 0,
-        });
-    }
-
-    if matches.len() < MIN_PNP_POINTS {
-        return Err(PnpError::NotEnoughPoints {
-            required: MIN_PNP_POINTS,
-            actual: matches.len(),
-        });
-    }
-
-    let current_len = current.len();
-    let keyframe_len = keyframe.detections().len();
-
-    let mut observations = Vec::with_capacity(matches.len());
-    for &(ci, ki) in matches.indices() {
-        if ci >= current_len || ki >= keyframe_len {
-            return Err(PnpError::IndexOutOfBounds {
-                current_len,
-                keyframe_len,
-                current_index: ci,
-                keyframe_index: ki,
-            });
-        }
-
-        let pixel = current.keypoints()[ci];
-        let bearing = normalize_bearing(pixel, intrinsics)?;
-        let world = keyframe
-            .landmark_for_detection(ki)
-            .ok_or(PnpError::MissingLandmark { keyframe_index: ki })?;
-        observations.push(Observation {
-            world,
-            pixel,
-            bearing,
-        });
-    }
-
-    Ok(observations)
-}
 
 pub fn solve_pnp_ransac(
     observations: &[Observation],
@@ -442,16 +366,6 @@ pub fn solve_pnp_ransac(
         inliers,
         iterations,
     })
-}
-
-pub fn solve_pnp(
-    keyframe: &Keyframe,
-    matches: &Matches<Verified>,
-    intrinsics: PinholeIntrinsics,
-    config: RansacConfig,
-) -> Result<PnpResult, PnpError> {
-    let observations = build_observations(keyframe, matches, intrinsics)?;
-    solve_pnp_ransac(&observations, intrinsics, config)
 }
 
 fn adaptive_ransac_iterations(inlier_count: usize, total: usize, confidence: f32) -> usize {

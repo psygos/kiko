@@ -2,11 +2,11 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::inference::InferenceError;
-use crate::map::{KeyframeId, SlamMap};
+use crate::map::SlamMap;
 use crate::{
-    Detections, DownscaleFactor, Frame, Keyframe, LightGlue, Matches, Observation,
-    PinholeIntrinsics, PnpError, PnpResult, RansacConfig, Raw, SuperPoint, TriangulationResult,
-    Triangulator, Verified, solve_pnp_ransac,
+    Detections, DownscaleFactor, Frame, LightGlue, Matches, Observation, PinholeIntrinsics,
+    PnpError, PnpResult, RansacConfig, Raw, SuperPoint, TriangulationResult, Triangulator,
+    Verified, solve_pnp_ransac,
 };
 
 pub(crate) struct StereoFrontend {
@@ -114,11 +114,9 @@ impl StereoFrontend {
     pub(crate) fn build_map_observations(
         &self,
         map: &SlamMap,
-        keyframe_id: KeyframeId,
         matches: &Matches<Verified>,
-        current: &Detections,
-    ) -> Result<TrackedMapObservations, crate::PnpError> {
-        build_map_observations(map, keyframe_id, matches, current, self.intrinsics)
+    ) -> Result<TrackedMapObservations, MapObservationError> {
+        build_map_observations(map, matches, self.intrinsics)
     }
 
     pub(crate) fn solve_tracking_pose(
@@ -131,9 +129,70 @@ impl StereoFrontend {
 }
 
 #[derive(Debug)]
+pub enum MapObservationError {
+    MissingMatchProvenance,
+    KeyframeProvenanceMismatch {
+        matches_frame: crate::FrameId,
+        map_frame: crate::FrameId,
+        matches_detections: usize,
+        map_keypoints: usize,
+    },
+    Map(crate::map::MapError),
+    Pnp(crate::PnpError),
+    NotEnoughPoints {
+        required: usize,
+        actual: usize,
+    },
+}
+
+impl std::fmt::Display for MapObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MapObservationError::MissingMatchProvenance => {
+                write!(f, "verified matches are missing keyframe provenance")
+            }
+            MapObservationError::KeyframeProvenanceMismatch {
+                matches_frame,
+                map_frame,
+                matches_detections,
+                map_keypoints,
+            } => write!(
+                f,
+                "verified matches reference frame {} with {matches_detections} detections, but the map keyframe is frame {} with {map_keypoints} keypoints",
+                matches_frame.as_u64(),
+                map_frame.as_u64()
+            ),
+            MapObservationError::Map(source) => {
+                write!(f, "map observation lookup failed: {source}")
+            }
+            MapObservationError::Pnp(source) => {
+                write!(f, "map observation bearing failed: {source}")
+            }
+            MapObservationError::NotEnoughPoints { required, actual } => write!(
+                f,
+                "map observation resolution requires {required} points, got {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MapObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MapObservationError::Map(source) => Some(source),
+            MapObservationError::Pnp(source) => Some(source),
+            MapObservationError::MissingMatchProvenance
+            | MapObservationError::KeyframeProvenanceMismatch { .. }
+            | MapObservationError::NotEnoughPoints { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct TrackedMapObservations {
     pub(crate) observations: Vec<crate::Observation>,
     pub(crate) verified_match_indices: Vec<usize>,
+    pub(crate) missing_map_point_associations: usize,
 }
 
 impl TrackedMapObservations {
@@ -144,44 +203,54 @@ impl TrackedMapObservations {
 
 pub(crate) fn build_map_observations(
     map: &SlamMap,
-    keyframe_id: KeyframeId,
     matches: &Matches<Verified>,
-    current: &Detections,
     intrinsics: PinholeIntrinsics,
-) -> Result<TrackedMapObservations, crate::PnpError> {
+) -> Result<TrackedMapObservations, MapObservationError> {
     const MIN_PNP_CORRESPONDENCES: usize = 4;
+    let keyframe_id = matches
+        .keyframe_id()
+        .ok_or(MapObservationError::MissingMatchProvenance)?;
+    let map_keyframe = map.keyframe(keyframe_id).ok_or(MapObservationError::Map(
+        crate::map::MapError::KeyframeNotFound(keyframe_id),
+    ))?;
+    let matches_frame = matches.source_b().frame_id();
+    if map_keyframe.frame_id() != matches_frame || map_keyframe.len() != matches.source_b().len() {
+        return Err(MapObservationError::KeyframeProvenanceMismatch {
+            matches_frame,
+            map_frame: map_keyframe.frame_id(),
+            matches_detections: matches.source_b().len(),
+            map_keypoints: map_keyframe.len(),
+        });
+    }
 
     let mut observations = Vec::with_capacity(matches.len());
     let mut verified_match_indices = Vec::with_capacity(matches.len());
-    let current_len = current.len();
+    let mut missing_map_point_associations = 0;
+    let current = matches.source_a();
 
     for (verified_match_idx, &(ci, ki)) in matches.indices().iter().enumerate() {
-        if ci >= current_len {
-            return Err(crate::PnpError::IndexOutOfBounds {
-                current_len,
-                keyframe_len: 0,
-                current_index: ci,
-                keyframe_index: ki,
-            });
-        }
-        let keypoint_ref = match map.keyframe_keypoint(keyframe_id, ki) {
-            Ok(kp) => kp,
-            Err(_) => continue,
-        };
-        let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
+        let keypoint_ref = map
+            .keyframe_keypoint(keyframe_id, ki)
+            .map_err(MapObservationError::Map)?;
+        let Some(point_id) = map
+            .map_point_for_keypoint(keypoint_ref)
+            .map_err(MapObservationError::Map)?
+        else {
+            missing_map_point_associations += 1;
             continue;
         };
-        let Some(point) = map.point(point_id) else {
-            continue;
-        };
+        let point = map.point(point_id).ok_or(MapObservationError::Map(
+            crate::map::MapError::MapPointNotFound(point_id),
+        ))?;
         let pixel = current.keypoints()[ci];
-        let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
+        let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)
+            .map_err(MapObservationError::Pnp)?;
         observations.push(obs);
         verified_match_indices.push(verified_match_idx);
     }
 
     if observations.len() < MIN_PNP_CORRESPONDENCES {
-        return Err(crate::PnpError::NotEnoughPoints {
+        return Err(MapObservationError::NotEnoughPoints {
             required: MIN_PNP_CORRESPONDENCES,
             actual: observations.len(),
         });
@@ -189,6 +258,7 @@ pub(crate) fn build_map_observations(
     Ok(TrackedMapObservations {
         observations,
         verified_match_indices,
+        missing_map_point_associations,
     })
 }
 
@@ -196,14 +266,13 @@ pub(crate) fn median_parallax_px(
     matches: &Matches<Verified>,
     verified_match_indices: &[usize],
     inliers: &[usize],
-    keyframe: &Keyframe,
 ) -> Option<f32> {
     if inliers.is_empty() {
         return None;
     }
 
     let left_kps = matches.source_a().keypoints();
-    let key_kps = keyframe.detections().keypoints();
+    let key_kps = matches.source_b().keypoints();
     let mut parallax = Vec::with_capacity(inliers.len());
 
     for &idx in inliers {
