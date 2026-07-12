@@ -516,6 +516,22 @@ impl MapGeneration {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapSnapshot {
+    instance_id: MapInstanceId,
+    generation: MapGeneration,
+}
+
+impl MapSnapshot {
+    pub fn instance_id(self) -> MapInstanceId {
+        self.instance_id
+    }
+
+    pub fn generation(self) -> MapGeneration {
+        self.generation
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SlamMap {
     instance_id: MapInstanceId,
@@ -563,6 +579,13 @@ impl SlamMap {
 
     pub fn instance_id(&self) -> MapInstanceId {
         self.instance_id
+    }
+
+    pub fn snapshot(&self) -> MapSnapshot {
+        MapSnapshot {
+            instance_id: self.instance_id,
+            generation: self.generation,
+        }
     }
 
     fn ensure_local_keypoint(&self, keypoint: KeyframeKeypoint) -> Result<(), MapError> {

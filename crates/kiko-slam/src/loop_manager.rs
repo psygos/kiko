@@ -27,6 +27,13 @@ impl LoopManager {
         global_map: &mut GlobalMap,
         verified: &VerifiedLoop,
     ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
+        let current = global_map.map().snapshot();
+        if verified.map_snapshot() != current {
+            return Err(TrackerError::StaleLoopProof {
+                proof: verified.map_snapshot(),
+                current,
+            });
+        }
         let mut candidate = global_map.clone();
         let corrections = self.apply_verified_loop_to_candidate(&mut candidate, verified)?;
         *global_map = candidate;
@@ -166,6 +173,7 @@ impl LoopManager {
 
     pub(crate) fn apply_error_kind(error: &TrackerError) -> LoopApplyError {
         match error {
+            TrackerError::StaleLoopProof { .. } => LoopApplyError::StaleCorrection,
             TrackerError::Map(crate::map::MapError::KeyframeNotFound(_)) => {
                 LoopApplyError::MissingKeyframe
             }

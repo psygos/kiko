@@ -1154,6 +1154,10 @@ pub enum TrackerError {
     PoseGraph(PoseGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
+    StaleLoopProof {
+        proof: crate::MapSnapshot,
+        current: crate::MapSnapshot,
+    },
     KeyframeRejected {
         landmarks: usize,
     },
@@ -1174,6 +1178,14 @@ impl std::fmt::Display for TrackerError {
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
+            TrackerError::StaleLoopProof { proof, current } => write!(
+                f,
+                "loop proof belongs to map instance {} generation {}, but current map is instance {} generation {}",
+                proof.instance_id().as_u64(),
+                proof.generation().as_u64(),
+                current.instance_id().as_u64(),
+                current.generation().as_u64(),
+            ),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -1198,7 +1210,9 @@ impl std::error::Error for TrackerError {
             TrackerError::MapObservation(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::Vio(_) => None,
-            TrackerError::KeyframeRejected { .. } | TrackerError::InvariantViolation(_) => None,
+            TrackerError::KeyframeRejected { .. }
+            | TrackerError::InvariantViolation(_)
+            | TrackerError::StaleLoopProof { .. } => None,
         }
     }
 }
@@ -5904,6 +5918,7 @@ mod tests {
         essential_graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
 
         let verified = crate::loop_closure::VerifiedLoop::from_parts(
+            &map,
             kf2,
             kf0,
             Pose::from_rt(
@@ -6026,6 +6041,55 @@ mod tests {
             let after = global_map.point(point_id).expect("point").position();
             assert_eq!([after.x, after.y, after.z], [before.x, before.y, before.z]);
         }
+    }
+
+    #[test]
+    fn loop_closure_rejects_proof_after_map_generation_changes() {
+        let (map, essential_graph, verified, _, before_points) = make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map, essential_graph);
+        let (point_id, position) = before_points[0];
+        global_map
+            .map_mut()
+            .set_map_point_position(point_id, position)
+            .expect("generation-changing write");
+        let current_snapshot = global_map.map().snapshot();
+        let loop_edges_before = global_map.essential_graph().snapshot().loop_edges.len();
+
+        let error = LoopManager::new(PoseGraphConfig::default())
+            .apply_verified_loop(&mut global_map, &verified)
+            .expect_err("stale loop proof must fail");
+        assert!(matches!(
+            error,
+            TrackerError::StaleLoopProof { proof, current }
+                if proof == verified.map_snapshot() && current == current_snapshot
+        ));
+        assert_eq!(
+            global_map.essential_graph().snapshot().loop_edges.len(),
+            loop_edges_before
+        );
+    }
+
+    #[test]
+    fn loop_closure_rejects_proof_from_another_map_instance() {
+        let (_, _, foreign_proof, _, _) = make_loop_closure_apply_fixture();
+        let (map, essential_graph, _, _, _) = make_loop_closure_apply_fixture();
+        let mut global_map = GlobalMap::from_parts(map, essential_graph);
+        assert_ne!(
+            foreign_proof.map_snapshot().instance_id(),
+            global_map.map().instance_id()
+        );
+
+        let error = LoopManager::new(PoseGraphConfig::default())
+            .apply_verified_loop(&mut global_map, &foreign_proof)
+            .expect_err("foreign loop proof must fail");
+        assert!(matches!(error, TrackerError::StaleLoopProof { .. }));
+        assert!(
+            global_map
+                .essential_graph()
+                .snapshot()
+                .loop_edges
+                .is_empty()
+        );
     }
 
     #[test]

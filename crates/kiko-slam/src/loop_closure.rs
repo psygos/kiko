@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::map::{KeyframeId, MapError, SlamMap};
+use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
@@ -914,6 +914,7 @@ pub struct RelocalizationCandidate {
 
 #[derive(Clone, Debug)]
 pub struct VerifiedLoop {
+    map_snapshot: MapSnapshot,
     query_kf: KeyframeId,
     match_kf: KeyframeId,
     query_pose_world: Pose,
@@ -921,6 +922,10 @@ pub struct VerifiedLoop {
 }
 
 impl VerifiedLoop {
+    pub fn map_snapshot(&self) -> MapSnapshot {
+        self.map_snapshot
+    }
+
     pub fn query_kf(&self) -> KeyframeId {
         self.query_kf
     }
@@ -939,12 +944,14 @@ impl VerifiedLoop {
 
     #[cfg(test)]
     pub(crate) fn from_parts(
+        map: &SlamMap,
         query_kf: KeyframeId,
         match_kf: KeyframeId,
         query_pose_world: Pose,
         inlier_count: usize,
     ) -> Self {
         Self {
+            map_snapshot: map.snapshot(),
             query_kf,
             match_kf,
             query_pose_world,
@@ -977,6 +984,8 @@ impl VerifiedRelocalization {
 #[derive(Debug)]
 pub enum LoopVerificationError {
     TooFewMatches { count: usize },
+    QueryIndexOutOfBounds { index: usize, len: usize },
+    Map(MapError),
     InvalidRansacConfig { source: RansacConfigError },
     PnpFailed(PnpError),
     InsufficientInliers { inliers: usize, required: usize },
@@ -987,6 +996,15 @@ impl std::fmt::Display for LoopVerificationError {
         match self {
             LoopVerificationError::TooFewMatches { count } => {
                 write!(f, "loop verification needs at least 4 matches, got {count}")
+            }
+            LoopVerificationError::QueryIndexOutOfBounds { index, len } => {
+                write!(
+                    f,
+                    "loop query keypoint index {index} is out of bounds for {len} keypoints"
+                )
+            }
+            LoopVerificationError::Map(source) => {
+                write!(f, "loop verification map lookup failed: {source}")
             }
             LoopVerificationError::PnpFailed(err) => {
                 write!(f, "loop verification PnP failed: {err}")
@@ -1005,9 +1023,11 @@ impl std::fmt::Display for LoopVerificationError {
 impl std::error::Error for LoopVerificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            LoopVerificationError::Map(source) => Some(source),
             LoopVerificationError::InvalidRansacConfig { source } => Some(source),
             LoopVerificationError::PnpFailed(source) => Some(source),
             LoopVerificationError::TooFewMatches { .. }
+            | LoopVerificationError::QueryIndexOutOfBounds { .. }
             | LoopVerificationError::InsufficientInliers { .. } => None,
         }
     }
@@ -1032,18 +1052,26 @@ fn verify_pose_from_keyframe(
 
     let mut observations = Vec::with_capacity(correspondences.len());
     for &(query_idx, match_idx) in correspondences {
-        let Some(&pixel) = query_keypoints.get(query_idx) else {
+        let pixel = *query_keypoints.get(query_idx).ok_or(
+            LoopVerificationError::QueryIndexOutOfBounds {
+                index: query_idx,
+                len: query_keypoints.len(),
+            },
+        )?;
+        let match_ref = map
+            .keyframe_keypoint(match_kf, match_idx)
+            .map_err(LoopVerificationError::Map)?;
+        let Some(point_id) = map
+            .map_point_for_keypoint(match_ref)
+            .map_err(LoopVerificationError::Map)?
+        else {
             continue;
         };
-        let Ok(match_ref) = map.keyframe_keypoint(match_kf, match_idx) else {
-            continue;
-        };
-        let Some(point_id) = map.map_point_for_keypoint(match_ref).ok().flatten() else {
-            continue;
-        };
-        let Some(point) = map.point(point_id) else {
-            continue;
-        };
+        let point =
+            map.point(point_id)
+                .ok_or(LoopVerificationError::Map(MapError::MapPointNotFound(
+                    point_id,
+                )))?;
         let obs = Observation::try_new(point.position(), pixel, intrinsics)
             .map_err(LoopVerificationError::PnpFailed)?;
         observations.push(obs);
@@ -1083,6 +1111,14 @@ impl LoopCandidate {
         ransac_config: RansacConfig,
         min_inliers: usize,
     ) -> Result<VerifiedLoop, LoopVerificationError> {
+        map.keyframe(self.query_kf)
+            .ok_or(LoopVerificationError::Map(MapError::KeyframeNotFound(
+                self.query_kf,
+            )))?;
+        map.keyframe(self.match_kf)
+            .ok_or(LoopVerificationError::Map(MapError::KeyframeNotFound(
+                self.match_kf,
+            )))?;
         let (query_pose_world, inlier_count) = verify_pose_from_keyframe(
             query_keypoints,
             correspondences,
@@ -1093,6 +1129,7 @@ impl LoopCandidate {
             min_inliers,
         )?;
         Ok(VerifiedLoop {
+            map_snapshot: map.snapshot(),
             query_kf: self.query_kf,
             match_kf: self.match_kf,
             query_pose_world,
@@ -1145,6 +1182,7 @@ mod tests {
 
     type LoopFixture = (
         SlamMap,
+        KeyframeId,
         KeyframeId,
         Vec<Keypoint>,
         Vec<(usize, usize)>,
@@ -1239,6 +1277,15 @@ mod tests {
                 match_keypoints,
             )
             .expect("match kf");
+        let query_kf = map
+            .add_keyframe(
+                FrameId::new(11),
+                Timestamp::from_nanos(11),
+                query_pose,
+                size,
+                query_keypoints.clone(),
+            )
+            .expect("query kf");
 
         for (idx, &point) in world_points.iter().enumerate() {
             let kp_ref = map.keyframe_keypoint(match_kf, idx).expect("kp ref");
@@ -1249,6 +1296,7 @@ mod tests {
         let correspondences = (0..world_points.len()).map(|i| (i, i)).collect::<Vec<_>>();
         (
             map,
+            query_kf,
             match_kf,
             query_keypoints,
             correspondences,
@@ -1518,9 +1566,15 @@ mod tests {
 
     #[test]
     fn loop_candidate_verify_succeeds_on_synthetic_geometry() {
-        let (map, match_kf, query_keypoints, correspondences, intrinsics, query_pose_world) =
-            make_loop_fixture();
-        let query_kf = make_keyframe_ids(1)[0];
+        let (
+            map,
+            query_kf,
+            match_kf,
+            query_keypoints,
+            correspondences,
+            intrinsics,
+            query_pose_world,
+        ) = make_loop_fixture();
         let candidate = LoopCandidate {
             query_kf,
             match_kf,
@@ -1538,6 +1592,7 @@ mod tests {
             .expect("verified loop");
         assert_eq!(verified.match_kf(), match_kf);
         assert_eq!(verified.query_kf(), query_kf);
+        assert_eq!(verified.map_snapshot(), map.snapshot());
         assert!(verified.inlier_count() >= 4);
         let actual = verified.query_pose_world().translation();
         let expected = query_pose_world.translation();
@@ -1553,9 +1608,10 @@ mod tests {
 
     #[test]
     fn loop_candidate_verify_rejects_insufficient_inliers() {
-        let (map, match_kf, query_keypoints, correspondences, intrinsics, _) = make_loop_fixture();
+        let (map, query_kf, match_kf, query_keypoints, correspondences, intrinsics, _) =
+            make_loop_fixture();
         let candidate = LoopCandidate {
-            query_kf: make_keyframe_ids(1)[0],
+            query_kf,
             match_kf,
             similarity: 0.95,
         };
@@ -1600,13 +1656,41 @@ mod tests {
             .expect_err("expected pnp failure");
         assert!(matches!(
             err,
-            LoopVerificationError::PnpFailed(_) | LoopVerificationError::TooFewMatches { .. }
+            LoopVerificationError::Map(MapError::KeyframeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn loop_candidate_verify_rejects_out_of_bounds_query_index() {
+        let (map, query_kf, match_kf, query_keypoints, mut correspondences, intrinsics, _) =
+            make_loop_fixture();
+        correspondences[0].0 = query_keypoints.len();
+        let candidate = LoopCandidate {
+            query_kf,
+            match_kf,
+            similarity: 0.95,
+        };
+
+        let error = candidate
+            .verify(
+                &query_keypoints,
+                &correspondences,
+                &map,
+                intrinsics,
+                RansacConfig::default(),
+                4,
+            )
+            .expect_err("invalid query index must fail");
+        assert!(matches!(
+            error,
+            LoopVerificationError::QueryIndexOutOfBounds { index, len }
+                if index == len && len == query_keypoints.len()
         ));
     }
 
     #[test]
     fn relocalization_candidate_verify_succeeds_without_map_mutation() {
-        let (map, match_kf, query_keypoints, correspondences, intrinsics, query_pose_world) =
+        let (map, _, match_kf, query_keypoints, correspondences, intrinsics, query_pose_world) =
             make_loop_fixture();
         let before_generation = map.generation();
         let candidate = RelocalizationCandidate {

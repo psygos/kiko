@@ -117,7 +117,8 @@ pub use loop_closure::{
     match_descriptors_for_loop,
 };
 pub use map::{
-    CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId, MapInstanceId,
+    CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, KeyframeId, MapGeneration,
+    MapInstanceId, MapSnapshot,
 };
 pub use map_from_odom::MapFromOdom;
 pub use math::{Pose64, Pose64Error};
