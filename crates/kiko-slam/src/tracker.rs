@@ -2418,16 +2418,6 @@ impl SlamTracker {
         Ok(())
     }
 
-    #[cfg(feature = "vio")]
-    fn on_keyframe_for_vio(
-        &mut self,
-        _keyframe_id: KeyframeId,
-        _pose_world: Pose,
-        _visual_observations: Vec<Observation>,
-    ) -> Result<(), TrackerError> {
-        Ok(())
-    }
-
     pub fn covisibility_snapshot(&self) -> crate::map::CovisibilitySnapshot {
         self.global_map.covisibility_snapshot()
     }
@@ -3867,36 +3857,32 @@ impl SlamTracker {
                     shared_pairs
                 );
             }
-            if let Ok((keyframe_output, keyframe_id)) = self.create_keyframe_internal(
+            match self.create_keyframe_internal(
                 left,
                 right,
                 new_pose,
                 Some(current.clone()),
                 Some(shared),
-                Some(tracked_observations.observations.clone()),
             ) {
-                keyframe_status = Some(KeyframeStatus::Created);
-                triangulation_stats = keyframe_output.diagnostics.triangulation;
-                ba_result = keyframe_output.diagnostics.ba_result.clone();
-                if let Some(keyframe) = keyframe_output.keyframe {
-                    let redundant = self
-                        .config
-                        .redundancy
-                        .map(|policy| {
-                            is_redundant(
-                                self.global_map.map(),
-                                keyframe_id,
-                                policy.max_covisibility(),
-                            )
-                        })
-                        .transpose()?
-                        .unwrap_or(false);
-                    if redundant {
-                        if let Err(err) =
-                            remove_keyframe_from_graph_and_db(&mut self.global_map, keyframe_id)
-                        {
-                            eprintln!("failed to remove redundant keyframe {keyframe_id:?}: {err}");
-                        } else {
+                Ok((keyframe_output, keyframe_id)) => {
+                    keyframe_status = Some(KeyframeStatus::Created);
+                    triangulation_stats = keyframe_output.diagnostics.triangulation;
+                    ba_result = keyframe_output.diagnostics.ba_result.clone();
+                    if let Some(keyframe) = keyframe_output.keyframe {
+                        let redundant = self
+                            .config
+                            .redundancy
+                            .map(|policy| {
+                                is_redundant(
+                                    self.global_map.map(),
+                                    keyframe_id,
+                                    policy.max_covisibility(),
+                                )
+                            })
+                            .transpose()?
+                            .unwrap_or(false);
+                        if redundant {
+                            remove_keyframe_from_graph_and_db(&mut self.global_map, keyframe_id)?;
                             self.emit_event(DiagnosticEvent::KeyframeRemoved {
                                 keyframe_id,
                                 reason: KeyframeRemovalReason::Redundant,
@@ -3905,87 +3891,96 @@ impl SlamTracker {
                                 place_recognition.remove_keyframe(keyframe_id);
                             }
                             self.bump_map_version();
-                        }
-                    } else {
-                        let window = self
-                            .global_map
-                            .covisible_window(keyframe_id, self.ba.window_size())?;
-                        if window.len() >= 2 {
-                            if self.backend.is_some() {
-                                if let Err(err) =
-                                    self.submit_backend_event(keyframe_id, window.clone())
-                                {
-                                    match err {
-                                        SubmitEventError::QueueFull => {
-                                            self.backend_stats.dropped_full =
-                                                self.backend_stats.dropped_full.saturating_add(1);
-                                        }
-                                        SubmitEventError::Disconnected => {
-                                            self.backend_stats.dropped_disconnected = self
-                                                .backend_stats
-                                                .dropped_disconnected
-                                                .saturating_add(1);
-                                            if let Some(supervisor) = self.backend.as_ref() {
-                                                self.backend_stats.respawn_count =
-                                                    supervisor.respawn_count();
-                                                if !supervisor.has_worker() {
+                        } else {
+                            let window = self
+                                .global_map
+                                .covisible_window(keyframe_id, self.ba.window_size())?;
+                            if window.len() >= 2 {
+                                if self.backend.is_some() {
+                                    if let Err(err) =
+                                        self.submit_backend_event(keyframe_id, window.clone())
+                                    {
+                                        match err {
+                                            SubmitEventError::QueueFull => {
+                                                self.backend_stats.dropped_full = self
+                                                    .backend_stats
+                                                    .dropped_full
+                                                    .saturating_add(1);
+                                            }
+                                            SubmitEventError::Disconnected => {
+                                                self.backend_stats.dropped_disconnected = self
+                                                    .backend_stats
+                                                    .dropped_disconnected
+                                                    .saturating_add(1);
+                                                if let Some(supervisor) = self.backend.as_ref() {
+                                                    self.backend_stats.respawn_count =
+                                                        supervisor.respawn_count();
+                                                    if !supervisor.has_worker() {
+                                                        self.backend = None;
+                                                    }
+                                                } else {
                                                     self.backend = None;
                                                 }
-                                            } else {
-                                                self.backend = None;
+                                            }
+                                            SubmitEventError::InvalidWindow(_)
+                                            | SubmitEventError::InvalidEvent(_) => {
+                                                self.backend_stats.rejected =
+                                                    self.backend_stats.rejected.saturating_add(1);
                                             }
                                         }
-                                        SubmitEventError::InvalidWindow(_)
-                                        | SubmitEventError::InvalidEvent(_) => {
-                                            self.backend_stats.rejected =
-                                                self.backend_stats.rejected.saturating_add(1);
+                                        eprintln!(
+                                            "backend submit failed for keyframe {keyframe_id:?}: {err}"
+                                        );
+                                        let result = self.ba.optimize_keyframe_window(
+                                            self.global_map.map_mut(),
+                                            &window,
+                                        );
+                                        ba_result = Some(result.clone());
+                                        if matches!(
+                                            result,
+                                            BaResult::Converged { .. }
+                                                | BaResult::MaxIterations { .. }
+                                        ) {
+                                            self.bump_map_version();
                                         }
                                     }
-                                    eprintln!(
-                                        "backend submit failed for keyframe {keyframe_id:?}: {err}"
-                                    );
-                                    let result = self.ba.optimize_keyframe_window(
-                                        self.global_map.map_mut(),
-                                        &window,
-                                    );
-                                    ba_result = Some(result.clone());
-                                    if matches!(
-                                        result,
-                                        BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                                    ) {
-                                        self.bump_map_version();
-                                    }
+                                } else if matches!(
+                                    {
+                                        let result = self.ba.optimize_keyframe_window(
+                                            self.global_map.map_mut(),
+                                            &window,
+                                        );
+                                        ba_result = Some(result.clone());
+                                        result
+                                    },
+                                    BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                                ) {
+                                    self.bump_map_version();
                                 }
-                            } else if matches!(
-                                {
-                                    let result = self.ba.optimize_keyframe_window(
-                                        self.global_map.map_mut(),
-                                        &window,
-                                    );
-                                    ba_result = Some(result.clone());
-                                    result
-                                },
-                                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                            ) {
-                                self.bump_map_version();
                             }
+                            self.state = TrackerState::Tracking {
+                                keyframe: keyframe.clone(),
+                                keyframe_id,
+                            };
+                            self.ba.reset();
+                            output_keyframe = Some(keyframe);
+                            output_matches = keyframe_output.stereo_matches;
                         }
-                        self.state = TrackerState::Tracking {
-                            keyframe: keyframe.clone(),
-                            keyframe_id,
-                        };
-                        self.ba.reset();
-                        output_keyframe = Some(keyframe);
-                        output_matches = keyframe_output.stereo_matches;
                     }
                 }
-            } else if self.trace_transitions {
-                eprintln!(
-                    "keyframe insertion rejected frame={} reason={} shared_pairs={}",
-                    frame_id.as_u64(),
-                    reason.trace_label(),
-                    shared_pairs
-                );
+                Err(TrackerError::KeyframeRejected { landmarks }) => {
+                    keyframe_status = Some(KeyframeStatus::Rejected);
+                    if self.trace_transitions {
+                        eprintln!(
+                            "keyframe insertion rejected frame={} reason={} shared_pairs={} landmarks={}",
+                            frame_id.as_u64(),
+                            reason.trace_label(),
+                            shared_pairs,
+                            landmarks
+                        );
+                    }
+                }
+                Err(err) => return Err(err),
             }
         }
 
@@ -4191,7 +4186,7 @@ impl SlamTracker {
         #[cfg(feature = "vio")]
         let capture_time = left.timestamp();
         let (output, keyframe_id) = match self
-            .create_keyframe_internal(left, right, pose_world, None, None, None)
+            .create_keyframe_internal(left, right, pose_world, None, None)
         {
             Ok(value) => value,
             Err(TrackerError::KeyframeRejected { landmarks }) => {
@@ -4254,7 +4249,6 @@ impl SlamTracker {
         pose_world: Pose,
         left_det: Option<Arc<Detections>>,
         shared: Option<SharedMatches>,
-        visual_observations: Option<Vec<Observation>>,
     ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
@@ -4353,14 +4347,6 @@ impl SlamTracker {
                 self.map_version,
             );
         }
-        #[cfg(not(feature = "vio"))]
-        let _ = visual_observations;
-        #[cfg(feature = "vio")]
-        self.on_keyframe_for_vio(
-            keyframe_id,
-            pose_world,
-            visual_observations.unwrap_or_default(),
-        )?;
 
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.keyframe_status = Some(KeyframeStatus::Created);
@@ -4386,6 +4372,20 @@ impl SlamTracker {
 }
 
 fn insert_keyframe_into_map(
+    map: &mut SlamMap,
+    keyframe: &Arc<Keyframe>,
+    timestamp: Timestamp,
+    pose_world: Pose,
+    shared: Option<&SharedMatches>,
+) -> Result<KeyframeId, TrackerError> {
+    let mut candidate = map.clone();
+    let keyframe_id =
+        insert_keyframe_into_candidate(&mut candidate, keyframe, timestamp, pose_world, shared)?;
+    *map = candidate;
+    Ok(keyframe_id)
+}
+
+fn insert_keyframe_into_candidate(
     map: &mut SlamMap,
     keyframe: &Arc<Keyframe>,
     timestamp: Timestamp,
@@ -4442,8 +4442,10 @@ fn remove_keyframe_from_graph_and_db(
     global_map: &mut GlobalMap,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
-    global_map.remove_keyframe_from_graph(keyframe_id)?;
-    global_map.remove_keyframe(keyframe_id)?;
+    let mut candidate = global_map.clone();
+    candidate.remove_keyframe_from_graph(keyframe_id)?;
+    candidate.remove_keyframe(keyframe_id)?;
+    *global_map = candidate;
     Ok(())
 }
 
@@ -4600,7 +4602,7 @@ mod tests {
         DescriptorExtractorFactory, DescriptorRequest, DescriptorSupervisor, DescriptorWorker,
         DescriptorWorkerResponse,
     };
-    use crate::pose_graph::{EssentialEdgeKind, EssentialGraph, PoseGraphConfig};
+    use crate::pose_graph::{EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig};
     use crate::{
         CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
         SensorId, Timestamp,
@@ -4946,6 +4948,50 @@ mod tests {
             assert_eq!(z, landmark.z);
         }
         assert_map_invariants(&map).expect("final invariants");
+
+        let candidate_detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(11),
+            keyframe.detections().width(),
+            keyframe.detections().height(),
+            keyframe.detections().keypoints().to_vec(),
+            keyframe.detections().scores().to_vec(),
+            keyframe.detections().descriptors().to_vec(),
+        )
+        .expect("candidate detections");
+        let candidate_keyframe = Arc::new(
+            Keyframe::from_arc(
+                Arc::new(candidate_detections),
+                keyframe.landmarks().to_vec(),
+                keyframe.landmark_indices().to_vec(),
+            )
+            .expect("candidate keyframe"),
+        );
+        let invalid_shared = SharedMatches {
+            keyframe_id,
+            pairs: vec![(usize::MAX, 0)],
+        };
+        let generation_before = map.generation();
+        let keyframes_before = map.num_keyframes();
+        let points_before = map.num_points();
+
+        let error = insert_keyframe_into_map(
+            &mut map,
+            &candidate_keyframe,
+            Timestamp::from_nanos(43),
+            Pose::identity(),
+            Some(&invalid_shared),
+        )
+        .expect_err("invalid shared association must reject the candidate transaction");
+
+        assert!(matches!(
+            error,
+            TrackerError::Map(crate::map::MapError::KeypointIndexOutOfBounds { .. })
+        ));
+        assert_eq!(map.generation(), generation_before);
+        assert_eq!(map.num_keyframes(), keyframes_before);
+        assert_eq!(map.num_points(), points_before);
+        assert_map_invariants(&map).expect("failed insertion preserved map invariants");
     }
 
     #[test]
@@ -5767,6 +5813,64 @@ mod tests {
         assert!(loop_db.descriptor_source(removed_kf).is_none());
         let input = global_map.essential_graph().pose_graph_input();
         assert!(input.keyframe_ids.iter().all(|&id| id != removed_kf));
+    }
+
+    #[test]
+    fn failed_keyframe_removal_preserves_essential_graph() {
+        let mut map = SlamMap::new();
+        let root = map
+            .add_keyframe_from_detections(
+                make_test_detections(1).as_ref(),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+            )
+            .expect("root keyframe");
+
+        let mut other_map = SlamMap::new();
+        other_map
+            .add_keyframe_from_detections(
+                make_test_detections(2).as_ref(),
+                Timestamp::from_nanos(2),
+                Pose::identity(),
+            )
+            .expect("other root");
+        let foreign_id = other_map
+            .add_keyframe_from_detections(
+                make_test_detections(3).as_ref(),
+                Timestamp::from_nanos(3),
+                Pose::identity(),
+            )
+            .expect("foreign keyframe");
+
+        let mut graph = EssentialGraph::new(1);
+        graph.add_keyframe(root, None, &map);
+        graph.add_loop_edge(EssentialEdge {
+            a: root,
+            b: foreign_id,
+            kind: EssentialEdgeKind::Loop,
+            relative_pose: crate::Pose64::identity(),
+            information: [[0.0; 6]; 6],
+        });
+        let mut global_map = GlobalMap::from_parts(map, graph);
+        let generation_before = global_map.map().generation();
+        let loop_edges_before = global_map.essential_graph().snapshot().loop_edges.len();
+
+        let error = remove_keyframe_from_graph_and_db(&mut global_map, foreign_id)
+            .expect_err("foreign map ID must not be removable");
+
+        assert!(matches!(
+            error,
+            TrackerError::Map(crate::map::MapError::KeyframeNotFound(id)) if id == foreign_id
+        ));
+        assert_eq!(global_map.map().generation(), generation_before);
+        assert_eq!(
+            global_map.essential_graph().snapshot().loop_edges.len(),
+            loop_edges_before
+        );
+        assert_eq!(
+            global_map.essential_graph().parent_of(foreign_id),
+            Some(root)
+        );
     }
 
     #[test]
