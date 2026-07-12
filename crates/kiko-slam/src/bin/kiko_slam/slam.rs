@@ -244,17 +244,30 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut attempted = 0usize;
     let mut processed = 0usize;
     let mut inference_errors = 0usize;
+    let mut prefetch_errors = 0usize;
     let mut read_errors = 0usize;
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
 
     // Prefetch pipeline: overlap SP(N+1) + speculative LG(N+1) with frame N.
+    enum PrefetchInferenceOutcome {
+        Detected {
+            detections: std::sync::Arc<kiko_slam::Detections>,
+            speculative_matches: Result<
+                Option<(kiko_slam::KeyframeId, kiko_slam::Matches<kiko_slam::Raw>)>,
+                kiko_slam::InferenceError,
+            >,
+        },
+        DetectionFailed {
+            source: kiko_slam::InferenceError,
+        },
+    }
+
     struct PrefetchResult {
         sp: kiko_slam::SuperPoint,
         lg: Option<kiko_slam::LightGlue>,
         frame_id: kiko_slam::FrameId,
-        detections: Option<std::sync::Arc<kiko_slam::Detections>>,
-        speculative_matches: Option<(kiko_slam::KeyframeId, kiko_slam::Matches<kiko_slam::Raw>)>,
+        outcome: PrefetchInferenceOutcome,
     }
     let mut pending_prefetch: Option<std::thread::JoinHandle<PrefetchResult>> = None;
     let ds = downscale;
@@ -296,10 +309,41 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(lg) = result.lg {
                         tracker.return_prefetch_lg(lg);
                     }
-                    let detections = result.detections.map(|dets| (result.frame_id, dets));
-                    (detections, result.speculative_matches)
+                    match result.outcome {
+                        PrefetchInferenceOutcome::Detected {
+                            detections,
+                            speculative_matches,
+                        } => {
+                            let speculative_matches = match speculative_matches {
+                                Ok(matches) => matches,
+                                Err(source) => {
+                                    prefetch_errors = prefetch_errors.saturating_add(1);
+                                    report_error_chain(
+                                        "speculative LightGlue prefetch failed; tracker will match synchronously",
+                                        &source,
+                                    );
+                                    None
+                                }
+                            };
+                            (Some((result.frame_id, detections)), speculative_matches)
+                        }
+                        PrefetchInferenceOutcome::DetectionFailed { source } => {
+                            prefetch_errors = prefetch_errors.saturating_add(1);
+                            report_error_chain(
+                                "SuperPoint prefetch failed; tracker will detect synchronously",
+                                &source,
+                            );
+                            (None, None)
+                        }
+                    }
                 }
-                Err(_) => (None, None),
+                Err(payload) => {
+                    return Err(std::io::Error::other(format!(
+                        "inference prefetch thread panicked: {}",
+                        kiko_slam::panic_payload_to_string(payload.as_ref())
+                    ))
+                    .into());
+                }
             }
         } else {
             (None, None)
@@ -319,7 +363,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         // Launch SP + speculative LG prefetch for the NEXT frame on a background thread
-        if let Some(ref next_b) = lookahead_bundle {
+        let below_pair_limit = should_prefetch_lookahead(attempted, args.dataset.max_pairs);
+        if below_pair_limit && let Some(ref next_b) = lookahead_bundle {
             if let Some(mut sp) = tracker.take_prefetch_sp() {
                 let mut lg = if use_speculative_lg {
                     tracker.take_prefetch_lg()
@@ -330,25 +375,29 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let next_left = next_b.pair().left().clone();
                 let next_fid = next_left.frame_id();
                 pending_prefetch = Some(std::thread::spawn(move || {
-                    let detections = sp
-                        .detect_with_downscale_limited(&next_left, ds, max_kp)
-                        .ok()
-                        .map(|d| std::sync::Arc::new(d.top_k(max_kp)));
-                    let speculative_matches = match (&detections, &mut lg, &keyframe_info) {
-                        (Some(dets), Some(lg_session), Some((keyframe_id, keyframe_dets))) => {
-                            lg_session
-                                .match_these(dets.clone(), keyframe_dets.clone())
-                                .ok()
-                                .map(|matches| (*keyframe_id, matches))
+                    let outcome = match sp.detect_with_downscale_limited(&next_left, ds, max_kp) {
+                        Ok(detections) => {
+                            let detections = std::sync::Arc::new(detections.top_k(max_kp));
+                            let speculative_matches = match (&mut lg, &keyframe_info) {
+                                (Some(lg_session), Some((keyframe_id, keyframe_dets))) => {
+                                    lg_session
+                                        .match_these(detections.clone(), keyframe_dets.clone())
+                                        .map(|matches| Some((*keyframe_id, matches)))
+                                }
+                                _ => Ok(None),
+                            };
+                            PrefetchInferenceOutcome::Detected {
+                                detections,
+                                speculative_matches,
+                            }
                         }
-                        _ => None,
+                        Err(source) => PrefetchInferenceOutcome::DetectionFailed { source },
                     };
                     PrefetchResult {
                         sp,
                         lg,
                         frame_id: next_fid,
-                        detections,
-                        speculative_matches,
+                        outcome,
                     }
                 }));
             }
@@ -511,15 +560,36 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, tracker_errors={inference_errors}, poses_logged={poses_logged}, keyframes={keyframes}"
+        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, tracker_errors={inference_errors}, prefetch_errors={prefetch_errors}, poses_logged={poses_logged}, keyframes={keyframes}"
     );
 
     Ok(())
 }
 
+fn report_error_chain(context: &str, error: &(dyn std::error::Error + 'static)) {
+    eprintln!("{context}: {error}");
+    let mut nested = error.source();
+    while let Some(cause) = nested {
+        eprintln!("  caused by: {cause}");
+        nested = cause.source();
+    }
+}
+
+fn should_prefetch_lookahead(attempted: usize, max_pairs: Option<usize>) -> bool {
+    max_pairs.is_none_or(|limit| attempted < limit)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SLAM_ENV_HELP;
+    use super::{SLAM_ENV_HELP, should_prefetch_lookahead};
+
+    #[test]
+    fn pair_limit_does_not_spawn_unused_prefetch_work() {
+        assert!(should_prefetch_lookahead(10, None));
+        assert!(should_prefetch_lookahead(9, Some(10)));
+        assert!(!should_prefetch_lookahead(10, Some(10)));
+        assert!(!should_prefetch_lookahead(11, Some(10)));
+    }
 
     #[test]
     fn slam_env_help_mentions_confirmed_surface_sigma_env() {
