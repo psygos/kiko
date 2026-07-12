@@ -394,7 +394,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                         if let (Some(samples), Some(triangulator), Some(pose)) = (
                             surface_samples.as_ref(),
                             dense_triangulator.as_ref(),
-                            output.pose.as_ref(),
+                            output.pose.current_estimate(),
                         ) {
                             let stereo = triangulator.stereo();
                             let raw_frame_points: Vec<[f32; 3]> = samples
@@ -458,7 +458,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("rerun imu log error: {err}");
                         }
                     }
-                    if let Some(pose) = output.pose.as_ref() {
+                    if let Some(pose) = output.pose.current_estimate() {
                         if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
                             eprintln!("rerun log error: {err}");
                         } else {

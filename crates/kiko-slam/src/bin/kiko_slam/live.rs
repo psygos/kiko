@@ -10,8 +10,8 @@ use kiko_slam::env::{env_bool, env_usize};
 use kiko_slam::{
     CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
     DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
-    ImuBatch, ImuSample, PairingDropReason, PairingOutcome, Point3, Raw, RerunSink, SendOutcome,
-    SensorId, SlamTracker, StereoPairer, SystemHealth, TrackingPose, VizPacket, bounded_channel,
+    ImuBatch, ImuSample, PairingDropReason, PairingOutcome, Point3, PoseStatus, Raw, RerunSink,
+    SendOutcome, SensorId, SlamTracker, StereoPairer, SystemHealth, VizPacket, bounded_channel,
     oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
 use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
@@ -43,7 +43,7 @@ struct LiveVizMsg {
     right: Frame,
     depth: Option<DepthImage>,
     imu: Option<ImuBatch>,
-    pose: Option<TrackingPose>,
+    pose: PoseStatus,
     vio_telemetry: Option<kiko_slam::VioTelemetry>,
     packet: Option<VizPacket<Raw>>,
     points: Option<Vec<Point3>>,
@@ -328,7 +328,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                if let Some(pose) = msg.pose.as_ref() {
+                if let Some(pose) = msg.pose.current_estimate() {
                     if let Err(err) = sink.log_tracking_pose(msg.left.timestamp(), pose) {
                         eprintln!("rerun log error: {err}");
                     }

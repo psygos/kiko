@@ -1329,7 +1329,7 @@ impl SystemHealth {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TrackingPose {
     cam_from_odom: Pose64,
     cam_from_map_corrected: Pose64,
@@ -1374,6 +1374,42 @@ impl TrackingPose {
     }
 }
 
+#[derive(Debug)]
+pub enum PoseStatus {
+    Current(TrackingPose),
+    Predicted(TrackingPose),
+    Stale {
+        pose: TrackingPose,
+        source_frame_id: FrameId,
+    },
+    Unavailable,
+}
+
+impl PoseStatus {
+    pub fn current_estimate(&self) -> Option<&TrackingPose> {
+        match self {
+            Self::Current(pose) | Self::Predicted(pose) => Some(pose),
+            Self::Stale { .. } | Self::Unavailable => None,
+        }
+    }
+
+    pub fn last_known_pose(&self) -> Option<&TrackingPose> {
+        match self {
+            Self::Current(pose) | Self::Predicted(pose) | Self::Stale { pose, .. } => Some(pose),
+            Self::Unavailable => None,
+        }
+    }
+
+    pub fn stale_source_frame_id(&self) -> Option<FrameId> {
+        match self {
+            Self::Stale {
+                source_frame_id, ..
+            } => Some(*source_frame_id),
+            Self::Current(_) | Self::Predicted(_) | Self::Unavailable => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct VioTelemetry {
     velocity_odom_mps: [f64; 3],
@@ -1407,7 +1443,7 @@ impl VioTelemetry {
 
 #[derive(Debug)]
 pub struct TrackerOutput {
-    pub pose: Option<TrackingPose>,
+    pub pose: PoseStatus,
     pub inliers: usize,
     pub keyframe: Option<Arc<Keyframe>>,
     pub stereo_matches: Option<Matches<Raw>>,
@@ -1416,6 +1452,21 @@ pub struct TrackerOutput {
     pub diagnostics: FrameDiagnostics,
     pub events: Vec<DiagnosticEvent>,
     pub vio_telemetry: Option<VioTelemetry>,
+}
+
+#[derive(Clone, Debug)]
+struct LastAcceptedPose {
+    frame_id: FrameId,
+    pose_world: Pose,
+    tracking_pose: TrackingPose,
+}
+
+#[derive(Debug)]
+struct CreatedKeyframe {
+    keyframe_id: KeyframeId,
+    keyframe: Arc<Keyframe>,
+    stereo_matches: Matches<Raw>,
+    diagnostics: FrameDiagnostics,
 }
 
 #[derive(Debug)]
@@ -1900,7 +1951,7 @@ pub struct SlamTracker {
     pending_events: Vec<DiagnosticEvent>,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
-    last_pose_world: Option<Pose>,
+    last_accepted_pose: Option<LastAcceptedPose>,
     next_capture_id: u64,
     previous_capture_time: Option<Timestamp>,
     map_from_odom: MapFromOdom,
@@ -2018,7 +2069,7 @@ impl SlamTracker {
             pending_events: Vec::new(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
-            last_pose_world: None,
+            last_accepted_pose: None,
             next_capture_id: 0,
             previous_capture_time: None,
             map_from_odom: MapFromOdom::identity(),
@@ -2119,11 +2170,11 @@ impl SlamTracker {
                 prefetched_matches,
             )
         } else {
-            let bootstrap_pose = self.last_pose_world.unwrap_or(Pose::identity());
+            let bootstrap_pose = self.last_pose_world().unwrap_or(Pose::identity());
             if self.trace_transitions {
                 eprintln!(
                     "tracker bootstrap keyframe: pose_source={} tx={:.3} ty={:.3} tz={:.3}",
-                    if self.last_pose_world.is_some() {
+                    if self.last_accepted_pose.is_some() {
                         "last_pose"
                     } else {
                         "identity"
@@ -2612,7 +2663,7 @@ impl SlamTracker {
     #[allow(clippy::too_many_arguments)]
     fn output_with_diagnostics(
         &mut self,
-        pose: Option<Pose>,
+        visual_pose: Option<Pose>,
         inliers: usize,
         keyframe: Option<Arc<Keyframe>>,
         stereo_matches: Option<Matches<Raw>>,
@@ -2621,30 +2672,25 @@ impl SlamTracker {
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
         #[cfg(feature = "vio")]
-        let pose = match (self.current_odom_pose(), pose) {
-            (Some(cam_from_odom), maybe_pose_map) => Some(tracking_pose_from_vio_output(
-                &self.map_from_odom,
-                cam_from_odom,
-                maybe_pose_map,
-            )),
-            (None, maybe_pose) => maybe_pose.map(|pose_world| {
-                let cam_from_odom = Pose64::from_pose32(pose_world);
-                let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
-                TrackingPose::new(cam_from_odom, cam_from_map, None)
-            }),
-        };
+        let current_odom_pose = self.current_odom_pose();
         #[cfg(not(feature = "vio"))]
-        let pose = pose.map(|pose_world| {
-            let cam_from_odom = Pose64::from_pose32(pose_world);
-            let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom);
-            TrackingPose::new(cam_from_odom, cam_from_map, None)
-        });
+        let current_odom_pose = None;
+        let pose = classify_pose_status(
+            &self.map_from_odom,
+            current_odom_pose,
+            visual_pose,
+            self.last_accepted_pose.as_ref(),
+        );
         #[cfg(feature = "vio")]
         let vio_telemetry = self.current_vio_telemetry();
         #[cfg(not(feature = "vio"))]
         let vio_telemetry = None;
-        if let Some(pose_world) = pose.as_ref() {
-            self.last_pose_world = Some(pose_world.cam_from_map_pose32());
+        if let PoseStatus::Current(pose_world) = &pose {
+            self.last_accepted_pose = Some(LastAcceptedPose {
+                frame_id,
+                pose_world: pose_world.cam_from_map_pose32(),
+                tracking_pose: pose_world.clone(),
+            });
             #[cfg(feature = "vio")]
             if self.trace_transitions {
                 if let Some(measurement) = pose_world.cam_from_map_visual_measurement_pose32() {
@@ -2680,22 +2726,14 @@ impl SlamTracker {
         }
     }
 
-    /// Build a `TrackerOutput` for a tracking failure (no pose, no keyframe, no matches).
+    /// Build an output whose pose is explicitly predicted, stale, or unavailable.
     fn tracking_failure_output(
         &mut self,
         frame_id: FrameId,
         health: TrackingHealth,
         diagnostics: FrameDiagnostics,
     ) -> TrackerOutput {
-        self.output_with_diagnostics(
-            self.last_pose_world,
-            0,
-            None,
-            None,
-            frame_id,
-            health,
-            diagnostics,
-        )
+        self.output_with_diagnostics(None, 0, None, None, frame_id, health, diagnostics)
     }
 
     fn drain_descriptor_responses(&mut self) {
@@ -3047,15 +3085,7 @@ impl SlamTracker {
         health: TrackingHealth,
     ) -> TrackerOutput {
         let diagnostics = self.empty_diagnostics();
-        self.output_with_diagnostics(
-            self.last_pose_world,
-            0,
-            None,
-            None,
-            frame_id,
-            health,
-            diagnostics,
-        )
+        self.output_with_diagnostics(None, 0, None, None, frame_id, health, diagnostics)
     }
 
     fn relocalization_pose_consistent(
@@ -3256,7 +3286,6 @@ impl SlamTracker {
         let reference_cam_from_odom = session.reference_cam_from_odom;
         match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
             RelocalizationStep::Recovered { pose_world } => {
-                self.last_pose_world = Some(pose_world);
                 self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
                     keyframe_id: candidate_id,
                 });
@@ -3398,7 +3427,11 @@ impl SlamTracker {
         if let Some(cam_from_odom) = self.current_odom_pose() {
             return Some(self.map_from_odom.odom_to_map(cam_from_odom).to_pose32());
         }
-        self.last_pose_world
+        self.last_pose_world()
+    }
+
+    fn last_pose_world(&self) -> Option<Pose> {
+        self.last_accepted_pose.as_ref().map(|last| last.pose_world)
     }
 
     fn projected_tracking_matches(
@@ -3929,108 +3962,109 @@ impl SlamTracker {
                 Some(current.clone()),
                 Some(shared),
             ) {
-                Ok((keyframe_output, keyframe_id)) => {
+                Ok(created) => {
+                    let CreatedKeyframe {
+                        keyframe_id,
+                        keyframe,
+                        stereo_matches,
+                        diagnostics: keyframe_diagnostics,
+                    } = created;
                     keyframe_status = Some(KeyframeStatus::Created);
-                    triangulation_stats = keyframe_output.diagnostics.triangulation;
-                    ba_result = keyframe_output.diagnostics.ba_result.clone();
-                    if let Some(keyframe) = keyframe_output.keyframe {
-                        let redundant = self
-                            .config
-                            .redundancy
-                            .map(|policy| {
-                                is_redundant(
-                                    self.global_map.map(),
-                                    keyframe_id,
-                                    policy.max_covisibility(),
-                                )
-                            })
-                            .transpose()?
-                            .unwrap_or(false);
-                        if redundant {
-                            remove_keyframe_from_graph_and_db(&mut self.global_map, keyframe_id)?;
-                            self.emit_event(DiagnosticEvent::KeyframeRemoved {
+                    triangulation_stats = keyframe_diagnostics.triangulation;
+                    ba_result = keyframe_diagnostics.ba_result.clone();
+                    let redundant = self
+                        .config
+                        .redundancy
+                        .map(|policy| {
+                            is_redundant(
+                                self.global_map.map(),
                                 keyframe_id,
-                                reason: KeyframeRemovalReason::Redundant,
-                            });
-                            if let Some(place_recognition) = self.place_recognition.as_mut() {
-                                place_recognition.remove_keyframe(keyframe_id);
-                            }
-                            self.bump_map_version();
-                        } else {
-                            let window = self
-                                .global_map
-                                .covisible_window(keyframe_id, self.ba.window_size())?;
-                            if window.len() >= 2 {
-                                if self.backend.is_some() {
-                                    if let Err(err) =
-                                        self.submit_backend_event(keyframe_id, window.clone())
-                                    {
-                                        match err {
-                                            SubmitEventError::QueueFull => {
-                                                self.backend_stats.dropped_full = self
-                                                    .backend_stats
-                                                    .dropped_full
-                                                    .saturating_add(1);
-                                            }
-                                            SubmitEventError::Disconnected => {
-                                                self.backend_stats.dropped_disconnected = self
-                                                    .backend_stats
-                                                    .dropped_disconnected
-                                                    .saturating_add(1);
-                                                if let Some(supervisor) = self.backend.as_ref() {
-                                                    self.backend_stats.respawn_count =
-                                                        supervisor.respawn_count();
-                                                    if !supervisor.has_worker() {
-                                                        self.backend = None;
-                                                    }
-                                                } else {
+                                policy.max_covisibility(),
+                            )
+                        })
+                        .transpose()?
+                        .unwrap_or(false);
+                    if redundant {
+                        remove_keyframe_from_graph_and_db(&mut self.global_map, keyframe_id)?;
+                        self.emit_event(DiagnosticEvent::KeyframeRemoved {
+                            keyframe_id,
+                            reason: KeyframeRemovalReason::Redundant,
+                        });
+                        if let Some(place_recognition) = self.place_recognition.as_mut() {
+                            place_recognition.remove_keyframe(keyframe_id);
+                        }
+                        self.bump_map_version();
+                    } else {
+                        let window = self
+                            .global_map
+                            .covisible_window(keyframe_id, self.ba.window_size())?;
+                        if window.len() >= 2 {
+                            if self.backend.is_some() {
+                                if let Err(err) =
+                                    self.submit_backend_event(keyframe_id, window.clone())
+                                {
+                                    match err {
+                                        SubmitEventError::QueueFull => {
+                                            self.backend_stats.dropped_full =
+                                                self.backend_stats.dropped_full.saturating_add(1);
+                                        }
+                                        SubmitEventError::Disconnected => {
+                                            self.backend_stats.dropped_disconnected = self
+                                                .backend_stats
+                                                .dropped_disconnected
+                                                .saturating_add(1);
+                                            if let Some(supervisor) = self.backend.as_ref() {
+                                                self.backend_stats.respawn_count =
+                                                    supervisor.respawn_count();
+                                                if !supervisor.has_worker() {
                                                     self.backend = None;
                                                 }
-                                            }
-                                            SubmitEventError::InvalidWindow(_)
-                                            | SubmitEventError::InvalidEvent(_) => {
-                                                self.backend_stats.rejected =
-                                                    self.backend_stats.rejected.saturating_add(1);
+                                            } else {
+                                                self.backend = None;
                                             }
                                         }
-                                        eprintln!(
-                                            "backend submit failed for keyframe {keyframe_id:?}: {err}"
-                                        );
-                                        let result = self.ba.optimize_keyframe_window(
-                                            self.global_map.map_mut(),
-                                            &window,
-                                        );
-                                        ba_result = Some(result.clone());
-                                        if matches!(
-                                            result,
-                                            BaResult::Converged { .. }
-                                                | BaResult::MaxIterations { .. }
-                                        ) {
-                                            self.bump_map_version();
+                                        SubmitEventError::InvalidWindow(_)
+                                        | SubmitEventError::InvalidEvent(_) => {
+                                            self.backend_stats.rejected =
+                                                self.backend_stats.rejected.saturating_add(1);
                                         }
                                     }
-                                } else if matches!(
-                                    {
-                                        let result = self.ba.optimize_keyframe_window(
-                                            self.global_map.map_mut(),
-                                            &window,
-                                        );
-                                        ba_result = Some(result.clone());
-                                        result
-                                    },
-                                    BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                                ) {
-                                    self.bump_map_version();
+                                    eprintln!(
+                                        "backend submit failed for keyframe {keyframe_id:?}: {err}"
+                                    );
+                                    let result = self.ba.optimize_keyframe_window(
+                                        self.global_map.map_mut(),
+                                        &window,
+                                    );
+                                    ba_result = Some(result.clone());
+                                    if matches!(
+                                        result,
+                                        BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                                    ) {
+                                        self.bump_map_version();
+                                    }
                                 }
+                            } else if matches!(
+                                {
+                                    let result = self.ba.optimize_keyframe_window(
+                                        self.global_map.map_mut(),
+                                        &window,
+                                    );
+                                    ba_result = Some(result.clone());
+                                    result
+                                },
+                                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+                            ) {
+                                self.bump_map_version();
                             }
-                            self.state = TrackerState::Tracking {
-                                keyframe: keyframe.clone(),
-                                keyframe_id,
-                            };
-                            self.ba.reset();
-                            output_keyframe = Some(keyframe);
-                            output_matches = keyframe_output.stereo_matches;
                         }
+                        self.state = TrackerState::Tracking {
+                            keyframe: keyframe.clone(),
+                            keyframe_id,
+                        };
+                        self.ba.reset();
+                        output_keyframe = Some(keyframe);
+                        output_matches = Some(stereo_matches);
                     }
                 }
                 Err(TrackerError::KeyframeRejected { landmarks }) => {
@@ -4250,9 +4284,7 @@ impl SlamTracker {
         let frame_id = left.frame_id();
         #[cfg(feature = "vio")]
         let capture_time = left.timestamp();
-        let (output, keyframe_id) = match self
-            .create_keyframe_internal(left, right, pose_world, None, None)
-        {
+        let created = match self.create_keyframe_internal(left, right, pose_world, None, None) {
             Ok(value) => value,
             Err(TrackerError::KeyframeRejected { landmarks }) => {
                 if self.trace_transitions {
@@ -4282,28 +4314,23 @@ impl SlamTracker {
                 return Err(err);
             }
         };
-        let Some(keyframe) = output.keyframe.clone() else {
-            return Err(TrackerError::InvariantViolation(
-                "create_keyframe_internal returned TrackerOutput without keyframe",
-            ));
-        };
+        let keyframe = Arc::clone(&created.keyframe);
         self.state = TrackerState::Tracking {
             keyframe,
-            keyframe_id,
+            keyframe_id: created.keyframe_id,
         };
         self.ba.reset();
         #[cfg(feature = "vio")]
         self.commit_authoritative_visual_pose(capture_time, pose_world, &[]);
         self.consecutive_tracking_failures = 0;
-        let diagnostics = output.diagnostics;
         Ok(self.output_with_diagnostics(
             Some(pose_world),
             0,
-            output.keyframe,
-            output.stereo_matches,
+            Some(created.keyframe),
+            Some(created.stereo_matches),
             frame_id,
             TrackingHealth::Good,
-            diagnostics,
+            created.diagnostics,
         ))
     }
 
@@ -4314,7 +4341,7 @@ impl SlamTracker {
         pose_world: Pose,
         left_det: Option<Arc<Detections>>,
         shared: Option<SharedMatches>,
-    ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
+    ) -> Result<CreatedKeyframe, TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
 
@@ -4419,20 +4446,12 @@ impl SlamTracker {
         diagnostics.features_detected = Some(left_arc.len());
         diagnostics.features_matched = Some(matches.len());
 
-        Ok((
-            TrackerOutput {
-                pose: None,
-                inliers: 0,
-                keyframe: Some(keyframe),
-                stereo_matches: Some(matches),
-                frame_id,
-                health: self.system_health(),
-                diagnostics,
-                events: Vec::new(),
-                vio_telemetry: None,
-            },
+        Ok(CreatedKeyframe {
             keyframe_id,
-        ))
+            keyframe,
+            stereo_matches: matches,
+            diagnostics,
+        })
     }
 }
 
@@ -4528,7 +4547,39 @@ fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
     }
 }
 
-#[cfg(feature = "vio")]
+fn classify_pose_status(
+    map_from_odom: &MapFromOdom,
+    current_odom_pose: Option<Pose64>,
+    visual_pose_map: Option<Pose>,
+    last_accepted_pose: Option<&LastAcceptedPose>,
+) -> PoseStatus {
+    match (current_odom_pose, visual_pose_map) {
+        (Some(cam_from_odom), visual_pose_map) => {
+            let pose = tracking_pose_from_vio_output(map_from_odom, cam_from_odom, visual_pose_map);
+            if visual_pose_map.is_some() {
+                PoseStatus::Current(pose)
+            } else {
+                PoseStatus::Predicted(pose)
+            }
+        }
+        (None, Some(pose_map)) => {
+            let cam_from_map = Pose64::from_pose32(pose_map);
+            let cam_from_odom = map_from_odom.map_to_odom(cam_from_map);
+            PoseStatus::Current(TrackingPose::new(
+                cam_from_odom,
+                cam_from_map,
+                Some(cam_from_map),
+            ))
+        }
+        (None, None) => {
+            last_accepted_pose.map_or(PoseStatus::Unavailable, |last| PoseStatus::Stale {
+                pose: last.tracking_pose.clone(),
+                source_frame_id: last.frame_id,
+            })
+        }
+    }
+}
+
 fn tracking_pose_from_vio_output(
     map_from_odom: &MapFromOdom,
     cam_from_odom: Pose64,
@@ -6303,6 +6354,70 @@ mod tests {
             beyond_rotation,
             cfg
         ));
+    }
+
+    #[test]
+    fn pose_status_distinguishes_stale_snapshot_from_current_estimate() {
+        let tracking_pose = TrackingPose::new(
+            Pose64::identity(),
+            Pose64::identity(),
+            Some(Pose64::identity()),
+        );
+        let last = LastAcceptedPose {
+            frame_id: FrameId::new(41),
+            pose_world: Pose::identity(),
+            tracking_pose,
+        };
+
+        let status = classify_pose_status(&MapFromOdom::identity(), None, None, Some(&last));
+        assert!(status.current_estimate().is_none());
+        assert!(status.last_known_pose().is_some());
+        assert_eq!(status.stale_source_frame_id(), Some(FrameId::new(41)));
+        assert!(matches!(status, PoseStatus::Stale { .. }));
+    }
+
+    #[test]
+    fn pose_status_marks_inertial_only_output_as_predicted() {
+        let cam_from_odom = Pose64::try_from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.4, -0.2, 0.1],
+        )
+        .expect("odom pose");
+        let status =
+            classify_pose_status(&MapFromOdom::identity(), Some(cam_from_odom), None, None);
+
+        let PoseStatus::Predicted(pose) = status else {
+            panic!("inertial-only output must be predicted");
+        };
+        assert_eq!(pose.cam_from_odom(), cam_from_odom);
+        assert_eq!(pose.cam_from_map(), cam_from_odom);
+        assert!(pose.cam_from_map_visual_measurement().is_none());
+    }
+
+    #[test]
+    fn visual_output_without_prediction_preserves_map_and_odom_frames() {
+        let mut bridge = MapFromOdom::identity();
+        bridge.set_pose_map_from_odom(
+            Pose64::try_from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [1.0, 0.0, 0.0],
+            )
+            .expect("map-from-odom"),
+        );
+        let visual_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [2.0, 0.0, 0.0],
+        );
+        let expected_map = Pose64::from_pose32(visual_pose);
+        let expected_odom = bridge.map_to_odom(expected_map);
+
+        let status = classify_pose_status(&bridge, None, Some(visual_pose), None);
+        let PoseStatus::Current(pose) = status else {
+            panic!("accepted visual output must be current");
+        };
+        assert_eq!(pose.cam_from_map(), expected_map);
+        assert_eq!(pose.cam_from_odom(), expected_odom);
+        assert_eq!(pose.cam_from_map_visual_measurement(), Some(expected_map));
     }
 
     #[cfg(feature = "vio")]
