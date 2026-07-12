@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::math;
-use crate::{DepthImage, MeasuredDepth, Pose};
+use crate::{DepthImage, MeasuredDepth, Pose, Pose64, Pose64Error};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
 
@@ -13,21 +13,57 @@ const BLOCK_VOL: usize = BLOCK_SIDE * BLOCK_SIDE * BLOCK_SIDE;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TsdfConfig {
-    pub voxel_size: f32,
+    voxel_size_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TsdfConfigError {
+    InvalidVoxelSize { value: f32 },
+}
+
+impl std::fmt::Display for TsdfConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidVoxelSize { value } => {
+                write!(
+                    f,
+                    "TSDF voxel size must be positive and finite, got {value}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TsdfConfigError {}
+
+impl TsdfConfig {
+    pub fn try_new(voxel_size_m: f32) -> Result<Self, TsdfConfigError> {
+        if !voxel_size_m.is_finite() || voxel_size_m <= 0.0 {
+            return Err(TsdfConfigError::InvalidVoxelSize {
+                value: voxel_size_m,
+            });
+        }
+        Ok(Self { voxel_size_m })
+    }
+
+    pub fn voxel_size_m(self) -> f32 {
+        self.voxel_size_m
+    }
 }
 
 impl Default for TsdfConfig {
     fn default() -> Self {
-        Self { voxel_size: 0.03 }
+        Self { voxel_size_m: 0.03 }
     }
 }
 
 pub type TsdfCameraIntrinsics = crate::pnp::PinholeIntrinsics;
 pub type TsdfCameraIntrinsicsError = crate::pnp::IntrinsicsError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TsdfIntegrateMsgError {
     GrayscaleDimensionMismatch { expected: usize, actual: usize },
+    InvalidPose(Pose64Error),
 }
 
 impl std::fmt::Display for TsdfIntegrateMsgError {
@@ -39,11 +75,21 @@ impl std::fmt::Display for TsdfIntegrateMsgError {
                     "TSDF grayscale length mismatch: expected {expected} bytes, got {actual}"
                 )
             }
+            TsdfIntegrateMsgError::InvalidPose(source) => {
+                write!(f, "TSDF integration pose is invalid: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for TsdfIntegrateMsgError {}
+impl std::error::Error for TsdfIntegrateMsgError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPose(source) => Some(source),
+            Self::GrayscaleDimensionMismatch { .. } => None,
+        }
+    }
+}
 
 /// Authoritative TSDF integration input.
 ///
@@ -90,6 +136,7 @@ impl TsdfIntegrateMsg {
                 actual: grayscale.len(),
             });
         }
+        Pose64::try_from_pose32(cam_from_map).map_err(TsdfIntegrateMsgError::InvalidPose)?;
         Ok(Self {
             depth_image,
             grayscale: Arc::from(grayscale.into_boxed_slice()),
@@ -116,6 +163,7 @@ impl TsdfIntegrateMsg {
 }
 
 /// Mesh triangle with vertex positions and colors.
+#[derive(Debug)]
 pub struct MeshData {
     pub positions: Vec<[f32; 3]>,
     pub indices: Vec<[u32; 3]>,
@@ -125,6 +173,45 @@ pub struct MeshData {
 pub struct TsdfWorker {
     tx: Sender<TsdfIntegrateMsg>,
     mesh_rx: Receiver<MeshData>,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub enum TsdfWorkerError {
+    ZeroQueueDepth,
+    Spawn(std::io::Error),
+}
+
+impl std::fmt::Display for TsdfWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroQueueDepth => write!(f, "TSDF queue depth must be greater than zero"),
+            Self::Spawn(source) => write!(f, "failed to spawn TSDF worker: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for TsdfWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(source) => Some(source),
+            Self::ZeroQueueDepth => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TsdfSubmitOutcome {
+    Submitted,
+    QueueFull,
+    Disconnected,
+}
+
+#[derive(Debug)]
+pub enum TsdfMeshOutcome {
+    Available(MeshData),
+    Empty,
+    Disconnected,
 }
 
 #[derive(Clone, Copy)]
@@ -353,14 +440,17 @@ impl Layer {
 }
 
 impl TsdfWorker {
-    pub fn spawn(config: TsdfConfig, queue_depth: usize) -> Self {
+    pub fn spawn(config: TsdfConfig, queue_depth: usize) -> Result<Self, TsdfWorkerError> {
+        if queue_depth == 0 {
+            return Err(TsdfWorkerError::ZeroQueueDepth);
+        }
         let (tx, rx) = crossbeam_channel::bounded::<TsdfIntegrateMsg>(queue_depth);
         let (mesh_tx, mesh_rx) = crossbeam_channel::bounded::<MeshData>(2);
 
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("kiko-tsdf".into())
             .spawn(move || {
-                let mut layer = Layer::new(config.voxel_size);
+                let mut layer = Layer::new(config.voxel_size_m());
                 let mut count = 0u64;
                 while let Ok(msg) = rx.recv() {
                     layer.integrate_depth(&msg);
@@ -374,25 +464,36 @@ impl TsdfWorker {
                             mesh.positions.len(),
                             mesh.indices.len(),
                         );
-                        let _ = mesh_tx.try_send(mesh);
+                        match mesh_tx.try_send(mesh) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {}
+                            Err(TrySendError::Disconnected(_)) => break,
+                        }
                     }
                 }
             })
-            .expect("failed to spawn tsdf worker");
+            .map_err(TsdfWorkerError::Spawn)?;
 
-        Self { tx, mesh_rx }
+        Ok(Self {
+            tx,
+            mesh_rx,
+            _thread: thread,
+        })
     }
 
-    pub fn try_integrate(&self, msg: TsdfIntegrateMsg) -> bool {
+    pub fn try_integrate(&self, msg: TsdfIntegrateMsg) -> TsdfSubmitOutcome {
         match self.tx.try_send(msg) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            Err(TrySendError::Disconnected(_)) => false,
+            Ok(()) => TsdfSubmitOutcome::Submitted,
+            Err(TrySendError::Full(_)) => TsdfSubmitOutcome::QueueFull,
+            Err(TrySendError::Disconnected(_)) => TsdfSubmitOutcome::Disconnected,
         }
     }
 
-    pub fn try_recv_mesh(&self) -> Option<MeshData> {
-        self.mesh_rx.try_recv().ok()
+    pub fn try_recv_mesh(&self) -> TsdfMeshOutcome {
+        match self.mesh_rx.try_recv() {
+            Ok(mesh) => TsdfMeshOutcome::Available(mesh),
+            Err(crossbeam_channel::TryRecvError::Empty) => TsdfMeshOutcome::Empty,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => TsdfMeshOutcome::Disconnected,
+        }
     }
 }
 
@@ -420,6 +521,18 @@ mod tests {
             err,
             TsdfCameraIntrinsicsError::NonPositive { field: "fx", value } if value == 0.0
         ));
+    }
+
+    #[test]
+    fn tsdf_config_rejects_invalid_voxel_sizes() {
+        for value in [0.0, -0.01, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                TsdfConfig::try_new(value),
+                Err(TsdfConfigError::InvalidVoxelSize { value: actual })
+                    if actual.to_bits() == value.to_bits()
+            ));
+        }
+        assert_eq!(TsdfConfig::default().voxel_size_m(), 0.03);
     }
 
     #[test]
@@ -457,5 +570,65 @@ mod tests {
         assert_eq!(msg.depth_image().height(), 2);
         assert_eq!(msg.grayscale().len(), 4);
         assert_eq!(msg.intrinsics().fx(), 100.0);
+    }
+
+    #[test]
+    fn tsdf_msg_rejects_invalid_pose_with_source_context() {
+        let intrinsics =
+            TsdfCameraIntrinsics::try_new(100.0, 100.0, 10.0, 10.0).expect("intrinsics");
+        let invalid_pose = Pose::from_rt(
+            [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        );
+        let error = TsdfIntegrateMsg::try_new(
+            measured_depth_image(),
+            vec![128; 4],
+            invalid_pose,
+            intrinsics,
+        )
+        .expect_err("invalid pose must fail");
+        assert!(matches!(error, TsdfIntegrateMsgError::InvalidPose(_)));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn tsdf_worker_rejects_zero_queue_depth_without_spawning() {
+        assert!(matches!(
+            TsdfWorker::spawn(TsdfConfig::default(), 0),
+            Err(TsdfWorkerError::ZeroQueueDepth)
+        ));
+    }
+
+    #[test]
+    fn tsdf_submit_distinguishes_backpressure_from_disconnect() {
+        let intrinsics =
+            TsdfCameraIntrinsics::try_new(100.0, 100.0, 10.0, 10.0).expect("intrinsics");
+        let make_msg = || {
+            TsdfIntegrateMsg::try_new(
+                measured_depth_image(),
+                vec![128; 4],
+                Pose::identity(),
+                intrinsics,
+            )
+            .expect("message")
+        };
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.try_send(make_msg()).expect("fill queue");
+        let (_mesh_tx, mesh_rx) = crossbeam_channel::bounded(1);
+        let worker = TsdfWorker {
+            tx,
+            mesh_rx,
+            _thread: std::thread::spawn(|| {}),
+        };
+        assert_eq!(
+            worker.try_integrate(make_msg()),
+            TsdfSubmitOutcome::QueueFull
+        );
+        drop(rx);
+        assert_eq!(
+            worker.try_integrate(make_msg()),
+            TsdfSubmitOutcome::Disconnected
+        );
     }
 }

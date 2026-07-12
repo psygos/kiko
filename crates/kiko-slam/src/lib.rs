@@ -155,8 +155,9 @@ pub use triangulation::{
     TriangulationStats, Triangulator,
 };
 pub use tsdf::{
-    MeshData, TsdfCameraIntrinsics, TsdfCameraIntrinsicsError, TsdfConfig, TsdfIntegrateMsg,
-    TsdfIntegrateMsgError, TsdfWorker,
+    MeshData, TsdfCameraIntrinsics, TsdfCameraIntrinsicsError, TsdfConfig, TsdfConfigError,
+    TsdfIntegrateMsg, TsdfIntegrateMsgError, TsdfMeshOutcome, TsdfSubmitOutcome, TsdfWorker,
+    TsdfWorkerError,
 };
 #[cfg(feature = "vio")]
 pub use vio::{
