@@ -143,6 +143,37 @@ impl std::fmt::Display for InferenceError {
         }
     }
 }
+
+pub(super) fn require_output_elements(
+    name: &str,
+    actual: usize,
+    required: usize,
+) -> Result<(), InferenceError> {
+    if actual < required {
+        return Err(InferenceError::UnexpectedOutput {
+            name: name.to_string(),
+            expected: format!("at least {required} elements"),
+            actual: format!("{actual} elements"),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn output_record_count(
+    name: &str,
+    scalar_count: usize,
+    record_width: usize,
+) -> Result<usize, InferenceError> {
+    if record_width == 0 || scalar_count % record_width != 0 {
+        return Err(InferenceError::UnexpectedOutput {
+            name: name.to_string(),
+            expected: format!("records of {record_width} scalar values"),
+            actual: format!("{scalar_count} scalar values"),
+        });
+    }
+    Ok(scalar_count / record_width)
+}
+
 pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
 
@@ -235,5 +266,34 @@ fn env_opt_level(key: &str) -> Option<GraphOptimizationLevel> {
             eprintln!("invalid {key}={raw}, ignoring");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InferenceError, output_record_count, require_output_elements};
+
+    #[test]
+    fn required_output_elements_rejects_truncated_tensors() {
+        assert!(matches!(
+            require_output_elements("mscores0", 1, 2),
+            Err(InferenceError::UnexpectedOutput {
+                name,
+                expected,
+                actual,
+            }) if name == "mscores0"
+                && expected == "at least 2 elements"
+                && actual == "1 elements"
+        ));
+        assert!(require_output_elements("mscores0", 2, 2).is_ok());
+    }
+
+    #[test]
+    fn output_record_count_rejects_partial_records() {
+        assert!(matches!(
+            output_record_count("matches0", 3, 2),
+            Err(InferenceError::UnexpectedOutput { name, .. }) if name == "matches0"
+        ));
+        assert_eq!(output_record_count("matches0", 4, 2).expect("pairs"), 2);
     }
 }

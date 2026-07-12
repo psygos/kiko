@@ -618,6 +618,11 @@ pub enum DetectionError {
         component: usize,
         value: f32,
     },
+    SelectionIndexOutOfBounds {
+        selection_index: usize,
+        detection_index: usize,
+        detection_count: usize,
+    },
 }
 
 impl std::fmt::Display for DetectionError {
@@ -658,6 +663,14 @@ impl std::fmt::Display for DetectionError {
                 f,
                 "detection {detection_index} descriptor component {component} is non-finite: {value}"
             ),
+            DetectionError::SelectionIndexOutOfBounds {
+                selection_index,
+                detection_index,
+                detection_count,
+            } => write!(
+                f,
+                "detection selection {selection_index} references index {detection_index}, but the batch contains {detection_count} detections"
+            ),
         }
     }
 }
@@ -670,7 +683,8 @@ impl std::error::Error for DetectionError {
             | DetectionError::NonFiniteKeypoint { .. }
             | DetectionError::KeypointOutOfBounds { .. }
             | DetectionError::NonFiniteScore { .. }
-            | DetectionError::NonFiniteDescriptor { .. } => None,
+            | DetectionError::NonFiniteDescriptor { .. }
+            | DetectionError::SelectionIndexOutOfBounds { .. } => None,
         }
     }
 }
@@ -841,6 +855,32 @@ impl Detections {
             scores: new_scores,
             descriptors: new_descriptors,
         }
+    }
+
+    pub(crate) fn select(&self, indices: &[usize]) -> Result<Self, DetectionError> {
+        let mut keypoints = Vec::with_capacity(indices.len());
+        let mut scores = Vec::with_capacity(indices.len());
+        let mut descriptors = Vec::with_capacity(indices.len());
+        for (selection_index, &detection_index) in indices.iter().enumerate() {
+            let Some(&keypoint) = self.keypoints.get(detection_index) else {
+                return Err(DetectionError::SelectionIndexOutOfBounds {
+                    selection_index,
+                    detection_index,
+                    detection_count: self.len(),
+                });
+            };
+            keypoints.push(keypoint);
+            scores.push(self.scores[detection_index]);
+            descriptors.push(self.descriptors[detection_index]);
+        }
+        Ok(Self {
+            sensor_id: self.sensor_id,
+            frame_id: self.frame_id,
+            dimensions: self.dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        })
     }
 }
 
@@ -1031,6 +1071,37 @@ pub enum MatchError {
         score_len: usize,
         indices_len: usize,
     },
+    SourceAIndexOutOfBounds {
+        match_index: usize,
+        detection_index: usize,
+        detection_count: usize,
+    },
+    SourceBIndexOutOfBounds {
+        match_index: usize,
+        detection_index: usize,
+        detection_count: usize,
+    },
+    DuplicateSourceAIndex {
+        detection_index: usize,
+        first_match: usize,
+        duplicate_match: usize,
+    },
+    DuplicateSourceBIndex {
+        detection_index: usize,
+        first_match: usize,
+        duplicate_match: usize,
+    },
+    NonFiniteScore {
+        match_index: usize,
+        value: f32,
+    },
+    SourceBatchMismatch {
+        operation: &'static str,
+        actual_frame: FrameId,
+        actual_sensor: SensorId,
+        expected_frame: FrameId,
+        expected_sensor: SensorId,
+    },
 }
 
 impl std::fmt::Display for MatchError {
@@ -1042,6 +1113,53 @@ impl std::fmt::Display for MatchError {
             } => write!(
                 f,
                 "match shape mismatch: scores={score_len}, indices={indices_len}"
+            ),
+            MatchError::SourceAIndexOutOfBounds {
+                match_index,
+                detection_index,
+                detection_count,
+            } => write!(
+                f,
+                "match {match_index} source-a index {detection_index} is out of bounds for {detection_count} detections"
+            ),
+            MatchError::SourceBIndexOutOfBounds {
+                match_index,
+                detection_index,
+                detection_count,
+            } => write!(
+                f,
+                "match {match_index} source-b index {detection_index} is out of bounds for {detection_count} detections"
+            ),
+            MatchError::DuplicateSourceAIndex {
+                detection_index,
+                first_match,
+                duplicate_match,
+            } => write!(
+                f,
+                "source-a detection {detection_index} is reused by matches {first_match} and {duplicate_match}"
+            ),
+            MatchError::DuplicateSourceBIndex {
+                detection_index,
+                first_match,
+                duplicate_match,
+            } => write!(
+                f,
+                "source-b detection {detection_index} is reused by matches {first_match} and {duplicate_match}"
+            ),
+            MatchError::NonFiniteScore { match_index, value } => {
+                write!(f, "match {match_index} has non-finite score {value}")
+            }
+            MatchError::SourceBatchMismatch {
+                operation,
+                actual_frame,
+                actual_sensor,
+                expected_frame,
+                expected_sensor,
+            } => write!(
+                f,
+                "cannot {operation}: source-b is a different detection batch (actual={actual_sensor:?}/frame {}, expected={expected_sensor:?}/frame {})",
+                actual_frame.as_u64(),
+                expected_frame.as_u64()
             ),
         }
     }
@@ -1065,47 +1183,38 @@ impl Matches<Raw> {
         indices: Vec<(usize, usize)>,
         scores: Vec<f32>,
     ) -> Result<Self, MatchError> {
-        Matches::<Raw>::from_parts(source_a, source_b, indices, scores)
-    }
-
-    pub fn with_landmarks(&self, keyframe: &Keyframe) -> Result<Matches<Verified>, MatchError> {
-        let mut indices = Vec::new();
-        let mut scores = Vec::new();
-        for (idx, &(a, b)) in self.indices.iter().enumerate() {
-            if keyframe.landmark_for_detection(b).is_some() {
-                indices.push((a, b));
-                scores.push(self.scores[idx]);
-            }
-        }
-
-        Matches::new_verified(self.source_a_arc(), self.source_b_arc(), indices, scores)
-    }
-}
-
-impl Matches<Verified> {
-    pub fn new_verified(
-        source_a: Arc<Detections>,
-        source_b: Arc<Detections>,
-        indices: Vec<(usize, usize)>,
-        scores: Vec<f32>,
-    ) -> Result<Self, MatchError> {
-        Matches::<Verified>::from_parts(source_a, source_b, indices, scores)
-    }
-}
-
-impl<State> Matches<State> {
-    fn from_parts(
-        source_a: Arc<Detections>,
-        source_b: Arc<Detections>,
-        indices: Vec<(usize, usize)>,
-        scores: Vec<f32>,
-    ) -> Result<Self, MatchError> {
         if indices.len() != scores.len() {
             return Err(MatchError::Mismatch {
                 score_len: scores.len(),
                 indices_len: indices.len(),
             });
         }
+
+        for (match_index, (&(source_a_index, source_b_index), &score)) in
+            indices.iter().zip(&scores).enumerate()
+        {
+            if source_a_index >= source_a.len() {
+                return Err(MatchError::SourceAIndexOutOfBounds {
+                    match_index,
+                    detection_index: source_a_index,
+                    detection_count: source_a.len(),
+                });
+            }
+            if source_b_index >= source_b.len() {
+                return Err(MatchError::SourceBIndexOutOfBounds {
+                    match_index,
+                    detection_index: source_b_index,
+                    detection_count: source_b.len(),
+                });
+            }
+            if !score.is_finite() {
+                return Err(MatchError::NonFiniteScore {
+                    match_index,
+                    value: score,
+                });
+            }
+        }
+
         Ok(Self {
             source_a,
             source_b,
@@ -1115,6 +1224,68 @@ impl<State> Matches<State> {
         })
     }
 
+    pub fn with_landmarks(&self, keyframe: &Keyframe) -> Result<Matches<Verified>, MatchError> {
+        self.require_source_b(keyframe.detections(), "resolve landmark correspondences")?;
+        let mut indices = Vec::with_capacity(self.indices.len());
+        let mut scores = Vec::with_capacity(self.scores.len());
+        for (idx, &(a, b)) in self.indices.iter().enumerate() {
+            if keyframe.landmark_for_detection(b).is_some() {
+                indices.push((a, b));
+                scores.push(self.scores[idx]);
+            }
+        }
+
+        Matches::from_verified_subset(self.source_a_arc(), self.source_b_arc(), indices, scores)
+    }
+}
+
+impl Matches<Verified> {
+    fn from_verified_subset(
+        source_a: Arc<Detections>,
+        source_b: Arc<Detections>,
+        indices: Vec<(usize, usize)>,
+        scores: Vec<f32>,
+    ) -> Result<Self, MatchError> {
+        if indices.len() < 2 {
+            return Ok(Self {
+                source_a,
+                source_b,
+                indices,
+                scores,
+                _state: PhantomData,
+            });
+        }
+        let mut source_a_matches = vec![None; source_a.len()];
+        let mut source_b_matches = vec![None; source_b.len()];
+        for (match_index, &(source_a_index, source_b_index)) in indices.iter().enumerate() {
+            if let Some(first_match) = source_a_matches[source_a_index] {
+                return Err(MatchError::DuplicateSourceAIndex {
+                    detection_index: source_a_index,
+                    first_match,
+                    duplicate_match: match_index,
+                });
+            }
+            if let Some(first_match) = source_b_matches[source_b_index] {
+                return Err(MatchError::DuplicateSourceBIndex {
+                    detection_index: source_b_index,
+                    first_match,
+                    duplicate_match: match_index,
+                });
+            }
+            source_a_matches[source_a_index] = Some(match_index);
+            source_b_matches[source_b_index] = Some(match_index);
+        }
+        Ok(Self {
+            source_a,
+            source_b,
+            indices,
+            scores,
+            _state: PhantomData,
+        })
+    }
+}
+
+impl<State> Matches<State> {
     pub fn len(&self) -> usize {
         self.indices.len()
     }
@@ -1145,6 +1316,23 @@ impl<State> Matches<State> {
 
     pub fn scores(&self) -> &[f32] {
         &self.scores
+    }
+
+    pub(crate) fn require_source_b(
+        &self,
+        expected: &Arc<Detections>,
+        operation: &'static str,
+    ) -> Result<(), MatchError> {
+        if Arc::ptr_eq(&self.source_b, expected) {
+            return Ok(());
+        }
+        Err(MatchError::SourceBatchMismatch {
+            operation,
+            actual_frame: self.source_b.frame_id(),
+            actual_sensor: self.source_b.sensor_id(),
+            expected_frame: expected.frame_id(),
+            expected_sensor: expected.sensor_id(),
+        })
     }
 }
 
@@ -1247,10 +1435,12 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, DownscaleError,
         DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError, FrameId,
-        Keypoint, SensorId, Timestamp, U8_SCALE,
+        Keyframe, Keypoint, MatchError, Matches, Point3, SensorId, Timestamp, U8_SCALE,
     };
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
@@ -1268,6 +1458,27 @@ mod tests {
             return 0.0;
         }
         dot / (norm_a.sqrt() * norm_b.sqrt())
+    }
+
+    fn detection_batch(sensor_id: SensorId, frame_id: u64, len: usize) -> Arc<Detections> {
+        let keypoints = (0..len)
+            .map(|index| Keypoint {
+                x: index as f32 + 1.0,
+                y: 1.0,
+            })
+            .collect();
+        Arc::new(
+            Detections::new(
+                sensor_id,
+                FrameId::new(frame_id),
+                32,
+                24,
+                keypoints,
+                vec![1.0; len],
+                vec![Descriptor([0.0; DESCRIPTOR_DIM]); len],
+            )
+            .expect("valid detection batch"),
+        )
     }
 
     #[test]
@@ -1377,6 +1588,139 @@ mod tests {
             Err(DetectionError::NonFiniteDescriptor {
                 detection_index: 0,
                 component: 7,
+                ..
+            })
+        ));
+
+        let batch = detection_batch(SensorId::StereoLeft, 1, 1);
+        assert!(matches!(
+            batch.select(&[1]),
+            Err(DetectionError::SelectionIndexOutOfBounds {
+                selection_index: 0,
+                detection_index: 1,
+                detection_count: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_matches_reject_forged_correspondences() {
+        let source_a = detection_batch(SensorId::StereoLeft, 1, 2);
+        let source_b = detection_batch(SensorId::StereoRight, 1, 2);
+
+        assert!(matches!(
+            Matches::new(
+                Arc::clone(&source_a),
+                Arc::clone(&source_b),
+                vec![(2, 0)],
+                vec![1.0],
+            ),
+            Err(MatchError::SourceAIndexOutOfBounds { match_index: 0, .. })
+        ));
+        assert!(matches!(
+            Matches::new(
+                Arc::clone(&source_a),
+                Arc::clone(&source_b),
+                vec![(0, 2)],
+                vec![1.0],
+            ),
+            Err(MatchError::SourceBIndexOutOfBounds { match_index: 0, .. })
+        ));
+        assert!(matches!(
+            Matches::new(source_a, source_b, vec![(0, 0)], vec![f32::NAN]),
+            Err(MatchError::NonFiniteScore { match_index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn verified_matches_require_the_exact_keyframe_detection_batch() {
+        let current = detection_batch(SensorId::StereoLeft, 2, 2);
+        let keyframe_detections = detection_batch(SensorId::StereoLeft, 1, 2);
+        let keyframe = Keyframe::from_arc(
+            Arc::clone(&keyframe_detections),
+            vec![Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            }],
+            vec![1],
+        )
+        .expect("keyframe");
+
+        let matches = Matches::new(
+            Arc::clone(&current),
+            Arc::clone(&keyframe_detections),
+            vec![(0, 0), (1, 1)],
+            vec![0.8, 0.9],
+        )
+        .expect("raw matches");
+        let verified = matches.with_landmarks(&keyframe).expect("verified matches");
+        assert_eq!(verified.indices(), &[(1, 1)]);
+
+        let same_metadata_different_batch = detection_batch(SensorId::StereoLeft, 1, 2);
+        let forged = Matches::new(
+            current,
+            same_metadata_different_batch,
+            vec![(0, 1)],
+            vec![1.0],
+        )
+        .expect("raw matches");
+        assert!(matches!(
+            forged.with_landmarks(&keyframe),
+            Err(MatchError::SourceBatchMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verified_matches_reject_duplicate_correspondences() {
+        let current = detection_batch(SensorId::StereoLeft, 2, 2);
+        let keyframe_detections = detection_batch(SensorId::StereoLeft, 1, 2);
+        let keyframe = Keyframe::from_arc(
+            Arc::clone(&keyframe_detections),
+            vec![
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                Point3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+            ],
+            vec![0, 1],
+        )
+        .expect("keyframe");
+
+        let duplicate_current = Matches::new(
+            Arc::clone(&current),
+            Arc::clone(&keyframe_detections),
+            vec![(0, 0), (0, 1)],
+            vec![1.0, 0.9],
+        )
+        .expect("duplicates are lawful in raw stereo matches");
+        assert!(matches!(
+            duplicate_current.with_landmarks(&keyframe),
+            Err(MatchError::DuplicateSourceAIndex {
+                first_match: 0,
+                duplicate_match: 1,
+                ..
+            })
+        ));
+
+        let duplicate_landmark = Matches::new(
+            current,
+            keyframe_detections,
+            vec![(0, 0), (1, 0)],
+            vec![1.0, 0.9],
+        )
+        .expect("duplicates are lawful in raw stereo matches");
+        assert!(matches!(
+            duplicate_landmark.with_landmarks(&keyframe),
+            Err(MatchError::DuplicateSourceBIndex {
+                first_match: 0,
+                duplicate_match: 1,
                 ..
             })
         ));

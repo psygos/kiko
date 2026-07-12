@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
-    Detections, FrameDimensions, FrameDimensionsError, FrameId, Keypoint, Matches, Raw, SensorId,
+    DetectionError, Detections, FrameDimensions, FrameDimensionsError, FrameId, Keypoint, Matches,
+    Raw, SensorId,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -230,22 +231,9 @@ pub struct TriangulationStats {
 
 #[derive(Debug)]
 pub enum TriangulationError {
-    SensorMismatch {
-        left: SensorId,
-        right: SensorId,
-    },
-    IndexOutOfBounds {
-        left_len: usize,
-        right_len: usize,
-        left_index: usize,
-        right_index: usize,
-    },
-    NoLandmarks {
-        stats: TriangulationStats,
-    },
-    InvalidDetections {
-        message: String,
-    },
+    SensorMismatch { left: SensorId, right: SensorId },
+    NoLandmarks { stats: TriangulationStats },
+    InvalidDetections { source: KeyframeError },
 }
 
 impl std::fmt::Display for TriangulationError {
@@ -255,17 +243,6 @@ impl std::fmt::Display for TriangulationError {
                 write!(
                     f,
                     "triangulation requires stereo left/right detections, got left={left:?}, right={right:?}"
-                )
-            }
-            TriangulationError::IndexOutOfBounds {
-                left_len,
-                right_len,
-                left_index,
-                right_index,
-            } => {
-                write!(
-                    f,
-                    "match index out of bounds: left_index={left_index} (len={left_len}), right_index={right_index} (len={right_len})"
                 )
             }
             TriangulationError::NoLandmarks { stats } => {
@@ -279,14 +256,23 @@ impl std::fmt::Display for TriangulationError {
                     stats.dropped_duplicate
                 )
             }
-            TriangulationError::InvalidDetections { message } => {
-                write!(f, "failed to build detections: {message}")
+            TriangulationError::InvalidDetections { source } => {
+                write!(f, "failed to build triangulation keyframe: {source}")
             }
         }
     }
 }
 
-impl std::error::Error for TriangulationError {}
+impl std::error::Error for TriangulationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TriangulationError::InvalidDetections { source } => Some(source),
+            TriangulationError::SensorMismatch { .. } | TriangulationError::NoLandmarks { .. } => {
+                None
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RectifiedRowMismatchError {
@@ -379,7 +365,7 @@ pub enum KeyframeError {
         actual: SensorId,
     },
     InvalidTrackingDetections {
-        message: String,
+        source: DetectionError,
     },
 }
 
@@ -407,14 +393,25 @@ impl std::fmt::Display for KeyframeError {
                     "keyframe detections must be from {expected:?}, got {actual:?}"
                 )
             }
-            KeyframeError::InvalidTrackingDetections { message } => {
-                write!(f, "failed to build tracking detections: {message}")
+            KeyframeError::InvalidTrackingDetections { source } => {
+                write!(f, "failed to build tracking detections: {source}")
             }
         }
     }
 }
 
-impl std::error::Error for KeyframeError {}
+impl std::error::Error for KeyframeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            KeyframeError::InvalidTrackingDetections { source } => Some(source),
+            KeyframeError::Empty
+            | KeyframeError::LenMismatch { .. }
+            | KeyframeError::LandmarkIndexOutOfBounds { .. }
+            | KeyframeError::DuplicateLandmarkIndex { .. }
+            | KeyframeError::SensorMismatch { .. } => None,
+        }
+    }
+}
 
 impl Keyframe {
     pub fn new(
@@ -460,10 +457,11 @@ impl Keyframe {
             index_to_landmark[det_idx] = Some(landmark_idx);
         }
 
-        let tracking_detections = build_tracking_detections(&detections, &landmark_indices)
-            .map_err(|err| KeyframeError::InvalidTrackingDetections {
-                message: err.to_string(),
-            })?;
+        let tracking_detections = Arc::new(
+            detections
+                .select(&landmark_indices)
+                .map_err(|source| KeyframeError::InvalidTrackingDetections { source })?,
+        );
 
         Ok(Self {
             frame_id: detections.frame_id(),
@@ -492,6 +490,7 @@ impl Keyframe {
         &self,
         matches: &Matches<Raw>,
     ) -> Result<Matches<Raw>, crate::MatchError> {
+        matches.require_source_b(&self.tracking_detections, "remap tracking matches")?;
         let mut indices = Vec::with_capacity(matches.len());
         let mut scores = Vec::with_capacity(matches.len());
         for (match_idx, &(current_idx, tracking_idx)) in matches.indices().iter().enumerate() {
@@ -521,31 +520,6 @@ impl Keyframe {
         let landmark_idx = *self.index_to_landmark.get(index)?;
         landmark_idx.map(|idx| self.landmarks[idx])
     }
-}
-
-fn build_tracking_detections(
-    detections: &Arc<Detections>,
-    landmark_indices: &[usize],
-) -> Result<Arc<Detections>, crate::DetectionError> {
-    let mut keypoints = Vec::with_capacity(landmark_indices.len());
-    let mut scores = Vec::with_capacity(landmark_indices.len());
-    let mut descriptors = Vec::with_capacity(landmark_indices.len());
-
-    for &idx in landmark_indices {
-        keypoints.push(detections.keypoints()[idx]);
-        scores.push(detections.scores()[idx]);
-        descriptors.push(detections.descriptors()[idx]);
-    }
-
-    Ok(Arc::new(Detections::new(
-        detections.sensor_id(),
-        detections.frame_id(),
-        detections.width(),
-        detections.height(),
-        keypoints,
-        scores,
-        descriptors,
-    )?))
 }
 
 #[derive(Debug)]
@@ -579,12 +553,8 @@ impl Triangulator {
             return Vec::new();
         }
         let left_len = left.len();
-        let right_len = right.len();
         let mut best: Vec<Option<(usize, f32)>> = vec![None; left_len];
         for (&(li, ri), &score) in matches.indices().iter().zip(matches.scores()) {
-            if li >= left_len || ri >= right_len {
-                continue;
-            }
             match best[li] {
                 Some((_, best_score)) if best_score >= score => {}
                 _ => {
@@ -647,7 +617,6 @@ impl Triangulator {
         }
 
         let left_len = left.len();
-        let right_len = right.len();
         let mut stats = TriangulationStats {
             candidate_matches: matches.len(),
             ..TriangulationStats::default()
@@ -655,14 +624,6 @@ impl Triangulator {
 
         let mut best: Vec<Option<(usize, f32)>> = vec![None; left_len];
         for (&(li, ri), &score) in matches.indices().iter().zip(matches.scores()) {
-            if li >= left_len || ri >= right_len {
-                return Err(TriangulationError::IndexOutOfBounds {
-                    left_len,
-                    right_len,
-                    left_index: li,
-                    right_index: ri,
-                });
-            }
             match best[li] {
                 Some((_, best_score)) if best_score >= score => {
                     stats.dropped_duplicate += 1;
@@ -728,11 +689,8 @@ impl Triangulator {
             return Err(TriangulationError::NoLandmarks { stats });
         }
 
-        let keyframe = Keyframe::from_arc(left, landmarks, landmark_indices).map_err(|err| {
-            TriangulationError::InvalidDetections {
-                message: err.to_string(),
-            }
-        })?;
+        let keyframe = Keyframe::from_arc(left, landmarks, landmark_indices)
+            .map_err(|source| TriangulationError::InvalidDetections { source })?;
 
         Ok(TriangulationResult { keyframe, stats })
     }
@@ -775,6 +733,15 @@ mod tests {
         ));
         let mismatch = RectifiedRowMismatchPx::new(0.25).expect("row mismatch");
         assert_eq!(mismatch.value_px(), 0.25);
+    }
+
+    #[test]
+    fn triangulation_error_preserves_keyframe_source() {
+        let err = TriangulationError::InvalidDetections {
+            source: KeyframeError::Empty,
+        };
+        let source = std::error::Error::source(&err).expect("nested keyframe error");
+        assert_eq!(source.to_string(), KeyframeError::Empty.to_string());
     }
 
     #[test]
@@ -962,11 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn triangulate_returns_index_out_of_bounds_for_bad_match_indices() {
-        let stereo =
-            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
-        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
-
+    fn matches_reject_out_of_bounds_before_triangulation() {
         let left = make_detections(
             SensorId::StereoLeft,
             FrameId::new(30),
@@ -983,25 +946,14 @@ mod tests {
             vec![Keypoint { x: 300.0, y: 240.0 }],
         )
         .expect("right");
-        let matches = Matches::new(left, right, vec![(0, 2)], vec![1.0]).expect("matches");
-
-        let err = triangulator
-            .triangulate(&matches)
-            .expect_err("index error expected");
-        match err {
-            TriangulationError::IndexOutOfBounds {
-                left_len,
-                right_len,
-                left_index,
-                right_index,
-            } => {
-                assert_eq!(left_len, 1);
-                assert_eq!(right_len, 1);
-                assert_eq!(left_index, 0);
-                assert_eq!(right_index, 2);
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        assert!(matches!(
+            Matches::new(left, right, vec![(0, 2)], vec![1.0]),
+            Err(crate::MatchError::SourceBIndexOutOfBounds {
+                match_index: 0,
+                detection_index: 2,
+                detection_count: 1,
+            })
+        ));
     }
 
     #[test]
@@ -1142,5 +1094,13 @@ mod tests {
         assert_eq!(remapped.indices(), &[(0, 0), (1, 2)]);
         assert_eq!(remapped.scores(), &[0.9, 0.8]);
         assert_eq!(remapped.source_b().len(), 3);
+
+        let copied_tracking_batch = std::sync::Arc::new((**keyframe.tracking_detections()).clone());
+        let wrong_source = Matches::new(current, copied_tracking_batch, vec![(0, 0)], vec![0.9])
+            .expect("raw matches");
+        assert!(matches!(
+            keyframe.remap_tracking_matches(&wrong_source),
+            Err(crate::MatchError::SourceBatchMismatch { .. })
+        ));
     }
 }

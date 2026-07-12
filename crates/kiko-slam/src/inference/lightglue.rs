@@ -89,7 +89,8 @@ impl LightGlue {
 
             if is_pair_format {
                 // Fused/TRT format: matches0 is [N, 2] with (left_idx, right_idx) pairs
-                let num_pairs = matches_data.len() / 2;
+                let num_pairs = super::output_record_count("matches0", matches_data.len(), 2)?;
+                super::require_output_elements("mscores0", scores_data.len(), num_pairs)?;
                 for i in 0..num_pairs {
                     let left_idx = usize::try_from(matches_data[2 * i]).map_err(|_| {
                         InferenceError::UnexpectedOutput {
@@ -105,23 +106,16 @@ impl LightGlue {
                             actual: format!("index {}", matches_data[2 * i + 1]),
                         }
                     })?;
-                    let score = scores_data.get(i).copied().unwrap_or(1.0);
                     indices.push((left_idx, right_idx));
-                    scores.push(score);
+                    scores.push(scores_data[i]);
                 }
             } else {
                 // Standard format: matches0 is [1, num_keypoints] with per-keypoint match index
+                super::require_output_elements("mscores0", scores_data.len(), matches_data.len())?;
                 for (i, &match_idx) in matches_data.iter().enumerate() {
                     if match_idx < 0 {
                         continue;
                     }
-                    let Some(&score) = scores_data.get(i) else {
-                        return Err(InferenceError::UnexpectedOutput {
-                            name: "mscores0".to_string(),
-                            expected: format!("at least {} elements", matches_data.len()),
-                            actual: format!("{} elements", scores_data.len()),
-                        });
-                    };
                     let right_idx = usize::try_from(match_idx).map_err(|_| {
                         InferenceError::UnexpectedOutput {
                             name: "matches0".to_string(),
@@ -130,7 +124,7 @@ impl LightGlue {
                         }
                     })?;
                     indices.push((i, right_idx));
-                    scores.push(score);
+                    scores.push(scores_data[i]);
                 }
             }
         }

@@ -148,16 +148,22 @@ fn parse_stereo_fused_outputs(
 
     let left_keypoints = parse_keypoints_i64_xy(&left_data, max_keypoints, "keypoints0")?;
     let right_keypoints = parse_keypoints_i64_xy(&right_data, max_keypoints, "keypoints1")?;
-    let mut match_indices = Vec::with_capacity(matches_data.len() / 2);
-    let mut match_scores = Vec::with_capacity(matches_data.len() / 2);
-    for i in 0..(matches_data.len() / 2) {
+    let left_output_count = left_data.len() / 2;
+    let right_output_count = right_data.len() / 2;
+    let match_count = super::output_record_count("matches0", matches_data.len(), 2)?;
+    super::require_output_elements("mscores0", scores_data.len(), match_count)?;
+    let mut match_indices = Vec::with_capacity(match_count);
+    let mut match_scores = Vec::with_capacity(match_count);
+    for i in 0..match_count {
         let left_idx =
             usize::try_from(matches_data[2 * i]).map_err(|_| negative_index("matches0"))?;
         let right_idx =
             usize::try_from(matches_data[2 * i + 1]).map_err(|_| negative_index("matches0"))?;
+        require_index("matches0", left_idx, left_output_count)?;
+        require_index("matches0", right_idx, right_output_count)?;
         if left_idx < left_keypoints.len() && right_idx < right_keypoints.len() {
             match_indices.push((left_idx, right_idx));
-            match_scores.push(scores_data.get(i).copied().unwrap_or(1.0));
+            match_scores.push(scores_data[i]);
         }
     }
 
@@ -192,22 +198,26 @@ fn parse_legacy_pipeline_outputs(
         .1
         .to_vec();
 
-    let kpts_per_image = kpts_data.len() / 4;
+    let kpts_per_image = super::output_record_count("keypoints", kpts_data.len(), 4)?;
     let left_data = &kpts_data[..kpts_per_image * 2];
     let right_data = &kpts_data[kpts_per_image * 2..];
     let left_keypoints = parse_keypoints_i64_xy(left_data, max_keypoints, "keypoints")?;
     let right_keypoints = parse_keypoints_i64_xy(right_data, max_keypoints, "keypoints")?;
 
-    let mut match_indices = Vec::with_capacity(matches_data.len() / 3);
-    let mut match_scores = Vec::with_capacity(matches_data.len() / 3);
-    for i in 0..(matches_data.len() / 3) {
+    let match_count = super::output_record_count("matches", matches_data.len(), 3)?;
+    super::require_output_elements("mscores", scores_data.len(), match_count)?;
+    let mut match_indices = Vec::with_capacity(match_count);
+    let mut match_scores = Vec::with_capacity(match_count);
+    for i in 0..match_count {
         let left_idx =
             usize::try_from(matches_data[i * 3 + 1]).map_err(|_| negative_index("matches"))?;
         let right_idx =
             usize::try_from(matches_data[i * 3 + 2]).map_err(|_| negative_index("matches"))?;
+        require_index("matches", left_idx, kpts_per_image)?;
+        require_index("matches", right_idx, kpts_per_image)?;
         if left_idx < left_keypoints.len() && right_idx < right_keypoints.len() {
             match_indices.push((left_idx, right_idx));
-            match_scores.push(scores_data.get(i).copied().unwrap_or(1.0));
+            match_scores.push(scores_data[i]);
         }
     }
 
@@ -256,4 +266,15 @@ fn negative_index(name: &str) -> InferenceError {
         expected: "non-negative index".to_string(),
         actual: "negative index".to_string(),
     }
+}
+
+fn require_index(name: &str, index: usize, available: usize) -> Result<(), InferenceError> {
+    if index >= available {
+        return Err(InferenceError::UnexpectedOutput {
+            name: name.to_string(),
+            expected: format!("indices below {available}"),
+            actual: format!("index {index}"),
+        });
+    }
+    Ok(())
 }
