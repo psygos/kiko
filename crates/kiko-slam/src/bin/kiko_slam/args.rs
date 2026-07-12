@@ -148,16 +148,6 @@ impl RerunArgs {
 }
 
 #[derive(Args, Clone, Debug)]
-pub struct RectifyArgs {
-    /// Maximum principal point delta tolerance (pixels)
-    #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
-    pub rectify_tolerance: Option<f32>,
-    /// Allow unrectified calibration data
-    #[arg(long, env = "KIKO_ALLOW_UNRECTIFIED", default_value_t = false)]
-    pub allow_unrectified: bool,
-}
-
-#[derive(Args, Clone, Debug)]
 #[cfg(feature = "record")]
 pub struct CameraArgs {
     #[arg(long, default_value_t = 640)]

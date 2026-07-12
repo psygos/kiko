@@ -1,13 +1,11 @@
 use kiko_slam::{
     BackendConfig, DownscaleFactor, GlobalDescriptorConfig, KeyframePolicy, KeypointLimit,
     LmConfig, LocalBaConfig, LoopClosureConfig, LoopClosureConfigInput, LoopSubsystemConfig,
-    ProjectedMatcherConfig, RansacConfig, RectificationMode, RectifiedStereoConfig,
-    RedundancyPolicy, RelocalizationConfig, TrackingMatcher, TriangulationConfig,
+    ProjectedMatcherConfig, RansacConfig, RedundancyPolicy, RelocalizationConfig, TrackingMatcher,
+    TriangulationConfig,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
-
-use crate::args::RectifyArgs;
 
 // BA defaults (overridable via KIKO_BA_* / KIKO_LM_* env vars)
 const DEFAULT_BA_WINDOW: usize = 10;
@@ -284,15 +282,4 @@ pub fn build_ba_config_with_overrides(
         config.motion_prior_weight()
     );
     Ok(config)
-}
-
-pub fn build_rectified_stereo_config(args: &RectifyArgs) -> RectifiedStereoConfig {
-    RectifiedStereoConfig {
-        max_principal_delta_px: args.rectify_tolerance,
-        rectification: if args.allow_unrectified {
-            RectificationMode::AllowUnrectified
-        } else {
-            RectificationMode::RequireRectified
-        },
-    }
 }

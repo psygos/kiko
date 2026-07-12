@@ -146,9 +146,9 @@ pub use tracker::{
     TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, Point3, RectificationMode, RectifiedRowMismatchError,
-    RectifiedRowMismatchPx, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
-    SparseStereoSample, TriangulationConfig, TriangulationError, TriangulationResult,
+    Keyframe, KeyframeError, Point3, RectifiedRowMismatchError, RectifiedRowMismatchPx,
+    RectifiedStereo, RectifiedStereoError, SparseStereoSample, SparseStereoSamples,
+    TriangulationConfig, TriangulationConfigError, TriangulationError, TriangulationResult,
     TriangulationStats, Triangulator,
 };
 pub use tsdf::{

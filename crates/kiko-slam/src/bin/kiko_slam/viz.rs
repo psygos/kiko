@@ -7,8 +7,7 @@ use kiko_slam::{
     RectifiedStereo, RerunSink, TriangulationConfig, TriangulationError, Triangulator,
 };
 
-use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs};
-use crate::config::build_rectified_stereo_config;
+use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RerunArgs};
 use crate::rerun_recording;
 
 #[derive(Args, Clone, Debug)]
@@ -18,8 +17,6 @@ pub struct VizArgs {
     pub inference: InferenceArgs,
     #[command(flatten)]
     pub rerun: RerunArgs,
-    #[command(flatten)]
-    pub rectify: RectifyArgs,
     #[command(flatten)]
     pub dataset: DatasetArgs,
 }
@@ -36,10 +33,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let inference = InferenceConfig::from_args(&args.inference)?;
 
-    let rectified = RectifiedStereo::from_calibration_with_config(
-        reader.calibration(),
-        build_rectified_stereo_config(&args.rectify),
-    )?;
+    let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset") {

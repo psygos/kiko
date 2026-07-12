@@ -8,13 +8,8 @@ use kiko_slam::{
 };
 use kiko_slam::{ProjectedMatcherConfig, TrackingMatcher};
 
-use crate::args::{
-    DatasetArgs, InferenceArgs, InferenceConfig, RectifyArgs, RerunArgs, RunProfileArg,
-};
-use crate::config::{
-    TrackerDefaults, TrackerOverrides, build_rectified_stereo_config,
-    build_tracker_config_with_overrides,
-};
+use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, RerunArgs, RunProfileArg};
+use crate::config::{TrackerDefaults, TrackerOverrides, build_tracker_config_with_overrides};
 use crate::rerun_recording;
 
 const SLAM_ENV_HELP: &str = "\
@@ -111,8 +106,6 @@ pub struct SlamArgs {
     #[command(flatten)]
     pub rerun: RerunArgs,
     #[command(flatten)]
-    pub rectify: RectifyArgs,
-    #[command(flatten)]
     pub dataset: DatasetArgs,
 }
 
@@ -163,10 +156,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference_args = args.inference.with_profile_defaults(args.profile)?;
     let inference = InferenceConfig::from_args(&inference_args)?;
 
-    let rectified = RectifiedStereo::from_calibration_with_config(
-        reader.calibration(),
-        build_rectified_stereo_config(&args.rectify),
-    )?;
+    let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
     let dense_cloud_enabled = kiko_slam::env::env_bool("KIKO_DENSE_CLOUD").unwrap_or(false);
     let dense_config = kiko_slam::DenseCloudConfig::from_env();
     let dense_triangulator = if dense_cloud_enabled {
@@ -374,7 +364,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     // Extract measured stereo samples before matches are consumed.
                     let surface_samples = dense_triangulator
                         .as_ref()
-                        .map(|tri| tri.extract_stereo_samples(&matches));
+                        .map(|tri| tri.extract_stereo_samples(&matches))
+                        .transpose()?;
 
                     let points = output
                         .keyframe
@@ -400,43 +391,45 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Generate stable sparse surface observations for the low-resolution voxel map.
                     if let Some(sink) = sink.as_mut() {
-                        if let Some(samples) = surface_samples {
-                            if let Some(pose) = output.pose.as_ref() {
-                                let stereo = dense_triangulator.as_ref().unwrap().stereo();
-                                let raw_frame_points: Vec<[f32; 3]> = samples
-                                    .iter()
-                                    .map(|sample| {
-                                        let z = sample.depth_m;
-                                        let x = (sample.u - stereo.left().cx) * z / stereo.fx();
-                                        let v = 0.5 * (sample.v + sample.right_v);
-                                        let y = (v - stereo.left().cy) * z / stereo.fy();
-                                        [x, y, z]
-                                    })
-                                    .collect();
-                                let surface = kiko_slam::generate_stable_surface_points(
-                                    &samples,
-                                    stereo.fx(),
-                                    stereo.fy(),
-                                    stereo.left().cx,
-                                    stereo.left().cy,
-                                    stereo.baseline_m(),
-                                    left.data(),
-                                    left.width(),
-                                    left.height(),
-                                    &dense_config,
-                                );
-                                if let Err(err) = sink.log_surface_observations(
-                                    left.timestamp(),
-                                    &raw_frame_points,
-                                    &surface.points,
-                                    &surface.stats,
-                                    pose.cam_from_map_pose32(),
-                                    &output.diagnostics,
-                                    true,
-                                    output.keyframe.is_some(),
-                                ) {
-                                    eprintln!("stable surface: {err}");
-                                }
+                        if let (Some(samples), Some(triangulator), Some(pose)) = (
+                            surface_samples.as_ref(),
+                            dense_triangulator.as_ref(),
+                            output.pose.as_ref(),
+                        ) {
+                            let stereo = triangulator.stereo();
+                            let raw_frame_points: Vec<[f32; 3]> = samples
+                                .samples
+                                .iter()
+                                .map(|sample| {
+                                    let z = sample.depth_m;
+                                    let x = (sample.u - stereo.left().cx) * z / stereo.fx();
+                                    let y = (sample.v - stereo.left().cy) * z / stereo.fy();
+                                    [x, y, z]
+                                })
+                                .collect();
+                            let surface = kiko_slam::generate_stable_surface_points(
+                                &samples.samples,
+                                stereo.fx(),
+                                stereo.fy(),
+                                stereo.left().cx,
+                                stereo.left().cy,
+                                stereo.baseline_m(),
+                                left.data(),
+                                left.width(),
+                                left.height(),
+                                &dense_config,
+                            );
+                            if let Err(err) = sink.log_surface_observations(
+                                left.timestamp(),
+                                &raw_frame_points,
+                                &surface.points,
+                                &surface.stats,
+                                pose.cam_from_map_pose32(),
+                                &output.diagnostics,
+                                true,
+                                output.keyframe.is_some(),
+                            ) {
+                                eprintln!("stable surface: {err}");
                             }
                         }
                     }

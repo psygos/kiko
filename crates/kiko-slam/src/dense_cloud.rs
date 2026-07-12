@@ -351,7 +351,7 @@ pub fn generate_stable_surface_points(
 
         let z = sample.depth_m;
         let x = (sample.u - cx) * z / fx;
-        let v = 0.5 * (sample.v + sample.right_v);
+        let v = sample.v;
         let y = (v - cy) * z / fy;
         let position_variance = stereo_position_variance_m2(
             sample.u,

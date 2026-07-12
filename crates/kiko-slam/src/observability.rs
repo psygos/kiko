@@ -96,7 +96,7 @@ const PATH_TRI_CANDIDATES: &str = "diagnostics/triangulation/candidates";
 const PATH_TRI_KEPT: &str = "diagnostics/triangulation/kept";
 const PATH_TRI_DROPPED_DISPARITY: &str = "diagnostics/triangulation/dropped_disparity";
 const PATH_TRI_DROPPED_DEPTH: &str = "diagnostics/triangulation/dropped_depth";
-const PATH_TRI_DROPPED_OUT_OF_BOUNDS: &str = "diagnostics/triangulation/dropped_out_of_bounds";
+const PATH_TRI_DROPPED_NUMERICAL: &str = "diagnostics/triangulation/dropped_numerical";
 const PATH_TRI_DROPPED_DUPLICATE: &str = "diagnostics/triangulation/dropped_duplicate";
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
@@ -371,10 +371,7 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_TRI_KEPT, stats.kept as f64));
         scalars.push((PATH_TRI_DROPPED_DISPARITY, stats.dropped_disparity as f64));
         scalars.push((PATH_TRI_DROPPED_DEPTH, stats.dropped_depth as f64));
-        scalars.push((
-            PATH_TRI_DROPPED_OUT_OF_BOUNDS,
-            stats.dropped_out_of_bounds as f64,
-        ));
+        scalars.push((PATH_TRI_DROPPED_NUMERICAL, stats.dropped_numerical as f64));
         scalars.push((PATH_TRI_DROPPED_DUPLICATE, stats.dropped_duplicate as f64));
     }
 
@@ -779,8 +776,8 @@ mod tests {
             candidate_matches: 10,
             kept: 8,
             dropped_disparity: 1,
-            dropped_out_of_bounds: 0,
             dropped_depth: 1,
+            dropped_numerical: 0,
             dropped_duplicate: 0,
         });
         let scalars = diagnostics_scalars(&diag);

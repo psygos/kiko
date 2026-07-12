@@ -6,7 +6,7 @@ use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
     Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint, MatchError,
     Matches, Observation, PinholeIntrinsics, PnpError, Point3, Pose, Raw, RectifiedStereo,
-    RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp, math,
+    RectifiedStereoError, SensorId, Timestamp, math,
 };
 
 #[derive(Debug)]
@@ -118,10 +118,7 @@ pub(crate) fn make_rectified_stereo(
         rectified: true,
         imu: None,
     };
-    Ok(RectifiedStereo::from_calibration_with_config(
-        &calibration,
-        RectifiedStereoConfig::default(),
-    )?)
+    Ok(RectifiedStereo::from_calibration(&calibration)?)
 }
 
 pub(crate) fn grid_points_xy(
