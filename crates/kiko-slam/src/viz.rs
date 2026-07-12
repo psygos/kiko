@@ -2,8 +2,7 @@ use std::num::NonZeroUsize;
 
 use crate::{
     CovisibilitySnapshot, DepthImage, Detections, Frame, FrameDiagnostics, ImuBatch, Keypoint,
-    Point3, Pose, Raw, Timestamp, TrackingPose, VioTelemetry, VizPacket, env::env_f32,
-    env::env_usize,
+    Point3, Pose, Raw, Timestamp, TrackingPose, VioTelemetry, VizPacket,
 };
 
 use std::collections::HashMap;
@@ -107,6 +106,20 @@ pub enum RerunSinkInitError {
     SurfaceMapConfig {
         source: crate::SurfaceMapConfigError,
     },
+    Environment {
+        setting: &'static str,
+        source: crate::env::EnvError,
+    },
+    InvalidPoseQualityThreshold {
+        setting: &'static str,
+        source: crate::DiagnosticMetricError,
+    },
+    InvalidTrackDistance {
+        value_px: f32,
+    },
+    InvalidTrackSimilarity {
+        value: f32,
+    },
 }
 
 impl std::fmt::Display for RerunSinkInitError {
@@ -115,6 +128,26 @@ impl std::fmt::Display for RerunSinkInitError {
             Self::SurfaceMapConfig { source } => {
                 write!(f, "failed to configure surface visualization map: {source}")
             }
+            Self::Environment { setting, source } => {
+                write!(
+                    f,
+                    "failed to read visualization setting {setting}: {source}"
+                )
+            }
+            Self::InvalidPoseQualityThreshold { setting, source } => {
+                write!(
+                    f,
+                    "invalid surface pose-quality setting {setting}: {source}"
+                )
+            }
+            Self::InvalidTrackDistance { value_px } => write!(
+                f,
+                "visualization track distance must be positive and finite, got {value_px} px"
+            ),
+            Self::InvalidTrackSimilarity { value } => write!(
+                f,
+                "visualization track similarity must be finite and in [-1, 1], got {value}"
+            ),
         }
     }
 }
@@ -123,8 +156,18 @@ impl std::error::Error for RerunSinkInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SurfaceMapConfig { source } => Some(source),
+            Self::Environment { source, .. } => Some(source),
+            Self::InvalidPoseQualityThreshold { source, .. } => Some(source),
+            Self::InvalidTrackDistance { .. } | Self::InvalidTrackSimilarity { .. } => None,
         }
     }
+}
+
+fn viz_env<T>(
+    setting: &'static str,
+    result: Result<Option<T>, crate::env::EnvError>,
+) -> Result<Option<T>, RerunSinkInitError> {
+    result.map_err(|source| RerunSinkInitError::Environment { setting, source })
 }
 
 #[derive(Debug)]
@@ -149,17 +192,19 @@ impl RerunSink {
     ) -> Result<Self, RerunSinkInitError> {
         let surface_map_config = crate::SurfaceMapConfig::try_from_env()
             .map_err(|source| RerunSinkInitError::SurfaceMapConfig { source })?;
+        let surface_pose_quality_gate = SurfacePoseQualityGate::try_from_env()?;
+        let track_config = TrackConfig::try_from_env()?;
         Ok(Self {
             rec,
             decimation,
             frame_index: 0,
             depth_index: 0,
-            tracks: TrackState::new(),
+            tracks: TrackState::new(track_config),
             odom_trajectory: TrajectoryLog::default(),
             corrected_trajectory: TrajectoryLog::default(),
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
-            surface_pose_quality_gate: SurfacePoseQualityGate::load(),
+            surface_pose_quality_gate,
             surface_map: crate::SurfaceBeliefMap::new(surface_map_config),
         })
     }
@@ -740,21 +785,53 @@ impl Default for SurfacePoseQualityGate {
 }
 
 impl SurfacePoseQualityGate {
-    fn load() -> Self {
+    fn try_new(
+        min_accepted_inliers: usize,
+        max_accepted_inlier_reprojection_rmse_px: f32,
+    ) -> Result<Self, RerunSinkInitError> {
+        let max_accepted_inlier_reprojection_rmse_px =
+            crate::PnpAcceptedInlierPixelResidualMetric::new(
+                max_accepted_inlier_reprojection_rmse_px,
+            )
+            .map_err(|source| RerunSinkInitError::InvalidPoseQualityThreshold {
+                setting: "maximum accepted-inlier reprojection RMSE",
+                source,
+            })?;
+        Ok(Self {
+            min_accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(min_accepted_inliers),
+            max_accepted_inlier_reprojection_rmse_px,
+        })
+    }
+
+    fn try_from_env() -> Result<Self, RerunSinkInitError> {
         let mut gate = Self::default();
-        if let Some(count) = env_usize("KIKO_SURFACE_MIN_ACCEPTED_INLIERS")
-            .or_else(|| env_usize("KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS"))
-        {
+        if let Some(count) = viz_env(
+            "KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS",
+            crate::env::try_env_usize("KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS"),
+        )? {
             gate.min_accepted_inliers = crate::PnpAcceptedInlierCountMetric::new(count);
         }
-        if let Some(value_px) = env_f32("KIKO_SURFACE_MAX_ACCEPTED_INLIER_REPROJECTION_RMSE_PX")
-            .or_else(|| env_f32("KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX"))
-        {
-            if let Ok(metric) = crate::PnpAcceptedInlierPixelResidualMetric::new(value_px) {
-                gate.max_accepted_inlier_reprojection_rmse_px = metric;
-            }
+        if let Some(count) = viz_env(
+            "KIKO_SURFACE_MIN_ACCEPTED_INLIERS",
+            crate::env::try_env_usize("KIKO_SURFACE_MIN_ACCEPTED_INLIERS"),
+        )? {
+            gate.min_accepted_inliers = crate::PnpAcceptedInlierCountMetric::new(count);
         }
-        gate
+
+        let mut max_rmse_px = gate.max_accepted_inlier_reprojection_rmse_px.value_px();
+        if let Some(value_px) = viz_env(
+            "KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX",
+            crate::env::try_env_f32("KIKO_SURFACE_MAX_TRACKED_REPROJECTION_RMSE_PX"),
+        )? {
+            max_rmse_px = value_px;
+        }
+        if let Some(value_px) = viz_env(
+            "KIKO_SURFACE_MAX_ACCEPTED_INLIER_REPROJECTION_RMSE_PX",
+            crate::env::try_env_f32("KIKO_SURFACE_MAX_ACCEPTED_INLIER_REPROJECTION_RMSE_PX"),
+        )? {
+            max_rmse_px = value_px;
+        }
+        Self::try_new(gate.min_accepted_inliers.count(), max_rmse_px)
     }
 
     fn decide(self, diagnostics: &FrameDiagnostics) -> SurfacePoseQualityDecision {
@@ -1264,13 +1341,35 @@ struct TrackConfig {
 }
 
 impl TrackConfig {
-    fn load() -> Self {
-        let max_distance_px = env_f32("KIKO_TRACK_MAX_DIST").unwrap_or(24.0);
-        let min_similarity = env_f32("KIKO_TRACK_MIN_SIM").unwrap_or(0.8);
-        Self {
+    fn try_new(max_distance_px: f32, min_similarity: f32) -> Result<Self, RerunSinkInitError> {
+        if !max_distance_px.is_finite() || max_distance_px <= 0.0 {
+            return Err(RerunSinkInitError::InvalidTrackDistance {
+                value_px: max_distance_px,
+            });
+        }
+        if !min_similarity.is_finite() || !(-1.0..=1.0).contains(&min_similarity) {
+            return Err(RerunSinkInitError::InvalidTrackSimilarity {
+                value: min_similarity,
+            });
+        }
+        Ok(Self {
             max_distance_px,
             min_similarity,
-        }
+        })
+    }
+
+    fn try_from_env() -> Result<Self, RerunSinkInitError> {
+        let max_distance_px = viz_env(
+            "KIKO_TRACK_MAX_DIST",
+            crate::env::try_env_f32("KIKO_TRACK_MAX_DIST"),
+        )?
+        .unwrap_or(24.0);
+        let min_similarity = viz_env(
+            "KIKO_TRACK_MIN_SIM",
+            crate::env::try_env_f32("KIKO_TRACK_MIN_SIM"),
+        )?
+        .unwrap_or(0.8);
+        Self::try_new(max_distance_px, min_similarity)
     }
 }
 
@@ -1283,9 +1382,9 @@ struct TrackState {
 }
 
 impl TrackState {
-    fn new() -> Self {
+    fn new(config: TrackConfig) -> Self {
         Self {
-            config: TrackConfig::load(),
+            config,
             prev_left: None,
             prev_track_ids: Vec::new(),
             next_track_id: 0,
@@ -1494,8 +1593,9 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        RerunSink, SurfacePoseQualityDecision, SurfacePoseQualityGate, VizDecimation,
-        surface_integration_scalars, surface_pose_quality_scalars, surface_summary_scalars,
+        RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
+        TrackConfig, VizDecimation, surface_integration_scalars, surface_pose_quality_scalars,
+        surface_summary_scalars,
     };
     use crate::{
         Frame, FrameDiagnostics, FrameId, Pose, RectifiedRowMismatchPx, SensorId,
@@ -1511,6 +1611,28 @@ mod tests {
             RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         )
         .expect("stable surface point")
+    }
+
+    #[test]
+    fn visualization_runtime_config_rejects_invalid_numeric_states() {
+        assert!(matches!(
+            SurfacePoseQualityGate::try_new(8, f32::NAN),
+            Err(RerunSinkInitError::InvalidPoseQualityThreshold { .. })
+        ));
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                TrackConfig::try_new(invalid, 0.8),
+                Err(RerunSinkInitError::InvalidTrackDistance { .. })
+            ));
+        }
+        for invalid in [-1.1, 1.1, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                TrackConfig::try_new(24.0, invalid),
+                Err(RerunSinkInitError::InvalidTrackSimilarity { .. })
+            ));
+        }
+        assert!(TrackConfig::try_new(24.0, -1.0).is_ok());
+        assert!(TrackConfig::try_new(24.0, 1.0).is_ok());
     }
 
     #[test]
