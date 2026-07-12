@@ -4,7 +4,7 @@ use crate::map::{KeyframeId, MapError, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
-    RansacConfig, solve_pnp_ransac,
+    RansacConfig, RansacConfigError, solve_pnp_ransac,
 };
 
 pub(crate) const GLOBAL_DESCRIPTOR_DIM: usize = crate::DESCRIPTOR_DIM * 2;
@@ -266,8 +266,6 @@ pub enum LoopClosureConfigError {
     TooFewMinInliers { value: usize, min: usize },
     NonPositiveMaxCorrectionTranslation { value: f32 },
     InvalidMaxCorrectionRotationDeg { value: f32 },
-    ZeroRansacIterations,
-    NonPositiveRansacThresholdPx { value: f32 },
 }
 
 impl std::fmt::Display for LoopClosureConfigError {
@@ -305,13 +303,6 @@ impl std::fmt::Display for LoopClosureConfigError {
             LoopClosureConfigError::InvalidMaxCorrectionRotationDeg { value } => write!(
                 f,
                 "loop max correction rotation must be in (0, 180], got {value}"
-            ),
-            LoopClosureConfigError::ZeroRansacIterations => {
-                write!(f, "loop ransac max iterations must be > 0")
-            }
-            LoopClosureConfigError::NonPositiveRansacThresholdPx { value } => write!(
-                f,
-                "loop ransac reprojection threshold must be > 0, got {value}"
             ),
         }
     }
@@ -377,16 +368,6 @@ impl LoopClosureConfig {
                 value: max_correction_rotation_deg,
             });
         }
-        if ransac.max_iterations == 0 {
-            return Err(LoopClosureConfigError::ZeroRansacIterations);
-        }
-        if !ransac.reprojection_threshold_px.is_finite() || ransac.reprojection_threshold_px <= 0.0
-        {
-            return Err(LoopClosureConfigError::NonPositiveRansacThresholdPx {
-                value: ransac.reprojection_threshold_px,
-            });
-        }
-
         Ok(Self {
             similarity_threshold,
             descriptor_match_threshold,
@@ -451,8 +432,6 @@ impl Default for LoopClosureConfig {
         debug_assert!(defaults.max_correction_translation > 0.0);
         debug_assert!(defaults.max_correction_rotation_deg > 0.0);
         debug_assert!(defaults.max_correction_rotation_deg <= 180.0);
-        debug_assert!(defaults.ransac.max_iterations > 0);
-        debug_assert!(defaults.ransac.reprojection_threshold_px > 0.0);
 
         Self {
             similarity_threshold: defaults.similarity_threshold.clamp(f32::MIN_POSITIVE, 1.0),
@@ -467,15 +446,7 @@ impl Default for LoopClosureConfig {
             max_correction_rotation_deg: defaults
                 .max_correction_rotation_deg
                 .clamp(f32::MIN_POSITIVE, 180.0),
-            ransac: RansacConfig {
-                max_iterations: defaults.ransac.max_iterations.max(1),
-                reprojection_threshold_px: defaults
-                    .ransac
-                    .reprojection_threshold_px
-                    .max(f32::MIN_POSITIVE),
-                min_inliers: defaults.ransac.min_inliers,
-                seed: defaults.ransac.seed,
-            },
+            ransac: defaults.ransac,
         }
     }
 }
@@ -1006,6 +977,7 @@ impl VerifiedRelocalization {
 #[derive(Debug)]
 pub enum LoopVerificationError {
     TooFewMatches { count: usize },
+    InvalidRansacConfig { source: RansacConfigError },
     PnpFailed(PnpError),
     InsufficientInliers { inliers: usize, required: usize },
 }
@@ -1019,6 +991,9 @@ impl std::fmt::Display for LoopVerificationError {
             LoopVerificationError::PnpFailed(err) => {
                 write!(f, "loop verification PnP failed: {err}")
             }
+            LoopVerificationError::InvalidRansacConfig { source } => {
+                write!(f, "loop verification RANSAC config failed: {source}")
+            }
             LoopVerificationError::InsufficientInliers { inliers, required } => write!(
                 f,
                 "loop verification inliers below threshold: inliers={inliers}, required={required}"
@@ -1030,6 +1005,7 @@ impl std::fmt::Display for LoopVerificationError {
 impl std::error::Error for LoopVerificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            LoopVerificationError::InvalidRansacConfig { source } => Some(source),
             LoopVerificationError::PnpFailed(source) => Some(source),
             LoopVerificationError::TooFewMatches { .. }
             | LoopVerificationError::InsufficientInliers { .. } => None,
@@ -1082,10 +1058,9 @@ fn verify_pose_from_keyframe(
     // Use a relaxed inlier threshold for the RANSAC solver itself so it can
     // find a valid pose even with some outlier correspondences.  The actual
     // quality gate is the post-PnP inlier check below.
-    let pnp_config = RansacConfig {
-        min_inliers: MIN_PNP_POINTS,
-        ..ransac_config
-    };
+    let pnp_config = ransac_config
+        .try_with_min_inliers(MIN_PNP_POINTS)
+        .map_err(|source| LoopVerificationError::InvalidRansacConfig { source })?;
 
     let result = solve_pnp_ransac(&observations, intrinsics, pnp_config)
         .map_err(LoopVerificationError::PnpFailed)?;

@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use crate::dataset::CameraIntrinsics;
 use crate::{Keyframe, Keypoint, Matches, Point3, Verified, math};
 
@@ -160,16 +162,97 @@ impl Pose {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RansacConfig {
-    pub max_iterations: usize,
-    pub reprojection_threshold_px: f32,
-    pub min_inliers: usize,
-    pub seed: u64,
+    max_iterations: NonZeroUsize,
+    reprojection_threshold_px: f32,
+    min_inliers: usize,
+    seed: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RansacConfigError {
+    ZeroMaxIterations,
+    InvalidReprojectionThresholdPx { value: f32 },
+    TooFewMinInliers { value: usize, minimum: usize },
+}
+
+impl std::fmt::Display for RansacConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RansacConfigError::ZeroMaxIterations => {
+                write!(f, "RANSAC max iterations must be greater than zero")
+            }
+            RansacConfigError::InvalidReprojectionThresholdPx { value } => write!(
+                f,
+                "RANSAC reprojection threshold must be positive and finite, got {value}"
+            ),
+            RansacConfigError::TooFewMinInliers { value, minimum } => write!(
+                f,
+                "RANSAC minimum inliers must be at least {minimum}, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RansacConfigError {}
+
+impl RansacConfig {
+    pub fn new(
+        max_iterations: usize,
+        reprojection_threshold_px: f32,
+        min_inliers: usize,
+        seed: u64,
+    ) -> Result<Self, RansacConfigError> {
+        let max_iterations =
+            NonZeroUsize::new(max_iterations).ok_or(RansacConfigError::ZeroMaxIterations)?;
+        if !reprojection_threshold_px.is_finite() || reprojection_threshold_px <= 0.0 {
+            return Err(RansacConfigError::InvalidReprojectionThresholdPx {
+                value: reprojection_threshold_px,
+            });
+        }
+        if min_inliers < MIN_PNP_POINTS {
+            return Err(RansacConfigError::TooFewMinInliers {
+                value: min_inliers,
+                minimum: MIN_PNP_POINTS,
+            });
+        }
+        Ok(Self {
+            max_iterations,
+            reprojection_threshold_px,
+            min_inliers,
+            seed,
+        })
+    }
+
+    pub fn max_iterations(self) -> usize {
+        self.max_iterations.get()
+    }
+
+    pub fn reprojection_threshold_px(self) -> f32 {
+        self.reprojection_threshold_px
+    }
+
+    pub fn min_inliers(self) -> usize {
+        self.min_inliers
+    }
+
+    pub fn seed(self) -> u64 {
+        self.seed
+    }
+
+    pub fn try_with_min_inliers(self, min_inliers: usize) -> Result<Self, RansacConfigError> {
+        Self::new(
+            self.max_iterations(),
+            self.reprojection_threshold_px,
+            min_inliers,
+            self.seed,
+        )
+    }
 }
 
 impl Default for RansacConfig {
     fn default() -> Self {
         Self {
-            max_iterations: 200,
+            max_iterations: NonZeroUsize::MIN.saturating_add(199),
             reprojection_threshold_px: 2.0,
             min_inliers: 20,
             seed: 0x5EED_u64,
@@ -293,16 +376,17 @@ pub fn solve_pnp_ransac(
         });
     }
 
-    let mut rng = XorShift64::new(config.seed);
+    let mut rng = XorShift64::new(config.seed());
     let mut best_pose = None;
     let mut best_inliers: Vec<usize> = Vec::new();
     let mut candidate_inliers = Vec::with_capacity(observations.len());
 
     let mut iterations = 0usize;
     let total = observations.len();
-    let mut target_iterations = config.max_iterations.max(1);
+    let mut target_iterations = config.max_iterations();
 
-    let threshold_sq = config.reprojection_threshold_px * config.reprojection_threshold_px;
+    let threshold_px = config.reprojection_threshold_px();
+    let threshold_sq = threshold_px * threshold_px;
     while iterations < target_iterations {
         iterations += 1;
         let sample = sample_three(&mut rng, total);
@@ -341,13 +425,13 @@ pub fn solve_pnp_ransac(
     }
 
     let pose = best_pose.ok_or(PnpError::NoSolution)?;
-    if best_inliers.len() < config.min_inliers {
+    if best_inliers.len() < config.min_inliers() {
         return Err(PnpError::NoSolution);
     }
 
     let refined_pose = refine_pose_on_inliers(pose, observations, intrinsics, &best_inliers);
     let refined_inliers = collect_inliers(refined_pose, observations, intrinsics, threshold_sq);
-    let (pose, inliers) = if refined_inliers.len() >= config.min_inliers {
+    let (pose, inliers) = if refined_inliers.len() >= config.min_inliers() {
         (refined_pose, refined_inliers)
     } else {
         (pose, best_inliers)
@@ -1086,6 +1170,25 @@ mod tests {
         sum.sqrt()
     }
 
+    #[test]
+    fn ransac_config_rejects_invalid_solver_inputs() {
+        assert!(matches!(
+            RansacConfig::new(0, 1.0, MIN_PNP_POINTS, 1),
+            Err(RansacConfigError::ZeroMaxIterations)
+        ));
+        assert!(matches!(
+            RansacConfig::new(1, f32::NAN, MIN_PNP_POINTS, 1),
+            Err(RansacConfigError::InvalidReprojectionThresholdPx { .. })
+        ));
+        assert!(matches!(
+            RansacConfig::new(1, 1.0, MIN_PNP_POINTS - 1, 1),
+            Err(RansacConfigError::TooFewMinInliers {
+                value,
+                minimum,
+            }) if value == MIN_PNP_POINTS - 1 && minimum == MIN_PNP_POINTS
+        ));
+    }
+
     fn l2(a: [f32; 3], b: [f32; 3]) -> f32 {
         let dx = a[0] - b[0];
         let dy = a[1] - b[1];
@@ -1134,12 +1237,7 @@ mod tests {
             observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
         assert!(observations.len() >= 20);
 
-        let config = RansacConfig {
-            max_iterations: 700,
-            reprojection_threshold_px: 1.0,
-            min_inliers: 20,
-            seed: 0xBAD5EED,
-        };
+        let config = RansacConfig::new(700, 1.0, 20, 0xBAD5EED).expect("RANSAC config");
         let result = solve_pnp_ransac(&observations, intrinsics, config).expect("pnp");
         assert!(result.inliers.len() >= 20, "insufficient inliers");
 
@@ -1169,12 +1267,7 @@ mod tests {
                 .push(Observation::try_new(obs.world(), pixel, intrinsics).expect("observation"));
         }
 
-        let config = RansacConfig {
-            max_iterations: 1000,
-            reprojection_threshold_px: 2.0,
-            min_inliers: 14,
-            seed: 0x1337,
-        };
+        let config = RansacConfig::new(1000, 2.0, 14, 0x1337).expect("RANSAC config");
         let result = solve_pnp_ransac(&with_outliers, intrinsics, config).expect("pnp");
         assert!(
             result.inliers.len() >= 14,

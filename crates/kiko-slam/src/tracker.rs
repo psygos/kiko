@@ -37,8 +37,9 @@ use crate::{
     Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics, FrameId, Keyframe,
     KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue, LocalBaConfig,
     LocalBundleAdjuster, LoopClosureStatus, MapFromOdom, MapObservation, Matches, Observation,
-    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, Raw, StereoPair,
-    SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator, Verified,
+    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, RansacConfigError, Raw,
+    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
+    Verified,
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
@@ -1116,6 +1117,7 @@ pub enum TrackerError {
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
+    RansacConfig(RansacConfigError),
     KeyframeRejected {
         landmarks: usize,
     },
@@ -1134,6 +1136,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
+            TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -1154,6 +1157,7 @@ impl std::error::Error for TrackerError {
             TrackerError::Map(source) => Some(source),
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::PoseGraph(source) => Some(source),
+            TrackerError::RansacConfig(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::Vio(_) => None,
             TrackerError::KeyframeRejected { .. } | TrackerError::InvariantViolation(_) => None,
@@ -1200,6 +1204,12 @@ impl From<EssentialGraphError> for TrackerError {
 impl From<PoseGraphError> for TrackerError {
     fn from(err: PoseGraphError) -> Self {
         TrackerError::PoseGraph(err)
+    }
+}
+
+impl From<RansacConfigError> for TrackerError {
+    fn from(err: RansacConfigError) -> Self {
+        TrackerError::RansacConfig(err)
     }
 }
 
@@ -1463,14 +1473,14 @@ fn summarize_depths(points: &[Point3]) -> Option<DepthSummary> {
     })
 }
 
-fn adaptive_tracking_ransac_config(base: RansacConfig, observation_count: usize) -> RansacConfig {
+fn adaptive_tracking_ransac_config(
+    base: RansacConfig,
+    observation_count: usize,
+) -> Result<RansacConfig, RansacConfigError> {
     let target_min_inliers = observation_count.saturating_add(TRACKING_RANSAC_INLIER_DIVISOR - 1)
         / TRACKING_RANSAC_INLIER_DIVISOR;
-    let max_configured = base.min_inliers.max(MIN_TRACKING_RANSAC_INLIERS);
-    RansacConfig {
-        min_inliers: target_min_inliers.clamp(MIN_TRACKING_RANSAC_INLIERS, max_configured),
-        ..base
-    }
+    let max_configured = base.min_inliers().max(MIN_TRACKING_RANSAC_INLIERS);
+    base.try_with_min_inliers(target_min_inliers.clamp(MIN_TRACKING_RANSAC_INLIERS, max_configured))
 }
 
 #[cfg(feature = "vio")]
@@ -3303,7 +3313,8 @@ impl SlamTracker {
             Err(err) => return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err))),
         };
         let tracking_ransac =
-            adaptive_tracking_ransac_config(self.config.ransac, tracked_observations.len());
+            adaptive_tracking_ransac_config(self.config.ransac, tracked_observations.len())
+                .map_err(|err| TrackingAttemptError::Fatal(TrackerError::RansacConfig(err)))?;
 
         let result = match self
             .frontend
@@ -3315,7 +3326,7 @@ impl SlamTracker {
                     matches: match_count,
                     verified: verified_count,
                     observations: tracked_observations.len(),
-                    required_inliers: tracking_ransac.min_inliers,
+                    required_inliers: tracking_ransac.min_inliers(),
                 });
             }
             Err(err) => return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err))),
@@ -3867,7 +3878,7 @@ impl SlamTracker {
                 frame_id.as_u64(),
                 tracked_observations.len(),
                 result.inliers.len(),
-                tracking_ransac.min_inliers,
+                tracking_ransac.min_inliers(),
                 matches.len(),
                 verified.len(),
                 parallax_px
@@ -5999,16 +6010,20 @@ mod tests {
 
     #[test]
     fn adaptive_tracking_ransac_relaxes_sparse_observation_sets() {
-        let base = RansacConfig {
-            min_inliers: 8,
-            ..RansacConfig::default()
-        };
+        let base = RansacConfig::default()
+            .try_with_min_inliers(8)
+            .expect("RANSAC config");
 
-        assert_eq!(adaptive_tracking_ransac_config(base, 4).min_inliers, 4);
-        assert_eq!(adaptive_tracking_ransac_config(base, 14).min_inliers, 4);
-        assert_eq!(adaptive_tracking_ransac_config(base, 19).min_inliers, 5);
-        assert_eq!(adaptive_tracking_ransac_config(base, 32).min_inliers, 8);
-        assert_eq!(adaptive_tracking_ransac_config(base, 200).min_inliers, 8);
+        let adaptive = |count| {
+            adaptive_tracking_ransac_config(base, count)
+                .expect("derived RANSAC config")
+                .min_inliers()
+        };
+        assert_eq!(adaptive(4), 4);
+        assert_eq!(adaptive(14), 4);
+        assert_eq!(adaptive(19), 5);
+        assert_eq!(adaptive(32), 8);
+        assert_eq!(adaptive(200), 8);
     }
 
     #[test]

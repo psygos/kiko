@@ -130,7 +130,7 @@ pub use pipeline::{
 pub use place_recognition::DescriptorStats;
 pub use pnp::{
     IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
-    build_observations, solve_pnp, solve_pnp_ransac,
+    RansacConfigError, build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use runtime_imu::{
     RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,

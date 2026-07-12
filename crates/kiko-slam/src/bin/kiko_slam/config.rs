@@ -70,10 +70,7 @@ pub fn build_tracker_config_with_overrides(
     let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY")
         .unwrap_or(DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY);
     let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(defaults.min_inliers);
-    let ransac = RansacConfig {
-        min_inliers,
-        ..RansacConfig::default()
-    };
+    let ransac = RansacConfig::default().try_with_min_inliers(min_inliers)?;
     let tracking_matcher = tracking_matcher_from_env(
         overrides
             .tracking_matcher
@@ -113,9 +110,9 @@ pub fn build_tracker_config_with_overrides(
             loop_cfg.min_streak(),
             loop_cfg.max_correction_translation(),
             loop_cfg.max_correction_rotation_deg(),
-            loop_cfg.ransac().max_iterations,
-            loop_cfg.ransac().reprojection_threshold_px,
-            loop_cfg.ransac().min_inliers,
+            loop_cfg.ransac().max_iterations(),
+            loop_cfg.ransac().reprojection_threshold_px(),
+            loop_cfg.ransac().min_inliers(),
         );
         if relocalization_enabled {
             LoopSubsystemConfig::with_relocalization(
@@ -225,17 +222,18 @@ fn build_loop_closure_config_from_env() -> Result<LoopClosureConfig, Box<dyn std
         input.max_correction_rotation_deg = v;
     }
 
-    let mut ransac = input.ransac;
-    if let Some(v) = env_usize("KIKO_LOOP_RANSAC_MAX_ITERATIONS") {
-        ransac.max_iterations = v;
-    }
-    if let Some(v) = env_f32("KIKO_LOOP_RANSAC_THRESHOLD_PX") {
-        ransac.reprojection_threshold_px = v;
-    }
-    if let Some(v) = env_usize("KIKO_LOOP_RANSAC_MIN_INLIERS") {
-        ransac.min_inliers = v;
-    }
-    input.ransac = ransac;
+    let ransac = input.ransac;
+    let max_iterations =
+        env_usize("KIKO_LOOP_RANSAC_MAX_ITERATIONS").unwrap_or(ransac.max_iterations());
+    let reprojection_threshold_px =
+        env_f32("KIKO_LOOP_RANSAC_THRESHOLD_PX").unwrap_or(ransac.reprojection_threshold_px());
+    let min_inliers = env_usize("KIKO_LOOP_RANSAC_MIN_INLIERS").unwrap_or(ransac.min_inliers());
+    input.ransac = RansacConfig::new(
+        max_iterations,
+        reprojection_threshold_px,
+        min_inliers,
+        ransac.seed(),
+    )?;
 
     LoopClosureConfig::new(input).map_err(Into::into)
 }
