@@ -64,9 +64,11 @@ impl DatasetReader {
             .map(|imu| imu.extrinsics.time_offset_ns)
             .unwrap_or(0);
         let imu_samples = read_imu_samples(&root, &meta, imu_time_offset_ns)?;
-        let pairing_window = PairingWindowNs::new(manifest.header.pairing_window_ns as i64)
-            .map_err(|_| DatasetError::InvalidConfig {
-                msg: "manifest pairing_window_ns must be > 0",
+        let pairing_window =
+            PairingWindowNs::try_from(manifest.header.pairing_window_ns).map_err(|_| {
+                DatasetError::InvalidConfig {
+                    msg: "manifest pairing_window_ns must be > 0",
+                }
             })?;
         Ok(Self {
             root,
@@ -409,7 +411,7 @@ fn fps_from_frames(frames: &[FrameInfo]) -> Option<f64> {
         return None;
     }
     let (min_ts, max_ts) = min_max_ts(frames);
-    let span_ns = (max_ts - min_ts).abs() as f64;
+    let span_ns = max_ts.abs_diff(min_ts) as f64;
     if span_ns <= 0.0 {
         return None;
     }
@@ -435,7 +437,7 @@ fn fps_from_manifest_pairs(entries: &[super::ManifestEntry]) -> Option<f64> {
             max_ts = max_ts.max(right.timestamp_ns);
         }
     }
-    let span_ns = (max_ts - min_ts).abs() as f64;
+    let span_ns = max_ts.abs_diff(min_ts) as f64;
     if span_ns <= 0.0 {
         return None;
     }

@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 // Compatibility shims for ORT static archive built with GCC 14 / glibc 2.38.
@@ -212,6 +212,10 @@ impl Timestamp {
         self.delta_ns(earlier) as f64 / 1_000_000_000.0
     }
 
+    pub fn absolute_delta_ns(self, other: Timestamp) -> u64 {
+        self.0.abs_diff(other.0)
+    }
+
     pub fn midpoint(a: Timestamp, b: Timestamp) -> Timestamp {
         let midpoint = ((a.0 as i128) + (b.0 as i128)) / 2;
         Timestamp(midpoint.clamp(i64::MIN as i128, i64::MAX as i128) as i64)
@@ -266,8 +270,8 @@ pub enum PairError {
         right: FrameDimensions,
     },
     TimestampDelta {
-        delta_ns: i64,
-        max_delta_ns: i64,
+        delta_ns: u64,
+        max_delta_ns: u64,
     },
     SensorMismatch {
         left: SensorId,
@@ -307,25 +311,32 @@ impl std::fmt::Display for PairError {
 impl std::error::Error for PairError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DownscaleFactor(NonZeroUsize);
+pub struct DownscaleFactor(NonZeroU32);
 
 impl DownscaleFactor {
-    pub fn new(value: NonZeroUsize) -> Self {
+    pub fn new(value: NonZeroU32) -> Self {
         Self(value)
     }
 
     pub fn get(self) -> usize {
+        self.0.get() as usize
+    }
+
+    pub fn as_u32(self) -> u32 {
         self.0.get()
     }
 
     pub fn identity() -> Self {
-        Self(NonZeroUsize::MIN)
+        Self(NonZeroU32::MIN)
     }
 }
 
 #[derive(Debug)]
 pub enum DownscaleError {
     Zero,
+    TooLarge {
+        value: usize,
+    },
     InputLenMismatch {
         expected: usize,
         actual: usize,
@@ -341,6 +352,9 @@ impl std::fmt::Display for DownscaleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
+            DownscaleError::TooLarge { value } => {
+                write!(f, "downscale factor {value} exceeds u32::MAX")
+            }
             DownscaleError::InputLenMismatch { expected, actual } => {
                 write!(
                     f,
@@ -365,7 +379,8 @@ impl TryFrom<usize> for DownscaleFactor {
     type Error = DownscaleError;
 
     fn try_from(value: usize) -> Result<Self, Self::Error> {
-        NonZeroUsize::new(value)
+        let value = u32::try_from(value).map_err(|_| DownscaleError::TooLarge { value })?;
+        NonZeroU32::new(value)
             .map(DownscaleFactor)
             .ok_or(DownscaleError::Zero)
     }
@@ -713,7 +728,7 @@ impl StereoPair {
             });
         }
 
-        let delta = (left.timestamp().as_nanos() - right.timestamp().as_nanos()).abs();
+        let delta = left.timestamp().absolute_delta_ns(right.timestamp());
         if delta > window.as_ns() {
             return Err(PairError::TimestampDelta {
                 delta_ns: delta,
@@ -742,8 +757,10 @@ impl StereoPair {
         (self.left, self.right)
     }
 
-    pub fn timestamp_delta_ns(&self) -> i64 {
-        (self.left.timestamp().as_nanos() - self.right.timestamp().as_nanos()).abs()
+    pub fn timestamp_delta_ns(&self) -> u64 {
+        self.left
+            .timestamp()
+            .absolute_delta_ns(self.right.timestamp())
     }
 
     pub fn capture_time(&self) -> Timestamp {
@@ -1063,7 +1080,10 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Timestamp, U8_SCALE};
+    use super::{
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DownscaleError, DownscaleFactor, Timestamp,
+        U8_SCALE,
+    };
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;
@@ -1141,6 +1161,24 @@ mod tests {
         let later = Timestamp::from_nanos(25);
         assert_eq!(later.delta_ns(earlier), 15);
         assert_eq!(earlier.delta_ns(later), -15);
+    }
+
+    #[test]
+    fn timestamp_absolute_delta_handles_full_i64_domain() {
+        let earliest = Timestamp::from_nanos(i64::MIN);
+        let latest = Timestamp::from_nanos(i64::MAX);
+        assert_eq!(earliest.absolute_delta_ns(latest), u64::MAX);
+        assert_eq!(latest.absolute_delta_ns(earliest), u64::MAX);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn downscale_factor_rejects_values_that_cannot_narrow_to_u32() {
+        let value = u32::MAX as usize + 1;
+        assert!(matches!(
+            DownscaleFactor::try_from(value),
+            Err(DownscaleError::TooLarge { value: rejected }) if rejected == value
+        ));
     }
 
     #[test]

@@ -1147,15 +1147,15 @@ fn compute_period_ns(frames: &[FrameInfo]) -> Option<u64> {
     if frames.len() < 2 {
         return None;
     }
-    let mut deltas: Vec<i64> = frames
+    let mut deltas: Vec<u64> = frames
         .windows(2)
-        .map(|pair| pair[1].timestamp_ns - pair[0].timestamp_ns)
+        .map(|pair| pair[1].timestamp_ns.abs_diff(pair[0].timestamp_ns))
         .collect();
     deltas.sort_unstable();
-    Some(median_i64(&deltas).unsigned_abs())
+    Some(median_u64(&deltas))
 }
 
-fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) -> Vec<i64> {
+fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) -> Vec<u64> {
     let mut deltas = Vec::new();
     if right.is_empty() {
         return deltas;
@@ -1168,16 +1168,16 @@ fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) ->
             right_idx += 1;
         }
 
-        let mut best: Option<i64> = None;
+        let mut best: Option<u64> = None;
         let candidates = [Some(right_idx), right_idx.checked_sub(1)];
 
         for idx in candidates.into_iter().flatten() {
             if idx >= right.len() {
                 continue;
             }
-            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).abs();
+            let delta = right[idx].timestamp_ns.abs_diff(left_frame.timestamp_ns);
             if let Some(gate_ns) = gate {
-                if delta as u64 > gate_ns {
+                if delta > gate_ns {
                     continue;
                 }
             }
@@ -1193,17 +1193,17 @@ fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) ->
     deltas
 }
 
-fn build_delta_stats(deltas: &[i64]) -> Option<DeltaStats> {
+fn build_delta_stats(deltas: &[u64]) -> Option<DeltaStats> {
     if deltas.is_empty() {
         return None;
     }
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
-    let min = sorted.first().copied().unwrap_or(0) as u64;
-    let max = sorted.last().copied().unwrap_or(0) as u64;
-    let median = median_i64(&sorted) as u64;
-    let p95 = percentile_i64(&sorted, 0.95) as u64;
-    let p99 = percentile_i64(&sorted, 0.99) as u64;
+    let min = sorted.first().copied().unwrap_or(0);
+    let max = sorted.last().copied().unwrap_or(0);
+    let median = median_u64(&sorted);
+    let p95 = percentile_u64(&sorted, 0.95);
+    let p99 = percentile_u64(&sorted, 0.99);
     Some(DeltaStats {
         min,
         median,
@@ -1214,27 +1214,27 @@ fn build_delta_stats(deltas: &[i64]) -> Option<DeltaStats> {
 }
 
 fn compute_pairing_window_ns(
-    deltas: &[i64],
+    deltas: &[u64],
     stats: Option<&DeltaStats>,
     left_period: Option<u64>,
 ) -> u64 {
     if deltas.is_empty() {
-        return left_period.unwrap_or(0) / 4;
+        return (left_period.unwrap_or(0) / 4).max(1);
     }
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
-    let median = median_i64(&sorted);
+    let median = median_u64(&sorted);
     let mad = median_absolute_deviation(&sorted, median);
     let p99 = stats
         .map(|s| s.p99)
-        .unwrap_or_else(|| sorted.last().copied().unwrap_or(0) as u64);
-    let mut window = p99.max((median + 6 * mad).max(0) as u64);
+        .unwrap_or_else(|| sorted.last().copied().unwrap_or(0));
+    let mut window = p99.max(median.saturating_add(mad.saturating_mul(6)));
     if let Some(period) = left_period {
         if period > 0 {
             window = window.min(period / 4);
         }
     }
-    window
+    window.max(1)
 }
 
 fn pair_entries(
@@ -1280,7 +1280,7 @@ fn pair_entries(
         let mut best_delta = None;
 
         for idx in [left_candidate, right_candidate].into_iter().flatten() {
-            let delta = (right[idx].timestamp_ns - left_frame.timestamp_ns).unsigned_abs();
+            let delta = right[idx].timestamp_ns.abs_diff(left_frame.timestamp_ns);
             if best_delta.is_none_or(|b| delta < b) {
                 best_delta = Some(delta);
                 best_idx = Some(idx);
@@ -1346,7 +1346,7 @@ fn pair_entries(
     )
 }
 
-fn median_i64(sorted: &[i64]) -> i64 {
+fn median_u64(sorted: &[u64]) -> u64 {
     let len = sorted.len();
     if len == 0 {
         return 0;
@@ -1356,11 +1356,13 @@ fn median_i64(sorted: &[i64]) -> i64 {
     } else {
         let a = sorted[len / 2 - 1];
         let b = sorted[len / 2];
-        (a + b) / 2
+        (a / 2)
+            .saturating_add(b / 2)
+            .saturating_add((a % 2 + b % 2) / 2)
     }
 }
 
-fn percentile_i64(sorted: &[i64], pct: f64) -> i64 {
+fn percentile_u64(sorted: &[u64], pct: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
     }
@@ -1368,10 +1370,10 @@ fn percentile_i64(sorted: &[i64], pct: f64) -> i64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-fn median_absolute_deviation(sorted: &[i64], median: i64) -> i64 {
-    let mut deviations: Vec<i64> = sorted.iter().map(|v| (v - median).abs()).collect();
+fn median_absolute_deviation(sorted: &[u64], median: u64) -> u64 {
+    let mut deviations: Vec<u64> = sorted.iter().map(|value| value.abs_diff(median)).collect();
     deviations.sort_unstable();
-    median_i64(&deviations)
+    median_u64(&deviations)
 }
 
 fn dataset_id(dataset_dir: &Path) -> String {
@@ -1380,4 +1382,21 @@ fn dataset_id(dataset_dir: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("dataset")
         .to_string()
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::{build_delta_stats, compute_pairing_window_ns, median_u64};
+
+    #[test]
+    fn exact_sync_still_produces_a_readable_nonzero_pairing_window() {
+        let deltas = [0_u64, 0, 0];
+        let stats = build_delta_stats(&deltas).expect("delta stats");
+        assert_eq!(compute_pairing_window_ns(&deltas, Some(&stats), None), 1);
+    }
+
+    #[test]
+    fn median_does_not_overflow_at_u64_max() {
+        assert_eq!(median_u64(&[u64::MAX, u64::MAX]), u64::MAX);
+    }
 }

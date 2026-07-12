@@ -43,7 +43,7 @@ pub fn normalise_downscale_into(
         });
     }
 
-    let factor_u32 = factor.get() as u32;
+    let factor_u32 = factor.as_u32();
     if width % factor_u32 != 0 || height % factor_u32 != 0 {
         return Err(crate::DownscaleError::NonDivisible {
             width,
@@ -91,7 +91,7 @@ pub fn downscale_u8_into(
         });
     }
 
-    let factor_u32 = factor.get() as u32;
+    let factor_u32 = factor.as_u32();
     if width % factor_u32 != 0 || height % factor_u32 != 0 {
         return Err(crate::DownscaleError::NonDivisible {
             width,

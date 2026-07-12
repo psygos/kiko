@@ -1,21 +1,33 @@
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU64, NonZeroUsize};
 
 use crate::{Frame, PairError, SensorId, StereoPair};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PairingWindowNs(i64);
+pub struct PairingWindowNs(NonZeroU64);
 
 impl PairingWindowNs {
     pub fn new(window_ns: i64) -> Result<Self, PairingConfigError> {
         if window_ns <= 0 {
             return Err(PairingConfigError::NonPositiveWindow { window_ns });
         }
-        Ok(Self(window_ns))
+        Ok(Self(NonZeroU64::new(window_ns as u64).ok_or(
+            PairingConfigError::NonPositiveWindow { window_ns },
+        )?))
     }
 
-    pub fn as_ns(&self) -> i64 {
-        self.0
+    pub fn as_ns(&self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl TryFrom<u64> for PairingWindowNs {
+    type Error = PairingConfigError;
+
+    fn try_from(window_ns: u64) -> Result<Self, Self::Error> {
+        NonZeroU64::new(window_ns)
+            .map(Self)
+            .ok_or(PairingConfigError::NonPositiveWindow { window_ns: 0 })
     }
 }
 
@@ -217,18 +229,18 @@ impl StereoPairer {
         self.max_pending_per_side
     }
 
-    fn best_right(&self, left_ts: i64) -> Option<(usize, i64, i64)> {
+    fn best_right(&self, left_ts: i64) -> Option<(usize, u64, i64)> {
         if self.right.is_empty() {
             return None;
         }
 
         let mut best_idx = 0usize;
-        let mut best_delta = i64::MAX;
+        let mut best_delta = u64::MAX;
         let mut best_ts = 0i64;
 
         for (idx, right) in self.right.iter().enumerate() {
             let right_ts = right.timestamp().as_nanos();
-            let delta = (right_ts - left_ts).abs();
+            let delta = right_ts.abs_diff(left_ts);
             if delta < best_delta {
                 best_delta = delta;
                 best_idx = idx;
@@ -315,6 +327,25 @@ mod tests {
         let outcome = pairer.next_outcome().expect("pairing should not fail");
         assert!(matches!(
             outcome,
+            PairingOutcome::Dropped {
+                sensor: SensorId::StereoLeft,
+                reason: PairingDropReason::OutsideWindow,
+            }
+        ));
+    }
+
+    #[test]
+    fn pairing_handles_timestamps_spanning_the_full_i64_domain() {
+        let window = PairingWindowNs::new(i64::MAX).expect("maximum signed window");
+        let mut pairer = StereoPairer::new_with_max_pending(
+            window,
+            PendingFramesCapacity::try_from(2).expect("capacity"),
+        );
+        pairer.push_left(frame(SensorId::StereoLeft, i64::MIN, 1));
+        pairer.push_right(frame(SensorId::StereoRight, i64::MAX, 2));
+
+        assert!(matches!(
+            pairer.next_outcome().expect("pairing should not overflow"),
             PairingOutcome::Dropped {
                 sensor: SensorId::StereoLeft,
                 reason: PairingDropReason::OutsideWindow,
