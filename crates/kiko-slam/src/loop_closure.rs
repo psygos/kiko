@@ -538,6 +538,16 @@ pub enum LoopDetectError {
     ApplyFailed(LoopApplyError),
 }
 
+impl LoopDetectError {
+    pub fn is_candidate_rejection(&self) -> bool {
+        match self {
+            Self::TooFewCorrespondences { .. } | Self::CorrectionTooLarge { .. } => true,
+            Self::VerificationFailed(source) => source.is_candidate_rejection(),
+            Self::ApplyFailed(_) => false,
+        }
+    }
+}
+
 impl std::fmt::Display for LoopDetectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1063,6 +1073,21 @@ pub enum LoopVerificationError {
     InsufficientInliers { inliers: usize, required: usize },
 }
 
+impl LoopVerificationError {
+    pub fn is_candidate_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::TooFewMatches { .. }
+                | Self::InsufficientInliers { .. }
+                | Self::PnpFailed(
+                    PnpError::NotEnoughPoints { .. }
+                        | PnpError::Degenerate { .. }
+                        | PnpError::NoSolution
+                )
+        )
+    }
+}
+
 impl std::fmt::Display for LoopVerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1401,6 +1426,45 @@ mod tests {
         let pnp = verification.source().expect("pnp source");
         assert_eq!(pnp.to_string(), "pnp failed to find a valid pose");
         assert!(pnp.source().is_none());
+    }
+
+    #[test]
+    fn loop_candidate_rejections_are_distinct_from_operational_failures() {
+        for rejection in [
+            super::LoopDetectError::TooFewCorrespondences { count: 3 },
+            super::LoopDetectError::CorrectionTooLarge {
+                translation: 2.0,
+                rotation_deg: 15.0,
+            },
+            super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
+                crate::PnpError::NoSolution,
+            )),
+            super::LoopDetectError::VerificationFailed(
+                super::LoopVerificationError::InsufficientInliers {
+                    inliers: 3,
+                    required: 4,
+                },
+            ),
+        ] {
+            assert!(rejection.is_candidate_rejection(), "{rejection}");
+        }
+
+        for failure in [
+            super::LoopDetectError::VerificationFailed(
+                super::LoopVerificationError::QueryIndexOutOfBounds { index: 4, len: 4 },
+            ),
+            super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
+                crate::PnpError::NonFiniteObservation {
+                    field: "world.x",
+                    value: f32::NAN,
+                },
+            )),
+            super::LoopDetectError::ApplyFailed(LoopApplyError::from(MapError::KeyframeNotFound(
+                KeyframeId::default(),
+            ))),
+        ] {
+            assert!(!failure.is_candidate_rejection(), "{failure}");
+        }
     }
 
     #[test]

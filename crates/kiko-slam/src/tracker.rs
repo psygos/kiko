@@ -1642,6 +1642,8 @@ pub enum TrackerError {
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
     DescriptorMatch(DescriptorMatchError),
+    LoopVerification(LoopVerificationError),
+    LoopClosure(LoopDetectError),
     BundleAdjusterWorkspace(LocalBundleAdjusterWorkspaceError),
     PoseBa(crate::PoseBaError),
     BaExecution(crate::BaExecutionError),
@@ -1679,6 +1681,10 @@ impl std::fmt::Display for TrackerError {
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
+            TrackerError::LoopVerification(err) => {
+                write!(f, "relocalization verification failed: {err}")
+            }
+            TrackerError::LoopClosure(err) => write!(f, "loop closure processing failed: {err}"),
             TrackerError::BundleAdjusterWorkspace(err) => {
                 write!(f, "bundle-adjustment workspace allocation failed: {err}")
             }
@@ -1708,6 +1714,8 @@ impl std::error::Error for TrackerError {
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
+            TrackerError::LoopVerification(source) => Some(source),
+            TrackerError::LoopClosure(source) => Some(source),
             TrackerError::BundleAdjusterWorkspace(source) => Some(source),
             TrackerError::PoseBa(source) => Some(source),
             TrackerError::BaExecution(source) => Some(source),
@@ -1777,6 +1785,18 @@ impl From<MapObservationError> for TrackerError {
 impl From<DescriptorMatchError> for TrackerError {
     fn from(err: DescriptorMatchError) -> Self {
         TrackerError::DescriptorMatch(err)
+    }
+}
+
+impl From<LoopVerificationError> for TrackerError {
+    fn from(source: LoopVerificationError) -> Self {
+        Self::LoopVerification(source)
+    }
+}
+
+impl From<LoopDetectError> for TrackerError {
+    fn from(source: LoopDetectError) -> Self {
+        Self::LoopClosure(source)
     }
 }
 
@@ -2788,9 +2808,7 @@ impl SlamTracker {
         let (_, pair, _, _) = capture.into_parts();
         self.drain_backend_responses();
         self.drain_descriptor_responses();
-        if let Err(err) = self.process_pending_loop_closure() {
-            eprintln!("loop closure: {err}");
-        }
+        self.process_pending_loop_closure()?;
         let tracking = match &self.state {
             TrackerState::NeedKeyframe => None,
             TrackerState::Tracking {
@@ -3400,13 +3418,13 @@ impl SlamTracker {
         }
     }
 
-    fn process_pending_loop_closure(&mut self) -> Result<Option<VerifiedLoop>, LoopDetectError> {
+    fn process_pending_loop_closure(&mut self) -> Result<(), LoopDetectError> {
         let Some(place_recognition) = self.place_recognition.as_mut() else {
-            return Ok(None);
+            return Ok(());
         };
         let config = place_recognition.loop_config();
         let Some(pending) = place_recognition.take_pending_loop() else {
-            return Ok(None);
+            return Ok(());
         };
         let query_quantized: Vec<_> = pending
             .detections
@@ -3415,7 +3433,7 @@ impl SlamTracker {
             .map(crate::Descriptor::quantize)
             .collect();
 
-        let mut first_error: Option<LoopDetectError> = None;
+        let mut first_rejection: Option<LoopDetectError> = None;
         for candidate in pending.candidates {
             let correspondences = match match_quantized_descriptors_for_loop(
                 &query_quantized,
@@ -3425,18 +3443,19 @@ impl SlamTracker {
             ) {
                 Ok(correspondences) => correspondences,
                 Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(LoopDetectError::VerificationFailed(
-                            LoopVerificationError::DescriptorMatch(err),
-                        ));
-                    }
-                    continue;
+                    let error = LoopDetectError::VerificationFailed(
+                        LoopVerificationError::DescriptorMatch(err),
+                    );
+                    self.emit_event(DiagnosticEvent::LoopClosureRejected {
+                        reason: LoopManager::reject_reason(&error),
+                    });
+                    return Err(error);
                 }
             };
 
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
-                if first_error.is_none() {
-                    first_error = Some(LoopDetectError::TooFewCorrespondences {
+                if first_rejection.is_none() {
+                    first_rejection = Some(LoopDetectError::TooFewCorrespondences {
                         count: correspondences.len(),
                     });
                 }
@@ -3459,8 +3478,15 @@ impl SlamTracker {
             ) {
                 Ok(value) => value,
                 Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(LoopDetectError::VerificationFailed(err));
+                    let error = LoopDetectError::VerificationFailed(err);
+                    if !error.is_candidate_rejection() {
+                        self.emit_event(DiagnosticEvent::LoopClosureRejected {
+                            reason: LoopManager::reject_reason(&error),
+                        });
+                        return Err(error);
+                    }
+                    if first_rejection.is_none() {
+                        first_rejection = Some(error);
                     }
                     continue;
                 }
@@ -3471,20 +3497,21 @@ impl SlamTracker {
                 .keyframe(candidate.candidate)
                 .map(|entry| entry.pose())
             else {
-                if first_error.is_none() {
-                    first_error = Some(LoopDetectError::ApplyFailed(LoopApplyError::from(
-                        crate::map::MapError::KeyframeNotFound(candidate.candidate),
-                    )));
-                }
-                continue;
+                let error = LoopDetectError::ApplyFailed(LoopApplyError::from(
+                    crate::map::MapError::KeyframeNotFound(candidate.candidate),
+                ));
+                self.emit_event(DiagnosticEvent::LoopClosureRejected {
+                    reason: LoopManager::reject_reason(&error),
+                });
+                return Err(error);
             };
             let (translation, rotation_deg) =
                 LoopManager::correction_magnitude(match_pose, verified.query_pose_world());
             if translation > config.max_correction_translation()
                 || rotation_deg > config.max_correction_rotation_deg()
             {
-                if first_error.is_none() {
-                    first_error = Some(LoopDetectError::CorrectionTooLarge {
+                if first_rejection.is_none() {
+                    first_rejection = Some(LoopDetectError::CorrectionTooLarge {
                         translation,
                         rotation_deg,
                     });
@@ -3492,7 +3519,7 @@ impl SlamTracker {
                 continue;
             }
 
-            if let Err(err) = self.apply_loop_closure(verified.clone()) {
+            if let Err(err) = self.apply_loop_closure(verified) {
                 let detect_err = LoopDetectError::ApplyFailed(err);
                 self.emit_event(DiagnosticEvent::LoopClosureRejected {
                     reason: LoopManager::reject_reason(&detect_err),
@@ -3504,17 +3531,15 @@ impl SlamTracker {
                 match_kf: candidate.candidate,
                 similarity: candidate.similarity,
             });
-            return Ok(Some(verified));
+            return Ok(());
         }
 
-        if let Some(err) = first_error {
+        if let Some(err) = first_rejection {
             self.emit_event(DiagnosticEvent::LoopClosureRejected {
                 reason: LoopManager::reject_reason(&err),
             });
-            Err(err)
-        } else {
-            Ok(None)
         }
+        Ok(())
     }
 
     fn submit_backend_event(
@@ -3867,7 +3892,8 @@ impl SlamTracker {
                 cfg.min_inliers(),
             ) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(source) if source.is_candidate_rejection() => continue,
+                Err(source) => return Err(TrackerError::LoopVerification(source)),
             };
             return Ok(Some(verified));
         }
