@@ -10,7 +10,7 @@ use crate::args::{
     DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RunProfileArg,
 };
 use crate::config::{TrackerDefaults, TrackerOverrides, build_tracker_config_with_overrides};
-use crate::rerun_recording;
+use crate::{rerun_recording, verify_run_integrity};
 
 const SLAM_ENV_HELP: &str = "\
 ENVIRONMENT VARIABLES (expert tuning):
@@ -243,9 +243,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut attempted = 0usize;
     let mut processed = 0usize;
-    let mut inference_errors = 0usize;
-    let mut prefetch_errors = 0usize;
+    let mut tracker_errors = 0usize;
+    let mut prefetch_fallbacks = 0usize;
     let mut read_errors = 0usize;
+    let mut visualization_errors = 0usize;
+    let mut visualization_fallbacks = 0usize;
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
 
@@ -278,8 +280,23 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let skip = args.dataset.skip_frames;
     if skip > 0 {
         eprintln!("skipping first {skip} frames");
-        for _ in 0..skip {
-            let _ = bundles_iter.next();
+        for skipped in 0..skip {
+            match bundles_iter.next() {
+                Some(Ok(_)) => {}
+                Some(Err(err)) => {
+                    read_errors = read_errors.saturating_add(1);
+                    report_error_chain("read error while skipping a frame", &err);
+                }
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "requested --skip-frames={skip}, but the dataset ended after {skipped} entries"
+                        ),
+                    )
+                    .into());
+                }
+            }
         }
     }
     // Read-ahead: grab the first bundle
@@ -317,7 +334,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             let speculative_matches = match speculative_matches {
                                 Ok(matches) => matches,
                                 Err(source) => {
-                                    prefetch_errors = prefetch_errors.saturating_add(1);
+                                    prefetch_fallbacks = prefetch_fallbacks.saturating_add(1);
                                     report_error_chain(
                                         "speculative LightGlue prefetch failed; tracker will match synchronously",
                                         &source,
@@ -328,7 +345,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             (Some((result.frame_id, detections)), speculative_matches)
                         }
                         PrefetchInferenceOutcome::DetectionFailed { source } => {
-                            prefetch_errors = prefetch_errors.saturating_add(1);
+                            prefetch_fallbacks = prefetch_fallbacks.saturating_add(1);
                             report_error_chain(
                                 "SuperPoint prefetch failed; tracker will detect synchronously",
                                 &source,
@@ -429,14 +446,17 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                         match VizPacket::try_new(left.clone(), right.clone(), matches) {
                             Ok(packet) => {
                                 if let Err(err) = sink.log_with_points(&packet, points) {
+                                    visualization_errors = visualization_errors.saturating_add(1);
                                     eprintln!("rerun log error: {err}");
                                 }
                             }
                             Err(err) => {
+                                visualization_fallbacks = visualization_fallbacks.saturating_add(1);
                                 eprintln!(
                                     "viz packet error: {err}; falling back to raw stereo views"
                                 );
                                 if let Err(log_err) = sink.log_frames(&left, &right) {
+                                    visualization_errors = visualization_errors.saturating_add(1);
                                     eprintln!("rerun log error: {log_err}");
                                 }
                             }
@@ -482,6 +502,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 true,
                                 output.keyframe.is_some(),
                             ) {
+                                visualization_errors = visualization_errors.saturating_add(1);
                                 eprintln!("stable surface: {err}");
                             }
                         }
@@ -495,12 +516,14 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(err) =
                                 sink.log_covisibility_graph(left.timestamp(), &snapshot)
                             {
+                                visualization_errors = visualization_errors.saturating_add(1);
                                 eprintln!("rerun log error: {err}");
                             }
                         }
                     }
                 } else if let Some(sink) = sink.as_mut() {
                     if let Err(err) = sink.log_frames(&left, &right) {
+                        visualization_errors = visualization_errors.saturating_add(1);
                         eprintln!("rerun log error: {err}");
                     }
                 }
@@ -508,11 +531,13 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(sink) = sink.as_mut() {
                     if let Some(batch) = imu.as_ref() {
                         if let Err(err) = sink.log_imu_batch(batch) {
+                            visualization_errors = visualization_errors.saturating_add(1);
                             eprintln!("rerun imu log error: {err}");
                         }
                     }
                     if let Some(pose) = output.pose.current_estimate() {
                         if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
+                            visualization_errors = visualization_errors.saturating_add(1);
                             eprintln!("rerun log error: {err}");
                         } else {
                             poses_logged += 1;
@@ -520,17 +545,21 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
                         if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
+                            visualization_errors = visualization_errors.saturating_add(1);
                             eprintln!("rerun imu log error: {err}");
                         }
                     }
                     if let Err(err) = sink.log_system_health(timestamp, &output.health) {
+                        visualization_errors = visualization_errors.saturating_add(1);
                         eprintln!("rerun health error: {err}");
                     }
                     if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
+                        visualization_errors = visualization_errors.saturating_add(1);
                         eprintln!("rerun diagnostics error: {err}");
                     }
                     for event in &output.events {
                         if let Err(err) = sink.log_event(timestamp, event) {
+                            visualization_errors = visualization_errors.saturating_add(1);
                             eprintln!("rerun event error: {err}");
                         }
                     }
@@ -538,7 +567,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                 processed += 1;
             }
             Err(err) => {
-                inference_errors += 1;
+                tracker_errors = tracker_errors.saturating_add(1);
                 eprintln!("tracker error: {err}");
             }
         }
@@ -560,8 +589,19 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, tracker_errors={inference_errors}, prefetch_errors={prefetch_errors}, poses_logged={poses_logged}, keyframes={keyframes}"
+        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, tracker_errors={tracker_errors}, prefetch_fallbacks={prefetch_fallbacks}, visualization_fallbacks={visualization_fallbacks}, visualization_errors={visualization_errors}, poses_logged={poses_logged}, keyframes={keyframes}"
     );
+
+    verify_run_integrity(
+        "slam",
+        "pairs",
+        processed,
+        &[
+            ("dataset_read", read_errors),
+            ("tracker", tracker_errors),
+            ("visualization_output", visualization_errors),
+        ],
+    )?;
 
     Ok(())
 }

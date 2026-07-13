@@ -6,7 +6,7 @@ use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{RerunSink, TriangulationConfig, TriangulationError, Triangulator};
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs};
-use crate::rerun_recording;
+use crate::{rerun_recording, verify_run_integrity};
 
 #[derive(Args, Clone, Debug)]
 #[command(about = "Visualize stereo feature matches on a recorded dataset")]
@@ -51,6 +51,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut read_errors = 0usize;
     let mut triangulation_empty = 0usize;
     let mut triangulation_errors = 0usize;
+    let mut visualization_errors = 0usize;
     let mut triangulated_points = 0usize;
     let mut total_matches = 0usize;
 
@@ -86,6 +87,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let points = keyframe.as_ref().map(|kf| kf.landmarks());
                 if let Some(sink) = sink.as_mut() {
                     if let Err(err) = sink.log_with_points(&packet, points) {
+                        visualization_errors = visualization_errors.saturating_add(1);
                         eprintln!("rerun log error: {err}");
                     }
                 }
@@ -122,9 +124,21 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, triangulated_points={triangulated_points}"
+        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, visualization_errors={visualization_errors}, triangulated_points={triangulated_points}"
     );
     eprintln!("summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}");
+
+    verify_run_integrity(
+        "viz",
+        "pairs",
+        processed,
+        &[
+            ("dataset_read", read_errors),
+            ("inference", inference_errors),
+            ("triangulation", triangulation_errors),
+            ("visualization_output", visualization_errors),
+        ],
+    )?;
 
     Ok(())
 }

@@ -6,6 +6,7 @@ use kiko_slam::InferencePipeline;
 use kiko_slam::dataset::DatasetReader;
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose};
+use crate::verify_run_integrity;
 
 #[derive(Args, Clone, Debug)]
 #[command(about = "Benchmark inference pipeline throughput")]
@@ -384,14 +385,18 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if accum.processed == 0 {
-        return Err("no paired frames processed".into());
-    }
+    verify_run_integrity(
+        "bench",
+        "pairs",
+        accum.processed,
+        &[
+            ("dataset_read", accum.read_errors),
+            ("stereo_pairing", accum.pairing_errors),
+            ("inference", accum.inference_errors),
+        ],
+    )?;
     if accum.matches_nonzero == 0 {
         return Err("no nonzero matches; check models/data".into());
-    }
-    if accum.inference_errors > 0 {
-        return Err("inference errors encountered during run".into());
     }
 
     Ok(())

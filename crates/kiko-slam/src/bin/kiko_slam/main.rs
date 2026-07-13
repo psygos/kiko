@@ -10,6 +10,65 @@ mod record;
 mod slam;
 mod viz;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RunIntegrityError {
+    command: &'static str,
+    successful_item: &'static str,
+    successful_items: usize,
+    total_failures: u128,
+    first_failed_stage: Option<&'static str>,
+    first_stage_failures: usize,
+}
+
+impl std::fmt::Display for RunIntegrityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(stage) = self.first_failed_stage {
+            write!(
+                f,
+                "{} did not complete cleanly: successful_{}={}, total_failures={}, first_failed_stage={} ({})",
+                self.command,
+                self.successful_item,
+                self.successful_items,
+                self.total_failures,
+                stage,
+                self.first_stage_failures
+            )
+        } else {
+            write!(
+                f,
+                "{} produced no successful {}",
+                self.command, self.successful_item
+            )
+        }
+    }
+}
+
+impl std::error::Error for RunIntegrityError {}
+
+fn verify_run_integrity(
+    command: &'static str,
+    successful_item: &'static str,
+    successful_items: usize,
+    failures: &[(&'static str, usize)],
+) -> Result<(), RunIntegrityError> {
+    let first_failure = failures.iter().copied().find(|(_, count)| *count > 0);
+    let total_failures = failures
+        .iter()
+        .map(|(_, count)| *count as u128)
+        .sum::<u128>();
+    if successful_items > 0 && total_failures == 0 {
+        return Ok(());
+    }
+    Err(RunIntegrityError {
+        command,
+        successful_item,
+        successful_items,
+        total_failures,
+        first_failed_stage: first_failure.map(|(stage, _)| stage),
+        first_stage_failures: first_failure.map_or(0, |(_, count)| count),
+    })
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "kiko-slam", about = "Kiko SLAM tools")]
 struct Cli {
@@ -89,7 +148,7 @@ mod tests {
     use super::args::PrefetchSession;
     use super::bench::{BenchAccum, summarize_bench};
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
-    use super::{Cli, Command};
+    use super::{Cli, Command, verify_run_integrity};
     use clap::Parser;
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
     use std::ffi::OsString;
@@ -100,6 +159,22 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn run_integrity_requires_success_and_zero_stage_failures() {
+        verify_run_integrity("bench", "pairs", 3, &[("read", 0), ("inference", 0)])
+            .expect("clean run");
+
+        let partial = verify_run_integrity("bench", "pairs", 2, &[("read", 1), ("inference", 2)])
+            .expect_err("partial run");
+        assert_eq!(partial.total_failures, 3);
+        assert_eq!(partial.first_failed_stage, Some("read"));
+        assert_eq!(partial.first_stage_failures, 1);
+
+        let empty = verify_run_integrity("bench", "pairs", 0, &[]).expect_err("empty run");
+        assert_eq!(empty.total_failures, 0);
+        assert_eq!(empty.first_failed_stage, None);
     }
 
     #[test]
