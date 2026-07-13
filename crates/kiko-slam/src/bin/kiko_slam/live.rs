@@ -14,7 +14,6 @@ use kiko_slam::{
     RerunSink, SendOutcome, SensorId, SlamTracker, StereoPairer, SystemHealth, VizPacket,
     bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
-use kiko_slam::{PinholeIntrinsics, RectifiedStereo};
 use oak_sys::{
     DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig,
 };
@@ -347,19 +346,16 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let dataset_calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config)?;
     let dataset_calibration =
         kiko_slam::apply_runtime_imu_calibration_override(&dataset_calibration)?;
-    let rectified = RectifiedStereo::from_calibration(&dataset_calibration)?;
-    let intrinsics = PinholeIntrinsics::try_from(&dataset_calibration.left)?;
-    let calibration =
-        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, &dataset_calibration)?;
+    let calibration = CalibrationBundle::from_dataset_calibration(&dataset_calibration)?;
     #[cfg(feature = "vio")]
-    if vio_enabled && !calibration.has_imu() {
+    if vio_enabled && calibration.inertial().is_none() {
         return Err(
             "KIKO_VIO=true requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );
     }
     let imu_time_offset_ns = calibration
-        .imu_extrinsics()
-        .map(|extrinsics| extrinsics.time_offset_ns())
+        .inertial()
+        .map(|inertial| inertial.extrinsics().time_offset_ns())
         .unwrap_or(0);
 
     let tracker_config = build_tracker_config(

@@ -6,9 +6,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::{
-    CaptureBundleError, CaptureIntervalError, DepthImage, Frame, FrameDimensions,
-    FrameDimensionsError, FrameError, ImuBatch, ImuBatchError, ImuBatchSliceError, ImuSampleError,
-    ImuTimestampShiftError, PairError, PairingConfigError, SensorId, StereoPair, Timestamp,
+    CalibrationBundleError, CaptureBundleError, CaptureIntervalError, DepthImage, Frame,
+    FrameDimensions, FrameDimensionsError, FrameError, ImuBatch, ImuBatchError, ImuBatchSliceError,
+    ImuSampleError, ImuTimestampShiftError, PairError, PairingConfigError, SensorId, StereoPair,
+    Timestamp,
 };
 
 pub mod format {
@@ -626,6 +627,14 @@ pub enum DatasetError {
     DeserializeJson {
         source: serde_json::Error,
     },
+    InvalidCalibration {
+        path: PathBuf,
+        source: CalibrationBundleError,
+    },
+    CalibrationDimensionsMismatch {
+        metadata: FrameDimensions,
+        calibration: FrameDimensions,
+    },
     InvalidManifest {
         path: PathBuf,
         source: DatasetManifestError,
@@ -754,6 +763,22 @@ impl std::fmt::Display for DatasetError {
             DatasetError::DeserializeJson { source } => {
                 write!(f, "failed to deserialize JSON: {source}")
             }
+            DatasetError::InvalidCalibration { path, source } => write!(
+                f,
+                "invalid dataset calibration {}: {source}",
+                path.display()
+            ),
+            DatasetError::CalibrationDimensionsMismatch {
+                metadata,
+                calibration,
+            } => write!(
+                f,
+                "dataset mono dimensions {}x{} do not match calibration dimensions {}x{}",
+                metadata.width(),
+                metadata.height(),
+                calibration.width(),
+                calibration.height()
+            ),
             DatasetError::InvalidManifest { path, source } => {
                 write!(f, "invalid dataset manifest {}: {source}", path.display())
             }
@@ -796,6 +821,7 @@ impl std::error::Error for DatasetError {
             DatasetError::SerializeJson { source } | DatasetError::DeserializeJson { source } => {
                 Some(source)
             }
+            DatasetError::InvalidCalibration { source, .. } => Some(source),
             DatasetError::InvalidManifest { source, .. } => Some(source),
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::InvalidCaptureInterval { source } => Some(source),
@@ -813,6 +839,7 @@ impl std::error::Error for DatasetError {
             | DatasetError::FrameByteLengthOverflow { .. }
             | DatasetError::FrameSizeMismatch { .. }
             | DatasetError::InvalidImuLength { .. }
+            | DatasetError::CalibrationDimensionsMismatch { .. }
             | DatasetError::FrameSequenceExhausted { .. }
             | DatasetError::CaptureSequenceExhausted
             | DatasetError::WorkerJoin { .. }
@@ -883,6 +910,12 @@ impl DatasetWriter {
         }
 
         let path = path.into();
+        let validated_calibration = crate::CalibrationBundle::from_dataset_calibration(calibration)
+            .map_err(|source| DatasetError::InvalidCalibration {
+                path: path.join(format::CALIBRATION_FILE),
+                source,
+            })?;
+        require_calibration_dimensions(meta, &validated_calibration)?;
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1968,6 +2001,29 @@ fn read_calibration_with_imu_override(
     }
 }
 
+fn require_calibration_dimensions<'a>(
+    meta: &'a Meta,
+    calibration: &crate::CalibrationBundle,
+) -> Result<&'a MonoMeta, DatasetError> {
+    let mono = meta.mono.as_ref().ok_or(DatasetError::InvalidConfig {
+        msg: "meta.json missing mono config",
+    })?;
+    let metadata = FrameDimensions::try_new(mono.width, mono.height).map_err(|source| {
+        DatasetError::InvalidFrameDimensions {
+            stream: "mono metadata",
+            source,
+        }
+    })?;
+    let calibrated = calibration.stereo().dimensions();
+    if metadata != calibrated {
+        return Err(DatasetError::CalibrationDimensionsMismatch {
+            metadata,
+            calibration: calibrated,
+        });
+    }
+    Ok(mono)
+}
+
 fn scan_frames_with_depth(
     frames_dir: &Path,
     width: u32,
@@ -2825,6 +2881,48 @@ mod tests {
             error,
             DatasetError::OutputAlreadyExists { path: actual } if actual == path
         ));
+    }
+
+    #[test]
+    fn dataset_writer_rejects_invalid_or_mismatched_calibration_before_side_effects() {
+        let invalid_path = unique_temp_path("writer-invalid-calibration");
+        let mut invalid = test_calibration();
+        invalid.baseline_m = 0.0;
+        let error = DatasetWriter::create(&invalid_path, &test_meta(), &invalid)
+            .expect_err("invalid calibration must fail");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidCalibration {
+                path,
+                source: CalibrationBundleError::InvalidStereo {
+                    source: crate::RectifiedStereoError::InvalidBaseline { baseline_m: 0.0 },
+                },
+            } if path == &invalid_path.join(format::CALIBRATION_FILE)
+        ));
+        let calibration_source = std::error::Error::source(&error).expect("calibration source");
+        assert!(
+            calibration_source.source().is_some(),
+            "stereo source must survive"
+        );
+        assert!(!invalid_path.exists());
+
+        let mismatch_path = unique_temp_path("writer-calibration-dimensions");
+        let mut mismatch = test_calibration();
+        mismatch.left.width = 3;
+        mismatch.right.width = 3;
+        let error = DatasetWriter::create(&mismatch_path, &test_meta(), &mismatch)
+            .expect_err("calibration dimensions must match metadata");
+        assert!(matches!(
+            error,
+            DatasetError::CalibrationDimensionsMismatch {
+                metadata,
+                calibration,
+            } if metadata.width() == 2
+                && metadata.height() == 2
+                && calibration.width() == 3
+                && calibration.height() == 2
+        ));
+        assert!(!mismatch_path.exists());
     }
 
     #[test]

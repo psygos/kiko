@@ -3,9 +3,7 @@ use std::time::Instant;
 use clap::Args;
 
 use kiko_slam::dataset::DatasetReader;
-use kiko_slam::{
-    RectifiedStereo, RerunSink, TriangulationConfig, TriangulationError, Triangulator,
-};
+use kiko_slam::{RerunSink, TriangulationConfig, TriangulationError, Triangulator};
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs};
 use crate::rerun_recording;
@@ -33,7 +31,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let inference = InferenceConfig::from_args(&args.inference, InferencePurpose::Visualization)?;
 
-    let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
+    let rectified = reader.calibration().stereo().clone();
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset") {

@@ -49,7 +49,7 @@ mod tsdf;
 #[cfg(feature = "vio")]
 mod vio;
 mod viz;
-pub use calibration::{CalibrationBundle, CalibrationBundleError};
+pub use calibration::{CalibrationBundle, CalibrationBundleError, InertialCalibration};
 pub use capture::{
     CaptureBundle, CaptureBundleError, CaptureId, CaptureImu, CaptureInterval, CaptureIntervalError,
 };
@@ -96,8 +96,8 @@ pub use geometry::{
 };
 pub use imu::{
     ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBatchSliceError, ImuBias,
-    ImuExtrinsics, ImuExtrinsicsError, ImuNoiseModel, ImuSample, ImuSampleError,
-    ImuTimestampShiftError,
+    ImuBiasError, ImuExtrinsics, ImuExtrinsicsError, ImuNoiseModel, ImuNoiseModelError, ImuSample,
+    ImuSampleError, ImuTimestampShiftError,
 };
 #[cfg(feature = "vio")]
 pub use local_ba::{

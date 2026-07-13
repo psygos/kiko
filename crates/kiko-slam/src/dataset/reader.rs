@@ -7,16 +7,15 @@ use crate::{
 };
 
 use super::{
-    Calibration, DatasetError, DatasetImuRecordError, DatasetIndex, DatasetIndexFrameRef,
-    DatasetPairIndex, FrameInfo, IMU_RECORD_BYTES, format, read_calibration_with_imu_override,
-    read_manifest, read_meta, scan_frames_with_depth,
+    DatasetError, DatasetImuRecordError, DatasetIndex, DatasetIndexFrameRef, DatasetPairIndex,
+    FrameInfo, IMU_RECORD_BYTES, format, read_calibration_with_imu_override, read_manifest,
+    read_meta, require_calibration_dimensions, scan_frames_with_depth,
 };
 
 #[derive(Debug)]
 pub struct DatasetReader {
     root: PathBuf,
-    meta: super::Meta,
-    calibration: Calibration,
+    calibration: crate::CalibrationBundle,
     manifest: DatasetIndex,
     frame_dimensions: crate::FrameDimensions,
     left_seq: u64,
@@ -57,11 +56,16 @@ impl DatasetReader {
                 msg: "runtime IMU override requires IMU data in dataset meta",
             });
         }
-        let calibration = read_calibration_with_imu_override(&root, imu_override.as_ref())?;
+        let calibration_document =
+            read_calibration_with_imu_override(&root, imu_override.as_ref())?;
+        let calibration_path = root.join(format::CALIBRATION_FILE);
+        let calibration = crate::CalibrationBundle::from_dataset_calibration(&calibration_document)
+            .map_err(|source| DatasetError::InvalidCalibration {
+                path: calibration_path,
+                source,
+            })?;
+        let mono = require_calibration_dimensions(&meta, &calibration)?;
         let manifest_file = read_manifest(&root)?;
-        let mono = meta.mono.as_ref().ok_or(DatasetError::InvalidConfig {
-            msg: "meta.json missing mono config",
-        })?;
         let frames = scan_frames_with_depth(
             &root.join(format::FRAMES_DIR),
             mono.width,
@@ -78,14 +82,12 @@ impl DatasetReader {
                 }
             })?;
         let imu_time_offset_ns = calibration
-            .imu
-            .as_ref()
-            .map(|imu| imu.extrinsics.time_offset_ns)
+            .inertial()
+            .map(|inertial| inertial.extrinsics().time_offset_ns())
             .unwrap_or(0);
         let imu_samples = read_imu_samples(&root, &meta, imu_time_offset_ns)?;
         Ok(Self {
             root,
-            meta,
             calibration,
             manifest,
             frame_dimensions,
@@ -95,12 +97,12 @@ impl DatasetReader {
         })
     }
 
-    pub fn meta(&self) -> &super::Meta {
-        &self.meta
+    pub fn calibration(&self) -> &crate::CalibrationBundle {
+        &self.calibration
     }
 
-    pub fn calibration(&self) -> &Calibration {
-        &self.calibration
+    pub fn has_imu_data(&self) -> bool {
+        self.imu_samples.is_some()
     }
 
     pub fn stats(&self) -> DatasetStats {
@@ -160,15 +162,15 @@ impl DatasetReader {
             });
         }
 
-        let batch = imu_samples
-            .slice(start_idx..end_idx)
-            .map_err(|source| DatasetError::InvalidImuSlice {
+        let batch = imu_samples.slice(start_idx..end_idx).map_err(|source| {
+            DatasetError::InvalidImuSlice {
                 start_ns: interval
                     .start_exclusive()
                     .map(|timestamp| timestamp.as_nanos()),
                 end_ns: interval.end_inclusive().as_nanos(),
                 source,
-            })?;
+            }
+        })?;
         Ok(CaptureImu::present(batch))
     }
 }
@@ -901,6 +903,69 @@ mod tests {
     }
 
     #[test]
+    fn reader_rejects_invalid_or_mismatched_calibration_at_open() {
+        let invalid_dir = unique_temp_dir("reader-invalid-calibration");
+        let (writer, handle) =
+            DatasetWriter::create(&invalid_dir, &meta_with_imu(), &calibration()).expect("writer");
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let calibration_path = invalid_dir.join(crate::dataset::format::CALIBRATION_FILE);
+        let mut invalid = calibration();
+        invalid.baseline_m = 0.0;
+        std::fs::write(
+            &calibration_path,
+            serde_json::to_vec_pretty(&invalid).expect("serialize invalid calibration"),
+        )
+        .expect("write invalid calibration");
+
+        let error = DatasetReader::open(&invalid_dir).expect_err("invalid calibration must fail");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidCalibration {
+                path,
+                source: crate::CalibrationBundleError::InvalidStereo {
+                    source: crate::RectifiedStereoError::InvalidBaseline { baseline_m: 0.0 },
+                },
+            } if path == &calibration_path
+        ));
+        assert!(
+            error.source().and_then(std::error::Error::source).is_some(),
+            "stereo validation source must remain available"
+        );
+        let _ = std::fs::remove_dir_all(&invalid_dir);
+
+        let mismatch_dir = unique_temp_dir("reader-calibration-dimensions");
+        let (writer, handle) =
+            DatasetWriter::create(&mismatch_dir, &meta_with_imu(), &calibration()).expect("writer");
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let mut mismatch = calibration();
+        mismatch.left.width = 3;
+        mismatch.right.width = 3;
+        std::fs::write(
+            mismatch_dir.join(crate::dataset::format::CALIBRATION_FILE),
+            serde_json::to_vec_pretty(&mismatch).expect("serialize mismatched calibration"),
+        )
+        .expect("write mismatched calibration");
+
+        let error = DatasetReader::open(&mismatch_dir)
+            .expect_err("calibration dimensions must match metadata");
+        assert!(matches!(
+            error,
+            DatasetError::CalibrationDimensionsMismatch {
+                metadata,
+                calibration,
+            } if metadata.width() == 2
+                && metadata.height() == 2
+                && calibration.width() == 3
+                && calibration.height() == 2
+        ));
+        let _ = std::fs::remove_dir_all(&mismatch_dir);
+    }
+
+    #[test]
     fn reader_rejects_unresolved_manifest_references_with_full_source_context() {
         let dataset_dir = unique_temp_dir("reader-invalid-manifest-reference");
         let (writer, handle) =
@@ -1130,11 +1195,10 @@ mod tests {
         assert_eq!(
             reader
                 .calibration()
-                .imu
-                .as_ref()
-                .expect("stored imu calibration")
-                .extrinsics
-                .time_offset_ns,
+                .inertial()
+                .expect("stored inertial calibration")
+                .extrinsics()
+                .time_offset_ns(),
             10
         );
 
@@ -1190,11 +1254,10 @@ mod tests {
         assert_eq!(
             reader
                 .calibration()
-                .imu
-                .as_ref()
-                .expect("stored imu calibration")
-                .extrinsics
-                .time_offset_ns,
+                .inertial()
+                .expect("stored inertial calibration")
+                .extrinsics()
+                .time_offset_ns(),
             0
         );
 

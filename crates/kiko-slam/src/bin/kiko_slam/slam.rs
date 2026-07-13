@@ -3,10 +3,8 @@ use std::time::Instant;
 use clap::Args;
 
 use kiko_slam::dataset::DatasetReader;
-use kiko_slam::{
-    CalibrationBundle, PinholeIntrinsics, RectifiedStereo, RerunSink, SlamTracker, VizPacket,
-};
 use kiko_slam::{ProjectedMatcherConfig, TrackingMatcher};
+use kiko_slam::{RerunSink, SlamTracker, VizPacket};
 
 use crate::args::{
     DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RunProfileArg,
@@ -144,7 +142,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         runtime_imu_override,
     )?;
     #[cfg(feature = "vio")]
-    if vio_enabled && reader.meta().imu.is_none() {
+    if vio_enabled && !reader.has_imu_data() {
         return Err("--vio requires IMU data in the dataset".into());
     }
     let stats = reader.stats();
@@ -158,7 +156,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference_args = args.inference.with_profile_defaults(args.profile)?;
     let inference = InferenceConfig::from_args(&inference_args, InferencePurpose::Slam)?;
 
-    let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
+    let calibration = reader.calibration().clone();
+    let rectified = calibration.stereo().clone();
     let dense_cloud_enabled = kiko_slam::env::try_env_bool("KIKO_DENSE_CLOUD")?.unwrap_or(false);
     let dense_config = kiko_slam::DenseCloudConfig::try_from_env()?;
     let dense_triangulator = if dense_cloud_enabled {
@@ -174,11 +173,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             "stable surface map: enabled (measured sparse stereo -> surface belief); TSDF remains disabled in stereo-only slam mode"
         );
     }
-    let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
-    let calibration =
-        CalibrationBundle::from_dataset_calibration(intrinsics, rectified, reader.calibration())?;
     #[cfg(feature = "vio")]
-    if vio_enabled && !calibration.has_imu() {
+    if vio_enabled && calibration.inertial().is_none() {
         return Err(
             "VIO requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );

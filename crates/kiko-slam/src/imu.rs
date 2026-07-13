@@ -111,6 +111,49 @@ pub struct ImuBias {
     pub gyro: [f64; 3],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ImuBiasError {
+    NonFiniteAccel { axis: usize, value: f64 },
+    NonFiniteGyro { axis: usize, value: f64 },
+}
+
+impl std::fmt::Display for ImuBiasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteAccel { axis, value } => {
+                write!(
+                    f,
+                    "imu accelerometer bias axis {axis} must be finite, got {value}"
+                )
+            }
+            Self::NonFiniteGyro { axis, value } => {
+                write!(
+                    f,
+                    "imu gyroscope bias axis {axis} must be finite, got {value}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImuBiasError {}
+
+impl ImuBias {
+    pub fn try_new(accel: [f64; 3], gyro: [f64; 3]) -> Result<Self, ImuBiasError> {
+        for (axis, value) in accel.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(ImuBiasError::NonFiniteAccel { axis, value });
+            }
+        }
+        for (axis, value) in gyro.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(ImuBiasError::NonFiniteGyro { axis, value });
+            }
+        }
+        Ok(Self { accel, gyro })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImuNoiseModel {
     accel_noise_density: f64,
@@ -691,6 +734,21 @@ mod tests {
         let bias = ImuBias::default();
         assert_eq!(bias.accel, [0.0; 3]);
         assert_eq!(bias.gyro, [0.0; 3]);
+    }
+
+    #[test]
+    fn imu_bias_constructor_rejects_nonfinite_axes() {
+        assert!(matches!(
+            ImuBias::try_new([0.0, f64::NAN, 0.0], [0.0; 3]),
+            Err(ImuBiasError::NonFiniteAccel { axis: 1, value }) if value.is_nan()
+        ));
+        assert_eq!(
+            ImuBias::try_new([0.0; 3], [0.0, 0.0, f64::INFINITY]),
+            Err(ImuBiasError::NonFiniteGyro {
+                axis: 2,
+                value: f64::INFINITY,
+            })
+        );
     }
 
     #[test]

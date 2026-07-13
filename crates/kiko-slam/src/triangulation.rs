@@ -14,7 +14,7 @@ pub struct RectifiedStereo {
     baseline_m: f32,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RectifiedStereoError {
     InvalidLeftDimensions(FrameDimensionsError),
     InvalidRightDimensions(FrameDimensionsError),

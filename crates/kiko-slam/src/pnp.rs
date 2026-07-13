@@ -55,6 +55,15 @@ impl PinholeIntrinsics {
         Ok(Self { fx, fy, cx, cy })
     }
 
+    pub(crate) fn from_rectified_stereo(stereo: &crate::RectifiedStereo) -> Self {
+        Self {
+            fx: stereo.fx(),
+            fy: stereo.fy(),
+            cx: stereo.cx(),
+            cy: stereo.cy(),
+        }
+    }
+
     pub fn fx(&self) -> f32 {
         self.fx
     }

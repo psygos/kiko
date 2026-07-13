@@ -1532,6 +1532,8 @@ pub enum TrackerInitError {
         source: DescriptorInitError,
     },
     #[cfg(feature = "vio")]
+    MissingVioCalibration,
+    #[cfg(feature = "vio")]
     VioGravity {
         source: crate::GravityError,
     },
@@ -1554,6 +1556,10 @@ impl std::fmt::Display for TrackerInitError {
                 write!(f, "failed to initialize learned descriptors: {source}")
             }
             #[cfg(feature = "vio")]
+            TrackerInitError::MissingVioCalibration => {
+                write!(f, "VIO is enabled but inertial calibration is unavailable")
+            }
+            #[cfg(feature = "vio")]
             TrackerInitError::VioGravity { source } => {
                 write!(f, "invalid VIO gravity configuration: {source}")
             }
@@ -1570,6 +1576,8 @@ impl std::error::Error for TrackerInitError {
         match self {
             Self::BackendWorker { source } => Some(source),
             Self::Descriptor { source } => Some(source),
+            #[cfg(feature = "vio")]
+            Self::MissingVioCalibration => None,
             #[cfg(feature = "vio")]
             Self::VioGravity { source } => Some(source),
             #[cfg(feature = "vio")]
@@ -2523,50 +2531,44 @@ impl SlamTracker {
         let frontend = StereoFrontend::new(superpoint, lightglue, triangulator, intrinsics);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         #[cfg(feature = "vio")]
-        let local_estimator = match (
-            config.vio_enabled,
-            calibration.imu_noise(),
-            calibration.has_imu(),
-        ) {
-            (true, Some(noise), true) => {
-                let gravity = Gravity::try_new([0.0, calibration.gravity_magnitude_mps2(), 0.0])
-                    .map_err(|source| TrackerInitError::VioGravity { source })?;
-                let camera_from_body = calibration
-                    .imu_extrinsics()
-                    .map(|extrinsics| extrinsics.t_cam_imu())
-                    .unwrap_or_else(Pose64::identity);
-                let calibrated_bias = calibration.initial_bias().cloned();
-                let bias_prior = calibrated_bias
-                    .clone()
-                    .map(|bias| crate::VioBiasPrior::new(100.0, bias))
-                    .transpose()
+        let local_estimator =
+            match requested_inertial_calibration(config.vio_enabled, &calibration)? {
+                Some(inertial) => {
+                    let gravity = Gravity::try_new([0.0, inertial.gravity_magnitude_mps2(), 0.0])
+                        .map_err(|source| TrackerInitError::VioGravity { source })?;
+                    let camera_from_body = inertial.extrinsics().t_cam_imu();
+                    let calibrated_bias = inertial.initial_bias().cloned();
+                    let bias_prior = calibrated_bias
+                        .clone()
+                        .map(|bias| crate::VioBiasPrior::new(100.0, bias))
+                        .transpose()
+                        .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
+                    let solve_config = crate::VioSolveConfig::new(
+                        gravity,
+                        camera_from_body,
+                        intrinsics,
+                        config.ba.lm(),
+                        config.runtime.vio_max_iterations(),
+                        f64::from(config.ba.huber_delta_px()),
+                        10.0, // anchor velocity info
+                        bias_prior,
+                    )
                     .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
-                let solve_config = crate::VioSolveConfig::new(
-                    gravity,
-                    camera_from_body,
-                    intrinsics,
-                    config.ba.lm(),
-                    config.runtime.vio_max_iterations(),
-                    f64::from(config.ba.huber_delta_px()),
-                    10.0, // anchor velocity info
-                    bias_prior,
-                )
-                .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
-                LocalEstimator::Inertial(Box::new(VioRuntime {
-                    camera_from_body,
-                    noise: noise.clone(),
-                    pending_imu: ImuAccumulator::new(),
-                    predicted_state: None,
-                    last_visual_measurement_body_odom: None,
-                    calibrated_bias,
-                    last_optimized_state: None,
-                    solve_config,
-                    vio_window: None,
-                    max_window: config.runtime.vio_window_size(),
-                }))
-            }
-            _ => LocalEstimator::VisualOnly,
-        };
+                    LocalEstimator::Inertial(Box::new(VioRuntime {
+                        camera_from_body,
+                        noise: inertial.noise().clone(),
+                        pending_imu: ImuAccumulator::new(),
+                        predicted_state: None,
+                        last_visual_measurement_body_odom: None,
+                        calibrated_bias,
+                        last_optimized_state: None,
+                        solve_config,
+                        vio_window: None,
+                        max_window: config.runtime.vio_window_size(),
+                    }))
+                }
+                None => LocalEstimator::VisualOnly,
+            };
         let backend = match config.backend {
             Some(backend_config) => BackendSubsystem::Configured(Box::new(
                 BackendSupervisor::spawn_with_max_respawns(
@@ -5058,6 +5060,18 @@ impl SlamTracker {
     }
 }
 
+#[cfg(feature = "vio")]
+fn requested_inertial_calibration(
+    vio_enabled: bool,
+    calibration: &CalibrationBundle,
+) -> Result<Option<&crate::InertialCalibration>, TrackerInitError> {
+    match (vio_enabled, calibration.inertial()) {
+        (true, Some(inertial)) => Ok(Some(inertial)),
+        (true, None) => Err(TrackerInitError::MissingVioCalibration),
+        (false, _) => Ok(None),
+    }
+}
+
 fn insert_keyframe_into_map(
     map: &mut SlamMap,
     keyframe: &Arc<Keyframe>,
@@ -5417,6 +5431,24 @@ mod tests {
                 .expect("solver configuration source")
                 .to_string()
                 .contains("anchor_velocity_info")
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn requesting_vio_without_inertial_calibration_fails_closed() {
+        let stereo = crate::test_helpers::make_rectified_stereo(4, 4, 100.0, 100.0, 2.0, 2.0, 0.1)
+            .expect("stereo");
+        let calibration = CalibrationBundle::visual_only(stereo);
+
+        assert!(matches!(
+            requested_inertial_calibration(true, &calibration),
+            Err(TrackerInitError::MissingVioCalibration)
+        ));
+        assert!(
+            requested_inertial_calibration(false, &calibration)
+                .expect("visual-only request")
+                .is_none()
         );
     }
 
