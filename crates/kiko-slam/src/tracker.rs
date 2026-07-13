@@ -89,7 +89,7 @@ pub struct TrackerRuntimeConfig {
     trace_transitions: bool,
     cull_min_observations: NonZeroUsize,
     #[cfg(feature = "vio")]
-    vio_window_size: NonZeroUsize,
+    vio_window_capacity: crate::VioWindowCapacity,
     #[cfg(feature = "vio")]
     vio_max_iterations: NonZeroUsize,
 }
@@ -102,7 +102,9 @@ pub enum TrackerRuntimeConfigError {
     },
     ZeroCullMinimum,
     #[cfg(feature = "vio")]
-    ZeroVioWindowSize,
+    InvalidVioWindowCapacity {
+        source: crate::VioWindowCapacityError,
+    },
     #[cfg(feature = "vio")]
     ZeroVioIterations,
 }
@@ -117,14 +119,26 @@ impl std::fmt::Display for TrackerRuntimeConfigError {
                 write!(f, "map culling minimum observations must be non-zero")
             }
             #[cfg(feature = "vio")]
-            Self::ZeroVioWindowSize => write!(f, "VIO window size must be non-zero"),
+            Self::InvalidVioWindowCapacity { source } => {
+                write!(f, "invalid VIO window capacity: {source}")
+            }
             #[cfg(feature = "vio")]
             Self::ZeroVioIterations => write!(f, "VIO iteration count must be non-zero"),
         }
     }
 }
 
-impl std::error::Error for TrackerRuntimeConfigError {}
+impl std::error::Error for TrackerRuntimeConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            #[cfg(feature = "vio")]
+            Self::InvalidVioWindowCapacity { source } => Some(source),
+            Self::RespawnLimitTooLarge { .. } | Self::ZeroCullMinimum => None,
+            #[cfg(feature = "vio")]
+            Self::ZeroVioIterations => None,
+        }
+    }
+}
 
 impl TrackerRuntimeConfig {
     pub fn try_new(
@@ -150,7 +164,8 @@ impl TrackerRuntimeConfig {
             cull_min_observations: NonZeroUsize::new(cull_min_observations)
                 .ok_or(TrackerRuntimeConfigError::ZeroCullMinimum)?,
             #[cfg(feature = "vio")]
-            vio_window_size: NonZeroUsize::new(5).expect("literal is non-zero"),
+            vio_window_capacity: crate::VioWindowCapacity::new(5)
+                .expect("default VIO window capacity is valid"),
             #[cfg(feature = "vio")]
             vio_max_iterations: NonZeroUsize::new(3).expect("literal is non-zero"),
         })
@@ -162,8 +177,8 @@ impl TrackerRuntimeConfig {
         window_size: usize,
         max_iterations: usize,
     ) -> Result<Self, TrackerRuntimeConfigError> {
-        self.vio_window_size =
-            NonZeroUsize::new(window_size).ok_or(TrackerRuntimeConfigError::ZeroVioWindowSize)?;
+        self.vio_window_capacity = crate::VioWindowCapacity::new(window_size)
+            .map_err(|source| TrackerRuntimeConfigError::InvalidVioWindowCapacity { source })?;
         self.vio_max_iterations = NonZeroUsize::new(max_iterations)
             .ok_or(TrackerRuntimeConfigError::ZeroVioIterations)?;
         Ok(self)
@@ -186,8 +201,8 @@ impl TrackerRuntimeConfig {
     }
 
     #[cfg(feature = "vio")]
-    pub fn vio_window_size(self) -> NonZeroUsize {
-        self.vio_window_size
+    pub fn vio_window_capacity(self) -> crate::VioWindowCapacity {
+        self.vio_window_capacity
     }
 
     #[cfg(feature = "vio")]
@@ -204,7 +219,8 @@ impl Default for TrackerRuntimeConfig {
             trace_transitions: false,
             cull_min_observations: NonZeroUsize::new(1).expect("literal is non-zero"),
             #[cfg(feature = "vio")]
-            vio_window_size: NonZeroUsize::new(5).expect("literal is non-zero"),
+            vio_window_capacity: crate::VioWindowCapacity::new(5)
+                .expect("default VIO window capacity is valid"),
             #[cfg(feature = "vio")]
             vio_max_iterations: NonZeroUsize::new(3).expect("literal is non-zero"),
         }
@@ -1546,6 +1562,10 @@ pub enum TrackerInitError {
     VioSolveConfig {
         source: crate::VioSolveConfigError,
     },
+    #[cfg(feature = "vio")]
+    VioOptimizerWorkspace {
+        source: crate::VioOptimizerWorkspaceError,
+    },
 }
 
 impl std::fmt::Display for TrackerInitError {
@@ -1575,6 +1595,10 @@ impl std::fmt::Display for TrackerInitError {
             TrackerInitError::VioSolveConfig { source } => {
                 write!(f, "invalid VIO solver configuration: {source}")
             }
+            #[cfg(feature = "vio")]
+            TrackerInitError::VioOptimizerWorkspace { source } => {
+                write!(f, "failed to initialize VIO optimizer workspace: {source}")
+            }
         }
     }
 }
@@ -1591,6 +1615,8 @@ impl std::error::Error for TrackerInitError {
             Self::VioGravity { source } => Some(source),
             #[cfg(feature = "vio")]
             Self::VioSolveConfig { source } => Some(source),
+            #[cfg(feature = "vio")]
+            Self::VioOptimizerWorkspace { source } => Some(source),
         }
     }
 }
@@ -2204,12 +2230,10 @@ struct VioRuntime {
     calibrated_bias: Option<crate::ImuBias>,
     /// The last BA-optimized NavState. Used as base for preintegration.
     last_optimized_state: Option<crate::NavState>,
-    /// VIO solve config (immutable after construction).
-    solve_config: crate::VioSolveConfig,
+    /// VIO solve configuration and reusable scratch workspace.
+    optimizer: crate::local_ba::VioOptimizer,
     /// Sliding window for tightly-coupled VIO BA.
     vio_window: Option<crate::local_ba::VioWindow>,
-    /// Max window size before oldest frame rolls off.
-    max_window: NonZeroUsize,
 }
 
 #[cfg(feature = "vio")]
@@ -2576,6 +2600,7 @@ impl SlamTracker {
                         .transpose()
                         .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
                     let solve_config = crate::VioSolveConfig::new(
+                        config.runtime.vio_window_capacity(),
                         gravity,
                         camera_from_body,
                         intrinsics,
@@ -2586,6 +2611,8 @@ impl SlamTracker {
                         bias_prior,
                     )
                     .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
+                    let optimizer = crate::local_ba::VioOptimizer::try_new(solve_config)
+                        .map_err(|source| TrackerInitError::VioOptimizerWorkspace { source })?;
                     LocalEstimator::Inertial(Box::new(VioRuntime {
                         camera_from_body,
                         noise: inertial.noise().clone(),
@@ -2594,9 +2621,8 @@ impl SlamTracker {
                         last_visual_measurement_body_odom: None,
                         calibrated_bias,
                         last_optimized_state: None,
-                        solve_config,
+                        optimizer,
                         vio_window: None,
-                        max_window: config.runtime.vio_window_size(),
                     }))
                 }
                 None => LocalEstimator::VisualOnly,
@@ -2838,7 +2864,7 @@ impl SlamTracker {
         };
 
         // Build or extend the VIO window
-        use crate::local_ba::{VioAnchor, VioSuccessor, VioWindow, optimize_vio};
+        use crate::local_ba::{VioAnchor, VioSuccessor, VioWindow};
 
         if vio_runtime.vio_window.is_none() {
             if let (Some(anchor_state), Some(successor_observations)) =
@@ -2856,9 +2882,8 @@ impl SlamTracker {
                         preintegrated,
                     }],
                 };
-                let result = optimize_vio(
+                let result = vio_runtime.optimizer.optimize(
                     &mut candidate_window,
-                    &vio_runtime.solve_config,
                     self.global_map.map(),
                     &self.map_from_odom,
                 )?;
@@ -2884,10 +2909,10 @@ impl SlamTracker {
                     let delta_r =
                         (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
                     eprintln!(
-                        "vio ba: frames={} termination={:?} iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
+                        "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
                         candidate_window.len(),
                         result.termination,
-                        result.iterations,
+                        result.attempted_iterations,
                         result.accepted_steps,
                         result.rejected_steps,
                         result.rejected_nonprojectable_candidate_steps,
@@ -2969,7 +2994,13 @@ impl SlamTracker {
         });
 
         // Trim window
-        while candidate_window.len() > vio_runtime.max_window.get() {
+        let window_capacity_frames = vio_runtime
+            .optimizer
+            .config()
+            .window_capacity()
+            .frames()
+            .get();
+        while candidate_window.len() > window_capacity_frames {
             if candidate_window.successors.len() <= 1 {
                 break;
             }
@@ -2984,9 +3015,8 @@ impl SlamTracker {
         }
 
         // Run the VIO optimizer
-        let result = optimize_vio(
+        let result = vio_runtime.optimizer.optimize(
             &mut candidate_window,
-            &vio_runtime.solve_config,
             self.global_map.map(),
             &self.map_from_odom,
         )?;
@@ -3012,10 +3042,10 @@ impl SlamTracker {
             let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
             let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
             eprintln!(
-                "vio ba: frames={} termination={:?} iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
+                "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
                 candidate_window.len(),
                 result.termination,
-                result.iterations,
+                result.attempted_iterations,
                 result.accepted_steps,
                 result.rejected_steps,
                 result.rejected_nonprojectable_candidate_steps,
@@ -4813,7 +4843,7 @@ impl SlamTracker {
             diagnostics.vio_calibrated_bias_prior_active = match &self.local_estimator {
                 LocalEstimator::VisualOnly => None,
                 LocalEstimator::Inertial(vio_runtime) => {
-                    Some(vio_runtime.solve_config.has_calibrated_bias_prior())
+                    Some(vio_runtime.optimizer.config().has_calibrated_bias_prior())
                 }
             };
             if let Some(vio_tracked_metrics) = vio_proposal_tracked_metrics.as_ref() {
@@ -5426,6 +5456,19 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "vio")]
+    fn unaddressable_vio_workspace_error() -> crate::VioOptimizerWorkspaceError {
+        let mut allocation_probe = Vec::<u8>::new();
+        let source = allocation_probe
+            .try_reserve_exact(usize::MAX)
+            .expect_err("an unaddressable vector capacity must fail");
+        crate::VioOptimizerWorkspaceError::Allocation {
+            buffer: "test",
+            requested_elements: usize::MAX,
+            source,
+        }
+    }
+
     #[test]
     fn tracker_error_preserves_inference_domain_source_chain() {
         let error = TrackerError::Inference(InferenceError::Frame(
@@ -5511,6 +5554,14 @@ mod tests {
                 .to_string()
                 .contains("velocity-anchor information")
         );
+
+        let workspace = TrackerInitError::VioOptimizerWorkspace {
+            source: unaddressable_vio_workspace_error(),
+        };
+        let workspace_source = workspace.source().expect("VIO workspace source");
+        let allocator = workspace_source.source().expect("allocator source");
+        assert!(!allocator.to_string().is_empty());
+        assert!(allocator.source().is_none());
     }
 
     #[cfg(feature = "vio")]
@@ -7636,10 +7687,21 @@ mod tests {
         #[cfg(feature = "vio")]
         {
             let defaults = TrackerRuntimeConfig::default();
-            assert!(matches!(
-                defaults.try_with_vio(0, 3),
-                Err(TrackerRuntimeConfigError::ZeroVioWindowSize)
-            ));
+            for actual in [0, 1] {
+                let error = defaults
+                    .try_with_vio(actual, 3)
+                    .expect_err("undersized VIO window must fail");
+                assert!(matches!(
+                    &error,
+                    TrackerRuntimeConfigError::InvalidVioWindowCapacity {
+                        source: crate::VioWindowCapacityError::TooFewFrames {
+                            minimum: 2,
+                            actual: error_actual,
+                        },
+                    } if *error_actual == actual
+                ));
+                assert!(error.source().is_some());
+            }
             assert!(matches!(
                 defaults.try_with_vio(5, 0),
                 Err(TrackerRuntimeConfigError::ZeroVioIterations)
@@ -8061,7 +8123,7 @@ mod tests {
     ) -> crate::VioSolveResult {
         crate::VioSolveResult {
             termination: crate::VioSolveTermination::IterationLimit,
-            iterations: accepted_steps,
+            attempted_iterations: accepted_steps,
             accepted_steps,
             rejected_steps: 0,
             rejected_nonprojectable_candidate_steps: 0,
@@ -8183,6 +8245,7 @@ mod tests {
         let lm = crate::LmConfig::new(1e-3, 10.0, 1e-6, 1e6, 0.25, 0.75).expect("lm");
         let gravity = crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity");
         crate::VioSolveConfig::new(
+            crate::VioWindowCapacity::new(5).expect("window capacity"),
             gravity,
             Pose64::identity(),
             make_test_vio_intrinsics(),
@@ -8193,6 +8256,11 @@ mod tests {
             None,
         )
         .expect("solve config")
+    }
+
+    #[cfg(feature = "vio")]
+    fn make_test_vio_optimizer() -> crate::local_ba::VioOptimizer {
+        crate::local_ba::VioOptimizer::try_new(make_test_vio_solve_config()).expect("VIO optimizer")
     }
 
     #[cfg(feature = "vio")]
@@ -8212,9 +8280,8 @@ mod tests {
             )),
             calibrated_bias: None,
             last_optimized_state: None,
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: None,
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let current_body_odom = Pose64::from_pose32(Pose::from_rt(
@@ -8241,9 +8308,8 @@ mod tests {
             last_visual_measurement_body_odom: None,
             calibrated_bias: None,
             last_optimized_state: None,
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: None,
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let first = crate::ImuBatch::new(vec![
@@ -8285,9 +8351,8 @@ mod tests {
             last_visual_measurement_body_odom: None,
             calibrated_bias: None,
             last_optimized_state: None,
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: None,
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let batch = crate::ImuBatch::new(vec![
@@ -8367,12 +8432,11 @@ mod tests {
             last_visual_measurement_body_odom: None,
             calibrated_bias: None,
             last_optimized_state: Some(stale_state.clone()),
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: Some(crate::local_ba::VioWindow {
                 anchor: stale_anchor,
                 successors: Vec::new(),
             }),
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         runtime.commit_authoritative_visual_anchor(replacement_anchor);
@@ -8458,9 +8522,8 @@ mod tests {
                 crate::ImuBias::try_new([9.0; 3], [9.0; 3]).expect("finite calibrated bias"),
             ),
             last_optimized_state: Some(previous_state),
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: None,
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let body_odom = Pose64::from_pose32(Pose::from_rt(
@@ -8520,7 +8583,7 @@ mod tests {
             )),
             calibrated_bias: None,
             last_optimized_state: Some(previous_state.clone()),
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: Some(crate::local_ba::VioWindow {
                 anchor: crate::local_ba::VioAnchor {
                     state: previous_state.clone(),
@@ -8529,7 +8592,6 @@ mod tests {
                 },
                 successors: Vec::new(),
             }),
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let body_odom = Pose64::from_pose32(Pose::from_rt(
@@ -8588,7 +8650,7 @@ mod tests {
             )),
             calibrated_bias: None,
             last_optimized_state: Some(nav_state.clone()),
-            solve_config: make_test_vio_solve_config(),
+            optimizer: make_test_vio_optimizer(),
             vio_window: Some(crate::local_ba::VioWindow {
                 anchor: crate::local_ba::VioAnchor {
                     state: nav_state,
@@ -8597,7 +8659,6 @@ mod tests {
                 },
                 successors: Vec::new(),
             }),
-            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         runtime.reset_runtime_continuity();

@@ -103,8 +103,8 @@ pub use imu::{
 pub use local_ba::{
     AnchorFrameInput, InertialFrameInput, VioBiasPrior, VioBiasPriorInformationQuantity,
     VioConvergenceCriterion, VioCostBreakdown, VioEvaluationStage, VioFrameEstimate,
-    VioLinearizationQuantity, VioSolveConfig, VioSolveConfigError, VioSolveError, VioSolveResult,
-    VioSolveTermination,
+    VioLinearizationQuantity, VioOptimizerWorkspaceError, VioSolveConfig, VioSolveConfigError,
+    VioSolveError, VioSolveResult, VioSolveTermination, VioWindowCapacity, VioWindowCapacityError,
 };
 pub use local_ba::{
     BaCorrection, BaCost, BaCostError, BaExecutionError, BaOptimization, BaOutcomeError, BaResult,

@@ -186,7 +186,8 @@ pub fn build_tracker_config_with_overrides(
     )?;
     #[cfg(feature = "vio")]
     let runtime = runtime.try_with_vio(
-        try_env_usize("KIKO_VIO_WINDOW")?.unwrap_or(runtime_defaults.vio_window_size().get()),
+        try_env_usize("KIKO_VIO_WINDOW")?
+            .unwrap_or(runtime_defaults.vio_window_capacity().frames().get()),
         try_env_usize("KIKO_VIO_ITERS")?.unwrap_or(runtime_defaults.vio_max_iterations().get()),
     )?;
 

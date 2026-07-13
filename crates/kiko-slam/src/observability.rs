@@ -117,7 +117,7 @@ const PATH_POSE_BA_CONVERGED: &str = "diagnostics/pose_ba/converged";
 #[cfg(feature = "vio")]
 const PATH_VIO_FINAL_COST: &str = "diagnostics/vio/final_cost";
 #[cfg(feature = "vio")]
-const PATH_VIO_ITERATIONS: &str = "diagnostics/vio/iterations";
+const PATH_VIO_ATTEMPTED_ITERATIONS: &str = "diagnostics/vio/attempted_iterations";
 #[cfg(feature = "vio")]
 const PATH_VIO_CONVERGED: &str = "diagnostics/vio/converged";
 #[cfg(feature = "vio")]
@@ -481,7 +481,10 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
 
     #[cfg(feature = "vio")]
     if let Some(vio_result) = diag.vio_solve_result.as_ref() {
-        scalars.push((PATH_VIO_ITERATIONS, vio_result.iterations as f64));
+        scalars.push((
+            PATH_VIO_ATTEMPTED_ITERATIONS,
+            vio_result.attempted_iterations as f64,
+        ));
         scalars.push((PATH_VIO_FINAL_COST, vio_result.final_cost));
         scalars.push((
             PATH_VIO_CONVERGED,
@@ -853,8 +856,8 @@ mod tests {
     };
     #[cfg(feature = "vio")]
     use super::{
-        PATH_VIO_ACCEPTED_STEPS, PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE,
-        PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
+        PATH_VIO_ACCEPTED_STEPS, PATH_VIO_ATTEMPTED_ITERATIONS,
+        PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE, PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
         PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS,
         PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS,
         PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS, PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS,
@@ -1018,7 +1021,7 @@ mod tests {
             diag.vio_calibrated_bias_prior_active = Some(true);
             diag.vio_solve_result = Some(VioSolveResult {
                 termination: VioSolveTermination::IterationLimit,
-                iterations: 3,
+                attempted_iterations: 3,
                 accepted_steps: 2,
                 rejected_steps: 1,
                 rejected_nonprojectable_candidate_steps: 1,
@@ -1048,6 +1051,16 @@ mod tests {
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_POSE_BA_CONVERGED && value.abs() < f64::EPSILON
         }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_ATTEMPTED_ITERATIONS && (*value - 3.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(
+            scalars
+                .iter()
+                .all(|(path, _)| *path != "diagnostics/vio/iterations")
+        );
         #[cfg(feature = "vio")]
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS

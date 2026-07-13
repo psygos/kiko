@@ -7,6 +7,50 @@ use crate::{
     math,
 };
 
+fn try_vec_with_capacity<T>(requested_elements: usize) -> Result<Vec<T>, TryReserveError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(requested_elements)?;
+    Ok(values)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DenseWorkspaceShape {
+    dimension: usize,
+    matrix_elements: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DenseWorkspaceShapeError {
+    DimensionOverflow { item_count: usize },
+    MatrixElementCountOverflow { dimension: usize },
+    MatrixByteLengthUnaddressable { element_count: usize },
+}
+
+impl DenseWorkspaceShape {
+    fn try_new(
+        item_count: usize,
+        dimensions_per_item: usize,
+        scalar_bytes: usize,
+    ) -> Result<Self, DenseWorkspaceShapeError> {
+        let dimension = item_count
+            .checked_mul(dimensions_per_item)
+            .ok_or(DenseWorkspaceShapeError::DimensionOverflow { item_count })?;
+        let matrix_elements = dimension
+            .checked_mul(dimension)
+            .ok_or(DenseWorkspaceShapeError::MatrixElementCountOverflow { dimension })?;
+        matrix_elements
+            .checked_mul(scalar_bytes)
+            .filter(|&byte_len| byte_len <= isize::MAX as usize)
+            .ok_or(DenseWorkspaceShapeError::MatrixByteLengthUnaddressable {
+                element_count: matrix_elements,
+            })?;
+        Ok(Self {
+            dimension,
+            matrix_elements,
+        })
+    }
+}
+
 /// Maximum camera-translation update in metres for convergence detection.
 const POSE_TRANSLATION_STEP_CONVERGENCE_M: f32 = 1e-4;
 /// Maximum camera-rotation update in radians for convergence detection.
@@ -42,38 +86,9 @@ const ABSOLUTE_MIN_OBSERVATIONS: usize = 4;
 const POSE_TANGENT_DIMENSION: usize = 6;
 
 #[derive(Clone, Copy, Debug)]
-struct BaWorkspaceShape {
-    pose_dimension: usize,
-    dense_matrix_elements: usize,
-}
-
-impl BaWorkspaceShape {
-    fn try_from_window(window: NonZeroUsize) -> Result<Self, LocalBaConfigError> {
-        let pose_dimension = window.get().checked_mul(POSE_TANGENT_DIMENSION).ok_or(
-            LocalBaConfigError::PoseDimensionOverflow {
-                window: window.get(),
-            },
-        )?;
-        let dense_matrix_elements = pose_dimension
-            .checked_mul(pose_dimension)
-            .ok_or(LocalBaConfigError::DenseMatrixElementCountOverflow { pose_dimension })?;
-        dense_matrix_elements
-            .checked_mul(std::mem::size_of::<f32>())
-            .filter(|&byte_len| byte_len <= isize::MAX as usize)
-            .ok_or(LocalBaConfigError::DenseMatrixByteLengthUnaddressable {
-                element_count: dense_matrix_elements,
-            })?;
-        Ok(Self {
-            pose_dimension,
-            dense_matrix_elements,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct LocalBaConfig {
     window: NonZeroUsize,
-    workspace: BaWorkspaceShape,
+    workspace: DenseWorkspaceShape,
     max_iterations: NonZeroUsize,
     min_observations: NonZeroUsize,
     huber_delta_px: f32,
@@ -369,7 +384,24 @@ impl LocalBaConfig {
         lm: LmConfig,
     ) -> Result<Self, LocalBaConfigError> {
         let window = NonZeroUsize::new(window).ok_or(LocalBaConfigError::ZeroWindow)?;
-        let workspace = BaWorkspaceShape::try_from_window(window)?;
+        let workspace = DenseWorkspaceShape::try_new(
+            window.get(),
+            POSE_TANGENT_DIMENSION,
+            std::mem::size_of::<f32>(),
+        )
+        .map_err(|source| match source {
+            DenseWorkspaceShapeError::DimensionOverflow { item_count } => {
+                LocalBaConfigError::PoseDimensionOverflow { window: item_count }
+            }
+            DenseWorkspaceShapeError::MatrixElementCountOverflow { dimension } => {
+                LocalBaConfigError::DenseMatrixElementCountOverflow {
+                    pose_dimension: dimension,
+                }
+            }
+            DenseWorkspaceShapeError::MatrixByteLengthUnaddressable { element_count } => {
+                LocalBaConfigError::DenseMatrixByteLengthUnaddressable { element_count }
+            }
+        })?;
         let max_iterations =
             NonZeroUsize::new(max_iterations).ok_or(LocalBaConfigError::ZeroIterations)?;
         let min_observations =
@@ -860,15 +892,34 @@ impl std::error::Error for ObservationSetError {}
 
 #[derive(Debug)]
 pub enum ObservationResolveError {
-    Map { source: crate::map::MapError },
-    MissingAssociation { keypoint: KeyframeKeypoint },
-    MissingMapPoint { point_id: MapPointId },
-    Pnp { source: crate::PnpError },
+    Allocation {
+        requested_observations: usize,
+        source: TryReserveError,
+    },
+    Map {
+        source: crate::map::MapError,
+    },
+    MissingAssociation {
+        keypoint: KeyframeKeypoint,
+    },
+    MissingMapPoint {
+        point_id: MapPointId,
+    },
+    Pnp {
+        source: crate::PnpError,
+    },
 }
 
 impl std::fmt::Display for ObservationResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Allocation {
+                requested_observations,
+                source,
+            } => write!(
+                f,
+                "could not allocate BA buffer for {requested_observations} resolved observations: {source}"
+            ),
             Self::Map { source } => write!(f, "BA observation map lookup failed: {source}"),
             Self::MissingAssociation { keypoint } => write!(
                 f,
@@ -890,6 +941,7 @@ impl std::fmt::Display for ObservationResolveError {
 impl std::error::Error for ObservationResolveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Allocation { source, .. } => Some(source),
             Self::Map { source } => Some(source),
             Self::Pnp { source } => Some(source),
             Self::MissingAssociation { .. } | Self::MissingMapPoint { .. } => None,
@@ -1053,7 +1105,31 @@ impl ObservationSet {
         intrinsics: PinholeIntrinsics,
         min_required: NonZeroUsize,
     ) -> Result<Option<ResolvedObservationSet>, ObservationResolveError> {
-        let mut resolved = Vec::with_capacity(self.observations.len());
+        let mut resolved = Vec::new();
+        if !self.resolve_observations_into(map, intrinsics, min_required, &mut resolved)? {
+            return Ok(None);
+        }
+        Ok(Some(ResolvedObservationSet {
+            observations: resolved,
+        }))
+    }
+
+    fn resolve_observations_into(
+        &self,
+        map: &SlamMap,
+        intrinsics: PinholeIntrinsics,
+        min_required: NonZeroUsize,
+        resolved: &mut Vec<Observation>,
+    ) -> Result<bool, ObservationResolveError> {
+        resolved.clear();
+        if resolved.capacity() < self.observations.len() {
+            resolved
+                .try_reserve_exact(self.observations.len())
+                .map_err(|source| ObservationResolveError::Allocation {
+                    requested_observations: self.observations.len(),
+                    source,
+                })?;
+        }
         for obs in &self.observations {
             let keypoint_ref = obs.keyframe_keypoint();
             let point_id = map
@@ -1070,12 +1146,7 @@ impl ObservationSet {
                 .map_err(|source| ObservationResolveError::Pnp { source })?;
             resolved.push(observation);
         }
-        if resolved.len() < min_required.get() {
-            return Ok(None);
-        }
-        Ok(Some(ResolvedObservationSet {
-            observations: resolved,
-        }))
+        Ok(resolved.len() >= min_required.get())
     }
 }
 
@@ -1156,6 +1227,93 @@ const VIO_STATE_CONVERGENCE_TOLERANCES: [f64; VIO_STATE_DIM] = [
 const VIO_RELATIVE_COST_CONVERGENCE_TOLERANCE: f64 = 1e-10;
 #[cfg(feature = "vio")]
 const VIO_RELATIVE_COST_SCALE_FLOOR: f64 = 1e-12;
+#[cfg(feature = "vio")]
+const MIN_VIO_WINDOW_FRAMES: usize = 2;
+
+/// Validated maximum number of frames in one VIO solve.
+///
+/// Construction proves that the corresponding dense `f64` normal matrix has
+/// an addressable element and byte count. It does not promise that the host
+/// has enough memory; workspace allocation remains fallible.
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VioWindowCapacity {
+    frames: NonZeroUsize,
+    workspace: DenseWorkspaceShape,
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioWindowCapacityError {
+    TooFewFrames { minimum: usize, actual: usize },
+    StateDimensionOverflow { frames: usize },
+    DenseMatrixElementCountOverflow { state_dimension: usize },
+    DenseMatrixByteLengthUnaddressable { element_count: usize },
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioWindowCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFewFrames { minimum, actual } => write!(
+                f,
+                "VIO window capacity must be at least {minimum} frames, got {actual}"
+            ),
+            Self::StateDimensionOverflow { frames } => write!(
+                f,
+                "VIO state dimension overflows usize for a {frames}-frame window"
+            ),
+            Self::DenseMatrixElementCountOverflow { state_dimension } => write!(
+                f,
+                "VIO dense matrix element count overflows usize for state dimension {state_dimension}"
+            ),
+            Self::DenseMatrixByteLengthUnaddressable { element_count } => write!(
+                f,
+                "VIO dense matrix with {element_count} f64 elements exceeds the addressable vector byte length"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::error::Error for VioWindowCapacityError {}
+
+#[cfg(feature = "vio")]
+impl VioWindowCapacity {
+    pub fn new(frames: usize) -> Result<Self, VioWindowCapacityError> {
+        let actual_frames = frames;
+        let frames = NonZeroUsize::new(frames).ok_or(VioWindowCapacityError::TooFewFrames {
+            minimum: MIN_VIO_WINDOW_FRAMES,
+            actual: actual_frames,
+        })?;
+        if frames.get() < MIN_VIO_WINDOW_FRAMES {
+            return Err(VioWindowCapacityError::TooFewFrames {
+                minimum: MIN_VIO_WINDOW_FRAMES,
+                actual: actual_frames,
+            });
+        }
+        let workspace =
+            DenseWorkspaceShape::try_new(frames.get(), VIO_STATE_DIM, std::mem::size_of::<f64>())
+                .map_err(|source| match source {
+                DenseWorkspaceShapeError::DimensionOverflow { item_count } => {
+                    VioWindowCapacityError::StateDimensionOverflow { frames: item_count }
+                }
+                DenseWorkspaceShapeError::MatrixElementCountOverflow { dimension } => {
+                    VioWindowCapacityError::DenseMatrixElementCountOverflow {
+                        state_dimension: dimension,
+                    }
+                }
+                DenseWorkspaceShapeError::MatrixByteLengthUnaddressable { element_count } => {
+                    VioWindowCapacityError::DenseMatrixByteLengthUnaddressable { element_count }
+                }
+            })?;
+        Ok(Self { frames, workspace })
+    }
+
+    pub fn frames(self) -> NonZeroUsize {
+        self.frames
+    }
+}
 
 /// The first frame in a VIO window. Has no predecessor, hence no preintegration.
 /// Carries the velocity-anchor reference. The optional calibrated bias prior
@@ -1259,6 +1417,7 @@ impl VioBiasPrior {
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub struct VioSolveConfig {
+    window_capacity: VioWindowCapacity,
     gravity: crate::Gravity,
     camera_from_body: crate::Pose64,
     intrinsics: PinholeIntrinsics,
@@ -1333,6 +1492,7 @@ impl std::error::Error for VioSolveConfigError {}
 impl VioSolveConfig {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        window_capacity: VioWindowCapacity,
         gravity: crate::Gravity,
         camera_from_body: crate::Pose64,
         intrinsics: PinholeIntrinsics,
@@ -1363,6 +1523,7 @@ impl VioSolveConfig {
             });
         }
         Ok(Self {
+            window_capacity,
             gravity,
             camera_from_body,
             intrinsics,
@@ -1378,8 +1539,153 @@ impl VioSolveConfig {
         self.gravity
     }
 
+    pub fn window_capacity(&self) -> VioWindowCapacity {
+        self.window_capacity
+    }
+
     pub fn has_calibrated_bias_prior(&self) -> bool {
         self.calibrated_bias_prior.is_some()
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Debug)]
+pub enum VioOptimizerWorkspaceError {
+    Allocation {
+        buffer: &'static str,
+        requested_elements: usize,
+        source: TryReserveError,
+    },
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioOptimizerWorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allocation {
+                buffer,
+                requested_elements,
+                source,
+            } => write!(
+                f,
+                "could not allocate VIO optimizer {buffer} buffer with {requested_elements} elements: {source}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::error::Error for VioOptimizerWorkspaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Allocation { source, .. } => Some(source),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+fn try_vio_buffer<T>(
+    buffer: &'static str,
+    requested_elements: usize,
+) -> Result<Vec<T>, VioOptimizerWorkspaceError> {
+    try_vec_with_capacity(requested_elements).map_err(|source| {
+        VioOptimizerWorkspaceError::Allocation {
+            buffer,
+            requested_elements,
+            source,
+        }
+    })
+}
+
+#[cfg(feature = "vio")]
+fn try_zeroed_vio_f64_buffer(
+    buffer: &'static str,
+    requested_elements: usize,
+) -> Result<Vec<f64>, VioOptimizerWorkspaceError> {
+    let mut values = try_vio_buffer(buffer, requested_elements)?;
+    values.resize(requested_elements, 0.0);
+    Ok(values)
+}
+
+#[cfg(feature = "vio")]
+#[derive(Default)]
+struct VioResolvedFrameObservations {
+    available: bool,
+    observations: Vec<Observation>,
+}
+
+#[cfg(feature = "vio")]
+impl VioResolvedFrameObservations {
+    fn available(&self) -> Option<&[Observation]> {
+        self.available.then_some(self.observations.as_slice())
+    }
+}
+
+#[cfg(feature = "vio")]
+struct VioSolveWorkspace {
+    states: Vec<crate::NavState>,
+    candidate_states: Vec<crate::NavState>,
+    resolved_observations: Vec<VioResolvedFrameObservations>,
+    visual_support: VisualFactorSupport,
+    current_linearization: VioLinearization,
+    scratch_linearization: VioLinearization,
+}
+
+#[cfg(feature = "vio")]
+impl VioSolveWorkspace {
+    fn try_new(capacity: VioWindowCapacity) -> Result<Self, VioOptimizerWorkspaceError> {
+        let frame_capacity = capacity.frames.get();
+        let shape = capacity.workspace;
+
+        let mut resolved_observations =
+            try_vio_buffer("resolved-observation frame", frame_capacity)?;
+        resolved_observations.resize_with(frame_capacity, VioResolvedFrameObservations::default);
+
+        Ok(Self {
+            states: try_vio_buffer("current state", frame_capacity)?,
+            candidate_states: try_vio_buffer("candidate state", frame_capacity)?,
+            resolved_observations,
+            visual_support: VisualFactorSupport::try_new(frame_capacity)?,
+            current_linearization: VioLinearization::try_new(shape)?,
+            scratch_linearization: VioLinearization::try_new(shape)?,
+        })
+    }
+}
+
+/// Stateful VIO optimizer with fixed dense workspaces sized at construction.
+///
+/// The optimizer is intentionally not cloneable: its buffers are scratch
+/// storage, not authoritative estimator state.
+#[cfg(feature = "vio")]
+pub(crate) struct VioOptimizer {
+    config: VioSolveConfig,
+    workspace: VioSolveWorkspace,
+}
+
+#[cfg(feature = "vio")]
+impl VioOptimizer {
+    pub(crate) fn try_new(config: VioSolveConfig) -> Result<Self, VioOptimizerWorkspaceError> {
+        let workspace = VioSolveWorkspace::try_new(config.window_capacity)?;
+        Ok(Self { config, workspace })
+    }
+
+    pub(crate) fn config(&self) -> &VioSolveConfig {
+        &self.config
+    }
+
+    pub(crate) fn optimize(
+        &mut self,
+        window: &mut VioWindow,
+        map: &SlamMap,
+        map_from_odom: &crate::MapFromOdom,
+    ) -> Result<VioSolveResult, VioSolveError> {
+        optimize_vio_with_workspace(
+            window,
+            &self.config,
+            &mut self.workspace,
+            map,
+            map_from_odom,
+        )
     }
 }
 
@@ -1420,7 +1726,7 @@ impl VioWindow {
 
 /// Per-factor objective contributions from a VIO BA evaluation.
 #[cfg(feature = "vio")]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct VioCostBreakdown {
     pub reprojection_cost: f64,
     pub imu_cost: f64,
@@ -1507,6 +1813,16 @@ struct VioEvaluation {
 #[cfg(feature = "vio")]
 #[derive(Debug)]
 pub enum VioSolveError {
+    WindowExceedsConfiguredCapacity {
+        actual_frames: usize,
+        capacity_frames: usize,
+    },
+    WorkspaceGrowth {
+        buffer: &'static str,
+        frame_index: usize,
+        requested_elements: usize,
+        source: TryReserveError,
+    },
     Observation {
         source: ObservationResolveError,
     },
@@ -1587,6 +1903,22 @@ pub enum VioSolveError {
 impl std::fmt::Display for VioSolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::WindowExceedsConfiguredCapacity {
+                actual_frames,
+                capacity_frames,
+            } => write!(
+                f,
+                "VIO window has {actual_frames} frames but optimizer capacity is {capacity_frames}"
+            ),
+            Self::WorkspaceGrowth {
+                buffer,
+                frame_index,
+                requested_elements,
+                source,
+            } => write!(
+                f,
+                "could not grow VIO {buffer} buffer for frame {frame_index} to {requested_elements} elements: {source}"
+            ),
             Self::Observation { source } => {
                 write!(f, "VIO observation resolution failed: {source}")
             }
@@ -1701,6 +2033,7 @@ impl std::fmt::Display for VioSolveError {
 impl std::error::Error for VioSolveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::WorkspaceGrowth { source, .. } => Some(source),
             Self::Observation { source } => Some(source),
             Self::LinearSolve { source, .. } => Some(source),
             Self::StateRetraction { source, .. } => Some(source),
@@ -1708,7 +2041,8 @@ impl std::error::Error for VioSolveError {
             Self::ImuJacobian { source, .. } => Some(source),
             Self::BiasRandomWalkFactor { source, .. } => Some(source),
             Self::ReprojectionJacobianRetraction { source, .. } => Some(source),
-            Self::ReprojectionFactorUnavailable { .. }
+            Self::WindowExceedsConfiguredCapacity { .. }
+            | Self::ReprojectionFactorUnavailable { .. }
             | Self::ReprojectionJacobianUnavailable { .. }
             | Self::NonFiniteReprojectionJacobian { .. }
             | Self::NonFiniteLinearization { .. }
@@ -1745,7 +2079,7 @@ impl From<ObservationResolveError> for VioSolveError {
 #[derive(Clone, Debug)]
 pub struct VioSolveResult {
     pub termination: VioSolveTermination,
-    pub iterations: usize,
+    pub attempted_iterations: usize,
     pub accepted_steps: usize,
     pub rejected_steps: usize,
     /// Candidate steps rejected because an initially active visual factor, or
@@ -2520,15 +2854,13 @@ fn try_buffer_with_capacity<T>(
     buffer: &'static str,
     requested_elements: usize,
 ) -> Result<Vec<T>, LocalBundleAdjusterWorkspaceError> {
-    let mut values = Vec::new();
-    values
-        .try_reserve_exact(requested_elements)
-        .map_err(|source| LocalBundleAdjusterWorkspaceError::Allocation {
+    try_vec_with_capacity(requested_elements).map_err(|source| {
+        LocalBundleAdjusterWorkspaceError::Allocation {
             buffer,
             requested_elements,
             source,
-        })?;
-    Ok(values)
+        }
+    })
 }
 
 fn try_zeroed_f32_buffer(
@@ -2565,8 +2897,8 @@ impl LocalBundleAdjuster {
         let shape = config.workspace;
         let frames = try_buffer_with_capacity("frame window", config.window())?;
         let pose_backup_buf = try_buffer_with_capacity("pose backup", config.window())?;
-        let a_buf = try_zeroed_f32_buffer("dense normal matrix", shape.dense_matrix_elements)?;
-        let b_buf = try_zeroed_f32_buffer("normal-equation RHS", shape.pose_dimension)?;
+        let a_buf = try_zeroed_f32_buffer("dense normal matrix", shape.matrix_elements)?;
+        let b_buf = try_zeroed_f32_buffer("normal-equation RHS", shape.dimension)?;
         Ok(Self {
             config,
             intrinsics,
@@ -3181,20 +3513,29 @@ fn vio_step_is_componentwise_small(delta: &[f64]) -> bool {
 ///
 /// Convention: we assemble gradient `g = J^T Ω r` and solve `H δ = -g`.
 #[cfg(feature = "vio")]
-pub fn optimize_vio(
+fn optimize_vio_with_workspace(
     window: &mut VioWindow,
     config: &VioSolveConfig,
+    workspace: &mut VioSolveWorkspace,
     map: &SlamMap,
     map_from_odom: &crate::MapFromOdom,
 ) -> Result<VioSolveResult, VioSolveError> {
     use crate::vio::solve::solve_dense_f64;
 
     let n_frames = window.len();
+    let capacity_frames = config.window_capacity.frames.get();
+    if n_frames > capacity_frames {
+        return Err(VioSolveError::WindowExceedsConfiguredCapacity {
+            actual_frames: n_frames,
+            capacity_frames,
+        });
+    }
+    // Capacity construction proved this product and its square addressable.
     let dim = n_frames * VIO_STATE_DIM;
     if n_frames < 2 {
         return Ok(VioSolveResult {
             termination: VioSolveTermination::NotRequired,
-            iterations: 0,
+            attempted_iterations: 0,
             accepted_steps: 0,
             rejected_steps: 0,
             rejected_nonprojectable_candidate_steps: 0,
@@ -3208,34 +3549,52 @@ pub fn optimize_vio(
         });
     }
 
+    let VioSolveWorkspace {
+        states,
+        candidate_states,
+        resolved_observations,
+        visual_support,
+        current_linearization,
+        scratch_linearization,
+    } = workspace;
     let max_iters = config.max_iterations.get();
     let mut lambda = f64::from(config.lm.initial_lambda);
-    let mut states = window.states().cloned().collect::<Vec<_>>();
-    let resolved_observations = (0..n_frames)
-        .map(|frame_idx| match window.observations(frame_idx) {
-            Some(observations) => observations.resolve(map, config.intrinsics, NonZeroUsize::MIN),
-            None => Ok(None),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let visual_support = VisualFactorSupport::from_initial_states(
-        &states,
-        &resolved_observations,
+    states.clear();
+    states.extend(window.states().cloned());
+    for (frame_index, resolved) in resolved_observations[..n_frames].iter_mut().enumerate() {
+        resolved.available = false;
+        resolved.observations.clear();
+        if let Some(observations) = window.observations(frame_index) {
+            resolved.available = observations.resolve_observations_into(
+                map,
+                config.intrinsics,
+                NonZeroUsize::MIN,
+                &mut resolved.observations,
+            )?;
+        }
+    }
+    visual_support.update_from_initial_states(
+        states,
+        resolved_observations,
         config,
         map_from_odom,
-    );
-    let mut linearization = linearize_vio_states(
+    )?;
+    linearize_vio_states(
         window,
-        &states,
-        &resolved_observations,
-        &visual_support,
+        states,
+        ResolvedVioVisualFactors {
+            observations: resolved_observations,
+            support: visual_support,
+        },
         config,
         map_from_odom,
         VioEvaluation {
             stage: VioEvaluationStage::Initial,
             iteration: 0,
         },
+        current_linearization,
     )?;
-    let mut current_cost = linearization.cost_breakdown.total_cost();
+    let mut current_cost = current_linearization.cost_breakdown.total_cost();
     if !current_cost.is_finite() {
         return Err(VioSolveError::NonFiniteCost {
             stage: VioEvaluationStage::Initial,
@@ -3252,24 +3611,35 @@ pub fn optimize_vio(
     for iteration in 0..max_iters {
         attempted_iterations = iteration + 1;
 
-        let mut h_solve = linearization.hessian.clone();
-        for i in 0..dim {
-            h_solve[i * dim + i] += lambda;
+        let matrix_elements = dim * dim;
+        scratch_linearization.hessian[..matrix_elements]
+            .copy_from_slice(&current_linearization.hessian[..matrix_elements]);
+        for (destination, source) in scratch_linearization.rhs[..dim]
+            .iter_mut()
+            .zip(&current_linearization.rhs[..dim])
+        {
+            *destination = -*source;
         }
-        let mut neg_g: Vec<f64> = linearization.rhs.iter().map(|v| -v).collect();
-        solve_dense_f64(&mut h_solve, &mut neg_g, dim).map_err(|source| {
-            VioSolveError::LinearSolve {
-                iteration: attempted_iterations,
-                source,
-            }
+        for i in 0..dim {
+            scratch_linearization.hessian[i * dim + i] += lambda;
+        }
+        solve_dense_f64(
+            &mut scratch_linearization.hessian[..matrix_elements],
+            &mut scratch_linearization.rhs[..dim],
+            dim,
+        )
+        .map_err(|source| VioSolveError::LinearSolve {
+            iteration: attempted_iterations,
+            source,
         })?;
-        let delta = neg_g;
+        let step_is_componentwise_small =
+            vio_step_is_componentwise_small(&scratch_linearization.rhs[..dim]);
 
-        let mut candidate_states = Vec::with_capacity(n_frames);
+        candidate_states.clear();
         for (frame_idx, state) in states.iter().enumerate() {
             let base = frame_idx * VIO_STATE_DIM;
             let mut tangent = [0.0_f64; VIO_STATE_DIM];
-            tangent.copy_from_slice(&delta[base..base + VIO_STATE_DIM]);
+            tangent.copy_from_slice(&scratch_linearization.rhs[base..base + VIO_STATE_DIM]);
             let candidate_state =
                 state
                     .retract(&tangent)
@@ -3281,19 +3651,22 @@ pub fn optimize_vio(
             candidate_states.push(candidate_state);
         }
 
-        let candidate_linearization = match linearize_vio_states(
+        match linearize_vio_states(
             window,
-            &candidate_states,
-            &resolved_observations,
-            &visual_support,
+            candidate_states,
+            ResolvedVioVisualFactors {
+                observations: resolved_observations,
+                support: visual_support,
+            },
             config,
             map_from_odom,
             VioEvaluation {
                 stage: VioEvaluationStage::Candidate,
                 iteration: attempted_iterations,
             },
+            scratch_linearization,
         ) {
-            Ok(linearization) => linearization,
+            Ok(()) => {}
             Err(error) if error.is_rejected_candidate_nonprojectability() => {
                 rejected_steps += 1;
                 rejected_nonprojectable_candidate_steps += 1;
@@ -3302,8 +3675,8 @@ pub fn optimize_vio(
                 continue;
             }
             Err(error) => return Err(error),
-        };
-        let candidate_cost = candidate_linearization.cost_breakdown.total_cost();
+        }
+        let candidate_cost = scratch_linearization.cost_breakdown.total_cost();
         if !candidate_cost.is_finite() {
             return Err(VioSolveError::NonFiniteCost {
                 stage: VioEvaluationStage::Candidate,
@@ -3313,14 +3686,14 @@ pub fn optimize_vio(
         }
         if candidate_cost < current_cost {
             let cost_decrease = current_cost - candidate_cost;
-            states = candidate_states;
-            linearization = candidate_linearization;
+            std::mem::swap(states, candidate_states);
+            std::mem::swap(current_linearization, scratch_linearization);
             current_cost = candidate_cost;
             accepted_steps += 1;
             lambda =
                 (lambda / f64::from(config.lm.lambda_factor)).max(f64::from(config.lm.min_lambda));
             let relative_cost_scale = current_cost.abs().max(VIO_RELATIVE_COST_SCALE_FLOOR);
-            if vio_step_is_componentwise_small(&delta)
+            if step_is_componentwise_small
                 && cost_decrease < VIO_RELATIVE_COST_CONVERGENCE_TOLERANCE * relative_cost_scale
             {
                 termination = Some(VioSolveTermination::Converged {
@@ -3367,12 +3740,12 @@ pub fn optimize_vio(
         } else {
             VioSolveTermination::IterationLimit
         }),
-        iterations: attempted_iterations,
+        attempted_iterations,
         accepted_steps,
         rejected_steps,
         rejected_nonprojectable_candidate_steps,
         final_cost: current_cost,
-        cost_breakdown: linearization.cost_breakdown,
+        cost_breakdown: current_linearization.cost_breakdown,
         last_frame_active_visual_factor_count: visual_support.last_frame_factor_count(),
         initially_excluded_nonprojectable_visual_factor_count: visual_support
             .initially_excluded_nonprojectable_factor_count,
@@ -3390,29 +3763,76 @@ struct VioLinearization {
 }
 
 #[cfg(feature = "vio")]
+impl VioLinearization {
+    fn try_new(shape: DenseWorkspaceShape) -> Result<Self, VioOptimizerWorkspaceError> {
+        Ok(Self {
+            hessian: try_zeroed_vio_f64_buffer("dense normal matrix", shape.matrix_elements)?,
+            rhs: try_zeroed_vio_f64_buffer("normal-equation RHS", shape.dimension)?,
+            cost_breakdown: VioCostBreakdown::default(),
+        })
+    }
+
+    fn reset(&mut self, state_dimension: usize) {
+        self.hessian[..state_dimension * state_dimension].fill(0.0);
+        self.rhs[..state_dimension].fill(0.0);
+        self.cost_breakdown = VioCostBreakdown::default();
+    }
+}
+
+#[cfg(feature = "vio")]
 struct VisualFactorSupport {
     observation_indices_by_frame: Vec<Vec<usize>>,
+    active_frame_count: usize,
     initially_excluded_nonprojectable_factor_count: usize,
 }
 
 #[cfg(feature = "vio")]
+struct ResolvedVioVisualFactors<'a> {
+    observations: &'a [VioResolvedFrameObservations],
+    support: &'a VisualFactorSupport,
+}
+
+#[cfg(feature = "vio")]
 impl VisualFactorSupport {
-    fn from_initial_states(
+    fn try_new(frame_capacity: usize) -> Result<Self, VioOptimizerWorkspaceError> {
+        let mut observation_indices_by_frame =
+            try_vio_buffer("visual-support frame", frame_capacity)?;
+        observation_indices_by_frame.resize_with(frame_capacity, Vec::new);
+        Ok(Self {
+            observation_indices_by_frame,
+            active_frame_count: 0,
+            initially_excluded_nonprojectable_factor_count: 0,
+        })
+    }
+
+    fn update_from_initial_states(
+        &mut self,
         states: &[crate::NavState],
-        resolved_observations: &[Option<ResolvedObservationSet>],
+        resolved_observations: &[VioResolvedFrameObservations],
         config: &VioSolveConfig,
         map_from_odom: &crate::MapFromOdom,
-    ) -> Self {
-        debug_assert_eq!(states.len(), resolved_observations.len());
-        let mut observation_indices_by_frame = Vec::with_capacity(states.len());
-        let mut initially_excluded_nonprojectable_factor_count = 0;
+    ) -> Result<(), VioSolveError> {
+        debug_assert!(resolved_observations.len() >= states.len());
+        debug_assert!(self.observation_indices_by_frame.len() >= states.len());
+        self.active_frame_count = states.len();
+        self.initially_excluded_nonprojectable_factor_count = 0;
 
         for (frame_index, state) in states.iter().enumerate() {
-            let mut active_indices = Vec::new();
-            if let Some(resolved) = &resolved_observations[frame_index] {
-                active_indices.reserve(resolved.observations().len());
+            let active_indices = &mut self.observation_indices_by_frame[frame_index];
+            active_indices.clear();
+            if let Some(resolved) = resolved_observations[frame_index].available() {
+                if active_indices.capacity() < resolved.len() {
+                    active_indices
+                        .try_reserve_exact(resolved.len())
+                        .map_err(|source| VioSolveError::WorkspaceGrowth {
+                            buffer: "visual-factor support",
+                            frame_index,
+                            requested_elements: resolved.len(),
+                            source,
+                        })?;
+                }
                 let cam_from_map = vio_cam_from_map(state, config.camera_from_body, map_from_odom);
-                for (observation_index, observation) in resolved.observations().iter().enumerate() {
+                for (observation_index, observation) in resolved.iter().enumerate() {
                     if reprojection_residual_and_jacobians(
                         cam_from_map,
                         observation.world(),
@@ -3423,17 +3843,12 @@ impl VisualFactorSupport {
                     {
                         active_indices.push(observation_index);
                     } else {
-                        initially_excluded_nonprojectable_factor_count += 1;
+                        self.initially_excluded_nonprojectable_factor_count += 1;
                     }
                 }
             }
-            observation_indices_by_frame.push(active_indices);
         }
-
-        Self {
-            observation_indices_by_frame,
-            initially_excluded_nonprojectable_factor_count,
-        }
+        Ok(())
     }
 
     fn indices_for_frame(&self, frame_index: usize) -> &[usize] {
@@ -3441,7 +3856,9 @@ impl VisualFactorSupport {
     }
 
     fn last_frame_factor_count(&self) -> usize {
-        self.observation_indices_by_frame.last().map_or(0, Vec::len)
+        self.active_frame_count
+            .checked_sub(1)
+            .map_or(0, |index| self.observation_indices_by_frame[index].len())
     }
 }
 
@@ -3449,34 +3866,43 @@ impl VisualFactorSupport {
 fn linearize_vio_states(
     window: &VioWindow,
     states: &[crate::NavState],
-    resolved_observations: &[Option<ResolvedObservationSet>],
-    visual_support: &VisualFactorSupport,
+    visual_factors: ResolvedVioVisualFactors<'_>,
     config: &VioSolveConfig,
     map_from_odom: &crate::MapFromOdom,
     evaluation: VioEvaluation,
-) -> Result<VioLinearization, VioSolveError> {
+    output: &mut VioLinearization,
+) -> Result<(), VioSolveError> {
     use crate::ImuFactor;
     use crate::vio::bias_random_walk_residual;
     use crate::vio::solve::{
         IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor, accumulate_factor, imu_jacobians,
     };
     let VioEvaluation { stage, iteration } = evaluation;
+    let ResolvedVioVisualFactors {
+        observations: resolved_observations,
+        support: visual_support,
+    } = visual_factors;
 
     debug_assert_eq!(states.len(), window.len());
     let n_frames = window.len();
-    debug_assert_eq!(resolved_observations.len(), n_frames);
-    debug_assert_eq!(visual_support.observation_indices_by_frame.len(), n_frames);
+    debug_assert!(resolved_observations.len() >= n_frames);
+    debug_assert!(visual_support.observation_indices_by_frame.len() >= n_frames);
     let dim = n_frames * STATE_DIM;
-    let mut hessian = vec![0.0_f64; dim * dim];
-    let mut rhs = vec![0.0_f64; dim];
-    let mut cost_breakdown = VioCostBreakdown::default();
+    output.reset(dim);
+    let VioLinearization {
+        hessian,
+        rhs,
+        cost_breakdown,
+    } = output;
+    let hessian = &mut hessian[..dim * dim];
+    let rhs = &mut rhs[..dim];
 
     for (frame_idx, state) in states.iter().enumerate() {
         let base = frame_idx * STATE_DIM;
         let cam_pose = vio_cam_from_map(state, config.camera_from_body, map_from_odom);
-        if let Some(resolved) = &resolved_observations[frame_idx] {
+        if let Some(resolved) = resolved_observations[frame_idx].available() {
             for &observation_index in visual_support.indices_for_frame(frame_idx) {
-                let obs = &resolved.observations()[observation_index];
+                let obs = &resolved[observation_index];
                 let world = obs.world();
                 let pixel = obs.pixel();
                 let (residual, _, _) =
@@ -3579,15 +4005,7 @@ fn linearize_vio_states(
                 }
                 let r_f64 = [residual_f64[0] * sqrt_w, residual_f64[1] * sqrt_w];
                 let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
-                accumulate_factor(
-                    &mut hessian,
-                    &mut rhs,
-                    dim,
-                    &j_15,
-                    &identity_2,
-                    &r_f64,
-                    base,
-                );
+                accumulate_factor(hessian, rhs, dim, &j_15, &identity_2, &r_f64, base);
             }
         }
     }
@@ -3628,33 +4046,9 @@ fn linearize_vio_states(
 
         let base_prev = succ_idx * STATE_DIM;
         let base_curr = (succ_idx + 1) * STATE_DIM;
-        accumulate_factor(
-            &mut hessian,
-            &mut rhs,
-            dim,
-            &j_prev,
-            info,
-            &residual,
-            base_prev,
-        );
-        accumulate_factor(
-            &mut hessian,
-            &mut rhs,
-            dim,
-            &j_curr,
-            info,
-            &residual,
-            base_curr,
-        );
-        accumulate_cross_factor(
-            &mut hessian,
-            dim,
-            &j_prev,
-            &j_curr,
-            info,
-            base_prev,
-            base_curr,
-        );
+        accumulate_factor(hessian, rhs, dim, &j_prev, info, &residual, base_prev);
+        accumulate_factor(hessian, rhs, dim, &j_curr, info, &residual, base_curr);
+        accumulate_cross_factor(hessian, dim, &j_prev, &j_curr, info, base_prev, base_curr);
     }
 
     for succ_idx in 0..window.successors.len() {
@@ -3735,23 +4129,24 @@ fn linearize_vio_states(
         }
     }
 
-    let linearization = VioLinearization {
-        hessian,
-        rhs,
-        cost_breakdown,
-    };
-    validate_vio_linearization_values(&linearization, evaluation)?;
-    Ok(linearization)
+    validate_vio_linearization_values(output, dim, evaluation)
 }
 
 #[cfg(feature = "vio")]
 fn validate_vio_linearization_values(
     linearization: &VioLinearization,
+    state_dimension: usize,
     evaluation: VioEvaluation,
 ) -> Result<(), VioSolveError> {
     for (quantity, values) in [
-        (VioLinearizationQuantity::Hessian, &linearization.hessian),
-        (VioLinearizationQuantity::RightHandSide, &linearization.rhs),
+        (
+            VioLinearizationQuantity::Hessian,
+            &linearization.hessian[..state_dimension * state_dimension],
+        ),
+        (
+            VioLinearizationQuantity::RightHandSide,
+            &linearization.rhs[..state_dimension],
+        ),
     ] {
         for (index, value) in values.iter().copied().enumerate() {
             if !value.is_finite() {
@@ -4226,6 +4621,46 @@ mod tests {
 
     fn lm(initial_lambda: f32) -> LmConfig {
         LmConfig::new(initial_lambda, 10.0, 1e-8, 1e4, 0.25, 0.75).expect("valid lm")
+    }
+
+    #[cfg(feature = "vio")]
+    fn vio_window_capacity() -> VioWindowCapacity {
+        VioWindowCapacity::new(5).expect("valid test VIO window capacity")
+    }
+
+    #[cfg(feature = "vio")]
+    fn test_preintegrated_imu() -> crate::PreintegratedImu {
+        let batch = crate::ImuBatch::new(vec![
+            crate::ImuSample::new(Timestamp::from_nanos(0), [0.0; 3], [0.0; 3])
+                .expect("first IMU sample"),
+            crate::ImuSample::new(Timestamp::from_nanos(10_000_000), [0.0; 3], [0.0; 3])
+                .expect("second IMU sample"),
+        ])
+        .expect("IMU batch");
+        crate::PreintegratedImu::integrate(
+            &batch,
+            &crate::ImuBias::default(),
+            &crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise"),
+        )
+        .expect("preintegration")
+    }
+
+    #[cfg(feature = "vio")]
+    fn test_vio_solve_config(window_frames: usize) -> VioSolveConfig {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        VioSolveConfig::new(
+            VioWindowCapacity::new(window_frames).expect("window capacity"),
+            crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+            crate::Pose64::identity(),
+            intrinsics,
+            lm(1e-3),
+            NonZeroUsize::new(2).expect("iterations"),
+            2.0,
+            1.0,
+            None,
+        )
+        .expect("VIO solve config")
     }
 
     fn pose_close(a: Pose, b: Pose, tol: f32) -> bool {
@@ -5941,6 +6376,7 @@ mod tests {
             };
             let error = validate_vio_linearization_values(
                 &linearization,
+                1,
                 VioEvaluation {
                     stage: VioEvaluationStage::Candidate,
                     iteration: 3,
@@ -5978,6 +6414,197 @@ mod tests {
         nonfinite[0] = f64::NAN;
         assert!(!vio_step_is_componentwise_small(&nonfinite));
         assert!(!vio_step_is_componentwise_small(&[0.0; VIO_STATE_DIM - 1]));
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_window_capacity_rejects_invalid_dense_workspace_shapes() {
+        for actual in [0, 1] {
+            assert!(matches!(
+                VioWindowCapacity::new(actual),
+                Err(VioWindowCapacityError::TooFewFrames {
+                    minimum: 2,
+                    actual: error_actual,
+                }) if error_actual == actual
+            ));
+        }
+        assert!(matches!(
+            VioWindowCapacity::new(usize::MAX),
+            Err(VioWindowCapacityError::StateDimensionOverflow { .. })
+        ));
+
+        let element_overflow_frames = usize::MAX / VIO_STATE_DIM;
+        assert!(matches!(
+            VioWindowCapacity::new(element_overflow_frames),
+            Err(VioWindowCapacityError::DenseMatrixElementCountOverflow { .. })
+        ));
+
+        let byte_overflow_dimension = 1_usize << (usize::BITS / 2 - 2);
+        let byte_overflow_frames = byte_overflow_dimension.div_ceil(VIO_STATE_DIM);
+        assert!(matches!(
+            VioWindowCapacity::new(byte_overflow_frames),
+            Err(VioWindowCapacityError::DenseMatrixByteLengthUnaddressable { .. })
+        ));
+
+        let capacity = vio_window_capacity();
+        assert_eq!(capacity.frames().get(), 5);
+        assert_eq!(capacity.workspace.dimension, 5 * VIO_STATE_DIM);
+        assert_eq!(
+            capacity.workspace.matrix_elements,
+            25 * VIO_STATE_DIM * VIO_STATE_DIM
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_optimizer_allocation_error_preserves_allocator_source() {
+        let error = try_vio_buffer::<u8>("test", usize::MAX)
+            .expect_err("an unaddressable vector capacity must fail");
+
+        assert!(matches!(
+            error,
+            VioOptimizerWorkspaceError::Allocation {
+                requested_elements: usize::MAX,
+                ..
+            }
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_observation_allocation_error_preserves_full_source_chain() {
+        let mut allocation_probe = Vec::<u8>::new();
+        let source = allocation_probe
+            .try_reserve_exact(usize::MAX)
+            .expect_err("an unaddressable vector capacity must fail");
+        let error = VioSolveError::from(ObservationResolveError::Allocation {
+            requested_observations: usize::MAX,
+            source,
+        });
+
+        let resolution = std::error::Error::source(&error).expect("observation resolution source");
+        let allocator = resolution.source().expect("allocator source");
+        assert!(!allocator.to_string().is_empty());
+        assert!(allocator.source().is_none());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_optimizer_rejects_windows_beyond_preallocated_capacity() {
+        let state = crate::NavState::try_new(
+            crate::Pose64::identity(),
+            [0.0; 3],
+            crate::ImuBias::default(),
+        )
+        .expect("state");
+        let preintegrated = test_preintegrated_imu();
+        let mut window = VioWindow {
+            anchor: VioAnchor {
+                state: state.clone(),
+                observations: None,
+                anchor_velocity_odom_mps: [0.0; 3],
+            },
+            successors: vec![
+                VioSuccessor {
+                    state: state.clone(),
+                    observations: None,
+                    preintegrated: preintegrated.clone(),
+                },
+                VioSuccessor {
+                    state,
+                    observations: None,
+                    preintegrated,
+                },
+            ],
+        };
+        let mut optimizer =
+            VioOptimizer::try_new(test_vio_solve_config(2)).expect("optimizer workspace");
+
+        let error = optimizer
+            .optimize(
+                &mut window,
+                &SlamMap::new(),
+                &crate::MapFromOdom::identity(),
+            )
+            .expect_err("three frames must not enter a two-frame workspace");
+        assert!(matches!(
+            error,
+            VioSolveError::WindowExceedsConfiguredCapacity {
+                actual_frames: 3,
+                capacity_frames: 2,
+            }
+        ));
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_optimizer_reuses_dense_and_state_buffers_across_solves() {
+        fn sorted_pair(first: usize, second: usize) -> [usize; 2] {
+            if first <= second {
+                [first, second]
+            } else {
+                [second, first]
+            }
+        }
+
+        fn allocation_addresses(
+            optimizer: &VioOptimizer,
+        ) -> ([usize; 2], [usize; 2], [usize; 2], usize, usize) {
+            let workspace = &optimizer.workspace;
+            (
+                sorted_pair(
+                    workspace.current_linearization.hessian.as_ptr() as usize,
+                    workspace.scratch_linearization.hessian.as_ptr() as usize,
+                ),
+                sorted_pair(
+                    workspace.current_linearization.rhs.as_ptr() as usize,
+                    workspace.scratch_linearization.rhs.as_ptr() as usize,
+                ),
+                sorted_pair(
+                    workspace.states.as_ptr() as usize,
+                    workspace.candidate_states.as_ptr() as usize,
+                ),
+                workspace.resolved_observations.as_ptr() as usize,
+                workspace
+                    .visual_support
+                    .observation_indices_by_frame
+                    .as_ptr() as usize,
+            )
+        }
+
+        let state = crate::NavState::try_new(
+            crate::Pose64::identity(),
+            [0.0; 3],
+            crate::ImuBias::default(),
+        )
+        .expect("state");
+        let mut window = VioWindow {
+            anchor: VioAnchor {
+                state: state.clone(),
+                observations: None,
+                anchor_velocity_odom_mps: [0.0; 3],
+            },
+            successors: vec![VioSuccessor {
+                state,
+                observations: None,
+                preintegrated: test_preintegrated_imu(),
+            }],
+        };
+        let mut optimizer =
+            VioOptimizer::try_new(test_vio_solve_config(5)).expect("optimizer workspace");
+        let before = allocation_addresses(&optimizer);
+
+        for _ in 0..2 {
+            optimizer
+                .optimize(
+                    &mut window,
+                    &SlamMap::new(),
+                    &crate::MapFromOdom::identity(),
+                )
+                .expect("bounded VIO solve");
+            assert_eq!(allocation_addresses(&optimizer), before);
+        }
     }
 
     #[cfg(feature = "vio")]
@@ -6033,6 +6660,7 @@ mod tests {
         for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(matches!(
                 VioSolveConfig::new(
+                    vio_window_capacity(),
                     crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
                     crate::Pose64::identity(),
                     intrinsics,
@@ -6049,6 +6677,7 @@ mod tests {
         }
         assert!(matches!(
             VioSolveConfig::new(
+                vio_window_capacity(),
                 crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
                 crate::Pose64::identity(),
                 intrinsics,
@@ -6063,6 +6692,7 @@ mod tests {
         for huber_delta_px in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(matches!(
                 VioSolveConfig::new(
+                    vio_window_capacity(),
                     crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
                     crate::Pose64::identity(),
                     intrinsics,
@@ -6079,6 +6709,7 @@ mod tests {
         for huber_delta_px in [0.0, -1.0] {
             assert!(matches!(
                 VioSolveConfig::new(
+                    vio_window_capacity(),
                     crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
                     crate::Pose64::identity(),
                     intrinsics,
@@ -6101,6 +6732,7 @@ mod tests {
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let prior = VioBiasPrior::new(2.0, 3.0, crate::ImuBias::default()).expect("bias prior");
         let config = VioSolveConfig::new(
+            vio_window_capacity(),
             crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
             crate::Pose64::identity(),
             intrinsics,
@@ -6118,10 +6750,12 @@ mod tests {
         )
         .expect("state");
         let states = vec![state.clone()];
-        let resolved = vec![None];
+        let resolved = vec![VioResolvedFrameObservations::default()];
         let map_from_odom = crate::MapFromOdom::identity();
-        let support =
-            VisualFactorSupport::from_initial_states(&states, &resolved, &config, &map_from_odom);
+        let mut support = VisualFactorSupport::try_new(1).expect("visual support workspace");
+        support
+            .update_from_initial_states(&states, &resolved, &config, &map_from_odom)
+            .expect("visual support");
         let window = VioWindow {
             anchor: VioAnchor {
                 state,
@@ -6131,17 +6765,22 @@ mod tests {
             successors: Vec::new(),
         };
 
-        let linearization = linearize_vio_states(
+        let mut linearization =
+            VioLinearization::try_new(vio_window_capacity().workspace).expect("linearization");
+        linearize_vio_states(
             &window,
             &states,
-            &resolved,
-            &support,
+            ResolvedVioVisualFactors {
+                observations: &resolved,
+                support: &support,
+            },
             &config,
             &map_from_odom,
             VioEvaluation {
                 stage: VioEvaluationStage::Initial,
                 iteration: 0,
             },
+            &mut linearization,
         )
         .expect("finite linearization");
         let accel_index = 9;
@@ -6165,6 +6804,7 @@ mod tests {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let config = VioSolveConfig::new(
+            vio_window_capacity(),
             crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
             crate::Pose64::identity(),
             intrinsics,
@@ -6203,35 +6843,29 @@ mod tests {
         )
         .expect("behind observation");
         let resolved = vec![
-            None,
-            Some(ResolvedObservationSet {
+            VioResolvedFrameObservations::default(),
+            VioResolvedFrameObservations {
+                available: true,
                 observations: vec![front, behind],
-            }),
+            },
         ];
         let map_from_odom = crate::MapFromOdom::identity();
-        let support = VisualFactorSupport::from_initial_states(
-            &initial_states,
-            &resolved,
-            &config,
-            &map_from_odom,
-        );
+        let mut support = VisualFactorSupport::try_new(2).expect("visual support workspace");
+        support
+            .update_from_initial_states(&initial_states, &resolved, &config, &map_from_odom)
+            .expect("visual support");
         assert_eq!(support.indices_for_frame(1), &[0]);
         assert_eq!(support.last_frame_factor_count(), 1);
         assert_eq!(support.initially_excluded_nonprojectable_factor_count, 1);
+        let active_index_buffer = support.observation_indices_by_frame[1].as_ptr();
+        support
+            .update_from_initial_states(&initial_states, &resolved, &config, &map_from_odom)
+            .expect("repeat visual support update");
+        assert_eq!(
+            support.observation_indices_by_frame[1].as_ptr(),
+            active_index_buffer
+        );
 
-        let batch = crate::ImuBatch::new(vec![
-            crate::ImuSample::new(Timestamp::from_nanos(0), [0.0; 3], [0.0; 3])
-                .expect("first IMU sample"),
-            crate::ImuSample::new(Timestamp::from_nanos(10_000_000), [0.0; 3], [0.0; 3])
-                .expect("second IMU sample"),
-        ])
-        .expect("IMU batch");
-        let preintegrated = crate::PreintegratedImu::integrate(
-            &batch,
-            &crate::ImuBias::default(),
-            &crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise"),
-        )
-        .expect("preintegration");
         let window = VioWindow {
             anchor: VioAnchor {
                 state: initial_states[0].clone(),
@@ -6241,7 +6875,7 @@ mod tests {
             successors: vec![VioSuccessor {
                 state: initial_states[1].clone(),
                 observations: None,
-                preintegrated,
+                preintegrated: test_preintegrated_imu(),
             }],
         };
         let moved_past_point = crate::NavState::try_new(
@@ -6255,17 +6889,22 @@ mod tests {
         .expect("translated state");
         let candidate_states = vec![initial_states[0].clone(), moved_past_point];
 
+        let mut candidate_linearization =
+            VioLinearization::try_new(vio_window_capacity().workspace).expect("linearization");
         let error = match linearize_vio_states(
             &window,
             &candidate_states,
-            &resolved,
-            &support,
+            ResolvedVioVisualFactors {
+                observations: &resolved,
+                support: &support,
+            },
             &config,
             &map_from_odom,
             VioEvaluation {
                 stage: VioEvaluationStage::Candidate,
                 iteration: 1,
             },
+            &mut candidate_linearization,
         ) {
             Ok(_) => panic!("candidate must not remove an initially active visual factor"),
             Err(error) => error,

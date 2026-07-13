@@ -26,6 +26,10 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_LM_MIN=1e-8            LM lambda floor
     KIKO_LM_MAX=10000           LM lambda ceiling
 
+  Visual-Inertial Optimization (requires `vio` feature):
+    KIKO_VIO_WINDOW=5           Max frames; minimum 2, dense workspace allocated at startup
+    KIKO_VIO_ITERS=3            Max LM iterations per VIO solve
+
   Keyframe Policy:
     KIKO_KEYFRAME_MIN_POINTS=12          Min triangulated points to accept keyframe
     KIKO_KEYFRAME_REFRESH_INLIERS=12     Min inliers to skip keyframe insertion
@@ -610,5 +614,12 @@ mod tests {
     #[test]
     fn slam_env_help_mentions_runtime_imu_override_file_env() {
         assert!(SLAM_ENV_HELP.contains("KIKO_IMU_CALIBRATION_FILE"));
+    }
+
+    #[test]
+    fn slam_env_help_describes_vio_workspace_controls() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_VIO_WINDOW=5"));
+        assert!(SLAM_ENV_HELP.contains("minimum 2"));
+        assert!(SLAM_ENV_HELP.contains("KIKO_VIO_ITERS=3"));
     }
 }
