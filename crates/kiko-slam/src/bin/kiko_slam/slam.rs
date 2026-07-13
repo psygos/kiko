@@ -174,7 +174,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
     if dense_cloud_enabled {
         eprintln!(
-            "stable surface map: enabled (measured sparse stereo -> surface belief); TSDF remains disabled in stereo-only slam mode"
+            "stable surface map: enabled (measured sparse stereo -> surface belief; TSDF integration unsupported)"
         );
     }
     #[cfg(feature = "vio")]

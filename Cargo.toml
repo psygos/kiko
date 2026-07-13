@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
   "crates/kiko-slam",
-  "crates/nvblox-sys",
   "crates/oak-sys",
   "comms/robot-server",
   "comms/desktop-client/src-tauri",

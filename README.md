@@ -12,8 +12,7 @@ Kiko is a social robot combining custom SLAM and an expression engine. The SLAM 
 kiko/
 ├── crates/
 │   ├── kiko-slam/       # SLAM, VIO, inference, Rerun visualization
-│   ├── oak-sys/         # OAK-D camera FFI bindings
-│   └── nvblox-sys/      # Optional dense mapping FFI bindings
+│   └── oak-sys/         # OAK-D camera FFI bindings
 ├── comms/
 │   ├── robot-server/    # Robot communication hub
 │   └── desktop-client/  # Tauri control UI

@@ -7,7 +7,6 @@ edition = "2024"
 default = []
 record = ["oak-sys", "ctrlc", "chrono"]
 vio = []
-nvblox = ["nvblox-sys"]
 ort-coreml = ["ort/coreml"]
 ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]
@@ -26,7 +25,6 @@ re_log_encoding = "=0.27.3"
 serde = "1.0.228"
 serde_json = "1.0.149"
 slotmap = "1.0"
-nvblox-sys = { path = "../nvblox-sys", optional = true }
 oak-sys = { path = "../oak-sys", optional = true }
 ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }

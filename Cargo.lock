@@ -5793,7 +5793,6 @@ dependencies = [
  "image 0.25.10",
  "libc",
  "ndarray 0.17.2",
- "nvblox-sys",
  "oak-sys",
  "ort",
  "re_arrow_util",
@@ -6839,13 +6838,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "nvblox-sys"
-version = "0.1.0"
-dependencies = [
- "cc",
 ]
 
 [[package]]

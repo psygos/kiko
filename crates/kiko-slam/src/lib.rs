@@ -45,7 +45,6 @@ mod surface_map;
 pub(crate) mod test_helpers;
 mod tracker;
 mod triangulation;
-mod tsdf;
 #[cfg(feature = "vio")]
 mod vio;
 mod viz;
@@ -165,11 +164,6 @@ pub use triangulation::{
     RectifiedStereo, RectifiedStereoError, SparseStereoSample, SparseStereoSamples,
     TriangulationConfig, TriangulationConfigError, TriangulationError, TriangulationResult,
     TriangulationStats, Triangulator,
-};
-pub use tsdf::{
-    MeshData, TsdfCameraIntrinsics, TsdfCameraIntrinsicsError, TsdfConfig, TsdfConfigError,
-    TsdfIntegrateMsg, TsdfIntegrateMsgError, TsdfMeshOutcome, TsdfSubmitOutcome, TsdfWorker,
-    TsdfWorkerError,
 };
 #[cfg(feature = "vio")]
 pub use vio::{

@@ -488,33 +488,6 @@ impl RerunSink {
         self.log_surface_map_state()
     }
 
-    /// Log TSDF mesh as a triangle mesh with vertex colors.
-    pub fn log_tsdf_mesh(&self, mesh: &crate::tsdf::MeshData) -> Result<(), VizLogError> {
-        if mesh.positions.is_empty() {
-            return Ok(());
-        }
-        let positions: Vec<rerun::Position3D> = mesh
-            .positions
-            .iter()
-            .map(|p| rerun::Position3D::new(p[0], p[1], p[2]))
-            .collect();
-        let indices: Vec<rerun::TriangleIndices> = mesh
-            .indices
-            .iter()
-            .map(|t| rerun::TriangleIndices::from([t[0], t[1], t[2]]))
-            .collect();
-        let colors: Vec<rerun::Color> = mesh
-            .colors
-            .iter()
-            .map(|c| rerun::Color::from_rgb(c[0], c[1], c[2]))
-            .collect();
-        let mesh3d = rerun::Mesh3D::new(positions)
-            .with_triangle_indices(indices)
-            .with_vertex_colors(colors);
-        self.rec.log_static("world/tsdf_mesh", &mesh3d)?;
-        Ok(())
-    }
-
     pub fn log_vio_telemetry(
         &self,
         timestamp: Timestamp,
