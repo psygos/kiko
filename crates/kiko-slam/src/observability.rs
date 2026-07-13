@@ -42,6 +42,7 @@ const PATH_HEALTH_BACKEND_ALIVE: &str = "diagnostics/health/backend_alive";
 const PATH_HEALTH_DESCRIPTOR_ALIVE: &str = "diagnostics/health/descriptor_alive";
 const PATH_HEALTH_BACKEND_SUBMITTED: &str = "diagnostics/health/backend_submitted";
 const PATH_HEALTH_BACKEND_APPLIED: &str = "diagnostics/health/backend_applied";
+const PATH_HEALTH_BACKEND_UNCHANGED: &str = "diagnostics/health/backend_unchanged";
 const PATH_HEALTH_BACKEND_DROPPED_FULL: &str = "diagnostics/health/backend_dropped_full";
 const PATH_HEALTH_BACKEND_DROPPED_DISCONNECTED: &str =
     "diagnostics/health/backend_dropped_disconnected";
@@ -106,6 +107,9 @@ const PATH_TRI_DROPPED_DUPLICATE: &str = "diagnostics/triangulation/dropped_dupl
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
 const PATH_BA_ITERATIONS: &str = "diagnostics/ba/iterations";
+const PATH_BA_ACCEPTED_STEPS: &str = "diagnostics/ba/accepted_steps";
+const PATH_BA_STALLED: &str = "diagnostics/ba/stalled";
+const PATH_BA_STATIONARY: &str = "diagnostics/ba/stationary";
 const PATH_POSE_BA_ITERATIONS: &str = "diagnostics/pose_ba/iterations";
 const PATH_POSE_BA_CONVERGED: &str = "diagnostics/pose_ba/converged";
 #[cfg(feature = "vio")]
@@ -410,16 +414,38 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
 
     if let Some(ba_result) = diag.ba_result.as_ref() {
         match ba_result {
-            BaResult::Converged {
-                iterations,
-                final_cost,
+            BaResult::Optimized(optimization) => {
+                scalars.push((
+                    PATH_BA_ITERATIONS,
+                    optimization.termination().iterations().get() as f64,
+                ));
+                scalars.push((
+                    PATH_BA_ACCEPTED_STEPS,
+                    optimization.accepted_steps().get() as f64,
+                ));
+                scalars.push((PATH_BA_FINAL_COST, optimization.final_cost().get()));
+                scalars.push((PATH_BA_STALLED, 0.0));
+                scalars.push((PATH_BA_STATIONARY, 0.0));
             }
-            | BaResult::MaxIterations {
-                iterations,
-                final_cost,
-            } => {
-                scalars.push((PATH_BA_ITERATIONS, *iterations as f64));
-                scalars.push((PATH_BA_FINAL_COST, *final_cost));
+            BaResult::Stationary(stationary) => {
+                scalars.push((
+                    PATH_BA_ITERATIONS,
+                    stationary.detected_at_iteration().get() as f64,
+                ));
+                scalars.push((PATH_BA_ACCEPTED_STEPS, 0.0));
+                scalars.push((PATH_BA_FINAL_COST, stationary.retained_cost().get()));
+                scalars.push((PATH_BA_STALLED, 0.0));
+                scalars.push((PATH_BA_STATIONARY, 1.0));
+            }
+            BaResult::Stalled(stall) => {
+                scalars.push((
+                    PATH_BA_ITERATIONS,
+                    stall.attempted_iterations().get() as f64,
+                ));
+                scalars.push((PATH_BA_ACCEPTED_STEPS, 0.0));
+                scalars.push((PATH_BA_FINAL_COST, stall.retained_cost().get()));
+                scalars.push((PATH_BA_STALLED, 1.0));
+                scalars.push((PATH_BA_STATIONARY, 0.0));
             }
             BaResult::Degenerate { .. } => {}
         }
@@ -557,6 +583,14 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             format!("backend BA degenerate: {reason:?}"),
             rerun::TextLogLevel::WARN,
         ),
+        DiagnosticEvent::BaStalled {
+            attempted_iterations,
+        } => (
+            format!(
+                "backend BA stalled without an accepted step after {attempted_iterations} iterations"
+            ),
+            rerun::TextLogLevel::WARN,
+        ),
     }
 }
 
@@ -669,6 +703,10 @@ impl RerunSink {
             &rerun::Scalars::single(health.backend_stats.applied as f64),
         )?;
         rec.log(
+            PATH_HEALTH_BACKEND_UNCHANGED,
+            &rerun::Scalars::single(health.backend_stats.unchanged as f64),
+        )?;
+        rec.log(
             PATH_HEALTH_BACKEND_DROPPED_FULL,
             &rerun::Scalars::single(health.backend_stats.dropped_full as f64),
         )?;
@@ -703,7 +741,9 @@ impl RerunSink {
 #[cfg(test)]
 mod tests {
     use super::{
-        PATH_HEALTH_PNP_INLIER_RATIO, PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
+        PATH_BA_ACCEPTED_STEPS, PATH_BA_FINAL_COST, PATH_BA_ITERATIONS, PATH_BA_STALLED,
+        PATH_BA_STATIONARY, PATH_HEALTH_PNP_INLIER_RATIO,
+        PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MAX,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_MSE_PER_AXIS,
         PATH_HEALTH_PNP_PROJECTABLE_TRACKED_REPROJECTION_RMSE,
         PATH_HEALTH_VIO_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE,
@@ -756,6 +796,49 @@ mod tests {
                 .iter()
                 .any(|(path, value)| *path == PATH_MAP_POINTS && *value == 13.0)
         );
+    }
+
+    #[test]
+    fn diagnostics_scalars_distinguish_optimized_stationary_and_stalled_ba() {
+        let iterations = std::num::NonZeroUsize::new(3).expect("nonzero");
+        let accepted_steps = std::num::NonZeroUsize::new(2).expect("nonzero");
+        let optimized = crate::BaResult::Optimized(
+            crate::BaOptimization::new(
+                crate::BaTermination::IterationLimit { iterations },
+                accepted_steps,
+                crate::BaCost::new(1.5).expect("valid cost"),
+            )
+            .expect("valid result"),
+        );
+        let stationary = crate::BaResult::Stationary(crate::BaStationary::new(
+            std::num::NonZeroUsize::MIN,
+            crate::BaCost::new(2.5).expect("valid cost"),
+        ));
+        let stalled = crate::BaResult::Stalled(crate::BaStall::new(
+            iterations,
+            crate::BaCost::new(3.5).expect("valid cost"),
+        ));
+
+        for (result, expected) in [
+            (optimized, (3.0, 2.0, 1.5, 0.0, 0.0)),
+            (stationary, (1.0, 0.0, 2.5, 0.0, 1.0)),
+            (stalled, (3.0, 0.0, 3.5, 1.0, 0.0)),
+        ] {
+            let mut diagnostics = FrameDiagnostics::empty(0, 0);
+            diagnostics.ba_result = Some(result);
+            let scalars = diagnostics_scalars(&diagnostics);
+            let value = |path| {
+                scalars
+                    .iter()
+                    .find_map(|(actual, value)| (*actual == path).then_some(*value))
+                    .expect("BA scalar")
+            };
+            assert_eq!(value(PATH_BA_ITERATIONS), expected.0);
+            assert_eq!(value(PATH_BA_ACCEPTED_STEPS), expected.1);
+            assert_eq!(value(PATH_BA_FINAL_COST), expected.2);
+            assert_eq!(value(PATH_BA_STALLED), expected.3);
+            assert_eq!(value(PATH_BA_STATIONARY), expected.4);
+        }
     }
 
     #[test]
@@ -1015,6 +1098,9 @@ mod tests {
         });
         let _ = format_event(&DiagnosticEvent::BaDegenerate {
             reason: crate::DegenerateReason::NoFactors,
+        });
+        let _ = format_event(&DiagnosticEvent::BaStalled {
+            attempted_iterations: std::num::NonZeroUsize::MIN,
         });
     }
 }

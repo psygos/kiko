@@ -375,11 +375,185 @@ impl LocalBaConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct BaCost(f64);
+
+impl BaCost {
+    pub fn new(value: f64) -> Result<Self, BaCostError> {
+        if !value.is_finite() {
+            return Err(BaCostError::NonFinite { value });
+        }
+        if value < 0.0 {
+            return Err(BaCostError::Negative { value });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BaCostError {
+    NonFinite { value: f64 },
+    Negative { value: f64 },
+}
+
+impl std::fmt::Display for BaCostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { value } => write!(f, "BA cost must be finite, got {value}"),
+            Self::Negative { value } => write!(f, "BA cost must be non-negative, got {value}"),
+        }
+    }
+}
+
+impl std::error::Error for BaCostError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaTermination {
+    Converged { iterations: NonZeroUsize },
+    IterationLimit { iterations: NonZeroUsize },
+}
+
+impl BaTermination {
+    pub fn iterations(self) -> NonZeroUsize {
+        match self {
+            Self::Converged { iterations } | Self::IterationLimit { iterations } => iterations,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaOptimization {
+    termination: BaTermination,
+    accepted_steps: NonZeroUsize,
+    final_cost: BaCost,
+}
+
+impl BaOptimization {
+    pub(crate) fn new(
+        termination: BaTermination,
+        accepted_steps: NonZeroUsize,
+        final_cost: BaCost,
+    ) -> Result<Self, BaOutcomeError> {
+        let iterations = termination.iterations();
+        if accepted_steps > iterations {
+            return Err(BaOutcomeError::AcceptedStepsExceedIterations {
+                accepted_steps,
+                iterations,
+            });
+        }
+        Ok(Self {
+            termination,
+            accepted_steps,
+            final_cost,
+        })
+    }
+
+    pub fn termination(self) -> BaTermination {
+        self.termination
+    }
+
+    pub fn accepted_steps(self) -> NonZeroUsize {
+        self.accepted_steps
+    }
+
+    pub fn final_cost(self) -> BaCost {
+        self.final_cost
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaStall {
+    attempted_iterations: NonZeroUsize,
+    retained_cost: BaCost,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BaStationary {
+    detected_at_iteration: NonZeroUsize,
+    retained_cost: BaCost,
+}
+
+impl BaStationary {
+    pub(crate) fn new(detected_at_iteration: NonZeroUsize, retained_cost: BaCost) -> Self {
+        Self {
+            detected_at_iteration,
+            retained_cost,
+        }
+    }
+
+    pub fn detected_at_iteration(self) -> NonZeroUsize {
+        self.detected_at_iteration
+    }
+
+    pub fn retained_cost(self) -> BaCost {
+        self.retained_cost
+    }
+}
+
+impl BaStall {
+    pub(crate) fn new(attempted_iterations: NonZeroUsize, retained_cost: BaCost) -> Self {
+        Self {
+            attempted_iterations,
+            retained_cost,
+        }
+    }
+
+    pub fn attempted_iterations(self) -> NonZeroUsize {
+        self.attempted_iterations
+    }
+
+    pub fn retained_cost(self) -> BaCost {
+        self.retained_cost
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaOutcomeError {
+    AcceptedStepsExceedIterations {
+        accepted_steps: NonZeroUsize,
+        iterations: NonZeroUsize,
+    },
+}
+
+impl std::fmt::Display for BaOutcomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AcceptedStepsExceedIterations {
+                accepted_steps,
+                iterations,
+            } => write!(
+                f,
+                "BA accepted steps ({accepted_steps}) exceed attempted iterations ({iterations})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BaOutcomeError {}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum BaResult {
-    Converged { iterations: usize, final_cost: f64 },
-    MaxIterations { iterations: usize, final_cost: f64 },
+    Optimized(BaOptimization),
+    Stationary(BaStationary),
+    Stalled(BaStall),
     Degenerate { reason: DegenerateReason },
+}
+
+impl BaResult {
+    pub fn optimization(&self) -> Option<BaOptimization> {
+        match self {
+            Self::Optimized(optimization) => Some(*optimization),
+            Self::Stationary(_) | Self::Stalled(_) | Self::Degenerate { .. } => None,
+        }
+    }
+
+    pub fn is_applicable(&self) -> bool {
+        matches!(self, Self::Optimized(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,6 +603,17 @@ pub enum BaExecutionError {
         iteration: usize,
         source: LinearSolveError,
     },
+    InvalidCost {
+        stage: &'static str,
+        iteration: usize,
+        source: BaCostError,
+    },
+    InvalidOutcome {
+        source: BaOutcomeError,
+    },
+    InvariantViolation {
+        message: &'static str,
+    },
 }
 
 impl std::fmt::Display for BaExecutionError {
@@ -469,6 +654,20 @@ impl std::fmt::Display for BaExecutionError {
                 f,
                 "full BA pose system failed at iteration {iteration}: {source}"
             ),
+            Self::InvalidCost {
+                stage,
+                iteration,
+                source,
+            } => write!(
+                f,
+                "full BA {stage} cost is invalid at iteration {iteration}: {source}"
+            ),
+            Self::InvalidOutcome { source } => {
+                write!(f, "full BA produced an invalid outcome: {source}")
+            }
+            Self::InvariantViolation { message } => {
+                write!(f, "full BA invariant violation: {message}")
+            }
         }
     }
 }
@@ -479,9 +678,12 @@ impl std::error::Error for BaExecutionError {
             Self::MapLookup { source, .. } | Self::WriteBack { source } => Some(source),
             Self::LandmarkLinearSystem { source, .. } => Some(source),
             Self::PoseLinearSystem { source, .. } => Some(source),
+            Self::InvalidCost { source, .. } => Some(source),
+            Self::InvalidOutcome { source } => Some(source),
             Self::DuplicateKeyframe { .. }
             | Self::MissingKeyframe { .. }
-            | Self::DuplicateLandmarkObservation { .. } => None,
+            | Self::DuplicateLandmarkObservation { .. }
+            | Self::InvariantViolation { .. } => None,
         }
     }
 }
@@ -1853,10 +2055,7 @@ impl LocalBundleAdjuster {
         };
 
         let result = self.optimize_full(&mut problem)?;
-        if matches!(
-            result,
-            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-        ) {
+        if result.is_applicable() {
             problem
                 .write_back(map)
                 .map_err(|source| BaExecutionError::WriteBack { source })?;
@@ -1893,15 +2092,21 @@ impl LocalBundleAdjuster {
         let lm_config = self.config.lm();
         let initial_cost = match full_problem_cost(problem, self.intrinsics, huber, motion_weight) {
             Ok(cost) => cost,
-            Err(nonprojectable) => {
+            Err(FullProblemCostError::NonProjectable { count }) => {
                 return Ok(BaResult::Degenerate {
-                    reason: DegenerateReason::NonProjectableFactors {
-                        count: nonprojectable.count.get(),
-                    },
+                    reason: DegenerateReason::NonProjectableFactors { count: count.get() },
+                });
+            }
+            Err(FullProblemCostError::InvalidCost { source }) => {
+                return Err(BaExecutionError::InvalidCost {
+                    stage: "initial",
+                    iteration: 0,
+                    source,
                 });
             }
         };
-        let mut lm_state = LmState::new(lm_config, initial_cost);
+        let mut lm_state = LmState::new(lm_config, initial_cost.get());
+        let mut accepted_steps = 0_usize;
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
         let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
@@ -2077,45 +2282,134 @@ impl LocalBundleAdjuster {
             let prev_cost = lm_state.prev_cost();
             let (action, candidate_cost) =
                 match full_problem_cost(problem, self.intrinsics, huber, motion_weight) {
-                    Ok(cost) => (lm_state.step(cost, predicted_decrease, lm_config), cost),
-                    Err(_) => {
+                    Ok(cost) => (
+                        lm_state.step(cost.get(), predicted_decrease, lm_config),
+                        cost,
+                    ),
+                    Err(FullProblemCostError::NonProjectable { .. }) => {
                         lm_state.reject(lm_config);
-                        (LmAction::Reject, prev_cost)
+                        (
+                            LmAction::Reject,
+                            BaCost::new(prev_cost).map_err(|source| {
+                                BaExecutionError::InvalidCost {
+                                    stage: "retained",
+                                    iteration: iter + 1,
+                                    source,
+                                }
+                            })?,
+                        )
+                    }
+                    Err(FullProblemCostError::InvalidCost { source }) => {
+                        restore_full_ba_candidate(
+                            problem,
+                            pose_backup.as_slice(),
+                            landmark_backup.as_slice(),
+                        );
+                        return Err(BaExecutionError::InvalidCost {
+                            stage: "candidate",
+                            iteration: iter + 1,
+                            source,
+                        });
                     }
                 };
             match action {
                 LmAction::Accept => {
+                    accepted_steps = accepted_steps.saturating_add(1);
                     let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
                     if max_step < STEP_CONVERGENCE_THRESHOLD
-                        || (prev_cost - candidate_cost).abs() <= threshold
+                        || (prev_cost - candidate_cost.get()).abs() <= threshold
                     {
-                        return Ok(BaResult::Converged {
-                            iterations: iter + 1,
-                            final_cost: candidate_cost,
-                        });
+                        let iterations = nonzero_iteration_index(iter);
+                        let accepted_steps = NonZeroUsize::new(accepted_steps).ok_or(
+                            BaExecutionError::InvariantViolation {
+                                message: "accepted LM action did not increment accepted-step count",
+                            },
+                        )?;
+                        let optimization = BaOptimization::new(
+                            BaTermination::Converged { iterations },
+                            accepted_steps,
+                            candidate_cost,
+                        )
+                        .map_err(|source| BaExecutionError::InvalidOutcome { source })?;
+                        return Ok(BaResult::Optimized(optimization));
                     }
                 }
                 LmAction::Reject => {
-                    for (pose_var, pose) in
-                        problem.poses.iter_mut().zip(pose_backup.iter().copied())
-                    {
-                        pose_var.pose = pose;
-                    }
-                    for (landmark_var, point) in problem
-                        .landmarks
-                        .iter_mut()
-                        .zip(landmark_backup.iter().copied())
-                    {
-                        landmark_var.position = point;
+                    restore_full_ba_candidate(
+                        problem,
+                        pose_backup.as_slice(),
+                        landmark_backup.as_slice(),
+                    );
+                    if max_step <= f32::EPSILON {
+                        let iterations = nonzero_iteration_index(iter);
+                        let retained_cost = BaCost::new(prev_cost).map_err(|source| {
+                            BaExecutionError::InvalidCost {
+                                stage: "stationary",
+                                iteration: iterations.get(),
+                                source,
+                            }
+                        })?;
+                        let Some(accepted_steps) = NonZeroUsize::new(accepted_steps) else {
+                            return Ok(BaResult::Stationary(BaStationary::new(
+                                iterations,
+                                retained_cost,
+                            )));
+                        };
+                        let optimization = BaOptimization::new(
+                            BaTermination::Converged { iterations },
+                            accepted_steps,
+                            retained_cost,
+                        )
+                        .map_err(|source| BaExecutionError::InvalidOutcome { source })?;
+                        return Ok(BaResult::Optimized(optimization));
                     }
                 }
             }
         }
 
-        Ok(BaResult::MaxIterations {
-            iterations: max_iters,
-            final_cost: lm_state.prev_cost(),
-        })
+        let attempted_iterations = self.config.max_iterations;
+        let final_cost =
+            BaCost::new(lm_state.prev_cost()).map_err(|source| BaExecutionError::InvalidCost {
+                stage: "final",
+                iteration: max_iters,
+                source,
+            })?;
+        let Some(accepted_steps) = NonZeroUsize::new(accepted_steps) else {
+            return Ok(BaResult::Stalled(BaStall::new(
+                attempted_iterations,
+                final_cost,
+            )));
+        };
+        let optimization = BaOptimization::new(
+            BaTermination::IterationLimit {
+                iterations: attempted_iterations,
+            },
+            accepted_steps,
+            final_cost,
+        )
+        .map_err(|source| BaExecutionError::InvalidOutcome { source })?;
+        Ok(BaResult::Optimized(optimization))
+    }
+}
+
+fn nonzero_iteration_index(zero_based_iteration: usize) -> NonZeroUsize {
+    NonZeroUsize::MIN.saturating_add(zero_based_iteration)
+}
+
+fn restore_full_ba_candidate(
+    problem: &mut FullBaProblem,
+    pose_backup: &[Pose],
+    landmark_backup: &[Point3],
+) {
+    for (pose_var, pose) in problem.poses.iter_mut().zip(pose_backup.iter().copied()) {
+        pose_var.pose = pose;
+    }
+    for (landmark_var, point) in problem
+        .landmarks
+        .iter_mut()
+        .zip(landmark_backup.iter().copied())
+    {
+        landmark_var.position = point;
     }
 }
 
@@ -2558,9 +2852,10 @@ fn vio_cam_from_map(
     map_from_odom.odom_to_map(cam_from_odom).to_pose32()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct NonProjectableFactors {
-    count: NonZeroUsize,
+#[derive(Debug)]
+enum FullProblemCostError {
+    NonProjectable { count: NonZeroUsize },
+    InvalidCost { source: BaCostError },
 }
 
 fn full_problem_cost(
@@ -2568,7 +2863,7 @@ fn full_problem_cost(
     intrinsics: PinholeIntrinsics,
     huber_delta_px: f32,
     motion_weight: f32,
-) -> Result<f64, NonProjectableFactors> {
+) -> Result<BaCost, FullProblemCostError> {
     let mut cost = 0.0_f64;
     let huber = huber_delta_px as f64;
     let mut nonprojectable_count = 0_usize;
@@ -2604,8 +2899,8 @@ fn full_problem_cost(
     }
 
     match NonZeroUsize::new(nonprojectable_count) {
-        Some(count) => Err(NonProjectableFactors { count }),
-        None => Ok(cost),
+        Some(count) => Err(FullProblemCostError::NonProjectable { count }),
+        None => BaCost::new(cost).map_err(|source| FullProblemCostError::InvalidCost { source }),
     }
 }
 
@@ -3289,6 +3584,28 @@ mod tests {
     }
 
     #[test]
+    fn ba_outcome_types_reject_forged_costs_and_step_counts() {
+        assert!(matches!(
+            BaCost::new(f64::NAN),
+            Err(BaCostError::NonFinite { .. })
+        ));
+        assert!(matches!(
+            BaCost::new(-1.0),
+            Err(BaCostError::Negative { .. })
+        ));
+        let iterations = NonZeroUsize::new(2).expect("nonzero");
+        let accepted_steps = NonZeroUsize::new(3).expect("nonzero");
+        assert!(matches!(
+            BaOptimization::new(
+                BaTermination::IterationLimit { iterations },
+                accepted_steps,
+                BaCost::new(1.0).expect("valid cost"),
+            ),
+            Err(BaOutcomeError::AcceptedStepsExceedIterations { .. })
+        ));
+    }
+
+    #[test]
     fn lm_state_good_rho_decreases_lambda() {
         let config = LmConfig::default();
         let mut state = LmState::new(config, 10.0);
@@ -3657,7 +3974,10 @@ mod tests {
 
         let error = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
             .expect_err("a behind-camera factor cannot disappear from cost");
-        assert_eq!(error.count.get(), 1);
+        assert!(matches!(
+            error,
+            FullProblemCostError::NonProjectable { count } if count.get() == 1
+        ));
 
         let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
@@ -3793,7 +4113,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_full_returns_max_iterations_with_bad_init() {
+    fn optimize_full_returns_iteration_limit_with_bad_init() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.8, -0.3, 0.4, 0.2, -0.1, 0.15]);
         let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
@@ -3807,8 +4127,143 @@ mod tests {
         .expect("full BA problem");
         assert!(matches!(
             ba.optimize_full(&mut problem),
-            Ok(BaResult::MaxIterations { iterations: 1, .. })
+            Ok(BaResult::Optimized(optimization))
+                if matches!(
+                    optimization.termination(),
+                    BaTermination::IterationLimit { iterations } if iterations.get() == 1
+                )
         ));
+    }
+
+    #[test]
+    fn optimize_full_reports_stationary_problem_without_applicable_correction() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let point = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 3.0,
+        };
+        let mut factors = Vec::new();
+        for pose in [PoseVarIndex(0), PoseVarIndex(1)] {
+            factors.push(ReprojectionFactor {
+                pose,
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 310.0, y: 240.0 },
+            });
+            factors.push(ReprojectionFactor {
+                pose,
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 330.0, y: 240.0 },
+            });
+        }
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: point,
+            }],
+            factors,
+        };
+        let config = LocalBaConfig::new(5, 3, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+
+        let result = ba.optimize_full(&mut problem).expect("stationary solve");
+
+        assert!(matches!(
+            result,
+            BaResult::Stationary(stationary)
+                if stationary.detected_at_iteration() == NonZeroUsize::MIN
+        ));
+        assert!(!result.is_applicable());
+        assert!(pose_close(problem.poses[1].pose, Pose::identity(), 0.0));
+        assert_eq!(problem.landmarks[0].position.x, point.x);
+        assert_eq!(problem.landmarks[0].position.y, point.y);
+        assert_eq!(problem.landmarks[0].position.z, point.z);
+    }
+
+    #[test]
+    fn stalled_ba_result_cannot_be_applied_as_a_correction() {
+        let result = BaResult::Stalled(BaStall::new(
+            NonZeroUsize::new(3).expect("nonzero"),
+            BaCost::new(4.0).expect("valid cost"),
+        ));
+        assert!(!result.is_applicable());
+        assert!(result.optimization().is_none());
+    }
+
+    #[test]
+    fn optimize_full_reports_rejected_nonzero_proposals_as_stalled() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let original_point = Point3 {
+            x: 1e-3,
+            y: 0.0,
+            z: 1e-3,
+        };
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: original_point,
+            }],
+            factors: vec![
+                ReprojectionFactor {
+                    pose: PoseVarIndex(0),
+                    landmark: LandmarkVarIndex(0),
+                    pixel: Keypoint {
+                        x: 10_000.0,
+                        y: 240.0,
+                    },
+                },
+                ReprojectionFactor {
+                    pose: PoseVarIndex(1),
+                    landmark: LandmarkVarIndex(0),
+                    pixel: Keypoint {
+                        x: 10_000.0,
+                        y: 240.0,
+                    },
+                },
+            ],
+        };
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e4), 0.0).expect("BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let original_poses: Vec<_> = problem.poses.iter().map(|pose| pose.pose).collect();
+
+        let result = ba.optimize_full(&mut problem).expect("stalled solve");
+
+        assert!(matches!(result, BaResult::Stalled(_)), "got {result:?}");
+        assert!(!result.is_applicable());
+        assert!(
+            problem
+                .poses
+                .iter()
+                .zip(original_poses)
+                .all(|(actual, expected)| pose_close(actual.pose, expected, 0.0))
+        );
+        assert!(
+            problem.landmarks[0].position.x == original_point.x
+                && problem.landmarks[0].position.y == original_point.y
+                && problem.landmarks[0].position.z == original_point.z
+        );
     }
 
     #[test]
@@ -3826,12 +4281,12 @@ mod tests {
         .expect("full BA problem");
         let result = ba.optimize_full(&mut problem).expect("full BA solve");
         match result {
-            BaResult::Converged {
-                iterations,
-                final_cost,
-            } => {
-                assert!(iterations < config.max_iterations());
-                assert!(final_cost.is_finite());
+            BaResult::Optimized(optimization) => {
+                let BaTermination::Converged { iterations } = optimization.termination() else {
+                    panic!("expected convergence, got {optimization:?}");
+                };
+                assert!(iterations.get() < config.max_iterations());
+                assert!(optimization.final_cost().get().is_finite());
             }
             other => panic!("expected convergence, got {other:?}"),
         }
@@ -3851,18 +4306,17 @@ mod tests {
         )
         .expect("full BA problem");
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
-            .expect("initial factors are projectable");
+            .expect("initial factors are projectable")
+            .get();
         let result = ba.optimize_full(&mut problem).expect("full BA solve");
         let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
-            .expect("optimized factors remain projectable");
+            .expect("optimized factors remain projectable")
+            .get();
         assert!(
             after < before,
             "cost did not improve: before={before}, after={after}"
         );
-        assert!(matches!(
-            result,
-            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-        ));
+        assert!(result.is_applicable());
     }
 
     #[test]
@@ -3879,13 +4333,12 @@ mod tests {
         )
         .expect("full BA problem");
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
-            .expect("initial factors are projectable");
+            .expect("initial factors are projectable")
+            .get();
         let result = ba.optimize_full(&mut problem).expect("full BA solve");
         let final_cost = match result {
-            BaResult::Converged { final_cost, .. } | BaResult::MaxIterations { final_cost, .. } => {
-                final_cost
-            }
-            BaResult::Degenerate { reason } => panic!("unexpected degeneracy: {reason:?}"),
+            BaResult::Optimized(optimization) => optimization.final_cost().get(),
+            other => panic!("unexpected BA outcome: {other:?}"),
         };
         assert!(
             final_cost <= before + 1e-6,
@@ -4103,10 +4556,7 @@ mod tests {
             .optimize_keyframe_window(&mut map, &[kf_0, kf_1])
             .expect("full local BA execution");
         assert!(
-            matches!(
-                result,
-                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-            ),
+            result.is_applicable(),
             "full local BA should succeed, got {result:?}"
         );
         assert_map_invariants(&map).expect("map invariants after BA");

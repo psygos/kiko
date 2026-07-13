@@ -106,7 +106,8 @@ pub use local_ba::{
     VioSolveTermination,
 };
 pub use local_ba::{
-    BaCorrection, BaExecutionError, BaResult, DegenerateReason, LinearSolveError, LmConfig,
+    BaCorrection, BaCost, BaCostError, BaExecutionError, BaOptimization, BaOutcomeError, BaResult,
+    BaStall, BaStationary, BaTermination, DegenerateReason, LinearSolveError, LmConfig,
     LmConfigError, LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation,
     Matrix3InverseError, ObservationResolveError, ObservationSet, ObservationSetError, PoseBaError,
     PoseBaOutcome, PoseBaRefinement, PoseBaTermination,

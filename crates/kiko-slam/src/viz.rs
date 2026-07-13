@@ -860,6 +860,16 @@ impl SurfacePoseQualityGate {
                     .max_accepted_inlier_reprojection_rmse_px,
             };
         }
+        if let Some(crate::BaResult::Stalled(stall)) = diagnostics.ba_result.as_ref() {
+            return SurfacePoseQualityDecision::RejectStalledBundleAdjustment {
+                accepted_inliers,
+                min_required_accepted_inliers: self.min_accepted_inliers,
+                stall: *stall,
+                accepted_inlier_reprojection_rmse_px: diagnostics.pnp_inlier_reprojection_rmse_px,
+                max_allowed_accepted_inlier_reprojection_rmse_px: self
+                    .max_accepted_inlier_reprojection_rmse_px,
+            };
+        }
         match diagnostics.pnp_inlier_reprojection_rmse_px {
             Some(accepted_inlier_reprojection_rmse_px)
                 if accepted_inlier_reprojection_rmse_px.value_px()
@@ -915,6 +925,14 @@ enum SurfacePoseQualityDecision {
         max_allowed_accepted_inlier_reprojection_rmse_px:
             crate::PnpAcceptedInlierPixelResidualMetric,
     },
+    RejectStalledBundleAdjustment {
+        accepted_inliers: crate::PnpAcceptedInlierCountMetric,
+        min_required_accepted_inliers: crate::PnpAcceptedInlierCountMetric,
+        stall: crate::BaStall,
+        accepted_inlier_reprojection_rmse_px: Option<crate::PnpAcceptedInlierPixelResidualMetric>,
+        max_allowed_accepted_inlier_reprojection_rmse_px:
+            crate::PnpAcceptedInlierPixelResidualMetric,
+    },
     RejectHighAcceptedInlierReprojectionRmse {
         accepted_inliers: crate::PnpAcceptedInlierCountMetric,
         min_required_accepted_inliers: crate::PnpAcceptedInlierCountMetric,
@@ -942,7 +960,7 @@ impl SurfacePoseQualityDecision {
 }
 
 fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&'static str, f64)> {
-    let mut scalars = Vec::with_capacity(14);
+    let mut scalars = Vec::with_capacity(16);
     let (
         accepted,
         rejected_low_count,
@@ -1046,6 +1064,28 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
             accepted_inlier_reprojection_rmse_px.map(|value| value.value_px() as f64),
             Some(max_allowed_accepted_inlier_reprojection_rmse_px.value_px() as f64),
         ),
+        SurfacePoseQualityDecision::RejectStalledBundleAdjustment {
+            accepted_inliers,
+            min_required_accepted_inliers,
+            stall: _,
+            accepted_inlier_reprojection_rmse_px,
+            max_allowed_accepted_inlier_reprojection_rmse_px,
+        } => (
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            Some(accepted_inliers.count() as f64),
+            Some(min_required_accepted_inliers.count() as f64),
+            accepted_inlier_reprojection_rmse_px.map(|value| value.value_px() as f64),
+            Some(max_allowed_accepted_inlier_reprojection_rmse_px.value_px() as f64),
+        ),
         SurfacePoseQualityDecision::RejectHighAcceptedInlierReprojectionRmse {
             accepted_inliers,
             min_required_accepted_inliers,
@@ -1123,6 +1163,26 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
     scalars.push((
         "diagnostics/surface/pose_gate/rejected_degenerate_ba_result",
         rejected_degenerate_ba_result,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/rejected_stalled_ba_result",
+        if matches!(
+            decision,
+            SurfacePoseQualityDecision::RejectStalledBundleAdjustment { .. }
+        ) {
+            1.0
+        } else {
+            0.0
+        },
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/stalled_ba_iterations",
+        match decision {
+            SurfacePoseQualityDecision::RejectStalledBundleAdjustment { stall, .. } => {
+                stall.attempted_iterations().get() as f64
+            }
+            _ => 0.0,
+        },
     ));
     scalars.push((
         "diagnostics/surface/pose_gate/rejected_high_accepted_inlier_reprojection_rmse",
@@ -1833,6 +1893,42 @@ mod tests {
     }
 
     #[test]
+    fn surface_pose_quality_gate_rejects_stalled_ba_but_allows_stationary_ba() {
+        let gate = SurfacePoseQualityGate::default();
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
+        diagnostics.pnp_inlier_reprojection_rmse_px =
+            Some(crate::PnpAcceptedInlierPixelResidualMetric::new(1.0).expect("rmse"));
+        let iterations = std::num::NonZeroUsize::new(3).expect("nonzero");
+        diagnostics.ba_result = Some(crate::BaResult::Stalled(crate::BaStall::new(
+            iterations,
+            crate::BaCost::new(2.0).expect("cost"),
+        )));
+
+        let stalled = gate.decide(&diagnostics);
+        assert!(matches!(
+            stalled,
+            SurfacePoseQualityDecision::RejectStalledBundleAdjustment { stall, .. }
+                if stall.attempted_iterations() == iterations
+        ));
+        let scalars = surface_pose_quality_scalars(&stalled);
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/rejected_stalled_ba_result",
+            1.0
+        )));
+        assert!(scalars.contains(&("diagnostics/surface/pose_gate/stalled_ba_iterations", 3.0)));
+
+        diagnostics.ba_result = Some(crate::BaResult::Stationary(crate::BaStationary::new(
+            std::num::NonZeroUsize::MIN,
+            crate::BaCost::new(1.0).expect("cost"),
+        )));
+        assert!(matches!(
+            gate.decide(&diagnostics),
+            SurfacePoseQualityDecision::Accept { .. }
+        ));
+    }
+
+    #[test]
     fn surface_pose_quality_scalars_export_decision_and_threshold() {
         let decision =
             SurfacePoseQualityDecision::RejectHighAcceptedInlierReprojectionRmse {
@@ -1990,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn log_surface_observations_degenerate_ba_path_leaves_surface_map_unchanged() {
+    fn log_surface_observations_non_applicable_ba_paths_leave_surface_map_unchanged() {
         let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
             .memory()
             .expect("in-memory rerun stream");
@@ -2020,6 +2116,28 @@ mod tests {
             false,
         )
         .expect("surface logging");
+
+        assert_eq!(sink.surface_map.num_voxels(), 0);
+
+        diagnostics.ba_result = Some(crate::BaResult::Stalled(crate::BaStall::new(
+            std::num::NonZeroUsize::new(3).expect("nonzero"),
+            crate::BaCost::new(2.0).expect("cost"),
+        )));
+        sink.log_surface_observations(
+            Timestamp::from_nanos(2),
+            &[[0.0, 0.0, 2.0]],
+            &[point],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+            true,
+            false,
+        )
+        .expect("stalled surface logging");
 
         assert_eq!(sink.surface_map.num_voxels(), 0);
         assert!(storage.num_msgs() > 0);

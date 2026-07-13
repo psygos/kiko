@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::local_ba::{BaResult, DegenerateReason};
@@ -605,12 +606,16 @@ pub enum DiagnosticEvent {
     BaDegenerate {
         reason: DegenerateReason,
     },
+    BaStalled {
+        attempted_iterations: NonZeroUsize,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::mem::discriminant;
+    use std::num::NonZeroUsize;
 
     use super::{
         DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics, LoopClosureRejectReason,
@@ -826,13 +831,16 @@ mod tests {
             DiagnosticEvent::BaDegenerate {
                 reason: DegenerateReason::NoFactors,
             },
+            DiagnosticEvent::BaStalled {
+                attempted_iterations: NonZeroUsize::MIN,
+            },
         ];
 
         let mut kinds = HashSet::new();
         for event in events {
             kinds.insert(discriminant(&event));
         }
-        assert_eq!(kinds.len(), 7);
+        assert_eq!(kinds.len(), 8);
     }
 
     #[test]

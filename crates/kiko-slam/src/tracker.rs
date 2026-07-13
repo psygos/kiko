@@ -737,10 +737,7 @@ impl CorrectionEvent {
             result: result.clone(),
         };
 
-        if matches!(
-            result,
-            BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-        ) {
+        if result.is_applicable() {
             correction.pose_deltas = Vec::with_capacity(event.window.as_slice().len());
             for &keyframe_id in event.window.as_slice() {
                 let before = event
@@ -834,6 +831,7 @@ pub struct BackendStats {
     pub dropped_full: u64,
     pub dropped_disconnected: u64,
     pub applied: u64,
+    pub unchanged: u64,
     pub stale: u64,
     pub rejected: u64,
     pub worker_failures: u64,
@@ -872,6 +870,7 @@ impl std::error::Error for SubmitEventError {
 
 #[derive(Debug)]
 enum ApplyCorrectionError {
+    NonApplicableBaOutcome,
     StaleSnapshot {
         current: MapSnapshot,
         correction: MapSnapshot,
@@ -888,6 +887,12 @@ enum ApplyCorrectionError {
 impl std::fmt::Display for ApplyCorrectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ApplyCorrectionError::NonApplicableBaOutcome => {
+                write!(
+                    f,
+                    "cannot apply a BA outcome that contains no accepted step"
+                )
+            }
             ApplyCorrectionError::StaleSnapshot {
                 current,
                 correction,
@@ -910,7 +915,8 @@ impl std::error::Error for ApplyCorrectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ApplyCorrectionError::Map(source) => Some(source),
-            ApplyCorrectionError::StaleSnapshot { .. }
+            ApplyCorrectionError::NonApplicableBaOutcome
+            | ApplyCorrectionError::StaleSnapshot { .. }
             | ApplyCorrectionError::MissingKeyframe { .. }
             | ApplyCorrectionError::MissingMapPoint { .. } => None,
         }
@@ -3309,7 +3315,7 @@ impl SlamTracker {
             };
             match response {
                 BackendResponse::Correction(correction) => match &correction.correction.result {
-                    BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
+                    BaResult::Optimized(_) => {
                         let current_snapshot = self.global_map.map().snapshot();
                         match apply_correction_event(
                             self.global_map.map_mut(),
@@ -3342,6 +3348,28 @@ impl SlamTracker {
                             "backend BA degenerate (req={}, keyframe={:?}): {reason:?}",
                             correction.request_id.as_u64(),
                             correction.trigger_keyframe
+                        );
+                    }
+                    BaResult::Stationary(stationary) => {
+                        self.backend_stats.unchanged =
+                            self.backend_stats.unchanged.saturating_add(1);
+                        eprintln!(
+                            "backend BA already stationary (req={}, keyframe={:?}, iteration={})",
+                            correction.request_id.as_u64(),
+                            correction.trigger_keyframe,
+                            stationary.detected_at_iteration(),
+                        );
+                    }
+                    BaResult::Stalled(stall) => {
+                        self.backend_stats.rejected = self.backend_stats.rejected.saturating_add(1);
+                        self.emit_event(DiagnosticEvent::BaStalled {
+                            attempted_iterations: stall.attempted_iterations(),
+                        });
+                        eprintln!(
+                            "backend BA stalled (req={}, keyframe={:?}, iterations={})",
+                            correction.request_id.as_u64(),
+                            correction.trigger_keyframe,
+                            stall.attempted_iterations(),
                         );
                     }
                 },
@@ -4434,22 +4462,12 @@ impl SlamTracker {
                                         &window,
                                     )?;
                                     ba_result = Some(result.clone());
-                                    if matches!(
-                                        result,
-                                        BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                                    ) {}
                                 }
-                            } else if matches!(
-                                {
-                                    let result = self.ba.optimize_keyframe_window(
-                                        self.global_map.map_mut(),
-                                        &window,
-                                    )?;
-                                    ba_result = Some(result.clone());
-                                    result
-                                },
-                                BaResult::Converged { .. } | BaResult::MaxIterations { .. }
-                            ) {
+                            } else {
+                                let result = self
+                                    .ba
+                                    .optimize_keyframe_window(self.global_map.map_mut(), &window)?;
+                                ba_result = Some(result);
                             }
                         }
                         self.state = TrackerState::Tracking {
@@ -5061,6 +5079,9 @@ fn apply_correction_event(
     current_snapshot: MapSnapshot,
     correction: &CorrectionEvent,
 ) -> Result<(), ApplyCorrectionError> {
+    if !correction.correction.result.is_applicable() {
+        return Err(ApplyCorrectionError::NonApplicableBaOutcome);
+    }
     if correction.source_snapshot != current_snapshot {
         return Err(ApplyCorrectionError::StaleSnapshot {
             current: current_snapshot,
@@ -5665,10 +5686,16 @@ mod tests {
             correction: BaCorrection {
                 pose_deltas: vec![(keyframe_id, [0.0; 6])],
                 landmark_deltas: vec![(point_id, [1.0, 2.0, 3.0])],
-                result: BaResult::Converged {
-                    iterations: 1,
-                    final_cost: 0.0,
-                },
+                result: BaResult::Optimized(
+                    crate::BaOptimization::new(
+                        crate::BaTermination::Converged {
+                            iterations: NonZeroUsize::MIN,
+                        },
+                        NonZeroUsize::MIN,
+                        crate::BaCost::new(0.0).expect("finite cost"),
+                    )
+                    .expect("valid BA result"),
+                ),
             },
         };
         let position = map.point(point_id).expect("point").position();
@@ -5679,6 +5706,43 @@ mod tests {
             apply_correction_event(&mut map, stale, &correction),
             Err(ApplyCorrectionError::StaleSnapshot { .. })
         ));
+    }
+
+    #[test]
+    fn correction_apply_rejects_stalled_ba_even_with_forged_deltas() {
+        let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        let source_snapshot = map.snapshot();
+        let original_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        let original_point = map.point(point_id).expect("point").position();
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::MIN),
+            source_snapshot,
+            trigger_keyframe: keyframe_id,
+            correction: BaCorrection {
+                pose_deltas: vec![(keyframe_id, [1.0; 6])],
+                landmark_deltas: vec![(point_id, [1.0; 3])],
+                result: BaResult::Stalled(crate::BaStall::new(
+                    NonZeroUsize::MIN,
+                    crate::BaCost::new(1.0).expect("valid cost"),
+                )),
+            },
+        };
+
+        let error = apply_correction_event(&mut map, source_snapshot, &correction)
+            .expect_err("stalled BA must not mutate the map");
+
+        assert!(matches!(
+            error,
+            ApplyCorrectionError::NonApplicableBaOutcome
+        ));
+        let retained_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        assert_eq!(retained_pose.rotation(), original_pose.rotation());
+        assert_eq!(retained_pose.translation(), original_pose.translation());
+        let retained_point = map.point(point_id).expect("point").position();
+        assert_eq!(retained_point.x, original_point.x);
+        assert_eq!(retained_point.y, original_point.y);
+        assert_eq!(retained_point.z, original_point.z);
+        assert_eq!(map.snapshot(), source_snapshot);
     }
 
     #[test]
@@ -5730,10 +5794,16 @@ mod tests {
                         corrected_point.z - 1.0,
                     ],
                 )],
-                result: BaResult::Converged {
-                    iterations: 2,
-                    final_cost: 0.1,
-                },
+                result: BaResult::Optimized(
+                    crate::BaOptimization::new(
+                        crate::BaTermination::Converged {
+                            iterations: NonZeroUsize::new(2).expect("nonzero"),
+                        },
+                        NonZeroUsize::new(2).expect("nonzero"),
+                        crate::BaCost::new(0.1).expect("finite cost"),
+                    )
+                    .expect("valid BA result"),
+                ),
             },
         };
 
@@ -5808,8 +5878,9 @@ mod tests {
                 assert!(matches!(
                     correction.correction.result,
                     BaResult::Degenerate { .. }
-                        | BaResult::Converged { .. }
-                        | BaResult::MaxIterations { .. }
+                        | BaResult::Optimized(_)
+                        | BaResult::Stationary(_)
+                        | BaResult::Stalled(_)
                 ));
             }
             BackendResponse::Failure { error, .. } => {
