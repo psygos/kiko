@@ -1958,8 +1958,8 @@ impl VioTelemetry {
         let bias = state.bias();
         Self {
             velocity_odom_mps: state.velocity_odom_mps(),
-            accel_bias_mps2: bias.accel,
-            gyro_bias_radps: bias.gyro,
+            accel_bias_mps2: bias.accel_mps2(),
+            gyro_bias_radps: bias.gyro_radps(),
         }
     }
 
@@ -2216,8 +2216,8 @@ impl VioRuntime {
     fn bias_seed(&self) -> crate::ImuBias {
         self.last_optimized_state
             .as_ref()
-            .map(|state| state.bias().clone())
-            .or_else(|| self.calibrated_bias.clone())
+            .map(|state| *state.bias())
+            .or(self.calibrated_bias)
             .unwrap_or_default()
     }
 
@@ -2537,9 +2537,8 @@ impl SlamTracker {
                     let gravity = Gravity::try_new([0.0, inertial.gravity_magnitude_mps2(), 0.0])
                         .map_err(|source| TrackerInitError::VioGravity { source })?;
                     let camera_from_body = inertial.extrinsics().t_cam_imu();
-                    let calibrated_bias = inertial.initial_bias().cloned();
+                    let calibrated_bias = inertial.initial_bias().copied();
                     let bias_prior = calibrated_bias
-                        .clone()
                         .map(|bias| crate::VioBiasPrior::new(100.0, bias))
                         .transpose()
                         .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
@@ -2775,7 +2774,7 @@ impl SlamTracker {
         let prev_vel = vio_runtime.velocity_seed(body_odom, capture_time);
         let prev_bias = vio_runtime.bias_seed();
 
-        let nav_state = crate::NavState::try_new(body_odom, prev_vel, prev_bias.clone())
+        let nav_state = crate::NavState::try_new(body_odom, prev_vel, prev_bias)
             .map_err(TrackerError::VioState)?;
 
         // Preintegrate pending IMU
@@ -2845,6 +2844,7 @@ impl SlamTracker {
                 if self.trace_transitions {
                     let vel = optimized.velocity_odom_mps();
                     let bias = optimized.bias();
+                    let accel_bias_mps2 = bias.accel_mps2();
                     let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
                     let delta_t =
                         (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
@@ -2866,9 +2866,9 @@ impl SlamTracker {
                         vel[0],
                         vel[1],
                         vel[2],
-                        bias.accel[0],
-                        bias.accel[1],
-                        bias.accel[2],
+                        accel_bias_mps2[0],
+                        accel_bias_mps2[1],
+                        accel_bias_mps2[2],
                         delta_t * 1000.0,
                         delta_r.to_degrees() * 1000.0,
                     );
@@ -2968,6 +2968,7 @@ impl SlamTracker {
         if self.trace_transitions {
             let vel = optimized.velocity_odom_mps();
             let bias = optimized.bias();
+            let accel_bias_mps2 = bias.accel_mps2();
             let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
             let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
             let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
@@ -2987,9 +2988,9 @@ impl SlamTracker {
                 vel[0],
                 vel[1],
                 vel[2],
-                bias.accel[0],
-                bias.accel[1],
-                bias.accel[2],
+                accel_bias_mps2[0],
+                accel_bias_mps2[1],
+                accel_bias_mps2[2],
                 delta_t * 1000.0,
                 delta_r.to_degrees() * 1000.0,
             );
@@ -8225,10 +8226,8 @@ mod tests {
                 [0.0, 0.0, 0.0],
             )),
             [0.1, 0.2, 0.3],
-            crate::ImuBias {
-                accel: [0.01, 0.02, 0.03],
-                gyro: [0.001, 0.002, 0.003],
-            },
+            crate::ImuBias::try_new([0.01, 0.02, 0.03], [0.001, 0.002, 0.003])
+                .expect("finite stale bias"),
         )
         .expect("stale nav state");
         let replacement_state = crate::NavState::try_new(
@@ -8237,10 +8236,8 @@ mod tests {
                 [1.0, -0.5, 0.25],
             )),
             [0.4, 0.5, 0.6],
-            crate::ImuBias {
-                accel: [0.3, -0.1, 0.2],
-                gyro: [0.01, -0.02, 0.03],
-            },
+            crate::ImuBias::try_new([0.3, -0.1, 0.2], [0.01, -0.02, 0.03])
+                .expect("finite replacement bias"),
         )
         .expect("replacement nav state");
 
@@ -8301,8 +8298,14 @@ mod tests {
             committed.velocity_odom_mps(),
             replacement_state.velocity_odom_mps()
         );
-        assert_eq!(committed.bias().accel, replacement_state.bias().accel);
-        assert_eq!(committed.bias().gyro, replacement_state.bias().gyro);
+        assert_eq!(
+            committed.bias().accel_mps2(),
+            replacement_state.bias().accel_mps2()
+        );
+        assert_eq!(
+            committed.bias().gyro_radps(),
+            replacement_state.bias().gyro_radps()
+        );
         let predicted = runtime.predicted_state.as_ref().expect("predicted state");
         assert_eq!(
             predicted.pose_odom_from_body().translation(),
@@ -8329,17 +8332,15 @@ mod tests {
     #[test]
     fn vio_runtime_commit_authoritative_pose_keeps_authoritative_bias_and_uses_pose_delta_velocity()
     {
-        let previous_bias = crate::ImuBias {
-            accel: [0.3, -0.1, 0.2],
-            gyro: [0.01, -0.02, 0.03],
-        };
+        let previous_bias = crate::ImuBias::try_new([0.3, -0.1, 0.2], [0.01, -0.02, 0.03])
+            .expect("finite previous bias");
         let previous_state = crate::NavState::try_new(
             Pose64::from_pose32(Pose::from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 [0.5, -0.5, 1.0],
             )),
             [1.0, 2.0, 3.0],
-            previous_bias.clone(),
+            previous_bias,
         )
         .expect("previous nav state");
         let observations = make_single_observation_set();
@@ -8363,10 +8364,9 @@ mod tests {
                 Timestamp::from_nanos(1_000_000_000),
                 previous_state.pose_odom_from_body(),
             )),
-            calibrated_bias: Some(crate::ImuBias {
-                accel: [9.0, 9.0, 9.0],
-                gyro: [9.0, 9.0, 9.0],
-            }),
+            calibrated_bias: Some(
+                crate::ImuBias::try_new([9.0; 3], [9.0; 3]).expect("finite calibrated bias"),
+            ),
             last_optimized_state: Some(previous_state),
             solve_config: make_test_vio_solve_config(),
             vio_window: None,
@@ -8392,16 +8392,16 @@ mod tests {
             committed.pose_odom_from_body().translation(),
             [2.0, 0.0, 5.0]
         );
-        assert_eq!(committed.bias().accel, previous_bias.accel);
-        assert_eq!(committed.bias().gyro, previous_bias.gyro);
+        assert_eq!(committed.bias().accel_mps2(), previous_bias.accel_mps2());
+        assert_eq!(committed.bias().gyro_radps(), previous_bias.gyro_radps());
         assert!((committed.velocity_odom_mps()[0] - 1.5).abs() < 1e-12);
         assert!((committed.velocity_odom_mps()[1] - 0.5).abs() < 1e-12);
         assert!((committed.velocity_odom_mps()[2] - 4.0).abs() < 1e-12);
         let window = runtime.vio_window.as_ref().expect("vio window");
         assert_eq!(window.len(), 1);
         assert_eq!(
-            window.anchor.synced.nav_state().bias().accel,
-            previous_bias.accel
+            window.anchor.synced.nav_state().bias().accel_mps2(),
+            previous_bias.accel_mps2()
         );
         assert!(window.anchor.observations.is_some());
     }
@@ -8415,10 +8415,8 @@ mod tests {
                 [0.5, -0.5, 1.0],
             )),
             [1.0, 2.0, 3.0],
-            crate::ImuBias {
-                accel: [0.3, -0.1, 0.2],
-                gyro: [0.01, -0.02, 0.03],
-            },
+            crate::ImuBias::try_new([0.3, -0.1, 0.2], [0.01, -0.02, 0.03])
+                .expect("finite previous bias"),
         )
         .expect("previous nav state");
         let mut runtime = VioRuntime {

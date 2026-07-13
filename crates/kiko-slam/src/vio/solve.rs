@@ -378,10 +378,7 @@ mod tests {
                 [1.0, -0.5, 0.3],
             ),
             [0.5, -0.2, 0.1],
-            ImuBias {
-                accel: [0.1, -0.05, 0.02],
-                gyro: [0.001, -0.002, 0.003],
-            },
+            ImuBias::try_new([0.1, -0.05, 0.02], [0.001, -0.002, 0.003]).expect("finite bias"),
         )
         .expect("state_i");
         let state_j = NavState::try_new(
@@ -394,10 +391,7 @@ mod tests {
                 [1.5, -0.3, 0.6],
             ),
             [0.8, -0.1, 0.3],
-            ImuBias {
-                accel: [0.12, -0.04, 0.03],
-                gyro: [0.002, -0.001, 0.004],
-            },
+            ImuBias::try_new([0.12, -0.04, 0.03], [0.002, -0.001, 0.004]).expect("finite bias"),
         )
         .expect("state_j");
         let preintegrated = PreintegratedImu::integrate(

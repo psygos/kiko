@@ -1,5 +1,5 @@
 use crate::math::{mat_mul_f64, mat_mul_vec_f64, so3_exp_f64, so3_log_f64};
-use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample};
+use crate::{ImuBatch, ImuBias, ImuBiasError, ImuNoiseModel, ImuSample};
 
 const BIAS_FD_EPS: f64 = 1e-6;
 
@@ -7,6 +7,7 @@ const BIAS_FD_EPS: f64 = 1e-6;
 pub enum PreintegrationError {
     TooFewSamples { len: usize },
     NonPositiveDeltaTime { dt_seconds: f64 },
+    InvalidBiasPerturbation { source: ImuBiasError },
 }
 
 impl std::fmt::Display for PreintegrationError {
@@ -21,11 +22,24 @@ impl std::fmt::Display for PreintegrationError {
             PreintegrationError::NonPositiveDeltaTime { dt_seconds } => {
                 write!(f, "imu sample dt must be > 0, got {dt_seconds}")
             }
+            PreintegrationError::InvalidBiasPerturbation { source } => {
+                write!(
+                    f,
+                    "invalid finite-difference imu bias perturbation: {source}"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for PreintegrationError {}
+impl std::error::Error for PreintegrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidBiasPerturbation { source } => Some(source),
+            Self::TooFewSamples { .. } | Self::NonPositiveDeltaTime { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CorrectedPreintegration {
@@ -74,7 +88,7 @@ impl PreintegratedImu {
         Ok(Self {
             batch: batch.clone(),
             noise: noise.clone(),
-            bias_linearization: bias.clone(),
+            bias_linearization: *bias,
             delta_rotation: core.delta_rotation,
             delta_velocity: core.delta_velocity,
             delta_position: core.delta_position,
@@ -93,8 +107,8 @@ impl PreintegratedImu {
     }
 
     pub fn corrected_first_order(&self, new_bias: &ImuBias) -> CorrectedPreintegration {
-        let delta_accel = sub_vec3(new_bias.accel, self.bias_linearization.accel);
-        let delta_gyro = sub_vec3(new_bias.gyro, self.bias_linearization.gyro);
+        let delta_accel = sub_vec3(new_bias.accel_mps2(), self.bias_linearization.accel_mps2());
+        let delta_gyro = sub_vec3(new_bias.gyro_radps(), self.bias_linearization.gyro_radps());
         let rotation_delta = mat_mul_vec_f64(self.d_rotation_d_gyro_bias, delta_gyro);
         let rotation = mat_mul_f64(so3_exp_f64(rotation_delta), self.delta_rotation);
         let velocity = add_vec3(
@@ -191,6 +205,8 @@ fn integrate_core(
     let mut delta_position = [0.0_f64; 3];
     let mut dt_total = 0.0_f64;
     let mut covariance = [[0.0_f64; 9]; 9];
+    let accel_bias_mps2 = bias.accel_mps2();
+    let gyro_bias_radps = bias.gyro_radps();
 
     for pair in samples.windows(2) {
         let a = &pair[0];
@@ -200,12 +216,12 @@ fn integrate_core(
             return Err(PreintegrationError::NonPositiveDeltaTime { dt_seconds: dt });
         }
 
-        let gyro_a = sub_vec3(a.gyro_radps(), bias.gyro);
-        let gyro_b = sub_vec3(b.gyro_radps(), bias.gyro);
+        let gyro_a = sub_vec3(a.gyro_radps(), gyro_bias_radps);
+        let gyro_b = sub_vec3(b.gyro_radps(), gyro_bias_radps);
         let omega_mid = scale_vec3(add_vec3(gyro_a, gyro_b), 0.5);
 
-        let accel_a = sub_vec3(a.accel_mps2(), bias.accel);
-        let accel_b = sub_vec3(b.accel_mps2(), bias.accel);
+        let accel_a = sub_vec3(a.accel_mps2(), accel_bias_mps2);
+        let accel_b = sub_vec3(b.accel_mps2(), accel_bias_mps2);
 
         let delta_rotation_next =
             mat_mul_f64(delta_rotation, so3_exp_f64(scale_vec3(omega_mid, dt)));
@@ -262,10 +278,16 @@ fn finite_difference_gyro_jacobian(
 ) -> Result<[[f64; 3]; 3], PreintegrationError> {
     let mut jacobian = [[0.0_f64; 3]; 3];
     for axis in 0..3 {
-        let mut plus = bias.clone();
-        let mut minus = bias.clone();
-        plus.gyro[axis] += BIAS_FD_EPS;
-        minus.gyro[axis] -= BIAS_FD_EPS;
+        let mut plus_delta = [0.0; 3];
+        let mut minus_delta = [0.0; 3];
+        plus_delta[axis] = BIAS_FD_EPS;
+        minus_delta[axis] = -BIAS_FD_EPS;
+        let plus = bias
+            .checked_add([0.0; 3], plus_delta)
+            .map_err(|source| PreintegrationError::InvalidBiasPerturbation { source })?;
+        let minus = bias
+            .checked_add([0.0; 3], minus_delta)
+            .map_err(|source| PreintegrationError::InvalidBiasPerturbation { source })?;
         let plus_projected = project(integrate_core(batch.samples(), &plus, noise)?);
         let minus_projected = project(integrate_core(batch.samples(), &minus, noise)?);
         for row in 0..3 {
@@ -284,10 +306,16 @@ fn finite_difference_accel_jacobian(
 ) -> Result<[[f64; 3]; 3], PreintegrationError> {
     let mut jacobian = [[0.0_f64; 3]; 3];
     for axis in 0..3 {
-        let mut plus = bias.clone();
-        let mut minus = bias.clone();
-        plus.accel[axis] += BIAS_FD_EPS;
-        minus.accel[axis] -= BIAS_FD_EPS;
+        let mut plus_delta = [0.0; 3];
+        let mut minus_delta = [0.0; 3];
+        plus_delta[axis] = BIAS_FD_EPS;
+        minus_delta[axis] = -BIAS_FD_EPS;
+        let plus = bias
+            .checked_add(plus_delta, [0.0; 3])
+            .map_err(|source| PreintegrationError::InvalidBiasPerturbation { source })?;
+        let minus = bias
+            .checked_add(minus_delta, [0.0; 3])
+            .map_err(|source| PreintegrationError::InvalidBiasPerturbation { source })?;
         let plus_projected = project(integrate_core(batch.samples(), &plus, noise)?);
         let minus_projected = project(integrate_core(batch.samples(), &minus, noise)?);
         for row in 0..3 {
@@ -658,10 +686,8 @@ mod tests {
         let base_bias = ImuBias::default();
         let preintegrated =
             PreintegratedImu::integrate(&batch, &base_bias, &noise()).expect("preintegrated");
-        let new_bias = ImuBias {
-            accel: [1e-4, -2e-4, 3e-4],
-            gyro: [-1e-4, 2e-4, -1e-4],
-        };
+        let new_bias =
+            ImuBias::try_new([1e-4, -2e-4, 3e-4], [-1e-4, 2e-4, -1e-4]).expect("finite bias");
         let corrected = preintegrated.corrected_first_order(&new_bias);
         let exact = preintegrated
             .reintegrate_exact(&new_bias)

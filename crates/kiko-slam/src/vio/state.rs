@@ -1,5 +1,5 @@
 use crate::math::{se3_exp_f64, se3_log_f64};
-use crate::{ImuBias, Pose64};
+use crate::{ImuBias, ImuBiasError, Pose64};
 
 pub type NavTangent = [f64; 15];
 
@@ -8,8 +8,7 @@ pub enum NavStateError {
     NonFinitePoseTranslation { axis: usize, value: f64 },
     NonFinitePoseRotation { row: usize, col: usize, value: f64 },
     NonFiniteVelocity { axis: usize, value: f64 },
-    NonFiniteBiasAccel { axis: usize, value: f64 },
-    NonFiniteBiasGyro { axis: usize, value: f64 },
+    InvalidBias { source: ImuBiasError },
 }
 
 impl std::fmt::Display for NavStateError {
@@ -30,20 +29,23 @@ impl std::fmt::Display for NavStateError {
             NavStateError::NonFiniteVelocity { axis, value } => {
                 write!(f, "velocity axis {axis} must be finite, got {value}")
             }
-            NavStateError::NonFiniteBiasAccel { axis, value } => {
-                write!(
-                    f,
-                    "accelerometer bias axis {axis} must be finite, got {value}"
-                )
-            }
-            NavStateError::NonFiniteBiasGyro { axis, value } => {
-                write!(f, "gyroscope bias axis {axis} must be finite, got {value}")
+            NavStateError::InvalidBias { source } => {
+                write!(f, "invalid navigation-state imu bias: {source}")
             }
         }
     }
 }
 
-impl std::error::Error for NavStateError {}
+impl std::error::Error for NavStateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidBias { source } => Some(source),
+            Self::NonFinitePoseTranslation { .. }
+            | Self::NonFinitePoseRotation { .. }
+            | Self::NonFiniteVelocity { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NavState {
@@ -81,16 +83,6 @@ impl NavState {
                 return Err(NavStateError::NonFiniteVelocity { axis, value });
             }
         }
-        for (axis, value) in bias.accel.iter().copied().enumerate() {
-            if !value.is_finite() {
-                return Err(NavStateError::NonFiniteBiasAccel { axis, value });
-            }
-        }
-        for (axis, value) in bias.gyro.iter().copied().enumerate() {
-            if !value.is_finite() {
-                return Err(NavStateError::NonFiniteBiasGyro { axis, value });
-            }
-        }
         Ok(Self {
             pose_odom_from_body,
             velocity_odom_mps,
@@ -119,18 +111,13 @@ impl NavState {
             self.velocity_odom_mps[1] + delta[7],
             self.velocity_odom_mps[2] + delta[8],
         ];
-        let bias = ImuBias {
-            accel: [
-                self.bias.accel[0] + delta[9],
-                self.bias.accel[1] + delta[10],
-                self.bias.accel[2] + delta[11],
-            ],
-            gyro: [
-                self.bias.gyro[0] + delta[12],
-                self.bias.gyro[1] + delta[13],
-                self.bias.gyro[2] + delta[14],
-            ],
-        };
+        let bias = self
+            .bias
+            .checked_add(
+                [delta[9], delta[10], delta[11]],
+                [delta[12], delta[13], delta[14]],
+            )
+            .map_err(|source| NavStateError::InvalidBias { source })?;
         Self::try_new(pose_odom_from_body, velocity_odom_mps, bias)
     }
 
@@ -145,12 +132,16 @@ impl NavState {
         tangent[6] = other.velocity_odom_mps[0] - self.velocity_odom_mps[0];
         tangent[7] = other.velocity_odom_mps[1] - self.velocity_odom_mps[1];
         tangent[8] = other.velocity_odom_mps[2] - self.velocity_odom_mps[2];
-        tangent[9] = other.bias.accel[0] - self.bias.accel[0];
-        tangent[10] = other.bias.accel[1] - self.bias.accel[1];
-        tangent[11] = other.bias.accel[2] - self.bias.accel[2];
-        tangent[12] = other.bias.gyro[0] - self.bias.gyro[0];
-        tangent[13] = other.bias.gyro[1] - self.bias.gyro[1];
-        tangent[14] = other.bias.gyro[2] - self.bias.gyro[2];
+        let self_accel_bias_mps2 = self.bias.accel_mps2();
+        let other_accel_bias_mps2 = other.bias.accel_mps2();
+        let self_gyro_bias_radps = self.bias.gyro_radps();
+        let other_gyro_bias_radps = other.bias.gyro_radps();
+        tangent[9] = other_accel_bias_mps2[0] - self_accel_bias_mps2[0];
+        tangent[10] = other_accel_bias_mps2[1] - self_accel_bias_mps2[1];
+        tangent[11] = other_accel_bias_mps2[2] - self_accel_bias_mps2[2];
+        tangent[12] = other_gyro_bias_radps[0] - self_gyro_bias_radps[0];
+        tangent[13] = other_gyro_bias_radps[1] - self_gyro_bias_radps[1];
+        tangent[14] = other_gyro_bias_radps[2] - self_gyro_bias_radps[2];
         tangent
     }
 }
@@ -211,12 +202,9 @@ mod tests {
 
     #[test]
     fn nav_state_preserves_constructor_values() {
-        let bias = ImuBias {
-            accel: [0.1, 0.2, 0.3],
-            gyro: [0.4, 0.5, 0.6],
-        };
-        let state = NavState::try_new(Pose64::identity(), [1.0, 2.0, 3.0], bias.clone())
-            .expect("nav state");
+        let bias = ImuBias::try_new([0.1, 0.2, 0.3], [0.4, 0.5, 0.6]).expect("finite bias");
+        let state =
+            NavState::try_new(Pose64::identity(), [1.0, 2.0, 3.0], bias).expect("nav state");
         assert_eq!(state.pose_odom_from_body().translation(), [0.0, 0.0, 0.0]);
         assert_eq!(state.velocity_odom_mps(), [1.0, 2.0, 3.0]);
         assert_eq!(state.bias(), &bias);
@@ -234,10 +222,7 @@ mod tests {
         let state = NavState::try_new(
             Pose64::identity(),
             [0.5, -0.2, 0.1],
-            ImuBias {
-                accel: [0.01, -0.02, 0.03],
-                gyro: [0.001, -0.002, 0.003],
-            },
+            ImuBias::try_new([0.01, -0.02, 0.03], [0.001, -0.002, 0.003]).expect("finite bias"),
         )
         .expect("nav state");
         let delta: NavTangent = [
@@ -288,5 +273,24 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn nav_state_retract_preserves_nonfinite_bias_source() {
+        let state = NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default())
+            .expect("navigation state");
+        let mut delta = [0.0; 15];
+        delta[13] = f64::NAN;
+
+        let error = state
+            .retract(&delta)
+            .expect_err("nonfinite bias update must fail");
+        assert!(matches!(
+            error,
+            NavStateError::InvalidBias {
+                source: ImuBiasError::NonFiniteGyroRadps { axis: 1, value },
+            } if value.is_nan()
+        ));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

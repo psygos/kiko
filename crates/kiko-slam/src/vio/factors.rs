@@ -128,13 +128,17 @@ pub fn pose_prior_residual(state: &NavState, pose_measurement_odom: Pose64) -> [
 pub fn bias_random_walk_residual(state_i: &NavState, state_j: &NavState) -> [f64; 6] {
     let bias_i = state_i.bias();
     let bias_j = state_j.bias();
+    let accel_i_mps2 = bias_i.accel_mps2();
+    let accel_j_mps2 = bias_j.accel_mps2();
+    let gyro_i_radps = bias_i.gyro_radps();
+    let gyro_j_radps = bias_j.gyro_radps();
     [
-        bias_j.accel[0] - bias_i.accel[0],
-        bias_j.accel[1] - bias_i.accel[1],
-        bias_j.accel[2] - bias_i.accel[2],
-        bias_j.gyro[0] - bias_i.gyro[0],
-        bias_j.gyro[1] - bias_i.gyro[1],
-        bias_j.gyro[2] - bias_i.gyro[2],
+        accel_j_mps2[0] - accel_i_mps2[0],
+        accel_j_mps2[1] - accel_i_mps2[1],
+        accel_j_mps2[2] - accel_i_mps2[2],
+        gyro_j_radps[0] - gyro_i_radps[0],
+        gyro_j_radps[1] - gyro_i_radps[1],
+        gyro_j_radps[2] - gyro_i_radps[2],
     ]
 }
 
@@ -303,33 +307,32 @@ mod tests {
 
     #[test]
     fn bias_random_walk_residual_is_zero_for_equal_biases() {
-        let bias = ImuBias {
-            accel: [0.1, -0.2, 0.3],
-            gyro: [0.01, -0.02, 0.03],
-        };
-        let state_i =
-            NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state i");
+        let bias = ImuBias::try_new([0.1, -0.2, 0.3], [0.01, -0.02, 0.03]).expect("finite bias");
+        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
         assert_eq!(bias_random_walk_residual(&state_i, &state_j), [0.0; 6]);
     }
 
     #[test]
     fn imu_factor_applies_first_order_bias_correction() {
-        let bias = ImuBias {
-            accel: [0.1, -0.05, 0.02],
-            gyro: [0.01, -0.015, 0.005],
-        };
+        let bias =
+            ImuBias::try_new([0.1, -0.05, 0.02], [0.01, -0.015, 0.005]).expect("finite bias");
         let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
-        let accel_measurement = [bias.accel[0], bias.accel[1], 9.81 + bias.accel[2]];
+        let accel_bias_mps2 = bias.accel_mps2();
+        let gyro_bias_radps = bias.gyro_radps();
+        let accel_measurement = [
+            accel_bias_mps2[0],
+            accel_bias_mps2[1],
+            9.81 + accel_bias_mps2[2],
+        ];
         let batch = batch(&[
-            (0, accel_measurement, bias.gyro),
-            (10_000_000, accel_measurement, bias.gyro),
-            (20_000_000, accel_measurement, bias.gyro),
+            (0, accel_measurement, gyro_bias_radps),
+            (10_000_000, accel_measurement, gyro_bias_radps),
+            (20_000_000, accel_measurement, gyro_bias_radps),
         ]);
         let preintegrated = PreintegratedImu::integrate(&batch, &ImuBias::default(), &noise())
             .expect("preintegrated");
-        let state_i =
-            NavState::try_new(Pose64::identity(), [0.0; 3], bias.clone()).expect("state i");
+        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
         let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
         let norm = residual

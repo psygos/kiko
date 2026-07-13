@@ -315,8 +315,8 @@ mod tests {
             .expect("inertial calibration")
             .initial_bias()
             .expect("initial bias");
-        assert_eq!(bias.accel, [0.01, -0.02, 0.03]);
-        assert_eq!(bias.gyro, [0.001, -0.002, 0.003]);
+        assert_eq!(bias.accel_mps2(), [0.01, -0.02, 0.03]);
+        assert_eq!(bias.gyro_radps(), [0.001, -0.002, 0.003]);
     }
 
     #[test]
@@ -386,7 +386,7 @@ mod tests {
         assert!(matches!(
             &error,
             CalibrationBundleError::InvalidInitialBias {
-                source: ImuBiasError::NonFiniteAccel { axis: 0, value },
+                source: ImuBiasError::NonFiniteAccelMps2 { axis: 0, value },
             } if value.is_nan()
         ));
         assert!(std::error::Error::source(&error).is_some());

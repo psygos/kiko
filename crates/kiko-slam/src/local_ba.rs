@@ -2780,19 +2780,21 @@ fn linearize_vio_states(
 
     if let Some(bias_prior) = config.anchor_bias_prior.as_ref() {
         let bias_info_w = bias_prior.info();
-        let calib_accel = bias_prior.bias().accel;
-        let calib_gyro = bias_prior.bias().gyro;
+        let calibrated_accel_mps2 = bias_prior.bias().accel_mps2();
+        let calibrated_gyro_radps = bias_prior.bias().gyro_radps();
         for (frame_idx, state) in states.iter().map(SyncedPose::nav_state).enumerate() {
             let base = frame_idx * STATE_DIM;
             let bias = state.bias();
+            let accel_mps2 = bias.accel_mps2();
+            let gyro_radps = bias.gyro_radps();
             for axis in 0..3 {
-                let accel_residual = bias.accel[axis] - calib_accel[axis];
+                let accel_residual = accel_mps2[axis] - calibrated_accel_mps2[axis];
                 hessian[(base + 9 + axis) * dim + (base + 9 + axis)] += bias_info_w;
                 rhs[base + 9 + axis] += bias_info_w * accel_residual;
                 cost_breakdown.bias_prior_cost +=
                     0.5 * bias_info_w * accel_residual * accel_residual;
 
-                let gyro_residual = bias.gyro[axis] - calib_gyro[axis];
+                let gyro_residual = gyro_radps[axis] - calibrated_gyro_radps[axis];
                 hessian[(base + 12 + axis) * dim + (base + 12 + axis)] += bias_info_w;
                 rhs[base + 12 + axis] += bias_info_w * gyro_residual;
                 cost_breakdown.bias_prior_cost += 0.5 * bias_info_w * gyro_residual * gyro_residual;

@@ -105,31 +105,31 @@ impl ImuSample {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ImuBias {
-    pub accel: [f64; 3],
-    pub gyro: [f64; 3],
+    accel_mps2: [f64; 3],
+    gyro_radps: [f64; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ImuBiasError {
-    NonFiniteAccel { axis: usize, value: f64 },
-    NonFiniteGyro { axis: usize, value: f64 },
+    NonFiniteAccelMps2 { axis: usize, value: f64 },
+    NonFiniteGyroRadps { axis: usize, value: f64 },
 }
 
 impl std::fmt::Display for ImuBiasError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NonFiniteAccel { axis, value } => {
+            Self::NonFiniteAccelMps2 { axis, value } => {
                 write!(
                     f,
-                    "imu accelerometer bias axis {axis} must be finite, got {value}"
+                    "imu accelerometer bias axis {axis} must be finite m/s^2, got {value}"
                 )
             }
-            Self::NonFiniteGyro { axis, value } => {
+            Self::NonFiniteGyroRadps { axis, value } => {
                 write!(
                     f,
-                    "imu gyroscope bias axis {axis} must be finite, got {value}"
+                    "imu gyroscope bias axis {axis} must be finite rad/s, got {value}"
                 )
             }
         }
@@ -139,18 +139,48 @@ impl std::fmt::Display for ImuBiasError {
 impl std::error::Error for ImuBiasError {}
 
 impl ImuBias {
-    pub fn try_new(accel: [f64; 3], gyro: [f64; 3]) -> Result<Self, ImuBiasError> {
-        for (axis, value) in accel.iter().copied().enumerate() {
+    pub fn try_new(accel_mps2: [f64; 3], gyro_radps: [f64; 3]) -> Result<Self, ImuBiasError> {
+        for (axis, value) in accel_mps2.iter().copied().enumerate() {
             if !value.is_finite() {
-                return Err(ImuBiasError::NonFiniteAccel { axis, value });
+                return Err(ImuBiasError::NonFiniteAccelMps2 { axis, value });
             }
         }
-        for (axis, value) in gyro.iter().copied().enumerate() {
+        for (axis, value) in gyro_radps.iter().copied().enumerate() {
             if !value.is_finite() {
-                return Err(ImuBiasError::NonFiniteGyro { axis, value });
+                return Err(ImuBiasError::NonFiniteGyroRadps { axis, value });
             }
         }
-        Ok(Self { accel, gyro })
+        Ok(Self {
+            accel_mps2,
+            gyro_radps,
+        })
+    }
+
+    pub fn accel_mps2(self) -> [f64; 3] {
+        self.accel_mps2
+    }
+
+    pub fn gyro_radps(self) -> [f64; 3] {
+        self.gyro_radps
+    }
+
+    pub(crate) fn checked_add(
+        self,
+        accel_delta_mps2: [f64; 3],
+        gyro_delta_radps: [f64; 3],
+    ) -> Result<Self, ImuBiasError> {
+        Self::try_new(
+            [
+                self.accel_mps2[0] + accel_delta_mps2[0],
+                self.accel_mps2[1] + accel_delta_mps2[1],
+                self.accel_mps2[2] + accel_delta_mps2[2],
+            ],
+            [
+                self.gyro_radps[0] + gyro_delta_radps[0],
+                self.gyro_radps[1] + gyro_delta_radps[1],
+                self.gyro_radps[2] + gyro_delta_radps[2],
+            ],
+        )
     }
 }
 
@@ -732,20 +762,54 @@ mod tests {
     #[test]
     fn imu_bias_default_is_zero() {
         let bias = ImuBias::default();
-        assert_eq!(bias.accel, [0.0; 3]);
-        assert_eq!(bias.gyro, [0.0; 3]);
+        assert_eq!(bias.accel_mps2(), [0.0; 3]);
+        assert_eq!(bias.gyro_radps(), [0.0; 3]);
     }
 
     #[test]
     fn imu_bias_constructor_rejects_nonfinite_axes() {
-        assert!(matches!(
-            ImuBias::try_new([0.0, f64::NAN, 0.0], [0.0; 3]),
-            Err(ImuBiasError::NonFiniteAccel { axis: 1, value }) if value.is_nan()
-        ));
+        for nonfinite in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for axis in 0..3 {
+                let mut accel_mps2 = [0.0; 3];
+                accel_mps2[axis] = nonfinite;
+                assert!(matches!(
+                    ImuBias::try_new(accel_mps2, [0.0; 3]),
+                    Err(ImuBiasError::NonFiniteAccelMps2 {
+                        axis: actual_axis,
+                        value,
+                    }) if actual_axis == axis
+                        && (value == nonfinite || value.is_nan() && nonfinite.is_nan())
+                ));
+
+                let mut gyro_radps = [0.0; 3];
+                gyro_radps[axis] = nonfinite;
+                assert!(matches!(
+                    ImuBias::try_new([0.0; 3], gyro_radps),
+                    Err(ImuBiasError::NonFiniteGyroRadps {
+                        axis: actual_axis,
+                        value,
+                    }) if actual_axis == axis
+                        && (value == nonfinite || value.is_nan() && nonfinite.is_nan())
+                ));
+            }
+        }
+
+        let finite_extrema = ImuBias::try_new(
+            [f64::MAX, -f64::MAX, f64::MIN_POSITIVE],
+            [-f64::MIN_POSITIVE, -0.0, 0.0],
+        )
+        .expect("all finite values are valid biases");
         assert_eq!(
-            ImuBias::try_new([0.0; 3], [0.0, 0.0, f64::INFINITY]),
-            Err(ImuBiasError::NonFiniteGyro {
-                axis: 2,
+            finite_extrema.accel_mps2(),
+            [f64::MAX, -f64::MAX, f64::MIN_POSITIVE]
+        );
+        assert_eq!(finite_extrema.gyro_radps(), [-f64::MIN_POSITIVE, -0.0, 0.0]);
+
+        let large = ImuBias::try_new([f64::MAX, 0.0, 0.0], [0.0; 3]).expect("finite bias");
+        assert_eq!(
+            large.checked_add([f64::MAX, 0.0, 0.0], [0.0; 3]),
+            Err(ImuBiasError::NonFiniteAccelMps2 {
+                axis: 0,
                 value: f64::INFINITY,
             })
         );
