@@ -187,12 +187,17 @@ impl Pose64 {
                 return Err(Pose64Error::TranslationOutOfF32Range { axis, value });
             }
         }
-        let pose = self.to_pose32();
+        let pose = self.to_pose32_unchecked();
         Self::try_from_pose32(pose)?;
         Ok(pose)
     }
 
+    #[cfg(test)]
     pub(crate) fn to_pose32(self) -> Pose {
+        self.to_pose32_unchecked()
+    }
+
+    fn to_pose32_unchecked(self) -> Pose {
         let mut rotation = [[0.0_f32; 3]; 3];
         for (row_idx, row) in rotation.iter_mut().enumerate() {
             for (col_idx, value) in row.iter_mut().enumerate() {

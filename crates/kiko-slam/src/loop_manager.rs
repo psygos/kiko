@@ -62,10 +62,12 @@ impl LoopManager {
             .keyframe(match_kf)
             .ok_or(crate::map::MapError::KeyframeNotFound(match_kf))?
             .pose();
-        let loop_relative = Pose64::from_pose32(Self::loop_relative_pose(
-            match_pose,
-            verified.query_pose_world(),
-        ));
+        let loop_relative = Self::try_loop_relative_pose64(match_pose, verified.query_pose_world())
+            .map_err(|source| LoopApplyError::PoseConversion {
+                operation: "relative loop-pose construction",
+                keyframe_id: None,
+                source,
+            })?;
 
         essential_graph.add_loop_edge(EssentialEdge {
             a: match_kf,
@@ -88,7 +90,13 @@ impl LoopManager {
                 .ok_or(crate::map::MapError::KeyframeNotFound(keyframe_id))?
                 .pose();
             old_poses.insert(keyframe_id, pose);
-            initial_poses.push(Pose64::from_pose32(pose));
+            initial_poses.push(Pose64::try_from_pose32(pose).map_err(|source| {
+                LoopApplyError::PoseConversion {
+                    operation: "initial pose widening",
+                    keyframe_id: Some(keyframe_id),
+                    source,
+                }
+            })?);
         }
 
         let result = self.optimizer.optimize(&input.edges, &mut initial_poses)?;
@@ -100,20 +108,23 @@ impl LoopManager {
                 },
             });
         }
-        let corrected_poses: HashMap<KeyframeId, Pose> = input
+        let mut corrected_poses = HashMap::with_capacity(input.keyframe_ids.len());
+        let mut pose_updates = Vec::with_capacity(input.keyframe_ids.len());
+        for (keyframe_id, corrected_pose) in input
             .keyframe_ids
             .iter()
             .copied()
-            .zip(
-                result
-                    .corrected_poses
-                    .into_iter()
-                    .map(|pose| pose.to_pose32()),
-            )
-            .collect();
-
-        for (keyframe_id, corrected_pose) in &corrected_poses {
-            map.set_keyframe_pose(*keyframe_id, *corrected_pose)?;
+            .zip(result.corrected_poses)
+        {
+            let corrected_pose = corrected_pose.try_to_pose32().map_err(|source| {
+                LoopApplyError::PoseConversion {
+                    operation: "optimized pose narrowing",
+                    keyframe_id: Some(keyframe_id),
+                    source,
+                }
+            })?;
+            corrected_poses.insert(keyframe_id, corrected_pose);
+            pose_updates.push((keyframe_id, corrected_pose));
         }
 
         let mut point_updates = Vec::new();
@@ -164,19 +175,21 @@ impl LoopManager {
             }
         }
 
-        for (point_id, corrected_world) in point_updates {
-            map.set_map_point_position(point_id, corrected_world)?;
-        }
+        map.apply_geometry_updates(&pose_updates, &point_updates)?;
 
-        Ok(corrected_poses.into_iter().collect())
+        Ok(pose_updates)
     }
 
-    pub(crate) fn correction_magnitude(match_pose: Pose, query_pose_world: Pose) -> (f32, f32) {
-        let loop_relative = Self::loop_relative_pose(match_pose, query_pose_world);
-        (
-            loop_translation_norm(loop_relative),
-            loop_rotation_angle_deg(loop_relative),
-        )
+    pub(crate) fn correction_magnitude(
+        current_query_pose_world: Pose,
+        estimated_query_pose_world: Pose,
+    ) -> Result<(f64, f64), crate::Pose64Error> {
+        let correction =
+            Self::try_pose_correction64(current_query_pose_world, estimated_query_pose_world)?;
+        Ok((
+            translation_norm_m(correction),
+            rotation_angle_deg(correction),
+        ))
     }
 
     pub(crate) fn reject_reason(error: &LoopDetectError) -> LoopClosureRejectReason {
@@ -185,22 +198,36 @@ impl LoopManager {
                 LoopClosureRejectReason::TooFewCorrespondences { count: *count }
             }
             LoopDetectError::VerificationFailed(_) => LoopClosureRejectReason::VerificationFailed,
+            LoopDetectError::CorrectionEvaluation { .. } => {
+                LoopClosureRejectReason::CorrectionEvaluationFailed
+            }
             LoopDetectError::CorrectionTooLarge {
-                translation,
+                translation_m,
                 rotation_deg,
             } => LoopClosureRejectReason::CorrectionTooLarge {
-                translation_m: *translation,
+                translation_m: *translation_m,
                 rotation_deg: *rotation_deg,
             },
             LoopDetectError::ApplyFailed(_) => LoopClosureRejectReason::ApplyFailed,
         }
     }
 
-    fn loop_relative_pose(match_pose: Pose, query_pose_world: Pose) -> Pose {
-        Pose64::from_pose32(match_pose)
-            .inverse()
-            .compose(Pose64::from_pose32(query_pose_world))
-            .to_pose32()
+    fn try_loop_relative_pose64(
+        match_pose: Pose,
+        query_pose_world: Pose,
+    ) -> Result<Pose64, crate::Pose64Error> {
+        let match_pose = Pose64::try_from_pose32(match_pose)?;
+        let query_pose_world = Pose64::try_from_pose32(query_pose_world)?;
+        Ok(match_pose.inverse().compose(query_pose_world))
+    }
+
+    fn try_pose_correction64(
+        current_pose_world: Pose,
+        estimated_pose_world: Pose,
+    ) -> Result<Pose64, crate::Pose64Error> {
+        let current_pose_world = Pose64::try_from_pose32(current_pose_world)?;
+        let estimated_pose_world = Pose64::try_from_pose32(estimated_pose_world)?;
+        Ok(estimated_pose_world.compose(current_pose_world.inverse()))
     }
 }
 
@@ -218,16 +245,19 @@ fn camera_to_world(pose_world: Pose, point: Point3) -> Point3 {
     }
 }
 
-fn loop_translation_norm(pose: Pose) -> f32 {
+fn translation_norm_m(pose: Pose64) -> f64 {
     let t = pose.translation();
-    (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
+    t[0].hypot(t[1]).hypot(t[2])
 }
 
-fn loop_rotation_angle_deg(pose: Pose) -> f32 {
+fn rotation_angle_deg(pose: Pose64) -> f64 {
     let r = pose.rotation();
-    let trace = r[0][0] + r[1][1] + r[2][2];
-    let cos_theta = ((trace - 1.0) * 0.5).clamp(-1.0, 1.0);
-    cos_theta.acos().to_degrees()
+    let sin_theta = 0.5
+        * (r[2][1] - r[1][2])
+            .hypot(r[0][2] - r[2][0])
+            .hypot(r[1][0] - r[0][1]);
+    let cos_theta = 0.5 * (r[0][0] + r[1][1] + r[2][2] - 1.0);
+    sin_theta.atan2(cos_theta).to_degrees()
 }
 
 /// Heuristic isotropic information scaled by verified PnP support. This is not

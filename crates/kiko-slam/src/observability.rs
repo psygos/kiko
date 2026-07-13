@@ -608,6 +608,9 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
                     format!("too few correspondences ({count})")
                 }
                 LoopClosureRejectReason::VerificationFailed => "verification failed".to_string(),
+                LoopClosureRejectReason::CorrectionEvaluationFailed => {
+                    "correction evaluation failed".to_string()
+                }
                 LoopClosureRejectReason::CorrectionTooLarge {
                     translation_m,
                     rotation_deg,

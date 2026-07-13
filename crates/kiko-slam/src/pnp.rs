@@ -419,9 +419,9 @@ pub enum PnpRefinementFallback {
         iteration: NonZeroUsize,
         source: crate::LinearSolveError,
     },
-    InvalidPose {
+    InvalidPoseUpdate {
         iteration: NonZeroUsize,
-        source: crate::Pose64Error,
+        source: crate::Se3TangentError,
     },
     Stationary {
         iteration: NonZeroUsize,
@@ -450,7 +450,7 @@ impl PnpRefinementFallback {
             Self::InvalidInlierIndex { iteration, .. }
             | Self::NonProjectableInliers { iteration, .. }
             | Self::LinearSolve { iteration, .. }
-            | Self::InvalidPose { iteration, .. }
+            | Self::InvalidPoseUpdate { iteration, .. }
             | Self::Stationary { iteration }
             | Self::NoImprovement { iteration, .. }
             | Self::InvalidObjective { iteration, .. } => Some(*iteration),
@@ -479,9 +479,9 @@ impl std::fmt::Display for PnpRefinementFallback {
                 f,
                 "PnP refinement linear solve failed at iteration {iteration}: {source}"
             ),
-            Self::InvalidPose { iteration, source } => write!(
+            Self::InvalidPoseUpdate { iteration, source } => write!(
                 f,
-                "PnP refinement produced an invalid pose at iteration {iteration}: {source}"
+                "PnP refinement pose update is invalid at iteration {iteration}: {source}"
             ),
             Self::Stationary { iteration } => write!(
                 f,
@@ -519,7 +519,7 @@ impl std::error::Error for PnpRefinementFallback {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LinearSolve { source, .. } => Some(source),
-            Self::InvalidPose { source, .. } => Some(source),
+            Self::InvalidPoseUpdate { source, .. } => Some(source),
             Self::EmptyInlierSet
             | Self::InvalidInlierIndex { .. }
             | Self::NonProjectableInliers { .. }
@@ -759,18 +759,14 @@ fn refine_pose_on_inliers(
         crate::local_ba::solve_linear_system(&mut hessian, &mut rhs, 6)
             .map_err(|source| PnpRefinementFallback::LinearSolve { iteration, source })?;
 
-        let delta = rhs;
-        let step_norm = delta
-            .iter()
-            .map(|&component| {
-                let component = f64::from(component);
-                component * component
-            })
-            .sum::<f64>()
-            .sqrt();
-        let candidate = crate::local_ba::apply_se3_delta(pose, delta);
-        crate::Pose64::try_from_pose32(candidate)
-            .map_err(|source| PnpRefinementFallback::InvalidPose { iteration, source })?;
+        let step_m_rad = rhs;
+        let tangent = crate::Se3Tangent64::try_from_meters_radians(step_m_rad.map(f64::from))
+            .map_err(|source| PnpRefinementFallback::InvalidPoseUpdate { iteration, source })?;
+        let normalized_step_norm = pnp_refinement_normalized_step_norm(tangent)
+            .map_err(|source| PnpRefinementFallback::InvalidPoseUpdate { iteration, source })?;
+        let candidate = tangent
+            .try_apply_left_to_metric_pose(pose)
+            .map_err(|source| PnpRefinementFallback::InvalidPoseUpdate { iteration, source })?;
         let mut candidate_nonprojectable = 0usize;
         let mut candidate_cost = 0.0_f64;
         for &idx in inlier_indices {
@@ -789,7 +785,7 @@ fn refine_pose_on_inliers(
         match decide_refinement_step(
             iteration,
             accepted_any,
-            step_norm,
+            normalized_step_norm,
             current_cost,
             candidate_cost,
         )? {
@@ -817,10 +813,21 @@ enum RefinementStepDecision {
     Finish(PnpRefinementTermination),
 }
 
+fn pnp_refinement_normalized_step_norm(
+    tangent: crate::Se3Tangent64,
+) -> Result<f64, crate::Se3TangentError> {
+    let translation_step_norm_m = tangent.try_translation_tangent_norm_m()?;
+    let rotation_step_norm_rad = tangent.try_rotation_vector_norm_rad()?;
+    Ok(
+        (translation_step_norm_m / PNP_REFINEMENT_TRANSLATION_CONVERGENCE_M)
+            .hypot(rotation_step_norm_rad / PNP_REFINEMENT_ROTATION_CONVERGENCE_RAD),
+    )
+}
+
 fn decide_refinement_step(
     iteration: NonZeroUsize,
     accepted_any: bool,
-    step_norm: f64,
+    normalized_step_norm: f64,
     current_cost: f64,
     candidate_cost: f64,
 ) -> Result<RefinementStepDecision, PnpRefinementFallback> {
@@ -835,7 +842,7 @@ fn decide_refinement_step(
         candidate_cost,
     )?;
 
-    if step_norm < f64::from(PNP_REFINEMENT_STEP_EPS) {
+    if normalized_step_norm < 1.0 {
         return if accepted_any {
             Ok(RefinementStepDecision::Finish(
                 PnpRefinementTermination::Converged {
@@ -1112,8 +1119,10 @@ const RANSAC_CONFIDENCE: f32 = 0.99;
 const PNP_REFINEMENT_ITERS: usize = 8;
 /// Damping added to the normal equations during PnP pose refinement.
 const PNP_REFINEMENT_DAMPING: f32 = 1e-4;
-/// Convergence threshold for PnP pose refinement.
-const PNP_REFINEMENT_STEP_EPS: f32 = 1e-5;
+/// Translation-tangent convergence threshold for PnP pose refinement, in meters.
+const PNP_REFINEMENT_TRANSLATION_CONVERGENCE_M: f64 = 1e-5;
+/// Rotation-vector convergence threshold for PnP pose refinement, in radians.
+const PNP_REFINEMENT_ROTATION_CONVERGENCE_RAD: f64 = 1e-5;
 
 fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
     if coeffs.iter().any(|coefficient| !coefficient.is_finite()) {
@@ -1805,6 +1814,51 @@ mod tests {
             "expected refinement to improve reprojection error: initial={initial_rmse}, refined={refined_rmse}"
         );
         assert!(termination.iterations().get() <= PNP_REFINEMENT_ITERS);
+    }
+
+    #[test]
+    fn refinement_convergence_norm_normalizes_meter_and_radian_domains() {
+        let translation_only = crate::Se3Tangent64::try_from_meters_radians([
+            PNP_REFINEMENT_TRANSLATION_CONVERGENCE_M,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ])
+        .expect("finite translation tangent");
+        let rotation_only = crate::Se3Tangent64::try_from_meters_radians([
+            0.0,
+            0.0,
+            0.0,
+            PNP_REFINEMENT_ROTATION_CONVERGENCE_RAD,
+            0.0,
+            0.0,
+        ])
+        .expect("finite rotation vector");
+        let both = crate::Se3Tangent64::try_from_meters_radians([
+            PNP_REFINEMENT_TRANSLATION_CONVERGENCE_M,
+            0.0,
+            0.0,
+            PNP_REFINEMENT_ROTATION_CONVERGENCE_RAD,
+            0.0,
+            0.0,
+        ])
+        .expect("finite mixed-domain tangent");
+
+        assert_eq!(
+            pnp_refinement_normalized_step_norm(translation_only).expect("finite norm"),
+            1.0
+        );
+        assert_eq!(
+            pnp_refinement_normalized_step_norm(rotation_only).expect("finite norm"),
+            1.0
+        );
+        assert!(
+            (pnp_refinement_normalized_step_norm(both).expect("finite norm") - 2.0_f64.sqrt())
+                .abs()
+                < 1e-12
+        );
     }
 
     #[test]

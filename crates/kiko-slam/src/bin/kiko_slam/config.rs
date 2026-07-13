@@ -148,7 +148,7 @@ pub fn build_tracker_config_with_overrides(
             loop_cfg.max_candidates(),
             loop_cfg.temporal_gap(),
             loop_cfg.min_streak(),
-            loop_cfg.max_correction_translation(),
+            loop_cfg.max_correction_translation_m(),
             loop_cfg.max_correction_rotation_deg(),
             loop_cfg.ransac().max_iterations(),
             loop_cfg.ransac().reprojection_threshold_px(),
@@ -283,7 +283,7 @@ fn build_loop_closure_config_from_env() -> Result<LoopClosureConfig, Box<dyn std
         input.min_streak = v;
     }
     if let Some(v) = try_env_f32("KIKO_LOOP_MAX_CORRECTION_TRANSLATION_M")? {
-        input.max_correction_translation = v;
+        input.max_correction_translation_m = v;
     }
     if let Some(v) = try_env_f32("KIKO_LOOP_MAX_CORRECTION_ROTATION_DEG")? {
         input.max_correction_rotation_deg = v;

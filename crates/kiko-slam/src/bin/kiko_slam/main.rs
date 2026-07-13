@@ -456,7 +456,7 @@ mod tests {
         assert_eq!(loop_cfg.max_candidates(), 5);
         assert_eq!(loop_cfg.temporal_gap(), 25);
         assert_eq!(loop_cfg.min_streak(), 2);
-        assert!((loop_cfg.max_correction_translation() - 4.5).abs() < 1e-6);
+        assert!((loop_cfg.max_correction_translation_m() - 4.5).abs() < 1e-6);
         assert!((loop_cfg.max_correction_rotation_deg() - 25.0).abs() < 1e-6);
         assert_eq!(loop_cfg.ransac().max_iterations(), 150);
         assert!((loop_cfg.ransac().reprojection_threshold_px() - 1.75).abs() < 1e-6);

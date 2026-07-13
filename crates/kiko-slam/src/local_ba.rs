@@ -683,6 +683,11 @@ pub enum BaExecutionError {
         iteration: usize,
         source: LinearSolveError,
     },
+    InvalidPoseUpdate {
+        iteration: usize,
+        pose_index: usize,
+        source: crate::Se3TangentError,
+    },
     InvalidCost {
         stage: &'static str,
         iteration: usize,
@@ -741,6 +746,14 @@ impl std::fmt::Display for BaExecutionError {
                 f,
                 "full BA pose system failed at iteration {iteration}: {source}"
             ),
+            Self::InvalidPoseUpdate {
+                iteration,
+                pose_index,
+                source,
+            } => write!(
+                f,
+                "full BA pose {pose_index} update failed at iteration {iteration}: {source}"
+            ),
             Self::InvalidCost {
                 stage,
                 iteration,
@@ -765,6 +778,7 @@ impl std::error::Error for BaExecutionError {
             Self::MapLookup { source, .. } | Self::WriteBack { source } => Some(source),
             Self::LandmarkLinearSystem { source, .. } => Some(source),
             Self::PoseLinearSystem { source, .. } => Some(source),
+            Self::InvalidPoseUpdate { source, .. } => Some(source),
             Self::InvalidCost { source, .. } => Some(source),
             Self::InvalidOutcome { source } => Some(source),
             Self::DuplicateKeyframe { .. }
@@ -865,11 +879,138 @@ impl std::fmt::Display for Matrix3InverseError {
 
 impl std::error::Error for Matrix3InverseError {}
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LandmarkDeltaMeters([f32; 3]);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LandmarkDeltaError {
+    NonFiniteComponent { axis: usize, value: f32 },
+    NonFiniteAppliedCoordinate { axis: usize, value: f32 },
+}
+
+impl std::fmt::Display for LandmarkDeltaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteComponent { axis, value } => write!(
+                f,
+                "landmark delta axis {axis} must be finite meters, got {value}"
+            ),
+            Self::NonFiniteAppliedCoordinate { axis, value } => write!(
+                f,
+                "landmark delta produced non-finite map coordinate axis {axis}: {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LandmarkDeltaError {}
+
+impl LandmarkDeltaMeters {
+    pub fn try_from_components_m(components_m: [f32; 3]) -> Result<Self, LandmarkDeltaError> {
+        for (axis, value) in components_m.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(LandmarkDeltaError::NonFiniteComponent { axis, value });
+            }
+        }
+        Ok(Self(components_m))
+    }
+
+    pub fn components_m(self) -> [f32; 3] {
+        self.0
+    }
+
+    pub fn try_apply(self, point: Point3) -> Result<Point3, LandmarkDeltaError> {
+        let components = [
+            point.x + self.0[0],
+            point.y + self.0[1],
+            point.z + self.0[2],
+        ];
+        for (axis, value) in components.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(LandmarkDeltaError::NonFiniteAppliedCoordinate { axis, value });
+            }
+        }
+        Ok(Point3 {
+            x: components[0],
+            y: components[1],
+            z: components[2],
+        })
+    }
+}
+
+/// Backend-produced correction whose geometry components are validated before
+/// the value can cross the worker boundary.
+///
+/// ```compile_fail
+/// use kiko_slam::BaCorrection;
+///
+/// let _ = BaCorrection {
+///     pose_tangents: Vec::new(),
+///     landmark_deltas_m: Vec::new(),
+///     result: todo!(),
+/// };
+/// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct BaCorrection {
-    pub pose_deltas: Vec<(KeyframeId, [f32; 6])>,
-    pub landmark_deltas: Vec<(MapPointId, [f32; 3])>,
-    pub result: BaResult,
+    pose_tangents: Vec<(KeyframeId, crate::Se3Tangent64)>,
+    landmark_deltas_m: Vec<(MapPointId, LandmarkDeltaMeters)>,
+    result: BaResult,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaCorrectionError {
+    GeometryForNonApplicableOutcome {
+        pose_tangent_count: usize,
+        landmark_delta_count: usize,
+    },
+}
+
+impl std::fmt::Display for BaCorrectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GeometryForNonApplicableOutcome {
+                pose_tangent_count,
+                landmark_delta_count,
+            } => write!(
+                f,
+                "non-applicable BA outcome cannot carry geometry corrections (pose tangents={pose_tangent_count}, landmark deltas={landmark_delta_count})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BaCorrectionError {}
+
+impl BaCorrection {
+    pub(crate) fn try_new(
+        pose_tangents: Vec<(KeyframeId, crate::Se3Tangent64)>,
+        landmark_deltas_m: Vec<(MapPointId, LandmarkDeltaMeters)>,
+        result: BaResult,
+    ) -> Result<Self, BaCorrectionError> {
+        if !result.is_applicable() && (!pose_tangents.is_empty() || !landmark_deltas_m.is_empty()) {
+            return Err(BaCorrectionError::GeometryForNonApplicableOutcome {
+                pose_tangent_count: pose_tangents.len(),
+                landmark_delta_count: landmark_deltas_m.len(),
+            });
+        }
+        Ok(Self {
+            pose_tangents,
+            landmark_deltas_m,
+            result,
+        })
+    }
+
+    pub fn pose_tangents(&self) -> &[(KeyframeId, crate::Se3Tangent64)] {
+        &self.pose_tangents
+    }
+
+    pub fn landmark_deltas_m(&self) -> &[(MapPointId, LandmarkDeltaMeters)] {
+        &self.landmark_deltas_m
+    }
+
+    pub fn result(&self) -> &BaResult {
+        &self.result
+    }
 }
 
 #[derive(Debug)]
@@ -989,10 +1130,10 @@ pub enum PoseBaError {
         iteration: usize,
         source: LinearSolveError,
     },
-    InvalidPose {
+    InvalidPoseUpdate {
         iteration: usize,
         frame_index: usize,
-        source: crate::Pose64Error,
+        source: crate::Se3TangentError,
     },
     InvariantViolation {
         message: &'static str,
@@ -1013,13 +1154,13 @@ impl std::fmt::Display for PoseBaError {
                 f,
                 "pose-only BA linear solve failed at iteration {iteration}: {source}"
             ),
-            Self::InvalidPose {
+            Self::InvalidPoseUpdate {
                 iteration,
                 frame_index,
                 source,
             } => write!(
                 f,
-                "pose-only BA produced an invalid pose for frame {frame_index} at iteration {iteration}: {source}"
+                "pose-only BA pose update is invalid for frame {frame_index} at iteration {iteration}: {source}"
             ),
             Self::InvariantViolation { message } => {
                 write!(f, "pose-only BA invariant violation: {message}")
@@ -1033,7 +1174,7 @@ impl std::error::Error for PoseBaError {
         match self {
             Self::Observation { source } => Some(source),
             Self::LinearSolve { source, .. } => Some(source),
-            Self::InvalidPose { source, .. } => Some(source),
+            Self::InvalidPoseUpdate { source, .. } => Some(source),
             Self::NoProjectableFactors { .. } | Self::InvariantViolation { .. } => None,
         }
     }
@@ -3465,9 +3606,8 @@ impl LocalBundleAdjuster {
                 let step = extract_se3_delta(b, i * POSE_TANGENT_DIMENSION);
                 all_steps_converged &= se3_step_is_converged(step);
                 let pose = self.frames[i].pose;
-                let updated = apply_se3_delta(pose, step);
-                crate::Pose64::try_from_pose32(updated).map_err(|source| {
-                    PoseBaError::InvalidPose {
+                let updated = try_apply_se3_step_m_rad(pose, step).map_err(|source| {
+                    PoseBaError::InvalidPoseUpdate {
                         iteration: iter + 1,
                         frame_index: i,
                         source,
@@ -3700,17 +3840,24 @@ impl LocalBundleAdjuster {
                     let gradient = pose_rhs_before_schur[base + k] as f64;
                     predicted_decrease += 0.5 * d * ((pose_damping as f64) * d + gradient);
                 }
-                pose_var.pose = apply_se3_delta(pose_var.pose, delta);
+                pose_var.pose =
+                    try_apply_se3_step_m_rad(pose_var.pose, delta).map_err(|source| {
+                        BaExecutionError::InvalidPoseUpdate {
+                            iteration: iter + 1,
+                            pose_index: pose_i,
+                            source,
+                        }
+                    })?;
             }
 
             for (landmark_i, landmark_var) in problem.landmarks.iter_mut().enumerate() {
                 let schur = &schur_landmarks[landmark_i];
                 let mut coupling = [0.0_f32; 3];
                 for link in &schur.links {
-                    let pose_delta = extract_se3_delta(rhs, link.pose.tangent_offset());
-                    for (row, pose_delta_value) in pose_delta.iter().enumerate() {
+                    let pose_step = extract_se3_delta(rhs, link.pose.tangent_offset());
+                    for (row, pose_step_value) in pose_step.iter().enumerate() {
                         for (col, link_value) in link.b[row].iter().enumerate() {
-                            coupling[col] += *link_value * *pose_delta_value;
+                            coupling[col] += *link_value * *pose_step_value;
                         }
                     }
                 }
@@ -4745,17 +4892,19 @@ fn reprojection_residual_and_jacobians(
     Some((residual, jac_pose, jac_landmark))
 }
 
-pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
-    crate::math::se3_exp_f64(delta.map(f64::from))
-        .compose(crate::Pose64::from_pose32(pose))
-        .to_pose32()
+pub(crate) fn try_apply_se3_step_m_rad(
+    pose: Pose,
+    step_m_rad: [f32; 6],
+) -> Result<Pose, crate::Se3TangentError> {
+    crate::Se3Tangent64::try_from_meters_radians(step_m_rad.map(f64::from))?
+        .try_apply_left_to_metric_pose(pose)
 }
 
-pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
-    crate::math::se3_log_f64(
-        crate::Pose64::from_pose32(to).compose(crate::Pose64::from_pose32(from).inverse()),
-    )
-    .map(|value| value as f32)
+pub(crate) fn try_se3_tangent_between(
+    from: Pose,
+    to: Pose,
+) -> Result<crate::Se3Tangent64, crate::Se3TangentError> {
+    crate::Se3Tangent64::try_between_metric_poses(from, to)
 }
 
 fn accumulate_pose_hessian(
@@ -5040,8 +5189,23 @@ mod tests {
         (dx * dx + dy * dy + dz * dz).sqrt()
     }
 
+    #[test]
+    fn landmark_delta_rejects_non_finite_meter_component() {
+        assert!(matches!(
+            LandmarkDeltaMeters::try_from_components_m([0.0, f32::INFINITY, 0.0]),
+            Err(LandmarkDeltaError::NonFiniteComponent {
+                axis: 1,
+                value,
+            }) if value.is_infinite()
+        ));
+    }
+
     fn lm(initial_lambda: f32) -> LmConfig {
         LmConfig::new(initial_lambda, 10.0, 1e-8, 1e4, 0.25, 0.75).expect("valid lm")
+    }
+
+    fn apply_se3_step_m_rad(pose: Pose, step_m_rad: [f32; 6]) -> Pose {
+        try_apply_se3_step_m_rad(pose, step_m_rad).expect("finite test SE(3) update")
     }
 
     #[cfg(feature = "vio")]
@@ -5169,7 +5333,7 @@ mod tests {
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let true_pose_0 = Pose::identity();
         let true_pose_1 = axis_angle_pose([0.20, -0.02, 0.03], [0.0, 0.03, -0.01]);
-        let noisy_pose_1 = apply_se3_delta(true_pose_1, noisy_pose_delta);
+        let noisy_pose_1 = apply_se3_step_m_rad(true_pose_1, noisy_pose_delta);
 
         let points_true = vec![
             Point3 {
@@ -5730,9 +5894,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_se3_delta_zero_is_fixpoint() {
+    fn apply_se3_step_m_rad_zero_is_fixpoint() {
         let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
-        let out = apply_se3_delta(pose, [0.0; 6]);
+        let out = apply_se3_step_m_rad(pose, [0.0; 6]);
         assert!(pose_close(pose, out, 1e-7));
     }
 
@@ -5765,10 +5929,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_se3_delta_matches_pose64_reference_update() {
+    fn apply_se3_step_m_rad_matches_pose64_reference_update() {
         let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
         let delta = [0.12, -0.07, 0.05, 0.18, -0.09, 0.11];
-        let actual = apply_se3_delta(pose, delta);
+        let actual = apply_se3_step_m_rad(pose, delta);
         let expected = crate::math::se3_exp_f64(delta.map(f64::from))
             .compose(crate::Pose64::from_pose32(pose))
             .to_pose32();
@@ -5776,17 +5940,18 @@ mod tests {
     }
 
     #[test]
-    fn se3_delta_between_matches_pose64_reference_log() {
+    fn se3_tangent_between_matches_pose64_reference_log() {
         let from = axis_angle_pose([0.2, -0.3, 0.4], [0.05, -0.03, 0.02]);
         let to = axis_angle_pose([0.5, -0.1, 0.2], [0.18, -0.07, 0.11]);
-        let actual = se3_delta_between(from, to);
+        let actual = try_se3_tangent_between(from, to)
+            .expect("finite relative tangent")
+            .components_m_rad();
         let expected = crate::math::se3_log_f64(
             crate::Pose64::from_pose32(to).compose(crate::Pose64::from_pose32(from).inverse()),
-        )
-        .map(|value| value as f32);
+        );
         for axis in 0..6 {
             assert!(
-                (actual[axis] - expected[axis]).abs() < 1e-5,
+                (actual[axis] - expected[axis]).abs() < 1e-12,
                 "delta mismatch on axis {axis}: actual={}, expected={}",
                 actual[axis],
                 expected[axis]
@@ -6314,8 +6479,10 @@ mod tests {
             let mut delta_neg = [0.0_f32; 6];
             delta_neg[col] = -eps;
 
-            let r_plus = projection_residual(apply_se3_delta(pose, delta_pos), &obs, intrinsics);
-            let r_minus = projection_residual(apply_se3_delta(pose, delta_neg), &obs, intrinsics);
+            let r_plus =
+                projection_residual(apply_se3_step_m_rad(pose, delta_pos), &obs, intrinsics);
+            let r_minus =
+                projection_residual(apply_se3_step_m_rad(pose, delta_neg), &obs, intrinsics);
             let numeric = [
                 (r_plus[0] - r_minus[0]) / (2.0 * eps),
                 (r_plus[1] - r_minus[1]) / (2.0 * eps),
@@ -6399,7 +6566,7 @@ mod tests {
         );
 
         let original_fixed_pose = map.keyframe(keyframe_1).expect("fixed keyframe").pose();
-        problem.variable_poses[1].pose = apply_se3_delta(
+        problem.variable_poses[1].pose = apply_se3_step_m_rad(
             problem.variable_poses[1].pose,
             [0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
@@ -6477,7 +6644,7 @@ mod tests {
         );
         map.set_keyframe_pose(
             keyframe_2,
-            apply_se3_delta(true_pose_2, [0.06, -0.02, 0.03, 0.012, -0.008, 0.006]),
+            apply_se3_step_m_rad(true_pose_2, [0.06, -0.02, 0.03, 0.012, -0.008, 0.006]),
         )
         .expect("perturb variable keyframe pose");
         let fixed_pose_before = map.keyframe(keyframe_1).expect("fixed keyframe").pose();
@@ -6620,7 +6787,8 @@ mod tests {
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let true_pose_0 = Pose::identity();
         let true_pose_1 = axis_angle_pose([0.20, -0.02, 0.03], [0.0, 0.03, -0.01]);
-        let noisy_pose_1 = apply_se3_delta(true_pose_1, [0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
+        let noisy_pose_1 =
+            apply_se3_step_m_rad(true_pose_1, [0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
 
         let points_true = vec![
             Point3 {

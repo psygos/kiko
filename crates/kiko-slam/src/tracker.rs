@@ -734,9 +734,26 @@ struct CorrectionEvent {
 
 #[derive(Debug)]
 enum CorrectionBuildError {
-    MissingKeyframe { keyframe_id: KeyframeId },
-    MissingMapPoint { point_id: MapPointId },
-    MapLookup { source: crate::map::MapError },
+    MissingKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    MissingMapPoint {
+        point_id: MapPointId,
+    },
+    MapLookup {
+        source: crate::map::MapError,
+    },
+    PoseTangent {
+        keyframe_id: KeyframeId,
+        source: crate::Se3TangentError,
+    },
+    LandmarkDelta {
+        point_id: MapPointId,
+        source: crate::LandmarkDeltaError,
+    },
+    InvalidCorrection {
+        source: crate::BaCorrectionError,
+    },
 }
 
 impl std::fmt::Display for CorrectionBuildError {
@@ -751,6 +768,20 @@ impl std::fmt::Display for CorrectionBuildError {
             CorrectionBuildError::MapLookup { source } => {
                 write!(f, "optimized map lookup failed: {source}")
             }
+            CorrectionBuildError::PoseTangent {
+                keyframe_id,
+                source,
+            } => write!(
+                f,
+                "optimized keyframe {keyframe_id:?} correction tangent is invalid: {source}"
+            ),
+            CorrectionBuildError::LandmarkDelta { point_id, source } => write!(
+                f,
+                "optimized map point {point_id:?} correction delta is invalid: {source}"
+            ),
+            CorrectionBuildError::InvalidCorrection { source } => {
+                write!(f, "backend BA correction is contradictory: {source}")
+            }
         }
     }
 }
@@ -759,6 +790,9 @@ impl std::error::Error for CorrectionBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MapLookup { source } => Some(source),
+            Self::PoseTangent { source, .. } => Some(source),
+            Self::LandmarkDelta { source, .. } => Some(source),
+            Self::InvalidCorrection { source } => Some(source),
             Self::MissingKeyframe { .. } | Self::MissingMapPoint { .. } => None,
         }
     }
@@ -770,14 +804,12 @@ impl CorrectionEvent {
         optimized_map: &SlamMap,
         result: BaResult,
     ) -> Result<Self, CorrectionBuildError> {
-        let mut correction = BaCorrection {
-            pose_deltas: Vec::new(),
-            landmark_deltas: Vec::new(),
-            result: result.clone(),
-        };
+        let is_applicable = result.is_applicable();
+        let mut pose_tangents = Vec::new();
+        let mut landmark_deltas_m = Vec::new();
 
-        if result.is_applicable() {
-            correction.pose_deltas = Vec::with_capacity(event.window.as_slice().len());
+        if is_applicable {
+            pose_tangents = Vec::with_capacity(event.window.as_slice().len());
             for &keyframe_id in event.window.as_slice() {
                 let before = event
                     .map_snapshot
@@ -786,12 +818,16 @@ impl CorrectionEvent {
                 let after = optimized_map
                     .keyframe(keyframe_id)
                     .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
-                let delta = crate::local_ba::se3_delta_between(before.pose(), after.pose());
-                correction.pose_deltas.push((keyframe_id, delta));
+                let tangent = crate::local_ba::try_se3_tangent_between(before.pose(), after.pose())
+                    .map_err(|source| CorrectionBuildError::PoseTangent {
+                        keyframe_id,
+                        source,
+                    })?;
+                pose_tangents.push((keyframe_id, tangent));
             }
 
             let point_ids = collect_window_points(optimized_map, &event.window)?;
-            correction.landmark_deltas = Vec::with_capacity(point_ids.len());
+            landmark_deltas_m = Vec::with_capacity(point_ids.len());
             for point_id in point_ids {
                 let before = event
                     .map_snapshot
@@ -802,16 +838,17 @@ impl CorrectionEvent {
                     .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
                 let before_pos = before.position();
                 let after_pos = after.position();
-                correction.landmark_deltas.push((
-                    point_id,
-                    [
-                        after_pos.x - before_pos.x,
-                        after_pos.y - before_pos.y,
-                        after_pos.z - before_pos.z,
-                    ],
-                ));
+                let delta_m = crate::LandmarkDeltaMeters::try_from_components_m([
+                    after_pos.x - before_pos.x,
+                    after_pos.y - before_pos.y,
+                    after_pos.z - before_pos.z,
+                ])
+                .map_err(|source| CorrectionBuildError::LandmarkDelta { point_id, source })?;
+                landmark_deltas_m.push((point_id, delta_m));
             }
         }
+        let correction = BaCorrection::try_new(pose_tangents, landmark_deltas_m, result)
+            .map_err(|source| CorrectionBuildError::InvalidCorrection { source })?;
 
         Ok(Self {
             request_id: event.request_id,
@@ -954,6 +991,14 @@ enum ApplyCorrectionError {
     MissingMapPoint {
         point_id: MapPointId,
     },
+    PoseUpdate {
+        keyframe_id: KeyframeId,
+        source: crate::Se3TangentError,
+    },
+    LandmarkUpdate {
+        point_id: MapPointId,
+        source: crate::LandmarkDeltaError,
+    },
     Map(crate::map::MapError),
 }
 
@@ -979,6 +1024,17 @@ impl std::fmt::Display for ApplyCorrectionError {
             ApplyCorrectionError::MissingMapPoint { point_id } => {
                 write!(f, "correction references missing map point {point_id:?}")
             }
+            ApplyCorrectionError::PoseUpdate {
+                keyframe_id,
+                source,
+            } => write!(
+                f,
+                "correction for keyframe {keyframe_id:?} produced an invalid pose: {source}"
+            ),
+            ApplyCorrectionError::LandmarkUpdate { point_id, source } => write!(
+                f,
+                "correction for map point {point_id:?} produced an invalid position: {source}"
+            ),
             ApplyCorrectionError::Map(err) => write!(f, "map correction apply error: {err}"),
         }
     }
@@ -988,6 +1044,8 @@ impl std::error::Error for ApplyCorrectionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ApplyCorrectionError::Map(source) => Some(source),
+            ApplyCorrectionError::PoseUpdate { source, .. } => Some(source),
+            ApplyCorrectionError::LandmarkUpdate { source, .. } => Some(source),
             ApplyCorrectionError::NonApplicableBaOutcome
             | ApplyCorrectionError::StaleSnapshot { .. }
             | ApplyCorrectionError::MissingKeyframe { .. }
@@ -1640,6 +1698,7 @@ pub enum TrackerError {
     Map(crate::map::MapError),
     MapFrameTransform(crate::GeometryError),
     PoseConversion(crate::Pose64Error),
+    Se3Tangent(crate::Se3TangentError),
     EssentialGraph(EssentialGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
@@ -1681,6 +1740,7 @@ impl std::fmt::Display for TrackerError {
                 write!(f, "map/odometry frame transform failed: {err}")
             }
             TrackerError::PoseConversion(err) => write!(f, "pose conversion failed: {err}"),
+            TrackerError::Se3Tangent(err) => write!(f, "SE(3) tangent error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
@@ -1718,6 +1778,7 @@ impl std::error::Error for TrackerError {
             TrackerError::Map(source) => Some(source),
             TrackerError::MapFrameTransform(source) => Some(source),
             TrackerError::PoseConversion(source) => Some(source),
+            TrackerError::Se3Tangent(source) => Some(source),
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
@@ -1781,6 +1842,12 @@ impl From<crate::GeometryError> for TrackerError {
 impl From<crate::Pose64Error> for TrackerError {
     fn from(source: crate::Pose64Error) -> Self {
         Self::PoseConversion(source)
+    }
+}
+
+impl From<crate::Se3TangentError> for TrackerError {
+    fn from(source: crate::Se3TangentError) -> Self {
+        Self::Se3Tangent(source)
     }
 }
 
@@ -2186,23 +2253,15 @@ fn trace_vio_solve(
     optimized: &crate::NavState,
     visual_pose_world: Pose,
     vio_pose_world: Pose,
-) {
+) -> Result<(), crate::Se3TangentError> {
     let velocity_odom_mps = optimized.velocity_odom_mps();
     let accel_bias_mps2 = optimized.bias().accel_mps2();
-    let pose_delta = crate::local_ba::se3_delta_between(visual_pose_world, vio_pose_world);
-    let translation_delta_m = pose_delta[..3]
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>()
-        .sqrt();
-    let rotation_delta_rad = pose_delta[3..]
-        .iter()
-        .map(|value| value * value)
-        .sum::<f32>()
-        .sqrt();
+    let pose_tangent = crate::local_ba::try_se3_tangent_between(visual_pose_world, vio_pose_world)?;
+    let translation_tangent_norm_m = pose_tangent.try_translation_tangent_norm_m()?;
+    let rotation_vector_norm_rad = pose_tangent.try_rotation_vector_norm_rad()?;
     let objective = result.objective_breakdown();
     eprintln!(
-        "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_mixed_objective={:.1} reprojection_robust_px2={:.1} imu_mahalanobis={:.1} velocity_anchor_mahalanobis={:.1} bias_random_walk_mahalanobis={:.1} bias_prior_mahalanobis={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
+        "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_mixed_objective={:.1} reprojection_robust_px2={:.1} imu_mahalanobis={:.1} velocity_anchor_mahalanobis={:.1} bias_random_walk_mahalanobis={:.1} bias_prior_mahalanobis={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] se3_translation_tangent_mm={:.2} rotation_vector_mdeg={:.1}",
         frame_count,
         result.termination(),
         result.attempted_iterations(),
@@ -2226,9 +2285,10 @@ fn trace_vio_solve(
         accel_bias_mps2[0],
         accel_bias_mps2[1],
         accel_bias_mps2[2],
-        translation_delta_m * 1000.0,
-        rotation_delta_rad.to_degrees() * 1000.0,
+        translation_tangent_norm_m * 1000.0,
+        rotation_vector_norm_rad.to_degrees() * 1000.0,
     );
+    Ok(())
 }
 
 #[cfg(feature = "vio")]
@@ -2992,7 +3052,7 @@ impl SlamTracker {
                         &optimized,
                         pose_world,
                         cam_from_map,
-                    );
+                    )?;
                 }
 
                 return Ok(PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
@@ -3101,7 +3161,7 @@ impl SlamTracker {
                 &optimized,
                 pose_world,
                 cam_from_map,
-            );
+            )?;
         }
 
         Ok(PoseRefinementProposal::Vio(Box::new(VioPoseProposal {
@@ -3339,31 +3399,34 @@ impl SlamTracker {
         #[cfg(not(feature = "vio"))]
         let vio_telemetry = None;
         if let PoseStatus::Current(pose_world) = &pose {
+            #[cfg(feature = "vio")]
+            let trace_metrics = if self.trace_transitions {
+                pose_world
+                    .cam_from_map_visual_measurement_pose32()
+                    .map(|measurement| {
+                        let tangent = crate::local_ba::try_se3_tangent_between(
+                            pose_world.cam_from_map_pose32(),
+                            measurement,
+                        )?;
+                        Ok::<_, crate::Se3TangentError>((
+                            tangent.try_translation_tangent_norm_m()?,
+                            tangent.try_rotation_vector_norm_rad()?.to_degrees(),
+                        ))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             self.last_accepted_pose = Some(LastAcceptedPose {
                 frame_id,
                 pose_world: pose_world.cam_from_map_pose32(),
                 tracking_pose: pose_world.clone(),
             });
             #[cfg(feature = "vio")]
-            if self.trace_transitions {
-                if let Some(measurement) = pose_world.cam_from_map_visual_measurement_pose32() {
-                    let delta = crate::local_ba::se3_delta_between(
-                        pose_world.cam_from_map_pose32(),
-                        measurement,
-                    );
-                    if delta.iter().all(|value| value.is_finite()) {
-                        let translation_m =
-                            (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2])
-                                .sqrt();
-                        let rotation_deg =
-                            (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
-                                .sqrt()
-                                .to_degrees();
-                        eprintln!(
-                            "vio pose delta translation_m={translation_m:.3} rotation_deg={rotation_deg:.3}"
-                        );
-                    }
-                }
+            if let Some((translation_tangent_m, rotation_vector_deg)) = trace_metrics {
+                eprintln!(
+                    "vio pose delta se3_translation_tangent_m={translation_tangent_m:.3} rotation_vector_deg={rotation_vector_deg:.3}"
+                );
             }
         }
         Ok(TrackerOutput {
@@ -3518,27 +3581,30 @@ impl SlamTracker {
                 }
             };
 
-            let Some(match_pose) = self
+            let Some(current_query_pose_world) = self
                 .global_map
-                .keyframe(candidate.candidate)
+                .keyframe(pending.query_kf)
                 .map(|entry| entry.pose())
             else {
                 let error = LoopDetectError::ApplyFailed(LoopApplyError::from(
-                    crate::map::MapError::KeyframeNotFound(candidate.candidate),
+                    crate::map::MapError::KeyframeNotFound(pending.query_kf),
                 ));
                 self.emit_event(DiagnosticEvent::LoopClosureRejected {
                     reason: LoopManager::reject_reason(&error),
                 });
                 return Err(error);
             };
-            let (translation, rotation_deg) =
-                LoopManager::correction_magnitude(match_pose, verified.query_pose_world());
-            if translation > config.max_correction_translation()
-                || rotation_deg > config.max_correction_rotation_deg()
+            let (translation_m, rotation_deg) = LoopManager::correction_magnitude(
+                current_query_pose_world,
+                verified.query_pose_world(),
+            )
+            .map_err(|source| LoopDetectError::CorrectionEvaluation { source })?;
+            if translation_m > f64::from(config.max_correction_translation_m())
+                || rotation_deg > f64::from(config.max_correction_rotation_deg())
             {
                 if first_rejection.is_none() {
                     first_rejection = Some(LoopDetectError::CorrectionTooLarge {
-                        translation,
+                        translation_m,
                         rotation_deg,
                     });
                 }
@@ -3628,7 +3694,7 @@ impl SlamTracker {
                 }
             };
             match response {
-                BackendResponse::Correction(correction) => match &correction.correction.result {
+                BackendResponse::Correction(correction) => match correction.correction.result() {
                     BaResult::Optimized(_) => {
                         let current_snapshot = self.global_map.map().snapshot();
                         match apply_correction_event(
@@ -3817,15 +3883,14 @@ impl SlamTracker {
         previous_pose: Pose,
         current_pose: Pose,
         cfg: RelocalizationConfig,
-    ) -> bool {
-        let delta = crate::local_ba::se3_delta_between(previous_pose, current_pose);
-        let translation_delta =
-            (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        let rotation_delta_deg = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
-            .sqrt()
-            .to_degrees();
-        translation_delta <= cfg.max_translation_delta_m()
-            && rotation_delta_deg <= cfg.max_rotation_delta_deg()
+    ) -> Result<bool, crate::Se3TangentError> {
+        let tangent = crate::local_ba::try_se3_tangent_between(previous_pose, current_pose)?;
+        let translation_tangent_norm_m = tangent.try_translation_tangent_norm_m()?;
+        let rotation_vector_norm_deg = tangent.try_rotation_vector_norm_rad()?.to_degrees();
+        Ok(
+            translation_tangent_norm_m <= f64::from(cfg.max_translation_delta_m())
+                && rotation_vector_norm_deg <= f64::from(cfg.max_rotation_delta_deg()),
+        )
     }
 
     fn fail_relocalization(
@@ -3931,21 +3996,22 @@ impl SlamTracker {
         candidate_id: KeyframeId,
         pose_world: Pose,
         cfg: RelocalizationConfig,
-    ) -> RelocalizationStep {
+    ) -> Result<RelocalizationStep, crate::Se3TangentError> {
         let required_confirmations = cfg.min_confirmations();
-        match session.phase {
-            RelocalizationPhase::Confirming {
-                candidate,
-                confirmations,
-                pose_world: previous_pose,
-            } if candidate == candidate_id
-                && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg) =>
+        if let RelocalizationPhase::Confirming {
+            candidate,
+            confirmations,
+            pose_world: previous_pose,
+        } = session.phase
+        {
+            if candidate == candidate_id
+                && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg)?
             {
                 let next_confirmations = confirmations.saturating_add(1);
                 if next_confirmations.get() >= required_confirmations {
-                    return RelocalizationStep::Recovered { pose_world };
+                    return Ok(RelocalizationStep::Recovered { pose_world });
                 }
-                RelocalizationStep::Continue(RelocalizationSession {
+                return Ok(RelocalizationStep::Continue(RelocalizationSession {
                     attempts: session.attempts,
                     phase: RelocalizationPhase::Confirming {
                         candidate,
@@ -3954,10 +4020,13 @@ impl SlamTracker {
                     },
                     last_detections: session.last_detections,
                     reference_cam_from_odom: session.reference_cam_from_odom,
-                })
+                }));
             }
-            _ if required_confirmations <= 1 => RelocalizationStep::Recovered { pose_world },
-            _ => RelocalizationStep::Continue(RelocalizationSession {
+        }
+        if required_confirmations <= 1 {
+            Ok(RelocalizationStep::Recovered { pose_world })
+        } else {
+            Ok(RelocalizationStep::Continue(RelocalizationSession {
                 attempts: session.attempts,
                 phase: RelocalizationPhase::Confirming {
                     candidate: candidate_id,
@@ -3966,7 +4035,7 @@ impl SlamTracker {
                 },
                 last_detections: session.last_detections,
                 reference_cam_from_odom: session.reference_cam_from_odom,
-            }),
+            }))
         }
     }
 
@@ -4015,7 +4084,7 @@ impl SlamTracker {
         session.last_detections = current;
         #[cfg(feature = "vio")]
         let reference_cam_from_odom = session.reference_cam_from_odom;
-        match Self::relocalization_step(session, candidate_id, pose_world, cfg) {
+        match Self::relocalization_step(session, candidate_id, pose_world, cfg)? {
             RelocalizationStep::Recovered { pose_world } => {
                 self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
                     keyframe_id: candidate_id,
@@ -5411,7 +5480,7 @@ fn apply_correction_event(
     current_snapshot: MapSnapshot,
     correction: &CorrectionEvent,
 ) -> Result<(), ApplyCorrectionError> {
-    if !correction.correction.result.is_applicable() {
+    if !correction.correction.result().is_applicable() {
         return Err(ApplyCorrectionError::NonApplicableBaOutcome);
     }
     if correction.source_snapshot != current_snapshot {
@@ -5421,46 +5490,42 @@ fn apply_correction_event(
         });
     }
 
-    for (keyframe_id, _) in &correction.correction.pose_deltas {
-        if map.keyframe(*keyframe_id).is_none() {
-            return Err(ApplyCorrectionError::MissingKeyframe {
-                keyframe_id: *keyframe_id,
-            });
-        }
-    }
-    for (point_id, _) in &correction.correction.landmark_deltas {
-        if map.point(*point_id).is_none() {
-            return Err(ApplyCorrectionError::MissingMapPoint {
-                point_id: *point_id,
-            });
-        }
-    }
-
-    for (keyframe_id, delta) in &correction.correction.pose_deltas {
+    let mut pose_updates = Vec::with_capacity(correction.correction.pose_tangents().len());
+    for (keyframe_id, tangent) in correction.correction.pose_tangents() {
         let current_pose = map
             .keyframe(*keyframe_id)
             .ok_or(ApplyCorrectionError::MissingKeyframe {
                 keyframe_id: *keyframe_id,
             })?
             .pose();
-        let corrected = crate::local_ba::apply_se3_delta(current_pose, *delta);
-        map.set_keyframe_pose(*keyframe_id, corrected)?;
+        let corrected = tangent
+            .try_apply_left_to_metric_pose(current_pose)
+            .map_err(|source| ApplyCorrectionError::PoseUpdate {
+                keyframe_id: *keyframe_id,
+                source,
+            })?;
+        pose_updates.push((*keyframe_id, corrected));
     }
-    for (point_id, delta) in &correction.correction.landmark_deltas {
+
+    let mut point_updates = Vec::with_capacity(correction.correction.landmark_deltas_m().len());
+    for (point_id, delta_m) in correction.correction.landmark_deltas_m() {
         let current = map
             .point(*point_id)
             .ok_or(ApplyCorrectionError::MissingMapPoint {
                 point_id: *point_id,
             })?
             .position();
-        let corrected = Point3 {
-            x: current.x + delta[0],
-            y: current.y + delta[1],
-            z: current.z + delta[2],
-        };
-        map.set_map_point_position(*point_id, corrected)?;
+        let corrected =
+            delta_m
+                .try_apply(current)
+                .map_err(|source| ApplyCorrectionError::LandmarkUpdate {
+                    point_id: *point_id,
+                    source,
+                })?;
+        point_updates.push((*point_id, corrected));
     }
-    Ok(())
+    map.apply_geometry_updates(&pose_updates, &point_updates)
+        .map_err(ApplyCorrectionError::from)
 }
 
 #[cfg(test)]
@@ -5491,6 +5556,36 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
+    }
+
+    fn se3_tangent(components: [f64; 6]) -> crate::Se3Tangent64 {
+        crate::Se3Tangent64::try_from_meters_radians(components).expect("finite test tangent")
+    }
+
+    fn landmark_delta(components_m: [f32; 3]) -> crate::LandmarkDeltaMeters {
+        crate::LandmarkDeltaMeters::try_from_components_m(components_m)
+            .expect("finite test landmark delta")
+    }
+
+    fn ba_correction(
+        pose_tangents: Vec<(KeyframeId, crate::Se3Tangent64)>,
+        landmark_deltas_m: Vec<(MapPointId, crate::LandmarkDeltaMeters)>,
+        result: BaResult,
+    ) -> BaCorrection {
+        BaCorrection::try_new(pose_tangents, landmark_deltas_m, result)
+            .expect("consistent test BA correction")
+    }
+
+    fn optimized_ba_result(iterations: usize, cost: f64) -> BaResult {
+        let iterations = NonZeroUsize::new(iterations).expect("non-zero test iteration count");
+        BaResult::Optimized(
+            crate::BaOptimization::new(
+                crate::BaTermination::Converged { iterations },
+                iterations,
+                crate::BaCost::new(cost).expect("finite test cost"),
+            )
+            .expect("valid test BA result"),
+        )
     }
 
     fn test_map_snapshot() -> MapSnapshot {
@@ -6203,20 +6298,11 @@ mod tests {
             request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
             source_snapshot,
             trigger_keyframe: keyframe_id,
-            correction: BaCorrection {
-                pose_deltas: vec![(keyframe_id, [0.0; 6])],
-                landmark_deltas: vec![(point_id, [1.0, 2.0, 3.0])],
-                result: BaResult::Optimized(
-                    crate::BaOptimization::new(
-                        crate::BaTermination::Converged {
-                            iterations: NonZeroUsize::MIN,
-                        },
-                        NonZeroUsize::MIN,
-                        crate::BaCost::new(0.0).expect("finite cost"),
-                    )
-                    .expect("valid BA result"),
-                ),
-            },
+            correction: ba_correction(
+                vec![(keyframe_id, se3_tangent([0.0; 6]))],
+                vec![(point_id, landmark_delta([1.0, 2.0, 3.0]))],
+                optimized_ba_result(1, 0.0),
+            ),
         };
         let position = map.point(point_id).expect("point").position();
         map.set_map_point_position(point_id, position)
@@ -6229,23 +6315,33 @@ mod tests {
     }
 
     #[test]
-    fn correction_apply_rejects_stalled_ba_even_with_forged_deltas() {
+    fn stalled_ba_cannot_carry_geometry_and_cannot_be_applied() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
         let source_snapshot = map.snapshot();
         let original_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
         let original_point = map.point(point_id).expect("point").position();
+        let stalled = BaResult::Stalled(crate::BaStall::new(
+            NonZeroUsize::MIN,
+            crate::BaCost::new(1.0).expect("valid cost"),
+        ));
+        let contradiction = BaCorrection::try_new(
+            vec![(keyframe_id, se3_tangent([1.0; 6]))],
+            vec![(point_id, landmark_delta([1.0; 3]))],
+            stalled.clone(),
+        )
+        .expect_err("stalled BA cannot carry geometry");
+        assert!(matches!(
+            contradiction,
+            crate::BaCorrectionError::GeometryForNonApplicableOutcome {
+                pose_tangent_count: 1,
+                landmark_delta_count: 1,
+            }
+        ));
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::MIN),
             source_snapshot,
             trigger_keyframe: keyframe_id,
-            correction: BaCorrection {
-                pose_deltas: vec![(keyframe_id, [1.0; 6])],
-                landmark_deltas: vec![(point_id, [1.0; 3])],
-                result: BaResult::Stalled(crate::BaStall::new(
-                    NonZeroUsize::MIN,
-                    crate::BaCost::new(1.0).expect("valid cost"),
-                )),
-            },
+            correction: ba_correction(Vec::new(), Vec::new(), stalled),
         };
 
         let error = apply_correction_event(&mut map, source_snapshot, &correction)
@@ -6259,6 +6355,96 @@ mod tests {
         assert_eq!(retained_pose.rotation(), original_pose.rotation());
         assert_eq!(retained_pose.translation(), original_pose.translation());
         let retained_point = map.point(point_id).expect("point").position();
+        assert_eq!(retained_point.x, original_point.x);
+        assert_eq!(retained_point.y, original_point.y);
+        assert_eq!(retained_point.z, original_point.z);
+        assert_eq!(map.snapshot(), source_snapshot);
+    }
+
+    #[test]
+    fn correction_apply_is_atomic_when_landmark_addition_overflows() {
+        let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        map.set_map_point_position(
+            point_id,
+            Point3 {
+                x: f32::MAX,
+                y: 0.0,
+                z: 1.0,
+            },
+        )
+        .expect("finite extreme point");
+        let source_snapshot = map.snapshot();
+        let original_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::MIN),
+            source_snapshot,
+            trigger_keyframe: keyframe_id,
+            correction: ba_correction(
+                vec![(keyframe_id, se3_tangent([0.1, 0.0, 0.0, 0.0, 0.0, 0.0]))],
+                vec![(point_id, landmark_delta([f32::MAX, 0.0, 0.0]))],
+                optimized_ba_result(1, 0.0),
+            ),
+        };
+
+        let error = apply_correction_event(&mut map, source_snapshot, &correction)
+            .expect_err("overflowing landmark correction must fail");
+
+        assert!(matches!(
+            error,
+            ApplyCorrectionError::LandmarkUpdate {
+                point_id: actual,
+                source: crate::LandmarkDeltaError::NonFiniteAppliedCoordinate {
+                    axis: 0,
+                    value,
+                },
+            } if actual == point_id && value.is_infinite()
+        ));
+        let retained_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        assert_eq!(retained_pose.rotation(), original_pose.rotation());
+        assert_eq!(retained_pose.translation(), original_pose.translation());
+        assert_eq!(map.snapshot(), source_snapshot);
+    }
+
+    #[test]
+    fn correction_apply_is_atomic_when_pose_update_exceeds_f32_domain() {
+        let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        let source_snapshot = map.snapshot();
+        let original_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        let original_point = map.point(point_id).expect("point").position();
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::MIN),
+            source_snapshot,
+            trigger_keyframe: keyframe_id,
+            correction: ba_correction(
+                vec![(
+                    keyframe_id,
+                    se3_tangent([f64::MAX, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                )],
+                vec![(point_id, landmark_delta([0.25, 0.0, 0.0]))],
+                optimized_ba_result(1, 0.0),
+            ),
+        };
+
+        let error = apply_correction_event(&mut map, source_snapshot, &correction)
+            .expect_err("unrepresentable pose correction must fail");
+
+        assert!(matches!(
+            error,
+            ApplyCorrectionError::PoseUpdate {
+                keyframe_id: actual,
+                source: crate::Se3TangentError::InvalidPose {
+                    operation: "SE(3) left-update result",
+                    source: crate::Pose64Error::TranslationOutOfF32Range {
+                        axis: 0,
+                        value,
+                    },
+                },
+            } if actual == keyframe_id && value == f64::MAX
+        ));
+        let retained_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        let retained_point = map.point(point_id).expect("point").position();
+        assert_eq!(retained_pose.rotation(), original_pose.rotation());
+        assert_eq!(retained_pose.translation(), original_pose.translation());
         assert_eq!(retained_point.x, original_point.x);
         assert_eq!(retained_point.y, original_point.y);
         assert_eq!(retained_point.z, original_point.z);
@@ -6288,47 +6474,42 @@ mod tests {
     #[test]
     fn correction_apply_updates_pose_and_landmark_atomically() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
-        let corrected_pose = Pose::from_rt(
-            [[1.0, 0.0, 0.0], [0.0, 0.999, -0.01], [0.0, 0.01, 0.999]],
-            [0.2, -0.1, 0.05],
-        );
+        let corrected_pose =
+            crate::test_helpers::axis_angle_pose([0.2, -0.1, 0.05], [0.01, 0.0, 0.0]);
         let corrected_point = Point3 {
             x: 0.4,
             y: -0.3,
             z: 2.1,
         };
         let initial_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
-        let pose_delta = crate::local_ba::se3_delta_between(initial_pose, corrected_pose);
+        let pose_tangent = crate::local_ba::try_se3_tangent_between(initial_pose, corrected_pose)
+            .expect("finite correction tangent");
         let source_snapshot = map.snapshot();
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
             source_snapshot,
             trigger_keyframe: keyframe_id,
-            correction: BaCorrection {
-                pose_deltas: vec![(keyframe_id, pose_delta)],
-                landmark_deltas: vec![(
+            correction: ba_correction(
+                vec![(keyframe_id, pose_tangent)],
+                vec![(
                     point_id,
-                    [
+                    landmark_delta([
                         corrected_point.x,
                         corrected_point.y,
                         corrected_point.z - 1.0,
-                    ],
+                    ]),
                 )],
-                result: BaResult::Optimized(
-                    crate::BaOptimization::new(
-                        crate::BaTermination::Converged {
-                            iterations: NonZeroUsize::new(2).expect("nonzero"),
-                        },
-                        NonZeroUsize::new(2).expect("nonzero"),
-                        crate::BaCost::new(0.1).expect("finite cost"),
-                    )
-                    .expect("valid BA result"),
-                ),
-            },
+                optimized_ba_result(2, 0.1),
+            ),
         };
 
         apply_correction_event(&mut map, source_snapshot, &correction).expect("correction apply");
         assert_map_invariants(&map).expect("post-correction invariants");
+        assert_eq!(
+            map.snapshot().generation().as_u64(),
+            source_snapshot.generation().as_u64() + 1,
+            "batched geometry correction must advance map generation once"
+        );
 
         let stored_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
         for i in 0..3 {
@@ -6397,7 +6578,7 @@ mod tests {
         match response {
             BackendResponse::Correction(correction) => {
                 assert!(matches!(
-                    correction.correction.result,
+                    correction.correction.result(),
                     BaResult::Degenerate { .. }
                         | BaResult::Optimized(_)
                         | BaResult::Stationary(_)
@@ -7387,6 +7568,41 @@ mod tests {
     }
 
     #[test]
+    fn loop_correction_translation_norm_does_not_overflow_in_f32_domain() {
+        let estimated_query_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f32::MAX, f32::MAX, 0.0],
+        );
+
+        let (translation_m, rotation_deg) =
+            LoopManager::correction_magnitude(Pose::identity(), estimated_query_pose)
+                .expect("finite f64 correction magnitude");
+
+        assert!(translation_m.is_finite());
+        assert!(translation_m > f64::from(f32::MAX));
+        assert_eq!(rotation_deg, 0.0);
+    }
+
+    #[test]
+    fn loop_correction_limit_uses_query_pose_change_not_absolute_position() {
+        let current_query_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [10_000.0, -20_000.0, 30_000.0],
+        );
+        let estimated_query_pose = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [10_000.25, -20_000.5, 30_000.125],
+        );
+
+        let (translation_m, rotation_deg) =
+            LoopManager::correction_magnitude(current_query_pose, estimated_query_pose)
+                .expect("finite query-pose correction");
+
+        assert!((0.5..1.0).contains(&translation_m));
+        assert_eq!(rotation_deg, 0.0);
+    }
+
+    #[test]
     fn loop_closure_reprojects_map_points_with_pose_correction() {
         let (map, essential_graph, verified, _query_kf, before_points) =
             make_loop_closure_apply_fixture();
@@ -7915,7 +8131,8 @@ mod tests {
             candidate,
             pose,
             cfg,
-        );
+        )
+        .expect("finite relocalization tangent");
         let RelocalizationStep::Continue(session) = step else {
             panic!("first successful relocalization should begin confirmation")
         };
@@ -7952,7 +8169,8 @@ mod tests {
             candidate,
             pose,
             cfg,
-        );
+        )
+        .expect("finite relocalization tangent");
 
         assert!(matches!(step, RelocalizationStep::Recovered { .. }));
     }
@@ -7966,21 +8184,19 @@ mod tests {
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [cfg.max_translation_delta_m() * 0.5, 0.0, 0.0],
         );
-        assert!(SlamTracker::relocalization_pose_consistent(
-            identity,
-            within_translation,
-            cfg
-        ));
+        assert!(
+            SlamTracker::relocalization_pose_consistent(identity, within_translation, cfg)
+                .expect("finite translation tangent")
+        );
 
         let beyond_translation = Pose::from_rt(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [cfg.max_translation_delta_m() * 1.5, 0.0, 0.0],
         );
-        assert!(!SlamTracker::relocalization_pose_consistent(
-            identity,
-            beyond_translation,
-            cfg
-        ));
+        assert!(
+            !SlamTracker::relocalization_pose_consistent(identity, beyond_translation, cfg)
+                .expect("finite translation tangent")
+        );
 
         let half_angle = (cfg.max_rotation_delta_deg() * 0.5).to_radians();
         let within_rotation = Pose::from_rt(
@@ -7991,11 +8207,10 @@ mod tests {
             ],
             [0.0, 0.0, 0.0],
         );
-        assert!(SlamTracker::relocalization_pose_consistent(
-            identity,
-            within_rotation,
-            cfg
-        ));
+        assert!(
+            SlamTracker::relocalization_pose_consistent(identity, within_rotation, cfg)
+                .expect("finite rotation tangent")
+        );
 
         let over_angle = (cfg.max_rotation_delta_deg() * 1.5).to_radians();
         let beyond_rotation = Pose::from_rt(
@@ -8006,11 +8221,10 @@ mod tests {
             ],
             [0.0, 0.0, 0.0],
         );
-        assert!(!SlamTracker::relocalization_pose_consistent(
-            identity,
-            beyond_rotation,
-            cfg
-        ));
+        assert!(
+            !SlamTracker::relocalization_pose_consistent(identity, beyond_rotation, cfg)
+                .expect("finite rotation tangent")
+        );
     }
 
     #[test]

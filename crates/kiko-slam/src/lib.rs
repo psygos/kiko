@@ -91,7 +91,8 @@ pub use diagnostics::{
 pub use frontend::MapObservationError;
 pub use geometry::{
     BodyFrame, CamLFrame, CamRFrame, Cov3, GeometryError, ImageFrame, Info3, MapFrame, OdomFrame,
-    Point3d, PositiveF64, StdDev, Transform3d, UnitRay3d, Variance, Vec3d, VoxelFrame,
+    Point3d, PositiveF64, Se3Tangent64, Se3TangentError, Se3TangentPart, StdDev, Transform3d,
+    UnitRay3d, Variance, Vec3d, VoxelFrame,
 };
 pub use imu::{
     ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBatchSliceError, ImuBias,
@@ -107,12 +108,12 @@ pub use local_ba::{
     VioSolveTermination, VioWindowCapacity, VioWindowCapacityError,
 };
 pub use local_ba::{
-    BaCorrection, BaCost, BaCostError, BaExecutionError, BaOptimization, BaOutcomeError, BaResult,
-    BaStall, BaStationary, BaTermination, DegenerateReason, LinearSolveError, LmConfig,
-    LmConfigError, LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster,
-    LocalBundleAdjusterWorkspaceError, MapObservation, Matrix3InverseError,
-    ObservationResolveError, ObservationSet, ObservationSetError, PoseBaError, PoseBaOutcome,
-    PoseBaRefinement, PoseBaTermination,
+    BaCorrection, BaCorrectionError, BaCost, BaCostError, BaExecutionError, BaOptimization,
+    BaOutcomeError, BaResult, BaStall, BaStationary, BaTermination, DegenerateReason,
+    LandmarkDeltaError, LandmarkDeltaMeters, LinearSolveError, LmConfig, LmConfigError,
+    LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, LocalBundleAdjusterWorkspaceError,
+    MapObservation, Matrix3InverseError, ObservationResolveError, ObservationSet,
+    ObservationSetError, PoseBaError, PoseBaOutcome, PoseBaRefinement, PoseBaTermination,
 };
 pub use loop_closure::{
     DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,

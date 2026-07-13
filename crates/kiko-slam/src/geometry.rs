@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
-use crate::math::Pose64;
+use crate::math::{Pose64, se3_exp_f64, se3_log_f64};
+use crate::{Pose, Pose64Error};
 
 const MATRIX_SYMMETRY_EPSILON: f64 = 1e-12;
 const UNIT_RAY_NORM_EPSILON: f64 = 1e-12;
@@ -413,6 +414,170 @@ impl<To, From> Transform3d<To, From> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Se3TangentPart {
+    TranslationTangentMeters,
+    RotationVectorRadians,
+}
+
+impl std::fmt::Display for Se3TangentPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TranslationTangentMeters => f.write_str("translation tangent (m)"),
+            Self::RotationVectorRadians => f.write_str("rotation vector (rad)"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Se3TangentError {
+    NonFiniteComponent {
+        part: Se3TangentPart,
+        axis: usize,
+        value: f64,
+    },
+    NonFiniteNorm {
+        part: Se3TangentPart,
+        value: f64,
+    },
+    InvalidPose {
+        operation: &'static str,
+        source: Pose64Error,
+    },
+}
+
+impl std::fmt::Display for Se3TangentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteComponent { part, axis, value } => {
+                write!(f, "SE(3) {part} axis {axis} must be finite, got {value}")
+            }
+            Self::NonFiniteNorm { part, value } => {
+                write!(f, "SE(3) {part} norm is not finite: {value}")
+            }
+            Self::InvalidPose { operation, source } => {
+                write!(f, "{operation} is not a representable rigid pose: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Se3TangentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPose { source, .. } => Some(source),
+            Self::NonFiniteComponent { .. } | Self::NonFiniteNorm { .. } => None,
+        }
+    }
+}
+
+/// Finite `se(3)` tangent with translation-tangent components in meters and
+/// rotation-vector components in radians.
+///
+/// The first three components are the logarithm's translation tangent, not
+/// necessarily the relative transform's Cartesian translation for large
+/// rotations.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Se3Tangent64 {
+    translation_tangent_m: [f64; 3],
+    rotation_vector_rad: [f64; 3],
+}
+
+impl Se3Tangent64 {
+    pub(crate) fn try_from_meters_radians(components: [f64; 6]) -> Result<Self, Se3TangentError> {
+        let [tx, ty, tz, rx, ry, rz] = components;
+        let translation_tangent_m = [tx, ty, tz];
+        let rotation_vector_rad = [rx, ry, rz];
+        validate_se3_components(
+            translation_tangent_m,
+            Se3TangentPart::TranslationTangentMeters,
+        )?;
+        validate_se3_components(rotation_vector_rad, Se3TangentPart::RotationVectorRadians)?;
+        Ok(Self {
+            translation_tangent_m,
+            rotation_vector_rad,
+        })
+    }
+
+    pub(crate) fn try_between_metric_poses(from: Pose, to: Pose) -> Result<Self, Se3TangentError> {
+        let from =
+            Pose64::try_from_pose32(from).map_err(|source| Se3TangentError::InvalidPose {
+                operation: "SE(3) logarithm source pose",
+                source,
+            })?;
+        let to = Pose64::try_from_pose32(to).map_err(|source| Se3TangentError::InvalidPose {
+            operation: "SE(3) logarithm destination pose",
+            source,
+        })?;
+        Self::try_from_meters_radians(se3_log_f64(to.compose(from.inverse())))
+    }
+
+    pub fn components_m_rad(self) -> [f64; 6] {
+        let [tx, ty, tz] = self.translation_tangent_m;
+        let [rx, ry, rz] = self.rotation_vector_rad;
+        [tx, ty, tz, rx, ry, rz]
+    }
+
+    pub fn translation_tangent_m(self) -> [f64; 3] {
+        self.translation_tangent_m
+    }
+
+    pub fn rotation_vector_rad(self) -> [f64; 3] {
+        self.rotation_vector_rad
+    }
+
+    pub fn try_translation_tangent_norm_m(self) -> Result<f64, Se3TangentError> {
+        try_norm3_f64(
+            self.translation_tangent_m,
+            Se3TangentPart::TranslationTangentMeters,
+        )
+    }
+
+    pub fn try_rotation_vector_norm_rad(self) -> Result<f64, Se3TangentError> {
+        try_norm3_f64(
+            self.rotation_vector_rad,
+            Se3TangentPart::RotationVectorRadians,
+        )
+    }
+
+    /// Apply this tangent as the left update `Exp(delta) * pose`.
+    pub(crate) fn try_apply_left_to_metric_pose(self, pose: Pose) -> Result<Pose, Se3TangentError> {
+        let pose =
+            Pose64::try_from_pose32(pose).map_err(|source| Se3TangentError::InvalidPose {
+                operation: "SE(3) left-update base pose",
+                source,
+            })?;
+        se3_exp_f64(self.components_m_rad())
+            .compose(pose)
+            .try_to_pose32()
+            .map_err(|source| Se3TangentError::InvalidPose {
+                operation: "SE(3) left-update result",
+                source,
+            })
+    }
+}
+
+fn validate_se3_components(
+    components: [f64; 3],
+    part: Se3TangentPart,
+) -> Result<(), Se3TangentError> {
+    for (axis, value) in components.into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(Se3TangentError::NonFiniteComponent { part, axis, value });
+        }
+    }
+    Ok(())
+}
+
+fn try_norm3_f64(vector: [f64; 3], part: Se3TangentPart) -> Result<f64, Se3TangentError> {
+    let value = vector[0].hypot(vector[1]).hypot(vector[2]);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(Se3TangentError::NonFiniteNorm { part, value })
+    }
+}
+
 fn ensure_finite(value: f64, context: &'static str) -> Result<(), GeometryError> {
     if !value.is_finite() {
         return Err(GeometryError::NonFiniteScalar { context, value });
@@ -508,10 +673,10 @@ fn cholesky_3x3(matrix: [[f64; 3]; 3]) -> Result<[[f64; 3]; 3], GeometryError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BodyFrame, Cov3, GeometryError, MapFrame, OdomFrame, Point3d, PositiveF64, StdDev,
-        Transform3d, UnitRay3d, Variance, Vec3d,
+        BodyFrame, Cov3, GeometryError, MapFrame, OdomFrame, Point3d, PositiveF64, Se3Tangent64,
+        Se3TangentError, Se3TangentPart, StdDev, Transform3d, UnitRay3d, Variance, Vec3d,
     };
-    use crate::Pose64;
+    use crate::{Pose, Pose64, Pose64Error};
 
     #[test]
     fn positive_scalar_and_uncertainty_wrappers_are_lawful() {
@@ -534,6 +699,69 @@ mod tests {
         assert!(matches!(
             Vec3d::<MapFrame>::try_from_xyz(0.0, f64::INFINITY, 0.0),
             Err(GeometryError::NonFiniteScalar { .. })
+        ));
+    }
+
+    #[test]
+    fn se3_tangent_rejects_non_finite_components_with_units() {
+        assert!(matches!(
+            Se3Tangent64::try_from_meters_radians([0.0, 0.0, 0.0, 0.0, f64::NAN, 0.0]),
+            Err(Se3TangentError::NonFiniteComponent {
+                part: Se3TangentPart::RotationVectorRadians,
+                axis: 1,
+                value,
+            }) if value.is_nan()
+        ));
+    }
+
+    #[test]
+    fn se3_tangent_round_trips_left_update_and_log() {
+        let components = [0.2, -0.1, 0.05, 0.03, -0.02, 0.01];
+        let tangent = Se3Tangent64::try_from_meters_radians(components).expect("finite tangent");
+        let updated = tangent
+            .try_apply_left_to_metric_pose(Pose::identity())
+            .expect("representable update");
+        let recovered = Se3Tangent64::try_between_metric_poses(Pose::identity(), updated)
+            .expect("finite recovered tangent")
+            .components_m_rad();
+
+        for (axis, (actual, expected)) in recovered.into_iter().zip(components).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "tangent component {axis}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn se3_tangent_reports_unrepresentable_left_update_result() {
+        let tangent = Se3Tangent64::try_from_meters_radians([f64::MAX, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .expect("finite f64 tangent");
+
+        assert!(matches!(
+            tangent.try_apply_left_to_metric_pose(Pose::identity()),
+            Err(Se3TangentError::InvalidPose {
+                operation: "SE(3) left-update result",
+                source: Pose64Error::TranslationOutOfF32Range {
+                    axis: 0,
+                    value,
+                },
+            }) if value == f64::MAX
+        ));
+    }
+
+    #[test]
+    fn se3_tangent_reports_unrepresentable_norm() {
+        let tangent =
+            Se3Tangent64::try_from_meters_radians([f64::MAX, f64::MAX, 0.0, 0.0, 0.0, 0.0])
+                .expect("finite components");
+
+        assert!(matches!(
+            tangent.try_translation_tangent_norm_m(),
+            Err(Se3TangentError::NonFiniteNorm {
+                part: Se3TangentPart::TranslationTangentMeters,
+                value,
+            }) if value.is_infinite()
         ));
     }
 

@@ -35,7 +35,7 @@ pub struct LoopClosureConfig {
     max_candidates: NonZeroUsize,
     temporal_gap: NonZeroUsize,
     min_streak: NonZeroUsize,
-    max_correction_translation: f32,
+    max_correction_translation_m: f32,
     max_correction_rotation_deg: f32,
     ransac: RansacConfig,
 }
@@ -48,7 +48,7 @@ pub struct LoopClosureConfigInput {
     pub max_candidates: usize,
     pub temporal_gap: usize,
     pub min_streak: usize,
-    pub max_correction_translation: f32,
+    pub max_correction_translation_m: f32,
     pub max_correction_rotation_deg: f32,
     pub ransac: RansacConfig,
 }
@@ -62,7 +62,7 @@ impl Default for LoopClosureConfigInput {
             max_candidates: DEFAULT_LOOP_MAX_CANDIDATES.get(),
             temporal_gap: DEFAULT_LOOP_TEMPORAL_GAP.get(),
             min_streak: DEFAULT_LOOP_MIN_STREAK.get(),
-            max_correction_translation: DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M,
+            max_correction_translation_m: DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M,
             max_correction_rotation_deg: DEFAULT_LOOP_MAX_CORRECTION_ROTATION_DEG,
             ransac: RansacConfig::default(),
         }
@@ -268,7 +268,7 @@ pub enum LoopClosureConfigError {
     ZeroTemporalGap,
     ZeroMinStreak,
     TooFewMinInliers { value: usize, min: usize },
-    NonPositiveMaxCorrectionTranslation { value: f32 },
+    InvalidMaxCorrectionTranslationM { value: f32 },
     InvalidMaxCorrectionRotationDeg { value: f32 },
 }
 
@@ -300,13 +300,13 @@ impl std::fmt::Display for LoopClosureConfigError {
             LoopClosureConfigError::TooFewMinInliers { value, min } => {
                 write!(f, "loop min inliers must be >= {min}, got {value}")
             }
-            LoopClosureConfigError::NonPositiveMaxCorrectionTranslation { value } => write!(
+            LoopClosureConfigError::InvalidMaxCorrectionTranslationM { value } => write!(
                 f,
-                "loop max correction translation must be > 0, got {value}"
+                "loop max correction translation must be positive finite meters, got {value}"
             ),
             LoopClosureConfigError::InvalidMaxCorrectionRotationDeg { value } => write!(
                 f,
-                "loop max correction rotation must be in (0, 180], got {value}"
+                "loop max correction rotation must be finite degrees in (0, 180], got {value}"
             ),
         }
     }
@@ -323,7 +323,7 @@ impl LoopClosureConfig {
             max_candidates,
             temporal_gap,
             min_streak,
-            max_correction_translation,
+            max_correction_translation_m,
             max_correction_rotation_deg,
             ransac,
         } = input;
@@ -357,12 +357,10 @@ impl LoopClosureConfig {
                 min: MIN_PNP_POINTS,
             });
         }
-        if !max_correction_translation.is_finite() || max_correction_translation <= 0.0 {
-            return Err(
-                LoopClosureConfigError::NonPositiveMaxCorrectionTranslation {
-                    value: max_correction_translation,
-                },
-            );
+        if !max_correction_translation_m.is_finite() || max_correction_translation_m <= 0.0 {
+            return Err(LoopClosureConfigError::InvalidMaxCorrectionTranslationM {
+                value: max_correction_translation_m,
+            });
         }
         if !max_correction_rotation_deg.is_finite()
             || max_correction_rotation_deg <= 0.0
@@ -379,7 +377,7 @@ impl LoopClosureConfig {
             max_candidates,
             temporal_gap,
             min_streak,
-            max_correction_translation,
+            max_correction_translation_m,
             max_correction_rotation_deg,
             ransac,
         })
@@ -409,8 +407,8 @@ impl LoopClosureConfig {
         self.min_streak.get()
     }
 
-    pub fn max_correction_translation(self) -> f32 {
-        self.max_correction_translation
+    pub fn max_correction_translation_m(self) -> f32 {
+        self.max_correction_translation_m
     }
 
     pub fn max_correction_rotation_deg(self) -> f32 {
@@ -431,7 +429,7 @@ impl Default for LoopClosureConfig {
             max_candidates: DEFAULT_LOOP_MAX_CANDIDATES,
             temporal_gap: DEFAULT_LOOP_TEMPORAL_GAP,
             min_streak: DEFAULT_LOOP_MIN_STREAK,
-            max_correction_translation: DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M,
+            max_correction_translation_m: DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M,
             max_correction_rotation_deg: DEFAULT_LOOP_MAX_CORRECTION_ROTATION_DEG,
             ransac: RansacConfig::default(),
         }
@@ -445,6 +443,7 @@ pub enum LoopApplyErrorKind {
     MissingMapPoint,
     MapMutation,
     PoseGraph,
+    PoseConversion,
     MapFrameAlignment,
 }
 
@@ -456,6 +455,7 @@ impl std::fmt::Display for LoopApplyErrorKind {
             Self::MissingMapPoint => write!(f, "missing map point"),
             Self::MapMutation => write!(f, "map mutation"),
             Self::PoseGraph => write!(f, "pose-graph optimization"),
+            Self::PoseConversion => write!(f, "pose conversion"),
             Self::MapFrameAlignment => write!(f, "map/odometry frame alignment"),
         }
     }
@@ -472,6 +472,11 @@ pub enum LoopApplyError {
     },
     PoseGraph {
         source: PoseGraphError,
+    },
+    PoseConversion {
+        operation: &'static str,
+        keyframe_id: Option<KeyframeId>,
+        source: crate::Pose64Error,
     },
     MapFrameAlignment {
         source: crate::GeometryError,
@@ -490,6 +495,7 @@ impl LoopApplyError {
             } => LoopApplyErrorKind::MissingMapPoint,
             Self::Map { .. } => LoopApplyErrorKind::MapMutation,
             Self::PoseGraph { .. } => LoopApplyErrorKind::PoseGraph,
+            Self::PoseConversion { .. } => LoopApplyErrorKind::PoseConversion,
             Self::MapFrameAlignment { .. } => LoopApplyErrorKind::MapFrameAlignment,
         }
     }
@@ -500,6 +506,7 @@ impl std::error::Error for LoopApplyError {
         match self {
             Self::Map { source } => Some(source),
             Self::PoseGraph { source } => Some(source),
+            Self::PoseConversion { source, .. } => Some(source),
             Self::MapFrameAlignment { source } => Some(source),
             Self::StaleCorrection { .. } => None,
         }
@@ -520,6 +527,20 @@ impl std::fmt::Display for LoopApplyError {
             Self::Map { source } => write!(f, "loop-closure map operation failed: {source}"),
             Self::PoseGraph { source } => {
                 write!(f, "loop-closure pose-graph optimization failed: {source}")
+            }
+            Self::PoseConversion {
+                operation,
+                keyframe_id,
+                source,
+            } => {
+                if let Some(keyframe_id) = keyframe_id {
+                    write!(
+                        f,
+                        "loop-closure {operation} failed for keyframe {keyframe_id:?}: {source}"
+                    )
+                } else {
+                    write!(f, "loop-closure {operation} failed: {source}")
+                }
             }
             Self::MapFrameAlignment { source } => {
                 write!(f, "loop-closure map/odometry alignment failed: {source}")
@@ -542,9 +563,17 @@ impl From<PoseGraphError> for LoopApplyError {
 
 #[derive(Debug)]
 pub enum LoopDetectError {
-    TooFewCorrespondences { count: usize },
+    TooFewCorrespondences {
+        count: usize,
+    },
     VerificationFailed(LoopVerificationError),
-    CorrectionTooLarge { translation: f32, rotation_deg: f32 },
+    CorrectionEvaluation {
+        source: crate::Pose64Error,
+    },
+    CorrectionTooLarge {
+        translation_m: f64,
+        rotation_deg: f64,
+    },
     ApplyFailed(LoopApplyError),
 }
 
@@ -553,7 +582,7 @@ impl LoopDetectError {
         match self {
             Self::TooFewCorrespondences { .. } | Self::CorrectionTooLarge { .. } => true,
             Self::VerificationFailed(source) => source.is_candidate_rejection(),
-            Self::ApplyFailed(_) => false,
+            Self::CorrectionEvaluation { .. } | Self::ApplyFailed(_) => false,
         }
     }
 }
@@ -570,12 +599,15 @@ impl std::fmt::Display for LoopDetectError {
             LoopDetectError::VerificationFailed(err) => {
                 write!(f, "loop closure verification failed: {err}")
             }
+            LoopDetectError::CorrectionEvaluation { source } => {
+                write!(f, "loop closure correction evaluation failed: {source}")
+            }
             LoopDetectError::CorrectionTooLarge {
-                translation,
+                translation_m,
                 rotation_deg,
             } => write!(
                 f,
-                "loop closure rejected: correction too large (translation={translation:.3}m, rotation={rotation_deg:.2}deg)"
+                "loop closure rejected: correction too large (translation={translation_m:.3}m, rotation={rotation_deg:.2}deg)"
             ),
             LoopDetectError::ApplyFailed(err) => {
                 write!(f, "loop closure apply failed: {err}")
@@ -588,6 +620,7 @@ impl std::error::Error for LoopDetectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             LoopDetectError::VerificationFailed(source) => Some(source),
+            LoopDetectError::CorrectionEvaluation { source } => Some(source),
             LoopDetectError::ApplyFailed(source) => Some(source),
             LoopDetectError::TooFewCorrespondences { .. }
             | LoopDetectError::CorrectionTooLarge { .. } => None,
@@ -1443,7 +1476,7 @@ mod tests {
         for rejection in [
             super::LoopDetectError::TooFewCorrespondences { count: 3 },
             super::LoopDetectError::CorrectionTooLarge {
-                translation: 2.0,
+                translation_m: 2.0,
                 rotation_deg: 15.0,
             },
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
@@ -2041,7 +2074,7 @@ mod tests {
         assert_eq!(input.max_candidates, 3);
         assert_eq!(input.temporal_gap, 30);
         assert_eq!(input.min_streak, 3);
-        assert_eq!(input.max_correction_translation, 5.0);
+        assert_eq!(input.max_correction_translation_m, 5.0);
         assert_eq!(input.max_correction_rotation_deg, 30.0);
         let cfg = LoopClosureConfig::default();
         assert_eq!(cfg.similarity_threshold(), input.similarity_threshold);
@@ -2054,14 +2087,30 @@ mod tests {
         assert_eq!(cfg.temporal_gap(), input.temporal_gap);
         assert_eq!(cfg.min_streak(), input.min_streak);
         assert_eq!(
-            cfg.max_correction_translation(),
-            input.max_correction_translation
+            cfg.max_correction_translation_m(),
+            input.max_correction_translation_m
         );
         assert_eq!(
             cfg.max_correction_rotation_deg(),
             input.max_correction_rotation_deg
         );
         LoopClosureConfig::new(input).expect("default input must parse without repair");
+    }
+
+    #[test]
+    fn loop_correction_translation_limit_requires_positive_finite_meters() {
+        for value in [0.0, f32::NAN, f32::INFINITY] {
+            let input = LoopClosureConfigInput {
+                max_correction_translation_m: value,
+                ..LoopClosureConfigInput::default()
+            };
+            assert!(matches!(
+                LoopClosureConfig::new(input),
+                Err(super::LoopClosureConfigError::InvalidMaxCorrectionTranslationM {
+                    value: actual,
+                }) if actual.to_bits() == value.to_bits()
+            ));
+        }
     }
 
     #[test]
@@ -2094,6 +2143,34 @@ mod tests {
         assert!(error.to_string().contains("map/odometry alignment failed"));
         let preserved = error.source().expect("geometry source");
         assert_eq!(preserved.to_string(), source.to_string());
+    }
+
+    #[test]
+    fn loop_pose_conversion_errors_preserve_source_and_are_not_candidate_rejections() {
+        let source = crate::Pose64Error::TranslationOutOfF32Range {
+            axis: 1,
+            value: f64::MAX,
+        };
+        let apply = LoopApplyError::PoseConversion {
+            operation: "test optimized pose narrowing",
+            keyframe_id: None,
+            source,
+        };
+        assert_eq!(apply.kind(), LoopApplyErrorKind::PoseConversion);
+        assert_eq!(
+            apply.source().expect("pose conversion source").to_string(),
+            source.to_string()
+        );
+
+        let detect = super::LoopDetectError::CorrectionEvaluation { source };
+        assert!(!detect.is_candidate_rejection());
+        assert_eq!(
+            detect
+                .source()
+                .expect("correction evaluation source")
+                .to_string(),
+            source.to_string()
+        );
     }
 
     #[test]

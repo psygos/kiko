@@ -444,9 +444,10 @@ pub enum LoopClosureRejectReason {
         count: usize,
     },
     VerificationFailed,
+    CorrectionEvaluationFailed,
     CorrectionTooLarge {
-        translation_m: f32,
-        rotation_deg: f32,
+        translation_m: f64,
+        rotation_deg: f64,
     },
     ApplyFailed,
 }
