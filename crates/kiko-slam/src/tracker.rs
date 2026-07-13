@@ -1410,8 +1410,12 @@ pub enum TrackerInitError {
         source: DescriptorInitError,
     },
     #[cfg(feature = "vio")]
-    VioInvalidGravity {
-        message: String,
+    VioGravity {
+        source: crate::GravityError,
+    },
+    #[cfg(feature = "vio")]
+    VioSolveConfig {
+        source: crate::VioSolveConfigError,
     },
 }
 
@@ -1422,8 +1426,12 @@ impl std::fmt::Display for TrackerInitError {
                 write!(f, "failed to initialize learned descriptors: {source}")
             }
             #[cfg(feature = "vio")]
-            TrackerInitError::VioInvalidGravity { message } => {
-                write!(f, "invalid vio gravity configuration: {message}")
+            TrackerInitError::VioGravity { source } => {
+                write!(f, "invalid VIO gravity configuration: {source}")
+            }
+            #[cfg(feature = "vio")]
+            TrackerInitError::VioSolveConfig { source } => {
+                write!(f, "invalid VIO solver configuration: {source}")
             }
         }
     }
@@ -1434,7 +1442,9 @@ impl std::error::Error for TrackerInitError {
         match self {
             Self::Descriptor { source } => Some(source),
             #[cfg(feature = "vio")]
-            Self::VioInvalidGravity { .. } => None,
+            Self::VioGravity { source } => Some(source),
+            #[cfg(feature = "vio")]
+            Self::VioSolveConfig { source } => Some(source),
         }
     }
 }
@@ -2391,9 +2401,7 @@ impl SlamTracker {
         ) {
             (true, Some(noise), true) => {
                 let gravity = Gravity::try_new([0.0, calibration.gravity_magnitude_mps2(), 0.0])
-                    .map_err(|err| TrackerInitError::VioInvalidGravity {
-                        message: err.to_string(),
-                    })?;
+                    .map_err(|source| TrackerInitError::VioGravity { source })?;
                 let camera_from_body = calibration
                     .imu_extrinsics()
                     .map(|extrinsics| extrinsics.t_cam_imu())
@@ -2403,9 +2411,7 @@ impl SlamTracker {
                     .clone()
                     .map(|bias| crate::VioBiasPrior::new(100.0, bias))
                     .transpose()
-                    .map_err(|err| TrackerInitError::VioInvalidGravity {
-                        message: err.to_string(),
-                    })?;
+                    .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
                 let solve_config = crate::VioSolveConfig::new(
                     gravity,
                     camera_from_body,
@@ -2416,9 +2422,7 @@ impl SlamTracker {
                     10.0, // anchor velocity info
                     bias_prior,
                 )
-                .map_err(|err| TrackerInitError::VioInvalidGravity {
-                    message: err.to_string(),
-                })?;
+                .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
                 LocalEstimator::Inertial(Box::new(VioRuntime {
                     camera_from_body,
                     noise: noise.clone(),
@@ -5204,6 +5208,32 @@ mod tests {
         let thread = descriptor.source().expect("thread spawn source");
         assert_eq!(thread.to_string(), "thread capacity exhausted");
         assert!(thread.source().is_none());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn tracker_init_error_preserves_vio_configuration_sources() {
+        let gravity = TrackerInitError::VioGravity {
+            source: crate::GravityError::ZeroNorm,
+        };
+        assert_eq!(
+            gravity.source().expect("gravity source").to_string(),
+            "gravity vector must have non-zero norm"
+        );
+
+        let solve = TrackerInitError::VioSolveConfig {
+            source: crate::VioSolveConfigError::NonFiniteAnchorWeight {
+                field: "anchor_velocity_info",
+                value: f64::NAN,
+            },
+        };
+        assert!(
+            solve
+                .source()
+                .expect("solver configuration source")
+                .to_string()
+                .contains("anchor_velocity_info")
+        );
     }
 
     #[cfg(feature = "vio")]
