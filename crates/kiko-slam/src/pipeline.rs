@@ -27,17 +27,31 @@ impl KeypointLimit {
 #[derive(Debug)]
 pub enum KeypointLimitError {
     Zero,
+    InvalidInteger {
+        value: String,
+        source: std::num::ParseIntError,
+    },
 }
 
 impl std::fmt::Display for KeypointLimitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KeypointLimitError::Zero => write!(f, "keypoint limit must be > 0"),
+            KeypointLimitError::InvalidInteger { value, source } => {
+                write!(f, "invalid keypoint limit integer {value:?}: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for KeypointLimitError {}
+impl std::error::Error for KeypointLimitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidInteger { source, .. } => Some(source),
+            Self::Zero => None,
+        }
+    }
+}
 
 impl TryFrom<usize> for KeypointLimit {
     type Error = KeypointLimitError;
@@ -56,14 +70,17 @@ impl std::fmt::Display for KeypointLimit {
 }
 
 impl std::str::FromStr for KeypointLimit {
-    type Err = String;
+    type Err = KeypointLimitError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: usize = s
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid keypoint limit: {s}"))?;
-        Self::try_from(value).map_err(|e| e.to_string())
+        let value: usize =
+            s.trim()
+                .parse()
+                .map_err(|source| KeypointLimitError::InvalidInteger {
+                    value: s.to_string(),
+                    source,
+                })?;
+        Self::try_from(value)
     }
 }
 
@@ -241,7 +258,7 @@ pub struct PipelineTimings {
 
 #[cfg(test)]
 mod tests {
-    use super::PipelineError;
+    use super::{KeypointLimit, KeypointLimitError, PipelineError};
     use crate::{FrameError, inference::InferenceError};
     use std::error::Error as _;
 
@@ -258,5 +275,22 @@ mod tests {
         let frame = inference.source().expect("frame source");
         assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
         assert!(frame.source().is_none());
+    }
+
+    #[test]
+    fn keypoint_limit_parser_preserves_integer_source_and_domain_error() {
+        let parse_error = "not-a-limit"
+            .parse::<KeypointLimit>()
+            .expect_err("invalid integer must fail");
+        assert!(matches!(
+            &parse_error,
+            KeypointLimitError::InvalidInteger { .. }
+        ));
+        assert!(parse_error.source().is_some());
+
+        assert!(matches!(
+            "0".parse::<KeypointLimit>(),
+            Err(KeypointLimitError::Zero)
+        ));
     }
 }

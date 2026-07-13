@@ -399,6 +399,10 @@ impl DownscaleFactor {
 #[derive(Debug)]
 pub enum DownscaleError {
     Zero,
+    InvalidInteger {
+        value: String,
+        source: std::num::ParseIntError,
+    },
     TooLarge {
         value: usize,
     },
@@ -418,6 +422,9 @@ impl std::fmt::Display for DownscaleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
+            DownscaleError::InvalidInteger { value, source } => {
+                write!(f, "invalid downscale factor integer {value:?}: {source}")
+            }
             DownscaleError::TooLarge { value } => {
                 write!(f, "downscale factor {value} exceeds u32::MAX")
             }
@@ -445,6 +452,7 @@ impl std::fmt::Display for DownscaleError {
 impl std::error::Error for DownscaleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            DownscaleError::InvalidInteger { source, .. } => Some(source),
             DownscaleError::InvalidDimensions(source) => Some(source),
             DownscaleError::Zero
             | DownscaleError::TooLarge { .. }
@@ -472,14 +480,17 @@ impl std::fmt::Display for DownscaleFactor {
 }
 
 impl std::str::FromStr for DownscaleFactor {
-    type Err = String;
+    type Err = DownscaleError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let value: usize = s
             .trim()
             .parse()
-            .map_err(|_| format!("invalid downscale factor: {s}"))?;
-        Self::try_from(value).map_err(|e| e.to_string())
+            .map_err(|source| DownscaleError::InvalidInteger {
+                value: s.to_string(),
+                source,
+            })?;
+        Self::try_from(value)
     }
 }
 
@@ -1477,6 +1488,7 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::sync::Arc;
 
     use super::map::SlamMap;
@@ -1833,6 +1845,23 @@ mod tests {
         assert!(matches!(
             DownscaleFactor::try_from(value),
             Err(DownscaleError::TooLarge { value: rejected }) if rejected == value
+        ));
+    }
+
+    #[test]
+    fn downscale_factor_parser_preserves_integer_source_and_domain_errors() {
+        let parse_error = "not-a-factor"
+            .parse::<DownscaleFactor>()
+            .expect_err("invalid integer must fail");
+        assert!(matches!(
+            &parse_error,
+            DownscaleError::InvalidInteger { .. }
+        ));
+        assert!(parse_error.source().is_some());
+
+        assert!(matches!(
+            "0".parse::<DownscaleFactor>(),
+            Err(DownscaleError::Zero)
         ));
     }
 

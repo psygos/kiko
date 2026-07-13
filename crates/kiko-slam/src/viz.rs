@@ -34,17 +34,31 @@ impl Default for VizDecimation {
 #[derive(Debug)]
 pub enum VizDecimationError {
     Zero,
+    InvalidInteger {
+        value: String,
+        source: std::num::ParseIntError,
+    },
 }
 
 impl std::fmt::Display for VizDecimationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VizDecimationError::Zero => write!(f, "decimation must be > 0"),
+            VizDecimationError::InvalidInteger { value, source } => {
+                write!(f, "invalid decimation integer {value:?}: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for VizDecimationError {}
+impl std::error::Error for VizDecimationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidInteger { source, .. } => Some(source),
+            Self::Zero => None,
+        }
+    }
+}
 
 impl TryFrom<usize> for VizDecimation {
     type Error = VizDecimationError;
@@ -63,14 +77,17 @@ impl std::fmt::Display for VizDecimation {
 }
 
 impl std::str::FromStr for VizDecimation {
-    type Err = String;
+    type Err = VizDecimationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let value: usize = s
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid decimation: {s}"))?;
-        Self::try_from(value).map_err(|e| e.to_string())
+        let value: usize =
+            s.trim()
+                .parse()
+                .map_err(|source| VizDecimationError::InvalidInteger {
+                    value: s.to_string(),
+                    source,
+                })?;
+        Self::try_from(value)
     }
 }
 
@@ -1658,14 +1675,15 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 mod tests {
     use super::{
         RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
-        TrackConfig, VizDecimation, surface_integration_scalars, surface_pose_quality_scalars,
-        surface_summary_scalars,
+        TrackConfig, VizDecimation, VizDecimationError, surface_integration_scalars,
+        surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
         Frame, FrameDiagnostics, FrameId, Pose, RectifiedRowMismatchPx, SensorId,
         StableSurfacePoint, StableSurfaceStats, Timestamp,
         surface_map::{SurfaceBatchIntegrationSummary, SurfaceMapSummary},
     };
+    use std::error::Error as _;
 
     fn stable_surface_point() -> StableSurfacePoint {
         StableSurfacePoint::try_new(
@@ -1697,6 +1715,23 @@ mod tests {
         }
         assert!(TrackConfig::try_new(24.0, -1.0).is_ok());
         assert!(TrackConfig::try_new(24.0, 1.0).is_ok());
+    }
+
+    #[test]
+    fn viz_decimation_parser_preserves_integer_source_and_domain_error() {
+        let parse_error = "not-a-decimation"
+            .parse::<VizDecimation>()
+            .expect_err("invalid integer must fail");
+        assert!(matches!(
+            &parse_error,
+            VizDecimationError::InvalidInteger { .. }
+        ));
+        assert!(parse_error.source().is_some());
+
+        assert!(matches!(
+            "0".parse::<VizDecimation>(),
+            Err(VizDecimationError::Zero)
+        ));
     }
 
     #[test]
