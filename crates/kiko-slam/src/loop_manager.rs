@@ -22,11 +22,22 @@ impl LoopManager {
         }
     }
 
+    #[cfg(any(not(feature = "vio"), test))]
     pub(crate) fn apply_verified_loop(
         &self,
         global_map: &mut GlobalMap,
         verified: &VerifiedLoop,
     ) -> Result<Vec<(KeyframeId, Pose)>, LoopApplyError> {
+        let (candidate, corrections) = self.prepare_verified_loop(global_map, verified)?;
+        *global_map = candidate;
+        Ok(corrections)
+    }
+
+    pub(crate) fn prepare_verified_loop(
+        &self,
+        global_map: &GlobalMap,
+        verified: &VerifiedLoop,
+    ) -> Result<(GlobalMap, Vec<(KeyframeId, Pose)>), LoopApplyError> {
         let current = global_map.map().snapshot();
         if verified.map_snapshot() != current {
             return Err(LoopApplyError::StaleCorrection {
@@ -36,8 +47,7 @@ impl LoopManager {
         }
         let mut candidate = global_map.clone();
         let corrections = self.apply_verified_loop_to_candidate(&mut candidate, verified)?;
-        *global_map = candidate;
-        Ok(corrections)
+        Ok((candidate, corrections))
     }
 
     fn apply_verified_loop_to_candidate(

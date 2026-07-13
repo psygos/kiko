@@ -445,6 +445,7 @@ pub enum LoopApplyErrorKind {
     MissingMapPoint,
     MapMutation,
     PoseGraph,
+    MapFrameAlignment,
 }
 
 impl std::fmt::Display for LoopApplyErrorKind {
@@ -455,6 +456,7 @@ impl std::fmt::Display for LoopApplyErrorKind {
             Self::MissingMapPoint => write!(f, "missing map point"),
             Self::MapMutation => write!(f, "map mutation"),
             Self::PoseGraph => write!(f, "pose-graph optimization"),
+            Self::MapFrameAlignment => write!(f, "map/odometry frame alignment"),
         }
     }
 }
@@ -471,6 +473,9 @@ pub enum LoopApplyError {
     PoseGraph {
         source: PoseGraphError,
     },
+    MapFrameAlignment {
+        source: crate::GeometryError,
+    },
 }
 
 impl LoopApplyError {
@@ -485,6 +490,7 @@ impl LoopApplyError {
             } => LoopApplyErrorKind::MissingMapPoint,
             Self::Map { .. } => LoopApplyErrorKind::MapMutation,
             Self::PoseGraph { .. } => LoopApplyErrorKind::PoseGraph,
+            Self::MapFrameAlignment { .. } => LoopApplyErrorKind::MapFrameAlignment,
         }
     }
 }
@@ -494,6 +500,7 @@ impl std::error::Error for LoopApplyError {
         match self {
             Self::Map { source } => Some(source),
             Self::PoseGraph { source } => Some(source),
+            Self::MapFrameAlignment { source } => Some(source),
             Self::StaleCorrection { .. } => None,
         }
     }
@@ -513,6 +520,9 @@ impl std::fmt::Display for LoopApplyError {
             Self::Map { source } => write!(f, "loop-closure map operation failed: {source}"),
             Self::PoseGraph { source } => {
                 write!(f, "loop-closure pose-graph optimization failed: {source}")
+            }
+            Self::MapFrameAlignment { source } => {
+                write!(f, "loop-closure map/odometry alignment failed: {source}")
             }
         }
     }
@@ -2069,6 +2079,21 @@ mod tests {
         let apply = detected.source().expect("loop-apply source");
         let pose_graph = apply.source().expect("pose-graph source");
         assert!(pose_graph.to_string().contains("did not converge"));
+    }
+
+    #[test]
+    fn loop_apply_error_preserves_map_frame_alignment_source() {
+        let source = crate::GeometryError::NonFiniteTransformTranslation {
+            operation: "test map/odometry alignment",
+            axis: 2,
+            value: f64::INFINITY,
+        };
+        let error = LoopApplyError::MapFrameAlignment { source };
+
+        assert_eq!(error.kind(), LoopApplyErrorKind::MapFrameAlignment);
+        assert!(error.to_string().contains("map/odometry alignment failed"));
+        let preserved = error.source().expect("geometry source");
+        assert_eq!(preserved.to_string(), source.to_string());
     }
 
     #[test]

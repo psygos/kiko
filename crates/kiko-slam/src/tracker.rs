@@ -1638,6 +1638,8 @@ pub enum TrackerError {
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
+    MapFrameTransform(crate::GeometryError),
+    PoseConversion(crate::Pose64Error),
     EssentialGraph(EssentialGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
@@ -1675,6 +1677,10 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
             TrackerError::Map(err) => write!(f, "map error: {err}"),
+            TrackerError::MapFrameTransform(err) => {
+                write!(f, "map/odometry frame transform failed: {err}")
+            }
+            TrackerError::PoseConversion(err) => write!(f, "pose conversion failed: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
@@ -1710,6 +1716,8 @@ impl std::error::Error for TrackerError {
             TrackerError::Triangulation(source) => Some(source),
             TrackerError::Pnp(source) => Some(source),
             TrackerError::Map(source) => Some(source),
+            TrackerError::MapFrameTransform(source) => Some(source),
+            TrackerError::PoseConversion(source) => Some(source),
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
@@ -1761,6 +1769,18 @@ impl From<crate::PnpError> for TrackerError {
 impl From<crate::map::MapError> for TrackerError {
     fn from(err: crate::map::MapError) -> Self {
         TrackerError::Map(err)
+    }
+}
+
+impl From<crate::GeometryError> for TrackerError {
+    fn from(source: crate::GeometryError) -> Self {
+        Self::MapFrameTransform(source)
+    }
+}
+
+impl From<crate::Pose64Error> for TrackerError {
+    fn from(source: crate::Pose64Error) -> Self {
+        Self::PoseConversion(source)
     }
 }
 
@@ -1932,46 +1952,39 @@ impl SystemHealth {
 
 #[derive(Clone, Debug)]
 pub struct TrackingPose {
-    cam_from_odom: Pose64,
-    cam_from_map_corrected: Pose64,
-    cam_from_map_visual_measurement: Option<Pose64>,
+    cam_from_odom: Pose,
+    cam_from_map_corrected: Pose,
+    cam_from_map_visual_measurement: Option<Pose>,
 }
 
 impl TrackingPose {
-    pub fn new(
+    fn try_new(
         cam_from_odom: Pose64,
         cam_from_map_corrected: Pose64,
         cam_from_map_visual_measurement: Option<Pose64>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, crate::Pose64Error> {
+        let cam_from_odom = cam_from_odom.try_to_pose32()?;
+        let cam_from_map_corrected = cam_from_map_corrected.try_to_pose32()?;
+        let cam_from_map_visual_measurement = cam_from_map_visual_measurement
+            .map(Pose64::try_to_pose32)
+            .transpose()?;
+        Ok(Self {
             cam_from_odom,
             cam_from_map_corrected,
             cam_from_map_visual_measurement,
-        }
-    }
-
-    pub fn cam_from_odom(&self) -> Pose64 {
-        self.cam_from_odom
-    }
-
-    pub fn cam_from_map(&self) -> Pose64 {
-        self.cam_from_map_corrected
-    }
-
-    pub fn cam_from_map_visual_measurement(&self) -> Option<Pose64> {
-        self.cam_from_map_visual_measurement
+        })
     }
 
     pub fn cam_from_odom_pose32(&self) -> Pose {
-        self.cam_from_odom.to_pose32()
+        self.cam_from_odom
     }
 
     pub fn cam_from_map_pose32(&self) -> Pose {
-        self.cam_from_map_corrected.to_pose32()
+        self.cam_from_map_corrected
     }
 
     pub fn cam_from_map_visual_measurement_pose32(&self) -> Option<Pose> {
-        self.cam_from_map_visual_measurement.map(Pose64::to_pose32)
+        self.cam_from_map_visual_measurement
     }
 }
 
@@ -2896,7 +2909,7 @@ impl SlamTracker {
         // Build NavState for this frame from visual pose
         let camera_odom = self
             .map_from_odom
-            .map_to_odom(Pose64::from_pose32(pose_world));
+            .try_map_to_odom(Pose64::from_pose32(pose_world))?;
         let body_odom =
             pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
         let visual_velocity_seed = vio_runtime.visual_velocity_seed(body_odom, capture_time);
@@ -2967,7 +2980,10 @@ impl SlamTracker {
                     optimized.pose_odom_from_body(),
                     vio_runtime.camera_from_body,
                 );
-                let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom).to_pose32();
+                let cam_from_map = self
+                    .map_from_odom
+                    .try_odom_to_map(cam_from_odom)?
+                    .try_to_pose32()?;
 
                 if self.trace_transitions {
                     trace_vio_solve(
@@ -3073,7 +3089,10 @@ impl SlamTracker {
             optimized.pose_odom_from_body(),
             vio_runtime.camera_from_body,
         );
-        let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom).to_pose32();
+        let cam_from_map = self
+            .map_from_odom
+            .try_odom_to_map(cam_from_odom)?
+            .try_to_pose32()?;
 
         if self.trace_transitions {
             trace_vio_solve(
@@ -3136,18 +3155,19 @@ impl SlamTracker {
         capture_time: Timestamp,
         pose_world: Pose,
         map_observations: &[MapObservation],
-    ) {
+    ) -> Result<(), TrackerError> {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
-            return;
+            return Ok(());
         };
         let camera_odom = self
             .map_from_odom
-            .map_to_odom(Pose64::from_pose32(pose_world));
+            .try_map_to_odom(Pose64::from_pose32(pose_world))?;
         let body_odom =
             pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
         let observations =
             ObservationSet::when_sufficient(map_observations.to_vec(), self.ba.min_observations());
         vio_runtime.commit_authoritative_pose(capture_time, body_odom, observations);
+        Ok(())
     }
 
     #[cfg(feature = "vio")]
@@ -3206,15 +3226,17 @@ impl SlamTracker {
 
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), LoopApplyError> {
         #[cfg(feature = "vio")]
-        let corrected = self
+        let (candidate_map, corrected) = self
             .loop_manager
-            .apply_verified_loop(&mut self.global_map, &verified)?;
+            .prepare_verified_loop(&self.global_map, &verified)?;
         #[cfg(not(feature = "vio"))]
         self.loop_manager
             .apply_verified_loop(&mut self.global_map, &verified)?;
         #[cfg(feature = "vio")]
         {
-            self.realign_map_from_odom(&corrected);
+            self.realign_map_from_odom(&corrected)
+                .map_err(|source| LoopApplyError::MapFrameAlignment { source })?;
+            self.global_map = candidate_map;
             self.reset_inertial_runtime_continuity();
         }
         Ok(())
@@ -3230,18 +3252,22 @@ impl SlamTracker {
     }
 
     #[cfg(feature = "vio")]
-    fn realign_map_from_odom(&mut self, corrected_poses: &[(KeyframeId, Pose)]) {
+    fn realign_map_from_odom(
+        &mut self,
+        corrected_poses: &[(KeyframeId, Pose)],
+    ) -> Result<(), crate::GeometryError> {
         // After loop closure, corrected_poses contains updated map-frame poses.
         // Use the most recent one to realign map_from_odom so that the odom
         // trajectory remains continuous while the map frame absorbs the correction.
         let Some(cam_from_odom) = self.current_odom_pose() else {
-            return;
+            return Ok(());
         };
         // Use the last corrected pose (most recent keyframe) as the alignment target
         if let Some((_, corrected_map_pose)) = corrected_poses.last() {
             self.map_from_odom
-                .align_to_pose(Pose64::from_pose32(*corrected_map_pose), cam_from_odom);
+                .try_align_to_pose(Pose64::from_pose32(*corrected_map_pose), cam_from_odom)?;
         }
+        Ok(())
     }
 
     #[cfg(feature = "vio")]
@@ -3297,7 +3323,7 @@ impl SlamTracker {
         frame_id: FrameId,
         tracking: TrackingHealth,
         diagnostics: FrameDiagnostics,
-    ) -> TrackerOutput {
+    ) -> Result<TrackerOutput, TrackerError> {
         #[cfg(feature = "vio")]
         let current_odom_pose = self.current_odom_pose();
         #[cfg(not(feature = "vio"))]
@@ -3307,7 +3333,7 @@ impl SlamTracker {
             current_odom_pose,
             visual_pose,
             self.last_accepted_pose.as_ref(),
-        );
+        )?;
         #[cfg(feature = "vio")]
         let vio_telemetry = self.current_vio_telemetry();
         #[cfg(not(feature = "vio"))]
@@ -3340,7 +3366,7 @@ impl SlamTracker {
                 }
             }
         }
-        TrackerOutput {
+        Ok(TrackerOutput {
             pose,
             inliers,
             keyframe,
@@ -3350,7 +3376,7 @@ impl SlamTracker {
             diagnostics,
             events: self.drain_events(),
             vio_telemetry,
-        }
+        })
     }
 
     /// Build an output whose pose is explicitly predicted, stale, or unavailable.
@@ -3359,7 +3385,7 @@ impl SlamTracker {
         frame_id: FrameId,
         health: TrackingHealth,
         diagnostics: FrameDiagnostics,
-    ) -> TrackerOutput {
+    ) -> Result<TrackerOutput, TrackerError> {
         self.output_with_diagnostics(None, 0, None, None, frame_id, health, diagnostics)
     }
 
@@ -3782,7 +3808,7 @@ impl SlamTracker {
         &mut self,
         frame_id: FrameId,
         health: TrackingHealth,
-    ) -> TrackerOutput {
+    ) -> Result<TrackerOutput, TrackerError> {
         let diagnostics = self.empty_diagnostics();
         self.output_with_diagnostics(None, 0, None, None, frame_id, health, diagnostics)
     }
@@ -3808,7 +3834,7 @@ impl SlamTracker {
         cfg: RelocalizationConfig,
         session: RelocalizationSession,
         current: Arc<Detections>,
-    ) -> TrackerOutput {
+    ) -> Result<TrackerOutput, TrackerError> {
         let next_attempts = session.attempts.saturating_add(1);
         if self.trace_transitions {
             eprintln!(
@@ -3955,7 +3981,7 @@ impl SlamTracker {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
             self.state = TrackerState::NeedKeyframe;
-            return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
+            return self.relocalization_output(frame_id, TrackingHealth::Lost);
         };
 
         let current =
@@ -3963,18 +3989,18 @@ impl SlamTracker {
                 .detect(&left, self.config.downscale, self.config.max_keypoints())?;
 
         if current.is_empty() {
-            return Ok(self.fail_relocalization(frame_id, cfg, session, Arc::clone(&current)));
+            return self.fail_relocalization(frame_id, cfg, session, Arc::clone(&current));
         }
 
         if self.place_recognition.is_none() {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
             self.state = TrackerState::NeedKeyframe;
-            return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
+            return self.relocalization_output(frame_id, TrackingHealth::Lost);
         }
 
         let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg)? else {
-            return Ok(self.fail_relocalization(frame_id, cfg, session, current));
+            return self.fail_relocalization(frame_id, cfg, session, current);
         };
         let candidate_id = verified.match_kf();
         let pose_world = verified.pose_world();
@@ -3999,10 +4025,10 @@ impl SlamTracker {
                     if let Some(reference_cam_from_odom) =
                         reference_cam_from_odom.or_else(|| self.current_odom_pose())
                     {
-                        self.map_from_odom.align_to_pose(
+                        self.map_from_odom.try_align_to_pose(
                             Pose64::from_pose32(pose_world),
                             reference_cam_from_odom,
-                        );
+                        )?;
                     }
                     self.reset_inertial_runtime_continuity();
                 }
@@ -4028,7 +4054,7 @@ impl SlamTracker {
                 }
             }
         }
-        Ok(self.relocalization_output(frame_id, TrackingHealth::Degraded))
+        self.relocalization_output(frame_id, TrackingHealth::Degraded)
     }
 
     fn build_tracking_attempt(
@@ -4127,12 +4153,16 @@ impl SlamTracker {
             .map_err(|err| TrackerError::Inference(InferenceError::Match(err)))
     }
 
-    fn predicted_tracking_pose(&self) -> Option<Pose> {
+    fn predicted_tracking_pose(&self) -> Result<Option<Pose>, TrackerError> {
         #[cfg(feature = "vio")]
         if let Some(cam_from_odom) = self.current_odom_pose() {
-            return Some(self.map_from_odom.odom_to_map(cam_from_odom).to_pose32());
+            return Ok(Some(
+                self.map_from_odom
+                    .try_odom_to_map(cam_from_odom)?
+                    .try_to_pose32()?,
+            ));
         }
-        self.last_pose_world()
+        Ok(self.last_pose_world())
     }
 
     fn last_pose_world(&self) -> Option<Pose> {
@@ -4146,7 +4176,7 @@ impl SlamTracker {
         keyframe_id: KeyframeId,
         config: ProjectedMatcherConfig,
     ) -> Result<Option<Matches<Raw>>, TrackerError> {
-        let Some(predicted_pose) = self.predicted_tracking_pose() else {
+        let Some(predicted_pose) = self.predicted_tracking_pose()? else {
             return Ok(None);
         };
         let radius = config.search_radius_px();
@@ -4278,7 +4308,7 @@ impl SlamTracker {
             diagnostics.features_detected = Some(current.len());
             diagnostics.features_matched = Some(0);
             diagnostics.tracking_time = Some(tracking_start.elapsed());
-            return Ok(self.tracking_failure_output(frame_id, tracking_health, diagnostics));
+            return self.tracking_failure_output(frame_id, tracking_health, diagnostics);
         } else {
             let mut attempt = None;
             if let TrackingMatcher::Projected(config) = self.config.tracking_matcher {
@@ -4377,11 +4407,11 @@ impl SlamTracker {
                             diagnostics.features_detected = Some(current.len());
                             diagnostics.features_matched = Some(matches);
                             diagnostics.tracking_time = Some(tracking_start.elapsed());
-                            return Ok(self.tracking_failure_output(
+                            return self.tracking_failure_output(
                                 frame_id,
                                 tracking_health,
                                 diagnostics,
-                            ));
+                            );
                         }
                         Err(TrackingAttemptError::PnpFailed {
                             matches,
@@ -4407,11 +4437,11 @@ impl SlamTracker {
                             diagnostics.pnp_tracked_observations =
                                 Some(crate::PnpTrackedObservationCountMetric::new(observations));
                             diagnostics.tracking_time = Some(tracking_start.elapsed());
-                            return Ok(self.tracking_failure_output(
+                            return self.tracking_failure_output(
                                 frame_id,
                                 tracking_health,
                                 diagnostics,
-                            ));
+                            );
                         }
                         Err(TrackingAttemptError::Fatal(err)) => return Err(err),
                     }
@@ -4525,7 +4555,7 @@ impl SlamTracker {
                     left.timestamp(),
                     visual_pose_world,
                     &map_observations_for_authoritative_visual_pose,
-                );
+                )?;
                 (
                     visual_pose_world,
                     crate::TrackingPoseSource::VisualTracking,
@@ -4554,7 +4584,7 @@ impl SlamTracker {
                         left.timestamp(),
                         adopted_pose,
                         &map_observations_for_authoritative_visual_pose,
-                    );
+                    )?;
                     (
                         adopted_pose,
                         crate::TrackingPoseSource::VisualBundleAdjustment,
@@ -4569,7 +4599,7 @@ impl SlamTracker {
                         left.timestamp(),
                         visual_pose_world,
                         &map_observations_for_authoritative_visual_pose,
-                    );
+                    )?;
                     (
                         visual_pose_world,
                         crate::TrackingPoseSource::VisualTracking,
@@ -4615,7 +4645,7 @@ impl SlamTracker {
                         left.timestamp(),
                         visual_pose_world,
                         &map_observations_for_authoritative_visual_pose,
-                    );
+                    )?;
                     (visual_pose_world, crate::TrackingPoseSource::VisualTracking)
                 };
                 (
@@ -4967,7 +4997,7 @@ impl SlamTracker {
         diagnostics.features_detected = Some(current.len());
         diagnostics.features_matched = Some(matches.len());
 
-        Ok(self.output_with_diagnostics(
+        self.output_with_diagnostics(
             Some(pose_world),
             result.inliers().len(),
             output_keyframe,
@@ -4975,7 +5005,7 @@ impl SlamTracker {
             frame_id,
             TrackingHealth::Good,
             diagnostics,
-        ))
+        )
     }
 
     fn create_keyframe(
@@ -5001,11 +5031,11 @@ impl SlamTracker {
                 self.reset_inertial_runtime_continuity();
                 let mut diagnostics = self.empty_diagnostics();
                 diagnostics.keyframe_status = Some(KeyframeStatus::Rejected);
-                return Ok(self.tracking_failure_output(
+                return self.tracking_failure_output(
                     frame_id,
                     TrackingHealth::Degraded,
                     diagnostics,
-                ));
+                );
             }
             Err(err) => {
                 if self.trace_transitions {
@@ -5024,9 +5054,9 @@ impl SlamTracker {
         };
         self.ba.reset();
         #[cfg(feature = "vio")]
-        self.commit_authoritative_visual_pose(capture_time, pose_world, &[]);
+        self.commit_authoritative_visual_pose(capture_time, pose_world, &[])?;
         self.consecutive_tracking_failures = 0;
-        Ok(self.output_with_diagnostics(
+        self.output_with_diagnostics(
             Some(pose_world),
             0,
             Some(created.keyframe),
@@ -5034,7 +5064,7 @@ impl SlamTracker {
             frame_id,
             TrackingHealth::Good,
             created.diagnostics,
-        ))
+        )
     }
 
     fn create_keyframe_internal(
@@ -5270,10 +5300,11 @@ fn classify_pose_status(
     current_odom_pose: Option<Pose64>,
     visual_pose_map: Option<Pose>,
     last_accepted_pose: Option<&LastAcceptedPose>,
-) -> PoseStatus {
-    match (current_odom_pose, visual_pose_map) {
+) -> Result<PoseStatus, TrackerError> {
+    Ok(match (current_odom_pose, visual_pose_map) {
         (Some(cam_from_odom), visual_pose_map) => {
-            let pose = tracking_pose_from_vio_output(map_from_odom, cam_from_odom, visual_pose_map);
+            let pose =
+                tracking_pose_from_vio_output(map_from_odom, cam_from_odom, visual_pose_map)?;
             if visual_pose_map.is_some() {
                 PoseStatus::Current(pose)
             } else {
@@ -5282,12 +5313,12 @@ fn classify_pose_status(
         }
         (None, Some(pose_map)) => {
             let cam_from_map = Pose64::from_pose32(pose_map);
-            let cam_from_odom = map_from_odom.map_to_odom(cam_from_map);
-            PoseStatus::Current(TrackingPose::new(
+            let cam_from_odom = map_from_odom.try_map_to_odom(cam_from_map)?;
+            PoseStatus::Current(TrackingPose::try_new(
                 cam_from_odom,
                 cam_from_map,
                 Some(cam_from_map),
-            ))
+            )?)
         }
         (None, None) => {
             last_accepted_pose.map_or(PoseStatus::Unavailable, |last| PoseStatus::Stale {
@@ -5295,21 +5326,21 @@ fn classify_pose_status(
                 source_frame_id: last.frame_id,
             })
         }
-    }
+    })
 }
 
 fn tracking_pose_from_vio_output(
     map_from_odom: &MapFromOdom,
     cam_from_odom: Pose64,
     pose_map_measurement: Option<Pose>,
-) -> TrackingPose {
-    let cam_from_map_corrected = map_from_odom.odom_to_map(cam_from_odom);
+) -> Result<TrackingPose, TrackerError> {
+    let cam_from_map_corrected = map_from_odom.try_odom_to_map(cam_from_odom)?;
     let cam_from_map_visual_measurement = pose_map_measurement.map(Pose64::from_pose32);
-    TrackingPose::new(
+    Ok(TrackingPose::try_new(
         cam_from_odom,
         cam_from_map_corrected,
         cam_from_map_visual_measurement,
-    )
+    )?)
 }
 
 fn build_shared_matches(
@@ -7399,6 +7430,26 @@ mod tests {
     }
 
     #[test]
+    fn prepared_loop_closure_does_not_mutate_authoritative_map() {
+        let (map, essential_graph, verified, query_kf, _) = make_loop_closure_apply_fixture();
+        let global_map = GlobalMap::from_parts(map, essential_graph);
+        let before_generation = global_map.map().generation();
+        let before_pose = global_map.keyframe(query_kf).expect("query pose").pose();
+
+        let (candidate, corrections) = LoopManager::new(PoseGraphConfig::default())
+            .prepare_verified_loop(&global_map, &verified)
+            .expect("prepare loop closure");
+
+        assert!(!corrections.is_empty());
+        assert_eq!(global_map.map().generation(), before_generation);
+        assert_eq!(global_map.essential_graph().snapshot().loop_edges.len(), 0);
+        let after_pose = global_map.keyframe(query_kf).expect("query pose").pose();
+        assert_eq!(after_pose.rotation(), before_pose.rotation());
+        assert_eq!(after_pose.translation(), before_pose.translation());
+        assert_eq!(candidate.essential_graph().snapshot().loop_edges.len(), 1);
+    }
+
+    #[test]
     fn loop_closure_failure_leaves_global_map_unchanged() {
         let (map, essential_graph, verified, query_kf, before_points) =
             make_loop_closure_apply_fixture();
@@ -7964,22 +8015,41 @@ mod tests {
 
     #[test]
     fn pose_status_distinguishes_stale_snapshot_from_current_estimate() {
-        let tracking_pose = TrackingPose::new(
+        let tracking_pose = TrackingPose::try_new(
             Pose64::identity(),
             Pose64::identity(),
             Some(Pose64::identity()),
-        );
+        )
+        .expect("tracking pose");
         let last = LastAcceptedPose {
             frame_id: FrameId::new(41),
             pose_world: Pose::identity(),
             tracking_pose,
         };
 
-        let status = classify_pose_status(&MapFromOdom::identity(), None, None, Some(&last));
+        let status = classify_pose_status(&MapFromOdom::identity(), None, None, Some(&last))
+            .expect("pose status");
         assert!(status.current_estimate().is_none());
         assert!(status.last_known_pose().is_some());
         assert_eq!(status.stale_source_frame_id(), Some(FrameId::new(41)));
         assert!(matches!(status, PoseStatus::Stale { .. }));
+    }
+
+    #[test]
+    fn tracking_pose_rejects_translation_outside_f32_output_domain() {
+        let unrepresentable = Pose64::try_from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        )
+        .expect("finite f64 pose");
+
+        assert!(matches!(
+            TrackingPose::try_new(unrepresentable, Pose64::identity(), None),
+            Err(crate::Pose64Error::TranslationOutOfF32Range {
+                axis: 0,
+                value,
+            }) if value == f64::MAX
+        ));
     }
 
     #[test]
@@ -7990,40 +8060,73 @@ mod tests {
         )
         .expect("odom pose");
         let status =
-            classify_pose_status(&MapFromOdom::identity(), Some(cam_from_odom), None, None);
+            classify_pose_status(&MapFromOdom::identity(), Some(cam_from_odom), None, None)
+                .expect("pose status");
 
         let PoseStatus::Predicted(pose) = status else {
             panic!("inertial-only output must be predicted");
         };
-        assert_eq!(pose.cam_from_odom(), cam_from_odom);
-        assert_eq!(pose.cam_from_map(), cam_from_odom);
-        assert!(pose.cam_from_map_visual_measurement().is_none());
+        let expected = cam_from_odom.to_pose32();
+        assert_eq!(
+            pose.cam_from_odom_pose32().translation(),
+            expected.translation()
+        );
+        assert_eq!(pose.cam_from_odom_pose32().rotation(), expected.rotation());
+        assert_eq!(
+            pose.cam_from_map_pose32().translation(),
+            expected.translation()
+        );
+        assert_eq!(pose.cam_from_map_pose32().rotation(), expected.rotation());
+        assert!(pose.cam_from_map_visual_measurement_pose32().is_none());
     }
 
     #[test]
     fn visual_output_without_prediction_preserves_map_and_odom_frames() {
+        let map_from_odom_pose = Pose64::try_from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 0.0, 0.0],
+        )
+        .expect("map-from-odom");
         let mut bridge = MapFromOdom::identity();
-        bridge.set_pose_map_from_odom(
-            Pose64::try_from_rt(
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                [1.0, 0.0, 0.0],
-            )
-            .expect("map-from-odom"),
-        );
+        bridge
+            .try_align_to_pose(Pose64::identity(), map_from_odom_pose)
+            .expect("bridge");
         let visual_pose = Pose::from_rt(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [2.0, 0.0, 0.0],
         );
         let expected_map = Pose64::from_pose32(visual_pose);
-        let expected_odom = bridge.map_to_odom(expected_map);
+        let expected_odom = bridge.try_map_to_odom(expected_map).expect("odom pose");
 
-        let status = classify_pose_status(&bridge, None, Some(visual_pose), None);
+        let status =
+            classify_pose_status(&bridge, None, Some(visual_pose), None).expect("pose status");
         let PoseStatus::Current(pose) = status else {
             panic!("accepted visual output must be current");
         };
-        assert_eq!(pose.cam_from_map(), expected_map);
-        assert_eq!(pose.cam_from_odom(), expected_odom);
-        assert_eq!(pose.cam_from_map_visual_measurement(), Some(expected_map));
+        assert_eq!(
+            pose.cam_from_map_pose32().translation(),
+            expected_map.to_pose32().translation()
+        );
+        assert_eq!(
+            pose.cam_from_map_pose32().rotation(),
+            expected_map.to_pose32().rotation()
+        );
+        assert_eq!(
+            pose.cam_from_odom_pose32().translation(),
+            expected_odom.to_pose32().translation()
+        );
+        assert_eq!(
+            pose.cam_from_odom_pose32().rotation(),
+            expected_odom.to_pose32().rotation()
+        );
+        let measurement = pose
+            .cam_from_map_visual_measurement_pose32()
+            .expect("visual measurement");
+        assert_eq!(
+            measurement.translation(),
+            expected_map.to_pose32().translation()
+        );
+        assert_eq!(measurement.rotation(), expected_map.to_pose32().rotation());
     }
 
     #[cfg(feature = "vio")]
@@ -8038,8 +8141,13 @@ mod tests {
             [2.0, 3.0, -1.0],
         );
         let mut bridge = MapFromOdom::identity();
-        bridge.align_to_pose(Pose64::from_pose32(pose_map), cam_from_odom);
-        let mapped = bridge.odom_to_map(cam_from_odom).to_pose32();
+        bridge
+            .try_align_to_pose(Pose64::from_pose32(pose_map), cam_from_odom)
+            .expect("bridge alignment");
+        let mapped = bridge
+            .try_odom_to_map(cam_from_odom)
+            .expect("map pose")
+            .to_pose32();
         assert_eq!(mapped.translation(), pose_map.translation());
         assert_eq!(mapped.rotation(), pose_map.rotation());
     }
@@ -8060,11 +8168,17 @@ mod tests {
             [2.0, 3.0, -1.0],
         );
         let mut bridge = MapFromOdom::identity();
-        bridge.set_pose_map_from_odom(bridge_pose);
-        let expected_bridge_pose = bridge.odom_to_map(cam_from_odom).to_pose32();
+        bridge
+            .try_align_to_pose(Pose64::identity(), bridge_pose)
+            .expect("map/odom bridge");
+        let expected_bridge_pose = bridge
+            .try_odom_to_map(cam_from_odom)
+            .expect("map pose")
+            .to_pose32();
 
         let tracking_pose =
-            tracking_pose_from_vio_output(&bridge, cam_from_odom, Some(measured_map_pose));
+            tracking_pose_from_vio_output(&bridge, cam_from_odom, Some(measured_map_pose))
+                .expect("tracking pose");
 
         assert_eq!(
             tracking_pose.cam_from_map_pose32().translation(),

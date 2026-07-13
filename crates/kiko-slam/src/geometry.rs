@@ -299,6 +299,12 @@ impl<Frame> Info3<Frame> {
 /// let cam_from_body = Transform3d::<CamLFrame, BodyFrame>::from_pose64(Pose64::identity()).unwrap();
 /// let _ = map_from_odom.try_compose(cam_from_body);
 /// ```
+///
+/// ```compile_fail
+/// use kiko_slam::{MapFrame, OdomFrame, Transform3d};
+///
+/// let _ = Transform3d::<MapFrame, OdomFrame>::identity();
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform3d<To, From> {
     pose: Pose64,
@@ -308,15 +314,20 @@ pub struct Transform3d<To, From> {
 
 impl<Frame> Transform3d<Frame, Frame> {
     pub fn identity() -> Self {
+        Self::identity_between_frames()
+    }
+}
+
+impl<To, From> Transform3d<To, From> {
+    /// Declare two distinct frame origins coincident at an internal trust boundary.
+    pub(crate) fn identity_between_frames() -> Self {
         Self {
             pose: Pose64::identity(),
             _to: PhantomData,
             _from: PhantomData,
         }
     }
-}
 
-impl<To, From> Transform3d<To, From> {
     pub fn from_pose64(pose: Pose64) -> Result<Self, GeometryError> {
         validate_pose_is_finite(pose, "frame-typed transform construction")?;
         Ok(Self {

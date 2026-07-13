@@ -2052,6 +2052,18 @@ pub enum VioSolveError {
     InvalidOutcome {
         source: VioSolveOutcomeError,
     },
+    MapFrameTransform {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        frame_index: usize,
+        source: crate::GeometryError,
+    },
+    PoseConversion {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        frame_index: usize,
+        source: crate::Pose64Error,
+    },
 }
 
 #[cfg(feature = "vio")]
@@ -2183,6 +2195,24 @@ impl std::fmt::Display for VioSolveError {
             Self::InvalidOutcome { source } => {
                 write!(f, "VIO solver produced an invalid outcome: {source}")
             }
+            Self::MapFrameTransform {
+                stage,
+                iteration,
+                frame_index,
+                source,
+            } => write!(
+                f,
+                "VIO {stage} map/odometry transform failed at iteration {iteration}, frame {frame_index}: {source}"
+            ),
+            Self::PoseConversion {
+                stage,
+                iteration,
+                frame_index,
+                source,
+            } => write!(
+                f,
+                "VIO {stage} camera pose cannot be represented as f32 at iteration {iteration}, frame {frame_index}: {source}"
+            ),
         }
     }
 }
@@ -2201,6 +2231,8 @@ impl std::error::Error for VioSolveError {
             Self::ReprojectionJacobianRetraction { source, .. } => Some(source),
             Self::InvalidObjective { source, .. } => Some(source),
             Self::InvalidOutcome { source } => Some(source),
+            Self::MapFrameTransform { source, .. } => Some(source),
+            Self::PoseConversion { source, .. } => Some(source),
             Self::WindowExceedsConfiguredCapacity { .. }
             | Self::ReprojectionFactorUnavailable { .. }
             | Self::ReprojectionJacobianUnavailable { .. }
@@ -4170,7 +4202,16 @@ impl VisualFactorSupport {
                             source,
                         })?;
                 }
-                let cam_from_map = vio_cam_from_map(state, config.camera_from_body, map_from_odom);
+                let cam_from_map = vio_cam_from_map_pose32(
+                    state,
+                    config.camera_from_body,
+                    map_from_odom,
+                    VioEvaluation {
+                        stage: VioEvaluationStage::Initial,
+                        iteration: 0,
+                    },
+                    frame_index,
+                )?;
                 for (observation_index, observation) in resolved.iter().enumerate() {
                     if reprojection_residual_and_jacobians(
                         cam_from_map,
@@ -4238,7 +4279,13 @@ fn linearize_vio_states(
 
     for (frame_idx, state) in states.iter().enumerate() {
         let base = frame_idx * STATE_DIM;
-        let cam_pose = vio_cam_from_map(state, config.camera_from_body, map_from_odom);
+        let cam_pose = vio_cam_from_map_pose32(
+            state,
+            config.camera_from_body,
+            map_from_odom,
+            evaluation,
+            frame_idx,
+        )?;
         if let Some(resolved) = resolved_observations[frame_idx].available() {
             for &observation_index in visual_support.indices_for_frame(frame_idx) {
                 let obs = &resolved[observation_index];
@@ -4294,9 +4341,20 @@ fn linearize_vio_states(
                             source,
                         }
                     })?;
-                    let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body, map_from_odom);
-                    let p_minus =
-                        vio_cam_from_map(&s_minus, config.camera_from_body, map_from_odom);
+                    let p_plus = vio_cam_from_map_pose32(
+                        &s_plus,
+                        config.camera_from_body,
+                        map_from_odom,
+                        evaluation,
+                        frame_idx,
+                    )?;
+                    let p_minus = vio_cam_from_map_pose32(
+                        &s_minus,
+                        config.camera_from_body,
+                        map_from_odom,
+                        evaluation,
+                        frame_idx,
+                    )?;
                     let (r_plus, _, _) = reprojection_residual_and_jacobians(
                         p_plus,
                         world,
@@ -4511,13 +4569,31 @@ fn validate_vio_linearization_values(
 /// Compute camera-from-map pose from NavState (body-in-odom), extrinsics,
 /// and the current map/odom bridge.
 #[cfg(feature = "vio")]
-fn vio_cam_from_map(
+fn vio_cam_from_map_pose32(
     state: &crate::NavState,
     camera_from_body: crate::Pose64,
     map_from_odom: &crate::MapFromOdom,
-) -> Pose {
+    evaluation: VioEvaluation,
+    frame_index: usize,
+) -> Result<Pose, VioSolveError> {
+    let VioEvaluation { stage, iteration } = evaluation;
     let cam_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
-    map_from_odom.odom_to_map(cam_from_odom).to_pose32()
+    let cam_from_map = map_from_odom
+        .try_odom_to_map(cam_from_odom)
+        .map_err(|source| VioSolveError::MapFrameTransform {
+            stage,
+            iteration,
+            frame_index,
+            source,
+        })?;
+    cam_from_map
+        .try_to_pose32()
+        .map_err(|source| VioSolveError::PoseConversion {
+            stage,
+            iteration,
+            frame_index,
+            source,
+        })
 }
 
 #[derive(Debug)]
@@ -7499,17 +7575,73 @@ mod tests {
             [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
             [0.1, 0.2, 0.3],
         );
-        let mut bridge = crate::MapFromOdom::identity();
-        bridge.set_pose_map_from_odom(crate::Pose64::from_rt(
+        let map_from_odom_pose = crate::Pose64::from_rt(
             [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
             [0.5, -0.25, 1.5],
-        ));
+        );
+        let mut bridge = crate::MapFromOdom::identity();
+        bridge
+            .try_align_to_pose(crate::Pose64::identity(), map_from_odom_pose)
+            .expect("map/odom bridge");
 
         let cam_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
-        let expected = bridge.odom_to_map(cam_from_odom).to_pose32();
-        let actual = vio_cam_from_map(&state, camera_from_body, &bridge);
+        let expected = bridge
+            .try_odom_to_map(cam_from_odom)
+            .expect("map pose")
+            .to_pose32();
+        let actual = vio_cam_from_map_pose32(
+            &state,
+            camera_from_body,
+            &bridge,
+            VioEvaluation {
+                stage: VioEvaluationStage::Initial,
+                iteration: 0,
+            },
+            0,
+        )
+        .expect("VIO map pose");
 
         assert_eq!(actual.translation(), expected.translation());
         assert_eq!(actual.rotation(), expected.rotation());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_cam_from_map_reports_f32_output_domain_with_evaluation_context() {
+        let state = crate::NavState::try_new(
+            crate::Pose64::try_from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [f64::MAX, 0.0, 0.0],
+            )
+            .expect("finite f64 pose"),
+            [0.0; 3],
+            crate::ImuBias::default(),
+        )
+        .expect("finite navigation state");
+
+        let error = vio_cam_from_map_pose32(
+            &state,
+            crate::Pose64::identity(),
+            &crate::MapFromOdom::identity(),
+            VioEvaluation {
+                stage: VioEvaluationStage::Candidate,
+                iteration: 7,
+            },
+            3,
+        )
+        .expect_err("f64 pose outside the output domain must fail");
+
+        assert!(matches!(
+            error,
+            VioSolveError::PoseConversion {
+                stage: VioEvaluationStage::Candidate,
+                iteration: 7,
+                frame_index: 3,
+                source: crate::Pose64Error::TranslationOutOfF32Range {
+                    axis: 0,
+                    value,
+                },
+            } if value == -f64::MAX
+        ));
     }
 }
