@@ -4,7 +4,10 @@ use std::num::NonZeroU32;
 use crate::map::{KeyframeId, SlamMap};
 use crate::{Pose64, Pose64Error};
 
-use super::{PoseGraphEdge, PoseGraphError, scaled_identity6};
+use super::{
+    PoseGraphEdge, PoseGraphError, PoseGraphInformation, PoseGraphInformationError,
+    scaled_identity6,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EssentialEdgeKind {
@@ -16,11 +19,93 @@ pub enum EssentialEdgeKind {
 
 #[derive(Clone, Debug)]
 pub struct EssentialEdge {
-    pub a: KeyframeId,
-    pub b: KeyframeId,
-    pub kind: EssentialEdgeKind,
-    pub relative_pose: Pose64,
-    pub information: [[f64; 6]; 6],
+    a: KeyframeId,
+    b: KeyframeId,
+    kind: EssentialEdgeKind,
+    relative_pose: Pose64,
+    information: PoseGraphInformation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EssentialEdgeError {
+    SelfEdge { keyframe_id: KeyframeId },
+    RelativePose { source: Pose64Error },
+    Information { source: PoseGraphInformationError },
+}
+
+impl std::fmt::Display for EssentialEdgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfEdge { keyframe_id } => write!(
+                f,
+                "essential graph edge endpoints must differ, both were {keyframe_id:?}"
+            ),
+            Self::RelativePose { source } => {
+                write!(f, "invalid essential graph relative pose: {source}")
+            }
+            Self::Information { source } => {
+                write!(f, "invalid essential graph edge information: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EssentialEdgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::RelativePose { source } => Some(source),
+            Self::Information { source } => Some(source),
+            Self::SelfEdge { .. } => None,
+        }
+    }
+}
+
+impl EssentialEdge {
+    /// Construct one validated constraint whose measurement uses the graph's
+    /// exact algebraic convention `pose(a).inverse().compose(pose(b))`.
+    fn try_new(
+        a: KeyframeId,
+        b: KeyframeId,
+        kind: EssentialEdgeKind,
+        relative_pose: Pose64,
+        information: [[f64; 6]; 6],
+    ) -> Result<Self, EssentialEdgeError> {
+        if a == b {
+            return Err(EssentialEdgeError::SelfEdge { keyframe_id: a });
+        }
+        let relative_pose =
+            Pose64::try_from_rt(relative_pose.rotation(), relative_pose.translation())
+                .map_err(|source| EssentialEdgeError::RelativePose { source })?;
+        let information = PoseGraphInformation::try_new(information)
+            .map_err(|source| EssentialEdgeError::Information { source })?;
+        Ok(Self {
+            a,
+            b,
+            kind,
+            relative_pose,
+            information,
+        })
+    }
+
+    pub fn endpoint_a(&self) -> KeyframeId {
+        self.a
+    }
+
+    pub fn endpoint_b(&self) -> KeyframeId {
+        self.b
+    }
+
+    pub fn kind(&self) -> EssentialEdgeKind {
+        self.kind
+    }
+
+    pub fn relative_pose(&self) -> Pose64 {
+        self.relative_pose
+    }
+
+    pub fn information(&self) -> &PoseGraphInformation {
+        &self.information
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -66,12 +151,9 @@ pub enum EssentialGraphError {
     MissingInsertionFallback {
         registered_keyframes: usize,
     },
-    UnexpectedEdgeKind {
-        expected: EssentialEdgeKind,
-        actual: EssentialEdgeKind,
-    },
-    SelfEdge {
-        keyframe_id: KeyframeId,
+    EdgeConstruction {
+        kind: EssentialEdgeKind,
+        source: EssentialEdgeError,
     },
 }
 
@@ -100,14 +182,12 @@ impl std::fmt::Display for EssentialGraphError {
                 f,
                 "essential graph has {registered_keyframes} registered keyframes but no insertion-order fallback"
             ),
-            EssentialGraphError::UnexpectedEdgeKind { expected, actual } => write!(
-                f,
-                "essential graph edge insertion expected kind {expected:?}, got {actual:?}"
-            ),
-            EssentialGraphError::SelfEdge { keyframe_id } => write!(
-                f,
-                "essential graph edge endpoints must differ, both were {keyframe_id:?}"
-            ),
+            EssentialGraphError::EdgeConstruction { kind, source } => {
+                write!(
+                    f,
+                    "failed to construct {kind:?} essential graph edge: {source}"
+                )
+            }
         }
     }
 }
@@ -116,11 +196,10 @@ impl std::error::Error for EssentialGraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidPose { source, .. } => Some(source),
+            Self::EdgeConstruction { source, .. } => Some(source),
             Self::KeyframeNotFound { .. }
             | Self::RootRemovalDenied { .. }
-            | Self::MissingInsertionFallback { .. }
-            | Self::UnexpectedEdgeKind { .. }
-            | Self::SelfEdge { .. } => None,
+            | Self::MissingInsertionFallback { .. } => None,
         }
     }
 }
@@ -191,6 +270,13 @@ impl EssentialGraph {
 
         let parent_pose = map_pose64(map, parent)?;
         let spanning_relative_pose = parent_pose.inverse().compose(keyframe_pose);
+        let spanning_edge = parse_essential_edge(
+            parent,
+            keyframe_id,
+            EssentialEdgeKind::SpanningTree,
+            spanning_relative_pose,
+            scaled_identity6(parent_weight),
+        )?;
         let mut new_strong_edges = Vec::new();
         if selected_by_covisibility && let Some(neighbors) = covisibility {
             let keyframe_pose_inverse = keyframe_pose.inverse();
@@ -201,13 +287,13 @@ impl EssentialGraph {
                     && !contains_edge(&self.strong_covis_edges, keyframe_id, neighbor)
                 {
                     let neighbor_pose = map_pose64(map, neighbor)?;
-                    new_strong_edges.push(EssentialEdge {
-                        a: keyframe_id,
-                        b: neighbor,
-                        kind: EssentialEdgeKind::StrongCovisibility,
-                        relative_pose: keyframe_pose_inverse.compose(neighbor_pose),
-                        information: scaled_identity6(f64::from(weight.get())),
-                    });
+                    new_strong_edges.push(parse_essential_edge(
+                        keyframe_id,
+                        neighbor,
+                        EssentialEdgeKind::StrongCovisibility,
+                        keyframe_pose_inverse.compose(neighbor_pose),
+                        scaled_identity6(f64::from(weight.get())),
+                    )?);
                 }
             }
         }
@@ -216,48 +302,50 @@ impl EssentialGraph {
         self.order.push(keyframe_id);
         self.parent.insert(keyframe_id, parent);
         self.strong_covis_edges.extend(new_strong_edges);
-        self.spanning_edges.push(EssentialEdge {
-            a: parent,
-            b: keyframe_id,
-            kind: EssentialEdgeKind::SpanningTree,
-            relative_pose: spanning_relative_pose,
-            information: scaled_identity6(parent_weight),
-        });
+        self.spanning_edges.push(spanning_edge);
         Ok(())
     }
 
-    pub fn add_loop_edge(&mut self, edge: EssentialEdge) -> Result<(), EssentialGraphError> {
-        self.validate_registered_edge(&edge, EssentialEdgeKind::Loop)?;
+    pub fn add_loop_edge(
+        &mut self,
+        a: KeyframeId,
+        b: KeyframeId,
+        relative_pose: Pose64,
+        information: [[f64; 6]; 6],
+    ) -> Result<(), EssentialGraphError> {
+        let edge = parse_essential_edge(a, b, EssentialEdgeKind::Loop, relative_pose, information)?;
+        self.validate_registered_endpoints(&edge)?;
         self.loop_edges
             .retain(|existing| !same_endpoints(existing.a, existing.b, edge.a, edge.b));
         self.loop_edges.push(edge);
         Ok(())
     }
 
-    pub fn add_odometry_edge(&mut self, edge: EssentialEdge) -> Result<(), EssentialGraphError> {
-        self.validate_registered_edge(&edge, EssentialEdgeKind::Odometry)?;
+    pub fn add_odometry_edge(
+        &mut self,
+        a: KeyframeId,
+        b: KeyframeId,
+        relative_pose: Pose64,
+        information: [[f64; 6]; 6],
+    ) -> Result<(), EssentialGraphError> {
+        let edge = parse_essential_edge(
+            a,
+            b,
+            EssentialEdgeKind::Odometry,
+            relative_pose,
+            information,
+        )?;
+        self.validate_registered_endpoints(&edge)?;
         self.odometry_edges
             .retain(|existing| !same_endpoints(existing.a, existing.b, edge.a, edge.b));
         self.odometry_edges.push(edge);
         Ok(())
     }
 
-    fn validate_registered_edge(
+    fn validate_registered_endpoints(
         &self,
         edge: &EssentialEdge,
-        expected_kind: EssentialEdgeKind,
     ) -> Result<(), EssentialGraphError> {
-        if edge.kind != expected_kind {
-            return Err(EssentialGraphError::UnexpectedEdgeKind {
-                expected: expected_kind,
-                actual: edge.kind,
-            });
-        }
-        if edge.a == edge.b {
-            return Err(EssentialGraphError::SelfEdge {
-                keyframe_id: edge.a,
-            });
-        }
         for keyframe_id in [edge.a, edge.b] {
             if !self.parent.contains_key(&keyframe_id) {
                 return Err(EssentialGraphError::KeyframeNotFound { keyframe_id });
@@ -300,13 +388,13 @@ impl EssentialGraph {
                     && same_endpoints(edge.a, edge.b, parent, child)
             });
             if !retained_edge_exists {
-                replacement_edges.push(EssentialEdge {
-                    a: parent,
-                    b: child,
-                    kind: EssentialEdgeKind::SpanningTree,
-                    relative_pose: relative_pose(map, parent, child)?,
-                    information: scaled_identity6(1.0),
-                });
+                replacement_edges.push(parse_essential_edge(
+                    parent,
+                    child,
+                    EssentialEdgeKind::SpanningTree,
+                    relative_pose(map, parent, child)?,
+                    scaled_identity6(1.0),
+                )?);
             }
         }
 
@@ -355,7 +443,7 @@ impl EssentialGraph {
     }
 
     pub fn pose_graph_input(&self) -> Result<PoseGraphInput, PoseGraphError> {
-        let mut keyframe_ids = self.order.clone();
+        let keyframe_ids = self.order.clone();
         let mut id_to_idx = HashMap::with_capacity(keyframe_ids.len());
         for (idx, &id) in keyframe_ids.iter().enumerate() {
             id_to_idx.insert(id, idx);
@@ -363,11 +451,28 @@ impl EssentialGraph {
 
         let mut edges = Vec::with_capacity(self.iter_all_edges().size_hint().0);
         for (edge_index, edge) in self.iter_all_edges().enumerate() {
-            let from = keyframe_index(&mut keyframe_ids, &mut id_to_idx, edge.a);
-            let to = keyframe_index(&mut keyframe_ids, &mut id_to_idx, edge.b);
+            let from = *id_to_idx.get(&edge.a).ok_or(
+                PoseGraphError::UnregisteredEssentialEdgeEndpoint {
+                    edge_index,
+                    endpoint: "a",
+                    keyframe_id: edge.a,
+                },
+            )?;
+            let to = *id_to_idx.get(&edge.b).ok_or(
+                PoseGraphError::UnregisteredEssentialEdgeEndpoint {
+                    edge_index,
+                    endpoint: "b",
+                    keyframe_id: edge.b,
+                },
+            )?;
             edges.push(
-                PoseGraphEdge::try_new(from, to, edge.relative_pose, edge.information)
-                    .map_err(|source| PoseGraphError::EdgeConstruction { edge_index, source })?,
+                PoseGraphEdge::try_from_validated_information(
+                    from,
+                    to,
+                    edge.relative_pose,
+                    edge.information,
+                )
+                .map_err(|source| PoseGraphError::EdgeConstruction { edge_index, source })?,
             );
         }
 
@@ -382,16 +487,15 @@ impl EssentialGraph {
     }
 }
 
-fn keyframe_index(
-    keyframe_ids: &mut Vec<KeyframeId>,
-    id_to_idx: &mut HashMap<KeyframeId, usize>,
-    keyframe_id: KeyframeId,
-) -> usize {
-    *id_to_idx.entry(keyframe_id).or_insert_with(|| {
-        let index = keyframe_ids.len();
-        keyframe_ids.push(keyframe_id);
-        index
-    })
+fn parse_essential_edge(
+    a: KeyframeId,
+    b: KeyframeId,
+    kind: EssentialEdgeKind,
+    relative_pose: Pose64,
+    information: [[f64; 6]; 6],
+) -> Result<EssentialEdge, EssentialGraphError> {
+    EssentialEdge::try_new(a, b, kind, relative_pose, information)
+        .map_err(|source| EssentialGraphError::EdgeConstruction { kind, source })
 }
 
 fn contains_edge(edges: &[EssentialEdge], a: KeyframeId, b: KeyframeId) -> bool {

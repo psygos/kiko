@@ -1,8 +1,7 @@
 use crate::global_map::GlobalMap;
 use crate::map::KeyframeId;
 use crate::pose_graph::{
-    EssentialEdge, EssentialEdgeKind, PoseGraphConfig, PoseGraphError, PoseGraphOptimizer,
-    PoseGraphTermination,
+    PoseGraphConfig, PoseGraphError, PoseGraphOptimizer, PoseGraphTermination,
 };
 use crate::{
     LoopApplyError, LoopClosureRejectReason, LoopDetectError, Point3, Pose, Pose64, VerifiedLoop,
@@ -70,13 +69,12 @@ impl LoopManager {
             })?;
 
         essential_graph
-            .add_loop_edge(EssentialEdge {
-                a: match_kf,
-                b: query_kf,
-                kind: EssentialEdgeKind::Loop,
-                relative_pose: loop_relative,
-                information: heuristic_loop_information_from_inlier_count(verified.inlier_count()),
-            })
+            .add_loop_edge(
+                match_kf,
+                query_kf,
+                loop_relative,
+                heuristic_loop_information_from_inlier_count(verified.inlier_count()),
+            )
             .map_err(|source| LoopApplyError::EssentialGraph { source })?;
 
         let input = essential_graph.pose_graph_input()?;

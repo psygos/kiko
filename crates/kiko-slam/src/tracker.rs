@@ -5547,9 +5547,7 @@ mod tests {
         DescriptorSupervisorOutput, DescriptorWorker, DescriptorWorkerResponse,
         SubmitDescriptorError,
     };
-    use crate::pose_graph::{
-        EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphError,
-    };
+    use crate::pose_graph::{EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphError};
     use crate::{
         CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
         SensorId, Timestamp,
@@ -7664,7 +7662,7 @@ mod tests {
             .expect("apply loop closure");
         let snapshot = global_map.essential_graph().snapshot();
         assert_eq!(snapshot.loop_edges.len(), 1);
-        assert_eq!(snapshot.loop_edges[0].kind, EssentialEdgeKind::Loop);
+        assert_eq!(snapshot.loop_edges[0].kind(), EssentialEdgeKind::Loop);
     }
 
     #[test]
@@ -7845,13 +7843,12 @@ mod tests {
             .expect("valid graph root");
         let order_before = graph.snapshot().order;
         let error = graph
-            .add_loop_edge(EssentialEdge {
-                a: root,
-                b: foreign_id,
-                kind: EssentialEdgeKind::Loop,
-                relative_pose: crate::Pose64::identity(),
-                information: crate::pose_graph::scaled_identity6(1.0),
-            })
+            .add_loop_edge(
+                root,
+                foreign_id,
+                crate::Pose64::identity(),
+                crate::pose_graph::scaled_identity6(1.0),
+            )
             .expect_err("foreign endpoint must not be registered implicitly");
 
         assert!(matches!(

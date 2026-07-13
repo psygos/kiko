@@ -62,11 +62,26 @@ impl PoseGraphEdge {
         measurement: Pose64,
         information: [[f64; 6]; 6],
     ) -> Result<Self, PoseGraphEdgeError> {
-        if from == to {
-            return Err(PoseGraphEdgeError::SelfEdge { pose_index: from });
-        }
+        validate_distinct_edge_endpoints(from, to)?;
+        let measurement = Pose64::try_from_rt(measurement.rotation(), measurement.translation())
+            .map_err(|source| PoseGraphEdgeError::Measurement { source })?;
         let information = PoseGraphInformation::try_new(information)
             .map_err(|source| PoseGraphEdgeError::Information { source })?;
+        Ok(Self {
+            from,
+            to,
+            measurement,
+            information,
+        })
+    }
+
+    pub(crate) fn try_from_validated_information(
+        from: usize,
+        to: usize,
+        measurement: Pose64,
+        information: PoseGraphInformation,
+    ) -> Result<Self, PoseGraphEdgeError> {
+        validate_distinct_edge_endpoints(from, to)?;
         Ok(Self {
             from,
             to,
@@ -89,6 +104,14 @@ impl PoseGraphEdge {
 
     pub fn information(&self) -> &PoseGraphInformation {
         &self.information
+    }
+}
+
+fn validate_distinct_edge_endpoints(from: usize, to: usize) -> Result<(), PoseGraphEdgeError> {
+    if from == to {
+        Err(PoseGraphEdgeError::SelfEdge { pose_index: from })
+    } else {
+        Ok(())
     }
 }
 

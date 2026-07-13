@@ -3,7 +3,7 @@ use std::error::Error as _;
 use std::num::NonZeroU32;
 
 use super::{
-    BlockCsr6x6, EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
+    BlockCsr6x6, EssentialEdgeError, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
     PcgStopReason, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphTermination,
     compute_edge_error, compute_edge_jacobians, solve_pcg,
 };
@@ -469,11 +469,27 @@ fn pose_graph_config_rejects_invalid_numeric_values() {
 }
 
 #[test]
-fn pose_graph_edge_parses_information_once_and_rejects_invalid_domains() {
+fn pose_graph_edge_parses_measurement_and_information_once() {
     assert!(matches!(
         PoseGraphEdge::try_new(2, 2, Pose64::identity(), scalar_block(1.0)),
         Err(super::PoseGraphEdgeError::SelfEdge { pose_index: 2 })
     ));
+
+    let huge_translation = Pose64::try_from_rt(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [f64::MAX, 0.0, 0.0],
+    )
+    .expect("finite test pose");
+    let overflowed_measurement = huge_translation.compose(huge_translation);
+    let measurement_error = PoseGraphEdge::try_new(0, 1, overflowed_measurement, scalar_block(1.0))
+        .expect_err("arithmetic-overflowed measurement must be reparsed");
+    assert!(matches!(
+        measurement_error,
+        super::PoseGraphEdgeError::Measurement {
+            source: crate::Pose64Error::NonFiniteTranslation { axis: 0, .. },
+        }
+    ));
+    assert!(measurement_error.source().is_some());
 
     let mut nonfinite = scalar_block(1.0);
     nonfinite[1][4] = f64::NAN;
@@ -817,15 +833,12 @@ fn essential_graph_does_not_duplicate_the_spanning_parent_as_a_strong_edge() {
     assert!(snapshot.strong_covis_edges.is_empty());
 
     for spanning in &snapshot.spanning_edges {
-        assert!(
-            snapshot
-                .strong_covis_edges
-                .iter()
-                .all(
-                    |strong| !((spanning.a == strong.a && spanning.b == strong.b)
-                        || (spanning.a == strong.b && spanning.b == strong.a))
-                )
-        );
+        assert!(snapshot.strong_covis_edges.iter().all(|strong| {
+            !((spanning.endpoint_a() == strong.endpoint_a()
+                && spanning.endpoint_b() == strong.endpoint_b())
+                || (spanning.endpoint_a() == strong.endpoint_b()
+                    && spanning.endpoint_b() == strong.endpoint_a()))
+        }));
     }
 }
 
@@ -846,8 +859,11 @@ fn essential_graph_retains_strong_non_parent_neighbors() {
     assert_eq!(snapshot.parent.get(&kf2), Some(&kf1));
     assert_eq!(snapshot.strong_covis_edges.len(), 1);
     let strong = &snapshot.strong_covis_edges[0];
-    assert_eq!(strong.kind, EssentialEdgeKind::StrongCovisibility);
-    assert!((strong.a == kf2 && strong.b == kf0) || (strong.a == kf0 && strong.b == kf2));
+    assert_eq!(strong.kind(), EssentialEdgeKind::StrongCovisibility);
+    assert!(
+        (strong.endpoint_a() == kf2 && strong.endpoint_b() == kf0)
+            || (strong.endpoint_a() == kf0 && strong.endpoint_b() == kf2)
+    );
 }
 
 #[test]
@@ -859,13 +875,7 @@ fn essential_graph_snapshot_is_independent_copy() {
     add_graph_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
     let snapshot = graph.snapshot();
     graph
-        .add_loop_edge(EssentialEdge {
-            a: kf2,
-            b: kf0,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(1.0),
-        })
+        .add_loop_edge(kf2, kf0, Pose64::identity(), scalar_block(1.0))
         .expect("registered loop endpoints");
     assert_eq!(snapshot.loop_edges.len(), 0);
     assert_eq!(graph.snapshot().loop_edges.len(), 1);
@@ -892,31 +902,22 @@ fn essential_graph_deduplicates_loop_edges_by_keyframe_pair() {
     add_graph_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
 
     graph
-        .add_loop_edge(EssentialEdge {
-            a: kf2,
-            b: kf0,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(1.0),
-        })
+        .add_loop_edge(kf2, kf0, Pose64::identity(), scalar_block(1.0))
         .expect("registered loop endpoints");
     graph
-        .add_loop_edge(EssentialEdge {
-            a: kf2,
-            b: kf0,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(3.0),
-        })
+        .add_loop_edge(kf2, kf0, Pose64::identity(), scalar_block(3.0))
         .expect("registered loop endpoints");
 
     let snapshot = graph.snapshot();
     assert_eq!(snapshot.loop_edges.len(), 1);
-    assert_eq!(snapshot.loop_edges[0].information, scalar_block(3.0));
+    assert_eq!(
+        *snapshot.loop_edges[0].information().matrix(),
+        scalar_block(3.0)
+    );
 }
 
 #[test]
-fn essential_graph_input_preserves_invalid_edge_construction_source() {
+fn essential_graph_parses_external_edge_payload_before_mutation() {
     let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
     add_graph_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
@@ -924,47 +925,56 @@ fn essential_graph_input_preserves_invalid_edge_construction_source() {
 
     let mut asymmetric = scalar_block(1.0);
     asymmetric[0][1] = 0.5;
-    graph
-        .add_loop_edge(EssentialEdge {
-            a: kf0,
-            b: kf1,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: Pose64::identity(),
-            information: asymmetric,
-        })
-        .expect("registered loop endpoints");
-
     let error = graph
-        .pose_graph_input()
-        .expect_err("invalid raw essential-edge information must fail at parse boundary");
+        .add_loop_edge(kf0, kf1, Pose64::identity(), asymmetric)
+        .expect_err("invalid information must fail at the graph insertion boundary");
     assert!(matches!(
         error,
-        super::PoseGraphError::EdgeConstruction {
-            source: super::PoseGraphEdgeError::Information {
+        EssentialGraphError::EdgeConstruction {
+            kind: EssentialEdgeKind::Loop,
+            source: EssentialEdgeError::Information {
                 source: super::PoseGraphInformationError::Asymmetric { .. },
             },
-            ..
         }
     ));
     assert!(error.source().is_some());
     assert!(error.source().and_then(std::error::Error::source).is_some());
+    assert!(graph.snapshot().loop_edges.is_empty());
+    graph
+        .pose_graph_input()
+        .expect("a rejected edge cannot poison later graph conversion");
+
+    let huge_translation = Pose64::try_from_rt(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [f64::MAX, 0.0, 0.0],
+    )
+    .expect("finite test pose");
+    let overflowed_relative_pose = huge_translation.compose(huge_translation);
+    let pose_error = graph
+        .add_loop_edge(kf0, kf1, overflowed_relative_pose, scalar_block(1.0))
+        .expect_err("arithmetic-overflowed relative pose must be reparsed");
+    assert!(matches!(
+        pose_error,
+        EssentialGraphError::EdgeConstruction {
+            kind: EssentialEdgeKind::Loop,
+            source: EssentialEdgeError::RelativePose {
+                source: crate::Pose64Error::NonFiniteTranslation { axis: 0, .. },
+            },
+        }
+    ));
+    assert!(pose_error.source().is_some());
+    assert!(graph.snapshot().loop_edges.is_empty());
 }
 
 #[test]
-fn essential_graph_external_edges_require_registered_distinct_endpoints_and_truthful_kind() {
+fn essential_graph_external_edges_require_registered_distinct_endpoints() {
     let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
     add_graph_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
     let before = graph.snapshot();
 
     let missing = graph
-        .add_loop_edge(EssentialEdge {
-            a: kf0,
-            b: kf1,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(1.0),
-        })
+        .add_loop_edge(kf0, kf1, Pose64::identity(), scalar_block(1.0))
         .expect_err("unregistered endpoint must fail before mutation");
     assert_eq!(
         missing,
@@ -974,38 +984,27 @@ fn essential_graph_external_edges_require_registered_distinct_endpoints_and_trut
     assert!(graph.snapshot().loop_edges.is_empty());
 
     add_graph_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
-    let wrong_kind = graph
-        .add_loop_edge(EssentialEdge {
-            a: kf0,
-            b: kf1,
-            kind: EssentialEdgeKind::Odometry,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(1.0),
-        })
-        .expect_err("loop insertion must reject a mislabeled edge");
-    assert_eq!(
-        wrong_kind,
-        EssentialGraphError::UnexpectedEdgeKind {
-            expected: EssentialEdgeKind::Loop,
-            actual: EssentialEdgeKind::Odometry,
-        }
-    );
-
     let self_edge = graph
-        .add_odometry_edge(EssentialEdge {
-            a: kf0,
-            b: kf0,
-            kind: EssentialEdgeKind::Odometry,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(1.0),
-        })
+        .add_odometry_edge(kf0, kf0, Pose64::identity(), scalar_block(1.0))
         .expect_err("self edge must fail before mutation");
-    assert_eq!(
+    assert!(matches!(
         self_edge,
-        EssentialGraphError::SelfEdge { keyframe_id: kf0 }
-    );
+        EssentialGraphError::EdgeConstruction {
+            kind: EssentialEdgeKind::Odometry,
+            source: EssentialEdgeError::SelfEdge { keyframe_id },
+        } if keyframe_id == kf0
+    ));
     assert!(graph.snapshot().loop_edges.is_empty());
     assert!(graph.snapshot().odometry_edges.is_empty());
+
+    graph
+        .add_odometry_edge(kf0, kf1, Pose64::identity(), scalar_block(1.0))
+        .expect("registered distinct odometry endpoints");
+    assert_eq!(graph.snapshot().odometry_edges.len(), 1);
+    assert_eq!(
+        graph.snapshot().odometry_edges[0].kind(),
+        EssentialEdgeKind::Odometry
+    );
 }
 
 #[test]
@@ -1028,7 +1027,7 @@ fn essential_graph_remove_keyframe_reparents_children() {
         snapshot
             .spanning_edges
             .iter()
-            .all(|edge| edge.a != kf1 && edge.b != kf1)
+            .all(|edge| edge.endpoint_a() != kf1 && edge.endpoint_b() != kf1)
     );
     let input = graph.pose_graph_input().expect("valid graph input");
     assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
@@ -1105,13 +1104,7 @@ fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
     add_graph_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
     add_graph_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
     graph
-        .add_loop_edge(EssentialEdge {
-            a: kf2,
-            b: kf0,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: Pose64::identity(),
-            information: scalar_block(1.0),
-        })
+        .add_loop_edge(kf2, kf0, Pose64::identity(), scalar_block(1.0))
         .expect("registered loop endpoints");
     assert_eq!(graph.snapshot().loop_edges.len(), 1);
 
@@ -1124,13 +1117,13 @@ fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
         snapshot
             .strong_covis_edges
             .iter()
-            .all(|e| e.a != kf2 && e.b != kf2)
+            .all(|edge| edge.endpoint_a() != kf2 && edge.endpoint_b() != kf2)
     );
     assert!(
         snapshot
             .spanning_edges
             .iter()
-            .all(|e| e.a != kf2 && e.b != kf2)
+            .all(|edge| edge.endpoint_a() != kf2 && edge.endpoint_b() != kf2)
     );
 }
 
@@ -1181,8 +1174,8 @@ fn essential_graph_random_remove_preserves_connectivity_invariants() {
             .chain(snapshot.strong_covis_edges.iter())
             .chain(snapshot.loop_edges.iter())
         {
-            assert!(alive_set.contains(&edge.a));
-            assert!(alive_set.contains(&edge.b));
+            assert!(alive_set.contains(&edge.endpoint_a()));
+            assert!(alive_set.contains(&edge.endpoint_b()));
         }
 
         let input = graph.pose_graph_input().expect("valid graph input");

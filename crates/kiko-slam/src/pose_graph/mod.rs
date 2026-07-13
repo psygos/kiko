@@ -13,6 +13,8 @@ const ROTATION_STEP_CONVERGENCE_RAD: f64 = 1e-6;
 /// Near-zero normalized residual threshold in the Huber kernel.
 const HUBER_NEAR_ZERO_NORMALIZED_RESIDUAL: f64 = 1e-12;
 
+use crate::map::KeyframeId;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PcgStopReason {
     Converged,
@@ -89,6 +91,11 @@ pub enum PoseGraphError {
     EdgeConstruction {
         edge_index: usize,
         source: PoseGraphEdgeError,
+    },
+    UnregisteredEssentialEdgeEndpoint {
+        edge_index: usize,
+        endpoint: &'static str,
+        keyframe_id: KeyframeId,
     },
     InvalidRobustSquaredNorm {
         outer_iteration: usize,
@@ -189,6 +196,7 @@ impl std::error::Error for PoseGraphInformationError {}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PoseGraphEdgeError {
     SelfEdge { pose_index: usize },
+    Measurement { source: crate::Pose64Error },
     Information { source: PoseGraphInformationError },
 }
 
@@ -201,6 +209,9 @@ impl std::fmt::Display for PoseGraphEdgeError {
                     "pose graph edge endpoints must differ, both were {pose_index}"
                 )
             }
+            Self::Measurement { source } => {
+                write!(f, "invalid pose graph edge measurement: {source}")
+            }
             Self::Information { source } => {
                 write!(f, "invalid pose graph edge information: {source}")
             }
@@ -211,6 +222,7 @@ impl std::fmt::Display for PoseGraphEdgeError {
 impl std::error::Error for PoseGraphEdgeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Measurement { source } => Some(source),
             Self::Information { source } => Some(source),
             Self::SelfEdge { .. } => None,
         }
@@ -314,6 +326,14 @@ impl std::fmt::Display for PoseGraphError {
             PoseGraphError::EdgeConstruction { edge_index, source } => {
                 write!(f, "pose graph edge {edge_index} is invalid: {source}")
             }
+            PoseGraphError::UnregisteredEssentialEdgeEndpoint {
+                edge_index,
+                endpoint,
+                keyframe_id,
+            } => write!(
+                f,
+                "essential graph edge {edge_index} endpoint {endpoint} references unregistered keyframe {keyframe_id:?}"
+            ),
             PoseGraphError::InvalidRobustSquaredNorm {
                 outer_iteration,
                 edge_index,
@@ -381,8 +401,8 @@ mod solver;
 mod sparse;
 
 pub use essential::{
-    EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, EssentialGraphSnapshot,
-    PoseGraphInput,
+    EssentialEdge, EssentialEdgeError, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
+    EssentialGraphSnapshot, PoseGraphInput,
 };
 pub use optimizer::{
     PoseGraphConfig, PoseGraphConfigError, PoseGraphConvergenceCriterion, PoseGraphEdge,
