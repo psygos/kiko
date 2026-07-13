@@ -7199,7 +7199,7 @@ mod tests {
         Vec<(MapPointId, Point3)>,
     ) {
         let mut map = SlamMap::new();
-        let image_size = crate::map::ImageSize::try_new(640, 480).expect("image size");
+        let image_size = crate::FrameDimensions::try_new(640, 480).expect("image size");
         let keypoints = vec![
             Keypoint { x: 120.0, y: 100.0 },
             Keypoint { x: 220.0, y: 110.0 },

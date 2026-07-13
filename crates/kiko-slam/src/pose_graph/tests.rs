@@ -7,10 +7,11 @@ use super::{
     PcgStopReason, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphTermination,
     compute_edge_error, compute_edge_jacobians, solve_pcg,
 };
-use crate::Pose64;
-use crate::map::{ImageSize, SlamMap};
+use crate::map::SlamMap;
 use crate::math::se3_exp_f64;
-use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp};
+use crate::{
+    CompactDescriptor, FrameDimensions, FrameId, Keypoint, Point3, Pose, Pose64, Timestamp,
+};
 
 #[derive(Clone, Debug)]
 struct Lcg {
@@ -46,7 +47,7 @@ fn make_map_for_essential_graph() -> (
     crate::map::KeyframeId,
 ) {
     let mut map = SlamMap::new();
-    let size = ImageSize::try_new(640, 480).expect("size");
+    let size = FrameDimensions::try_new(640, 480).expect("size");
     let keypoints = vec![
         Keypoint { x: 20.0, y: 20.0 },
         Keypoint { x: 40.0, y: 20.0 },
@@ -123,7 +124,7 @@ fn make_map_for_essential_graph() -> (
 
 fn make_chain_keyframes(count: usize) -> (SlamMap, Vec<crate::map::KeyframeId>) {
     let mut map = SlamMap::new();
-    let size = ImageSize::try_new(640, 480).expect("size");
+    let size = FrameDimensions::try_new(640, 480).expect("size");
     let keypoints = vec![Keypoint { x: 20.0, y: 20.0 }, Keypoint { x: 40.0, y: 20.0 }];
     let mut ids = Vec::with_capacity(count);
     for idx in 0..count {

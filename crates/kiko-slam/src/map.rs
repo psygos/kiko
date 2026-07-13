@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use slotmap::{SlotMap, new_key_type};
 
 use crate::{
-    CompactDescriptor, Detections, FrameId, Keypoint, Point3, Pose, Pose64, Pose64Error, SensorId,
-    Timestamp,
+    CompactDescriptor, Detections, FrameDimensions, FrameId, Keypoint, Point3, Pose, Pose64,
+    Pose64Error, SensorId, Timestamp,
 };
 
 /// Fixed-point scale factor for descriptor blending (8-bit precision).
@@ -30,50 +30,6 @@ impl MapInstanceId {
 
     pub fn as_u64(self) -> u64 {
         self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImageSize {
-    width: u32,
-    height: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ImageSizeError {
-    ZeroDimension { width: u32, height: u32 },
-}
-
-impl std::fmt::Display for ImageSizeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ImageSizeError::ZeroDimension { width, height } => {
-                write!(f, "image size must be positive, got {width}x{height}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ImageSizeError {}
-
-impl ImageSize {
-    pub fn try_new(width: u32, height: u32) -> Result<Self, ImageSizeError> {
-        if width == 0 || height == 0 {
-            return Err(ImageSizeError::ZeroDimension { width, height });
-        }
-        Ok(Self { width, height })
-    }
-
-    pub fn width(self) -> u32 {
-        self.width
-    }
-
-    pub fn height(self) -> u32 {
-        self.height
-    }
-
-    pub fn max_dim(self) -> u32 {
-        self.width.max(self.height)
     }
 }
 
@@ -236,7 +192,7 @@ pub struct KeyframeEntry {
     frame_id: FrameId,
     timestamp: Timestamp,
     pose: Pose,
-    image_size: ImageSize,
+    image_size: FrameDimensions,
     keypoints: Vec<Keypoint>,
     point_refs: Vec<Option<MapPointId>>,
 }
@@ -254,7 +210,7 @@ impl KeyframeEntry {
         self.pose
     }
 
-    pub fn image_size(&self) -> ImageSize {
+    pub fn image_size(&self) -> FrameDimensions {
         self.image_size
     }
 
@@ -407,10 +363,6 @@ pub enum MapError {
         point_id: MapPointId,
         keyframe_id: KeyframeId,
     },
-    InvalidImageSize {
-        width: u32,
-        height: u32,
-    },
     EmptyKeyframe {
         frame_id: FrameId,
     },
@@ -463,9 +415,6 @@ impl std::fmt::Display for MapError {
                 f,
                 "map point {point_id:?} already observed in keyframe {keyframe_id:?}"
             ),
-            MapError::InvalidImageSize { width, height } => {
-                write!(f, "invalid image size {width}x{height}")
-            }
             MapError::EmptyKeyframe { frame_id } => {
                 write!(f, "keyframe {frame_id:?} has no keypoints")
             }
@@ -626,20 +575,12 @@ impl SlamMap {
             });
         }
 
-        let image_size =
-            ImageSize::try_new(detections.width(), detections.height()).map_err(|_| {
-                MapError::InvalidImageSize {
-                    width: detections.width(),
-                    height: detections.height(),
-                }
-            })?;
-
         let keypoints = detections.keypoints().to_vec();
         self.add_keyframe(
             detections.frame_id(),
             timestamp,
             pose,
-            image_size,
+            detections.dimensions(),
             keypoints,
         )
     }
@@ -649,7 +590,7 @@ impl SlamMap {
         frame_id: FrameId,
         timestamp: Timestamp,
         pose: Pose,
-        image_size: ImageSize,
+        image_size: FrameDimensions,
         keypoints: Vec<Keypoint>,
     ) -> Result<KeyframeId, MapError> {
         if let Some(existing) = self.frame_to_keyframe.get(&frame_id) {
@@ -1153,7 +1094,7 @@ fn validate_map_pose(pose: Pose) -> Result<(), MapError> {
         .map_err(MapError::InvalidPose)
 }
 
-fn validate_keypoints(keypoints: &[Keypoint], image_size: ImageSize) -> Result<(), MapError> {
+fn validate_keypoints(keypoints: &[Keypoint], image_size: FrameDimensions) -> Result<(), MapError> {
     for (index, keypoint) in keypoints.iter().enumerate() {
         for (axis, value, upper_bound) in [
             ("x", keypoint.x, image_size.width()),
@@ -1562,7 +1503,7 @@ pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompactDescriptor, Keypoint, Pose, Timestamp};
+    use crate::{CompactDescriptor, Descriptor, Keypoint, Pose, SensorId, Timestamp};
 
     fn make_keypoints(n: usize) -> Vec<Keypoint> {
         (0..n)
@@ -1578,8 +1519,33 @@ mod tests {
     }
 
     #[test]
+    fn keyframes_reuse_validated_detection_dimensions() {
+        let dimensions = FrameDimensions::try_new(7, 5).expect("dimensions");
+        let detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            dimensions.width(),
+            dimensions.height(),
+            vec![Keypoint { x: 3.0, y: 2.0 }],
+            vec![1.0],
+            vec![Descriptor([0.0; crate::DESCRIPTOR_DIM])],
+        )
+        .expect("detections");
+        let mut map = SlamMap::new();
+
+        let keyframe_id = map
+            .add_keyframe_from_detections(&detections, Timestamp::from_nanos(1), Pose::identity())
+            .expect("keyframe");
+
+        assert_eq!(
+            map.keyframe(keyframe_id).expect("entry").image_size(),
+            dimensions
+        );
+    }
+
+    #[test]
     fn keyframe_construction_rejects_invalid_keypoints_without_mutation() {
-        let size = ImageSize::try_new(640, 480).expect("image size");
+        let size = FrameDimensions::try_new(640, 480).expect("image size");
         for (axis, keypoint) in [
             (
                 "x",
@@ -1624,7 +1590,7 @@ mod tests {
 
     #[test]
     fn map_point_writes_reject_non_finite_positions_transactionally() {
-        let size = ImageSize::try_new(640, 480).expect("image size");
+        let size = FrameDimensions::try_new(640, 480).expect("image size");
         let mut map = SlamMap::new();
         let keyframe = map
             .add_keyframe(
@@ -1690,7 +1656,7 @@ mod tests {
 
     #[test]
     fn map_pose_writes_reject_invalid_se3_with_source_context() {
-        let size = ImageSize::try_new(640, 480).expect("image size");
+        let size = FrameDimensions::try_new(640, 480).expect("image size");
         let invalid = Pose::from_rt(
             [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [0.0; 3],
@@ -1732,7 +1698,7 @@ mod tests {
 
     #[test]
     fn geometry_batch_preflights_every_update_before_mutation() {
-        let size = ImageSize::try_new(640, 480).expect("image size");
+        let size = FrameDimensions::try_new(640, 480).expect("image size");
         let mut map = SlamMap::new();
         let keyframe = map
             .add_keyframe(
@@ -1791,7 +1757,7 @@ mod tests {
 
     #[test]
     fn keyframe_keypoints_are_scoped_to_their_map_instance() {
-        let size = ImageSize::try_new(640, 480).expect("image size");
+        let size = FrameDimensions::try_new(640, 480).expect("image size");
         let mut map_a = SlamMap::new();
         let keyframe_a = map_a
             .add_keyframe(
@@ -1831,7 +1797,7 @@ mod tests {
 
     #[test]
     fn map_snapshots_order_generations_only_within_the_same_instance() {
-        let size = ImageSize::try_new(640, 480).expect("image size");
+        let size = FrameDimensions::try_new(640, 480).expect("image size");
         let mut map = SlamMap::new();
         let before = map.snapshot();
         map.add_keyframe(
@@ -1852,7 +1818,7 @@ mod tests {
     #[test]
     fn descriptor_blend_uses_u8_weighted_average() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         let kf = map
             .add_keyframe(
@@ -1887,7 +1853,7 @@ mod tests {
     #[test]
     fn descriptor_update_preserves_map_invariants() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         let kf = map
             .add_keyframe(
@@ -1924,7 +1890,7 @@ mod tests {
         let mut map = SlamMap::new();
         assert_eq!(map.generation().as_u64(), 0);
 
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         let kf1 = map
             .add_keyframe(
@@ -1954,7 +1920,7 @@ mod tests {
     #[test]
     fn map_clone_preserves_generation() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         let _ = map
             .add_keyframe(
@@ -1973,7 +1939,7 @@ mod tests {
     #[test]
     fn covisibility_increments_and_decrements_on_map_point_changes() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         assert_map_invariants(&map).expect("empty map invariants");
 
@@ -2024,7 +1990,7 @@ mod tests {
     #[test]
     fn duplicate_observation_is_rejected() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         assert_map_invariants(&map).expect("empty map invariants");
 
@@ -2085,7 +2051,7 @@ mod tests {
     #[test]
     fn remove_keyframe_removes_orphaned_points() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         assert_map_invariants(&map).expect("empty map invariants");
 
@@ -2123,7 +2089,7 @@ mod tests {
     #[test]
     fn covisibility_updates_for_shared_points() {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
         assert_map_invariants(&map).expect("empty map invariants");
 

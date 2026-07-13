@@ -1250,11 +1250,12 @@ mod tests {
         RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
         aggregate_global_descriptor, match_descriptors_for_loop,
     };
-    use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
+    use crate::map::{KeyframeId, MapError, SlamMap};
     use crate::pose_graph::PoseGraphError;
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
     use crate::{
-        CompactDescriptor, Descriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
+        CompactDescriptor, Descriptor, FrameDimensions, FrameId, Keypoint, Point3, Pose,
+        RansacConfig, Timestamp,
     };
     use std::error::Error as _;
 
@@ -1276,7 +1277,7 @@ mod tests {
 
     fn make_keyframe_ids(n: usize) -> Vec<KeyframeId> {
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(320, 240).expect("size");
+        let size = FrameDimensions::try_new(320, 240).expect("size");
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             let id = map
@@ -1345,7 +1346,7 @@ mod tests {
         }
 
         let mut map = SlamMap::new();
-        let size = ImageSize::try_new(640, 480).expect("size");
+        let size = FrameDimensions::try_new(640, 480).expect("size");
         let match_kf = map
             .add_keyframe(
                 FrameId::new(10),
@@ -1839,7 +1840,7 @@ mod tests {
     fn match_descriptors_finds_mutual_matches() {
         let mut map = SlamMap::new();
         let keypoints = vec![Keypoint { x: 20.0, y: 20.0 }, Keypoint { x: 40.0, y: 20.0 }];
-        let image_size = ImageSize::try_new(80, 60).expect("image size");
+        let image_size = FrameDimensions::try_new(80, 60).expect("image size");
         let kf = map
             .add_keyframe(
                 FrameId::new(11),
@@ -1894,7 +1895,7 @@ mod tests {
             Keypoint { x: 40.0, y: 20.0 },
             Keypoint { x: 60.0, y: 20.0 },
         ];
-        let image_size = ImageSize::try_new(80, 60).expect("image size");
+        let image_size = FrameDimensions::try_new(80, 60).expect("image size");
         let kf = map
             .add_keyframe(
                 FrameId::new(21),
