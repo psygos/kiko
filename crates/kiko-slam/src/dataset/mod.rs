@@ -6,11 +6,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::{
-    DepthImage, Frame, FrameError, ImuBatch, ImuSampleError, ImuTimestampShiftError, PairError,
-    SensorId, StereoPair,
+    DepthImage, Frame, FrameDimensions, FrameDimensionsError, FrameError, ImuBatch, ImuSampleError,
+    ImuTimestampShiftError, PairError, SensorId, StereoPair,
 };
 
 pub mod format {
+    use std::num::ParseIntError;
+
     pub const FRAMES_DIR: &str = "frames";
     pub const META_FILE: &str = "meta.json";
     pub const CALIBRATION_FILE: &str = "calibration.json";
@@ -18,15 +20,110 @@ pub mod format {
     pub const IMU_FILE: &str = "imu.bin";
     pub const FRAME_SUFFIX: &str = ".raw";
 
-    pub fn frame_name(timestamp_ns: i64, sensor: &str) -> String {
-        format!("{timestamp_ns}_{sensor}{FRAME_SUFFIX}")
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum FrameKind {
+        MonoLeft,
+        MonoRight,
+        Depth,
     }
 
-    pub fn parse_frame_filename(filename: &str) -> Option<(i64, String)> {
-        let stem = filename.strip_suffix(FRAME_SUFFIX)?;
-        let (timestamp_str, sensor) = stem.split_once('_')?;
-        let timestamp_ns = timestamp_str.parse::<i64>().ok()?;
-        Some((timestamp_ns, sensor.to_string()))
+    impl FrameKind {
+        pub const fn as_str(self) -> &'static str {
+            match self {
+                Self::MonoLeft => "mono_left",
+                Self::MonoRight => "mono_right",
+                Self::Depth => "depth",
+            }
+        }
+
+        fn parse(value: &str) -> Result<Self, FrameFilenameError> {
+            match value {
+                "mono_left" => Ok(Self::MonoLeft),
+                "mono_right" => Ok(Self::MonoRight),
+                "depth" => Ok(Self::Depth),
+                _ => Err(FrameFilenameError::UnknownFrameKind {
+                    value: value.to_string(),
+                }),
+            }
+        }
+    }
+
+    impl std::fmt::Display for FrameKind {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FrameFilename {
+        timestamp_ns: i64,
+        kind: FrameKind,
+    }
+
+    impl FrameFilename {
+        pub const fn timestamp_ns(self) -> i64 {
+            self.timestamp_ns
+        }
+
+        pub const fn kind(self) -> FrameKind {
+            self.kind
+        }
+    }
+
+    #[derive(Debug)]
+    pub enum FrameFilenameError {
+        MissingRawSuffix,
+        MissingTimestampSeparator,
+        InvalidTimestamp { source: ParseIntError },
+        UnknownFrameKind { value: String },
+    }
+
+    impl std::fmt::Display for FrameFilenameError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::MissingRawSuffix => write!(f, "frame filename must end with {FRAME_SUFFIX}"),
+                Self::MissingTimestampSeparator => {
+                    write!(f, "frame filename must contain a timestamp and frame kind")
+                }
+                Self::InvalidTimestamp { source } => {
+                    write!(f, "frame filename has an invalid i64 timestamp: {source}")
+                }
+                Self::UnknownFrameKind { value } => {
+                    write!(f, "frame filename has unknown frame kind {value:?}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for FrameFilenameError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            match self {
+                Self::InvalidTimestamp { source } => Some(source),
+                Self::MissingRawSuffix
+                | Self::MissingTimestampSeparator
+                | Self::UnknownFrameKind { .. } => None,
+            }
+        }
+    }
+
+    pub fn frame_name(timestamp_ns: i64, kind: FrameKind) -> String {
+        format!("{timestamp_ns}_{}{FRAME_SUFFIX}", kind.as_str())
+    }
+
+    pub fn parse_frame_filename(filename: &str) -> Result<FrameFilename, FrameFilenameError> {
+        let stem = filename
+            .strip_suffix(FRAME_SUFFIX)
+            .ok_or(FrameFilenameError::MissingRawSuffix)?;
+        let (timestamp_str, kind) = stem
+            .split_once('_')
+            .ok_or(FrameFilenameError::MissingTimestampSeparator)?;
+        let timestamp_ns = timestamp_str
+            .parse::<i64>()
+            .map_err(|source| FrameFilenameError::InvalidTimestamp { source })?;
+        Ok(FrameFilename {
+            timestamp_ns,
+            kind: FrameKind::parse(kind)?,
+        })
     }
 }
 
@@ -221,6 +318,31 @@ pub enum DatasetError {
         path: PathBuf,
         source: std::io::Error,
     },
+    NonUnicodeFrameFilename {
+        path: PathBuf,
+    },
+    InvalidFrameFilename {
+        path: PathBuf,
+        source: format::FrameFilenameError,
+    },
+    UnexpectedFrameKind {
+        path: PathBuf,
+        kind: format::FrameKind,
+    },
+    InvalidFrameDimensions {
+        stream: &'static str,
+        source: FrameDimensionsError,
+    },
+    FrameByteLengthOverflow {
+        stream: &'static str,
+        width: u32,
+        height: u32,
+    },
+    FrameSizeMismatch {
+        path: PathBuf,
+        expected_bytes: u64,
+        actual_bytes: u64,
+    },
     InvalidImuLength {
         path: PathBuf,
         byte_len: usize,
@@ -283,6 +405,41 @@ impl std::fmt::Display for DatasetError {
             DatasetError::ReadFile { path, source } => {
                 write!(f, "failed to read file {}: {}", path.display(), source)
             }
+            DatasetError::NonUnicodeFrameFilename { path } => write!(
+                f,
+                "dataset frame filename is not valid Unicode: {}",
+                path.display()
+            ),
+            DatasetError::InvalidFrameFilename { path, source } => write!(
+                f,
+                "invalid dataset frame filename {}: {source}",
+                path.display()
+            ),
+            DatasetError::UnexpectedFrameKind { path, kind } => write!(
+                f,
+                "dataset contains an unconfigured {kind} frame: {}",
+                path.display()
+            ),
+            DatasetError::InvalidFrameDimensions { stream, source } => {
+                write!(f, "invalid {stream} dataset dimensions: {source}")
+            }
+            DatasetError::FrameByteLengthOverflow {
+                stream,
+                width,
+                height,
+            } => write!(
+                f,
+                "{stream} frame byte length overflows u64 for dimensions {width}x{height}"
+            ),
+            DatasetError::FrameSizeMismatch {
+                path,
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "dataset frame {} has {actual_bytes} bytes; expected {expected_bytes}",
+                path.display()
+            ),
             DatasetError::InvalidImuLength {
                 path,
                 byte_len,
@@ -347,8 +504,14 @@ impl std::error::Error for DatasetError {
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::InvalidFrame { source, .. } => Some(source),
             DatasetError::InvalidImuRecord { source, .. } => Some(source),
+            DatasetError::InvalidFrameFilename { source, .. } => Some(source),
+            DatasetError::InvalidFrameDimensions { source, .. } => Some(source),
             DatasetError::InvalidConfig { .. }
             | DatasetError::OutputAlreadyExists { .. }
+            | DatasetError::NonUnicodeFrameFilename { .. }
+            | DatasetError::UnexpectedFrameKind { .. }
+            | DatasetError::FrameByteLengthOverflow { .. }
+            | DatasetError::FrameSizeMismatch { .. }
             | DatasetError::InvalidImuLength { .. }
             | DatasetError::WorkerJoin { .. }
             | DatasetError::MissingImuSamples { .. } => None,
@@ -871,7 +1034,7 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
         dimensions,
         data,
     } = frame;
-    let filename = format::frame_name(timestamp.as_nanos(), sensor_to_str(sensor_id));
+    let filename = format::frame_name(timestamp.as_nanos(), frame_kind(sensor_id));
     let path = frames_dir.join(&filename);
 
     let expected_len = dimensions.area();
@@ -889,7 +1052,7 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
 }
 
 fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), DatasetError> {
-    let filename = format::frame_name(depth.timestamp().as_nanos(), "depth");
+    let filename = format::frame_name(depth.timestamp().as_nanos(), format::FrameKind::Depth);
     let path = frames_dir.join(&filename);
     let expected = (depth.width() as usize).saturating_mul(depth.height() as usize);
     if depth.depth_m().len() != expected {
@@ -945,10 +1108,10 @@ fn write_imu_to_file(dataset_dir: &Path, batch: &ImuBatch) -> Result<(), Dataset
         .map_err(|source| DatasetError::WriteFile { path, source })
 }
 
-fn sensor_to_str(id: SensorId) -> &'static str {
+fn frame_kind(id: SensorId) -> format::FrameKind {
     match id {
-        SensorId::StereoLeft => "mono_left",
-        SensorId::StereoRight => "mono_right",
+        SensorId::StereoLeft => format::FrameKind::MonoLeft,
+        SensorId::StereoRight => format::FrameKind::MonoRight,
     }
 }
 
@@ -1060,9 +1223,6 @@ struct FrameInfo {
 struct FrameSet {
     left: Vec<FrameInfo>,
     right: Vec<FrameInfo>,
-    depth: Vec<FrameInfo>,
-    parse_fail: u64,
-    size_mismatch: u64,
 }
 
 fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
@@ -1071,21 +1231,12 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         msg: "meta.json missing mono config",
     })?;
 
-    let mut frames = scan_frames_with_depth(
+    let FrameSet { left, right } = scan_frames_with_depth(
         &state.frames_dir,
         mono.width,
         mono.height,
         meta.depth.as_ref(),
     )?;
-    let parse_fail = frames.parse_fail;
-    let size_mismatch = frames.size_mismatch;
-    let mut left = std::mem::take(&mut frames.left);
-    let mut right = std::mem::take(&mut frames.right);
-    let mut depth_frames = std::mem::take(&mut frames.depth);
-
-    left.sort_by_key(|f| f.timestamp_ns);
-    right.sort_by_key(|f| f.timestamp_ns);
-    depth_frames.sort_by_key(|f| f.timestamp_ns);
 
     let left_period = compute_period_ns(&left);
     let gate = left_period.map(|p| p / 4).filter(|p| *p > 0);
@@ -1118,8 +1269,8 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
             drops_by_reason: DropStats {
                 spool_full: state.dropped.load(Ordering::Relaxed),
                 write_fail: state.write_failed.load(Ordering::Relaxed),
-                parse_fail,
-                size_mismatch,
+                parse_fail: 0,
+                size_mismatch: 0,
                 outside_window,
             },
             delta_stats,
@@ -1189,10 +1340,6 @@ fn read_calibration_with_imu_override(
     }
 }
 
-fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {
-    scan_frames_with_depth(frames_dir, width, height, None)
-}
-
 fn scan_frames_with_depth(
     frames_dir: &Path,
     width: u32,
@@ -1202,16 +1349,18 @@ fn scan_frames_with_depth(
     let mut frames = FrameSet {
         left: Vec::new(),
         right: Vec::new(),
-        depth: Vec::new(),
-        parse_fail: 0,
-        size_mismatch: 0,
     };
-    let mono_expected_len = (width as u64).saturating_mul(height as u64);
-    let depth_expected_len = depth.map(|meta| {
-        (meta.width as u64)
-            .saturating_mul(meta.height as u64)
-            .saturating_mul(std::mem::size_of::<f32>() as u64)
-    });
+    let mono_expected_len = expected_frame_bytes("mono", width, height, 1)?;
+    let depth_expected_len = depth
+        .map(|meta| {
+            expected_frame_bytes(
+                "depth",
+                meta.width,
+                meta.height,
+                std::mem::size_of::<f32>() as u64,
+            )
+        })
+        .transpose()?;
 
     let entries = std::fs::read_dir(frames_dir).map_err(|e| DatasetError::ReadDirectory {
         path: frames_dir.to_path_buf(),
@@ -1224,67 +1373,88 @@ fn scan_frames_with_depth(
             source: e,
         })?;
         let path = entry.path();
-        if !path.is_file() {
+        let file_type = entry.file_type().map_err(|source| DatasetError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        if !file_type.is_file() {
             continue;
         }
-        let filename = match path.file_name().and_then(|f| f.to_str()) {
-            Some(name) => name,
-            None => {
-                frames.parse_fail += 1;
-                continue;
+        if path.extension() != Some(std::ffi::OsStr::new("raw")) {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .ok_or_else(|| DatasetError::NonUnicodeFrameFilename { path: path.clone() })?;
+        let parsed = format::parse_frame_filename(filename).map_err(|source| {
+            DatasetError::InvalidFrameFilename {
+                path: path.clone(),
+                source,
             }
-        };
-
-        let (timestamp_ns, sensor) = match format::parse_frame_filename(filename) {
-            Some(info) => info,
-            None => {
-                frames.parse_fail += 1;
-                continue;
-            }
-        };
-
-        let rel_path = format!("{}/{}", format::FRAMES_DIR, filename);
-        let info = FrameInfo {
-            timestamp_ns,
-            path: rel_path,
-        };
-        match sensor.as_str() {
-            "mono_left" | "mono_right" | "depth" => {
-                let metadata = entry.metadata().map_err(|e| DatasetError::ReadFile {
+        })?;
+        let expected_len = match parsed.kind() {
+            format::FrameKind::MonoLeft | format::FrameKind::MonoRight => mono_expected_len,
+            format::FrameKind::Depth => {
+                depth_expected_len.ok_or_else(|| DatasetError::UnexpectedFrameKind {
                     path: path.clone(),
-                    source: e,
-                })?;
-                let expected_len = match sensor.as_str() {
-                    "mono_left" | "mono_right" => mono_expected_len,
-                    "depth" => match depth_expected_len {
-                        Some(len) => len,
-                        None => continue,
-                    },
-                    _ => {
-                        frames.parse_fail = frames.parse_fail.saturating_add(1);
-                        continue;
-                    }
-                };
-                if metadata.len() != expected_len {
-                    frames.size_mismatch += 1;
-                    continue;
-                }
-                match sensor.as_str() {
-                    "mono_left" => frames.left.push(info),
-                    "mono_right" => frames.right.push(info),
-                    "depth" => frames.depth.push(info),
-                    _ => {
-                        frames.parse_fail = frames.parse_fail.saturating_add(1);
-                    }
-                }
+                    kind: parsed.kind(),
+                })?
             }
-            _ => {
-                frames.parse_fail += 1;
-            }
+        };
+        let metadata = entry.metadata().map_err(|source| DatasetError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        if metadata.len() != expected_len {
+            return Err(DatasetError::FrameSizeMismatch {
+                path,
+                expected_bytes: expected_len,
+                actual_bytes: metadata.len(),
+            });
+        }
+
+        let target = match parsed.kind() {
+            format::FrameKind::MonoLeft => Some(&mut frames.left),
+            format::FrameKind::MonoRight => Some(&mut frames.right),
+            format::FrameKind::Depth => None,
+        };
+        if let Some(target) = target {
+            target.push(FrameInfo {
+                timestamp_ns: parsed.timestamp_ns(),
+                path: format!("{}/{}", format::FRAMES_DIR, filename),
+            });
         }
     }
 
+    frames.left.sort_unstable_by_key(|frame| frame.timestamp_ns);
+    frames
+        .right
+        .sort_unstable_by_key(|frame| frame.timestamp_ns);
     Ok(frames)
+}
+
+fn expected_frame_bytes(
+    stream: &'static str,
+    width: u32,
+    height: u32,
+    bytes_per_pixel: u64,
+) -> Result<u64, DatasetError> {
+    let dimensions = FrameDimensions::try_new(width, height)
+        .map_err(|source| DatasetError::InvalidFrameDimensions { stream, source })?;
+    let pixels =
+        u64::try_from(dimensions.area()).map_err(|_| DatasetError::FrameByteLengthOverflow {
+            stream,
+            width,
+            height,
+        })?;
+    pixels
+        .checked_mul(bytes_per_pixel)
+        .ok_or(DatasetError::FrameByteLengthOverflow {
+            stream,
+            width,
+            height,
+        })
 }
 
 fn compute_period_ns(frames: &[FrameInfo]) -> Option<u64> {
@@ -1613,6 +1783,120 @@ mod tests {
     }
 
     #[test]
+    fn frame_filename_parser_returns_typed_kind_and_timestamp_source() {
+        let parsed = format::parse_frame_filename("-42_mono_right.raw").expect("filename");
+        assert_eq!(parsed.timestamp_ns(), -42);
+        assert_eq!(parsed.kind(), format::FrameKind::MonoRight);
+
+        let invalid_timestamp = format::parse_frame_filename("not-an-i64_mono_left.raw")
+            .expect_err("timestamp must be parsed once at the filename boundary");
+        assert!(matches!(
+            invalid_timestamp,
+            format::FrameFilenameError::InvalidTimestamp { .. }
+        ));
+        assert!(std::error::Error::source(&invalid_timestamp).is_some());
+
+        assert!(matches!(
+            format::parse_frame_filename("42_color.raw"),
+            Err(format::FrameFilenameError::UnknownFrameKind { value }) if value == "color"
+        ));
+    }
+
+    #[test]
+    fn frame_scan_ignores_non_raw_files_but_rejects_malformed_raw_files() {
+        let root = unique_temp_path("scan-malformed-raw");
+        let frames_dir = root.join(format::FRAMES_DIR);
+        std::fs::create_dir_all(&frames_dir).expect("frames directory");
+        std::fs::write(frames_dir.join("notes.txt"), b"not dataset data").expect("unrelated file");
+        let malformed_path = frames_dir.join("not-an-i64_mono_left.raw");
+        std::fs::write(&malformed_path, [0_u8; 4]).expect("malformed frame");
+
+        let error = scan_frames_with_depth(&frames_dir, 2, 2, None)
+            .expect_err("malformed raw files must not disappear into counters");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidFrameFilename { path, .. } if path == &malformed_path
+        ));
+        let filename = std::error::Error::source(&error).expect("filename source");
+        assert!(
+            filename.source().is_some(),
+            "integer parse source must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frame_scan_rejects_wrong_size_and_unconfigured_depth() {
+        let root = unique_temp_path("scan-invalid-frame");
+        let frames_dir = root.join(format::FRAMES_DIR);
+        std::fs::create_dir_all(&frames_dir).expect("frames directory");
+        let short_path = frames_dir.join("1_mono_left.raw");
+        std::fs::write(&short_path, [0_u8; 3]).expect("short frame");
+
+        let size_error = scan_frames_with_depth(&frames_dir, 2, 2, None)
+            .expect_err("wrong-sized raw frame must fail the scan");
+        assert!(matches!(
+            size_error,
+            DatasetError::FrameSizeMismatch {
+                path,
+                expected_bytes: 4,
+                actual_bytes: 3,
+            } if path == short_path
+        ));
+
+        std::fs::remove_file(&short_path).expect("remove short frame");
+        let depth_path = frames_dir.join("2_depth.raw");
+        std::fs::write(&depth_path, [0_u8; 16]).expect("depth frame");
+        let depth_error = scan_frames_with_depth(&frames_dir, 2, 2, None)
+            .expect_err("depth frames require declared depth metadata");
+        assert!(matches!(
+            depth_error,
+            DatasetError::UnexpectedFrameKind {
+                path,
+                kind: format::FrameKind::Depth,
+            } if path == depth_path
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn frame_scan_sorts_once_for_pairing_and_stats() {
+        let root = unique_temp_path("scan-sorts");
+        let frames_dir = root.join(format::FRAMES_DIR);
+        std::fs::create_dir_all(&frames_dir).expect("frames directory");
+        for filename in [
+            "20_mono_left.raw",
+            "10_mono_left.raw",
+            "21_mono_right.raw",
+            "11_mono_right.raw",
+        ] {
+            std::fs::write(frames_dir.join(filename), [0_u8; 4]).expect("frame");
+        }
+
+        let frames = scan_frames_with_depth(&frames_dir, 2, 2, None).expect("scan");
+        assert_eq!(
+            frames
+                .left
+                .iter()
+                .map(|frame| frame.timestamp_ns)
+                .collect::<Vec<_>>(),
+            vec![10, 20]
+        );
+        assert_eq!(
+            frames
+                .right
+                .iter()
+                .map(|frame| frame.timestamp_ns)
+                .collect::<Vec<_>>(),
+            vec![11, 21]
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn dataset_writer_rejects_existing_output_path() {
         let path = unique_temp_path("writer-existing-output");
         std::fs::create_dir(&path).expect("create existing output");
@@ -1667,12 +1951,12 @@ mod tests {
         assert_eq!(stats.frames_dropped, 0);
         assert!(
             path.join(format::FRAMES_DIR)
-                .join(format::frame_name(100, "mono_left"))
+                .join(format::frame_name(100, format::FrameKind::MonoLeft))
                 .is_file()
         );
         assert!(
             path.join(format::FRAMES_DIR)
-                .join(format::frame_name(104, "mono_right"))
+                .join(format::frame_name(104, format::FrameKind::MonoRight))
                 .is_file()
         );
     }
@@ -1733,7 +2017,7 @@ mod tests {
         assert_eq!(
             std::fs::read(
                 path.join(format::FRAMES_DIR)
-                    .join(format::frame_name(100, "mono_left"))
+                    .join(format::frame_name(100, format::FrameKind::MonoLeft))
             )
             .expect("original frame"),
             vec![1; 4]

@@ -8,7 +8,7 @@ use crate::{
 
 use super::{
     Calibration, DatasetError, DatasetImuRecordError, FrameInfo, IMU_RECORD_BYTES, Manifest,
-    format, read_calibration_with_imu_override, read_manifest, read_meta, scan_frames,
+    format, read_calibration_with_imu_override, read_manifest, read_meta, scan_frames_with_depth,
 };
 
 #[derive(Debug)]
@@ -18,6 +18,7 @@ pub struct DatasetReader {
     calibration: Calibration,
     manifest: Manifest,
     pairing_window: PairingWindowNs,
+    stats: DatasetStats,
     left_seq: u64,
     right_seq: u64,
     imu_samples: Option<Box<[ImuSample]>>,
@@ -58,24 +59,35 @@ impl DatasetReader {
         }
         let calibration = read_calibration_with_imu_override(&root, imu_override.as_ref())?;
         let manifest = read_manifest(&root)?;
-        let imu_time_offset_ns = calibration
-            .imu
-            .as_ref()
-            .map(|imu| imu.extrinsics.time_offset_ns)
-            .unwrap_or(0);
-        let imu_samples = read_imu_samples(&root, &meta, imu_time_offset_ns)?;
         let pairing_window =
             PairingWindowNs::try_from(manifest.header.pairing_window_ns).map_err(|_| {
                 DatasetError::InvalidConfig {
                     msg: "manifest pairing_window_ns must be > 0",
                 }
             })?;
+        let mono = meta.mono.as_ref().ok_or(DatasetError::InvalidConfig {
+            msg: "meta.json missing mono config",
+        })?;
+        let frames = scan_frames_with_depth(
+            &root.join(format::FRAMES_DIR),
+            mono.width,
+            mono.height,
+            meta.depth.as_ref(),
+        )?;
+        let stats = DatasetStats::from_frames_and_manifest(&frames, &manifest);
+        let imu_time_offset_ns = calibration
+            .imu
+            .as_ref()
+            .map(|imu| imu.extrinsics.time_offset_ns)
+            .unwrap_or(0);
+        let imu_samples = read_imu_samples(&root, &meta, imu_time_offset_ns)?;
         Ok(Self {
             root,
             meta,
             calibration,
             manifest,
             pairing_window,
+            stats,
             left_seq: 0,
             right_seq: 0,
             imu_samples,
@@ -90,15 +102,8 @@ impl DatasetReader {
         &self.calibration
     }
 
-    pub fn stats(&self) -> Result<DatasetStats, DatasetError> {
-        let mono = self.meta.mono.as_ref().ok_or(DatasetError::InvalidConfig {
-            msg: "meta.json missing mono config",
-        })?;
-        let frames = scan_frames(&self.root.join(format::FRAMES_DIR), mono.width, mono.height)?;
-        Ok(DatasetStats::from_frames_and_manifest(
-            &frames,
-            &self.manifest,
-        ))
+    pub fn stats(&self) -> DatasetStats {
+        self.stats
     }
 
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
@@ -416,29 +421,28 @@ fn fps_from_frames(frames: &[FrameInfo]) -> Option<f64> {
 }
 
 fn fps_from_manifest_pairs(entries: &[super::ManifestEntry]) -> Option<f64> {
-    let paired: Vec<&super::ManifestEntry> = entries
-        .iter()
-        .filter(|entry| matches!(entry.pairing, super::ManifestPairing::Paired { .. }))
-        .collect();
-    if paired.len() < 2 {
-        return None;
-    }
+    let mut pair_count = 0_usize;
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    for entry in paired.iter().copied() {
+    for entry in entries {
+        let super::ManifestPairing::Paired { right, .. } = &entry.pairing else {
+            continue;
+        };
+        pair_count = pair_count.saturating_add(1);
         min_ts = min_ts.min(entry.left.timestamp_ns);
         max_ts = max_ts.max(entry.left.timestamp_ns);
-        if let super::ManifestPairing::Paired { right, .. } = &entry.pairing {
-            min_ts = min_ts.min(right.timestamp_ns);
-            max_ts = max_ts.max(right.timestamp_ns);
-        }
+        min_ts = min_ts.min(right.timestamp_ns);
+        max_ts = max_ts.max(right.timestamp_ns);
+    }
+    if pair_count < 2 {
+        return None;
     }
     let span_ns = max_ts.abs_diff(min_ts) as f64;
     if span_ns <= 0.0 {
         return None;
     }
     let span_s = span_ns / 1_000_000_000.0;
-    Some((paired.len().saturating_sub(1)) as f64 / span_s)
+    Some((pair_count - 1) as f64 / span_s)
 }
 
 fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
@@ -669,9 +673,6 @@ mod tests {
                 timestamp_ns: 1_000_000_010,
                 path: "right1.raw".to_string(),
             }],
-            depth: Vec::new(),
-            parse_fail: 0,
-            size_mismatch: 0,
         };
         let manifest = Manifest {
             header: super::super::ManifestHeader {

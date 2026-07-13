@@ -198,12 +198,18 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let open_time = open_start.elapsed();
 
     let stats_start = Instant::now();
-    let stats = reader.stats()?;
+    let stats = reader.stats();
     let stats_time = stats_start.elapsed();
 
     eprintln!("dataset: {}", dataset_path.display());
-    eprintln!("dataset open: {:.2}ms", open_time.as_secs_f64() * 1000.0);
-    eprintln!("scan frames: {:.2}ms", stats_time.as_secs_f64() * 1000.0);
+    eprintln!(
+        "dataset validation + open: {:.2}ms",
+        open_time.as_secs_f64() * 1000.0
+    );
+    eprintln!(
+        "cached stats lookup: {:.2}ms",
+        stats_time.as_secs_f64() * 1000.0
+    );
     eprintln!(
         "camera fps: left={:.2?} right={:.2?} paired={:.2?} (left={}, right={})",
         stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count

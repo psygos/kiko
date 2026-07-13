@@ -23,7 +23,7 @@ pub struct VizArgs {
 
 pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
-    let stats = reader.stats()?;
+    let stats = reader.stats();
 
     eprintln!("dataset: {}", args.dataset.path.display());
     eprintln!(

@@ -147,7 +147,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     if vio_enabled && reader.meta().imu.is_none() {
         return Err("--vio requires IMU data in the dataset".into());
     }
-    let stats = reader.stats()?;
+    let stats = reader.stats();
 
     eprintln!("dataset: {}", args.dataset.path.display());
     eprintln!(
