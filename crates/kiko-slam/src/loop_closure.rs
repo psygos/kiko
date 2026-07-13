@@ -670,11 +670,12 @@ pub struct GlobalDescriptor([f32; GLOBAL_DESCRIPTOR_DIM]);
 
 impl GlobalDescriptor {
     pub fn try_new(values: [f32; GLOBAL_DESCRIPTOR_DIM]) -> Result<Self, GlobalDescriptorError> {
-        let mut norm_sq = 0.0_f32;
+        let mut norm_sq = 0.0_f64;
         for (idx, &value) in values.iter().enumerate() {
             if !value.is_finite() {
                 return Err(GlobalDescriptorError::NonFiniteValue { index: idx, value });
             }
+            let value = f64::from(value);
             norm_sq += value * value;
         }
         if norm_sq <= 0.0 {
@@ -684,7 +685,7 @@ impl GlobalDescriptor {
         let inv_norm = 1.0 / norm_sq.sqrt();
         let mut normalized = values;
         for v in &mut normalized {
-            *v *= inv_norm;
+            *v = (f64::from(*v) * inv_norm) as f32;
         }
         Ok(Self(normalized))
     }
@@ -702,9 +703,6 @@ impl GlobalDescriptor {
                 (dot + a * b, na + a * a, nb + b * b)
             },
         );
-        if norm_a <= 0.0 || norm_b <= 0.0 {
-            return 0.0;
-        }
         (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
     }
 
@@ -715,19 +713,21 @@ impl GlobalDescriptor {
             return Err(GlobalDescriptorError::EmptyInput);
         }
 
-        let mut out = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
-        let count = descriptors.len() as f32;
+        let mut mean = [0.0_f64; crate::DESCRIPTOR_DIM];
+        let mut max = [f32::NEG_INFINITY; crate::DESCRIPTOR_DIM];
         for d in descriptors {
             for (idx, value) in d.0.iter().copied().enumerate() {
-                out[idx] += value;
-                let max_slot = &mut out[crate::DESCRIPTOR_DIM + idx];
-                if value > *max_slot {
-                    *max_slot = value;
+                mean[idx] += f64::from(value);
+                if value > max[idx] {
+                    max[idx] = value;
                 }
             }
         }
-        for value in &mut out[..crate::DESCRIPTOR_DIM] {
-            *value /= count;
+        let count = descriptors.len() as f64;
+        let mut out = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
+        for idx in 0..crate::DESCRIPTOR_DIM {
+            out[idx] = (mean[idx] / count) as f32;
+            out[crate::DESCRIPTOR_DIM + idx] = max[idx];
         }
 
         Self::try_new(out)
@@ -992,11 +992,7 @@ impl KeyframeDatabase {
                 similarity: descriptor.cosine_similarity(&candidate.descriptor),
             });
         }
-        matches.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        matches.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
         matches.truncate(top_k);
         matches
     }
@@ -1017,11 +1013,7 @@ impl KeyframeDatabase {
                 similarity: descriptor.cosine_similarity(&entry.descriptor),
             })
             .collect();
-        matches.sort_by(|a, b| {
-            b.similarity
-                .partial_cmp(&a.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        matches.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
         matches.truncate(top_k);
         matches
     }
@@ -1951,6 +1943,42 @@ mod tests {
         );
         assert!(values[4] > 0.0);
         assert!(values[256 + 4] > 0.0);
+    }
+
+    #[test]
+    fn global_descriptor_normalization_handles_extreme_finite_inputs() {
+        let descriptor = GlobalDescriptor::try_new([f32::MAX; super::GLOBAL_DESCRIPTOR_DIM])
+            .expect("finite descriptor must not overflow during normalization");
+        let norm = descriptor
+            .as_array()
+            .iter()
+            .map(|&value| {
+                let value = f64::from(value);
+                value * value
+            })
+            .sum::<f64>()
+            .sqrt();
+
+        assert!(descriptor.as_array().iter().all(|value| value.is_finite()));
+        assert!((norm - 1.0).abs() < 1e-6, "normalized norm was {norm}");
+        let similarity = descriptor.cosine_similarity(&descriptor);
+        assert!(similarity.is_finite());
+        assert!((similarity - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn global_descriptor_max_pool_preserves_all_negative_dimensions() {
+        let descriptor = aggregate_global_descriptor(&[
+            Descriptor([-2.0; crate::DESCRIPTOR_DIM]),
+            Descriptor([-1.0; crate::DESCRIPTOR_DIM]),
+        ])
+        .expect("negative finite descriptors remain valid");
+
+        assert!(
+            descriptor.as_array()[crate::DESCRIPTOR_DIM..]
+                .iter()
+                .all(|&value| value < 0.0)
+        );
     }
 
     #[test]

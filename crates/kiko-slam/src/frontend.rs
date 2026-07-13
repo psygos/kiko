@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::inference::InferenceError;
@@ -314,7 +313,7 @@ pub(crate) fn median_parallax_px(
         return None;
     }
 
-    parallax.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    parallax.sort_by(f32::total_cmp);
     let mid = parallax.len() / 2;
     let median = if parallax.len() % 2 == 0 {
         (parallax[mid - 1] + parallax[mid]) * 0.5
