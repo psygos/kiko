@@ -639,6 +639,102 @@ impl std::error::Error for ObservationResolveError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoseBaTermination {
+    Converged { iterations: NonZeroUsize },
+    IterationLimit { iterations: NonZeroUsize },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PoseBaRefinement {
+    pose: Pose,
+    termination: PoseBaTermination,
+}
+
+impl PoseBaRefinement {
+    pub fn pose(self) -> Pose {
+        self.pose
+    }
+
+    pub fn termination(self) -> PoseBaTermination {
+        self.termination
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PoseBaOutcome {
+    Refined(PoseBaRefinement),
+    InsufficientSupport,
+}
+
+#[derive(Debug)]
+pub enum PoseBaError {
+    Observation {
+        source: ObservationResolveError,
+    },
+    NoProjectableFactors {
+        iteration: usize,
+    },
+    LinearSolve {
+        iteration: usize,
+        source: LinearSolveError,
+    },
+    InvalidPose {
+        iteration: usize,
+        frame_index: usize,
+        source: crate::Pose64Error,
+    },
+    InvariantViolation {
+        message: &'static str,
+    },
+}
+
+impl std::fmt::Display for PoseBaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Observation { source } => {
+                write!(f, "pose-only BA observation resolution failed: {source}")
+            }
+            Self::NoProjectableFactors { iteration } => write!(
+                f,
+                "pose-only BA has no projectable factors at iteration {iteration}"
+            ),
+            Self::LinearSolve { iteration, source } => write!(
+                f,
+                "pose-only BA linear solve failed at iteration {iteration}: {source}"
+            ),
+            Self::InvalidPose {
+                iteration,
+                frame_index,
+                source,
+            } => write!(
+                f,
+                "pose-only BA produced an invalid pose for frame {frame_index} at iteration {iteration}: {source}"
+            ),
+            Self::InvariantViolation { message } => {
+                write!(f, "pose-only BA invariant violation: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PoseBaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation { source } => Some(source),
+            Self::LinearSolve { source, .. } => Some(source),
+            Self::InvalidPose { source, .. } => Some(source),
+            Self::NoProjectableFactors { .. } | Self::InvariantViolation { .. } => None,
+        }
+    }
+}
+
+impl From<ObservationResolveError> for PoseBaError {
+    fn from(source: ObservationResolveError) -> Self {
+        Self::Observation { source }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MapObservation {
     keyframe_keypoint: KeyframeKeypoint,
@@ -1517,6 +1613,7 @@ pub struct LocalBundleAdjuster {
     config: LocalBaConfig,
     intrinsics: PinholeIntrinsics,
     frames: Vec<BaFrame>,
+    pose_backup_buf: Vec<Pose>,
     a_buf: Vec<f32>,
     b_buf: Vec<f32>,
 }
@@ -1530,6 +1627,7 @@ impl LocalBundleAdjuster {
             config,
             intrinsics,
             frames: Vec::new(),
+            pose_backup_buf: Vec::with_capacity(config.window()),
             a_buf,
             b_buf,
         }
@@ -1552,7 +1650,7 @@ impl LocalBundleAdjuster {
         map: &SlamMap,
         pose: Pose,
         observations: ObservationSet,
-    ) -> Result<Option<Pose>, ObservationResolveError> {
+    ) -> Result<PoseBaOutcome, PoseBaError> {
         let retained_start = self
             .frames
             .len()
@@ -1570,27 +1668,170 @@ impl LocalBundleAdjuster {
                     .observations
                     .resolve(map, self.intrinsics, self.config.min_observations)?
             else {
-                return Ok(None);
+                return Ok(PoseBaOutcome::InsufficientSupport);
             };
             resolved.push(frame_observations);
         }
         let Some(frame_observations) =
             observations.resolve(map, self.intrinsics, self.config.min_observations)?
         else {
-            return Ok(None);
+            return Ok(PoseBaOutcome::InsufficientSupport);
         };
         resolved.push(frame_observations);
 
+        debug_assert!(self.frames.len() <= self.config.window());
+        let evicted = (self.frames.len() == self.config.window()).then(|| self.frames.remove(0));
+        self.pose_backup_buf.clear();
+        self.pose_backup_buf
+            .extend(self.frames.iter().map(|frame| frame.pose));
         self.frames.push(BaFrame { pose, observations });
-        if self.frames.len() > self.config.window() {
-            let excess = self.frames.len() - self.config.window();
-            self.frames.drain(0..excess);
+
+        let termination = match self.optimize(&resolved) {
+            Ok(termination) => termination,
+            Err(error) => {
+                self.rollback_pose_push(evicted);
+                return Err(error);
+            }
+        };
+        let Some(refined_pose) = self.frames.last().map(|frame| frame.pose) else {
+            self.rollback_pose_push(evicted);
+            return Err(PoseBaError::InvariantViolation {
+                message: "successful solve left an empty frame window",
+            });
+        };
+        Ok(PoseBaOutcome::Refined(PoseBaRefinement {
+            pose: refined_pose,
+            termination,
+        }))
+    }
+
+    fn rollback_pose_push(&mut self, evicted: Option<BaFrame>) {
+        self.frames.pop();
+        for (frame, pose) in self
+            .frames
+            .iter_mut()
+            .zip(self.pose_backup_buf.iter().copied())
+        {
+            frame.pose = pose;
+        }
+        if let Some(frame) = evicted {
+            self.frames.insert(0, frame);
+        }
+    }
+
+    fn optimize(
+        &mut self,
+        resolved: &[ResolvedObservationSet],
+    ) -> Result<PoseBaTermination, PoseBaError> {
+        let frame_count = self.frames.len();
+        if frame_count == 0 {
+            return Err(PoseBaError::InvariantViolation {
+                message: "optimizer called with an empty frame window",
+            });
+        }
+        debug_assert_eq!(frame_count, resolved.len());
+
+        let dim = frame_count * 6;
+        let max_iters = self.config.max_iterations();
+        let huber = self.config.huber_delta_px();
+        let damping = self.config.lm().initial_lambda().max(MIN_POSE_DAMPING);
+        let motion_weight = self.config.motion_prior_weight();
+
+        for iter in 0..max_iters {
+            let a = &mut self.a_buf[..dim * dim];
+            let b = &mut self.b_buf[..dim];
+            a.fill(0.0);
+            b.fill(0.0);
+
+            let mut projectable_factors = 0usize;
+            for (idx, (frame, observations)) in self.frames.iter().zip(resolved).enumerate() {
+                let base = idx * 6;
+                for obs in observations.observations() {
+                    if let Some((residual, jac)) =
+                        reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
+                    {
+                        projectable_factors = projectable_factors.saturating_add(1);
+                        let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
+                        let weight = huber_weight(r_norm, huber);
+                        let scale = weight.sqrt();
+                        let r0 = residual[0] * scale;
+                        let r1 = residual[1] * scale;
+                        let j = jac.map(|row| row.map(|v| v * scale));
+
+                        for c in 0..6 {
+                            let jr = j[0][c] * r0 + j[1][c] * r1;
+                            b[base + c] -= jr;
+                            for d in 0..6 {
+                                let jt_j = j[0][c] * j[0][d] + j[1][c] * j[1][d];
+                                a[(base + c) * dim + (base + d)] += jt_j;
+                            }
+                        }
+                    }
+                }
+            }
+            if projectable_factors == 0 {
+                return Err(PoseBaError::NoProjectableFactors {
+                    iteration: iter + 1,
+                });
+            }
+
+            if motion_weight > 0.0 && frame_count >= 2 {
+                for i in 1..frame_count {
+                    accumulate_motion_prior(
+                        a,
+                        b,
+                        dim,
+                        self.frames[i - 1].pose,
+                        self.frames[i].pose,
+                        (i - 1) * 6,
+                        i * 6,
+                        motion_weight,
+                    );
+                }
+            }
+
+            for i in 0..dim {
+                a[i * dim + i] += damping;
+            }
+
+            solve_linear_system(a, b, dim).map_err(|source| PoseBaError::LinearSolve {
+                iteration: iter + 1,
+                source,
+            })?;
+
+            let mut max_step = 0.0_f32;
+            for i in 0..frame_count {
+                let step = extract_se3_delta(b, i * 6);
+                let step_norm = norm6(step);
+                if step_norm > max_step {
+                    max_step = step_norm;
+                }
+                let pose = self.frames[i].pose;
+                let updated = apply_se3_delta(pose, step);
+                crate::Pose64::try_from_pose32(updated).map_err(|source| {
+                    PoseBaError::InvalidPose {
+                        iteration: iter + 1,
+                        frame_index: i,
+                        source,
+                    }
+                })?;
+                self.frames[i].pose = updated;
+            }
+
+            if max_step < STEP_CONVERGENCE_THRESHOLD {
+                return Ok(PoseBaTermination::Converged {
+                    iterations: NonZeroUsize::new(iter + 1).ok_or(
+                        PoseBaError::InvariantViolation {
+                            message: "converged iteration count is zero",
+                        },
+                    )?,
+                });
+            }
         }
 
-        if !self.optimize(&resolved) {
-            return Ok(None);
-        }
-        Ok(self.frames.last().map(|frame| frame.pose))
+        Ok(PoseBaTermination::IterationLimit {
+            iterations: self.config.max_iterations,
+        })
     }
 
     pub fn optimize_keyframe_window(
@@ -1622,92 +1863,6 @@ impl LocalBundleAdjuster {
         }
 
         Ok(result)
-    }
-
-    fn optimize(&mut self, resolved: &[ResolvedObservationSet]) -> bool {
-        let frame_count = self.frames.len();
-        if frame_count == 0 {
-            return false;
-        }
-        debug_assert_eq!(frame_count, resolved.len());
-
-        let dim = frame_count * 6;
-        let max_iters = self.config.max_iterations();
-        let huber = self.config.huber_delta_px();
-        let damping = self.config.lm().initial_lambda().max(MIN_POSE_DAMPING);
-        let motion_weight = self.config.motion_prior_weight();
-
-        for _ in 0..max_iters {
-            let a = &mut self.a_buf[..dim * dim];
-            let b = &mut self.b_buf[..dim];
-            a.fill(0.0);
-            b.fill(0.0);
-
-            for (idx, (frame, observations)) in self.frames.iter().zip(resolved).enumerate() {
-                let base = idx * 6;
-                for obs in observations.observations() {
-                    if let Some((residual, jac)) =
-                        reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
-                    {
-                        let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                        let weight = huber_weight(r_norm, huber);
-                        let scale = weight.sqrt();
-                        let r0 = residual[0] * scale;
-                        let r1 = residual[1] * scale;
-                        let j = jac.map(|row| row.map(|v| v * scale));
-
-                        for c in 0..6 {
-                            let jr = j[0][c] * r0 + j[1][c] * r1;
-                            b[base + c] -= jr;
-                            for d in 0..6 {
-                                let jt_j = j[0][c] * j[0][d] + j[1][c] * j[1][d];
-                                a[(base + c) * dim + (base + d)] += jt_j;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if motion_weight > 0.0 && frame_count >= 2 {
-                for i in 1..frame_count {
-                    accumulate_motion_prior(
-                        a,
-                        b,
-                        dim,
-                        self.frames[i - 1].pose,
-                        self.frames[i].pose,
-                        (i - 1) * 6,
-                        i * 6,
-                        motion_weight,
-                    );
-                }
-            }
-
-            for i in 0..dim {
-                a[i * dim + i] += damping;
-            }
-
-            if solve_linear_system(a, b, dim).is_err() {
-                return false;
-            }
-
-            let mut max_step = 0.0_f32;
-            for i in 0..frame_count {
-                let step = extract_se3_delta(b, i * 6);
-                let step_norm = norm6(step);
-                if step_norm > max_step {
-                    max_step = step_norm;
-                }
-                let pose = self.frames[i].pose;
-                self.frames[i].pose = apply_se3_delta(pose, step);
-            }
-
-            if max_step < STEP_CONVERGENCE_THRESHOLD {
-                break;
-            }
-        }
-
-        true
     }
 
     fn optimize_full(&mut self, problem: &mut FullBaProblem) -> Result<BaResult, BaExecutionError> {
@@ -3227,10 +3382,83 @@ mod tests {
 
         assert!(matches!(
             error,
-            ObservationResolveError::MissingAssociation { keypoint }
+            PoseBaError::Observation {
+                source: ObservationResolveError::MissingAssociation { keypoint }
+            }
                 if keypoint == removed_keypoint
         ));
         assert!(ba.frames.is_empty(), "failed push must be transactional");
+    }
+
+    #[test]
+    fn failed_pose_solve_restores_evicted_frame_and_pose() {
+        let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let mut point_ids = Vec::new();
+        let observations = ObservationSet::new(
+            (0..4)
+                .map(|index| {
+                    let keypoint = map.keyframe_keypoint(keyframe_id, index).expect("keypoint");
+                    point_ids.push(
+                        map.map_point_for_keypoint(keypoint)
+                            .expect("association lookup")
+                            .expect("map point"),
+                    );
+                    MapObservation::new(keypoint, map.keypoint(keypoint).expect("pixel"))
+                })
+                .collect(),
+            NonZeroUsize::new(4).expect("literal is non-zero"),
+        )
+        .expect("observations");
+        let config = LocalBaConfig::new(1, 3, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let original_pose = axis_angle_pose([0.1, -0.2, 0.3], [0.01, -0.02, 0.03]);
+        let first = ba
+            .push_frame(&map, original_pose, observations.clone())
+            .expect("first solve");
+        assert!(matches!(first, PoseBaOutcome::Refined(_)));
+        let retained = ba.frames[0].clone();
+
+        for point_id in point_ids {
+            map.set_map_point_position(
+                point_id,
+                Point3 {
+                    x: f32::MAX,
+                    y: 0.0,
+                    z: 1.0,
+                },
+            )
+            .expect("finite extreme point");
+        }
+
+        let error = ba
+            .push_frame(&map, Pose::identity(), observations)
+            .expect_err("non-finite normal equations must fail");
+
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(
+            error,
+            PoseBaError::LinearSolve {
+                iteration: 1,
+                source: LinearSolveError::NonFiniteMatrix { .. }
+                    | LinearSolveError::NonFiniteRhs { .. },
+            }
+        ));
+        assert_eq!(ba.frames.len(), 1);
+        assert!(pose_close(ba.frames[0].pose, retained.pose, 0.0));
+        assert_eq!(
+            ba.frames[0].observations.observations().len(),
+            retained.observations.observations().len()
+        );
+        for (actual, expected) in ba.frames[0]
+            .observations
+            .observations()
+            .iter()
+            .zip(retained.observations.observations())
+        {
+            assert_eq!(actual.keyframe_keypoint(), expected.keyframe_keypoint());
+            assert_eq!(actual.pixel().x, expected.pixel().x);
+            assert_eq!(actual.pixel().y, expected.pixel().y);
+        }
     }
 
     #[test]

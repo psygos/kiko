@@ -108,7 +108,8 @@ pub use local_ba::{
 pub use local_ba::{
     BaCorrection, BaExecutionError, BaResult, DegenerateReason, LinearSolveError, LmConfig,
     LmConfigError, LocalBaConfig, LocalBaConfigError, LocalBundleAdjuster, MapObservation,
-    Matrix3InverseError, ObservationResolveError, ObservationSet, ObservationSetError,
+    Matrix3InverseError, ObservationResolveError, ObservationSet, ObservationSetError, PoseBaError,
+    PoseBaOutcome, PoseBaRefinement, PoseBaTermination,
 };
 pub use loop_closure::{
     DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,

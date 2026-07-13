@@ -501,6 +501,7 @@ pub struct FrameDiagnostics {
     pub keyframe_status: Option<KeyframeStatus>,
     pub triangulation: Option<TriangulationStats>,
     pub ba_result: Option<BaResult>,
+    pub pose_ba_termination: Option<crate::PoseBaTermination>,
     #[cfg(feature = "vio")]
     pub vio_solve_result: Option<crate::VioSolveResult>,
     #[cfg(feature = "vio")]
@@ -550,6 +551,7 @@ impl FrameDiagnostics {
             keyframe_status: None,
             triangulation: None,
             ba_result: None,
+            pose_ba_termination: None,
             #[cfg(feature = "vio")]
             vio_solve_result: None,
             #[cfg(feature = "vio")]

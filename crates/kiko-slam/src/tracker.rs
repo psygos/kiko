@@ -1418,7 +1418,7 @@ pub enum TrackerError {
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
     DescriptorMatch(DescriptorMatchError),
-    BaObservation(crate::ObservationResolveError),
+    PoseBa(crate::PoseBaError),
     BaExecution(crate::BaExecutionError),
     StaleLoopProof {
         proof: crate::MapSnapshot,
@@ -1459,9 +1459,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
-            TrackerError::BaObservation(err) => {
-                write!(f, "bundle-adjustment observation error: {err}")
-            }
+            TrackerError::PoseBa(err) => write!(f, "pose-only bundle adjustment failed: {err}"),
             TrackerError::BaExecution(err) => {
                 write!(f, "bundle-adjustment execution error: {err}")
             }
@@ -1496,7 +1494,7 @@ impl std::error::Error for TrackerError {
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
-            TrackerError::BaObservation(source) => Some(source),
+            TrackerError::PoseBa(source) => Some(source),
             TrackerError::BaExecution(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioAccumulator(source) => Some(source),
@@ -1575,9 +1573,9 @@ impl From<DescriptorMatchError> for TrackerError {
     }
 }
 
-impl From<crate::ObservationResolveError> for TrackerError {
-    fn from(source: crate::ObservationResolveError) -> Self {
-        Self::BaObservation(source)
+impl From<crate::PoseBaError> for TrackerError {
+    fn from(source: crate::PoseBaError) -> Self {
+        Self::PoseBa(source)
     }
 }
 
@@ -2132,7 +2130,7 @@ impl VioRuntime {
 #[derive(Debug)]
 enum PoseRefinementProposal {
     None,
-    VisualBa(VisualBaPoseProposal),
+    VisualBa(Box<VisualBaPoseProposal>),
     Vio(Box<VioPoseProposal>),
 }
 
@@ -2140,6 +2138,7 @@ enum PoseRefinementProposal {
 #[derive(Debug)]
 struct VisualBaPoseProposal {
     pose_world: Pose,
+    termination: crate::PoseBaTermination,
     optimized_ba: LocalBundleAdjuster,
 }
 
@@ -2604,10 +2603,11 @@ impl SlamTracker {
             let observations =
                 ObservationSet::when_sufficient(map_observations, self.ba.min_observations());
             return Ok(match observations {
-                Some(set) => self.propose_visual_ba_pose(pose_world, set)?.map_or(
-                    PoseRefinementProposal::None,
-                    PoseRefinementProposal::VisualBa,
-                ),
+                Some(set) => self
+                    .propose_visual_ba_pose(pose_world, set)?
+                    .map_or(PoseRefinementProposal::None, |proposal| {
+                        PoseRefinementProposal::VisualBa(Box::new(proposal))
+                    }),
                 None => PoseRefinementProposal::None,
             });
         };
@@ -2643,10 +2643,11 @@ impl SlamTracker {
         let Some(preintegrated) = preintegrated else {
             // No IMU data — fall back to visual BA
             return Ok(match obs_set {
-                Some(set) => self.propose_visual_ba_pose(pose_world, set)?.map_or(
-                    PoseRefinementProposal::None,
-                    PoseRefinementProposal::VisualBa,
-                ),
+                Some(set) => self
+                    .propose_visual_ba_pose(pose_world, set)?
+                    .map_or(PoseRefinementProposal::None, |proposal| {
+                        PoseRefinementProposal::VisualBa(Box::new(proposal))
+                    }),
                 None => PoseRefinementProposal::None,
             });
         };
@@ -2738,10 +2739,11 @@ impl SlamTracker {
                 vio_runtime.predicted_state = Some(nav_state);
                 vio_runtime.pending_imu.clear();
                 return Ok(match obs_set {
-                    Some(set) => self.propose_visual_ba_pose(pose_world, set)?.map_or(
-                        PoseRefinementProposal::None,
-                        PoseRefinementProposal::VisualBa,
-                    ),
+                    Some(set) => self
+                        .propose_visual_ba_pose(pose_world, set)?
+                        .map_or(PoseRefinementProposal::None, |proposal| {
+                            PoseRefinementProposal::VisualBa(Box::new(proposal))
+                        }),
                     None => PoseRefinementProposal::None,
                 });
             }
@@ -2853,14 +2855,16 @@ impl SlamTracker {
         &self,
         pose_world: Pose,
         observations: ObservationSet,
-    ) -> Result<Option<VisualBaPoseProposal>, crate::ObservationResolveError> {
+    ) -> Result<Option<VisualBaPoseProposal>, crate::PoseBaError> {
         let mut candidate_ba = self.ba.clone();
-        Ok(candidate_ba
-            .push_frame(self.global_map.map(), pose_world, observations)?
-            .map(|refined_pose| VisualBaPoseProposal {
-                pose_world: refined_pose,
+        match candidate_ba.push_frame(self.global_map.map(), pose_world, observations)? {
+            crate::PoseBaOutcome::Refined(refinement) => Ok(Some(VisualBaPoseProposal {
+                pose_world: refinement.pose(),
+                termination: refinement.termination(),
                 optimized_ba: candidate_ba,
-            }))
+            })),
+            crate::PoseBaOutcome::InsufficientSupport => Ok(None),
+        }
     }
 
     #[cfg(feature = "vio")]
@@ -4150,12 +4154,20 @@ impl SlamTracker {
         let refinement =
             self.run_vio_or_visual_ba(left.timestamp(), visual_pose_world, map_observations)?;
         #[cfg(not(feature = "vio"))]
-        let refined_world =
+        let (refined_world, pose_ba_termination) =
             match ObservationSet::when_sufficient(map_observations, self.ba.min_observations()) {
-                Some(set) => self
-                    .ba
-                    .push_frame(self.global_map.map(), visual_pose_world, set)?,
-                None => None,
+                Some(set) => {
+                    match self
+                        .ba
+                        .push_frame(self.global_map.map(), visual_pose_world, set)?
+                    {
+                        crate::PoseBaOutcome::Refined(refinement) => {
+                            (Some(refinement.pose()), Some(refinement.termination()))
+                        }
+                        crate::PoseBaOutcome::InsufficientSupport => (None, None),
+                    }
+                }
+                None => (None, None),
             };
         #[cfg(not(feature = "vio"))]
         let pose_world = refined_world.unwrap_or(visual_pose_world);
@@ -4187,6 +4199,7 @@ impl SlamTracker {
             vio_proposal_tracked_metrics,
             vio_proposal_accepted_inlier_metrics,
             vio_solve_result,
+            pose_ba_termination,
         ) = match refinement {
             PoseRefinementProposal::None => {
                 self.commit_authoritative_visual_pose(
@@ -4201,9 +4214,12 @@ impl SlamTracker {
                     None,
                     None,
                     None,
+                    None,
                 )
             }
             PoseRefinementProposal::VisualBa(proposal) => {
+                let proposal = *proposal;
+                let pose_ba_termination = Some(proposal.termination);
                 let visual_ba_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
                     &proposal.pose_world,
                     &inlier_observations,
@@ -4227,6 +4243,7 @@ impl SlamTracker {
                         None,
                         None,
                         None,
+                        pose_ba_termination,
                     )
                 } else {
                     self.commit_authoritative_visual_pose(
@@ -4241,6 +4258,7 @@ impl SlamTracker {
                         None,
                         None,
                         None,
+                        pose_ba_termination,
                     )
                 }
             }
@@ -4288,6 +4306,7 @@ impl SlamTracker {
                     Some(vio_tracked_metrics),
                     Some(vio_accepted_inlier_metrics),
                     Some(vio_solve_result),
+                    None,
                 )
             }
         };
@@ -4635,6 +4654,7 @@ impl SlamTracker {
         diagnostics.keyframe_status = keyframe_status;
         diagnostics.triangulation = triangulation_stats;
         diagnostics.ba_result = ba_result;
+        diagnostics.pose_ba_termination = pose_ba_termination;
         diagnostics.tracking_time = Some(tracking_start.elapsed());
         diagnostics.features_detected = Some(current.len());
         diagnostics.features_matched = Some(matches.len());

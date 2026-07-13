@@ -103,6 +103,8 @@ const PATH_TRI_DROPPED_DUPLICATE: &str = "diagnostics/triangulation/dropped_dupl
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
 const PATH_BA_ITERATIONS: &str = "diagnostics/ba/iterations";
+const PATH_POSE_BA_ITERATIONS: &str = "diagnostics/pose_ba/iterations";
+const PATH_POSE_BA_CONVERGED: &str = "diagnostics/pose_ba/converged";
 #[cfg(feature = "vio")]
 const PATH_VIO_FINAL_COST: &str = "diagnostics/vio/final_cost";
 #[cfg(feature = "vio")]
@@ -407,6 +409,14 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
             BaResult::Degenerate { .. } => {}
         }
     }
+    if let Some(termination) = diag.pose_ba_termination {
+        let (iterations, converged) = match termination {
+            crate::PoseBaTermination::Converged { iterations } => (iterations, 1.0),
+            crate::PoseBaTermination::IterationLimit { iterations } => (iterations, 0.0),
+        };
+        scalars.push((PATH_POSE_BA_ITERATIONS, iterations.get() as f64));
+        scalars.push((PATH_POSE_BA_CONVERGED, converged));
+    }
 
     #[cfg(feature = "vio")]
     if let Some(vio_result) = diag.vio_solve_result.as_ref() {
@@ -685,8 +695,8 @@ mod tests {
         PATH_HEALTH_VIO_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE,
         PATH_HEALTH_VISUAL_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE,
         PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES,
-        PATH_MAP_POINTS, PATH_TRACKING_PNP_ACCEPTED_INLIERS,
-        PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+        PATH_MAP_POINTS, PATH_POSE_BA_CONVERGED, PATH_POSE_BA_ITERATIONS,
+        PATH_TRACKING_PNP_ACCEPTED_INLIERS, PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
         PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS,
         PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS, PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
         PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
@@ -800,6 +810,9 @@ mod tests {
                 .expect("vio shared accepted-inlier rmse"),
         );
         diag.vio_proposal_disposition = Some(VioProposalDisposition::Adopted);
+        diag.pose_ba_termination = Some(crate::PoseBaTermination::IterationLimit {
+            iterations: std::num::NonZeroUsize::new(7).expect("literal is non-zero"),
+        });
         #[cfg(feature = "vio")]
         {
             diag.vio_calibrated_bias_prior_active = Some(true);
@@ -825,6 +838,12 @@ mod tests {
             dropped_duplicate: 0,
         });
         let scalars = diagnostics_scalars(&diag);
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_POSE_BA_ITERATIONS && (*value - 7.0).abs() < f64::EPSILON
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_POSE_BA_CONVERGED && value.abs() < f64::EPSILON
+        }));
         assert!(
             scalars
                 .iter()
