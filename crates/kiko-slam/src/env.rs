@@ -7,6 +7,7 @@ pub enum EnvError {
     InvalidInteger {
         key: &'static str,
         value: String,
+        target: &'static str,
         source: std::num::ParseIntError,
     },
     InvalidFloat {
@@ -24,9 +25,12 @@ impl std::fmt::Display for EnvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NonUnicode { key, .. } => write!(f, "environment variable {key} is not Unicode"),
-            Self::InvalidInteger { key, value, .. } => {
-                write!(f, "environment variable {key} is not an integer: {value:?}")
-            }
+            Self::InvalidInteger {
+                key, value, target, ..
+            } => write!(
+                f,
+                "environment variable {key} is not a valid {target} integer: {value:?}"
+            ),
             Self::InvalidFloat { key, value, .. } => {
                 write!(f, "environment variable {key} is not a float: {value:?}")
             }
@@ -64,10 +68,33 @@ pub fn try_env_usize(key: &'static str) -> Result<Option<usize>, EnvError> {
     let Some(value) = raw_env(key)? else {
         return Ok(None);
     };
-    value
-        .parse()
-        .map(Some)
-        .map_err(|source| EnvError::InvalidInteger { key, value, source })
+    parse_integer(key, value, "usize").map(Some)
+}
+
+pub fn try_env_u32(key: &'static str) -> Result<Option<u32>, EnvError> {
+    let Some(value) = raw_env(key)? else {
+        return Ok(None);
+    };
+    parse_integer(key, value, "u32").map(Some)
+}
+
+pub fn try_env_i64(key: &'static str) -> Result<Option<i64>, EnvError> {
+    let Some(value) = raw_env(key)? else {
+        return Ok(None);
+    };
+    parse_integer(key, value, "i64").map(Some)
+}
+
+fn parse_integer<T>(key: &'static str, value: String, target: &'static str) -> Result<T, EnvError>
+where
+    T: std::str::FromStr<Err = std::num::ParseIntError>,
+{
+    value.parse().map_err(|source| EnvError::InvalidInteger {
+        key,
+        value,
+        target,
+        source,
+    })
 }
 
 pub fn try_env_f32(key: &'static str) -> Result<Option<f32>, EnvError> {
@@ -156,6 +183,7 @@ mod tests {
         let error = EnvError::InvalidInteger {
             key: "KIKO_TEST",
             value: "not-an-integer".to_string(),
+            target: "usize",
             source,
         };
         assert!(error.source().is_some());
@@ -166,6 +194,20 @@ mod tests {
             value: "not-a-float".to_string(),
             source,
         };
+        assert!(error.source().is_some());
+    }
+
+    #[test]
+    fn strict_u32_parser_reports_destination_width_and_source() {
+        const KEY: &str = "KIKO_TEST_U32_OVERFLOW";
+        let error = parse_integer::<u32>(KEY, "4294967296".to_string(), "u32")
+            .expect_err("overflowing u32 must fail");
+
+        assert!(matches!(
+            &error,
+            EnvError::InvalidInteger { key, target, .. }
+                if *key == KEY && *target == "u32"
+        ));
         assert!(error.source().is_some());
     }
 }

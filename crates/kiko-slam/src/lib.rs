@@ -149,9 +149,10 @@ pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
     KeyframeInsertReason, KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx,
-    PoseStatus, ProjectedMatcherConfig, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
-    SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
-    TrackingMatcher, TrackingPose, VioTelemetry,
+    PoseStatus, ProjectedMatcherConfig, ProjectedMatcherConfigError, RedundancyPolicy,
+    RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError,
+    TrackerInitError, TrackerOutput, TrackerRuntimeConfig, TrackerRuntimeConfigError,
+    TrackingHealth, TrackingMatcher, TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectifiedRowMismatchError, RectifiedRowMismatchPx,

@@ -8,11 +8,11 @@ use clap::Args;
 use kiko_slam::dataset::{
     Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta, WriteOutcome,
 };
-use kiko_slam::env::{env_bool, env_usize};
+use kiko_slam::env::{try_env_bool, try_env_i64, try_env_u32, try_env_usize};
 use kiko_slam::{
-    FrameId, PairingConfigError, PairingDropReason, PairingOutcome, PairingWindowNs,
-    PendingFramesCapacity, SensorId, StereoPairer, load_runtime_imu_calibration_from_env,
-    oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
+    FrameId, PairingDropReason, PairingOutcome, PairingWindowNs, PendingFramesCapacity, SensorId,
+    StereoPairer, load_runtime_imu_calibration_from_env, oak_to_depth_image, oak_to_frame,
+    oak_to_imu_batch,
 };
 use oak_sys::{
     DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig,
@@ -23,6 +23,29 @@ use crate::args::CameraArgs;
 
 const DEFAULT_PAIRING_WINDOW_NS: i64 = 5_000_000;
 const DEFAULT_PAIRER_MAX_PENDING_PER_SIDE: usize = 64;
+
+#[derive(Debug)]
+struct RuntimeSettingError<E> {
+    key: &'static str,
+    value: String,
+    source: E,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for RuntimeSettingError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "environment variable {} has invalid value {:?}: {}",
+            self.key, self.value, self.source
+        )
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for RuntimeSettingError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 #[derive(Args, Clone, Debug)]
 #[command(about = "Record stereo dataset from OAK-D camera")]
@@ -128,8 +151,8 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: args.camera.fps,
         rectified: args.camera.rectified(),
     };
-    let depth_enabled = env_bool("KIKO_RECORD_DEPTH").unwrap_or(false);
-    let imu_enabled = env_bool("KIKO_RECORD_IMU").unwrap_or(false);
+    let depth_enabled = try_env_bool("KIKO_RECORD_DEPTH")?.unwrap_or(false);
+    let imu_enabled = try_env_bool("KIKO_RECORD_IMU")?.unwrap_or(false);
     let depth_config = depth_enabled.then_some(DepthConfig {
         width: mono_config.width,
         height: mono_config.height,
@@ -137,7 +160,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         align_to_rgb: false,
     });
     let imu_config = imu_enabled.then_some(ImuConfig {
-        rate_hz: u32::try_from(env_usize("KIKO_RECORD_IMU_RATE_HZ").unwrap_or(400)).unwrap_or(400),
+        rate_hz: try_env_u32("KIKO_RECORD_IMU_RATE_HZ")?.unwrap_or(400),
     });
 
     let config = DeviceConfig {
@@ -172,9 +195,9 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut pending_capacity_left_drops = 0u64;
     let mut pending_capacity_right_drops = 0u64;
     let pairing_window = load_pairing_window()?;
-    let pairer_max_pending = load_pairer_max_pending_per_side();
+    let pairer_max_pending = load_pairer_max_pending_per_side()?;
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
-    let read_timeout_ms = load_oak_read_timeout_ms();
+    let read_timeout_ms = load_oak_read_timeout_ms()?;
     let start = Instant::now();
 
     eprintln!("recording... press ctrl+c to stop");
@@ -412,43 +435,31 @@ pub(crate) fn build_calibration(
     })
 }
 
-pub(crate) fn load_pairing_window() -> Result<PairingWindowNs, PairingConfigError> {
-    let window_ns = match env_usize("KIKO_PAIRING_WINDOW_NS") {
-        Some(raw) => match i64::try_from(raw) {
-            Ok(value) => value,
-            Err(_) => {
-                eprintln!(
-                    "invalid KIKO_PAIRING_WINDOW_NS={raw}, exceeds i64::MAX, using default {DEFAULT_PAIRING_WINDOW_NS}"
-                );
-                DEFAULT_PAIRING_WINDOW_NS
-            }
-        },
-        None => DEFAULT_PAIRING_WINDOW_NS,
-    };
-    match PairingWindowNs::new(window_ns) {
-        Ok(window) => Ok(window),
-        Err(err) => {
-            eprintln!("invalid pairing window from env ({err}); using default");
-            PairingWindowNs::new(DEFAULT_PAIRING_WINDOW_NS)
-        }
-    }
+pub(crate) fn load_pairing_window() -> Result<PairingWindowNs, Box<dyn std::error::Error>> {
+    const KEY: &str = "KIKO_PAIRING_WINDOW_NS";
+    let window_ns = try_env_i64(KEY)?.unwrap_or(DEFAULT_PAIRING_WINDOW_NS);
+    PairingWindowNs::new(window_ns).map_err(|source| {
+        Box::new(RuntimeSettingError {
+            key: KEY,
+            value: window_ns.to_string(),
+            source,
+        }) as Box<dyn std::error::Error>
+    })
 }
 
-pub(crate) fn load_pairer_max_pending_per_side() -> PendingFramesCapacity {
-    let raw = env_usize("KIKO_PAIRER_MAX_PENDING_PER_SIDE")
-        .unwrap_or(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE);
-    match PendingFramesCapacity::try_from(raw) {
-        Ok(capacity) => capacity,
-        Err(err) => {
-            eprintln!("invalid pairer capacity from env ({err}); using default");
-            PendingFramesCapacity::try_from(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE)
-                .expect("default pairer capacity")
-        }
-    }
+pub(crate) fn load_pairer_max_pending_per_side()
+-> Result<PendingFramesCapacity, Box<dyn std::error::Error>> {
+    const KEY: &str = "KIKO_PAIRER_MAX_PENDING_PER_SIDE";
+    let raw = try_env_usize(KEY)?.unwrap_or(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE);
+    PendingFramesCapacity::try_from(raw).map_err(|source| {
+        Box::new(RuntimeSettingError {
+            key: KEY,
+            value: raw.to_string(),
+            source,
+        }) as Box<dyn std::error::Error>
+    })
 }
 
-pub(crate) fn load_oak_read_timeout_ms() -> u32 {
-    env_usize("KIKO_OAK_READ_TIMEOUT_MS")
-        .unwrap_or(2)
-        .min(u32::MAX as usize) as u32
+pub(crate) fn load_oak_read_timeout_ms() -> Result<u32, Box<dyn std::error::Error>> {
+    Ok(try_env_u32("KIKO_OAK_READ_TIMEOUT_MS")?.unwrap_or(2))
 }

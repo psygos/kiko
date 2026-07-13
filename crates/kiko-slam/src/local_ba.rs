@@ -60,6 +60,8 @@ pub enum LmConfigError {
     NonPositiveMinLambda { value: f32 },
     NonPositiveMaxLambda { value: f32 },
     MinLambdaExceedsMax { min: f32, max: f32 },
+    InitialLambdaBelowMin { initial: f32, min: f32 },
+    InitialLambdaAboveMax { initial: f32, max: f32 },
     InvalidRhoAccept { value: f32 },
     InvalidRhoGood { value: f32 },
     InvalidRhoOrdering { rho_accept: f32, rho_good: f32 },
@@ -89,6 +91,14 @@ impl std::fmt::Display for LmConfigError {
                     "LM min lambda must be <= max lambda (min={min}, max={max})"
                 )
             }
+            LmConfigError::InitialLambdaBelowMin { initial, min } => write!(
+                f,
+                "LM initial lambda must be >= min lambda (initial={initial}, min={min})"
+            ),
+            LmConfigError::InitialLambdaAboveMax { initial, max } => write!(
+                f,
+                "LM initial lambda must be <= max lambda (initial={initial}, max={max})"
+            ),
             LmConfigError::InvalidRhoAccept { value } => {
                 write!(f, "LM rho_accept must be in (0, 1) (got {value})")
             }
@@ -141,6 +151,18 @@ impl LmConfig {
         if min_lambda > max_lambda {
             return Err(LmConfigError::MinLambdaExceedsMax {
                 min: min_lambda,
+                max: max_lambda,
+            });
+        }
+        if initial_lambda < min_lambda {
+            return Err(LmConfigError::InitialLambdaBelowMin {
+                initial: initial_lambda,
+                min: min_lambda,
+            });
+        }
+        if initial_lambda > max_lambda {
+            return Err(LmConfigError::InitialLambdaAboveMax {
+                initial: initial_lambda,
                 max: max_lambda,
             });
         }
@@ -1961,7 +1983,8 @@ pub fn optimize_vio(
             }
         } else {
             rejected_steps += 1;
-            lambda *= f64::from(config.lm.lambda_factor);
+            lambda =
+                (lambda * f64::from(config.lm.lambda_factor)).min(f64::from(config.lm.max_lambda));
         }
     }
 
@@ -2918,6 +2941,14 @@ mod tests {
         assert!(matches!(
             LmConfig::new(1e-4, 10.0, 1e-2, 1e-3, 0.25, 0.75),
             Err(LmConfigError::MinLambdaExceedsMax { .. })
+        ));
+        assert!(matches!(
+            LmConfig::new(1e-5, 10.0, 1e-4, 1e4, 0.25, 0.75),
+            Err(LmConfigError::InitialLambdaBelowMin { .. })
+        ));
+        assert!(matches!(
+            LmConfig::new(1e5, 10.0, 1e-8, 1e4, 0.25, 0.75),
+            Err(LmConfigError::InitialLambdaAboveMax { .. })
         ));
         assert!(matches!(
             LmConfig::new(1e-4, 10.0, 1e-8, 1e4, 0.8, 0.7),

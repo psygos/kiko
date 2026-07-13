@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::Args;
 
-use kiko_slam::env::{env_bool, env_usize};
+use kiko_slam::env::{try_env_bool, try_env_u32, try_env_usize};
 use kiko_slam::{
     CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
     DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
@@ -270,13 +270,16 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: args.camera.fps,
         rectified: args.camera.rectified(),
     };
-    let depth_enabled = env_bool("KIKO_LIVE_DEPTH").unwrap_or(false);
-    let imu_enabled = env_bool("KIKO_LIVE_IMU").unwrap_or(false);
+    let depth_enabled = try_env_bool("KIKO_LIVE_DEPTH")?.unwrap_or(false);
+    let imu_enabled = try_env_bool("KIKO_LIVE_IMU")?.unwrap_or(false);
+    let vio_enabled = try_env_bool("KIKO_VIO")?.unwrap_or(false);
     #[cfg(feature = "vio")]
-    if env_bool("KIKO_VIO").unwrap_or(false) && !imu_enabled {
+    if vio_enabled && !imu_enabled {
         return Err("KIKO_VIO=true requires KIKO_LIVE_IMU=true".into());
     }
-    let depth_queue_depth = env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH").unwrap_or(8);
+    #[cfg(not(feature = "vio"))]
+    let _ = vio_enabled;
+    let depth_queue_depth = try_env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH")?.unwrap_or(8);
 
     let config = DeviceConfig {
         rgb: None,
@@ -288,8 +291,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             align_to_rgb: false,
         }),
         imu: imu_enabled.then_some(ImuConfig {
-            rate_hz: u32::try_from(env_usize("KIKO_LIVE_IMU_RATE_HZ").unwrap_or(400))
-                .unwrap_or(400),
+            rate_hz: try_env_u32("KIKO_LIVE_IMU_RATE_HZ")?.unwrap_or(400),
         }),
         queue: QueueConfig {
             size: 8,
@@ -301,16 +303,16 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut device = oak_sys::Device::connect("", config)?;
 
     let pairing_window = load_pairing_window()?;
-    let pairer_max_pending = load_pairer_max_pending_per_side();
+    let pairer_max_pending = load_pairer_max_pending_per_side()?;
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
-    let read_timeout_ms = load_oak_read_timeout_ms();
+    let read_timeout_ms = load_oak_read_timeout_ms()?;
 
-    let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH").unwrap_or(12);
+    let pair_queue_depth = try_env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH")?.unwrap_or(12);
     let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
     let (pair_tx, pair_rx, pair_stats) =
         bounded_channel::<CaptureBundle>(pair_capacity, DropPolicy::DropOldest);
 
-    let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH").unwrap_or(12);
+    let viz_queue_depth = try_env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
     let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
     let (depth_tx, depth_rx, depth_stats_handle) = if depth_enabled {
@@ -350,7 +352,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let calibration =
         CalibrationBundle::from_dataset_calibration(intrinsics, rectified, &dataset_calibration)?;
     #[cfg(feature = "vio")]
-    if env_bool("KIKO_VIO").unwrap_or(false) && !calibration.has_imu() {
+    if vio_enabled && !calibration.has_imu() {
         return Err(
             "KIKO_VIO=true requires IMU calibration via calibration.json, KIKO_IMU_CALIBRATION_FILE, or KIKO_IMU_* env".into(),
         );
@@ -454,7 +456,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let decimation = args.rerun.rerun_decimation;
     let rerun = args.rerun.clone();
-    let live_viz_enabled = env_bool("KIKO_LIVE_VIZ").unwrap_or(true);
+    let live_viz_enabled = try_env_bool("KIKO_LIVE_VIZ")?.unwrap_or(true);
     let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut sink = if live_viz_enabled {
             match rerun_recording(&rerun, "kiko-slam-live") {

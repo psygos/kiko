@@ -159,7 +159,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference = InferenceConfig::from_args(&inference_args, InferencePurpose::Slam)?;
 
     let rectified = RectifiedStereo::from_calibration(reader.calibration())?;
-    let dense_cloud_enabled = kiko_slam::env::env_bool("KIKO_DENSE_CLOUD").unwrap_or(false);
+    let dense_cloud_enabled = kiko_slam::env::try_env_bool("KIKO_DENSE_CLOUD")?.unwrap_or(false);
     let dense_config = kiko_slam::DenseCloudConfig::try_from_env()?;
     let dense_triangulator = if dense_cloud_enabled {
         Some(kiko_slam::Triangulator::new(

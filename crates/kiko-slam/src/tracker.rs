@@ -13,12 +13,8 @@ const MIN_TRACKING_RANSAC_INLIERS: usize = MIN_PNP_CORRESPONDENCES;
 /// Target roughly 25% of tracked observations as the adaptive inlier gate until
 /// the configured mature-map threshold becomes achievable.
 const TRACKING_RANSAC_INLIER_DIVISOR: usize = 4;
-/// Default maximum respawn attempts for backend and descriptor workers.
-const DEFAULT_MAX_RESPAWNS: u32 = 3;
 /// Minimum keyframes required for multi-frame optimization (BA or pose graph).
 const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
-/// Default minimum observations per map point to survive culling.
-const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 
 use crate::frontend::{
     MapObservationError, StereoFrontend, TrackedMapObservations, median_parallax_px,
@@ -63,6 +59,7 @@ pub struct TrackerConfig {
     pub redundancy: Option<RedundancyPolicy>,
     pub backend: Option<BackendConfig>,
     pub loop_subsystem: LoopSubsystemConfig,
+    pub runtime: TrackerRuntimeConfig,
     #[cfg(feature = "vio")]
     pub vio_enabled: bool,
 }
@@ -85,6 +82,135 @@ impl TrackerConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackerRuntimeConfig {
+    backend_max_respawns: u32,
+    descriptor_max_respawns: u32,
+    trace_transitions: bool,
+    cull_min_observations: NonZeroUsize,
+    #[cfg(feature = "vio")]
+    vio_window_size: NonZeroUsize,
+    #[cfg(feature = "vio")]
+    vio_max_iterations: NonZeroUsize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackerRuntimeConfigError {
+    RespawnLimitTooLarge {
+        field: &'static str,
+        value: usize,
+    },
+    ZeroCullMinimum,
+    #[cfg(feature = "vio")]
+    ZeroVioWindowSize,
+    #[cfg(feature = "vio")]
+    ZeroVioIterations,
+}
+
+impl std::fmt::Display for TrackerRuntimeConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RespawnLimitTooLarge { field, value } => {
+                write!(f, "tracker runtime `{field}` must fit in u32, got {value}")
+            }
+            Self::ZeroCullMinimum => {
+                write!(f, "map culling minimum observations must be non-zero")
+            }
+            #[cfg(feature = "vio")]
+            Self::ZeroVioWindowSize => write!(f, "VIO window size must be non-zero"),
+            #[cfg(feature = "vio")]
+            Self::ZeroVioIterations => write!(f, "VIO iteration count must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for TrackerRuntimeConfigError {}
+
+impl TrackerRuntimeConfig {
+    pub fn try_new(
+        backend_max_respawns: usize,
+        descriptor_max_respawns: usize,
+        trace_transitions: bool,
+        cull_min_observations: usize,
+    ) -> Result<Self, TrackerRuntimeConfigError> {
+        Ok(Self {
+            backend_max_respawns: u32::try_from(backend_max_respawns).map_err(|_| {
+                TrackerRuntimeConfigError::RespawnLimitTooLarge {
+                    field: "backend_max_respawns",
+                    value: backend_max_respawns,
+                }
+            })?,
+            descriptor_max_respawns: u32::try_from(descriptor_max_respawns).map_err(|_| {
+                TrackerRuntimeConfigError::RespawnLimitTooLarge {
+                    field: "descriptor_max_respawns",
+                    value: descriptor_max_respawns,
+                }
+            })?,
+            trace_transitions,
+            cull_min_observations: NonZeroUsize::new(cull_min_observations)
+                .ok_or(TrackerRuntimeConfigError::ZeroCullMinimum)?,
+            #[cfg(feature = "vio")]
+            vio_window_size: NonZeroUsize::new(5).expect("literal is non-zero"),
+            #[cfg(feature = "vio")]
+            vio_max_iterations: NonZeroUsize::new(3).expect("literal is non-zero"),
+        })
+    }
+
+    #[cfg(feature = "vio")]
+    pub fn try_with_vio(
+        mut self,
+        window_size: usize,
+        max_iterations: usize,
+    ) -> Result<Self, TrackerRuntimeConfigError> {
+        self.vio_window_size =
+            NonZeroUsize::new(window_size).ok_or(TrackerRuntimeConfigError::ZeroVioWindowSize)?;
+        self.vio_max_iterations = NonZeroUsize::new(max_iterations)
+            .ok_or(TrackerRuntimeConfigError::ZeroVioIterations)?;
+        Ok(self)
+    }
+
+    pub fn backend_max_respawns(self) -> u32 {
+        self.backend_max_respawns
+    }
+
+    pub fn descriptor_max_respawns(self) -> u32 {
+        self.descriptor_max_respawns
+    }
+
+    pub fn trace_transitions(self) -> bool {
+        self.trace_transitions
+    }
+
+    pub fn cull_min_observations(self) -> NonZeroUsize {
+        self.cull_min_observations
+    }
+
+    #[cfg(feature = "vio")]
+    pub fn vio_window_size(self) -> NonZeroUsize {
+        self.vio_window_size
+    }
+
+    #[cfg(feature = "vio")]
+    pub fn vio_max_iterations(self) -> NonZeroUsize {
+        self.vio_max_iterations
+    }
+}
+
+impl Default for TrackerRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            backend_max_respawns: 3,
+            descriptor_max_respawns: 3,
+            trace_transitions: false,
+            cull_min_observations: NonZeroUsize::new(1).expect("literal is non-zero"),
+            #[cfg(feature = "vio")]
+            vio_window_size: NonZeroUsize::new(5).expect("literal is non-zero"),
+            #[cfg(feature = "vio")]
+            vio_max_iterations: NonZeroUsize::new(3).expect("literal is non-zero"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrackingMatcher {
     LightGlue,
@@ -99,10 +225,122 @@ impl TrackingMatcher {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProjectedMatcherConfig {
-    pub search_radius_px: f32,
-    pub min_similarity: f32,
-    pub min_matches: usize,
-    pub min_inliers: usize,
+    search_radius_px: f32,
+    min_similarity: f32,
+    min_matches: NonZeroUsize,
+    min_inliers: NonZeroUsize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProjectedMatcherConfigError {
+    InvalidSearchRadius { value: f32 },
+    InvalidSimilarity { value: f32 },
+    TooFewMatches { value: usize, minimum: usize },
+    TooFewInliers { value: usize, minimum: usize },
+    InliersExceedMatches { matches: usize, inliers: usize },
+}
+
+impl std::fmt::Display for ProjectedMatcherConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSearchRadius { value } => {
+                write!(
+                    f,
+                    "projected matcher search radius must be finite and > 0, got {value}"
+                )
+            }
+            Self::InvalidSimilarity { value } => write!(
+                f,
+                "projected matcher minimum similarity must be finite and in [-1, 1], got {value}"
+            ),
+            Self::TooFewMatches { value, minimum } => write!(
+                f,
+                "projected matcher requires at least {minimum} matches, got {value}"
+            ),
+            Self::TooFewInliers { value, minimum } => write!(
+                f,
+                "projected matcher requires at least {minimum} inliers, got {value}"
+            ),
+            Self::InliersExceedMatches { matches, inliers } => write!(
+                f,
+                "projected matcher minimum inliers ({inliers}) cannot exceed minimum matches ({matches})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectedMatcherConfigError {}
+
+const MIN_PROJECTED_CORRESPONDENCES: usize = 4;
+
+impl ProjectedMatcherConfig {
+    pub fn new(
+        search_radius_px: f32,
+        min_similarity: f32,
+        min_matches: usize,
+        min_inliers: usize,
+    ) -> Result<Self, ProjectedMatcherConfigError> {
+        if !search_radius_px.is_finite() || search_radius_px <= 0.0 {
+            return Err(ProjectedMatcherConfigError::InvalidSearchRadius {
+                value: search_radius_px,
+            });
+        }
+        if !min_similarity.is_finite() || !(-1.0..=1.0).contains(&min_similarity) {
+            return Err(ProjectedMatcherConfigError::InvalidSimilarity {
+                value: min_similarity,
+            });
+        }
+        if min_matches < MIN_PROJECTED_CORRESPONDENCES {
+            return Err(ProjectedMatcherConfigError::TooFewMatches {
+                value: min_matches,
+                minimum: MIN_PROJECTED_CORRESPONDENCES,
+            });
+        }
+        if min_inliers < MIN_PROJECTED_CORRESPONDENCES {
+            return Err(ProjectedMatcherConfigError::TooFewInliers {
+                value: min_inliers,
+                minimum: MIN_PROJECTED_CORRESPONDENCES,
+            });
+        }
+        if min_inliers > min_matches {
+            return Err(ProjectedMatcherConfigError::InliersExceedMatches {
+                matches: min_matches,
+                inliers: min_inliers,
+            });
+        }
+        Ok(Self {
+            search_radius_px,
+            min_similarity,
+            min_matches: NonZeroUsize::new(min_matches).ok_or(
+                ProjectedMatcherConfigError::TooFewMatches {
+                    value: min_matches,
+                    minimum: MIN_PROJECTED_CORRESPONDENCES,
+                },
+            )?,
+            min_inliers: NonZeroUsize::new(min_inliers).ok_or(
+                ProjectedMatcherConfigError::TooFewInliers {
+                    value: min_inliers,
+                    minimum: MIN_PROJECTED_CORRESPONDENCES,
+                },
+            )?,
+        })
+    }
+
+    pub fn search_radius_px(self) -> f32 {
+        self.search_radius_px
+    }
+
+    pub fn min_similarity(self) -> f32 {
+        self.min_similarity
+    }
+
+    pub fn min_matches(self) -> usize {
+        self.min_matches.get()
+    }
+
+    pub fn min_inliers(self) -> usize {
+        self.min_inliers.get()
+    }
 }
 
 impl ProjectedMatcherConfig {
@@ -110,8 +348,8 @@ impl ProjectedMatcherConfig {
         Self {
             search_radius_px: 32.0,
             min_similarity: 0.45,
-            min_matches: 32,
-            min_inliers: 24,
+            min_matches: NonZeroUsize::new(32).unwrap(),
+            min_inliers: NonZeroUsize::new(24).unwrap(),
         }
     }
 }
@@ -1786,7 +2024,7 @@ struct VioRuntime {
     /// Sliding window for tightly-coupled VIO BA.
     vio_window: Option<crate::local_ba::VioWindow>,
     /// Max window size before oldest frame rolls off.
-    max_window: usize,
+    max_window: NonZeroUsize,
 }
 
 #[cfg(feature = "vio")]
@@ -2141,8 +2379,6 @@ impl SlamTracker {
                     .imu_extrinsics()
                     .map(|extrinsics| extrinsics.t_cam_imu())
                     .unwrap_or_else(Pose64::identity);
-                let vio_window_size = crate::env::env_usize("KIKO_VIO_WINDOW").unwrap_or(5);
-                let vio_max_iters = crate::env::env_usize("KIKO_VIO_ITERS").unwrap_or(3);
                 let calibrated_bias = calibration.initial_bias().cloned();
                 let bias_prior = calibrated_bias
                     .clone()
@@ -2156,8 +2392,7 @@ impl SlamTracker {
                     camera_from_body,
                     intrinsics,
                     config.ba.lm(),
-                    std::num::NonZeroUsize::new(vio_max_iters)
-                        .unwrap_or(NonZeroUsize::new(3).unwrap()),
+                    config.runtime.vio_max_iterations(),
                     f64::from(config.ba.huber_delta_px()),
                     10.0, // anchor velocity info
                     bias_prior,
@@ -2175,14 +2410,11 @@ impl SlamTracker {
                     last_optimized_state: None,
                     solve_config,
                     vio_window: None,
-                    max_window: vio_window_size,
+                    max_window: config.runtime.vio_window_size(),
                 }))
             }
             _ => LocalEstimator::VisualOnly,
         };
-        let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(DEFAULT_MAX_RESPAWNS);
         let backend = config
             .backend
             .map_or(BackendSubsystem::Disabled, |backend_cfg| {
@@ -2190,25 +2422,26 @@ impl SlamTracker {
                     backend_cfg,
                     intrinsics,
                     config.ba,
-                    backend_max_respawns,
+                    config.runtime.backend_max_respawns(),
                 ))
             });
         let loop_config = config.loop_closure_config();
-        let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(DEFAULT_MAX_RESPAWNS);
         let place_recognition = match (loop_config, config.global_descriptor_config()) {
             (Some(loop_config), Some(descriptor_config)) => Some(
-                PlaceRecognition::new(loop_config, descriptor_config, descriptor_max_respawns)
-                    .map_err(|err| match err {
-                        PlaceRecognitionInitError::DescriptorUnavailable { model_path } => {
-                            TrackerInitError::DescriptorUnavailable { model_path }
-                        }
-                    })?,
+                PlaceRecognition::new(
+                    loop_config,
+                    descriptor_config,
+                    config.runtime.descriptor_max_respawns(),
+                )
+                .map_err(|err| match err {
+                    PlaceRecognitionInitError::DescriptorUnavailable { model_path } => {
+                        TrackerInitError::DescriptorUnavailable { model_path }
+                    }
+                })?,
             ),
             _ => None,
         };
-        let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
+        let trace_transitions = config.runtime.trace_transitions();
         Ok(Self {
             frontend,
             config,
@@ -2542,7 +2775,7 @@ impl SlamTracker {
         });
 
         // Trim window
-        while candidate_window.len() > vio_runtime.max_window {
+        while candidate_window.len() > vio_runtime.max_window.get() {
             if candidate_window.successors.len() <= 1 {
                 break;
             }
@@ -3593,7 +3826,7 @@ impl SlamTracker {
         let Some(predicted_pose) = self.predicted_tracking_pose() else {
             return Ok(None);
         };
-        let radius = config.search_radius_px;
+        let radius = config.search_radius_px();
         let radius_sq = radius * radius;
         let intrinsics = self.frontend.intrinsics();
         let grid = CurrentKeypointGrid::new(&current, radius);
@@ -3635,7 +3868,7 @@ impl SlamTracker {
                     return;
                 }
                 let similarity = descriptor_similarity(&current_descriptors[current_idx], key_desc);
-                if similarity < config.min_similarity {
+                if similarity < config.min_similarity() {
                     return;
                 }
                 let spatial_penalty = 0.05 * (distance_sq / radius_sq);
@@ -3657,7 +3890,7 @@ impl SlamTracker {
             }
         }
 
-        if candidates.len() < config.min_matches {
+        if candidates.len() < config.min_matches() {
             return Ok(None);
         }
         candidates.sort_unstable_by(|a, b| {
@@ -3680,7 +3913,7 @@ impl SlamTracker {
             scores.push(candidate.score);
         }
 
-        if indices.len() < config.min_matches {
+        if indices.len() < config.min_matches() {
             return Ok(None);
         }
         Matches::new(current, Arc::clone(keyframe.detections()), indices, scores)
@@ -3737,7 +3970,8 @@ impl SlamTracker {
                         match self.build_tracking_attempt(keyframe, keyframe_id, projected_matches)
                         {
                             Ok(projected_attempt)
-                                if projected_attempt.result.inliers.len() >= config.min_inliers =>
+                                if projected_attempt.result.inliers.len()
+                                    >= config.min_inliers() =>
                             {
                                 if self.trace_transitions {
                                     eprintln!(
@@ -3758,7 +3992,7 @@ impl SlamTracker {
                                         projected_match_count,
                                         projected_attempt.tracked_observations.len(),
                                         projected_attempt.result.inliers.len(),
-                                        config.min_inliers,
+                                        config.min_inliers(),
                                     );
                                 }
                             }
@@ -4565,6 +4799,7 @@ impl SlamTracker {
             left.timestamp(),
             pose_world,
             shared.as_ref(),
+            self.config.runtime.cull_min_observations(),
         )?;
         self.emit_event(DiagnosticEvent::KeyframeCreated {
             keyframe_id,
@@ -4601,10 +4836,17 @@ fn insert_keyframe_into_map(
     timestamp: Timestamp,
     pose_world: Pose,
     shared: Option<&SharedMatches>,
+    cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
     let mut candidate = map.clone();
-    let keyframe_id =
-        insert_keyframe_into_candidate(&mut candidate, keyframe, timestamp, pose_world, shared)?;
+    let keyframe_id = insert_keyframe_into_candidate(
+        &mut candidate,
+        keyframe,
+        timestamp,
+        pose_world,
+        shared,
+        cull_min_observations,
+    )?;
     *map = candidate;
     Ok(keyframe_id)
 }
@@ -4615,6 +4857,7 @@ fn insert_keyframe_into_candidate(
     timestamp: Timestamp,
     pose_world: Pose,
     shared: Option<&SharedMatches>,
+    cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
     let keyframe_id =
         map.add_keyframe_from_detections(keyframe.detections().as_ref(), timestamp, pose_world)?;
@@ -4632,14 +4875,9 @@ fn insert_keyframe_into_candidate(
         }
     }
 
-    // Keep singleton points by default so active keyframes retain enough
-    // point associations for robust PnP. Enable stronger culling only via env.
-    let cull_min_observations = crate::env::env_usize("KIKO_MAP_CULL_MIN_OBSERVATIONS")
-        .unwrap_or(DEFAULT_CULL_MIN_OBSERVATIONS)
-        .max(DEFAULT_CULL_MIN_OBSERVATIONS);
-    if cull_min_observations > 1 && map.num_points() > 0 {
+    if cull_min_observations.get() > 1 && map.num_points() > 0 {
         let points_before = map.num_points();
-        let culled_points = map.cull_points(cull_min_observations);
+        let culled_points = map.cull_points(cull_min_observations.get());
         debug_assert!(
             culled_points <= points_before,
             "culled more points than existed"
@@ -5313,6 +5551,7 @@ mod tests {
             Timestamp::from_nanos(42),
             Pose::identity(),
             None,
+            NonZeroUsize::new(1).expect("literal is non-zero"),
         )
         .expect("insert keyframe");
         assert_map_invariants(&map).expect("post-insertion invariants");
@@ -5367,6 +5606,7 @@ mod tests {
             Timestamp::from_nanos(43),
             Pose::identity(),
             Some(&invalid_shared),
+            NonZeroUsize::new(1).expect("literal is non-zero"),
         )
         .expect_err("invalid shared association must reject the candidate transaction");
 
@@ -6437,6 +6677,57 @@ mod tests {
     }
 
     #[test]
+    fn projected_matcher_config_rejects_unusable_geometry_and_support() {
+        assert!(matches!(
+            ProjectedMatcherConfig::new(f32::NAN, 0.5, 8, 4),
+            Err(ProjectedMatcherConfigError::InvalidSearchRadius { .. })
+        ));
+        assert!(matches!(
+            ProjectedMatcherConfig::new(16.0, 1.1, 8, 4),
+            Err(ProjectedMatcherConfigError::InvalidSimilarity { .. })
+        ));
+        assert!(matches!(
+            ProjectedMatcherConfig::new(16.0, 0.5, 3, 3),
+            Err(ProjectedMatcherConfigError::TooFewMatches { .. })
+        ));
+        assert!(matches!(
+            ProjectedMatcherConfig::new(16.0, 0.5, 8, 9),
+            Err(ProjectedMatcherConfigError::InliersExceedMatches { .. })
+        ));
+    }
+
+    #[test]
+    fn tracker_runtime_config_rejects_unrepresentable_limits() {
+        assert!(matches!(
+            TrackerRuntimeConfig::try_new(3, 3, false, 0),
+            Err(TrackerRuntimeConfigError::ZeroCullMinimum)
+        ));
+        if usize::BITS > u32::BITS {
+            let overflowing = u32::MAX as usize + 1;
+            assert!(matches!(
+                TrackerRuntimeConfig::try_new(overflowing, 3, false, 1),
+                Err(TrackerRuntimeConfigError::RespawnLimitTooLarge {
+                    field: "backend_max_respawns",
+                    value,
+                }) if value == overflowing
+            ));
+        }
+
+        #[cfg(feature = "vio")]
+        {
+            let defaults = TrackerRuntimeConfig::default();
+            assert!(matches!(
+                defaults.try_with_vio(0, 3),
+                Err(TrackerRuntimeConfigError::ZeroVioWindowSize)
+            ));
+            assert!(matches!(
+                defaults.try_with_vio(5, 0),
+                Err(TrackerRuntimeConfigError::ZeroVioIterations)
+            ));
+        }
+    }
+
+    #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
         let detections = make_test_detections(900);
         assert!(
@@ -6999,7 +7290,7 @@ mod tests {
             last_optimized_state: None,
             solve_config: make_test_vio_solve_config(),
             vio_window: None,
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let current_body_odom = Pose64::from_pose32(Pose::from_rt(
@@ -7028,7 +7319,7 @@ mod tests {
             last_optimized_state: None,
             solve_config: make_test_vio_solve_config(),
             vio_window: None,
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let first = crate::ImuBatch::new(vec![
@@ -7072,7 +7363,7 @@ mod tests {
             last_optimized_state: None,
             solve_config: make_test_vio_solve_config(),
             vio_window: None,
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let batch = crate::ImuBatch::new(vec![
@@ -7161,7 +7452,7 @@ mod tests {
                 anchor: stale_anchor,
                 successors: Vec::new(),
             }),
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         runtime.commit_authoritative_visual_anchor(replacement_anchor);
@@ -7251,7 +7542,7 @@ mod tests {
             last_optimized_state: Some(previous_state),
             solve_config: make_test_vio_solve_config(),
             vio_window: None,
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let body_odom = Pose64::from_pose32(Pose::from_rt(
@@ -7322,7 +7613,7 @@ mod tests {
                 },
                 successors: Vec::new(),
             }),
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         let body_odom = Pose64::from_pose32(Pose::from_rt(
@@ -7390,7 +7681,7 @@ mod tests {
                 },
                 successors: Vec::new(),
             }),
-            max_window: 5,
+            max_window: NonZeroUsize::new(5).expect("literal is non-zero"),
         };
 
         runtime.reset_runtime_continuity();

@@ -178,6 +178,46 @@ mod tests {
     }
 
     #[test]
+    fn build_ba_config_rejects_malformed_integer_with_source() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "KIKO_BA_WINDOW";
+        let saved = std::env::var_os(key);
+        set_env(key, "not-an-integer");
+
+        let error = build_ba_config().expect_err("malformed integer must fail");
+
+        assert!(error.to_string().contains(key));
+        assert!(error.source().is_some());
+        restore_env(key, saved);
+    }
+
+    #[test]
+    fn build_tracker_config_rejects_unknown_tracking_matcher() {
+        let _guard = env_lock().lock().expect("env lock");
+        let primary = "KIKO_TRACKING_MATCHER";
+        let legacy = "KIKO_TRACK_MATCHER";
+        let saved_primary = std::env::var_os(primary);
+        let saved_legacy = std::env::var_os(legacy);
+        set_env(primary, "mystery");
+        restore_env(legacy, None);
+
+        let error = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect_err("unknown matcher must fail");
+
+        assert!(error.to_string().contains("unknown tracking matcher"));
+        restore_env(primary, saved_primary);
+        restore_env(legacy, saved_legacy);
+    }
+
+    #[test]
     fn build_tracker_config_reads_loop_env_settings() {
         let _guard = env_lock().lock().expect("env lock");
         let keys = [
