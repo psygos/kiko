@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::thread;
@@ -839,6 +839,7 @@ enum BackendResponse {
     WorkerPanic {
         request_id: BackendRequestId,
         source_snapshot: MapSnapshot,
+        message: String,
     },
     Failure {
         request_id: BackendRequestId,
@@ -851,32 +852,54 @@ enum BackendResponse {
 pub struct BackendStats {
     pub submitted: u64,
     pub dropped_full: u64,
-    pub dropped_disconnected: u64,
+    pub dropped_unavailable: u64,
     pub applied: u64,
     pub unchanged: u64,
     pub stale: u64,
     pub rejected: u64,
     pub worker_failures: u64,
+    pub restart_failures: u64,
     pub respawn_count: u32,
+    pub respawn_exhausted: bool,
     pub panics: u64,
 }
 
 #[derive(Debug)]
 enum SubmitEventError {
+    NotConfigured,
     InvalidWindow(BackendWindowError),
     InvalidEvent(KeyframeEventError),
     QueueFull,
-    Disconnected,
-    RequestId { source: BackendRequestIdError },
+    Unavailable {
+        exhausted: bool,
+        source: Option<Arc<std::io::Error>>,
+    },
+    RequestId {
+        source: BackendRequestIdError,
+    },
 }
 
 impl std::fmt::Display for SubmitEventError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            SubmitEventError::NotConfigured => write!(f, "backend optimization is not configured"),
             SubmitEventError::InvalidWindow(err) => write!(f, "invalid backend window: {err}"),
             SubmitEventError::InvalidEvent(err) => write!(f, "invalid backend event: {err}"),
             SubmitEventError::QueueFull => write!(f, "backend event queue is full"),
-            SubmitEventError::Disconnected => write!(f, "backend worker is disconnected"),
+            SubmitEventError::Unavailable {
+                exhausted,
+                source: Some(source),
+            } => write!(
+                f,
+                "backend worker is unavailable (restart_exhausted={exhausted}): {source}"
+            ),
+            SubmitEventError::Unavailable {
+                exhausted,
+                source: None,
+            } => write!(
+                f,
+                "backend worker is unavailable (restart_exhausted={exhausted})"
+            ),
             SubmitEventError::RequestId { source } => {
                 write!(f, "could not allocate a backend request ID: {source}")
             }
@@ -890,7 +913,13 @@ impl std::error::Error for SubmitEventError {
             SubmitEventError::InvalidWindow(source) => Some(source),
             SubmitEventError::InvalidEvent(source) => Some(source),
             SubmitEventError::RequestId { source } => Some(source),
-            SubmitEventError::QueueFull | SubmitEventError::Disconnected => None,
+            SubmitEventError::Unavailable {
+                source: Some(source),
+                ..
+            } => Some(source.as_ref()),
+            SubmitEventError::NotConfigured
+            | SubmitEventError::QueueFull
+            | SubmitEventError::Unavailable { source: None, .. } => None,
         }
     }
 }
@@ -960,7 +989,13 @@ impl From<crate::map::MapError> for ApplyCorrectionError {
 struct BackendWorker {
     tx: Sender<KeyframeEvent>,
     rx: Receiver<BackendResponse>,
-    next_request_id: u64,
+    _thread: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+enum BackendWorkerSubmitError {
+    QueueFull,
+    Disconnected(Box<KeyframeEvent>),
 }
 
 impl BackendWorker {
@@ -975,7 +1010,7 @@ impl BackendWorker {
         // the tracking thread falls behind response draining.
         let (tx_resp, rx_resp) = crossbeam_channel::bounded::<BackendResponse>(queue_depth);
 
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("kiko-backend".to_string())
             .spawn(move || {
                 let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
@@ -1022,11 +1057,12 @@ impl BackendWorker {
                                 break;
                             }
                         }
-                        Err(_) => {
+                        Err(payload) => {
                             if tx_resp
                                 .send(BackendResponse::WorkerPanic {
                                     request_id,
                                     source_snapshot,
+                                    message: crate::panic_payload_to_string(payload.as_ref()),
                                 })
                                 .is_err()
                             {
@@ -1044,19 +1080,17 @@ impl BackendWorker {
         Ok(Self {
             tx: tx_req,
             rx: rx_resp,
-            next_request_id: 0,
+            _thread: thread,
         })
     }
 
-    fn next_request_id(&mut self) -> Result<BackendRequestId, BackendRequestIdError> {
-        BackendRequestId::from_counter(&mut self.next_request_id)
-    }
-
-    fn try_submit(&self, event: KeyframeEvent) -> Result<(), SubmitEventError> {
+    fn try_submit(&self, event: KeyframeEvent) -> Result<(), BackendWorkerSubmitError> {
         match self.tx.try_send(event) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SubmitEventError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(SubmitEventError::Disconnected),
+            Err(TrySendError::Full(_event)) => Err(BackendWorkerSubmitError::QueueFull),
+            Err(TrySendError::Disconnected(event)) => {
+                Err(BackendWorkerSubmitError::Disconnected(Box::new(event)))
+            }
         }
     }
 
@@ -1067,6 +1101,25 @@ impl BackendWorker {
             Err(TryRecvError::Disconnected) => Err(()),
         }
     }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self._thread.is_finished()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BackendRestartFailure {
+    respawn_count: u32,
+    max_respawns: u32,
+    exhausted: bool,
+    error: Arc<std::io::Error>,
+}
+
+#[derive(Debug)]
+enum BackendSupervisorOutput {
+    Worker(BackendResponse),
+    RestartFailure(BackendRestartFailure),
 }
 
 #[derive(Debug)]
@@ -1075,24 +1128,23 @@ struct BackendSupervisor {
     config: BackendConfig,
     intrinsics: PinholeIntrinsics,
     ba_config: LocalBaConfig,
+    next_request_counter: u64,
     respawn_count: u32,
     max_respawns: u32,
     spawn_exhausted: bool,
+    last_spawn_error: Option<Arc<std::io::Error>>,
+    pending_outputs: VecDeque<BackendSupervisorOutput>,
+    #[cfg(test)]
+    spawn_failures: VecDeque<std::io::Error>,
 }
 
 impl BackendSupervisor {
-    fn spawn_worker(
-        config: BackendConfig,
-        intrinsics: PinholeIntrinsics,
-        ba_config: LocalBaConfig,
-    ) -> Option<BackendWorker> {
-        match BackendWorker::spawn(config, intrinsics, ba_config) {
-            Ok(worker) => Some(worker),
-            Err(err) => {
-                eprintln!("failed to spawn backend worker thread: {err}");
-                None
-            }
+    fn spawn_worker(&mut self) -> Result<BackendWorker, std::io::Error> {
+        #[cfg(test)]
+        if let Some(error) = self.spawn_failures.pop_front() {
+            return Err(error);
         }
+        BackendWorker::spawn(self.config, self.intrinsics, self.ba_config)
     }
 
     fn spawn_with_max_respawns(
@@ -1100,21 +1152,22 @@ impl BackendSupervisor {
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
         max_respawns: u32,
-    ) -> Self {
-        let worker = Self::spawn_worker(config, intrinsics, ba_config);
-        let spawn_exhausted = worker.is_none() && max_respawns == 0;
-        if worker.is_none() {
-            eprintln!("backend worker unavailable at startup; backend optimization disabled");
-        }
-        Self {
-            worker,
+    ) -> Result<Self, std::io::Error> {
+        let worker = BackendWorker::spawn(config, intrinsics, ba_config)?;
+        Ok(Self {
+            worker: Some(worker),
             config,
             intrinsics,
             ba_config,
+            next_request_counter: 0,
             respawn_count: 0,
             max_respawns,
-            spawn_exhausted,
-        }
+            spawn_exhausted: false,
+            last_spawn_error: None,
+            pending_outputs: VecDeque::new(),
+            #[cfg(test)]
+            spawn_failures: VecDeque::new(),
+        })
     }
 
     #[cfg(test)]
@@ -1125,6 +1178,7 @@ impl BackendSupervisor {
         max_respawns: u32,
     ) -> Self {
         Self::spawn_with_max_respawns(config, intrinsics, ba_config, max_respawns)
+            .expect("spawn backend supervisor")
     }
 
     fn check_health(&mut self) {
@@ -1146,14 +1200,54 @@ impl BackendSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        self.worker = Self::spawn_worker(self.config, self.intrinsics, self.ba_config);
-        self.respawn_count = self.respawn_count.saturating_add(1);
-        if self.worker.is_none() && self.respawn_count >= self.max_respawns {
-            self.spawn_exhausted = true;
-            eprintln!(
-                "backend worker respawn exhausted after {} attempts",
-                self.max_respawns
-            );
+        let respawn_count = self.respawn_count.saturating_add(1);
+        self.respawn_count = respawn_count;
+        match self.spawn_worker() {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.last_spawn_error = None;
+            }
+            Err(error) => {
+                let error = Arc::new(error);
+                let exhausted = respawn_count >= self.max_respawns;
+                eprintln!("backend worker respawn failed: {error}");
+                if exhausted {
+                    self.spawn_exhausted = true;
+                    eprintln!(
+                        "backend worker respawn exhausted after {} attempts",
+                        self.max_respawns
+                    );
+                } else {
+                    eprintln!("backend worker remains unavailable; will retry");
+                }
+                self.last_spawn_error = Some(Arc::clone(&error));
+                self.pending_outputs
+                    .push_back(BackendSupervisorOutput::RestartFailure(
+                        BackendRestartFailure {
+                            respawn_count,
+                            max_respawns: self.max_respawns,
+                            exhausted,
+                            error,
+                        },
+                    ));
+            }
+        }
+    }
+
+    fn disconnect_worker(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        while let Ok(Some(response)) = worker.try_recv() {
+            self.pending_outputs
+                .push_back(BackendSupervisorOutput::Worker(response));
+        }
+    }
+
+    fn unavailable_error(&self) -> SubmitEventError {
+        SubmitEventError::Unavailable {
+            exhausted: self.spawn_exhausted,
+            source: self.last_spawn_error.as_ref().map(Arc::clone),
         }
     }
 
@@ -1162,38 +1256,49 @@ impl BackendSupervisor {
             self.check_health();
         }
         let Some(worker) = self.worker.as_ref() else {
-            return Err(SubmitEventError::Disconnected);
+            return Err(self.unavailable_error());
         };
-        let result = worker.try_submit(event);
-        if matches!(result, Err(SubmitEventError::Disconnected)) {
-            self.worker = None;
-            self.check_health();
+        let event = match worker.try_submit(event) {
+            Ok(()) => return Ok(()),
+            Err(BackendWorkerSubmitError::QueueFull) => {
+                return Err(SubmitEventError::QueueFull);
+            }
+            Err(BackendWorkerSubmitError::Disconnected(event)) => *event,
+        };
+
+        self.disconnect_worker();
+        self.check_health();
+        let Some(worker) = self.worker.as_ref() else {
+            return Err(self.unavailable_error());
+        };
+        match worker.try_submit(event) {
+            Ok(()) => Ok(()),
+            Err(BackendWorkerSubmitError::QueueFull) => Err(SubmitEventError::QueueFull),
+            Err(BackendWorkerSubmitError::Disconnected(_event)) => {
+                self.disconnect_worker();
+                Err(self.unavailable_error())
+            }
         }
-        result
     }
 
-    fn try_recv(&mut self) -> Option<BackendResponse> {
-        let response = {
-            let worker = self.worker.as_ref()?;
-            worker.try_recv()
-        };
+    fn try_recv(&mut self) -> Option<BackendSupervisorOutput> {
+        if let Some(output) = self.pending_outputs.pop_front() {
+            return Some(output);
+        }
+        let response = self.worker.as_ref()?.try_recv();
         match response {
-            Ok(Some(BackendResponse::WorkerPanic {
-                request_id,
-                source_snapshot,
-            })) => {
-                self.worker = None;
-                self.check_health();
-                Some(BackendResponse::WorkerPanic {
-                    request_id,
-                    source_snapshot,
-                })
+            Ok(Some(response)) => {
+                if matches!(response, BackendResponse::WorkerPanic { .. }) {
+                    self.disconnect_worker();
+                    self.check_health();
+                }
+                Some(BackendSupervisorOutput::Worker(response))
             }
-            Ok(response) => response,
+            Ok(None) => None,
             Err(()) => {
-                self.worker = None;
+                self.disconnect_worker();
                 self.check_health();
-                None
+                self.pending_outputs.pop_front()
             }
         }
     }
@@ -1202,10 +1307,10 @@ impl BackendSupervisor {
         if self.worker.is_none() {
             self.check_health();
         }
-        self.worker
-            .as_mut()
-            .ok_or(SubmitEventError::Disconnected)?
-            .next_request_id()
+        if self.worker.is_none() {
+            return Err(self.unavailable_error());
+        }
+        BackendRequestId::from_counter(&mut self.next_request_counter)
             .map_err(|source| SubmitEventError::RequestId { source })
     }
 
@@ -1219,15 +1324,29 @@ impl BackendSupervisor {
         self.respawn_count
     }
 
+    fn respawn_exhausted(&self) -> bool {
+        self.spawn_exhausted
+    }
+
     fn has_worker(&self) -> bool {
         self.worker.is_some()
+    }
+
+    #[cfg(test)]
+    fn fail_next_spawn(&mut self, error: std::io::Error) {
+        self.spawn_failures.push_back(error);
+    }
+
+    #[cfg(test)]
+    fn worker_thread_is_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(BackendWorker::is_finished)
     }
 }
 
 #[derive(Debug)]
 enum BackendSubsystem {
     Disabled,
-    Configured(BackendSupervisor),
+    Configured(Box<BackendSupervisor>),
 }
 
 impl BackendSubsystem {
@@ -1406,6 +1525,9 @@ impl RedundancyPolicy {
 
 #[derive(Debug)]
 pub enum TrackerInitError {
+    BackendWorker {
+        source: std::io::Error,
+    },
     Descriptor {
         source: DescriptorInitError,
     },
@@ -1422,6 +1544,12 @@ pub enum TrackerInitError {
 impl std::fmt::Display for TrackerInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TrackerInitError::BackendWorker { source } => {
+                write!(
+                    f,
+                    "failed to initialize backend optimization worker: {source}"
+                )
+            }
             TrackerInitError::Descriptor { source } => {
                 write!(f, "failed to initialize learned descriptors: {source}")
             }
@@ -1440,6 +1568,7 @@ impl std::fmt::Display for TrackerInitError {
 impl std::error::Error for TrackerInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::BackendWorker { source } => Some(source),
             Self::Descriptor { source } => Some(source),
             #[cfg(feature = "vio")]
             Self::VioGravity { source } => Some(source),
@@ -2438,16 +2567,18 @@ impl SlamTracker {
             }
             _ => LocalEstimator::VisualOnly,
         };
-        let backend = config
-            .backend
-            .map_or(BackendSubsystem::Disabled, |backend_cfg| {
-                BackendSubsystem::Configured(BackendSupervisor::spawn_with_max_respawns(
-                    backend_cfg,
+        let backend = match config.backend {
+            Some(backend_config) => BackendSubsystem::Configured(Box::new(
+                BackendSupervisor::spawn_with_max_respawns(
+                    backend_config,
                     intrinsics,
                     config.ba,
                     config.runtime.backend_max_respawns(),
-                ))
-            });
+                )
+                .map_err(|source| TrackerInitError::BackendWorker { source })?,
+            )),
+            None => BackendSubsystem::Disabled,
+        };
         let loop_config = config.loop_closure_config();
         let place_recognition = match (loop_config, config.global_descriptor_config()) {
             (Some(loop_config), Some(descriptor_config)) => Some(
@@ -2948,7 +3079,14 @@ impl SlamTracker {
     }
 
     pub fn backend_stats(&self) -> BackendStats {
-        self.backend_stats
+        match self.backend.supervisor() {
+            Some(supervisor) => BackendStats {
+                respawn_count: supervisor.respawn_count(),
+                respawn_exhausted: supervisor.respawn_exhausted(),
+                ..self.backend_stats
+            },
+            None => self.backend_stats,
+        }
     }
 
     pub fn descriptor_stats(&self) -> DescriptorStats {
@@ -2970,7 +3108,7 @@ impl SlamTracker {
             backend_alive,
             descriptor_expected,
             descriptor_alive,
-            self.backend_stats,
+            self.backend_stats(),
         )
     }
 
@@ -3311,7 +3449,7 @@ impl SlamTracker {
         window_ids: Vec<KeyframeId>,
     ) -> Result<(), SubmitEventError> {
         let Some(supervisor) = self.backend.supervisor_mut() else {
-            return Err(SubmitEventError::Disconnected);
+            return Err(SubmitEventError::NotConfigured);
         };
 
         let window = BackendWindow::try_new(window_ids).map_err(SubmitEventError::InvalidWindow)?;
@@ -3327,7 +3465,6 @@ impl SlamTracker {
         )
         .map_err(SubmitEventError::InvalidEvent)?;
         supervisor.submit(event)?;
-        self.backend_stats.respawn_count = supervisor.respawn_count();
         self.backend_stats.submitted = self.backend_stats.submitted.saturating_add(1);
         Ok(())
     }
@@ -3338,13 +3475,32 @@ impl SlamTracker {
                 let Some(supervisor) = self.backend.supervisor_mut() else {
                     return;
                 };
-                let response = supervisor.try_recv();
-                self.backend_stats.respawn_count = supervisor.respawn_count();
-                response
+                supervisor.try_recv()
             };
 
-            let Some(response) = response else {
+            let Some(output) = response else {
                 break;
+            };
+            let response = match output {
+                BackendSupervisorOutput::Worker(response) => response,
+                BackendSupervisorOutput::RestartFailure(failure) => {
+                    self.backend_stats.restart_failures =
+                        self.backend_stats.restart_failures.saturating_add(1);
+                    eprintln!(
+                        "backend worker restart failed (attempt={}/{}, exhausted={}): {}",
+                        failure.respawn_count,
+                        failure.max_respawns,
+                        failure.exhausted,
+                        failure.error
+                    );
+                    self.emit_event(DiagnosticEvent::BackendWorkerRestartFailed {
+                        respawn_count: failure.respawn_count,
+                        max_respawns: failure.max_respawns,
+                        exhausted: failure.exhausted,
+                        error: failure.error,
+                    });
+                    continue;
+                }
             };
             match response {
                 BackendResponse::Correction(correction) => match &correction.correction.result {
@@ -3422,22 +3578,25 @@ impl SlamTracker {
                 BackendResponse::WorkerPanic {
                     request_id,
                     source_snapshot,
+                    message,
                 } => {
                     self.backend_stats.panics = self.backend_stats.panics.saturating_add(1);
                     self.backend_stats.worker_failures =
                         self.backend_stats.worker_failures.saturating_add(1);
-                    if let Some(supervisor) = self.backend.supervisor_mut() {
-                        supervisor.check_health();
-                        self.backend_stats.respawn_count = supervisor.respawn_count();
-                    }
-                    self.emit_event(DiagnosticEvent::BackendWorkerDied {
-                        respawn_count: self.backend_stats.respawn_count,
-                    });
+                    let respawn_count = self
+                        .backend
+                        .supervisor()
+                        .map_or(0, BackendSupervisor::respawn_count);
                     eprintln!(
-                        "backend worker panic (req={}, snapshot={})",
+                        "backend worker panic (req={}, snapshot={}): {}",
                         request_id.as_u64(),
-                        source_snapshot
+                        source_snapshot,
+                        message
                     );
+                    self.emit_event(DiagnosticEvent::BackendWorkerDied {
+                        respawn_count,
+                        message,
+                    });
                 }
             }
         }
@@ -4470,17 +4629,14 @@ impl SlamTracker {
                                             self.backend_stats.dropped_full =
                                                 self.backend_stats.dropped_full.saturating_add(1);
                                         }
-                                        SubmitEventError::Disconnected => {
-                                            self.backend_stats.dropped_disconnected = self
+                                        SubmitEventError::Unavailable { .. } => {
+                                            self.backend_stats.dropped_unavailable = self
                                                 .backend_stats
-                                                .dropped_disconnected
+                                                .dropped_unavailable
                                                 .saturating_add(1);
-                                            if let Some(supervisor) = self.backend.supervisor() {
-                                                self.backend_stats.respawn_count =
-                                                    supervisor.respawn_count();
-                                            }
                                         }
-                                        SubmitEventError::InvalidWindow(_)
+                                        SubmitEventError::NotConfigured
+                                        | SubmitEventError::InvalidWindow(_)
                                         | SubmitEventError::InvalidEvent(_)
                                         | SubmitEventError::RequestId { .. } => {
                                             self.backend_stats.rejected =
@@ -5223,6 +5379,17 @@ mod tests {
 
         let descriptor = error.source().expect("descriptor initialization source");
         let thread = descriptor.source().expect("thread spawn source");
+        assert_eq!(thread.to_string(), "thread capacity exhausted");
+        assert!(thread.source().is_none());
+    }
+
+    #[test]
+    fn tracker_init_error_preserves_backend_thread_source() {
+        let error = TrackerInitError::BackendWorker {
+            source: std::io::Error::other("thread capacity exhausted"),
+        };
+
+        let thread = error.source().expect("backend thread source");
         assert_eq!(thread.to_string(), "thread capacity exhausted");
         assert!(thread.source().is_none());
     }
@@ -5978,12 +6145,13 @@ mod tests {
                 .expect("intrinsics");
         let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
             .expect("ba config");
-        let mut worker =
+        let worker =
             BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
         let source_snapshot = map.snapshot();
-        let request_id = worker.next_request_id().expect("request ID");
+        let mut request_counter = 0;
+        let request_id = BackendRequestId::from_counter(&mut request_counter).expect("request ID");
         let event =
             KeyframeEvent::try_new(request_id, source_snapshot, kf_b, window, map).expect("event");
         worker.try_submit(event).expect("submit");
@@ -6037,9 +6205,8 @@ mod tests {
         );
 
         let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
-        let mut req_counter = 0;
         let event = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
+            supervisor.next_request_id().expect("request ID"),
             map,
             kf_a,
             kf_b,
@@ -6050,7 +6217,9 @@ mod tests {
         for _ in 0..100 {
             if matches!(
                 supervisor.try_recv(),
-                Some(BackendResponse::WorkerPanic { .. })
+                Some(BackendSupervisorOutput::Worker(
+                    BackendResponse::WorkerPanic { .. }
+                ))
             ) {
                 saw_panic = true;
                 break;
@@ -6072,6 +6241,174 @@ mod tests {
     }
 
     #[test]
+    fn backend_restart_failure_retains_source_and_exhaustion_state() {
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
+        let mut supervisor = BackendSupervisor::with_max_respawns(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            1,
+        );
+        supervisor.fail_next_spawn(std::io::Error::other("thread capacity exhausted"));
+
+        let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let panic_event = make_forced_panic_event(
+            supervisor.next_request_id().expect("request ID"),
+            map,
+            kf_a,
+            kf_b,
+        );
+        supervisor.submit(panic_event).expect("submit panic");
+
+        let mut saw_panic = false;
+        let mut restart_failure = None;
+        for _ in 0..100 {
+            match supervisor.try_recv() {
+                Some(BackendSupervisorOutput::Worker(BackendResponse::WorkerPanic {
+                    message,
+                    ..
+                })) => {
+                    assert_eq!(message, "forced backend worker panic");
+                    saw_panic = true;
+                }
+                Some(BackendSupervisorOutput::RestartFailure(failure)) => {
+                    restart_failure = Some(failure);
+                }
+                Some(BackendSupervisorOutput::Worker(response)) => {
+                    panic!("unexpected backend response: {response:?}");
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+            if saw_panic && restart_failure.is_some() {
+                break;
+            }
+        }
+
+        assert!(saw_panic, "expected worker panic response");
+        let failure = restart_failure.expect("restart failure output");
+        assert_eq!(failure.respawn_count, 1);
+        assert_eq!(failure.max_respawns, 1);
+        assert!(failure.exhausted);
+        assert_eq!(failure.error.to_string(), "thread capacity exhausted");
+        assert_eq!(supervisor.respawn_count(), 1);
+        assert!(supervisor.respawn_exhausted());
+        assert!(!supervisor.has_worker());
+
+        let unavailable = supervisor
+            .next_request_id()
+            .expect_err("exhausted supervisor must remain unavailable");
+        assert!(matches!(
+            &unavailable,
+            SubmitEventError::Unavailable {
+                exhausted: true,
+                source: Some(_)
+            }
+        ));
+        assert_eq!(
+            unavailable.source().expect("restart source").to_string(),
+            "thread capacity exhausted"
+        );
+    }
+
+    #[test]
+    fn backend_disconnect_retry_preserves_event_and_queued_panic() {
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
+        let mut supervisor = BackendSupervisor::with_max_respawns(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            2,
+        );
+
+        let (panic_map, panic_kf_a, panic_kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let panic_request_id = supervisor.next_request_id().expect("panic request ID");
+        supervisor
+            .submit(make_forced_panic_event(
+                panic_request_id,
+                panic_map,
+                panic_kf_a,
+                panic_kf_b,
+            ))
+            .expect("submit panic");
+        for _ in 0..100 {
+            if supervisor.worker_thread_is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            supervisor.worker_thread_is_finished(),
+            "backend worker did not terminate after forced panic"
+        );
+
+        let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let source_snapshot = map.snapshot();
+        let request_id = supervisor.next_request_id().expect("retry request ID");
+        assert_eq!(request_id.as_u64(), panic_request_id.as_u64() + 1);
+        let event = KeyframeEvent::try_new(
+            request_id,
+            source_snapshot,
+            kf_b,
+            BackendWindow::try_new(vec![kf_a, kf_b]).expect("window"),
+            map,
+        )
+        .expect("event");
+        supervisor
+            .submit(event)
+            .expect("retry exact event on replacement worker");
+        assert_eq!(supervisor.respawn_count(), 1);
+
+        match supervisor.try_recv() {
+            Some(BackendSupervisorOutput::Worker(BackendResponse::WorkerPanic {
+                request_id,
+                message,
+                ..
+            })) => {
+                assert_eq!(request_id, panic_request_id);
+                assert_eq!(message, "forced backend worker panic");
+            }
+            output => panic!("queued panic response was not preserved: {output:?}"),
+        }
+
+        let mut completed_request = None;
+        for _ in 0..100 {
+            match supervisor.try_recv() {
+                Some(BackendSupervisorOutput::Worker(BackendResponse::Correction(correction))) => {
+                    completed_request = Some((correction.request_id, correction.source_snapshot));
+                    break;
+                }
+                Some(BackendSupervisorOutput::Worker(BackendResponse::Failure {
+                    request_id,
+                    source_snapshot,
+                    ..
+                })) => {
+                    completed_request = Some((request_id, source_snapshot));
+                    break;
+                }
+                Some(BackendSupervisorOutput::Worker(BackendResponse::WorkerPanic {
+                    message,
+                    ..
+                })) => panic!("replacement worker panicked: {message}"),
+                Some(BackendSupervisorOutput::RestartFailure(failure)) => {
+                    panic!("replacement worker failed: {}", failure.error);
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(
+            completed_request,
+            Some((request_id, source_snapshot)),
+            "replacement worker must process the retained event"
+        );
+    }
+
+    #[test]
     fn backend_supervisor_enforces_max_respawns() {
         let intrinsics =
             crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
@@ -6084,11 +6421,9 @@ mod tests {
             1,
         );
 
-        let mut req_counter = 0;
-
         let (map1, kf_a1, kf_b1) = make_map_with_two_keyframes_one_shared_point();
         let panic1 = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
+            supervisor.next_request_id().expect("request ID"),
             map1,
             kf_a1,
             kf_b1,
@@ -6097,7 +6432,9 @@ mod tests {
         for _ in 0..100 {
             if matches!(
                 supervisor.try_recv(),
-                Some(BackendResponse::WorkerPanic { .. })
+                Some(BackendSupervisorOutput::Worker(
+                    BackendResponse::WorkerPanic { .. }
+                ))
             ) {
                 break;
             }
@@ -6114,17 +6451,16 @@ mod tests {
         assert!(supervisor.has_worker());
 
         let (map2, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
-        let panic2 = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
-            map2,
-            kf_a2,
-            kf_b2,
-        );
+        let second_request_id = supervisor.next_request_id().expect("request ID");
+        assert_eq!(second_request_id.as_u64(), 2);
+        let panic2 = make_forced_panic_event(second_request_id, map2, kf_a2, kf_b2);
         supervisor.submit(panic2).expect("submit panic2");
         for _ in 0..100 {
             if matches!(
                 supervisor.try_recv(),
-                Some(BackendResponse::WorkerPanic { .. })
+                Some(BackendSupervisorOutput::Worker(
+                    BackendResponse::WorkerPanic { .. }
+                ))
             ) {
                 break;
             }
@@ -6141,7 +6477,7 @@ mod tests {
         assert_eq!(supervisor.respawn_count(), 1);
         assert!(!supervisor.has_worker());
 
-        let backend = BackendSubsystem::Configured(supervisor);
+        let backend = BackendSubsystem::Configured(Box::new(supervisor));
         assert_eq!(backend.health_flags(), (true, false));
         assert!(backend.is_configured());
     }
@@ -6183,11 +6519,9 @@ mod tests {
                 .expect("ba config"),
             2,
         );
-        let mut req_counter = 0;
-
         let (map_panic, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
         let panic_event = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
+            supervisor.next_request_id().expect("request ID"),
             map_panic,
             kf_a,
             kf_b,
@@ -6198,7 +6532,9 @@ mod tests {
         for _ in 0..100 {
             if matches!(
                 supervisor.try_recv(),
-                Some(BackendResponse::WorkerPanic { .. })
+                Some(BackendSupervisorOutput::Worker(
+                    BackendResponse::WorkerPanic { .. }
+                ))
             ) {
                 saw_panic = true;
                 break;
@@ -6220,7 +6556,7 @@ mod tests {
         let window = BackendWindow::try_new(vec![kf_a2, kf_b2]).expect("window");
         let source_snapshot = map_ok.snapshot();
         let ok_event = KeyframeEvent::try_new(
-            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
+            supervisor.next_request_id().expect("request ID"),
             source_snapshot,
             kf_b2,
             window,
@@ -6234,12 +6570,16 @@ mod tests {
         let mut got_non_panic = false;
         for _ in 0..100 {
             match supervisor.try_recv() {
-                Some(BackendResponse::Correction(_)) | Some(BackendResponse::Failure { .. }) => {
+                Some(BackendSupervisorOutput::Worker(BackendResponse::Correction(_)))
+                | Some(BackendSupervisorOutput::Worker(BackendResponse::Failure { .. })) => {
                     got_non_panic = true;
                     break;
                 }
-                Some(BackendResponse::WorkerPanic { .. }) => {
+                Some(BackendSupervisorOutput::Worker(BackendResponse::WorkerPanic { .. })) => {
                     panic!("worker panicked again on normal event");
+                }
+                Some(BackendSupervisorOutput::RestartFailure(failure)) => {
+                    panic!("unexpected restart failure: {}", failure.error);
                 }
                 None => {}
             }

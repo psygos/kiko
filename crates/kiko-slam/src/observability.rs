@@ -44,12 +44,14 @@ const PATH_HEALTH_BACKEND_SUBMITTED: &str = "diagnostics/health/backend_submitte
 const PATH_HEALTH_BACKEND_APPLIED: &str = "diagnostics/health/backend_applied";
 const PATH_HEALTH_BACKEND_UNCHANGED: &str = "diagnostics/health/backend_unchanged";
 const PATH_HEALTH_BACKEND_DROPPED_FULL: &str = "diagnostics/health/backend_dropped_full";
-const PATH_HEALTH_BACKEND_DROPPED_DISCONNECTED: &str =
-    "diagnostics/health/backend_dropped_disconnected";
+const PATH_HEALTH_BACKEND_DROPPED_UNAVAILABLE: &str =
+    "diagnostics/health/backend_dropped_unavailable";
 const PATH_HEALTH_BACKEND_STALE: &str = "diagnostics/health/backend_stale";
 const PATH_HEALTH_BACKEND_REJECTED: &str = "diagnostics/health/backend_rejected";
 const PATH_HEALTH_BACKEND_WORKER_FAILURES: &str = "diagnostics/health/backend_worker_failures";
+const PATH_HEALTH_BACKEND_RESTART_FAILURES: &str = "diagnostics/health/backend_restart_failures";
 const PATH_HEALTH_BACKEND_RESPAWN_COUNT: &str = "diagnostics/health/backend_respawn_count";
+const PATH_HEALTH_BACKEND_RESPAWN_EXHAUSTED: &str = "diagnostics/health/backend_respawn_exhausted";
 const PATH_HEALTH_BACKEND_PANICS: &str = "diagnostics/health/backend_panics";
 
 const PATH_TRACKING_FEATURES_DETECTED: &str = "diagnostics/tracking/features_detected";
@@ -563,8 +565,22 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
                 rerun::TextLogLevel::WARN,
             )
         }
-        DiagnosticEvent::BackendWorkerDied { respawn_count } => (
-            format!("backend worker died (respawns={respawn_count})"),
+        DiagnosticEvent::BackendWorkerDied {
+            respawn_count,
+            message,
+        } => (
+            format!("backend worker died (respawns={respawn_count}): {message}"),
+            rerun::TextLogLevel::ERROR,
+        ),
+        DiagnosticEvent::BackendWorkerRestartFailed {
+            respawn_count,
+            max_respawns,
+            exhausted,
+            error,
+        } => (
+            format!(
+                "backend worker restart failed (attempt={respawn_count}/{max_respawns}, exhausted={exhausted}): {error}"
+            ),
             rerun::TextLogLevel::ERROR,
         ),
         DiagnosticEvent::DescriptorWorkerDied { respawn_count } => (
@@ -732,8 +748,8 @@ impl RerunSink {
             &rerun::Scalars::single(health.backend_stats.dropped_full as f64),
         )?;
         rec.log(
-            PATH_HEALTH_BACKEND_DROPPED_DISCONNECTED,
-            &rerun::Scalars::single(health.backend_stats.dropped_disconnected as f64),
+            PATH_HEALTH_BACKEND_DROPPED_UNAVAILABLE,
+            &rerun::Scalars::single(health.backend_stats.dropped_unavailable as f64),
         )?;
         rec.log(
             PATH_HEALTH_BACKEND_STALE,
@@ -748,8 +764,20 @@ impl RerunSink {
             &rerun::Scalars::single(health.backend_stats.worker_failures as f64),
         )?;
         rec.log(
+            PATH_HEALTH_BACKEND_RESTART_FAILURES,
+            &rerun::Scalars::single(health.backend_stats.restart_failures as f64),
+        )?;
+        rec.log(
             PATH_HEALTH_BACKEND_RESPAWN_COUNT,
             &rerun::Scalars::single(health.backend_stats.respawn_count as f64),
+        )?;
+        rec.log(
+            PATH_HEALTH_BACKEND_RESPAWN_EXHAUSTED,
+            &rerun::Scalars::single(if health.backend_stats.respawn_exhausted {
+                1.0
+            } else {
+                0.0
+            }),
         )?;
         rec.log(
             PATH_HEALTH_BACKEND_PANICS,
@@ -1084,8 +1112,12 @@ mod tests {
 
     #[test]
     fn format_event_maps_worker_death_to_error() {
-        let (text, level) = format_event(&DiagnosticEvent::BackendWorkerDied { respawn_count: 2 });
+        let (text, level) = format_event(&DiagnosticEvent::BackendWorkerDied {
+            respawn_count: 2,
+            message: "forced panic".to_string(),
+        });
         assert!(text.contains("backend worker died"));
+        assert!(text.contains("forced panic"));
         assert_eq!(level, rerun::TextLogLevel::ERROR);
     }
 
@@ -1111,7 +1143,16 @@ mod tests {
         let _ = format_event(&DiagnosticEvent::LoopClosureRejected {
             reason: LoopClosureRejectReason::VerificationFailed,
         });
-        let _ = format_event(&DiagnosticEvent::BackendWorkerDied { respawn_count: 1 });
+        let _ = format_event(&DiagnosticEvent::BackendWorkerDied {
+            respawn_count: 1,
+            message: "forced panic".to_string(),
+        });
+        let _ = format_event(&DiagnosticEvent::BackendWorkerRestartFailed {
+            respawn_count: 1,
+            max_respawns: 2,
+            exhausted: false,
+            error: std::sync::Arc::new(std::io::Error::other("test restart failure")),
+        });
         let _ = format_event(&DiagnosticEvent::DescriptorWorkerDied { respawn_count: 1 });
         let _ = format_event(&DiagnosticEvent::DescriptorWorkerRestartFailed {
             respawn_count: 1,

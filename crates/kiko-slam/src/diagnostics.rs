@@ -597,6 +597,13 @@ pub enum DiagnosticEvent {
     },
     BackendWorkerDied {
         respawn_count: u32,
+        message: String,
+    },
+    BackendWorkerRestartFailed {
+        respawn_count: u32,
+        max_respawns: u32,
+        exhausted: bool,
+        error: Arc<std::io::Error>,
     },
     DescriptorWorkerDied {
         respawn_count: u32,
@@ -838,7 +845,16 @@ mod tests {
             DiagnosticEvent::LoopClosureRejected {
                 reason: LoopClosureRejectReason::VerificationFailed,
             },
-            DiagnosticEvent::BackendWorkerDied { respawn_count: 1 },
+            DiagnosticEvent::BackendWorkerDied {
+                respawn_count: 1,
+                message: "forced panic".to_string(),
+            },
+            DiagnosticEvent::BackendWorkerRestartFailed {
+                respawn_count: 1,
+                max_respawns: 3,
+                exhausted: false,
+                error: std::sync::Arc::new(std::io::Error::other("test restart failure")),
+            },
             DiagnosticEvent::DescriptorWorkerDied { respawn_count: 2 },
             DiagnosticEvent::DescriptorWorkerRestartFailed {
                 respawn_count: 2,
@@ -868,7 +884,7 @@ mod tests {
         for event in events {
             kinds.insert(discriminant(&event));
         }
-        assert_eq!(kinds.len(), 10);
+        assert_eq!(kinds.len(), 11);
     }
 
     #[test]
