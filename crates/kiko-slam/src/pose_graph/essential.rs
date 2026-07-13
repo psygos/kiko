@@ -129,8 +129,18 @@ impl EssentialGraph {
             {
                 strongest = Some((neighbor, weight.get()));
             }
+        }
 
+        let Some((parent, parent_weight)) = strongest else {
+            if let Some(parent) = fallback_parent {
+                self.attach_parent(keyframe_id, parent, 1.0, map);
+            }
+            return;
+        };
+
+        for (&neighbor, &weight) in neighbors {
             if weight.get() >= self.strong_threshold
+                && neighbor != parent
                 && !contains_edge(&self.strong_covis_edges, keyframe_id, neighbor)
                 && let Some(relative_pose) = relative_pose(map, keyframe_id, neighbor)
             {
@@ -143,14 +153,7 @@ impl EssentialGraph {
                 });
             }
         }
-
-        let Some((parent, weight)) = strongest else {
-            if let Some(parent) = fallback_parent {
-                self.attach_parent(keyframe_id, parent, 1.0, map);
-            }
-            return;
-        };
-        self.attach_parent(keyframe_id, parent, weight as f64, map);
+        self.attach_parent(keyframe_id, parent, parent_weight as f64, map);
     }
 
     pub fn add_loop_edge(&mut self, edge: EssentialEdge) {
@@ -263,7 +266,8 @@ impl EssentialGraph {
         Ok(())
     }
 
-    /// Iterate over all essential edges (spanning tree + strong covisibility + loop).
+    /// Iterate over all essential edges: spanning-tree, strong-covisibility,
+    /// odometry, and loop constraints.
     fn iter_all_edges(&self) -> impl Iterator<Item = &EssentialEdge> {
         self.spanning_edges
             .iter()

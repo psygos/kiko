@@ -662,17 +662,47 @@ fn essential_graph_builds_spanning_tree_connectivity() {
 }
 
 #[test]
-fn essential_graph_respects_strong_edge_threshold() {
+fn essential_graph_does_not_duplicate_the_spanning_parent_as_a_strong_edge() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
     graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
     graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
     graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
     let snapshot = graph.snapshot();
+    assert!(snapshot.strong_covis_edges.is_empty());
+
+    for spanning in &snapshot.spanning_edges {
+        assert!(
+            snapshot
+                .strong_covis_edges
+                .iter()
+                .all(
+                    |strong| !((spanning.a == strong.a && spanning.b == strong.b)
+                        || (spanning.a == strong.b && spanning.b == strong.a))
+                )
+        );
+    }
+}
+
+#[test]
+fn essential_graph_retains_strong_non_parent_neighbors() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+
+    let neighbors = HashMap::from([
+        (kf0, NonZeroU32::new(2).expect("non-zero weight")),
+        (kf1, NonZeroU32::new(3).expect("non-zero weight")),
+    ]);
+    graph.add_keyframe(kf2, Some(&neighbors), &map);
+
+    let snapshot = graph.snapshot();
+    assert_eq!(snapshot.parent.get(&kf2), Some(&kf1));
     assert_eq!(snapshot.strong_covis_edges.len(), 1);
     let strong = &snapshot.strong_covis_edges[0];
     assert_eq!(strong.kind, EssentialEdgeKind::StrongCovisibility);
-    assert!((strong.a == kf1 && strong.b == kf0) || (strong.a == kf0 && strong.b == kf1));
+    assert!((strong.a == kf2 && strong.b == kf0) || (strong.a == kf0 && strong.b == kf2));
 }
 
 #[test]
