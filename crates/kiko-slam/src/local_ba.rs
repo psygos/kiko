@@ -4214,7 +4214,7 @@ fn linearize_vio_states(
     use crate::ImuFactor;
     use crate::vio::bias_random_walk_residual;
     use crate::vio::solve::{
-        IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor, accumulate_factor, imu_jacobians,
+        STATE_DIM, accumulate_factor, accumulate_paired_factor, imu_jacobians,
     };
     let VioEvaluation { stage, iteration } = evaluation;
     let ResolvedVioVisualFactors {
@@ -4375,19 +4375,18 @@ fn linearize_vio_states(
                 }
             })?;
 
-        let mut imu_squared_mahalanobis = 0.0;
-        for i in 0..IMU_RESIDUAL_DIM {
-            for j in 0..IMU_RESIDUAL_DIM {
-                imu_squared_mahalanobis += residual[i] * info[i][j] * residual[j];
-            }
-        }
-        objective_breakdown.imu_mahalanobis += 0.5 * imu_squared_mahalanobis;
-
         let base_prev = succ_idx * STATE_DIM;
         let base_curr = (succ_idx + 1) * STATE_DIM;
-        accumulate_factor(hessian, rhs, dim, &j_prev, info, &residual, base_prev);
-        accumulate_factor(hessian, rhs, dim, &j_curr, info, &residual, base_curr);
-        accumulate_cross_factor(hessian, dim, &j_prev, &j_curr, info, base_prev, base_curr);
+        let imu_squared_mahalanobis = accumulate_paired_factor(
+            hessian,
+            rhs,
+            dim,
+            [&j_prev, &j_curr],
+            info,
+            &residual,
+            [base_prev, base_curr],
+        );
+        objective_breakdown.imu_mahalanobis += 0.5 * imu_squared_mahalanobis;
     }
 
     for succ_idx in 0..window.successors.len() {

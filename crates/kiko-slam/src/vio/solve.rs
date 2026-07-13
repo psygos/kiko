@@ -624,10 +624,10 @@ pub(crate) fn solve_dense_f64(
 
 /// Accumulate `J^T * Ω * J` into the Hessian and `J^T * Ω * r` into the RHS.
 /// `j` is `[residual_dim][state_dim]` (row-major).
-/// `info` is `[residual_dim][residual_dim]`.
+/// `info` is a symmetric `[residual_dim][residual_dim]` information matrix.
 /// `residual` is `[residual_dim]`.
 /// `base` is the column/row offset in the Hessian for this frame.
-pub fn accumulate_factor<const R: usize, const S: usize>(
+pub(crate) fn accumulate_factor<const R: usize, const S: usize>(
     hessian: &mut [f64],
     rhs: &mut [f64],
     dim: usize,
@@ -636,68 +636,111 @@ pub fn accumulate_factor<const R: usize, const S: usize>(
     residual: &[f64; R],
     base: usize,
 ) {
-    // Compute Ω · J (R × S) and Ω · r (R)
     let mut omega_j = [[0.0_f64; S]; R];
     let mut omega_r = [0.0_f64; R];
     for i in 0..R {
         for k in 0..R {
-            omega_r[i] += info[i][k] * residual[k];
+            omega_r[i] = info[i][k].mul_add(residual[k], omega_r[i]);
             for col in 0..S {
-                omega_j[i][col] += info[i][k] * j[k][col];
+                omega_j[i][col] = info[i][k].mul_add(j[k][col], omega_j[i][col]);
             }
         }
     }
-    // Accumulate J^T · (Ω · J) into Hessian
+
+    // The diagonal normal block is symmetric, so compute each entry once.
     for row in 0..S {
-        for col in 0..S {
-            let mut val = 0.0;
+        for col in row..S {
+            let mut value = 0.0;
             for k in 0..R {
-                val += j[k][row] * omega_j[k][col];
+                value = j[k][row].mul_add(omega_j[k][col], value);
             }
-            hessian[(base + row) * dim + (base + col)] += val;
+            hessian[(base + row) * dim + (base + col)] += value;
+            if row != col {
+                hessian[(base + col) * dim + (base + row)] += value;
+            }
         }
     }
-    // Accumulate J^T · (Ω · r) into RHS
     for row in 0..S {
-        let mut val = 0.0;
+        let mut value = 0.0;
         for k in 0..R {
-            val += j[k][row] * omega_r[k];
+            value = j[k][row].mul_add(omega_r[k], value);
         }
-        rhs[base + row] += val;
+        rhs[base + row] += value;
     }
 }
 
-/// Accumulate cross-term `J_a^T * Ω * J_b` into Hessian at (base_a, base_b)
-/// and symmetrically at (base_b, base_a).
-pub fn accumulate_cross_factor<const R: usize, const S: usize>(
+/// Accumulate both diagonal blocks, both RHS blocks, and the cross block for a
+/// factor coupling two states. Each information-weighted input is computed
+/// once; `info` must be symmetric. Returns the dimensionless squared
+/// Mahalanobis residual `r^T * Ω * r` from the same weighted residual used by
+/// the normal equations.
+pub(crate) fn accumulate_paired_factor<const R: usize, const S: usize>(
     hessian: &mut [f64],
+    rhs: &mut [f64],
     dim: usize,
-    j_a: &[[f64; S]; R],
-    j_b: &[[f64; S]; R],
+    jacobians: [&[[f64; S]; R]; 2],
     info: &[[f64; R]; R],
-    base_a: usize,
-    base_b: usize,
-) {
-    // Compute Ω · J_b (R × S)
+    residual: &[f64; R],
+    bases: [usize; 2],
+) -> f64 {
+    let [j_a, j_b] = jacobians;
+    let [base_a, base_b] = bases;
+    let mut omega_ja = [[0.0_f64; S]; R];
     let mut omega_jb = [[0.0_f64; S]; R];
-    for (i, omega_row) in omega_jb.iter_mut().enumerate().take(R) {
-        for (k, j_b_row) in j_b.iter().enumerate().take(R) {
+    let mut omega_r = [0.0_f64; R];
+    for i in 0..R {
+        for k in 0..R {
+            omega_r[i] = info[i][k].mul_add(residual[k], omega_r[i]);
             for col in 0..S {
-                omega_row[col] += info[i][k] * j_b_row[col];
+                omega_ja[i][col] = info[i][k].mul_add(j_a[k][col], omega_ja[i][col]);
+                omega_jb[i][col] = info[i][k].mul_add(j_b[k][col], omega_jb[i][col]);
             }
         }
     }
-    // J_a^T · (Ω · J_b) at (base_a, base_b) + transpose at (base_b, base_a)
+
+    for row in 0..S {
+        for col in row..S {
+            let mut value_a = 0.0;
+            let mut value_b = 0.0;
+            for k in 0..R {
+                value_a = j_a[k][row].mul_add(omega_ja[k][col], value_a);
+                value_b = j_b[k][row].mul_add(omega_jb[k][col], value_b);
+            }
+            hessian[(base_a + row) * dim + (base_a + col)] += value_a;
+            hessian[(base_b + row) * dim + (base_b + col)] += value_b;
+            if row != col {
+                hessian[(base_a + col) * dim + (base_a + row)] += value_a;
+                hessian[(base_b + col) * dim + (base_b + row)] += value_b;
+            }
+        }
+
+        let mut rhs_a = 0.0;
+        let mut rhs_b = 0.0;
+        for k in 0..R {
+            rhs_a = j_a[k][row].mul_add(omega_r[k], rhs_a);
+            rhs_b = j_b[k][row].mul_add(omega_r[k], rhs_b);
+        }
+        rhs[base_a + row] += rhs_a;
+        rhs[base_b + row] += rhs_b;
+    }
+
     for row in 0..S {
         for col in 0..S {
-            let mut val = 0.0;
-            for (k, omega_row) in omega_jb.iter().enumerate().take(R) {
-                val += j_a[k][row] * omega_row[col];
+            let mut value = 0.0;
+            for k in 0..R {
+                value = j_a[k][row].mul_add(omega_jb[k][col], value);
             }
-            hessian[(base_a + row) * dim + (base_b + col)] += val;
-            hessian[(base_b + col) * dim + (base_a + row)] += val;
+            hessian[(base_a + row) * dim + (base_b + col)] += value;
+            hessian[(base_b + col) * dim + (base_a + row)] += value;
         }
     }
+
+    residual
+        .iter()
+        .zip(omega_r)
+        .fold(0.0, |sum, (residual, weighted)| {
+            residual.mul_add(weighted, sum)
+        })
 }
 
 // -----------------------------------------------------------------------
@@ -732,6 +775,51 @@ mod tests {
                 .collect(),
         )
         .expect("batch")
+    }
+
+    fn reference_accumulate_factor<const R: usize, const S: usize>(
+        hessian: &mut [f64],
+        rhs: &mut [f64],
+        dim: usize,
+        jacobian: &[[f64; S]; R],
+        information: &[[f64; R]; R],
+        residual: &[f64; R],
+        base: usize,
+    ) {
+        for state_row in 0..S {
+            for state_col in 0..S {
+                let mut value = 0.0;
+                for residual_row in 0..R {
+                    for residual_col in 0..R {
+                        value += jacobian[residual_row][state_row]
+                            * information[residual_row][residual_col]
+                            * jacobian[residual_col][state_col];
+                    }
+                }
+                hessian[(base + state_row) * dim + (base + state_col)] += value;
+            }
+
+            let mut value = 0.0;
+            for residual_row in 0..R {
+                for (residual_col, residual_value) in residual.iter().enumerate() {
+                    value += jacobian[residual_row][state_row]
+                        * information[residual_row][residual_col]
+                        * residual_value;
+                }
+            }
+            rhs[base + state_row] += value;
+        }
+    }
+
+    fn assert_slice_close(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = 2e-13 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "index={index}, actual={actual}, expected={expected}, tolerance={tolerance}"
+            );
+        }
     }
 
     /// IMU Jacobians must be finite for non-trivial states.
@@ -857,6 +945,120 @@ mod tests {
         ));
         let factor_source = std::error::Error::source(&error).expect("factor source");
         assert!(factor_source.source().is_some());
+    }
+
+    #[test]
+    fn factor_accumulators_match_direct_reference_and_preserve_exact_symmetry() {
+        const R: usize = 3;
+        const S: usize = 4;
+        const DIM: usize = 11;
+        const BASE_A: usize = 1;
+        const BASE_B: usize = 7;
+        let information = [[2.0, 0.2, -0.1], [0.2, 1.5, 0.3], [-0.1, 0.3, 1.2]];
+        let residual = [0.7, -1.1, 0.25];
+        let jacobian_a = [
+            [0.2, -0.4, 1.1, 0.3],
+            [1.3, 0.5, -0.2, 0.8],
+            [-0.7, 0.9, 0.4, -1.2],
+        ];
+        let jacobian_b = [
+            [0.6, 1.0, -0.3, 0.2],
+            [-0.5, 0.7, 0.9, -0.4],
+            [1.2, -0.8, 0.1, 0.5],
+        ];
+
+        let mut single_hessian = vec![0.0; DIM * DIM];
+        let mut single_rhs = vec![0.0; DIM];
+        let mut expected_single_hessian = single_hessian.clone();
+        let mut expected_single_rhs = single_rhs.clone();
+        accumulate_factor(
+            &mut single_hessian,
+            &mut single_rhs,
+            DIM,
+            &jacobian_a,
+            &information,
+            &residual,
+            BASE_A,
+        );
+        reference_accumulate_factor(
+            &mut expected_single_hessian,
+            &mut expected_single_rhs,
+            DIM,
+            &jacobian_a,
+            &information,
+            &residual,
+            BASE_A,
+        );
+        assert_slice_close(&single_hessian, &expected_single_hessian);
+        assert_slice_close(&single_rhs, &expected_single_rhs);
+
+        let mut paired_hessian = vec![0.0; DIM * DIM];
+        let mut paired_rhs = vec![0.0; DIM];
+        let mut expected_paired_hessian = paired_hessian.clone();
+        let mut expected_paired_rhs = paired_rhs.clone();
+        let squared_mahalanobis = accumulate_paired_factor(
+            &mut paired_hessian,
+            &mut paired_rhs,
+            DIM,
+            [&jacobian_a, &jacobian_b],
+            &information,
+            &residual,
+            [BASE_A, BASE_B],
+        );
+        let mut expected_squared_mahalanobis = 0.0;
+        for row in 0..R {
+            for col in 0..R {
+                expected_squared_mahalanobis +=
+                    residual[row] * information[row][col] * residual[col];
+            }
+        }
+        reference_accumulate_factor(
+            &mut expected_paired_hessian,
+            &mut expected_paired_rhs,
+            DIM,
+            &jacobian_a,
+            &information,
+            &residual,
+            BASE_A,
+        );
+        reference_accumulate_factor(
+            &mut expected_paired_hessian,
+            &mut expected_paired_rhs,
+            DIM,
+            &jacobian_b,
+            &information,
+            &residual,
+            BASE_B,
+        );
+        for state_row in 0..S {
+            for state_col in 0..S {
+                let mut value = 0.0;
+                for residual_row in 0..R {
+                    for (residual_col, jacobian_b_row) in jacobian_b.iter().enumerate() {
+                        value += jacobian_a[residual_row][state_row]
+                            * information[residual_row][residual_col]
+                            * jacobian_b_row[state_col];
+                    }
+                }
+                expected_paired_hessian[(BASE_A + state_row) * DIM + (BASE_B + state_col)] += value;
+                expected_paired_hessian[(BASE_B + state_col) * DIM + (BASE_A + state_row)] += value;
+            }
+        }
+        assert_slice_close(&paired_hessian, &expected_paired_hessian);
+        assert_slice_close(&paired_rhs, &expected_paired_rhs);
+        assert!(
+            (squared_mahalanobis - expected_squared_mahalanobis).abs()
+                <= 2e-13 * expected_squared_mahalanobis.abs().max(1.0)
+        );
+        for row in 0..DIM {
+            for col in 0..DIM {
+                assert_eq!(
+                    paired_hessian[row * DIM + col].to_bits(),
+                    paired_hessian[col * DIM + row].to_bits(),
+                    "Hessian lost exact symmetry at ({row}, {col})"
+                );
+            }
+        }
     }
 
     /// Dense solver: trivial 2×2 system.
