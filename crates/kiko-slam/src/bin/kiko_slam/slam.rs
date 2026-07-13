@@ -21,7 +21,7 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_BA_MIN_OBS=8           Min observations per landmark
     KIKO_BA_HUBER_PX=3.0        Huber robust kernel delta (pixels)
     KIKO_BA_DAMPING=0.001       Initial LM lambda
-    KIKO_BA_MOTION_WEIGHT=0.0   Motion prior regularization weight
+    KIKO_BA_MOTION_WEIGHT       Unsupported legacy mixed-unit regularizer (startup error)
     KIKO_LM_FACTOR=10.0         LM lambda scale factor
     KIKO_LM_MIN=1e-8            LM lambda floor
     KIKO_LM_MAX=10000           LM lambda ceiling

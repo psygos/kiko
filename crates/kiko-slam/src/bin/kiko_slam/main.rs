@@ -159,7 +159,7 @@ mod tests {
         set_env("KIKO_LM_FACTOR", "12.0");
         set_env("KIKO_LM_MIN", "0.000001");
         set_env("KIKO_LM_MAX", "5000");
-        set_env("KIKO_BA_MOTION_WEIGHT", "0.25");
+        restore_env("KIKO_BA_MOTION_WEIGHT", None);
 
         let config = build_ba_config().expect("build config");
         assert_eq!(config.window(), 12);
@@ -170,11 +170,28 @@ mod tests {
         assert!((config.lm().lambda_factor() - 12.0).abs() < 1e-9);
         assert!((config.lm().min_lambda() - 1e-6).abs() < 1e-12);
         assert!((config.lm().max_lambda() - 5000.0).abs() < 1e-6);
-        assert!((config.motion_prior_weight() - 0.25).abs() < 1e-6);
 
         for (key, value) in saved {
             restore_env(&key, value);
         }
+    }
+
+    #[test]
+    fn build_ba_config_rejects_removed_mixed_unit_motion_regularizer() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "KIKO_BA_MOTION_WEIGHT";
+        let saved = std::env::var_os(key);
+
+        for value in ["0", "0.25"] {
+            set_env(key, value);
+            let error = build_ba_config().expect_err("legacy motion regularizer must fail closed");
+            let message = error.to_string();
+            assert!(message.contains(key));
+            assert!(message.contains("mixed metres and radians"));
+            assert!(message.contains("zero relative motion"));
+        }
+
+        restore_env(key, saved);
     }
 
     #[test]

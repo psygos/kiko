@@ -33,10 +33,11 @@ use crate::{
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     DescriptorMatchError, Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics,
     FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue,
-    LocalBaConfig, LocalBundleAdjuster, LoopClosureStatus, LoopVerificationError, MapFromOdom,
-    MapObservation, MapSnapshot, Matches, Observation, ObservationSet, PinholeIntrinsics, Point3,
-    Pose, Pose64, RansacConfig, RansacConfigError, Raw, StereoPair, SuperPoint, Timestamp,
-    TriangulationConfig, TriangulationError, Triangulator, Verified,
+    LocalBaConfig, LocalBundleAdjuster, LocalBundleAdjusterWorkspaceError, LoopClosureStatus,
+    LoopVerificationError, MapFromOdom, MapObservation, MapSnapshot, Matches, Observation,
+    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, RansacConfigError, Raw,
+    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
+    Verified,
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
@@ -1004,6 +1005,8 @@ impl BackendWorker {
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
     ) -> Result<Self, std::io::Error> {
+        let mut ba =
+            LocalBundleAdjuster::try_new(intrinsics, ba_config).map_err(std::io::Error::other)?;
         let queue_depth = config.queue_depth();
         let (tx_req, rx_req) = crossbeam_channel::bounded::<KeyframeEvent>(queue_depth);
         // Keep backend responses bounded to prevent unbounded memory growth if
@@ -1013,7 +1016,6 @@ impl BackendWorker {
         let thread = thread::Builder::new()
             .name("kiko-backend".to_string())
             .spawn(move || {
-                let mut ba = LocalBundleAdjuster::new(intrinsics, ba_config);
                 while let Ok(event) = rx_req.recv() {
                     let request_id = event.request_id;
                     let source_snapshot = event.source_snapshot;
@@ -1525,6 +1527,9 @@ impl RedundancyPolicy {
 
 #[derive(Debug)]
 pub enum TrackerInitError {
+    BundleAdjuster {
+        source: LocalBundleAdjusterWorkspaceError,
+    },
     BackendWorker {
         source: std::io::Error,
     },
@@ -1546,6 +1551,9 @@ pub enum TrackerInitError {
 impl std::fmt::Display for TrackerInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TrackerInitError::BundleAdjuster { source } => {
+                write!(f, "failed to initialize local bundle adjuster: {source}")
+            }
             TrackerInitError::BackendWorker { source } => {
                 write!(
                     f,
@@ -1574,6 +1582,7 @@ impl std::fmt::Display for TrackerInitError {
 impl std::error::Error for TrackerInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::BundleAdjuster { source } => Some(source),
             Self::BackendWorker { source } => Some(source),
             Self::Descriptor { source } => Some(source),
             #[cfg(feature = "vio")]
@@ -1607,6 +1616,7 @@ pub enum TrackerError {
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
     DescriptorMatch(DescriptorMatchError),
+    BundleAdjusterWorkspace(LocalBundleAdjusterWorkspaceError),
     PoseBa(crate::PoseBaError),
     BaExecution(crate::BaExecutionError),
     KeyframeRejected {
@@ -1643,6 +1653,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
+            TrackerError::BundleAdjusterWorkspace(err) => {
+                write!(f, "bundle-adjustment workspace allocation failed: {err}")
+            }
             TrackerError::PoseBa(err) => write!(f, "pose-only bundle adjustment failed: {err}"),
             TrackerError::BaExecution(err) => {
                 write!(f, "bundle-adjustment execution error: {err}")
@@ -1669,6 +1682,7 @@ impl std::error::Error for TrackerError {
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
+            TrackerError::BundleAdjusterWorkspace(source) => Some(source),
             TrackerError::PoseBa(source) => Some(source),
             TrackerError::BaExecution(source) => Some(source),
             #[cfg(feature = "vio")]
@@ -1737,6 +1751,12 @@ impl From<MapObservationError> for TrackerError {
 impl From<DescriptorMatchError> for TrackerError {
     fn from(err: DescriptorMatchError) -> Self {
         TrackerError::DescriptorMatch(err)
+    }
+}
+
+impl From<LocalBundleAdjusterWorkspaceError> for TrackerError {
+    fn from(source: LocalBundleAdjusterWorkspaceError) -> Self {
+        Self::BundleAdjusterWorkspace(source)
     }
 }
 
@@ -2535,7 +2555,8 @@ impl SlamTracker {
         let intrinsics = calibration.intrinsics();
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let frontend = StereoFrontend::new(superpoint, lightglue, triangulator, intrinsics);
-        let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
+        let ba = LocalBundleAdjuster::try_new(intrinsics, config.ba)
+            .map_err(|source| TrackerInitError::BundleAdjuster { source })?;
         #[cfg(feature = "vio")]
         let local_estimator =
             match requested_inertial_calibration(config.vio_enabled, &calibration)? {
@@ -3033,8 +3054,8 @@ impl SlamTracker {
         &self,
         pose_world: Pose,
         observations: ObservationSet,
-    ) -> Result<Option<VisualBaPoseProposal>, crate::PoseBaError> {
-        let mut candidate_ba = self.ba.clone();
+    ) -> Result<Option<VisualBaPoseProposal>, TrackerError> {
+        let mut candidate_ba = self.ba.try_fork()?;
         match candidate_ba.push_frame(self.global_map.map(), pose_world, observations)? {
             crate::PoseBaOutcome::Refined(refinement) => Ok(Some(VisualBaPoseProposal {
                 pose_world: refinement.pose(),
@@ -5393,6 +5414,18 @@ mod tests {
         SlamMap::new().snapshot()
     }
 
+    fn unaddressable_ba_workspace_error() -> LocalBundleAdjusterWorkspaceError {
+        let mut allocation_probe = Vec::<u8>::new();
+        let source = allocation_probe
+            .try_reserve_exact(usize::MAX)
+            .expect_err("an unaddressable vector capacity must fail");
+        LocalBundleAdjusterWorkspaceError::Allocation {
+            buffer: "test",
+            requested_elements: usize::MAX,
+            source,
+        }
+    }
+
     #[test]
     fn tracker_error_preserves_inference_domain_source_chain() {
         let error = TrackerError::Inference(InferenceError::Frame(
@@ -5431,6 +5464,28 @@ mod tests {
         let thread = error.source().expect("backend thread source");
         assert_eq!(thread.to_string(), "thread capacity exhausted");
         assert!(thread.source().is_none());
+    }
+
+    #[test]
+    fn tracker_init_error_preserves_bundle_adjuster_allocation_source_chain() {
+        let error = TrackerInitError::BundleAdjuster {
+            source: unaddressable_ba_workspace_error(),
+        };
+
+        let bundle_adjuster = error.source().expect("bundle-adjuster source");
+        let allocator = bundle_adjuster.source().expect("allocator source");
+        assert!(!allocator.to_string().is_empty());
+        assert!(allocator.source().is_none());
+    }
+
+    #[test]
+    fn tracker_runtime_error_preserves_bundle_adjuster_allocation_source_chain() {
+        let error = TrackerError::from(unaddressable_ba_workspace_error());
+
+        let workspace = error.source().expect("bundle-adjuster workspace source");
+        let allocator = workspace.source().expect("allocator source");
+        assert!(!allocator.to_string().is_empty());
+        assert!(allocator.source().is_none());
     }
 
     #[cfg(feature = "vio")]
@@ -6206,7 +6261,7 @@ mod tests {
         let intrinsics =
             crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
                 .expect("intrinsics");
-        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
             .expect("ba config");
         let worker =
             BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
@@ -6262,7 +6317,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             3,
         );
@@ -6311,7 +6366,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             1,
         );
@@ -6384,7 +6439,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             2,
         );
@@ -6479,7 +6534,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             1,
         );
@@ -6560,7 +6615,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             3,
         );
@@ -6578,7 +6633,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             2,
         );

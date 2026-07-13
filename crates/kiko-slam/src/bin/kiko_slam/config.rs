@@ -16,7 +16,6 @@ const DEFAULT_BA_DAMPING: f32 = 1e-3;
 const DEFAULT_LM_FACTOR: f32 = 10.0;
 const DEFAULT_LM_MIN: f32 = 1e-8;
 const DEFAULT_LM_MAX: f32 = 1e4;
-const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
 
 // Keyframe policy defaults
 const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
@@ -44,6 +43,23 @@ impl std::fmt::Display for TrackingMatcherParseError {
 }
 
 impl std::error::Error for TrackingMatcherParseError {}
+
+#[derive(Debug)]
+struct UnsupportedBaMotionRegularizerError {
+    value: f32,
+}
+
+impl std::fmt::Display for UnsupportedBaMotionRegularizerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KIKO_BA_MOTION_WEIGHT={} is unsupported: the removed heuristic mixed metres and radians and biased consecutive keyframes toward zero relative motion; use measured VIO/IMU constraints instead",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedBaMotionRegularizerError {}
 
 pub struct TrackerDefaults {
     pub min_keyframe_points: usize,
@@ -314,7 +330,9 @@ pub fn build_ba_config_with_overrides(
     let lambda_factor = try_env_f32("KIKO_LM_FACTOR")?.unwrap_or(DEFAULT_LM_FACTOR);
     let min_lambda = try_env_f32("KIKO_LM_MIN")?.unwrap_or(DEFAULT_LM_MIN);
     let max_lambda = try_env_f32("KIKO_LM_MAX")?.unwrap_or(DEFAULT_LM_MAX);
-    let motion = try_env_f32("KIKO_BA_MOTION_WEIGHT")?.unwrap_or(DEFAULT_BA_MOTION_WEIGHT);
+    if let Some(value) = try_env_f32("KIKO_BA_MOTION_WEIGHT")? {
+        return Err(Box::new(UnsupportedBaMotionRegularizerError { value }));
+    }
     let default_lm = LmConfig::default();
     let lm = LmConfig::new(
         initial_lambda,
@@ -324,9 +342,9 @@ pub fn build_ba_config_with_overrides(
         default_lm.rho_accept(),
         default_lm.rho_good(),
     )?;
-    let config = LocalBaConfig::new(window, iters, min_obs, huber, lm, motion)?;
+    let config = LocalBaConfig::new(window, iters, min_obs, huber, lm)?;
     eprintln!(
-        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={} motion_weight={}",
+        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={}",
         config.window(),
         config.max_iterations(),
         config.min_observations(),
@@ -334,8 +352,7 @@ pub fn build_ba_config_with_overrides(
         config.lm().initial_lambda(),
         config.lm().lambda_factor(),
         config.lm().min_lambda(),
-        config.lm().max_lambda(),
-        config.motion_prior_weight()
+        config.lm().max_lambda()
     );
     Ok(config)
 }

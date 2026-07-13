@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, TryReserveError};
 use std::num::NonZeroUsize;
 
 use crate::{
@@ -38,15 +38,46 @@ const MIN_LANDMARK_OBSERVATIONS: usize = 2;
 const MIN_SCALE_ANCHOR_DISPLACEMENT_M: f32 = 1e-6;
 /// Absolute minimum observation count for BA config (PnP geometric minimum).
 const ABSOLUTE_MIN_OBSERVATIONS: usize = 4;
+/// Number of tangent parameters in one SE(3) pose update.
+const POSE_TANGENT_DIMENSION: usize = 6;
+
+#[derive(Clone, Copy, Debug)]
+struct BaWorkspaceShape {
+    pose_dimension: usize,
+    dense_matrix_elements: usize,
+}
+
+impl BaWorkspaceShape {
+    fn try_from_window(window: NonZeroUsize) -> Result<Self, LocalBaConfigError> {
+        let pose_dimension = window.get().checked_mul(POSE_TANGENT_DIMENSION).ok_or(
+            LocalBaConfigError::PoseDimensionOverflow {
+                window: window.get(),
+            },
+        )?;
+        let dense_matrix_elements = pose_dimension
+            .checked_mul(pose_dimension)
+            .ok_or(LocalBaConfigError::DenseMatrixElementCountOverflow { pose_dimension })?;
+        dense_matrix_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|&byte_len| byte_len <= isize::MAX as usize)
+            .ok_or(LocalBaConfigError::DenseMatrixByteLengthUnaddressable {
+                element_count: dense_matrix_elements,
+            })?;
+        Ok(Self {
+            pose_dimension,
+            dense_matrix_elements,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct LocalBaConfig {
     window: NonZeroUsize,
+    workspace: BaWorkspaceShape,
     max_iterations: NonZeroUsize,
     min_observations: NonZeroUsize,
     huber_delta_px: f32,
     lm: LmConfig,
-    motion_prior_weight: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -292,7 +323,9 @@ pub enum LocalBaConfigError {
     ZeroObservations,
     TooFewObservations { min: usize },
     NonPositiveHuber { value: f32 },
-    NegativeMotionWeight { value: f32 },
+    PoseDimensionOverflow { window: usize },
+    DenseMatrixElementCountOverflow { pose_dimension: usize },
+    DenseMatrixByteLengthUnaddressable { element_count: usize },
 }
 
 impl std::fmt::Display for LocalBaConfigError {
@@ -309,9 +342,18 @@ impl std::fmt::Display for LocalBaConfigError {
             LocalBaConfigError::NonPositiveHuber { value } => {
                 write!(f, "local BA huber delta must be > 0 (got {value})")
             }
-            LocalBaConfigError::NegativeMotionWeight { value } => {
-                write!(f, "local BA motion prior weight must be >= 0 (got {value})")
-            }
+            LocalBaConfigError::PoseDimensionOverflow { window } => write!(
+                f,
+                "local BA pose dimension overflows usize for a {window}-pose window"
+            ),
+            LocalBaConfigError::DenseMatrixElementCountOverflow { pose_dimension } => write!(
+                f,
+                "local BA dense matrix element count overflows usize for pose dimension {pose_dimension}"
+            ),
+            LocalBaConfigError::DenseMatrixByteLengthUnaddressable { element_count } => write!(
+                f,
+                "local BA dense matrix with {element_count} f32 elements exceeds the addressable vector byte length"
+            ),
         }
     }
 }
@@ -325,9 +367,9 @@ impl LocalBaConfig {
         min_observations: usize,
         huber_delta_px: f32,
         lm: LmConfig,
-        motion_prior_weight: f32,
     ) -> Result<Self, LocalBaConfigError> {
         let window = NonZeroUsize::new(window).ok_or(LocalBaConfigError::ZeroWindow)?;
+        let workspace = BaWorkspaceShape::try_from_window(window)?;
         let max_iterations =
             NonZeroUsize::new(max_iterations).ok_or(LocalBaConfigError::ZeroIterations)?;
         let min_observations =
@@ -342,18 +384,13 @@ impl LocalBaConfig {
                 value: huber_delta_px,
             });
         }
-        if motion_prior_weight < 0.0 || !motion_prior_weight.is_finite() {
-            return Err(LocalBaConfigError::NegativeMotionWeight {
-                value: motion_prior_weight,
-            });
-        }
         Ok(Self {
             window,
+            workspace,
             max_iterations,
             min_observations,
             huber_delta_px,
             lm,
-            motion_prior_weight,
         })
     }
 
@@ -375,10 +412,6 @@ impl LocalBaConfig {
 
     pub fn lm(&self) -> LmConfig {
         self.lm
-    }
-
-    pub fn motion_prior_weight(&self) -> f32 {
-        self.motion_prior_weight
     }
 }
 
@@ -2001,8 +2034,8 @@ impl PoseVarIndex {
         self.0
     }
 
-    fn offset6(self) -> usize {
-        self.0 * 6
+    fn tangent_offset(self) -> usize {
+        self.0 * POSE_TANGENT_DIMENSION
     }
 }
 
@@ -2427,7 +2460,7 @@ struct LandmarkSchur {
     links: Vec<PoseLandmarkCross>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LocalBundleAdjuster {
     config: LocalBaConfig,
     intrinsics: PinholeIntrinsics,
@@ -2437,19 +2470,124 @@ pub struct LocalBundleAdjuster {
     b_buf: Vec<f32>,
 }
 
+#[derive(Debug)]
+pub enum LocalBundleAdjusterWorkspaceError {
+    Allocation {
+        buffer: &'static str,
+        requested_elements: usize,
+        source: TryReserveError,
+    },
+    SourceExceedsCapacity {
+        buffer: &'static str,
+        source_elements: usize,
+        requested_capacity: usize,
+    },
+}
+
+impl std::fmt::Display for LocalBundleAdjusterWorkspaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Allocation {
+                buffer,
+                requested_elements,
+                source,
+            } => write!(
+                f,
+                "could not allocate local BA {buffer} buffer with {requested_elements} elements: {source}"
+            ),
+            Self::SourceExceedsCapacity {
+                buffer,
+                source_elements,
+                requested_capacity,
+            } => write!(
+                f,
+                "cannot fork local BA {buffer} buffer with {source_elements} elements into capacity {requested_capacity}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LocalBundleAdjusterWorkspaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Allocation { source, .. } => Some(source),
+            Self::SourceExceedsCapacity { .. } => None,
+        }
+    }
+}
+
+fn try_buffer_with_capacity<T>(
+    buffer: &'static str,
+    requested_elements: usize,
+) -> Result<Vec<T>, LocalBundleAdjusterWorkspaceError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(requested_elements)
+        .map_err(|source| LocalBundleAdjusterWorkspaceError::Allocation {
+            buffer,
+            requested_elements,
+            source,
+        })?;
+    Ok(values)
+}
+
+fn try_zeroed_f32_buffer(
+    buffer: &'static str,
+    requested_elements: usize,
+) -> Result<Vec<f32>, LocalBundleAdjusterWorkspaceError> {
+    let mut values = try_buffer_with_capacity(buffer, requested_elements)?;
+    values.resize(requested_elements, 0.0);
+    Ok(values)
+}
+
+fn try_cloned_buffer<T: Clone>(
+    buffer: &'static str,
+    source: &[T],
+    capacity: usize,
+) -> Result<Vec<T>, LocalBundleAdjusterWorkspaceError> {
+    if source.len() > capacity {
+        return Err(LocalBundleAdjusterWorkspaceError::SourceExceedsCapacity {
+            buffer,
+            source_elements: source.len(),
+            requested_capacity: capacity,
+        });
+    }
+    let mut values = try_buffer_with_capacity(buffer, capacity)?;
+    values.extend_from_slice(source);
+    Ok(values)
+}
+
 impl LocalBundleAdjuster {
-    pub fn new(intrinsics: PinholeIntrinsics, config: LocalBaConfig) -> Self {
-        let dim = config.window().saturating_mul(6);
-        let a_buf = vec![0.0_f32; dim * dim];
-        let b_buf = vec![0.0_f32; dim];
-        Self {
+    pub fn try_new(
+        intrinsics: PinholeIntrinsics,
+        config: LocalBaConfig,
+    ) -> Result<Self, LocalBundleAdjusterWorkspaceError> {
+        let shape = config.workspace;
+        let frames = try_buffer_with_capacity("frame window", config.window())?;
+        let pose_backup_buf = try_buffer_with_capacity("pose backup", config.window())?;
+        let a_buf = try_zeroed_f32_buffer("dense normal matrix", shape.dense_matrix_elements)?;
+        let b_buf = try_zeroed_f32_buffer("normal-equation RHS", shape.pose_dimension)?;
+        Ok(Self {
             config,
             intrinsics,
-            frames: Vec::new(),
-            pose_backup_buf: Vec::with_capacity(config.window()),
+            frames,
+            pose_backup_buf,
             a_buf,
             b_buf,
-        }
+        })
+    }
+
+    /// Fork the authoritative frame window into a fresh solver workspace.
+    /// Scratch buffers are reinitialized because they carry no state between solves.
+    pub fn try_fork(&self) -> Result<Self, LocalBundleAdjusterWorkspaceError> {
+        Ok(Self {
+            config: self.config,
+            intrinsics: self.intrinsics,
+            frames: try_cloned_buffer("frame window", &self.frames, self.config.window())?,
+            pose_backup_buf: try_buffer_with_capacity("pose backup", self.config.window())?,
+            a_buf: try_zeroed_f32_buffer("dense normal matrix", self.a_buf.len())?,
+            b_buf: try_zeroed_f32_buffer("normal-equation RHS", self.b_buf.len())?,
+        })
     }
 
     pub fn reset(&mut self) {
@@ -2550,11 +2688,10 @@ impl LocalBundleAdjuster {
         }
         debug_assert_eq!(frame_count, resolved.len());
 
-        let dim = frame_count * 6;
+        let dim = frame_count * POSE_TANGENT_DIMENSION;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
         let damping = self.config.lm().initial_lambda().max(MIN_POSE_DAMPING);
-        let motion_weight = self.config.motion_prior_weight();
 
         for iter in 0..max_iters {
             let a = &mut self.a_buf[..dim * dim];
@@ -2564,7 +2701,7 @@ impl LocalBundleAdjuster {
 
             let mut projectable_factors = 0usize;
             for (idx, (frame, observations)) in self.frames.iter().zip(resolved).enumerate() {
-                let base = idx * 6;
+                let base = idx * POSE_TANGENT_DIMENSION;
                 for obs in observations.observations() {
                     if let Some((residual, jac)) =
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
@@ -2594,21 +2731,6 @@ impl LocalBundleAdjuster {
                 });
             }
 
-            if motion_weight > 0.0 && frame_count >= 2 {
-                for i in 1..frame_count {
-                    accumulate_motion_prior(
-                        a,
-                        b,
-                        dim,
-                        self.frames[i - 1].pose,
-                        self.frames[i].pose,
-                        (i - 1) * 6,
-                        i * 6,
-                        motion_weight,
-                    );
-                }
-            }
-
             for i in 0..dim {
                 a[i * dim + i] += damping;
             }
@@ -2620,7 +2742,7 @@ impl LocalBundleAdjuster {
 
             let mut all_steps_converged = true;
             for i in 0..frame_count {
-                let step = extract_se3_delta(b, i * 6);
+                let step = extract_se3_delta(b, i * POSE_TANGENT_DIMENSION);
                 all_steps_converged &= se3_step_is_converged(step);
                 let pose = self.frames[i].pose;
                 let updated = apply_se3_delta(pose, step);
@@ -2699,12 +2821,11 @@ impl LocalBundleAdjuster {
             });
         }
 
-        let pose_dim = pose_count * 6;
+        let pose_dim = pose_count * POSE_TANGENT_DIMENSION;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
-        let motion_weight = self.config.motion_prior_weight();
         let lm_config = self.config.lm();
-        let initial_cost = match full_problem_cost(problem, self.intrinsics, huber, motion_weight) {
+        let initial_cost = match full_problem_cost(problem, self.intrinsics, huber) {
             Ok(cost) => cost,
             Err(FullProblemCostError::NonProjectable { count }) => {
                 return Ok(BaResult::Degenerate {
@@ -2782,21 +2903,6 @@ impl LocalBundleAdjuster {
                 }
             }
 
-            if motion_weight > 0.0 && pose_count >= 2 {
-                for i in 1..pose_count {
-                    accumulate_motion_prior(
-                        s,
-                        rhs,
-                        pose_dim,
-                        problem.variable_poses[i - 1].pose,
-                        problem.variable_poses[i].pose,
-                        (i - 1) * 6,
-                        i * 6,
-                        motion_weight,
-                    );
-                }
-            }
-
             // Fixing the first camera removes the rigid gauge, but left-image
             // factors do not guarantee a conditioned metric-scale baseline.
             // Preserve the stereo-initialized scale by fixing the
@@ -2830,14 +2936,14 @@ impl LocalBundleAdjuster {
 
                 let inv_c_b = math::mat_mul_vec(inv_c, acc.b);
                 for link_i in &acc.links {
-                    let base_i = link_i.pose.offset6();
+                    let base_i = link_i.pose.tangent_offset();
                     let rhs_contrib = mat63_mul_vec3(link_i.b, inv_c_b);
                     for row in 0..6 {
                         rhs[base_i + row] -= rhs_contrib[row];
                     }
 
                     for link_j in &acc.links {
-                        let base_j = link_j.pose.offset6();
+                        let base_j = link_j.pose.tangent_offset();
                         let block = schur_block(link_i.b, inv_c, link_j.b);
                         for row in 0..6 {
                             for col in 0..6 {
@@ -2866,7 +2972,7 @@ impl LocalBundleAdjuster {
             let mut predicted_decrease = 0.0_f64;
             let mut all_steps_converged = true;
             for (pose_i, pose_var) in problem.variable_poses.iter_mut().enumerate() {
-                let base = pose_i * 6;
+                let base = pose_i * POSE_TANGENT_DIMENSION;
                 let delta = extract_se3_delta(rhs, base);
                 all_steps_converged &= se3_step_is_converged(delta);
                 for k in 0..6 {
@@ -2881,7 +2987,7 @@ impl LocalBundleAdjuster {
                 let schur = &schur_landmarks[landmark_i];
                 let mut coupling = [0.0_f32; 3];
                 for link in &schur.links {
-                    let pose_delta = extract_se3_delta(rhs, link.pose.offset6());
+                    let pose_delta = extract_se3_delta(rhs, link.pose.tangent_offset());
                     for (row, pose_delta_value) in pose_delta.iter().enumerate() {
                         for (col, link_value) in link.b[row].iter().enumerate() {
                             coupling[col] += *link_value * *pose_delta_value;
@@ -2917,38 +3023,36 @@ impl LocalBundleAdjuster {
             }
 
             let prev_cost = lm_state.prev_cost();
-            let (action, candidate_cost) =
-                match full_problem_cost(problem, self.intrinsics, huber, motion_weight) {
-                    Ok(cost) => (
-                        lm_state.step(cost.get(), predicted_decrease, lm_config),
-                        cost,
-                    ),
-                    Err(FullProblemCostError::NonProjectable { .. }) => {
-                        lm_state.reject(lm_config);
-                        (
-                            LmAction::Reject,
-                            BaCost::new(prev_cost).map_err(|source| {
-                                BaExecutionError::InvalidCost {
-                                    stage: "retained",
-                                    iteration: iter + 1,
-                                    source,
-                                }
-                            })?,
-                        )
-                    }
-                    Err(FullProblemCostError::InvalidCost { source }) => {
-                        restore_full_ba_candidate(
-                            problem,
-                            pose_backup.as_slice(),
-                            landmark_backup.as_slice(),
-                        );
-                        return Err(BaExecutionError::InvalidCost {
-                            stage: "candidate",
+            let (action, candidate_cost) = match full_problem_cost(problem, self.intrinsics, huber)
+            {
+                Ok(cost) => (
+                    lm_state.step(cost.get(), predicted_decrease, lm_config),
+                    cost,
+                ),
+                Err(FullProblemCostError::NonProjectable { .. }) => {
+                    lm_state.reject(lm_config);
+                    (
+                        LmAction::Reject,
+                        BaCost::new(prev_cost).map_err(|source| BaExecutionError::InvalidCost {
+                            stage: "retained",
                             iteration: iter + 1,
                             source,
-                        });
-                    }
-                };
+                        })?,
+                    )
+                }
+                Err(FullProblemCostError::InvalidCost { source }) => {
+                    restore_full_ba_candidate(
+                        problem,
+                        pose_backup.as_slice(),
+                        landmark_backup.as_slice(),
+                    );
+                    return Err(BaExecutionError::InvalidCost {
+                        stage: "candidate",
+                        iteration: iter + 1,
+                        source,
+                    });
+                }
+            };
             match action {
                 LmAction::Accept => {
                     accepted_steps = accepted_steps.saturating_add(1);
@@ -3686,7 +3790,6 @@ fn full_problem_cost(
     problem: &FullBaProblem,
     intrinsics: PinholeIntrinsics,
     huber_delta_px: f32,
-    motion_weight: f32,
 ) -> Result<BaCost, FullProblemCostError> {
     let mut cost = 0.0_f64;
     let huber = huber_delta_px as f64;
@@ -3709,20 +3812,6 @@ fn full_problem_cost(
         } else {
             huber * (r_norm - 0.5 * huber)
         };
-    }
-
-    if motion_weight > 0.0 {
-        let w2 = (motion_weight as f64) * (motion_weight as f64);
-        for i in 1..problem.variable_poses.len() {
-            let delta = se3_delta_between(
-                problem.variable_poses[i - 1].pose,
-                problem.variable_poses[i].pose,
-            );
-            for &value in &delta {
-                let d = value as f64;
-                cost += 0.5 * w2 * d * d;
-            }
-        }
     }
 
     match NonZeroUsize::new(nonprojectable_count) {
@@ -3859,7 +3948,7 @@ fn accumulate_pose_hessian(
     pose_idx: PoseVarIndex,
     j_pose: [[f32; 6]; 2],
 ) {
-    let base = pose_idx.offset6();
+    let base = pose_idx.tangent_offset();
     for row in 0..6 {
         for col in 0..6 {
             let jt_j = j_pose[0][row] * j_pose[0][col] + j_pose[1][row] * j_pose[1][col];
@@ -3874,7 +3963,7 @@ fn accumulate_pose_rhs(
     j_pose: [[f32; 6]; 2],
     residual: [f32; 2],
 ) {
-    let base = pose_idx.offset6();
+    let base = pose_idx.tangent_offset();
     for col in 0..6 {
         rhs[base + col] -= j_pose[0][col] * residual[0] + j_pose[1][col] * residual[1];
     }
@@ -3917,33 +4006,6 @@ fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
     ]
 }
 
-/// Accumulate motion-prior terms for a consecutive pair of poses into the
-/// normal equations (Hessian `hessian` and right-hand side `rhs`).
-#[allow(clippy::too_many_arguments)]
-fn accumulate_motion_prior(
-    hessian: &mut [f32],
-    rhs: &mut [f32],
-    dim: usize,
-    prev_pose: Pose,
-    curr_pose: Pose,
-    base_prev: usize,
-    base_curr: usize,
-    weight: f32,
-) {
-    let residual = se3_delta_between(prev_pose, curr_pose);
-    let w2 = weight * weight;
-    for k in 0..6 {
-        let r = residual[k] * w2;
-        rhs[base_prev + k] += r;
-        rhs[base_curr + k] -= r;
-
-        hessian[(base_prev + k) * dim + (base_prev + k)] += w2;
-        hessian[(base_curr + k) * dim + (base_curr + k)] += w2;
-        hessian[(base_prev + k) * dim + (base_curr + k)] -= w2;
-        hessian[(base_curr + k) * dim + (base_prev + k)] -= w2;
-    }
-}
-
 fn huber_weight(r_norm: f32, delta: f32) -> f32 {
     if r_norm <= delta { 1.0 } else { delta / r_norm }
 }
@@ -3976,7 +4038,7 @@ fn schur_block(b_i: [[f32; 3]; 6], inv_c: [[f32; 3]; 3], b_j: [[f32; 3]; 6]) -> 
 }
 
 fn fix_pose_block(hessian: &mut [f32], rhs: &mut [f32], pose_dim: usize, pose_idx: PoseVarIndex) {
-    let base = pose_idx.offset6();
+    let base = pose_idx.tangent_offset();
     for row in 0..6 {
         let idx = base + row;
         for col in 0..pose_dim {
@@ -4147,6 +4209,13 @@ mod tests {
         axis_angle_pose, make_detections, make_pinhole_intrinsics, project_world_point,
     };
     use crate::{FrameId, Keypoint, Point3, SensorId, Timestamp};
+
+    fn make_bundle_adjuster(
+        intrinsics: PinholeIntrinsics,
+        config: LocalBaConfig,
+    ) -> LocalBundleAdjuster {
+        LocalBundleAdjuster::try_new(intrinsics, config).expect("allocate local BA workspace")
+    }
 
     fn l2_3(a: [f32; 3], b: [f32; 3]) -> f32 {
         let dx = a[0] - b[0];
@@ -4456,29 +4525,80 @@ mod tests {
     #[test]
     fn local_ba_config_rejects_invalid_values() {
         assert!(matches!(
-            LocalBaConfig::new(0, 10, 4, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(0, 10, 4, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::ZeroWindow)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 0, 4, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 0, 4, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::ZeroIterations)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 0, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 10, 0, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::ZeroObservations)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 3, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 10, 3, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::TooFewObservations { .. })
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 0.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 10, 4, 0.0, lm(1e-3)),
             Err(LocalBaConfigError::NonPositiveHuber { .. })
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), -1.0),
-            Err(LocalBaConfigError::NegativeMotionWeight { .. })
+            LocalBaConfig::new(usize::MAX, 10, 4, 1.0, lm(1e-3)),
+            Err(LocalBaConfigError::PoseDimensionOverflow { .. })
         ));
+
+        let element_overflow_window = usize::MAX / POSE_TANGENT_DIMENSION;
+        assert!(matches!(
+            LocalBaConfig::new(element_overflow_window, 10, 4, 1.0, lm(1e-3)),
+            Err(LocalBaConfigError::DenseMatrixElementCountOverflow { .. })
+        ));
+
+        let near_sqrt_usize_max = 1_usize << (usize::BITS / 2 - 1);
+        let byte_overflow_window = near_sqrt_usize_max / POSE_TANGENT_DIMENSION;
+        assert!(matches!(
+            LocalBaConfig::new(byte_overflow_window, 10, 4, 1.0, lm(1e-3)),
+            Err(LocalBaConfigError::DenseMatrixByteLengthUnaddressable { .. })
+        ));
+    }
+
+    #[test]
+    fn local_ba_workspace_is_checked_and_preallocated_once() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let config = LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3)).expect("valid BA config");
+
+        let ba = LocalBundleAdjuster::try_new(intrinsics, config).expect("allocate BA workspace");
+
+        assert_eq!(ba.a_buf.len(), 30 * 30);
+        assert_eq!(ba.b_buf.len(), 30);
+        assert!(ba.frames.capacity() >= 5);
+        assert!(ba.pose_backup_buf.capacity() >= 5);
+    }
+
+    #[test]
+    fn local_ba_allocation_error_preserves_allocator_source() {
+        let error = try_buffer_with_capacity::<u8>("test", usize::MAX)
+            .expect_err("an unaddressable vector capacity must fail");
+
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    #[test]
+    fn local_ba_fork_rejects_source_larger_than_declared_capacity() {
+        let error = try_cloned_buffer("test", &[1_u8, 2], 1)
+            .expect_err("source larger than capacity must fail explicitly");
+
+        assert!(matches!(
+            &error,
+            LocalBundleAdjusterWorkspaceError::SourceExceedsCapacity {
+                source_elements: 2,
+                requested_capacity: 1,
+                ..
+            }
+        ));
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
@@ -4636,8 +4756,8 @@ mod tests {
             .expect("fixture association");
         map.remove_map_point(removed_point)
             .expect("remove fixture point");
-        let config = LocalBaConfig::new(5, 10, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 10, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
 
         let error = ba
             .push_frame(&map, Pose::identity(), observations)
@@ -4672,8 +4792,8 @@ mod tests {
             NonZeroUsize::new(4).expect("literal is non-zero"),
         )
         .expect("observations");
-        let config = LocalBaConfig::new(1, 3, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(1, 3, 4, 2.0, lm(1e-3)).expect("BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let original_pose = axis_angle_pose([0.1, -0.2, 0.3], [0.01, -0.02, 0.03]);
         let first = ba
             .push_frame(&map, original_pose, observations.clone())
@@ -4877,26 +4997,6 @@ mod tests {
     }
 
     #[test]
-    fn motion_prior_rhs_uses_the_same_squared_weight_as_cost_and_hessian() {
-        let previous = Pose::identity();
-        let current = Pose::from_rt(
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            [1.0, 0.0, 0.0],
-        );
-
-        for (weight, expected) in [(0.5_f32, 0.25_f32), (2.0_f32, 4.0_f32)] {
-            let mut hessian = vec![0.0_f32; 12 * 12];
-            let mut rhs = vec![0.0_f32; 12];
-            accumulate_motion_prior(&mut hessian, &mut rhs, 12, previous, current, 0, 6, weight);
-
-            assert!((rhs[0] - expected).abs() < 1e-6);
-            assert!((rhs[6] + expected).abs() < 1e-6);
-            assert!((hessian[0] - expected).abs() < 1e-6);
-            assert!((hessian[6 * 12 + 6] - expected).abs() < 1e-6);
-        }
-    }
-
-    #[test]
     fn full_problem_cost_rejects_nonprojectable_factors() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
@@ -4927,15 +5027,15 @@ mod tests {
             }],
         );
 
-        let error = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+        let error = full_problem_cost(&problem, intrinsics, 2.0)
             .expect_err("a behind-camera factor cannot disappear from cost");
         assert!(matches!(
             error,
             FullProblemCostError::NonProjectable { count } if count.get() == 1
         ));
 
-        let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-3)).expect("BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         assert_eq!(
             ba.optimize_full(&mut problem).expect("degenerate outcome"),
             BaResult::Degenerate {
@@ -4948,8 +5048,8 @@ mod tests {
     fn optimize_full_reports_degenerate_variants() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
 
         let mut no_poses = FullBaProblem {
             variable_poses: Vec::new(),
@@ -5048,8 +5148,8 @@ mod tests {
     fn optimize_full_returns_iteration_limit_with_bad_init() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.8, -0.3, 0.4, 0.2, -0.1, 0.15]);
-        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[kf_0, kf_1],
@@ -5107,8 +5207,8 @@ mod tests {
             }],
             factors,
         );
-        let config = LocalBaConfig::new(5, 3, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 3, 4, 2.0, lm(1e-3)).expect("BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
 
         let result = ba.optimize_full(&mut problem).expect("stationary solve");
 
@@ -5182,8 +5282,8 @@ mod tests {
                 },
             ],
         );
-        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e4), 0.0).expect("BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e4)).expect("BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let original_poses: Vec<_> = problem
             .variable_poses
             .iter()
@@ -5212,8 +5312,8 @@ mod tests {
     fn optimize_full_returns_converged_on_synthetic_scene() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[kf_0, kf_1],
@@ -5248,8 +5348,8 @@ mod tests {
     fn optimize_full_recovers_from_large_perturbation() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.45, -0.20, 0.28, 0.15, -0.08, 0.10]);
-        let config = LocalBaConfig::new(5, 30, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 30, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[kf_0, kf_1],
@@ -5257,11 +5357,11 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("initial factors are projectable")
             .get();
         let result = ba.optimize_full(&mut problem).expect("full BA solve");
-        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("optimized factors remain projectable")
             .get();
         assert!(
@@ -5275,8 +5375,8 @@ mod tests {
     fn optimize_full_final_cost_does_not_increase() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.12, -0.05, 0.07, 0.03, -0.02, 0.01]);
-        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[kf_0, kf_1],
@@ -5284,7 +5384,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("initial factors are projectable")
             .get();
         let result = ba.optimize_full(&mut problem).expect("full BA solve");
@@ -5299,11 +5399,11 @@ mod tests {
     }
 
     #[test]
-    fn local_bundle_adjuster_clone_supports_transactional_candidate_updates() {
+    fn local_bundle_adjuster_try_fork_supports_transactional_candidate_updates() {
         let (map, intrinsics, kf_0, _kf_1, _, _) =
             build_full_ba_fixture([0.12, -0.05, 0.07, 0.03, -0.02, 0.01]);
-        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let observations = ObservationSet::new(
             (0..4)
                 .map(|idx| {
@@ -5319,7 +5419,7 @@ mod tests {
         let _ = ba.push_frame(&map, Pose::identity(), observations.clone());
         let original_len = ba.frames.len();
 
-        let mut candidate_ba = ba.clone();
+        let mut candidate_ba = ba.try_fork().expect("allocate candidate BA workspace");
         let _ = candidate_ba.push_frame(&map, Pose::identity(), observations);
 
         assert_eq!(
@@ -5397,8 +5497,8 @@ mod tests {
             variable_pose_1,
             Some(0),
         );
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("BA config");
+        let ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[keyframe_0, keyframe_2],
@@ -5469,8 +5569,8 @@ mod tests {
             axis_angle_pose([0.32, -0.01, 0.02], [0.0, 0.015, -0.01]),
             None,
         );
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("BA config");
+        let ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[keyframe_0, keyframe_2],
@@ -5491,7 +5591,7 @@ mod tests {
                 .any(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
         );
 
-        let before = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+        let before = full_problem_cost(&problem, intrinsics, 2.0)
             .expect("initial cost")
             .get();
         let fixed_factor = problem
@@ -5500,7 +5600,7 @@ mod tests {
             .find(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
             .expect("fixed factor");
         fixed_factor.pixel.x += 1_000.0;
-        let after = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+        let after = full_problem_cost(&problem, intrinsics, 2.0)
             .expect("perturbed cost")
             .get();
         assert!(after > before, "fixed factor must affect cost");
@@ -5525,8 +5625,8 @@ mod tests {
         )
         .expect("perturb variable keyframe pose");
         let fixed_pose_before = map.keyframe(keyframe_1).expect("fixed keyframe").pose();
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let before_problem = FullBaProblem::try_from_map(
             &map,
             &[keyframe_0, keyframe_2],
@@ -5534,7 +5634,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before_cost = full_problem_cost(&before_problem, intrinsics, 2.0, 0.0)
+        let before_cost = full_problem_cost(&before_problem, intrinsics, 2.0)
             .expect("initial cost")
             .get();
 
@@ -5550,7 +5650,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("updated full BA problem");
-        let after_cost = full_problem_cost(&after_problem, intrinsics, 2.0, 0.0)
+        let after_cost = full_problem_cost(&after_problem, intrinsics, 2.0)
             .expect("updated cost")
             .get();
         assert!(
@@ -5568,8 +5668,8 @@ mod tests {
     fn monocular_cost_has_scale_gauge_but_exact_anchor_preserves_metric_scale() {
         let (map, intrinsics, keyframe_0, keyframe_1, _, _) =
             build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
-        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("BA config");
+        let ba = make_bundle_adjuster(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
             &[keyframe_0, keyframe_1],
@@ -5582,13 +5682,13 @@ mod tests {
         let anchored_coordinate_before = anchor
             .axis
             .coordinate_m(problem.landmarks[anchor.landmark.as_usize()].position);
-        let cost_before = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+        let cost_before = full_problem_cost(&problem, intrinsics, 2.0)
             .expect("initial cost")
             .get();
 
         scale_problem_about_fixed_camera(&mut problem, 1.75);
 
-        let cost_after = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+        let cost_after = full_problem_cost(&problem, intrinsics, 2.0)
             .expect("scaled cost")
             .get();
         let anchored_coordinate_after = anchor
@@ -5776,8 +5876,8 @@ mod tests {
         let before_pose_err = pose_distance(map.keyframe(kf_1).expect("kf1").pose(), true_pose_1);
         let before_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
 
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
         let result = ba
             .optimize_keyframe_window(&mut map, &[kf_0, kf_1])
             .expect("full local BA execution");
@@ -5804,8 +5904,8 @@ mod tests {
     fn optimize_keyframe_window_reports_duplicate_ids_as_execution_error() {
         let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
         let before = map.snapshot();
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
 
         let error = ba
             .optimize_keyframe_window(&mut map, &[keyframe_id, keyframe_id])
