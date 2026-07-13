@@ -977,7 +977,7 @@ impl SurfacePoseQualityDecision {
 }
 
 fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&'static str, f64)> {
-    let mut scalars = Vec::with_capacity(16);
+    let mut scalars = Vec::with_capacity(22);
     let (
         accepted,
         rejected_low_count,
@@ -1053,6 +1053,8 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
                 crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
                 crate::DegenerateReason::TooFewObservations { .. } => 0.0,
                 crate::DegenerateReason::NoFactors => 0.0,
+                crate::DegenerateReason::DisconnectedFromFixedPose { .. } => 0.0,
+                crate::DegenerateReason::UnobservableMetricScale => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
@@ -1060,20 +1062,26 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
                 crate::DegenerateReason::TooFewLandmarks { .. } => 1.0,
                 crate::DegenerateReason::TooFewObservations { .. } => 0.0,
                 crate::DegenerateReason::NoFactors => 0.0,
+                crate::DegenerateReason::DisconnectedFromFixedPose { .. } => 0.0,
+                crate::DegenerateReason::UnobservableMetricScale => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. } => 0.0,
                 crate::DegenerateReason::TooFewLandmarks { .. } => 0.0,
-                crate::DegenerateReason::TooFewObservations { .. }
-                | crate::DegenerateReason::NoFactors => 1.0,
+                crate::DegenerateReason::TooFewObservations { .. } => 0.0,
+                crate::DegenerateReason::NoFactors => 1.0,
+                crate::DegenerateReason::DisconnectedFromFixedPose { .. } => 0.0,
+                crate::DegenerateReason::UnobservableMetricScale => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 0.0,
             },
             match degenerate_reason {
                 crate::DegenerateReason::TooFewPoses { .. }
                 | crate::DegenerateReason::TooFewLandmarks { .. }
                 | crate::DegenerateReason::TooFewObservations { .. }
-                | crate::DegenerateReason::NoFactors => 0.0,
+                | crate::DegenerateReason::NoFactors
+                | crate::DegenerateReason::DisconnectedFromFixedPose { .. }
+                | crate::DegenerateReason::UnobservableMetricScale => 0.0,
                 crate::DegenerateReason::NonProjectableFactors { .. } => 1.0,
             },
             Some(accepted_inliers.count() as f64),
@@ -1217,9 +1225,59 @@ fn surface_pose_quality_scalars(decision: &SurfacePoseQualityDecision) -> Vec<(&
         "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
         ba_degenerate_no_factors,
     ));
+    let (too_few_observations, observation_count, required_observation_count) = match decision {
+        SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            degenerate_reason:
+                crate::DegenerateReason::TooFewObservations {
+                    required, actual, ..
+                },
+            ..
+        } => (1.0, *actual as f64, *required as f64),
+        _ => (0.0, 0.0, 0.0),
+    };
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_too_few_observations",
+        too_few_observations,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_keyframe_observation_count",
+        observation_count,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_required_keyframe_observation_count",
+        required_observation_count,
+    ));
     scalars.push((
         "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
         ba_degenerate_nonprojectable_factors,
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_unobservable_metric_scale",
+        f64::from(matches!(
+            decision,
+            SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+                degenerate_reason: crate::DegenerateReason::UnobservableMetricScale,
+                ..
+            }
+        )),
+    ));
+    let disconnected_pose_count = match decision {
+        SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            degenerate_reason:
+                crate::DegenerateReason::DisconnectedFromFixedPose {
+                    disconnected_pose_count,
+                },
+            ..
+        } => disconnected_pose_count.get() as f64,
+        _ => 0.0,
+    };
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_disconnected_from_fixed_pose",
+        f64::from(disconnected_pose_count > 0.0),
+    ));
+    scalars.push((
+        "diagnostics/surface/pose_gate/ba_degenerate_disconnected_pose_count",
+        disconnected_pose_count,
     ));
     if let Some(value) = rmse_px {
         scalars.push((
@@ -2014,6 +2072,10 @@ mod tests {
             0.0
         )));
         assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_unobservable_metric_scale",
+            0.0
+        )));
+        assert!(scalars.contains(&(
             "diagnostics/surface/pose_gate/accepted_inlier_reprojection_rmse_px",
             2.0
         )));
@@ -2069,6 +2131,40 @@ mod tests {
     }
 
     #[test]
+    fn surface_pose_quality_scalars_do_not_mislabel_low_observation_support() {
+        let decision = SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(12),
+            min_required_accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(8),
+            degenerate_reason: crate::DegenerateReason::TooFewObservations {
+                keyframe_id: crate::KeyframeId::default(),
+                required: 8,
+                actual: 3,
+            },
+            accepted_inlier_reprojection_rmse_px: None,
+            max_allowed_accepted_inlier_reprojection_rmse_px:
+                crate::PnpAcceptedInlierPixelResidualMetric::new(1.5).expect("rmse"),
+        };
+
+        let scalars = surface_pose_quality_scalars(&decision);
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_too_few_observations",
+            1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_keyframe_observation_count",
+            3.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_required_keyframe_observation_count",
+            8.0
+        )));
+    }
+
+    #[test]
     fn surface_pose_quality_scalars_export_nonprojectable_ba_factors() {
         let decision = SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
             accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(12),
@@ -2087,6 +2183,60 @@ mod tests {
         assert!(scalars.contains(&(
             "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
             1.0
+        )));
+    }
+
+    #[test]
+    fn surface_pose_quality_scalars_export_unobservable_metric_scale() {
+        let decision = SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(12),
+            min_required_accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(8),
+            degenerate_reason: crate::DegenerateReason::UnobservableMetricScale,
+            accepted_inlier_reprojection_rmse_px: None,
+            max_allowed_accepted_inlier_reprojection_rmse_px:
+                crate::PnpAcceptedInlierPixelResidualMetric::new(1.5).expect("rmse"),
+        };
+
+        let scalars = surface_pose_quality_scalars(&decision);
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_unobservable_metric_scale",
+            1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_no_factors",
+            0.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_nonprojectable_factors",
+            0.0
+        )));
+    }
+
+    #[test]
+    fn surface_pose_quality_scalars_export_disconnected_pose_count() {
+        let decision = SurfacePoseQualityDecision::RejectDegenerateBundleAdjustment {
+            accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(12),
+            min_required_accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(8),
+            degenerate_reason: crate::DegenerateReason::DisconnectedFromFixedPose {
+                disconnected_pose_count: std::num::NonZeroUsize::new(2).expect("nonzero"),
+            },
+            accepted_inlier_reprojection_rmse_px: None,
+            max_allowed_accepted_inlier_reprojection_rmse_px:
+                crate::PnpAcceptedInlierPixelResidualMetric::new(1.5).expect("rmse"),
+        };
+
+        let scalars = surface_pose_quality_scalars(&decision);
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_disconnected_from_fixed_pose",
+            1.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_disconnected_pose_count",
+            2.0
+        )));
+        assert!(scalars.contains(&(
+            "diagnostics/surface/pose_gate/ba_degenerate_unobservable_metric_scale",
+            0.0
         )));
     }
 

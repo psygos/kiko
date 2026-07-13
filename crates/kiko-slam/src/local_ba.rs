@@ -7,8 +7,12 @@ use crate::{
     math,
 };
 
-/// Maximum SE3 parameter step for convergence detection.
-const STEP_CONVERGENCE_THRESHOLD: f32 = 1e-4;
+/// Maximum camera-translation update in metres for convergence detection.
+const POSE_TRANSLATION_STEP_CONVERGENCE_M: f32 = 1e-4;
+/// Maximum camera-rotation update in radians for convergence detection.
+const POSE_ROTATION_STEP_CONVERGENCE_RAD: f32 = 1e-4;
+/// Maximum landmark-position update in metres for convergence detection.
+const LANDMARK_STEP_CONVERGENCE_M: f32 = 1e-4;
 /// Relative cost tolerance for LM convergence.
 const RELATIVE_COST_TOLERANCE: f64 = 1e-6;
 /// Floor for cost magnitude to avoid division-near-zero in relative convergence.
@@ -29,6 +33,9 @@ const MIN_DETERMINANT: f64 = 1e-18;
 const MIN_BA_POSES: usize = 2;
 /// Minimum observations per landmark for inclusion in full BA.
 const MIN_LANDMARK_OBSERVATIONS: usize = 2;
+/// Minimum separation from the fixed camera centre used to condition the
+/// exact metric-scale anchor. Map positions and camera translations are metres.
+const MIN_SCALE_ANCHOR_DISPLACEMENT_M: f32 = 1e-6;
 /// Absolute minimum observation count for BA config (PnP geometric minimum).
 const ABSOLUTE_MIN_OBSERVATIONS: usize = 4;
 
@@ -570,6 +577,10 @@ pub enum DegenerateReason {
         actual: usize,
     },
     NoFactors,
+    DisconnectedFromFixedPose {
+        disconnected_pose_count: NonZeroUsize,
+    },
+    UnobservableMetricScale,
     NonProjectableFactors {
         count: usize,
     },
@@ -581,6 +592,10 @@ pub enum BaExecutionError {
         keyframe_id: KeyframeId,
     },
     MissingKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    MissingObservationKeyframe {
+        point_id: MapPointId,
         keyframe_id: KeyframeId,
     },
     DuplicateLandmarkObservation {
@@ -628,6 +643,13 @@ impl std::fmt::Display for BaExecutionError {
                     "full BA window references missing keyframe {keyframe_id:?}"
                 )
             }
+            Self::MissingObservationKeyframe {
+                point_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "landmark {point_id:?} observation references missing keyframe {keyframe_id:?}"
+            ),
             Self::DuplicateLandmarkObservation {
                 point_id,
                 keyframe_id,
@@ -682,6 +704,7 @@ impl std::error::Error for BaExecutionError {
             Self::InvalidOutcome { source } => Some(source),
             Self::DuplicateKeyframe { .. }
             | Self::MissingKeyframe { .. }
+            | Self::MissingObservationKeyframe { .. }
             | Self::DuplicateLandmarkObservation { .. }
             | Self::InvariantViolation { .. } => None,
         }
@@ -1802,6 +1825,10 @@ enum FullBaBuildError {
     MissingKeyframe {
         keyframe_id: KeyframeId,
     },
+    MissingObservationKeyframe {
+        point_id: MapPointId,
+        keyframe_id: KeyframeId,
+    },
     TooFewKeyframes {
         required: usize,
         actual: usize,
@@ -1820,6 +1847,13 @@ enum FullBaBuildError {
         required: usize,
         actual: usize,
     },
+    DisconnectedFromFixedPose {
+        disconnected_pose_count: NonZeroUsize,
+    },
+    UnobservableMetricScale {
+        max_camera_displacement_m: f32,
+        min_required_m: f32,
+    },
 }
 
 impl std::fmt::Display for FullBaBuildError {
@@ -1835,6 +1869,13 @@ impl std::fmt::Display for FullBaBuildError {
                     "full BA window references missing keyframe {keyframe_id:?}"
                 )
             }
+            FullBaBuildError::MissingObservationKeyframe {
+                point_id,
+                keyframe_id,
+            } => write!(
+                f,
+                "landmark {point_id:?} observation references missing keyframe {keyframe_id:?}"
+            ),
             FullBaBuildError::TooFewKeyframes { required, actual } => {
                 write!(
                     f,
@@ -1865,6 +1906,19 @@ impl std::fmt::Display for FullBaBuildError {
                 f,
                 "keyframe {keyframe_id:?} has too few BA observations: required={required}, actual={actual}"
             ),
+            FullBaBuildError::DisconnectedFromFixedPose {
+                disconnected_pose_count,
+            } => write!(
+                f,
+                "full BA has {disconnected_pose_count} variable pose(s) disconnected from the exactly fixed first pose"
+            ),
+            FullBaBuildError::UnobservableMetricScale {
+                max_camera_displacement_m,
+                min_required_m,
+            } => write!(
+                f,
+                "full BA cannot condition its exact metric-scale anchor: maximum landmark displacement from the fixed camera centre is {max_camera_displacement_m}m, required >= {min_required_m}m"
+            ),
         }
     }
 }
@@ -1876,10 +1930,13 @@ impl std::error::Error for FullBaBuildError {
             Self::EmptyWindow
             | Self::DuplicateKeyframe { .. }
             | Self::MissingKeyframe { .. }
+            | Self::MissingObservationKeyframe { .. }
             | Self::TooFewKeyframes { .. }
             | Self::DuplicateLandmarkObservation { .. }
             | Self::NoLandmarks
-            | Self::PoseHasTooFewObservations { .. } => None,
+            | Self::PoseHasTooFewObservations { .. }
+            | Self::DisconnectedFromFixedPose { .. }
+            | Self::UnobservableMetricScale { .. } => None,
         }
     }
 }
@@ -1902,12 +1959,27 @@ fn classify_full_ba_build_error(
             required,
             actual,
         }),
+        FullBaBuildError::DisconnectedFromFixedPose {
+            disconnected_pose_count,
+        } => Ok(DegenerateReason::DisconnectedFromFixedPose {
+            disconnected_pose_count,
+        }),
+        FullBaBuildError::UnobservableMetricScale { .. } => {
+            Ok(DegenerateReason::UnobservableMetricScale)
+        }
         FullBaBuildError::DuplicateKeyframe { keyframe_id } => {
             Err(BaExecutionError::DuplicateKeyframe { keyframe_id })
         }
         FullBaBuildError::MissingKeyframe { keyframe_id } => {
             Err(BaExecutionError::MissingKeyframe { keyframe_id })
         }
+        FullBaBuildError::MissingObservationKeyframe {
+            point_id,
+            keyframe_id,
+        } => Err(BaExecutionError::MissingObservationKeyframe {
+            point_id,
+            keyframe_id,
+        }),
         FullBaBuildError::DuplicateLandmarkObservation {
             point_id,
             keyframe_id,
@@ -1935,6 +2007,15 @@ impl PoseVarIndex {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FixedPoseIndex(usize);
+
+impl FixedPoseIndex {
+    fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct LandmarkVarIndex(usize);
 
 impl LandmarkVarIndex {
@@ -1950,23 +2031,168 @@ struct PoseVariable {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct FixedPose {
+    pose: Pose,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct LandmarkVariable {
     point_id: MapPointId,
     position: Point3,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FactorPose {
+    Variable(PoseVarIndex),
+    Fixed(FixedPoseIndex),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ReprojectionFactor {
-    pose: PoseVarIndex,
+    pose: FactorPose,
     landmark: LandmarkVarIndex,
     pixel: Keypoint,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LandmarkAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl LandmarkAxis {
+    fn index(self) -> usize {
+        match self {
+            Self::X => 0,
+            Self::Y => 1,
+            Self::Z => 2,
+        }
+    }
+
+    fn coordinate_m(self, point: Point3) -> f32 {
+        match self {
+            Self::X => point.x,
+            Self::Y => point.y,
+            Self::Z => point.z,
+        }
+    }
+
+    fn set_coordinate_m(self, point: &mut Point3, coordinate_m: f32) {
+        match self {
+            Self::X => point.x = coordinate_m,
+            Self::Y => point.y = coordinate_m,
+            Self::Z => point.z = coordinate_m,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MetricScaleAnchor {
+    landmark: LandmarkVarIndex,
+    axis: LandmarkAxis,
+    initial_coordinate_m: f32,
+    absolute_camera_displacement_m: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MetricScaleAnchorError {
+    max_camera_displacement_m: f32,
+    min_required_m: f32,
+}
+
+impl MetricScaleAnchor {
+    fn select(
+        fixed_world_to_camera: Pose,
+        landmarks: &[LandmarkVariable],
+    ) -> Result<Self, MetricScaleAnchorError> {
+        let fixed_camera_center_m = fixed_world_to_camera.inverse().translation();
+        let mut best: Option<Self> = None;
+
+        for (landmark_index, landmark) in landmarks.iter().enumerate() {
+            for axis in [LandmarkAxis::X, LandmarkAxis::Y, LandmarkAxis::Z] {
+                let coordinate_m = axis.coordinate_m(landmark.position);
+                let displacement_m = (coordinate_m - fixed_camera_center_m[axis.index()]).abs();
+                if !displacement_m.is_finite()
+                    || best.is_some_and(|anchor| {
+                        displacement_m <= anchor.absolute_camera_displacement_m
+                    })
+                {
+                    continue;
+                }
+                best = Some(Self {
+                    landmark: LandmarkVarIndex(landmark_index),
+                    axis,
+                    initial_coordinate_m: coordinate_m,
+                    absolute_camera_displacement_m: displacement_m,
+                });
+            }
+        }
+
+        let max_displacement_m = best
+            .map(|anchor| anchor.absolute_camera_displacement_m)
+            .unwrap_or(0.0);
+        match best {
+            Some(anchor)
+                if anchor.absolute_camera_displacement_m >= MIN_SCALE_ANCHOR_DISPLACEMENT_M =>
+            {
+                Ok(anchor)
+            }
+            _ => Err(MetricScaleAnchorError {
+                max_camera_displacement_m: max_displacement_m,
+                min_required_m: MIN_SCALE_ANCHOR_DISPLACEMENT_M,
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FullBaProblem {
-    poses: Vec<PoseVariable>,
+    variable_poses: Vec<PoseVariable>,
+    fixed_poses: Vec<FixedPose>,
     landmarks: Vec<LandmarkVariable>,
     factors: Vec<ReprojectionFactor>,
+    metric_scale_anchor: MetricScaleAnchor,
+}
+
+fn disconnected_variable_pose_count(
+    pose_count: usize,
+    landmark_count: usize,
+    factors: &[ReprojectionFactor],
+) -> Option<NonZeroUsize> {
+    let mut reachable_poses = vec![false; pose_count];
+    let fixed_pose_reachable = reachable_poses.first_mut()?;
+    *fixed_pose_reachable = true;
+    let mut reachable_landmarks = vec![false; landmark_count];
+
+    loop {
+        let mut changed = false;
+        for factor in factors {
+            let FactorPose::Variable(pose) = factor.pose else {
+                continue;
+            };
+            let pose_index = pose.as_usize();
+            let landmark_index = factor.landmark.as_usize();
+            if reachable_poses[pose_index] && !reachable_landmarks[landmark_index] {
+                reachable_landmarks[landmark_index] = true;
+                changed = true;
+            }
+            if reachable_landmarks[landmark_index] && !reachable_poses[pose_index] {
+                reachable_poses[pose_index] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    NonZeroUsize::new(
+        reachable_poses
+            .into_iter()
+            .filter(|reachable| !reachable)
+            .count(),
+    )
 }
 
 impl FullBaProblem {
@@ -1980,8 +2206,9 @@ impl FullBaProblem {
             return Err(FullBaBuildError::EmptyWindow);
         }
 
-        let mut poses = Vec::new();
-        let mut seen_keyframes = HashSet::new();
+        let variable_pose_capacity = requested_window.len().min(max_window.get());
+        let mut variable_poses = Vec::with_capacity(variable_pose_capacity);
+        let mut seen_keyframes = HashSet::with_capacity(variable_pose_capacity);
         for &keyframe_id in requested_window.iter().take(max_window.get()) {
             if !seen_keyframes.insert(keyframe_id) {
                 return Err(FullBaBuildError::DuplicateKeyframe { keyframe_id });
@@ -1989,52 +2216,48 @@ impl FullBaProblem {
             let entry = map
                 .keyframe(keyframe_id)
                 .ok_or(FullBaBuildError::MissingKeyframe { keyframe_id })?;
-            poses.push(PoseVariable {
+            variable_poses.push(PoseVariable {
                 keyframe_id,
                 pose: entry.pose(),
             });
         }
 
-        if poses.len() < MIN_BA_POSES {
+        if variable_poses.len() < MIN_BA_POSES {
             return Err(FullBaBuildError::TooFewKeyframes {
                 required: MIN_BA_POSES,
-                actual: poses.len(),
+                actual: variable_poses.len(),
             });
         }
 
-        let mut pose_lookup = HashMap::new();
-        for (idx, pose) in poses.iter().enumerate() {
+        let mut pose_lookup = HashMap::with_capacity(variable_poses.len());
+        for (idx, pose) in variable_poses.iter().enumerate() {
             pose_lookup.insert(pose.keyframe_id, PoseVarIndex(idx));
         }
 
+        let mut fixed_poses = Vec::new();
+        let mut fixed_pose_lookup = HashMap::new();
         let mut landmarks = Vec::new();
         let mut factors = Vec::new();
-        let mut pose_counts = vec![0_usize; poses.len()];
+        let mut pose_counts = vec![0_usize; variable_poses.len()];
+        let mut seen_observation_keyframes = HashSet::new();
 
         for (point_id, point) in map.points() {
-            let mut local_observations = Vec::new();
-            let mut seen_local_poses = HashSet::new();
-
+            seen_observation_keyframes.clear();
+            let mut variable_observation_count = 0_usize;
             for &obs in point.observations() {
-                let Some(&pose_idx) = pose_lookup.get(&obs.keyframe_id()) else {
-                    continue;
-                };
-                if !seen_local_poses.insert(pose_idx) {
+                if !seen_observation_keyframes.insert(obs.keyframe_id()) {
                     return Err(FullBaBuildError::DuplicateLandmarkObservation {
                         point_id,
                         keyframe_id: obs.keyframe_id(),
                     });
                 }
-                let pixel = map
-                    .keypoint(obs)
-                    .map_err(|source| FullBaBuildError::MapLookup {
-                        keypoint: obs,
-                        source,
-                    })?;
-                local_observations.push((pose_idx, pixel));
+                variable_observation_count = variable_observation_count
+                    .saturating_add(usize::from(pose_lookup.contains_key(&obs.keyframe_id())));
             }
 
-            if local_observations.len() < MIN_LANDMARK_OBSERVATIONS {
+            if variable_observation_count == 0
+                || point.observation_count() < MIN_LANDMARK_OBSERVATIONS
+            {
                 continue;
             }
 
@@ -2044,10 +2267,44 @@ impl FullBaProblem {
                 position: point.position(),
             });
 
-            for (pose_idx, pixel) in local_observations {
-                pose_counts[pose_idx.as_usize()] += 1;
+            // Outside-window observations retain their measured pixels and use
+            // immutable camera poses, so moving this landmark cannot silently
+            // discard constraints owned by the rest of the map.
+            for &obs in point.observations() {
+                let pixel = map
+                    .keypoint(obs)
+                    .map_err(|source| FullBaBuildError::MapLookup {
+                        keypoint: obs,
+                        source,
+                    })?;
+                let pose = match pose_lookup.get(&obs.keyframe_id()).copied() {
+                    Some(pose_idx) => {
+                        let pose_count = &mut pose_counts[pose_idx.as_usize()];
+                        *pose_count = pose_count.saturating_add(1);
+                        FactorPose::Variable(pose_idx)
+                    }
+                    None => {
+                        let fixed_pose_idx =
+                            match fixed_pose_lookup.get(&obs.keyframe_id()).copied() {
+                                Some(index) => index,
+                                None => {
+                                    let entry = map.keyframe(obs.keyframe_id()).ok_or(
+                                        FullBaBuildError::MissingObservationKeyframe {
+                                            point_id,
+                                            keyframe_id: obs.keyframe_id(),
+                                        },
+                                    )?;
+                                    let index = FixedPoseIndex(fixed_poses.len());
+                                    fixed_poses.push(FixedPose { pose: entry.pose() });
+                                    fixed_pose_lookup.insert(obs.keyframe_id(), index);
+                                    index
+                                }
+                            };
+                        FactorPose::Fixed(fixed_pose_idx)
+                    }
+                };
                 factors.push(ReprojectionFactor {
-                    pose: pose_idx,
+                    pose,
                     landmark: landmark_idx,
                     pixel,
                 });
@@ -2058,7 +2315,7 @@ impl FullBaProblem {
             return Err(FullBaBuildError::NoLandmarks);
         }
 
-        for (idx, pose) in poses.iter().enumerate() {
+        for (idx, pose) in variable_poses.iter().enumerate() {
             if pose_counts[idx] < min_observations.get() {
                 return Err(FullBaBuildError::PoseHasTooFewObservations {
                     keyframe_id: pose.keyframe_id,
@@ -2068,16 +2325,41 @@ impl FullBaProblem {
             }
         }
 
+        // One exact pose and one exact scale coordinate only remove a single
+        // connected component's similarity gauge.
+        if let Some(disconnected_pose_count) =
+            disconnected_variable_pose_count(variable_poses.len(), landmarks.len(), &factors)
+        {
+            return Err(FullBaBuildError::DisconnectedFromFixedPose {
+                disconnected_pose_count,
+            });
+        }
+
+        let metric_scale_anchor = MetricScaleAnchor::select(variable_poses[0].pose, &landmarks)
+            .map_err(|error| FullBaBuildError::UnobservableMetricScale {
+                max_camera_displacement_m: error.max_camera_displacement_m,
+                min_required_m: error.min_required_m,
+            })?;
+
         Ok(Self {
-            poses,
+            variable_poses,
+            fixed_poses,
             landmarks,
             factors,
+            metric_scale_anchor,
         })
+    }
+
+    fn factor_pose(&self, pose: FactorPose) -> Pose {
+        match pose {
+            FactorPose::Variable(index) => self.variable_poses[index.as_usize()].pose,
+            FactorPose::Fixed(index) => self.fixed_poses[index.as_usize()].pose,
+        }
     }
 
     fn write_back(&self, map: &mut SlamMap) -> Result<(), crate::map::MapError> {
         let pose_updates = self
-            .poses
+            .variable_poses
             .iter()
             .map(|pose| (pose.keyframe_id, pose.pose))
             .collect::<Vec<_>>();
@@ -2104,6 +2386,12 @@ struct LandmarkAccumulator {
 }
 
 impl LandmarkAccumulator {
+    fn reset(&mut self) {
+        self.c = [[0.0; 3]; 3];
+        self.b = [0.0; 3];
+        self.links.clear();
+    }
+
     fn add_link(&mut self, pose: PoseVarIndex, cross: [[f32; 3]; 6]) {
         if let Some(existing) = self.links.iter_mut().find(|link| link.pose == pose) {
             for (row, cross_row) in cross.iter().enumerate() {
@@ -2114,6 +2402,21 @@ impl LandmarkAccumulator {
             return;
         }
         self.links.push(PoseLandmarkCross { pose, b: cross });
+    }
+
+    fn fix_delta_axis(&mut self, axis: LandmarkAxis) {
+        let axis = axis.index();
+        for index in 0..3 {
+            self.c[axis][index] = 0.0;
+            self.c[index][axis] = 0.0;
+        }
+        self.c[axis][axis] = 1.0;
+        self.b[axis] = 0.0;
+        for link in &mut self.links {
+            for row in &mut link.b {
+                row[axis] = 0.0;
+            }
+        }
     }
 }
 
@@ -2315,13 +2618,10 @@ impl LocalBundleAdjuster {
                 source,
             })?;
 
-            let mut max_step = 0.0_f32;
+            let mut all_steps_converged = true;
             for i in 0..frame_count {
                 let step = extract_se3_delta(b, i * 6);
-                let step_norm = norm6(step);
-                if step_norm > max_step {
-                    max_step = step_norm;
-                }
+                all_steps_converged &= se3_step_is_converged(step);
                 let pose = self.frames[i].pose;
                 let updated = apply_se3_delta(pose, step);
                 crate::Pose64::try_from_pose32(updated).map_err(|source| {
@@ -2334,7 +2634,7 @@ impl LocalBundleAdjuster {
                 self.frames[i].pose = updated;
             }
 
-            if max_step < STEP_CONVERGENCE_THRESHOLD {
+            if all_steps_converged {
                 return Ok(PoseBaTermination::Converged {
                     iterations: NonZeroUsize::new(iter + 1).ok_or(
                         PoseBaError::InvariantViolation {
@@ -2379,7 +2679,7 @@ impl LocalBundleAdjuster {
     }
 
     fn optimize_full(&mut self, problem: &mut FullBaProblem) -> Result<BaResult, BaExecutionError> {
-        let pose_count = problem.poses.len();
+        let pose_count = problem.variable_poses.len();
         let landmark_count = problem.landmarks.len();
         if pose_count < MIN_BA_POSES {
             return Ok(BaResult::Degenerate {
@@ -2424,13 +2724,15 @@ impl LocalBundleAdjuster {
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
         let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
-        let mut landmark_accumulators: Vec<LandmarkAccumulator> =
-            Vec::with_capacity(landmark_count);
+        let mut landmark_accumulators: Vec<LandmarkAccumulator> = (0..landmark_count)
+            .map(|_| LandmarkAccumulator::default())
+            .collect();
+        let mut schur_landmarks: Vec<LandmarkSchur> = Vec::with_capacity(landmark_count);
         let mut pose_rhs_before_schur: Vec<f32> = vec![0.0; pose_dim];
 
         for iter in 0..max_iters {
             pose_backup.clear();
-            pose_backup.extend(problem.poses.iter().map(|pv| pv.pose));
+            pose_backup.extend(problem.variable_poses.iter().map(|pv| pv.pose));
             landmark_backup.clear();
             landmark_backup.extend(problem.landmarks.iter().map(|lv| lv.position));
 
@@ -2442,14 +2744,13 @@ impl LocalBundleAdjuster {
             let pose_damping = lm_state.lambda().max(lm_config.min_lambda());
             let landmark_damping = pose_damping.max(MIN_LANDMARK_DAMPING);
 
-            landmark_accumulators.clear();
-            landmark_accumulators
-                .extend((0..landmark_count).map(|_| LandmarkAccumulator::default()));
+            for accumulator in &mut landmark_accumulators {
+                accumulator.reset();
+            }
 
             for factor in &problem.factors {
-                let pose_idx = factor.pose;
                 let landmark_idx = factor.landmark;
-                let pose = problem.poses[pose_idx.as_usize()].pose;
+                let pose = problem.factor_pose(factor.pose);
                 let point = problem.landmarks[landmark_idx.as_usize()].position;
 
                 let Some((residual, j_pose, j_landmark)) =
@@ -2468,16 +2769,17 @@ impl LocalBundleAdjuster {
                 let j_pose_scaled = j_pose.map(|row| row.map(|v| v * scale));
                 let j_landmark_scaled = j_landmark.map(|row| row.map(|v| v * scale));
 
-                accumulate_pose_hessian(s, pose_dim, pose_idx, j_pose_scaled);
-                accumulate_pose_rhs(rhs, pose_idx, j_pose_scaled, r_scaled);
-
                 let acc = &mut landmark_accumulators[landmark_idx.as_usize()];
                 accumulate_landmark_hessian(&mut acc.c, j_landmark_scaled);
                 accumulate_landmark_rhs(&mut acc.b, j_landmark_scaled, r_scaled);
-                acc.add_link(
-                    pose_idx,
-                    pose_landmark_cross(j_pose_scaled, j_landmark_scaled),
-                );
+                if let FactorPose::Variable(pose_idx) = factor.pose {
+                    accumulate_pose_hessian(s, pose_dim, pose_idx, j_pose_scaled);
+                    accumulate_pose_rhs(rhs, pose_idx, j_pose_scaled, r_scaled);
+                    acc.add_link(
+                        pose_idx,
+                        pose_landmark_cross(j_pose_scaled, j_landmark_scaled),
+                    );
+                }
             }
 
             if motion_weight > 0.0 && pose_count >= 2 {
@@ -2486,8 +2788,8 @@ impl LocalBundleAdjuster {
                         s,
                         rhs,
                         pose_dim,
-                        problem.poses[i - 1].pose,
-                        problem.poses[i].pose,
+                        problem.variable_poses[i - 1].pose,
+                        problem.variable_poses[i].pose,
                         (i - 1) * 6,
                         i * 6,
                         motion_weight,
@@ -2495,14 +2797,26 @@ impl LocalBundleAdjuster {
                 }
             }
 
+            // Fixing the first camera removes the rigid gauge, but left-image
+            // factors do not guarantee a conditioned metric-scale baseline.
+            // Preserve the stereo-initialized scale by fixing the
+            // best-conditioned landmark coordinate exactly, without a
+            // unit-mixing weighted residual.
+            let scale_anchor = problem.metric_scale_anchor;
+            debug_assert!(
+                scale_anchor.absolute_camera_displacement_m >= MIN_SCALE_ANCHOR_DISPLACEMENT_M
+            );
+            landmark_accumulators[scale_anchor.landmark.as_usize()]
+                .fix_delta_axis(scale_anchor.axis);
+
             pose_rhs_before_schur.copy_from_slice(rhs);
 
             for i in 0..pose_dim {
                 s[i * pose_dim + i] += pose_damping;
             }
 
-            let mut schur_landmarks = Vec::with_capacity(landmark_count);
-            for (landmark_index, acc) in landmark_accumulators.drain(..).enumerate() {
+            schur_landmarks.clear();
+            for (landmark_index, acc) in landmark_accumulators.iter_mut().enumerate() {
                 let mut c = acc.c;
                 for (i, c_row) in c.iter_mut().enumerate() {
                     c_row[i] += landmark_damping;
@@ -2536,7 +2850,7 @@ impl LocalBundleAdjuster {
                 schur_landmarks.push(LandmarkSchur {
                     inv_c,
                     b: acc.b,
-                    links: acc.links,
+                    links: std::mem::take(&mut acc.links),
                 });
             }
 
@@ -2550,11 +2864,11 @@ impl LocalBundleAdjuster {
             })?;
 
             let mut predicted_decrease = 0.0_f64;
-            let mut max_step = 0.0_f32;
-            for (pose_i, pose_var) in problem.poses.iter_mut().enumerate() {
+            let mut all_steps_converged = true;
+            for (pose_i, pose_var) in problem.variable_poses.iter_mut().enumerate() {
                 let base = pose_i * 6;
                 let delta = extract_se3_delta(rhs, base);
-                max_step = max_step.max(norm6(delta));
+                all_steps_converged &= se3_step_is_converged(delta);
                 for k in 0..6 {
                     let d = delta[k] as f64;
                     let gradient = pose_rhs_before_schur[base + k] as f64;
@@ -2581,7 +2895,7 @@ impl LocalBundleAdjuster {
                     schur.b[2] - coupling[2],
                 ];
                 let delta_landmark = math::mat_mul_vec(schur.inv_c, rhs_landmark);
-                max_step = max_step.max(norm3(delta_landmark));
+                all_steps_converged &= norm3(delta_landmark) < LANDMARK_STEP_CONVERGENCE_M;
                 for (axis, d) in delta_landmark.iter().enumerate() {
                     let d = *d as f64;
                     let gradient = schur.b[axis] as f64;
@@ -2591,6 +2905,15 @@ impl LocalBundleAdjuster {
                 landmark_var.position.x += delta_landmark[0];
                 landmark_var.position.y += delta_landmark[1];
                 landmark_var.position.z += delta_landmark[2];
+                if landmark_i == scale_anchor.landmark.as_usize() {
+                    scale_anchor.axis.set_coordinate_m(
+                        &mut landmark_var.position,
+                        scale_anchor.initial_coordinate_m,
+                    );
+                }
+            }
+            for (accumulator, schur) in landmark_accumulators.iter_mut().zip(&mut schur_landmarks) {
+                accumulator.links = std::mem::take(&mut schur.links);
             }
 
             let prev_cost = lm_state.prev_cost();
@@ -2630,8 +2953,7 @@ impl LocalBundleAdjuster {
                 LmAction::Accept => {
                     accepted_steps = accepted_steps.saturating_add(1);
                     let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
-                    if max_step < STEP_CONVERGENCE_THRESHOLD
-                        || (prev_cost - candidate_cost.get()).abs() <= threshold
+                    if all_steps_converged || (prev_cost - candidate_cost.get()).abs() <= threshold
                     {
                         let iterations = nonzero_iteration_index(iter);
                         let accepted_steps = NonZeroUsize::new(accepted_steps).ok_or(
@@ -2654,7 +2976,7 @@ impl LocalBundleAdjuster {
                         pose_backup.as_slice(),
                         landmark_backup.as_slice(),
                     );
-                    if max_step <= f32::EPSILON {
+                    if all_steps_converged {
                         let iterations = nonzero_iteration_index(iter);
                         let retained_cost = BaCost::new(prev_cost).map_err(|source| {
                             BaExecutionError::InvalidCost {
@@ -2715,7 +3037,11 @@ fn restore_full_ba_candidate(
     pose_backup: &[Pose],
     landmark_backup: &[Point3],
 ) {
-    for (pose_var, pose) in problem.poses.iter_mut().zip(pose_backup.iter().copied()) {
+    for (pose_var, pose) in problem
+        .variable_poses
+        .iter_mut()
+        .zip(pose_backup.iter().copied())
+    {
         pose_var.pose = pose;
     }
     for (landmark_var, point) in problem
@@ -3367,7 +3693,7 @@ fn full_problem_cost(
     let mut nonprojectable_count = 0_usize;
 
     for factor in &problem.factors {
-        let pose = problem.poses[factor.pose.as_usize()].pose;
+        let pose = problem.factor_pose(factor.pose);
         let point = problem.landmarks[factor.landmark.as_usize()].position;
         let Some((residual, _, _)) =
             reprojection_residual_and_jacobians(pose, point, factor.pixel, intrinsics)
@@ -3387,8 +3713,11 @@ fn full_problem_cost(
 
     if motion_weight > 0.0 {
         let w2 = (motion_weight as f64) * (motion_weight as f64);
-        for i in 1..problem.poses.len() {
-            let delta = se3_delta_between(problem.poses[i - 1].pose, problem.poses[i].pose);
+        for i in 1..problem.variable_poses.len() {
+            let delta = se3_delta_between(
+                problem.variable_poses[i - 1].pose,
+                problem.variable_poses[i].pose,
+            );
             for &value in &delta {
                 let d = value as f64;
                 cost += 0.5 * w2 * d * d;
@@ -3720,8 +4049,9 @@ fn norm3(v: [f32; 3]) -> f32 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
-fn norm6(v: [f32; 6]) -> f32 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3] + v[4] * v[4] + v[5] * v[5]).sqrt()
+fn se3_step_is_converged(delta: [f32; 6]) -> bool {
+    norm3([delta[0], delta[1], delta[2]]) < POSE_TRANSLATION_STEP_CONVERGENCE_M
+        && norm3([delta[3], delta[4], delta[5]]) < POSE_ROTATION_STEP_CONVERGENCE_RAD
 }
 
 pub(crate) fn solve_linear_system(
@@ -4023,6 +4353,104 @@ mod tests {
         }
 
         (map, intrinsics, kf_0, kf_1, true_pose_1, points_true)
+    }
+
+    fn add_fixed_observation_keyframe(
+        map: &mut SlamMap,
+        intrinsics: PinholeIntrinsics,
+        source_keyframe: KeyframeId,
+        points_world_m: &[Point3],
+        world_to_camera: Pose,
+        omitted_point_index: Option<usize>,
+    ) -> KeyframeId {
+        let keypoints = points_world_m
+            .iter()
+            .copied()
+            .map(|point| {
+                project_world_point(world_to_camera, point, intrinsics)
+                    .expect("fixture point visible in fixed camera")
+            })
+            .collect();
+        let detections =
+            make_detections(SensorId::StereoLeft, FrameId::new(502), 640, 480, keypoints)
+                .expect("fixed-camera detections");
+        let fixed_keyframe = map
+            .add_keyframe_from_detections(
+                detections.as_ref(),
+                Timestamp::from_nanos(3_000_000),
+                world_to_camera,
+            )
+            .expect("insert fixed-camera keyframe");
+
+        for index in 0..points_world_m.len() {
+            if omitted_point_index == Some(index) {
+                continue;
+            }
+            let source_keypoint = map
+                .keyframe_keypoint(source_keyframe, index)
+                .expect("source keypoint");
+            let point_id = map
+                .map_point_for_keypoint(source_keypoint)
+                .expect("source association lookup")
+                .expect("source map point");
+            let fixed_keypoint = map
+                .keyframe_keypoint(fixed_keyframe, index)
+                .expect("fixed keypoint");
+            map.add_observation(point_id, fixed_keypoint)
+                .expect("add fixed-camera observation");
+        }
+        fixed_keyframe
+    }
+
+    fn make_full_ba_problem(
+        variable_poses: Vec<PoseVariable>,
+        fixed_poses: Vec<FixedPose>,
+        landmarks: Vec<LandmarkVariable>,
+        factors: Vec<ReprojectionFactor>,
+    ) -> FullBaProblem {
+        let metric_scale_anchor = MetricScaleAnchor::select(variable_poses[0].pose, &landmarks)
+            .expect("test problem has an observable metric-scale anchor");
+        FullBaProblem {
+            variable_poses,
+            fixed_poses,
+            landmarks,
+            factors,
+            metric_scale_anchor,
+        }
+    }
+
+    fn dummy_metric_scale_anchor() -> MetricScaleAnchor {
+        MetricScaleAnchor {
+            landmark: LandmarkVarIndex(0),
+            axis: LandmarkAxis::X,
+            initial_coordinate_m: 0.0,
+            absolute_camera_displacement_m: MIN_SCALE_ANCHOR_DISPLACEMENT_M,
+        }
+    }
+
+    fn scale_problem_about_fixed_camera(problem: &mut FullBaProblem, scale: f32) {
+        let fixed_camera_center_m = problem.variable_poses[0].pose.inverse().translation();
+        for pose in &mut problem.variable_poses {
+            let camera_center_m = pose.pose.inverse().translation();
+            let scaled_center_m = std::array::from_fn(|axis| {
+                fixed_camera_center_m[axis]
+                    + scale * (camera_center_m[axis] - fixed_camera_center_m[axis])
+            });
+            let rotation = pose.pose.rotation();
+            let rotated_center = math::mat_mul_vec(rotation, scaled_center_m);
+            pose.pose = Pose::from_rt(
+                rotation,
+                [-rotated_center[0], -rotated_center[1], -rotated_center[2]],
+            );
+        }
+        for landmark in &mut problem.landmarks {
+            landmark.position.x =
+                fixed_camera_center_m[0] + scale * (landmark.position.x - fixed_camera_center_m[0]);
+            landmark.position.y =
+                fixed_camera_center_m[1] + scale * (landmark.position.y - fixed_camera_center_m[1]);
+            landmark.position.z =
+                fixed_camera_center_m[2] + scale * (landmark.position.z - fixed_camera_center_m[2]);
+        }
     }
 
     #[test]
@@ -4333,6 +4761,34 @@ mod tests {
     }
 
     #[test]
+    fn se3_convergence_checks_translation_and_rotation_in_their_own_units() {
+        assert!(se3_step_is_converged([
+            0.5 * POSE_TRANSLATION_STEP_CONVERGENCE_M,
+            0.0,
+            0.0,
+            0.5 * POSE_ROTATION_STEP_CONVERGENCE_RAD,
+            0.0,
+            0.0,
+        ]));
+        assert!(!se3_step_is_converged([
+            POSE_TRANSLATION_STEP_CONVERGENCE_M,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ]));
+        assert!(!se3_step_is_converged([
+            0.0,
+            0.0,
+            0.0,
+            POSE_ROTATION_STEP_CONVERGENCE_RAD,
+            0.0,
+            0.0,
+        ]));
+    }
+
+    #[test]
     fn apply_se3_delta_matches_pose64_reference_update() {
         let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
         let delta = [0.12, -0.07, 0.05, 0.18, -0.09, 0.11];
@@ -4444,8 +4900,8 @@ mod tests {
     fn full_problem_cost_rejects_nonprojectable_factors() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let mut problem = FullBaProblem {
-            poses: vec![
+        let mut problem = make_full_ba_problem(
+            vec![
                 PoseVariable {
                     keyframe_id: KeyframeId::default(),
                     pose: Pose::identity(),
@@ -4455,7 +4911,8 @@ mod tests {
                     pose: Pose::identity(),
                 },
             ],
-            landmarks: vec![LandmarkVariable {
+            Vec::new(),
+            vec![LandmarkVariable {
                 point_id: MapPointId::default(),
                 position: Point3 {
                     x: 0.0,
@@ -4463,12 +4920,12 @@ mod tests {
                     z: -1.0,
                 },
             }],
-            factors: vec![ReprojectionFactor {
-                pose: PoseVarIndex(0),
+            vec![ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(0)),
                 landmark: LandmarkVarIndex(0),
                 pixel: Keypoint { x: 320.0, y: 240.0 },
             }],
-        };
+        );
 
         let error = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
             .expect_err("a behind-camera factor cannot disappear from cost");
@@ -4495,9 +4952,11 @@ mod tests {
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
 
         let mut no_poses = FullBaProblem {
-            poses: Vec::new(),
+            variable_poses: Vec::new(),
+            fixed_poses: Vec::new(),
             landmarks: Vec::new(),
             factors: Vec::new(),
+            metric_scale_anchor: dummy_metric_scale_anchor(),
         };
         assert!(matches!(
             ba.optimize_full(&mut no_poses),
@@ -4507,7 +4966,7 @@ mod tests {
         ));
 
         let mut no_landmarks = FullBaProblem {
-            poses: vec![
+            variable_poses: vec![
                 PoseVariable {
                     keyframe_id: KeyframeId::default(),
                     pose: Pose::identity(),
@@ -4517,8 +4976,10 @@ mod tests {
                     pose: Pose::identity(),
                 },
             ],
+            fixed_poses: Vec::new(),
             landmarks: Vec::new(),
             factors: Vec::new(),
+            metric_scale_anchor: dummy_metric_scale_anchor(),
         };
         assert!(matches!(
             ba.optimize_full(&mut no_landmarks),
@@ -4528,7 +4989,7 @@ mod tests {
         ));
 
         let mut no_factors = FullBaProblem {
-            poses: vec![
+            variable_poses: vec![
                 PoseVariable {
                     keyframe_id: KeyframeId::default(),
                     pose: Pose::identity(),
@@ -4538,6 +4999,7 @@ mod tests {
                     pose: Pose::identity(),
                 },
             ],
+            fixed_poses: Vec::new(),
             landmarks: vec![LandmarkVariable {
                 point_id: MapPointId::default(),
                 position: Point3 {
@@ -4547,6 +5009,7 @@ mod tests {
                 },
             }],
             factors: Vec::new(),
+            metric_scale_anchor: dummy_metric_scale_anchor(),
         };
         assert!(matches!(
             ba.optimize_full(&mut no_factors),
@@ -4557,57 +5020,28 @@ mod tests {
     }
 
     #[test]
-    fn optimize_full_reports_landmark_breakdown_without_mutating_problem() {
-        let intrinsics =
-            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-8), 0.0).expect("BA config");
-        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
-        let original_pose = axis_angle_pose([0.1, -0.2, 0.3], [0.01, -0.02, 0.03]);
-        let original_point = Point3 {
-            x: 0.0,
-            y: 0.0,
-            z: 1e20,
-        };
-        let mut problem = FullBaProblem {
-            poses: vec![
-                PoseVariable {
-                    keyframe_id: KeyframeId::default(),
-                    pose: Pose::identity(),
-                },
-                PoseVariable {
-                    keyframe_id: KeyframeId::default(),
-                    pose: original_pose,
-                },
-            ],
-            landmarks: vec![LandmarkVariable {
-                point_id: MapPointId::default(),
-                position: original_point,
-            }],
-            factors: vec![ReprojectionFactor {
+    fn exact_metric_scale_anchor_removes_one_landmark_degree_of_freedom() {
+        let mut accumulator = LandmarkAccumulator {
+            c: [[4.0, 1.0, 2.0], [1.0, 5.0, 3.0], [2.0, 3.0, 6.0]],
+            b: [7.0, 8.0, 9.0],
+            links: vec![PoseLandmarkCross {
                 pose: PoseVarIndex(1),
-                landmark: LandmarkVarIndex(0),
-                pixel: Keypoint { x: 320.0, y: 240.0 },
+                b: [[1.0, 2.0, 3.0]; 6],
             }],
         };
 
-        let error = ba
-            .optimize_full(&mut problem)
-            .expect_err("near-zero landmark information must be a solver error");
+        accumulator.fix_delta_axis(LandmarkAxis::Y);
 
-        assert!(std::error::Error::source(&error).is_some());
-        assert!(matches!(
-            error,
-            BaExecutionError::LandmarkLinearSystem {
-                iteration: 1,
-                landmark_index: 0,
-                source: Matrix3InverseError::Singular { .. },
-            }
-        ));
-        assert!(pose_close(problem.poses[1].pose, original_pose, 0.0));
-        let retained_point = problem.landmarks[0].position;
-        assert_eq!(retained_point.x, original_point.x);
-        assert_eq!(retained_point.y, original_point.y);
-        assert_eq!(retained_point.z, original_point.z);
+        assert_eq!(accumulator.c[1], [0.0, 1.0, 0.0]);
+        assert_eq!([accumulator.c[0][1], accumulator.c[2][1]], [0.0, 0.0]);
+        assert_eq!(accumulator.b[1], 0.0);
+        assert!(accumulator.links[0].b.iter().all(|row| row[1] == 0.0));
+
+        let delta = math::mat_mul_vec(
+            invert_3x3(accumulator.c).expect("anchored block is invertible"),
+            accumulator.b,
+        );
+        assert_eq!(delta[1], 0.0);
     }
 
     #[test]
@@ -4645,18 +5079,18 @@ mod tests {
         let mut factors = Vec::new();
         for pose in [PoseVarIndex(0), PoseVarIndex(1)] {
             factors.push(ReprojectionFactor {
-                pose,
+                pose: FactorPose::Variable(pose),
                 landmark: LandmarkVarIndex(0),
                 pixel: Keypoint { x: 310.0, y: 240.0 },
             });
             factors.push(ReprojectionFactor {
-                pose,
+                pose: FactorPose::Variable(pose),
                 landmark: LandmarkVarIndex(0),
                 pixel: Keypoint { x: 330.0, y: 240.0 },
             });
         }
-        let mut problem = FullBaProblem {
-            poses: vec![
+        let mut problem = make_full_ba_problem(
+            vec![
                 PoseVariable {
                     keyframe_id: KeyframeId::default(),
                     pose: Pose::identity(),
@@ -4666,12 +5100,13 @@ mod tests {
                     pose: Pose::identity(),
                 },
             ],
-            landmarks: vec![LandmarkVariable {
+            Vec::new(),
+            vec![LandmarkVariable {
                 point_id: MapPointId::default(),
                 position: point,
             }],
             factors,
-        };
+        );
         let config = LocalBaConfig::new(5, 3, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
 
@@ -4683,7 +5118,11 @@ mod tests {
                 if stationary.detected_at_iteration() == NonZeroUsize::MIN
         ));
         assert!(!result.is_applicable());
-        assert!(pose_close(problem.poses[1].pose, Pose::identity(), 0.0));
+        assert!(pose_close(
+            problem.variable_poses[1].pose,
+            Pose::identity(),
+            0.0
+        ));
         assert_eq!(problem.landmarks[0].position.x, point.x);
         assert_eq!(problem.landmarks[0].position.y, point.y);
         assert_eq!(problem.landmarks[0].position.z, point.z);
@@ -4708,8 +5147,8 @@ mod tests {
             y: 0.0,
             z: 1e-3,
         };
-        let mut problem = FullBaProblem {
-            poses: vec![
+        let mut problem = make_full_ba_problem(
+            vec![
                 PoseVariable {
                     keyframe_id: KeyframeId::default(),
                     pose: Pose::identity(),
@@ -4719,13 +5158,14 @@ mod tests {
                     pose: Pose::identity(),
                 },
             ],
-            landmarks: vec![LandmarkVariable {
+            Vec::new(),
+            vec![LandmarkVariable {
                 point_id: MapPointId::default(),
                 position: original_point,
             }],
-            factors: vec![
+            vec![
                 ReprojectionFactor {
-                    pose: PoseVarIndex(0),
+                    pose: FactorPose::Variable(PoseVarIndex(0)),
                     landmark: LandmarkVarIndex(0),
                     pixel: Keypoint {
                         x: 10_000.0,
@@ -4733,7 +5173,7 @@ mod tests {
                     },
                 },
                 ReprojectionFactor {
-                    pose: PoseVarIndex(1),
+                    pose: FactorPose::Variable(PoseVarIndex(1)),
                     landmark: LandmarkVarIndex(0),
                     pixel: Keypoint {
                         x: 10_000.0,
@@ -4741,10 +5181,14 @@ mod tests {
                     },
                 },
             ],
-        };
+        );
         let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e4), 0.0).expect("BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
-        let original_poses: Vec<_> = problem.poses.iter().map(|pose| pose.pose).collect();
+        let original_poses: Vec<_> = problem
+            .variable_poses
+            .iter()
+            .map(|pose| pose.pose)
+            .collect();
 
         let result = ba.optimize_full(&mut problem).expect("stalled solve");
 
@@ -4752,7 +5196,7 @@ mod tests {
         assert!(!result.is_applicable());
         assert!(
             problem
-                .poses
+                .variable_poses
                 .iter()
                 .zip(original_poses)
                 .all(|(actual, expected)| pose_close(actual.pose, expected, 0.0))
@@ -4777,6 +5221,10 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
+        let scale_anchor = problem.metric_scale_anchor;
+        let anchored_coordinate_before = scale_anchor
+            .axis
+            .coordinate_m(problem.landmarks[scale_anchor.landmark.as_usize()].position);
         let result = ba.optimize_full(&mut problem).expect("full BA solve");
         match result {
             BaResult::Optimized(optimization) => {
@@ -4788,6 +5236,12 @@ mod tests {
             }
             other => panic!("expected convergence, got {other:?}"),
         }
+        assert_eq!(
+            scale_anchor
+                .axis
+                .coordinate_m(problem.landmarks[scale_anchor.landmark.as_usize()].position),
+            anchored_coordinate_before
+        );
     }
 
     #[test]
@@ -4928,6 +5382,280 @@ mod tests {
                 tol1
             );
         }
+    }
+
+    #[test]
+    fn full_ba_retains_fixed_observations_for_selected_landmarks() {
+        let (mut map, intrinsics, keyframe_0, keyframe_1, _, points_world_m) =
+            build_full_ba_fixture([0.04, -0.01, 0.02, 0.01, -0.005, 0.004]);
+        let variable_pose_1 = axis_angle_pose([0.36, 0.01, 0.02], [0.0, -0.02, 0.015]);
+        let keyframe_2 = add_fixed_observation_keyframe(
+            &mut map,
+            intrinsics,
+            keyframe_0,
+            &points_world_m,
+            variable_pose_1,
+            Some(0),
+        );
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[keyframe_0, keyframe_2],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem with fixed observations");
+
+        assert_eq!(problem.fixed_poses.len(), 1);
+        let point_0 = map
+            .map_point_for_keypoint(
+                map.keyframe_keypoint(keyframe_0, 0)
+                    .expect("keyframe-0 keypoint"),
+            )
+            .expect("point lookup")
+            .expect("point association");
+        let landmark_0 = problem
+            .landmarks
+            .iter()
+            .position(|landmark| landmark.point_id == point_0)
+            .map(LandmarkVarIndex)
+            .expect("landmark with one variable and one fixed observation is retained");
+        let landmark_0_factors: Vec<_> = problem
+            .factors
+            .iter()
+            .filter(|factor| factor.landmark == landmark_0)
+            .collect();
+        assert_eq!(landmark_0_factors.len(), 2);
+        assert_eq!(
+            landmark_0_factors
+                .iter()
+                .filter(|factor| matches!(factor.pose, FactorPose::Variable(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            landmark_0_factors
+                .iter()
+                .filter(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
+                .count(),
+            1
+        );
+
+        let original_fixed_pose = map.keyframe(keyframe_1).expect("fixed keyframe").pose();
+        problem.variable_poses[1].pose = apply_se3_delta(
+            problem.variable_poses[1].pose,
+            [0.01, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        problem
+            .write_back(&mut map)
+            .expect("transactional variable-only writeback");
+        assert!(pose_close(
+            map.keyframe(keyframe_1).expect("fixed keyframe").pose(),
+            original_fixed_pose,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn fixed_observation_factor_contributes_to_full_ba_cost() {
+        let (mut map, intrinsics, keyframe_0, keyframe_1, _, points_world_m) =
+            build_full_ba_fixture([0.0; 6]);
+        let keyframe_2 = add_fixed_observation_keyframe(
+            &mut map,
+            intrinsics,
+            keyframe_0,
+            &points_world_m,
+            axis_angle_pose([0.32, -0.01, 0.02], [0.0, 0.015, -0.01]),
+            None,
+        );
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[keyframe_0, keyframe_2],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem with fixed observations");
+        assert_eq!(problem.fixed_poses.len(), 1);
+        assert!(pose_close(
+            problem.fixed_poses[0].pose,
+            map.keyframe(keyframe_1).expect("fixed keyframe").pose(),
+            0.0
+        ));
+        assert!(
+            problem
+                .factors
+                .iter()
+                .any(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
+        );
+
+        let before = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+            .expect("initial cost")
+            .get();
+        let fixed_factor = problem
+            .factors
+            .iter_mut()
+            .find(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
+            .expect("fixed factor");
+        fixed_factor.pixel.x += 1_000.0;
+        let after = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+            .expect("perturbed cost")
+            .get();
+        assert!(after > before, "fixed factor must affect cost");
+    }
+
+    #[test]
+    fn full_ba_solves_with_fixed_factors_without_moving_fixed_keyframes() {
+        let (mut map, intrinsics, keyframe_0, keyframe_1, _, points_world_m) =
+            build_full_ba_fixture([0.0; 6]);
+        let true_pose_2 = axis_angle_pose([0.34, 0.01, -0.02], [0.0, -0.018, 0.012]);
+        let keyframe_2 = add_fixed_observation_keyframe(
+            &mut map,
+            intrinsics,
+            keyframe_0,
+            &points_world_m,
+            true_pose_2,
+            None,
+        );
+        map.set_keyframe_pose(
+            keyframe_2,
+            apply_se3_delta(true_pose_2, [0.06, -0.02, 0.03, 0.012, -0.008, 0.006]),
+        )
+        .expect("perturb variable keyframe pose");
+        let fixed_pose_before = map.keyframe(keyframe_1).expect("fixed keyframe").pose();
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let before_problem = FullBaProblem::try_from_map(
+            &map,
+            &[keyframe_0, keyframe_2],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        let before_cost = full_problem_cost(&before_problem, intrinsics, 2.0, 0.0)
+            .expect("initial cost")
+            .get();
+
+        let result = ba
+            .optimize_keyframe_window(&mut map, &[keyframe_0, keyframe_2])
+            .expect("full BA with fixed factors");
+
+        assert!(result.is_applicable(), "unexpected BA outcome: {result:?}");
+        let after_problem = FullBaProblem::try_from_map(
+            &map,
+            &[keyframe_0, keyframe_2],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("updated full BA problem");
+        let after_cost = full_problem_cost(&after_problem, intrinsics, 2.0, 0.0)
+            .expect("updated cost")
+            .get();
+        assert!(
+            after_cost < before_cost,
+            "fixed-factor solve did not improve cost: before={before_cost}, after={after_cost}"
+        );
+        assert!(pose_close(
+            map.keyframe(keyframe_1).expect("fixed keyframe").pose(),
+            fixed_pose_before,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn monocular_cost_has_scale_gauge_but_exact_anchor_preserves_metric_scale() {
+        let (map, intrinsics, keyframe_0, keyframe_1, _, _) =
+            build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
+        let ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[keyframe_0, keyframe_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        assert!(problem.fixed_poses.is_empty());
+        let anchor = problem.metric_scale_anchor;
+        let anchored_coordinate_before = anchor
+            .axis
+            .coordinate_m(problem.landmarks[anchor.landmark.as_usize()].position);
+        let cost_before = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+            .expect("initial cost")
+            .get();
+
+        scale_problem_about_fixed_camera(&mut problem, 1.75);
+
+        let cost_after = full_problem_cost(&problem, intrinsics, 2.0, 0.0)
+            .expect("scaled cost")
+            .get();
+        let anchored_coordinate_after = anchor
+            .axis
+            .coordinate_m(problem.landmarks[anchor.landmark.as_usize()].position);
+        assert!(
+            (cost_after - cost_before).abs() <= 1e-3 * cost_before.abs().max(1.0),
+            "monocular reprojection cost changed under a similarity scale: before={cost_before}, after={cost_after}"
+        );
+        assert_ne!(anchored_coordinate_after, anchored_coordinate_before);
+    }
+
+    #[test]
+    fn metric_scale_anchor_rejects_near_zero_camera_displacement() {
+        let landmarks = [LandmarkVariable {
+            point_id: MapPointId::default(),
+            position: Point3 {
+                x: 0.25 * MIN_SCALE_ANCHOR_DISPLACEMENT_M,
+                y: -0.5 * MIN_SCALE_ANCHOR_DISPLACEMENT_M,
+                z: 0.75 * MIN_SCALE_ANCHOR_DISPLACEMENT_M,
+            },
+        }];
+
+        let error = MetricScaleAnchor::select(Pose::identity(), &landmarks)
+            .expect_err("near-zero displacement cannot condition a scale anchor");
+        assert!(error.max_camera_displacement_m < error.min_required_m);
+    }
+
+    #[test]
+    fn full_ba_connectivity_is_rooted_at_the_exactly_fixed_pose() {
+        let factors = [
+            ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(0)),
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 0.0, y: 0.0 },
+            },
+            ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(1)),
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 0.0, y: 0.0 },
+            },
+            ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(2)),
+                landmark: LandmarkVarIndex(1),
+                pixel: Keypoint { x: 0.0, y: 0.0 },
+            },
+            ReprojectionFactor {
+                pose: FactorPose::Fixed(FixedPoseIndex(0)),
+                landmark: LandmarkVarIndex(1),
+                pixel: Keypoint { x: 0.0, y: 0.0 },
+            },
+        ];
+
+        assert_eq!(
+            disconnected_variable_pose_count(3, 2, &factors),
+            NonZeroUsize::new(1)
+        );
+        let reason = classify_full_ba_build_error(FullBaBuildError::DisconnectedFromFixedPose {
+            disconnected_pose_count: NonZeroUsize::MIN,
+        })
+        .expect("disconnected graph is a mathematical degeneracy");
+        assert_eq!(
+            reason,
+            DegenerateReason::DisconnectedFromFixedPose {
+                disconnected_pose_count: NonZeroUsize::MIN
+            }
+        );
     }
 
     #[test]
