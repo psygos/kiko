@@ -22,12 +22,30 @@ pub struct ImageFrame;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GeometryError {
-    NonFiniteScalar { context: &'static str, value: f64 },
-    NonPositiveScalar { context: &'static str, value: f64 },
+    NonFiniteScalar {
+        context: &'static str,
+        value: f64,
+    },
+    NonPositiveScalar {
+        context: &'static str,
+        value: f64,
+    },
     ZeroNormRay,
-    MatrixNotSymmetric { max_asymmetry: f64 },
+    MatrixNotSymmetric {
+        max_asymmetry: f64,
+    },
     MatrixNotPositiveDefinite,
-    NonFiniteTransform,
+    NonFiniteTransformRotation {
+        operation: &'static str,
+        row: usize,
+        col: usize,
+        value: f64,
+    },
+    NonFiniteTransformTranslation {
+        operation: &'static str,
+        axis: usize,
+        value: f64,
+    },
 }
 
 impl std::fmt::Display for GeometryError {
@@ -47,9 +65,23 @@ impl std::fmt::Display for GeometryError {
             GeometryError::MatrixNotPositiveDefinite => {
                 write!(f, "matrix must be positive definite")
             }
-            GeometryError::NonFiniteTransform => {
-                write!(f, "transform must contain only finite values")
-            }
+            GeometryError::NonFiniteTransformRotation {
+                operation,
+                row,
+                col,
+                value,
+            } => write!(
+                f,
+                "{operation} produced non-finite rotation[{row}][{col}]={value}"
+            ),
+            GeometryError::NonFiniteTransformTranslation {
+                operation,
+                axis,
+                value,
+            } => write!(
+                f,
+                "{operation} produced non-finite translation axis {axis}={value}"
+            ),
         }
     }
 }
@@ -116,11 +148,10 @@ pub struct Point3d<Frame> {
 
 impl<Frame> Point3d<Frame> {
     pub fn try_from_xyz(x: f64, y: f64, z: f64) -> Result<Self, GeometryError> {
-        ensure_finite(x, "point.x")?;
-        ensure_finite(y, "point.y")?;
-        ensure_finite(z, "point.z")?;
+        let coords = [x, y, z];
+        validate_coordinates(coords, ["point.x", "point.y", "point.z"])?;
         Ok(Self {
-            coords: [x, y, z],
+            coords,
             _frame: PhantomData,
         })
     }
@@ -154,11 +185,10 @@ pub struct Vec3d<Frame> {
 
 impl<Frame> Vec3d<Frame> {
     pub fn try_from_xyz(x: f64, y: f64, z: f64) -> Result<Self, GeometryError> {
-        ensure_finite(x, "vector.x")?;
-        ensure_finite(y, "vector.y")?;
-        ensure_finite(z, "vector.z")?;
+        let coords = [x, y, z];
+        validate_coordinates(coords, ["vector.x", "vector.y", "vector.z"])?;
         Ok(Self {
-            coords: [x, y, z],
+            coords,
             _frame: PhantomData,
         })
     }
@@ -259,7 +289,7 @@ impl<Frame> Info3<Frame> {
 ///
 /// let map_from_odom = Transform3d::<MapFrame, OdomFrame>::from_pose64(Pose64::identity()).unwrap();
 /// let body_point = Point3d::<BodyFrame>::try_from_xyz(1.0, 2.0, 3.0).unwrap();
-/// let _ = map_from_odom.transform_point(body_point);
+/// let _ = map_from_odom.try_transform_point(body_point);
 /// ```
 ///
 /// ```compile_fail
@@ -267,7 +297,7 @@ impl<Frame> Info3<Frame> {
 ///
 /// let map_from_odom = Transform3d::<MapFrame, OdomFrame>::from_pose64(Pose64::identity()).unwrap();
 /// let cam_from_body = Transform3d::<CamLFrame, BodyFrame>::from_pose64(Pose64::identity()).unwrap();
-/// let _ = map_from_odom.compose(cam_from_body);
+/// let _ = map_from_odom.try_compose(cam_from_body);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Transform3d<To, From> {
@@ -288,9 +318,7 @@ impl<Frame> Transform3d<Frame, Frame> {
 
 impl<To, From> Transform3d<To, From> {
     pub fn from_pose64(pose: Pose64) -> Result<Self, GeometryError> {
-        if !pose_is_finite(pose) {
-            return Err(GeometryError::NonFiniteTransform);
-        }
+        validate_pose_is_finite(pose, "frame-typed transform construction")?;
         Ok(Self {
             pose,
             _to: PhantomData,
@@ -313,39 +341,64 @@ impl<To, From> Transform3d<To, From> {
         }
     }
 
-    pub fn inverse(self) -> Transform3d<From, To> {
-        Transform3d {
-            pose: self.pose.inverse(),
+    pub fn try_inverse(self) -> Result<Transform3d<From, To>, GeometryError> {
+        let pose = self.pose.inverse();
+        validate_pose_is_finite(pose, "frame-typed transform inversion")?;
+        Ok(Transform3d {
+            pose,
             _to: PhantomData,
             _from: PhantomData,
-        }
+        })
     }
 
-    pub fn compose<Source>(self, other: Transform3d<From, Source>) -> Transform3d<To, Source> {
-        Transform3d {
-            pose: self.pose.compose(other.pose),
+    pub fn try_compose<Source>(
+        self,
+        other: Transform3d<From, Source>,
+    ) -> Result<Transform3d<To, Source>, GeometryError> {
+        let pose = self.pose.compose(other.pose);
+        validate_pose_is_finite(pose, "frame-typed transform composition")?;
+        Ok(Transform3d {
+            pose,
             _to: PhantomData,
             _from: PhantomData,
-        }
+        })
     }
 
-    pub fn transform_point(self, point: Point3d<From>) -> Point3d<To> {
+    pub fn try_transform_point(self, point: Point3d<From>) -> Result<Point3d<To>, GeometryError> {
         let rotated = mat_mul_vec_f64_local(self.pose.rotation(), point.coords);
-        Point3d {
-            coords: [
-                rotated[0] + self.pose.translation()[0],
-                rotated[1] + self.pose.translation()[1],
-                rotated[2] + self.pose.translation()[2],
+        let coords = [
+            rotated[0] + self.pose.translation()[0],
+            rotated[1] + self.pose.translation()[1],
+            rotated[2] + self.pose.translation()[2],
+        ];
+        validate_coordinates(
+            coords,
+            [
+                "transformed point.x",
+                "transformed point.y",
+                "transformed point.z",
             ],
+        )?;
+        Ok(Point3d {
+            coords,
             _frame: PhantomData,
-        }
+        })
     }
 
-    pub fn transform_vector(self, vector: Vec3d<From>) -> Vec3d<To> {
-        Vec3d {
-            coords: mat_mul_vec_f64_local(self.pose.rotation(), vector.coords),
+    pub fn try_transform_vector(self, vector: Vec3d<From>) -> Result<Vec3d<To>, GeometryError> {
+        let coords = mat_mul_vec_f64_local(self.pose.rotation(), vector.coords);
+        validate_coordinates(
+            coords,
+            [
+                "transformed vector.x",
+                "transformed vector.y",
+                "transformed vector.z",
+            ],
+        )?;
+        Ok(Vec3d {
+            coords,
             _frame: PhantomData,
-        }
+        })
     }
 }
 
@@ -356,9 +409,39 @@ fn ensure_finite(value: f64, context: &'static str) -> Result<(), GeometryError>
     Ok(())
 }
 
-fn pose_is_finite(pose: Pose64) -> bool {
-    pose.rotation().into_iter().flatten().all(f64::is_finite)
-        && pose.translation().into_iter().all(f64::is_finite)
+fn validate_coordinates(
+    values: [f64; 3],
+    contexts: [&'static str; 3],
+) -> Result<(), GeometryError> {
+    for (value, context) in values.into_iter().zip(contexts) {
+        ensure_finite(value, context)?;
+    }
+    Ok(())
+}
+
+fn validate_pose_is_finite(pose: Pose64, operation: &'static str) -> Result<(), GeometryError> {
+    for (row, values) in pose.rotation().into_iter().enumerate() {
+        for (col, value) in values.into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(GeometryError::NonFiniteTransformRotation {
+                    operation,
+                    row,
+                    col,
+                    value,
+                });
+            }
+        }
+    }
+    for (axis, value) in pose.translation().into_iter().enumerate() {
+        if !value.is_finite() {
+            return Err(GeometryError::NonFiniteTransformTranslation {
+                operation,
+                axis,
+                value,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn mat_mul_vec_f64_local(r: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
@@ -461,8 +544,14 @@ mod tests {
         );
         let map_from_odom = Transform3d::<MapFrame, OdomFrame>::from_pose64(pose).expect("pose");
         let odom_point = Point3d::<OdomFrame>::try_from_xyz(0.5, -1.0, 2.0).expect("point");
-        let map_point = map_from_odom.transform_point(odom_point);
-        let recovered = map_from_odom.inverse().transform_point(map_point);
+        let map_point = map_from_odom
+            .try_transform_point(odom_point)
+            .expect("map point");
+        let recovered = map_from_odom
+            .try_inverse()
+            .expect("inverse")
+            .try_transform_point(map_point)
+            .expect("recovered point");
         let recovered = recovered.as_array();
         assert!((recovered[0] - 0.5).abs() < 1e-12);
         assert!((recovered[1] + 1.0).abs() < 1e-12);
@@ -482,6 +571,97 @@ mod tests {
         assert!(matches!(
             Cov3::<MapFrame>::try_from_array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0],]),
             Err(GeometryError::MatrixNotPositiveDefinite)
+        ));
+    }
+
+    #[test]
+    fn transform_composition_rejects_finite_input_translation_overflow() {
+        let max_translation = Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        );
+        let map_from_odom =
+            Transform3d::<MapFrame, OdomFrame>::from_pose64(max_translation).expect("finite pose");
+        let odom_from_body =
+            Transform3d::<OdomFrame, BodyFrame>::from_pose64(max_translation).expect("finite pose");
+
+        assert!(matches!(
+            map_from_odom.try_compose(odom_from_body),
+            Err(GeometryError::NonFiniteTransformTranslation {
+                operation: "frame-typed transform composition",
+                axis: 0,
+                value,
+            }) if value.is_infinite()
+        ));
+    }
+
+    #[test]
+    fn transform_point_rejects_finite_input_coordinate_overflow() {
+        let pose = Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        );
+        let map_from_odom =
+            Transform3d::<MapFrame, OdomFrame>::from_pose64(pose).expect("finite pose");
+        let point = Point3d::<OdomFrame>::try_from_xyz(f64::MAX, 0.0, 0.0).expect("finite point");
+
+        assert!(matches!(
+            map_from_odom.try_transform_point(point),
+            Err(GeometryError::NonFiniteScalar {
+                context: "transformed point.x",
+                value,
+            }) if value.is_infinite()
+        ));
+    }
+
+    #[test]
+    fn transform_inverse_rejects_finite_translation_overflow() {
+        let half_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
+        let pose = Pose64::try_from_rt(
+            [
+                [half_sqrt_two, -half_sqrt_two, 0.0],
+                [half_sqrt_two, half_sqrt_two, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            [f64::MAX, f64::MAX, 0.0],
+        )
+        .expect("valid finite pose");
+        let map_from_odom =
+            Transform3d::<MapFrame, OdomFrame>::from_pose64(pose).expect("finite pose");
+
+        assert!(matches!(
+            map_from_odom.try_inverse(),
+            Err(GeometryError::NonFiniteTransformTranslation {
+                operation: "frame-typed transform inversion",
+                value,
+                ..
+            }) if !value.is_finite()
+        ));
+    }
+
+    #[test]
+    fn transform_vector_rejects_finite_coordinate_overflow() {
+        let half_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
+        let pose = Pose64::try_from_rt(
+            [
+                [half_sqrt_two, -half_sqrt_two, 0.0],
+                [half_sqrt_two, half_sqrt_two, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            [0.0; 3],
+        )
+        .expect("valid finite pose");
+        let map_from_odom =
+            Transform3d::<MapFrame, OdomFrame>::from_pose64(pose).expect("finite pose");
+        let vector =
+            Vec3d::<OdomFrame>::try_from_xyz(f64::MAX, f64::MAX, 0.0).expect("finite vector");
+
+        assert!(matches!(
+            map_from_odom.try_transform_vector(vector),
+            Err(GeometryError::NonFiniteScalar {
+                context: "transformed vector.y",
+                value,
+            }) if value.is_infinite()
         ));
     }
 }
