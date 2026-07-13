@@ -318,11 +318,10 @@ impl std::fmt::Display for DenseSolveInput {
     }
 }
 
-/// Solve a dense linear system `A x = b` via in-place Gauss-Jordan
-/// elimination with scaled partial pivoting. `a` is row-major `dim × dim`;
-/// `b` initially holds the right-hand side and receives the solution.
+/// Failure from the checked dense linear-system solver.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DenseSolveError {
+    ZeroDimension,
     DimensionOverflow {
         dim: usize,
     },
@@ -330,6 +329,7 @@ pub enum DenseSolveError {
         dim: usize,
         matrix_len: usize,
         rhs_len: usize,
+        row_scale_len: usize,
     },
     NonFiniteInput {
         input: DenseSolveInput,
@@ -343,7 +343,29 @@ pub enum DenseSolveError {
         scaled_pivot: f64,
         tolerance: f64,
     },
+    NonFinitePivotRatio {
+        column: usize,
+        row: usize,
+        pivot_magnitude: f64,
+        row_scale: f64,
+        scaled_pivot: f64,
+    },
+    NonFiniteEliminationMultiplier {
+        column: usize,
+        row: usize,
+        value: f64,
+    },
+    UnderflowedEliminationMultiplier {
+        column: usize,
+        row: usize,
+        numerator: f64,
+        pivot: f64,
+    },
     NonFiniteEliminatedMatrix {
+        index: usize,
+        value: f64,
+    },
+    NonFiniteEliminatedRightHandSide {
         index: usize,
         value: f64,
     },
@@ -356,6 +378,7 @@ pub enum DenseSolveError {
 impl std::fmt::Display for DenseSolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ZeroDimension => f.write_str("dense solver dimension must be non-zero"),
             Self::DimensionOverflow { dim } => {
                 write!(f, "dense solver dimension {dim} overflows matrix size")
             }
@@ -363,9 +386,10 @@ impl std::fmt::Display for DenseSolveError {
                 dim,
                 matrix_len,
                 rhs_len,
+                row_scale_len,
             } => write!(
                 f,
-                "dense solver expected a {dim}x{dim} matrix and RHS length {dim}, got matrix length {matrix_len} and RHS length {rhs_len}"
+                "dense solver expected a {dim}x{dim} matrix, RHS length {dim}, and row-scale workspace length {dim}; got matrix length {matrix_len}, RHS length {rhs_len}, and row-scale length {row_scale_len}"
             ),
             Self::NonFiniteInput {
                 input,
@@ -385,9 +409,36 @@ impl std::fmt::Display for DenseSolveError {
                 f,
                 "dense solver is singular or ill-conditioned at column {column}: pivot magnitude {pivot_magnitude}, row scale {row_scale}, scaled pivot {scaled_pivot} <= tolerance {tolerance}"
             ),
+            Self::NonFinitePivotRatio {
+                column,
+                row,
+                pivot_magnitude,
+                row_scale,
+                scaled_pivot,
+            } => write!(
+                f,
+                "dense solver scaled pivot is non-finite at column {column}, row {row}: pivot magnitude {pivot_magnitude}, row scale {row_scale}, scaled pivot {scaled_pivot}"
+            ),
+            Self::NonFiniteEliminationMultiplier { column, row, value } => write!(
+                f,
+                "dense solver elimination multiplier at column {column}, row {row} is non-finite: {value}"
+            ),
+            Self::UnderflowedEliminationMultiplier {
+                column,
+                row,
+                numerator,
+                pivot,
+            } => write!(
+                f,
+                "dense solver elimination multiplier underflowed to zero at column {column}, row {row}: numerator {numerator}, pivot {pivot}"
+            ),
             Self::NonFiniteEliminatedMatrix { index, value } => write!(
                 f,
                 "dense solver eliminated matrix[{index}] is non-finite: {value}"
+            ),
+            Self::NonFiniteEliminatedRightHandSide { index, value } => write!(
+                f,
+                "dense solver eliminated right-hand side[{index}] is non-finite: {value}"
             ),
             Self::NonFiniteSolution { index, value } => {
                 write!(f, "dense solver solution[{index}] is non-finite: {value}")
@@ -398,15 +449,32 @@ impl std::fmt::Display for DenseSolveError {
 
 impl std::error::Error for DenseSolveError {}
 
-pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> Result<(), DenseSolveError> {
+/// Solve `A x = b` via in-place Gaussian elimination, scaled partial
+/// pivoting, and back-substitution. `a` is row-major `dim × dim`; `b`
+/// initially holds the right-hand side and receives the solution.
+/// `row_scales` is caller-owned scratch with exactly `dim` entries.
+///
+/// Shape and finite-input errors leave `a` and `b` unchanged. Errors detected
+/// during elimination or back-substitution can leave both buffers partially
+/// transformed; callers must discard them after any error.
+pub(crate) fn solve_dense_f64(
+    a: &mut [f64],
+    b: &mut [f64],
+    dim: usize,
+    row_scales: &mut [f64],
+) -> Result<(), DenseSolveError> {
+    if dim == 0 {
+        return Err(DenseSolveError::ZeroDimension);
+    }
     let matrix_len = dim
         .checked_mul(dim)
         .ok_or(DenseSolveError::DimensionOverflow { dim })?;
-    if a.len() != matrix_len || b.len() != dim {
+    if a.len() != matrix_len || b.len() != dim || row_scales.len() != dim {
         return Err(DenseSolveError::DimensionMismatch {
             dim,
             matrix_len: a.len(),
             rhs_len: b.len(),
+            row_scale_len: row_scales.len(),
         });
     }
     for (index, &value) in a.iter().enumerate() {
@@ -428,39 +496,54 @@ pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> Result<(), D
         }
     }
 
-    let mut row_scales = (0..dim)
-        .map(|row| {
-            a[row * dim..(row + 1) * dim]
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max)
-        })
-        .collect::<Vec<_>>();
+    for (row, row_scale) in row_scales.iter_mut().enumerate() {
+        *row_scale = a[row * dim..(row + 1) * dim]
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+    }
     let scaled_pivot_tolerance = DENSE_PIVOT_EPSILON_MULTIPLIER * f64::EPSILON * dim.max(1) as f64;
 
     for col in 0..dim {
         // Scaled partial pivoting makes the breakdown decision independent of
         // the physical units or a uniform rescaling of the linear system.
         let mut max_row = col;
-        let mut max_scaled_pivot = if row_scales[col] > 0.0 {
-            a[col * dim + col].abs() / row_scales[col]
-        } else {
-            0.0
-        };
-        for row in (col + 1)..dim {
-            let candidate = if row_scales[row] > 0.0 {
-                a[row * dim + col].abs() / row_scales[row]
+        let mut max_scaled_pivot = 0.0;
+        let mut max_pivot_magnitude = 0.0;
+        for row in col..dim {
+            let pivot_magnitude = a[row * dim + col].abs();
+            if !pivot_magnitude.is_finite() {
+                return Err(DenseSolveError::NonFiniteEliminatedMatrix {
+                    index: row * dim + col,
+                    value: a[row * dim + col],
+                });
+            }
+            let row_scale = row_scales[row];
+            let candidate = if row_scale > 0.0 {
+                pivot_magnitude / row_scale
             } else {
                 0.0
             };
-            if candidate > max_scaled_pivot {
+            if !candidate.is_finite() {
+                return Err(DenseSolveError::NonFinitePivotRatio {
+                    column: col,
+                    row,
+                    pivot_magnitude,
+                    row_scale,
+                    scaled_pivot: candidate,
+                });
+            }
+            if candidate > max_scaled_pivot
+                || (candidate == max_scaled_pivot && pivot_magnitude > max_pivot_magnitude)
+            {
                 max_scaled_pivot = candidate;
+                max_pivot_magnitude = pivot_magnitude;
                 max_row = row;
             }
         }
-        let pivot_magnitude = a[max_row * dim + col].abs();
+        let pivot_magnitude = max_pivot_magnitude;
         let row_scale = row_scales[max_row];
-        if !max_scaled_pivot.is_finite() || max_scaled_pivot <= scaled_pivot_tolerance {
+        if max_scaled_pivot <= scaled_pivot_tolerance {
             return Err(DenseSolveError::SingularOrIllConditioned {
                 column: col,
                 pivot_magnitude,
@@ -477,33 +560,60 @@ pub fn solve_dense_f64(a: &mut [f64], b: &mut [f64], dim: usize) -> Result<(), D
             row_scales.swap(col, max_row);
         }
         let pivot = a[col * dim + col];
-        for k in col..dim {
-            a[col * dim + k] /= pivot;
-        }
-        b[col] /= pivot;
-        for row in 0..dim {
-            if row == col {
+        for row in (col + 1)..dim {
+            let numerator = a[row * dim + col];
+            let multiplier = numerator / pivot;
+            if !multiplier.is_finite() {
+                return Err(DenseSolveError::NonFiniteEliminationMultiplier {
+                    column: col,
+                    row,
+                    value: multiplier,
+                });
+            }
+            if multiplier == 0.0 && numerator != 0.0 {
+                return Err(DenseSolveError::UnderflowedEliminationMultiplier {
+                    column: col,
+                    row,
+                    numerator,
+                    pivot,
+                });
+            }
+            a[row * dim + col] = 0.0;
+            if multiplier == 0.0 {
                 continue;
             }
-            let factor = a[row * dim + col];
-            if factor == 0.0 {
-                continue;
+            for k in (col + 1)..dim {
+                let index = row * dim + k;
+                let value = (-multiplier).mul_add(a[col * dim + k], a[index]);
+                if !value.is_finite() {
+                    return Err(DenseSolveError::NonFiniteEliminatedMatrix { index, value });
+                }
+                a[index] = value;
             }
-            for k in col..dim {
-                a[row * dim + k] -= factor * a[col * dim + k];
+            let value = (-multiplier).mul_add(b[col], b[row]);
+            if !value.is_finite() {
+                return Err(DenseSolveError::NonFiniteEliminatedRightHandSide {
+                    index: row,
+                    value,
+                });
             }
-            b[row] -= factor * b[col];
+            b[row] = value;
         }
     }
-    for (index, &value) in a.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(DenseSolveError::NonFiniteEliminatedMatrix { index, value });
+
+    for row in (0..dim).rev() {
+        let mut value = b[row];
+        for col in (row + 1)..dim {
+            value = (-a[row * dim + col]).mul_add(b[col], value);
+            if !value.is_finite() {
+                return Err(DenseSolveError::NonFiniteSolution { index: row, value });
+            }
         }
-    }
-    for (index, &value) in b.iter().enumerate() {
+        value /= a[row * dim + row];
         if !value.is_finite() {
-            return Err(DenseSolveError::NonFiniteSolution { index, value });
+            return Err(DenseSolveError::NonFiniteSolution { index: row, value });
         }
+        b[row] = value;
     }
     Ok(())
 }
@@ -598,6 +708,15 @@ pub fn accumulate_cross_factor<const R: usize, const S: usize>(
 mod tests {
     use super::*;
     use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Pose64, Timestamp};
+
+    fn solve_dense_for_test(
+        a: &mut [f64],
+        b: &mut [f64],
+        dim: usize,
+    ) -> Result<(), DenseSolveError> {
+        let mut row_scales = vec![0.0; dim];
+        solve_dense_f64(a, b, dim, &mut row_scales)
+    }
 
     fn noise() -> ImuNoiseModel {
         ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise")
@@ -748,7 +867,7 @@ mod tests {
         // => x = 1, y = 2
         let mut a = vec![2.0, 3.0, 1.0, 1.0];
         let mut b = vec![8.0, 3.0];
-        solve_dense_f64(&mut a, &mut b, 2).expect("nonsingular system");
+        solve_dense_for_test(&mut a, &mut b, 2).expect("nonsingular system");
         assert!((b[0] - 1.0).abs() < 1e-12);
         assert!((b[1] - 2.0).abs() < 1e-12);
     }
@@ -759,7 +878,7 @@ mod tests {
         let mut a = vec![1.0, 2.0, 2.0, 4.0];
         let mut b = vec![3.0, 6.0];
         assert!(matches!(
-            solve_dense_f64(&mut a, &mut b, 2),
+            solve_dense_for_test(&mut a, &mut b, 2),
             Err(DenseSolveError::SingularOrIllConditioned { column: 1, .. })
         ));
     }
@@ -769,7 +888,7 @@ mod tests {
         let scale = 1e-300;
         let mut a = vec![2.0 * scale, 3.0 * scale, scale, scale];
         let mut b = vec![8.0 * scale, 3.0 * scale];
-        solve_dense_f64(&mut a, &mut b, 2).expect("scaled nonsingular system");
+        solve_dense_for_test(&mut a, &mut b, 2).expect("scaled nonsingular system");
         assert!((b[0] - 1.0).abs() < 1e-12);
         assert!((b[1] - 2.0).abs() < 1e-12);
     }
@@ -780,25 +899,157 @@ mod tests {
             let mut a = vec![scale, 2.0 * scale, 2.0 * scale, 4.0 * scale];
             let mut b = vec![3.0 * scale, 6.0 * scale];
             assert!(matches!(
-                solve_dense_f64(&mut a, &mut b, 2),
+                solve_dense_for_test(&mut a, &mut b, 2),
                 Err(DenseSolveError::SingularOrIllConditioned { column: 1, .. })
             ));
         }
     }
 
     #[test]
+    fn dense_solver_recovers_diagonally_dominant_systems_across_scales() {
+        for dim in 1..=8 {
+            let mut matrix = vec![0.0; dim * dim];
+            for row in 0..dim {
+                let mut off_diagonal_abs_sum = 0.0;
+                for col in 0..dim {
+                    if row == col {
+                        continue;
+                    }
+                    let value = ((row * 17 + col * 13 + 3) % 11) as f64 * 0.02 - 0.1;
+                    matrix[row * dim + col] = value;
+                    off_diagonal_abs_sum += value.abs();
+                }
+                matrix[row * dim + row] = 1.0 + off_diagonal_abs_sum;
+            }
+            let expected = (0..dim)
+                .map(|index| index as f64 * 0.375 - 0.8)
+                .collect::<Vec<_>>();
+            let unscaled_rhs = (0..dim)
+                .map(|row| {
+                    (0..dim)
+                        .map(|col| matrix[row * dim + col] * expected[col])
+                        .sum::<f64>()
+                })
+                .collect::<Vec<_>>();
+
+            for scale in [1e-200, 1e-100, 1.0, 1e100, 1e200] {
+                let mut scaled_matrix =
+                    matrix.iter().map(|value| value * scale).collect::<Vec<_>>();
+                let mut solution = unscaled_rhs
+                    .iter()
+                    .map(|value| value * scale)
+                    .collect::<Vec<_>>();
+                solve_dense_for_test(&mut scaled_matrix, &mut solution, dim)
+                    .expect("well-conditioned scaled system");
+
+                for (index, (actual, expected)) in solution.iter().zip(expected.iter()).enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() <= 1e-11 * expected.abs().max(1.0),
+                        "dim={dim}, scale={scale:e}, index={index}, actual={actual}, expected={expected}"
+                    );
+                }
+                for row in 0..dim {
+                    let reconstructed = (0..dim)
+                        .map(|col| matrix[row * dim + col] * solution[col])
+                        .sum::<f64>();
+                    assert!(
+                        (reconstructed - unscaled_rhs[row]).abs()
+                            <= 1e-11 * unscaled_rhs[row].abs().max(1.0),
+                        "dim={dim}, scale={scale:e}, row={row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_solver_rejects_zero_and_wrong_workspace_without_mutating_inputs() {
+        assert!(matches!(
+            solve_dense_f64(&mut [], &mut [], 0, &mut []),
+            Err(DenseSolveError::ZeroDimension)
+        ));
+
+        let mut matrix = [2.0, 3.0, 1.0, 1.0];
+        let mut rhs = [8.0, 3.0];
+        let original_matrix = matrix;
+        let original_rhs = rhs;
+        assert!(matches!(
+            solve_dense_f64(&mut matrix, &mut rhs, 2, &mut [0.0]),
+            Err(DenseSolveError::DimensionMismatch {
+                dim: 2,
+                matrix_len: 4,
+                rhs_len: 2,
+                row_scale_len: 1,
+            })
+        ));
+        assert_eq!(matrix, original_matrix);
+        assert_eq!(rhs, original_rhs);
+    }
+
+    #[test]
+    fn dense_solver_reports_the_operation_that_first_becomes_nonfinite() {
+        let mut matrix = [1e308, 1e308, 1e308, -1e308];
+        let mut rhs = [0.0, 0.0];
+        assert!(matches!(
+            solve_dense_f64(&mut matrix, &mut rhs, 2, &mut [0.0; 2]),
+            Err(DenseSolveError::NonFiniteEliminatedMatrix {
+                index: 3,
+                value: f64::NEG_INFINITY,
+            })
+        ));
+
+        let mut matrix = [1.0, 0.0, -1.0, 1.0];
+        let mut rhs = [1e308, 1e308];
+        assert!(matches!(
+            solve_dense_f64(&mut matrix, &mut rhs, 2, &mut [0.0; 2]),
+            Err(DenseSolveError::NonFiniteEliminatedRightHandSide {
+                index: 1,
+                value: f64::INFINITY,
+            })
+        ));
+
+        let mut matrix = [1e308, 1e308, 1e-308, 2e-308];
+        let mut rhs = [1e308, 3e-308];
+        assert!(matches!(
+            solve_dense_f64(&mut matrix, &mut rhs, 2, &mut [0.0; 2]),
+            Err(DenseSolveError::UnderflowedEliminationMultiplier {
+                column: 0,
+                row: 1,
+                numerator: 1e-308,
+                pivot: 1e308,
+            })
+        ));
+    }
+
+    #[test]
     fn dense_solver_rejects_shape_and_nonfinite_inputs() {
         assert!(matches!(
-            solve_dense_f64(&mut [1.0, 0.0, 1.0], &mut [1.0, 2.0], 2),
+            solve_dense_for_test(&mut [1.0, 0.0, 1.0], &mut [1.0, 2.0], 2),
             Err(DenseSolveError::DimensionMismatch { .. })
         ));
         assert!(matches!(
-            solve_dense_f64(&mut [1.0, 0.0, 0.0, f64::NAN], &mut [1.0, 2.0], 2,),
+            solve_dense_for_test(&mut [1.0, 0.0, 0.0, f64::NAN], &mut [1.0, 2.0], 2,),
             Err(DenseSolveError::NonFiniteInput {
                 input: DenseSolveInput::Matrix,
                 index: 3,
                 ..
             })
         ));
+
+        let mut matrix = [1.0, 0.0, 0.0, 1.0];
+        let mut rhs = [1.0, f64::INFINITY];
+        let original_matrix = matrix;
+        assert!(matches!(
+            solve_dense_f64(&mut matrix, &mut rhs, 2, &mut [9.0; 2]),
+            Err(DenseSolveError::NonFiniteInput {
+                input: DenseSolveInput::RightHandSide,
+                index: 1,
+                value: f64::INFINITY,
+            })
+        ));
+        assert_eq!(matrix, original_matrix);
+        assert_eq!(rhs[0], 1.0);
+        assert!(rhs[1].is_infinite());
     }
 }

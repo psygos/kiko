@@ -1625,6 +1625,7 @@ impl VioResolvedFrameObservations {
 struct VioSolveWorkspace {
     states: Vec<crate::NavState>,
     candidate_states: Vec<crate::NavState>,
+    linear_solver_row_scales: Vec<f64>,
     resolved_observations: Vec<VioResolvedFrameObservations>,
     visual_support: VisualFactorSupport,
     current_linearization: VioLinearization,
@@ -1644,6 +1645,10 @@ impl VioSolveWorkspace {
         Ok(Self {
             states: try_vio_buffer("current state", frame_capacity)?,
             candidate_states: try_vio_buffer("candidate state", frame_capacity)?,
+            linear_solver_row_scales: try_zeroed_vio_f64_buffer(
+                "dense solver row scales",
+                shape.dimension,
+            )?,
             resolved_observations,
             visual_support: VisualFactorSupport::try_new(frame_capacity)?,
             current_linearization: VioLinearization::try_new(shape)?,
@@ -3890,6 +3895,7 @@ fn optimize_vio_with_workspace(
     let VioSolveWorkspace {
         states,
         candidate_states,
+        linear_solver_row_scales,
         resolved_observations,
         visual_support,
         current_linearization,
@@ -3959,6 +3965,7 @@ fn optimize_vio_with_workspace(
             &mut scratch_linearization.hessian[..matrix_elements],
             &mut scratch_linearization.rhs[..dim],
             dim,
+            &mut linear_solver_row_scales[..dim],
         )
         .map_err(|source| VioSolveError::LinearSolve {
             iteration: attempted_iteration,
@@ -7102,7 +7109,7 @@ mod tests {
 
         fn allocation_addresses(
             optimizer: &VioOptimizer,
-        ) -> ([usize; 2], [usize; 2], [usize; 2], usize, usize) {
+        ) -> ([usize; 2], [usize; 2], [usize; 2], usize, usize, usize) {
             let workspace = &optimizer.workspace;
             (
                 sorted_pair(
@@ -7117,6 +7124,7 @@ mod tests {
                     workspace.states.as_ptr() as usize,
                     workspace.candidate_states.as_ptr() as usize,
                 ),
+                workspace.linear_solver_row_scales.as_ptr() as usize,
                 workspace.resolved_observations.as_ptr() as usize,
                 workspace
                     .visual_support
