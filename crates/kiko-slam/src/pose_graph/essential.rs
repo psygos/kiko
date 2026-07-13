@@ -1,10 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 
 use crate::Pose64;
 use crate::map::{KeyframeId, SlamMap};
 
-use super::{PoseGraphEdge, scaled_identity6};
+use super::{PoseGraphEdge, PoseGraphError, scaled_identity6};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EssentialEdgeKind {
@@ -92,6 +92,10 @@ impl EssentialGraph {
         self.parent.get(&keyframe_id).copied()
     }
 
+    /// Add one keyframe in graph order. Covisibility entries for keyframes not
+    /// yet registered in this graph are intentionally ineligible as parents
+    /// or strong edges; this preserves an acyclic spanning tree even when the
+    /// supplied map already contains later keyframes.
     pub fn add_keyframe(
         &mut self,
         keyframe_id: KeyframeId,
@@ -123,6 +127,9 @@ impl EssentialGraph {
 
         let mut strongest = None;
         for (&neighbor, &weight) in neighbors {
+            if neighbor == keyframe_id || !self.parent.contains_key(&neighbor) {
+                continue;
+            }
             if strongest
                 .as_ref()
                 .is_none_or(|(_, best_w): &(KeyframeId, u32)| weight.get() > *best_w)
@@ -141,6 +148,7 @@ impl EssentialGraph {
         for (&neighbor, &weight) in neighbors {
             if weight.get() >= self.strong_threshold
                 && neighbor != parent
+                && self.parent.contains_key(&neighbor)
                 && !contains_edge(&self.strong_covis_edges, keyframe_id, neighbor)
                 && let Some(relative_pose) = relative_pose(map, keyframe_id, neighbor)
             {
@@ -288,44 +296,44 @@ impl EssentialGraph {
         }
     }
 
-    pub fn pose_graph_input(&self) -> PoseGraphInput {
+    pub fn pose_graph_input(&self) -> Result<PoseGraphInput, PoseGraphError> {
         let mut keyframe_ids = self.order.clone();
-        let mut seen: HashSet<KeyframeId> = keyframe_ids.iter().copied().collect();
-        for edge in self.iter_all_edges() {
-            if seen.insert(edge.a) {
-                keyframe_ids.push(edge.a);
-            }
-            if seen.insert(edge.b) {
-                keyframe_ids.push(edge.b);
-            }
-        }
-
-        let mut id_to_idx = HashMap::new();
+        let mut id_to_idx = HashMap::with_capacity(keyframe_ids.len());
         for (idx, &id) in keyframe_ids.iter().enumerate() {
             id_to_idx.insert(id, idx);
         }
 
-        let edges = self
-            .iter_all_edges()
-            .filter_map(|edge| {
-                Some(PoseGraphEdge {
-                    from: *id_to_idx.get(&edge.a)?,
-                    to: *id_to_idx.get(&edge.b)?,
-                    measurement: edge.relative_pose,
-                    information: edge.information,
-                })
-            })
-            .collect();
+        let mut edges = Vec::with_capacity(self.iter_all_edges().size_hint().0);
+        for (edge_index, edge) in self.iter_all_edges().enumerate() {
+            let from = keyframe_index(&mut keyframe_ids, &mut id_to_idx, edge.a);
+            let to = keyframe_index(&mut keyframe_ids, &mut id_to_idx, edge.b);
+            edges.push(
+                PoseGraphEdge::try_new(from, to, edge.relative_pose, edge.information)
+                    .map_err(|source| PoseGraphError::EdgeConstruction { edge_index, source })?,
+            );
+        }
 
-        PoseGraphInput {
+        Ok(PoseGraphInput {
             keyframe_ids,
             edges,
-        }
+        })
     }
 
-    pub fn all_edges(&self) -> Vec<PoseGraphEdge> {
-        self.pose_graph_input().edges
+    pub fn all_edges(&self) -> Result<Vec<PoseGraphEdge>, PoseGraphError> {
+        self.pose_graph_input().map(|input| input.edges)
     }
+}
+
+fn keyframe_index(
+    keyframe_ids: &mut Vec<KeyframeId>,
+    id_to_idx: &mut HashMap<KeyframeId, usize>,
+    keyframe_id: KeyframeId,
+) -> usize {
+    *id_to_idx.entry(keyframe_id).or_insert_with(|| {
+        let index = keyframe_ids.len();
+        keyframe_ids.push(keyframe_id);
+        index
+    })
 }
 
 fn contains_edge(edges: &[EssentialEdge], a: KeyframeId, b: KeyframeId) -> bool {

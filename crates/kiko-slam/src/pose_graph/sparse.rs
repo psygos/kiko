@@ -121,6 +121,27 @@ impl BlockCsr6x6 {
         diagonal
     }
 
+    pub(super) fn fix_block_to_zero_increment(
+        &mut self,
+        block_index: usize,
+    ) -> Result<(), PoseGraphError> {
+        self.validate_index(block_index, block_index)?;
+        for value_index in self.row_ptr[block_index]..self.row_ptr[block_index + 1] {
+            self.values[value_index] = [[0.0; 6]; 6];
+        }
+        for row in 0..self.nrows {
+            if let Some(value_index) = self.find_index(row, block_index) {
+                self.values[value_index] = [[0.0; 6]; 6];
+            }
+        }
+
+        let mut identity = [[0.0_f64; 6]; 6];
+        for (axis, row) in identity.iter_mut().enumerate() {
+            row[axis] = 1.0;
+        }
+        self.insert(block_index, block_index, identity)
+    }
+
     pub(super) fn validate_symmetric(&self) -> Result<(), PoseGraphError> {
         for row in 0..self.nrows {
             for idx in self.row_ptr[row]..self.row_ptr[row + 1] {

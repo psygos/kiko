@@ -1993,8 +1993,8 @@ mod tests {
     fn loop_apply_error_preserves_pose_graph_source() {
         let error = LoopApplyError::PoseGraph {
             source: PoseGraphError::NotConverged {
-                iterations: 4,
-                residual_norm: 2.5,
+                outer_iterations: 4,
+                last_linear_solve_residual_norm: 2.5,
             },
         };
 

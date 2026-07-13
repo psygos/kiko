@@ -1,13 +1,17 @@
-/// Step size for numerical Jacobian computation via central differences.
-const NUMERICAL_DIFF_EPS: f64 = 1e-6;
-/// Anchor regularization weight to remove gauge freedom in pose graph optimization.
-const ANCHOR_REGULARIZATION: f64 = 1e9;
-/// Maximum SE3 step norm; larger steps are clamped for stability.
-const MAX_STEP_NORM: f64 = 1.0;
-/// Step convergence threshold for the pose graph optimizer.
-const POSE_GRAPH_CONVERGENCE: f64 = 1e-6;
-/// Near-zero threshold in Huber weight to avoid division by zero.
-const HUBER_NEAR_ZERO: f64 = 1e-12;
+/// Translation step in metres for numerical Jacobian central differences.
+const NUMERICAL_DIFF_TRANSLATION_STEP_M: f64 = 1e-6;
+/// Rotation step in radians for numerical Jacobian central differences.
+const NUMERICAL_DIFF_ROTATION_STEP_RAD: f64 = 1e-6;
+/// Maximum translation step norm in metres; larger steps are clamped.
+const MAX_TRANSLATION_STEP_M: f64 = 1.0;
+/// Maximum rotation step norm in radians; larger steps are clamped.
+const MAX_ROTATION_STEP_RAD: f64 = 1.0;
+/// Per-pose translation-step norm convergence threshold in metres.
+const TRANSLATION_STEP_CONVERGENCE_M: f64 = 1e-6;
+/// Per-pose rotation-step norm convergence threshold in radians.
+const ROTATION_STEP_CONVERGENCE_RAD: f64 = 1e-6;
+/// Near-zero normalized residual threshold in the Huber kernel.
+const HUBER_NEAR_ZERO_NORMALIZED_RESIDUAL: f64 = 1e-12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PcgStopReason {
@@ -73,36 +77,144 @@ pub enum PoseGraphError {
         transpose: f64,
     },
     EdgeFromOutOfBounds {
+        edge_index: usize,
         from: usize,
         pose_count: usize,
     },
     EdgeToOutOfBounds {
+        edge_index: usize,
         to: usize,
         pose_count: usize,
     },
-    InvalidEdgeSet {
-        invalid_edges: usize,
-        pose_count: usize,
+    EdgeConstruction {
+        edge_index: usize,
+        source: PoseGraphEdgeError,
     },
-    NonFiniteResidual {
-        iteration: usize,
+    InvalidRobustSquaredNorm {
+        outer_iteration: usize,
+        edge_index: usize,
+        value: f64,
+    },
+    NonFiniteLinearSolveResidual {
+        outer_iteration: usize,
+        value: f64,
     },
     NonFiniteStep {
-        iteration: usize,
+        outer_iteration: usize,
         pose_index: usize,
     },
     PcgDidNotConverge {
         outer_iteration: usize,
-        iterations: usize,
+        pcg_iterations: usize,
         initial_residual_norm: f64,
         residual_norm: f64,
         target_residual_norm: f64,
         stop_reason: PcgStopReason,
     },
     NotConverged {
-        iterations: usize,
-        residual_norm: f64,
+        outer_iterations: usize,
+        last_linear_solve_residual_norm: f64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PoseGraphInformationError {
+    NonFiniteEntry {
+        row: usize,
+        col: usize,
+        value: f64,
+    },
+    NonFiniteNormalizedEntry {
+        row: usize,
+        col: usize,
+        value: f64,
+    },
+    NonPositiveDiagonal {
+        axis: usize,
+        value: f64,
+    },
+    Asymmetric {
+        row: usize,
+        col: usize,
+        upper: f64,
+        lower: f64,
+        relative_tolerance: f64,
+    },
+    NotPositiveDefinite {
+        pivot: usize,
+        normalized_schur_complement: f64,
+        tolerance: f64,
+    },
+}
+
+impl std::fmt::Display for PoseGraphInformationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteEntry { row, col, value } => write!(
+                f,
+                "pose graph information entry ({row}, {col}) must be finite, got {value}"
+            ),
+            Self::NonFiniteNormalizedEntry { row, col, value } => write!(
+                f,
+                "dimensionless pose graph information entry ({row}, {col}) became non-finite during diagonal normalization: {value}"
+            ),
+            Self::NonPositiveDiagonal { axis, value } => write!(
+                f,
+                "pose graph information diagonal {axis} must be finite and > 0, got {value}"
+            ),
+            Self::Asymmetric {
+                row,
+                col,
+                upper,
+                lower,
+                relative_tolerance,
+            } => write!(
+                f,
+                "pose graph information is asymmetric at ({row}, {col}): upper {upper}, lower {lower}, relative tolerance {relative_tolerance}"
+            ),
+            Self::NotPositiveDefinite {
+                pivot,
+                normalized_schur_complement,
+                tolerance,
+            } => write!(
+                f,
+                "dimensionless pose graph information is not numerically positive definite at pivot {pivot}: normalized Schur complement {normalized_schur_complement} must be finite and > {tolerance}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PoseGraphInformationError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PoseGraphEdgeError {
+    SelfEdge { pose_index: usize },
+    Information { source: PoseGraphInformationError },
+}
+
+impl std::fmt::Display for PoseGraphEdgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SelfEdge { pose_index } => {
+                write!(
+                    f,
+                    "pose graph edge endpoints must differ, both were {pose_index}"
+                )
+            }
+            Self::Information { source } => {
+                write!(f, "invalid pose graph edge information: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PoseGraphEdgeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Information { source } => Some(source),
+            Self::SelfEdge { .. } => None,
+        }
+    }
 }
 
 impl std::fmt::Display for PoseGraphError {
@@ -179,61 +291,81 @@ impl std::fmt::Display for PoseGraphError {
                 f,
                 "pcg matrix is asymmetric at block ({row}, {col}) element ({block_row}, {block_col}): forward={forward}, transpose={transpose}"
             ),
-            PoseGraphError::EdgeFromOutOfBounds { from, pose_count } => {
-                write!(
-                    f,
-                    "pose graph edge.from out of bounds: from={from}, pose_count={pose_count}"
-                )
-            }
-            PoseGraphError::EdgeToOutOfBounds { to, pose_count } => {
-                write!(
-                    f,
-                    "pose graph edge.to out of bounds: to={to}, pose_count={pose_count}"
-                )
-            }
-            PoseGraphError::InvalidEdgeSet {
-                invalid_edges,
+            PoseGraphError::EdgeFromOutOfBounds {
+                edge_index,
+                from,
                 pose_count,
+            } => {
+                write!(
+                    f,
+                    "pose graph edge {edge_index} from-index is out of bounds: from={from}, pose_count={pose_count}"
+                )
+            }
+            PoseGraphError::EdgeToOutOfBounds {
+                edge_index,
+                to,
+                pose_count,
+            } => {
+                write!(
+                    f,
+                    "pose graph edge {edge_index} to-index is out of bounds: to={to}, pose_count={pose_count}"
+                )
+            }
+            PoseGraphError::EdgeConstruction { edge_index, source } => {
+                write!(f, "pose graph edge {edge_index} is invalid: {source}")
+            }
+            PoseGraphError::InvalidRobustSquaredNorm {
+                outer_iteration,
+                edge_index,
+                value,
             } => write!(
                 f,
-                "pose graph contains {invalid_edges} invalid edges for pose_count={pose_count}"
+                "pose graph edge {edge_index} Mahalanobis squared residual must be finite and >= 0 at outer iteration {outer_iteration}, got {value}"
             ),
-            PoseGraphError::NonFiniteResidual { iteration } => {
-                write!(
-                    f,
-                    "pose graph residual became non-finite at iteration {iteration}"
-                )
-            }
+            PoseGraphError::NonFiniteLinearSolveResidual {
+                outer_iteration,
+                value,
+            } => write!(
+                f,
+                "pose graph PCG residual norm became non-finite at outer iteration {outer_iteration}: {value}"
+            ),
             PoseGraphError::NonFiniteStep {
-                iteration,
+                outer_iteration,
                 pose_index,
             } => write!(
                 f,
-                "pose graph step became non-finite at iteration {iteration} for pose {pose_index}"
+                "pose graph step became non-finite at outer iteration {outer_iteration} for pose {pose_index}"
             ),
             PoseGraphError::PcgDidNotConverge {
                 outer_iteration,
-                iterations,
+                pcg_iterations,
                 initial_residual_norm,
                 residual_norm,
                 target_residual_norm,
                 stop_reason,
             } => write!(
                 f,
-                "pose graph PCG stopped without convergence at outer iteration {outer_iteration} after {iterations} inner iterations ({stop_reason:?}, residual_norm={residual_norm:.3e}, initial_residual_norm={initial_residual_norm:.3e}, target_residual_norm={target_residual_norm:.3e})"
+                "pose graph PCG stopped without convergence at outer iteration {outer_iteration} after {pcg_iterations} inner iterations ({stop_reason:?}, residual_norm={residual_norm:.3e}, initial_residual_norm={initial_residual_norm:.3e}, target_residual_norm={target_residual_norm:.3e})"
             ),
             PoseGraphError::NotConverged {
-                iterations,
-                residual_norm,
+                outer_iterations,
+                last_linear_solve_residual_norm,
             } => write!(
                 f,
-                "pose graph did not converge after {iterations} iterations (residual_norm={residual_norm:.3e})"
+                "pose graph did not converge after {outer_iterations} outer iterations (last_linear_solve_residual_norm={last_linear_solve_residual_norm:.3e})"
             ),
         }
     }
 }
 
-impl std::error::Error for PoseGraphError {}
+impl std::error::Error for PoseGraphError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EdgeConstruction { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) fn scaled_identity6(scale: f64) -> [[f64; 6]; 6] {
     let mut out = [[0.0_f64; 6]; 6];
@@ -253,8 +385,9 @@ pub use essential::{
     PoseGraphInput,
 };
 pub use optimizer::{
-    PoseGraphConfig, PoseGraphConfigError, PoseGraphEdge, PoseGraphOptimizer, PoseGraphResult,
-    PoseGraphTermination, compute_edge_error, compute_edge_jacobians,
+    PoseGraphConfig, PoseGraphConfigError, PoseGraphConvergenceCriterion, PoseGraphEdge,
+    PoseGraphInformation, PoseGraphOptimizer, PoseGraphResult, PoseGraphTermination,
+    compute_edge_error, compute_edge_jacobians,
 };
 pub use solver::{PcgResult, solve_pcg};
 pub use sparse::BlockCsr6x6;

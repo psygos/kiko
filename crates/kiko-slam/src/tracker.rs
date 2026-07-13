@@ -7281,12 +7281,12 @@ mod tests {
         let defaults = PoseGraphConfig::default();
         let loop_manager = LoopManager::new(
             PoseGraphConfig::try_new(
-                0,
-                defaults.pcg_max_iters(),
+                1,
+                defaults.max_pcg_iterations(),
                 defaults.pcg_tol(),
-                defaults.huber_delta(),
+                defaults.huber_delta_normalized_residual(),
             )
-            .expect("zero-iteration test config"),
+            .expect("single-outer-iteration test config"),
         );
 
         let error = loop_manager
@@ -7296,7 +7296,10 @@ mod tests {
         assert!(matches!(
             error,
             LoopApplyError::PoseGraph {
-                source: PoseGraphError::NotConverged { iterations: 0, .. }
+                source: PoseGraphError::NotConverged {
+                    outer_iterations: 1,
+                    ..
+                }
             }
         ));
         assert_eq!(global_map.map().generation(), before_generation);
@@ -7385,7 +7388,10 @@ mod tests {
         assert!(global_map.keyframe(removed_kf).is_none());
         assert!(global_map.essential_graph().parent_of(removed_kf).is_none());
         assert!(loop_db.descriptor_source(removed_kf).is_none());
-        let input = global_map.essential_graph().pose_graph_input();
+        let input = global_map
+            .essential_graph()
+            .pose_graph_input()
+            .expect("valid essential graph input");
         assert!(input.keyframe_ids.iter().all(|&id| id != removed_kf));
     }
 

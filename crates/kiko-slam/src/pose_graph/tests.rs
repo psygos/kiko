@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::error::Error as _;
 use std::num::NonZeroU32;
 
 use super::{
@@ -211,6 +212,24 @@ fn block_csr_diagonal_extraction_returns_only_diagonal_blocks() {
 }
 
 #[test]
+fn block_csr_exact_anchor_removes_all_anchor_coupling() {
+    let mut h = BlockCsr6x6::new(2);
+    h.insert(0, 0, scalar_block(4.0)).expect("anchor diagonal");
+    h.insert(0, 1, scalar_block(2.0)).expect("forward coupling");
+    h.insert(1, 0, scalar_block(2.0)).expect("reverse coupling");
+    h.insert(1, 1, scalar_block(3.0)).expect("free diagonal");
+
+    h.fix_block_to_zero_increment(0).expect("fix anchor");
+
+    assert_eq!(h.get(0, 0), Some(scalar_block(1.0)));
+    assert_eq!(h.get(0, 1), Some([[0.0; 6]; 6]));
+    assert_eq!(h.get(1, 0), Some([[0.0; 6]; 6]));
+    assert_eq!(h.get(1, 1), Some(scalar_block(3.0)));
+    h.validate_symmetric()
+        .expect("fixed system remains symmetric");
+}
+
+#[test]
 fn block_csr_rejects_nonfinite_updates_transactionally() {
     let mut h = BlockCsr6x6::new(1);
     h.insert(0, 0, scalar_block(1.0)).expect("insert");
@@ -355,12 +374,8 @@ fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
     let pose_a = Pose64::identity();
     let pose_b = se3_exp_f64([0.2, -0.1, 0.05, 0.03, -0.02, 0.01]);
     let measurement = pose_a.inverse().compose(pose_b);
-    let edge = PoseGraphEdge {
-        from: 0,
-        to: 1,
-        measurement,
-        information: scalar_block(1.0),
-    };
+    let edge = PoseGraphEdge::try_new(0, 1, measurement, scalar_block(1.0))
+        .expect("valid pose graph edge");
     let error = compute_edge_error(&edge, &[pose_a, pose_b]).expect("edge error");
     let norm: f64 = error.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert!(norm < 1e-9, "expected near-zero error, got {norm}");
@@ -374,16 +389,12 @@ fn pose_graph_edge_jacobians_match_finite_difference() {
         .inverse()
         .compose(pose_b)
         .compose(se3_exp_f64([0.01, -0.005, 0.002, 0.001, -0.0015, 0.0008]));
-    let edge = PoseGraphEdge {
-        from: 0,
-        to: 1,
-        measurement,
-        information: scalar_block(1.0),
-    };
+    let edge = PoseGraphEdge::try_new(0, 1, measurement, scalar_block(1.0))
+        .expect("valid pose graph edge");
     let poses = [pose_a, pose_b];
     let (j_from, j_to) = compute_edge_jacobians(&edge, &poses).expect("jacobians");
     let eps = 1e-6;
-    for (pose_idx, jacobian) in [(edge.from, j_from), (edge.to, j_to)] {
+    for (pose_idx, jacobian) in [(edge.from(), j_from), (edge.to(), j_to)] {
         for col in 0..6 {
             let mut plus = poses;
             let mut minus = poses;
@@ -409,12 +420,7 @@ fn pose_graph_edge_jacobians_match_finite_difference() {
 
 fn edge(from: usize, to: usize, from_pose: Pose64, to_pose: Pose64) -> PoseGraphEdge {
     let measurement = from_pose.inverse().compose(to_pose);
-    PoseGraphEdge {
-        from,
-        to,
-        measurement,
-        information: scalar_block(1.0),
-    }
+    PoseGraphEdge::try_new(from, to, measurement, scalar_block(1.0)).expect("valid pose graph edge")
 }
 
 fn optimizer_config(max_iterations: usize, pcg_max_iters: usize, pcg_tol: f64) -> PoseGraphConfig {
@@ -423,6 +429,14 @@ fn optimizer_config(max_iterations: usize, pcg_max_iters: usize, pcg_tol: f64) -
 
 #[test]
 fn pose_graph_config_rejects_invalid_numeric_values() {
+    assert!(matches!(
+        PoseGraphConfig::try_new(0, 100, 1e-6, 1.0),
+        Err(super::PoseGraphConfigError::ZeroOuterIterations)
+    ));
+    assert!(matches!(
+        PoseGraphConfig::try_new(20, 0, 1e-6, 1.0),
+        Err(super::PoseGraphConfigError::ZeroPcgIterations)
+    ));
     for invalid in [0.0, -1.0, 1.01, f64::NAN, f64::INFINITY] {
         assert!(matches!(
             PoseGraphConfig::try_new(20, 100, invalid, 1.0),
@@ -432,14 +446,89 @@ fn pose_graph_config_rejects_invalid_numeric_values() {
     for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         assert!(matches!(
             PoseGraphConfig::try_new(20, 100, 1e-6, invalid),
-            Err(super::PoseGraphConfigError::InvalidHuberDelta { .. })
+            Err(super::PoseGraphConfigError::InvalidNormalizedResidualHuberDelta { .. })
         ));
     }
     let config = optimizer_config(7, 11, 1e-4);
-    assert_eq!(config.max_iterations(), 7);
-    assert_eq!(config.pcg_max_iters(), 11);
+    assert_eq!(config.max_outer_iterations(), 7);
+    assert_eq!(config.max_pcg_iterations(), 11);
     assert_eq!(config.pcg_tol(), 1e-4);
-    assert_eq!(config.huber_delta(), 1.0);
+    assert_eq!(config.huber_delta_normalized_residual(), 1.0);
+}
+
+#[test]
+fn pose_graph_edge_parses_information_once_and_rejects_invalid_domains() {
+    assert!(matches!(
+        PoseGraphEdge::try_new(2, 2, Pose64::identity(), scalar_block(1.0)),
+        Err(super::PoseGraphEdgeError::SelfEdge { pose_index: 2 })
+    ));
+
+    let mut nonfinite = scalar_block(1.0);
+    nonfinite[1][4] = f64::NAN;
+    let nonfinite_error =
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), nonfinite).expect_err("non-finite info");
+    assert!(matches!(
+        nonfinite_error,
+        super::PoseGraphEdgeError::Information {
+            source: super::PoseGraphInformationError::NonFiniteEntry {
+                row: 1,
+                col: 4,
+                value,
+            },
+        } if value.is_nan()
+    ));
+    assert!(nonfinite_error.source().is_some());
+
+    let mut asymmetric = scalar_block(1.0);
+    asymmetric[0][1] = 0.25;
+    assert!(matches!(
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), asymmetric),
+        Err(super::PoseGraphEdgeError::Information {
+            source: super::PoseGraphInformationError::Asymmetric { row: 0, col: 1, .. },
+        })
+    ));
+
+    let mut indefinite = scalar_block(1.0);
+    indefinite[0][1] = 2.0;
+    indefinite[1][0] = 2.0;
+    assert!(matches!(
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), indefinite),
+        Err(super::PoseGraphEdgeError::Information {
+            source: super::PoseGraphInformationError::NotPositiveDefinite { .. },
+        })
+    ));
+}
+
+#[test]
+fn pose_graph_information_normalization_is_invariant_to_diagonal_scale() {
+    let mut information = [[0.0_f64; 6]; 6];
+    for (axis, value) in [1e-300, 1e-180, 1e-60, 1e60, 1e180, 1e300]
+        .into_iter()
+        .enumerate()
+    {
+        information[axis][axis] = value;
+    }
+    let parsed = super::PoseGraphInformation::try_new(information)
+        .expect("positive diagonal information across scales");
+    assert_eq!(parsed.matrix(), &information);
+    assert!(!parsed.was_symmetrized());
+}
+
+#[test]
+fn pose_graph_reports_within_tolerance_information_symmetrization() {
+    let mut information = scalar_block(2.0);
+    information[0][1] = 0.5;
+    information[1][0] = 0.5 + 4.0 * f64::EPSILON;
+    let edge = PoseGraphEdge::try_new(0, 1, Pose64::identity(), information)
+        .expect("within-tolerance asymmetry");
+    assert!(edge.information().was_symmetrized());
+    let parsed = edge.information().matrix();
+    assert_eq!(parsed[0][1], parsed[1][0]);
+
+    let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+    let mut poses = vec![Pose64::identity(), Pose64::identity()];
+    let result = optimizer.optimize(&[edge], &mut poses).expect("optimize");
+    assert_eq!(result.symmetrized_edge_information_count, 1);
 }
 
 fn translation_error(poses: &[Pose64], target: &[Pose64]) -> f64 {
@@ -480,7 +569,12 @@ fn pose_graph_optimizer_ring_graph_converges() {
     let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
     let result = optimizer.optimize(&edges, &mut initial).expect("optimize");
     let after = translation_error(&result.corrected_poses, &gt);
-    assert_eq!(result.termination, PoseGraphTermination::Converged);
+    assert!(matches!(
+        result.termination,
+        PoseGraphTermination::Converged {
+            criterion: super::PoseGraphConvergenceCriterion::TranslationAndRotationStepNorms
+        }
+    ));
     assert!(
         after < before,
         "ring graph did not improve: before={before}, after={after}"
@@ -532,84 +626,55 @@ fn pose_graph_optimizer_keeps_anchor_pose_fixed() {
 }
 
 #[test]
+fn pose_graph_reports_translation_and_rotation_step_clamps_separately() {
+    let target = [Pose64::identity(), Pose64::identity()];
+    let edges = vec![edge(0, 1, target[0], target[1])];
+    let mut initial = vec![target[0], se3_exp_f64([100.0, 0.0, 0.0, 2.5, 0.0, 0.0])];
+    let optimizer = PoseGraphOptimizer::new(optimizer_config(1, 100, 1e-6));
+    let result = optimizer.optimize(&edges, &mut initial).expect("optimize");
+
+    assert_eq!(result.termination, PoseGraphTermination::IterationLimit);
+    assert_eq!(result.clamped_translation_step_count, 1);
+    assert_eq!(result.clamped_rotation_step_count, 1);
+    assert!((result.last_max_translation_step_m - 1.0).abs() < 1e-12);
+    assert!((result.last_max_rotation_step_rad - 1.0).abs() < 1e-12);
+    assert!(result.last_linear_solve_residual_norm.is_finite());
+}
+
+#[test]
 fn pose_graph_optimizer_rejects_invalid_edges() {
     let poses = vec![Pose64::identity()];
     let mut initial = poses.clone();
     let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
     let err = optimizer
         .optimize(
-            &[PoseGraphEdge {
-                from: 0,
-                to: 1,
-                measurement: Pose64::identity(),
-                information: scalar_block(1.0),
-            }],
+            &[
+                PoseGraphEdge::try_new(0, 1, Pose64::identity(), scalar_block(1.0))
+                    .expect("valid edge with unresolved endpoint"),
+            ],
             &mut initial,
         )
         .expect_err("invalid edge should fail");
     assert!(matches!(
         err,
-        super::PoseGraphError::InvalidEdgeSet {
-            invalid_edges: 1,
-            pose_count: 1
+        super::PoseGraphError::EdgeToOutOfBounds {
+            edge_index: 0,
+            to: 1,
+            pose_count: 1,
         }
     ));
 }
 
 #[test]
-fn pose_graph_optimizer_reports_non_convergence() {
-    let gt = [
-        Pose64::identity(),
-        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-    ];
-    let edges = vec![edge(0, 1, gt[0], gt[1])];
-    let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
-    let defaults = PoseGraphConfig::default();
-    let optimizer = PoseGraphOptimizer::new(
-        PoseGraphConfig::try_new(
-            0,
-            defaults.pcg_max_iters(),
-            defaults.pcg_tol(),
-            defaults.huber_delta(),
-        )
-        .expect("zero-iteration test config"),
+fn pose_graph_configuration_cannot_represent_zero_iteration_limits() {
+    assert_eq!(
+        PoseGraphConfig::try_new(0, 1, 1e-6, 1.0).expect_err("zero outer iterations"),
+        super::PoseGraphConfigError::ZeroOuterIterations
     );
-    let result = optimizer
-        .optimize(&edges, &mut initial)
-        .expect("optimizer should return non-converged result");
-    assert_eq!(result.termination, PoseGraphTermination::IterationLimit);
-    assert_eq!(result.iterations, 0);
-}
-
-#[test]
-fn pose_graph_optimizer_rejects_pcg_iteration_limit_without_mutating_input() {
-    let gt = [
-        Pose64::identity(),
-        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-    ];
-    let edges = vec![edge(0, 1, gt[0], gt[1])];
-    let mut initial = vec![gt[0], se3_exp_f64([1.4, 0.3, 0.0, 0.0, 0.02, 0.0])];
-    let before = initial.clone();
-    let defaults = PoseGraphConfig::default();
-    let optimizer = PoseGraphOptimizer::new(
-        PoseGraphConfig::try_new(1, 0, defaults.pcg_tol(), defaults.huber_delta())
-            .expect("zero-PCG-iteration test config"),
+    assert_eq!(
+        PoseGraphConfig::try_new(1, 0, 1e-6, 1.0).expect_err("zero PCG iterations"),
+        super::PoseGraphConfigError::ZeroPcgIterations
     );
-
-    let err = optimizer
-        .optimize(&edges, &mut initial)
-        .expect_err("an exhausted inner solve must fail");
-
-    assert!(matches!(
-        err,
-        super::PoseGraphError::PcgDidNotConverge {
-            outer_iteration: 1,
-            iterations: 0,
-            stop_reason: PcgStopReason::IterationLimit,
-            ..
-        }
-    ));
-    assert_eq!(initial, before, "failed optimization mutated caller poses");
 }
 
 #[test]
@@ -639,7 +704,7 @@ fn pose_graph_optimizer_rejects_partial_pcg_step_without_mutating_input() {
         error,
         super::PoseGraphError::PcgDidNotConverge {
             outer_iteration: 1,
-            iterations: 1,
+            pcg_iterations: 1,
             stop_reason: PcgStopReason::IterationLimit,
             ..
         }
@@ -658,7 +723,33 @@ fn essential_graph_builds_spanning_tree_connectivity() {
     assert_eq!(graph.parent_of(kf0), Some(kf0));
     assert_eq!(graph.parent_of(kf1), Some(kf0));
     assert_eq!(graph.parent_of(kf2), Some(kf1));
-    assert!(graph.all_edges().len() >= 2);
+    assert!(graph.all_edges().expect("valid graph edges").len() >= 2);
+}
+
+#[test]
+fn essential_graph_never_selects_a_future_keyframe_as_parent() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(1);
+    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+
+    let snapshot = graph.snapshot();
+    let order_index = snapshot
+        .order
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, keyframe_id)| (keyframe_id, index))
+        .collect::<HashMap<_, _>>();
+    for (&child, &parent) in &snapshot.parent {
+        if child == parent {
+            assert_eq!(child, kf0, "only the root may be its own parent");
+        } else {
+            assert!(order_index[&parent] < order_index[&child]);
+        }
+    }
+    assert!(graph.pose_graph_input().is_ok());
 }
 
 #[test]
@@ -765,6 +856,39 @@ fn essential_graph_deduplicates_loop_edges_by_keyframe_pair() {
 }
 
 #[test]
+fn essential_graph_input_preserves_invalid_edge_construction_source() {
+    let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+
+    let mut asymmetric = scalar_block(1.0);
+    asymmetric[0][1] = 0.5;
+    graph.add_loop_edge(EssentialEdge {
+        a: kf0,
+        b: kf1,
+        kind: EssentialEdgeKind::Loop,
+        relative_pose: Pose64::identity(),
+        information: asymmetric,
+    });
+
+    let error = graph
+        .pose_graph_input()
+        .expect_err("invalid raw essential-edge information must fail at parse boundary");
+    assert!(matches!(
+        error,
+        super::PoseGraphError::EdgeConstruction {
+            source: super::PoseGraphEdgeError::Information {
+                source: super::PoseGraphInformationError::Asymmetric { .. },
+            },
+            ..
+        }
+    ));
+    assert!(error.source().is_some());
+    assert!(error.source().and_then(std::error::Error::source).is_some());
+}
+
+#[test]
 fn essential_graph_remove_keyframe_reparents_children() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
@@ -786,7 +910,7 @@ fn essential_graph_remove_keyframe_reparents_children() {
             .iter()
             .all(|edge| edge.a != kf1 && edge.b != kf1)
     );
-    let input = graph.pose_graph_input();
+    let input = graph.pose_graph_input().expect("valid graph input");
     assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
 }
 
@@ -907,12 +1031,12 @@ fn essential_graph_random_remove_preserves_connectivity_invariants() {
             assert!(alive_set.contains(&edge.b));
         }
 
-        let input = graph.pose_graph_input();
+        let input = graph.pose_graph_input().expect("valid graph input");
         let input_set: HashSet<_> = input.keyframe_ids.iter().copied().collect();
         assert!(input_set.is_subset(&alive_set));
         for edge in &input.edges {
-            assert!(edge.from < input.keyframe_ids.len());
-            assert!(edge.to < input.keyframe_ids.len());
+            assert!(edge.from() < input.keyframe_ids.len());
+            assert!(edge.to() < input.keyframe_ids.len());
         }
     }
 }

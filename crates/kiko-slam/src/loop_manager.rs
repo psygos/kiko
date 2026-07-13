@@ -62,10 +62,10 @@ impl LoopManager {
             b: query_kf,
             kind: EssentialEdgeKind::Loop,
             relative_pose: loop_relative,
-            information: loop_information_matrix(verified.inlier_count()),
+            information: heuristic_loop_information_from_inlier_count(verified.inlier_count()),
         });
 
-        let input = essential_graph.pose_graph_input();
+        let input = essential_graph.pose_graph_input()?;
         if input.keyframe_ids.len() < MIN_OPTIMIZATION_KEYFRAMES || input.edges.is_empty() {
             return Ok(Vec::new());
         }
@@ -82,11 +82,11 @@ impl LoopManager {
         }
 
         let result = self.optimizer.optimize(&input.edges, &mut initial_poses)?;
-        if result.termination != PoseGraphTermination::Converged {
+        if !matches!(result.termination, PoseGraphTermination::Converged { .. }) {
             return Err(LoopApplyError::PoseGraph {
                 source: PoseGraphError::NotConverged {
-                    iterations: result.iterations,
-                    residual_norm: result.residual_norm,
+                    outer_iterations: result.outer_iterations,
+                    last_linear_solve_residual_norm: result.last_linear_solve_residual_norm,
                 },
             });
         }
@@ -220,8 +220,10 @@ fn loop_rotation_angle_deg(pose: Pose) -> f32 {
     cos_theta.acos().to_degrees()
 }
 
-fn loop_information_matrix(inlier_count: usize) -> [[f64; 6]; 6] {
-    let weight = inlier_count.max(1) as f64;
+/// Heuristic isotropic information scaled by verified PnP support. This is not
+/// a covariance-derived uncertainty estimate.
+fn heuristic_loop_information_from_inlier_count(inlier_count: usize) -> [[f64; 6]; 6] {
+    let weight = inlier_count as f64;
     let mut info = [[0.0_f64; 6]; 6];
     for (axis, row) in info.iter_mut().enumerate() {
         row[axis] = weight;
