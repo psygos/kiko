@@ -5,7 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, FrameError, ImuBatch, PairError, SensorId, StereoPair};
+use crate::{
+    DepthImage, Frame, FrameError, ImuBatch, ImuSampleError, ImuTimestampShiftError, PairError,
+    SensorId, StereoPair,
+};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -173,6 +176,35 @@ impl WriterStats {
 }
 
 #[derive(Debug)]
+pub enum DatasetImuRecordError {
+    Decode { source: std::io::Error },
+    InvalidSample { source: ImuSampleError },
+    TimestampShift { source: ImuTimestampShiftError },
+}
+
+impl std::fmt::Display for DatasetImuRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decode { source } => write!(f, "could not decode fixed-width fields: {source}"),
+            Self::InvalidSample { source } => write!(f, "invalid IMU sample: {source}"),
+            Self::TimestampShift { source } => {
+                write!(f, "invalid IMU timestamp shift: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatasetImuRecordError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode { source } => Some(source),
+            Self::InvalidSample { source } => Some(source),
+            Self::TimestampShift { source } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum DatasetError {
     OutputAlreadyExists {
         path: PathBuf,
@@ -188,6 +220,16 @@ pub enum DatasetError {
     ReadFile {
         path: PathBuf,
         source: std::io::Error,
+    },
+    InvalidImuLength {
+        path: PathBuf,
+        byte_len: usize,
+        record_bytes: usize,
+    },
+    InvalidImuRecord {
+        path: PathBuf,
+        record_index: usize,
+        source: DatasetImuRecordError,
     },
     InvalidConfig {
         msg: &'static str,
@@ -241,6 +283,24 @@ impl std::fmt::Display for DatasetError {
             DatasetError::ReadFile { path, source } => {
                 write!(f, "failed to read file {}: {}", path.display(), source)
             }
+            DatasetError::InvalidImuLength {
+                path,
+                byte_len,
+                record_bytes,
+            } => write!(
+                f,
+                "invalid IMU file {}: {byte_len} bytes is not a whole number of {record_bytes}-byte records",
+                path.display()
+            ),
+            DatasetError::InvalidImuRecord {
+                path,
+                record_index,
+                source,
+            } => write!(
+                f,
+                "invalid IMU record {record_index} in {}: {source}",
+                path.display()
+            ),
             DatasetError::InvalidConfig { msg } => write!(f, "invalid dataset config: {msg}"),
             DatasetError::InvalidFrame { path, source } => {
                 write!(f, "invalid dataset frame {}: {source}", path.display())
@@ -286,8 +346,10 @@ impl std::error::Error for DatasetError {
             }
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::InvalidFrame { source, .. } => Some(source),
+            DatasetError::InvalidImuRecord { source, .. } => Some(source),
             DatasetError::InvalidConfig { .. }
             | DatasetError::OutputAlreadyExists { .. }
+            | DatasetError::InvalidImuLength { .. }
             | DatasetError::WorkerJoin { .. }
             | DatasetError::MissingImuSamples { .. } => None,
         }
@@ -729,7 +791,8 @@ impl WriterState {
     }
 }
 
-const IMU_RECORD_BYTES: usize = std::mem::size_of::<i64>() + 6 * std::mem::size_of::<f64>();
+pub(super) const IMU_RECORD_BYTES: usize =
+    std::mem::size_of::<i64>() + 6 * std::mem::size_of::<f64>();
 
 fn writer_loop(state: Arc<WriterState>) {
     loop {

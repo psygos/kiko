@@ -7,8 +7,8 @@ use crate::{
 };
 
 use super::{
-    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration_with_imu_override,
-    read_manifest, read_meta, scan_frames,
+    Calibration, DatasetError, DatasetImuRecordError, FrameInfo, IMU_RECORD_BYTES, Manifest,
+    format, read_calibration_with_imu_override, read_manifest, read_meta, scan_frames,
 };
 
 #[derive(Debug)]
@@ -451,6 +451,59 @@ fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
     (min_ts, max_ts)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RawImuRecord {
+    timestamp_ns: i64,
+    accel_mps2: [f64; 3],
+    gyro_radps: [f64; 3],
+}
+
+impl RawImuRecord {
+    fn parse(mut bytes: &[u8]) -> Result<Self, std::io::Error> {
+        fn read_array<const N: usize>(input: &mut &[u8]) -> Result<[u8; N], std::io::Error> {
+            let mut bytes = [0_u8; N];
+            std::io::Read::read_exact(input, &mut bytes)?;
+            Ok(bytes)
+        }
+
+        fn read_f64(input: &mut &[u8]) -> Result<f64, std::io::Error> {
+            read_array(input).map(f64::from_le_bytes)
+        }
+
+        let record = Self {
+            timestamp_ns: i64::from_le_bytes(read_array(&mut bytes)?),
+            accel_mps2: [
+                read_f64(&mut bytes)?,
+                read_f64(&mut bytes)?,
+                read_f64(&mut bytes)?,
+            ],
+            gyro_radps: [
+                read_f64(&mut bytes)?,
+                read_f64(&mut bytes)?,
+                read_f64(&mut bytes)?,
+            ],
+        };
+        if !bytes.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IMU record contains trailing bytes",
+            ));
+        }
+        Ok(record)
+    }
+
+    fn into_sample(self, time_offset_ns: i64) -> Result<ImuSample, DatasetImuRecordError> {
+        ImuSample::new(
+            Timestamp::from_nanos(self.timestamp_ns),
+            self.accel_mps2,
+            self.gyro_radps,
+        )
+        .map_err(|source| DatasetImuRecordError::InvalidSample { source })?
+        .shifted_timestamp_ns(time_offset_ns)
+        .map_err(|source| DatasetImuRecordError::TimestampShift { source })
+    }
+}
+
 fn read_imu_samples(
     root: &Path,
     meta: &super::Meta,
@@ -470,53 +523,29 @@ fn read_imu_samples(
             end_ns: 0,
         });
     }
-    const RECORD_BYTES: usize = std::mem::size_of::<i64>() + 6 * std::mem::size_of::<f64>();
-    let chunks = bytes.chunks_exact(RECORD_BYTES);
+    let chunks = bytes.chunks_exact(IMU_RECORD_BYTES);
     if !chunks.remainder().is_empty() {
-        return Err(DatasetError::ReadFile {
+        return Err(DatasetError::InvalidImuLength {
             path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "imu.bin length is not a whole number of imu records",
-            ),
+            byte_len: bytes.len(),
+            record_bytes: IMU_RECORD_BYTES,
         });
     }
-    let mut samples = Vec::with_capacity(bytes.len() / RECORD_BYTES);
-    for chunk in chunks {
-        let timestamp = i64::from_le_bytes(chunk[0..8].try_into().expect("timestamp bytes"));
-        let mut offset = 8usize;
-        let read_f64 = |chunk: &[u8], offset: &mut usize| -> f64 {
-            let end = *offset + 8;
-            let value = f64::from_le_bytes(chunk[*offset..end].try_into().expect("f64 bytes"));
-            *offset = end;
-            value
-        };
-        let accel = [
-            read_f64(chunk, &mut offset),
-            read_f64(chunk, &mut offset),
-            read_f64(chunk, &mut offset),
-        ];
-        let gyro = [
-            read_f64(chunk, &mut offset),
-            read_f64(chunk, &mut offset),
-            read_f64(chunk, &mut offset),
-        ];
-        let sample = ImuSample::new(Timestamp::from_nanos(timestamp), accel, gyro)
-            .map_err(|source| DatasetError::ReadFile {
+    let mut samples = Vec::with_capacity(bytes.len() / IMU_RECORD_BYTES);
+    for (record_index, chunk) in chunks.enumerate() {
+        let record =
+            RawImuRecord::parse(chunk).map_err(|source| DatasetError::InvalidImuRecord {
                 path: path.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid imu sample: {source}"),
-                ),
-            })?
-            .shifted_timestamp_ns(time_offset_ns)
-            .map_err(|source| DatasetError::ReadFile {
-                path: path.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("invalid imu timestamp shift: {source}"),
-                ),
+                record_index,
+                source: DatasetImuRecordError::Decode { source },
             })?;
+        let sample = record.into_sample(time_offset_ns).map_err(|source| {
+            DatasetError::InvalidImuRecord {
+                path: path.clone(),
+                record_index,
+                source,
+            }
+        })?;
         samples.push(sample);
     }
     Ok(Some(samples.into_boxed_slice()))
@@ -530,6 +559,7 @@ mod tests {
         ImuNoiseMeta, Meta, MonoMeta,
     };
     use crate::{ImuBatch, ImuSample, SensorId};
+    use std::error::Error as _;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -551,6 +581,75 @@ mod tests {
         ];
         let fps = fps_from_frames(&frames).expect("fps");
         assert!((fps - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn raw_imu_record_parser_rejects_short_and_trailing_input_without_panicking() {
+        let short = [0_u8; IMU_RECORD_BYTES - 1];
+        assert_eq!(
+            RawImuRecord::parse(&short)
+                .expect_err("short record")
+                .kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+
+        let trailing = [0_u8; IMU_RECORD_BYTES + 1];
+        assert_eq!(
+            RawImuRecord::parse(&trailing)
+                .expect_err("trailing byte")
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn imu_file_length_error_reports_the_format_boundary() {
+        let dataset_dir = unique_temp_dir("invalid-imu-length");
+        std::fs::create_dir_all(&dataset_dir).expect("dataset directory");
+        let path = dataset_dir.join(crate::dataset::format::IMU_FILE);
+        std::fs::write(&path, [0_u8; 3]).expect("malformed IMU file");
+
+        let error = read_imu_samples(&dataset_dir, &meta_with_imu(), 0)
+            .expect_err("partial record must fail");
+        assert!(matches!(
+            error,
+            DatasetError::InvalidImuLength {
+                path: actual_path,
+                byte_len: 3,
+                record_bytes: IMU_RECORD_BYTES,
+            } if actual_path == path
+        ));
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn invalid_imu_sample_preserves_record_and_domain_source() {
+        let dataset_dir = unique_temp_dir("invalid-imu-sample");
+        std::fs::create_dir_all(&dataset_dir).expect("dataset directory");
+        let path = dataset_dir.join(crate::dataset::format::IMU_FILE);
+        let mut bytes = Vec::with_capacity(IMU_RECORD_BYTES);
+        bytes.extend_from_slice(&7_i64.to_le_bytes());
+        for value in [f64::NAN, 0.0, 0.0, 0.0, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).expect("invalid IMU file");
+
+        let error = read_imu_samples(&dataset_dir, &meta_with_imu(), 0)
+            .expect_err("nonfinite sample must fail");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidImuRecord {
+                path: actual_path,
+                record_index: 0,
+                source: DatasetImuRecordError::InvalidSample { .. },
+            } if actual_path == &path
+        ));
+        let record = error.source().expect("record source");
+        let sample = record.source().expect("sample source");
+        assert!(sample.to_string().contains("imu accel axis 0"));
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
     }
 
     #[test]
@@ -927,7 +1026,17 @@ mod tests {
 
         let open_err =
             DatasetReader::open(&dataset_dir).expect_err("embedded offset should overflow");
-        assert!(matches!(open_err, DatasetError::ReadFile { .. }));
+        assert!(matches!(
+            &open_err,
+            DatasetError::InvalidImuRecord {
+                record_index: 0,
+                source: DatasetImuRecordError::TimestampShift { .. },
+                ..
+            }
+        ));
+        let record = open_err.source().expect("record source");
+        let shift = record.source().expect("timestamp-shift source");
+        assert!(shift.to_string().contains("overflowed i64 range"));
 
         let reader = DatasetReader::open_with_imu_calibration_override(
             &dataset_dir,
