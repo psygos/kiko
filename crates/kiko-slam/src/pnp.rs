@@ -301,16 +301,72 @@ impl PnpResult {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PnpRefinementTermination {
-    Converged { iterations: NonZeroUsize },
-    IterationLimit { iterations: NonZeroUsize },
+    Converged {
+        iterations: NonZeroUsize,
+    },
+    IterationLimit {
+        iterations: NonZeroUsize,
+    },
+    Stalled {
+        iterations: NonZeroUsize,
+        current_cost: PnpRefinementCost,
+        candidate_cost: PnpRefinementCost,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct PnpRefinementCost(f64);
+
+impl PnpRefinementCost {
+    fn try_new(
+        iteration: NonZeroUsize,
+        stage: PnpRefinementObjectiveStage,
+        value: f64,
+    ) -> Result<Self, PnpRefinementFallback> {
+        if !value.is_finite() || value < 0.0 {
+            return Err(PnpRefinementFallback::InvalidObjective {
+                iteration,
+                stage,
+                value,
+            });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PnpRefinementCost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpRefinementObjectiveStage {
+    Current,
+    Candidate,
+}
+
+impl std::fmt::Display for PnpRefinementObjectiveStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Current => write!(f, "current"),
+            Self::Candidate => write!(f, "candidate"),
+        }
+    }
 }
 
 impl PnpRefinementTermination {
     pub fn iterations(self) -> NonZeroUsize {
         match self {
-            Self::Converged { iterations } | Self::IterationLimit { iterations } => iterations,
+            Self::Converged { iterations }
+            | Self::IterationLimit { iterations }
+            | Self::Stalled { iterations, .. } => iterations,
         }
     }
 }
@@ -358,6 +414,19 @@ pub enum PnpRefinementFallback {
         iteration: NonZeroUsize,
         source: crate::Pose64Error,
     },
+    Stationary {
+        iteration: NonZeroUsize,
+    },
+    NoImprovement {
+        iteration: NonZeroUsize,
+        current_cost: PnpRefinementCost,
+        candidate_cost: PnpRefinementCost,
+    },
+    InvalidObjective {
+        iteration: NonZeroUsize,
+        stage: PnpRefinementObjectiveStage,
+        value: f64,
+    },
     LostConsensus {
         termination: PnpRefinementTermination,
         candidate_inliers: usize,
@@ -372,7 +441,10 @@ impl PnpRefinementFallback {
             Self::InvalidInlierIndex { iteration, .. }
             | Self::NonProjectableInliers { iteration, .. }
             | Self::LinearSolve { iteration, .. }
-            | Self::InvalidPose { iteration, .. } => Some(*iteration),
+            | Self::InvalidPose { iteration, .. }
+            | Self::Stationary { iteration }
+            | Self::NoImprovement { iteration, .. }
+            | Self::InvalidObjective { iteration, .. } => Some(*iteration),
             Self::LostConsensus { termination, .. } => Some(termination.iterations()),
         }
     }
@@ -402,6 +474,26 @@ impl std::fmt::Display for PnpRefinementFallback {
                 f,
                 "PnP refinement produced an invalid pose at iteration {iteration}: {source}"
             ),
+            Self::Stationary { iteration } => write!(
+                f,
+                "PnP refinement was already stationary at iteration {iteration}"
+            ),
+            Self::NoImprovement {
+                iteration,
+                current_cost,
+                candidate_cost,
+            } => write!(
+                f,
+                "PnP refinement proposal did not improve the fixed-inlier objective at iteration {iteration} (current={current_cost}, candidate={candidate_cost})"
+            ),
+            Self::InvalidObjective {
+                iteration,
+                stage,
+                value,
+            } => write!(
+                f,
+                "PnP refinement {stage} objective must be finite and nonnegative at iteration {iteration}, got {value}"
+            ),
             Self::LostConsensus {
                 termination,
                 candidate_inliers,
@@ -422,6 +514,9 @@ impl std::error::Error for PnpRefinementFallback {
             Self::EmptyInlierSet
             | Self::InvalidInlierIndex { .. }
             | Self::NonProjectableInliers { .. }
+            | Self::Stationary { .. }
+            | Self::NoImprovement { .. }
+            | Self::InvalidObjective { .. }
             | Self::LostConsensus { .. } => None,
         }
     }
@@ -607,12 +702,14 @@ fn refine_pose_on_inliers(
     let mut pose = initial_pose;
     let mut hessian = [0.0_f32; 36];
     let mut rhs = [0.0_f32; 6];
+    let mut accepted_any = false;
 
     for iter in 0..PNP_REFINEMENT_ITERS {
         let iteration = NonZeroUsize::MIN.saturating_add(iter);
         hessian.fill(0.0);
         rhs.fill(0.0);
         let mut nonprojectable = 0usize;
+        let mut current_cost = 0.0_f64;
 
         for &idx in inlier_indices {
             let obs = observations
@@ -628,6 +725,11 @@ fn refine_pose_on_inliers(
                 nonprojectable = nonprojectable.saturating_add(1);
                 continue;
             };
+
+            let residual_x = f64::from(residual[0]);
+            let residual_y = f64::from(residual[1]);
+            current_cost =
+                residual_x.mul_add(residual_x, residual_y.mul_add(residual_y, current_cost));
 
             for row in 0..6 {
                 rhs[row] -= jacobian[0][row] * residual[0] + jacobian[1][row] * residual[1];
@@ -649,36 +751,46 @@ fn refine_pose_on_inliers(
             .map_err(|source| PnpRefinementFallback::LinearSolve { iteration, source })?;
 
         let delta = rhs;
-        let step_norm = (delta[0] * delta[0]
-            + delta[1] * delta[1]
-            + delta[2] * delta[2]
-            + delta[3] * delta[3]
-            + delta[4] * delta[4]
-            + delta[5] * delta[5])
+        let step_norm = delta
+            .iter()
+            .map(|&component| {
+                let component = f64::from(component);
+                component * component
+            })
+            .sum::<f64>()
             .sqrt();
         let candidate = crate::local_ba::apply_se3_delta(pose, delta);
         crate::Pose64::try_from_pose32(candidate)
             .map_err(|source| PnpRefinementFallback::InvalidPose { iteration, source })?;
-        let candidate_nonprojectable = inlier_indices
-            .iter()
-            .filter(|&&idx| {
-                observations
-                    .get(idx)
-                    .and_then(|obs| reprojection_error_sq_px(candidate, obs, intrinsics))
-                    .is_none()
-            })
-            .count();
+        let mut candidate_nonprojectable = 0usize;
+        let mut candidate_cost = 0.0_f64;
+        for &idx in inlier_indices {
+            let Some(error_sq) = observations
+                .get(idx)
+                .and_then(|obs| reprojection_error_sq_px(candidate, obs, intrinsics))
+            else {
+                candidate_nonprojectable = candidate_nonprojectable.saturating_add(1);
+                continue;
+            };
+            candidate_cost += f64::from(error_sq);
+        }
         if let Some(count) = NonZeroUsize::new(candidate_nonprojectable) {
             return Err(PnpRefinementFallback::NonProjectableInliers { iteration, count });
         }
-        pose = candidate;
-        if step_norm < PNP_REFINEMENT_STEP_EPS {
-            return Ok((
-                pose,
-                PnpRefinementTermination::Converged {
-                    iterations: iteration,
-                },
-            ));
+        match decide_refinement_step(
+            iteration,
+            accepted_any,
+            step_norm,
+            current_cost,
+            candidate_cost,
+        )? {
+            RefinementStepDecision::Accept => {
+                pose = candidate;
+                accepted_any = true;
+            }
+            RefinementStepDecision::Finish(termination) => {
+                return Ok((pose, termination));
+            }
         }
     }
 
@@ -688,6 +800,63 @@ fn refine_pose_on_inliers(
             iterations: NonZeroUsize::MIN.saturating_add(PNP_REFINEMENT_ITERS - 1),
         },
     ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RefinementStepDecision {
+    Accept,
+    Finish(PnpRefinementTermination),
+}
+
+fn decide_refinement_step(
+    iteration: NonZeroUsize,
+    accepted_any: bool,
+    step_norm: f64,
+    current_cost: f64,
+    candidate_cost: f64,
+) -> Result<RefinementStepDecision, PnpRefinementFallback> {
+    let current_cost = PnpRefinementCost::try_new(
+        iteration,
+        PnpRefinementObjectiveStage::Current,
+        current_cost,
+    )?;
+    let candidate_cost = PnpRefinementCost::try_new(
+        iteration,
+        PnpRefinementObjectiveStage::Candidate,
+        candidate_cost,
+    )?;
+
+    if step_norm < f64::from(PNP_REFINEMENT_STEP_EPS) {
+        return if accepted_any {
+            Ok(RefinementStepDecision::Finish(
+                PnpRefinementTermination::Converged {
+                    iterations: iteration,
+                },
+            ))
+        } else {
+            Err(PnpRefinementFallback::Stationary { iteration })
+        };
+    }
+
+    if candidate_cost < current_cost {
+        return Ok(RefinementStepDecision::Accept);
+    }
+
+    if accepted_any {
+        Ok(RefinementStepDecision::Finish(
+            PnpRefinementTermination::Stalled {
+                iterations: iteration,
+                current_cost,
+                candidate_cost,
+            },
+        ))
+    } else {
+        Err(PnpRefinementFallback::NoImprovement {
+            iteration,
+            current_cost,
+            candidate_cost,
+        })
+    }
 }
 
 fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
@@ -1627,6 +1796,80 @@ mod tests {
             "expected refinement to improve reprojection error: initial={initial_rmse}, refined={refined_rmse}"
         );
         assert!(termination.iterations().get() <= PNP_REFINEMENT_ITERS);
+    }
+
+    #[test]
+    fn refinement_objective_gate_never_accepts_a_non_improving_step() {
+        let iteration = NonZeroUsize::MIN;
+        assert_eq!(
+            decide_refinement_step(iteration, false, 1.0, 10.0, 9.0).expect("improving step"),
+            RefinementStepDecision::Accept
+        );
+        assert!(matches!(
+            decide_refinement_step(iteration, false, 1.0, 10.0, 10.0),
+            Err(PnpRefinementFallback::NoImprovement { .. })
+        ));
+        assert!(matches!(
+            decide_refinement_step(iteration, false, 0.0, 10.0, 10.0),
+            Err(PnpRefinementFallback::Stationary { .. })
+        ));
+        assert!(matches!(
+            decide_refinement_step(iteration, true, 1.0, 10.0, 11.0),
+            Ok(RefinementStepDecision::Finish(
+                PnpRefinementTermination::Stalled { .. }
+            ))
+        ));
+        assert!(matches!(
+            decide_refinement_step(iteration, false, 1.0, f64::NAN, 9.0),
+            Err(PnpRefinementFallback::InvalidObjective {
+                stage: PnpRefinementObjectiveStage::Current,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn refine_pose_never_increases_the_fixed_inlier_objective() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let world = synthetic_world_points();
+        let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
+        let observations =
+            observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
+        let inlier_indices: Vec<usize> = (0..observations.len()).collect();
+
+        for initial in [
+            axis_angle_pose([0.23, -0.08, 0.33], [0.10, -0.04, 0.02]),
+            axis_angle_pose([0.15, -0.15, 0.40], [0.02, -0.10, 0.08]),
+            axis_angle_pose([0.30, 0.00, 0.25], [0.15, 0.02, -0.03]),
+        ] {
+            let initial_cost: f64 = inlier_indices
+                .iter()
+                .map(|&index| {
+                    f64::from(
+                        reprojection_error_sq_px(initial, &observations[index], intrinsics)
+                            .expect("initial projection"),
+                    )
+                })
+                .sum();
+            if let Ok((refined, _)) =
+                refine_pose_on_inliers(initial, &observations, intrinsics, &inlier_indices)
+            {
+                let refined_cost: f64 = inlier_indices
+                    .iter()
+                    .map(|&index| {
+                        f64::from(
+                            reprojection_error_sq_px(refined, &observations[index], intrinsics)
+                                .expect("refined projection"),
+                        )
+                    })
+                    .sum();
+                assert!(
+                    refined_cost <= initial_cost,
+                    "refinement increased fixed-inlier cost: initial={initial_cost}, refined={refined_cost}"
+                );
+            }
+        }
     }
 
     #[test]
