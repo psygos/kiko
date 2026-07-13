@@ -11,8 +11,8 @@ use kiko_slam::{
     CalibrationBundle, CaptureBundle, CaptureId, CaptureImu, CaptureInterval, ChannelCapacity,
     DepthImage, DiagnosticEvent, DropPolicy, DropReceiver, Frame, FrameDiagnostics, FrameId,
     ImuAccumulator, ImuBatch, PairingDropReason, PairingOutcome, Point3, PoseStatus, Raw,
-    RerunSink, SendOutcome, SensorId, SlamTracker, StereoPairer, SystemHealth, VizPacket,
-    bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
+    RerunSink, SendOutcome, SensorId, SlamTracker, StereoPairer, SystemHealth, VizLogError,
+    VizPacket, bounded_channel, oak_to_depth_image, oak_to_frame, oak_to_imu_batch,
 };
 use oak_sys::{
     DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig,
@@ -67,6 +67,10 @@ enum LiveThreadError {
     VizPacket {
         source: kiko_slam::VizError,
     },
+    VizLog {
+        operation: &'static str,
+        source: VizLogError,
+    },
     FrameProcessingPanic {
         detail: String,
     },
@@ -88,6 +92,9 @@ impl std::fmt::Display for LiveThreadError {
             LiveThreadError::VizPacket { source } => {
                 write!(f, "visualization packet construction failed: {source}")
             }
+            LiveThreadError::VizLog { operation, source } => {
+                write!(f, "failed to log {operation}: {source}")
+            }
             LiveThreadError::FrameProcessingPanic { detail } => {
                 write!(f, "inference panic while processing frame: {detail}")
             }
@@ -102,6 +109,7 @@ impl std::error::Error for LiveThreadError {
             LiveThreadError::VizInit { source } => Some(source),
             LiveThreadError::Tracker { source } => Some(source),
             LiveThreadError::VizPacket { source } => Some(source),
+            LiveThreadError::VizLog { source, .. } => Some(source),
             LiveThreadError::VizChannelDisconnected
             | LiveThreadError::FrameProcessingPanic { .. } => None,
         }
@@ -233,6 +241,18 @@ impl std::error::Error for LiveWorkerError {
     }
 }
 
+impl LiveWorkerError {
+    fn is_viz_disconnect_cascade(&self) -> bool {
+        matches!(
+            self,
+            Self::Failed {
+                source: LiveThreadError::VizChannelDisconnected,
+                ..
+            }
+        )
+    }
+}
+
 fn join_live_worker(
     worker: &'static str,
     handle: thread::JoinHandle<Result<(), LiveThreadError>>,
@@ -253,6 +273,58 @@ fn drain_latest_depth(rx: &DropReceiver<DepthImage>) -> Option<DepthImage> {
         latest = Some(depth);
     }
     latest
+}
+
+fn map_viz_log(
+    operation: &'static str,
+    result: Result<(), VizLogError>,
+) -> Result<(), LiveThreadError> {
+    result.map_err(|source| LiveThreadError::VizLog { operation, source })
+}
+
+fn log_live_viz_message(sink: &mut RerunSink, msg: &LiveVizMsg) -> Result<(), LiveThreadError> {
+    let timestamp = msg.left.timestamp();
+    if let Some(packet) = msg.packet.as_ref() {
+        map_viz_log(
+            "stereo matches",
+            sink.log_with_points(packet, msg.points.as_deref()),
+        )?;
+    } else {
+        map_viz_log("stereo frames", sink.log_frames(&msg.left, &msg.right))?;
+    }
+    if let Some(depth) = msg.depth.as_ref() {
+        map_viz_log("depth frame", sink.log_depth(depth))?;
+    }
+    if let Some(imu) = msg.imu.as_ref() {
+        map_viz_log("IMU batch", sink.log_imu_batch(imu))?;
+    }
+    if let Some(pose) = msg.pose.current_estimate() {
+        map_viz_log("tracking pose", sink.log_tracking_pose(timestamp, pose))?;
+    }
+    if let Some(vio_telemetry) = msg.vio_telemetry.as_ref() {
+        map_viz_log(
+            "VIO telemetry",
+            sink.log_vio_telemetry(timestamp, vio_telemetry),
+        )?;
+    }
+    if let Some(snapshot) = msg.covisibility_snapshot.as_ref() {
+        map_viz_log(
+            "covisibility graph",
+            sink.log_covisibility_graph(timestamp, snapshot),
+        )?;
+    }
+    map_viz_log(
+        "system health telemetry",
+        sink.log_system_health(timestamp, &msg.health),
+    )?;
+    map_viz_log(
+        "frame diagnostics",
+        sink.log_diagnostics(timestamp, &msg.diagnostics),
+    )?;
+    for event in &msg.events {
+        map_viz_log("diagnostic event", sink.log_event(timestamp, event))?;
+    }
+    Ok(())
 }
 
 pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -471,50 +543,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
         for msg in viz_rx.iter() {
             if let Some(sink) = sink.as_mut() {
-                if let Some(packet) = msg.packet.as_ref() {
-                    if let Err(err) = sink.log_with_points(packet, msg.points.as_deref()) {
-                        eprintln!("rerun log error: {err}");
-                    }
-                } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
-                    eprintln!("rerun log error: {err}");
-                }
-                if let Some(depth) = msg.depth.as_ref() {
-                    if let Err(err) = sink.log_depth(depth) {
-                        eprintln!("rerun log error: {err}");
-                    }
-                }
-                if let Some(imu) = msg.imu.as_ref() {
-                    if let Err(err) = sink.log_imu_batch(imu) {
-                        eprintln!("rerun imu log error: {err}");
-                    }
-                }
-
-                if let Some(pose) = msg.pose.current_estimate() {
-                    if let Err(err) = sink.log_tracking_pose(msg.left.timestamp(), pose) {
-                        eprintln!("rerun log error: {err}");
-                    }
-                }
-                if let Some(vio_telemetry) = msg.vio_telemetry.as_ref() {
-                    if let Err(err) = sink.log_vio_telemetry(msg.left.timestamp(), vio_telemetry) {
-                        eprintln!("rerun imu log error: {err}");
-                    }
-                }
-                if let Some(snapshot) = msg.covisibility_snapshot.as_ref() {
-                    if let Err(err) = sink.log_covisibility_graph(msg.left.timestamp(), snapshot) {
-                        eprintln!("rerun log error: {err}");
-                    }
-                }
-                if let Err(err) = sink.log_system_health(msg.left.timestamp(), &msg.health) {
-                    eprintln!("rerun health error: {err}");
-                }
-                if let Err(err) = sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics) {
-                    eprintln!("rerun diagnostics error: {err}");
-                }
-                for event in &msg.events {
-                    if let Err(err) = sink.log_event(msg.left.timestamp(), event) {
-                        eprintln!("rerun event error: {err}");
-                    }
-                }
+                log_live_viz_message(sink, &msg)?;
             }
         }
         Ok(())
@@ -722,14 +751,17 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(error));
         }
     }
-    if let Err(error) = inference_result {
-        if let Err(worker_error) = &viz_result {
-            eprintln!("secondary live shutdown error: {worker_error}");
+    match (inference_result, viz_result) {
+        (Err(inference_error), Err(viz_error)) if inference_error.is_viz_disconnect_cascade() => {
+            eprintln!("secondary live shutdown error: {inference_error}");
+            return Err(Box::new(viz_error));
         }
-        return Err(Box::new(error));
-    }
-    if let Err(error) = viz_result {
-        return Err(Box::new(error));
+        (Err(inference_error), Err(viz_error)) => {
+            eprintln!("secondary live shutdown error: {viz_error}");
+            return Err(Box::new(inference_error));
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(Box::new(error)),
+        (Ok(()), Ok(())) => {}
     }
     if let Some(error) = capture_error {
         return Err(Box::new(error));
@@ -782,4 +814,52 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::{LiveThreadError, LiveWorkerError, map_viz_log};
+    use kiko_slam::VizLogError;
+
+    #[test]
+    fn visualization_log_failure_retains_operation_and_source_chain() {
+        let error = map_viz_log(
+            "tracking pose",
+            Err(VizLogError::Rerun(
+                rerun::RecordingStreamError::NotAProxyEndpoint,
+            )),
+        )
+        .expect_err("logging failure must propagate");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to log tracking pose: rerun logging error: not a `/proxy` endpoint"
+        );
+        let viz_source = error.source().expect("visualization source");
+        assert_eq!(
+            viz_source.to_string(),
+            "rerun logging error: not a `/proxy` endpoint"
+        );
+        assert!(
+            viz_source.source().is_some(),
+            "rerun source must be chained"
+        );
+    }
+
+    #[test]
+    fn visualization_disconnect_cascade_is_classified_for_root_cause_selection() {
+        let cascade = LiveWorkerError::Failed {
+            worker: "inference",
+            source: LiveThreadError::VizChannelDisconnected,
+        };
+        let unrelated = LiveWorkerError::Panicked {
+            worker: "inference",
+            detail: "test panic".to_owned(),
+        };
+
+        assert!(cascade.is_viz_disconnect_cascade());
+        assert!(!unrelated.is_viz_disconnect_cascade());
+    }
 }
