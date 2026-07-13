@@ -3,10 +3,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::InferenceError;
 use crate::local_ba::{BaResult, DegenerateReason};
 use crate::map::{KeyframeId, MapSnapshot};
 use crate::triangulation::TriangulationStats;
+use crate::{DescriptorInitError, InferenceError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationSupport {
@@ -601,6 +601,12 @@ pub enum DiagnosticEvent {
     DescriptorWorkerDied {
         respawn_count: u32,
     },
+    DescriptorWorkerRestartFailed {
+        respawn_count: u32,
+        max_respawns: u32,
+        exhausted: bool,
+        error: Arc<DescriptorInitError>,
+    },
     DescriptorInferenceFailed {
         keyframe_id: KeyframeId,
         source_snapshot: MapSnapshot,
@@ -834,6 +840,14 @@ mod tests {
             },
             DiagnosticEvent::BackendWorkerDied { respawn_count: 1 },
             DiagnosticEvent::DescriptorWorkerDied { respawn_count: 2 },
+            DiagnosticEvent::DescriptorWorkerRestartFailed {
+                respawn_count: 2,
+                max_respawns: 3,
+                exhausted: false,
+                error: std::sync::Arc::new(crate::DescriptorInitError::WorkerThread {
+                    source: std::io::Error::other("test restart failure"),
+                }),
+            },
             DiagnosticEvent::DescriptorInferenceFailed {
                 keyframe_id: crate::KeyframeId::default(),
                 source_snapshot: crate::map::SlamMap::new().snapshot(),
@@ -854,7 +868,7 @@ mod tests {
         for event in events {
             kinds.insert(discriminant(&event));
         }
-        assert_eq!(kinds.len(), 9);
+        assert_eq!(kinds.len(), 10);
     }
 
     #[test]

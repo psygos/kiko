@@ -571,6 +571,17 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             format!("descriptor worker died (respawns={respawn_count})"),
             rerun::TextLogLevel::ERROR,
         ),
+        DiagnosticEvent::DescriptorWorkerRestartFailed {
+            respawn_count,
+            max_respawns,
+            exhausted,
+            error,
+        } => (
+            format!(
+                "descriptor worker restart failed (attempt={respawn_count}/{max_respawns}, exhausted={exhausted}): {error}"
+            ),
+            rerun::TextLogLevel::ERROR,
+        ),
         DiagnosticEvent::DescriptorInferenceFailed {
             keyframe_id,
             source_snapshot,
@@ -1102,6 +1113,14 @@ mod tests {
         });
         let _ = format_event(&DiagnosticEvent::BackendWorkerDied { respawn_count: 1 });
         let _ = format_event(&DiagnosticEvent::DescriptorWorkerDied { respawn_count: 1 });
+        let _ = format_event(&DiagnosticEvent::DescriptorWorkerRestartFailed {
+            respawn_count: 1,
+            max_respawns: 2,
+            exhausted: false,
+            error: std::sync::Arc::new(crate::DescriptorInitError::WorkerThread {
+                source: std::io::Error::other("test restart failure"),
+            }),
+        });
         let _ = format_event(&DiagnosticEvent::DescriptorInferenceFailed {
             keyframe_id: crate::KeyframeId::default(),
             source_snapshot: crate::map::SlamMap::new().snapshot(),

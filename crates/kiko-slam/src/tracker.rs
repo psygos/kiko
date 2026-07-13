@@ -3143,7 +3143,7 @@ impl SlamTracker {
             });
         for event in events {
             match event {
-                PlaceRecognitionEvent::WorkerFailure {
+                PlaceRecognitionEvent::InferenceFailed {
                     keyframe_id,
                     source_snapshot,
                     error,
@@ -3157,7 +3157,7 @@ impl SlamTracker {
                         error: Arc::new(error),
                     });
                 }
-                PlaceRecognitionEvent::WorkerPanic {
+                PlaceRecognitionEvent::Panicked {
                     keyframe_id,
                     source_snapshot,
                     message,
@@ -3167,6 +3167,22 @@ impl SlamTracker {
                         "descriptor worker panic (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {message}"
                     );
                     self.emit_event(DiagnosticEvent::DescriptorWorkerDied { respawn_count });
+                }
+                PlaceRecognitionEvent::RestartFailed {
+                    respawn_count,
+                    max_respawns,
+                    exhausted,
+                    error,
+                } => {
+                    eprintln!(
+                        "descriptor worker restart failed (attempt={respawn_count}/{max_respawns}, exhausted={exhausted}): {error}"
+                    );
+                    self.emit_event(DiagnosticEvent::DescriptorWorkerRestartFailed {
+                        respawn_count,
+                        max_respawns,
+                        exhausted,
+                        error,
+                    });
                 }
             }
         }
@@ -5156,7 +5172,8 @@ mod tests {
     use crate::map::assert_map_invariants;
     use crate::place_recognition::{
         DescriptorExtractorFactory, DescriptorInitError, DescriptorRequest, DescriptorSupervisor,
-        DescriptorWorker, DescriptorWorkerResponse,
+        DescriptorSupervisorOutput, DescriptorWorker, DescriptorWorkerResponse,
+        SubmitDescriptorError,
     };
     use crate::pose_graph::{
         EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphError,
@@ -6371,7 +6388,9 @@ mod tests {
         let mut saw_panic = false;
         for _ in 0..50 {
             match supervisor.try_recv() {
-                Some(DescriptorWorkerResponse::WorkerPanic { .. }) => {
+                Some(DescriptorSupervisorOutput::Worker(
+                    DescriptorWorkerResponse::WorkerPanic { .. },
+                )) => {
                     saw_panic = true;
                     break;
                 }
@@ -6395,15 +6414,25 @@ mod tests {
         let mut recovered = None;
         for _ in 0..50 {
             match supervisor.try_recv() {
-                Some(DescriptorWorkerResponse::Descriptor(value)) => {
+                Some(DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(
+                    value,
+                ))) => {
                     recovered = Some(value);
                     break;
                 }
-                Some(DescriptorWorkerResponse::Failure { error, .. }) => {
+                Some(DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Failure {
+                    error,
+                    ..
+                })) => {
                     panic!("unexpected descriptor failure after respawn: {error}");
                 }
-                Some(DescriptorWorkerResponse::WorkerPanic { .. }) => {
+                Some(DescriptorSupervisorOutput::Worker(
+                    DescriptorWorkerResponse::WorkerPanic { .. },
+                )) => {
                     panic!("unexpected second panic");
+                }
+                Some(DescriptorSupervisorOutput::RestartFailure(failure)) => {
+                    panic!("unexpected restart failure: {}", failure.error);
                 }
                 None => {}
             }
@@ -6412,6 +6441,92 @@ mod tests {
 
         let recovered = recovered.expect("descriptor response after respawn");
         assert_eq!(recovered.descriptor, descriptor);
+        assert_eq!(*calls.lock().expect("calls lock"), 1);
+    }
+
+    #[test]
+    fn descriptor_supervisor_retries_the_owned_request_after_disconnect() {
+        let config = GlobalDescriptorConfig::new(2).expect("config");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(0_usize));
+        let descriptor = make_global_descriptor_basis(19);
+        let factory: DescriptorExtractorFactory = {
+            let spawn_count = Arc::clone(&spawn_count);
+            let calls = Arc::clone(&calls);
+            let descriptor = descriptor.clone();
+            Arc::new(move || {
+                if spawn_count.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    Ok(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
+                } else {
+                    Ok(Box::new(StubDescriptorExtractor {
+                        descriptor: descriptor.clone(),
+                        calls: Arc::clone(&calls),
+                    }) as Box<dyn PlaceDescriptorExtractor>)
+                }
+            })
+        };
+        let mut supervisor =
+            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(81),
+            Timestamp::from_nanos(81),
+            16,
+            12,
+            vec![96_u8; 16 * 12],
+        )
+        .expect("frame");
+        supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: test_map_snapshot(),
+                frame: frame.clone(),
+            })
+            .expect("submit panic request");
+
+        for _ in 0..50 {
+            if supervisor.worker_thread_is_finished() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            supervisor.worker_thread_is_finished(),
+            "panic worker did not exit"
+        );
+
+        supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: test_map_snapshot(),
+                frame,
+            })
+            .expect("disconnected request should be retried on replacement worker");
+
+        let mut recovered = None;
+        let mut preserved_panic = false;
+        for _ in 0..50 {
+            match supervisor.try_recv() {
+                Some(DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(
+                    response,
+                ))) => {
+                    recovered = Some(response);
+                }
+                Some(DescriptorSupervisorOutput::Worker(
+                    DescriptorWorkerResponse::WorkerPanic { .. },
+                )) => preserved_panic = true,
+                Some(other) => panic!("unexpected descriptor supervisor output: {other:?}"),
+                None => {}
+            }
+            if preserved_panic && recovered.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(preserved_panic, "old worker panic response was discarded");
+        let recovered = recovered.expect("retried descriptor response");
+        assert_eq!(recovered.descriptor, descriptor);
+        assert_eq!(supervisor.respawn_count(), 1);
         assert_eq!(*calls.lock().expect("calls lock"), 1);
     }
 
@@ -6466,7 +6581,9 @@ mod tests {
         let mut recovered = None;
         for _ in 0..50 {
             match supervisor.try_recv() {
-                Some(DescriptorWorkerResponse::Descriptor(value)) => {
+                Some(DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(
+                    value,
+                ))) => {
                     recovered = Some(value);
                     break;
                 }
@@ -6481,6 +6598,92 @@ mod tests {
         assert_eq!(supervisor.respawn_count(), 1);
         assert!(supervisor.has_worker());
         assert_eq!(*calls.lock().expect("calls lock"), 1);
+    }
+
+    #[test]
+    fn descriptor_supervisor_preserves_restart_failure_and_exhaustion() {
+        let config = GlobalDescriptorConfig::new(2).expect("config");
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let factory: DescriptorExtractorFactory = {
+            let spawn_count = Arc::clone(&spawn_count);
+            Arc::new(move || {
+                if spawn_count.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    Ok(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
+                } else {
+                    Err(DescriptorInitError::WorkerThread {
+                        source: std::io::Error::other("forced descriptor respawn failure"),
+                    })
+                }
+            })
+        };
+        let mut supervisor =
+            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 1);
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(80),
+            Timestamp::from_nanos(80),
+            16,
+            12,
+            vec![64_u8; 16 * 12],
+        )
+        .expect("frame");
+        supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: test_map_snapshot(),
+                frame: frame.clone(),
+            })
+            .expect("submit panic request");
+
+        let mut saw_panic = false;
+        let mut restart_failure = None;
+        for _ in 0..50 {
+            match supervisor.try_recv() {
+                Some(DescriptorSupervisorOutput::Worker(
+                    DescriptorWorkerResponse::WorkerPanic { .. },
+                )) => saw_panic = true,
+                Some(DescriptorSupervisorOutput::RestartFailure(failure)) => {
+                    restart_failure = Some(failure);
+                }
+                Some(other) => panic!("unexpected descriptor supervisor output: {other:?}"),
+                None => {}
+            }
+            if saw_panic && restart_failure.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(saw_panic, "expected worker panic output");
+        let restart_failure = restart_failure.expect("typed restart failure");
+        assert_eq!(restart_failure.respawn_count, 1);
+        assert_eq!(restart_failure.max_respawns, 1);
+        assert!(restart_failure.exhausted);
+        assert_eq!(
+            restart_failure
+                .error
+                .source()
+                .expect("thread-spawn source")
+                .to_string(),
+            "forced descriptor respawn failure"
+        );
+        assert!(!supervisor.has_worker());
+
+        let unavailable = supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: test_map_snapshot(),
+                frame,
+            })
+            .expect_err("exhausted supervisor must reject work");
+        assert!(matches!(
+            &unavailable,
+            SubmitDescriptorError::Unavailable {
+                exhausted: true,
+                source: Some(_),
+            }
+        ));
+        assert!(unavailable.source().is_some());
     }
 
     fn make_loop_closure_apply_fixture() -> (

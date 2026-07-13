@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -20,10 +20,12 @@ use crate::MapSnapshot;
 pub struct DescriptorStats {
     pub submitted: u64,
     pub dropped_full: u64,
-    pub dropped_disconnected: u64,
+    pub dropped_unavailable: u64,
     pub applied: u64,
     pub worker_failures: u64,
+    pub restart_failures: u64,
     pub respawn_count: u32,
+    pub respawn_exhausted: bool,
     pub panics: u64,
 }
 
@@ -66,7 +68,44 @@ pub(crate) enum DescriptorWorkerResponse {
 #[derive(Debug)]
 pub(crate) enum SubmitDescriptorError {
     QueueFull,
-    Disconnected,
+    Unavailable {
+        exhausted: bool,
+        source: Option<Arc<DescriptorInitError>>,
+    },
+}
+
+impl std::fmt::Display for SubmitDescriptorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "descriptor request queue is full"),
+            Self::Unavailable {
+                exhausted,
+                source: Some(source),
+            } => write!(
+                f,
+                "descriptor worker is unavailable (restart_exhausted={exhausted}): {source}"
+            ),
+            Self::Unavailable {
+                exhausted,
+                source: None,
+            } => write!(
+                f,
+                "descriptor worker is unavailable (restart_exhausted={exhausted})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubmitDescriptorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unavailable {
+                source: Some(source),
+                ..
+            } => Some(source.as_ref()),
+            Self::QueueFull | Self::Unavailable { source: None, .. } => None,
+        }
+    }
 }
 
 pub(crate) type DescriptorExtractorFactory =
@@ -118,6 +157,12 @@ pub(crate) struct DescriptorWorker {
     tx: Sender<DescriptorRequest>,
     rx: Receiver<DescriptorWorkerResponse>,
     _thread: thread::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DescriptorWorkerSubmitError {
+    QueueFull(DescriptorRequest),
+    Disconnected(DescriptorRequest),
 }
 
 impl DescriptorWorker {
@@ -188,11 +233,18 @@ impl DescriptorWorker {
         Self::spawn(config, extractor)
     }
 
-    pub(crate) fn submit(&self, request: DescriptorRequest) -> Result<(), SubmitDescriptorError> {
+    pub(crate) fn submit(
+        &self,
+        request: DescriptorRequest,
+    ) -> Result<(), DescriptorWorkerSubmitError> {
         match self.tx.try_send(request) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(SubmitDescriptorError::QueueFull),
-            Err(TrySendError::Disconnected(_)) => Err(SubmitDescriptorError::Disconnected),
+            Err(TrySendError::Full(request)) => {
+                Err(DescriptorWorkerSubmitError::QueueFull(request))
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                Err(DescriptorWorkerSubmitError::Disconnected(request))
+            }
         }
     }
 
@@ -203,6 +255,11 @@ impl DescriptorWorker {
             Err(TryRecvError::Disconnected) => Err(()),
         }
     }
+
+    #[cfg(test)]
+    fn is_finished(&self) -> bool {
+        self._thread.is_finished()
+    }
 }
 
 pub(crate) struct DescriptorSupervisor {
@@ -212,6 +269,22 @@ pub(crate) struct DescriptorSupervisor {
     respawn_count: u32,
     max_respawns: u32,
     spawn_exhausted: bool,
+    last_spawn_error: Option<Arc<DescriptorInitError>>,
+    pending_outputs: VecDeque<DescriptorSupervisorOutput>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DescriptorRestartFailure {
+    pub(crate) respawn_count: u32,
+    pub(crate) max_respawns: u32,
+    pub(crate) exhausted: bool,
+    pub(crate) error: Arc<DescriptorInitError>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DescriptorSupervisorOutput {
+    Worker(DescriptorWorkerResponse),
+    RestartFailure(DescriptorRestartFailure),
 }
 
 impl DescriptorSupervisor {
@@ -241,6 +314,8 @@ impl DescriptorSupervisor {
             respawn_count: 0,
             max_respawns,
             spawn_exhausted: false,
+            last_spawn_error: None,
+            pending_outputs: VecDeque::new(),
         })
     }
 
@@ -250,9 +325,13 @@ impl DescriptorSupervisor {
         factory: DescriptorExtractorFactory,
         max_respawns: u32,
     ) -> Self {
-        let worker = Self::spawn_worker(config, &factory)
-            .inspect_err(|error| eprintln!("descriptor worker unavailable: {error}"))
-            .ok();
+        let (worker, last_spawn_error) = match Self::spawn_worker(config, &factory) {
+            Ok(worker) => (Some(worker), None),
+            Err(error) => {
+                eprintln!("descriptor worker unavailable: {error}");
+                (None, Some(Arc::new(error)))
+            }
+        };
         let spawn_exhausted = worker.is_none() && max_respawns == 0;
         Self {
             worker,
@@ -261,6 +340,8 @@ impl DescriptorSupervisor {
             respawn_count: 0,
             max_respawns,
             spawn_exhausted,
+            last_spawn_error,
+            pending_outputs: VecDeque::new(),
         }
     }
 
@@ -291,20 +372,54 @@ impl DescriptorSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        self.worker = Self::spawn_worker(self.config, &self.factory)
-            .inspect_err(|error| eprintln!("descriptor worker respawn failed: {error}"))
-            .ok();
-        self.respawn_count = self.respawn_count.saturating_add(1);
-        if self.worker.is_none() {
-            if self.respawn_count >= self.max_respawns {
-                self.spawn_exhausted = true;
-                eprintln!(
-                    "descriptor worker respawn exhausted after {} attempts",
-                    self.max_respawns
-                );
-            } else {
-                eprintln!("descriptor worker remains unavailable; will retry");
+        let respawn_count = self.respawn_count.saturating_add(1);
+        self.respawn_count = respawn_count;
+        match Self::spawn_worker(self.config, &self.factory) {
+            Ok(worker) => {
+                self.worker = Some(worker);
+                self.last_spawn_error = None;
             }
+            Err(error) => {
+                let error = Arc::new(error);
+                let exhausted = respawn_count >= self.max_respawns;
+                eprintln!("descriptor worker respawn failed: {error}");
+                if exhausted {
+                    self.spawn_exhausted = true;
+                    eprintln!(
+                        "descriptor worker respawn exhausted after {} attempts",
+                        self.max_respawns
+                    );
+                } else {
+                    eprintln!("descriptor worker remains unavailable; will retry");
+                }
+                self.last_spawn_error = Some(Arc::clone(&error));
+                self.pending_outputs
+                    .push_back(DescriptorSupervisorOutput::RestartFailure(
+                        DescriptorRestartFailure {
+                            respawn_count,
+                            max_respawns: self.max_respawns,
+                            exhausted,
+                            error,
+                        },
+                    ));
+            }
+        }
+    }
+
+    fn disconnect_worker(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        while let Ok(Some(response)) = worker.try_recv() {
+            self.pending_outputs
+                .push_back(DescriptorSupervisorOutput::Worker(response));
+        }
+    }
+
+    fn unavailable_error(&self) -> SubmitDescriptorError {
+        SubmitDescriptorError::Unavailable {
+            exhausted: self.spawn_exhausted,
+            source: self.last_spawn_error.as_ref().map(Arc::clone),
         }
     }
 
@@ -316,31 +431,51 @@ impl DescriptorSupervisor {
             self.check_health();
         }
         let Some(worker) = self.worker.as_ref() else {
-            return Err(SubmitDescriptorError::Disconnected);
+            return Err(self.unavailable_error());
         };
-        let result = worker.submit(request);
-        if matches!(result, Err(SubmitDescriptorError::Disconnected)) {
-            self.worker = None;
-            self.check_health();
+        let request = match worker.submit(request) {
+            Ok(()) => return Ok(()),
+            Err(DescriptorWorkerSubmitError::QueueFull(_request)) => {
+                return Err(SubmitDescriptorError::QueueFull);
+            }
+            Err(DescriptorWorkerSubmitError::Disconnected(request)) => request,
+        };
+
+        self.disconnect_worker();
+        self.check_health();
+        let Some(worker) = self.worker.as_ref() else {
+            return Err(self.unavailable_error());
+        };
+        match worker.submit(request) {
+            Ok(()) => Ok(()),
+            Err(DescriptorWorkerSubmitError::QueueFull(_request)) => {
+                Err(SubmitDescriptorError::QueueFull)
+            }
+            Err(DescriptorWorkerSubmitError::Disconnected(_request)) => {
+                self.disconnect_worker();
+                Err(self.unavailable_error())
+            }
         }
-        result
     }
 
-    pub(crate) fn try_recv(&mut self) -> Option<DescriptorWorkerResponse> {
-        let worker = self.worker.as_ref()?;
-        match worker.try_recv() {
+    pub(crate) fn try_recv(&mut self) -> Option<DescriptorSupervisorOutput> {
+        if let Some(output) = self.pending_outputs.pop_front() {
+            return Some(output);
+        }
+        let response = self.worker.as_ref()?.try_recv();
+        match response {
             Ok(Some(response)) => {
                 if matches!(response, DescriptorWorkerResponse::WorkerPanic { .. }) {
-                    self.worker = None;
+                    self.disconnect_worker();
                     self.check_health();
                 }
-                Some(response)
+                Some(DescriptorSupervisorOutput::Worker(response))
             }
             Ok(None) => None,
             Err(()) => {
-                self.worker = None;
+                self.disconnect_worker();
                 self.check_health();
-                None
+                self.pending_outputs.pop_front()
             }
         }
     }
@@ -349,23 +484,40 @@ impl DescriptorSupervisor {
         self.respawn_count
     }
 
+    pub(crate) fn respawn_exhausted(&self) -> bool {
+        self.spawn_exhausted
+    }
+
     pub(crate) fn has_worker(&self) -> bool {
         self.worker.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_thread_is_finished(&self) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(DescriptorWorker::is_finished)
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum PlaceRecognitionEvent {
-    WorkerFailure {
+    InferenceFailed {
         keyframe_id: KeyframeId,
         source_snapshot: MapSnapshot,
         error: InferenceError,
     },
-    WorkerPanic {
+    Panicked {
         keyframe_id: KeyframeId,
         source_snapshot: MapSnapshot,
         message: String,
         respawn_count: u32,
+    },
+    RestartFailed {
+        respawn_count: u32,
+        max_respawns: u32,
+        exhausted: bool,
+        error: Arc<DescriptorInitError>,
     },
 }
 
@@ -397,7 +549,11 @@ impl PlaceRecognition {
     }
 
     pub(crate) fn descriptor_stats(&self) -> DescriptorStats {
-        self.descriptor_stats
+        DescriptorStats {
+            respawn_count: self.descriptor_worker.respawn_count(),
+            respawn_exhausted: self.descriptor_worker.respawn_exhausted(),
+            ..self.descriptor_stats
+        }
     }
 
     pub(crate) fn loop_config(&self) -> LoopClosureConfig {
@@ -467,10 +623,23 @@ impl PlaceRecognition {
     ) -> Vec<PlaceRecognitionEvent> {
         let mut events = Vec::new();
         loop {
-            let Some(response) = self.descriptor_worker.try_recv() else {
+            let Some(output) = self.descriptor_worker.try_recv() else {
                 break;
             };
-            self.descriptor_stats.respawn_count = self.descriptor_worker.respawn_count();
+            let response = match output {
+                DescriptorSupervisorOutput::Worker(response) => response,
+                DescriptorSupervisorOutput::RestartFailure(failure) => {
+                    self.descriptor_stats.restart_failures =
+                        self.descriptor_stats.restart_failures.saturating_add(1);
+                    events.push(PlaceRecognitionEvent::RestartFailed {
+                        respawn_count: failure.respawn_count,
+                        max_respawns: failure.max_respawns,
+                        exhausted: failure.exhausted,
+                        error: failure.error,
+                    });
+                    continue;
+                }
+            };
             match response {
                 DescriptorWorkerResponse::Descriptor(response) => {
                     if !response
@@ -498,7 +667,7 @@ impl PlaceRecognition {
                 } => {
                     self.descriptor_stats.worker_failures =
                         self.descriptor_stats.worker_failures.saturating_add(1);
-                    events.push(PlaceRecognitionEvent::WorkerFailure {
+                    events.push(PlaceRecognitionEvent::InferenceFailed {
                         keyframe_id,
                         source_snapshot,
                         error,
@@ -512,11 +681,11 @@ impl PlaceRecognition {
                     self.descriptor_stats.panics = self.descriptor_stats.panics.saturating_add(1);
                     self.descriptor_stats.worker_failures =
                         self.descriptor_stats.worker_failures.saturating_add(1);
-                    events.push(PlaceRecognitionEvent::WorkerPanic {
+                    events.push(PlaceRecognitionEvent::Panicked {
                         keyframe_id,
                         source_snapshot,
                         message,
-                        respawn_count: self.descriptor_stats.respawn_count,
+                        respawn_count: self.descriptor_worker.respawn_count(),
                     });
                 }
             }
@@ -599,11 +768,10 @@ impl PlaceRecognition {
                     self.descriptor_stats.dropped_full.saturating_add(1);
                 eprintln!("descriptor worker queue full; keeping bootstrap descriptor");
             }
-            Err(SubmitDescriptorError::Disconnected) => {
-                self.descriptor_stats.dropped_disconnected =
-                    self.descriptor_stats.dropped_disconnected.saturating_add(1);
-                self.descriptor_stats.respawn_count = self.descriptor_worker.respawn_count();
-                eprintln!("descriptor worker disconnected; retrying with supervisor");
+            Err(error @ SubmitDescriptorError::Unavailable { .. }) => {
+                self.descriptor_stats.dropped_unavailable =
+                    self.descriptor_stats.dropped_unavailable.saturating_add(1);
+                eprintln!("descriptor request not submitted: {error}");
             }
         }
     }
