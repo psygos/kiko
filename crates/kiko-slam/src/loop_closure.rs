@@ -2,12 +2,30 @@ use std::num::NonZeroUsize;
 
 use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
+use crate::pose_graph::PoseGraphError;
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
     RansacConfig, RansacConfigError, solve_pnp_ransac,
 };
 
 pub(crate) const GLOBAL_DESCRIPTOR_DIM: usize = crate::DESCRIPTOR_DIM * 2;
+
+const DEFAULT_RELOCALIZATION_MAX_ATTEMPTS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(29);
+const DEFAULT_RELOCALIZATION_MIN_INLIERS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(19);
+const DEFAULT_RELOCALIZATION_MAX_CANDIDATES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2);
+const DEFAULT_RELOCALIZATION_MIN_CONFIRMATIONS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
+const DEFAULT_RELOCALIZATION_DESCRIPTOR_MATCH_THRESHOLD: f32 = 0.7;
+const DEFAULT_RELOCALIZATION_MAX_TRANSLATION_DELTA_M: f32 = 1.5;
+const DEFAULT_RELOCALIZATION_MAX_ROTATION_DELTA_DEG: f32 = 10.0;
+
+const DEFAULT_LOOP_SIMILARITY_THRESHOLD: f32 = 0.75;
+const DEFAULT_LOOP_DESCRIPTOR_MATCH_THRESHOLD: f32 = 0.7;
+const DEFAULT_LOOP_MIN_INLIERS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(19);
+const DEFAULT_LOOP_MAX_CANDIDATES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2);
+const DEFAULT_LOOP_TEMPORAL_GAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(29);
+const DEFAULT_LOOP_MIN_STREAK: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2);
+const DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M: f32 = 5.0;
+const DEFAULT_LOOP_MAX_CORRECTION_ROTATION_DEG: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct LoopClosureConfig {
@@ -38,14 +56,14 @@ pub struct LoopClosureConfigInput {
 impl Default for LoopClosureConfigInput {
     fn default() -> Self {
         Self {
-            similarity_threshold: 0.75,
-            descriptor_match_threshold: 0.7,
-            min_inliers: 20,
-            max_candidates: 3,
-            temporal_gap: 30,
-            min_streak: 3,
-            max_correction_translation: 5.0,
-            max_correction_rotation_deg: 30.0,
+            similarity_threshold: DEFAULT_LOOP_SIMILARITY_THRESHOLD,
+            descriptor_match_threshold: DEFAULT_LOOP_DESCRIPTOR_MATCH_THRESHOLD,
+            min_inliers: DEFAULT_LOOP_MIN_INLIERS.get(),
+            max_candidates: DEFAULT_LOOP_MAX_CANDIDATES.get(),
+            temporal_gap: DEFAULT_LOOP_TEMPORAL_GAP.get(),
+            min_streak: DEFAULT_LOOP_MIN_STREAK.get(),
+            max_correction_translation: DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M,
+            max_correction_rotation_deg: DEFAULT_LOOP_MAX_CORRECTION_ROTATION_DEG,
             ransac: RansacConfig::default(),
         }
     }
@@ -76,13 +94,13 @@ pub struct RelocalizationConfigInput {
 impl Default for RelocalizationConfigInput {
     fn default() -> Self {
         Self {
-            max_attempts: 30,
-            min_inliers: 20,
-            max_candidates: 3,
-            descriptor_match_threshold: 0.7,
-            min_confirmations: 2,
-            max_translation_delta_m: 1.5,
-            max_rotation_delta_deg: 10.0,
+            max_attempts: DEFAULT_RELOCALIZATION_MAX_ATTEMPTS.get(),
+            min_inliers: DEFAULT_RELOCALIZATION_MIN_INLIERS.get(),
+            max_candidates: DEFAULT_RELOCALIZATION_MAX_CANDIDATES.get(),
+            descriptor_match_threshold: DEFAULT_RELOCALIZATION_DESCRIPTOR_MATCH_THRESHOLD,
+            min_confirmations: DEFAULT_RELOCALIZATION_MIN_CONFIRMATIONS.get(),
+            max_translation_delta_m: DEFAULT_RELOCALIZATION_MAX_TRANSLATION_DELTA_M,
+            max_rotation_delta_deg: DEFAULT_RELOCALIZATION_MAX_ROTATION_DELTA_DEG,
         }
     }
 }
@@ -229,28 +247,14 @@ impl RelocalizationConfig {
 
 impl Default for RelocalizationConfig {
     fn default() -> Self {
-        let defaults = RelocalizationConfigInput::default();
-        debug_assert!(defaults.min_inliers >= MIN_PNP_POINTS);
-        debug_assert!(defaults.max_attempts > 0);
-        debug_assert!(defaults.max_candidates > 0);
-        debug_assert!(defaults.min_confirmations > 0);
-        debug_assert!(defaults.descriptor_match_threshold > 0.0);
-        debug_assert!(defaults.descriptor_match_threshold <= 1.0);
-        debug_assert!(defaults.max_translation_delta_m > 0.0);
-        debug_assert!(defaults.max_rotation_delta_deg > 0.0);
-        debug_assert!(defaults.max_rotation_delta_deg <= 180.0);
-
         Self {
-            max_attempts: NonZeroUsize::new(defaults.max_attempts).unwrap_or(NonZeroUsize::MIN),
-            min_inliers: NonZeroUsize::new(defaults.min_inliers).unwrap_or(NonZeroUsize::MIN),
-            max_candidates: NonZeroUsize::new(defaults.max_candidates).unwrap_or(NonZeroUsize::MIN),
-            descriptor_match_threshold: defaults.descriptor_match_threshold,
-            min_confirmations: NonZeroUsize::new(defaults.min_confirmations)
-                .unwrap_or(NonZeroUsize::MIN),
-            max_translation_delta_m: defaults.max_translation_delta_m.max(f32::MIN_POSITIVE),
-            max_rotation_delta_deg: defaults
-                .max_rotation_delta_deg
-                .clamp(f32::MIN_POSITIVE, 180.0),
+            max_attempts: DEFAULT_RELOCALIZATION_MAX_ATTEMPTS,
+            min_inliers: DEFAULT_RELOCALIZATION_MIN_INLIERS,
+            max_candidates: DEFAULT_RELOCALIZATION_MAX_CANDIDATES,
+            descriptor_match_threshold: DEFAULT_RELOCALIZATION_DESCRIPTOR_MATCH_THRESHOLD,
+            min_confirmations: DEFAULT_RELOCALIZATION_MIN_CONFIRMATIONS,
+            max_translation_delta_m: DEFAULT_RELOCALIZATION_MAX_TRANSLATION_DELTA_M,
+            max_rotation_delta_deg: DEFAULT_RELOCALIZATION_MAX_ROTATION_DELTA_DEG,
         }
     }
 }
@@ -420,57 +424,109 @@ impl LoopClosureConfig {
 
 impl Default for LoopClosureConfig {
     fn default() -> Self {
-        let defaults = LoopClosureConfigInput::default();
-        debug_assert!(defaults.min_inliers >= MIN_PNP_POINTS);
-        debug_assert!(defaults.max_candidates > 0);
-        debug_assert!(defaults.temporal_gap > 0);
-        debug_assert!(defaults.min_streak > 0);
-        debug_assert!(defaults.similarity_threshold > 0.0);
-        debug_assert!(defaults.similarity_threshold <= 1.0);
-        debug_assert!(defaults.descriptor_match_threshold > 0.0);
-        debug_assert!(defaults.descriptor_match_threshold <= 1.0);
-        debug_assert!(defaults.max_correction_translation > 0.0);
-        debug_assert!(defaults.max_correction_rotation_deg > 0.0);
-        debug_assert!(defaults.max_correction_rotation_deg <= 180.0);
-
         Self {
-            similarity_threshold: defaults.similarity_threshold.clamp(f32::MIN_POSITIVE, 1.0),
-            descriptor_match_threshold: defaults
-                .descriptor_match_threshold
-                .clamp(f32::MIN_POSITIVE, 1.0),
-            min_inliers: NonZeroUsize::new(defaults.min_inliers).unwrap_or(NonZeroUsize::MIN),
-            max_candidates: NonZeroUsize::new(defaults.max_candidates).unwrap_or(NonZeroUsize::MIN),
-            temporal_gap: NonZeroUsize::new(defaults.temporal_gap).unwrap_or(NonZeroUsize::MIN),
-            min_streak: NonZeroUsize::new(defaults.min_streak).unwrap_or(NonZeroUsize::MIN),
-            max_correction_translation: defaults.max_correction_translation.max(f32::MIN_POSITIVE),
-            max_correction_rotation_deg: defaults
-                .max_correction_rotation_deg
-                .clamp(f32::MIN_POSITIVE, 180.0),
-            ransac: defaults.ransac,
+            similarity_threshold: DEFAULT_LOOP_SIMILARITY_THRESHOLD,
+            descriptor_match_threshold: DEFAULT_LOOP_DESCRIPTOR_MATCH_THRESHOLD,
+            min_inliers: DEFAULT_LOOP_MIN_INLIERS,
+            max_candidates: DEFAULT_LOOP_MAX_CANDIDATES,
+            temporal_gap: DEFAULT_LOOP_TEMPORAL_GAP,
+            min_streak: DEFAULT_LOOP_MIN_STREAK,
+            max_correction_translation: DEFAULT_LOOP_MAX_CORRECTION_TRANSLATION_M,
+            max_correction_rotation_deg: DEFAULT_LOOP_MAX_CORRECTION_ROTATION_DEG,
+            ransac: RansacConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopApplyErrorKind {
+    StaleCorrection,
+    MissingKeyframe,
+    MissingMapPoint,
+    MapMutation,
+    PoseGraph,
+}
+
+impl std::fmt::Display for LoopApplyErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleCorrection => write!(f, "stale correction"),
+            Self::MissingKeyframe => write!(f, "missing keyframe"),
+            Self::MissingMapPoint => write!(f, "missing map point"),
+            Self::MapMutation => write!(f, "map mutation"),
+            Self::PoseGraph => write!(f, "pose-graph optimization"),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum LoopApplyError {
-    StaleCorrection,
-    MissingKeyframe,
-    MissingMapPoint,
-    MapMutation,
-    InvariantViolation,
+    StaleCorrection {
+        proof: MapSnapshot,
+        current: MapSnapshot,
+    },
+    Map {
+        source: MapError,
+    },
+    PoseGraph {
+        source: PoseGraphError,
+    },
 }
 
-impl std::error::Error for LoopApplyError {}
+impl LoopApplyError {
+    pub fn kind(&self) -> LoopApplyErrorKind {
+        match self {
+            Self::StaleCorrection { .. } => LoopApplyErrorKind::StaleCorrection,
+            Self::Map {
+                source: MapError::KeyframeNotFound(_),
+            } => LoopApplyErrorKind::MissingKeyframe,
+            Self::Map {
+                source: MapError::MapPointNotFound(_),
+            } => LoopApplyErrorKind::MissingMapPoint,
+            Self::Map { .. } => LoopApplyErrorKind::MapMutation,
+            Self::PoseGraph { .. } => LoopApplyErrorKind::PoseGraph,
+        }
+    }
+}
+
+impl std::error::Error for LoopApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map { source } => Some(source),
+            Self::PoseGraph { source } => Some(source),
+            Self::StaleCorrection { .. } => None,
+        }
+    }
+}
 
 impl std::fmt::Display for LoopApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoopApplyError::StaleCorrection => write!(f, "stale correction"),
-            LoopApplyError::MissingKeyframe => write!(f, "missing keyframe"),
-            LoopApplyError::MissingMapPoint => write!(f, "missing map point"),
-            LoopApplyError::MapMutation => write!(f, "map mutation failed"),
-            LoopApplyError::InvariantViolation => write!(f, "invariant violation"),
+            Self::StaleCorrection { proof, current } => write!(
+                f,
+                "loop proof belongs to map instance {} generation {}, but current map is instance {} generation {}",
+                proof.instance_id().as_u64(),
+                proof.generation().as_u64(),
+                current.instance_id().as_u64(),
+                current.generation().as_u64(),
+            ),
+            Self::Map { source } => write!(f, "loop-closure map operation failed: {source}"),
+            Self::PoseGraph { source } => {
+                write!(f, "loop-closure pose-graph optimization failed: {source}")
+            }
         }
+    }
+}
+
+impl From<MapError> for LoopApplyError {
+    fn from(source: MapError) -> Self {
+        Self::Map { source }
+    }
+}
+
+impl From<PoseGraphError> for LoopApplyError {
+    fn from(source: PoseGraphError) -> Self {
+        Self::PoseGraph { source }
     }
 }
 
@@ -1189,11 +1245,13 @@ impl RelocalizationCandidate {
 mod tests {
     use super::{
         DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
-        KeyframeDatabase, LoopCandidate, LoopClosureConfig, LoopVerificationError,
-        RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
-        RelocalizationConfigInput, aggregate_global_descriptor, match_descriptors_for_loop,
+        KeyframeDatabase, LoopApplyError, LoopApplyErrorKind, LoopCandidate, LoopClosureConfig,
+        LoopClosureConfigInput, LoopVerificationError, RelocalizationCandidate,
+        RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+        aggregate_global_descriptor, match_descriptors_for_loop,
     };
     use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
+    use crate::pose_graph::PoseGraphError;
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
     use crate::{
         CompactDescriptor, Descriptor, FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
@@ -1574,14 +1632,26 @@ mod tests {
 
     #[test]
     fn relocalization_config_default_values() {
+        let input = RelocalizationConfigInput::default();
+        assert_eq!(input.max_attempts, 30);
+        assert_eq!(input.min_inliers, 20);
+        assert_eq!(input.max_candidates, 3);
+        assert_eq!(input.descriptor_match_threshold, 0.7);
+        assert_eq!(input.min_confirmations, 2);
+        assert_eq!(input.max_translation_delta_m, 1.5);
+        assert_eq!(input.max_rotation_delta_deg, 10.0);
         let cfg = RelocalizationConfig::default();
-        assert_eq!(cfg.max_attempts(), 30);
-        assert_eq!(cfg.min_inliers(), 20);
-        assert_eq!(cfg.max_candidates(), 3);
-        assert!((cfg.descriptor_match_threshold() - 0.7).abs() < 1e-6);
-        assert_eq!(cfg.min_confirmations(), 2);
-        assert!((cfg.max_translation_delta_m() - 1.5).abs() < 1e-6);
-        assert!((cfg.max_rotation_delta_deg() - 10.0).abs() < 1e-6);
+        assert_eq!(cfg.max_attempts(), input.max_attempts);
+        assert_eq!(cfg.min_inliers(), input.min_inliers);
+        assert_eq!(cfg.max_candidates(), input.max_candidates);
+        assert_eq!(
+            cfg.descriptor_match_threshold(),
+            input.descriptor_match_threshold
+        );
+        assert_eq!(cfg.min_confirmations(), input.min_confirmations);
+        assert_eq!(cfg.max_translation_delta_m(), input.max_translation_delta_m);
+        assert_eq!(cfg.max_rotation_delta_deg(), input.max_rotation_delta_deg);
+        RelocalizationConfig::new(input).expect("default input must parse without repair");
     }
 
     #[test]
@@ -1889,14 +1959,60 @@ mod tests {
 
     #[test]
     fn loop_closure_config_default_values() {
+        let input = LoopClosureConfigInput::default();
+        assert_eq!(input.similarity_threshold, 0.75);
+        assert_eq!(input.descriptor_match_threshold, 0.7);
+        assert_eq!(input.min_inliers, 20);
+        assert_eq!(input.max_candidates, 3);
+        assert_eq!(input.temporal_gap, 30);
+        assert_eq!(input.min_streak, 3);
+        assert_eq!(input.max_correction_translation, 5.0);
+        assert_eq!(input.max_correction_rotation_deg, 30.0);
         let cfg = LoopClosureConfig::default();
-        assert!((cfg.similarity_threshold() - 0.75).abs() < 1e-6);
-        assert!((cfg.descriptor_match_threshold() - 0.7).abs() < 1e-6);
-        assert_eq!(cfg.min_inliers(), 20);
-        assert_eq!(cfg.max_candidates(), 3);
-        assert_eq!(cfg.temporal_gap(), 30);
-        assert_eq!(cfg.min_streak(), 3);
-        assert!((cfg.max_correction_translation() - 5.0).abs() < 1e-6);
-        assert!((cfg.max_correction_rotation_deg() - 30.0).abs() < 1e-6);
+        assert_eq!(cfg.similarity_threshold(), input.similarity_threshold);
+        assert_eq!(
+            cfg.descriptor_match_threshold(),
+            input.descriptor_match_threshold
+        );
+        assert_eq!(cfg.min_inliers(), input.min_inliers);
+        assert_eq!(cfg.max_candidates(), input.max_candidates);
+        assert_eq!(cfg.temporal_gap(), input.temporal_gap);
+        assert_eq!(cfg.min_streak(), input.min_streak);
+        assert_eq!(
+            cfg.max_correction_translation(),
+            input.max_correction_translation
+        );
+        assert_eq!(
+            cfg.max_correction_rotation_deg(),
+            input.max_correction_rotation_deg
+        );
+        LoopClosureConfig::new(input).expect("default input must parse without repair");
+    }
+
+    #[test]
+    fn loop_apply_error_preserves_pose_graph_source() {
+        let error = LoopApplyError::PoseGraph {
+            source: PoseGraphError::NotConverged {
+                iterations: 4,
+                residual_norm: 2.5,
+            },
+        };
+
+        assert_eq!(error.kind(), LoopApplyErrorKind::PoseGraph);
+        assert!(error.to_string().contains("pose-graph optimization"));
+        let detected = super::LoopDetectError::ApplyFailed(error);
+        let apply = detected.source().expect("loop-apply source");
+        let pose_graph = apply.source().expect("pose-graph source");
+        assert!(pose_graph.to_string().contains("did not converge"));
+    }
+
+    #[test]
+    fn loop_apply_error_classifies_map_failure_without_discarding_source() {
+        let keyframe_id = KeyframeId::default();
+        let error = LoopApplyError::from(MapError::KeyframeNotFound(keyframe_id));
+
+        assert_eq!(error.kind(), LoopApplyErrorKind::MissingKeyframe);
+        assert!(error.source().is_some());
+        assert!(error.to_string().contains("keyframe not found"));
     }
 }

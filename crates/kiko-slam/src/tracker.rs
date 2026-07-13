@@ -29,7 +29,7 @@ use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
     DescriptorStats, PlaceRecognition, PlaceRecognitionEvent, PlaceRecognitionInitError,
 };
-use crate::pose_graph::{EssentialGraphError, PoseGraphConfig, PoseGraphError};
+use crate::pose_graph::{EssentialGraphError, PoseGraphConfig};
 use crate::{
     BaCorrection, BaResult, CalibrationBundle, CaptureBundle, CaptureBundleError, CaptureId,
     DescriptorMatchError, Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics,
@@ -1420,16 +1420,11 @@ pub enum TrackerError {
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
-    PoseGraph(PoseGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
     DescriptorMatch(DescriptorMatchError),
     PoseBa(crate::PoseBaError),
     BaExecution(crate::BaExecutionError),
-    StaleLoopProof {
-        proof: crate::MapSnapshot,
-        current: crate::MapSnapshot,
-    },
     KeyframeRejected {
         landmarks: usize,
     },
@@ -1459,7 +1454,6 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
-            TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
             TrackerError::DescriptorMatch(err) => {
@@ -1469,14 +1463,6 @@ impl std::fmt::Display for TrackerError {
             TrackerError::BaExecution(err) => {
                 write!(f, "bundle-adjustment execution error: {err}")
             }
-            TrackerError::StaleLoopProof { proof, current } => write!(
-                f,
-                "loop proof belongs to map instance {} generation {}, but current map is instance {} generation {}",
-                proof.instance_id().as_u64(),
-                proof.generation().as_u64(),
-                current.instance_id().as_u64(),
-                current.generation().as_u64(),
-            ),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -1496,7 +1482,6 @@ impl std::error::Error for TrackerError {
             TrackerError::Pnp(source) => Some(source),
             TrackerError::Map(source) => Some(source),
             TrackerError::EssentialGraph(source) => Some(source),
-            TrackerError::PoseGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
@@ -1512,9 +1497,7 @@ impl std::error::Error for TrackerError {
             TrackerError::VioPreintegration(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioSolve(source) => Some(source),
-            TrackerError::KeyframeRejected { .. }
-            | TrackerError::InvariantViolation(_)
-            | TrackerError::StaleLoopProof { .. } => None,
+            TrackerError::KeyframeRejected { .. } | TrackerError::InvariantViolation(_) => None,
         }
     }
 }
@@ -1552,12 +1535,6 @@ impl From<crate::map::MapError> for TrackerError {
 impl From<EssentialGraphError> for TrackerError {
     fn from(err: EssentialGraphError) -> Self {
         TrackerError::EssentialGraph(err)
-    }
-}
-
-impl From<PoseGraphError> for TrackerError {
-    fn from(err: PoseGraphError) -> Self {
-        TrackerError::PoseGraph(err)
     }
 }
 
@@ -2960,7 +2937,7 @@ impl SlamTracker {
         )
     }
 
-    pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
+    pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), LoopApplyError> {
         #[cfg(feature = "vio")]
         let corrected = self
             .loop_manager
@@ -3225,9 +3202,9 @@ impl SlamTracker {
                 .map(|entry| entry.pose())
             else {
                 if first_error.is_none() {
-                    first_error = Some(LoopDetectError::ApplyFailed(
-                        LoopApplyError::MissingKeyframe,
-                    ));
+                    first_error = Some(LoopDetectError::ApplyFailed(LoopApplyError::from(
+                        crate::map::MapError::KeyframeNotFound(candidate.candidate),
+                    )));
                 }
                 continue;
             };
@@ -3246,7 +3223,7 @@ impl SlamTracker {
             }
 
             if let Err(err) = self.apply_loop_closure(verified.clone()) {
-                let detect_err = LoopDetectError::ApplyFailed(LoopManager::apply_error_kind(&err));
+                let detect_err = LoopDetectError::ApplyFailed(err);
                 self.emit_event(DiagnosticEvent::LoopClosureRejected {
                     reason: LoopManager::reject_reason(&detect_err),
                 });
@@ -5141,7 +5118,9 @@ mod tests {
         DescriptorExtractorFactory, DescriptorRequest, DescriptorSupervisor, DescriptorWorker,
         DescriptorWorkerResponse,
     };
-    use crate::pose_graph::{EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig};
+    use crate::pose_graph::{
+        EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphError,
+    };
     use crate::{
         CompactDescriptor, Descriptor, Detections, Keypoint, PlaceDescriptorExtractor, Point3,
         SensorId, Timestamp,
@@ -6530,7 +6509,9 @@ mod tests {
 
         assert!(matches!(
             error,
-            TrackerError::PoseGraph(PoseGraphError::NotConverged { iterations: 0, .. })
+            LoopApplyError::PoseGraph {
+                source: PoseGraphError::NotConverged { iterations: 0, .. }
+            }
         ));
         assert_eq!(global_map.map().generation(), before_generation);
         let after_query_pose = global_map.keyframe(query_kf).expect("query pose").pose();
@@ -6566,7 +6547,7 @@ mod tests {
             .expect_err("stale loop proof must fail");
         assert!(matches!(
             error,
-            TrackerError::StaleLoopProof { proof, current }
+            LoopApplyError::StaleCorrection { proof, current }
                 if proof == verified.map_snapshot() && current == current_snapshot
         ));
         assert_eq!(
@@ -6588,7 +6569,7 @@ mod tests {
         let error = LoopManager::new(PoseGraphConfig::default())
             .apply_verified_loop(&mut global_map, &foreign_proof)
             .expect_err("foreign loop proof must fail");
-        assert!(matches!(error, TrackerError::StaleLoopProof { .. }));
+        assert!(matches!(error, LoopApplyError::StaleCorrection { .. }));
         assert!(
             global_map
                 .essential_graph()

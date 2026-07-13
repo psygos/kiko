@@ -1,4 +1,5 @@
 use crate::global_map::GlobalMap;
+use crate::map::KeyframeId;
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, PoseGraphConfig, PoseGraphError, PoseGraphOptimizer,
     PoseGraphTermination,
@@ -6,7 +7,6 @@ use crate::pose_graph::{
 use crate::{
     LoopApplyError, LoopClosureRejectReason, LoopDetectError, Point3, Pose, Pose64, VerifiedLoop,
 };
-use crate::{map::KeyframeId, tracker::TrackerError};
 use std::collections::HashMap;
 
 const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
@@ -26,10 +26,10 @@ impl LoopManager {
         &self,
         global_map: &mut GlobalMap,
         verified: &VerifiedLoop,
-    ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
+    ) -> Result<Vec<(KeyframeId, Pose)>, LoopApplyError> {
         let current = global_map.map().snapshot();
         if verified.map_snapshot() != current {
-            return Err(TrackerError::StaleLoopProof {
+            return Err(LoopApplyError::StaleCorrection {
                 proof: verified.map_snapshot(),
                 current,
             });
@@ -44,15 +44,13 @@ impl LoopManager {
         &self,
         global_map: &mut GlobalMap,
         verified: &VerifiedLoop,
-    ) -> Result<Vec<(KeyframeId, Pose)>, TrackerError> {
+    ) -> Result<Vec<(KeyframeId, Pose)>, LoopApplyError> {
         let (map, essential_graph) = global_map.split_mut();
         let query_kf = verified.query_kf();
         let match_kf = verified.match_kf();
         let match_pose = map
             .keyframe(match_kf)
-            .ok_or(TrackerError::Map(crate::map::MapError::KeyframeNotFound(
-                match_kf,
-            )))?
+            .ok_or(crate::map::MapError::KeyframeNotFound(match_kf))?
             .pose();
         let loop_relative = Pose64::from_pose32(Self::loop_relative_pose(
             match_pose,
@@ -77,9 +75,7 @@ impl LoopManager {
         for &keyframe_id in &input.keyframe_ids {
             let pose = map
                 .keyframe(keyframe_id)
-                .ok_or(TrackerError::Map(crate::map::MapError::KeyframeNotFound(
-                    keyframe_id,
-                )))?
+                .ok_or(crate::map::MapError::KeyframeNotFound(keyframe_id))?
                 .pose();
             old_poses.insert(keyframe_id, pose);
             initial_poses.push(Pose64::from_pose32(pose));
@@ -87,10 +83,12 @@ impl LoopManager {
 
         let result = self.optimizer.optimize(&input.edges, &mut initial_poses)?;
         if result.termination != PoseGraphTermination::Converged {
-            return Err(TrackerError::PoseGraph(PoseGraphError::NotConverged {
-                iterations: result.iterations,
-                residual_norm: result.residual_norm,
-            }));
+            return Err(LoopApplyError::PoseGraph {
+                source: PoseGraphError::NotConverged {
+                    iterations: result.iterations,
+                    residual_norm: result.residual_norm,
+                },
+            });
         }
         let corrected_poses: HashMap<KeyframeId, Pose> = input
             .keyframe_ids
@@ -169,21 +167,6 @@ impl LoopManager {
             loop_translation_norm(loop_relative),
             loop_rotation_angle_deg(loop_relative),
         )
-    }
-
-    pub(crate) fn apply_error_kind(error: &TrackerError) -> LoopApplyError {
-        match error {
-            TrackerError::StaleLoopProof { .. } => LoopApplyError::StaleCorrection,
-            TrackerError::Map(crate::map::MapError::KeyframeNotFound(_)) => {
-                LoopApplyError::MissingKeyframe
-            }
-            TrackerError::Map(crate::map::MapError::MapPointNotFound(_)) => {
-                LoopApplyError::MissingMapPoint
-            }
-            TrackerError::Map(_) => LoopApplyError::MapMutation,
-            TrackerError::InvariantViolation(_) => LoopApplyError::InvariantViolation,
-            _ => LoopApplyError::MapMutation,
-        }
     }
 
     pub(crate) fn reject_reason(error: &LoopDetectError) -> LoopClosureRejectReason {

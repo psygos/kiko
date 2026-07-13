@@ -114,9 +114,9 @@ pub use local_ba::{
 };
 pub use loop_closure::{
     DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
-    KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig, LoopClosureConfigError,
-    LoopClosureConfigInput, LoopDetectError, LoopVerificationError, PlaceMatch,
-    RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
+    KeyframeDatabase, LoopApplyError, LoopApplyErrorKind, LoopCandidate, LoopClosureConfig,
+    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
+    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
     RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
     aggregate_global_descriptor, match_descriptors_for_loop,
 };
