@@ -89,7 +89,6 @@ pub use diagnostics::{
     VisualVsVioSharedProjectableTrackedObservationReprojectionMsePerAxisPx2Metric,
     VisualVsVioSharedProjectableTrackedObservationsSupport,
 };
-pub use env::{env_bool, env_f32, env_usize};
 pub use frontend::MapObservationError;
 pub use geometry::{
     BodyFrame, CamLFrame, CamRFrame, Cov3, GeometryError, ImageFrame, Info3, MapFrame, OdomFrame,

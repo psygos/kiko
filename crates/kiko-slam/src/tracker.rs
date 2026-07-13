@@ -447,6 +447,8 @@ impl std::fmt::Display for GlobalDescriptorConfigError {
 impl std::error::Error for GlobalDescriptorConfigError {}
 
 impl GlobalDescriptorConfig {
+    const DEFAULT_QUEUE_DEPTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
+
     pub fn new(queue_depth: usize) -> Result<Self, GlobalDescriptorConfigError> {
         let queue_depth =
             NonZeroUsize::new(queue_depth).ok_or(GlobalDescriptorConfigError::ZeroQueueDepth)?;
@@ -461,7 +463,7 @@ impl GlobalDescriptorConfig {
 impl Default for GlobalDescriptorConfig {
     fn default() -> Self {
         Self {
-            queue_depth: NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
+            queue_depth: Self::DEFAULT_QUEUE_DEPTH,
         }
     }
 }
@@ -489,6 +491,8 @@ impl std::fmt::Display for BackendConfigError {
 impl std::error::Error for BackendConfigError {}
 
 impl BackendConfig {
+    const DEFAULT_QUEUE_DEPTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(1);
+
     pub fn new(queue_depth: usize) -> Result<Self, BackendConfigError> {
         let queue_depth =
             NonZeroUsize::new(queue_depth).ok_or(BackendConfigError::ZeroQueueDepth)?;
@@ -503,7 +507,7 @@ impl BackendConfig {
 impl Default for BackendConfig {
     fn default() -> Self {
         Self {
-            queue_depth: NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
+            queue_depth: Self::DEFAULT_QUEUE_DEPTH,
         }
     }
 }
@@ -542,10 +546,29 @@ pub struct RedundancyPolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct BackendRequestId(NonZeroU64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackendRequestIdError {
+    Exhausted,
+}
+
+impl std::fmt::Display for BackendRequestIdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exhausted => write!(f, "backend request ID space is exhausted"),
+        }
+    }
+}
+
+impl std::error::Error for BackendRequestIdError {}
+
 impl BackendRequestId {
-    fn from_counter(counter: &mut u64) -> Self {
-        *counter = counter.saturating_add(1).max(1);
-        Self(NonZeroU64::new(*counter).unwrap_or(NonZeroU64::MIN))
+    fn from_counter(counter: &mut u64) -> Result<Self, BackendRequestIdError> {
+        let next = counter
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(BackendRequestIdError::Exhausted)?;
+        *counter = next.get();
+        Ok(Self(next))
     }
 
     fn as_u64(self) -> u64 {
@@ -845,6 +868,7 @@ enum SubmitEventError {
     InvalidEvent(KeyframeEventError),
     QueueFull,
     Disconnected,
+    RequestId { source: BackendRequestIdError },
 }
 
 impl std::fmt::Display for SubmitEventError {
@@ -854,6 +878,9 @@ impl std::fmt::Display for SubmitEventError {
             SubmitEventError::InvalidEvent(err) => write!(f, "invalid backend event: {err}"),
             SubmitEventError::QueueFull => write!(f, "backend event queue is full"),
             SubmitEventError::Disconnected => write!(f, "backend worker is disconnected"),
+            SubmitEventError::RequestId { source } => {
+                write!(f, "could not allocate a backend request ID: {source}")
+            }
         }
     }
 }
@@ -863,6 +890,7 @@ impl std::error::Error for SubmitEventError {
         match self {
             SubmitEventError::InvalidWindow(source) => Some(source),
             SubmitEventError::InvalidEvent(source) => Some(source),
+            SubmitEventError::RequestId { source } => Some(source),
             SubmitEventError::QueueFull | SubmitEventError::Disconnected => None,
         }
     }
@@ -1021,7 +1049,7 @@ impl BackendWorker {
         })
     }
 
-    fn next_request_id(&mut self) -> BackendRequestId {
+    fn next_request_id(&mut self) -> Result<BackendRequestId, BackendRequestIdError> {
         BackendRequestId::from_counter(&mut self.next_request_id)
     }
 
@@ -1171,11 +1199,15 @@ impl BackendSupervisor {
         }
     }
 
-    fn next_request_id(&mut self) -> Option<BackendRequestId> {
+    fn next_request_id(&mut self) -> Result<BackendRequestId, SubmitEventError> {
         if self.worker.is_none() {
             self.check_health();
         }
-        self.worker.as_mut().map(BackendWorker::next_request_id)
+        self.worker
+            .as_mut()
+            .ok_or(SubmitEventError::Disconnected)?
+            .next_request_id()
+            .map_err(|source| SubmitEventError::RequestId { source })
     }
 
     #[cfg(test)]
@@ -3257,9 +3289,7 @@ impl SlamTracker {
         };
 
         let window = BackendWindow::try_new(window_ids).map_err(SubmitEventError::InvalidWindow)?;
-        let request_id = supervisor
-            .next_request_id()
-            .ok_or(SubmitEventError::Disconnected)?;
+        let request_id = supervisor.next_request_id()?;
         let map_snapshot = self.global_map.clone_map();
         let source_snapshot = map_snapshot.snapshot();
         let event = KeyframeEvent::try_new(
@@ -3600,16 +3630,15 @@ impl SlamTracker {
             } if candidate == candidate_id
                 && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg) =>
             {
-                let next_confirmations = confirmations.get().saturating_add(1);
-                if next_confirmations >= required_confirmations {
+                let next_confirmations = confirmations.saturating_add(1);
+                if next_confirmations.get() >= required_confirmations {
                     return RelocalizationStep::Recovered { pose_world };
                 }
                 RelocalizationStep::Continue(RelocalizationSession {
                     attempts: session.attempts,
                     phase: RelocalizationPhase::Confirming {
                         candidate,
-                        confirmations: NonZeroUsize::new(next_confirmations)
-                            .unwrap_or(NonZeroUsize::MIN),
+                        confirmations: next_confirmations,
                         pose_world,
                     },
                     last_detections: session.last_detections,
@@ -4426,7 +4455,8 @@ impl SlamTracker {
                                             }
                                         }
                                         SubmitEventError::InvalidWindow(_)
-                                        | SubmitEventError::InvalidEvent(_) => {
+                                        | SubmitEventError::InvalidEvent(_)
+                                        | SubmitEventError::RequestId { .. } => {
                                             self.backend_stats.rejected =
                                                 self.backend_stats.rejected.saturating_add(1);
                                         }
@@ -5655,6 +5685,45 @@ mod tests {
     }
 
     #[test]
+    fn queue_defaults_and_backend_request_ids_are_nonzero_by_construction() {
+        assert_eq!(GlobalDescriptorConfig::default().queue_depth(), 2);
+        assert_eq!(BackendConfig::default().queue_depth(), 2);
+
+        let mut counter = 0;
+        assert_eq!(
+            BackendRequestId::from_counter(&mut counter)
+                .expect("first request ID")
+                .as_u64(),
+            1
+        );
+        assert_eq!(counter, 1);
+        assert_eq!(
+            BackendRequestId::from_counter(&mut counter)
+                .expect("second request ID")
+                .as_u64(),
+            2
+        );
+        assert_eq!(counter, 2);
+
+        counter = u64::MAX;
+        assert!(matches!(
+            BackendRequestId::from_counter(&mut counter),
+            Err(BackendRequestIdError::Exhausted)
+        ));
+        assert_eq!(counter, u64::MAX);
+
+        let submit_error = SubmitEventError::RequestId {
+            source: BackendRequestIdError::Exhausted,
+        };
+        assert_eq!(
+            std::error::Error::source(&submit_error)
+                .expect("request ID source")
+                .to_string(),
+            "backend request ID space is exhausted"
+        );
+    }
+
+    #[test]
     fn correction_apply_rejects_stale_snapshot() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
         let source_snapshot = map.snapshot();
@@ -5831,9 +5900,9 @@ mod tests {
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
         let source_snapshot = map.snapshot();
+        let request_id = worker.next_request_id().expect("request ID");
         let event =
-            KeyframeEvent::try_new(worker.next_request_id(), source_snapshot, kf_b, window, map)
-                .expect("event");
+            KeyframeEvent::try_new(request_id, source_snapshot, kf_b, window, map).expect("event");
         worker.try_submit(event).expect("submit");
 
         let mut response = None;
@@ -5887,7 +5956,7 @@ mod tests {
         let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
         let mut req_counter = 0;
         let event = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
+            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
             map,
             kf_a,
             kf_b,
@@ -5936,7 +6005,7 @@ mod tests {
 
         let (map1, kf_a1, kf_b1) = make_map_with_two_keyframes_one_shared_point();
         let panic1 = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
+            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
             map1,
             kf_a1,
             kf_b1,
@@ -5963,7 +6032,7 @@ mod tests {
 
         let (map2, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
         let panic2 = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
+            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
             map2,
             kf_a2,
             kf_b2,
@@ -6035,7 +6104,7 @@ mod tests {
 
         let (map_panic, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
         let panic_event = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
+            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
             map_panic,
             kf_a,
             kf_b,
@@ -6068,7 +6137,7 @@ mod tests {
         let window = BackendWindow::try_new(vec![kf_a2, kf_b2]).expect("window");
         let source_snapshot = map_ok.snapshot();
         let ok_event = KeyframeEvent::try_new(
-            BackendRequestId::from_counter(&mut req_counter),
+            BackendRequestId::from_counter(&mut req_counter).expect("request ID"),
             source_snapshot,
             kf_b2,
             window,
