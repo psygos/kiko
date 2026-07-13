@@ -21,7 +21,7 @@ pub struct DatasetReader {
     frame_dimensions: crate::FrameDimensions,
     left_seq: u64,
     right_seq: u64,
-    imu_samples: Option<Box<[ImuSample]>>,
+    imu_samples: Option<ImuBatch>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,9 +131,10 @@ impl DatasetReader {
     }
 
     fn imu_for_interval(&self, interval: CaptureInterval) -> Result<CaptureImu, DatasetError> {
-        let Some(samples) = self.imu_samples.as_deref() else {
+        let Some(imu_samples) = self.imu_samples.as_ref() else {
             return Ok(CaptureImu::Absent);
         };
+        let samples = imu_samples.samples();
         let startup_interval = interval.start_exclusive().is_none();
 
         let start_idx = match interval.start_exclusive() {
@@ -159,18 +160,15 @@ impl DatasetReader {
             });
         }
 
-        let batch = match ImuBatch::new(samples[start_idx..end_idx].to_vec()) {
-            Ok(batch) => batch,
-            Err(_) if startup_interval || before_first_imu_sample => return Ok(CaptureImu::Absent),
-            Err(_) => {
-                return Err(DatasetError::MissingImuSamples {
-                    start_ns: interval
-                        .start_exclusive()
-                        .map(|timestamp| timestamp.as_nanos()),
-                    end_ns: interval.end_inclusive().as_nanos(),
-                });
-            }
-        };
+        let batch = imu_samples
+            .slice(start_idx..end_idx)
+            .map_err(|source| DatasetError::InvalidImuSlice {
+                start_ns: interval
+                    .start_exclusive()
+                    .map(|timestamp| timestamp.as_nanos()),
+                end_ns: interval.end_inclusive().as_nanos(),
+                source,
+            })?;
         Ok(CaptureImu::present(batch))
     }
 }
@@ -215,11 +213,22 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
         let pair = self.reader.manifest.pairs.get(self.index)?;
         self.index += 1;
 
+        let (left_frame_id, next_left_sequence) =
+            match next_frame_id(self.reader.left_seq, SensorId::StereoLeft) {
+                Ok(sequence) => sequence,
+                Err(err) => return Some(Err(err)),
+            };
+        let (right_frame_id, next_right_sequence) =
+            match next_frame_id(self.reader.right_seq, SensorId::StereoRight) {
+                Ok(sequence) => sequence,
+                Err(err) => return Some(Err(err)),
+            };
+
         let left_start = Instant::now();
         let left_frame = match read_indexed_frame(
             &self.reader.root,
             self.reader.frame_dimensions,
-            &mut self.reader.left_seq,
+            left_frame_id,
             &pair.left,
             SensorId::StereoLeft,
         ) {
@@ -233,7 +242,7 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
         let right_frame = match read_indexed_frame(
             &self.reader.root,
             self.reader.frame_dimensions,
-            &mut self.reader.right_seq,
+            right_frame_id,
             &pair.right,
             SensorId::StereoRight,
         ) {
@@ -246,6 +255,8 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
         let pair_start = Instant::now();
         let pair = StereoPair::from_parts(left_frame, right_frame);
         let pairing = pair_start.elapsed();
+        self.reader.left_seq = next_left_sequence;
+        self.reader.right_seq = next_right_sequence;
 
         let timings = DatasetReadTimings {
             left_read: left_time,
@@ -265,6 +276,10 @@ impl<'a> Iterator for DatasetBundles<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let pair_index = self.reader.manifest.pairs.get(self.index)?;
         self.index += 1;
+        let (capture_id, next_capture_seq) = match next_capture_id(self.capture_seq) {
+            Ok(sequence) => sequence,
+            Err(err) => return Some(Err(err)),
+        };
         let pair = match read_indexed_pair(
             &self.reader.root,
             self.reader.frame_dimensions,
@@ -277,26 +292,20 @@ impl<'a> Iterator for DatasetBundles<'a> {
         };
         let interval = match CaptureInterval::new(self.previous_capture_time, pair.capture_time()) {
             Ok(interval) => interval,
-            Err(_) => {
-                return Some(Err(DatasetError::InvalidConfig {
-                    msg: "capture bundle interval must be strictly increasing",
-                }));
-            }
+            Err(source) => return Some(Err(DatasetError::InvalidCaptureInterval { source })),
         };
         let imu = match self.reader.imu_for_interval(interval) {
             Ok(imu) => imu,
             Err(err) => return Some(Err(err)),
         };
-        let capture_id = CaptureId::new(self.capture_seq);
-        self.capture_seq = self.capture_seq.saturating_add(1);
-        self.previous_capture_time = Some(interval.end_inclusive());
-        Some(
-            CaptureBundle::new(capture_id, pair, interval, imu).map_err(|_| {
-                DatasetError::InvalidConfig {
-                    msg: "capture bundle interval must match pair capture time",
-                }
-            }),
-        )
+        match CaptureBundle::new(capture_id, pair, interval, imu) {
+            Ok(bundle) => {
+                self.capture_seq = next_capture_seq;
+                self.previous_capture_time = Some(interval.end_inclusive());
+                Some(Ok(bundle))
+            }
+            Err(source) => Some(Err(DatasetError::InvalidCaptureBundle { source })),
+        }
     }
 }
 
@@ -307,27 +316,46 @@ fn read_indexed_pair(
     right_sequence: &mut u64,
     pair: &DatasetPairIndex,
 ) -> Result<StereoPair, DatasetError> {
+    let (left_frame_id, next_left_sequence) = next_frame_id(*left_sequence, SensorId::StereoLeft)?;
+    let (right_frame_id, next_right_sequence) =
+        next_frame_id(*right_sequence, SensorId::StereoRight)?;
     let left = read_indexed_frame(
         root,
         dimensions,
-        left_sequence,
+        left_frame_id,
         &pair.left,
         SensorId::StereoLeft,
     )?;
     let right = read_indexed_frame(
         root,
         dimensions,
-        right_sequence,
+        right_frame_id,
         &pair.right,
         SensorId::StereoRight,
     )?;
+    *left_sequence = next_left_sequence;
+    *right_sequence = next_right_sequence;
     Ok(StereoPair::from_parts(left, right))
+}
+
+fn next_frame_id(sequence: u64, sensor: SensorId) -> Result<(FrameId, u64), DatasetError> {
+    let next_sequence = sequence
+        .checked_add(1)
+        .ok_or(DatasetError::FrameSequenceExhausted { sensor })?;
+    Ok((FrameId::new(sequence), next_sequence))
+}
+
+fn next_capture_id(sequence: u64) -> Result<(CaptureId, u64), DatasetError> {
+    let next_sequence = sequence
+        .checked_add(1)
+        .ok_or(DatasetError::CaptureSequenceExhausted)?;
+    Ok((CaptureId::new(sequence), next_sequence))
 }
 
 fn read_indexed_frame(
     root: &Path,
     dimensions: crate::FrameDimensions,
-    sequence: &mut u64,
+    frame_id: FrameId,
     frame_ref: &DatasetIndexFrameRef,
     sensor: SensorId,
 ) -> Result<Frame, DatasetError> {
@@ -336,8 +364,6 @@ fn read_indexed_frame(
         path: path.clone(),
         source,
     })?;
-    let frame_id = FrameId::new(*sequence);
-    *sequence = sequence.saturating_add(1);
     Frame::new(
         sensor,
         frame_id,
@@ -479,7 +505,7 @@ fn read_imu_samples(
     root: &Path,
     meta: &super::Meta,
     time_offset_ns: i64,
-) -> Result<Option<Box<[ImuSample]>>, DatasetError> {
+) -> Result<Option<ImuBatch>, DatasetError> {
     if meta.imu.is_none() {
         return Ok(None);
     }
@@ -519,7 +545,9 @@ fn read_imu_samples(
         })?;
         samples.push(sample);
     }
-    Ok(Some(samples.into_boxed_slice()))
+    ImuBatch::new(samples)
+        .map(Some)
+        .map_err(|source| DatasetError::InvalidImuBatch { path, source })
 }
 
 #[cfg(test)]
@@ -626,6 +654,67 @@ mod tests {
     }
 
     #[test]
+    fn imu_file_is_parsed_once_into_a_strictly_ordered_batch() {
+        let dataset_dir = unique_temp_dir("invalid-imu-order");
+        std::fs::create_dir_all(&dataset_dir).expect("dataset directory");
+        let path = dataset_dir.join(crate::dataset::format::IMU_FILE);
+        let mut bytes = Vec::with_capacity(IMU_RECORD_BYTES * 2);
+        for timestamp_ns in [20_i64, 10_i64] {
+            bytes.extend_from_slice(&timestamp_ns.to_le_bytes());
+            for value in [0.0_f64; 6] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        std::fs::write(&path, bytes).expect("out-of-order IMU file");
+
+        let error = read_imu_samples(&dataset_dir, &meta_with_imu(), 0)
+            .expect_err("out-of-order timestamps must fail at file load");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidImuBatch {
+                path: actual_path,
+                source: crate::ImuBatchError::NonIncreasingTimestamps {
+                    previous,
+                    current,
+                },
+            } if actual_path == &path
+                && previous.as_nanos() == 20
+                && current.as_nanos() == 10
+        ));
+        assert!(error.source().is_some(), "batch error must remain sourced");
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
+    }
+
+    #[test]
+    fn dataset_capture_errors_preserve_nested_domain_sources() {
+        let timestamp = Timestamp::from_nanos(10);
+        let interval_source = crate::CaptureIntervalError::NonIncreasing {
+            start_exclusive: timestamp,
+            end_inclusive: timestamp,
+        };
+        let interval_error = DatasetError::InvalidCaptureInterval {
+            source: interval_source,
+        };
+        assert_eq!(
+            interval_error
+                .source()
+                .expect("interval source")
+                .to_string(),
+            interval_source.to_string()
+        );
+
+        let bundle_error = DatasetError::InvalidCaptureBundle {
+            source: crate::CaptureBundleError::InvalidInterval(interval_source),
+        };
+        let bundle_source = bundle_error.source().expect("bundle source");
+        assert!(
+            bundle_source.source().is_some(),
+            "interval source must survive"
+        );
+    }
+
+    #[test]
     fn paired_stats_count_only_manifest_pairs() {
         let frames = super::super::FrameSet {
             mono_dimensions: crate::FrameDimensions::try_new(640, 480).expect("dimensions"),
@@ -659,6 +748,76 @@ mod tests {
         assert_eq!(stats.right_count, 1);
         assert_eq!(stats.paired_count, 1);
         assert_eq!(stats.paired_fps, None);
+    }
+
+    #[test]
+    fn indexed_pair_sequences_advance_transactionally_and_never_saturate() {
+        let dataset_dir = unique_temp_dir("reader-frame-sequence");
+        std::fs::create_dir_all(&dataset_dir).expect("dataset directory");
+        let pair_index = DatasetPairIndex {
+            left: DatasetIndexFrameRef {
+                timestamp: Timestamp::from_nanos(10),
+                path: Arc::from("left.raw"),
+            },
+            right: DatasetIndexFrameRef {
+                timestamp: Timestamp::from_nanos(12),
+                path: Arc::from("right.raw"),
+            },
+        };
+        let dimensions = crate::FrameDimensions::try_new(2, 2).expect("dimensions");
+        let mut left_sequence = 7_u64;
+        let mut right_sequence = 9_u64;
+        std::fs::write(dataset_dir.join("left.raw"), [0_u8; 4]).expect("left frame");
+
+        let missing_right = read_indexed_pair(
+            &dataset_dir,
+            dimensions,
+            &mut left_sequence,
+            &mut right_sequence,
+            &pair_index,
+        )
+        .expect_err("missing right frame must fail");
+        assert!(matches!(missing_right, DatasetError::ReadFile { .. }));
+        assert_eq!(left_sequence, 7);
+        assert_eq!(right_sequence, 9);
+
+        std::fs::write(dataset_dir.join("right.raw"), [0_u8; 4]).expect("right frame");
+        let pair = read_indexed_pair(
+            &dataset_dir,
+            dimensions,
+            &mut left_sequence,
+            &mut right_sequence,
+            &pair_index,
+        )
+        .expect("pair");
+        assert_eq!(pair.left().frame_id(), FrameId::new(7));
+        assert_eq!(pair.right().frame_id(), FrameId::new(9));
+        assert_eq!(left_sequence, 8);
+        assert_eq!(right_sequence, 10);
+
+        left_sequence = u64::MAX;
+        let exhausted = read_indexed_pair(
+            &dataset_dir,
+            dimensions,
+            &mut left_sequence,
+            &mut right_sequence,
+            &pair_index,
+        )
+        .expect_err("sequence exhaustion must be explicit");
+        assert!(matches!(
+            exhausted,
+            DatasetError::FrameSequenceExhausted {
+                sensor: SensorId::StereoLeft,
+            }
+        ));
+        assert_eq!(left_sequence, u64::MAX);
+        assert_eq!(right_sequence, 10);
+        assert!(matches!(
+            next_capture_id(u64::MAX),
+            Err(DatasetError::CaptureSequenceExhausted)
+        ));
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -817,6 +976,12 @@ mod tests {
         handle.finish().expect("finish dataset");
 
         let mut reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let source_imu_ptr = reader
+            .imu_samples
+            .as_ref()
+            .expect("loaded IMU batch")
+            .samples()
+            .as_ptr();
         let mut bundles = reader.bundles();
 
         let first = bundles.next().expect("first bundle").expect("first ok");
@@ -829,6 +994,7 @@ mod tests {
         assert_eq!(first_imu.len(), 2);
         assert_eq!(first_imu.start_time().as_nanos(), 90);
         assert_eq!(first_imu.end_time().as_nanos(), 102);
+        assert!(std::ptr::eq(first_imu.samples().as_ptr(), source_imu_ptr));
 
         let second = bundles.next().expect("second bundle").expect("second ok");
         assert_eq!(second.capture_id().as_u64(), 1);

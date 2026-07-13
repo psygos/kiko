@@ -6,7 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::{
-    DepthImage, Frame, FrameDimensions, FrameDimensionsError, FrameError, ImuBatch, ImuSampleError,
+    CaptureBundleError, CaptureIntervalError, DepthImage, Frame, FrameDimensions,
+    FrameDimensionsError, FrameError, ImuBatch, ImuBatchError, ImuBatchSliceError, ImuSampleError,
     ImuTimestampShiftError, PairError, PairingConfigError, SensorId, StereoPair, Timestamp,
 };
 
@@ -596,6 +597,15 @@ pub enum DatasetError {
         record_index: usize,
         source: DatasetImuRecordError,
     },
+    InvalidImuBatch {
+        path: PathBuf,
+        source: ImuBatchError,
+    },
+    InvalidImuSlice {
+        start_ns: Option<i64>,
+        end_ns: i64,
+        source: ImuBatchSliceError,
+    },
     InvalidConfig {
         msg: &'static str,
     },
@@ -626,6 +636,16 @@ pub enum DatasetError {
     PairingFailed {
         source: PairError,
     },
+    InvalidCaptureInterval {
+        source: CaptureIntervalError,
+    },
+    InvalidCaptureBundle {
+        source: CaptureBundleError,
+    },
+    FrameSequenceExhausted {
+        sensor: SensorId,
+    },
+    CaptureSequenceExhausted,
     MissingImuSamples {
         start_ns: Option<i64>,
         end_ns: i64,
@@ -705,6 +725,19 @@ impl std::fmt::Display for DatasetError {
                 "invalid IMU record {record_index} in {}: {source}",
                 path.display()
             ),
+            DatasetError::InvalidImuBatch { path, source } => write!(
+                f,
+                "invalid IMU sample sequence in {}: {source}",
+                path.display()
+            ),
+            DatasetError::InvalidImuSlice {
+                start_ns,
+                end_ns,
+                source,
+            } => write!(
+                f,
+                "invalid dataset IMU slice for interval ({start_ns:?}, {end_ns}]: {source}"
+            ),
             DatasetError::InvalidConfig { msg } => write!(f, "invalid dataset config: {msg}"),
             DatasetError::InvalidFrame { path, source } => {
                 write!(f, "invalid dataset frame {}: {source}", path.display())
@@ -730,6 +763,18 @@ impl std::fmt::Display for DatasetError {
             DatasetError::PairingFailed { source } => {
                 write!(f, "dataset pairing failed: {source}")
             }
+            DatasetError::InvalidCaptureInterval { source } => {
+                write!(f, "invalid dataset capture interval: {source}")
+            }
+            DatasetError::InvalidCaptureBundle { source } => {
+                write!(f, "invalid dataset capture bundle: {source}")
+            }
+            DatasetError::FrameSequenceExhausted { sensor } => {
+                write!(f, "dataset {sensor:?} frame sequence exhausted u64 IDs")
+            }
+            DatasetError::CaptureSequenceExhausted => {
+                write!(f, "dataset capture sequence exhausted u64 IDs")
+            }
             DatasetError::MissingImuSamples { start_ns, end_ns } => {
                 write!(
                     f,
@@ -753,8 +798,12 @@ impl std::error::Error for DatasetError {
             }
             DatasetError::InvalidManifest { source, .. } => Some(source),
             DatasetError::PairingFailed { source } => Some(source),
+            DatasetError::InvalidCaptureInterval { source } => Some(source),
+            DatasetError::InvalidCaptureBundle { source } => Some(source),
             DatasetError::InvalidFrame { source, .. } => Some(source),
             DatasetError::InvalidImuRecord { source, .. } => Some(source),
+            DatasetError::InvalidImuBatch { source, .. } => Some(source),
+            DatasetError::InvalidImuSlice { source, .. } => Some(source),
             DatasetError::InvalidFrameFilename { source, .. } => Some(source),
             DatasetError::InvalidFrameDimensions { source, .. } => Some(source),
             DatasetError::InvalidConfig { .. }
@@ -764,6 +813,8 @@ impl std::error::Error for DatasetError {
             | DatasetError::FrameByteLengthOverflow { .. }
             | DatasetError::FrameSizeMismatch { .. }
             | DatasetError::InvalidImuLength { .. }
+            | DatasetError::FrameSequenceExhausted { .. }
+            | DatasetError::CaptureSequenceExhausted
             | DatasetError::WorkerJoin { .. }
             | DatasetError::MissingImuSamples { .. } => None,
         }

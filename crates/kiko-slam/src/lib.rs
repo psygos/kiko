@@ -95,8 +95,9 @@ pub use geometry::{
     Point3d, PositiveF64, StdDev, Transform3d, UnitRay3d, Variance, Vec3d, VoxelFrame,
 };
 pub use imu::{
-    ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBias, ImuExtrinsics,
-    ImuExtrinsicsError, ImuNoiseModel, ImuSample, ImuSampleError, ImuTimestampShiftError,
+    ImuAccumulator, ImuAccumulatorError, ImuBatch, ImuBatchError, ImuBatchSliceError, ImuBias,
+    ImuExtrinsics, ImuExtrinsicsError, ImuNoiseModel, ImuSample, ImuSampleError,
+    ImuTimestampShiftError,
 };
 #[cfg(feature = "vio")]
 pub use local_ba::{

@@ -194,13 +194,23 @@ impl CaptureBundle {
         }
 
         if let Some(batch) = imu.batch() {
-            for sample in batch.samples() {
-                if !interval.contains(sample.timestamp()) {
-                    return Err(CaptureBundleError::ImuOutsideInterval {
-                        sample_time: sample.timestamp(),
-                        interval,
-                    });
-                }
+            let samples = batch.samples();
+            let first_time = samples[0].timestamp();
+            if !interval.contains(first_time) {
+                return Err(CaptureBundleError::ImuOutsideInterval {
+                    sample_time: first_time,
+                    interval,
+                });
+            }
+            let last_time = samples[samples.len() - 1].timestamp();
+            if !interval.contains(last_time) {
+                let first_after_end = samples.partition_point(|sample| {
+                    sample.timestamp().as_nanos() <= interval.end_inclusive().as_nanos()
+                });
+                return Err(CaptureBundleError::ImuOutsideInterval {
+                    sample_time: samples[first_after_end].timestamp(),
+                    interval,
+                });
             }
         }
 
@@ -404,6 +414,39 @@ mod tests {
         .expect_err("sample after interval end should be rejected");
         assert_eq!(
             err,
+            CaptureBundleError::ImuOutsideInterval {
+                sample_time: Timestamp::from_nanos(103),
+                interval,
+            }
+        );
+    }
+
+    #[test]
+    fn capture_bundle_reports_the_first_ordered_sample_after_interval_end() {
+        let pair = stereo_pair(100, 104);
+        let interval = CaptureInterval::new(Some(Timestamp::from_nanos(90)), pair.capture_time())
+            .expect("interval");
+        let batch = ImuBatch::new(
+            [91, 103, 104]
+                .into_iter()
+                .map(|timestamp| {
+                    crate::ImuSample::new(Timestamp::from_nanos(timestamp), [0.0; 3], [0.0; 3])
+                        .expect("sample")
+                })
+                .collect(),
+        )
+        .expect("batch");
+
+        let error = CaptureBundle::new(
+            CaptureId::new(3),
+            pair,
+            interval,
+            CaptureImu::present(batch),
+        )
+        .expect_err("samples after interval end must be rejected");
+
+        assert_eq!(
+            error,
             CaptureBundleError::ImuOutsideInterval {
                 sample_time: Timestamp::from_nanos(103),
                 interval,

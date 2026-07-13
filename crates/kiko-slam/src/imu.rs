@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::Arc;
 
 use crate::{Pose64, Timestamp};
@@ -322,6 +323,32 @@ impl std::fmt::Display for ImuBatchError {
 impl std::error::Error for ImuBatchError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImuBatchSliceError {
+    InvalidRange {
+        start: usize,
+        end: usize,
+        batch_len: usize,
+    },
+}
+
+impl std::fmt::Display for ImuBatchSliceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRange {
+                start,
+                end,
+                batch_len,
+            } => write!(
+                f,
+                "imu batch slice {start}..{end} must be nonempty and within batch length {batch_len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ImuBatchSliceError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImuAccumulatorError {
     NonIncreasingTimestamps {
         previous: Timestamp,
@@ -464,6 +491,7 @@ impl ImuAccumulator {
 #[derive(Clone, Debug)]
 pub struct ImuBatch {
     samples: Arc<[ImuSample]>,
+    range: Range<usize>,
 }
 
 impl ImuBatch {
@@ -479,29 +507,48 @@ impl ImuBatch {
             }
             previous = current;
         }
+        let len = samples.len();
         Ok(Self {
             samples: Arc::from(samples.into_boxed_slice()),
+            range: 0..len,
+        })
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Result<Self, ImuBatchSliceError> {
+        let start = range.start;
+        let end = range.end;
+        let batch_len = self.len();
+        if start >= end || end > batch_len {
+            return Err(ImuBatchSliceError::InvalidRange {
+                start,
+                end,
+                batch_len,
+            });
+        }
+        Ok(Self {
+            samples: Arc::clone(&self.samples),
+            range: self.range.start + start..self.range.start + end,
         })
     }
 
     pub fn samples(&self) -> &[ImuSample] {
-        self.samples.as_ref()
+        &self.samples[self.range.clone()]
     }
 
     pub fn len(&self) -> usize {
-        self.samples.len()
+        self.range.end - self.range.start
     }
 
     pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
+        self.range.start == self.range.end
     }
 
     pub fn start_time(&self) -> Timestamp {
-        self.samples[0].timestamp()
+        self.samples[self.range.start].timestamp()
     }
 
     pub fn end_time(&self) -> Timestamp {
-        self.samples[self.samples.len() - 1].timestamp()
+        self.samples[self.range.end - 1].timestamp()
     }
 
     pub fn dt_seconds(&self) -> f64 {
@@ -593,6 +640,36 @@ mod tests {
         assert_eq!(batch.start_time(), Timestamp::from_nanos(10));
         assert_eq!(batch.end_time(), Timestamp::from_nanos(70));
         assert!((batch.dt_seconds() - 60e-9).abs() < 1e-15);
+    }
+
+    #[test]
+    fn imu_batch_slices_are_nonempty_bounded_and_share_validated_storage() {
+        let samples = [10, 30, 70]
+            .into_iter()
+            .map(|timestamp| {
+                ImuSample::new(Timestamp::from_nanos(timestamp), [0.0; 3], [0.0; 3])
+                    .expect("sample")
+            })
+            .collect();
+        let batch = ImuBatch::new(samples).expect("batch");
+
+        let tail = batch.slice(1..3).expect("tail");
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail.start_time(), Timestamp::from_nanos(30));
+        assert_eq!(tail.end_time(), Timestamp::from_nanos(70));
+        assert!(std::ptr::eq(&batch.samples()[1], &tail.samples()[0]));
+
+        let last = tail.slice(1..2).expect("nested slice");
+        assert_eq!(last.start_time(), Timestamp::from_nanos(70));
+        assert!(std::ptr::eq(&batch.samples()[2], &last.samples()[0]));
+
+        let reversed = Range { start: 2, end: 1 };
+        for range in [0..0, reversed, 0..4] {
+            assert!(matches!(
+                batch.slice(range),
+                Err(ImuBatchSliceError::InvalidRange { batch_len: 3, .. })
+            ));
+        }
     }
 
     #[test]
