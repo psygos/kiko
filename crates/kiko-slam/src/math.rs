@@ -162,11 +162,6 @@ impl Pose64 {
     }
 
     pub fn try_from_pose32(pose: Pose) -> Result<Self, Pose64Error> {
-        let converted = Self::from_pose32(pose);
-        Self::try_from_rt(converted.rotation, converted.translation)
-    }
-
-    pub(crate) fn from_pose32(pose: Pose) -> Self {
         let pose_rotation = pose.rotation();
         let mut rotation = [[0.0_f64; 3]; 3];
         for (row_idx, row) in rotation.iter_mut().enumerate() {
@@ -175,10 +170,15 @@ impl Pose64 {
             }
         }
         let t = pose.translation();
-        Self {
+        Self::try_from_rt(
             rotation,
-            translation: [t[0] as f64, t[1] as f64, t[2] as f64],
-        }
+            [f64::from(t[0]), f64::from(t[1]), f64::from(t[2])],
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_pose32(pose: Pose) -> Self {
+        Self::try_from_pose32(pose).expect("test pose must satisfy the Pose64 SE(3) invariant")
     }
 
     pub fn try_to_pose32(self) -> Result<Pose, Pose64Error> {

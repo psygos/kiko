@@ -127,16 +127,22 @@ impl GlobalMap {
         self.map.set_map_point_position(point_id, position)
     }
 
-    pub(crate) fn add_keyframe_to_graph(&mut self, keyframe_id: KeyframeId) {
+    pub(crate) fn add_keyframe_to_graph(
+        &mut self,
+        keyframe_id: KeyframeId,
+    ) -> Result<(), EssentialGraphError> {
         let neighbors = self.map.covisibility().neighbors(keyframe_id).cloned();
         self.essential_graph
-            .add_keyframe(keyframe_id, neighbors.as_ref(), &self.map);
+            .add_keyframe(keyframe_id, neighbors.as_ref(), &self.map)
     }
 
     #[cfg(feature = "vio")]
     #[allow(dead_code)]
-    pub(crate) fn add_odometry_edge(&mut self, edge: EssentialEdge) {
-        self.essential_graph.add_odometry_edge(edge);
+    pub(crate) fn add_odometry_edge(
+        &mut self,
+        edge: EssentialEdge,
+    ) -> Result<(), EssentialGraphError> {
+        self.essential_graph.add_odometry_edge(edge)
     }
 
     pub(crate) fn remove_keyframe_from_graph(

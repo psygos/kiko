@@ -2967,9 +2967,8 @@ impl SlamTracker {
         };
 
         // Build NavState for this frame from visual pose
-        let camera_odom = self
-            .map_from_odom
-            .try_map_to_odom(Pose64::from_pose32(pose_world))?;
+        let pose_world_64 = Pose64::try_from_pose32(pose_world)?;
+        let camera_odom = self.map_from_odom.try_map_to_odom(pose_world_64)?;
         let body_odom =
             pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
         let visual_velocity_seed = vio_runtime.visual_velocity_seed(body_odom, capture_time);
@@ -3219,9 +3218,8 @@ impl SlamTracker {
         let LocalEstimator::Inertial(vio_runtime) = &mut self.local_estimator else {
             return Ok(());
         };
-        let camera_odom = self
-            .map_from_odom
-            .try_map_to_odom(Pose64::from_pose32(pose_world))?;
+        let pose_world_64 = Pose64::try_from_pose32(pose_world)?;
+        let camera_odom = self.map_from_odom.try_map_to_odom(pose_world_64)?;
         let body_odom =
             pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
         let observations =
@@ -3294,8 +3292,7 @@ impl SlamTracker {
             .apply_verified_loop(&mut self.global_map, &verified)?;
         #[cfg(feature = "vio")]
         {
-            self.realign_map_from_odom(&corrected)
-                .map_err(|source| LoopApplyError::MapFrameAlignment { source })?;
+            self.realign_map_from_odom(&corrected)?;
             self.global_map = candidate_map;
             self.reset_inertial_runtime_continuity();
         }
@@ -3315,7 +3312,7 @@ impl SlamTracker {
     fn realign_map_from_odom(
         &mut self,
         corrected_poses: &[(KeyframeId, Pose)],
-    ) -> Result<(), crate::GeometryError> {
+    ) -> Result<(), LoopApplyError> {
         // After loop closure, corrected_poses contains updated map-frame poses.
         // Use the most recent one to realign map_from_odom so that the odom
         // trajectory remains continuous while the map frame absorbs the correction.
@@ -3323,9 +3320,18 @@ impl SlamTracker {
             return Ok(());
         };
         // Use the last corrected pose (most recent keyframe) as the alignment target
-        if let Some((_, corrected_map_pose)) = corrected_poses.last() {
+        if let Some((keyframe_id, corrected_map_pose)) = corrected_poses.last() {
+            let corrected_map_pose =
+                Pose64::try_from_pose32(*corrected_map_pose).map_err(|source| {
+                    LoopApplyError::PoseConversion {
+                        operation: "map/odometry realignment pose widening",
+                        keyframe_id: Some(*keyframe_id),
+                        source,
+                    }
+                })?;
             self.map_from_odom
-                .try_align_to_pose(Pose64::from_pose32(*corrected_map_pose), cam_from_odom)?;
+                .try_align_to_pose(corrected_map_pose, cam_from_odom)
+                .map_err(|source| LoopApplyError::MapFrameAlignment { source })?;
         }
         Ok(())
     }
@@ -4086,21 +4092,21 @@ impl SlamTracker {
         let reference_cam_from_odom = session.reference_cam_from_odom;
         match Self::relocalization_step(session, candidate_id, pose_world, cfg)? {
             RelocalizationStep::Recovered { pose_world } => {
-                self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
-                    keyframe_id: candidate_id,
-                });
                 #[cfg(feature = "vio")]
                 {
                     if let Some(reference_cam_from_odom) =
                         reference_cam_from_odom.or_else(|| self.current_odom_pose())
                     {
                         self.map_from_odom.try_align_to_pose(
-                            Pose64::from_pose32(pose_world),
+                            Pose64::try_from_pose32(pose_world)?,
                             reference_cam_from_odom,
                         )?;
                     }
                     self.reset_inertial_runtime_continuity();
                 }
+                self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
+                    keyframe_id: candidate_id,
+                });
                 if let Some(place_recognition) = self.place_recognition.as_mut() {
                     place_recognition.clear_pending();
                 }
@@ -5220,8 +5226,8 @@ impl SlamTracker {
                 ),
             }
         }
-        let keyframe_id = insert_keyframe_into_map(
-            self.global_map.map_mut(),
+        let keyframe_id = insert_keyframe_into_global_map(
+            &mut self.global_map,
             &keyframe,
             left.timestamp(),
             pose_world,
@@ -5232,7 +5238,6 @@ impl SlamTracker {
             keyframe_id,
             landmarks,
         });
-        self.global_map.add_keyframe_to_graph(keyframe_id);
         if let Some(place_recognition) = self.place_recognition.as_mut() {
             place_recognition.on_keyframe(
                 keyframe_id,
@@ -5269,24 +5274,25 @@ fn requested_inertial_calibration(
     }
 }
 
-fn insert_keyframe_into_map(
-    map: &mut SlamMap,
+fn insert_keyframe_into_global_map(
+    global_map: &mut GlobalMap,
     keyframe: &Arc<Keyframe>,
     timestamp: Timestamp,
     pose_world: Pose,
     shared: Option<&SharedMatches>,
     cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
-    let mut candidate = map.clone();
+    let mut candidate = global_map.clone();
     let keyframe_id = insert_keyframe_into_candidate(
-        &mut candidate,
+        candidate.map_mut(),
         keyframe,
         timestamp,
         pose_world,
         shared,
         cull_min_observations,
     )?;
-    *map = candidate;
+    candidate.add_keyframe_to_graph(keyframe_id)?;
+    *global_map = candidate;
     Ok(keyframe_id)
 }
 
@@ -5381,7 +5387,7 @@ fn classify_pose_status(
             }
         }
         (None, Some(pose_map)) => {
-            let cam_from_map = Pose64::from_pose32(pose_map);
+            let cam_from_map = Pose64::try_from_pose32(pose_map)?;
             let cam_from_odom = map_from_odom.try_map_to_odom(cam_from_map)?;
             PoseStatus::Current(TrackingPose::try_new(
                 cam_from_odom,
@@ -5404,7 +5410,9 @@ fn tracking_pose_from_vio_output(
     pose_map_measurement: Option<Pose>,
 ) -> Result<TrackingPose, TrackerError> {
     let cam_from_map_corrected = map_from_odom.try_odom_to_map(cam_from_odom)?;
-    let cam_from_map_visual_measurement = pose_map_measurement.map(Pose64::from_pose32);
+    let cam_from_map_visual_measurement = pose_map_measurement
+        .map(Pose64::try_from_pose32)
+        .transpose()?;
     Ok(TrackingPose::try_new(
         cam_from_odom,
         cam_from_map_corrected,
@@ -6161,10 +6169,10 @@ mod tests {
                 .expect("keyframe"),
         );
 
-        let mut map = SlamMap::new();
-        assert_map_invariants(&map).expect("empty map invariants");
-        let keyframe_id = insert_keyframe_into_map(
-            &mut map,
+        let mut global_map = GlobalMap::new(100);
+        assert_map_invariants(global_map.map()).expect("empty map invariants");
+        let keyframe_id = insert_keyframe_into_global_map(
+            &mut global_map,
             &keyframe,
             Timestamp::from_nanos(42),
             Pose::identity(),
@@ -6172,25 +6180,33 @@ mod tests {
             NonZeroUsize::new(1).expect("literal is non-zero"),
         )
         .expect("insert keyframe");
-        assert_map_invariants(&map).expect("post-insertion invariants");
+        assert_map_invariants(global_map.map()).expect("post-insertion invariants");
 
-        assert_eq!(map.num_keyframes(), 1);
-        assert_eq!(map.num_points(), keyframe.landmarks().len());
+        assert_eq!(global_map.map().num_keyframes(), 1);
+        assert_eq!(global_map.map().num_points(), keyframe.landmarks().len());
+        assert_eq!(
+            global_map.essential_graph().parent_of(keyframe_id),
+            Some(keyframe_id)
+        );
 
         for &det_idx in keyframe.landmark_indices() {
-            let kp_ref = map.keyframe_keypoint(keyframe_id, det_idx).expect("kp ref");
-            let point_id = map
+            let kp_ref = global_map
+                .map()
+                .keyframe_keypoint(keyframe_id, det_idx)
+                .expect("kp ref");
+            let point_id = global_map
+                .map()
                 .map_point_for_keypoint(kp_ref)
                 .expect("map lookup")
                 .expect("point id");
-            let point = map.point(point_id).expect("point");
+            let point = global_map.map().point(point_id).expect("point");
             let landmark = keyframe.landmark_for_detection(det_idx).expect("landmark");
             let Point3 { x, y, z } = point.position();
             assert_eq!(x, landmark.x);
             assert_eq!(y, landmark.y);
             assert_eq!(z, landmark.z);
         }
-        assert_map_invariants(&map).expect("final invariants");
+        assert_map_invariants(global_map.map()).expect("final invariants");
 
         let candidate_detections = Detections::new(
             SensorId::StereoLeft,
@@ -6214,12 +6230,12 @@ mod tests {
             keyframe_id,
             pairs: vec![(usize::MAX, 0)],
         };
-        let generation_before = map.generation();
-        let keyframes_before = map.num_keyframes();
-        let points_before = map.num_points();
+        let generation_before = global_map.map().generation();
+        let keyframes_before = global_map.map().num_keyframes();
+        let points_before = global_map.map().num_points();
 
-        let error = insert_keyframe_into_map(
-            &mut map,
+        let error = insert_keyframe_into_global_map(
+            &mut global_map,
             &candidate_keyframe,
             Timestamp::from_nanos(43),
             Pose::identity(),
@@ -6232,10 +6248,10 @@ mod tests {
             error,
             TrackerError::Map(crate::map::MapError::KeypointIndexOutOfBounds { .. })
         ));
-        assert_eq!(map.generation(), generation_before);
-        assert_eq!(map.num_keyframes(), keyframes_before);
-        assert_eq!(map.num_points(), points_before);
-        assert_map_invariants(&map).expect("failed insertion preserved map invariants");
+        assert_eq!(global_map.map().generation(), generation_before);
+        assert_eq!(global_map.map().num_keyframes(), keyframes_before);
+        assert_eq!(global_map.map().num_points(), points_before);
+        assert_map_invariants(global_map.map()).expect("failed insertion preserved map invariants");
     }
 
     #[test]
@@ -7518,9 +7534,15 @@ mod tests {
             .collect();
 
         let mut essential_graph = EssentialGraph::new(1);
-        essential_graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-        essential_graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-        essential_graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+        essential_graph
+            .add_keyframe(kf0, map.covisibility().neighbors(kf0), &map)
+            .expect("valid graph root");
+        essential_graph
+            .add_keyframe(kf1, map.covisibility().neighbors(kf1), &map)
+            .expect("valid graph keyframe");
+        essential_graph
+            .add_keyframe(kf2, map.covisibility().neighbors(kf2), &map)
+            .expect("valid graph keyframe");
 
         let verified = crate::loop_closure::VerifiedLoop::from_parts(
             &map,
@@ -7791,7 +7813,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_keyframe_removal_preserves_essential_graph() {
+    fn essential_graph_rejects_foreign_loop_endpoint_without_mutation() {
         let mut map = SlamMap::new();
         let root = map
             .add_keyframe_from_detections(
@@ -7818,34 +7840,27 @@ mod tests {
             .expect("foreign keyframe");
 
         let mut graph = EssentialGraph::new(1);
-        graph.add_keyframe(root, None, &map);
-        graph.add_loop_edge(EssentialEdge {
-            a: root,
-            b: foreign_id,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: crate::Pose64::identity(),
-            information: [[0.0; 6]; 6],
-        });
-        let mut global_map = GlobalMap::from_parts(map, graph);
-        let generation_before = global_map.map().generation();
-        let loop_edges_before = global_map.essential_graph().snapshot().loop_edges.len();
-
-        let error = remove_keyframe_from_graph_and_db(&mut global_map, foreign_id)
-            .expect_err("foreign map ID must not be removable");
+        graph
+            .add_keyframe(root, None, &map)
+            .expect("valid graph root");
+        let order_before = graph.snapshot().order;
+        let error = graph
+            .add_loop_edge(EssentialEdge {
+                a: root,
+                b: foreign_id,
+                kind: EssentialEdgeKind::Loop,
+                relative_pose: crate::Pose64::identity(),
+                information: crate::pose_graph::scaled_identity6(1.0),
+            })
+            .expect_err("foreign endpoint must not be registered implicitly");
 
         assert!(matches!(
             error,
-            TrackerError::Map(crate::map::MapError::KeyframeNotFound(id)) if id == foreign_id
+            EssentialGraphError::KeyframeNotFound { keyframe_id } if keyframe_id == foreign_id
         ));
-        assert_eq!(global_map.map().generation(), generation_before);
-        assert_eq!(
-            global_map.essential_graph().snapshot().loop_edges.len(),
-            loop_edges_before
-        );
-        assert_eq!(
-            global_map.essential_graph().parent_of(foreign_id),
-            Some(root)
-        );
+        assert_eq!(graph.snapshot().order, order_before);
+        assert!(graph.snapshot().loop_edges.is_empty());
+        assert_eq!(graph.parent_of(foreign_id), None);
     }
 
     #[test]

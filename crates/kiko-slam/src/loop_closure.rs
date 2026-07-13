@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
-use crate::pose_graph::PoseGraphError;
+use crate::pose_graph::{EssentialGraphError, PoseGraphError};
 use crate::{
     CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
     RansacConfig, RansacConfigError, solve_pnp_ransac,
@@ -442,6 +442,7 @@ pub enum LoopApplyErrorKind {
     MissingKeyframe,
     MissingMapPoint,
     MapMutation,
+    EssentialGraph,
     PoseGraph,
     PoseConversion,
     MapFrameAlignment,
@@ -454,6 +455,7 @@ impl std::fmt::Display for LoopApplyErrorKind {
             Self::MissingKeyframe => write!(f, "missing keyframe"),
             Self::MissingMapPoint => write!(f, "missing map point"),
             Self::MapMutation => write!(f, "map mutation"),
+            Self::EssentialGraph => write!(f, "essential-graph mutation"),
             Self::PoseGraph => write!(f, "pose-graph optimization"),
             Self::PoseConversion => write!(f, "pose conversion"),
             Self::MapFrameAlignment => write!(f, "map/odometry frame alignment"),
@@ -469,6 +471,9 @@ pub enum LoopApplyError {
     },
     Map {
         source: MapError,
+    },
+    EssentialGraph {
+        source: EssentialGraphError,
     },
     PoseGraph {
         source: PoseGraphError,
@@ -494,6 +499,7 @@ impl LoopApplyError {
                 source: MapError::MapPointNotFound(_),
             } => LoopApplyErrorKind::MissingMapPoint,
             Self::Map { .. } => LoopApplyErrorKind::MapMutation,
+            Self::EssentialGraph { .. } => LoopApplyErrorKind::EssentialGraph,
             Self::PoseGraph { .. } => LoopApplyErrorKind::PoseGraph,
             Self::PoseConversion { .. } => LoopApplyErrorKind::PoseConversion,
             Self::MapFrameAlignment { .. } => LoopApplyErrorKind::MapFrameAlignment,
@@ -505,6 +511,7 @@ impl std::error::Error for LoopApplyError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Map { source } => Some(source),
+            Self::EssentialGraph { source } => Some(source),
             Self::PoseGraph { source } => Some(source),
             Self::PoseConversion { source, .. } => Some(source),
             Self::MapFrameAlignment { source } => Some(source),
@@ -525,6 +532,9 @@ impl std::fmt::Display for LoopApplyError {
                 current.generation().as_u64(),
             ),
             Self::Map { source } => write!(f, "loop-closure map operation failed: {source}"),
+            Self::EssentialGraph { source } => {
+                write!(f, "loop-closure essential-graph mutation failed: {source}")
+            }
             Self::PoseGraph { source } => {
                 write!(f, "loop-closure pose-graph optimization failed: {source}")
             }
@@ -2128,6 +2138,20 @@ mod tests {
         let apply = detected.source().expect("loop-apply source");
         let pose_graph = apply.source().expect("pose-graph source");
         assert!(pose_graph.to_string().contains("did not converge"));
+    }
+
+    #[test]
+    fn loop_apply_error_preserves_essential_graph_source() {
+        let keyframe_id = KeyframeId::default();
+        let source = super::EssentialGraphError::KeyframeNotFound { keyframe_id };
+        let error = LoopApplyError::EssentialGraph { source };
+
+        assert_eq!(error.kind(), LoopApplyErrorKind::EssentialGraph);
+        assert!(error.to_string().contains("essential-graph mutation"));
+        assert_eq!(
+            error.source().expect("essential-graph source").to_string(),
+            source.to_string()
+        );
     }
 
     #[test]

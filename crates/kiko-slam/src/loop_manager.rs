@@ -69,13 +69,15 @@ impl LoopManager {
                 source,
             })?;
 
-        essential_graph.add_loop_edge(EssentialEdge {
-            a: match_kf,
-            b: query_kf,
-            kind: EssentialEdgeKind::Loop,
-            relative_pose: loop_relative,
-            information: heuristic_loop_information_from_inlier_count(verified.inlier_count()),
-        });
+        essential_graph
+            .add_loop_edge(EssentialEdge {
+                a: match_kf,
+                b: query_kf,
+                kind: EssentialEdgeKind::Loop,
+                relative_pose: loop_relative,
+                information: heuristic_loop_information_from_inlier_count(verified.inlier_count()),
+            })
+            .map_err(|source| LoopApplyError::EssentialGraph { source })?;
 
         let input = essential_graph.pose_graph_input()?;
         if input.keyframe_ids.len() < MIN_OPTIMIZATION_KEYFRAMES || input.edges.is_empty() {
