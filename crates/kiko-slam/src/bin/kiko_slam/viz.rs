@@ -5,7 +5,9 @@ use clap::Args;
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{RerunSink, TriangulationConfig, TriangulationError, Triangulator};
 
-use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs};
+use crate::args::{
+    DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
+};
 use crate::{rerun_recording, verify_run_integrity};
 
 #[derive(Args, Clone, Debug)]
@@ -20,6 +22,7 @@ pub struct VizArgs {
 }
 
 pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let rerun_output = RerunOutput::try_from_args(&args.rerun)?;
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats();
 
@@ -34,13 +37,8 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rectified = reader.calibration().stereo().clone();
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
-    let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset") {
-        Ok(rec) => Some(RerunSink::try_new(rec, args.rerun.rerun_decimation)?),
-        Err(err) => {
-            eprintln!("failed to initialize rerun; continuing headless: {err}");
-            None
-        }
-    };
+    let rec = rerun_recording(rerun_output.destination(), "kiko-slam-dataset")?;
+    let mut sink = RerunSink::try_new(rec, rerun_output.decimation())?;
 
     let mut pipeline = inference.into_pipeline()?;
 
@@ -51,7 +49,6 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut read_errors = 0usize;
     let mut triangulation_empty = 0usize;
     let mut triangulation_errors = 0usize;
-    let mut visualization_errors = 0usize;
     let mut triangulated_points = 0usize;
     let mut total_matches = 0usize;
 
@@ -85,12 +82,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let points = keyframe.as_ref().map(|kf| kf.landmarks());
-                if let Some(sink) = sink.as_mut() {
-                    if let Err(err) = sink.log_with_points(&packet, points) {
-                        visualization_errors = visualization_errors.saturating_add(1);
-                        eprintln!("rerun log error: {err}");
-                    }
-                }
+                sink.log_with_points(&packet, points)?;
                 processed += 1;
             }
             Err(err) => {
@@ -124,7 +116,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!(
-        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, visualization_errors={visualization_errors}, triangulated_points={triangulated_points}"
+        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, triangulated_points={triangulated_points}"
     );
     eprintln!("summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}");
 
@@ -136,7 +128,6 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
             ("dataset_read", read_errors),
             ("inference", inference_errors),
             ("triangulation", triangulation_errors),
-            ("visualization_output", visualization_errors),
         ],
     )?;
 

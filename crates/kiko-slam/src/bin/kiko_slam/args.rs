@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Args, ValueEnum};
 
@@ -6,8 +6,6 @@ use kiko_slam::{
     DownscaleFactor, End2EndPipeline, InferenceBackend, InferencePipeline, KeypointLimit,
     LightGlue, SuperPoint, VizDecimation,
 };
-
-use std::path::Path;
 
 pub const DEFAULT_MAX_KEYPOINTS: usize = 1024;
 const DEFAULT_MAC_CPU_MAX_KEYPOINTS: usize = 512;
@@ -115,13 +113,28 @@ pub struct RerunArgs {
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value = "1")]
     pub rerun_decimation: VizDecimation,
     /// Save Rerun data to .rrd file instead of streaming
-    #[arg(long, env = "KIKO_RERUN_SAVE", visible_alias = "rerun-save")]
+    #[arg(
+        long,
+        env = "KIKO_RERUN_SAVE",
+        visible_alias = "rerun-save",
+        group = "rerun_destination"
+    )]
     pub save_rrd: Option<PathBuf>,
     /// Stream Rerun data to a remote viewer, e.g. rerun+http://192.168.50.1:9876/proxy
-    #[arg(long, env = "KIKO_RERUN_URL", value_name = "URL")]
+    #[arg(
+        long,
+        env = "KIKO_RERUN_URL",
+        value_name = "URL",
+        group = "rerun_destination"
+    )]
     pub rerun_url: Option<String>,
     /// Stream to the default laptop Rerun viewer endpoint.
-    #[arg(long, env = "KIKO_RERUN_LAPTOP", default_value_t = false)]
+    #[arg(
+        long,
+        env = "KIKO_RERUN_LAPTOP",
+        default_value_t = false,
+        group = "rerun_destination"
+    )]
     pub rerun_laptop: bool,
     /// Default laptop Rerun endpoint used by --rerun-laptop.
     #[arg(
@@ -132,20 +145,91 @@ pub struct RerunArgs {
     )]
     pub rerun_laptop_url: String,
     /// Host a gRPC server on 0.0.0.0 so remote Rerun viewers can connect to this machine
-    #[arg(long, env = "KIKO_RERUN_SERVE", default_value_t = false)]
+    #[arg(
+        long,
+        env = "KIKO_RERUN_SERVE",
+        default_value_t = false,
+        group = "rerun_destination"
+    )]
     pub rerun_serve: bool,
     /// Port for the gRPC server when using --rerun-serve (default: 9876)
     #[arg(long, env = "KIKO_RERUN_PORT", default_value_t = 9876)]
     pub rerun_port: u16,
 }
 
-impl RerunArgs {
-    pub fn stream_url(&self) -> Option<&str> {
-        self.rerun_url
-            .as_deref()
-            .or_else(|| self.rerun_laptop.then_some(self.rerun_laptop_url.as_str()))
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RerunDestination {
+    Save(PathBuf),
+    Serve { port: u16 },
+    Connect(String),
+    ImplicitLocalViewer,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RerunOutput {
+    destination: RerunDestination,
+    decimation: VizDecimation,
+}
+
+impl RerunOutput {
+    pub fn try_from_args(args: &RerunArgs) -> Result<Self, RerunArgsError> {
+        let destination_count = usize::from(args.save_rrd.is_some())
+            + usize::from(args.rerun_url.is_some())
+            + usize::from(args.rerun_laptop)
+            + usize::from(args.rerun_serve);
+        if destination_count > 1 {
+            return Err(RerunArgsError::ConflictingDestinations { destination_count });
+        }
+
+        let destination = if let Some(path) = args.save_rrd.as_ref() {
+            RerunDestination::Save(path.clone())
+        } else if args.rerun_serve {
+            RerunDestination::Serve {
+                port: args.rerun_port,
+            }
+        } else if let Some(url) = args.rerun_url.as_ref() {
+            RerunDestination::Connect(url.clone())
+        } else if args.rerun_laptop {
+            RerunDestination::Connect(args.rerun_laptop_url.clone())
+        } else {
+            RerunDestination::ImplicitLocalViewer
+        };
+        Ok(Self {
+            destination,
+            decimation: args.rerun_decimation,
+        })
+    }
+
+    pub fn destination(&self) -> &RerunDestination {
+        &self.destination
+    }
+
+    pub fn decimation(&self) -> VizDecimation {
+        self.decimation
+    }
+
+    pub fn has_explicit_destination(&self) -> bool {
+        !matches!(self.destination, RerunDestination::ImplicitLocalViewer)
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RerunArgsError {
+    ConflictingDestinations { destination_count: usize },
+}
+
+impl std::fmt::Display for RerunArgsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictingDestinations { destination_count } => write!(
+                f,
+                "rerun output has {destination_count} destinations; configure at most one of --save-rrd, --rerun-url, --rerun-laptop, or --rerun-serve"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RerunArgsError {}
 
 #[derive(Args, Clone, Debug)]
 #[cfg(feature = "record")]

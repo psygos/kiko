@@ -18,7 +18,9 @@ use oak_sys::{
     DepthConfig, DepthError, DeviceConfig, ImageError, ImuConfig, ImuError, MonoConfig, QueueConfig,
 };
 
-use crate::args::{CameraArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs};
+use crate::args::{
+    CameraArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
+};
 use crate::config::{TrackerDefaults, build_tracker_config};
 use crate::record::{
     build_calibration, load_oak_read_timeout_ms, load_pairer_max_pending_per_side,
@@ -60,6 +62,9 @@ enum LiveThreadError {
     VizInit {
         source: kiko_slam::RerunSinkInitError,
     },
+    RerunRecordingInit {
+        source: Box<crate::RerunRecordingInitError>,
+    },
     VizChannelDisconnected,
     Tracker {
         source: kiko_slam::TrackerError,
@@ -85,6 +90,9 @@ impl std::fmt::Display for LiveThreadError {
             LiveThreadError::VizInit { source } => {
                 write!(f, "failed to initialize visualization: {source}")
             }
+            LiveThreadError::RerunRecordingInit { source } => {
+                write!(f, "failed to initialize required Rerun output: {source}")
+            }
             LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
             LiveThreadError::Tracker { source } => {
                 write!(f, "tracker frame processing failed: {source}")
@@ -107,6 +115,7 @@ impl std::error::Error for LiveThreadError {
         match self {
             LiveThreadError::TrackerInit { source } => Some(source),
             LiveThreadError::VizInit { source } => Some(source),
+            LiveThreadError::RerunRecordingInit { source } => Some(source.as_ref()),
             LiveThreadError::Tracker { source } => Some(source),
             LiveThreadError::VizPacket { source } => Some(source),
             LiveThreadError::VizLog { source, .. } => Some(source),
@@ -328,6 +337,15 @@ fn log_live_viz_message(sink: &mut RerunSink, msg: &LiveVizMsg) -> Result<(), Li
 }
 
 pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let rerun_output = RerunOutput::try_from_args(&args.rerun)?;
+    let live_viz_enabled = try_env_bool("KIKO_LIVE_VIZ")?.unwrap_or(true);
+    if !live_viz_enabled && rerun_output.has_explicit_destination() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "KIKO_LIVE_VIZ=false conflicts with an explicit Rerun save, serve, or connect destination",
+        )
+        .into());
+    }
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -522,18 +540,20 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     });
 
-    let decimation = args.rerun.rerun_decimation;
-    let rerun = args.rerun.clone();
-    let live_viz_enabled = try_env_bool("KIKO_LIVE_VIZ")?.unwrap_or(true);
     let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let mut sink = if live_viz_enabled {
-            match rerun_recording(&rerun, "kiko-slam-live") {
+            match rerun_recording(rerun_output.destination(), "kiko-slam-live") {
                 Ok(rec) => Some(
-                    RerunSink::try_new(rec, decimation)
+                    RerunSink::try_new(rec, rerun_output.decimation())
                         .map_err(|source| LiveThreadError::VizInit { source })?,
                 ),
-                Err(err) => {
-                    eprintln!("failed to connect to rerun viewer; continuing headless: {err}");
+                Err(source) if rerun_output.has_explicit_destination() => {
+                    return Err(LiveThreadError::RerunRecordingInit {
+                        source: Box::new(source),
+                    });
+                }
+                Err(source) => {
+                    eprintln!("local Rerun viewer unavailable; continuing headless: {source}");
                     None
                 }
             }

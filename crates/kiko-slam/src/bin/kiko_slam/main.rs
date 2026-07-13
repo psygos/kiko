@@ -106,49 +106,139 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-pub fn rerun_recording(
-    args: &args::RerunArgs,
-    name: &str,
-) -> Result<rerun::RecordingStream, Box<dyn std::error::Error>> {
-    if let Some(path) = &args.save_rrd {
-        let path = if path.is_dir() {
-            path.join(format!("{name}.rrd"))
-        } else {
-            path.clone()
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+#[derive(Debug)]
+enum RerunRecordingInitError {
+    CreateParent {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Save {
+        path: std::path::PathBuf,
+        source: rerun::RecordingStreamError,
+    },
+    Serve {
+        port: u16,
+        source: rerun::RecordingStreamError,
+    },
+    Connect {
+        url: String,
+        source: rerun::RecordingStreamError,
+    },
+    SpawnLocalViewer {
+        source: rerun::RecordingStreamError,
+    },
+}
+
+impl std::fmt::Display for RerunRecordingInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateParent { path, source } => write!(
+                f,
+                "failed to create Rerun output directory {}: {source}",
+                path.display()
+            ),
+            Self::Save { path, source } => {
+                write!(
+                    f,
+                    "failed to initialize Rerun recording at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Serve { port, source } => {
+                write!(f, "failed to serve Rerun output on port {port}: {source}")
+            }
+            Self::Connect { url, source } => {
+                write!(f, "failed to connect Rerun output to {url}: {source}")
+            }
+            Self::SpawnLocalViewer { source } => {
+                write!(f, "failed to spawn or reuse a local Rerun viewer: {source}")
+            }
         }
-        eprintln!("rerun: saving to {}", path.display());
-        let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
-        Ok(rec)
-    } else if args.rerun_serve {
-        let port = args.rerun_port;
-        eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
-        eprintln!(
-            "rerun: on your laptop run:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
-        );
-        let rec = rerun::RecordingStreamBuilder::new(name).serve_grpc_opts(
-            "0.0.0.0",
-            port,
-            Default::default(),
-        )?;
-        Ok(rec)
-    } else if let Some(url) = args.stream_url() {
-        eprintln!("rerun: connecting to {url}");
-        Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc_opts(url)?)
-    } else {
-        eprintln!("rerun: spawning or reusing a local viewer");
-        Ok(rerun::RecordingStreamBuilder::new(name).spawn()?)
+    }
+}
+
+impl std::error::Error for RerunRecordingInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateParent { source, .. } => Some(source),
+            Self::Save { source, .. }
+            | Self::Serve { source, .. }
+            | Self::Connect { source, .. }
+            | Self::SpawnLocalViewer { source } => Some(source),
+        }
+    }
+}
+
+fn rerun_recording(
+    destination: &args::RerunDestination,
+    name: &str,
+) -> Result<rerun::RecordingStream, RerunRecordingInitError> {
+    match destination {
+        args::RerunDestination::Save(path) => {
+            let path = if path.is_dir() {
+                path.join(format!("{name}.rrd"))
+            } else {
+                path.clone()
+            };
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent).map_err(|source| {
+                    RerunRecordingInitError::CreateParent {
+                        path: parent.to_owned(),
+                        source,
+                    }
+                })?;
+            }
+            let rec = rerun::RecordingStreamBuilder::new(name)
+                .save(&path)
+                .map_err(|source| RerunRecordingInitError::Save {
+                    path: path.clone(),
+                    source,
+                })?;
+            eprintln!("rerun: saving to {}", path.display());
+            Ok(rec)
+        }
+        args::RerunDestination::Serve { port } => {
+            let rec = rerun::RecordingStreamBuilder::new(name)
+                .serve_grpc_opts("0.0.0.0", *port, Default::default())
+                .map_err(|source| RerunRecordingInitError::Serve {
+                    port: *port,
+                    source,
+                })?;
+            eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
+            eprintln!(
+                "rerun: on your laptop run:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
+            );
+            Ok(rec)
+        }
+        args::RerunDestination::Connect(url) => {
+            let rec = rerun::RecordingStreamBuilder::new(name)
+                .connect_grpc_opts(url)
+                .map_err(|source| RerunRecordingInitError::Connect {
+                    url: url.clone(),
+                    source,
+                })?;
+            eprintln!("rerun: connecting to {url}");
+            Ok(rec)
+        }
+        args::RerunDestination::ImplicitLocalViewer => {
+            let rec = rerun::RecordingStreamBuilder::new(name)
+                .spawn()
+                .map_err(|source| RerunRecordingInitError::SpawnLocalViewer { source })?;
+            eprintln!("rerun: spawning or reusing a local viewer");
+            Ok(rec)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::args::PrefetchSession;
+    use super::args::{PrefetchSession, RerunArgsError, RerunDestination, RerunOutput};
     use super::bench::{BenchAccum, summarize_bench};
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
-    use super::{Cli, Command, verify_run_integrity};
+    use super::{Cli, Command, RerunRecordingInitError, rerun_recording, verify_run_integrity};
     use clap::Parser;
     use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
     use std::ffi::OsString;
@@ -394,8 +484,86 @@ mod tests {
             Command::Viz(args) => {
                 assert_eq!(args.rerun.save_rrd, Some(PathBuf::from("/tmp/debug.rrd")));
                 assert_eq!(args.dataset.path, PathBuf::from("/tmp/dataset"));
+                let output = RerunOutput::try_from_args(&args.rerun).expect("rerun output");
+                assert_eq!(
+                    output.destination(),
+                    &RerunDestination::Save(PathBuf::from("/tmp/debug.rrd"))
+                );
+                assert!(output.has_explicit_destination());
+
+                let mut local_args = args.rerun;
+                local_args.save_rrd = None;
+                let local = RerunOutput::try_from_args(&local_args).expect("local output");
+                assert_eq!(local.destination(), &RerunDestination::ImplicitLocalViewer);
+                assert!(!local.has_explicit_destination());
             }
             _ => panic!("expected viz command"),
+        }
+    }
+
+    #[test]
+    fn rerun_destinations_are_mutually_exclusive_at_cli_boundary() {
+        let error = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--backend",
+            "cpu",
+            "--save-rrd",
+            "/tmp/debug.rrd",
+            "--rerun-serve",
+            "/tmp/dataset",
+        ])
+        .expect_err("conflicting Rerun destinations must be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rerun_output_parser_rejects_forged_conflicting_args() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--backend",
+            "cpu",
+            "--save-rrd",
+            "/tmp/debug.rrd",
+            "/tmp/dataset",
+        ])
+        .expect("parse cli");
+        let Command::Viz(mut args) = cli.command else {
+            panic!("expected viz command");
+        };
+        args.rerun.rerun_serve = true;
+
+        assert_eq!(
+            RerunOutput::try_from_args(&args.rerun),
+            Err(RerunArgsError::ConflictingDestinations {
+                destination_count: 2
+            })
+        );
+    }
+
+    #[test]
+    fn rerun_recording_parent_failure_preserves_path_and_io_source() {
+        let blocker =
+            std::env::temp_dir().join(format!("kiko-rerun-parent-test-{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("create parent blocker");
+        let output_path = blocker.join("recording.rrd");
+
+        let error = rerun_recording(
+            &RerunDestination::Save(output_path),
+            "rerun-parent-error-test",
+        )
+        .expect_err("file parent must reject directory creation");
+        std::fs::remove_file(&blocker).expect("remove parent blocker");
+
+        match error {
+            RerunRecordingInitError::CreateParent { path, source } => {
+                assert_eq!(path, blocker);
+                assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected parent creation error, got {other}"),
         }
     }
 

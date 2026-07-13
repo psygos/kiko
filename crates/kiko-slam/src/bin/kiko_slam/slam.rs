@@ -7,7 +7,8 @@ use kiko_slam::{ProjectedMatcherConfig, TrackingMatcher};
 use kiko_slam::{RerunSink, SlamTracker, VizPacket};
 
 use crate::args::{
-    DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RunProfileArg,
+    DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
+    RunProfileArg,
 };
 use crate::config::{TrackerDefaults, TrackerOverrides, build_tracker_config_with_overrides};
 use crate::{rerun_recording, verify_run_integrity};
@@ -139,6 +140,7 @@ fn tracker_overrides(args: &SlamArgs, vio_enabled: bool) -> TrackerOverrides {
 }
 
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let rerun_output = RerunOutput::try_from_args(&args.rerun)?;
     let vio_enabled = vio_enabled(args);
     let runtime_imu_override = kiko_slam::load_runtime_imu_calibration_from_env()?;
     let mut reader = DatasetReader::open_with_imu_calibration_override(
@@ -207,10 +209,13 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         tracker_overrides(args, vio_enabled),
     )?;
     let use_speculative_lg = tracker_config.tracking_matcher.uses_speculative_lightglue();
-    let mut sink = match rerun_recording(&args.rerun, "kiko-slam-dataset-odometry") {
-        Ok(rec) => Some(RerunSink::try_new(rec, args.rerun.rerun_decimation)?),
+    let mut sink = match rerun_recording(rerun_output.destination(), "kiko-slam-dataset-odometry") {
+        Ok(rec) => Some(RerunSink::try_new(rec, rerun_output.decimation())?),
         Err(err) => {
-            eprintln!("failed to initialize rerun; continuing headless: {err}");
+            if rerun_output.has_explicit_destination() {
+                return Err(Box::new(err));
+            }
+            eprintln!("local Rerun viewer unavailable; continuing headless: {err}");
             None
         }
     };
