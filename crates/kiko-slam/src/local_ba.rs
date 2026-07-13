@@ -420,6 +420,15 @@ pub enum BaExecutionError {
     WriteBack {
         source: crate::map::MapError,
     },
+    LandmarkLinearSystem {
+        iteration: usize,
+        landmark_index: usize,
+        source: Matrix3InverseError,
+    },
+    PoseLinearSystem {
+        iteration: usize,
+        source: LinearSolveError,
+    },
 }
 
 impl std::fmt::Display for BaExecutionError {
@@ -448,6 +457,18 @@ impl std::fmt::Display for BaExecutionError {
                 keypoint.index()
             ),
             Self::WriteBack { source } => write!(f, "full BA writeback failed: {source}"),
+            Self::LandmarkLinearSystem {
+                iteration,
+                landmark_index,
+                source,
+            } => write!(
+                f,
+                "full BA landmark system {landmark_index} failed at iteration {iteration}: {source}"
+            ),
+            Self::PoseLinearSystem { iteration, source } => write!(
+                f,
+                "full BA pose system failed at iteration {iteration}: {source}"
+            ),
         }
     }
 }
@@ -456,12 +477,103 @@ impl std::error::Error for BaExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::MapLookup { source, .. } | Self::WriteBack { source } => Some(source),
+            Self::LandmarkLinearSystem { source, .. } => Some(source),
+            Self::PoseLinearSystem { source, .. } => Some(source),
             Self::DuplicateKeyframe { .. }
             | Self::MissingKeyframe { .. }
             | Self::DuplicateLandmarkObservation { .. } => None,
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinearSolveError {
+    ZeroDimension,
+    DimensionOverflow { dimension: usize },
+    MatrixLengthMismatch { expected: usize, actual: usize },
+    RhsLengthMismatch { expected: usize, actual: usize },
+    NonFiniteMatrix { index: usize },
+    NonFiniteRhs { index: usize },
+    SingularPivot { column: usize },
+    NonFiniteSolution { index: usize },
+}
+
+impl std::fmt::Display for LinearSolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroDimension => write!(f, "linear system dimension must be non-zero"),
+            Self::DimensionOverflow { dimension } => write!(
+                f,
+                "linear system matrix size overflows usize for dimension {dimension}"
+            ),
+            Self::MatrixLengthMismatch { expected, actual } => write!(
+                f,
+                "linear system matrix length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::RhsLengthMismatch { expected, actual } => write!(
+                f,
+                "linear system RHS length mismatch: expected {expected}, got {actual}"
+            ),
+            Self::NonFiniteMatrix { index } => {
+                write!(f, "linear system matrix entry {index} is non-finite")
+            }
+            Self::NonFiniteRhs { index } => {
+                write!(f, "linear system RHS entry {index} is non-finite")
+            }
+            Self::SingularPivot { column } => {
+                write!(f, "linear system has a singular pivot in column {column}")
+            }
+            Self::NonFiniteSolution { index } => {
+                write!(f, "linear system solution entry {index} is non-finite")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LinearSolveError {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Matrix3InverseError {
+    NonFiniteInput {
+        row: usize,
+        column: usize,
+        value: f32,
+    },
+    NonFiniteDeterminant {
+        value: f64,
+    },
+    Singular {
+        determinant: f64,
+    },
+    NonFiniteOutput {
+        row: usize,
+        column: usize,
+        value: f64,
+    },
+}
+
+impl std::fmt::Display for Matrix3InverseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteInput { row, column, value } => write!(
+                f,
+                "3x3 matrix input [{row},{column}] is non-finite: {value}"
+            ),
+            Self::NonFiniteDeterminant { value } => {
+                write!(f, "3x3 matrix determinant is non-finite: {value}")
+            }
+            Self::Singular { determinant } => {
+                write!(f, "3x3 matrix is singular (determinant={determinant})")
+            }
+            Self::NonFiniteOutput { row, column, value } => write!(
+                f,
+                "3x3 inverse output [{row},{column}] is non-finite: {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Matrix3InverseError {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BaCorrection {
@@ -1499,7 +1611,7 @@ impl LocalBundleAdjuster {
             }
         };
 
-        let result = self.optimize_full(&mut problem);
+        let result = self.optimize_full(&mut problem)?;
         if matches!(
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
@@ -1575,7 +1687,7 @@ impl LocalBundleAdjuster {
                 a[i * dim + i] += damping;
             }
 
-            if !solve_linear_system(a, b, dim) {
+            if solve_linear_system(a, b, dim).is_err() {
                 return false;
             }
 
@@ -1598,25 +1710,25 @@ impl LocalBundleAdjuster {
         true
     }
 
-    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> BaResult {
+    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> Result<BaResult, BaExecutionError> {
         let pose_count = problem.poses.len();
         let landmark_count = problem.landmarks.len();
         if pose_count < MIN_BA_POSES {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::TooFewPoses { count: pose_count },
-            };
+            });
         }
         if landmark_count == 0 {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::TooFewLandmarks {
                     count: landmark_count,
                 },
-            };
+            });
         }
         if problem.factors.is_empty() {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::NoFactors,
-            };
+            });
         }
 
         let pose_dim = pose_count * 6;
@@ -1624,18 +1736,17 @@ impl LocalBundleAdjuster {
         let huber = self.config.huber_delta_px();
         let motion_weight = self.config.motion_prior_weight();
         let lm_config = self.config.lm();
-        let mut final_cost = match full_problem_cost(problem, self.intrinsics, huber, motion_weight)
-        {
+        let initial_cost = match full_problem_cost(problem, self.intrinsics, huber, motion_weight) {
             Ok(cost) => cost,
             Err(nonprojectable) => {
-                return BaResult::Degenerate {
+                return Ok(BaResult::Degenerate {
                     reason: DegenerateReason::NonProjectableFactors {
                         count: nonprojectable.count.get(),
                     },
-                };
+                });
             }
         };
-        let mut lm_state = LmState::new(lm_config, final_cost);
+        let mut lm_state = LmState::new(lm_config, initial_cost);
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
         let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
@@ -1670,9 +1781,9 @@ impl LocalBundleAdjuster {
                 let Some((residual, j_pose, j_landmark)) =
                     reprojection_residual_and_jacobians(pose, point, factor.pixel, self.intrinsics)
                 else {
-                    return BaResult::Degenerate {
+                    return Ok(BaResult::Degenerate {
                         reason: DegenerateReason::NonProjectableFactors { count: 1 },
-                    };
+                    });
                 };
 
                 let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
@@ -1717,17 +1828,17 @@ impl LocalBundleAdjuster {
             }
 
             let mut schur_landmarks = Vec::with_capacity(landmark_count);
-            for acc in landmark_accumulators.drain(..) {
+            for (landmark_index, acc) in landmark_accumulators.drain(..).enumerate() {
                 let mut c = acc.c;
                 for (i, c_row) in c.iter_mut().enumerate() {
                     c_row[i] += landmark_damping;
                 }
-                let Some(inv_c) = invert_3x3(c) else {
-                    return BaResult::MaxIterations {
-                        iterations: iter + 1,
-                        final_cost,
-                    };
-                };
+                let inv_c =
+                    invert_3x3(c).map_err(|source| BaExecutionError::LandmarkLinearSystem {
+                        iteration: iter + 1,
+                        landmark_index,
+                        source,
+                    })?;
 
                 let inv_c_b = math::mat_mul_vec(inv_c, acc.b);
                 for link_i in &acc.links {
@@ -1757,12 +1868,12 @@ impl LocalBundleAdjuster {
 
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
 
-            if !solve_linear_system(s, rhs, pose_dim) {
-                return BaResult::MaxIterations {
-                    iterations: iter + 1,
-                    final_cost: lm_state.prev_cost(),
-                };
-            }
+            solve_linear_system(s, rhs, pose_dim).map_err(|source| {
+                BaExecutionError::PoseLinearSystem {
+                    iteration: iter + 1,
+                    source,
+                }
+            })?;
 
             let mut predicted_decrease = 0.0_f64;
             let mut max_step = 0.0_f32;
@@ -1819,15 +1930,14 @@ impl LocalBundleAdjuster {
                 };
             match action {
                 LmAction::Accept => {
-                    final_cost = candidate_cost;
                     let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
                     if max_step < STEP_CONVERGENCE_THRESHOLD
                         || (prev_cost - candidate_cost).abs() <= threshold
                     {
-                        return BaResult::Converged {
+                        return Ok(BaResult::Converged {
                             iterations: iter + 1,
-                            final_cost,
-                        };
+                            final_cost: candidate_cost,
+                        });
                     }
                 }
                 LmAction::Reject => {
@@ -1843,15 +1953,14 @@ impl LocalBundleAdjuster {
                     {
                         landmark_var.position = point;
                     }
-                    final_cost = prev_cost;
                 }
             }
         }
 
-        BaResult::MaxIterations {
+        Ok(BaResult::MaxIterations {
             iterations: max_iters,
             final_cost: lm_state.prev_cost(),
-        }
+        })
     }
 }
 
@@ -2582,7 +2691,14 @@ fn fix_pose_block(hessian: &mut [f32], rhs: &mut [f32], pose_dim: usize, pose_id
     }
 }
 
-fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+fn invert_3x3(m: [[f32; 3]; 3]) -> Result<[[f32; 3]; 3], Matrix3InverseError> {
+    for (row, values) in m.iter().enumerate() {
+        for (column, value) in values.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(Matrix3InverseError::NonFiniteInput { row, column, value });
+            }
+        }
+    }
     let a = m[0][0] as f64;
     let b = m[0][1] as f64;
     let c = m[0][2] as f64;
@@ -2594,8 +2710,11 @@ fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     let i = m[2][2] as f64;
 
     let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    if !det.is_finite() || det.abs() < MIN_DETERMINANT {
-        return None;
+    if !det.is_finite() {
+        return Err(Matrix3InverseError::NonFiniteDeterminant { value: det });
+    }
+    if det.abs() < MIN_DETERMINANT {
+        return Err(Matrix3InverseError::Singular { determinant: det });
     }
     let inv_det = 1.0 / det;
     let inv = [
@@ -2615,14 +2734,14 @@ fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
             (a * e - b * d) * inv_det,
         ],
     ];
-    if inv
-        .iter()
-        .flat_map(|row| row.iter())
-        .any(|value| !value.is_finite())
-    {
-        return None;
+    for (row, values) in inv.iter().enumerate() {
+        for (column, value) in values.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(Matrix3InverseError::NonFiniteOutput { row, column, value });
+            }
+        }
     }
-    Some([
+    Ok([
         [inv[0][0] as f32, inv[0][1] as f32, inv[0][2] as f32],
         [inv[1][0] as f32, inv[1][1] as f32, inv[1][2] as f32],
         [inv[2][0] as f32, inv[2][1] as f32, inv[2][2] as f32],
@@ -2637,20 +2756,55 @@ fn norm6(v: [f32; 6]) -> f32 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3] + v[4] * v[4] + v[5] * v[5]).sqrt()
 }
 
-pub(crate) fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
+pub(crate) fn solve_linear_system(
+    a: &mut [f32],
+    b: &mut [f32],
+    n: usize,
+) -> Result<(), LinearSolveError> {
+    if n == 0 {
+        return Err(LinearSolveError::ZeroDimension);
+    }
+    let expected_matrix_len = n
+        .checked_mul(n)
+        .ok_or(LinearSolveError::DimensionOverflow { dimension: n })?;
+    if a.len() != expected_matrix_len {
+        return Err(LinearSolveError::MatrixLengthMismatch {
+            expected: expected_matrix_len,
+            actual: a.len(),
+        });
+    }
+    if b.len() != n {
+        return Err(LinearSolveError::RhsLengthMismatch {
+            expected: n,
+            actual: b.len(),
+        });
+    }
+    if let Some(index) = a.iter().position(|value| !value.is_finite()) {
+        return Err(LinearSolveError::NonFiniteMatrix { index });
+    }
+    if let Some(index) = b.iter().position(|value| !value.is_finite()) {
+        return Err(LinearSolveError::NonFiniteRhs { index });
+    }
+
     for i in 0..n {
         let mut max_row = i;
         let mut max_val = a[i * n + i].abs();
         for r in (i + 1)..n {
             let val = a[r * n + i].abs();
+            if !val.is_finite() {
+                return Err(LinearSolveError::NonFiniteMatrix { index: r * n + i });
+            }
             if val > max_val {
                 max_val = val;
                 max_row = r;
             }
         }
 
+        if !max_val.is_finite() {
+            return Err(LinearSolveError::NonFiniteMatrix { index: i * n + i });
+        }
         if max_val < PIVOT_TOLERANCE {
-            return false;
+            return Err(LinearSolveError::SingularPivot { column: i });
         }
 
         if max_row != i {
@@ -2681,7 +2835,10 @@ pub(crate) fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> boo
         }
     }
 
-    true
+    if let Some(index) = b.iter().position(|value| !value.is_finite()) {
+        return Err(LinearSolveError::NonFiniteSolution { index });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3146,7 +3303,7 @@ mod tests {
     fn solve_linear_system_solves_identity_system() {
         let mut a = vec![1.0_f32, 0.0, 0.0, 1.0];
         let mut b = vec![2.5_f32, -3.0];
-        assert!(solve_linear_system(&mut a, &mut b, 2));
+        solve_linear_system(&mut a, &mut b, 2).expect("identity system");
         assert!((b[0] - 2.5).abs() < 1e-6);
         assert!((b[1] + 3.0).abs() < 1e-6);
     }
@@ -3155,7 +3312,49 @@ mod tests {
     fn solve_linear_system_reports_singular_matrix() {
         let mut a = vec![1.0_f32, 2.0, 2.0, 4.0];
         let mut b = vec![1.0_f32, 2.0];
-        assert!(!solve_linear_system(&mut a, &mut b, 2));
+        assert!(matches!(
+            solve_linear_system(&mut a, &mut b, 2),
+            Err(LinearSolveError::SingularPivot { .. })
+        ));
+    }
+
+    #[test]
+    fn solve_linear_system_rejects_invalid_shapes_and_nonfinite_inputs() {
+        let mut short_matrix = vec![1.0_f32; 3];
+        let mut rhs = vec![1.0_f32; 2];
+        assert_eq!(
+            solve_linear_system(&mut short_matrix, &mut rhs, 2),
+            Err(LinearSolveError::MatrixLengthMismatch {
+                expected: 4,
+                actual: 3,
+            })
+        );
+
+        let mut matrix = vec![1.0_f32, 0.0, 0.0, 1.0];
+        let mut short_rhs = vec![1.0_f32];
+        assert_eq!(
+            solve_linear_system(&mut matrix, &mut short_rhs, 2),
+            Err(LinearSolveError::RhsLengthMismatch {
+                expected: 2,
+                actual: 1,
+            })
+        );
+
+        let mut matrix = vec![1.0_f32, f32::NAN, 0.0, 1.0];
+        let mut rhs = vec![1.0_f32, 1.0];
+        assert_eq!(
+            solve_linear_system(&mut matrix, &mut rhs, 2),
+            Err(LinearSolveError::NonFiniteMatrix { index: 1 })
+        );
+    }
+
+    #[test]
+    fn ba_execution_error_preserves_linear_solve_source() {
+        let error = BaExecutionError::PoseLinearSystem {
+            iteration: 2,
+            source: LinearSolveError::SingularPivot { column: 4 },
+        };
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -3215,7 +3414,7 @@ mod tests {
         let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-3), 0.0).expect("BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         assert_eq!(
-            ba.optimize_full(&mut problem),
+            ba.optimize_full(&mut problem).expect("degenerate outcome"),
             BaResult::Degenerate {
                 reason: DegenerateReason::NonProjectableFactors { count: 1 }
             }
@@ -3236,9 +3435,9 @@ mod tests {
         };
         assert!(matches!(
             ba.optimize_full(&mut no_poses),
-            BaResult::Degenerate {
+            Ok(BaResult::Degenerate {
                 reason: DegenerateReason::TooFewPoses { count: 0 }
-            }
+            })
         ));
 
         let mut no_landmarks = FullBaProblem {
@@ -3257,9 +3456,9 @@ mod tests {
         };
         assert!(matches!(
             ba.optimize_full(&mut no_landmarks),
-            BaResult::Degenerate {
+            Ok(BaResult::Degenerate {
                 reason: DegenerateReason::TooFewLandmarks { count: 0 }
-            }
+            })
         ));
 
         let mut no_factors = FullBaProblem {
@@ -3285,10 +3484,64 @@ mod tests {
         };
         assert!(matches!(
             ba.optimize_full(&mut no_factors),
-            BaResult::Degenerate {
+            Ok(BaResult::Degenerate {
                 reason: DegenerateReason::NoFactors
+            })
+        ));
+    }
+
+    #[test]
+    fn optimize_full_reports_landmark_breakdown_without_mutating_problem() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let config = LocalBaConfig::new(5, 2, 4, 2.0, lm(1e-8), 0.0).expect("BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let original_pose = axis_angle_pose([0.1, -0.2, 0.3], [0.01, -0.02, 0.03]);
+        let original_point = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 1e20,
+        };
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: original_pose,
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: original_point,
+            }],
+            factors: vec![ReprojectionFactor {
+                pose: PoseVarIndex(1),
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 320.0, y: 240.0 },
+            }],
+        };
+
+        let error = ba
+            .optimize_full(&mut problem)
+            .expect_err("near-zero landmark information must be a solver error");
+
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(matches!(
+            error,
+            BaExecutionError::LandmarkLinearSystem {
+                iteration: 1,
+                landmark_index: 0,
+                source: Matrix3InverseError::Singular { .. },
             }
         ));
+        assert!(pose_close(problem.poses[1].pose, original_pose, 0.0));
+        let retained_point = problem.landmarks[0].position;
+        assert_eq!(retained_point.x, original_point.x);
+        assert_eq!(retained_point.y, original_point.y);
+        assert_eq!(retained_point.z, original_point.z);
     }
 
     #[test]
@@ -3306,7 +3559,7 @@ mod tests {
         .expect("full BA problem");
         assert!(matches!(
             ba.optimize_full(&mut problem),
-            BaResult::MaxIterations { iterations: 1, .. }
+            Ok(BaResult::MaxIterations { iterations: 1, .. })
         ));
     }
 
@@ -3323,7 +3576,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("full BA solve");
         match result {
             BaResult::Converged {
                 iterations,
@@ -3351,7 +3604,7 @@ mod tests {
         .expect("full BA problem");
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
             .expect("initial factors are projectable");
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("full BA solve");
         let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
             .expect("optimized factors remain projectable");
         assert!(
@@ -3379,7 +3632,7 @@ mod tests {
         .expect("full BA problem");
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
             .expect("initial factors are projectable");
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("full BA solve");
         let final_cost = match result {
             BaResult::Converged { final_cost, .. } | BaResult::MaxIterations { final_cost, .. } => {
                 final_cost

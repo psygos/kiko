@@ -463,7 +463,7 @@ fn refine_pose_on_inliers(
 
         let mut hessian_vec = hessian.to_vec();
         let mut rhs_vec = rhs.to_vec();
-        if !crate::local_ba::solve_linear_system(&mut hessian_vec, &mut rhs_vec, 6) {
+        if crate::local_ba::solve_linear_system(&mut hessian_vec, &mut rhs_vec, 6).is_err() {
             break;
         }
 
