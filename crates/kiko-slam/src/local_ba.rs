@@ -2633,7 +2633,7 @@ fn reprojection_residual_and_jacobians(
     let x = pc[0];
     let y = pc[1];
     let z = pc[2];
-    if z <= MIN_PROJECTION_DEPTH {
+    if pc.iter().any(|value| !value.is_finite()) || z <= MIN_PROJECTION_DEPTH {
         return None;
     }
 
@@ -2656,6 +2656,14 @@ fn reprojection_residual_and_jacobians(
     let b1 = dv_dx;
     let b2 = dv_dy;
     let b3 = dv_dz;
+
+    if residual.iter().any(|value| !value.is_finite())
+        || [du_dx, du_dz, dv_dy, dv_dz]
+            .iter()
+            .any(|value| !value.is_finite())
+    {
+        return None;
+    }
 
     let mut jac_pose = [[0.0_f32; 6]; 2];
 
@@ -2693,6 +2701,18 @@ fn reprojection_residual_and_jacobians(
         for value in row {
             *value = -*value;
         }
+    }
+
+    if jac_pose
+        .iter()
+        .flat_map(|row| row.iter())
+        .any(|value| !value.is_finite())
+        || jac_landmark
+            .iter()
+            .flat_map(|row| row.iter())
+            .any(|value| !value.is_finite())
+    {
+        return None;
     }
 
     Some((residual, jac_pose, jac_landmark))
@@ -3422,7 +3442,7 @@ mod tests {
             map.set_map_point_position(
                 point_id,
                 Point3 {
-                    x: f32::MAX,
+                    x: 1e13,
                     y: 0.0,
                     z: 1.0,
                 },

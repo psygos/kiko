@@ -277,9 +277,154 @@ impl Default for RansacConfig {
 
 #[derive(Debug)]
 pub struct PnpResult {
-    pub pose: Pose,
-    pub inliers: Vec<usize>,
-    pub iterations: usize,
+    pose: Pose,
+    inliers: Vec<usize>,
+    iterations: NonZeroUsize,
+    refinement: PnpRefinementStatus,
+}
+
+impl PnpResult {
+    pub fn pose(&self) -> Pose {
+        self.pose
+    }
+
+    pub fn inliers(&self) -> &[usize] {
+        &self.inliers
+    }
+
+    pub fn iterations(&self) -> NonZeroUsize {
+        self.iterations
+    }
+
+    pub fn refinement(&self) -> &PnpRefinementStatus {
+        &self.refinement
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpRefinementTermination {
+    Converged { iterations: NonZeroUsize },
+    IterationLimit { iterations: NonZeroUsize },
+}
+
+impl PnpRefinementTermination {
+    pub fn iterations(self) -> NonZeroUsize {
+        match self {
+            Self::Converged { iterations } | Self::IterationLimit { iterations } => iterations,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PnpRefinementStatus {
+    Applied {
+        termination: PnpRefinementTermination,
+    },
+    RetainedRansacPose {
+        reason: PnpRefinementFallback,
+    },
+}
+
+impl PnpRefinementStatus {
+    pub fn applied(&self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
+
+    pub fn iterations(&self) -> Option<NonZeroUsize> {
+        match self {
+            Self::Applied { termination } => Some(termination.iterations()),
+            Self::RetainedRansacPose { reason } => reason.iterations(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum PnpRefinementFallback {
+    EmptyInlierSet,
+    InvalidInlierIndex {
+        iteration: NonZeroUsize,
+        index: usize,
+        observation_count: usize,
+    },
+    NonProjectableInliers {
+        iteration: NonZeroUsize,
+        count: NonZeroUsize,
+    },
+    LinearSolve {
+        iteration: NonZeroUsize,
+        source: crate::LinearSolveError,
+    },
+    InvalidPose {
+        iteration: NonZeroUsize,
+        source: crate::Pose64Error,
+    },
+    LostConsensus {
+        termination: PnpRefinementTermination,
+        candidate_inliers: usize,
+        required_inliers: usize,
+    },
+}
+
+impl PnpRefinementFallback {
+    pub fn iterations(&self) -> Option<NonZeroUsize> {
+        match self {
+            Self::EmptyInlierSet => None,
+            Self::InvalidInlierIndex { iteration, .. }
+            | Self::NonProjectableInliers { iteration, .. }
+            | Self::LinearSolve { iteration, .. }
+            | Self::InvalidPose { iteration, .. } => Some(*iteration),
+            Self::LostConsensus { termination, .. } => Some(termination.iterations()),
+        }
+    }
+}
+
+impl std::fmt::Display for PnpRefinementFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyInlierSet => write!(f, "PnP refinement received no inliers"),
+            Self::InvalidInlierIndex {
+                iteration,
+                index,
+                observation_count,
+            } => write!(
+                f,
+                "PnP refinement inlier index {index} is out of bounds for {observation_count} observations at iteration {iteration}"
+            ),
+            Self::NonProjectableInliers { iteration, count } => write!(
+                f,
+                "PnP refinement has {count} nonprojectable inliers at iteration {iteration}"
+            ),
+            Self::LinearSolve { iteration, source } => write!(
+                f,
+                "PnP refinement linear solve failed at iteration {iteration}: {source}"
+            ),
+            Self::InvalidPose { iteration, source } => write!(
+                f,
+                "PnP refinement produced an invalid pose at iteration {iteration}: {source}"
+            ),
+            Self::LostConsensus {
+                termination,
+                candidate_inliers,
+                required_inliers,
+            } => write!(
+                f,
+                "PnP refinement ended with {termination:?} but retained only {candidate_inliers} inliers (required {required_inliers})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PnpRefinementFallback {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LinearSolve { source, .. } => Some(source),
+            Self::InvalidPose { source, .. } => Some(source),
+            Self::EmptyInlierSet
+            | Self::InvalidInlierIndex { .. }
+            | Self::NonProjectableInliers { .. }
+            | Self::LostConsensus { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -372,18 +517,44 @@ pub fn solve_pnp_ransac(
         return Err(PnpError::NoSolution);
     }
 
-    let refined_pose = refine_pose_on_inliers(pose, observations, intrinsics, &best_inliers);
-    let refined_inliers = collect_inliers(refined_pose, observations, intrinsics, threshold_sq);
-    let (pose, inliers) = if refined_inliers.len() >= config.min_inliers() {
-        (refined_pose, refined_inliers)
-    } else {
-        (pose, best_inliers)
-    };
+    let (pose, inliers, refinement) =
+        match refine_pose_on_inliers(pose, observations, intrinsics, &best_inliers) {
+            Ok((refined_pose, termination)) => {
+                let refined_inliers =
+                    collect_inliers(refined_pose, observations, intrinsics, threshold_sq);
+                if refined_inliers.len() >= config.min_inliers() {
+                    (
+                        refined_pose,
+                        refined_inliers,
+                        PnpRefinementStatus::Applied { termination },
+                    )
+                } else {
+                    let candidate_inliers = refined_inliers.len();
+                    (
+                        pose,
+                        best_inliers,
+                        PnpRefinementStatus::RetainedRansacPose {
+                            reason: PnpRefinementFallback::LostConsensus {
+                                termination,
+                                candidate_inliers,
+                                required_inliers: config.min_inliers(),
+                            },
+                        },
+                    )
+                }
+            }
+            Err(reason) => (
+                pose,
+                best_inliers,
+                PnpRefinementStatus::RetainedRansacPose { reason },
+            ),
+        };
 
     Ok(PnpResult {
         pose,
         inliers,
-        iterations,
+        iterations: NonZeroUsize::new(iterations).ok_or(PnpError::NoSolution)?,
+        refinement,
     })
 }
 
@@ -429,22 +600,32 @@ fn refine_pose_on_inliers(
     observations: &[Observation],
     intrinsics: PinholeIntrinsics,
     inlier_indices: &[usize],
-) -> Pose {
+) -> Result<(Pose, PnpRefinementTermination), PnpRefinementFallback> {
+    if inlier_indices.is_empty() {
+        return Err(PnpRefinementFallback::EmptyInlierSet);
+    }
     let mut pose = initial_pose;
     let mut hessian = [0.0_f32; 36];
     let mut rhs = [0.0_f32; 6];
 
-    for _ in 0..PNP_REFINEMENT_ITERS {
+    for iter in 0..PNP_REFINEMENT_ITERS {
+        let iteration = NonZeroUsize::MIN.saturating_add(iter);
         hessian.fill(0.0);
         rhs.fill(0.0);
+        let mut nonprojectable = 0usize;
 
         for &idx in inlier_indices {
-            let Some(obs) = observations.get(idx) else {
-                continue;
-            };
+            let obs = observations
+                .get(idx)
+                .ok_or(PnpRefinementFallback::InvalidInlierIndex {
+                    iteration,
+                    index: idx,
+                    observation_count: observations.len(),
+                })?;
             let Some((residual, jacobian)) =
                 crate::local_ba::reprojection_residual_and_jacobian(pose, obs, intrinsics)
             else {
+                nonprojectable = nonprojectable.saturating_add(1);
                 continue;
             };
 
@@ -456,20 +637,18 @@ fn refine_pose_on_inliers(
                 }
             }
         }
+        if let Some(count) = NonZeroUsize::new(nonprojectable) {
+            return Err(PnpRefinementFallback::NonProjectableInliers { iteration, count });
+        }
 
         for axis in 0..6 {
             hessian[axis * 6 + axis] += PNP_REFINEMENT_DAMPING;
         }
 
-        let mut hessian_vec = hessian.to_vec();
-        let mut rhs_vec = rhs.to_vec();
-        if crate::local_ba::solve_linear_system(&mut hessian_vec, &mut rhs_vec, 6).is_err() {
-            break;
-        }
+        crate::local_ba::solve_linear_system(&mut hessian, &mut rhs, 6)
+            .map_err(|source| PnpRefinementFallback::LinearSolve { iteration, source })?;
 
-        let delta = [
-            rhs_vec[0], rhs_vec[1], rhs_vec[2], rhs_vec[3], rhs_vec[4], rhs_vec[5],
-        ];
+        let delta = rhs;
         let step_norm = (delta[0] * delta[0]
             + delta[1] * delta[1]
             + delta[2] * delta[2]
@@ -477,13 +656,38 @@ fn refine_pose_on_inliers(
             + delta[4] * delta[4]
             + delta[5] * delta[5])
             .sqrt();
-        pose = crate::local_ba::apply_se3_delta(pose, delta);
+        let candidate = crate::local_ba::apply_se3_delta(pose, delta);
+        crate::Pose64::try_from_pose32(candidate)
+            .map_err(|source| PnpRefinementFallback::InvalidPose { iteration, source })?;
+        let candidate_nonprojectable = inlier_indices
+            .iter()
+            .filter(|&&idx| {
+                observations
+                    .get(idx)
+                    .and_then(|obs| reprojection_error_sq_px(candidate, obs, intrinsics))
+                    .is_none()
+            })
+            .count();
+        if let Some(count) = NonZeroUsize::new(candidate_nonprojectable) {
+            return Err(PnpRefinementFallback::NonProjectableInliers { iteration, count });
+        }
+        pose = candidate;
         if step_norm < PNP_REFINEMENT_STEP_EPS {
-            break;
+            return Ok((
+                pose,
+                PnpRefinementTermination::Converged {
+                    iterations: iteration,
+                },
+            ));
         }
     }
 
-    pose
+    Ok((
+        pose,
+        PnpRefinementTermination::IterationLimit {
+            iterations: NonZeroUsize::MIN.saturating_add(PNP_REFINEMENT_ITERS - 1),
+        },
+    ))
 }
 
 fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
@@ -908,14 +1112,15 @@ fn reprojection_error_sq_px(
         pose.translation(),
         vec3_from_point(obs.world),
     );
-    if pc[2] <= 0.0 {
+    if pc.iter().any(|value| !value.is_finite()) || pc[2] <= 0.0 {
         return None;
     }
     let u = intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx();
     let v = intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy();
     let dx = u - obs.pixel.x;
     let dy = v - obs.pixel.y;
-    Some(dx * dx + dy * dy)
+    let error_sq = dx * dx + dy * dy;
+    error_sq.is_finite().then_some(error_sq)
 }
 
 pub(crate) fn reprojection_errors(
@@ -1349,10 +1554,11 @@ mod tests {
 
         let config = RansacConfig::new(700, 1.0, 20, 0xBAD5EED).expect("RANSAC config");
         let result = solve_pnp_ransac(&observations, intrinsics, config).expect("pnp");
-        assert!(result.inliers.len() >= 20, "insufficient inliers");
+        assert!(result.inliers().len() >= 20, "insufficient inliers");
+        assert!(result.refinement().applied());
 
-        let rot_err = rot_frob_norm(result.pose.rotation(), pose_gt.rotation());
-        let trans_err = l2(result.pose.translation(), pose_gt.translation());
+        let rot_err = rot_frob_norm(result.pose().rotation(), pose_gt.rotation());
+        let trans_err = l2(result.pose().translation(), pose_gt.translation());
         assert!(rot_err < 0.03, "rotation error too high: {rot_err}");
         assert!(trans_err < 0.08, "translation error too high: {trans_err}");
     }
@@ -1380,13 +1586,13 @@ mod tests {
         let config = RansacConfig::new(1000, 2.0, 14, 0x1337).expect("RANSAC config");
         let result = solve_pnp_ransac(&with_outliers, intrinsics, config).expect("pnp");
         assert!(
-            result.inliers.len() >= 14,
+            result.inliers().len() >= 14,
             "expected robust inliers, got {}",
-            result.inliers.len()
+            result.inliers().len()
         );
 
-        let rot_err = rot_frob_norm(result.pose.rotation(), pose_gt.rotation());
-        let trans_err = l2(result.pose.translation(), pose_gt.translation());
+        let rot_err = rot_frob_norm(result.pose().rotation(), pose_gt.rotation());
+        let trans_err = l2(result.pose().translation(), pose_gt.translation());
         assert!(
             rot_err < 0.08,
             "rotation error too high with outliers: {rot_err}"
@@ -1409,7 +1615,9 @@ mod tests {
 
         let initial = axis_angle_pose([0.23, -0.08, 0.33], [0.10, -0.04, 0.02]);
         let initial_errors = reprojection_errors(&initial, &observations, intrinsics);
-        let refined = refine_pose_on_inliers(initial, &observations, intrinsics, &inlier_indices);
+        let (refined, termination) =
+            refine_pose_on_inliers(initial, &observations, intrinsics, &inlier_indices)
+                .expect("refinement");
         let refined_errors = reprojection_errors(&refined, &observations, intrinsics);
 
         let initial_rmse = reprojection_rmse(&initial_errors).expect("initial rmse");
@@ -1418,6 +1626,70 @@ mod tests {
             refined_rmse < initial_rmse,
             "expected refinement to improve reprojection error: initial={initial_rmse}, refined={refined_rmse}"
         );
+        assert!(termination.iterations().get() <= PNP_REFINEMENT_ITERS);
+    }
+
+    #[test]
+    fn refine_pose_reports_invalid_inlier_provenance() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let observations =
+            observations_from_projection(Pose::identity(), &synthetic_world_points(), intrinsics)
+                .expect("observations");
+        let invalid_index = observations.len();
+
+        let error = refine_pose_on_inliers(
+            Pose::identity(),
+            &observations,
+            intrinsics,
+            &[0, invalid_index],
+        )
+        .expect_err("invalid inlier index must not be skipped");
+
+        assert!(matches!(
+            error,
+            PnpRefinementFallback::InvalidInlierIndex {
+                index,
+                observation_count,
+                ..
+            } if index == invalid_index && observation_count == observations.len()
+        ));
+    }
+
+    #[test]
+    fn refine_pose_rejects_nonprojectable_inliers_instead_of_dropping_them() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: -1.0,
+            },
+            Keypoint { x: 320.0, y: 240.0 },
+            intrinsics,
+        )
+        .expect("finite observation");
+
+        let error = refine_pose_on_inliers(Pose::identity(), &[observation], intrinsics, &[0])
+            .expect_err("behind-camera inlier must fail refinement");
+
+        assert!(matches!(
+            error,
+            PnpRefinementFallback::NonProjectableInliers {
+                iteration,
+                count,
+            } if iteration.get() == 1 && count.get() == 1
+        ));
+    }
+
+    #[test]
+    fn pnp_refinement_fallback_preserves_nested_solver_source() {
+        let error = PnpRefinementFallback::LinearSolve {
+            iteration: NonZeroUsize::MIN,
+            source: crate::LinearSolveError::SingularPivot { column: 2 },
+        };
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]

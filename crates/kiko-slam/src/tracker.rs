@@ -3974,7 +3974,7 @@ impl SlamTracker {
                         match self.build_tracking_attempt(keyframe, keyframe_id, projected_matches)
                         {
                             Ok(projected_attempt)
-                                if projected_attempt.result.inliers.len()
+                                if projected_attempt.result.inliers().len()
                                     >= config.min_inliers() =>
                             {
                                 if self.trace_transitions {
@@ -3983,7 +3983,7 @@ impl SlamTracker {
                                         frame_id.as_u64(),
                                         projected_match_count,
                                         projected_attempt.tracked_observations.len(),
-                                        projected_attempt.result.inliers.len(),
+                                        projected_attempt.result.inliers().len(),
                                     );
                                 }
                                 attempt = Some(projected_attempt);
@@ -3995,7 +3995,7 @@ impl SlamTracker {
                                         frame_id.as_u64(),
                                         projected_match_count,
                                         projected_attempt.tracked_observations.len(),
-                                        projected_attempt.result.inliers.len(),
+                                        projected_attempt.result.inliers().len(),
                                         config.min_inliers(),
                                     );
                                 }
@@ -4107,8 +4107,8 @@ impl SlamTracker {
             result,
         } = attempt;
 
-        let mut map_observations = Vec::with_capacity(result.inliers.len());
-        for &idx in &result.inliers {
+        let mut map_observations = Vec::with_capacity(result.inliers().len());
+        for &idx in result.inliers() {
             let verified_idx = *tracked_observations.verified_match_indices.get(idx).ok_or(
                 TrackerError::Inference(InferenceError::InvariantViolation {
                     context: "tracked observation index out of bounds",
@@ -4131,7 +4131,7 @@ impl SlamTracker {
             map_observations.push(MapObservation::new(keypoint_ref, pixel));
         }
         let inlier_observations: Vec<_> = result
-            .inliers
+            .inliers()
             .iter()
             .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
             .collect();
@@ -4139,15 +4139,15 @@ impl SlamTracker {
         let parallax_px = median_parallax_px(
             &verified,
             &tracked_observations.verified_match_indices,
-            &result.inliers,
+            result.inliers(),
         );
         let covisibility = if keyframe.landmarks().is_empty() {
             0.0
         } else {
-            result.inliers.len() as f32 / keyframe.landmarks().len() as f32
+            result.inliers().len() as f32 / keyframe.landmarks().len() as f32
         };
 
-        let visual_pose_world = result.pose;
+        let visual_pose_world = result.pose();
         #[cfg(feature = "vio")]
         let map_observations_for_authoritative_visual_pose = map_observations.clone();
         #[cfg(feature = "vio")]
@@ -4322,14 +4322,14 @@ impl SlamTracker {
         let keyframe_decision =
             self.config
                 .keyframe_policy
-                .decide(result.inliers.len(), parallax_px, covisibility);
+                .decide(result.inliers().len(), parallax_px, covisibility);
         if self.trace_transitions {
             eprintln!(
                 "tracking success frame={} observations={} missing_associations={} inliers={} required_inliers={} matches={} verified={} parallax_px={} covisibility={:.3} decision={:?}",
                 frame_id.as_u64(),
                 tracked_observations.len(),
                 tracked_observations.missing_map_point_associations,
-                result.inliers.len(),
+                result.inliers().len(),
                 tracking_ransac.min_inliers(),
                 matches.len(),
                 verified.len(),
@@ -4347,7 +4347,7 @@ impl SlamTracker {
                 keyframe_id,
                 &verified,
                 &tracked_observations.verified_match_indices,
-                &result.inliers,
+                result.inliers(),
             );
             let shared_pairs = shared.pairs.len();
             if self.trace_transitions {
@@ -4492,7 +4492,7 @@ impl SlamTracker {
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.pnp_inlier_ratio = Some(
             crate::PnpInlierRatioMetric::new(
-                crate::PnpAcceptedInlierCountMetric::new(result.inliers.len()),
+                crate::PnpAcceptedInlierCountMetric::new(result.inliers().len()),
                 crate::PnpTrackedObservationCountMetric::new(tracked_observations.len()),
             )
             .expect("tracker must emit a finite inlier ratio over non-empty tracked observations"),
@@ -4501,14 +4501,15 @@ impl SlamTracker {
             tracked_observations.len(),
         ));
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(
-            result.inliers.len(),
+            result.inliers().len(),
         ));
         diagnostics.tracking_pose_source = Some(tracking_pose_source);
         diagnostics.pnp_projectable_tracked_observations =
             Some(crate::PnpProjectableTrackedObservationCountMetric::new(
                 projectable_tracked_observations,
             ));
-        diagnostics.ransac_iterations = Some(result.iterations);
+        diagnostics.ransac_iterations = Some(result.iterations().get());
+        diagnostics.pnp_refinement = Some(result.refinement().clone());
         diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
             tracked_metrics.rmse_px().map(|value| {
                 crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
@@ -4661,7 +4662,7 @@ impl SlamTracker {
 
         Ok(self.output_with_diagnostics(
             Some(pose_world),
-            result.inliers.len(),
+            result.inliers().len(),
             output_keyframe,
             output_matches,
             frame_id,

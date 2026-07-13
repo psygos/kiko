@@ -1112,13 +1112,13 @@ fn verify_pose_from_keyframe(
 
     let result = solve_pnp_ransac(&observations, intrinsics, pnp_config)
         .map_err(LoopVerificationError::PnpFailed)?;
-    if result.inliers.len() < required_inliers {
+    if result.inliers().len() < required_inliers {
         return Err(LoopVerificationError::InsufficientInliers {
-            inliers: result.inliers.len(),
+            inliers: result.inliers().len(),
             required: required_inliers,
         });
     }
-    Ok((result.pose, result.inliers.len()))
+    Ok((result.pose(), result.inliers().len()))
 }
 
 impl LoopCandidate {

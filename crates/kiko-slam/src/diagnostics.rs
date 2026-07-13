@@ -454,6 +454,7 @@ pub struct FrameDiagnostics {
     pub pnp_tracked_observations: Option<PnpTrackedObservationCountMetric>,
     pub pnp_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
     pub ransac_iterations: Option<usize>,
+    pub pnp_refinement: Option<crate::PnpRefinementStatus>,
     pub tracking_pose_source: Option<TrackingPoseSource>,
     pub pnp_projectable_tracked_observations: Option<PnpProjectableTrackedObservationCountMetric>,
     /// Reprojection RMSE in px over projectable tracked PnP observations under the solved pose.
@@ -523,6 +524,7 @@ impl FrameDiagnostics {
             pnp_tracked_observations: None,
             pnp_accepted_inliers: None,
             ransac_iterations: None,
+            pnp_refinement: None,
             tracking_pose_source: None,
             pnp_projectable_tracked_observations: None,
             pnp_projectable_tracked_observation_reprojection_rmse_px: None,

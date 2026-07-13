@@ -84,6 +84,9 @@ const PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT: &str =
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE: &str =
     "diagnostics/tracking/vio_proposal_rejected_higher_shared_accepted_inlier_reprojection_rmse";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
+const PATH_TRACKING_PNP_REFINEMENT_APPLIED: &str = "diagnostics/tracking/pnp_refinement_applied";
+const PATH_TRACKING_PNP_REFINEMENT_ITERATIONS: &str =
+    "diagnostics/tracking/pnp_refinement_iterations";
 const PATH_TRACKING_PARALLAX: &str = "diagnostics/tracking/parallax_px";
 const PATH_TRACKING_COVISIBILITY: &str = "diagnostics/tracking/covisibility";
 const PATH_TRACKING_KEYFRAME_CREATED: &str = "diagnostics/tracking/keyframe_created";
@@ -373,6 +376,18 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     }
     if let Some(v) = diag.ransac_iterations {
         scalars.push((PATH_TRACKING_RANSAC_ITERATIONS, v as f64));
+    }
+    if let Some(refinement) = diag.pnp_refinement.as_ref() {
+        scalars.push((
+            PATH_TRACKING_PNP_REFINEMENT_APPLIED,
+            if refinement.applied() { 1.0 } else { 0.0 },
+        ));
+        if let Some(iterations) = refinement.iterations() {
+            scalars.push((
+                PATH_TRACKING_PNP_REFINEMENT_ITERATIONS,
+                iterations.get() as f64,
+            ));
+        }
     }
     if let Some(v) = diag.parallax_px {
         scalars.push((PATH_TRACKING_PARALLAX, v as f64));
@@ -697,6 +712,7 @@ mod tests {
         PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES,
         PATH_MAP_POINTS, PATH_POSE_BA_CONVERGED, PATH_POSE_BA_ITERATIONS,
         PATH_TRACKING_PNP_ACCEPTED_INLIERS, PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+        PATH_TRACKING_PNP_REFINEMENT_APPLIED, PATH_TRACKING_PNP_REFINEMENT_ITERATIONS,
         PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS,
         PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS, PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
         PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
@@ -753,6 +769,11 @@ mod tests {
             .expect("ratio"),
         );
         diag.pnp_accepted_inliers = Some(PnpAcceptedInlierCountMetric::new(6));
+        diag.pnp_refinement = Some(crate::PnpRefinementStatus::Applied {
+            termination: crate::PnpRefinementTermination::Converged {
+                iterations: std::num::NonZeroUsize::new(2).expect("literal is non-zero"),
+            },
+        });
         diag.pnp_projectable_tracked_observations =
             Some(PnpProjectableTrackedObservationCountMetric::new(7));
         diag.pnp_projectable_tracked_observation_reprojection_rmse_px = Some(
@@ -843,6 +864,12 @@ mod tests {
         }));
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_POSE_BA_CONVERGED && value.abs() < f64::EPSILON
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_REFINEMENT_APPLIED && (*value - 1.0).abs() < f64::EPSILON
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_REFINEMENT_ITERATIONS && (*value - 2.0).abs() < f64::EPSILON
         }));
         assert!(
             scalars

@@ -136,7 +136,8 @@ pub use pipeline::{
 };
 pub use place_recognition::DescriptorStats;
 pub use pnp::{
-    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose, RansacConfig,
+    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpRefinementFallback,
+    PnpRefinementStatus, PnpRefinementTermination, PnpResult, Pose, RansacConfig,
     RansacConfigError, solve_pnp_ransac,
 };
 pub use runtime_imu::{
