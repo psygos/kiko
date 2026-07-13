@@ -3,12 +3,13 @@ use std::time::{Duration, Instant};
 
 use crate::{
     CaptureBundle, CaptureId, CaptureImu, CaptureInterval, Frame, FrameId, ImuBatch, ImuSample,
-    PairingWindowNs, SensorId, StereoPair, Timestamp,
+    SensorId, StereoPair, Timestamp,
 };
 
 use super::{
-    Calibration, DatasetError, DatasetImuRecordError, FrameInfo, IMU_RECORD_BYTES, Manifest,
-    format, read_calibration_with_imu_override, read_manifest, read_meta, scan_frames_with_depth,
+    Calibration, DatasetError, DatasetImuRecordError, DatasetIndex, DatasetIndexFrameRef,
+    DatasetPairIndex, FrameInfo, IMU_RECORD_BYTES, format, read_calibration_with_imu_override,
+    read_manifest, read_meta, scan_frames_with_depth,
 };
 
 #[derive(Debug)]
@@ -16,9 +17,8 @@ pub struct DatasetReader {
     root: PathBuf,
     meta: super::Meta,
     calibration: Calibration,
-    manifest: Manifest,
-    pairing_window: PairingWindowNs,
-    stats: DatasetStats,
+    manifest: DatasetIndex,
+    frame_dimensions: crate::FrameDimensions,
     left_seq: u64,
     right_seq: u64,
     imu_samples: Option<Box<[ImuSample]>>,
@@ -58,13 +58,7 @@ impl DatasetReader {
             });
         }
         let calibration = read_calibration_with_imu_override(&root, imu_override.as_ref())?;
-        let manifest = read_manifest(&root)?;
-        let pairing_window =
-            PairingWindowNs::try_from(manifest.header.pairing_window_ns).map_err(|_| {
-                DatasetError::InvalidConfig {
-                    msg: "manifest pairing_window_ns must be > 0",
-                }
-            })?;
+        let manifest_file = read_manifest(&root)?;
         let mono = meta.mono.as_ref().ok_or(DatasetError::InvalidConfig {
             msg: "meta.json missing mono config",
         })?;
@@ -74,7 +68,15 @@ impl DatasetReader {
             mono.height,
             meta.depth.as_ref(),
         )?;
-        let stats = DatasetStats::from_frames_and_manifest(&frames, &manifest);
+        let frame_dimensions = frames.mono_dimensions;
+        let manifest_path = root.join(format::MANIFEST_FILE);
+        let manifest =
+            DatasetIndex::try_from_manifest(manifest_file, &meta, &frames).map_err(|source| {
+                DatasetError::InvalidManifest {
+                    path: manifest_path,
+                    source,
+                }
+            })?;
         let imu_time_offset_ns = calibration
             .imu
             .as_ref()
@@ -86,8 +88,7 @@ impl DatasetReader {
             meta,
             calibration,
             manifest,
-            pairing_window,
-            stats,
+            frame_dimensions,
             left_seq: 0,
             right_seq: 0,
             imu_samples,
@@ -103,7 +104,7 @@ impl DatasetReader {
     }
 
     pub fn stats(&self) -> DatasetStats {
-        self.stats
+        self.manifest.stats
     }
 
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
@@ -127,18 +128,6 @@ impl DatasetReader {
             capture_seq: 0,
             previous_capture_time: None,
         }
-    }
-
-    fn next_left_id(&mut self) -> FrameId {
-        let id = self.left_seq;
-        self.left_seq = self.left_seq.saturating_add(1);
-        FrameId::new(id)
-    }
-
-    fn next_right_id(&mut self) -> FrameId {
-        let id = self.right_seq;
-        self.right_seq = self.right_seq.saturating_add(1);
-        FrameId::new(id)
     }
 
     fn imu_for_interval(&self, interval: CaptureInterval) -> Result<CaptureImu, DatasetError> {
@@ -207,31 +196,15 @@ impl<'a> Iterator for DatasetPairs<'a> {
     type Item = Result<StereoPair, DatasetError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.reader.manifest.entries.len() {
-            let entry = self.reader.manifest.entries[self.index].clone();
-            self.index += 1;
-
-            let right = match entry.pairing {
-                super::ManifestPairing::Paired { right, .. } => right,
-                super::ManifestPairing::MissingRight { .. } => continue,
-            };
-
-            let left_frame = match self.reader.read_frame(&entry.left, SensorId::StereoLeft) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-            let right_frame = match self.reader.read_frame(&right, SensorId::StereoRight) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-
-            match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
-                Ok(pair) => return Some(Ok(pair)),
-                Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
-            }
-        }
-
-        None
+        let pair = self.reader.manifest.pairs.get(self.index)?;
+        self.index += 1;
+        Some(read_indexed_pair(
+            &self.reader.root,
+            self.reader.frame_dimensions,
+            &mut self.reader.left_seq,
+            &mut self.reader.right_seq,
+            pair,
+        ))
     }
 }
 
@@ -239,51 +212,50 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
     type Item = Result<TimedPair, DatasetError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.reader.manifest.entries.len() {
-            let entry = self.reader.manifest.entries[self.index].clone();
-            self.index += 1;
+        let pair = self.reader.manifest.pairs.get(self.index)?;
+        self.index += 1;
 
-            let right = match entry.pairing {
-                super::ManifestPairing::Paired { right, .. } => right,
-                super::ManifestPairing::MissingRight { .. } => continue,
-            };
+        let left_start = Instant::now();
+        let left_frame = match read_indexed_frame(
+            &self.reader.root,
+            self.reader.frame_dimensions,
+            &mut self.reader.left_seq,
+            &pair.left,
+            SensorId::StereoLeft,
+        ) {
+            Ok(frame) => frame,
+            Err(err) => return Some(Err(err)),
+        };
+        let left_time = left_start.elapsed();
+        let left_bytes = left_frame.data().len();
 
-            let left_start = Instant::now();
-            let left_frame = match self.reader.read_frame(&entry.left, SensorId::StereoLeft) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-            let left_time = left_start.elapsed();
-            let left_bytes = left_frame.data().len();
+        let right_start = Instant::now();
+        let right_frame = match read_indexed_frame(
+            &self.reader.root,
+            self.reader.frame_dimensions,
+            &mut self.reader.right_seq,
+            &pair.right,
+            SensorId::StereoRight,
+        ) {
+            Ok(frame) => frame,
+            Err(err) => return Some(Err(err)),
+        };
+        let right_time = right_start.elapsed();
+        let right_bytes = right_frame.data().len();
 
-            let right_start = Instant::now();
-            let right_frame = match self.reader.read_frame(&right, SensorId::StereoRight) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-            let right_time = right_start.elapsed();
-            let right_bytes = right_frame.data().len();
+        let pair_start = Instant::now();
+        let pair = StereoPair::from_parts(left_frame, right_frame);
+        let pairing = pair_start.elapsed();
 
-            let pair_start = Instant::now();
-            let pair =
-                match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
-                    Ok(pair) => pair,
-                    Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
-                };
-            let pairing = pair_start.elapsed();
+        let timings = DatasetReadTimings {
+            left_read: left_time,
+            right_read: right_time,
+            pairing,
+            left_bytes,
+            right_bytes,
+        };
 
-            let timings = DatasetReadTimings {
-                left_read: left_time,
-                right_read: right_time,
-                pairing,
-                left_bytes,
-                right_bytes,
-            };
-
-            return Some(Ok(TimedPair { pair, timings }));
-        }
-
-        None
+        Some(Ok(TimedPair { pair, timings }))
     }
 }
 
@@ -291,89 +263,90 @@ impl<'a> Iterator for DatasetBundles<'a> {
     type Item = Result<CaptureBundle, DatasetError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.reader.manifest.entries.len() {
-            let entry = self.reader.manifest.entries[self.index].clone();
-            self.index += 1;
-
-            let right = match entry.pairing {
-                super::ManifestPairing::Paired { right, .. } => right,
-                super::ManifestPairing::MissingRight { .. } => continue,
-            };
-
-            let left_frame = match self.reader.read_frame(&entry.left, SensorId::StereoLeft) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-            let right_frame = match self.reader.read_frame(&right, SensorId::StereoRight) {
-                Ok(frame) => frame,
-                Err(err) => return Some(Err(err)),
-            };
-
-            let pair =
-                match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
-                    Ok(pair) => pair,
-                    Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
-                };
-            let interval =
-                match CaptureInterval::new(self.previous_capture_time, pair.capture_time()) {
-                    Ok(interval) => interval,
-                    Err(_) => {
-                        return Some(Err(DatasetError::InvalidConfig {
-                            msg: "capture bundle interval must be strictly increasing",
-                        }));
-                    }
-                };
-            let imu = match self.reader.imu_for_interval(interval) {
-                Ok(imu) => imu,
-                Err(err) => return Some(Err(err)),
-            };
-            let capture_id = CaptureId::new(self.capture_seq);
-            self.capture_seq = self.capture_seq.saturating_add(1);
-            self.previous_capture_time = Some(interval.end_inclusive());
-            return Some(
-                CaptureBundle::new(capture_id, pair, interval, imu).map_err(|_| {
-                    DatasetError::InvalidConfig {
-                        msg: "capture bundle interval must match pair capture time",
-                    }
-                }),
-            );
-        }
-        None
+        let pair_index = self.reader.manifest.pairs.get(self.index)?;
+        self.index += 1;
+        let pair = match read_indexed_pair(
+            &self.reader.root,
+            self.reader.frame_dimensions,
+            &mut self.reader.left_seq,
+            &mut self.reader.right_seq,
+            pair_index,
+        ) {
+            Ok(pair) => pair,
+            Err(err) => return Some(Err(err)),
+        };
+        let interval = match CaptureInterval::new(self.previous_capture_time, pair.capture_time()) {
+            Ok(interval) => interval,
+            Err(_) => {
+                return Some(Err(DatasetError::InvalidConfig {
+                    msg: "capture bundle interval must be strictly increasing",
+                }));
+            }
+        };
+        let imu = match self.reader.imu_for_interval(interval) {
+            Ok(imu) => imu,
+            Err(err) => return Some(Err(err)),
+        };
+        let capture_id = CaptureId::new(self.capture_seq);
+        self.capture_seq = self.capture_seq.saturating_add(1);
+        self.previous_capture_time = Some(interval.end_inclusive());
+        Some(
+            CaptureBundle::new(capture_id, pair, interval, imu).map_err(|_| {
+                DatasetError::InvalidConfig {
+                    msg: "capture bundle interval must match pair capture time",
+                }
+            }),
+        )
     }
 }
 
-impl DatasetReader {
-    fn read_frame(
-        &mut self,
-        frame_ref: &super::ManifestFrameRef,
-        sensor: SensorId,
-    ) -> Result<Frame, DatasetError> {
-        let (width, height) = match self.meta.mono.as_ref() {
-            Some(mono) => (mono.width, mono.height),
-            None => {
-                return Err(DatasetError::InvalidConfig {
-                    msg: "meta.json missing mono config",
-                });
-            }
-        };
-        let path = self.root.join(&frame_ref.path);
-        let data = std::fs::read(&path).map_err(|e| DatasetError::ReadFile {
-            path: path.clone(),
-            source: e,
-        })?;
-        Frame::new(
-            sensor,
-            match sensor {
-                SensorId::StereoLeft => self.next_left_id(),
-                SensorId::StereoRight => self.next_right_id(),
-            },
-            Timestamp::from_nanos(frame_ref.timestamp_ns),
-            width,
-            height,
-            data,
-        )
-        .map_err(|source| DatasetError::InvalidFrame { path, source })
-    }
+fn read_indexed_pair(
+    root: &Path,
+    dimensions: crate::FrameDimensions,
+    left_sequence: &mut u64,
+    right_sequence: &mut u64,
+    pair: &DatasetPairIndex,
+) -> Result<StereoPair, DatasetError> {
+    let left = read_indexed_frame(
+        root,
+        dimensions,
+        left_sequence,
+        &pair.left,
+        SensorId::StereoLeft,
+    )?;
+    let right = read_indexed_frame(
+        root,
+        dimensions,
+        right_sequence,
+        &pair.right,
+        SensorId::StereoRight,
+    )?;
+    Ok(StereoPair::from_parts(left, right))
+}
+
+fn read_indexed_frame(
+    root: &Path,
+    dimensions: crate::FrameDimensions,
+    sequence: &mut u64,
+    frame_ref: &DatasetIndexFrameRef,
+    sensor: SensorId,
+) -> Result<Frame, DatasetError> {
+    let path = root.join(frame_ref.path.as_ref());
+    let data = std::fs::read(&path).map_err(|source| DatasetError::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    let frame_id = FrameId::new(*sequence);
+    *sequence = sequence.saturating_add(1);
+    Frame::new(
+        sensor,
+        frame_id,
+        frame_ref.timestamp,
+        dimensions.width(),
+        dimensions.height(),
+        data,
+    )
+    .map_err(|source| DatasetError::InvalidFrame { path, source })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -387,15 +360,14 @@ pub struct DatasetStats {
 }
 
 impl DatasetStats {
-    fn from_frames_and_manifest(frames: &super::FrameSet, manifest: &Manifest) -> Self {
+    pub(super) fn from_frames_and_pairs(
+        frames: &super::FrameSet,
+        pairs: &[DatasetPairIndex],
+    ) -> Self {
         let left_fps = fps_from_frames(&frames.left);
         let right_fps = fps_from_frames(&frames.right);
-        let paired_count = manifest
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.pairing, super::ManifestPairing::Paired { .. }))
-            .count();
-        let paired_fps = fps_from_manifest_pairs(&manifest.entries);
+        let paired_count = pairs.len();
+        let paired_fps = fps_from_pairs(pairs);
         Self {
             left_count: frames.left.len(),
             right_count: frames.right.len(),
@@ -420,29 +392,24 @@ fn fps_from_frames(frames: &[FrameInfo]) -> Option<f64> {
     Some((frames.len().saturating_sub(1)) as f64 / span_s)
 }
 
-fn fps_from_manifest_pairs(entries: &[super::ManifestEntry]) -> Option<f64> {
-    let mut pair_count = 0_usize;
+fn fps_from_pairs(pairs: &[DatasetPairIndex]) -> Option<f64> {
+    if pairs.len() < 2 {
+        return None;
+    }
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    for entry in entries {
-        let super::ManifestPairing::Paired { right, .. } = &entry.pairing else {
-            continue;
-        };
-        pair_count = pair_count.saturating_add(1);
-        min_ts = min_ts.min(entry.left.timestamp_ns);
-        max_ts = max_ts.max(entry.left.timestamp_ns);
-        min_ts = min_ts.min(right.timestamp_ns);
-        max_ts = max_ts.max(right.timestamp_ns);
-    }
-    if pair_count < 2 {
-        return None;
+    for pair in pairs {
+        min_ts = min_ts.min(pair.left.timestamp.as_nanos());
+        max_ts = max_ts.max(pair.left.timestamp.as_nanos());
+        min_ts = min_ts.min(pair.right.timestamp.as_nanos());
+        max_ts = max_ts.max(pair.right.timestamp.as_nanos());
     }
     let span_ns = max_ts.abs_diff(min_ts) as f64;
     if span_ns <= 0.0 {
         return None;
     }
     let span_s = span_ns / 1_000_000_000.0;
-    Some((pair_count - 1) as f64 / span_s)
+    Some((pairs.len() - 1) as f64 / span_s)
 }
 
 fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
@@ -559,12 +526,14 @@ fn read_imu_samples(
 mod tests {
     use super::*;
     use crate::dataset::{
-        Calibration, CameraIntrinsics, DatasetWriter, ImuCalibration, ImuExtrinsicsMeta, ImuMeta,
-        ImuNoiseMeta, Meta, MonoMeta,
+        Calibration, CameraIntrinsics, DatasetFrameReferenceError, DatasetManifestError,
+        DatasetWriter, ImuCalibration, ImuExtrinsicsMeta, ImuMeta, ImuNoiseMeta, Manifest, Meta,
+        MonoMeta,
     };
     use crate::{ImuBatch, ImuSample, SensorId};
     use std::error::Error as _;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -659,6 +628,7 @@ mod tests {
     #[test]
     fn paired_stats_count_only_manifest_pairs() {
         let frames = super::super::FrameSet {
+            mono_dimensions: crate::FrameDimensions::try_new(640, 480).expect("dimensions"),
             left: vec![
                 FrameInfo {
                     timestamp_ns: 0,
@@ -674,60 +644,17 @@ mod tests {
                 path: "right1.raw".to_string(),
             }],
         };
-        let manifest = Manifest {
-            header: super::super::ManifestHeader {
-                dataset_id: "dataset".to_string(),
-                created_at: "now".to_string(),
-                device: "oak".to_string(),
-                format: "raw".to_string(),
-                width: 640,
-                height: 480,
-                fps: 30,
-                timebase: "ns".to_string(),
-                pairing_policy: "nearest".to_string(),
-                pairing_window_ns: 20_000_000,
+        let pairs = vec![DatasetPairIndex {
+            left: DatasetIndexFrameRef {
+                timestamp: Timestamp::from_nanos(1_000_000_000),
+                path: Arc::from("left1.raw"),
             },
-            stats: super::super::ManifestStats {
-                total_left: 2,
-                total_right: 1,
-                paired_count: 1,
-                left_orphans: 1,
-                right_orphans: 0,
-                drops_by_reason: super::super::DropStats {
-                    spool_full: 0,
-                    write_fail: 0,
-                    parse_fail: 0,
-                    size_mismatch: 0,
-                    outside_window: 0,
-                },
-                delta_stats: None,
+            right: DatasetIndexFrameRef {
+                timestamp: Timestamp::from_nanos(1_000_000_010),
+                path: Arc::from("right1.raw"),
             },
-            entries: vec![
-                super::super::ManifestEntry {
-                    left: super::super::ManifestFrameRef {
-                        timestamp_ns: 0,
-                        path: "left0.raw".to_string(),
-                    },
-                    pairing: super::super::ManifestPairing::MissingRight {
-                        reason: super::super::PairReason::NoRightFrames,
-                    },
-                },
-                super::super::ManifestEntry {
-                    left: super::super::ManifestFrameRef {
-                        timestamp_ns: 1_000_000_000,
-                        path: "left1.raw".to_string(),
-                    },
-                    pairing: super::super::ManifestPairing::Paired {
-                        right: super::super::ManifestFrameRef {
-                            timestamp_ns: 1_000_000_010,
-                            path: "right1.raw".to_string(),
-                        },
-                        delta_ns: 10,
-                    },
-                },
-            ],
-        };
-        let stats = DatasetStats::from_frames_and_manifest(&frames, &manifest);
+        }];
+        let stats = DatasetStats::from_frames_and_pairs(&frames, &pairs);
         assert_eq!(stats.left_count, 2);
         assert_eq!(stats.right_count, 1);
         assert_eq!(stats.paired_count, 1);
@@ -812,6 +739,52 @@ mod tests {
             depth: None,
             imu: Some(ImuMeta { rate_hz: 200 }),
         }
+    }
+
+    #[test]
+    fn reader_rejects_unresolved_manifest_references_with_full_source_context() {
+        let dataset_dir = unique_temp_dir("reader-invalid-manifest-reference");
+        let (writer, handle) =
+            DatasetWriter::create(&dataset_dir, &meta_with_imu(), &calibration()).expect("writer");
+        writer.write_frame(&mono_frame(SensorId::StereoLeft, 0, 100));
+        writer.write_frame(&mono_frame(SensorId::StereoRight, 1, 104));
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let manifest_path = dataset_dir.join(crate::dataset::format::MANIFEST_FILE);
+        let mut manifest: Manifest = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+        manifest.entries[0].left.path = "frames/100_missing.raw".to_string();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize altered manifest"),
+        )
+        .expect("write altered manifest");
+
+        let error = DatasetReader::open(&dataset_dir)
+            .expect_err("an unresolved manifest reference must fail open");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidManifest {
+                path,
+                source: DatasetManifestError::InvalidFrameReference {
+                    entry_index: 0,
+                    role: super::super::DatasetFrameRole::Left,
+                    source: DatasetFrameReferenceError::MissingFromDataset { .. },
+                },
+            } if path == &manifest_path
+        ));
+        let manifest_source = error.source().expect("manifest source");
+        let frame_reference_source = manifest_source.source().expect("frame-reference source");
+        assert!(
+            frame_reference_source
+                .to_string()
+                .contains("not present in the scanned dataset")
+        );
+
+        let _ = std::fs::remove_dir_all(&dataset_dir);
     }
 
     #[test]

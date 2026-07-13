@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,7 +7,7 @@ use std::thread;
 
 use crate::{
     DepthImage, Frame, FrameDimensions, FrameDimensionsError, FrameError, ImuBatch, ImuSampleError,
-    ImuTimestampShiftError, PairError, SensorId, StereoPair,
+    ImuTimestampShiftError, PairError, PairingConfigError, SensorId, StereoPair, Timestamp,
 };
 
 pub mod format {
@@ -301,6 +301,249 @@ impl std::error::Error for DatasetImuRecordError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatasetFrameRole {
+    Left,
+    Right,
+}
+
+impl std::fmt::Display for DatasetFrameRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Left => f.write_str("left"),
+            Self::Right => f.write_str("right"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DatasetFrameReferenceError {
+    NonCanonicalPath {
+        path: String,
+    },
+    WrongFrameKind {
+        path: String,
+        expected: format::FrameKind,
+        actual: format::FrameKind,
+    },
+    TimestampMismatch {
+        path: String,
+        declared_ns: i64,
+        filename_ns: i64,
+    },
+    MissingFromDataset {
+        path: String,
+    },
+}
+
+impl std::fmt::Display for DatasetFrameReferenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonCanonicalPath { path } => write!(
+                f,
+                "frame path {path:?} must be exactly {}/<frame filename>",
+                format::FRAMES_DIR
+            ),
+            Self::WrongFrameKind {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "frame path {path:?} has kind {actual}; expected {expected}"
+            ),
+            Self::TimestampMismatch {
+                path,
+                declared_ns,
+                filename_ns,
+            } => write!(
+                f,
+                "frame path {path:?} declares timestamp {declared_ns}, but its filename encodes {filename_ns}"
+            ),
+            Self::MissingFromDataset { path } => {
+                write!(
+                    f,
+                    "frame path {path:?} is not present in the scanned dataset"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatasetFrameReferenceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NonCanonicalPath { .. }
+            | Self::WrongFrameKind { .. }
+            | Self::TimestampMismatch { .. }
+            | Self::MissingFromDataset { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DatasetManifestError {
+    MissingMonoConfig,
+    HeaderTextMismatch {
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
+    HeaderNumberMismatch {
+        field: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    InvalidPairingWindow {
+        source: PairingConfigError,
+    },
+    InvalidFrameReference {
+        entry_index: usize,
+        role: DatasetFrameRole,
+        source: DatasetFrameReferenceError,
+    },
+    DuplicateFrameReference {
+        entry_index: usize,
+        role: DatasetFrameRole,
+        path: String,
+    },
+    NonIncreasingTimestamp {
+        entry_index: usize,
+        role: DatasetFrameRole,
+        previous_ns: i64,
+        current_ns: i64,
+    },
+    PairDeltaMismatch {
+        entry_index: usize,
+        declared_ns: u64,
+        actual_ns: u64,
+    },
+    PairOutsideWindow {
+        entry_index: usize,
+        delta_ns: u64,
+        pairing_window_ns: u64,
+    },
+    PairedCountExceedsAvailableRightFrames {
+        paired_count: usize,
+        available_right: usize,
+    },
+    CountMismatch {
+        field: &'static str,
+        declared: u64,
+        actual: u64,
+    },
+    CountOverflow {
+        field: &'static str,
+        value: usize,
+    },
+}
+
+impl std::fmt::Display for DatasetManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingMonoConfig => write!(f, "manifest requires mono dataset metadata"),
+            Self::HeaderTextMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "manifest header {field} must be {expected:?}, got {actual:?}"
+            ),
+            Self::HeaderNumberMismatch {
+                field,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "manifest header {field} must be {expected}, got {actual}"
+            ),
+            Self::InvalidPairingWindow { source } => {
+                write!(f, "manifest has an invalid pairing window: {source}")
+            }
+            Self::InvalidFrameReference {
+                entry_index,
+                role,
+                source,
+            } => write!(
+                f,
+                "manifest entry {entry_index} has an invalid {role} frame reference: {source}"
+            ),
+            Self::DuplicateFrameReference {
+                entry_index,
+                role,
+                path,
+            } => write!(
+                f,
+                "manifest entry {entry_index} repeats {role} frame path {path:?}"
+            ),
+            Self::NonIncreasingTimestamp {
+                entry_index,
+                role,
+                previous_ns,
+                current_ns,
+            } => write!(
+                f,
+                "manifest entry {entry_index} has non-increasing {role} timestamp {current_ns} after {previous_ns}"
+            ),
+            Self::PairDeltaMismatch {
+                entry_index,
+                declared_ns,
+                actual_ns,
+            } => write!(
+                f,
+                "manifest entry {entry_index} declares pair delta {declared_ns}ns, but timestamps differ by {actual_ns}ns"
+            ),
+            Self::PairOutsideWindow {
+                entry_index,
+                delta_ns,
+                pairing_window_ns,
+            } => write!(
+                f,
+                "manifest entry {entry_index} pair delta {delta_ns}ns exceeds the {pairing_window_ns}ns pairing window"
+            ),
+            Self::PairedCountExceedsAvailableRightFrames {
+                paired_count,
+                available_right,
+            } => write!(
+                f,
+                "validated manifest contains {paired_count} pairs but only {available_right} right frames are available"
+            ),
+            Self::CountMismatch {
+                field,
+                declared,
+                actual,
+            } => write!(
+                f,
+                "manifest count {field} declares {declared}, but validated data contains {actual}"
+            ),
+            Self::CountOverflow { field, value } => write!(
+                f,
+                "validated dataset count {field}={value} cannot be represented as u64"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DatasetManifestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPairingWindow { source } => Some(source),
+            Self::InvalidFrameReference { source, .. } => Some(source),
+            Self::MissingMonoConfig
+            | Self::HeaderTextMismatch { .. }
+            | Self::HeaderNumberMismatch { .. }
+            | Self::DuplicateFrameReference { .. }
+            | Self::NonIncreasingTimestamp { .. }
+            | Self::PairDeltaMismatch { .. }
+            | Self::PairOutsideWindow { .. }
+            | Self::PairedCountExceedsAvailableRightFrames { .. }
+            | Self::CountMismatch { .. }
+            | Self::CountOverflow { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DatasetError {
     OutputAlreadyExists {
@@ -372,6 +615,10 @@ pub enum DatasetError {
     },
     DeserializeJson {
         source: serde_json::Error,
+    },
+    InvalidManifest {
+        path: PathBuf,
+        source: DatasetManifestError,
     },
     WorkerJoin {
         message: String,
@@ -474,6 +721,9 @@ impl std::fmt::Display for DatasetError {
             DatasetError::DeserializeJson { source } => {
                 write!(f, "failed to deserialize JSON: {source}")
             }
+            DatasetError::InvalidManifest { path, source } => {
+                write!(f, "invalid dataset manifest {}: {source}", path.display())
+            }
             DatasetError::WorkerJoin { message } => {
                 write!(f, "writer thread panicked: {message}")
             }
@@ -501,6 +751,7 @@ impl std::error::Error for DatasetError {
             DatasetError::SerializeJson { source } | DatasetError::DeserializeJson { source } => {
                 Some(source)
             }
+            DatasetError::InvalidManifest { source, .. } => Some(source),
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::InvalidFrame { source, .. } => Some(source),
             DatasetError::InvalidImuRecord { source, .. } => Some(source),
@@ -1221,8 +1472,330 @@ struct FrameInfo {
 
 #[derive(Debug)]
 struct FrameSet {
+    mono_dimensions: FrameDimensions,
     left: Vec<FrameInfo>,
     right: Vec<FrameInfo>,
+}
+
+#[derive(Debug)]
+struct DatasetIndex {
+    stats: DatasetStats,
+    pairs: Box<[DatasetPairIndex]>,
+}
+
+#[derive(Debug)]
+struct DatasetPairIndex {
+    left: DatasetIndexFrameRef,
+    right: DatasetIndexFrameRef,
+}
+
+#[derive(Debug)]
+struct DatasetIndexFrameRef {
+    timestamp: Timestamp,
+    path: Arc<str>,
+}
+
+impl DatasetIndex {
+    fn try_from_manifest(
+        manifest: Manifest,
+        meta: &Meta,
+        frames: &FrameSet,
+    ) -> Result<Self, DatasetManifestError> {
+        let mono = meta
+            .mono
+            .as_ref()
+            .ok_or(DatasetManifestError::MissingMonoConfig)?;
+        require_manifest_text("format", &manifest.header.format, "raw")?;
+        require_manifest_text("timebase", &manifest.header.timebase, "device_ns")?;
+        require_manifest_text(
+            "pairing_policy",
+            &manifest.header.pairing_policy,
+            "time_symmetric",
+        )?;
+        require_manifest_text("created_at", &manifest.header.created_at, &meta.created)?;
+        require_manifest_text("device", &manifest.header.device, &meta.device)?;
+        require_manifest_number("width", manifest.header.width, mono.width)?;
+        require_manifest_number("height", manifest.header.height, mono.height)?;
+        require_manifest_number("fps", manifest.header.fps, mono.fps)?;
+        let pairing_window = crate::PairingWindowNs::try_from(manifest.header.pairing_window_ns)
+            .map_err(|source| DatasetManifestError::InvalidPairingWindow { source })?;
+
+        require_manifest_count(
+            "total_left",
+            manifest.stats.total_left,
+            count_as_u64("scanned_left", frames.left.len())?,
+        )?;
+        require_manifest_count(
+            "total_right",
+            manifest.stats.total_right,
+            count_as_u64("scanned_right", frames.right.len())?,
+        )?;
+        require_manifest_count(
+            "entries",
+            manifest.stats.total_left,
+            count_as_u64("entries", manifest.entries.len())?,
+        )?;
+
+        let available_frames: HashMap<&str, (format::FrameKind, i64)> = frames
+            .left
+            .iter()
+            .map(|frame| {
+                (
+                    frame.path.as_str(),
+                    (format::FrameKind::MonoLeft, frame.timestamp_ns),
+                )
+            })
+            .chain(frames.right.iter().map(|frame| {
+                (
+                    frame.path.as_str(),
+                    (format::FrameKind::MonoRight, frame.timestamp_ns),
+                )
+            }))
+            .collect();
+        let mut seen_left = HashSet::with_capacity(manifest.entries.len());
+        let mut seen_right = HashSet::with_capacity(manifest.entries.len());
+        let mut pairs = Vec::with_capacity(manifest.entries.len().min(frames.right.len()));
+        let mut previous_left = None;
+        let mut previous_right = None;
+        let mut left_orphans = 0_usize;
+        let mut outside_window = 0_usize;
+
+        for (entry_index, entry) in manifest.entries.into_iter().enumerate() {
+            let left = validate_manifest_frame_ref(
+                entry.left,
+                format::FrameKind::MonoLeft,
+                &available_frames,
+                entry_index,
+                DatasetFrameRole::Left,
+            )?;
+            insert_unique_frame_ref(&mut seen_left, &left, entry_index, DatasetFrameRole::Left)?;
+            require_increasing_timestamp(
+                &mut previous_left,
+                left.timestamp,
+                entry_index,
+                DatasetFrameRole::Left,
+            )?;
+
+            match entry.pairing {
+                ManifestPairing::Paired { right, delta_ns } => {
+                    let right = validate_manifest_frame_ref(
+                        right,
+                        format::FrameKind::MonoRight,
+                        &available_frames,
+                        entry_index,
+                        DatasetFrameRole::Right,
+                    )?;
+                    insert_unique_frame_ref(
+                        &mut seen_right,
+                        &right,
+                        entry_index,
+                        DatasetFrameRole::Right,
+                    )?;
+                    require_increasing_timestamp(
+                        &mut previous_right,
+                        right.timestamp,
+                        entry_index,
+                        DatasetFrameRole::Right,
+                    )?;
+                    let actual_delta = left
+                        .timestamp
+                        .as_nanos()
+                        .abs_diff(right.timestamp.as_nanos());
+                    if delta_ns != actual_delta {
+                        return Err(DatasetManifestError::PairDeltaMismatch {
+                            entry_index,
+                            declared_ns: delta_ns,
+                            actual_ns: actual_delta,
+                        });
+                    }
+                    if actual_delta > pairing_window.as_ns() {
+                        return Err(DatasetManifestError::PairOutsideWindow {
+                            entry_index,
+                            delta_ns: actual_delta,
+                            pairing_window_ns: pairing_window.as_ns(),
+                        });
+                    }
+                    pairs.push(DatasetPairIndex { left, right });
+                }
+                ManifestPairing::MissingRight { reason } => {
+                    left_orphans += 1;
+                    if matches!(reason, PairReason::OutsideWindow) {
+                        outside_window += 1;
+                    }
+                }
+            }
+        }
+
+        let paired_count = pairs.len();
+        let right_orphans = frames.right.len().checked_sub(paired_count).ok_or(
+            DatasetManifestError::PairedCountExceedsAvailableRightFrames {
+                paired_count,
+                available_right: frames.right.len(),
+            },
+        )?;
+        require_manifest_count(
+            "paired_count",
+            manifest.stats.paired_count,
+            count_as_u64("paired_count", paired_count)?,
+        )?;
+        require_manifest_count(
+            "left_orphans",
+            manifest.stats.left_orphans,
+            count_as_u64("left_orphans", left_orphans)?,
+        )?;
+        require_manifest_count(
+            "right_orphans",
+            manifest.stats.right_orphans,
+            count_as_u64("right_orphans", right_orphans)?,
+        )?;
+        require_manifest_count(
+            "drops_by_reason.outside_window",
+            manifest.stats.drops_by_reason.outside_window,
+            count_as_u64("outside_window", outside_window)?,
+        )?;
+
+        let stats = DatasetStats::from_frames_and_pairs(frames, &pairs);
+        Ok(Self {
+            stats,
+            pairs: pairs.into_boxed_slice(),
+        })
+    }
+}
+
+fn require_manifest_text(
+    field: &'static str,
+    actual: &str,
+    expected: &str,
+) -> Result<(), DatasetManifestError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(DatasetManifestError::HeaderTextMismatch {
+        field,
+        expected: expected.to_string(),
+        actual: actual.to_string(),
+    })
+}
+
+fn require_manifest_number(
+    field: &'static str,
+    actual: u32,
+    expected: u32,
+) -> Result<(), DatasetManifestError> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(DatasetManifestError::HeaderNumberMismatch {
+        field,
+        expected: u64::from(expected),
+        actual: u64::from(actual),
+    })
+}
+
+fn count_as_u64(field: &'static str, value: usize) -> Result<u64, DatasetManifestError> {
+    u64::try_from(value).map_err(|_| DatasetManifestError::CountOverflow { field, value })
+}
+
+fn require_manifest_count(
+    field: &'static str,
+    declared: u64,
+    actual: u64,
+) -> Result<(), DatasetManifestError> {
+    if declared == actual {
+        return Ok(());
+    }
+    Err(DatasetManifestError::CountMismatch {
+        field,
+        declared,
+        actual,
+    })
+}
+
+fn validate_manifest_frame_ref(
+    frame_ref: ManifestFrameRef,
+    expected_kind: format::FrameKind,
+    available: &HashMap<&str, (format::FrameKind, i64)>,
+    entry_index: usize,
+    role: DatasetFrameRole,
+) -> Result<DatasetIndexFrameRef, DatasetManifestError> {
+    let invalid = |source| DatasetManifestError::InvalidFrameReference {
+        entry_index,
+        role,
+        source,
+    };
+    let Some(filename) = Path::new(&frame_ref.path)
+        .file_name()
+        .and_then(|filename| filename.to_str())
+    else {
+        return Err(invalid(DatasetFrameReferenceError::NonCanonicalPath {
+            path: frame_ref.path,
+        }));
+    };
+    let canonical_path = format!("{}/{}", format::FRAMES_DIR, filename);
+    if frame_ref.path != canonical_path {
+        return Err(invalid(DatasetFrameReferenceError::NonCanonicalPath {
+            path: frame_ref.path,
+        }));
+    }
+    let Some(&(actual_kind, scanned_timestamp_ns)) = available.get(frame_ref.path.as_str()) else {
+        return Err(invalid(DatasetFrameReferenceError::MissingFromDataset {
+            path: frame_ref.path,
+        }));
+    };
+    if actual_kind != expected_kind {
+        return Err(invalid(DatasetFrameReferenceError::WrongFrameKind {
+            path: frame_ref.path,
+            expected: expected_kind,
+            actual: actual_kind,
+        }));
+    }
+    if scanned_timestamp_ns != frame_ref.timestamp_ns {
+        return Err(invalid(DatasetFrameReferenceError::TimestampMismatch {
+            path: frame_ref.path,
+            declared_ns: frame_ref.timestamp_ns,
+            filename_ns: scanned_timestamp_ns,
+        }));
+    }
+    Ok(DatasetIndexFrameRef {
+        timestamp: Timestamp::from_nanos(frame_ref.timestamp_ns),
+        path: Arc::from(frame_ref.path),
+    })
+}
+
+fn insert_unique_frame_ref(
+    seen: &mut HashSet<Arc<str>>,
+    frame_ref: &DatasetIndexFrameRef,
+    entry_index: usize,
+    role: DatasetFrameRole,
+) -> Result<(), DatasetManifestError> {
+    if seen.insert(Arc::clone(&frame_ref.path)) {
+        return Ok(());
+    }
+    Err(DatasetManifestError::DuplicateFrameReference {
+        entry_index,
+        role,
+        path: frame_ref.path.to_string(),
+    })
+}
+
+fn require_increasing_timestamp(
+    previous: &mut Option<Timestamp>,
+    current: Timestamp,
+    entry_index: usize,
+    role: DatasetFrameRole,
+) -> Result<(), DatasetManifestError> {
+    if let Some(previous_timestamp) = *previous
+        && current.as_nanos() <= previous_timestamp.as_nanos()
+    {
+        return Err(DatasetManifestError::NonIncreasingTimestamp {
+            entry_index,
+            role,
+            previous_ns: previous_timestamp.as_nanos(),
+            current_ns: current.as_nanos(),
+        });
+    }
+    *previous = Some(current);
+    Ok(())
 }
 
 fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
@@ -1231,7 +1804,11 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         msg: "meta.json missing mono config",
     })?;
 
-    let FrameSet { left, right } = scan_frames_with_depth(
+    let FrameSet {
+        mono_dimensions: _,
+        left,
+        right,
+    } = scan_frames_with_depth(
         &state.frames_dir,
         mono.width,
         mono.height,
@@ -1346,19 +1923,21 @@ fn scan_frames_with_depth(
     height: u32,
     depth: Option<&DepthMeta>,
 ) -> Result<FrameSet, DatasetError> {
+    let (mono_dimensions, mono_expected_len) = frame_layout("mono", width, height, 1)?;
     let mut frames = FrameSet {
+        mono_dimensions,
         left: Vec::new(),
         right: Vec::new(),
     };
-    let mono_expected_len = expected_frame_bytes("mono", width, height, 1)?;
     let depth_expected_len = depth
         .map(|meta| {
-            expected_frame_bytes(
+            frame_layout(
                 "depth",
                 meta.width,
                 meta.height,
                 std::mem::size_of::<f32>() as u64,
             )
+            .map(|(_, expected_bytes)| expected_bytes)
         })
         .transpose()?;
 
@@ -1434,12 +2013,12 @@ fn scan_frames_with_depth(
     Ok(frames)
 }
 
-fn expected_frame_bytes(
+fn frame_layout(
     stream: &'static str,
     width: u32,
     height: u32,
     bytes_per_pixel: u64,
-) -> Result<u64, DatasetError> {
+) -> Result<(FrameDimensions, u64), DatasetError> {
     let dimensions = FrameDimensions::try_new(width, height)
         .map_err(|source| DatasetError::InvalidFrameDimensions { stream, source })?;
     let pixels =
@@ -1448,13 +2027,15 @@ fn expected_frame_bytes(
             width,
             height,
         })?;
-    pixels
-        .checked_mul(bytes_per_pixel)
-        .ok_or(DatasetError::FrameByteLengthOverflow {
-            stream,
-            width,
-            height,
-        })
+    let expected_bytes =
+        pixels
+            .checked_mul(bytes_per_pixel)
+            .ok_or(DatasetError::FrameByteLengthOverflow {
+                stream,
+                width,
+                height,
+            })?;
+    Ok((dimensions, expected_bytes))
 }
 
 fn compute_period_ns(frames: &[FrameInfo]) -> Option<u64> {
@@ -1743,6 +2324,91 @@ mod tests {
         }
     }
 
+    fn manifest_validation_fixture() -> (Manifest, Meta, FrameSet) {
+        let meta = test_meta();
+        let frames = FrameSet {
+            mono_dimensions: FrameDimensions::try_new(2, 2).expect("dimensions"),
+            left: vec![
+                FrameInfo {
+                    timestamp_ns: 100,
+                    path: "frames/100_mono_left.raw".to_string(),
+                },
+                FrameInfo {
+                    timestamp_ns: 200,
+                    path: "frames/200_mono_left.raw".to_string(),
+                },
+            ],
+            right: vec![
+                FrameInfo {
+                    timestamp_ns: 104,
+                    path: "frames/104_mono_right.raw".to_string(),
+                },
+                FrameInfo {
+                    timestamp_ns: 204,
+                    path: "frames/204_mono_right.raw".to_string(),
+                },
+            ],
+        };
+        let manifest = Manifest {
+            header: ManifestHeader {
+                dataset_id: "fixture".to_string(),
+                created_at: meta.created.clone(),
+                device: meta.device.clone(),
+                format: "raw".to_string(),
+                width: 2,
+                height: 2,
+                fps: 10,
+                timebase: "device_ns".to_string(),
+                pairing_policy: "time_symmetric".to_string(),
+                pairing_window_ns: 10,
+            },
+            stats: ManifestStats {
+                total_left: 2,
+                total_right: 2,
+                paired_count: 2,
+                left_orphans: 0,
+                right_orphans: 0,
+                drops_by_reason: DropStats {
+                    spool_full: 0,
+                    write_fail: 0,
+                    parse_fail: 0,
+                    size_mismatch: 0,
+                    outside_window: 0,
+                },
+                delta_stats: None,
+            },
+            entries: vec![
+                ManifestEntry {
+                    left: ManifestFrameRef {
+                        timestamp_ns: 100,
+                        path: "frames/100_mono_left.raw".to_string(),
+                    },
+                    pairing: ManifestPairing::Paired {
+                        right: ManifestFrameRef {
+                            timestamp_ns: 104,
+                            path: "frames/104_mono_right.raw".to_string(),
+                        },
+                        delta_ns: 4,
+                    },
+                },
+                ManifestEntry {
+                    left: ManifestFrameRef {
+                        timestamp_ns: 200,
+                        path: "frames/200_mono_left.raw".to_string(),
+                    },
+                    pairing: ManifestPairing::Paired {
+                        right: ManifestFrameRef {
+                            timestamp_ns: 204,
+                            path: "frames/204_mono_right.raw".to_string(),
+                        },
+                        delta_ns: 4,
+                    },
+                },
+            ],
+        };
+        (manifest, meta, frames)
+    }
+
     fn test_pair() -> StereoPair {
         let left = Frame::new(
             SensorId::StereoLeft,
@@ -1894,6 +2560,206 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manifest_parses_into_a_trustworthy_runtime_index() {
+        let (manifest, meta, frames) = manifest_validation_fixture();
+        let index = DatasetIndex::try_from_manifest(manifest, &meta, &frames).expect("index");
+
+        assert_eq!(index.stats.left_count, 2);
+        assert_eq!(index.stats.right_count, 2);
+        assert_eq!(index.stats.paired_count, 2);
+        assert_eq!(index.pairs.len(), 2);
+        assert_eq!(index.pairs[0].left.timestamp.as_nanos(), 100);
+        assert_eq!(
+            index.pairs[0].left.path.as_ref(),
+            "frames/100_mono_left.raw"
+        );
+        assert_eq!(index.pairs[0].right.timestamp.as_nanos(), 104);
+        assert_eq!(
+            index.pairs[0].right.path.as_ref(),
+            "frames/104_mono_right.raw"
+        );
+    }
+
+    #[test]
+    fn manifest_orphans_are_counted_but_excluded_from_the_runtime_pair_index() {
+        let (mut manifest, meta, frames) = manifest_validation_fixture();
+        manifest.entries[1].pairing = ManifestPairing::MissingRight {
+            reason: PairReason::RightExhausted,
+        };
+        manifest.stats.paired_count = 1;
+        manifest.stats.left_orphans = 1;
+        manifest.stats.right_orphans = 1;
+
+        let index = DatasetIndex::try_from_manifest(manifest, &meta, &frames).expect("index");
+
+        assert_eq!(index.stats.left_count, 2);
+        assert_eq!(index.stats.right_count, 2);
+        assert_eq!(index.stats.paired_count, 1);
+        assert_eq!(index.pairs.len(), 1);
+        assert_eq!(index.pairs[0].left.timestamp.as_nanos(), 100);
+        assert_eq!(index.pairs[0].right.timestamp.as_nanos(), 104);
+    }
+
+    #[test]
+    fn manifest_rejects_noncanonical_and_wrong_role_paths() {
+        let (mut escaped, meta, frames) = manifest_validation_fixture();
+        escaped.entries[0].left.path = "../100_mono_left.raw".to_string();
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(escaped, &meta, &frames),
+            Err(DatasetManifestError::InvalidFrameReference {
+                entry_index: 0,
+                role: DatasetFrameRole::Left,
+                source: DatasetFrameReferenceError::NonCanonicalPath { .. },
+            })
+        ));
+
+        let (mut wrong_role, meta, frames) = manifest_validation_fixture();
+        wrong_role.entries[0].left = ManifestFrameRef {
+            timestamp_ns: 104,
+            path: "frames/104_mono_right.raw".to_string(),
+        };
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(wrong_role, &meta, &frames),
+            Err(DatasetManifestError::InvalidFrameReference {
+                entry_index: 0,
+                role: DatasetFrameRole::Left,
+                source: DatasetFrameReferenceError::WrongFrameKind {
+                    expected: format::FrameKind::MonoLeft,
+                    actual: format::FrameKind::MonoRight,
+                    ..
+                },
+            })
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_references_absent_from_the_scanned_dataset() {
+        let (mut manifest, meta, frames) = manifest_validation_fixture();
+        manifest.entries[0].left.path = "frames/not-an-i64_mono_left.raw".to_string();
+
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(manifest, &meta, &frames),
+            Err(DatasetManifestError::InvalidFrameReference {
+                entry_index: 0,
+                role: DatasetFrameRole::Left,
+                source: DatasetFrameReferenceError::MissingFromDataset { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_timestamp_delta_window_and_order_mismatches() {
+        let (mut timestamp, meta, frames) = manifest_validation_fixture();
+        timestamp.entries[0].left.timestamp_ns = 99;
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(timestamp, &meta, &frames),
+            Err(DatasetManifestError::InvalidFrameReference {
+                source: DatasetFrameReferenceError::TimestampMismatch { .. },
+                ..
+            })
+        ));
+
+        let (mut delta, meta, frames) = manifest_validation_fixture();
+        let ManifestPairing::Paired { delta_ns, .. } = &mut delta.entries[0].pairing else {
+            panic!("fixture pair");
+        };
+        *delta_ns = 5;
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(delta, &meta, &frames),
+            Err(DatasetManifestError::PairDeltaMismatch {
+                entry_index: 0,
+                declared_ns: 5,
+                actual_ns: 4,
+            })
+        ));
+
+        let (mut outside, meta, frames) = manifest_validation_fixture();
+        outside.header.pairing_window_ns = 3;
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(outside, &meta, &frames),
+            Err(DatasetManifestError::PairOutsideWindow {
+                entry_index: 0,
+                delta_ns: 4,
+                pairing_window_ns: 3,
+            })
+        ));
+
+        let (mut unordered, meta, frames) = manifest_validation_fixture();
+        unordered.entries.swap(0, 1);
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(unordered, &meta, &frames),
+            Err(DatasetManifestError::NonIncreasingTimestamp {
+                entry_index: 1,
+                role: DatasetFrameRole::Left,
+                previous_ns: 200,
+                current_ns: 100,
+            })
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_missing_and_false_count_claims() {
+        let (mut duplicate, meta, frames) = manifest_validation_fixture();
+        duplicate.entries[1].left = duplicate.entries[0].left.clone();
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(duplicate, &meta, &frames),
+            Err(DatasetManifestError::DuplicateFrameReference {
+                entry_index: 1,
+                role: DatasetFrameRole::Left,
+                ..
+            })
+        ));
+
+        let (mut missing, meta, frames) = manifest_validation_fixture();
+        missing.entries[0].left = ManifestFrameRef {
+            timestamp_ns: 300,
+            path: "frames/300_mono_left.raw".to_string(),
+        };
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(missing, &meta, &frames),
+            Err(DatasetManifestError::InvalidFrameReference {
+                source: DatasetFrameReferenceError::MissingFromDataset { .. },
+                ..
+            })
+        ));
+
+        let (mut false_count, meta, frames) = manifest_validation_fixture();
+        false_count.stats.paired_count = 1;
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(false_count, &meta, &frames),
+            Err(DatasetManifestError::CountMismatch {
+                field: "paired_count",
+                declared: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn manifest_rejects_header_and_pairing_window_mismatches_with_source() {
+        let (mut header, meta, frames) = manifest_validation_fixture();
+        header.header.width = 3;
+        assert!(matches!(
+            DatasetIndex::try_from_manifest(header, &meta, &frames),
+            Err(DatasetManifestError::HeaderNumberMismatch {
+                field: "width",
+                expected: 2,
+                actual: 3,
+            })
+        ));
+
+        let (mut window, meta, frames) = manifest_validation_fixture();
+        window.header.pairing_window_ns = 0;
+        let error = DatasetIndex::try_from_manifest(window, &meta, &frames)
+            .expect_err("zero window must fail");
+        assert!(matches!(
+            error,
+            DatasetManifestError::InvalidPairingWindow { .. }
+        ));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
