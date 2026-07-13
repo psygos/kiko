@@ -1,9 +1,11 @@
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::InferenceError;
 use crate::local_ba::{BaResult, DegenerateReason};
-use crate::map::KeyframeId;
+use crate::map::{KeyframeId, MapSnapshot};
 use crate::triangulation::TriangulationStats;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,6 +601,11 @@ pub enum DiagnosticEvent {
     DescriptorWorkerDied {
         respawn_count: u32,
     },
+    DescriptorInferenceFailed {
+        keyframe_id: KeyframeId,
+        source_snapshot: MapSnapshot,
+        error: Arc<InferenceError>,
+    },
     RelocalizationStarted,
     RelocalizationSucceeded {
         keyframe_id: KeyframeId,
@@ -827,6 +834,13 @@ mod tests {
             },
             DiagnosticEvent::BackendWorkerDied { respawn_count: 1 },
             DiagnosticEvent::DescriptorWorkerDied { respawn_count: 2 },
+            DiagnosticEvent::DescriptorInferenceFailed {
+                keyframe_id: crate::KeyframeId::default(),
+                source_snapshot: crate::map::SlamMap::new().snapshot(),
+                error: std::sync::Arc::new(crate::InferenceError::InvariantViolation {
+                    context: "test descriptor failure",
+                }),
+            },
             DiagnosticEvent::RelocalizationStarted,
             DiagnosticEvent::BaDegenerate {
                 reason: DegenerateReason::NoFactors,
@@ -840,7 +854,7 @@ mod tests {
         for event in events {
             kinds.insert(discriminant(&event));
         }
-        assert_eq!(kinds.len(), 8);
+        assert_eq!(kinds.len(), 9);
     }
 
     #[test]

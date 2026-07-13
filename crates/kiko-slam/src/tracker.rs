@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -27,7 +26,7 @@ use crate::loop_closure::{
 };
 use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
-    DescriptorStats, PlaceRecognition, PlaceRecognitionEvent, PlaceRecognitionInitError,
+    DescriptorInitError, DescriptorStats, PlaceRecognition, PlaceRecognitionEvent,
 };
 use crate::pose_graph::{EssentialGraphError, PoseGraphConfig};
 use crate::{
@@ -1407,8 +1406,8 @@ impl RedundancyPolicy {
 
 #[derive(Debug)]
 pub enum TrackerInitError {
-    DescriptorUnavailable {
-        model_path: PathBuf,
+    Descriptor {
+        source: DescriptorInitError,
     },
     #[cfg(feature = "vio")]
     VioInvalidGravity {
@@ -1419,11 +1418,9 @@ pub enum TrackerInitError {
 impl std::fmt::Display for TrackerInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TrackerInitError::DescriptorUnavailable { model_path } => write!(
-                f,
-                "loop closure requires learned descriptors but descriptor worker failed to start (model: {})",
-                model_path.display()
-            ),
+            TrackerInitError::Descriptor { source } => {
+                write!(f, "failed to initialize learned descriptors: {source}")
+            }
             #[cfg(feature = "vio")]
             TrackerInitError::VioInvalidGravity { message } => {
                 write!(f, "invalid vio gravity configuration: {message}")
@@ -1432,7 +1429,15 @@ impl std::fmt::Display for TrackerInitError {
     }
 }
 
-impl std::error::Error for TrackerInitError {}
+impl std::error::Error for TrackerInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Descriptor { source } => Some(source),
+            #[cfg(feature = "vio")]
+            Self::VioInvalidGravity { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum TrackerError {
@@ -2447,11 +2452,7 @@ impl SlamTracker {
                     descriptor_config,
                     config.runtime.descriptor_max_respawns(),
                 )
-                .map_err(|err| match err {
-                    PlaceRecognitionInitError::DescriptorUnavailable { model_path } => {
-                        TrackerInitError::DescriptorUnavailable { model_path }
-                    }
-                })?,
+                .map_err(|source| TrackerInitError::Descriptor { source })?,
             ),
             _ => None,
         };
@@ -3146,6 +3147,11 @@ impl SlamTracker {
                     eprintln!(
                         "descriptor worker failure (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
                     );
+                    self.emit_event(DiagnosticEvent::DescriptorInferenceFailed {
+                        keyframe_id,
+                        source_snapshot,
+                        error: Arc::new(error),
+                    });
                 }
                 PlaceRecognitionEvent::WorkerPanic {
                     keyframe_id,
@@ -5145,8 +5151,8 @@ mod tests {
     use crate::loop_manager::LoopManager;
     use crate::map::assert_map_invariants;
     use crate::place_recognition::{
-        DescriptorExtractorFactory, DescriptorRequest, DescriptorSupervisor, DescriptorWorker,
-        DescriptorWorkerResponse,
+        DescriptorExtractorFactory, DescriptorInitError, DescriptorRequest, DescriptorSupervisor,
+        DescriptorWorker, DescriptorWorkerResponse,
     };
     use crate::pose_graph::{
         EssentialEdge, EssentialEdgeKind, EssentialGraph, PoseGraphConfig, PoseGraphError,
@@ -5184,6 +5190,20 @@ mod tests {
         let frame = inference.source().expect("frame source");
         assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
         assert!(frame.source().is_none());
+    }
+
+    #[test]
+    fn tracker_init_error_preserves_descriptor_thread_source_chain() {
+        let error = TrackerInitError::Descriptor {
+            source: DescriptorInitError::WorkerThread {
+                source: std::io::Error::other("thread capacity exhausted"),
+            },
+        };
+
+        let descriptor = error.source().expect("descriptor initialization source");
+        let thread = descriptor.source().expect("thread spawn source");
+        assert_eq!(thread.to_string(), "thread capacity exhausted");
+        assert!(thread.source().is_none());
     }
 
     #[cfg(feature = "vio")]
@@ -5295,6 +5315,22 @@ mod tests {
             let mut calls = self.calls.lock().expect("calls lock");
             *calls = calls.saturating_add(1);
             Ok(self.descriptor.clone())
+        }
+    }
+
+    struct FailingDescriptorExtractor;
+
+    impl PlaceDescriptorExtractor for FailingDescriptorExtractor {
+        fn compute_descriptor(
+            &mut self,
+            _frame: &Frame,
+        ) -> Result<crate::loop_closure::GlobalDescriptor, InferenceError> {
+            Err(InferenceError::Frame(
+                crate::FrameError::DimensionMismatch {
+                    expected: 16 * 12,
+                    actual: 0,
+                },
+            ))
         }
     }
 
@@ -6216,6 +6252,49 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_worker_failure_preserves_inference_source_chain() {
+        let worker = DescriptorWorker::spawn_with_extractor(
+            GlobalDescriptorConfig::new(1).expect("config"),
+            Box::new(FailingDescriptorExtractor),
+        )
+        .expect("spawn descriptor worker");
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(78),
+            Timestamp::from_nanos(78),
+            16,
+            12,
+            vec![128_u8; 16 * 12],
+        )
+        .expect("frame");
+        worker
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: test_map_snapshot(),
+                frame,
+            })
+            .expect("submit descriptor request");
+
+        let mut failure = None;
+        for _ in 0..50 {
+            match worker.try_recv() {
+                Ok(Some(DescriptorWorkerResponse::Failure { error, .. })) => {
+                    failure = Some(error);
+                    break;
+                }
+                Ok(Some(other)) => panic!("unexpected descriptor worker response: {other:?}"),
+                Ok(None) => {}
+                Err(()) => panic!("descriptor worker disconnected"),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let failure = failure.expect("descriptor failure response");
+        let frame = failure.source().expect("frame source");
+        assert_eq!(frame.to_string(), "dimension mismatch: expected 192, got 0");
+    }
+
+    #[test]
     fn descriptor_supervisor_recovers_after_worker_panic() {
         let config = GlobalDescriptorConfig::new(2).expect("config");
         let spawn_count = Arc::new(AtomicUsize::new(0));
@@ -6229,9 +6308,9 @@ mod tests {
             Arc::new(move || {
                 let spawn_idx = spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
                 if spawn_idx == 0 {
-                    Some(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
+                    Ok(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
                 } else {
-                    Some(Box::new(StubDescriptorExtractor {
+                    Ok(Box::new(StubDescriptorExtractor {
                         descriptor: descriptor.clone(),
                         calls: Arc::clone(&calls),
                     }) as Box<dyn PlaceDescriptorExtractor>)
@@ -6320,9 +6399,11 @@ mod tests {
             Arc::new(move || {
                 let spawn_idx = spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
                 if spawn_idx == 0 {
-                    None
+                    Err(DescriptorInitError::ModelMissing {
+                        path: "transient-test-model.onnx".into(),
+                    })
                 } else {
-                    Some(Box::new(StubDescriptorExtractor {
+                    Ok(Box::new(StubDescriptorExtractor {
                         descriptor: descriptor.clone(),
                         calls: Arc::clone(&calls),
                     }) as Box<dyn PlaceDescriptorExtractor>)

@@ -134,7 +134,7 @@ pub use pairing::{
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
-pub use place_recognition::DescriptorStats;
+pub use place_recognition::{DescriptorInitError, DescriptorStats};
 pub use pnp::{
     IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpRefinementFallback,
     PnpRefinementStatus, PnpRefinementTermination, PnpResult, Pose, RansacConfig,

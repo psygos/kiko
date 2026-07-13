@@ -571,6 +571,16 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             format!("descriptor worker died (respawns={respawn_count})"),
             rerun::TextLogLevel::ERROR,
         ),
+        DiagnosticEvent::DescriptorInferenceFailed {
+            keyframe_id,
+            source_snapshot,
+            error,
+        } => (
+            format!(
+                "descriptor inference failed (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
+            ),
+            rerun::TextLogLevel::ERROR,
+        ),
         DiagnosticEvent::RelocalizationStarted => (
             "relocalization started".to_string(),
             rerun::TextLogLevel::WARN,
@@ -1092,6 +1102,13 @@ mod tests {
         });
         let _ = format_event(&DiagnosticEvent::BackendWorkerDied { respawn_count: 1 });
         let _ = format_event(&DiagnosticEvent::DescriptorWorkerDied { respawn_count: 1 });
+        let _ = format_event(&DiagnosticEvent::DescriptorInferenceFailed {
+            keyframe_id: crate::KeyframeId::default(),
+            source_snapshot: crate::map::SlamMap::new().snapshot(),
+            error: std::sync::Arc::new(crate::InferenceError::InvariantViolation {
+                context: "test descriptor failure",
+            }),
+        });
         let _ = format_event(&DiagnosticEvent::RelocalizationStarted);
         let _ = format_event(&DiagnosticEvent::RelocalizationSucceeded {
             keyframe_id: crate::map::KeyframeId::default(),

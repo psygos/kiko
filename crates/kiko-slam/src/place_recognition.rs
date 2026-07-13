@@ -8,7 +8,10 @@ use crate::loop_closure::{
     RelocalizationMatch, aggregate_global_descriptor,
 };
 use crate::map::KeyframeId;
-use crate::{Detections, EigenPlaces, Frame, GlobalDescriptorConfig, PlaceDescriptorExtractor};
+use crate::{
+    Detections, EigenPlaces, Frame, GlobalDescriptorConfig, InferenceError,
+    PlaceDescriptorExtractor,
+};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::MapSnapshot;
@@ -45,13 +48,13 @@ pub(crate) struct DescriptorResponse {
     pub(crate) descriptor: GlobalDescriptor,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum DescriptorWorkerResponse {
     Descriptor(Box<DescriptorResponse>),
     Failure {
         keyframe_id: KeyframeId,
         source_snapshot: MapSnapshot,
-        error: String,
+        error: InferenceError,
     },
     WorkerPanic {
         keyframe_id: KeyframeId,
@@ -67,7 +70,49 @@ pub(crate) enum SubmitDescriptorError {
 }
 
 pub(crate) type DescriptorExtractorFactory =
-    Arc<dyn Fn() -> Option<Box<dyn PlaceDescriptorExtractor>> + Send + Sync>;
+    Arc<dyn Fn() -> Result<Box<dyn PlaceDescriptorExtractor>, DescriptorInitError> + Send + Sync>;
+
+#[derive(Debug)]
+pub enum DescriptorInitError {
+    ModelMissing {
+        path: PathBuf,
+    },
+    ModelLoad {
+        path: PathBuf,
+        source: InferenceError,
+    },
+    WorkerThread {
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for DescriptorInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ModelMissing { path } => {
+                write!(f, "descriptor model does not exist at {}", path.display())
+            }
+            Self::ModelLoad { path, source } => write!(
+                f,
+                "failed to initialize descriptor model at {}: {source}",
+                path.display()
+            ),
+            Self::WorkerThread { source } => {
+                write!(f, "failed to spawn descriptor worker thread: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DescriptorInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ModelLoad { source, .. } => Some(source),
+            Self::WorkerThread { source } => Some(source),
+            Self::ModelMissing { .. } => None,
+        }
+    }
+}
 
 pub(crate) struct DescriptorWorker {
     tx: Sender<DescriptorRequest>,
@@ -77,8 +122,8 @@ pub(crate) struct DescriptorWorker {
 
 impl DescriptorWorker {
     fn model_path() -> PathBuf {
-        if let Ok(path) = std::env::var("KIKO_EIGENPLACES_MODEL") {
-            return PathBuf::from(path);
+        if let Some(path) = std::env::var_os("KIKO_EIGENPLACES_MODEL") {
+            return path.into();
         }
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models")
@@ -110,7 +155,7 @@ impl DescriptorWorker {
                         Ok(Err(err)) => DescriptorWorkerResponse::Failure {
                             keyframe_id: request.keyframe_id,
                             source_snapshot: request.source_snapshot,
-                            error: err.to_string(),
+                            error: err,
                         },
                         Err(payload) => DescriptorWorkerResponse::WorkerPanic {
                             keyframe_id: request.keyframe_id,
@@ -173,33 +218,42 @@ impl DescriptorSupervisor {
     fn default_factory() -> DescriptorExtractorFactory {
         Arc::new(|| {
             let path = DescriptorWorker::model_path();
-            match EigenPlaces::try_load(path, crate::InferenceBackend::auto()) {
-                Ok(Some(extractor)) => {
-                    Some(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>)
-                }
-                Ok(None) => None,
-                Err(err) => {
-                    eprintln!("failed to initialize eigenplaces descriptor extractor: {err}");
-                    None
-                }
-            }
+            let extractor = EigenPlaces::try_load(&path, crate::InferenceBackend::auto())
+                .map_err(|source| DescriptorInitError::ModelLoad {
+                    path: path.clone(),
+                    source,
+                })?
+                .ok_or_else(|| DescriptorInitError::ModelMissing { path })?;
+            Ok(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>)
         })
     }
 
-    fn spawn_with_max_respawns(config: GlobalDescriptorConfig, max_respawns: u32) -> Self {
-        Self::with_factory_and_max_respawns(config, Self::default_factory(), max_respawns)
+    fn spawn_with_max_respawns(
+        config: GlobalDescriptorConfig,
+        max_respawns: u32,
+    ) -> Result<Self, DescriptorInitError> {
+        let factory = Self::default_factory();
+        let worker = Self::spawn_worker(config, &factory)?;
+        Ok(Self {
+            worker: Some(worker),
+            config,
+            factory,
+            respawn_count: 0,
+            max_respawns,
+            spawn_exhausted: false,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_factory_and_max_respawns(
         config: GlobalDescriptorConfig,
         factory: DescriptorExtractorFactory,
         max_respawns: u32,
     ) -> Self {
-        let worker = Self::spawn_worker(config, &factory);
+        let worker = Self::spawn_worker(config, &factory)
+            .inspect_err(|error| eprintln!("descriptor worker unavailable: {error}"))
+            .ok();
         let spawn_exhausted = worker.is_none() && max_respawns == 0;
-        if worker.is_none() {
-            eprintln!("descriptor model unavailable; using bootstrap descriptors only");
-        }
         Self {
             worker,
             config,
@@ -213,15 +267,10 @@ impl DescriptorSupervisor {
     fn spawn_worker(
         config: GlobalDescriptorConfig,
         factory: &DescriptorExtractorFactory,
-    ) -> Option<DescriptorWorker> {
+    ) -> Result<DescriptorWorker, DescriptorInitError> {
         let extractor = factory()?;
-        match DescriptorWorker::spawn(config, extractor) {
-            Ok(worker) => Some(worker),
-            Err(err) => {
-                eprintln!("failed to spawn descriptor worker thread: {err}");
-                None
-            }
-        }
+        DescriptorWorker::spawn(config, extractor)
+            .map_err(|source| DescriptorInitError::WorkerThread { source })
     }
 
     fn check_health(&mut self) {
@@ -242,7 +291,9 @@ impl DescriptorSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        self.worker = Self::spawn_worker(self.config, &self.factory);
+        self.worker = Self::spawn_worker(self.config, &self.factory)
+            .inspect_err(|error| eprintln!("descriptor worker respawn failed: {error}"))
+            .ok();
         self.respawn_count = self.respawn_count.saturating_add(1);
         if self.worker.is_none() {
             if self.respawn_count >= self.max_respawns {
@@ -252,7 +303,7 @@ impl DescriptorSupervisor {
                     self.max_respawns
                 );
             } else {
-                eprintln!("descriptor worker respawn failed; will retry");
+                eprintln!("descriptor worker remains unavailable; will retry");
             }
         }
     }
@@ -303,12 +354,12 @@ impl DescriptorSupervisor {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum PlaceRecognitionEvent {
     WorkerFailure {
         keyframe_id: KeyframeId,
         source_snapshot: MapSnapshot,
-        error: String,
+        error: InferenceError,
     },
     WorkerPanic {
         keyframe_id: KeyframeId,
@@ -317,25 +368,6 @@ pub(crate) enum PlaceRecognitionEvent {
         respawn_count: u32,
     },
 }
-
-#[derive(Debug)]
-pub(crate) enum PlaceRecognitionInitError {
-    DescriptorUnavailable { model_path: PathBuf },
-}
-
-impl std::fmt::Display for PlaceRecognitionInitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PlaceRecognitionInitError::DescriptorUnavailable { model_path } => write!(
-                f,
-                "loop closure requires learned descriptors but descriptor worker failed to start (model: {})",
-                model_path.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for PlaceRecognitionInitError {}
 
 pub(crate) struct PlaceRecognition {
     database: KeyframeDatabase,
@@ -351,14 +383,9 @@ impl PlaceRecognition {
         loop_config: LoopClosureConfig,
         descriptor_config: GlobalDescriptorConfig,
         max_respawns: u32,
-    ) -> Result<Self, PlaceRecognitionInitError> {
+    ) -> Result<Self, DescriptorInitError> {
         let descriptor_worker =
-            DescriptorSupervisor::spawn_with_max_respawns(descriptor_config, max_respawns);
-        if !descriptor_worker.has_worker() {
-            return Err(PlaceRecognitionInitError::DescriptorUnavailable {
-                model_path: DescriptorWorker::model_path(),
-            });
-        }
+            DescriptorSupervisor::spawn_with_max_respawns(descriptor_config, max_respawns)?;
         Ok(Self {
             database: KeyframeDatabase::new(loop_config.temporal_gap()),
             descriptor_worker,
