@@ -188,7 +188,13 @@ fn coreml_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError
         if !ep.supported_by_platform() {
             return Ok(None);
         }
-        if !ep.is_available().map_err(InferenceError::Execution)? {
+        if !ep
+            .is_available()
+            .map_err(|source| InferenceError::BackendProbe {
+                backend: InferenceBackend::CoreMLGpu,
+                source,
+            })?
+        {
             return Ok(None);
         }
         Ok(Some(ep.build()))
@@ -241,7 +247,13 @@ fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> 
         if !ep.supported_by_platform() {
             return Ok(None);
         }
-        if !ep.is_available().map_err(InferenceError::Execution)? {
+        if !ep
+            .is_available()
+            .map_err(|source| InferenceError::BackendProbe {
+                backend: InferenceBackend::Cuda,
+                source,
+            })?
+        {
             return Ok(None);
         }
         Ok(Some(ep.build()))
@@ -293,7 +305,13 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
         if !ep.supported_by_platform() {
             return Ok(None);
         }
-        if !ep.is_available().map_err(InferenceError::Execution)? {
+        if !ep
+            .is_available()
+            .map_err(|source| InferenceError::BackendProbe {
+                backend: InferenceBackend::TensorRT,
+                source,
+            })?
+        {
             return Ok(None);
         }
         Ok(Some(ep.build()))

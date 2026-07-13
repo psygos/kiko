@@ -52,11 +52,27 @@ impl LightGlue {
         let desc_1 = dec_2.descriptors_flat();
 
         let kpts_0_tensor =
-            TensorRef::from_array_view(([1, dec_1.len(), 2], self.keypoints_0.as_slice()))?;
+            TensorRef::from_array_view(([1, dec_1.len(), 2], self.keypoints_0.as_slice()))
+                .map_err(|source| InferenceError::InputTensor {
+                    name: "kpts0",
+                    source,
+                })?;
         let kpts_1_tensor =
-            TensorRef::from_array_view(([1, dec_2.len(), 2], self.keypoints_1.as_slice()))?;
-        let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), DESCRIPTOR_DIM], desc_0))?;
-        let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), DESCRIPTOR_DIM], desc_1))?;
+            TensorRef::from_array_view(([1, dec_2.len(), 2], self.keypoints_1.as_slice()))
+                .map_err(|source| InferenceError::InputTensor {
+                    name: "kpts1",
+                    source,
+                })?;
+        let desc_0_tensor = TensorRef::from_array_view(([1, dec_1.len(), DESCRIPTOR_DIM], desc_0))
+            .map_err(|source| InferenceError::InputTensor {
+                name: "desc0",
+                source,
+            })?;
+        let desc_1_tensor = TensorRef::from_array_view(([1, dec_2.len(), DESCRIPTOR_DIM], desc_1))
+            .map_err(|source| InferenceError::InputTensor {
+                name: "desc1",
+                source,
+            })?;
 
         let mut indices = Vec::new();
         let mut scores = Vec::new();
@@ -67,25 +83,30 @@ impl LightGlue {
                 || {
                     self.session
                     .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
-                    .map_err(InferenceError::Execution)
+                    .map_err(|source| InferenceError::SessionRun {
+                        model: "lightglue",
+                        source,
+                    })
                 },
             )?;
-            let matches_raw = outputs
-                .get("matches0")
-                .ok_or_else(|| InferenceError::UnexpectedOutput {
-                    name: "matches0".to_string(),
-                    expected: "named output tensor".to_string(),
-                    actual: "missing output".to_string(),
-                })?
-                .try_extract_tensor::<i64>()?;
-            let scores_raw = outputs
-                .get("mscores0")
-                .ok_or_else(|| InferenceError::UnexpectedOutput {
-                    name: "mscores0".to_string(),
-                    expected: "named output tensor".to_string(),
-                    actual: "missing output".to_string(),
-                })?
-                .try_extract_tensor::<f32>()?;
+            let matches_value =
+                outputs
+                    .get("matches0")
+                    .ok_or_else(|| InferenceError::UnexpectedOutput {
+                        name: "matches0".to_string(),
+                        expected: "named output tensor".to_string(),
+                        actual: "missing output".to_string(),
+                    })?;
+            let scores_value =
+                outputs
+                    .get("mscores0")
+                    .ok_or_else(|| InferenceError::UnexpectedOutput {
+                        name: "mscores0".to_string(),
+                        expected: "named output tensor".to_string(),
+                        actual: "missing output".to_string(),
+                    })?;
+            let matches_raw = super::extract_tensor::<i64>(matches_value, "matches0")?;
+            let scores_raw = super::extract_tensor::<f32>(scores_value, "mscores0")?;
             let matches_shape = matches_raw.0;
             let matches_data = matches_raw.1;
             let scores_data = scores_raw.1;

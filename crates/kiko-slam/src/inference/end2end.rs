@@ -1,5 +1,5 @@
 use super::{InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session};
-use crate::{Descriptor, Detections, Frame, Keypoint, Matches, Raw};
+use crate::{Descriptor, Detections, Frame, FrameDimensions, Keypoint, Matches, Raw};
 use ort::session::Session;
 use ort::value::TensorRef;
 use std::path::Path;
@@ -45,22 +45,31 @@ impl End2EndPipeline {
         right: &Frame,
         max_keypoints: usize,
     ) -> Result<(Matches<Raw>, End2EndTimings), InferenceError> {
-        let w = left.width() as usize;
-        let h = left.height() as usize;
-        let pixels = w * h;
+        let dimensions = left.dimensions();
+        let batch_elements = stereo_batch_element_count(dimensions, right.dimensions())?;
+        let w = dimensions.width() as usize;
+        let h = dimensions.height() as usize;
+        let pixels = dimensions.area();
 
         // Prepare batch input: [2, 1, H, W] — both images concatenated
-        self.scratch.resize(2 * pixels, 0.0);
+        self.scratch.resize(batch_elements, 0.0);
         crate::preprocess::normalise_into(left.data(), &mut self.scratch[..pixels])?;
         crate::preprocess::normalise_into(right.data(), &mut self.scratch[pixels..])?;
 
-        let input_tensor = TensorRef::from_array_view(([2, 1, h, w], self.scratch.as_slice()))?;
+        let input_tensor = TensorRef::from_array_view(([2, 1, h, w], self.scratch.as_slice()))
+            .map_err(|source| InferenceError::InputTensor {
+                name: "images",
+                source,
+            })?;
 
         let start = Instant::now();
         let outputs = super::run_with_slow_call_diagnostics(self.diagnostics, "pipeline", || {
             self.session
                 .run(ort::inputs!["images" => input_tensor])
-                .map_err(InferenceError::Execution)
+                .map_err(|source| InferenceError::SessionRun {
+                    model: "end-to-end-superpoint-lightglue",
+                    source,
+                })
         })?;
         let total = start.elapsed();
 
@@ -112,6 +121,21 @@ impl End2EndPipeline {
     }
 }
 
+fn stereo_batch_element_count(
+    left: FrameDimensions,
+    right: FrameDimensions,
+) -> Result<usize, InferenceError> {
+    if left != right {
+        return Err(InferenceError::StereoInputDimensionsMismatch { left, right });
+    }
+    left.area()
+        .checked_mul(2)
+        .ok_or(InferenceError::InputBatchSizeOverflow {
+            dimensions: left,
+            batch_size: 2,
+        })
+}
+
 struct ParsedPipelineOutputs {
     left_keypoints: Vec<Keypoint>,
     right_keypoints: Vec<Keypoint>,
@@ -123,33 +147,25 @@ fn parse_stereo_fused_outputs(
     outputs: &ort::session::SessionOutputs<'_>,
     max_keypoints: usize,
 ) -> Result<ParsedPipelineOutputs, InferenceError> {
-    let left_data = outputs
+    let left_value = outputs
         .get("keypoints0")
-        .ok_or_else(|| missing_output("keypoints0"))?
-        .try_extract_tensor::<i64>()?
-        .1
-        .to_vec();
-    let right_data = outputs
+        .ok_or_else(|| missing_output("keypoints0"))?;
+    let right_value = outputs
         .get("keypoints1")
-        .ok_or_else(|| missing_output("keypoints1"))?
-        .try_extract_tensor::<i64>()?
-        .1
-        .to_vec();
-    let matches_data = outputs
+        .ok_or_else(|| missing_output("keypoints1"))?;
+    let matches_value = outputs
         .get("matches0")
-        .ok_or_else(|| missing_output("matches0"))?
-        .try_extract_tensor::<i64>()?
-        .1
-        .to_vec();
-    let scores_data = outputs
+        .ok_or_else(|| missing_output("matches0"))?;
+    let scores_value = outputs
         .get("mscores0")
-        .ok_or_else(|| missing_output("mscores0"))?
-        .try_extract_tensor::<f32>()?
-        .1
-        .to_vec();
+        .ok_or_else(|| missing_output("mscores0"))?;
+    let left_data = super::extract_tensor::<i64>(left_value, "keypoints0")?.1;
+    let right_data = super::extract_tensor::<i64>(right_value, "keypoints1")?.1;
+    let matches_data = super::extract_tensor::<i64>(matches_value, "matches0")?.1;
+    let scores_data = super::extract_tensor::<f32>(scores_value, "mscores0")?.1;
 
-    let left_keypoints = parse_keypoints_i64_xy(&left_data, max_keypoints, "keypoints0")?;
-    let right_keypoints = parse_keypoints_i64_xy(&right_data, max_keypoints, "keypoints1")?;
+    let left_keypoints = parse_keypoints_i64_xy(left_data, max_keypoints, "keypoints0")?;
+    let right_keypoints = parse_keypoints_i64_xy(right_data, max_keypoints, "keypoints1")?;
     let left_output_count = left_data.len() / 2;
     let right_output_count = right_data.len() / 2;
     let match_count = super::output_record_count("matches0", matches_data.len(), 2)?;
@@ -181,24 +197,18 @@ fn parse_legacy_pipeline_outputs(
     outputs: &ort::session::SessionOutputs<'_>,
     max_keypoints: usize,
 ) -> Result<ParsedPipelineOutputs, InferenceError> {
-    let kpts_data = outputs
+    let keypoints_value = outputs
         .get("keypoints")
-        .ok_or_else(|| missing_output("keypoints"))?
-        .try_extract_tensor::<i64>()?
-        .1
-        .to_vec();
-    let matches_data = outputs
+        .ok_or_else(|| missing_output("keypoints"))?;
+    let matches_value = outputs
         .get("matches")
-        .ok_or_else(|| missing_output("matches"))?
-        .try_extract_tensor::<i64>()?
-        .1
-        .to_vec();
-    let scores_data = outputs
+        .ok_or_else(|| missing_output("matches"))?;
+    let scores_value = outputs
         .get("mscores")
-        .ok_or_else(|| missing_output("mscores"))?
-        .try_extract_tensor::<f32>()?
-        .1
-        .to_vec();
+        .ok_or_else(|| missing_output("mscores"))?;
+    let kpts_data = super::extract_tensor::<i64>(keypoints_value, "keypoints")?.1;
+    let matches_data = super::extract_tensor::<i64>(matches_value, "matches")?.1;
+    let scores_data = super::extract_tensor::<f32>(scores_value, "mscores")?.1;
 
     let kpts_per_image = super::output_record_count("keypoints", kpts_data.len(), 4)?;
     let left_data = &kpts_data[..kpts_per_image * 2];
@@ -247,8 +257,8 @@ fn parse_keypoints_i64_xy(
     let mut keypoints = Vec::with_capacity(count);
     for i in 0..count {
         keypoints.push(Keypoint {
-            x: data[2 * i] as f32,
-            y: data[2 * i + 1] as f32,
+            x: super::exact_i64_output_f32(output_name, 2 * i, data[2 * i])?,
+            y: super::exact_i64_output_f32(output_name, 2 * i + 1, data[2 * i + 1])?,
         });
     }
     Ok(keypoints)
@@ -279,4 +289,44 @@ fn require_index(name: &str, index: usize, available: usize) -> Result<(), Infer
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stereo_batch_element_count;
+    use crate::{FrameDimensions, InferenceError};
+
+    #[test]
+    fn stereo_batch_layout_rejects_dimension_mismatch_before_buffer_mutation() {
+        let left = FrameDimensions::try_new(640, 480).expect("left dimensions");
+        let right = FrameDimensions::try_new(320, 240).expect("right dimensions");
+        assert!(matches!(
+            stereo_batch_element_count(left, right),
+            Err(InferenceError::StereoInputDimensionsMismatch {
+                left: actual_left,
+                right: actual_right,
+            }) if actual_left == left && actual_right == right
+        ));
+    }
+
+    #[test]
+    fn stereo_batch_layout_uses_checked_capacity_arithmetic() {
+        let dimensions = FrameDimensions::try_new(640, 480).expect("dimensions");
+        assert_eq!(
+            stereo_batch_element_count(dimensions, dimensions).expect("batch elements"),
+            2 * 640 * 480
+        );
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let huge = FrameDimensions::try_new(u32::MAX, u32::MAX).expect("64-bit dimensions");
+            assert!(matches!(
+                stereo_batch_element_count(huge, huge),
+                Err(InferenceError::InputBatchSizeOverflow {
+                    dimensions,
+                    batch_size: 2,
+                }) if dimensions == huge
+            ));
+        }
+    }
 }

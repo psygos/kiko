@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use ort::session::Session;
-use ort::value::TensorRef;
+use ort::value::{TensorElementType, TensorRef, ValueType};
 
 use crate::Frame;
 use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
@@ -64,14 +64,21 @@ impl EigenPlaces {
         let input_tensor = TensorRef::from_array_view((
             [1, INPUT_CHANNELS, INPUT_SIZE, INPUT_SIZE],
             self.scratch.as_slice(),
-        ))?;
+        ))
+        .map_err(|source| InferenceError::InputTensor {
+            name: "input",
+            source,
+        })?;
 
         // EigenPlaces ONNX exports use `input` for the image tensor.
         let outputs =
             super::run_with_slow_call_diagnostics(self.diagnostics, "eigenplaces", || {
                 self.session
                     .run(ort::inputs!["input" => input_tensor])
-                    .map_err(InferenceError::Execution)
+                    .map_err(|source| InferenceError::SessionRun {
+                        model: "eigenplaces",
+                        source,
+                    })
             })?;
 
         let raw_descriptor = extract_single_f32_output(&outputs)?;
@@ -110,9 +117,16 @@ fn extract_single_f32_output(
 ) -> Result<Vec<f32>, InferenceError> {
     let mut found: Option<(String, Vec<f32>)> = None;
     for (name, value) in outputs.iter() {
-        let Ok((_, data)) = value.try_extract_tensor::<f32>() else {
+        if !matches!(
+            value.dtype(),
+            ValueType::Tensor {
+                ty: TensorElementType::Float32,
+                ..
+            }
+        ) {
             continue;
-        };
+        }
+        let (_, data) = super::extract_tensor::<f32>(&value, name)?;
         if let Some((previous, _)) = &found {
             return Err(InferenceError::UnexpectedOutput {
                 name: "eigenplaces-output".to_string(),

@@ -1,8 +1,9 @@
 use super::{
     InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session, inference_env,
 };
-use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
+use crate::{Descriptor, Detections, DownscaleFactor, Frame, FrameDimensions, Keypoint};
 use ort::session::Session;
+use ort::value::Outlet;
 use ort::value::PrimitiveTensorElementType;
 use ort::value::TensorElementType;
 use ort::value::TensorRef;
@@ -27,8 +28,14 @@ pub struct SuperPoint {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SuperPointModelKind {
-    SparseOutputs,
+    SparseOutputs(SparseKeypointKind),
     DenseHeads,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SparseKeypointKind {
+    Float32,
+    Int64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,26 +62,8 @@ impl SuperPoint {
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let (session, selected, diagnostics) = build_session(path, backend)?;
-        let kind = if session
-            .outputs()
-            .iter()
-            .any(|output| output.name() == "dense_scores")
-            && session
-                .outputs()
-                .iter()
-                .any(|output| output.name() == "dense_descriptors")
-        {
-            SuperPointModelKind::DenseHeads
-        } else {
-            SuperPointModelKind::SparseOutputs
-        };
-        let input_kind = match session.inputs().first().map(|input| input.dtype()) {
-            Some(ValueType::Tensor {
-                ty: TensorElementType::Uint8,
-                ..
-            }) => SuperPointInputKind::Uint8,
-            _ => SuperPointInputKind::Float32,
-        };
+        let (kind, input_kind) =
+            parse_superpoint_model_interface(session.inputs(), session.outputs())?;
         let dense_candidate_cap =
             inference_env(crate::env::try_env_usize("KIKO_SUPERPOINT_DENSE_CAP"))?
                 .map(|value| {
@@ -114,21 +103,24 @@ impl SuperPoint {
     ) -> Result<Detections, InferenceError> {
         match self.input_kind {
             SuperPointInputKind::Float32 => {
-                let expected = (frame.width() as usize) * (frame.height() as usize);
+                let expected = frame.dimensions().area();
                 self.scratch.resize(expected, 0.0);
                 crate::preprocess::normalise_into(frame.data(), &mut self.scratch)?;
 
                 let input_tensor = TensorRef::from_array_view((
                     [1, 1, frame.height() as usize, frame.width() as usize],
                     self.scratch.as_slice(),
-                ))?;
+                ))
+                .map_err(|source| InferenceError::InputTensor {
+                    name: "image",
+                    source,
+                })?;
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
                     frame,
                     input_tensor,
-                    frame.width(),
-                    frame.height(),
+                    frame.dimensions(),
                     None,
                     &mut self.candidates,
                     &mut self.dense_score_map,
@@ -141,14 +133,17 @@ impl SuperPoint {
                 let input_tensor = TensorRef::from_array_view((
                     [1, 1, frame.height() as usize, frame.width() as usize],
                     frame.data(),
-                ))?;
+                ))
+                .map_err(|source| InferenceError::InputTensor {
+                    name: "image",
+                    source,
+                })?;
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
                     frame,
                     input_tensor,
-                    frame.width(),
-                    frame.height(),
+                    frame.dimensions(),
                     None,
                     &mut self.candidates,
                     &mut self.dense_score_map,
@@ -197,14 +192,17 @@ impl SuperPoint {
                         dimensions.width() as usize,
                     ],
                     self.scratch.as_slice(),
-                ))?;
+                ))
+                .map_err(|source| InferenceError::InputTensor {
+                    name: "image",
+                    source,
+                })?;
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
                     frame,
                     input_tensor,
-                    dimensions.width(),
-                    dimensions.height(),
+                    dimensions,
                     Some(downscale),
                     &mut self.candidates,
                     &mut self.dense_score_map,
@@ -231,14 +229,17 @@ impl SuperPoint {
                         dimensions.width() as usize,
                     ],
                     self.scratch_u8.as_slice(),
-                ))?;
+                ))
+                .map_err(|source| InferenceError::InputTensor {
+                    name: "image",
+                    source,
+                })?;
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
                     frame,
                     input_tensor,
-                    dimensions.width(),
-                    dimensions.height(),
+                    dimensions,
                     Some(downscale),
                     &mut self.candidates,
                     &mut self.dense_score_map,
@@ -251,6 +252,92 @@ impl SuperPoint {
     }
 }
 
+const SUPERPOINT_INTERFACE_DESCRIPTION: &str = "an image tensor input [1, 1, height, width] (dynamic dimensions allowed) of f32 or u8 and either sparse outputs keypoints:(f32|i64), scores:f32, descriptors:f32 or dense outputs dense_scores:f32, dense_descriptors:f32";
+
+fn parse_superpoint_model_interface(
+    inputs: &[Outlet],
+    outputs: &[Outlet],
+) -> Result<(SuperPointModelKind, SuperPointInputKind), InferenceError> {
+    let input_kind = match inputs
+        .iter()
+        .find(|outlet| outlet.name() == "image")
+        .map(Outlet::dtype)
+    {
+        Some(ValueType::Tensor {
+            ty: TensorElementType::Float32,
+            shape,
+            ..
+        }) if superpoint_input_shape_supported(shape) => SuperPointInputKind::Float32,
+        Some(ValueType::Tensor {
+            ty: TensorElementType::Uint8,
+            shape,
+            ..
+        }) if superpoint_input_shape_supported(shape) => SuperPointInputKind::Uint8,
+        _ => return Err(unsupported_superpoint_interface(inputs, outputs)),
+    };
+
+    let kind = if outlet_tensor_element_type(outputs, "dense_scores")
+        == Some(TensorElementType::Float32)
+        && outlet_tensor_element_type(outputs, "dense_descriptors")
+            == Some(TensorElementType::Float32)
+    {
+        SuperPointModelKind::DenseHeads
+    } else {
+        let keypoint_kind = match outlet_tensor_element_type(outputs, "keypoints") {
+            Some(TensorElementType::Float32) => SparseKeypointKind::Float32,
+            Some(TensorElementType::Int64) => SparseKeypointKind::Int64,
+            _ => return Err(unsupported_superpoint_interface(inputs, outputs)),
+        };
+        if outlet_tensor_element_type(outputs, "scores") != Some(TensorElementType::Float32)
+            || outlet_tensor_element_type(outputs, "descriptors")
+                != Some(TensorElementType::Float32)
+        {
+            return Err(unsupported_superpoint_interface(inputs, outputs));
+        }
+        SuperPointModelKind::SparseOutputs(keypoint_kind)
+    };
+
+    Ok((kind, input_kind))
+}
+
+fn superpoint_input_shape_supported(shape: &ort::value::Shape) -> bool {
+    shape.len() == 4
+        && matches!(shape[0], -1 | 1)
+        && matches!(shape[1], -1 | 1)
+        && (shape[2] == -1 || shape[2] > 0)
+        && (shape[3] == -1 || shape[3] > 0)
+}
+
+fn outlet_tensor_element_type(outlets: &[Outlet], name: &str) -> Option<TensorElementType> {
+    match outlets.iter().find(|outlet| outlet.name() == name)?.dtype() {
+        ValueType::Tensor { ty, .. } => Some(*ty),
+        _ => None,
+    }
+}
+
+fn unsupported_superpoint_interface(inputs: &[Outlet], outputs: &[Outlet]) -> InferenceError {
+    fn describe(outlets: &[Outlet]) -> String {
+        if outlets.is_empty() {
+            return "none".to_string();
+        }
+        outlets
+            .iter()
+            .map(|outlet| format!("{}:{}", outlet.name(), outlet.dtype()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    InferenceError::UnsupportedModelInterface {
+        model: "SuperPoint",
+        expected: SUPERPOINT_INTERFACE_DESCRIPTION,
+        actual: format!(
+            "inputs [{}], outputs [{}]",
+            describe(inputs),
+            describe(outputs)
+        ),
+    }
+}
+
 // Keep the session, frame metadata, tensor, and reusable scratch buffers explicit.
 #[allow(clippy::too_many_arguments)]
 fn run_with_tensor<T>(
@@ -258,8 +345,7 @@ fn run_with_tensor<T>(
     session: &mut Session,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
-    width: u32,
-    height: u32,
+    input_dimensions: FrameDimensions,
     downscale: Option<DownscaleFactor>,
     candidates: &mut Vec<DenseCandidate>,
     dense_score_map: &mut Vec<f32>,
@@ -271,12 +357,12 @@ where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
     match kind {
-        SuperPointModelKind::SparseOutputs => run_sparse_inference(
+        SuperPointModelKind::SparseOutputs(keypoint_kind) => run_sparse_inference(
             session,
             frame,
             input_tensor,
-            width,
-            height,
+            keypoint_kind,
+            input_dimensions,
             downscale,
             diagnostics,
         ),
@@ -284,8 +370,7 @@ where
             session,
             frame,
             input_tensor,
-            width,
-            height,
+            input_dimensions,
             downscale,
             candidates,
             dense_score_map,
@@ -300,8 +385,8 @@ fn run_sparse_inference<T>(
     session: &mut Session,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
-    width: u32,
-    height: u32,
+    keypoint_kind: SparseKeypointKind,
+    input_dimensions: FrameDimensions,
     downscale: Option<DownscaleFactor>,
     diagnostics: InferenceRunDiagnostics,
 ) -> Result<Detections, InferenceError>
@@ -311,7 +396,10 @@ where
     let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
             .run(ort::inputs!["image" => input_tensor])
-            .map_err(InferenceError::Execution)
+            .map_err(|source| InferenceError::SessionRun {
+                model: "superpoint-sparse",
+                source,
+            })
     })?;
 
     let keypoints_value =
@@ -341,26 +429,32 @@ where
     // `ort` may return a null backing pointer for empty tensors; avoid raw extraction in that case.
     let scores = match tensor_num_elements(scores_value, "scores")? {
         0 => Vec::new(),
-        _ => scores_value.try_extract_tensor::<f32>()?.1.to_vec(),
+        _ => super::extract_tensor::<f32>(scores_value, "scores")?
+            .1
+            .to_vec(),
     };
     let keypoints_pairs = match tensor_num_elements(keypoints_value, "keypoints")? {
         0 => Vec::new(),
-        _ => {
-            if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>() {
-                parse_keypoint_pairs(shape, data, "keypoints")?
-            } else if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<i64>() {
-                let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
-                parse_keypoint_pairs(shape, &data_f32, "keypoints")?
-            } else {
-                return Err(InferenceError::UnexpectedOutput {
-                    name: "keypoints".to_string(),
-                    expected: "tensor of f32 or i64".to_string(),
-                    actual: format!("{:?}", keypoints_value.dtype()),
-                });
+        _ => match keypoint_kind {
+            SparseKeypointKind::Float32 => {
+                let (shape, data) = super::extract_tensor::<f32>(keypoints_value, "keypoints")?;
+                parse_keypoint_pairs(shape, data, "keypoints", |index, value| {
+                    finite_keypoint_coordinate("keypoints", index, value)
+                })?
             }
-        }
+            SparseKeypointKind::Int64 => {
+                let (shape, data) = super::extract_tensor::<i64>(keypoints_value, "keypoints")?;
+                parse_keypoint_pairs(shape, data, "keypoints", |index, value| {
+                    super::exact_i64_output_f32("keypoints", index, value)
+                })?
+            }
+        },
     };
-    let mut keypoints = to_keypoints(&keypoints_pairs, width as f32, height as f32);
+    let mut keypoints = to_keypoints(
+        &keypoints_pairs,
+        input_dimensions.width() as f32,
+        input_dimensions.height() as f32,
+    );
     if let Some(scale) = downscale {
         let factor = scale.get() as f32;
         for kp in &mut keypoints {
@@ -371,7 +465,7 @@ where
     let descriptors = match tensor_num_elements(descriptors_value, "descriptors")? {
         0 => Vec::new(),
         _ => {
-            let descriptors_raw = descriptors_value.try_extract_tensor::<f32>()?;
+            let descriptors_raw = super::extract_tensor::<f32>(descriptors_value, "descriptors")?;
             parse_descriptors(descriptors_raw.1, "descriptors")?
         }
     };
@@ -394,8 +488,7 @@ fn run_dense_inference<T>(
     session: &mut Session,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
-    width: u32,
-    height: u32,
+    input_dimensions: FrameDimensions,
     downscale: Option<DownscaleFactor>,
     candidates: &mut Vec<DenseCandidate>,
     dense_score_map: &mut Vec<f32>,
@@ -409,7 +502,10 @@ where
     let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
             .run(ort::inputs!["image" => input_tensor])
-            .map_err(InferenceError::Execution)
+            .map_err(|source| InferenceError::SessionRun {
+                model: "superpoint-dense",
+                source,
+            })
     })?;
 
     let scores_value =
@@ -429,8 +525,9 @@ where
                 actual: "missing output".to_string(),
             })?;
 
-    let (scores_shape, scores_data) = scores_value.try_extract_tensor::<f32>()?;
-    let (desc_shape, desc_data) = descriptors_value.try_extract_tensor::<f32>()?;
+    let (scores_shape, scores_data) = super::extract_tensor::<f32>(scores_value, "dense_scores")?;
+    let (desc_shape, desc_data) =
+        super::extract_tensor::<f32>(descriptors_value, "dense_descriptors")?;
     let (grid_h, grid_w) = dense_scores_shape(scores_shape, scores_data.len())?;
     dense_descriptors_shape(desc_shape, desc_data.len(), grid_h, grid_w)?;
 
@@ -438,8 +535,8 @@ where
         scores_data,
         grid_h,
         grid_w,
-        width,
-        height,
+        input_dimensions.width(),
+        input_dimensions.height(),
         dense_score_map,
         candidates,
     );
@@ -471,8 +568,8 @@ where
             desc_data,
             grid_h,
             grid_w,
-            width,
-            height,
+            input_dimensions.width(),
+            input_dimensions.height(),
             candidate.x as f32,
             candidate.y as f32,
         ));
@@ -739,10 +836,11 @@ enum Normalization {
     NegOneToOne,
 }
 
-fn parse_keypoint_pairs(
+fn parse_keypoint_pairs<T: Copy>(
     shape: &ort::value::Shape,
-    data: &[f32],
+    data: &[T],
     output_name: &str,
+    mut parse_coordinate: impl FnMut(usize, T) -> Result<f32, InferenceError>,
 ) -> Result<Vec<[f32; 2]>, InferenceError> {
     let expected_len = shape.num_elements();
     if expected_len != 0 && expected_len != data.len() {
@@ -767,7 +865,10 @@ fn parse_keypoint_pairs(
 
     if dims.last().copied() == Some(2) {
         for i in 0..count {
-            pairs.push([data[2 * i], data[2 * i + 1]]);
+            pairs.push([
+                parse_coordinate(2 * i, data[2 * i])?,
+                parse_coordinate(2 * i + 1, data[2 * i + 1])?,
+            ]);
         }
         return Ok(pairs);
     }
@@ -775,7 +876,10 @@ fn parse_keypoint_pairs(
     if dims.first().copied() == Some(2) {
         let (first, second) = data.split_at(count);
         for i in 0..count {
-            pairs.push([first[i], second[i]]);
+            pairs.push([
+                parse_coordinate(i, first[i])?,
+                parse_coordinate(count + i, second[i])?,
+            ]);
         }
         return Ok(pairs);
     }
@@ -785,6 +889,22 @@ fn parse_keypoint_pairs(
         expected: "tensor with a leading or trailing dimension of size 2".to_string(),
         actual: format!("{shape}"),
     })
+}
+
+fn finite_keypoint_coordinate(
+    output_name: &str,
+    index: usize,
+    value: f32,
+) -> Result<f32, InferenceError> {
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(InferenceError::UnexpectedOutput {
+            name: output_name.to_string(),
+            expected: "finite keypoint coordinates".to_string(),
+            actual: format!("coordinate {index} is {value}"),
+        })
+    }
 }
 
 fn extract_xy(
@@ -870,6 +990,144 @@ fn scale_coordinate(value: f32, dim: f32, norm: Normalization) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tensor_outlet(name: &str, ty: TensorElementType) -> Outlet {
+        tensor_outlet_with_shape(name, ty, [-1_i64, -1, -1, -1])
+    }
+
+    fn tensor_outlet_with_shape<const N: usize>(
+        name: &str,
+        ty: TensorElementType,
+        shape: [i64; N],
+    ) -> Outlet {
+        Outlet::new(
+            name,
+            ValueType::Tensor {
+                ty,
+                shape: ort::value::Shape::new(shape),
+                dimension_symbols: ort::value::SymbolicDimensions::new(
+                    (0..N).map(|_| String::new()),
+                ),
+            },
+        )
+    }
+
+    #[test]
+    fn superpoint_interface_is_parsed_once_into_supported_kinds() {
+        let float_input = [tensor_outlet("image", TensorElementType::Float32)];
+        let uint8_input = [tensor_outlet("image", TensorElementType::Uint8)];
+        let sparse_i64 = [
+            tensor_outlet("keypoints", TensorElementType::Int64),
+            tensor_outlet("scores", TensorElementType::Float32),
+            tensor_outlet("descriptors", TensorElementType::Float32),
+        ];
+        let sparse_f32 = [
+            tensor_outlet("keypoints", TensorElementType::Float32),
+            tensor_outlet("scores", TensorElementType::Float32),
+            tensor_outlet("descriptors", TensorElementType::Float32),
+        ];
+        let dense = [
+            tensor_outlet("dense_scores", TensorElementType::Float32),
+            tensor_outlet("dense_descriptors", TensorElementType::Float32),
+        ];
+
+        assert_eq!(
+            parse_superpoint_model_interface(&float_input, &sparse_i64).expect("sparse i64"),
+            (
+                SuperPointModelKind::SparseOutputs(SparseKeypointKind::Int64),
+                SuperPointInputKind::Float32
+            )
+        );
+        assert_eq!(
+            parse_superpoint_model_interface(&uint8_input, &sparse_f32).expect("sparse f32"),
+            (
+                SuperPointModelKind::SparseOutputs(SparseKeypointKind::Float32),
+                SuperPointInputKind::Uint8
+            )
+        );
+        assert_eq!(
+            parse_superpoint_model_interface(&float_input, &dense).expect("dense"),
+            (
+                SuperPointModelKind::DenseHeads,
+                SuperPointInputKind::Float32
+            )
+        );
+    }
+
+    #[test]
+    fn superpoint_interface_rejects_missing_partial_and_wrong_typed_models() {
+        let float_input = [tensor_outlet("image", TensorElementType::Float32)];
+        let wrong_input = [tensor_outlet("image", TensorElementType::Int32)];
+        let wrong_shape_input = [tensor_outlet_with_shape(
+            "image",
+            TensorElementType::Float32,
+            [1_i64, 3, -1, -1],
+        )];
+        let sparse = [
+            tensor_outlet("keypoints", TensorElementType::Int64),
+            tensor_outlet("scores", TensorElementType::Float32),
+            tensor_outlet("descriptors", TensorElementType::Float32),
+        ];
+        let partial_dense = [tensor_outlet("dense_scores", TensorElementType::Float32)];
+        let wrong_sparse = [
+            tensor_outlet("keypoints", TensorElementType::Int32),
+            tensor_outlet("scores", TensorElementType::Float32),
+            tensor_outlet("descriptors", TensorElementType::Float32),
+        ];
+
+        for error in [
+            parse_superpoint_model_interface(&[], &sparse).expect_err("missing input"),
+            parse_superpoint_model_interface(&wrong_input, &sparse).expect_err("wrong input"),
+            parse_superpoint_model_interface(&wrong_shape_input, &sparse)
+                .expect_err("wrong input shape"),
+            parse_superpoint_model_interface(&float_input, &partial_dense)
+                .expect_err("partial dense outputs"),
+            parse_superpoint_model_interface(&float_input, &wrong_sparse)
+                .expect_err("wrong sparse keypoints"),
+        ] {
+            assert!(matches!(
+                error,
+                InferenceError::UnsupportedModelInterface {
+                    model: "SuperPoint",
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn sparse_keypoint_parser_preserves_layout_and_rejects_nonfinite_coordinates() {
+        let interleaved_shape = ort::value::Shape::new([2_i64, 2]);
+        let interleaved = parse_keypoint_pairs(
+            &interleaved_shape,
+            &[1.0_f32, 2.0, 3.0, 4.0],
+            "keypoints",
+            |index, value| finite_keypoint_coordinate("keypoints", index, value),
+        )
+        .expect("interleaved pairs");
+        assert_eq!(interleaved, [[1.0, 2.0], [3.0, 4.0]]);
+
+        let planar_shape = ort::value::Shape::new([2_i64, 3]);
+        let planar = parse_keypoint_pairs(
+            &planar_shape,
+            &[1_i64, 2, 3, 4, 5, 6],
+            "keypoints",
+            |index, value| super::super::exact_i64_output_f32("keypoints", index, value),
+        )
+        .expect("planar pairs");
+        assert_eq!(planar, [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]);
+
+        assert!(matches!(
+            parse_keypoint_pairs(
+                &interleaved_shape,
+                &[1.0_f32, f32::NAN, 3.0, 4.0],
+                "keypoints",
+                |index, value| finite_keypoint_coordinate("keypoints", index, value),
+            ),
+            Err(InferenceError::UnexpectedOutput { name, actual, .. })
+                if name == "keypoints" && actual.contains("coordinate 1")
+        ));
+    }
 
     #[test]
     fn parse_descriptors_accepts_complete_chunks() {

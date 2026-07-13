@@ -18,13 +18,50 @@ pub use place::PlaceDescriptorExtractor;
 
 #[derive(Debug)]
 pub enum InferenceError {
+    SessionBuilder {
+        source: OrtError,
+    },
     LoadFailed {
         path: PathBuf,
         source: OrtError,
     },
-
-    Execution(OrtError),
-
+    BackendProbe {
+        backend: InferenceBackend,
+        source: OrtError,
+    },
+    SessionConfiguration {
+        backend: InferenceBackend,
+        source: OrtError,
+    },
+    ExecutionProviderRegistration {
+        backend: InferenceBackend,
+        source: OrtError,
+    },
+    InputTensor {
+        name: &'static str,
+        source: OrtError,
+    },
+    SessionRun {
+        model: &'static str,
+        source: OrtError,
+    },
+    OutputTensor {
+        name: String,
+        source: OrtError,
+    },
+    UnsupportedModelInterface {
+        model: &'static str,
+        expected: &'static str,
+        actual: String,
+    },
+    StereoInputDimensionsMismatch {
+        left: crate::FrameDimensions,
+        right: crate::FrameDimensions,
+    },
+    InputBatchSizeOverflow {
+        dimensions: crate::FrameDimensions,
+        batch_size: usize,
+    },
     UnexpectedOutput {
         name: String,
         expected: String,
@@ -59,9 +96,14 @@ pub enum InferenceError {
 impl std::error::Error for InferenceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            InferenceError::LoadFailed { source, .. } | InferenceError::Execution(source) => {
-                Some(source)
-            }
+            InferenceError::SessionBuilder { source }
+            | InferenceError::LoadFailed { source, .. }
+            | InferenceError::BackendProbe { source, .. }
+            | InferenceError::SessionConfiguration { source, .. }
+            | InferenceError::ExecutionProviderRegistration { source, .. }
+            | InferenceError::InputTensor { source, .. }
+            | InferenceError::SessionRun { source, .. }
+            | InferenceError::OutputTensor { source, .. } => Some(source),
             InferenceError::Frame(source) => Some(source),
             InferenceError::Downscale(source) => Some(source),
             InferenceError::Detection(source) => Some(source),
@@ -70,17 +112,14 @@ impl std::error::Error for InferenceError {
             InferenceError::Environment(source) => Some(source),
             InferenceError::CacheDirectory { source, .. } => Some(source),
             InferenceError::UnexpectedOutput { .. }
+            | InferenceError::UnsupportedModelInterface { .. }
+            | InferenceError::StereoInputDimensionsMismatch { .. }
+            | InferenceError::InputBatchSizeOverflow { .. }
             | InferenceError::BackendUnavailable { .. }
             | InferenceError::InvalidSetting { .. }
             | InferenceError::ThreadPanic { .. }
             | InferenceError::InvariantViolation { .. } => None,
         }
-    }
-}
-
-impl From<OrtError> for InferenceError {
-    fn from(e: OrtError) -> Self {
-        InferenceError::Execution(e)
     }
 }
 
@@ -117,10 +156,60 @@ impl From<crate::loop_closure::GlobalDescriptorError> for InferenceError {
 impl std::fmt::Display for InferenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            InferenceError::SessionBuilder { source } => {
+                write!(f, "failed to create ONNX Runtime session builder: {source}")
+            }
             InferenceError::LoadFailed { path, source } => {
                 write!(f, "failed to load model at {}: {source}", path.display())
             }
-            InferenceError::Execution(e) => write!(f, "execution error: {e}"),
+            InferenceError::BackendProbe { backend, source } => write!(
+                f,
+                "failed to query {backend:?} ONNX Runtime provider availability: {source}"
+            ),
+            InferenceError::SessionConfiguration { backend, source } => write!(
+                f,
+                "failed to configure ONNX Runtime session for {backend:?}: {source}"
+            ),
+            InferenceError::ExecutionProviderRegistration { backend, source } => write!(
+                f,
+                "failed to register the ONNX Runtime provider stack for selected {backend:?} backend: {source}"
+            ),
+            InferenceError::InputTensor { name, source } => write!(
+                f,
+                "failed to construct ONNX Runtime input tensor '{name}': {source}"
+            ),
+            InferenceError::SessionRun { model, source } => {
+                write!(f, "ONNX Runtime model '{model}' execution failed: {source}")
+            }
+            InferenceError::OutputTensor { name, source } => write!(
+                f,
+                "failed to extract ONNX Runtime output tensor '{name}': {source}"
+            ),
+            InferenceError::UnsupportedModelInterface {
+                model,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "unsupported {model} model interface: expected {expected}, got {actual}"
+            ),
+            InferenceError::StereoInputDimensionsMismatch { left, right } => write!(
+                f,
+                "stereo inference requires equal image dimensions, got left={}x{} and right={}x{}",
+                left.width(),
+                left.height(),
+                right.width(),
+                right.height()
+            ),
+            InferenceError::InputBatchSizeOverflow {
+                dimensions,
+                batch_size,
+            } => write!(
+                f,
+                "inference batch of {batch_size} images at {}x{} exceeds addressable memory",
+                dimensions.width(),
+                dimensions.height()
+            ),
             InferenceError::UnexpectedOutput {
                 name,
                 expected,
@@ -201,6 +290,35 @@ pub(super) fn output_record_count(
     Ok(scalar_count / record_width)
 }
 
+pub(super) fn extract_tensor<'value, T: ort::value::PrimitiveTensorElementType>(
+    value: &'value ort::value::DynValue,
+    name: &str,
+) -> Result<(&'value ort::value::Shape, &'value [T]), InferenceError> {
+    value
+        .try_extract_tensor::<T>()
+        .map_err(|source| InferenceError::OutputTensor {
+            name: name.to_string(),
+            source,
+        })
+}
+
+pub(super) fn exact_i64_output_f32(
+    name: &str,
+    index: usize,
+    value: i64,
+) -> Result<f32, InferenceError> {
+    let converted = value as f32;
+    if converted as i128 == i128::from(value) {
+        Ok(converted)
+    } else {
+        Err(InferenceError::UnexpectedOutput {
+            name: name.to_string(),
+            expected: "integer values exactly representable as f32".to_string(),
+            actual: format!("element {index} is {value}"),
+        })
+    }
+}
+
 pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
 
@@ -259,17 +377,18 @@ fn build_session(
     backend: InferenceBackend,
 ) -> Result<(Session, InferenceBackend, InferenceRunDiagnostics), InferenceError> {
     let diagnostics = InferenceRunDiagnostics::try_from_env()?;
-    let mut builder = Session::builder().map_err(|e| InferenceError::LoadFailed {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    let mut builder =
+        Session::builder().map_err(|source| InferenceError::SessionBuilder { source })?;
 
     let selection = backend::select_backend(backend)?;
     builder = apply_session_config(builder, selection.selected())?;
     if !selection.providers().is_empty() {
         builder = builder
             .with_execution_providers(selection.providers())
-            .map_err(|err| InferenceError::Execution(err.into()))?;
+            .map_err(|source| InferenceError::ExecutionProviderRegistration {
+                backend: selection.selected(),
+                source: source.into(),
+            })?;
     }
 
     let session = builder
@@ -322,7 +441,10 @@ fn apply_session_config(
         .and_then(|b| b.with_intra_threads(intra))
         .and_then(|b| b.with_inter_threads(inter))
         .and_then(|b| b.with_parallel_execution(parallel_exec))
-        .map_err(|err| InferenceError::Execution(err.into()))
+        .map_err(|source| InferenceError::SessionConfiguration {
+            backend: selected,
+            source: source.into(),
+        })
 }
 
 fn env_opt_level(key: &'static str) -> Result<Option<GraphOptimizationLevel>, InferenceError> {
@@ -369,7 +491,10 @@ fn invalid_setting(
 
 #[cfg(test)]
 mod tests {
-    use super::{InferenceError, output_record_count, parse_opt_level, require_output_elements};
+    use super::{
+        InferenceError, exact_i64_output_f32, output_record_count, parse_opt_level,
+        require_output_elements,
+    };
 
     #[test]
     fn required_output_elements_rejects_truncated_tensors() {
@@ -405,5 +530,59 @@ mod tests {
             Err(InferenceError::UnexpectedOutput { name, .. }) if name == "matches0"
         ));
         assert_eq!(output_record_count("matches0", 4, 2).expect("pairs"), 2);
+    }
+
+    #[test]
+    fn ort_operation_errors_preserve_source_and_truthful_context() {
+        let errors = [
+            InferenceError::InputTensor {
+                name: "image",
+                source: ort::Error::new("input failure"),
+            },
+            InferenceError::SessionRun {
+                model: "superpoint",
+                source: ort::Error::new("run failure"),
+            },
+            InferenceError::OutputTensor {
+                name: "keypoints".to_string(),
+                source: ort::Error::new("extraction failure"),
+            },
+        ];
+
+        for error in &errors {
+            assert!(std::error::Error::source(&error).is_some());
+        }
+        assert!(errors[0].to_string().contains("input tensor 'image'"));
+        assert!(
+            errors[1]
+                .to_string()
+                .contains("model 'superpoint' execution")
+        );
+        assert!(errors[2].to_string().contains("output tensor 'keypoints'"));
+    }
+
+    #[test]
+    fn i64_to_f32_output_conversion_is_exact_or_rejected() {
+        for value in -10_000_i64..=10_000 {
+            assert_eq!(
+                exact_i64_output_f32("keypoints", 0, value).expect("small integer"),
+                value as f32
+            );
+        }
+        assert_eq!(
+            exact_i64_output_f32("keypoints", 0, 16_777_218).expect("representable even value"),
+            16_777_218.0
+        );
+        assert!(matches!(
+            exact_i64_output_f32("keypoints", 3, 16_777_217),
+            Err(InferenceError::UnexpectedOutput {
+                name,
+                expected,
+                actual,
+            }) if name == "keypoints"
+                && expected.contains("exactly representable")
+                && actual == "element 3 is 16777217"
+        ));
+        assert!(exact_i64_output_f32("keypoints", 0, i64::MAX).is_err());
     }
 }
