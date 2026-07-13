@@ -17,19 +17,6 @@ const IMU_GRAVITY_ENV: &str = "KIKO_IMU_GRAVITY_MPS2";
 const IMU_INITIAL_ACCEL_BIAS_ENV: &str = "KIKO_IMU_INITIAL_ACCEL_BIAS";
 const IMU_INITIAL_GYRO_BIAS_ENV: &str = "KIKO_IMU_INITIAL_GYRO_BIAS";
 
-const DIRECT_ENV_KEYS: [&str; 10] = [
-    IMU_ROTATION_ENV,
-    IMU_TRANSLATION_ENV,
-    IMU_ACCEL_NOISE_ENV,
-    IMU_GYRO_NOISE_ENV,
-    IMU_ACCEL_RW_ENV,
-    IMU_GYRO_RW_ENV,
-    IMU_TIME_OFFSET_ENV,
-    IMU_GRAVITY_ENV,
-    IMU_INITIAL_ACCEL_BIAS_ENV,
-    IMU_INITIAL_GYRO_BIAS_ENV,
-];
-
 #[derive(Debug)]
 pub enum RuntimeImuCalibrationError {
     ConflictingSources {
@@ -53,10 +40,19 @@ pub enum RuntimeImuCalibrationError {
     MissingEnv {
         key: &'static str,
     },
-    InvalidEnvScalar {
+    Environment {
+        source: crate::env::EnvError,
+    },
+    InvalidEnvFloat {
         key: &'static str,
         value: String,
-        message: String,
+        element_index: Option<usize>,
+        source: std::num::ParseFloatError,
+    },
+    InvalidEnvInteger {
+        key: &'static str,
+        value: String,
+        source: std::num::ParseIntError,
     },
     InvalidEnvVector {
         key: &'static str,
@@ -127,13 +123,28 @@ impl std::fmt::Display for RuntimeImuCalibrationError {
                     "{key} is required when runtime IMU env calibration is configured"
                 )
             }
-            Self::InvalidEnvScalar {
+            Self::Environment { source } => {
+                write!(f, "failed to read runtime IMU environment: {source}")
+            }
+            Self::InvalidEnvFloat {
                 key,
                 value,
-                message,
-            } => {
-                write!(f, "failed to parse {key}={value}: {message}")
-            }
+                element_index: None,
+                source,
+            } => write!(f, "failed to parse {key}={value:?} as a float: {source}"),
+            Self::InvalidEnvFloat {
+                key,
+                value,
+                element_index: Some(element_index),
+                source,
+            } => write!(
+                f,
+                "failed to parse zero-based element {element_index} of {key} ({value:?}) as a float: {source}"
+            ),
+            Self::InvalidEnvInteger { key, value, source } => write!(
+                f,
+                "failed to parse {key}={value:?} as an i64 integer: {source}"
+            ),
             Self::InvalidEnvVector {
                 key,
                 expected,
@@ -188,6 +199,9 @@ impl std::error::Error for RuntimeImuCalibrationError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
+            Self::Environment { source } => Some(source),
+            Self::InvalidEnvFloat { source, .. } => Some(source),
+            Self::InvalidEnvInteger { source, .. } => Some(source),
             Self::BasaltInvalidPose { source, .. } => Some(source),
             _ => None,
         }
@@ -207,25 +221,25 @@ pub fn apply_runtime_imu_calibration_override(
 
 pub fn load_runtime_imu_calibration_from_env()
 -> Result<Option<ImuCalibration>, RuntimeImuCalibrationError> {
-    let calibration_file = std::env::var(IMU_CALIBRATION_FILE_ENV).ok();
-    let direct_keys_present = DIRECT_ENV_KEYS
-        .into_iter()
-        .filter(|key| std::env::var(key).is_ok())
-        .collect::<Vec<_>>();
+    let RuntimeImuEnvironment {
+        calibration_file,
+        direct,
+    } = RuntimeImuEnvironment::read()?;
+    let has_direct = direct.has_any();
 
-    if calibration_file.is_some() && !direct_keys_present.is_empty() {
+    if calibration_file.is_some() && has_direct {
         return Err(RuntimeImuCalibrationError::ConflictingSources {
             file_env: IMU_CALIBRATION_FILE_ENV,
-            direct_keys_present,
+            direct_keys_present: direct.present_keys(),
         });
     }
 
     if let Some(path) = calibration_file {
-        return load_runtime_imu_calibration_from_path(Path::new(&path)).map(Some);
+        return load_runtime_imu_calibration_from_path(&path).map(Some);
     }
 
-    if !direct_keys_present.is_empty() {
-        return load_runtime_imu_calibration_from_direct_env().map(Some);
+    if has_direct {
+        return direct.into_calibration().map(Some);
     }
 
     Ok(None)
@@ -279,140 +293,229 @@ fn load_runtime_imu_calibration_from_path(
     })
 }
 
-fn load_runtime_imu_calibration_from_direct_env()
--> Result<ImuCalibration, RuntimeImuCalibrationError> {
-    let rotation = parse_matrix3_env(IMU_ROTATION_ENV)?;
-    let translation = parse_vec3_env(IMU_TRANSLATION_ENV)?;
-    let accel_noise_density = parse_scalar_env(IMU_ACCEL_NOISE_ENV)?;
-    let gyro_noise_density = parse_scalar_env(IMU_GYRO_NOISE_ENV)?;
-    let accel_random_walk = parse_scalar_env(IMU_ACCEL_RW_ENV)?;
-    let gyro_random_walk = parse_scalar_env(IMU_GYRO_RW_ENV)?;
-
-    let initial_accel_bias = match std::env::var(IMU_INITIAL_ACCEL_BIAS_ENV).ok() {
-        Some(_) => Some(parse_vec3_env(IMU_INITIAL_ACCEL_BIAS_ENV)?),
-        None => None,
-    };
-    let initial_gyro_bias = match std::env::var(IMU_INITIAL_GYRO_BIAS_ENV).ok() {
-        Some(_) => Some(parse_vec3_env(IMU_INITIAL_GYRO_BIAS_ENV)?),
-        None => None,
-    };
-    if initial_accel_bias.is_some() != initial_gyro_bias.is_some() {
-        let missing = if initial_accel_bias.is_none() {
-            IMU_INITIAL_ACCEL_BIAS_ENV
-        } else {
-            IMU_INITIAL_GYRO_BIAS_ENV
-        };
-        return Err(RuntimeImuCalibrationError::MissingEnv { key: missing });
-    }
-
-    Ok(ImuCalibration {
-        noise: ImuNoiseMeta {
-            accel_noise_density,
-            gyro_noise_density,
-            accel_random_walk,
-            gyro_random_walk,
-        },
-        extrinsics: ImuExtrinsicsMeta {
-            rotation,
-            translation,
-            time_offset_ns: parse_optional_i64_env(IMU_TIME_OFFSET_ENV)?.unwrap_or(0),
-        },
-        gravity_magnitude_mps2: parse_optional_scalar_env(IMU_GRAVITY_ENV)?.unwrap_or(9.81),
-        initial_accel_bias,
-        initial_gyro_bias,
-    })
+#[derive(Debug)]
+struct RuntimeImuEnvironment {
+    calibration_file: Option<PathBuf>,
+    direct: DirectImuEnvironment,
 }
 
-fn parse_scalar_env(key: &'static str) -> Result<f64, RuntimeImuCalibrationError> {
-    let raw = std::env::var(key).map_err(|_| RuntimeImuCalibrationError::MissingEnv { key })?;
-    parse_scalar_value(key, &raw)
-}
-
-fn parse_optional_scalar_env(key: &'static str) -> Result<Option<f64>, RuntimeImuCalibrationError> {
-    match std::env::var(key) {
-        Ok(raw) => parse_scalar_value(key, &raw).map(Some),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(raw)) => {
-            Err(RuntimeImuCalibrationError::InvalidEnvScalar {
-                key,
-                value: format!("{raw:?}"),
-                message: "value is not valid unicode".to_string(),
-            })
-        }
-    }
-}
-
-fn parse_optional_i64_env(key: &'static str) -> Result<Option<i64>, RuntimeImuCalibrationError> {
-    match std::env::var(key) {
-        Ok(raw) => raw.parse::<i64>().map(Some).map_err(|err| {
-            RuntimeImuCalibrationError::InvalidEnvScalar {
-                key,
-                value: raw,
-                message: err.to_string(),
-            }
-        }),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(std::env::VarError::NotUnicode(raw)) => {
-            Err(RuntimeImuCalibrationError::InvalidEnvScalar {
-                key,
-                value: format!("{raw:?}"),
-                message: "value is not valid unicode".to_string(),
-            })
-        }
-    }
-}
-
-fn parse_scalar_value(key: &'static str, raw: &str) -> Result<f64, RuntimeImuCalibrationError> {
-    raw.parse::<f64>()
-        .map_err(|err| RuntimeImuCalibrationError::InvalidEnvScalar {
-            key,
-            value: raw.to_string(),
-            message: err.to_string(),
+impl RuntimeImuEnvironment {
+    fn read() -> Result<Self, RuntimeImuCalibrationError> {
+        Ok(Self {
+            calibration_file: std::env::var_os(IMU_CALIBRATION_FILE_ENV).map(PathBuf::from),
+            direct: DirectImuEnvironment::read()?,
         })
+    }
 }
 
-fn parse_vec3_env(key: &'static str) -> Result<[f64; 3], RuntimeImuCalibrationError> {
-    let raw = std::env::var(key).map_err(|_| RuntimeImuCalibrationError::MissingEnv { key })?;
-    let values = parse_csv_f64(key, &raw, 3)?;
-    Ok([values[0], values[1], values[2]])
+#[derive(Debug)]
+struct DirectImuEnvironment {
+    rotation: CapturedEnvValue,
+    translation: CapturedEnvValue,
+    accel_noise_density: CapturedEnvValue,
+    gyro_noise_density: CapturedEnvValue,
+    accel_random_walk: CapturedEnvValue,
+    gyro_random_walk: CapturedEnvValue,
+    time_offset_ns: CapturedEnvValue,
+    gravity_magnitude_mps2: CapturedEnvValue,
+    initial_accel_bias: CapturedEnvValue,
+    initial_gyro_bias: CapturedEnvValue,
 }
 
-fn parse_matrix3_env(key: &'static str) -> Result<[[f64; 3]; 3], RuntimeImuCalibrationError> {
-    let raw = std::env::var(key).map_err(|_| RuntimeImuCalibrationError::MissingEnv { key })?;
-    let values = parse_csv_f64(key, &raw, 9)?;
-    Ok([
-        [values[0], values[1], values[2]],
-        [values[3], values[4], values[5]],
-        [values[6], values[7], values[8]],
-    ])
+impl DirectImuEnvironment {
+    fn read() -> Result<Self, RuntimeImuCalibrationError> {
+        Ok(Self {
+            rotation: CapturedEnvValue::read(IMU_ROTATION_ENV)?,
+            translation: CapturedEnvValue::read(IMU_TRANSLATION_ENV)?,
+            accel_noise_density: CapturedEnvValue::read(IMU_ACCEL_NOISE_ENV)?,
+            gyro_noise_density: CapturedEnvValue::read(IMU_GYRO_NOISE_ENV)?,
+            accel_random_walk: CapturedEnvValue::read(IMU_ACCEL_RW_ENV)?,
+            gyro_random_walk: CapturedEnvValue::read(IMU_GYRO_RW_ENV)?,
+            time_offset_ns: CapturedEnvValue::read(IMU_TIME_OFFSET_ENV)?,
+            gravity_magnitude_mps2: CapturedEnvValue::read(IMU_GRAVITY_ENV)?,
+            initial_accel_bias: CapturedEnvValue::read(IMU_INITIAL_ACCEL_BIAS_ENV)?,
+            initial_gyro_bias: CapturedEnvValue::read(IMU_INITIAL_GYRO_BIAS_ENV)?,
+        })
+    }
+
+    fn entries(&self) -> [&CapturedEnvValue; 10] {
+        [
+            &self.rotation,
+            &self.translation,
+            &self.accel_noise_density,
+            &self.gyro_noise_density,
+            &self.accel_random_walk,
+            &self.gyro_random_walk,
+            &self.time_offset_ns,
+            &self.gravity_magnitude_mps2,
+            &self.initial_accel_bias,
+            &self.initial_gyro_bias,
+        ]
+    }
+
+    fn has_any(&self) -> bool {
+        self.entries().into_iter().any(|value| value.is_present())
+    }
+
+    fn present_keys(&self) -> Vec<&'static str> {
+        self.entries()
+            .into_iter()
+            .filter_map(|value| value.is_present().then_some(value.key()))
+            .collect()
+    }
+
+    fn into_calibration(self) -> Result<ImuCalibration, RuntimeImuCalibrationError> {
+        let rotation = parse_required_matrix3(&self.rotation)?;
+        let translation = parse_required_vec3(&self.translation)?;
+        let accel_noise_density = parse_required_f64(&self.accel_noise_density)?;
+        let gyro_noise_density = parse_required_f64(&self.gyro_noise_density)?;
+        let accel_random_walk = parse_required_f64(&self.accel_random_walk)?;
+        let gyro_random_walk = parse_required_f64(&self.gyro_random_walk)?;
+        let time_offset_ns = parse_optional_i64(&self.time_offset_ns)?.unwrap_or(0);
+        let gravity_magnitude_mps2 =
+            parse_optional_f64(&self.gravity_magnitude_mps2)?.unwrap_or(9.81);
+        let initial_accel_bias = parse_optional_vec3(&self.initial_accel_bias)?;
+        let initial_gyro_bias = parse_optional_vec3(&self.initial_gyro_bias)?;
+        if initial_accel_bias.is_some() != initial_gyro_bias.is_some() {
+            let missing = if initial_accel_bias.is_none() {
+                IMU_INITIAL_ACCEL_BIAS_ENV
+            } else {
+                IMU_INITIAL_GYRO_BIAS_ENV
+            };
+            return Err(RuntimeImuCalibrationError::MissingEnv { key: missing });
+        }
+
+        Ok(ImuCalibration {
+            noise: ImuNoiseMeta {
+                accel_noise_density,
+                gyro_noise_density,
+                accel_random_walk,
+                gyro_random_walk,
+            },
+            extrinsics: ImuExtrinsicsMeta {
+                rotation,
+                translation,
+                time_offset_ns,
+            },
+            gravity_magnitude_mps2,
+            initial_accel_bias,
+            initial_gyro_bias,
+        })
+    }
 }
 
-fn parse_csv_f64(
+#[derive(Debug)]
+struct CapturedEnvValue {
     key: &'static str,
-    raw: &str,
-    expected: usize,
-) -> Result<Vec<f64>, RuntimeImuCalibrationError> {
-    let values = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            part.parse::<f64>()
-                .map_err(|err| RuntimeImuCalibrationError::InvalidEnvScalar {
-                    key,
+    raw: Option<String>,
+}
+
+impl CapturedEnvValue {
+    fn read(key: &'static str) -> Result<Self, RuntimeImuCalibrationError> {
+        let raw = crate::env::try_env_string(key)
+            .map_err(|source| RuntimeImuCalibrationError::Environment { source })?;
+        Ok(Self { key, raw })
+    }
+
+    fn key(&self) -> &'static str {
+        self.key
+    }
+
+    fn is_present(&self) -> bool {
+        self.raw.is_some()
+    }
+
+    fn raw(&self) -> Option<&str> {
+        self.raw.as_deref()
+    }
+
+    fn required(&self) -> Result<&str, RuntimeImuCalibrationError> {
+        self.raw()
+            .ok_or(RuntimeImuCalibrationError::MissingEnv { key: self.key })
+    }
+}
+
+fn parse_required_f64(value: &CapturedEnvValue) -> Result<f64, RuntimeImuCalibrationError> {
+    parse_f64(value.key(), value.required()?, None)
+}
+
+fn parse_optional_f64(value: &CapturedEnvValue) -> Result<Option<f64>, RuntimeImuCalibrationError> {
+    value
+        .raw()
+        .map(|raw| parse_f64(value.key(), raw, None))
+        .transpose()
+}
+
+fn parse_optional_i64(value: &CapturedEnvValue) -> Result<Option<i64>, RuntimeImuCalibrationError> {
+    value
+        .raw()
+        .map(|raw| {
+            raw.parse::<i64>()
+                .map_err(|source| RuntimeImuCalibrationError::InvalidEnvInteger {
+                    key: value.key(),
                     value: raw.to_string(),
-                    message: err.to_string(),
+                    source,
                 })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    if values.len() != expected {
+        .transpose()
+}
+
+fn parse_f64(
+    key: &'static str,
+    raw: &str,
+    element_index: Option<usize>,
+) -> Result<f64, RuntimeImuCalibrationError> {
+    raw.parse::<f64>()
+        .map_err(|source| RuntimeImuCalibrationError::InvalidEnvFloat {
+            key,
+            value: raw.to_string(),
+            element_index,
+            source,
+        })
+}
+
+fn parse_csv_f64<const N: usize>(
+    key: &'static str,
+    raw: &str,
+) -> Result<[f64; N], RuntimeImuCalibrationError> {
+    let mut values = [0.0; N];
+    let mut actual = 0_usize;
+    for (element_index, part) in raw.split(',').map(str::trim).enumerate() {
+        let value = parse_f64(key, part, Some(element_index))?;
+        if let Some(slot) = values.get_mut(element_index) {
+            *slot = value;
+        }
+        actual = element_index.saturating_add(1);
+    }
+    if actual != N {
         return Err(RuntimeImuCalibrationError::InvalidEnvVector {
             key,
-            expected,
-            actual: values.len(),
+            expected: N,
+            actual,
         });
     }
     Ok(values)
+}
+
+fn parse_required_vec3(value: &CapturedEnvValue) -> Result<[f64; 3], RuntimeImuCalibrationError> {
+    parse_csv_f64(value.key(), value.required()?)
+}
+
+fn parse_optional_vec3(
+    value: &CapturedEnvValue,
+) -> Result<Option<[f64; 3]>, RuntimeImuCalibrationError> {
+    value
+        .raw()
+        .map(|raw| parse_csv_f64(value.key(), raw))
+        .transpose()
+}
+
+fn parse_required_matrix3(
+    value: &CapturedEnvValue,
+) -> Result<[[f64; 3]; 3], RuntimeImuCalibrationError> {
+    let [m00, m01, m02, m10, m11, m12, m20, m21, m22] =
+        parse_csv_f64(value.key(), value.required()?)?;
+    Ok([[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]])
 }
 
 #[derive(Deserialize)]
@@ -595,6 +698,7 @@ fn rotation_from_quaternion(
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -605,20 +709,119 @@ mod tests {
     fn clear_runtime_imu_env() {
         for key in [
             IMU_CALIBRATION_FILE_ENV,
-            DIRECT_ENV_KEYS[0],
-            DIRECT_ENV_KEYS[1],
-            DIRECT_ENV_KEYS[2],
-            DIRECT_ENV_KEYS[3],
-            DIRECT_ENV_KEYS[4],
-            DIRECT_ENV_KEYS[5],
-            DIRECT_ENV_KEYS[6],
-            DIRECT_ENV_KEYS[7],
-            DIRECT_ENV_KEYS[8],
-            DIRECT_ENV_KEYS[9],
+            IMU_ROTATION_ENV,
+            IMU_TRANSLATION_ENV,
+            IMU_ACCEL_NOISE_ENV,
+            IMU_GYRO_NOISE_ENV,
+            IMU_ACCEL_RW_ENV,
+            IMU_GYRO_RW_ENV,
+            IMU_TIME_OFFSET_ENV,
+            IMU_GRAVITY_ENV,
+            IMU_INITIAL_ACCEL_BIAS_ENV,
+            IMU_INITIAL_GYRO_BIAS_ENV,
         ] {
             // Tests serialize environment mutation with a process-wide mutex.
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[test]
+    fn numeric_env_errors_preserve_the_parser_source() {
+        let invalid_float = CapturedEnvValue {
+            key: IMU_ACCEL_NOISE_ENV,
+            raw: Some("not-a-float".to_string()),
+        };
+        let float_error = parse_required_f64(&invalid_float).expect_err("invalid float must fail");
+        assert!(matches!(
+            &float_error,
+            RuntimeImuCalibrationError::InvalidEnvFloat {
+                key: IMU_ACCEL_NOISE_ENV,
+                element_index: None,
+                ..
+            }
+        ));
+        assert!(float_error.source().is_some());
+
+        let invalid_integer = CapturedEnvValue {
+            key: IMU_TIME_OFFSET_ENV,
+            raw: Some("not-an-integer".to_string()),
+        };
+        let integer_error =
+            parse_optional_i64(&invalid_integer).expect_err("invalid integer must fail");
+        assert!(matches!(
+            &integer_error,
+            RuntimeImuCalibrationError::InvalidEnvInteger {
+                key: IMU_TIME_OFFSET_ENV,
+                ..
+            }
+        ));
+        assert!(integer_error.source().is_some());
+    }
+
+    #[test]
+    fn fixed_vector_parser_rejects_empty_elements_with_exact_provenance() {
+        let invalid_vector = CapturedEnvValue {
+            key: IMU_TRANSLATION_ENV,
+            raw: Some("1,,3".to_string()),
+        };
+        let error = parse_required_vec3(&invalid_vector).expect_err("empty component must fail");
+        assert!(matches!(
+            &error,
+            RuntimeImuCalibrationError::InvalidEnvFloat {
+                key: IMU_TRANSLATION_ENV,
+                value,
+                element_index: Some(1),
+                ..
+            } if value.is_empty()
+        ));
+        assert!(error.source().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_direct_env_is_not_treated_as_absent() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let _guard = env_lock().lock().expect("env lock");
+        clear_runtime_imu_env();
+        // Tests serialize environment mutation with a process-wide mutex.
+        unsafe { std::env::set_var(IMU_ROTATION_ENV, OsString::from_vec(vec![0xff])) };
+
+        let error = load_runtime_imu_calibration_from_env().expect_err("non-Unicode direct value");
+        assert!(matches!(
+            &error,
+            RuntimeImuCalibrationError::Environment {
+                source: crate::env::EnvError::NonUnicode {
+                    key: IMU_ROTATION_ENV,
+                    ..
+                }
+            }
+        ));
+        let environment = error.source().expect("environment source");
+        assert!(environment.source().is_some());
+        clear_runtime_imu_env();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_calibration_file_is_preserved_as_a_path() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let _guard = env_lock().lock().expect("env lock");
+        clear_runtime_imu_env();
+        let raw_path = OsString::from_vec(b"/tmp/kiko-imu-\xff.json".to_vec());
+        let expected_path = PathBuf::from(&raw_path);
+        // Tests serialize environment mutation with a process-wide mutex.
+        unsafe { std::env::set_var(IMU_CALIBRATION_FILE_ENV, raw_path) };
+
+        let error = load_runtime_imu_calibration_from_env().expect_err("missing non-Unicode path");
+        assert!(matches!(
+            error,
+            RuntimeImuCalibrationError::Io { path, .. } if path == expected_path
+        ));
+        clear_runtime_imu_env();
     }
 
     #[test]
