@@ -115,7 +115,7 @@ const PATH_BA_STATIONARY: &str = "diagnostics/ba/stationary";
 const PATH_POSE_BA_ITERATIONS: &str = "diagnostics/pose_ba/iterations";
 const PATH_POSE_BA_CONVERGED: &str = "diagnostics/pose_ba/converged";
 #[cfg(feature = "vio")]
-const PATH_VIO_FINAL_COST: &str = "diagnostics/vio/final_cost";
+const PATH_VIO_FINAL_MIXED_OBJECTIVE: &str = "diagnostics/vio/final_mixed_objective";
 #[cfg(feature = "vio")]
 const PATH_VIO_ATTEMPTED_ITERATIONS: &str = "diagnostics/vio/attempted_iterations";
 #[cfg(feature = "vio")]
@@ -147,15 +147,19 @@ const PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS: &str =
 #[cfg(feature = "vio")]
 const PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE: &str = "diagnostics/vio/calibrated_bias_prior_active";
 #[cfg(feature = "vio")]
-const PATH_VIO_COST_REPROJECTION: &str = "diagnostics/vio/cost/reprojection";
+const PATH_VIO_OBJECTIVE_REPROJECTION_ROBUST_PX2: &str =
+    "diagnostics/vio/objective/reprojection_robust_px2";
 #[cfg(feature = "vio")]
-const PATH_VIO_COST_IMU: &str = "diagnostics/vio/cost/imu";
+const PATH_VIO_OBJECTIVE_IMU_MAHALANOBIS: &str = "diagnostics/vio/objective/imu_mahalanobis";
 #[cfg(feature = "vio")]
-const PATH_VIO_COST_BIAS_RANDOM_WALK: &str = "diagnostics/vio/cost/bias_random_walk";
+const PATH_VIO_OBJECTIVE_BIAS_RANDOM_WALK_MAHALANOBIS: &str =
+    "diagnostics/vio/objective/bias_random_walk_mahalanobis";
 #[cfg(feature = "vio")]
-const PATH_VIO_COST_VELOCITY_ANCHOR: &str = "diagnostics/vio/cost/velocity_anchor";
+const PATH_VIO_OBJECTIVE_VELOCITY_ANCHOR_MAHALANOBIS: &str =
+    "diagnostics/vio/objective/velocity_anchor_mahalanobis";
 #[cfg(feature = "vio")]
-const PATH_VIO_COST_BIAS_PRIOR: &str = "diagnostics/vio/cost/bias_prior";
+const PATH_VIO_OBJECTIVE_BIAS_PRIOR_MAHALANOBIS: &str =
+    "diagnostics/vio/objective/bias_prior_mahalanobis";
 
 const PATH_LOOP_CANDIDATES: &str = "diagnostics/loop/candidates";
 const PATH_LOOP_APPLIED: &str = "diagnostics/loop/applied";
@@ -483,66 +487,73 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     if let Some(vio_result) = diag.vio_solve_result.as_ref() {
         scalars.push((
             PATH_VIO_ATTEMPTED_ITERATIONS,
-            vio_result.attempted_iterations as f64,
+            vio_result.attempted_iterations() as f64,
         ));
-        scalars.push((PATH_VIO_FINAL_COST, vio_result.final_cost));
+        scalars.push((
+            PATH_VIO_FINAL_MIXED_OBJECTIVE,
+            vio_result.final_mixed_objective(),
+        ));
         scalars.push((
             PATH_VIO_CONVERGED,
-            if vio_result.termination.is_converged() {
+            if vio_result.termination().is_converged() {
                 1.0
             } else {
                 0.0
             },
         ));
-        let termination = match vio_result.termination {
+        let termination = match vio_result.termination() {
             crate::VioSolveTermination::NotRequired => 0.0,
             crate::VioSolveTermination::Converged { .. } => 1.0,
             crate::VioSolveTermination::IterationLimit => 2.0,
-            crate::VioSolveTermination::StalledNoCostImprovement => 3.0,
+            crate::VioSolveTermination::StalledNoObjectiveImprovement => 3.0,
         };
         scalars.push((PATH_VIO_TERMINATION, termination));
-        scalars.push((PATH_VIO_ACCEPTED_STEPS, vio_result.accepted_steps as f64));
-        scalars.push((PATH_VIO_REJECTED_STEPS, vio_result.rejected_steps as f64));
+        scalars.push((PATH_VIO_ACCEPTED_STEPS, vio_result.accepted_steps() as f64));
+        scalars.push((PATH_VIO_REJECTED_STEPS, vio_result.rejected_steps() as f64));
         scalars.push((
             PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS,
-            vio_result.rejected_nonprojectable_candidate_steps as f64,
+            vio_result.rejected_nonprojectable_candidate_steps() as f64,
         ));
         scalars.push((
             PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS,
-            vio_result.last_frame_active_visual_factor_count as f64,
+            vio_result.last_frame_active_visual_factor_count() as f64,
         ));
         scalars.push((
             PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS,
-            vio_result.initially_excluded_nonprojectable_visual_factor_count as f64,
+            vio_result.initially_excluded_nonprojectable_visual_factor_count() as f64,
         ));
         scalars.push((
             PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS,
-            vio_result.regularized_imu_residual_factor_count as f64,
+            vio_result.regularized_imu_residual_factor_count() as f64,
         ));
         scalars.push((
             PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
-            vio_result.floored_accel_bias_random_walk_factor_count as f64,
+            vio_result.floored_accel_bias_random_walk_factor_count() as f64,
         ));
         scalars.push((
             PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS,
-            vio_result.floored_gyro_bias_random_walk_factor_count as f64,
+            vio_result.floored_gyro_bias_random_walk_factor_count() as f64,
+        ));
+        let objective = vio_result.objective_breakdown();
+        scalars.push((
+            PATH_VIO_OBJECTIVE_REPROJECTION_ROBUST_PX2,
+            objective.reprojection_robust_px2(),
         ));
         scalars.push((
-            PATH_VIO_COST_REPROJECTION,
-            vio_result.cost_breakdown.reprojection_cost,
-        ));
-        scalars.push((PATH_VIO_COST_IMU, vio_result.cost_breakdown.imu_cost));
-        scalars.push((
-            PATH_VIO_COST_BIAS_RANDOM_WALK,
-            vio_result.cost_breakdown.bias_random_walk_cost,
+            PATH_VIO_OBJECTIVE_IMU_MAHALANOBIS,
+            objective.imu_mahalanobis(),
         ));
         scalars.push((
-            PATH_VIO_COST_VELOCITY_ANCHOR,
-            vio_result.cost_breakdown.velocity_anchor_cost,
+            PATH_VIO_OBJECTIVE_BIAS_RANDOM_WALK_MAHALANOBIS,
+            objective.bias_random_walk_mahalanobis(),
         ));
         scalars.push((
-            PATH_VIO_COST_BIAS_PRIOR,
-            vio_result.cost_breakdown.bias_prior_cost,
+            PATH_VIO_OBJECTIVE_VELOCITY_ANCHOR_MAHALANOBIS,
+            objective.velocity_anchor_mahalanobis(),
+        ));
+        scalars.push((
+            PATH_VIO_OBJECTIVE_BIAS_PRIOR_MAHALANOBIS,
+            objective.bias_prior_mahalanobis(),
         ));
     }
     #[cfg(feature = "vio")]
@@ -857,13 +868,19 @@ mod tests {
     #[cfg(feature = "vio")]
     use super::{
         PATH_VIO_ACCEPTED_STEPS, PATH_VIO_ATTEMPTED_ITERATIONS,
-        PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE, PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
+        PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE, PATH_VIO_FINAL_MIXED_OBJECTIVE,
+        PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
         PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS,
         PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS,
-        PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS, PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS,
+        PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS, PATH_VIO_OBJECTIVE_BIAS_PRIOR_MAHALANOBIS,
+        PATH_VIO_OBJECTIVE_BIAS_RANDOM_WALK_MAHALANOBIS, PATH_VIO_OBJECTIVE_IMU_MAHALANOBIS,
+        PATH_VIO_OBJECTIVE_REPROJECTION_ROBUST_PX2, PATH_VIO_OBJECTIVE_VELOCITY_ANCHOR_MAHALANOBIS,
+        PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS,
         PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS, PATH_VIO_REJECTED_STEPS,
         PATH_VIO_TERMINATION,
     };
+    #[cfg(feature = "vio")]
+    use crate::local_ba::VioFactorDiagnostics;
     use crate::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
         PnpAcceptedInlierCountMetric, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
@@ -879,7 +896,7 @@ mod tests {
         VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
     };
     #[cfg(feature = "vio")]
-    use crate::{VioCostBreakdown, VioSolveResult, VioSolveTermination};
+    use crate::{VioObjectiveBreakdown, VioSolveResult, VioSolveTermination};
 
     #[test]
     fn diagnostics_scalars_empty_has_baselines() {
@@ -1019,20 +1036,23 @@ mod tests {
         #[cfg(feature = "vio")]
         {
             diag.vio_calibrated_bias_prior_active = Some(true);
-            diag.vio_solve_result = Some(VioSolveResult {
-                termination: VioSolveTermination::IterationLimit,
-                attempted_iterations: 3,
-                accepted_steps: 2,
-                rejected_steps: 1,
-                rejected_nonprojectable_candidate_steps: 1,
-                final_cost: 4.0,
-                cost_breakdown: VioCostBreakdown::default(),
-                last_frame_active_visual_factor_count: 6,
-                initially_excluded_nonprojectable_visual_factor_count: 2,
-                regularized_imu_residual_factor_count: 2,
-                floored_accel_bias_random_walk_factor_count: 1,
-                floored_gyro_bias_random_walk_factor_count: 2,
-            });
+            diag.vio_solve_result = Some(
+                VioSolveResult::try_evaluated(
+                    VioSolveTermination::IterationLimit,
+                    2,
+                    1,
+                    1,
+                    VioObjectiveBreakdown::new(4.0, 0.0, 0.0, 0.0, 0.0).expect("valid objective"),
+                    VioFactorDiagnostics {
+                        last_frame_active_visual_factor_count: 6,
+                        initially_excluded_nonprojectable_visual_factor_count: 2,
+                        regularized_imu_residual_factor_count: 2,
+                        floored_accel_bias_random_walk_factor_count: 1,
+                        floored_gyro_bias_random_walk_factor_count: 2,
+                    },
+                )
+                .expect("valid VIO result"),
+            );
         }
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
@@ -1056,11 +1076,32 @@ mod tests {
             *path == PATH_VIO_ATTEMPTED_ITERATIONS && (*value - 3.0).abs() < f64::EPSILON
         }));
         #[cfg(feature = "vio")]
-        assert!(
-            scalars
-                .iter()
-                .all(|(path, _)| *path != "diagnostics/vio/iterations")
-        );
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_FINAL_MIXED_OBJECTIVE && (*value - 4.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        for (expected_path, expected_value) in [
+            (PATH_VIO_OBJECTIVE_REPROJECTION_ROBUST_PX2, 4.0),
+            (PATH_VIO_OBJECTIVE_IMU_MAHALANOBIS, 0.0),
+            (PATH_VIO_OBJECTIVE_BIAS_RANDOM_WALK_MAHALANOBIS, 0.0),
+            (PATH_VIO_OBJECTIVE_VELOCITY_ANCHOR_MAHALANOBIS, 0.0),
+            (PATH_VIO_OBJECTIVE_BIAS_PRIOR_MAHALANOBIS, 0.0),
+        ] {
+            assert!(scalars.iter().any(|(path, value)| {
+                *path == expected_path && (*value - expected_value).abs() < f64::EPSILON
+            }));
+        }
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().all(|(path, _)| !matches!(
+            *path,
+            "diagnostics/vio/iterations"
+                | "diagnostics/vio/final_cost"
+                | "diagnostics/vio/cost/reprojection"
+                | "diagnostics/vio/cost/imu"
+                | "diagnostics/vio/cost/bias_random_walk"
+                | "diagnostics/vio/cost/velocity_anchor"
+                | "diagnostics/vio/cost/bias_prior"
+        )));
         #[cfg(feature = "vio")]
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS

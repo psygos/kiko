@@ -2147,6 +2147,58 @@ fn adaptive_tracking_ransac_config(
 }
 
 #[cfg(feature = "vio")]
+fn trace_vio_solve(
+    frame_count: usize,
+    result: &crate::VioSolveResult,
+    optimized: &crate::NavState,
+    visual_pose_world: Pose,
+    vio_pose_world: Pose,
+) {
+    let velocity_odom_mps = optimized.velocity_odom_mps();
+    let accel_bias_mps2 = optimized.bias().accel_mps2();
+    let pose_delta = crate::local_ba::se3_delta_between(visual_pose_world, vio_pose_world);
+    let translation_delta_m = pose_delta[..3]
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    let rotation_delta_rad = pose_delta[3..]
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    let objective = result.objective_breakdown();
+    eprintln!(
+        "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_mixed_objective={:.1} reprojection_robust_px2={:.1} imu_mahalanobis={:.1} velocity_anchor_mahalanobis={:.1} bias_random_walk_mahalanobis={:.1} bias_prior_mahalanobis={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
+        frame_count,
+        result.termination(),
+        result.attempted_iterations(),
+        result.accepted_steps(),
+        result.rejected_steps(),
+        result.rejected_nonprojectable_candidate_steps(),
+        result.last_frame_active_visual_factor_count(),
+        result.initially_excluded_nonprojectable_visual_factor_count(),
+        result.regularized_imu_residual_factor_count(),
+        result.floored_accel_bias_random_walk_factor_count(),
+        result.floored_gyro_bias_random_walk_factor_count(),
+        result.final_mixed_objective(),
+        objective.reprojection_robust_px2(),
+        objective.imu_mahalanobis(),
+        objective.velocity_anchor_mahalanobis(),
+        objective.bias_random_walk_mahalanobis(),
+        objective.bias_prior_mahalanobis(),
+        velocity_odom_mps[0],
+        velocity_odom_mps[1],
+        velocity_odom_mps[2],
+        accel_bias_mps2[0],
+        accel_bias_mps2[1],
+        accel_bias_mps2[2],
+        translation_delta_m * 1000.0,
+        rotation_delta_rad.to_degrees() * 1000.0,
+    );
+}
+
+#[cfg(feature = "vio")]
 fn decide_vio_pose_adoption(
     solve_result: &crate::VioSolveResult,
     visual_metrics: &PoseReprojectionMetrics,
@@ -2155,7 +2207,7 @@ fn decide_vio_pose_adoption(
     if !solve_result.has_improved_estimate() {
         return crate::VioProposalDisposition::RejectedUnusableSolve;
     }
-    if solve_result.last_frame_active_visual_factor_count == 0 {
+    if solve_result.last_frame_active_visual_factor_count() == 0 {
         return crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport;
     }
     let shared = visual_metrics.shared_with(vio_metrics);
@@ -2900,41 +2952,12 @@ impl SlamTracker {
                 let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom).to_pose32();
 
                 if self.trace_transitions {
-                    let vel = optimized.velocity_odom_mps();
-                    let bias = optimized.bias();
-                    let accel_bias_mps2 = bias.accel_mps2();
-                    let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
-                    let delta_t =
-                        (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-                    let delta_r =
-                        (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
-                    eprintln!(
-                        "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
+                    trace_vio_solve(
                         candidate_window.len(),
-                        result.termination,
-                        result.attempted_iterations,
-                        result.accepted_steps,
-                        result.rejected_steps,
-                        result.rejected_nonprojectable_candidate_steps,
-                        result.last_frame_active_visual_factor_count,
-                        result.initially_excluded_nonprojectable_visual_factor_count,
-                        result.regularized_imu_residual_factor_count,
-                        result.floored_accel_bias_random_walk_factor_count,
-                        result.floored_gyro_bias_random_walk_factor_count,
-                        result.final_cost,
-                        result.cost_breakdown.reprojection_cost,
-                        result.cost_breakdown.imu_cost,
-                        result.cost_breakdown.velocity_anchor_cost,
-                        result.cost_breakdown.bias_random_walk_cost,
-                        result.cost_breakdown.bias_prior_cost,
-                        vel[0],
-                        vel[1],
-                        vel[2],
-                        accel_bias_mps2[0],
-                        accel_bias_mps2[1],
-                        accel_bias_mps2[2],
-                        delta_t * 1000.0,
-                        delta_r.to_degrees() * 1000.0,
+                        &result,
+                        &optimized,
+                        pose_world,
+                        cam_from_map,
                     );
                 }
 
@@ -3035,39 +3058,12 @@ impl SlamTracker {
         let cam_from_map = self.map_from_odom.odom_to_map(cam_from_odom).to_pose32();
 
         if self.trace_transitions {
-            let vel = optimized.velocity_odom_mps();
-            let bias = optimized.bias();
-            let accel_bias_mps2 = bias.accel_mps2();
-            let delta = crate::local_ba::se3_delta_between(pose_world, cam_from_map);
-            let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-            let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
-            eprintln!(
-                "vio ba: frames={} termination={:?} attempted_iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
+            trace_vio_solve(
                 candidate_window.len(),
-                result.termination,
-                result.attempted_iterations,
-                result.accepted_steps,
-                result.rejected_steps,
-                result.rejected_nonprojectable_candidate_steps,
-                result.last_frame_active_visual_factor_count,
-                result.initially_excluded_nonprojectable_visual_factor_count,
-                result.regularized_imu_residual_factor_count,
-                result.floored_accel_bias_random_walk_factor_count,
-                result.floored_gyro_bias_random_walk_factor_count,
-                result.final_cost,
-                result.cost_breakdown.reprojection_cost,
-                result.cost_breakdown.imu_cost,
-                result.cost_breakdown.velocity_anchor_cost,
-                result.cost_breakdown.bias_random_walk_cost,
-                result.cost_breakdown.bias_prior_cost,
-                vel[0],
-                vel[1],
-                vel[2],
-                accel_bias_mps2[0],
-                accel_bias_mps2[1],
-                accel_bias_mps2[2],
-                delta_t * 1000.0,
-                delta_r.to_degrees() * 1000.0,
+                &result,
+                &optimized,
+                pose_world,
+                cam_from_map,
             );
         }
 
@@ -8121,20 +8117,26 @@ mod tests {
         last_frame_active_visual_factor_count: usize,
         accepted_steps: usize,
     ) -> crate::VioSolveResult {
-        crate::VioSolveResult {
-            termination: crate::VioSolveTermination::IterationLimit,
-            attempted_iterations: accepted_steps,
+        let (termination, rejected_steps) = if accepted_steps == 0 {
+            (crate::VioSolveTermination::StalledNoObjectiveImprovement, 1)
+        } else {
+            (crate::VioSolveTermination::IterationLimit, 0)
+        };
+        crate::VioSolveResult::try_evaluated(
+            termination,
             accepted_steps,
-            rejected_steps: 0,
-            rejected_nonprojectable_candidate_steps: 0,
-            final_cost: 1.0,
-            cost_breakdown: crate::VioCostBreakdown::default(),
-            last_frame_active_visual_factor_count,
-            initially_excluded_nonprojectable_visual_factor_count: 0,
-            regularized_imu_residual_factor_count: 1,
-            floored_accel_bias_random_walk_factor_count: 1,
-            floored_gyro_bias_random_walk_factor_count: 1,
-        }
+            rejected_steps,
+            0,
+            crate::VioObjectiveBreakdown::new(1.0, 0.0, 0.0, 0.0, 0.0).expect("valid objective"),
+            crate::local_ba::VioFactorDiagnostics {
+                last_frame_active_visual_factor_count,
+                initially_excluded_nonprojectable_visual_factor_count: 0,
+                regularized_imu_residual_factor_count: 1,
+                floored_accel_bias_random_walk_factor_count: 1,
+                floored_gyro_bias_random_walk_factor_count: 1,
+            },
+        )
+        .expect("valid VIO result")
     }
 
     #[cfg(feature = "vio")]

@@ -1,5 +1,14 @@
 # Meta Review
 
+> Historical API note (2026-07-14): this review records the names used by the
+> commit it evaluated. The current API uses `VioObjectiveBreakdown`,
+> `VioSolveResult::objective_breakdown()`, and
+> `VioSolveResult::final_mixed_objective()`. The objective combines a robust
+> pixel-squared reprojection term with dimensionless Mahalanobis terms, so it
+> does not carry one physical unit. References to `VioCostBreakdown`,
+> `cost_breakdown`, and `final_cost` below are historical rather than current
+> API guidance.
+
 ## Commit Goal
 
 Make the VIO refinement path truthful and transactional. The solver must rescore candidate states and only accept a genuinely lower-cost state, proposal adoption must not mutate authoritative runtime or local-BA state until the proposal is accepted, and the diagnostics/observability surface must expose proposal support sets and VIO cost composition honestly enough to explain why a frame was or was not adopted.

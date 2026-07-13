@@ -1224,9 +1224,9 @@ const VIO_STATE_CONVERGENCE_TOLERANCES: [f64; VIO_STATE_DIM] = [
     VIO_GYRO_BIAS_CONVERGENCE_TOLERANCE_RADPS,
 ];
 #[cfg(feature = "vio")]
-const VIO_RELATIVE_COST_CONVERGENCE_TOLERANCE: f64 = 1e-10;
+const VIO_RELATIVE_OBJECTIVE_CONVERGENCE_TOLERANCE: f64 = 1e-10;
 #[cfg(feature = "vio")]
-const VIO_RELATIVE_COST_SCALE_FLOOR: f64 = 1e-12;
+const VIO_RELATIVE_OBJECTIVE_SCALE_FLOOR: f64 = 1e-12;
 #[cfg(feature = "vio")]
 const MIN_VIO_WINDOW_FRAMES: usize = 2;
 
@@ -1724,25 +1724,172 @@ impl VioWindow {
     }
 }
 
-/// Per-factor objective contributions from a VIO BA evaluation.
+/// Per-factor contributions to the VIO mixed objective.
+///
+/// The reprojection term is a robust pixel-squared quantity. The IMU,
+/// bias-random-walk, velocity-anchor, and bias-prior terms are dimensionless
+/// Mahalanobis quantities. Their sum is an optimization objective, not a
+/// measurement carrying one physical unit.
+///
+/// External callers cannot forge component values without using `new`:
+/// ```compile_fail
+/// use kiko_slam::VioObjectiveBreakdown;
+/// let _ = VioObjectiveBreakdown {
+///     reprojection_robust_px2: 0.0,
+///     imu_mahalanobis: 0.0,
+///     bias_random_walk_mahalanobis: 0.0,
+///     velocity_anchor_mahalanobis: 0.0,
+///     bias_prior_mahalanobis: 0.0,
+/// };
+/// ```
 #[cfg(feature = "vio")]
-#[derive(Clone, Copy, Debug, Default)]
-pub struct VioCostBreakdown {
-    pub reprojection_cost: f64,
-    pub imu_cost: f64,
-    pub bias_random_walk_cost: f64,
-    pub velocity_anchor_cost: f64,
-    pub bias_prior_cost: f64,
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct VioObjectiveBreakdown {
+    reprojection_robust_px2: f64,
+    imu_mahalanobis: f64,
+    bias_random_walk_mahalanobis: f64,
+    velocity_anchor_mahalanobis: f64,
+    bias_prior_mahalanobis: f64,
 }
 
 #[cfg(feature = "vio")]
-impl VioCostBreakdown {
-    pub fn total_cost(&self) -> f64 {
-        self.reprojection_cost
-            + self.imu_cost
-            + self.bias_random_walk_cost
-            + self.velocity_anchor_cost
-            + self.bias_prior_cost
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioObjectiveComponent {
+    ReprojectionRobustPx2,
+    ImuMahalanobis,
+    BiasRandomWalkMahalanobis,
+    VelocityAnchorMahalanobis,
+    BiasPriorMahalanobis,
+    MixedTotal,
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioObjectiveComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::ReprojectionRobustPx2 => "robust reprojection objective (px^2)",
+            Self::ImuMahalanobis => "IMU Mahalanobis objective",
+            Self::BiasRandomWalkMahalanobis => "bias random-walk Mahalanobis objective",
+            Self::VelocityAnchorMahalanobis => "velocity-anchor Mahalanobis objective",
+            Self::BiasPriorMahalanobis => "bias-prior Mahalanobis objective",
+            Self::MixedTotal => "mixed VIO objective total",
+        })
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VioObjectiveError {
+    NonFinite {
+        component: VioObjectiveComponent,
+        value: f64,
+    },
+    Negative {
+        component: VioObjectiveComponent,
+        value: f64,
+    },
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioObjectiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { component, value } => {
+                write!(f, "VIO {component} must be finite, got {value}")
+            }
+            Self::Negative { component, value } => {
+                write!(f, "VIO {component} must be non-negative, got {value}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::error::Error for VioObjectiveError {}
+
+#[cfg(feature = "vio")]
+impl VioObjectiveBreakdown {
+    pub fn new(
+        reprojection_robust_px2: f64,
+        imu_mahalanobis: f64,
+        bias_random_walk_mahalanobis: f64,
+        velocity_anchor_mahalanobis: f64,
+        bias_prior_mahalanobis: f64,
+    ) -> Result<Self, VioObjectiveError> {
+        let objective = Self {
+            reprojection_robust_px2,
+            imu_mahalanobis,
+            bias_random_walk_mahalanobis,
+            velocity_anchor_mahalanobis,
+            bias_prior_mahalanobis,
+        };
+        objective.validate()?;
+        Ok(objective)
+    }
+
+    pub fn reprojection_robust_px2(self) -> f64 {
+        self.reprojection_robust_px2
+    }
+
+    pub fn imu_mahalanobis(self) -> f64 {
+        self.imu_mahalanobis
+    }
+
+    pub fn bias_random_walk_mahalanobis(self) -> f64 {
+        self.bias_random_walk_mahalanobis
+    }
+
+    pub fn velocity_anchor_mahalanobis(self) -> f64 {
+        self.velocity_anchor_mahalanobis
+    }
+
+    pub fn bias_prior_mahalanobis(self) -> f64 {
+        self.bias_prior_mahalanobis
+    }
+
+    pub fn total_mixed_objective(self) -> f64 {
+        self.reprojection_robust_px2
+            + self.imu_mahalanobis
+            + self.bias_random_walk_mahalanobis
+            + self.velocity_anchor_mahalanobis
+            + self.bias_prior_mahalanobis
+    }
+
+    fn validate(self) -> Result<(), VioObjectiveError> {
+        for (component, value) in [
+            (
+                VioObjectiveComponent::ReprojectionRobustPx2,
+                self.reprojection_robust_px2,
+            ),
+            (VioObjectiveComponent::ImuMahalanobis, self.imu_mahalanobis),
+            (
+                VioObjectiveComponent::BiasRandomWalkMahalanobis,
+                self.bias_random_walk_mahalanobis,
+            ),
+            (
+                VioObjectiveComponent::VelocityAnchorMahalanobis,
+                self.velocity_anchor_mahalanobis,
+            ),
+            (
+                VioObjectiveComponent::BiasPriorMahalanobis,
+                self.bias_prior_mahalanobis,
+            ),
+        ] {
+            if !value.is_finite() {
+                return Err(VioObjectiveError::NonFinite { component, value });
+            }
+            if value < 0.0 {
+                return Err(VioObjectiveError::Negative { component, value });
+            }
+        }
+        let total = self.total_mixed_objective();
+        if !total.is_finite() {
+            return Err(VioObjectiveError::NonFinite {
+                component: VioObjectiveComponent::MixedTotal,
+                value: total,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -1750,7 +1897,7 @@ impl VioCostBreakdown {
 #[cfg(feature = "vio")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VioConvergenceCriterion {
-    ComponentwiseStepAndRelativeCost,
+    ComponentwiseStepAndRelativeObjective,
 }
 
 #[cfg(feature = "vio")]
@@ -1759,7 +1906,7 @@ pub enum VioSolveTermination {
     NotRequired,
     Converged { criterion: VioConvergenceCriterion },
     IterationLimit,
-    StalledNoCostImprovement,
+    StalledNoObjectiveImprovement,
 }
 
 #[cfg(feature = "vio")]
@@ -1892,10 +2039,13 @@ pub enum VioSolveError {
         index: usize,
         value: f64,
     },
-    NonFiniteCost {
+    InvalidObjective {
         stage: VioEvaluationStage,
         iteration: usize,
-        value: f64,
+        source: VioObjectiveError,
+    },
+    InvalidOutcome {
+        source: VioSolveOutcomeError,
     },
 }
 
@@ -2017,14 +2167,17 @@ impl std::fmt::Display for VioSolveError {
                 f,
                 "VIO {stage} linearization {quantity}[{index}] at iteration {iteration} must be finite, got {value}"
             ),
-            Self::NonFiniteCost {
+            Self::InvalidObjective {
                 stage,
                 iteration,
-                value,
+                source,
             } => write!(
                 f,
-                "VIO {stage} cost at iteration {iteration} must be finite, got {value}"
+                "VIO {stage} objective is invalid at iteration {iteration}: {source}"
             ),
+            Self::InvalidOutcome { source } => {
+                write!(f, "VIO solver produced an invalid outcome: {source}")
+            }
         }
     }
 }
@@ -2041,12 +2194,13 @@ impl std::error::Error for VioSolveError {
             Self::ImuJacobian { source, .. } => Some(source),
             Self::BiasRandomWalkFactor { source, .. } => Some(source),
             Self::ReprojectionJacobianRetraction { source, .. } => Some(source),
+            Self::InvalidObjective { source, .. } => Some(source),
+            Self::InvalidOutcome { source } => Some(source),
             Self::WindowExceedsConfiguredCapacity { .. }
             | Self::ReprojectionFactorUnavailable { .. }
             | Self::ReprojectionJacobianUnavailable { .. }
             | Self::NonFiniteReprojectionJacobian { .. }
-            | Self::NonFiniteLinearization { .. }
-            | Self::NonFiniteCost { .. } => None,
+            | Self::NonFiniteLinearization { .. } => None,
         }
     }
 }
@@ -2074,40 +2228,237 @@ impl From<ObservationResolveError> for VioSolveError {
     }
 }
 
-/// Diagnostics and termination outcome from a VIO BA solve.
 #[cfg(feature = "vio")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioSolveOutcomeError {
+    StepCountOverflow {
+        accepted_steps: usize,
+        rejected_steps: usize,
+    },
+    NonprojectableRejectionsExceedRejections {
+        nonprojectable_rejections: usize,
+        rejected_steps: usize,
+    },
+    TerminationIncompatibleWithSteps {
+        termination: VioSolveTermination,
+        accepted_steps: usize,
+        rejected_steps: usize,
+    },
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioSolveOutcomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StepCountOverflow {
+                accepted_steps,
+                rejected_steps,
+            } => write!(
+                f,
+                "VIO attempted-step count overflows usize: {accepted_steps} accepted + {rejected_steps} rejected"
+            ),
+            Self::NonprojectableRejectionsExceedRejections {
+                nonprojectable_rejections,
+                rejected_steps,
+            } => write!(
+                f,
+                "VIO nonprojectable candidate rejections ({nonprojectable_rejections}) exceed all rejected steps ({rejected_steps})"
+            ),
+            Self::TerminationIncompatibleWithSteps {
+                termination,
+                accepted_steps,
+                rejected_steps,
+            } => write!(
+                f,
+                "VIO termination {termination:?} is incompatible with {accepted_steps} accepted and {rejected_steps} rejected steps"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::error::Error for VioSolveOutcomeError {}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct VioSolveSteps {
+    attempted: usize,
+    accepted: usize,
+    rejected: usize,
+    rejected_nonprojectable_candidates: usize,
+}
+
+#[cfg(feature = "vio")]
+impl VioSolveSteps {
+    fn try_evaluated(
+        termination: VioSolveTermination,
+        accepted: usize,
+        rejected: usize,
+        rejected_nonprojectable_candidates: usize,
+    ) -> Result<Self, VioSolveOutcomeError> {
+        let attempted =
+            accepted
+                .checked_add(rejected)
+                .ok_or(VioSolveOutcomeError::StepCountOverflow {
+                    accepted_steps: accepted,
+                    rejected_steps: rejected,
+                })?;
+        if rejected_nonprojectable_candidates > rejected {
+            return Err(
+                VioSolveOutcomeError::NonprojectableRejectionsExceedRejections {
+                    nonprojectable_rejections: rejected_nonprojectable_candidates,
+                    rejected_steps: rejected,
+                },
+            );
+        }
+        let compatible = match termination {
+            VioSolveTermination::NotRequired => false,
+            VioSolveTermination::Converged { .. } | VioSolveTermination::IterationLimit => {
+                accepted > 0
+            }
+            VioSolveTermination::StalledNoObjectiveImprovement => accepted == 0 && rejected > 0,
+        };
+        if !compatible {
+            return Err(VioSolveOutcomeError::TerminationIncompatibleWithSteps {
+                termination,
+                accepted_steps: accepted,
+                rejected_steps: rejected,
+            });
+        }
+        Ok(Self {
+            attempted,
+            accepted,
+            rejected,
+            rejected_nonprojectable_candidates,
+        })
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VioFactorDiagnostics {
+    pub(crate) last_frame_active_visual_factor_count: usize,
+    pub(crate) initially_excluded_nonprojectable_visual_factor_count: usize,
+    pub(crate) regularized_imu_residual_factor_count: usize,
+    pub(crate) floored_accel_bias_random_walk_factor_count: usize,
+    pub(crate) floored_gyro_bias_random_walk_factor_count: usize,
+}
+
+/// Diagnostics and termination outcome from a VIO BA solve.
+///
+/// Fields are private so callers cannot forge contradictory step counts,
+/// termination states, or objective totals.
+///
+/// ```compile_fail
+/// use kiko_slam::{VioSolveResult, VioSolveTermination};
+/// let _ = VioSolveResult {
+///     termination: VioSolveTermination::NotRequired,
+/// };
+/// ```
+#[cfg(feature = "vio")]
+#[derive(Clone, Debug, PartialEq)]
 pub struct VioSolveResult {
-    pub termination: VioSolveTermination,
-    pub attempted_iterations: usize,
-    pub accepted_steps: usize,
-    pub rejected_steps: usize,
-    /// Candidate steps rejected because an initially active visual factor, or
-    /// one of its finite-difference perturbations, became nonprojectable.
-    pub rejected_nonprojectable_candidate_steps: usize,
-    pub final_cost: f64,
-    pub cost_breakdown: VioCostBreakdown,
-    /// Visual factors that were projectable in the initial state and retained
-    /// for every objective evaluation. Each factor contributes two residuals.
-    pub last_frame_active_visual_factor_count: usize,
-    /// Resolved visual observations excluded before optimization because they
-    /// were nonprojectable in the initial state.
-    pub initially_excluded_nonprojectable_visual_factor_count: usize,
-    /// IMU factors whose mixed-unit residual covariance received the explicit
-    /// block-unit diagonal regularization reported by their information type.
-    pub regularized_imu_residual_factor_count: usize,
-    /// Bias random-walk factors whose raw accelerometer-bias variance was
-    /// raised to the documented floor.
-    pub floored_accel_bias_random_walk_factor_count: usize,
-    /// Bias random-walk factors whose raw gyroscope-bias variance was raised
-    /// to the documented floor.
-    pub floored_gyro_bias_random_walk_factor_count: usize,
+    termination: VioSolveTermination,
+    steps: VioSolveSteps,
+    objective_breakdown: VioObjectiveBreakdown,
+    factors: VioFactorDiagnostics,
 }
 
 #[cfg(feature = "vio")]
 impl VioSolveResult {
+    pub(crate) fn not_required() -> Self {
+        Self {
+            termination: VioSolveTermination::NotRequired,
+            steps: VioSolveSteps::default(),
+            objective_breakdown: VioObjectiveBreakdown::default(),
+            factors: VioFactorDiagnostics::default(),
+        }
+    }
+
+    pub(crate) fn try_evaluated(
+        termination: VioSolveTermination,
+        accepted_steps: usize,
+        rejected_steps: usize,
+        rejected_nonprojectable_candidate_steps: usize,
+        objective_breakdown: VioObjectiveBreakdown,
+        factors: VioFactorDiagnostics,
+    ) -> Result<Self, VioSolveOutcomeError> {
+        Ok(Self {
+            termination,
+            steps: VioSolveSteps::try_evaluated(
+                termination,
+                accepted_steps,
+                rejected_steps,
+                rejected_nonprojectable_candidate_steps,
+            )?,
+            objective_breakdown,
+            factors,
+        })
+    }
+
+    pub fn termination(&self) -> VioSolveTermination {
+        self.termination
+    }
+
+    pub fn attempted_iterations(&self) -> usize {
+        self.steps.attempted
+    }
+
+    pub fn accepted_steps(&self) -> usize {
+        self.steps.accepted
+    }
+
+    pub fn rejected_steps(&self) -> usize {
+        self.steps.rejected
+    }
+
+    /// Candidate steps rejected because an initially active visual factor, or
+    /// one of its finite-difference perturbations, became nonprojectable.
+    pub fn rejected_nonprojectable_candidate_steps(&self) -> usize {
+        self.steps.rejected_nonprojectable_candidates
+    }
+
+    pub fn final_mixed_objective(&self) -> f64 {
+        self.objective_breakdown.total_mixed_objective()
+    }
+
+    pub fn objective_breakdown(&self) -> VioObjectiveBreakdown {
+        self.objective_breakdown
+    }
+
+    /// Visual factors that were projectable in the initial state and retained
+    /// for every objective evaluation. Each factor contributes two residuals.
+    pub fn last_frame_active_visual_factor_count(&self) -> usize {
+        self.factors.last_frame_active_visual_factor_count
+    }
+
+    /// Resolved visual observations excluded before optimization because they
+    /// were nonprojectable in the initial state.
+    pub fn initially_excluded_nonprojectable_visual_factor_count(&self) -> usize {
+        self.factors
+            .initially_excluded_nonprojectable_visual_factor_count
+    }
+
+    /// IMU factors whose mixed-unit residual covariance received the explicit
+    /// block-unit diagonal regularization reported by their information type.
+    pub fn regularized_imu_residual_factor_count(&self) -> usize {
+        self.factors.regularized_imu_residual_factor_count
+    }
+
+    /// Bias random-walk factors whose raw accelerometer-bias variance was
+    /// raised to the documented floor.
+    pub fn floored_accel_bias_random_walk_factor_count(&self) -> usize {
+        self.factors.floored_accel_bias_random_walk_factor_count
+    }
+
+    /// Bias random-walk factors whose raw gyroscope-bias variance was raised
+    /// to the documented floor.
+    pub fn floored_gyro_bias_random_walk_factor_count(&self) -> usize {
+        self.factors.floored_gyro_bias_random_walk_factor_count
+    }
+
     pub fn has_improved_estimate(&self) -> bool {
-        self.accepted_steps > 0
+        self.steps.accepted > 0
     }
 }
 
@@ -3533,20 +3884,7 @@ fn optimize_vio_with_workspace(
     // Capacity construction proved this product and its square addressable.
     let dim = n_frames * VIO_STATE_DIM;
     if n_frames < 2 {
-        return Ok(VioSolveResult {
-            termination: VioSolveTermination::NotRequired,
-            attempted_iterations: 0,
-            accepted_steps: 0,
-            rejected_steps: 0,
-            rejected_nonprojectable_candidate_steps: 0,
-            final_cost: 0.0,
-            cost_breakdown: VioCostBreakdown::default(),
-            last_frame_active_visual_factor_count: 0,
-            initially_excluded_nonprojectable_visual_factor_count: 0,
-            regularized_imu_residual_factor_count: 0,
-            floored_accel_bias_random_walk_factor_count: 0,
-            floored_gyro_bias_random_walk_factor_count: 0,
-        });
+        return Ok(VioSolveResult::not_required());
     }
 
     let VioSolveWorkspace {
@@ -3594,22 +3932,16 @@ fn optimize_vio_with_workspace(
         },
         current_linearization,
     )?;
-    let mut current_cost = current_linearization.cost_breakdown.total_cost();
-    if !current_cost.is_finite() {
-        return Err(VioSolveError::NonFiniteCost {
-            stage: VioEvaluationStage::Initial,
-            iteration: 0,
-            value: current_cost,
-        });
-    }
+    let mut current_mixed_objective = current_linearization
+        .objective_breakdown
+        .total_mixed_objective();
     let mut termination = None;
-    let mut attempted_iterations = 0;
     let mut accepted_steps = 0;
     let mut rejected_steps = 0;
     let mut rejected_nonprojectable_candidate_steps = 0;
 
     for iteration in 0..max_iters {
-        attempted_iterations = iteration + 1;
+        let attempted_iteration = iteration + 1;
 
         let matrix_elements = dim * dim;
         scratch_linearization.hessian[..matrix_elements]
@@ -3629,7 +3961,7 @@ fn optimize_vio_with_workspace(
             dim,
         )
         .map_err(|source| VioSolveError::LinearSolve {
-            iteration: attempted_iterations,
+            iteration: attempted_iteration,
             source,
         })?;
         let step_is_componentwise_small =
@@ -3644,7 +3976,7 @@ fn optimize_vio_with_workspace(
                 state
                     .retract(&tangent)
                     .map_err(|source| VioSolveError::StateRetraction {
-                        iteration: attempted_iterations,
+                        iteration: attempted_iteration,
                         frame_index: frame_idx,
                         source,
                     })?;
@@ -3662,7 +3994,7 @@ fn optimize_vio_with_workspace(
             map_from_odom,
             VioEvaluation {
                 stage: VioEvaluationStage::Candidate,
-                iteration: attempted_iterations,
+                iteration: attempted_iteration,
             },
             scratch_linearization,
         ) {
@@ -3676,28 +4008,26 @@ fn optimize_vio_with_workspace(
             }
             Err(error) => return Err(error),
         }
-        let candidate_cost = scratch_linearization.cost_breakdown.total_cost();
-        if !candidate_cost.is_finite() {
-            return Err(VioSolveError::NonFiniteCost {
-                stage: VioEvaluationStage::Candidate,
-                iteration: attempted_iterations,
-                value: candidate_cost,
-            });
-        }
-        if candidate_cost < current_cost {
-            let cost_decrease = current_cost - candidate_cost;
+        let candidate_mixed_objective = scratch_linearization
+            .objective_breakdown
+            .total_mixed_objective();
+        if candidate_mixed_objective < current_mixed_objective {
+            let objective_decrease = current_mixed_objective - candidate_mixed_objective;
             std::mem::swap(states, candidate_states);
             std::mem::swap(current_linearization, scratch_linearization);
-            current_cost = candidate_cost;
+            current_mixed_objective = candidate_mixed_objective;
             accepted_steps += 1;
             lambda =
                 (lambda / f64::from(config.lm.lambda_factor)).max(f64::from(config.lm.min_lambda));
-            let relative_cost_scale = current_cost.abs().max(VIO_RELATIVE_COST_SCALE_FLOOR);
+            let relative_objective_scale = current_mixed_objective
+                .abs()
+                .max(VIO_RELATIVE_OBJECTIVE_SCALE_FLOOR);
             if step_is_componentwise_small
-                && cost_decrease < VIO_RELATIVE_COST_CONVERGENCE_TOLERANCE * relative_cost_scale
+                && objective_decrease
+                    < VIO_RELATIVE_OBJECTIVE_CONVERGENCE_TOLERANCE * relative_objective_scale
             {
                 termination = Some(VioSolveTermination::Converged {
-                    criterion: VioConvergenceCriterion::ComponentwiseStepAndRelativeCost,
+                    criterion: VioConvergenceCriterion::ComponentwiseStepAndRelativeObjective,
                 });
                 break;
             }
@@ -3734,32 +4064,34 @@ fn optimize_vio_with_workspace(
                 .gyro_variance_floor_applied()
         })
         .count();
-    Ok(VioSolveResult {
-        termination: termination.unwrap_or(if accepted_steps == 0 && rejected_steps > 0 {
-            VioSolveTermination::StalledNoCostImprovement
-        } else {
-            VioSolveTermination::IterationLimit
-        }),
-        attempted_iterations,
+    let termination = termination.unwrap_or(if accepted_steps == 0 && rejected_steps > 0 {
+        VioSolveTermination::StalledNoObjectiveImprovement
+    } else {
+        VioSolveTermination::IterationLimit
+    });
+    VioSolveResult::try_evaluated(
+        termination,
         accepted_steps,
         rejected_steps,
         rejected_nonprojectable_candidate_steps,
-        final_cost: current_cost,
-        cost_breakdown: current_linearization.cost_breakdown,
-        last_frame_active_visual_factor_count: visual_support.last_frame_factor_count(),
-        initially_excluded_nonprojectable_visual_factor_count: visual_support
-            .initially_excluded_nonprojectable_factor_count,
-        regularized_imu_residual_factor_count,
-        floored_accel_bias_random_walk_factor_count,
-        floored_gyro_bias_random_walk_factor_count,
-    })
+        current_linearization.objective_breakdown,
+        VioFactorDiagnostics {
+            last_frame_active_visual_factor_count: visual_support.last_frame_factor_count(),
+            initially_excluded_nonprojectable_visual_factor_count: visual_support
+                .initially_excluded_nonprojectable_factor_count,
+            regularized_imu_residual_factor_count,
+            floored_accel_bias_random_walk_factor_count,
+            floored_gyro_bias_random_walk_factor_count,
+        },
+    )
+    .map_err(|source| VioSolveError::InvalidOutcome { source })
 }
 
 #[cfg(feature = "vio")]
 struct VioLinearization {
     hessian: Vec<f64>,
     rhs: Vec<f64>,
-    cost_breakdown: VioCostBreakdown,
+    objective_breakdown: VioObjectiveBreakdown,
 }
 
 #[cfg(feature = "vio")]
@@ -3768,14 +4100,14 @@ impl VioLinearization {
         Ok(Self {
             hessian: try_zeroed_vio_f64_buffer("dense normal matrix", shape.matrix_elements)?,
             rhs: try_zeroed_vio_f64_buffer("normal-equation RHS", shape.dimension)?,
-            cost_breakdown: VioCostBreakdown::default(),
+            objective_breakdown: VioObjectiveBreakdown::default(),
         })
     }
 
     fn reset(&mut self, state_dimension: usize) {
         self.hessian[..state_dimension * state_dimension].fill(0.0);
         self.rhs[..state_dimension].fill(0.0);
-        self.cost_breakdown = VioCostBreakdown::default();
+        self.objective_breakdown = VioObjectiveBreakdown::default();
     }
 }
 
@@ -3892,7 +4224,7 @@ fn linearize_vio_states(
     let VioLinearization {
         hessian,
         rhs,
-        cost_breakdown,
+        objective_breakdown,
     } = output;
     let hessian = &mut hessian[..dim * dim];
     let rhs = &mut rhs[..dim];
@@ -3914,17 +4246,17 @@ fn linearize_vio_states(
                             observation_index,
                         })?;
                 let residual_f64 = [f64::from(residual[0]), f64::from(residual[1])];
-                let r_norm = residual_f64[0].hypot(residual_f64[1]);
-                let huber_delta = config.huber_delta_px;
-                let (huber_weight, huber_cost) = if r_norm <= huber_delta {
-                    (1.0, 0.5 * r_norm * r_norm)
+                let residual_norm_px = residual_f64[0].hypot(residual_f64[1]);
+                let huber_delta_px = config.huber_delta_px;
+                let (huber_weight, huber_objective_px2) = if residual_norm_px <= huber_delta_px {
+                    (1.0, 0.5 * residual_norm_px * residual_norm_px)
                 } else {
                     (
-                        huber_delta / r_norm,
-                        huber_delta * (r_norm - 0.5 * huber_delta),
+                        huber_delta_px / residual_norm_px,
+                        huber_delta_px * (residual_norm_px - 0.5 * huber_delta_px),
                     )
                 };
-                cost_breakdown.reprojection_cost += huber_cost;
+                objective_breakdown.reprojection_robust_px2 += huber_objective_px2;
                 let sqrt_w = huber_weight.sqrt();
 
                 let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
@@ -4036,13 +4368,13 @@ fn linearize_vio_states(
                 }
             })?;
 
-        let mut imu_cost = 0.0;
+        let mut imu_squared_mahalanobis = 0.0;
         for i in 0..IMU_RESIDUAL_DIM {
             for j in 0..IMU_RESIDUAL_DIM {
-                imu_cost += residual[i] * info[i][j] * residual[j];
+                imu_squared_mahalanobis += residual[i] * info[i][j] * residual[j];
             }
         }
-        cost_breakdown.imu_cost += 0.5 * imu_cost;
+        objective_breakdown.imu_mahalanobis += 0.5 * imu_squared_mahalanobis;
 
         let base_prev = succ_idx * STATE_DIM;
         let base_curr = (succ_idx + 1) * STATE_DIM;
@@ -4066,7 +4398,7 @@ fn linearize_vio_states(
             })?;
         let bias_information_diagonal = preint.floored_bias_random_walk_information().diagonal();
 
-        let mut bias_cost = 0.0;
+        let mut bias_squared_mahalanobis = 0.0;
         let base_prev = succ_idx * STATE_DIM;
         let base_curr = (succ_idx + 1) * STATE_DIM;
         for (axis, (residual, information)) in bias_residual
@@ -4077,7 +4409,7 @@ fn linearize_vio_states(
             let previous_index = base_prev + 9 + axis;
             let current_index = base_curr + 9 + axis;
             let weighted_residual = information * residual;
-            bias_cost += residual * weighted_residual;
+            bias_squared_mahalanobis += residual * weighted_residual;
             hessian[previous_index * dim + previous_index] += information;
             hessian[current_index * dim + current_index] += information;
             hessian[previous_index * dim + current_index] -= information;
@@ -4085,7 +4417,7 @@ fn linearize_vio_states(
             rhs[previous_index] -= weighted_residual;
             rhs[current_index] += weighted_residual;
         }
-        cost_breakdown.bias_random_walk_cost += 0.5 * bias_cost;
+        objective_breakdown.bias_random_walk_mahalanobis += 0.5 * bias_squared_mahalanobis;
     }
 
     if config.anchor_velocity_information_s2_per_m2 > 0.0 {
@@ -4097,7 +4429,7 @@ fn linearize_vio_states(
             hessian[(base + 6 + axis) * dim + (base + 6 + axis)] +=
                 config.anchor_velocity_information_s2_per_m2;
             rhs[base + 6 + axis] += config.anchor_velocity_information_s2_per_m2 * residual;
-            cost_breakdown.velocity_anchor_cost +=
+            objective_breakdown.velocity_anchor_mahalanobis +=
                 0.5 * config.anchor_velocity_information_s2_per_m2 * residual * residual;
         }
     }
@@ -4116,14 +4448,14 @@ fn linearize_vio_states(
                 let accel_residual = accel_mps2[axis] - calibrated_accel_mps2[axis];
                 hessian[(base + 9 + axis) * dim + (base + 9 + axis)] += accel_information_s4_per_m2;
                 rhs[base + 9 + axis] += accel_information_s4_per_m2 * accel_residual;
-                cost_breakdown.bias_prior_cost +=
+                objective_breakdown.bias_prior_mahalanobis +=
                     0.5 * accel_information_s4_per_m2 * accel_residual * accel_residual;
 
                 let gyro_residual = gyro_radps[axis] - calibrated_gyro_radps[axis];
                 hessian[(base + 12 + axis) * dim + (base + 12 + axis)] +=
                     gyro_information_s2_per_rad2;
                 rhs[base + 12 + axis] += gyro_information_s2_per_rad2 * gyro_residual;
-                cost_breakdown.bias_prior_cost +=
+                objective_breakdown.bias_prior_mahalanobis +=
                     0.5 * gyro_information_s2_per_rad2 * gyro_residual * gyro_residual;
             }
         }
@@ -4160,7 +4492,14 @@ fn validate_vio_linearization_values(
             }
         }
     }
-    Ok(())
+    linearization
+        .objective_breakdown
+        .validate()
+        .map_err(|source| VioSolveError::InvalidObjective {
+            stage: evaluation.stage,
+            iteration: evaluation.iteration,
+            source,
+        })
 }
 
 /// Compute camera-from-map pose from NavState (body-in-odom), extrinsics,
@@ -6372,7 +6711,7 @@ mod tests {
             let linearization = VioLinearization {
                 hessian,
                 rhs,
-                cost_breakdown: VioCostBreakdown::default(),
+                objective_breakdown: VioObjectiveBreakdown::default(),
             };
             let error = validate_vio_linearization_values(
                 &linearization,
@@ -6394,6 +6733,219 @@ mod tests {
                 } if actual == quantity
             ));
         }
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_objective_breakdown_rejects_each_invalid_component_and_total_overflow() {
+        let construct = |values: [f64; 5]| {
+            VioObjectiveBreakdown::new(values[0], values[1], values[2], values[3], values[4])
+        };
+        let components = [
+            VioObjectiveComponent::ReprojectionRobustPx2,
+            VioObjectiveComponent::ImuMahalanobis,
+            VioObjectiveComponent::BiasRandomWalkMahalanobis,
+            VioObjectiveComponent::VelocityAnchorMahalanobis,
+            VioObjectiveComponent::BiasPriorMahalanobis,
+        ];
+
+        for (index, component) in components.into_iter().enumerate() {
+            for value in [f64::NAN, f64::INFINITY] {
+                let mut values = [0.0; 5];
+                values[index] = value;
+                assert!(matches!(
+                    construct(values),
+                    Err(VioObjectiveError::NonFinite {
+                        component: actual,
+                        ..
+                    }) if actual == component
+                ));
+            }
+
+            let mut values = [0.0; 5];
+            values[index] = -f64::MIN_POSITIVE;
+            assert!(matches!(
+                construct(values),
+                Err(VioObjectiveError::Negative {
+                    component: actual,
+                    ..
+                }) if actual == component
+            ));
+        }
+
+        assert!(matches!(
+            construct([f64::MAX, f64::MAX, 0.0, 0.0, 0.0]),
+            Err(VioObjectiveError::NonFinite {
+                component: VioObjectiveComponent::MixedTotal,
+                value: f64::INFINITY,
+            })
+        ));
+
+        let objective = construct([1.0, 2.0, 3.0, 4.0, 5.0]).expect("valid objective");
+        assert_eq!(objective.reprojection_robust_px2(), 1.0);
+        assert_eq!(objective.imu_mahalanobis(), 2.0);
+        assert_eq!(objective.bias_random_walk_mahalanobis(), 3.0);
+        assert_eq!(objective.velocity_anchor_mahalanobis(), 4.0);
+        assert_eq!(objective.bias_prior_mahalanobis(), 5.0);
+        assert_eq!(objective.total_mixed_objective(), 15.0);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_linearization_reports_invalid_objective_with_source_context() {
+        let linearization = VioLinearization {
+            hessian: vec![0.0],
+            rhs: vec![0.0],
+            objective_breakdown: VioObjectiveBreakdown {
+                reprojection_robust_px2: 0.0,
+                imu_mahalanobis: f64::NAN,
+                bias_random_walk_mahalanobis: 0.0,
+                velocity_anchor_mahalanobis: 0.0,
+                bias_prior_mahalanobis: 0.0,
+            },
+        };
+        let error = validate_vio_linearization_values(
+            &linearization,
+            1,
+            VioEvaluation {
+                stage: VioEvaluationStage::Candidate,
+                iteration: 7,
+            },
+        )
+        .expect_err("invalid objective must fail");
+        assert!(matches!(
+            &error,
+            VioSolveError::InvalidObjective {
+                stage: VioEvaluationStage::Candidate,
+                iteration: 7,
+                source: VioObjectiveError::NonFinite {
+                    component: VioObjectiveComponent::ImuMahalanobis,
+                    ..
+                },
+            }
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<VioObjectiveError>())
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_solve_result_derives_counts_and_rejects_incompatible_outcomes() {
+        let factors = VioFactorDiagnostics {
+            last_frame_active_visual_factor_count: 11,
+            initially_excluded_nonprojectable_visual_factor_count: 2,
+            regularized_imu_residual_factor_count: 4,
+            floored_accel_bias_random_walk_factor_count: 3,
+            floored_gyro_bias_random_walk_factor_count: 1,
+        };
+        let objective =
+            VioObjectiveBreakdown::new(1.0, 2.0, 3.0, 4.0, 5.0).expect("valid objective");
+        let result = VioSolveResult::try_evaluated(
+            VioSolveTermination::IterationLimit,
+            2,
+            3,
+            1,
+            objective,
+            factors,
+        )
+        .expect("consistent result");
+        assert_eq!(result.termination(), VioSolveTermination::IterationLimit);
+        assert_eq!(result.attempted_iterations(), 5);
+        assert_eq!(result.accepted_steps(), 2);
+        assert_eq!(result.rejected_steps(), 3);
+        assert_eq!(result.rejected_nonprojectable_candidate_steps(), 1);
+        assert_eq!(result.final_mixed_objective(), 15.0);
+        assert_eq!(result.objective_breakdown(), objective);
+        assert_eq!(result.last_frame_active_visual_factor_count(), 11);
+        assert_eq!(
+            result.initially_excluded_nonprojectable_visual_factor_count(),
+            2
+        );
+        assert_eq!(result.regularized_imu_residual_factor_count(), 4);
+        assert_eq!(result.floored_accel_bias_random_walk_factor_count(), 3);
+        assert_eq!(result.floored_gyro_bias_random_walk_factor_count(), 1);
+        assert!(result.has_improved_estimate());
+
+        let not_required = VioSolveResult::not_required();
+        assert_eq!(not_required.termination(), VioSolveTermination::NotRequired);
+        assert_eq!(not_required.attempted_iterations(), 0);
+        assert_eq!(not_required.final_mixed_objective(), 0.0);
+        assert!(!not_required.has_improved_estimate());
+
+        for (termination, accepted, rejected) in [
+            (VioSolveTermination::NotRequired, 1, 0),
+            (
+                VioSolveTermination::Converged {
+                    criterion: VioConvergenceCriterion::ComponentwiseStepAndRelativeObjective,
+                },
+                0,
+                1,
+            ),
+            (VioSolveTermination::IterationLimit, 0, 1),
+            (VioSolveTermination::StalledNoObjectiveImprovement, 1, 0),
+            (VioSolveTermination::StalledNoObjectiveImprovement, 0, 0),
+        ] {
+            assert!(matches!(
+                VioSolveResult::try_evaluated(
+                    termination,
+                    accepted,
+                    rejected,
+                    0,
+                    objective,
+                    factors,
+                ),
+                Err(VioSolveOutcomeError::TerminationIncompatibleWithSteps {
+                    termination: actual,
+                    accepted_steps: actual_accepted,
+                    rejected_steps: actual_rejected,
+                }) if actual == termination
+                    && actual_accepted == accepted
+                    && actual_rejected == rejected
+            ));
+        }
+
+        assert!(matches!(
+            VioSolveResult::try_evaluated(
+                VioSolveTermination::IterationLimit,
+                usize::MAX,
+                1,
+                0,
+                objective,
+                factors,
+            ),
+            Err(VioSolveOutcomeError::StepCountOverflow { .. })
+        ));
+        assert!(matches!(
+            VioSolveResult::try_evaluated(
+                VioSolveTermination::IterationLimit,
+                1,
+                1,
+                2,
+                objective,
+                factors,
+            ),
+            Err(
+                VioSolveOutcomeError::NonprojectableRejectionsExceedRejections {
+                    nonprojectable_rejections: 2,
+                    rejected_steps: 1,
+                }
+            )
+        ));
+
+        let root = VioSolveOutcomeError::TerminationIncompatibleWithSteps {
+            termination: VioSolveTermination::NotRequired,
+            accepted_steps: 1,
+            rejected_steps: 0,
+        };
+        let wrapped = VioSolveError::InvalidOutcome { source: root };
+        assert!(
+            std::error::Error::source(&wrapped)
+                .and_then(|source| source.downcast_ref::<VioSolveOutcomeError>())
+                .is_some()
+        );
     }
 
     #[cfg(feature = "vio")]
@@ -6795,7 +7347,10 @@ mod tests {
         );
         assert_eq!(linearization.rhs[accel_index], 2.0);
         assert_eq!(linearization.rhs[gyro_index], 6.0);
-        assert_eq!(linearization.cost_breakdown.bias_prior_cost, 7.0);
+        assert_eq!(
+            linearization.objective_breakdown.bias_prior_mahalanobis(),
+            7.0
+        );
     }
 
     #[cfg(feature = "vio")]

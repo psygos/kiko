@@ -102,9 +102,10 @@ pub use imu::{
 #[cfg(feature = "vio")]
 pub use local_ba::{
     AnchorFrameInput, InertialFrameInput, VioBiasPrior, VioBiasPriorInformationQuantity,
-    VioConvergenceCriterion, VioCostBreakdown, VioEvaluationStage, VioFrameEstimate,
-    VioLinearizationQuantity, VioOptimizerWorkspaceError, VioSolveConfig, VioSolveConfigError,
-    VioSolveError, VioSolveResult, VioSolveTermination, VioWindowCapacity, VioWindowCapacityError,
+    VioConvergenceCriterion, VioEvaluationStage, VioFrameEstimate, VioLinearizationQuantity,
+    VioObjectiveBreakdown, VioObjectiveComponent, VioObjectiveError, VioOptimizerWorkspaceError,
+    VioSolveConfig, VioSolveConfigError, VioSolveError, VioSolveOutcomeError, VioSolveResult,
+    VioSolveTermination, VioWindowCapacity, VioWindowCapacityError,
 };
 pub use local_ba::{
     BaCorrection, BaCost, BaCostError, BaExecutionError, BaOptimization, BaOutcomeError, BaResult,
