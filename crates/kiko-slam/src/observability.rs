@@ -127,6 +127,24 @@ const PATH_VIO_ACCEPTED_STEPS: &str = "diagnostics/vio/accepted_steps";
 #[cfg(feature = "vio")]
 const PATH_VIO_REJECTED_STEPS: &str = "diagnostics/vio/rejected_steps";
 #[cfg(feature = "vio")]
+const PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS: &str =
+    "diagnostics/vio/rejected_nonprojectable_candidate_steps";
+#[cfg(feature = "vio")]
+const PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS: &str =
+    "diagnostics/vio/last_frame_active_visual_factors";
+#[cfg(feature = "vio")]
+const PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS: &str =
+    "diagnostics/vio/initially_excluded_nonprojectable_visual_factors";
+#[cfg(feature = "vio")]
+const PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS: &str =
+    "diagnostics/vio/regularized_imu_residual_factors";
+#[cfg(feature = "vio")]
+const PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS: &str =
+    "diagnostics/vio/floored_accel_bias_random_walk_factors";
+#[cfg(feature = "vio")]
+const PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS: &str =
+    "diagnostics/vio/floored_gyro_bias_random_walk_factors";
+#[cfg(feature = "vio")]
 const PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE: &str = "diagnostics/vio/calibrated_bias_prior_active";
 #[cfg(feature = "vio")]
 const PATH_VIO_COST_REPROJECTION: &str = "diagnostics/vio/cost/reprojection";
@@ -483,6 +501,30 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_VIO_ACCEPTED_STEPS, vio_result.accepted_steps as f64));
         scalars.push((PATH_VIO_REJECTED_STEPS, vio_result.rejected_steps as f64));
         scalars.push((
+            PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS,
+            vio_result.rejected_nonprojectable_candidate_steps as f64,
+        ));
+        scalars.push((
+            PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS,
+            vio_result.last_frame_active_visual_factor_count as f64,
+        ));
+        scalars.push((
+            PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS,
+            vio_result.initially_excluded_nonprojectable_visual_factor_count as f64,
+        ));
+        scalars.push((
+            PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS,
+            vio_result.regularized_imu_residual_factor_count as f64,
+        ));
+        scalars.push((
+            PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
+            vio_result.floored_accel_bias_random_walk_factor_count as f64,
+        ));
+        scalars.push((
+            PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS,
+            vio_result.floored_gyro_bias_random_walk_factor_count as f64,
+        ));
+        scalars.push((
             PATH_VIO_COST_REPROJECTION,
             vio_result.cost_breakdown.reprojection_cost,
         ));
@@ -811,7 +853,12 @@ mod tests {
     };
     #[cfg(feature = "vio")]
     use super::{
-        PATH_VIO_ACCEPTED_STEPS, PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE, PATH_VIO_REJECTED_STEPS,
+        PATH_VIO_ACCEPTED_STEPS, PATH_VIO_CALIBRATED_BIAS_PRIOR_ACTIVE,
+        PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS,
+        PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS,
+        PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS,
+        PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS, PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS,
+        PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS, PATH_VIO_REJECTED_STEPS,
         PATH_VIO_TERMINATION,
     };
     use crate::{
@@ -974,10 +1021,14 @@ mod tests {
                 iterations: 3,
                 accepted_steps: 2,
                 rejected_steps: 1,
+                rejected_nonprojectable_candidate_steps: 1,
                 final_cost: 4.0,
                 cost_breakdown: VioCostBreakdown::default(),
-                last_frame_visual_residual_count: 6,
-                last_frame_translation_sigma: None,
+                last_frame_active_visual_factor_count: 6,
+                initially_excluded_nonprojectable_visual_factor_count: 2,
+                regularized_imu_residual_factor_count: 2,
+                floored_accel_bias_random_walk_factor_count: 1,
+                floored_gyro_bias_random_walk_factor_count: 2,
             });
         }
         diag.depth_reorder_warnings = Some(3);
@@ -996,6 +1047,36 @@ mod tests {
         }));
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_POSE_BA_CONVERGED && value.abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_REJECTED_NONPROJECTABLE_CANDIDATE_STEPS
+                && (*value - 1.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_LAST_FRAME_ACTIVE_VISUAL_FACTORS
+                && (*value - 6.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_INITIALLY_EXCLUDED_NONPROJECTABLE_VISUAL_FACTORS
+                && (*value - 2.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_REGULARIZED_IMU_RESIDUAL_FACTORS
+                && (*value - 2.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_FLOORED_ACCEL_BIAS_RANDOM_WALK_FACTORS
+                && (*value - 1.0).abs() < f64::EPSILON
+        }));
+        #[cfg(feature = "vio")]
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_VIO_FLOORED_GYRO_BIAS_RANDOM_WALK_FACTORS
+                && (*value - 2.0).abs() < f64::EPSILON
         }));
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_TRACKING_PNP_REFINEMENT_APPLIED && (*value - 1.0).abs() < f64::EPSILON

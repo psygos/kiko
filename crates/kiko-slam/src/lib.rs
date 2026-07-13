@@ -101,8 +101,9 @@ pub use imu::{
 };
 #[cfg(feature = "vio")]
 pub use local_ba::{
-    AnchorFrameInput, InertialFrameInput, VioBiasPrior, VioConvergenceCriterion, VioCostBreakdown,
-    VioFrameEstimate, VioSolveConfig, VioSolveConfigError, VioSolveError, VioSolveResult,
+    AnchorFrameInput, InertialFrameInput, VioBiasPrior, VioBiasPriorInformationQuantity,
+    VioConvergenceCriterion, VioCostBreakdown, VioEvaluationStage, VioFrameEstimate,
+    VioLinearizationQuantity, VioSolveConfig, VioSolveConfigError, VioSolveError, VioSolveResult,
     VioSolveTermination,
 };
 pub use local_ba::{
@@ -170,9 +171,13 @@ pub use tsdf::{
 };
 #[cfg(feature = "vio")]
 pub use vio::{
-    CorrectedPreintegration, Gravity, GravityError, ImuFactor, NavState, NavStateError, NavTangent,
-    PreintegratedImu, PreintegrationError, VioFactorError, VioObservation,
-    bias_random_walk_residual, pose_prior_residual, reprojection_residual,
+    BiasRandomWalkResidualQuantity, BiasRandomWalkVarianceQuantity, CorrectedPreintegration,
+    DenseSolveError, DenseSolveInput, FiniteDifferenceSide, FlooredBiasRandomWalkInformation,
+    Gravity, GravityError, ImuFactor, ImuJacobianEndpoint, ImuJacobianError,
+    ImuResidualCovarianceRegularization, ImuResidualQuantity, ImuResidualVarianceQuantity,
+    NavState, NavStateError, NavTangent, PreintegratedImu, PreintegrationError,
+    PreintegrationInformationError, PreintegrationQuantity, RegularizedImuResidualInformation,
+    VioFactorError,
 };
 pub use viz::{RerunSink, RerunSinkInitError, VizDecimation, VizDecimationError, VizLogError};
 

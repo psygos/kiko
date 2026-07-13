@@ -1041,54 +1041,73 @@ struct BaFrame {
 }
 
 // ---------------------------------------------------------------------------
-// VIO type system: parse-don't-validate
+// VIO window and solver types
 //
-// Invariants enforced by structure:
+// Layout guarantees:
 // 1. All frames in a VIO window carry NavState (no mixing with visual-only)
 // 2. Every frame except the first has a PreintegratedImu from its predecessor
 //    (encoded structurally: VioAnchor has no preintegration, VioSuccessor has one)
 // 3. Gravity is immutable for the window lifetime
-// 4. The Hessian dimension is always N * STATE_DIM (15)
-// 5. f32 Pose and f64 NavState are always in sync (SyncedPose)
+// 4. Each frame contributes STATE_DIM (15) scalar unknowns
 // ---------------------------------------------------------------------------
 
 /// Dimension of the inertial state per frame:
 /// [translation(3), rotation(3), velocity(3), accel_bias(3), gyro_bias(3)]
 #[cfg(feature = "vio")]
 const VIO_STATE_DIM: usize = 15;
-
-/// Pose in both f32 (for reprojection Jacobians) and f64 (for VIO math).
-/// The two representations are always in sync — constructed together,
-/// updated together. There is no public way to set one without the other.
 #[cfg(feature = "vio")]
-#[derive(Clone, Debug)]
-pub(crate) struct SyncedPose {
-    pub(crate) nav_state: crate::NavState,
-}
-
+const VIO_REPROJECTION_TRANSLATION_FD_STEP_M: f64 = 1e-4;
 #[cfg(feature = "vio")]
-impl SyncedPose {
-    pub(crate) fn new(nav_state: crate::NavState) -> Self {
-        Self { nav_state }
-    }
-
-    pub(crate) fn nav_state(&self) -> &crate::NavState {
-        &self.nav_state
-    }
-
-    /// Apply a 15D tangent-space retraction. Both representations update together.
-    pub(crate) fn retract(&self, delta: &crate::NavTangent) -> Result<Self, crate::NavStateError> {
-        let nav_state = self.nav_state.retract(delta)?;
-        Ok(Self::new(nav_state))
-    }
-}
+const VIO_REPROJECTION_ROTATION_FD_STEP_RAD: f64 = 1e-4;
+#[cfg(feature = "vio")]
+const VIO_REPROJECTION_POSE_FD_STEPS: [f64; 6] = [
+    VIO_REPROJECTION_TRANSLATION_FD_STEP_M,
+    VIO_REPROJECTION_TRANSLATION_FD_STEP_M,
+    VIO_REPROJECTION_TRANSLATION_FD_STEP_M,
+    VIO_REPROJECTION_ROTATION_FD_STEP_RAD,
+    VIO_REPROJECTION_ROTATION_FD_STEP_RAD,
+    VIO_REPROJECTION_ROTATION_FD_STEP_RAD,
+];
+#[cfg(feature = "vio")]
+const VIO_TRANSLATION_CONVERGENCE_TOLERANCE_M: f64 = 1e-6;
+#[cfg(feature = "vio")]
+const VIO_ROTATION_CONVERGENCE_TOLERANCE_RAD: f64 = 1e-6;
+#[cfg(feature = "vio")]
+const VIO_VELOCITY_CONVERGENCE_TOLERANCE_MPS: f64 = 1e-6;
+#[cfg(feature = "vio")]
+const VIO_ACCEL_BIAS_CONVERGENCE_TOLERANCE_MPS2: f64 = 1e-6;
+#[cfg(feature = "vio")]
+const VIO_GYRO_BIAS_CONVERGENCE_TOLERANCE_RADPS: f64 = 1e-6;
+#[cfg(feature = "vio")]
+const VIO_STATE_CONVERGENCE_TOLERANCES: [f64; VIO_STATE_DIM] = [
+    VIO_TRANSLATION_CONVERGENCE_TOLERANCE_M,
+    VIO_TRANSLATION_CONVERGENCE_TOLERANCE_M,
+    VIO_TRANSLATION_CONVERGENCE_TOLERANCE_M,
+    VIO_ROTATION_CONVERGENCE_TOLERANCE_RAD,
+    VIO_ROTATION_CONVERGENCE_TOLERANCE_RAD,
+    VIO_ROTATION_CONVERGENCE_TOLERANCE_RAD,
+    VIO_VELOCITY_CONVERGENCE_TOLERANCE_MPS,
+    VIO_VELOCITY_CONVERGENCE_TOLERANCE_MPS,
+    VIO_VELOCITY_CONVERGENCE_TOLERANCE_MPS,
+    VIO_ACCEL_BIAS_CONVERGENCE_TOLERANCE_MPS2,
+    VIO_ACCEL_BIAS_CONVERGENCE_TOLERANCE_MPS2,
+    VIO_ACCEL_BIAS_CONVERGENCE_TOLERANCE_MPS2,
+    VIO_GYRO_BIAS_CONVERGENCE_TOLERANCE_RADPS,
+    VIO_GYRO_BIAS_CONVERGENCE_TOLERANCE_RADPS,
+    VIO_GYRO_BIAS_CONVERGENCE_TOLERANCE_RADPS,
+];
+#[cfg(feature = "vio")]
+const VIO_RELATIVE_COST_CONVERGENCE_TOLERANCE: f64 = 1e-10;
+#[cfg(feature = "vio")]
+const VIO_RELATIVE_COST_SCALE_FLOOR: f64 = 1e-12;
 
 /// The first frame in a VIO window. Has no predecessor, hence no preintegration.
-/// Carries an anchor prior on velocity and bias.
+/// Carries the velocity-anchor reference. The optional calibrated bias prior
+/// is solve configuration and applies to every frame.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub(crate) struct VioAnchor {
-    pub(crate) synced: SyncedPose,
+    pub(crate) state: crate::NavState,
     /// Visual constraints tied to this anchor, when available.
     pub(crate) observations: Option<ObservationSet>,
     pub(crate) anchor_velocity_odom_mps: [f64; 3],
@@ -1099,42 +1118,80 @@ pub(crate) struct VioAnchor {
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub(crate) struct VioSuccessor {
-    pub(crate) synced: SyncedPose,
+    pub(crate) state: crate::NavState,
     /// Visual constraints for this frame. Some frames legitimately contribute
     /// only inertial continuity and carry no lawful visual observations.
     pub(crate) observations: Option<ObservationSet>,
     pub(crate) preintegrated: crate::PreintegratedImu,
 }
 
-/// Immutable configuration for a VIO solve window. Set once, used for
-/// all iterations. Gravity is a known constant.
+/// Validated diagonal prior on an IMU bias mean. Accelerometer and gyroscope
+/// information use their distinct inverse-variance units.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub struct VioBiasPrior {
-    info: f64,
+    accel_information_s4_per_m2: f64,
+    gyro_information_s2_per_rad2: f64,
     bias: crate::ImuBias,
 }
 
 #[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioBiasPriorInformationQuantity {
+    AccelerometerBiasS4PerM2,
+    GyroscopeBiasS2PerRad2,
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioBiasPriorInformationQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AccelerometerBiasS4PerM2 => "accelerometer-bias information (s^4/m^2)",
+            Self::GyroscopeBiasS2PerRad2 => "gyroscope-bias information (s^2/rad^2)",
+        })
+    }
+}
+
+#[cfg(feature = "vio")]
 impl VioBiasPrior {
-    pub fn new(info: f64, bias: crate::ImuBias) -> Result<Self, VioSolveConfigError> {
-        if !info.is_finite() {
-            return Err(VioSolveConfigError::NonFiniteAnchorWeight {
-                field: "anchor_bias_prior.info",
-                value: info,
-            });
+    pub fn new(
+        accel_information_s4_per_m2: f64,
+        gyro_information_s2_per_rad2: f64,
+        bias: crate::ImuBias,
+    ) -> Result<Self, VioSolveConfigError> {
+        for (quantity, value) in [
+            (
+                VioBiasPriorInformationQuantity::AccelerometerBiasS4PerM2,
+                accel_information_s4_per_m2,
+            ),
+            (
+                VioBiasPriorInformationQuantity::GyroscopeBiasS2PerRad2,
+                gyro_information_s2_per_rad2,
+            ),
+        ] {
+            if !value.is_finite() {
+                return Err(VioSolveConfigError::NonFiniteBiasPriorInformation { quantity, value });
+            }
+            if value <= 0.0 {
+                return Err(VioSolveConfigError::NonPositiveBiasPriorInformation {
+                    quantity,
+                    value,
+                });
+            }
         }
-        if info < 0.0 {
-            return Err(VioSolveConfigError::NegativeAnchorWeight {
-                field: "anchor_bias_prior.info",
-                value: info,
-            });
-        }
-        Ok(Self { info, bias })
+        Ok(Self {
+            accel_information_s4_per_m2,
+            gyro_information_s2_per_rad2,
+            bias,
+        })
     }
 
-    pub fn info(&self) -> f64 {
-        self.info
+    pub fn accel_information_s4_per_m2(&self) -> f64 {
+        self.accel_information_s4_per_m2
+    }
+
+    pub fn gyro_information_s2_per_rad2(&self) -> f64 {
+        self.gyro_information_s2_per_rad2
     }
 
     pub fn bias(&self) -> &crate::ImuBias {
@@ -1142,6 +1199,7 @@ impl VioBiasPrior {
     }
 }
 
+/// Immutable configuration shared by every evaluation of one VIO solve.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub struct VioSolveConfig {
@@ -1151,29 +1209,62 @@ pub struct VioSolveConfig {
     lm: LmConfig,
     max_iterations: NonZeroUsize,
     huber_delta_px: f64,
-    /// Diagonal information weight for the velocity anchor prior on frame 0.
-    anchor_velocity_info: f64,
-    /// Optional calibrated bias prior on all frames. Absent means “no
-    /// calibrated bias prior”, not “prior toward zero”.
-    anchor_bias_prior: Option<VioBiasPrior>,
+    /// Diagonal information for the velocity anchor on frame 0, in s^2/m^2.
+    anchor_velocity_information_s2_per_m2: f64,
+    /// Optional prior mean from inertial calibration, applied to every frame.
+    /// The information strengths are explicit inputs and are not inferred from
+    /// calibration covariance.
+    calibrated_bias_prior: Option<VioBiasPrior>,
 }
 
 #[cfg(feature = "vio")]
 #[derive(Debug)]
 pub enum VioSolveConfigError {
-    NonFiniteAnchorWeight { field: &'static str, value: f64 },
-    NegativeAnchorWeight { field: &'static str, value: f64 },
+    NonFiniteVelocityAnchorInformation {
+        value: f64,
+    },
+    NegativeVelocityAnchorInformation {
+        value: f64,
+    },
+    NonFiniteBiasPriorInformation {
+        quantity: VioBiasPriorInformationQuantity,
+        value: f64,
+    },
+    NonPositiveBiasPriorInformation {
+        quantity: VioBiasPriorInformationQuantity,
+        value: f64,
+    },
+    NonFiniteHuberDeltaPx {
+        value: f64,
+    },
+    NonPositiveHuberDeltaPx {
+        value: f64,
+    },
 }
 
 #[cfg(feature = "vio")]
 impl std::fmt::Display for VioSolveConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NonFiniteAnchorWeight { field, value } => {
-                write!(f, "VIO anchor weight `{field}` must be finite, got {value}")
+            Self::NonFiniteVelocityAnchorInformation { value } => write!(
+                f,
+                "VIO velocity-anchor information must be finite s^2/m^2, got {value}"
+            ),
+            Self::NegativeVelocityAnchorInformation { value } => write!(
+                f,
+                "VIO velocity-anchor information must be >= 0 s^2/m^2, got {value}"
+            ),
+            Self::NonFiniteBiasPriorInformation { quantity, value } => {
+                write!(f, "VIO {quantity} must be finite, got {value}")
             }
-            Self::NegativeAnchorWeight { field, value } => {
-                write!(f, "VIO anchor weight `{field}` must be >= 0, got {value}")
+            Self::NonPositiveBiasPriorInformation { quantity, value } => {
+                write!(f, "VIO {quantity} must be > 0, got {value}")
+            }
+            Self::NonFiniteHuberDeltaPx { value } => {
+                write!(f, "VIO Huber delta must be finite pixels, got {value}")
+            }
+            Self::NonPositiveHuberDeltaPx { value } => {
+                write!(f, "VIO Huber delta must be > 0 pixels, got {value}")
             }
         }
     }
@@ -1192,19 +1283,27 @@ impl VioSolveConfig {
         lm: LmConfig,
         max_iterations: NonZeroUsize,
         huber_delta_px: f64,
-        anchor_velocity_info: f64,
-        anchor_bias_prior: Option<VioBiasPrior>,
+        anchor_velocity_information_s2_per_m2: f64,
+        calibrated_bias_prior: Option<VioBiasPrior>,
     ) -> Result<Self, VioSolveConfigError> {
-        if !anchor_velocity_info.is_finite() {
-            return Err(VioSolveConfigError::NonFiniteAnchorWeight {
-                field: "anchor_velocity_info",
-                value: anchor_velocity_info,
+        if !anchor_velocity_information_s2_per_m2.is_finite() {
+            return Err(VioSolveConfigError::NonFiniteVelocityAnchorInformation {
+                value: anchor_velocity_information_s2_per_m2,
             });
         }
-        if anchor_velocity_info < 0.0 {
-            return Err(VioSolveConfigError::NegativeAnchorWeight {
-                field: "anchor_velocity_info",
-                value: anchor_velocity_info,
+        if anchor_velocity_information_s2_per_m2 < 0.0 {
+            return Err(VioSolveConfigError::NegativeVelocityAnchorInformation {
+                value: anchor_velocity_information_s2_per_m2,
+            });
+        }
+        if !huber_delta_px.is_finite() {
+            return Err(VioSolveConfigError::NonFiniteHuberDeltaPx {
+                value: huber_delta_px,
+            });
+        }
+        if huber_delta_px <= 0.0 {
+            return Err(VioSolveConfigError::NonPositiveHuberDeltaPx {
+                value: huber_delta_px,
             });
         }
         Ok(Self {
@@ -1214,8 +1313,8 @@ impl VioSolveConfig {
             lm,
             max_iterations,
             huber_delta_px,
-            anchor_velocity_info,
-            anchor_bias_prior,
+            anchor_velocity_information_s2_per_m2,
+            calibrated_bias_prior,
         })
     }
 
@@ -1223,18 +1322,18 @@ impl VioSolveConfig {
         self.gravity
     }
 
-    pub fn has_anchor_bias_prior(&self) -> bool {
-        self.anchor_bias_prior.is_some()
+    pub fn has_calibrated_bias_prior(&self) -> bool {
+        self.calibrated_bias_prior.is_some()
     }
 }
 
-/// A structurally valid VIO optimization window.
+/// A structurally complete VIO optimization window.
 ///
-/// Invariants enforced by construction:
+/// Layout guarantees:
 /// - At least one frame (the anchor)
 /// - Every successor has a PreintegratedImu from its predecessor
 /// - All frames carry NavState (no visual-only frames)
-/// - The Hessian dimension is `(1 + successors.len()) * VIO_STATE_DIM`
+/// - Each frame contributes `VIO_STATE_DIM` scalar unknowns
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub(crate) struct VioWindow {
@@ -1257,13 +1356,13 @@ impl VioWindow {
         }
     }
 
-    /// Iterate all synced poses in window order.
-    fn synced_poses(&self) -> impl Iterator<Item = &SyncedPose> {
-        std::iter::once(&self.anchor.synced).chain(self.successors.iter().map(|s| &s.synced))
+    /// Iterate all navigation states in window order.
+    fn states(&self) -> impl Iterator<Item = &crate::NavState> {
+        std::iter::once(&self.anchor.state).chain(self.successors.iter().map(|s| &s.state))
     }
 }
 
-/// Output from a VIO BA solve. Contains the refined state for all frames.
+/// Per-factor objective contributions from a VIO BA evaluation.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug, Default)]
 pub struct VioCostBreakdown {
@@ -1285,11 +1384,11 @@ impl VioCostBreakdown {
     }
 }
 
-/// Output from a VIO BA solve. Contains the refined state for all frames.
+/// Criterion that terminated a converged VIO solve.
 #[cfg(feature = "vio")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VioConvergenceCriterion {
-    StepAndRelativeCost,
+    ComponentwiseStepAndRelativeCost,
 }
 
 #[cfg(feature = "vio")]
@@ -1309,6 +1408,47 @@ impl VioSolveTermination {
 }
 
 #[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioEvaluationStage {
+    Initial,
+    Candidate,
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VioLinearizationQuantity {
+    Hessian,
+    RightHandSide,
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioLinearizationQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hessian => f.write_str("Hessian"),
+            Self::RightHandSide => f.write_str("right-hand side"),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl std::fmt::Display for VioEvaluationStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initial => f.write_str("initial"),
+            Self::Candidate => f.write_str("candidate"),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+#[derive(Clone, Copy)]
+struct VioEvaluation {
+    stage: VioEvaluationStage,
+    iteration: usize,
+}
+
+#[cfg(feature = "vio")]
 #[derive(Debug)]
 pub enum VioSolveError {
     Observation {
@@ -1316,15 +1456,72 @@ pub enum VioSolveError {
     },
     LinearSolve {
         iteration: usize,
-        source: crate::vio::solve::DenseSolveError,
+        source: crate::DenseSolveError,
     },
     StateRetraction {
         iteration: usize,
         frame_index: usize,
         source: crate::NavStateError,
     },
+    ImuFactor {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        successor_index: usize,
+        source: crate::VioFactorError,
+    },
+    ImuJacobian {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        successor_index: usize,
+        source: crate::ImuJacobianError,
+    },
+    BiasRandomWalkFactor {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        successor_index: usize,
+        source: crate::VioFactorError,
+    },
+    ReprojectionFactorUnavailable {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        frame_index: usize,
+        observation_index: usize,
+    },
+    ReprojectionJacobianRetraction {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        frame_index: usize,
+        observation_index: usize,
+        tangent_axis: usize,
+        side: crate::FiniteDifferenceSide,
+        source: crate::NavStateError,
+    },
+    ReprojectionJacobianUnavailable {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        frame_index: usize,
+        observation_index: usize,
+        tangent_axis: usize,
+        side: crate::FiniteDifferenceSide,
+    },
+    NonFiniteReprojectionJacobian {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        frame_index: usize,
+        observation_index: usize,
+        residual_axis: usize,
+        tangent_axis: usize,
+        value: f64,
+    },
+    NonFiniteLinearization {
+        stage: VioEvaluationStage,
+        iteration: usize,
+        quantity: VioLinearizationQuantity,
+        index: usize,
+        value: f64,
+    },
     NonFiniteCost {
-        stage: &'static str,
+        stage: VioEvaluationStage,
         iteration: usize,
         value: f64,
     },
@@ -1351,6 +1548,87 @@ impl std::fmt::Display for VioSolveError {
                 f,
                 "VIO state retraction failed at iteration {iteration}, frame {frame_index}: {source}"
             ),
+            Self::ImuFactor {
+                stage,
+                iteration,
+                successor_index,
+                source,
+            } => write!(
+                f,
+                "VIO {stage} IMU factor {successor_index} failed at iteration {iteration}: {source}"
+            ),
+            Self::ImuJacobian {
+                stage,
+                iteration,
+                successor_index,
+                source,
+            } => write!(
+                f,
+                "VIO {stage} IMU Jacobian {successor_index} failed at iteration {iteration}: {source}"
+            ),
+            Self::BiasRandomWalkFactor {
+                stage,
+                iteration,
+                successor_index,
+                source,
+            } => write!(
+                f,
+                "VIO {stage} bias random-walk factor {successor_index} failed at iteration {iteration}: {source}"
+            ),
+            Self::ReprojectionFactorUnavailable {
+                stage,
+                iteration,
+                frame_index,
+                observation_index,
+            } => write!(
+                f,
+                "VIO {stage} visual factor is nonprojectable at iteration {iteration}, frame {frame_index}, observation {observation_index}"
+            ),
+            Self::ReprojectionJacobianRetraction {
+                stage,
+                iteration,
+                frame_index,
+                observation_index,
+                tangent_axis,
+                side,
+                source,
+            } => write!(
+                f,
+                "VIO {stage} reprojection Jacobian retraction failed at iteration {iteration}, frame {frame_index}, observation {observation_index}, tangent axis {tangent_axis}, {side} side: {source}"
+            ),
+            Self::ReprojectionJacobianUnavailable {
+                stage,
+                iteration,
+                frame_index,
+                observation_index,
+                tangent_axis,
+                side,
+            } => write!(
+                f,
+                "VIO {stage} reprojection Jacobian is unavailable at iteration {iteration}, frame {frame_index}, observation {observation_index}, tangent axis {tangent_axis}, {side} side"
+            ),
+            Self::NonFiniteReprojectionJacobian {
+                stage,
+                iteration,
+                frame_index,
+                observation_index,
+                residual_axis,
+                tangent_axis,
+                value,
+            } => write!(
+                f,
+                "VIO {stage} reprojection Jacobian entry ({residual_axis}, {tangent_axis}) at iteration {iteration}, frame {frame_index}, observation {observation_index} must be finite, got {value}"
+            ),
+            Self::NonFiniteLinearization {
+                stage,
+                iteration,
+                quantity,
+                index,
+                value,
+            } => write!(
+                f,
+                "VIO {stage} linearization {quantity}[{index}] at iteration {iteration} must be finite, got {value}"
+            ),
             Self::NonFiniteCost {
                 stage,
                 iteration,
@@ -1370,8 +1648,32 @@ impl std::error::Error for VioSolveError {
             Self::Observation { source } => Some(source),
             Self::LinearSolve { source, .. } => Some(source),
             Self::StateRetraction { source, .. } => Some(source),
-            Self::NonFiniteCost { .. } => None,
+            Self::ImuFactor { source, .. } => Some(source),
+            Self::ImuJacobian { source, .. } => Some(source),
+            Self::BiasRandomWalkFactor { source, .. } => Some(source),
+            Self::ReprojectionJacobianRetraction { source, .. } => Some(source),
+            Self::ReprojectionFactorUnavailable { .. }
+            | Self::ReprojectionJacobianUnavailable { .. }
+            | Self::NonFiniteReprojectionJacobian { .. }
+            | Self::NonFiniteLinearization { .. }
+            | Self::NonFiniteCost { .. } => None,
         }
+    }
+}
+
+#[cfg(feature = "vio")]
+impl VioSolveError {
+    fn is_rejected_candidate_nonprojectability(&self) -> bool {
+        matches!(
+            self,
+            Self::ReprojectionFactorUnavailable {
+                stage: VioEvaluationStage::Candidate,
+                ..
+            } | Self::ReprojectionJacobianUnavailable {
+                stage: VioEvaluationStage::Candidate,
+                ..
+            }
+        )
     }
 }
 
@@ -1382,7 +1684,7 @@ impl From<ObservationResolveError> for VioSolveError {
     }
 }
 
-/// Output from a VIO BA solve. Contains the refined state for all frames.
+/// Diagnostics and termination outcome from a VIO BA solve.
 #[cfg(feature = "vio")]
 #[derive(Clone, Debug)]
 pub struct VioSolveResult {
@@ -1390,14 +1692,26 @@ pub struct VioSolveResult {
     pub iterations: usize,
     pub accepted_steps: usize,
     pub rejected_steps: usize,
+    /// Candidate steps rejected because an initially active visual factor, or
+    /// one of its finite-difference perturbations, became nonprojectable.
+    pub rejected_nonprojectable_candidate_steps: usize,
     pub final_cost: f64,
     pub cost_breakdown: VioCostBreakdown,
-    pub last_frame_visual_residual_count: usize,
-    /// Approximate posterior translation standard deviation for the last
-    /// frame, extracted from the Hessian diagonal. In meters.
-    /// This is the local linearization uncertainty — not a full posterior
-    /// covariance, but sufficient for weighting downstream fusion.
-    pub last_frame_translation_sigma: Option<[f64; 3]>,
+    /// Visual factors that were projectable in the initial state and retained
+    /// for every objective evaluation. Each factor contributes two residuals.
+    pub last_frame_active_visual_factor_count: usize,
+    /// Resolved visual observations excluded before optimization because they
+    /// were nonprojectable in the initial state.
+    pub initially_excluded_nonprojectable_visual_factor_count: usize,
+    /// IMU factors whose mixed-unit residual covariance received the explicit
+    /// block-unit diagonal regularization reported by their information type.
+    pub regularized_imu_residual_factor_count: usize,
+    /// Bias random-walk factors whose raw accelerometer-bias variance was
+    /// raised to the documented floor.
+    pub floored_accel_bias_random_walk_factor_count: usize,
+    /// Bias random-walk factors whose raw gyroscope-bias variance was raised
+    /// to the documented floor.
+    pub floored_gyro_bias_random_walk_factor_count: usize,
 }
 
 #[cfg(feature = "vio")]
@@ -2417,6 +2731,18 @@ fn restore_full_ba_candidate(
 // Tightly-coupled VIO optimizer
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "vio")]
+fn vio_step_is_componentwise_small(delta: &[f64]) -> bool {
+    let mut states = delta.chunks_exact(VIO_STATE_DIM);
+    let within_tolerance = states.by_ref().all(|state_delta| {
+        state_delta
+            .iter()
+            .zip(VIO_STATE_CONVERGENCE_TOLERANCES)
+            .all(|(value, tolerance)| value.abs() < tolerance)
+    });
+    within_tolerance && states.remainder().is_empty()
+}
+
 /// Run Levenberg-Marquardt on a VIO window, jointly optimizing poses,
 /// velocities, and IMU biases using reprojection + IMU + bias factors.
 ///
@@ -2441,33 +2767,48 @@ pub fn optimize_vio(
             iterations: 0,
             accepted_steps: 0,
             rejected_steps: 0,
+            rejected_nonprojectable_candidate_steps: 0,
             final_cost: 0.0,
             cost_breakdown: VioCostBreakdown::default(),
-            last_frame_visual_residual_count: 0,
-            last_frame_translation_sigma: None,
+            last_frame_active_visual_factor_count: 0,
+            initially_excluded_nonprojectable_visual_factor_count: 0,
+            regularized_imu_residual_factor_count: 0,
+            floored_accel_bias_random_walk_factor_count: 0,
+            floored_gyro_bias_random_walk_factor_count: 0,
         });
     }
 
     let max_iters = config.max_iterations.get();
     let mut lambda = f64::from(config.lm.initial_lambda);
-    let mut synced = window.synced_poses().cloned().collect::<Vec<_>>();
+    let mut states = window.states().cloned().collect::<Vec<_>>();
     let resolved_observations = (0..n_frames)
         .map(|frame_idx| match window.observations(frame_idx) {
             Some(observations) => observations.resolve(map, config.intrinsics, NonZeroUsize::MIN),
             None => Ok(None),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut linearization = linearize_vio_states(
-        window,
-        &synced,
+    let visual_support = VisualFactorSupport::from_initial_states(
+        &states,
         &resolved_observations,
         config,
         map_from_odom,
     );
+    let mut linearization = linearize_vio_states(
+        window,
+        &states,
+        &resolved_observations,
+        &visual_support,
+        config,
+        map_from_odom,
+        VioEvaluation {
+            stage: VioEvaluationStage::Initial,
+            iteration: 0,
+        },
+    )?;
     let mut current_cost = linearization.cost_breakdown.total_cost();
     if !current_cost.is_finite() {
         return Err(VioSolveError::NonFiniteCost {
-            stage: "initial",
+            stage: VioEvaluationStage::Initial,
             iteration: 0,
             value: current_cost,
         });
@@ -2476,6 +2817,7 @@ pub fn optimize_vio(
     let mut attempted_iterations = 0;
     let mut accepted_steps = 0;
     let mut rejected_steps = 0;
+    let mut rejected_nonprojectable_candidate_steps = 0;
 
     for iteration in 0..max_iters {
         attempted_iterations = iteration + 1;
@@ -2493,49 +2835,66 @@ pub fn optimize_vio(
         })?;
         let delta = neg_g;
 
-        let mut candidate_synced = Vec::with_capacity(n_frames);
-        for (frame_idx, synced_pose) in synced.iter().enumerate() {
+        let mut candidate_states = Vec::with_capacity(n_frames);
+        for (frame_idx, state) in states.iter().enumerate() {
             let base = frame_idx * VIO_STATE_DIM;
             let mut tangent = [0.0_f64; VIO_STATE_DIM];
             tangent.copy_from_slice(&delta[base..base + VIO_STATE_DIM]);
-            let new_synced =
-                synced_pose
+            let candidate_state =
+                state
                     .retract(&tangent)
                     .map_err(|source| VioSolveError::StateRetraction {
                         iteration: attempted_iterations,
                         frame_index: frame_idx,
                         source,
                     })?;
-            candidate_synced.push(new_synced);
+            candidate_states.push(candidate_state);
         }
 
-        let candidate_linearization = linearize_vio_states(
+        let candidate_linearization = match linearize_vio_states(
             window,
-            &candidate_synced,
+            &candidate_states,
             &resolved_observations,
+            &visual_support,
             config,
             map_from_odom,
-        );
+            VioEvaluation {
+                stage: VioEvaluationStage::Candidate,
+                iteration: attempted_iterations,
+            },
+        ) {
+            Ok(linearization) => linearization,
+            Err(error) if error.is_rejected_candidate_nonprojectability() => {
+                rejected_steps += 1;
+                rejected_nonprojectable_candidate_steps += 1;
+                lambda = (lambda * f64::from(config.lm.lambda_factor))
+                    .min(f64::from(config.lm.max_lambda));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let candidate_cost = candidate_linearization.cost_breakdown.total_cost();
         if !candidate_cost.is_finite() {
             return Err(VioSolveError::NonFiniteCost {
-                stage: "candidate",
+                stage: VioEvaluationStage::Candidate,
                 iteration: attempted_iterations,
                 value: candidate_cost,
             });
         }
         if candidate_cost < current_cost {
-            let step_norm: f64 = delta.iter().map(|d| d * d).sum::<f64>().sqrt();
             let cost_decrease = current_cost - candidate_cost;
-            synced = candidate_synced;
+            states = candidate_states;
             linearization = candidate_linearization;
             current_cost = candidate_cost;
             accepted_steps += 1;
             lambda =
                 (lambda / f64::from(config.lm.lambda_factor)).max(f64::from(config.lm.min_lambda));
-            if step_norm < 1e-6 && cost_decrease < 1e-10 * current_cost.max(1e-12) {
+            let relative_cost_scale = current_cost.abs().max(VIO_RELATIVE_COST_SCALE_FLOOR);
+            if vio_step_is_componentwise_small(&delta)
+                && cost_decrease < VIO_RELATIVE_COST_CONVERGENCE_TOLERANCE * relative_cost_scale
+            {
                 termination = Some(VioSolveTermination::Converged {
-                    criterion: VioConvergenceCriterion::StepAndRelativeCost,
+                    criterion: VioConvergenceCriterion::ComponentwiseStepAndRelativeCost,
                 });
                 break;
             }
@@ -2546,12 +2905,32 @@ pub fn optimize_vio(
         }
     }
 
-    window.anchor.synced = synced[0].clone();
+    window.anchor.state = states[0].clone();
     for (i, succ) in window.successors.iter_mut().enumerate() {
-        succ.synced = synced[i + 1].clone();
+        succ.state = states[i + 1].clone();
     }
 
-    let sigma = extract_last_frame_translation_sigma(&linearization.hessian, dim, n_frames);
+    let regularized_imu_residual_factor_count = window.successors.len();
+    let floored_accel_bias_random_walk_factor_count = window
+        .successors
+        .iter()
+        .filter(|successor| {
+            successor
+                .preintegrated
+                .floored_bias_random_walk_information()
+                .accel_variance_floor_applied()
+        })
+        .count();
+    let floored_gyro_bias_random_walk_factor_count = window
+        .successors
+        .iter()
+        .filter(|successor| {
+            successor
+                .preintegrated
+                .floored_bias_random_walk_information()
+                .gyro_variance_floor_applied()
+        })
+        .count();
     Ok(VioSolveResult {
         termination: termination.unwrap_or(if accepted_steps == 0 && rejected_steps > 0 {
             VioSolveTermination::StalledNoCostImprovement
@@ -2561,13 +2940,15 @@ pub fn optimize_vio(
         iterations: attempted_iterations,
         accepted_steps,
         rejected_steps,
+        rejected_nonprojectable_candidate_steps,
         final_cost: current_cost,
         cost_breakdown: linearization.cost_breakdown,
-        last_frame_visual_residual_count: *linearization
-            .reprojection_residual_counts
-            .last()
-            .unwrap_or(&0),
-        last_frame_translation_sigma: sigma,
+        last_frame_active_visual_factor_count: visual_support.last_frame_factor_count(),
+        initially_excluded_nonprojectable_visual_factor_count: visual_support
+            .initially_excluded_nonprojectable_factor_count,
+        regularized_imu_residual_factor_count,
+        floored_accel_bias_random_walk_factor_count,
+        floored_gyro_bias_random_walk_factor_count,
     })
 }
 
@@ -2576,98 +2957,197 @@ struct VioLinearization {
     hessian: Vec<f64>,
     rhs: Vec<f64>,
     cost_breakdown: VioCostBreakdown,
-    reprojection_residual_counts: Vec<usize>,
+}
+
+#[cfg(feature = "vio")]
+struct VisualFactorSupport {
+    observation_indices_by_frame: Vec<Vec<usize>>,
+    initially_excluded_nonprojectable_factor_count: usize,
+}
+
+#[cfg(feature = "vio")]
+impl VisualFactorSupport {
+    fn from_initial_states(
+        states: &[crate::NavState],
+        resolved_observations: &[Option<ResolvedObservationSet>],
+        config: &VioSolveConfig,
+        map_from_odom: &crate::MapFromOdom,
+    ) -> Self {
+        debug_assert_eq!(states.len(), resolved_observations.len());
+        let mut observation_indices_by_frame = Vec::with_capacity(states.len());
+        let mut initially_excluded_nonprojectable_factor_count = 0;
+
+        for (frame_index, state) in states.iter().enumerate() {
+            let mut active_indices = Vec::new();
+            if let Some(resolved) = &resolved_observations[frame_index] {
+                active_indices.reserve(resolved.observations().len());
+                let cam_from_map = vio_cam_from_map(state, config.camera_from_body, map_from_odom);
+                for (observation_index, observation) in resolved.observations().iter().enumerate() {
+                    if reprojection_residual_and_jacobians(
+                        cam_from_map,
+                        observation.world(),
+                        observation.pixel(),
+                        config.intrinsics,
+                    )
+                    .is_some()
+                    {
+                        active_indices.push(observation_index);
+                    } else {
+                        initially_excluded_nonprojectable_factor_count += 1;
+                    }
+                }
+            }
+            observation_indices_by_frame.push(active_indices);
+        }
+
+        Self {
+            observation_indices_by_frame,
+            initially_excluded_nonprojectable_factor_count,
+        }
+    }
+
+    fn indices_for_frame(&self, frame_index: usize) -> &[usize] {
+        &self.observation_indices_by_frame[frame_index]
+    }
+
+    fn last_frame_factor_count(&self) -> usize {
+        self.observation_indices_by_frame.last().map_or(0, Vec::len)
+    }
 }
 
 #[cfg(feature = "vio")]
 fn linearize_vio_states(
     window: &VioWindow,
-    states: &[SyncedPose],
+    states: &[crate::NavState],
     resolved_observations: &[Option<ResolvedObservationSet>],
+    visual_support: &VisualFactorSupport,
     config: &VioSolveConfig,
     map_from_odom: &crate::MapFromOdom,
-) -> VioLinearization {
+    evaluation: VioEvaluation,
+) -> Result<VioLinearization, VioSolveError> {
+    use crate::ImuFactor;
+    use crate::vio::bias_random_walk_residual;
     use crate::vio::solve::{
-        BIAS_RW_RESIDUAL_DIM, IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor,
-        accumulate_factor, imu_jacobians,
+        IMU_RESIDUAL_DIM, STATE_DIM, accumulate_cross_factor, accumulate_factor, imu_jacobians,
     };
-    use crate::{ImuFactor, bias_random_walk_residual};
+    let VioEvaluation { stage, iteration } = evaluation;
 
     debug_assert_eq!(states.len(), window.len());
     let n_frames = window.len();
     debug_assert_eq!(resolved_observations.len(), n_frames);
+    debug_assert_eq!(visual_support.observation_indices_by_frame.len(), n_frames);
     let dim = n_frames * STATE_DIM;
     let mut hessian = vec![0.0_f64; dim * dim];
     let mut rhs = vec![0.0_f64; dim];
     let mut cost_breakdown = VioCostBreakdown::default();
-    let mut reprojection_residual_counts = vec![0usize; n_frames];
 
-    for (frame_idx, synced) in states.iter().enumerate() {
+    for (frame_idx, state) in states.iter().enumerate() {
         let base = frame_idx * STATE_DIM;
-        let cam_pose = vio_cam_from_map(synced.nav_state(), config.camera_from_body, map_from_odom);
+        let cam_pose = vio_cam_from_map(state, config.camera_from_body, map_from_odom);
         if let Some(resolved) = &resolved_observations[frame_idx] {
-            for obs in resolved.observations() {
+            for &observation_index in visual_support.indices_for_frame(frame_idx) {
+                let obs = &resolved.observations()[observation_index];
                 let world = obs.world();
                 let pixel = obs.pixel();
-                let Some((residual, _, _)) =
+                let (residual, _, _) =
                     reprojection_residual_and_jacobians(cam_pose, world, pixel, config.intrinsics)
-                else {
-                    continue;
-                };
-                let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                let huber_delta = config.huber_delta_px as f32;
+                        .ok_or(VioSolveError::ReprojectionFactorUnavailable {
+                            stage,
+                            iteration,
+                            frame_index: frame_idx,
+                            observation_index,
+                        })?;
+                let residual_f64 = [f64::from(residual[0]), f64::from(residual[1])];
+                let r_norm = residual_f64[0].hypot(residual_f64[1]);
+                let huber_delta = config.huber_delta_px;
                 let (huber_weight, huber_cost) = if r_norm <= huber_delta {
-                    (1.0_f32, 0.5 * r_norm * r_norm)
+                    (1.0, 0.5 * r_norm * r_norm)
                 } else {
                     (
                         huber_delta / r_norm,
                         huber_delta * (r_norm - 0.5 * huber_delta),
                     )
                 };
-                cost_breakdown.reprojection_cost += f64::from(huber_cost);
+                cost_breakdown.reprojection_cost += huber_cost;
                 let sqrt_w = huber_weight.sqrt();
 
-                const FD_EPS: f64 = 1e-4;
                 let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
-                for axis in 0..6 {
+                for (axis, step) in VIO_REPROJECTION_POSE_FD_STEPS.into_iter().enumerate() {
                     let mut delta_plus = [0.0_f64; STATE_DIM];
                     let mut delta_minus = [0.0_f64; STATE_DIM];
-                    delta_plus[axis] = FD_EPS;
-                    delta_minus[axis] = -FD_EPS;
-                    let (Ok(s_plus), Ok(s_minus)) = (
-                        synced.nav_state().retract(&delta_plus),
-                        synced.nav_state().retract(&delta_minus),
-                    ) else {
-                        continue;
-                    };
+                    delta_plus[axis] = step;
+                    delta_minus[axis] = -step;
+                    let s_plus = state.retract(&delta_plus).map_err(|source| {
+                        VioSolveError::ReprojectionJacobianRetraction {
+                            stage,
+                            iteration,
+                            frame_index: frame_idx,
+                            observation_index,
+                            tangent_axis: axis,
+                            side: crate::FiniteDifferenceSide::Positive,
+                            source,
+                        }
+                    })?;
+                    let s_minus = state.retract(&delta_minus).map_err(|source| {
+                        VioSolveError::ReprojectionJacobianRetraction {
+                            stage,
+                            iteration,
+                            frame_index: frame_idx,
+                            observation_index,
+                            tangent_axis: axis,
+                            side: crate::FiniteDifferenceSide::Negative,
+                            source,
+                        }
+                    })?;
                     let p_plus = vio_cam_from_map(&s_plus, config.camera_from_body, map_from_odom);
                     let p_minus =
                         vio_cam_from_map(&s_minus, config.camera_from_body, map_from_odom);
-                    if let (Some((r_plus, _, _)), Some((r_minus, _, _))) = (
-                        reprojection_residual_and_jacobians(
-                            p_plus,
-                            world,
-                            pixel,
-                            config.intrinsics,
-                        ),
-                        reprojection_residual_and_jacobians(
-                            p_minus,
-                            world,
-                            pixel,
-                            config.intrinsics,
-                        ),
-                    ) {
-                        for row in 0..2 {
-                            j_15[row][axis] = f64::from(r_plus[row] - r_minus[row])
-                                / (2.0 * FD_EPS)
-                                * f64::from(sqrt_w);
+                    let (r_plus, _, _) = reprojection_residual_and_jacobians(
+                        p_plus,
+                        world,
+                        pixel,
+                        config.intrinsics,
+                    )
+                    .ok_or(VioSolveError::ReprojectionJacobianUnavailable {
+                        stage,
+                        iteration,
+                        frame_index: frame_idx,
+                        observation_index,
+                        tangent_axis: axis,
+                        side: crate::FiniteDifferenceSide::Positive,
+                    })?;
+                    let (r_minus, _, _) = reprojection_residual_and_jacobians(
+                        p_minus,
+                        world,
+                        pixel,
+                        config.intrinsics,
+                    )
+                    .ok_or(VioSolveError::ReprojectionJacobianUnavailable {
+                        stage,
+                        iteration,
+                        frame_index: frame_idx,
+                        observation_index,
+                        tangent_axis: axis,
+                        side: crate::FiniteDifferenceSide::Negative,
+                    })?;
+                    for row in 0..2 {
+                        let derivative =
+                            f64::from(r_plus[row] - r_minus[row]) / (2.0 * step) * sqrt_w;
+                        if !derivative.is_finite() {
+                            return Err(VioSolveError::NonFiniteReprojectionJacobian {
+                                stage,
+                                iteration,
+                                frame_index: frame_idx,
+                                observation_index,
+                                residual_axis: row,
+                                tangent_axis: axis,
+                                value: derivative,
+                            });
                         }
+                        j_15[row][axis] = derivative;
                     }
                 }
-                let r_f64 = [
-                    f64::from(residual[0] * sqrt_w),
-                    f64::from(residual[1] * sqrt_w),
-                ];
+                let r_f64 = [residual_f64[0] * sqrt_w, residual_f64[1] * sqrt_w];
                 let identity_2 = [[1.0, 0.0], [0.0, 1.0]];
                 accumulate_factor(
                     &mut hessian,
@@ -2678,21 +3158,35 @@ fn linearize_vio_states(
                     &r_f64,
                     base,
                 );
-                reprojection_residual_counts[frame_idx] =
-                    reprojection_residual_counts[frame_idx].saturating_add(1);
             }
         }
     }
 
     for succ_idx in 0..window.successors.len() {
-        let prev_state = states[succ_idx].nav_state();
-        let curr_state = states[succ_idx + 1].nav_state();
+        let prev_state = &states[succ_idx];
+        let curr_state = &states[succ_idx + 1];
         let preint = &window.successors[succ_idx].preintegrated;
         let gravity = config.gravity();
 
-        let residual = ImuFactor::residual(prev_state, curr_state, preint, &gravity);
-        let info = preint.residual_information();
-        let (j_prev, j_curr) = imu_jacobians(prev_state, curr_state, preint, gravity);
+        let residual =
+            ImuFactor::residual(prev_state, curr_state, preint, &gravity).map_err(|source| {
+                VioSolveError::ImuFactor {
+                    stage,
+                    iteration,
+                    successor_index: succ_idx,
+                    source,
+                }
+            })?;
+        let info = preint.regularized_residual_information().matrix();
+        let (j_prev, j_curr) =
+            imu_jacobians(prev_state, curr_state, preint, gravity).map_err(|source| {
+                VioSolveError::ImuJacobian {
+                    stage,
+                    iteration,
+                    successor_index: succ_idx,
+                    source,
+                }
+            })?;
 
         let mut imu_cost = 0.0;
         for i in 0..IMU_RESIDUAL_DIM {
@@ -2709,7 +3203,7 @@ fn linearize_vio_states(
             &mut rhs,
             dim,
             &j_prev,
-            &info,
+            info,
             &residual,
             base_prev,
         );
@@ -2718,7 +3212,7 @@ fn linearize_vio_states(
             &mut rhs,
             dim,
             &j_curr,
-            &info,
+            info,
             &residual,
             base_curr,
         );
@@ -2727,119 +3221,121 @@ fn linearize_vio_states(
             dim,
             &j_prev,
             &j_curr,
-            &info,
+            info,
             base_prev,
             base_curr,
         );
     }
 
     for succ_idx in 0..window.successors.len() {
-        let prev_state = states[succ_idx].nav_state();
-        let curr_state = states[succ_idx + 1].nav_state();
+        let prev_state = &states[succ_idx];
+        let curr_state = &states[succ_idx + 1];
         let preint = &window.successors[succ_idx].preintegrated;
-        let bias_residual = bias_random_walk_residual(prev_state, curr_state);
-        let bias_info = preint.bias_random_walk_information();
+        let bias_residual =
+            bias_random_walk_residual(prev_state, curr_state).map_err(|source| {
+                VioSolveError::BiasRandomWalkFactor {
+                    stage,
+                    iteration,
+                    successor_index: succ_idx,
+                    source,
+                }
+            })?;
+        let bias_information_diagonal = preint.floored_bias_random_walk_information().diagonal();
 
         let mut bias_cost = 0.0;
-        for i in 0..BIAS_RW_RESIDUAL_DIM {
-            for j in 0..BIAS_RW_RESIDUAL_DIM {
-                bias_cost += bias_residual[i] * bias_info[i][j] * bias_residual[j];
-            }
-        }
-        cost_breakdown.bias_random_walk_cost += 0.5 * bias_cost;
-
         let base_prev = succ_idx * STATE_DIM;
         let base_curr = (succ_idx + 1) * STATE_DIM;
-        for a in 0..BIAS_RW_RESIDUAL_DIM {
-            let mut omega_r = 0.0;
-            for b in 0..BIAS_RW_RESIDUAL_DIM {
-                let w = bias_info[a][b];
-                hessian[(base_prev + 9 + a) * dim + (base_prev + 9 + b)] += w;
-                hessian[(base_curr + 9 + a) * dim + (base_curr + 9 + b)] += w;
-                hessian[(base_prev + 9 + a) * dim + (base_curr + 9 + b)] -= w;
-                hessian[(base_curr + 9 + b) * dim + (base_prev + 9 + a)] -= w;
-                omega_r += w * bias_residual[b];
-            }
-            rhs[base_prev + 9 + a] -= omega_r;
-            rhs[base_curr + 9 + a] += omega_r;
+        for (axis, (residual, information)) in bias_residual
+            .into_iter()
+            .zip(bias_information_diagonal)
+            .enumerate()
+        {
+            let previous_index = base_prev + 9 + axis;
+            let current_index = base_curr + 9 + axis;
+            let weighted_residual = information * residual;
+            bias_cost += residual * weighted_residual;
+            hessian[previous_index * dim + previous_index] += information;
+            hessian[current_index * dim + current_index] += information;
+            hessian[previous_index * dim + current_index] -= information;
+            hessian[current_index * dim + previous_index] -= information;
+            rhs[previous_index] -= weighted_residual;
+            rhs[current_index] += weighted_residual;
         }
+        cost_breakdown.bias_random_walk_cost += 0.5 * bias_cost;
     }
 
-    if config.anchor_velocity_info > 0.0 {
-        let anchor_state = states[0].nav_state();
+    if config.anchor_velocity_information_s2_per_m2 > 0.0 {
+        let anchor_state = &states[0];
         let anchor_velocity = anchor_state.velocity_odom_mps();
         let base = 0;
         for axis in 0..3 {
             let residual = anchor_velocity[axis] - window.anchor.anchor_velocity_odom_mps[axis];
-            hessian[(base + 6 + axis) * dim + (base + 6 + axis)] += config.anchor_velocity_info;
-            rhs[base + 6 + axis] += config.anchor_velocity_info * residual;
+            hessian[(base + 6 + axis) * dim + (base + 6 + axis)] +=
+                config.anchor_velocity_information_s2_per_m2;
+            rhs[base + 6 + axis] += config.anchor_velocity_information_s2_per_m2 * residual;
             cost_breakdown.velocity_anchor_cost +=
-                0.5 * config.anchor_velocity_info * residual * residual;
+                0.5 * config.anchor_velocity_information_s2_per_m2 * residual * residual;
         }
     }
 
-    if let Some(bias_prior) = config.anchor_bias_prior.as_ref() {
-        let bias_info_w = bias_prior.info();
+    if let Some(bias_prior) = config.calibrated_bias_prior.as_ref() {
+        let accel_information_s4_per_m2 = bias_prior.accel_information_s4_per_m2();
+        let gyro_information_s2_per_rad2 = bias_prior.gyro_information_s2_per_rad2();
         let calibrated_accel_mps2 = bias_prior.bias().accel_mps2();
         let calibrated_gyro_radps = bias_prior.bias().gyro_radps();
-        for (frame_idx, state) in states.iter().map(SyncedPose::nav_state).enumerate() {
+        for (frame_idx, state) in states.iter().enumerate() {
             let base = frame_idx * STATE_DIM;
             let bias = state.bias();
             let accel_mps2 = bias.accel_mps2();
             let gyro_radps = bias.gyro_radps();
             for axis in 0..3 {
                 let accel_residual = accel_mps2[axis] - calibrated_accel_mps2[axis];
-                hessian[(base + 9 + axis) * dim + (base + 9 + axis)] += bias_info_w;
-                rhs[base + 9 + axis] += bias_info_w * accel_residual;
+                hessian[(base + 9 + axis) * dim + (base + 9 + axis)] += accel_information_s4_per_m2;
+                rhs[base + 9 + axis] += accel_information_s4_per_m2 * accel_residual;
                 cost_breakdown.bias_prior_cost +=
-                    0.5 * bias_info_w * accel_residual * accel_residual;
+                    0.5 * accel_information_s4_per_m2 * accel_residual * accel_residual;
 
                 let gyro_residual = gyro_radps[axis] - calibrated_gyro_radps[axis];
-                hessian[(base + 12 + axis) * dim + (base + 12 + axis)] += bias_info_w;
-                rhs[base + 12 + axis] += bias_info_w * gyro_residual;
-                cost_breakdown.bias_prior_cost += 0.5 * bias_info_w * gyro_residual * gyro_residual;
+                hessian[(base + 12 + axis) * dim + (base + 12 + axis)] +=
+                    gyro_information_s2_per_rad2;
+                rhs[base + 12 + axis] += gyro_information_s2_per_rad2 * gyro_residual;
+                cost_breakdown.bias_prior_cost +=
+                    0.5 * gyro_information_s2_per_rad2 * gyro_residual * gyro_residual;
             }
         }
     }
 
-    VioLinearization {
+    let linearization = VioLinearization {
         hessian,
         rhs,
         cost_breakdown,
-        reprojection_residual_counts,
-    }
+    };
+    validate_vio_linearization_values(&linearization, evaluation)?;
+    Ok(linearization)
 }
 
-/// Extract approximate posterior translation sigma for the last frame.
-/// Uses diagonal of the Hessian: σ_i ≈ 1/√(H[i,i]). This is a lower
-/// bound on the true marginal standard deviation (ignores correlations)
-/// but is cheap and directionally correct for downstream weighting.
 #[cfg(feature = "vio")]
-fn extract_last_frame_translation_sigma(
-    hessian: &[f64],
-    dim: usize,
-    n_frames: usize,
-) -> Option<[f64; 3]> {
-    use crate::vio::solve::STATE_DIM;
-    if n_frames == 0 || dim == 0 {
-        return None;
-    }
-    let base = (n_frames - 1) * STATE_DIM;
-    let mut sigma = [0.0_f64; 3];
-    for i in 0..3 {
-        let h_ii = hessian[(base + i) * dim + (base + i)];
-        if h_ii > 1e-12 {
-            sigma[i] = (1.0 / h_ii).sqrt();
-        } else {
-            return None; // degenerate — can't extract meaningful uncertainty
+fn validate_vio_linearization_values(
+    linearization: &VioLinearization,
+    evaluation: VioEvaluation,
+) -> Result<(), VioSolveError> {
+    for (quantity, values) in [
+        (VioLinearizationQuantity::Hessian, &linearization.hessian),
+        (VioLinearizationQuantity::RightHandSide, &linearization.rhs),
+    ] {
+        for (index, value) in values.iter().copied().enumerate() {
+            if !value.is_finite() {
+                return Err(VioSolveError::NonFiniteLinearization {
+                    stage: evaluation.stage,
+                    iteration: evaluation.iteration,
+                    quantity,
+                    index,
+                    value,
+                });
+            }
         }
     }
-    // Sanity: sigma should be positive, finite, and reasonable (< 10m)
-    if sigma.iter().all(|s| s.is_finite() && *s > 0.0 && *s < 10.0) {
-        Some(sigma)
-    } else {
-        None
-    }
+    Ok(())
 }
 
 /// Compute camera-from-map pose from NavState (body-in-odom), extrinsics,
@@ -3080,8 +3576,6 @@ fn pose_landmark_cross(j_pose: [[f32; 6]; 2], j_landmark: [[f32; 3]; 2]) -> [[f3
     cross
 }
 
-/// Accumulate motion-prior terms for a consecutive pair of poses into the
-/// normal equations (Hessian `hessian` and right-hand side `rhs`).
 /// Extract a 6-element SE3 delta from a solution vector at the given offset.
 fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
     [
@@ -3094,6 +3588,8 @@ fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
     ]
 }
 
+/// Accumulate motion-prior terms for a consecutive pair of poses into the
+/// normal equations (Hessian `hessian` and right-hand side `rhs`).
 #[allow(clippy::too_many_arguments)]
 fn accumulate_motion_prior(
     hessian: &mut [f32],
@@ -4593,6 +5089,369 @@ mod tests {
                 if actual == keyframe_id
         ));
         assert_eq!(map.snapshot(), before);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_linearization_rejects_nonfinite_hessian_and_rhs_before_success() {
+        for (quantity, hessian, rhs) in [
+            (
+                VioLinearizationQuantity::Hessian,
+                vec![f64::INFINITY],
+                vec![0.0],
+            ),
+            (
+                VioLinearizationQuantity::RightHandSide,
+                vec![0.0],
+                vec![f64::NAN],
+            ),
+        ] {
+            let linearization = VioLinearization {
+                hessian,
+                rhs,
+                cost_breakdown: VioCostBreakdown::default(),
+            };
+            let error = validate_vio_linearization_values(
+                &linearization,
+                VioEvaluation {
+                    stage: VioEvaluationStage::Candidate,
+                    iteration: 3,
+                },
+            )
+            .expect_err("nonfinite linearization must fail");
+            assert!(matches!(
+                error,
+                VioSolveError::NonFiniteLinearization {
+                    stage: VioEvaluationStage::Candidate,
+                    iteration: 3,
+                    quantity: actual,
+                    index: 0,
+                    ..
+                } if actual == quantity
+            ));
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_convergence_uses_componentwise_physical_unit_tolerances() {
+        assert!(vio_step_is_componentwise_small(&[0.0; VIO_STATE_DIM]));
+        for (axis, tolerance) in VIO_STATE_CONVERGENCE_TOLERANCES.into_iter().enumerate() {
+            let mut below = [0.0; VIO_STATE_DIM * 2];
+            below[axis] = 0.5 * tolerance;
+            below[VIO_STATE_DIM + axis] = -0.5 * tolerance;
+            assert!(vio_step_is_componentwise_small(&below), "axis {axis}");
+
+            let mut at_limit = [0.0; VIO_STATE_DIM];
+            at_limit[axis] = tolerance;
+            assert!(!vio_step_is_componentwise_small(&at_limit), "axis {axis}");
+        }
+        let mut nonfinite = [0.0; VIO_STATE_DIM];
+        nonfinite[0] = f64::NAN;
+        assert!(!vio_step_is_componentwise_small(&nonfinite));
+        assert!(!vio_step_is_componentwise_small(&[0.0; VIO_STATE_DIM - 1]));
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_config_preserves_bias_information_units_and_rejects_invalid_values() {
+        let prior = VioBiasPrior::new(2.0, 3.0, crate::ImuBias::default()).expect("bias prior");
+        assert_eq!(prior.accel_information_s4_per_m2(), 2.0);
+        assert_eq!(prior.gyro_information_s2_per_rad2(), 3.0);
+
+        for value in [0.0, -1.0] {
+            for (quantity, result) in [
+                (
+                    VioBiasPriorInformationQuantity::AccelerometerBiasS4PerM2,
+                    VioBiasPrior::new(value, 1.0, crate::ImuBias::default()),
+                ),
+                (
+                    VioBiasPriorInformationQuantity::GyroscopeBiasS2PerRad2,
+                    VioBiasPrior::new(1.0, value, crate::ImuBias::default()),
+                ),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(VioSolveConfigError::NonPositiveBiasPriorInformation {
+                        quantity: actual_quantity,
+                        value: actual_value,
+                    }) if actual_quantity == quantity && actual_value == value
+                ));
+            }
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (quantity, result) in [
+                (
+                    VioBiasPriorInformationQuantity::AccelerometerBiasS4PerM2,
+                    VioBiasPrior::new(value, 1.0, crate::ImuBias::default()),
+                ),
+                (
+                    VioBiasPriorInformationQuantity::GyroscopeBiasS2PerRad2,
+                    VioBiasPrior::new(1.0, value, crate::ImuBias::default()),
+                ),
+            ] {
+                assert!(matches!(
+                    result,
+                    Err(VioSolveConfigError::NonFiniteBiasPriorInformation {
+                        quantity: actual_quantity,
+                        value: actual_value,
+                    }) if actual_quantity == quantity && actual_value.to_bits() == value.to_bits()
+                ));
+            }
+        }
+
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                VioSolveConfig::new(
+                    crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+                    crate::Pose64::identity(),
+                    intrinsics,
+                    lm(1e-3),
+                    NonZeroUsize::MIN,
+                    2.0,
+                    value,
+                    None,
+                ),
+                Err(VioSolveConfigError::NonFiniteVelocityAnchorInformation {
+                    value: actual,
+                }) if actual.to_bits() == value.to_bits()
+            ));
+        }
+        assert!(matches!(
+            VioSolveConfig::new(
+                crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+                crate::Pose64::identity(),
+                intrinsics,
+                lm(1e-3),
+                NonZeroUsize::MIN,
+                2.0,
+                -1.0,
+                None,
+            ),
+            Err(VioSolveConfigError::NegativeVelocityAnchorInformation { value: -1.0 })
+        ));
+        for huber_delta_px in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(matches!(
+                VioSolveConfig::new(
+                    crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+                    crate::Pose64::identity(),
+                    intrinsics,
+                    lm(1e-3),
+                    NonZeroUsize::MIN,
+                    huber_delta_px,
+                    1.0,
+                    None,
+                ),
+                Err(VioSolveConfigError::NonFiniteHuberDeltaPx { value })
+                    if value.to_bits() == huber_delta_px.to_bits()
+            ));
+        }
+        for huber_delta_px in [0.0, -1.0] {
+            assert!(matches!(
+                VioSolveConfig::new(
+                    crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+                    crate::Pose64::identity(),
+                    intrinsics,
+                    lm(1e-3),
+                    NonZeroUsize::MIN,
+                    huber_delta_px,
+                    1.0,
+                    None,
+                ),
+                Err(VioSolveConfigError::NonPositiveHuberDeltaPx { value })
+                    if value == huber_delta_px
+            ));
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_bias_prior_applies_distinct_accel_and_gyro_information() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let prior = VioBiasPrior::new(2.0, 3.0, crate::ImuBias::default()).expect("bias prior");
+        let config = VioSolveConfig::new(
+            crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+            crate::Pose64::identity(),
+            intrinsics,
+            lm(1e-3),
+            NonZeroUsize::MIN,
+            2.0,
+            0.0,
+            Some(prior),
+        )
+        .expect("VIO config");
+        let state = crate::NavState::try_new(
+            crate::Pose64::identity(),
+            [0.0; 3],
+            crate::ImuBias::try_new([1.0, 0.0, 0.0], [2.0, 0.0, 0.0]).expect("bias"),
+        )
+        .expect("state");
+        let states = vec![state.clone()];
+        let resolved = vec![None];
+        let map_from_odom = crate::MapFromOdom::identity();
+        let support =
+            VisualFactorSupport::from_initial_states(&states, &resolved, &config, &map_from_odom);
+        let window = VioWindow {
+            anchor: VioAnchor {
+                state,
+                observations: None,
+                anchor_velocity_odom_mps: [0.0; 3],
+            },
+            successors: Vec::new(),
+        };
+
+        let linearization = linearize_vio_states(
+            &window,
+            &states,
+            &resolved,
+            &support,
+            &config,
+            &map_from_odom,
+            VioEvaluation {
+                stage: VioEvaluationStage::Initial,
+                iteration: 0,
+            },
+        )
+        .expect("finite linearization");
+        let accel_index = 9;
+        let gyro_index = 12;
+        assert_eq!(
+            linearization.hessian[accel_index * VIO_STATE_DIM + accel_index],
+            2.0
+        );
+        assert_eq!(
+            linearization.hessian[gyro_index * VIO_STATE_DIM + gyro_index],
+            3.0
+        );
+        assert_eq!(linearization.rhs[accel_index], 2.0);
+        assert_eq!(linearization.rhs[gyro_index], 6.0);
+        assert_eq!(linearization.cost_breakdown.bias_prior_cost, 7.0);
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_visual_factor_support_is_fixed_across_candidate_evaluations() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let config = VioSolveConfig::new(
+            crate::Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity"),
+            crate::Pose64::identity(),
+            intrinsics,
+            lm(1e-3),
+            NonZeroUsize::new(2).expect("iterations"),
+            2.0,
+            1.0,
+            None,
+        )
+        .expect("VIO config");
+        let identity_state = crate::NavState::try_new(
+            crate::Pose64::identity(),
+            [0.0; 3],
+            crate::ImuBias::default(),
+        )
+        .expect("identity state");
+        let initial_states = vec![identity_state.clone(), identity_state.clone()];
+        let front = Observation::try_new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 2.0,
+            },
+            Keypoint { x: 320.0, y: 240.0 },
+            intrinsics,
+        )
+        .expect("front observation");
+        let behind = Observation::try_new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: -2.0,
+            },
+            Keypoint { x: 320.0, y: 240.0 },
+            intrinsics,
+        )
+        .expect("behind observation");
+        let resolved = vec![
+            None,
+            Some(ResolvedObservationSet {
+                observations: vec![front, behind],
+            }),
+        ];
+        let map_from_odom = crate::MapFromOdom::identity();
+        let support = VisualFactorSupport::from_initial_states(
+            &initial_states,
+            &resolved,
+            &config,
+            &map_from_odom,
+        );
+        assert_eq!(support.indices_for_frame(1), &[0]);
+        assert_eq!(support.last_frame_factor_count(), 1);
+        assert_eq!(support.initially_excluded_nonprojectable_factor_count, 1);
+
+        let batch = crate::ImuBatch::new(vec![
+            crate::ImuSample::new(Timestamp::from_nanos(0), [0.0; 3], [0.0; 3])
+                .expect("first IMU sample"),
+            crate::ImuSample::new(Timestamp::from_nanos(10_000_000), [0.0; 3], [0.0; 3])
+                .expect("second IMU sample"),
+        ])
+        .expect("IMU batch");
+        let preintegrated = crate::PreintegratedImu::integrate(
+            &batch,
+            &crate::ImuBias::default(),
+            &crate::ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise"),
+        )
+        .expect("preintegration");
+        let window = VioWindow {
+            anchor: VioAnchor {
+                state: initial_states[0].clone(),
+                observations: None,
+                anchor_velocity_odom_mps: [0.0; 3],
+            },
+            successors: vec![VioSuccessor {
+                state: initial_states[1].clone(),
+                observations: None,
+                preintegrated,
+            }],
+        };
+        let moved_past_point = crate::NavState::try_new(
+            crate::Pose64::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.0, 0.0, 3.0],
+            ),
+            [0.0; 3],
+            crate::ImuBias::default(),
+        )
+        .expect("translated state");
+        let candidate_states = vec![initial_states[0].clone(), moved_past_point];
+
+        let error = match linearize_vio_states(
+            &window,
+            &candidate_states,
+            &resolved,
+            &support,
+            &config,
+            &map_from_odom,
+            VioEvaluation {
+                stage: VioEvaluationStage::Candidate,
+                iteration: 1,
+            },
+        ) {
+            Ok(_) => panic!("candidate must not remove an initially active visual factor"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            VioSolveError::ReprojectionFactorUnavailable {
+                stage: VioEvaluationStage::Candidate,
+                iteration: 1,
+                frame_index: 1,
+                observation_index: 0,
+            }
+        ));
+        assert!(error.is_rejected_candidate_nonprojectability());
     }
 
     #[cfg(feature = "vio")]

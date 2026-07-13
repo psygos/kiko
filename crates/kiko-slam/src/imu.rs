@@ -164,6 +164,7 @@ impl ImuBias {
         self.gyro_radps
     }
 
+    #[cfg(any(feature = "vio", test))]
     pub(crate) fn checked_add(
         self,
         accel_delta_mps2: [f64; 3],

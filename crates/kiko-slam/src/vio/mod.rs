@@ -3,9 +3,15 @@ mod preintegration;
 pub(crate) mod solve;
 mod state;
 
-pub use factors::{
-    ImuFactor, VioFactorError, VioObservation, bias_random_walk_residual, pose_prior_residual,
-    reprojection_residual,
+pub(crate) use factors::bias_random_walk_residual;
+pub use factors::{BiasRandomWalkResidualQuantity, ImuFactor, ImuResidualQuantity, VioFactorError};
+pub use preintegration::{
+    BiasRandomWalkVarianceQuantity, CorrectedPreintegration, FlooredBiasRandomWalkInformation,
+    ImuResidualCovarianceRegularization, ImuResidualVarianceQuantity, PreintegratedImu,
+    PreintegrationError, PreintegrationInformationError, PreintegrationQuantity,
+    RegularizedImuResidualInformation,
 };
-pub use preintegration::{CorrectedPreintegration, PreintegratedImu, PreintegrationError};
+pub use solve::{
+    DenseSolveError, DenseSolveInput, FiniteDifferenceSide, ImuJacobianEndpoint, ImuJacobianError,
+};
 pub use state::{Gravity, GravityError, NavState, NavStateError, NavTangent};

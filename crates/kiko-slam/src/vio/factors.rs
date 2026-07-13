@@ -1,62 +1,83 @@
 use crate::math::{mat_mul_f64, mat_mul_vec_f64, so3_log_f64};
-use crate::{
-    Gravity, Keypoint, MapFromOdom, NavState, Observation, PinholeIntrinsics, Point3, Pose64,
-    PreintegratedImu,
-};
+use crate::{Gravity, NavState, PreintegratedImu, PreintegrationError};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImuResidualQuantity {
+    RotationRadians,
+    VelocityMps,
+    PositionM,
+}
+
+impl std::fmt::Display for ImuResidualQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RotationRadians => "rotation residual (rad)",
+            Self::VelocityMps => "velocity residual (m/s)",
+            Self::PositionM => "position residual (m)",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BiasRandomWalkResidualQuantity {
+    AccelerometerMps2,
+    GyroscopeRadps,
+}
+
+impl std::fmt::Display for BiasRandomWalkResidualQuantity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::AccelerometerMps2 => "accelerometer-bias random-walk residual (m/s^2)",
+            Self::GyroscopeRadps => "gyroscope-bias random-walk residual (rad/s)",
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VioFactorError {
-    PointBehindCamera { depth_m: f64 },
-    NonFinitePoint { axis: usize, value: f32 },
+    PreintegrationCorrection {
+        source: PreintegrationError,
+    },
+    NonFiniteImuResidual {
+        quantity: ImuResidualQuantity,
+        axis: usize,
+        value: f64,
+    },
+    NonFiniteBiasRandomWalkResidual {
+        quantity: BiasRandomWalkResidualQuantity,
+        axis: usize,
+        value: f64,
+    },
 }
 
 impl std::fmt::Display for VioFactorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VioFactorError::PointBehindCamera { depth_m } => {
-                write!(f, "reprojection point lies behind camera (depth={depth_m})")
+            VioFactorError::PreintegrationCorrection { source } => {
+                write!(f, "imu preintegration bias correction failed: {source}")
             }
-            VioFactorError::NonFinitePoint { axis, value } => {
-                write!(
-                    f,
-                    "vio observation point axis {axis} must be finite, got {value}"
-                )
-            }
+            VioFactorError::NonFiniteImuResidual {
+                quantity,
+                axis,
+                value,
+            } => write!(f, "VIO {quantity} axis {axis} must be finite, got {value}"),
+            VioFactorError::NonFiniteBiasRandomWalkResidual {
+                quantity,
+                axis,
+                value,
+            } => write!(f, "VIO {quantity} axis {axis} must be finite, got {value}"),
         }
     }
 }
 
-impl std::error::Error for VioFactorError {}
-
-#[derive(Clone, Copy, Debug)]
-pub struct VioObservation {
-    point_map: Point3,
-    pixel: Keypoint,
-}
-
-impl VioObservation {
-    pub fn new(point_map: Point3, pixel: Keypoint) -> Result<Self, VioFactorError> {
-        for (axis, value) in [point_map.x, point_map.y, point_map.z]
-            .into_iter()
-            .enumerate()
-        {
-            if !value.is_finite() {
-                return Err(VioFactorError::NonFinitePoint { axis, value });
+impl std::error::Error for VioFactorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PreintegrationCorrection { source } => Some(source),
+            Self::NonFiniteImuResidual { .. } | Self::NonFiniteBiasRandomWalkResidual { .. } => {
+                None
             }
         }
-        Ok(Self { point_map, pixel })
-    }
-
-    pub fn from_map_observation(observation_map: Observation) -> Result<Self, VioFactorError> {
-        Self::new(observation_map.world(), observation_map.pixel())
-    }
-
-    pub fn point_map(&self) -> Point3 {
-        self.point_map
-    }
-
-    pub fn pixel(&self) -> Keypoint {
-        self.pixel
     }
 }
 
@@ -68,8 +89,10 @@ impl ImuFactor {
         state_j: &NavState,
         preintegrated: &PreintegratedImu,
         gravity: &Gravity,
-    ) -> [f64; 9] {
-        let corrected = preintegrated.corrected_first_order(state_i.bias());
+    ) -> Result<[f64; 9], VioFactorError> {
+        let corrected = preintegrated
+            .corrected_first_order(state_i.bias())
+            .map_err(|source| VioFactorError::PreintegrationCorrection { source })?;
         let pose_i = state_i.pose_odom_from_body();
         let pose_j = state_j.pose_odom_from_body();
         let r_i = pose_i.rotation();
@@ -79,35 +102,60 @@ impl ImuFactor {
         let v_i = state_i.velocity_odom_mps();
         let v_j = state_j.velocity_odom_mps();
         let g = gravity.vector_odom_mps2();
-        let dt = preintegrated.dt_seconds;
+        let duration_seconds = preintegrated.duration_seconds();
 
         let r_i_t = transpose3(r_i);
         let rotation_error = so3_log_f64(mat_mul_f64(
-            transpose3(corrected.delta_rotation),
+            transpose3(corrected.delta_rotation()),
             mat_mul_f64(r_i_t, r_j),
         ));
 
         let delta_position_odom = [
-            p_j[0] - p_i[0] - v_i[0] * dt - 0.5 * g[0] * dt * dt,
-            p_j[1] - p_i[1] - v_i[1] * dt - 0.5 * g[1] * dt * dt,
-            p_j[2] - p_i[2] - v_i[2] * dt - 0.5 * g[2] * dt * dt,
+            p_j[0]
+                - p_i[0]
+                - v_i[0] * duration_seconds
+                - 0.5 * g[0] * duration_seconds * duration_seconds,
+            p_j[1]
+                - p_i[1]
+                - v_i[1] * duration_seconds
+                - 0.5 * g[1] * duration_seconds * duration_seconds,
+            p_j[2]
+                - p_i[2]
+                - v_i[2] * duration_seconds
+                - 0.5 * g[2] * duration_seconds * duration_seconds,
         ];
         let delta_velocity_odom = [
-            v_j[0] - v_i[0] - g[0] * dt,
-            v_j[1] - v_i[1] - g[1] * dt,
-            v_j[2] - v_i[2] - g[2] * dt,
+            v_j[0] - v_i[0] - g[0] * duration_seconds,
+            v_j[1] - v_i[1] - g[1] * duration_seconds,
+            v_j[2] - v_i[2] - g[2] * duration_seconds,
         ];
 
         let position_error = sub_vec3(
             mat_mul_vec_f64(r_i_t, delta_position_odom),
-            corrected.delta_position,
+            corrected.delta_position_m(),
         );
         let velocity_error = sub_vec3(
             mat_mul_vec_f64(r_i_t, delta_velocity_odom),
-            corrected.delta_velocity,
+            corrected.delta_velocity_mps(),
         );
 
-        [
+        for (quantity, residual) in [
+            (ImuResidualQuantity::RotationRadians, rotation_error),
+            (ImuResidualQuantity::VelocityMps, velocity_error),
+            (ImuResidualQuantity::PositionM, position_error),
+        ] {
+            for (axis, value) in residual.into_iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(VioFactorError::NonFiniteImuResidual {
+                        quantity,
+                        axis,
+                        value,
+                    });
+                }
+            }
+        }
+
+        Ok([
             rotation_error[0],
             rotation_error[1],
             rotation_error[2],
@@ -117,70 +165,43 @@ impl ImuFactor {
             position_error[0],
             position_error[1],
             position_error[2],
-        ]
+        ])
     }
 }
 
-pub fn pose_prior_residual(state: &NavState, pose_measurement_odom: Pose64) -> [f64; 6] {
-    so3_se3_residual(pose_measurement_odom, state.pose_odom_from_body())
-}
-
-pub fn bias_random_walk_residual(state_i: &NavState, state_j: &NavState) -> [f64; 6] {
+pub(crate) fn bias_random_walk_residual(
+    state_i: &NavState,
+    state_j: &NavState,
+) -> Result<[f64; 6], VioFactorError> {
     let bias_i = state_i.bias();
     let bias_j = state_j.bias();
     let accel_i_mps2 = bias_i.accel_mps2();
     let accel_j_mps2 = bias_j.accel_mps2();
     let gyro_i_radps = bias_i.gyro_radps();
     let gyro_j_radps = bias_j.gyro_radps();
-    [
+    let residual = [
         accel_j_mps2[0] - accel_i_mps2[0],
         accel_j_mps2[1] - accel_i_mps2[1],
         accel_j_mps2[2] - accel_i_mps2[2],
         gyro_j_radps[0] - gyro_i_radps[0],
         gyro_j_radps[1] - gyro_i_radps[1],
         gyro_j_radps[2] - gyro_i_radps[2],
-    ]
-}
-
-pub fn reprojection_residual(
-    state: &NavState,
-    camera_from_body: Pose64,
-    map_from_odom: &MapFromOdom,
-    observation: VioObservation,
-    intrinsics: PinholeIntrinsics,
-) -> Result<[f64; 2], VioFactorError> {
-    let camera_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
-    let point_odom = map_from_odom.point_map_to_odom(observation.point_map());
-    let point_cam = transform_point(
-        camera_from_odom,
-        [
-            f64::from(point_odom.x),
-            f64::from(point_odom.y),
-            f64::from(point_odom.z),
-        ],
-    );
-    let x = point_cam[0];
-    let y = point_cam[1];
-    let z = point_cam[2];
-    if z <= 0.0 {
-        return Err(VioFactorError::PointBehindCamera { depth_m: z });
+    ];
+    for (residual_axis, value) in residual.into_iter().enumerate() {
+        if !value.is_finite() {
+            let quantity = if residual_axis < 3 {
+                BiasRandomWalkResidualQuantity::AccelerometerMps2
+            } else {
+                BiasRandomWalkResidualQuantity::GyroscopeRadps
+            };
+            return Err(VioFactorError::NonFiniteBiasRandomWalkResidual {
+                quantity,
+                axis: residual_axis % 3,
+                value,
+            });
+        }
     }
-    let u = f64::from(intrinsics.fx()) * (x / z) + f64::from(intrinsics.cx());
-    let v = f64::from(intrinsics.fy()) * (y / z) + f64::from(intrinsics.cy());
-    Ok([
-        f64::from(observation.pixel().x) - u,
-        f64::from(observation.pixel().y) - v,
-    ])
-}
-
-fn transform_point(transform: Pose64, point: [f64; 3]) -> [f64; 3] {
-    let rotated = mat_mul_vec_f64(transform.rotation(), point);
-    let translation = transform.translation();
-    [
-        rotated[0] + translation[0],
-        rotated[1] + translation[1],
-        rotated[2] + translation[2],
-    ]
+    Ok(residual)
 }
 
 fn transpose3(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
@@ -195,18 +216,10 @@ fn sub_vec3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn so3_se3_residual(target: Pose64, estimate: Pose64) -> [f64; 6] {
-    let delta = target.compose(estimate.inverse());
-    let rot = so3_log_f64(delta.rotation());
-    let t = delta.translation();
-    [t[0], t[1], t[2], rot[0], rot[1], rot[2]]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dataset::CameraIntrinsics;
-    use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Timestamp};
+    use crate::{ImuBatch, ImuBias, ImuNoiseModel, ImuSample, Pose64, Timestamp};
 
     fn noise() -> ImuNoiseModel {
         ImuNoiseModel::new(0.1, 0.01, 0.001, 0.0001).expect("noise")
@@ -223,18 +236,6 @@ mod tests {
                 .collect(),
         )
         .expect("imu batch")
-    }
-
-    fn intrinsics() -> PinholeIntrinsics {
-        PinholeIntrinsics::try_from(&CameraIntrinsics {
-            fx: 100.0,
-            fy: 100.0,
-            cx: 50.0,
-            cy: 40.0,
-            width: 100,
-            height: 80,
-        })
-        .expect("intrinsics")
     }
 
     #[test]
@@ -255,14 +256,17 @@ mod tests {
                 [
                     0.0,
                     0.0,
-                    -0.5 * 9.81 * preintegrated.dt_seconds * preintegrated.dt_seconds,
+                    -0.5 * 9.81
+                        * preintegrated.duration_seconds()
+                        * preintegrated.duration_seconds(),
                 ],
             ),
-            [0.0, 0.0, -9.81 * preintegrated.dt_seconds],
+            [0.0, 0.0, -9.81 * preintegrated.duration_seconds()],
             ImuBias::default(),
         )
         .expect("state j");
-        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
+        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity)
+            .expect("finite imu residual");
         let norm = residual
             .iter()
             .map(|value| value * value)
@@ -285,18 +289,21 @@ mod tests {
             NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state i");
         let state_j = NavState::try_new(
             Pose64::from_rt(
-                preintegrated.delta_rotation,
+                preintegrated.delta_rotation(),
                 [
                     0.0,
                     0.0,
-                    -0.5 * 9.81 * preintegrated.dt_seconds * preintegrated.dt_seconds,
+                    -0.5 * 9.81
+                        * preintegrated.duration_seconds()
+                        * preintegrated.duration_seconds(),
                 ],
             ),
-            [0.0, 0.0, -9.81 * preintegrated.dt_seconds],
+            [0.0, 0.0, -9.81 * preintegrated.duration_seconds()],
             ImuBias::default(),
         )
         .expect("state j");
-        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
+        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity)
+            .expect("finite imu residual");
         let norm = residual
             .iter()
             .map(|value| value * value)
@@ -310,7 +317,29 @@ mod tests {
         let bias = ImuBias::try_new([0.1, -0.2, 0.3], [0.01, -0.02, 0.03]).expect("finite bias");
         let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
-        assert_eq!(bias_random_walk_residual(&state_i, &state_j), [0.0; 6]);
+        assert_eq!(
+            bias_random_walk_residual(&state_i, &state_j).expect("finite residual"),
+            [0.0; 6]
+        );
+    }
+
+    #[test]
+    fn bias_random_walk_residual_rejects_subtraction_overflow_at_factor_boundary() {
+        let bias_i = ImuBias::try_new([-f64::MAX, 0.0, 0.0], [0.0; 3]).expect("finite bias i");
+        let bias_j = ImuBias::try_new([f64::MAX, 0.0, 0.0], [0.0; 3]).expect("finite bias j");
+        let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias_i).expect("state i");
+        let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias_j).expect("state j");
+
+        let error = bias_random_walk_residual(&state_i, &state_j)
+            .expect_err("overflowed residual must fail at factor boundary");
+        assert!(matches!(
+            error,
+            VioFactorError::NonFiniteBiasRandomWalkResidual {
+                quantity: BiasRandomWalkResidualQuantity::AccelerometerMps2,
+                axis: 0,
+                value,
+            } if value.is_infinite()
+        ));
     }
 
     #[test]
@@ -334,7 +363,8 @@ mod tests {
             .expect("preintegrated");
         let state_i = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state i");
         let state_j = NavState::try_new(Pose64::identity(), [0.0; 3], bias).expect("state j");
-        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity);
+        let residual = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity)
+            .expect("finite imu residual");
         let norm = residual
             .iter()
             .map(|value| value * value)
@@ -344,122 +374,29 @@ mod tests {
     }
 
     #[test]
-    fn reprojection_residual_is_zero_for_consistent_geometry() {
-        let state =
-            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
-        let observation = VioObservation::new(
-            Point3 {
-                x: 0.0,
-                y: 0.0,
-                z: 1.0,
-            },
-            Keypoint { x: 50.0, y: 40.0 },
-        )
-        .expect("vio observation");
-        let residual = reprojection_residual(
-            &state,
-            Pose64::identity(),
-            &MapFromOdom::identity(),
-            observation,
-            intrinsics(),
-        )
-        .expect("reprojection");
-        assert!((residual[0]).abs() < 1e-12);
-        assert!((residual[1]).abs() < 1e-12);
-    }
+    fn imu_factor_preserves_preintegration_correction_failure() {
+        let stationary = batch(&[(0, [0.0; 3], [0.0; 3]), (10_000_000, [0.0; 3], [0.0; 3])]);
+        let preintegrated = PreintegratedImu::integrate(&stationary, &ImuBias::default(), &noise())
+            .expect("preintegrated");
+        let huge_bias =
+            ImuBias::try_new([0.0; 3], [f64::MAX, 0.0, 0.0]).expect("finite but extreme bias");
+        let state_i =
+            NavState::try_new(Pose64::identity(), [0.0; 3], huge_bias).expect("previous state");
+        let state_j =
+            NavState::try_new(Pose64::identity(), [0.0; 3], huge_bias).expect("current state");
+        let gravity = Gravity::try_new([0.0, 0.0, -9.81]).expect("gravity");
 
-    #[test]
-    fn reprojection_residual_rejects_point_behind_camera() {
-        let state =
-            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
-        let observation = VioObservation::new(
-            Point3 {
-                x: 0.0,
-                y: 0.0,
-                z: -1.0,
-            },
-            Keypoint { x: 50.0, y: 40.0 },
-        )
-        .expect("vio observation");
-        let err = reprojection_residual(
-            &state,
-            Pose64::identity(),
-            &MapFromOdom::identity(),
-            observation,
-            intrinsics(),
-        )
-        .expect_err("point behind camera should fail");
-        assert_eq!(err, VioFactorError::PointBehindCamera { depth_m: -1.0 });
-    }
-
-    #[test]
-    fn vio_observation_from_map_observation_reframes_into_odom() {
-        let bridge = {
-            let mut bridge = MapFromOdom::identity();
-            bridge.set_pose_map_from_odom(Pose64::from_rt(
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                [1.0, 0.0, 0.0],
-            ));
-            bridge
-        };
-        let observation_map = Observation::try_new(
-            Point3 {
-                x: 1.25,
-                y: -0.5,
-                z: 2.0,
-            },
-            Keypoint { x: 10.0, y: 20.0 },
-            intrinsics(),
-        )
-        .expect("map observation");
-        let observation =
-            VioObservation::from_map_observation(observation_map).expect("vio observation");
-        let point_odom = bridge.point_map_to_odom(observation.point_map());
-        assert!((point_odom.x - 0.25).abs() < 1e-6);
-        assert!((point_odom.y + 0.5).abs() < 1e-6);
-        assert!((point_odom.z - 2.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn reprojection_residual_uses_current_bridge_for_map_points() {
-        let state =
-            NavState::try_new(Pose64::identity(), [0.0; 3], ImuBias::default()).expect("state");
-        let observation = VioObservation::new(
-            Point3 {
-                x: 0.0,
-                y: 0.0,
-                z: 1.0,
-            },
-            Keypoint { x: 50.0, y: 40.0 },
-        )
-        .expect("vio observation");
-        let identity_residual = reprojection_residual(
-            &state,
-            Pose64::identity(),
-            &MapFromOdom::identity(),
-            observation,
-            intrinsics(),
-        )
-        .expect("identity residual");
-        assert!(identity_residual[0].abs() < 1e-12);
-        assert!(identity_residual[1].abs() < 1e-12);
-
-        let shifted_bridge = {
-            let mut bridge = MapFromOdom::identity();
-            bridge.set_pose_map_from_odom(Pose64::from_rt(
-                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                [0.5, 0.0, 0.0],
-            ));
-            bridge
-        };
-        let shifted_residual = reprojection_residual(
-            &state,
-            Pose64::identity(),
-            &shifted_bridge,
-            observation,
-            intrinsics(),
-        )
-        .expect("shifted residual");
-        assert!(shifted_residual[0].abs() > 1.0);
+        let error = ImuFactor::residual(&state_i, &state_j, &preintegrated, &gravity)
+            .expect_err("overflowed bias correction must fail");
+        assert!(matches!(
+            error,
+            VioFactorError::PreintegrationCorrection {
+                source: PreintegrationError::InvalidRotation {
+                    quantity: crate::PreintegrationQuantity::DeltaRotation,
+                    ..
+                },
+            }
+        ));
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

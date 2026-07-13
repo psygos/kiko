@@ -2109,7 +2109,7 @@ fn decide_vio_pose_adoption(
     if !solve_result.has_improved_estimate() {
         return crate::VioProposalDisposition::RejectedUnusableSolve;
     }
-    if solve_result.last_frame_visual_residual_count == 0 {
+    if solve_result.last_frame_active_visual_factor_count == 0 {
         return crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport;
     }
     let shared = visual_metrics.shared_with(vio_metrics);
@@ -2233,7 +2233,7 @@ impl VioRuntime {
 
     #[cfg(test)]
     fn commit_authoritative_visual_anchor(&mut self, anchor: crate::local_ba::VioAnchor) {
-        let nav_state = anchor.synced.nav_state().clone();
+        let nav_state = anchor.state.clone();
         self.last_optimized_state = Some(nav_state.clone());
         self.predicted_state = Some(nav_state);
         self.vio_window = Some(crate::local_ba::VioWindow {
@@ -2261,7 +2261,7 @@ impl VioRuntime {
         self.predicted_state = Some(nav_state.clone());
         self.vio_window = observations.map(|observations| crate::local_ba::VioWindow {
             anchor: crate::local_ba::VioAnchor {
-                synced: crate::local_ba::SyncedPose::new(nav_state.clone()),
+                state: nav_state.clone(),
                 observations: Some(observations),
                 anchor_velocity_odom_mps: nav_state.velocity_odom_mps(),
             },
@@ -2518,6 +2518,12 @@ pub struct SlamTracker {
 
 impl SlamTracker {
     const DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD: u32 = 15;
+    #[cfg(feature = "vio")]
+    const HEURISTIC_VIO_ACCEL_BIAS_PRIOR_INFORMATION_S4_PER_M2: f64 = 100.0;
+    #[cfg(feature = "vio")]
+    const HEURISTIC_VIO_GYRO_BIAS_PRIOR_INFORMATION_S2_PER_RAD2: f64 = 100.0;
+    #[cfg(feature = "vio")]
+    const HEURISTIC_VIO_VELOCITY_ANCHOR_INFORMATION_S2_PER_M2: f64 = 10.0;
 
     pub fn try_new(
         superpoint: SuperPoint,
@@ -2539,7 +2545,13 @@ impl SlamTracker {
                     let camera_from_body = inertial.extrinsics().t_cam_imu();
                     let calibrated_bias = inertial.initial_bias().copied();
                     let bias_prior = calibrated_bias
-                        .map(|bias| crate::VioBiasPrior::new(100.0, bias))
+                        .map(|bias| {
+                            crate::VioBiasPrior::new(
+                                Self::HEURISTIC_VIO_ACCEL_BIAS_PRIOR_INFORMATION_S4_PER_M2,
+                                Self::HEURISTIC_VIO_GYRO_BIAS_PRIOR_INFORMATION_S2_PER_RAD2,
+                                bias,
+                            )
+                        })
                         .transpose()
                         .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
                     let solve_config = crate::VioSolveConfig::new(
@@ -2549,7 +2561,7 @@ impl SlamTracker {
                         config.ba.lm(),
                         config.runtime.vio_max_iterations(),
                         f64::from(config.ba.huber_delta_px()),
-                        10.0, // anchor velocity info
+                        Self::HEURISTIC_VIO_VELOCITY_ANCHOR_INFORMATION_S2_PER_M2,
                         bias_prior,
                     )
                     .map_err(|source| TrackerInitError::VioSolveConfig { source })?;
@@ -2805,7 +2817,7 @@ impl SlamTracker {
         };
 
         // Build or extend the VIO window
-        use crate::local_ba::{SyncedPose, VioAnchor, VioSuccessor, VioWindow, optimize_vio};
+        use crate::local_ba::{VioAnchor, VioSuccessor, VioWindow, optimize_vio};
 
         if vio_runtime.vio_window.is_none() {
             if let (Some(anchor_state), Some(successor_observations)) =
@@ -2813,12 +2825,12 @@ impl SlamTracker {
             {
                 let mut candidate_window = VioWindow {
                     anchor: VioAnchor {
-                        synced: SyncedPose::new(anchor_state.clone()),
+                        state: anchor_state.clone(),
                         observations: None,
                         anchor_velocity_odom_mps: anchor_state.velocity_odom_mps(),
                     },
                     successors: vec![VioSuccessor {
-                        synced: SyncedPose::new(nav_state.clone()),
+                        state: nav_state.clone(),
                         observations: Some(successor_observations),
                         preintegrated,
                     }],
@@ -2833,8 +2845,8 @@ impl SlamTracker {
                 let optimized = candidate_window
                     .successors
                     .last()
-                    .map(|s| s.synced.nav_state().clone())
-                    .unwrap_or_else(|| candidate_window.anchor.synced.nav_state().clone());
+                    .map(|successor| successor.state.clone())
+                    .unwrap_or_else(|| candidate_window.anchor.state.clone());
                 let cam_from_odom = camera_from_odom_from_pose_odom_from_body(
                     optimized.pose_odom_from_body(),
                     vio_runtime.camera_from_body,
@@ -2851,12 +2863,18 @@ impl SlamTracker {
                     let delta_r =
                         (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
                     eprintln!(
-                        "vio ba: frames={} termination={:?} iters={} accepted={} rejected={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                        "vio ba: frames={} termination={:?} iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
                         candidate_window.len(),
                         result.termination,
                         result.iterations,
                         result.accepted_steps,
                         result.rejected_steps,
+                        result.rejected_nonprojectable_candidate_steps,
+                        result.last_frame_active_visual_factor_count,
+                        result.initially_excluded_nonprojectable_visual_factor_count,
+                        result.regularized_imu_residual_factor_count,
+                        result.floored_accel_bias_random_walk_factor_count,
+                        result.floored_gyro_bias_random_walk_factor_count,
                         result.final_cost,
                         result.cost_breakdown.reprojection_cost,
                         result.cost_breakdown.imu_cost,
@@ -2902,7 +2920,7 @@ impl SlamTracker {
             }
             // First frame: create anchor
             let anchor = VioAnchor {
-                synced: SyncedPose::new(nav_state.clone()),
+                state: nav_state.clone(),
                 observations: obs_set.clone(),
                 anchor_velocity_odom_mps: nav_state.velocity_odom_mps(),
             };
@@ -2924,7 +2942,7 @@ impl SlamTracker {
             ));
         };
         candidate_window.successors.push(VioSuccessor {
-            synced: SyncedPose::new(nav_state.clone()),
+            state: nav_state.clone(),
             observations: obs_set.clone(),
             preintegrated,
         });
@@ -2936,9 +2954,9 @@ impl SlamTracker {
             }
             // Promote second frame to anchor, drop first successor's preintegration
             let old_succ = candidate_window.successors.remove(0);
-            let anchor_velocity_odom_mps = old_succ.synced.nav_state().velocity_odom_mps();
+            let anchor_velocity_odom_mps = old_succ.state.velocity_odom_mps();
             candidate_window.anchor = VioAnchor {
-                synced: old_succ.synced,
+                state: old_succ.state,
                 observations: old_succ.observations,
                 anchor_velocity_odom_mps,
             };
@@ -2956,8 +2974,8 @@ impl SlamTracker {
         let optimized = candidate_window
             .successors
             .last()
-            .map(|s| s.synced.nav_state().clone())
-            .unwrap_or_else(|| candidate_window.anchor.synced.nav_state().clone());
+            .map(|successor| successor.state.clone())
+            .unwrap_or_else(|| candidate_window.anchor.state.clone());
 
         let cam_from_odom = camera_from_odom_from_pose_odom_from_body(
             optimized.pose_odom_from_body(),
@@ -2973,12 +2991,18 @@ impl SlamTracker {
             let delta_t = (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
             let delta_r = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5]).sqrt();
             eprintln!(
-                "vio ba: frames={} termination={:?} iters={} accepted={} rejected={} cost={:.1} reproj={:.1} imu={:.1} vel_anchor={:.1} bias_rw={:.1} bias_prior={:.1} vel=[{:.3},{:.3},{:.3}] ba=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rot_delta_mdeg={:.1}",
+                "vio ba: frames={} termination={:?} iterations={} accepted_steps={} rejected_steps={} rejected_nonprojectable_candidate_steps={} last_frame_active_visual_factors={} initially_excluded_nonprojectable_visual_factors={} regularized_imu_residual_factors={} floored_accel_bias_random_walk_factors={} floored_gyro_bias_random_walk_factors={} final_cost={:.1} reprojection_cost={:.1} imu_cost={:.1} velocity_anchor_cost={:.1} bias_random_walk_cost={:.1} bias_prior_cost={:.1} velocity_odom_mps=[{:.3},{:.3},{:.3}] accel_bias_mps2=[{:.3},{:.3},{:.3}] pose_delta_mm={:.2} rotation_delta_mdeg={:.1}",
                 candidate_window.len(),
                 result.termination,
                 result.iterations,
                 result.accepted_steps,
                 result.rejected_steps,
+                result.rejected_nonprojectable_candidate_steps,
+                result.last_frame_active_visual_factor_count,
+                result.initially_excluded_nonprojectable_visual_factor_count,
+                result.regularized_imu_residual_factor_count,
+                result.floored_accel_bias_random_walk_factor_count,
+                result.floored_gyro_bias_random_walk_factor_count,
                 result.final_cost,
                 result.cost_breakdown.reprojection_cost,
                 result.cost_breakdown.imu_cost,
@@ -4768,7 +4792,7 @@ impl SlamTracker {
             diagnostics.vio_calibrated_bias_prior_active = match &self.local_estimator {
                 LocalEstimator::VisualOnly => None,
                 LocalEstimator::Inertial(vio_runtime) => {
-                    Some(vio_runtime.solve_config.has_anchor_bias_prior())
+                    Some(vio_runtime.solve_config.has_calibrated_bias_prior())
                 }
             };
             if let Some(vio_tracked_metrics) = vio_proposal_tracked_metrics.as_ref() {
@@ -5421,8 +5445,7 @@ mod tests {
         );
 
         let solve = TrackerInitError::VioSolveConfig {
-            source: crate::VioSolveConfigError::NonFiniteAnchorWeight {
-                field: "anchor_velocity_info",
+            source: crate::VioSolveConfigError::NonFiniteVelocityAnchorInformation {
                 value: f64::NAN,
             },
         };
@@ -5431,7 +5454,7 @@ mod tests {
                 .source()
                 .expect("solver configuration source")
                 .to_string()
-                .contains("anchor_velocity_info")
+                .contains("velocity-anchor information")
         );
     }
 
@@ -5470,15 +5493,22 @@ mod tests {
     fn tracker_error_preserves_vio_linear_solve_source() {
         let error = TrackerError::VioSolve(crate::VioSolveError::LinearSolve {
             iteration: 2,
-            source: crate::vio::solve::DenseSolveError::Singular {
+            source: crate::DenseSolveError::SingularOrIllConditioned {
                 column: 3,
                 pivot_magnitude: 0.0,
+                row_scale: 0.0,
+                scaled_pivot: 0.0,
+                tolerance: f64::EPSILON,
             },
         });
 
         let solve = error.source().expect("VIO solve source");
         let linear = solve.source().expect("dense linear solver source");
-        assert!(linear.to_string().contains("singular at column 3"));
+        assert!(
+            linear
+                .to_string()
+                .contains("singular or ill-conditioned at column 3")
+        );
     }
 
     #[test]
@@ -7965,7 +7995,7 @@ mod tests {
 
     #[cfg(feature = "vio")]
     fn make_test_vio_solve_result(
-        last_frame_visual_residual_count: usize,
+        last_frame_active_visual_factor_count: usize,
         accepted_steps: usize,
     ) -> crate::VioSolveResult {
         crate::VioSolveResult {
@@ -7973,10 +8003,14 @@ mod tests {
             iterations: accepted_steps,
             accepted_steps,
             rejected_steps: 0,
+            rejected_nonprojectable_candidate_steps: 0,
             final_cost: 1.0,
             cost_breakdown: crate::VioCostBreakdown::default(),
-            last_frame_visual_residual_count,
-            last_frame_translation_sigma: None,
+            last_frame_active_visual_factor_count,
+            initially_excluded_nonprojectable_visual_factor_count: 0,
+            regularized_imu_residual_factor_count: 1,
+            floored_accel_bias_random_walk_factor_count: 1,
+            floored_gyro_bias_random_walk_factor_count: 1,
         }
     }
 
@@ -8242,12 +8276,12 @@ mod tests {
         .expect("replacement nav state");
 
         let stale_anchor = crate::local_ba::VioAnchor {
-            synced: crate::local_ba::SyncedPose::new(stale_state.clone()),
+            state: stale_state.clone(),
             observations: Some(observations.clone()),
             anchor_velocity_odom_mps: stale_state.velocity_odom_mps(),
         };
         let replacement_anchor = crate::local_ba::VioAnchor {
-            synced: crate::local_ba::SyncedPose::new(replacement_state.clone()),
+            state: replacement_state.clone(),
             observations: Some(observations),
             anchor_velocity_odom_mps: replacement_state.velocity_odom_mps(),
         };
@@ -8318,12 +8352,7 @@ mod tests {
             "visual reanchor must replace the stale multi-frame window with a single authoritative anchor"
         );
         assert_eq!(
-            window
-                .anchor
-                .synced
-                .nav_state()
-                .pose_odom_from_body()
-                .translation(),
+            window.anchor.state.pose_odom_from_body().translation(),
             replacement_state.pose_odom_from_body().translation()
         );
     }
@@ -8400,7 +8429,7 @@ mod tests {
         let window = runtime.vio_window.as_ref().expect("vio window");
         assert_eq!(window.len(), 1);
         assert_eq!(
-            window.anchor.synced.nav_state().bias().accel_mps2(),
+            window.anchor.state.bias().accel_mps2(),
             previous_bias.accel_mps2()
         );
         assert!(window.anchor.observations.is_some());
@@ -8433,7 +8462,7 @@ mod tests {
             solve_config: make_test_vio_solve_config(),
             vio_window: Some(crate::local_ba::VioWindow {
                 anchor: crate::local_ba::VioAnchor {
-                    synced: crate::local_ba::SyncedPose::new(previous_state.clone()),
+                    state: previous_state.clone(),
                     observations: Some(make_single_observation_set()),
                     anchor_velocity_odom_mps: previous_state.velocity_odom_mps(),
                 },
@@ -8501,7 +8530,7 @@ mod tests {
             solve_config: make_test_vio_solve_config(),
             vio_window: Some(crate::local_ba::VioWindow {
                 anchor: crate::local_ba::VioAnchor {
-                    synced: crate::local_ba::SyncedPose::new(nav_state),
+                    state: nav_state,
                     observations: Some(observations),
                     anchor_velocity_odom_mps: [0.1, 0.2, 0.3],
                 },
