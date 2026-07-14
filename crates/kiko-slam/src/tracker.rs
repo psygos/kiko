@@ -15,9 +15,7 @@ const TRACKING_RANSAC_INLIER_DIVISOR: usize = 4;
 /// Minimum keyframes required for multi-frame optimization (BA or pose graph).
 const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 
-use crate::frontend::{
-    MapObservationError, StereoFrontend, TrackedMapObservations, median_parallax_px,
-};
+use crate::frontend::{MapObservationError, StereoFrontend, TrackedMapObservations};
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
     LoopApplyError, LoopClosureConfig, LoopDetectError, RelocalizationConfig, VerifiedLoop,
@@ -1785,6 +1783,7 @@ pub enum TrackerError {
     EssentialGraph(EssentialGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
+    TrackingInlierResolution(TrackingInlierResolutionError),
     ProjectedTrackingProjection(ProjectedTrackingProjectionError),
     DescriptorMatch(DescriptorMatchError),
     LoopVerification(LoopVerificationError),
@@ -1828,6 +1827,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
+            TrackerError::TrackingInlierResolution(err) => {
+                write!(f, "accepted tracking inlier resolution failed: {err}")
+            }
             TrackerError::ProjectedTrackingProjection(err) => {
                 write!(f, "projected tracking projection failed: {err}")
             }
@@ -1869,6 +1871,7 @@ impl std::error::Error for TrackerError {
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
+            TrackerError::TrackingInlierResolution(source) => Some(source),
             TrackerError::ProjectedTrackingProjection(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::LoopVerification(source) => Some(source),
@@ -1954,6 +1957,12 @@ impl From<RansacConfigError> for TrackerError {
 impl From<MapObservationError> for TrackerError {
     fn from(err: MapObservationError) -> Self {
         TrackerError::MapObservation(err)
+    }
+}
+
+impl From<TrackingInlierResolutionError> for TrackerError {
+    fn from(err: TrackingInlierResolutionError) -> Self {
+        TrackerError::TrackingInlierResolution(err)
     }
 }
 
@@ -2652,6 +2661,176 @@ struct SharedPoseReprojectionMetrics {
     count: usize,
     lhs_rmse_px: Option<f32>,
     rhs_rmse_px: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackingInlierIndexDomain {
+    TrackedObservation,
+    ObservationToVerifiedMatch,
+    VerifiedMatch,
+    CurrentDetectionKeypoint,
+    KeyframeDetectionKeypoint,
+}
+
+impl std::fmt::Display for TrackingInlierIndexDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::TrackedObservation => "tracked PnP observation batch",
+            Self::ObservationToVerifiedMatch => "tracked-observation-to-verified-match provenance",
+            Self::VerifiedMatch => "verified match batch",
+            Self::CurrentDetectionKeypoint => "current detection keypoints",
+            Self::KeyframeDetectionKeypoint => "keyframe detection keypoints",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TrackingInlierResolutionError {
+    IndexOutOfBounds {
+        domain: TrackingInlierIndexDomain,
+        index: usize,
+        len: usize,
+    },
+    NonFiniteParallaxPixels {
+        current_detection_index: usize,
+        keyframe_detection_index: usize,
+        value: f32,
+    },
+}
+
+impl std::fmt::Display for TrackingInlierResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IndexOutOfBounds { domain, index, len } => write!(
+                f,
+                "tracking inlier index {index} is out of bounds for {domain} of length {len}"
+            ),
+            Self::NonFiniteParallaxPixels {
+                current_detection_index,
+                keyframe_detection_index,
+                value,
+            } => write!(
+                f,
+                "tracking inlier parallax between current detection {current_detection_index} and keyframe detection {keyframe_detection_index} must be finite in pixels, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TrackingInlierResolutionError {}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedTrackingInlier {
+    observation: Observation,
+    current_detection_index: usize,
+    keyframe_detection_index: usize,
+    current_pixel: crate::Keypoint,
+    keyframe_pixel: crate::Keypoint,
+}
+
+impl ResolvedTrackingInlier {
+    fn parallax_px(self) -> Result<ParallaxSamplePx, TrackingInlierResolutionError> {
+        let dx = self.current_pixel.x - self.keyframe_pixel.x;
+        let dy = self.current_pixel.y - self.keyframe_pixel.y;
+        let value = dx.hypot(dy);
+        if !value.is_finite() {
+            return Err(TrackingInlierResolutionError::NonFiniteParallaxPixels {
+                current_detection_index: self.current_detection_index,
+                keyframe_detection_index: self.keyframe_detection_index,
+                value,
+            });
+        }
+        Ok(ParallaxSamplePx(value))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParallaxSamplePx(f32);
+
+fn inlier_index_error(
+    domain: TrackingInlierIndexDomain,
+    index: usize,
+    len: usize,
+) -> TrackingInlierResolutionError {
+    TrackingInlierResolutionError::IndexOutOfBounds { domain, index, len }
+}
+
+fn resolve_tracking_inlier(
+    tracked: &TrackedMapObservations,
+    verified: &Matches<Verified>,
+    observation_index: usize,
+) -> Result<ResolvedTrackingInlier, TrackingInlierResolutionError> {
+    let observation = tracked.observation(observation_index).ok_or_else(|| {
+        inlier_index_error(
+            TrackingInlierIndexDomain::TrackedObservation,
+            observation_index,
+            tracked.len(),
+        )
+    })?;
+    let verified_match_index =
+        tracked
+            .verified_match_index(observation_index)
+            .ok_or_else(|| {
+                inlier_index_error(
+                    TrackingInlierIndexDomain::ObservationToVerifiedMatch,
+                    observation_index,
+                    tracked.verified_match_mapping_len(),
+                )
+            })?;
+    let &(current_detection_index, keyframe_detection_index) = verified
+        .indices()
+        .get(verified_match_index)
+        .ok_or_else(|| {
+            inlier_index_error(
+                TrackingInlierIndexDomain::VerifiedMatch,
+                verified_match_index,
+                verified.len(),
+            )
+        })?;
+    let current_pixel = *verified
+        .source_a()
+        .keypoints()
+        .get(current_detection_index)
+        .ok_or_else(|| {
+            inlier_index_error(
+                TrackingInlierIndexDomain::CurrentDetectionKeypoint,
+                current_detection_index,
+                verified.source_a().len(),
+            )
+        })?;
+    let keyframe_pixel = *verified
+        .source_b()
+        .keypoints()
+        .get(keyframe_detection_index)
+        .ok_or_else(|| {
+            inlier_index_error(
+                TrackingInlierIndexDomain::KeyframeDetectionKeypoint,
+                keyframe_detection_index,
+                verified.source_b().len(),
+            )
+        })?;
+    Ok(ResolvedTrackingInlier {
+        observation,
+        current_detection_index,
+        keyframe_detection_index,
+        current_pixel,
+        keyframe_pixel,
+    })
+}
+
+fn median_parallax_px(samples: &mut [ParallaxSamplePx]) -> Option<f32> {
+    let len = samples.len();
+    if len == 0 {
+        return None;
+    }
+    let mid = len / 2;
+    let (lower, upper, _) = samples.select_nth_unstable_by(mid, |lhs, rhs| lhs.0.total_cmp(&rhs.0));
+    let upper = upper.0;
+    if len % 2 == 1 {
+        return Some(upper);
+    }
+    let lower = lower.iter().max_by(|lhs, rhs| lhs.0.total_cmp(&rhs.0))?.0;
+    Some(lower + (upper - lower) * 0.5)
 }
 
 struct TrackingAttempt {
@@ -4313,7 +4492,7 @@ impl SlamTracker {
 
         let result = match self
             .frontend
-            .solve_tracking_pose(&tracked_observations.observations, tracking_ransac)
+            .solve_tracking_pose(tracked_observations.observations(), tracking_ransac)
         {
             Ok(result) => result,
             Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
@@ -4692,44 +4871,25 @@ impl SlamTracker {
             result,
         } = attempt;
 
-        let mut map_observations = Vec::with_capacity(result.inliers().len());
-        for &idx in result.inliers() {
-            let verified_idx = *tracked_observations.verified_match_indices.get(idx).ok_or(
-                TrackerError::Inference(InferenceError::InvariantViolation {
-                    context: "tracked observation index out of bounds",
-                }),
-            )?;
-            let (ci, ki) = *verified
-                .indices()
-                .get(verified_idx)
-                .ok_or(TrackerError::Inference(
-                    InferenceError::InvariantViolation {
-                        context: "verified match index out of bounds",
-                    },
-                ))?;
-            let pixel = *current.keypoints().get(ci).ok_or(TrackerError::Inference(
-                InferenceError::InvariantViolation {
-                    context: "current keypoint index out of bounds",
-                },
-            ))?;
-            let keypoint_ref = self.global_map.keyframe_keypoint(keyframe_id, ki)?;
-            map_observations.push(MapObservation::new(keypoint_ref, pixel));
+        let inlier_count = result.inliers().len();
+        let mut map_observations = Vec::with_capacity(inlier_count);
+        let mut inlier_observations = Vec::with_capacity(inlier_count);
+        let mut parallax_samples = Vec::with_capacity(inlier_count);
+        for &observation_index in result.inliers() {
+            let resolved =
+                resolve_tracking_inlier(&tracked_observations, &verified, observation_index)?;
+            let keypoint_ref = self
+                .global_map
+                .keyframe_keypoint(keyframe_id, resolved.keyframe_detection_index)?;
+            map_observations.push(MapObservation::new(keypoint_ref, resolved.current_pixel));
+            inlier_observations.push(resolved.observation);
+            parallax_samples.push(resolved.parallax_px()?);
         }
-        let inlier_observations: Vec<_> = result
-            .inliers()
-            .iter()
-            .filter_map(|&idx| tracked_observations.observations.get(idx).copied())
-            .collect();
-
-        let parallax_px = median_parallax_px(
-            &verified,
-            &tracked_observations.verified_match_indices,
-            result.inliers(),
-        );
+        let parallax_px = median_parallax_px(&mut parallax_samples);
         let covisibility = if keyframe.landmarks().is_empty() {
             0.0
         } else {
-            result.inliers().len() as f32 / keyframe.landmarks().len() as f32
+            inlier_count as f32 / keyframe.landmarks().len() as f32
         };
 
         let visual_pose_world = result.pose();
@@ -4767,7 +4927,7 @@ impl SlamTracker {
         #[cfg(feature = "vio")]
         let visual_proposal_tracked_metrics = PoseReprojectionMetrics::from_pose(
             &visual_pose_world,
-            &tracked_observations.observations,
+            tracked_observations.observations(),
             intrinsics,
         );
         #[cfg(feature = "vio")]
@@ -4851,7 +5011,7 @@ impl SlamTracker {
                 let proposal = *proposal;
                 let vio_tracked_metrics = PoseReprojectionMetrics::from_pose(
                     &proposal.pose_world,
-                    &tracked_observations.observations,
+                    tracked_observations.observations(),
                     intrinsics,
                 );
                 let vio_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
@@ -4913,7 +5073,7 @@ impl SlamTracker {
                 "tracking success frame={} observations={} missing_associations={} inliers={} required_inliers={} matches={} verified={} parallax_px={} covisibility={:.3} decision={:?}",
                 frame_id.as_u64(),
                 tracked_observations.len(),
-                tracked_observations.missing_map_point_associations,
+                tracked_observations.missing_map_point_associations(),
                 result.inliers().len(),
                 tracking_ransac.min_inliers(),
                 matches.len(),
@@ -4931,9 +5091,9 @@ impl SlamTracker {
             let shared = build_shared_matches(
                 keyframe_id,
                 &verified,
-                &tracked_observations.verified_match_indices,
+                &tracked_observations,
                 result.inliers(),
-            );
+            )?;
             let shared_pairs = shared.pairs.len();
             if self.trace_transitions {
                 eprintln!(
@@ -5054,7 +5214,7 @@ impl SlamTracker {
         let intrinsics = self.frontend.intrinsics();
         let tracked_metrics = PoseReprojectionMetrics::from_pose(
             &pose_world,
-            &tracked_observations.observations,
+            tracked_observations.observations(),
             intrinsics,
         );
         let projectable_tracked_observations = tracked_metrics.projectable_count();
@@ -5596,19 +5756,18 @@ fn tracking_pose_from_vio_output(
 fn build_shared_matches(
     keyframe_id: KeyframeId,
     matches: &Matches<Verified>,
-    verified_match_indices: &[usize],
+    tracked: &TrackedMapObservations,
     inliers: &[usize],
-) -> SharedMatches {
+) -> Result<SharedMatches, TrackingInlierResolutionError> {
     let mut pairs = Vec::with_capacity(inliers.len());
-    for &idx in inliers {
-        let Some(&verified_idx) = verified_match_indices.get(idx) else {
-            continue;
-        };
-        if let Some(&(ci, ki)) = matches.indices().get(verified_idx) {
-            pairs.push((ci, ki));
-        }
+    for &observation_index in inliers {
+        let resolved = resolve_tracking_inlier(tracked, matches, observation_index)?;
+        pairs.push((
+            resolved.current_detection_index,
+            resolved.keyframe_detection_index,
+        ));
     }
-    SharedMatches { keyframe_id, pairs }
+    Ok(SharedMatches { keyframe_id, pairs })
 }
 
 fn is_redundant(
@@ -6193,9 +6352,48 @@ mod tests {
         let tracked = crate::frontend::build_map_observations(&map, &verified, intrinsics)
             .expect("tracked observations");
 
-        assert_eq!(tracked.observations.len(), 4);
-        assert_eq!(tracked.verified_match_indices, vec![0, 2, 3, 4]);
-        assert_eq!(tracked.missing_map_point_associations, 1);
+        assert_eq!(tracked.observations().len(), 4);
+        assert_eq!(tracked.verified_match_index(0), Some(0));
+        assert_eq!(tracked.verified_match_index(1), Some(2));
+        assert_eq!(tracked.verified_match_index(2), Some(3));
+        assert_eq!(tracked.verified_match_index(3), Some(4));
+        assert_eq!(tracked.missing_map_point_associations(), 1);
+
+        let resolved = resolve_tracking_inlier(&tracked, &verified, 1)
+            .expect("compacted observation provenance");
+        assert_eq!(resolved.current_detection_index, 2);
+        assert_eq!(resolved.keyframe_detection_index, 2);
+        assert_eq!(resolved.current_pixel.x, 110.0);
+
+        let shared = build_shared_matches(keyframe_id, &verified, &tracked, &[0, 1, 2, 3])
+            .expect("all compacted inliers resolve");
+        assert_eq!(shared.pairs, [(0, 0), (2, 2), (3, 3), (4, 4)]);
+
+        let invalid = resolve_tracking_inlier(&tracked, &verified, tracked.len())
+            .expect_err("out-of-range PnP inlier must fail closed");
+        assert!(matches!(
+            invalid,
+            TrackingInlierResolutionError::IndexOutOfBounds {
+                domain: TrackingInlierIndexDomain::TrackedObservation,
+                index: 4,
+                len: 4,
+            }
+        ));
+        let tracker_error = TrackerError::from(invalid);
+        assert!(
+            tracker_error
+                .to_string()
+                .contains("tracked PnP observation")
+        );
+        assert!(tracker_error.source().is_some());
+
+        assert!(matches!(
+            build_shared_matches(keyframe_id, &verified, &tracked, &[tracked.len()]),
+            Err(TrackingInlierResolutionError::IndexOutOfBounds {
+                domain: TrackingInlierIndexDomain::TrackedObservation,
+                ..
+            })
+        ));
 
         let wrong_detections = Detections::new(
             SensorId::StereoLeft,
@@ -6231,6 +6429,82 @@ mod tests {
             Err(MapObservationError::MapInstanceMismatch { expected, actual })
                 if expected == map.instance_id() && actual == foreign_map.instance_id()
         ));
+    }
+
+    #[test]
+    fn derived_tracking_parallax_rejects_nonfinite_pixel_arithmetic() {
+        let intrinsics =
+            PinholeIntrinsics::try_new(300.0, 300.0, 160.0, 120.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            Keypoint { x: 1.0, y: 1.0 },
+            intrinsics,
+        )
+        .expect("observation");
+        let resolved = ResolvedTrackingInlier {
+            observation,
+            current_detection_index: 7,
+            keyframe_detection_index: 11,
+            current_pixel: Keypoint {
+                x: f32::MAX,
+                y: 0.0,
+            },
+            keyframe_pixel: Keypoint {
+                x: -f32::MAX,
+                y: 0.0,
+            },
+        };
+
+        let error = resolved
+            .parallax_px()
+            .expect_err("finite inputs with overflowing subtraction must fail");
+        assert!(matches!(
+            error,
+            TrackingInlierResolutionError::NonFiniteParallaxPixels {
+                current_detection_index: 7,
+                keyframe_detection_index: 11,
+                value: f32::INFINITY,
+            }
+        ));
+        assert!(error.to_string().contains("finite in pixels"));
+    }
+
+    #[test]
+    fn parallax_median_is_permutation_invariant_and_overflow_safe() {
+        let cases = [
+            vec![3.0, 1.0, 2.0],
+            vec![4.0, 1.0, 3.0, 2.0],
+            vec![5.0, 1.0, 5.0, 1.0, 3.0],
+            vec![f32::MAX, f32::MAX],
+            vec![0.0],
+        ];
+
+        for values in cases {
+            let mut ordered = values.clone();
+            ordered.sort_by(f32::total_cmp);
+            let mid = ordered.len() / 2;
+            let expected = if ordered.len() % 2 == 1 {
+                ordered[mid]
+            } else {
+                ordered[mid - 1] + (ordered[mid] - ordered[mid - 1]) * 0.5
+            };
+
+            for rotation in 0..values.len() {
+                let mut permutation = values.clone();
+                permutation.rotate_left(rotation);
+                if rotation % 2 == 1 {
+                    permutation.reverse();
+                }
+                let mut samples: Vec<_> = permutation.into_iter().map(ParallaxSamplePx).collect();
+                assert_eq!(median_parallax_px(&mut samples), Some(expected));
+            }
+        }
+
+        assert_eq!(median_parallax_px(&mut []), None);
     }
 
     fn make_map_with_two_keyframes_one_shared_point() -> (SlamMap, KeyframeId, KeyframeId) {

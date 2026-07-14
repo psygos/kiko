@@ -161,7 +161,8 @@ pub use tracker::{
     ProjectedMatcherConfigError, ProjectedTrackingProjectionError, RedundancyPolicy,
     RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError,
     TrackerInitError, TrackerOutput, TrackerRuntimeConfig, TrackerRuntimeConfigError,
-    TrackingHealth, TrackingMatcher, TrackingPose, VioTelemetry,
+    TrackingHealth, TrackingInlierIndexDomain, TrackingInlierResolutionError, TrackingMatcher,
+    TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, Point3, RectifiedRowMismatchError, RectifiedRowMismatchPx,

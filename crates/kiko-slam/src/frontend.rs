@@ -200,14 +200,34 @@ impl std::error::Error for MapObservationError {
 
 #[derive(Debug)]
 pub(crate) struct TrackedMapObservations {
-    pub(crate) observations: Vec<crate::Observation>,
-    pub(crate) verified_match_indices: Vec<usize>,
-    pub(crate) missing_map_point_associations: usize,
+    observations: Vec<crate::Observation>,
+    verified_match_indices: Vec<usize>,
+    missing_map_point_associations: usize,
 }
 
 impl TrackedMapObservations {
     pub(crate) fn len(&self) -> usize {
         self.observations.len()
+    }
+
+    pub(crate) fn observations(&self) -> &[crate::Observation] {
+        &self.observations
+    }
+
+    pub(crate) fn observation(&self, index: usize) -> Option<crate::Observation> {
+        self.observations.get(index).copied()
+    }
+
+    pub(crate) fn verified_match_index(&self, index: usize) -> Option<usize> {
+        self.verified_match_indices.get(index).copied()
+    }
+
+    pub(crate) fn verified_match_mapping_len(&self) -> usize {
+        self.verified_match_indices.len()
+    }
+
+    pub(crate) fn missing_map_point_associations(&self) -> usize {
+        self.missing_map_point_associations
     }
 }
 
@@ -279,47 +299,4 @@ pub(crate) fn build_map_observations(
         verified_match_indices,
         missing_map_point_associations,
     })
-}
-
-pub(crate) fn median_parallax_px(
-    matches: &Matches<Verified>,
-    verified_match_indices: &[usize],
-    inliers: &[usize],
-) -> Option<f32> {
-    if inliers.is_empty() {
-        return None;
-    }
-
-    let left_kps = matches.source_a().keypoints();
-    let key_kps = matches.source_b().keypoints();
-    let mut parallax = Vec::with_capacity(inliers.len());
-
-    for &idx in inliers {
-        let Some(&verified_idx) = verified_match_indices.get(idx) else {
-            continue;
-        };
-        let Some(&(li, ki)) = matches.indices().get(verified_idx) else {
-            continue;
-        };
-        let (Some(left), Some(key)) = (left_kps.get(li), key_kps.get(ki)) else {
-            continue;
-        };
-        let dx = left.x - key.x;
-        let dy = left.y - key.y;
-        parallax.push((dx * dx + dy * dy).sqrt());
-    }
-
-    if parallax.is_empty() {
-        return None;
-    }
-
-    parallax.sort_by(f32::total_cmp);
-    let mid = parallax.len() / 2;
-    let median = if parallax.len() % 2 == 0 {
-        (parallax[mid - 1] + parallax[mid]) * 0.5
-    } else {
-        parallax[mid]
-    };
-
-    Some(median)
 }
