@@ -458,6 +458,7 @@ pub struct FrameDiagnostics {
     pub pnp_tracked_observations: Option<PnpTrackedObservationCountMetric>,
     pub pnp_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
     pub ransac_iterations: Option<usize>,
+    pub pnp_ransac_candidate_projection_rejections: Option<usize>,
     pub pnp_refinement: Option<crate::PnpRefinementStatus>,
     pub tracking_pose_source: Option<TrackingPoseSource>,
     pub pnp_projectable_tracked_observations: Option<PnpProjectableTrackedObservationCountMetric>,
@@ -528,6 +529,7 @@ impl FrameDiagnostics {
             pnp_tracked_observations: None,
             pnp_accepted_inliers: None,
             ransac_iterations: None,
+            pnp_ransac_candidate_projection_rejections: None,
             pnp_refinement: None,
             tracking_pose_source: None,
             pnp_projectable_tracked_observations: None,
@@ -840,6 +842,7 @@ mod tests {
         assert!(diag.pnp_tracked_observations.is_none());
         assert!(diag.pnp_accepted_inliers.is_none());
         assert!(diag.ransac_iterations.is_none());
+        assert!(diag.pnp_ransac_candidate_projection_rejections.is_none());
         assert!(diag.tracking_pose_source.is_none());
         assert!(diag.pnp_projectable_tracked_observations.is_none());
         assert!(

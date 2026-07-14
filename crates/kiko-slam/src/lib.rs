@@ -144,7 +144,8 @@ pub use pipeline::{
 pub use place_recognition::{BootstrapDescriptorError, DescriptorInitError, DescriptorStats};
 pub use pnp::{
     CameraFrameAxis, ImagePlaneAxis, IntrinsicsError, Observation, PinholeIntrinsics,
-    PinholeProjectionError, PnpError, PnpRefinementCost, PnpRefinementFallback,
+    PinholeProjectionError, PnpCandidateProjectionRejection, PnpCandidateProjectionRejections,
+    PnpError, PnpInlierBuffer, PnpRefinementCost, PnpRefinementFallback,
     PnpRefinementObjectiveStage, PnpRefinementStatus, PnpRefinementTermination, PnpResult, Pose,
     RansacConfig, RansacConfigError, ReprojectionEvaluationError, solve_pnp_ransac,
 };

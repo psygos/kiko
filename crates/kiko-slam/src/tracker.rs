@@ -4436,7 +4436,11 @@ impl SlamTracker {
             .solve_tracking_pose(tracked_observations.observations(), tracking_ransac)
         {
             Ok(result) => result,
-            Err(crate::PnpError::NotEnoughPoints { .. } | crate::PnpError::NoSolution) => {
+            Err(
+                crate::PnpError::NotEnoughPoints { .. }
+                | crate::PnpError::InsufficientObservationsForRequiredInliers { .. }
+                | crate::PnpError::NoSolution,
+            ) => {
                 return Err(TrackingAttemptError::PnpFailed {
                     matches: match_count,
                     verified: verified_count,
@@ -5185,6 +5189,11 @@ impl SlamTracker {
                 projectable_tracked_observations,
             ));
         diagnostics.ransac_iterations = Some(result.iterations().get());
+        diagnostics.pnp_ransac_candidate_projection_rejections = Some(
+            result
+                .candidate_projection_rejections()
+                .map_or(0, |rejections| rejections.count().get()),
+        );
         diagnostics.pnp_refinement = Some(result.refinement().clone());
         diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px = tracked_metrics
             .rmse_px()
@@ -5920,18 +5929,18 @@ mod tests {
             intrinsics,
         )
         .expect("finite observation");
-        let pose = Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]);
+        let pose = Pose::from_rt(Pose::identity().rotation(), [f32::NAN, 0.0, 0.0]);
         let evaluation = PoseReprojectionMetrics::try_from_pose(&pose, &[observation], intrinsics)
-            .expect_err("camera-frame overflow must fail reprojection evaluation");
+            .expect_err("nonfinite camera pose must fail reprojection evaluation");
         assert!(matches!(
             &evaluation,
             crate::ReprojectionEvaluationError::Projection {
                 observation_index: 0,
                 source: crate::PinholeProjectionError::NonFiniteCameraPointMeters {
                     axis: crate::CameraFrameAxis::X,
-                    value: f32::INFINITY,
+                    value,
                 },
-            }
+            } if value.is_nan()
         ));
 
         let tracker_error = TrackerError::from(evaluation);
@@ -8467,9 +8476,9 @@ mod tests {
             crate::pnp::PinholeProjection::NonPositiveCameraDepth { depth_m: -1.0 }
         );
 
-        let overflowing_pose = Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]);
+        let invalid_pose = Pose::from_rt(Pose::identity().rotation(), [f32::NAN, 0.0, 0.0]);
         let camera_error = crate::pnp::project_world_point_px(
-            overflowing_pose,
+            invalid_pose,
             Point3 {
                 x: f32::MAX,
                 y: 0.0,
@@ -8477,13 +8486,31 @@ mod tests {
             },
             intrinsics,
         )
-        .expect_err("camera-frame overflow must not be treated as non-visibility");
+        .expect_err("nonfinite camera geometry must not be treated as non-visibility");
         assert!(matches!(
             camera_error,
             crate::PinholeProjectionError::NonFiniteCameraPointMeters {
                 axis: crate::CameraFrameAxis::X,
-                value: f32::INFINITY,
-            }
+                value,
+            } if value.is_nan()
+        ));
+
+        let large_finite_error = crate::pnp::project_world_point_px(
+            Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]),
+            Point3 {
+                x: f32::MAX,
+                y: 0.0,
+                z: 1.0,
+            },
+            intrinsics,
+        )
+        .expect_err("finite f64 projection outside the f32 pixel domain must be explicit");
+        assert!(matches!(
+            large_finite_error,
+            crate::PinholeProjectionError::PixelCoordinateOutsideF32Domain {
+                axis: crate::ImagePlaneAxis::U,
+                value,
+            } if value.is_finite() && value > f64::from(f32::MAX)
         ));
 
         let pixel_error = crate::pnp::project_world_point_px(
@@ -8495,17 +8522,17 @@ mod tests {
             },
             intrinsics,
         )
-        .expect_err("pixel overflow must not be treated as non-visibility");
+        .expect_err("pixel outside the f32 domain must not be treated as non-visibility");
         assert!(matches!(
             pixel_error,
-            crate::PinholeProjectionError::NonFinitePixelCoordinatePx {
+            crate::PinholeProjectionError::PixelCoordinateOutsideF32Domain {
                 axis: crate::ImagePlaneAxis::U,
-                value: f32::INFINITY,
-            }
+                value,
+            } if value.is_finite() && value > f64::from(f32::MAX)
         ));
 
         let tracker_error = TrackerError::ProjectedTrackingProjection(pixel_error);
-        assert!(tracker_error.to_string().contains("pixels"));
+        assert!(tracker_error.to_string().contains("f32 pixel domain"));
         assert!(tracker_error.source().is_some());
     }
 

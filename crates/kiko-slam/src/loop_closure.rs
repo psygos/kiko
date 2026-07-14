@@ -1265,6 +1265,7 @@ impl LoopVerificationError {
                 | Self::InsufficientInliers { .. }
                 | Self::PnpFailed(
                     PnpError::NotEnoughPoints { .. }
+                        | PnpError::InsufficientObservationsForRequiredInliers { .. }
                         | PnpError::Degenerate { .. }
                         | PnpError::NoSolution
                 )
@@ -1742,6 +1743,12 @@ mod tests {
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
                 crate::PnpError::NoSolution,
             )),
+            super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
+                crate::PnpError::InsufficientObservationsForRequiredInliers {
+                    required_inliers: 5,
+                    observations: 4,
+                },
+            )),
             super::LoopDetectError::VerificationFailed(
                 super::LoopVerificationError::InsufficientInliers {
                     inliers: 3,
@@ -1761,6 +1768,9 @@ mod tests {
                     field: "world.x",
                     value: f32::NAN,
                 },
+            )),
+            super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
+                crate::PnpError::CandidateProjectionRejectionCountOverflow,
             )),
             super::LoopDetectError::ApplyFailed(LoopApplyError::from(MapError::KeyframeNotFound(
                 KeyframeId::default(),

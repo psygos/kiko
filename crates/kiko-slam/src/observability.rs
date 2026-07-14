@@ -87,6 +87,8 @@ const PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT: &str =
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE: &str =
     "diagnostics/tracking/vio_proposal_rejected_higher_shared_accepted_inlier_reprojection_rmse";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
+const PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS: &str =
+    "diagnostics/tracking/pnp_ransac_candidate_projection_rejections";
 const PATH_TRACKING_PNP_REFINEMENT_APPLIED: &str = "diagnostics/tracking/pnp_refinement_applied";
 const PATH_TRACKING_PNP_REFINEMENT_ITERATIONS: &str =
     "diagnostics/tracking/pnp_refinement_iterations";
@@ -404,6 +406,12 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     }
     if let Some(v) = diag.ransac_iterations {
         scalars.push((PATH_TRACKING_RANSAC_ITERATIONS, v as f64));
+    }
+    if let Some(v) = diag.pnp_ransac_candidate_projection_rejections {
+        scalars.push((
+            PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS,
+            v as f64,
+        ));
     }
     if let Some(refinement) = diag.pnp_refinement.as_ref() {
         scalars.push((
@@ -895,6 +903,7 @@ mod tests {
         PATH_HEALTH_VISUAL_PROPOSAL_SHARED_ACCEPTED_INLIER_REPROJECTION_RMSE, PATH_MAP_KEYFRAMES,
         PATH_MAP_POINTS, PATH_POSE_BA_CONVERGED, PATH_POSE_BA_ITERATIONS,
         PATH_TRACKING_PNP_ACCEPTED_INLIERS, PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
+        PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS,
         PATH_TRACKING_PNP_REFINEMENT_APPLIED, PATH_TRACKING_PNP_REFINEMENT_ITERATIONS,
         PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS,
         PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS, PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
@@ -1006,6 +1015,7 @@ mod tests {
             .expect("ratio"),
         );
         diag.pnp_accepted_inliers = Some(PnpAcceptedInlierCountMetric::new(6));
+        diag.pnp_ransac_candidate_projection_rejections = Some(2);
         diag.pnp_refinement = Some(crate::PnpRefinementStatus::Applied {
             termination: crate::PnpRefinementTermination::Converged {
                 iterations: std::num::NonZeroUsize::new(2).expect("literal is non-zero"),
@@ -1108,6 +1118,10 @@ mod tests {
         }));
         assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_POSE_BA_CONVERGED && value.abs() < f64::EPSILON
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS
+                && (*value - 2.0).abs() < f64::EPSILON
         }));
         #[cfg(feature = "vio")]
         assert!(scalars.iter().any(|(path, value)| {

@@ -67,8 +67,9 @@ impl std::fmt::Display for ImagePlaneAxis {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PinholeProjectionError {
-    NonFiniteCameraPointMeters { axis: CameraFrameAxis, value: f32 },
-    NonFinitePixelCoordinatePx { axis: ImagePlaneAxis, value: f32 },
+    NonFiniteCameraPointMeters { axis: CameraFrameAxis, value: f64 },
+    NonFinitePixelCoordinatePx { axis: ImagePlaneAxis, value: f64 },
+    PixelCoordinateOutsideF32Domain { axis: ImagePlaneAxis, value: f64 },
 }
 
 impl std::fmt::Display for PinholeProjectionError {
@@ -81,6 +82,10 @@ impl std::fmt::Display for PinholeProjectionError {
             Self::NonFinitePixelCoordinatePx { axis, value } => write!(
                 f,
                 "pinhole projection image-plane {axis} coordinate must be finite in pixels, got {value}"
+            ),
+            Self::PixelCoordinateOutsideF32Domain { axis, value } => write!(
+                f,
+                "pinhole projection image-plane {axis} coordinate is outside the finite f32 pixel domain: {value} px"
             ),
         }
     }
@@ -243,19 +248,38 @@ impl Pose {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PinholeProjection {
     Projected { u_px: f32, v_px: f32 },
-    NonPositiveCameraDepth { depth_m: f32 },
+    NonPositiveCameraDepth { depth_m: f64 },
 }
 
-pub(crate) fn project_world_point_px(
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PinholeProjectionF64 {
+    Projected { u_px: f64, v_px: f64 },
+    NonPositiveCameraDepth { depth_m: f64 },
+}
+
+fn project_world_point_f64_px(
     pose_world_to_camera: Pose,
     point_world_m: Point3,
     intrinsics: PinholeIntrinsics,
-) -> Result<PinholeProjection, PinholeProjectionError> {
-    let point_camera_m = math::transform_point(
-        pose_world_to_camera.rotation(),
-        pose_world_to_camera.translation(),
-        [point_world_m.x, point_world_m.y, point_world_m.z],
-    );
+) -> Result<PinholeProjectionF64, PinholeProjectionError> {
+    let rotation = pose_world_to_camera.rotation();
+    let translation = pose_world_to_camera.translation();
+    let point_world_m = [
+        f64::from(point_world_m.x),
+        f64::from(point_world_m.y),
+        f64::from(point_world_m.z),
+    ];
+    let mut point_camera_m = [0.0_f64; 3];
+    for axis in 0..3 {
+        point_camera_m[axis] = f64::from(rotation[axis][0]).mul_add(
+            point_world_m[0],
+            f64::from(rotation[axis][1]).mul_add(
+                point_world_m[1],
+                f64::from(rotation[axis][2])
+                    .mul_add(point_world_m[2], f64::from(translation[axis])),
+            ),
+        );
+    }
     for (axis, value) in [
         (CameraFrameAxis::X, point_camera_m[0]),
         (CameraFrameAxis::Y, point_camera_m[1]),
@@ -267,16 +291,43 @@ pub(crate) fn project_world_point_px(
     }
     let depth_m = point_camera_m[2];
     if depth_m <= 0.0 {
-        return Ok(PinholeProjection::NonPositiveCameraDepth { depth_m });
+        return Ok(PinholeProjectionF64::NonPositiveCameraDepth { depth_m });
     }
-    let u_px = intrinsics.fx() * (point_camera_m[0] / depth_m) + intrinsics.cx();
-    let v_px = intrinsics.fy() * (point_camera_m[1] / depth_m) + intrinsics.cy();
+    let u_px =
+        f64::from(intrinsics.fx()).mul_add(point_camera_m[0] / depth_m, f64::from(intrinsics.cx()));
+    let v_px =
+        f64::from(intrinsics.fy()).mul_add(point_camera_m[1] / depth_m, f64::from(intrinsics.cy()));
     for (axis, value) in [(ImagePlaneAxis::U, u_px), (ImagePlaneAxis::V, v_px)] {
         if !value.is_finite() {
             return Err(PinholeProjectionError::NonFinitePixelCoordinatePx { axis, value });
         }
     }
-    Ok(PinholeProjection::Projected { u_px, v_px })
+    Ok(PinholeProjectionF64::Projected { u_px, v_px })
+}
+
+pub(crate) fn project_world_point_px(
+    pose_world_to_camera: Pose,
+    point_world_m: Point3,
+    intrinsics: PinholeIntrinsics,
+) -> Result<PinholeProjection, PinholeProjectionError> {
+    let (u_px, v_px) =
+        match project_world_point_f64_px(pose_world_to_camera, point_world_m, intrinsics)? {
+            PinholeProjectionF64::Projected { u_px, v_px } => (u_px, v_px),
+            PinholeProjectionF64::NonPositiveCameraDepth { depth_m } => {
+                return Ok(PinholeProjection::NonPositiveCameraDepth { depth_m });
+            }
+        };
+    let narrow_px = |axis, value: f64| {
+        if value < -f64::from(f32::MAX) || value > f64::from(f32::MAX) {
+            Err(PinholeProjectionError::PixelCoordinateOutsideF32Domain { axis, value })
+        } else {
+            Ok(value as f32)
+        }
+    };
+    Ok(PinholeProjection::Projected {
+        u_px: narrow_px(ImagePlaneAxis::U, u_px)?,
+        v_px: narrow_px(ImagePlaneAxis::V, v_px)?,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -379,12 +430,98 @@ impl Default for RansacConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpInlierBuffer {
+    BestConsensus,
+    CandidateScratch,
+}
+
+impl std::fmt::Display for PnpInlierBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::BestConsensus => "best-consensus inlier indices",
+            Self::CandidateScratch => "candidate inlier scratch indices",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PnpCandidateProjectionRejection {
+    ransac_iteration: NonZeroUsize,
+    observation_index: usize,
+    source: PinholeProjectionError,
+}
+
+impl PnpCandidateProjectionRejection {
+    pub fn ransac_iteration(self) -> NonZeroUsize {
+        self.ransac_iteration
+    }
+
+    pub fn observation_index(self) -> usize {
+        self.observation_index
+    }
+
+    pub fn projection_error(self) -> PinholeProjectionError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for PnpCandidateProjectionRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RANSAC candidate projection failed at iteration {} for observation {}: {}",
+            self.ransac_iteration, self.observation_index, self.source
+        )
+    }
+}
+
+impl std::error::Error for PnpCandidateProjectionRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PnpCandidateProjectionRejections {
+    count: NonZeroUsize,
+    first: PnpCandidateProjectionRejection,
+}
+
+impl PnpCandidateProjectionRejections {
+    fn first(rejection: PnpCandidateProjectionRejection) -> Self {
+        Self {
+            count: NonZeroUsize::MIN,
+            first: rejection,
+        }
+    }
+
+    fn try_record_another(&mut self) -> Result<(), PnpError> {
+        self.count = self
+            .count
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or(PnpError::CandidateProjectionRejectionCountOverflow)?;
+        Ok(())
+    }
+
+    pub fn count(self) -> NonZeroUsize {
+        self.count
+    }
+
+    pub fn first_rejection(self) -> PnpCandidateProjectionRejection {
+        self.first
+    }
+}
+
 #[derive(Debug)]
 pub struct PnpResult {
     pose: Pose,
     inliers: Vec<usize>,
     iterations: NonZeroUsize,
     refinement: PnpRefinementStatus,
+    candidate_projection_rejections: Option<PnpCandidateProjectionRejections>,
 }
 
 impl PnpResult {
@@ -402,6 +539,10 @@ impl PnpResult {
 
     pub fn refinement(&self) -> &PnpRefinementStatus {
         &self.refinement
+    }
+
+    pub fn candidate_projection_rejections(&self) -> Option<PnpCandidateProjectionRejections> {
+        self.candidate_projection_rejections
     }
 }
 
@@ -518,6 +659,16 @@ pub enum PnpRefinementFallback {
         iteration: NonZeroUsize,
         source: crate::Se3TangentError,
     },
+    CandidateProjection {
+        iteration: NonZeroUsize,
+        observation_index: usize,
+        source: PinholeProjectionError,
+    },
+    PostRefinementConsensusProjection {
+        termination: PnpRefinementTermination,
+        observation_index: usize,
+        source: PinholeProjectionError,
+    },
     Stationary {
         iteration: NonZeroUsize,
     },
@@ -546,10 +697,12 @@ impl PnpRefinementFallback {
             | Self::NonProjectableInliers { iteration, .. }
             | Self::LinearSolve { iteration, .. }
             | Self::InvalidPoseUpdate { iteration, .. }
+            | Self::CandidateProjection { iteration, .. }
             | Self::Stationary { iteration }
             | Self::NoImprovement { iteration, .. }
             | Self::InvalidObjective { iteration, .. } => Some(*iteration),
-            Self::LostConsensus { termination, .. } => Some(termination.iterations()),
+            Self::PostRefinementConsensusProjection { termination, .. }
+            | Self::LostConsensus { termination, .. } => Some(termination.iterations()),
         }
     }
 }
@@ -577,6 +730,22 @@ impl std::fmt::Display for PnpRefinementFallback {
             Self::InvalidPoseUpdate { iteration, source } => write!(
                 f,
                 "PnP refinement pose update is invalid at iteration {iteration}: {source}"
+            ),
+            Self::CandidateProjection {
+                iteration,
+                observation_index,
+                source,
+            } => write!(
+                f,
+                "PnP refinement candidate projection failed at iteration {iteration} for observation {observation_index}: {source}"
+            ),
+            Self::PostRefinementConsensusProjection {
+                termination,
+                observation_index,
+                source,
+            } => write!(
+                f,
+                "PnP post-refinement consensus projection failed after {termination:?} for observation {observation_index}: {source}"
             ),
             Self::Stationary { iteration } => write!(
                 f,
@@ -615,6 +784,8 @@ impl std::error::Error for PnpRefinementFallback {
         match self {
             Self::LinearSolve { source, .. } => Some(source),
             Self::InvalidPoseUpdate { source, .. } => Some(source),
+            Self::CandidateProjection { source, .. }
+            | Self::PostRefinementConsensusProjection { source, .. } => Some(source),
             Self::EmptyInlierSet
             | Self::InvalidInlierIndex { .. }
             | Self::NonProjectableInliers { .. }
@@ -628,9 +799,33 @@ impl std::error::Error for PnpRefinementFallback {
 
 #[derive(Debug)]
 pub enum PnpError {
-    NotEnoughPoints { required: usize, actual: usize },
-    NonFiniteObservation { field: &'static str, value: f32 },
-    Degenerate { message: &'static str },
+    NotEnoughPoints {
+        required: usize,
+        actual: usize,
+    },
+    InsufficientObservationsForRequiredInliers {
+        required_inliers: usize,
+        observations: usize,
+    },
+    NonFiniteObservation {
+        field: &'static str,
+        value: f32,
+    },
+    Degenerate {
+        message: &'static str,
+    },
+    InlierBufferAllocation {
+        buffer: PnpInlierBuffer,
+        observation_count: usize,
+        source: TryReserveError,
+    },
+    AllGeneratedCandidatesFailedProjection {
+        rejections: PnpCandidateProjectionRejections,
+    },
+    NoConsensusAfterCandidateProjectionFailures {
+        rejections: PnpCandidateProjectionRejections,
+    },
+    CandidateProjectionRejectionCountOverflow,
     NoSolution,
 }
 
@@ -640,16 +835,61 @@ impl std::fmt::Display for PnpError {
             PnpError::NotEnoughPoints { required, actual } => {
                 write!(f, "pnp requires at least {required} points, got {actual}")
             }
+            PnpError::InsufficientObservationsForRequiredInliers {
+                required_inliers,
+                observations,
+            } => write!(
+                f,
+                "pnp requires {required_inliers} inliers but received only {observations} observations"
+            ),
             PnpError::NonFiniteObservation { field, value } => {
                 write!(f, "pnp observation {field} must be finite, got {value}")
             }
             PnpError::Degenerate { message } => write!(f, "pnp degenerate input: {message}"),
+            PnpError::InlierBufferAllocation {
+                buffer,
+                observation_count,
+                source,
+            } => write!(
+                f,
+                "failed to allocate {buffer} for {observation_count} PnP observations: {source}"
+            ),
+            PnpError::AllGeneratedCandidatesFailedProjection { rejections } => write!(
+                f,
+                "all generated PnP candidates failed numerical projection ({} rejected; first: {})",
+                rejections.count, rejections.first
+            ),
+            PnpError::NoConsensusAfterCandidateProjectionFailures { rejections } => write!(
+                f,
+                "PnP found no sufficient consensus after rejecting {} candidates for numerical projection failure (first: {})",
+                rejections.count, rejections.first
+            ),
+            PnpError::CandidateProjectionRejectionCountOverflow => write!(
+                f,
+                "PnP candidate projection rejection count exceeded the usize domain"
+            ),
             PnpError::NoSolution => write!(f, "pnp failed to find a valid pose"),
         }
     }
 }
 
-impl std::error::Error for PnpError {}
+impl std::error::Error for PnpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InlierBufferAllocation { source, .. } => Some(source),
+            Self::AllGeneratedCandidatesFailedProjection { rejections } => Some(&rejections.first),
+            Self::NoConsensusAfterCandidateProjectionFailures { rejections } => {
+                Some(&rejections.first)
+            }
+            Self::NotEnoughPoints { .. }
+            | Self::InsufficientObservationsForRequiredInliers { .. }
+            | Self::NonFiniteObservation { .. }
+            | Self::Degenerate { .. }
+            | Self::CandidateProjectionRejectionCountOverflow
+            | Self::NoSolution => None,
+        }
+    }
+}
 
 pub fn solve_pnp_ransac(
     observations: &[Observation],
@@ -662,38 +902,58 @@ pub fn solve_pnp_ransac(
             actual: observations.len(),
         });
     }
+    if observations.len() < config.min_inliers() {
+        return Err(PnpError::InsufficientObservationsForRequiredInliers {
+            required_inliers: config.min_inliers(),
+            observations: observations.len(),
+        });
+    }
 
     let mut rng = XorShift64::new(config.seed());
     let mut best_pose = None;
-    let mut best_inliers: Vec<usize> = Vec::new();
-    let mut candidate_inliers = Vec::with_capacity(observations.len());
+    let mut best_inliers = try_inlier_buffer(PnpInlierBuffer::BestConsensus, observations.len())?;
+    let mut candidate_inliers =
+        try_inlier_buffer(PnpInlierBuffer::CandidateScratch, observations.len())?;
+    let mut candidate_projection_rejections: Option<PnpCandidateProjectionRejections> = None;
+    let mut saw_projection_complete_candidate = false;
 
-    let mut iterations = 0usize;
+    let mut ransac_iteration = NonZeroUsize::MIN;
     let total = observations.len();
     let mut target_iterations = config.max_iterations();
 
-    let threshold_px = config.reprojection_threshold_px();
+    let threshold_px = f64::from(config.reprojection_threshold_px());
     let threshold_sq_px2 = threshold_px * threshold_px;
-    while iterations < target_iterations {
-        iterations += 1;
-        let sample = sample_three(&mut rng, total);
-        let Some([a, b, c]) = sample else { continue };
+    loop {
+        let [a, b, c] = sample_three(&mut rng, total).ok_or(PnpError::NotEnoughPoints {
+            required: 3,
+            actual: total,
+        })?;
 
         let obs = [&observations[a], &observations[b], &observations[c]];
         let candidates = p3p_solutions(obs);
-        if candidates.is_empty() {
-            continue;
-        }
-
-        for pose in candidates {
-            candidate_inliers.clear();
-            for (idx, obs) in observations.iter().enumerate() {
-                if let Some(residual_sq_px2) = reprojection_error_sq_px2(pose, obs, intrinsics) {
-                    if residual_sq_px2 <= threshold_sq_px2 {
-                        candidate_inliers.push(idx);
+        'candidate: for pose in candidates {
+            if let Err(failure) = collect_inliers_into(
+                &mut candidate_inliers,
+                pose,
+                observations,
+                intrinsics,
+                threshold_sq_px2,
+            ) {
+                let rejection = PnpCandidateProjectionRejection {
+                    ransac_iteration,
+                    observation_index: failure.observation_index,
+                    source: failure.source,
+                };
+                match candidate_projection_rejections.as_mut() {
+                    Some(rejections) => rejections.try_record_another()?,
+                    None => {
+                        candidate_projection_rejections =
+                            Some(PnpCandidateProjectionRejections::first(rejection));
                     }
                 }
+                continue 'candidate;
             }
+            saw_projection_complete_candidate = true;
 
             if candidate_inliers.len() > best_inliers.len() {
                 best_inliers.clear();
@@ -709,39 +969,66 @@ pub fn solve_pnp_ransac(
                 }
             }
         }
+        if ransac_iteration.get() >= target_iterations {
+            break;
+        }
+        ransac_iteration = ransac_iteration.saturating_add(1);
     }
 
-    let pose = best_pose.ok_or(PnpError::NoSolution)?;
+    let pose = match best_pose {
+        Some(pose) => pose,
+        None if !saw_projection_complete_candidate => {
+            if let Some(rejections) = candidate_projection_rejections {
+                return Err(PnpError::AllGeneratedCandidatesFailedProjection { rejections });
+            }
+            return Err(PnpError::NoSolution);
+        }
+        None => return Err(no_consensus_error(candidate_projection_rejections)),
+    };
     if best_inliers.len() < config.min_inliers() {
-        return Err(PnpError::NoSolution);
+        return Err(no_consensus_error(candidate_projection_rejections));
     }
 
     let (pose, inliers, refinement) =
         match refine_pose_on_inliers(pose, observations, intrinsics, &best_inliers) {
-            Ok((refined_pose, termination)) => {
-                let refined_inliers =
-                    collect_inliers(refined_pose, observations, intrinsics, threshold_sq_px2);
-                if refined_inliers.len() >= config.min_inliers() {
-                    (
-                        refined_pose,
-                        refined_inliers,
-                        PnpRefinementStatus::Applied { termination },
-                    )
-                } else {
-                    let candidate_inliers = refined_inliers.len();
+            Ok((refined_pose, termination)) => match collect_inliers_into(
+                &mut candidate_inliers,
+                refined_pose,
+                observations,
+                intrinsics,
+                threshold_sq_px2,
+            ) {
+                Ok(()) if candidate_inliers.len() >= config.min_inliers() => (
+                    refined_pose,
+                    candidate_inliers,
+                    PnpRefinementStatus::Applied { termination },
+                ),
+                Ok(()) => {
+                    let refined_inliers = candidate_inliers.len();
                     (
                         pose,
                         best_inliers,
                         PnpRefinementStatus::RetainedRansacPose {
                             reason: PnpRefinementFallback::LostConsensus {
                                 termination,
-                                candidate_inliers,
+                                candidate_inliers: refined_inliers,
                                 required_inliers: config.min_inliers(),
                             },
                         },
                     )
                 }
-            }
+                Err(failure) => (
+                    pose,
+                    best_inliers,
+                    PnpRefinementStatus::RetainedRansacPose {
+                        reason: PnpRefinementFallback::PostRefinementConsensusProjection {
+                            termination,
+                            observation_index: failure.observation_index,
+                            source: failure.source,
+                        },
+                    },
+                ),
+            },
             Err(reason) => (
                 pose,
                 best_inliers,
@@ -752,16 +1039,74 @@ pub fn solve_pnp_ransac(
     Ok(PnpResult {
         pose,
         inliers,
-        iterations: NonZeroUsize::new(iterations).ok_or(PnpError::NoSolution)?,
+        iterations: ransac_iteration,
         refinement,
+        candidate_projection_rejections,
     })
 }
 
-fn adaptive_ransac_iterations(inlier_count: usize, total: usize, confidence: f32) -> usize {
+fn no_consensus_error(
+    candidate_projection_rejections: Option<PnpCandidateProjectionRejections>,
+) -> PnpError {
+    match candidate_projection_rejections {
+        Some(rejections) => PnpError::NoConsensusAfterCandidateProjectionFailures { rejections },
+        None => PnpError::NoSolution,
+    }
+}
+
+fn try_inlier_buffer(
+    buffer: PnpInlierBuffer,
+    observation_count: usize,
+) -> Result<Vec<usize>, PnpError> {
+    let mut indices = Vec::new();
+    indices
+        .try_reserve_exact(observation_count)
+        .map_err(|source| PnpError::InlierBufferAllocation {
+            buffer,
+            observation_count,
+            source,
+        })?;
+    Ok(indices)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct IndexedProjectionFailure {
+    observation_index: usize,
+    source: PinholeProjectionError,
+}
+
+fn collect_inliers_into(
+    inliers: &mut Vec<usize>,
+    pose: Pose,
+    observations: &[Observation],
+    intrinsics: PinholeIntrinsics,
+    threshold_sq_px2: f64,
+) -> Result<(), IndexedProjectionFailure> {
+    inliers.clear();
+    for (observation_index, observation) in observations.iter().enumerate() {
+        match evaluate_reprojection_residual(pose, observation, intrinsics).map_err(|source| {
+            IndexedProjectionFailure {
+                observation_index,
+                source,
+            }
+        })? {
+            ReprojectionResidual::Projectable { residual_sq_px2 }
+                if residual_sq_px2 <= threshold_sq_px2 =>
+            {
+                inliers.push(observation_index);
+            }
+            ReprojectionResidual::Projectable { .. }
+            | ReprojectionResidual::NonPositiveCameraDepth { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn adaptive_ransac_iterations(inlier_count: usize, total: usize, confidence: f64) -> usize {
     if inlier_count == 0 || total == 0 {
         return usize::MAX;
     }
-    let inlier_ratio = (inlier_count as f32 / total as f32).clamp(0.0, 1.0);
+    let inlier_ratio = (inlier_count as f64 / total as f64).clamp(0.0, 1.0);
     let sample_success = inlier_ratio.powi(3);
     if sample_success >= 1.0 {
         return 1;
@@ -775,23 +1120,6 @@ fn adaptive_ransac_iterations(inlier_count: usize, total: usize, confidence: f32
         return usize::MAX;
     }
     (numerator / denominator).ceil().max(1.0) as usize
-}
-
-fn collect_inliers(
-    pose: Pose,
-    observations: &[Observation],
-    intrinsics: PinholeIntrinsics,
-    threshold_sq_px2: f32,
-) -> Vec<usize> {
-    let mut inliers = Vec::with_capacity(observations.len());
-    for (idx, obs) in observations.iter().enumerate() {
-        if let Some(residual_sq_px2) = reprojection_error_sq_px2(pose, obs, intrinsics) {
-            if residual_sq_px2 <= threshold_sq_px2 {
-                inliers.push(idx);
-            }
-        }
-    }
-    inliers
 }
 
 fn refine_pose_on_inliers(
@@ -865,14 +1193,28 @@ fn refine_pose_on_inliers(
         let mut candidate_nonprojectable = 0usize;
         let mut candidate_cost = 0.0_f64;
         for &idx in inlier_indices {
-            let Some(residual_sq_px2) = observations
-                .get(idx)
-                .and_then(|obs| reprojection_error_sq_px2(candidate, obs, intrinsics))
-            else {
-                candidate_nonprojectable = candidate_nonprojectable.saturating_add(1);
-                continue;
+            let observation =
+                observations
+                    .get(idx)
+                    .ok_or(PnpRefinementFallback::InvalidInlierIndex {
+                        iteration,
+                        index: idx,
+                        observation_count: observations.len(),
+                    })?;
+            match evaluate_reprojection_residual(candidate, observation, intrinsics).map_err(
+                |source| PnpRefinementFallback::CandidateProjection {
+                    iteration,
+                    observation_index: idx,
+                    source,
+                },
+            )? {
+                ReprojectionResidual::Projectable { residual_sq_px2 } => {
+                    candidate_cost += residual_sq_px2;
+                }
+                ReprojectionResidual::NonPositiveCameraDepth { .. } => {
+                    candidate_nonprojectable = candidate_nonprojectable.saturating_add(1);
+                }
             };
-            candidate_cost += f64::from(residual_sq_px2);
         }
         if let Some(count) = NonZeroUsize::new(candidate_nonprojectable) {
             return Err(PnpRefinementFallback::NonProjectableInliers { iteration, count });
@@ -1209,7 +1551,7 @@ const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
 /// Tolerance for accepting the dimensionless P3P equation evaluation as a valid root.
 const P3P_ROOT_TOLERANCE: f32 = 1e-3;
 /// Target confidence used to adaptively shorten RANSAC once a strong model exists.
-const RANSAC_CONFIDENCE: f32 = 0.99;
+const RANSAC_CONFIDENCE: f64 = 0.99;
 /// Number of nonlinear pose-only refinement steps on the best inlier set.
 const PNP_REFINEMENT_ITERS: usize = 8;
 /// Damping added to the normal equations during PnP pose refinement.
@@ -1384,42 +1726,28 @@ fn push_unique_root(roots: &mut Vec<(f32, f32)>, candidate: (f32, f32)) {
     roots.push(candidate);
 }
 
-fn reprojection_error_sq_px2(
-    pose: Pose,
-    obs: &Observation,
-    intrinsics: PinholeIntrinsics,
-) -> Option<f32> {
-    let pc = math::transform_point(
-        pose.rotation(),
-        pose.translation(),
-        vec3_from_point(obs.world),
-    );
-    if pc.iter().any(|value| !value.is_finite()) || pc[2] <= 0.0 {
-        return None;
-    }
-    let u = intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx();
-    let v = intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy();
-    let dx = u - obs.pixel.x;
-    let dy = v - obs.pixel.y;
-    let residual_sq_px2 = dx * dx + dy * dy;
-    residual_sq_px2.is_finite().then_some(residual_sq_px2)
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReprojectionResidual {
+    Projectable { residual_sq_px2: f64 },
+    NonPositiveCameraDepth { depth_m: f64 },
 }
 
-fn try_reprojection_error_sq_px2(
+fn evaluate_reprojection_residual(
     pose: Pose,
     observation: &Observation,
     intrinsics: PinholeIntrinsics,
-) -> Result<Option<f64>, PinholeProjectionError> {
-    let PinholeProjection::Projected { u_px, v_px } =
-        project_world_point_px(pose, observation.world, intrinsics)?
-    else {
-        return Ok(None);
+) -> Result<ReprojectionResidual, PinholeProjectionError> {
+    let (u_px, v_px) = match project_world_point_f64_px(pose, observation.world, intrinsics)? {
+        PinholeProjectionF64::Projected { u_px, v_px } => (u_px, v_px),
+        PinholeProjectionF64::NonPositiveCameraDepth { depth_m } => {
+            return Ok(ReprojectionResidual::NonPositiveCameraDepth { depth_m });
+        }
     };
-    let residual_u_px = f64::from(u_px) - f64::from(observation.pixel.x);
-    let residual_v_px = f64::from(v_px) - f64::from(observation.pixel.y);
-    Ok(Some(
-        residual_u_px.mul_add(residual_u_px, residual_v_px * residual_v_px),
-    ))
+    let residual_u_px = u_px - f64::from(observation.pixel.x);
+    let residual_v_px = v_px - f64::from(observation.pixel.y);
+    Ok(ReprojectionResidual::Projectable {
+        residual_sq_px2: residual_u_px.mul_add(residual_u_px, residual_v_px * residual_v_px),
+    })
 }
 
 #[derive(Debug)]
@@ -1489,13 +1817,13 @@ pub(crate) fn reprojection_residuals_px(
             source,
         })?;
     for (observation_index, observation) in observations.iter().enumerate() {
-        let residual_px = match try_reprojection_error_sq_px2(*pose, observation, intrinsics)
+        let residual_px = match evaluate_reprojection_residual(*pose, observation, intrinsics)
             .map_err(|source| ReprojectionEvaluationError::Projection {
                 observation_index,
                 source,
             })? {
-            Some(error_sq_px2) => {
-                let value_px = error_sq_px2.sqrt();
+            ReprojectionResidual::Projectable { residual_sq_px2 } => {
+                let value_px = residual_sq_px2.sqrt();
                 if value_px > f64::from(f32::MAX) {
                     return Err(ReprojectionEvaluationError::ResidualOutsideF32PixelDomain {
                         observation_index,
@@ -1504,7 +1832,7 @@ pub(crate) fn reprojection_residuals_px(
                 }
                 Some(value_px as f32)
             }
-            None => None,
+            ReprojectionResidual::NonPositiveCameraDepth { .. } => None,
         };
         residuals_px.push(residual_px);
     }
@@ -1936,6 +2264,7 @@ mod tests {
         let result = solve_pnp_ransac(&observations, intrinsics, config).expect("pnp");
         assert!(result.inliers().len() >= 20, "insufficient inliers");
         assert!(result.refinement().applied());
+        assert!(result.candidate_projection_rejections().is_none());
 
         let rot_err = rot_frob_norm(result.pose().rotation(), pose_gt.rotation());
         let trans_err = l2(result.pose().translation(), pose_gt.translation());
@@ -1981,6 +2310,148 @@ mod tests {
             trans_err < 0.18,
             "translation error too high with outliers: {trans_err}"
         );
+    }
+
+    #[test]
+    fn ransac_f32_max_pixel_threshold_is_squared_in_f64_without_overflow() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let pose = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
+        let observations =
+            observations_from_projection(pose, &synthetic_world_points(), intrinsics)
+                .expect("observations");
+        let threshold_sq_px2 = f64::from(f32::MAX).powi(2);
+        assert!(threshold_sq_px2.is_finite());
+
+        let config =
+            RansacConfig::new(100, f32::MAX, 20, 0xA11CE).expect("finite maximum f32 threshold");
+        let result = solve_pnp_ransac(&observations, intrinsics, config)
+            .expect("large finite threshold must remain representable");
+        assert_eq!(result.inliers().len(), observations.len());
+    }
+
+    #[test]
+    fn finite_extreme_projection_is_an_outlier_not_a_numerical_failure() {
+        let intrinsics =
+            PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("finite unit intrinsics");
+        let observation = Observation {
+            world: Point3 {
+                x: f32::MAX,
+                y: f32::MAX,
+                z: f32::MIN_POSITIVE,
+            },
+            pixel: Keypoint { x: 0.0, y: 0.0 },
+            bearing: [0.0, 0.0, 1.0],
+        };
+        let mut inliers = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, 1)
+            .expect("single-index scratch buffer");
+
+        collect_inliers_into(
+            &mut inliers,
+            Pose::identity(),
+            &[observation],
+            intrinsics,
+            1.0,
+        )
+        .expect("finite f32 inputs must remain numerically evaluable in f64");
+        assert!(inliers.is_empty());
+    }
+
+    #[test]
+    fn candidate_projection_rejection_summary_is_nonzero_and_source_chained() {
+        let intrinsics =
+            PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("finite unit intrinsics");
+        let observation = Observation::try_new(
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: 1.0,
+            },
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("finite observation");
+        let mut inliers = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, 1)
+            .expect("single-index scratch buffer");
+        let failure = collect_inliers_into(
+            &mut inliers,
+            Pose::from_rt(Pose::identity().rotation(), [f32::NAN, 0.0, 0.0]),
+            &[observation],
+            intrinsics,
+            1.0,
+        )
+        .expect_err("nonfinite candidate geometry must reject the candidate");
+        let rejection = PnpCandidateProjectionRejection {
+            ransac_iteration: NonZeroUsize::MIN,
+            observation_index: failure.observation_index,
+            source: failure.source,
+        };
+        let mut rejections = PnpCandidateProjectionRejections::first(rejection);
+        rejections
+            .try_record_another()
+            .expect("second rejection count");
+
+        assert_eq!(rejections.count().get(), 2);
+        assert_eq!(rejections.first_rejection().ransac_iteration().get(), 1);
+        assert_eq!(rejections.first_rejection().observation_index(), 0);
+        assert!(matches!(
+            rejections.first_rejection().projection_error(),
+            PinholeProjectionError::NonFiniteCameraPointMeters {
+                axis: CameraFrameAxis::X,
+                value,
+            } if value.is_nan()
+        ));
+
+        let error = PnpError::AllGeneratedCandidatesFailedProjection { rejections };
+        let rejection_source = std::error::Error::source(&error).expect("indexed rejection source");
+        assert!(error.to_string().contains("2 rejected"));
+        assert!(rejection_source.to_string().contains("observation 0"));
+        let projection_source = rejection_source.source().expect("projection source");
+        assert!(projection_source.to_string().contains("camera-frame x"));
+
+        let no_consensus = no_consensus_error(Some(rejections));
+        assert!(matches!(
+            &no_consensus,
+            PnpError::NoConsensusAfterCandidateProjectionFailures { .. }
+        ));
+        assert!(std::error::Error::source(&no_consensus).is_some());
+    }
+
+    #[test]
+    fn candidate_projection_rejection_count_overflow_is_explicit() {
+        let first = PnpCandidateProjectionRejection {
+            ransac_iteration: NonZeroUsize::MIN,
+            observation_index: 0,
+            source: PinholeProjectionError::NonFiniteCameraPointMeters {
+                axis: CameraFrameAxis::X,
+                value: f64::NAN,
+            },
+        };
+        let mut rejections = PnpCandidateProjectionRejections {
+            count: NonZeroUsize::MAX,
+            first,
+        };
+
+        assert!(matches!(
+            rejections.try_record_another(),
+            Err(PnpError::CandidateProjectionRejectionCountOverflow)
+        ));
+    }
+
+    #[test]
+    fn pnp_inlier_buffer_allocation_error_preserves_buffer_and_source() {
+        let error = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, usize::MAX)
+            .expect_err("unaddressable inlier buffer must fail");
+        assert!(matches!(
+            &error,
+            PnpError::InlierBufferAllocation {
+                buffer: PnpInlierBuffer::CandidateScratch,
+                observation_count: usize::MAX,
+                ..
+            }
+        ));
+        let source = std::error::Error::source(&error).expect("allocation source");
+        assert!(!source.to_string().is_empty());
     }
 
     #[test]
@@ -2104,10 +2575,14 @@ mod tests {
             let initial_cost: f64 = inlier_indices
                 .iter()
                 .map(|&index| {
-                    f64::from(
-                        reprojection_error_sq_px2(initial, &observations[index], intrinsics)
-                            .expect("initial projection"),
-                    )
+                    match evaluate_reprojection_residual(initial, &observations[index], intrinsics)
+                        .expect("finite initial projection")
+                    {
+                        ReprojectionResidual::Projectable { residual_sq_px2 } => residual_sq_px2,
+                        ReprojectionResidual::NonPositiveCameraDepth { .. } => {
+                            panic!("initial inlier must be projectable")
+                        }
+                    }
                 })
                 .sum();
             if let Ok((refined, _)) =
@@ -2116,10 +2591,20 @@ mod tests {
                 let refined_cost: f64 = inlier_indices
                     .iter()
                     .map(|&index| {
-                        f64::from(
-                            reprojection_error_sq_px2(refined, &observations[index], intrinsics)
-                                .expect("refined projection"),
+                        match evaluate_reprojection_residual(
+                            refined,
+                            &observations[index],
+                            intrinsics,
                         )
+                        .expect("finite refined projection")
+                        {
+                            ReprojectionResidual::Projectable { residual_sq_px2 } => {
+                                residual_sq_px2
+                            }
+                            ReprojectionResidual::NonPositiveCameraDepth { .. } => {
+                                panic!("refined inlier must be projectable")
+                            }
+                        }
                     })
                     .sum();
                 assert!(
@@ -2191,6 +2676,33 @@ mod tests {
             source: crate::LinearSolveError::SingularPivot { column: 2 },
         };
         assert!(std::error::Error::source(&error).is_some());
+
+        let projection = PnpRefinementFallback::CandidateProjection {
+            iteration: NonZeroUsize::MIN,
+            observation_index: 3,
+            source: PinholeProjectionError::NonFiniteCameraPointMeters {
+                axis: CameraFrameAxis::Z,
+                value: f64::NAN,
+            },
+        };
+        let source = std::error::Error::source(&projection).expect("projection source");
+        assert!(projection.to_string().contains("observation 3"));
+        assert!(source.to_string().contains("camera-frame z"));
+
+        let post_refinement = PnpRefinementFallback::PostRefinementConsensusProjection {
+            termination: PnpRefinementTermination::Converged {
+                iterations: NonZeroUsize::new(2).expect("nonzero literal"),
+            },
+            observation_index: 4,
+            source: PinholeProjectionError::NonFinitePixelCoordinatePx {
+                axis: ImagePlaneAxis::U,
+                value: f64::INFINITY,
+            },
+        };
+        assert_eq!(post_refinement.iterations().map(NonZeroUsize::get), Some(2));
+        assert!(post_refinement.to_string().contains("post-refinement"));
+        assert!(post_refinement.to_string().contains("observation 4"));
+        assert!(std::error::Error::source(&post_refinement).is_some());
     }
 
     #[test]
@@ -2242,6 +2754,29 @@ mod tests {
     }
 
     #[test]
+    fn solve_pnp_rejects_unreachable_required_inlier_count_before_sampling() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
+        let world = synthetic_world_points();
+        let observations =
+            observations_from_projection(Pose::identity(), &world[..MIN_PNP_POINTS], intrinsics)
+                .expect("four observations");
+        let required_inliers = observations.len() + 1;
+        let config =
+            RansacConfig::new(10, 2.0, required_inliers, 7).expect("globally valid RANSAC config");
+
+        let error = solve_pnp_ransac(&observations, intrinsics, config)
+            .expect_err("required consensus larger than input must fail before sampling");
+        assert!(matches!(
+            error,
+            PnpError::InsufficientObservationsForRequiredInliers {
+                required_inliers: actual_required,
+                observations: actual_observations,
+            } if actual_required == required_inliers && actual_observations == observations.len()
+        ));
+    }
+
+    #[test]
     fn reprojection_error_is_zero_for_exact_projection() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
@@ -2253,8 +2788,12 @@ mod tests {
         };
         let pixel = project_pixel_from_pose(pose, point, intrinsics);
         let obs = Observation::try_new(point, pixel, intrinsics).expect("obs");
-        let residual_sq_px2 =
-            reprojection_error_sq_px2(pose, &obs, intrinsics).expect("projectable residual");
+        let ReprojectionResidual::Projectable { residual_sq_px2 } =
+            evaluate_reprojection_residual(pose, &obs, intrinsics)
+                .expect("finite projectable residual")
+        else {
+            panic!("positive-depth observation must be projectable");
+        };
         assert!(
             residual_sq_px2 < 1e-8,
             "expected exact reprojection, got {residual_sq_px2} px^2"
@@ -2319,9 +2858,13 @@ mod tests {
             bearing: [0.0, 0.0, 1.0],
         };
 
-        let squared_px2 = try_reprojection_error_sq_px2(Pose::identity(), &observation, intrinsics)
+        let ReprojectionResidual::Projectable {
+            residual_sq_px2: squared_px2,
+        } = evaluate_reprojection_residual(Pose::identity(), &observation, intrinsics)
             .expect("finite projection")
-            .expect("positive camera depth");
+        else {
+            panic!("positive camera depth must be projectable");
+        };
         assert!(squared_px2.is_finite());
         assert!(squared_px2 > f64::from(f32::MAX).powi(2));
 
