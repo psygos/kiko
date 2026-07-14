@@ -5238,13 +5238,24 @@ impl SlamTracker {
             keyframe_id,
             landmarks,
         });
-        if let Some(place_recognition) = self.place_recognition.as_mut() {
-            place_recognition.on_keyframe(
-                keyframe_id,
-                keyframe.detections(),
-                &left,
-                self.global_map.map().snapshot(),
+        let source_snapshot = self.global_map.map().snapshot();
+        let bootstrap_descriptor_error =
+            self.place_recognition
+                .as_mut()
+                .and_then(|place_recognition| {
+                    place_recognition
+                        .on_keyframe(keyframe_id, keyframe.detections(), &left, source_snapshot)
+                        .err()
+                });
+        if let Some(error) = bootstrap_descriptor_error {
+            eprintln!(
+                "bootstrap loop descriptor unavailable (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
             );
+            self.emit_event(DiagnosticEvent::BootstrapDescriptorUnavailable {
+                keyframe_id,
+                source_snapshot,
+                error: Arc::new(error),
+            });
         }
 
         let mut diagnostics = self.empty_diagnostics();

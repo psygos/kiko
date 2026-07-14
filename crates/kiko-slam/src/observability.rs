@@ -667,6 +667,16 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             ),
             rerun::TextLogLevel::ERROR,
         ),
+        DiagnosticEvent::BootstrapDescriptorUnavailable {
+            keyframe_id,
+            source_snapshot,
+            error,
+        } => (
+            format!(
+                "bootstrap loop descriptor unavailable (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
+            ),
+            rerun::TextLogLevel::WARN,
+        ),
         DiagnosticEvent::RelocalizationStarted => (
             "relocalization started".to_string(),
             rerun::TextLogLevel::WARN,
@@ -1260,6 +1270,19 @@ mod tests {
     }
 
     #[test]
+    fn format_event_exposes_bootstrap_descriptor_degradation() {
+        let (text, level) = format_event(&DiagnosticEvent::BootstrapDescriptorUnavailable {
+            keyframe_id: crate::map::KeyframeId::default(),
+            source_snapshot: crate::map::SlamMap::new().snapshot(),
+            error: std::sync::Arc::new(crate::loop_closure::GlobalDescriptorError::ZeroNorm),
+        });
+
+        assert!(text.contains("bootstrap loop descriptor unavailable"));
+        assert!(text.contains("norm must be > 0"));
+        assert_eq!(level, rerun::TextLogLevel::WARN);
+    }
+
+    #[test]
     fn format_event_supports_all_variants() {
         let _ = format_event(&DiagnosticEvent::TrackingLost {
             consecutive_failures: 4,
@@ -1306,6 +1329,11 @@ mod tests {
             error: std::sync::Arc::new(crate::InferenceError::InvariantViolation {
                 context: "test descriptor failure",
             }),
+        });
+        let _ = format_event(&DiagnosticEvent::BootstrapDescriptorUnavailable {
+            keyframe_id: crate::KeyframeId::default(),
+            source_snapshot: crate::map::SlamMap::new().snapshot(),
+            error: std::sync::Arc::new(crate::loop_closure::GlobalDescriptorError::ZeroNorm),
         });
         let _ = format_event(&DiagnosticEvent::RelocalizationStarted);
         let _ = format_event(&DiagnosticEvent::RelocalizationSucceeded {

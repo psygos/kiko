@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::loop_closure::{
-    DescriptorSource, GlobalDescriptor, KeyframeDatabase, LoopClosureConfig, PlaceMatch,
-    RelocalizationMatch, aggregate_global_descriptor,
+    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopClosureConfig,
+    PlaceMatch, RelocalizationMatch, aggregate_global_descriptor,
 };
 use crate::map::KeyframeId;
 use crate::{
@@ -611,9 +611,10 @@ impl PlaceRecognition {
         detections: &Arc<Detections>,
         frame: &Frame,
         source_snapshot: MapSnapshot,
-    ) {
-        self.enqueue_loop_candidates(keyframe_id, detections);
+    ) -> Result<(), GlobalDescriptorError> {
+        let bootstrap_result = self.enqueue_loop_candidates(keyframe_id, detections);
         self.enqueue_descriptor_request(keyframe_id, frame, source_snapshot);
+        bootstrap_result
     }
 
     pub(crate) fn drain_responses(
@@ -693,10 +694,12 @@ impl PlaceRecognition {
         events
     }
 
-    fn enqueue_loop_candidates(&mut self, keyframe_id: KeyframeId, detections: &Arc<Detections>) {
-        let Ok(global_descriptor) = aggregate_global_descriptor(detections.descriptors()) else {
-            return;
-        };
+    fn enqueue_loop_candidates(
+        &mut self,
+        keyframe_id: KeyframeId,
+        detections: &Arc<Detections>,
+    ) -> Result<(), GlobalDescriptorError> {
+        let global_descriptor = aggregate_global_descriptor(detections.descriptors())?;
         self.database.insert_with_source(
             keyframe_id,
             global_descriptor.clone(),
@@ -711,7 +714,7 @@ impl PlaceRecognition {
 
         if candidates.is_empty() {
             self.loop_streak.clear();
-            return;
+            return Ok(());
         }
 
         let present: HashSet<KeyframeId> = candidates.iter().map(|m| m.candidate).collect();
@@ -723,7 +726,7 @@ impl PlaceRecognition {
         }
 
         if self.pending_loop.is_some() {
-            return;
+            return Ok(());
         }
 
         let promoted: Vec<PlaceMatch> = candidates
@@ -738,7 +741,7 @@ impl PlaceRecognition {
             .collect();
 
         if promoted.is_empty() {
-            return;
+            return Ok(());
         }
 
         self.pending_loop = Some(PendingLoopCandidate {
@@ -746,6 +749,7 @@ impl PlaceRecognition {
             detections: Arc::clone(detections),
             candidates: promoted,
         });
+        Ok(())
     }
 
     fn enqueue_descriptor_request(

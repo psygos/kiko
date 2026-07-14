@@ -620,6 +620,11 @@ pub enum DiagnosticEvent {
         source_snapshot: MapSnapshot,
         error: Arc<InferenceError>,
     },
+    BootstrapDescriptorUnavailable {
+        keyframe_id: KeyframeId,
+        source_snapshot: MapSnapshot,
+        error: Arc<crate::loop_closure::GlobalDescriptorError>,
+    },
     RelocalizationStarted,
     RelocalizationSucceeded {
         keyframe_id: KeyframeId,
@@ -872,6 +877,11 @@ mod tests {
                     context: "test descriptor failure",
                 }),
             },
+            DiagnosticEvent::BootstrapDescriptorUnavailable {
+                keyframe_id: crate::KeyframeId::default(),
+                source_snapshot: crate::map::SlamMap::new().snapshot(),
+                error: std::sync::Arc::new(crate::loop_closure::GlobalDescriptorError::ZeroNorm),
+            },
             DiagnosticEvent::RelocalizationStarted,
             DiagnosticEvent::BaDegenerate {
                 reason: DegenerateReason::NoFactors,
@@ -881,11 +891,12 @@ mod tests {
             },
         ];
 
+        let event_count = events.len();
         let mut kinds = HashSet::new();
         for event in events {
             kinds.insert(discriminant(&event));
         }
-        assert_eq!(kinds.len(), 11);
+        assert_eq!(kinds.len(), event_count);
     }
 
     #[test]
