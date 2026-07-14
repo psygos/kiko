@@ -623,7 +623,12 @@ pub enum DiagnosticEvent {
     BootstrapDescriptorUnavailable {
         keyframe_id: KeyframeId,
         source_snapshot: MapSnapshot,
-        error: Arc<crate::loop_closure::GlobalDescriptorError>,
+        error: Arc<crate::BootstrapDescriptorError>,
+    },
+    DescriptorIndexFailed {
+        keyframe_id: KeyframeId,
+        source_snapshot: MapSnapshot,
+        error: Arc<crate::loop_closure::KeyframeDatabaseError>,
     },
     RelocalizationStarted,
     RelocalizationSucceeded {
@@ -880,7 +885,18 @@ mod tests {
             DiagnosticEvent::BootstrapDescriptorUnavailable {
                 keyframe_id: crate::KeyframeId::default(),
                 source_snapshot: crate::map::SlamMap::new().snapshot(),
-                error: std::sync::Arc::new(crate::loop_closure::GlobalDescriptorError::ZeroNorm),
+                error: std::sync::Arc::new(crate::BootstrapDescriptorError::Aggregation {
+                    source: crate::loop_closure::GlobalDescriptorError::ZeroNorm,
+                }),
+            },
+            DiagnosticEvent::DescriptorIndexFailed {
+                keyframe_id: crate::KeyframeId::default(),
+                source_snapshot: crate::map::SlamMap::new().snapshot(),
+                error: std::sync::Arc::new(
+                    crate::loop_closure::KeyframeDatabaseError::SequenceExhausted {
+                        next_sequence: usize::MAX,
+                    },
+                ),
             },
             DiagnosticEvent::RelocalizationStarted,
             DiagnosticEvent::BaDegenerate {

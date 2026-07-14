@@ -3509,6 +3509,20 @@ impl SlamTracker {
                         error,
                     });
                 }
+                PlaceRecognitionEvent::IndexFailed {
+                    keyframe_id,
+                    source_snapshot,
+                    error,
+                } => {
+                    eprintln!(
+                        "learned descriptor index update failed (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
+                    );
+                    self.emit_event(DiagnosticEvent::DescriptorIndexFailed {
+                        keyframe_id,
+                        source_snapshot,
+                        error: Arc::new(error),
+                    });
+                }
             }
         }
     }
@@ -7801,11 +7815,16 @@ mod tests {
         let mut global_map = GlobalMap::from_parts(map.clone(), essential_graph.clone());
         let mut loop_db = KeyframeDatabase::new(0);
         for (idx, (keyframe_id, _)) in map.keyframes().enumerate() {
-            loop_db.insert_with_source(
-                keyframe_id,
-                make_global_descriptor_basis(idx),
-                crate::loop_closure::DescriptorSource::Bootstrap,
-            );
+            loop_db
+                .register_keyframe(keyframe_id)
+                .expect("descriptor sequence available");
+            loop_db
+                .set_descriptor(
+                    keyframe_id,
+                    make_global_descriptor_basis(idx),
+                    crate::loop_closure::DescriptorSource::Bootstrap,
+                )
+                .expect("descriptor sequence available");
         }
 
         remove_keyframe_from_graph_and_db(&mut global_map, removed_kf).expect("remove keyframe");

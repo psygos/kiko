@@ -677,6 +677,16 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             ),
             rerun::TextLogLevel::WARN,
         ),
+        DiagnosticEvent::DescriptorIndexFailed {
+            keyframe_id,
+            source_snapshot,
+            error,
+        } => (
+            format!(
+                "learned descriptor index update failed (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
+            ),
+            rerun::TextLogLevel::ERROR,
+        ),
         DiagnosticEvent::RelocalizationStarted => (
             "relocalization started".to_string(),
             rerun::TextLogLevel::WARN,
@@ -1274,7 +1284,9 @@ mod tests {
         let (text, level) = format_event(&DiagnosticEvent::BootstrapDescriptorUnavailable {
             keyframe_id: crate::map::KeyframeId::default(),
             source_snapshot: crate::map::SlamMap::new().snapshot(),
-            error: std::sync::Arc::new(crate::loop_closure::GlobalDescriptorError::ZeroNorm),
+            error: std::sync::Arc::new(crate::BootstrapDescriptorError::Aggregation {
+                source: crate::loop_closure::GlobalDescriptorError::ZeroNorm,
+            }),
         });
 
         assert!(text.contains("bootstrap loop descriptor unavailable"));
@@ -1333,7 +1345,18 @@ mod tests {
         let _ = format_event(&DiagnosticEvent::BootstrapDescriptorUnavailable {
             keyframe_id: crate::KeyframeId::default(),
             source_snapshot: crate::map::SlamMap::new().snapshot(),
-            error: std::sync::Arc::new(crate::loop_closure::GlobalDescriptorError::ZeroNorm),
+            error: std::sync::Arc::new(crate::BootstrapDescriptorError::Aggregation {
+                source: crate::loop_closure::GlobalDescriptorError::ZeroNorm,
+            }),
+        });
+        let _ = format_event(&DiagnosticEvent::DescriptorIndexFailed {
+            keyframe_id: crate::KeyframeId::default(),
+            source_snapshot: crate::map::SlamMap::new().snapshot(),
+            error: std::sync::Arc::new(
+                crate::loop_closure::KeyframeDatabaseError::SequenceExhausted {
+                    next_sequence: usize::MAX,
+                },
+            ),
         });
         let _ = format_event(&DiagnosticEvent::RelocalizationStarted);
         let _ = format_event(&DiagnosticEvent::RelocalizationSucceeded {

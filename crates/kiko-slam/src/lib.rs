@@ -117,9 +117,10 @@ pub use local_ba::{
 };
 pub use loop_closure::{
     DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
-    KeyframeDatabase, LoopApplyError, LoopApplyErrorKind, LoopCandidate, LoopClosureConfig,
-    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
-    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
+    KeyframeDatabase, KeyframeDatabaseError, KeyframeDescriptorUpdate, LoopApplyError,
+    LoopApplyErrorKind, LoopCandidate, LoopClosureConfig, LoopClosureConfigError,
+    LoopClosureConfigInput, LoopDetectError, LoopVerificationError, PlaceMatch,
+    RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
     RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
     aggregate_global_descriptor, match_descriptors_for_loop,
 };
@@ -138,7 +139,7 @@ pub use pairing::{
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
 };
-pub use place_recognition::{DescriptorInitError, DescriptorStats};
+pub use place_recognition::{BootstrapDescriptorError, DescriptorInitError, DescriptorStats};
 pub use pnp::{
     IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpRefinementCost,
     PnpRefinementFallback, PnpRefinementObjectiveStage, PnpRefinementStatus,

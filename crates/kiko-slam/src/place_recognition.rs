@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::loop_closure::{
-    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopClosureConfig,
-    PlaceMatch, RelocalizationMatch, aggregate_global_descriptor,
+    DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase,
+    KeyframeDatabaseError, LoopClosureConfig, PlaceMatch, RelocalizationMatch,
+    aggregate_global_descriptor,
 };
 use crate::map::KeyframeId;
 use crate::{
@@ -27,6 +28,37 @@ pub struct DescriptorStats {
     pub respawn_count: u32,
     pub respawn_exhausted: bool,
     pub panics: u64,
+}
+
+#[derive(Debug)]
+pub enum BootstrapDescriptorError {
+    Aggregation { source: GlobalDescriptorError },
+    Database { source: KeyframeDatabaseError },
+}
+
+impl std::fmt::Display for BootstrapDescriptorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Aggregation { source } => {
+                write!(f, "bootstrap descriptor aggregation failed: {source}")
+            }
+            Self::Database { source } => {
+                write!(
+                    f,
+                    "bootstrap descriptor database operation failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BootstrapDescriptorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Aggregation { source } => Some(source),
+            Self::Database { source } => Some(source),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -519,6 +551,11 @@ pub(crate) enum PlaceRecognitionEvent {
         exhausted: bool,
         error: Arc<DescriptorInitError>,
     },
+    IndexFailed {
+        keyframe_id: KeyframeId,
+        source_snapshot: MapSnapshot,
+        error: KeyframeDatabaseError,
+    },
 }
 
 pub(crate) struct PlaceRecognition {
@@ -611,7 +648,10 @@ impl PlaceRecognition {
         detections: &Arc<Detections>,
         frame: &Frame,
         source_snapshot: MapSnapshot,
-    ) -> Result<(), GlobalDescriptorError> {
+    ) -> Result<(), BootstrapDescriptorError> {
+        self.database
+            .register_keyframe(keyframe_id)
+            .map_err(|source| BootstrapDescriptorError::Database { source })?;
         let bootstrap_result = self.enqueue_loop_candidates(keyframe_id, detections);
         self.enqueue_descriptor_request(keyframe_id, frame, source_snapshot);
         bootstrap_result
@@ -652,13 +692,20 @@ impl PlaceRecognition {
                     if !keyframe_exists(response.keyframe_id) {
                         continue;
                     }
-                    if self.database.replace_descriptor(
+                    match self.database.set_descriptor(
                         response.keyframe_id,
                         response.descriptor,
                         DescriptorSource::Learned,
                     ) {
-                        self.descriptor_stats.applied =
-                            self.descriptor_stats.applied.saturating_add(1);
+                        Ok(_) => {
+                            self.descriptor_stats.applied =
+                                self.descriptor_stats.applied.saturating_add(1);
+                        }
+                        Err(error) => events.push(PlaceRecognitionEvent::IndexFailed {
+                            keyframe_id: response.keyframe_id,
+                            source_snapshot: response.source_snapshot,
+                            error,
+                        }),
                     }
                 }
                 DescriptorWorkerResponse::Failure {
@@ -698,17 +745,20 @@ impl PlaceRecognition {
         &mut self,
         keyframe_id: KeyframeId,
         detections: &Arc<Detections>,
-    ) -> Result<(), GlobalDescriptorError> {
-        let global_descriptor = aggregate_global_descriptor(detections.descriptors())?;
-        self.database.insert_with_source(
-            keyframe_id,
-            global_descriptor.clone(),
-            DescriptorSource::Bootstrap,
-        );
-
+    ) -> Result<(), BootstrapDescriptorError> {
+        let global_descriptor = aggregate_global_descriptor(detections.descriptors())
+            .map_err(|source| BootstrapDescriptorError::Aggregation { source })?;
         let mut candidates = self
             .database
-            .query(&global_descriptor, self.loop_config.max_candidates());
+            .query_loop_candidates(
+                keyframe_id,
+                &global_descriptor,
+                self.loop_config.max_candidates(),
+            )
+            .map_err(|source| BootstrapDescriptorError::Database { source })?;
+        self.database
+            .set_descriptor(keyframe_id, global_descriptor, DescriptorSource::Bootstrap)
+            .map_err(|source| BootstrapDescriptorError::Database { source })?;
         candidates
             .retain(|candidate| candidate.similarity >= self.loop_config.similarity_threshold());
 
@@ -778,5 +828,115 @@ impl PlaceRecognition {
                 eprintln!("descriptor request not submitted: {error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn descriptor_with_basis(index: usize) -> GlobalDescriptor {
+        let mut values = [0.0_f32; crate::loop_closure::GLOBAL_DESCRIPTOR_DIM];
+        values[index] = 1.0;
+        GlobalDescriptor::try_new(values).expect("valid descriptor")
+    }
+
+    fn recognition_without_worker() -> PlaceRecognition {
+        let descriptor_config = GlobalDescriptorConfig::new(1).expect("descriptor config");
+        let factory: DescriptorExtractorFactory = Arc::new(|| {
+            Err(DescriptorInitError::ModelMissing {
+                path: "intentionally-absent-test-model.onnx".into(),
+            })
+        });
+        PlaceRecognition {
+            database: KeyframeDatabase::new(LoopClosureConfig::default().temporal_gap()),
+            descriptor_worker: DescriptorSupervisor::with_factory_and_max_respawns(
+                descriptor_config,
+                factory,
+                0,
+            ),
+            descriptor_stats: DescriptorStats::default(),
+            loop_config: LoopClosureConfig::default(),
+            pending_loop: None,
+            loop_streak: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn learned_response_initializes_registered_descriptor_after_bootstrap_failure() {
+        let mut recognition = recognition_without_worker();
+        let keyframe_id = KeyframeId::default();
+        let source_snapshot = crate::map::SlamMap::new().snapshot();
+        let frame_id = crate::FrameId::new(1);
+        let detections = Arc::new(
+            Detections::new(
+                crate::SensorId::StereoLeft,
+                frame_id,
+                2,
+                2,
+                vec![crate::Keypoint { x: 0.0, y: 0.0 }],
+                vec![1.0],
+                vec![crate::Descriptor([0.0; crate::DESCRIPTOR_DIM])],
+            )
+            .expect("finite zero-norm detections"),
+        );
+        let frame = Frame::new(
+            crate::SensorId::StereoLeft,
+            frame_id,
+            crate::Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("frame");
+
+        let bootstrap_error = recognition
+            .on_keyframe(keyframe_id, &detections, &frame, source_snapshot)
+            .expect_err("zero-norm bootstrap descriptor must fail");
+        assert!(matches!(
+            bootstrap_error,
+            BootstrapDescriptorError::Aggregation {
+                source: GlobalDescriptorError::ZeroNorm
+            }
+        ));
+        assert_eq!(recognition.database.registered_len(), 1);
+        assert_eq!(recognition.database.descriptor_len(), 0);
+        assert_eq!(recognition.descriptor_stats().dropped_unavailable, 1);
+
+        recognition.descriptor_worker.pending_outputs.push_back(
+            DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(Box::new(
+                DescriptorResponse {
+                    keyframe_id,
+                    source_snapshot,
+                    descriptor: descriptor_with_basis(7),
+                },
+            ))),
+        );
+
+        let events = recognition.drain_responses(source_snapshot, |id| id == keyframe_id);
+
+        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert_eq!(recognition.database.registered_len(), 1);
+        assert_eq!(recognition.database.descriptor_len(), 1);
+        assert_eq!(
+            recognition.database.descriptor_source(keyframe_id),
+            Some(DescriptorSource::Learned)
+        );
+        assert_eq!(recognition.descriptor_stats().applied, 1);
+    }
+
+    #[test]
+    fn bootstrap_database_error_preserves_source() {
+        let error = BootstrapDescriptorError::Database {
+            source: KeyframeDatabaseError::SequenceExhausted {
+                next_sequence: usize::MAX,
+            },
+        };
+
+        assert!(matches!(
+            error.source(),
+            Some(source) if source.to_string().contains("sequence exhausted")
+        ));
     }
 }
