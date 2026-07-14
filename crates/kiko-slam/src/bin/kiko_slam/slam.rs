@@ -470,31 +470,17 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     // Generate stable sparse surface observations for the low-resolution voxel map.
                     if let Some(sink) = sink.as_mut() {
-                        if let (Some(samples), Some(triangulator), Some(pose)) = (
-                            surface_samples.as_ref(),
-                            dense_triangulator.as_ref(),
-                            output.pose.current_estimate(),
-                        ) {
-                            let stereo = triangulator.stereo();
-                            let raw_frame_points: Vec<[f32; 3]> = samples
-                                .samples
-                                .iter()
-                                .map(|sample| {
-                                    let z = sample.depth_m;
-                                    let x = (sample.u - stereo.left().cx) * z / stereo.fx();
-                                    let y = (sample.v - stereo.left().cy) * z / stereo.fy();
-                                    [x, y, z]
-                                })
-                                .collect();
+                        if let (Some(samples), Some(pose)) =
+                            (surface_samples.as_ref(), output.pose.current_estimate())
+                        {
                             let surface = kiko_slam::generate_stable_surface_points(
-                                &samples.samples,
-                                stereo,
+                                samples,
                                 &left,
                                 &dense_config,
                             )?;
                             if let Err(err) = sink.log_surface_observations(
                                 left.timestamp(),
-                                &raw_frame_points,
+                                &surface.measured_camera_points_m,
                                 &surface.points,
                                 &surface.stats,
                                 pose.cam_from_map_pose32(),

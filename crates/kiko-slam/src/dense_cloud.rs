@@ -6,7 +6,7 @@
 
 use std::collections::TryReserveError;
 
-use crate::triangulation::{RectifiedRowMismatchPx, RectifiedStereo, SparseStereoSample};
+use crate::triangulation::{RectifiedRowMismatchPx, SparseStereoSample, SparseStereoSamples};
 use crate::{
     DepthImage, DepthImageError, DiagnosticMetricError, Frame, FrameDimensions, FrameId,
     InterpolatedDepth, SensorId, StableSurfaceRetainedRawPixelResidualMetric, Timestamp,
@@ -331,8 +331,26 @@ pub struct StableSurfaceStats {
 /// Result of stable sparse surface observation generation.
 #[derive(Debug)]
 pub struct StableSurfaceResult {
+    /// All measured sparse stereo points in the left camera frame, in metres,
+    /// before stable-surface filtering.
+    pub measured_camera_points_m: Vec<[f32; 3]>,
     pub points: Vec<StableSurfacePoint>,
     pub stats: StableSurfaceStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StableSurfaceBuffer {
+    MeasuredCameraPoints,
+    RetainedPoints,
+}
+
+impl std::fmt::Display for StableSurfaceBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MeasuredCameraPoints => f.write_str("measured camera points"),
+            Self::RetainedPoints => f.write_str("retained stable surface points"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,13 +382,18 @@ pub enum StableSurfaceGenerationError {
         expected: FrameDimensions,
         actual: FrameDimensions,
     },
+    ImageFrameMismatch {
+        expected: FrameId,
+        actual: FrameId,
+    },
     ImagePixelUnavailable {
         sample_index: usize,
         pixel_index: usize,
         pixel_count: usize,
     },
-    PointAllocation {
-        requested_points: usize,
+    BufferAllocation {
+        buffer: StableSurfaceBuffer,
+        requested_elements: usize,
         source: TryReserveError,
     },
     InvalidDerivedPoint {
@@ -398,6 +421,12 @@ impl std::fmt::Display for StableSurfaceGenerationError {
                 actual.width(),
                 actual.height()
             ),
+            Self::ImageFrameMismatch { expected, actual } => write!(
+                f,
+                "stable surface intensity image frame must match the source left detections: expected {}, got {}",
+                expected.as_u64(),
+                actual.as_u64()
+            ),
             Self::ImagePixelUnavailable {
                 sample_index,
                 pixel_index,
@@ -406,12 +435,13 @@ impl std::fmt::Display for StableSurfaceGenerationError {
                 f,
                 "stable surface sample {sample_index} selected image pixel {pixel_index}, but the validated frame contains {pixel_count} pixels"
             ),
-            Self::PointAllocation {
-                requested_points,
+            Self::BufferAllocation {
+                buffer,
+                requested_elements,
                 source,
             } => write!(
                 f,
-                "failed to reserve {requested_points} stable surface points: {source}"
+                "failed to reserve {requested_elements} {buffer}: {source}"
             ),
             Self::InvalidDerivedPoint {
                 sample_index,
@@ -430,11 +460,12 @@ impl std::fmt::Display for StableSurfaceGenerationError {
 impl std::error::Error for StableSurfaceGenerationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::PointAllocation { source, .. } => Some(source),
+            Self::BufferAllocation { source, .. } => Some(source),
             Self::InvalidDerivedPoint { source, .. } => Some(source),
             Self::InvalidStatistic { source, .. } => Some(source),
             Self::ImageSensorMismatch { .. }
             | Self::ImageDimensionsMismatch { .. }
+            | Self::ImageFrameMismatch { .. }
             | Self::ImagePixelUnavailable { .. } => None,
         }
     }
@@ -590,8 +621,7 @@ pub fn generate_dense_depth_image(
 /// stereo feature, and points are filtered/ranked by propagated positional
 /// uncertainty before entering the voxel belief map.
 pub fn generate_stable_surface_points(
-    samples: &[SparseStereoSample],
-    stereo: &RectifiedStereo,
+    samples: &SparseStereoSamples,
     intensity_image: &Frame,
     config: &DenseCloudConfig,
 ) -> Result<StableSurfaceResult, StableSurfaceGenerationError> {
@@ -601,6 +631,13 @@ pub fn generate_stable_surface_points(
             actual: intensity_image.sensor_id(),
         });
     }
+    if intensity_image.frame_id() != samples.left_frame_id() {
+        return Err(StableSurfaceGenerationError::ImageFrameMismatch {
+            expected: samples.left_frame_id(),
+            actual: intensity_image.frame_id(),
+        });
+    }
+    let stereo = samples.stereo();
     if intensity_image.dimensions() != stereo.dimensions() {
         return Err(StableSurfaceGenerationError::ImageDimensionsMismatch {
             expected: stereo.dimensions(),
@@ -609,15 +646,24 @@ pub fn generate_stable_surface_points(
     }
 
     let mut stats = StableSurfaceStats {
-        input_samples: samples.len(),
+        input_samples: samples.samples().len(),
         ..Default::default()
     };
-    let requested_points = samples.len().min(config.max_points_per_keyframe);
+    let mut measured_camera_points_m = Vec::new();
+    measured_camera_points_m
+        .try_reserve_exact(samples.samples().len())
+        .map_err(|source| StableSurfaceGenerationError::BufferAllocation {
+            buffer: StableSurfaceBuffer::MeasuredCameraPoints,
+            requested_elements: samples.samples().len(),
+            source,
+        })?;
+    let requested_points = samples.samples().len().min(config.max_points_per_keyframe);
     let mut points = Vec::new();
     points
         .try_reserve_exact(requested_points)
-        .map_err(|source| StableSurfaceGenerationError::PointAllocation {
-            requested_points,
+        .map_err(|source| StableSurfaceGenerationError::BufferAllocation {
+            buffer: StableSurfaceBuffer::RetainedPoints,
+            requested_elements: requested_points,
             source,
         })?;
     let fx = stereo.fx();
@@ -634,14 +680,31 @@ pub fn generate_stable_surface_points(
     let sigma_d_feature_px = 0.5_f32;
     let sigma_feature_px = 0.5_f32;
 
-    for (sample_index, sample) in samples.iter().enumerate() {
-        if sample.disparity < config.min_disparity_px {
+    for (sample_index, sample) in samples.samples().iter().enumerate() {
+        let [u, v] = sample.left_pixel_px();
+        let z = sample.depth_m();
+        let x = (u - cx) * z / fx;
+        let y = (v - cy) * z / fy;
+        let camera_point_m = [x, y, z];
+        if let Some((axis, value)) = camera_point_m
+            .into_iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(StableSurfaceGenerationError::InvalidDerivedPoint {
+                sample_index,
+                source: StableSurfacePointError::NonFinitePosition { axis, value },
+            });
+        }
+        measured_camera_points_m.push(camera_point_m);
+
+        if sample.disparity_px() < config.min_disparity_px {
             stats.dropped_disparity += 1;
             continue;
         }
 
-        let px = sample.u.round() as i32;
-        let py = sample.v.round() as i32;
+        let px = u.round() as i32;
+        let py = v.round() as i32;
         if px < 0 || py < 0 || px >= image_width as i32 || py >= image_height as i32 {
             stats.dropped_out_of_bounds += 1;
             continue;
@@ -655,12 +718,8 @@ pub fn generate_stable_surface_points(
             });
         };
 
-        let z = sample.depth_m;
-        let x = (sample.u - cx) * z / fx;
-        let v = sample.v;
-        let y = (v - cy) * z / fy;
         let position_variance = stereo_position_variance_m2(
-            sample.u,
+            u,
             v,
             z,
             fx,
@@ -670,13 +729,13 @@ pub fn generate_stable_surface_points(
             baseline_m,
             sigma_d_feature_px,
             sigma_feature_px,
-            sample.rectified_row_mismatch_px.value_px(),
+            sample.rectified_row_mismatch_px().value_px(),
         );
         let point = StableSurfacePoint::try_new(
             [x, y, z],
             intensity,
             position_variance,
-            sample.rectified_row_mismatch_px,
+            sample.rectified_row_mismatch_px(),
         )
         .map_err(|source| StableSurfaceGenerationError::InvalidDerivedPoint {
             sample_index,
@@ -728,7 +787,11 @@ pub fn generate_stable_surface_points(
                 })?,
         );
     }
-    Ok(StableSurfaceResult { points, stats })
+    Ok(StableSurfaceResult {
+        measured_camera_points_m,
+        points,
+        stats,
+    })
 }
 
 /// Generate a dense point cloud by interpolating disparity over a Delaunay
@@ -1005,6 +1068,7 @@ fn edge_length(ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RectifiedStereo;
     use std::error::Error as _;
 
     fn zero_row_mismatch() -> RectifiedRowMismatchPx {
@@ -1036,9 +1100,17 @@ mod tests {
         .expect("valid test intensity image")
     }
 
+    fn stable_surface_test_batch(
+        samples: Vec<SparseStereoSample>,
+        stereo: &RectifiedStereo,
+    ) -> SparseStereoSamples {
+        SparseStereoSamples::for_test(samples, FrameId::new(1), FrameId::new(2), stereo.clone())
+    }
+
     #[test]
     fn stable_surface_generation_rejects_wrong_image_provenance_before_processing() {
         let stereo = stable_surface_test_rig(100, 100, 200.0, 200.0, 50.0, 50.0, 0.075);
+        let samples = stable_surface_test_batch(Vec::new(), &stereo);
         let right_image = Frame::new(
             SensorId::StereoRight,
             FrameId::new(1),
@@ -1049,23 +1121,38 @@ mod tests {
         )
         .expect("valid right image");
         assert!(matches!(
-            generate_stable_surface_points(
-                &[],
-                &stereo,
-                &right_image,
-                &DenseCloudConfig::default()
-            ),
+            generate_stable_surface_points(&samples, &right_image, &DenseCloudConfig::default()),
             Err(StableSurfaceGenerationError::ImageSensorMismatch {
                 expected: SensorId::StereoLeft,
                 actual: SensorId::StereoRight,
             })
         ));
 
+        let wrong_frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(99),
+            Timestamp::from_nanos(1),
+            100,
+            100,
+            vec![0; 100 * 100],
+        )
+        .expect("valid wrong-source left image");
+        assert!(matches!(
+            generate_stable_surface_points(
+                &samples,
+                &wrong_frame,
+                &DenseCloudConfig::default()
+            ),
+            Err(StableSurfaceGenerationError::ImageFrameMismatch {
+                expected,
+                actual,
+            }) if expected == samples.left_frame_id() && actual == wrong_frame.frame_id()
+        ));
+
         let wrong_size = stable_surface_test_image(vec![0; 50 * 50], 50, 50);
         assert!(matches!(
             generate_stable_surface_points(
-                &[],
-                &stereo,
+                &samples,
                 &wrong_size,
                 &DenseCloudConfig::default()
             ),
@@ -1080,7 +1167,7 @@ mod tests {
     fn stable_surface_generation_preserves_derived_point_and_metric_sources() {
         let stereo = stable_surface_test_rig(100, 100, 200.0, 200.0, f32::MAX, 50.0, 0.075);
         let image = stable_surface_test_image(vec![0; 100 * 100], 100, 100);
-        let samples = [SparseStereoSample {
+        let samples = vec![SparseStereoSample {
             u: 50.0,
             v: 50.0,
             right_u: 45.0,
@@ -1089,9 +1176,9 @@ mod tests {
             depth_m: 1.0,
             rectified_row_mismatch_px: zero_row_mismatch(),
         }];
-        let error =
-            generate_stable_surface_points(&samples, &stereo, &image, &DenseCloudConfig::default())
-                .expect_err("extreme principal point must not become an uncertainty rejection");
+        let samples = stable_surface_test_batch(samples, &stereo);
+        let error = generate_stable_surface_points(&samples, &image, &DenseCloudConfig::default())
+            .expect_err("extreme principal point must not become an uncertainty rejection");
         assert!(matches!(
             &error,
             StableSurfaceGenerationError::InvalidDerivedPoint {
@@ -1105,6 +1192,32 @@ mod tests {
                 .and_then(|source| source.downcast_ref::<StableSurfacePointError>())
                 .is_some()
         );
+
+        let overflow_stereo =
+            stable_surface_test_rig(100, 100, 200.0, 200.0, f32::MAX, 50.0, 0.075);
+        let overflow_samples = stable_surface_test_batch(
+            vec![SparseStereoSample {
+                u: 50.0,
+                v: 50.0,
+                right_u: 49.0,
+                right_v: 50.0,
+                disparity: 1.0,
+                depth_m: f32::MAX,
+                rectified_row_mismatch_px: zero_row_mismatch(),
+            }],
+            &overflow_stereo,
+        );
+        assert!(matches!(
+            generate_stable_surface_points(
+                &overflow_samples,
+                &image,
+                &DenseCloudConfig::default()
+            ),
+            Err(StableSurfaceGenerationError::InvalidDerivedPoint {
+                sample_index: 0,
+                source: StableSurfacePointError::NonFinitePosition { axis: 0, value },
+            }) if value.is_infinite()
+        ));
 
         let metric_error = StableSurfaceGenerationError::InvalidStatistic {
             statistic: StableSurfaceStatistic::MeanRetainedRectifiedRowMismatchPx,
@@ -1502,10 +1615,10 @@ mod tests {
             rectified_row_mismatch_px: RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         }];
         let stereo = stable_surface_test_rig(100, 100, fx, fy, cx, cy, baseline);
+        let samples = stable_surface_test_batch(samples, &stereo);
         let image = stable_surface_test_image(vec![128u8; 100 * 100], 100, 100);
-        let result =
-            generate_stable_surface_points(&samples, &stereo, &image, &DenseCloudConfig::default())
-                .expect("stable surface generation");
+        let result = generate_stable_surface_points(&samples, &image, &DenseCloudConfig::default())
+            .expect("stable surface generation");
         assert!(result.points.is_empty());
         assert_eq!(result.stats.dropped_uncertainty, 1);
         assert_eq!(result.stats.mean_accepted_position_sigma_m, None);
@@ -1544,6 +1657,7 @@ mod tests {
             },
         ];
         let stereo = stable_surface_test_rig(100, 100, fx, fy, cx, cy, baseline);
+        let samples = stable_surface_test_batch(samples, &stereo);
         let mut image_data = vec![0u8; 100 * 100];
         image_data[50 * 100 + 50] = 11;
         image_data[95 * 100 + 95] = 22;
@@ -1553,7 +1667,7 @@ mod tests {
             max_points_per_keyframe: 1,
             ..DenseCloudConfig::default()
         };
-        let result = generate_stable_surface_points(&samples, &stereo, &image, &config)
+        let result = generate_stable_surface_points(&samples, &image, &config)
             .expect("stable surface generation");
         assert_eq!(result.points.len(), 1);
         assert_eq!(result.points[0].intensity, 11);
@@ -1604,14 +1718,25 @@ mod tests {
             },
         ];
         let stereo = stable_surface_test_rig(100, 100, fx, fy, cx, cy, baseline);
+        let samples = stable_surface_test_batch(samples, &stereo);
         let image = stable_surface_test_image(vec![128u8; 100 * 100], 100, 100);
         let config = DenseCloudConfig {
             max_observation_std_dev_m: 1.0,
             ..DenseCloudConfig::default()
         };
-        let result = generate_stable_surface_points(&samples, &stereo, &image, &config)
+        let result = generate_stable_surface_points(&samples, &image, &config)
             .expect("stable surface generation");
         assert_eq!(result.points.len(), 2);
+        assert_eq!(result.measured_camera_points_m.len(), 2);
+        for (actual, expected) in result
+            .measured_camera_points_m
+            .iter()
+            .zip([[-0.075, -0.075, z], [0.075, 0.075, z]])
+        {
+            for axis in 0..3 {
+                assert!((actual[axis] - expected[axis]).abs() < 1e-6);
+            }
+        }
         assert_eq!(result.stats.points_generated, 2);
         assert_eq!(
             result
@@ -1705,9 +1830,11 @@ mod tests {
             rectified_row_mismatch_px: RectifiedRowMismatchPx::new(10.0).expect("row mismatch"),
         }];
 
-        let accepted = generate_stable_surface_points(&low_mismatch, &stereo, &image, &config)
+        let low_mismatch = stable_surface_test_batch(low_mismatch, &stereo);
+        let high_mismatch = stable_surface_test_batch(high_mismatch, &stereo);
+        let accepted = generate_stable_surface_points(&low_mismatch, &image, &config)
             .expect("low-mismatch stable surface generation");
-        let rejected = generate_stable_surface_points(&high_mismatch, &stereo, &image, &config)
+        let rejected = generate_stable_surface_points(&high_mismatch, &image, &config)
             .expect("high-mismatch stable surface generation");
 
         assert_eq!(accepted.points.len(), 1);

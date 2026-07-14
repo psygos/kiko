@@ -379,14 +379,36 @@ impl RectifiedRowMismatchPx {
 /// Produced by the same deduplication and filtering as triangulation.
 #[derive(Clone, Copy, Debug)]
 pub struct SparseStereoSample {
-    pub u: f32,
-    pub v: f32,
-    pub right_u: f32,
-    pub right_v: f32,
-    pub disparity: f32,
-    pub depth_m: f32,
+    pub(crate) u: f32,
+    pub(crate) v: f32,
+    pub(crate) right_u: f32,
+    pub(crate) right_v: f32,
+    pub(crate) disparity: f32,
+    pub(crate) depth_m: f32,
     /// Absolute vertical row mismatch on the rectified stereo pair, in pixels.
-    pub rectified_row_mismatch_px: RectifiedRowMismatchPx,
+    pub(crate) rectified_row_mismatch_px: RectifiedRowMismatchPx,
+}
+
+impl SparseStereoSample {
+    pub fn left_pixel_px(self) -> [f32; 2] {
+        [self.u, self.v]
+    }
+
+    pub fn right_pixel_px(self) -> [f32; 2] {
+        [self.right_u, self.right_v]
+    }
+
+    pub fn disparity_px(self) -> f32 {
+        self.disparity
+    }
+
+    pub fn depth_m(self) -> f32 {
+        self.depth_m
+    }
+
+    pub fn rectified_row_mismatch_px(self) -> RectifiedRowMismatchPx {
+        self.rectified_row_mismatch_px
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -589,10 +611,58 @@ pub struct TriangulationResult {
     pub stats: TriangulationStats,
 }
 
+/// Deduplicated stereo geometry bound to the exact detections and rectified rig
+/// that produced it. Public callers can inspect but cannot forge the batch.
 #[derive(Debug)]
 pub struct SparseStereoSamples {
-    pub samples: Vec<SparseStereoSample>,
-    pub stats: TriangulationStats,
+    samples: Vec<SparseStereoSample>,
+    stats: TriangulationStats,
+    left_frame_id: FrameId,
+    right_frame_id: FrameId,
+    stereo: RectifiedStereo,
+}
+
+impl SparseStereoSamples {
+    pub fn samples(&self) -> &[SparseStereoSample] {
+        &self.samples
+    }
+
+    pub fn stats(&self) -> TriangulationStats {
+        self.stats
+    }
+
+    pub fn left_frame_id(&self) -> FrameId {
+        self.left_frame_id
+    }
+
+    pub fn right_frame_id(&self) -> FrameId {
+        self.right_frame_id
+    }
+
+    pub fn stereo(&self) -> &RectifiedStereo {
+        &self.stereo
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        samples: Vec<SparseStereoSample>,
+        left_frame_id: FrameId,
+        right_frame_id: FrameId,
+        stereo: RectifiedStereo,
+    ) -> Self {
+        let count = samples.len();
+        Self {
+            samples,
+            stats: TriangulationStats {
+                candidate_matches: count,
+                kept: count,
+                ..TriangulationStats::default()
+            },
+            left_frame_id,
+            right_frame_id,
+            stereo,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -772,6 +842,9 @@ impl Triangulator {
                 .map(|(_, point)| point.sample)
                 .collect(),
             stats,
+            left_frame_id: matches.source_a().frame_id(),
+            right_frame_id: matches.source_b().frame_id(),
+            stereo: self.stereo.clone(),
         })
     }
 
@@ -1041,7 +1114,16 @@ mod tests {
         let samples = triangulator
             .extract_stereo_samples(&matches)
             .expect("stereo samples");
-        assert!(samples.samples[0].rectified_row_mismatch_px.value_px() < 1e-4);
+        assert_eq!(samples.left_frame_id(), FrameId::new(12));
+        assert_eq!(samples.right_frame_id(), FrameId::new(13));
+        assert_eq!(samples.stereo().right().fx, 420.0);
+        assert_eq!(samples.stats().kept, 1);
+        let sample = samples.samples()[0];
+        assert_eq!(sample.left_pixel_px(), [left_kp.x, left_kp.y]);
+        assert_eq!(sample.right_pixel_px(), [right_kp.x, right_kp.y]);
+        assert!(sample.disparity_px() > 0.0);
+        assert!((sample.depth_m() - recovered.z).abs() < 1e-4);
+        assert!(sample.rectified_row_mismatch_px().value_px() < 1e-4);
     }
 
     #[test]
