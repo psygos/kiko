@@ -143,9 +143,10 @@ pub use pipeline::{
 };
 pub use place_recognition::{BootstrapDescriptorError, DescriptorInitError, DescriptorStats};
 pub use pnp::{
-    IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpRefinementCost,
-    PnpRefinementFallback, PnpRefinementObjectiveStage, PnpRefinementStatus,
-    PnpRefinementTermination, PnpResult, Pose, RansacConfig, RansacConfigError, solve_pnp_ransac,
+    CameraFrameAxis, ImagePlaneAxis, IntrinsicsError, Observation, PinholeIntrinsics,
+    PinholeProjectionError, PnpError, PnpRefinementCost, PnpRefinementFallback,
+    PnpRefinementObjectiveStage, PnpRefinementStatus, PnpRefinementTermination, PnpResult, Pose,
+    RansacConfig, RansacConfigError, ReprojectionEvaluationError, solve_pnp_ransac,
 };
 pub use runtime_imu::{
     RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,
@@ -155,11 +156,10 @@ pub use surface_map::{
     SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapConfigError, SurfaceMapSummary,
 };
 pub use tracker::{
-    BackendConfig, BackendConfigError, BackendStats, CameraFrameAxis, ComponentHealth,
-    CovisibilityRatio, DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError,
-    ImagePlaneAxis, KeyframeDecision, KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
-    LoopSubsystemConfig, ParallaxPx, PoseStatus, ProjectedMatcherConfig,
-    ProjectedMatcherConfigError, ProjectedTrackingProjectionError, RedundancyPolicy,
+    BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
+    DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
+    KeyframeInsertReason, KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx,
+    PoseStatus, ProjectedMatcherConfig, ProjectedMatcherConfigError, RedundancyPolicy,
     RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError,
     TrackerInitError, TrackerOutput, TrackerRuntimeConfig, TrackerRuntimeConfigError,
     TrackingHealth, TrackingInlierIndexDomain, TrackingInlierResolutionError, TrackingMatcher,

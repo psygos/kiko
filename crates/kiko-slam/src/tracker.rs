@@ -296,61 +296,6 @@ impl std::fmt::Display for ProjectedMatcherConfigError {
 
 impl std::error::Error for ProjectedMatcherConfigError {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CameraFrameAxis {
-    X,
-    Y,
-    Z,
-}
-
-impl std::fmt::Display for CameraFrameAxis {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::X => "x",
-            Self::Y => "y",
-            Self::Z => "z",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImagePlaneAxis {
-    U,
-    V,
-}
-
-impl std::fmt::Display for ImagePlaneAxis {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::U => "u",
-            Self::V => "v",
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ProjectedTrackingProjectionError {
-    NonFiniteCameraPointMeters { axis: CameraFrameAxis, value: f32 },
-    NonFinitePixelCoordinate { axis: ImagePlaneAxis, value: f32 },
-}
-
-impl std::fmt::Display for ProjectedTrackingProjectionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NonFiniteCameraPointMeters { axis, value } => write!(
-                f,
-                "projected tracking camera-frame {axis} coordinate must be finite in meters, got {value}"
-            ),
-            Self::NonFinitePixelCoordinate { axis, value } => write!(
-                f,
-                "projected tracking pixel coordinate {axis} must be finite in pixels, got {value}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ProjectedTrackingProjectionError {}
-
 const MIN_PROJECTED_CORRESPONDENCES: usize = 4;
 const MIN_PROJECTED_RADIUS_SQUARED_PX2: f32 = f32::MIN_POSITIVE;
 // Each accepted axis delta can be as large as the radius. Keeping radius^2 at
@@ -1786,7 +1731,8 @@ pub enum TrackerError {
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
     TrackingInlierResolution(TrackingInlierResolutionError),
-    ProjectedTrackingProjection(ProjectedTrackingProjectionError),
+    ProjectedTrackingProjection(crate::PinholeProjectionError),
+    ReprojectionEvaluation(crate::ReprojectionEvaluationError),
     DiagnosticMetric(crate::DiagnosticMetricError),
     DescriptorMatch(DescriptorMatchError),
     LoopVerification(LoopVerificationError),
@@ -1836,6 +1782,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::ProjectedTrackingProjection(err) => {
                 write!(f, "projected tracking projection failed: {err}")
             }
+            TrackerError::ReprojectionEvaluation(err) => {
+                write!(f, "tracking reprojection evaluation failed: {err}")
+            }
             TrackerError::DiagnosticMetric(err) => {
                 write!(f, "tracking diagnostic metric construction failed: {err}")
             }
@@ -1879,6 +1828,7 @@ impl std::error::Error for TrackerError {
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::TrackingInlierResolution(source) => Some(source),
             TrackerError::ProjectedTrackingProjection(source) => Some(source),
+            TrackerError::ReprojectionEvaluation(source) => Some(source),
             TrackerError::DiagnosticMetric(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::LoopVerification(source) => Some(source),
@@ -1970,6 +1920,12 @@ impl From<MapObservationError> for TrackerError {
 impl From<TrackingInlierResolutionError> for TrackerError {
     fn from(err: TrackingInlierResolutionError) -> Self {
         TrackerError::TrackingInlierResolution(err)
+    }
+}
+
+impl From<crate::ReprojectionEvaluationError> for TrackerError {
+    fn from(source: crate::ReprojectionEvaluationError) -> Self {
+        Self::ReprojectionEvaluation(source)
     }
 }
 
@@ -2619,51 +2575,59 @@ struct VioPoseProposal {
 
 #[derive(Clone, Debug)]
 struct PoseReprojectionMetrics {
-    errors: Vec<Option<f32>>,
+    residuals_px: Vec<Option<f32>>,
 }
 
 impl PoseReprojectionMetrics {
-    fn from_pose(pose: &Pose, observations: &[Observation], intrinsics: PinholeIntrinsics) -> Self {
-        Self {
-            errors: crate::pnp::reprojection_errors(pose, observations, intrinsics),
-        }
+    fn try_from_pose(
+        pose: &Pose,
+        observations: &[Observation],
+        intrinsics: PinholeIntrinsics,
+    ) -> Result<Self, crate::ReprojectionEvaluationError> {
+        Ok(Self {
+            residuals_px: crate::pnp::reprojection_residuals_px(pose, observations, intrinsics)?,
+        })
     }
 
     fn projectable_count(&self) -> usize {
-        self.errors.iter().filter(|error| error.is_some()).count()
+        self.residuals_px
+            .iter()
+            .filter(|residual_px| residual_px.is_some())
+            .count()
     }
 
     fn rmse_px(&self) -> Option<f32> {
-        crate::pnp::reprojection_rmse(&self.errors)
+        crate::pnp::reprojection_rmse_px(&self.residuals_px)
     }
 
     fn max_px(&self) -> Option<f32> {
-        crate::pnp::reprojection_max(&self.errors)
+        crate::pnp::reprojection_max_px(&self.residuals_px)
     }
 
     fn mse_per_axis_px2(&self) -> Option<f64> {
-        crate::pnp::reprojection_mse_per_axis_px2(&self.errors)
+        crate::pnp::reprojection_mse_per_axis_px2(&self.residuals_px)
     }
 
     #[cfg(all(test, feature = "vio"))]
-    fn from_errors(errors: Vec<Option<f32>>) -> Self {
-        Self { errors }
+    fn from_residuals_px(residuals_px: Vec<Option<f32>>) -> Self {
+        Self { residuals_px }
     }
 
     #[cfg(feature = "vio")]
     fn shared_with(&self, other: &Self) -> SharedPoseReprojectionMetrics {
         let mut lhs = Vec::new();
         let mut rhs = Vec::new();
-        for (lhs_error, rhs_error) in self.errors.iter().zip(&other.errors) {
-            if let (Some(lhs_px), Some(rhs_px)) = (lhs_error, rhs_error) {
+        for (lhs_residual_px, rhs_residual_px) in self.residuals_px.iter().zip(&other.residuals_px)
+        {
+            if let (Some(lhs_px), Some(rhs_px)) = (lhs_residual_px, rhs_residual_px) {
                 lhs.push(Some(*lhs_px));
                 rhs.push(Some(*rhs_px));
             }
         }
         SharedPoseReprojectionMetrics {
             count: lhs.len(),
-            lhs_rmse_px: crate::pnp::reprojection_rmse(&lhs),
-            rhs_rmse_px: crate::pnp::reprojection_rmse(&rhs),
+            lhs_rmse_px: crate::pnp::reprojection_rmse_px(&lhs),
+            rhs_rmse_px: crate::pnp::reprojection_rmse_px(&rhs),
         }
     }
 }
@@ -2963,42 +2927,6 @@ impl CurrentKeypointGrid {
             }
         }
     }
-}
-
-fn project_world_point(
-    pose_world_to_camera: Pose,
-    point: Point3,
-    intrinsics: PinholeIntrinsics,
-) -> Result<Option<(f32, f32)>, ProjectedTrackingProjectionError> {
-    let pc = crate::math::transform_point(
-        pose_world_to_camera.rotation(),
-        pose_world_to_camera.translation(),
-        [point.x, point.y, point.z],
-    );
-    for (axis, value) in [
-        (CameraFrameAxis::X, pc[0]),
-        (CameraFrameAxis::Y, pc[1]),
-        (CameraFrameAxis::Z, pc[2]),
-    ] {
-        if !value.is_finite() {
-            return Err(
-                ProjectedTrackingProjectionError::NonFiniteCameraPointMeters { axis, value },
-            );
-        }
-    }
-    if pc[2] <= 0.0 {
-        return Ok(None);
-    }
-    let pixel = (
-        intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx(),
-        intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy(),
-    );
-    for (axis, value) in [(ImagePlaneAxis::U, pixel.0), (ImagePlaneAxis::V, pixel.1)] {
-        if !value.is_finite() {
-            return Err(ProjectedTrackingProjectionError::NonFinitePixelCoordinate { axis, value });
-        }
-    }
-    Ok(Some(pixel))
 }
 
 pub struct SlamTracker {
@@ -4609,10 +4537,15 @@ impl SlamTracker {
             let point = self.global_map.point(point_id).ok_or(TrackerError::Map(
                 crate::map::MapError::MapPointNotFound(point_id),
             ))?;
-            let Some((u, v)) = project_world_point(predicted_pose, point.position(), intrinsics)
-                .map_err(TrackerError::ProjectedTrackingProjection)?
-            else {
-                continue;
+            let (u, v) = match crate::pnp::project_world_point_px(
+                predicted_pose,
+                point.position(),
+                intrinsics,
+            )
+            .map_err(TrackerError::ProjectedTrackingProjection)?
+            {
+                crate::pnp::PinholeProjection::Projected { u_px, v_px } => (u_px, v_px),
+                crate::pnp::PinholeProjection::NonPositiveCameraDepth { .. } => continue,
             };
             if u < -radius
                 || v < -radius
@@ -4938,17 +4871,17 @@ impl SlamTracker {
         #[cfg(feature = "vio")]
         let intrinsics = self.frontend.intrinsics();
         #[cfg(feature = "vio")]
-        let visual_proposal_tracked_metrics = PoseReprojectionMetrics::from_pose(
+        let visual_proposal_tracked_metrics = PoseReprojectionMetrics::try_from_pose(
             &visual_pose_world,
             tracked_observations.observations(),
             intrinsics,
-        );
+        )?;
         #[cfg(feature = "vio")]
-        let visual_proposal_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
+        let visual_proposal_accepted_inlier_metrics = PoseReprojectionMetrics::try_from_pose(
             &visual_pose_world,
             &inlier_observations,
             intrinsics,
-        );
+        )?;
         #[cfg(feature = "vio")]
         let (
             pose_world,
@@ -4978,11 +4911,11 @@ impl SlamTracker {
             PoseRefinementProposal::VisualBa(proposal) => {
                 let proposal = *proposal;
                 let pose_ba_termination = Some(proposal.termination);
-                let visual_ba_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
+                let visual_ba_accepted_inlier_metrics = PoseReprojectionMetrics::try_from_pose(
                     &proposal.pose_world,
                     &inlier_observations,
                     intrinsics,
-                );
+                )?;
                 if should_adopt_visual_ba_proposal(
                     &visual_proposal_accepted_inlier_metrics,
                     &visual_ba_accepted_inlier_metrics,
@@ -5022,16 +4955,16 @@ impl SlamTracker {
             }
             PoseRefinementProposal::Vio(proposal) => {
                 let proposal = *proposal;
-                let vio_tracked_metrics = PoseReprojectionMetrics::from_pose(
+                let vio_tracked_metrics = PoseReprojectionMetrics::try_from_pose(
                     &proposal.pose_world,
                     tracked_observations.observations(),
                     intrinsics,
-                );
-                let vio_accepted_inlier_metrics = PoseReprojectionMetrics::from_pose(
+                )?;
+                let vio_accepted_inlier_metrics = PoseReprojectionMetrics::try_from_pose(
                     &proposal.pose_world,
                     &inlier_observations,
                     intrinsics,
-                );
+                )?;
                 let disposition = decide_vio_pose_adoption(
                     &proposal.solve_result,
                     &visual_proposal_accepted_inlier_metrics,
@@ -5225,14 +5158,14 @@ impl SlamTracker {
 
         #[cfg(not(feature = "vio"))]
         let intrinsics = self.frontend.intrinsics();
-        let tracked_metrics = PoseReprojectionMetrics::from_pose(
+        let tracked_metrics = PoseReprojectionMetrics::try_from_pose(
             &pose_world,
             tracked_observations.observations(),
             intrinsics,
-        );
+        )?;
         let projectable_tracked_observations = tracked_metrics.projectable_count();
         let accepted_inlier_metrics =
-            PoseReprojectionMetrics::from_pose(&pose_world, &inlier_observations, intrinsics);
+            PoseReprojectionMetrics::try_from_pose(&pose_world, &inlier_observations, intrinsics)?;
         // VIO visual correction will be handled by tightly-coupled BA (M2).
 
         let mut diagnostics = self.empty_diagnostics();
@@ -5972,6 +5905,40 @@ mod tests {
         let source = error.source().expect("diagnostic metric source");
         assert_eq!(source.to_string(), metric_error.to_string());
         assert!(source.source().is_none());
+    }
+
+    #[test]
+    fn tracker_error_preserves_indexed_reprojection_projection_source() {
+        let intrinsics = PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("finite intrinsics");
+        let observation = Observation::try_new(
+            Point3 {
+                x: f32::MAX,
+                y: 0.0,
+                z: 1.0,
+            },
+            crate::Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("finite observation");
+        let pose = Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]);
+        let evaluation = PoseReprojectionMetrics::try_from_pose(&pose, &[observation], intrinsics)
+            .expect_err("camera-frame overflow must fail reprojection evaluation");
+        assert!(matches!(
+            &evaluation,
+            crate::ReprojectionEvaluationError::Projection {
+                observation_index: 0,
+                source: crate::PinholeProjectionError::NonFiniteCameraPointMeters {
+                    axis: crate::CameraFrameAxis::X,
+                    value: f32::INFINITY,
+                },
+            }
+        ));
+
+        let tracker_error = TrackerError::from(evaluation);
+        let evaluation_source = tracker_error.source().expect("evaluation source");
+        let projection_source = evaluation_source.source().expect("projection source");
+        assert!(projection_source.to_string().contains("camera-frame x"));
+        assert!(projection_source.source().is_none());
     }
 
     #[test]
@@ -8467,7 +8434,7 @@ mod tests {
     fn projected_world_point_distinguishes_visibility_from_numerical_failure() {
         let intrinsics =
             PinholeIntrinsics::try_new(100.0, 120.0, 10.0, 20.0).expect("finite intrinsics");
-        let visible = project_world_point(
+        let visible = crate::pnp::project_world_point_px(
             Pose::identity(),
             Point3 {
                 x: 1.0,
@@ -8477,9 +8444,15 @@ mod tests {
             intrinsics,
         )
         .expect("finite projection");
-        assert_eq!(visible, Some((60.0, 140.0)));
+        assert_eq!(
+            visible,
+            crate::pnp::PinholeProjection::Projected {
+                u_px: 60.0,
+                v_px: 140.0
+            }
+        );
 
-        let behind = project_world_point(
+        let behind = crate::pnp::project_world_point_px(
             Pose::identity(),
             Point3 {
                 x: 0.0,
@@ -8489,10 +8462,13 @@ mod tests {
             intrinsics,
         )
         .expect("negative depth is an ordinary visibility rejection");
-        assert_eq!(behind, None);
+        assert_eq!(
+            behind,
+            crate::pnp::PinholeProjection::NonPositiveCameraDepth { depth_m: -1.0 }
+        );
 
         let overflowing_pose = Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]);
-        let camera_error = project_world_point(
+        let camera_error = crate::pnp::project_world_point_px(
             overflowing_pose,
             Point3 {
                 x: f32::MAX,
@@ -8504,13 +8480,13 @@ mod tests {
         .expect_err("camera-frame overflow must not be treated as non-visibility");
         assert!(matches!(
             camera_error,
-            ProjectedTrackingProjectionError::NonFiniteCameraPointMeters {
-                axis: CameraFrameAxis::X,
+            crate::PinholeProjectionError::NonFiniteCameraPointMeters {
+                axis: crate::CameraFrameAxis::X,
                 value: f32::INFINITY,
             }
         ));
 
-        let pixel_error = project_world_point(
+        let pixel_error = crate::pnp::project_world_point_px(
             Pose::identity(),
             Point3 {
                 x: 1.0,
@@ -8522,8 +8498,8 @@ mod tests {
         .expect_err("pixel overflow must not be treated as non-visibility");
         assert!(matches!(
             pixel_error,
-            ProjectedTrackingProjectionError::NonFinitePixelCoordinate {
-                axis: ImagePlaneAxis::U,
+            crate::PinholeProjectionError::NonFinitePixelCoordinatePx {
+                axis: crate::ImagePlaneAxis::U,
                 value: f32::INFINITY,
             }
         ));
@@ -9103,7 +9079,7 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn vio_pose_adoption_rejects_changed_projectable_support_even_when_counts_match() {
-        let visual = PoseReprojectionMetrics::from_errors(vec![
+        let visual = PoseReprojectionMetrics::from_residuals_px(vec![
             Some(1.0),
             Some(1.0),
             Some(1.0),
@@ -9111,7 +9087,7 @@ mod tests {
             Some(1.0),
             None,
         ]);
-        let vio = PoseReprojectionMetrics::from_errors(vec![
+        let vio = PoseReprojectionMetrics::from_residuals_px(vec![
             None,
             Some(0.1),
             Some(0.1),
@@ -9129,10 +9105,18 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn vio_pose_adoption_rejects_missing_current_vio_observation_support() {
-        let visual =
-            PoseReprojectionMetrics::from_errors(vec![Some(1.0), Some(1.0), Some(1.0), Some(1.0)]);
-        let vio =
-            PoseReprojectionMetrics::from_errors(vec![Some(0.5), Some(0.5), Some(0.5), Some(0.5)]);
+        let visual = PoseReprojectionMetrics::from_residuals_px(vec![
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+        ]);
+        let vio = PoseReprojectionMetrics::from_residuals_px(vec![
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+        ]);
         let solve_result = make_test_vio_solve_result(0, 1);
 
         assert_eq!(
@@ -9144,10 +9128,18 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn vio_pose_adoption_rejects_solve_without_an_accepted_step() {
-        let visual =
-            PoseReprojectionMetrics::from_errors(vec![Some(1.0), Some(1.0), Some(1.0), Some(1.0)]);
-        let vio =
-            PoseReprojectionMetrics::from_errors(vec![Some(0.5), Some(0.5), Some(0.5), Some(0.5)]);
+        let visual = PoseReprojectionMetrics::from_residuals_px(vec![
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+            Some(1.0),
+        ]);
+        let vio = PoseReprojectionMetrics::from_residuals_px(vec![
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+            Some(0.5),
+        ]);
         let solve_result = make_test_vio_solve_result(4, 0);
 
         assert_eq!(
@@ -9159,7 +9151,7 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn visual_ba_adoption_requires_exact_projectable_support_match() {
-        let visual = PoseReprojectionMetrics::from_errors(vec![
+        let visual = PoseReprojectionMetrics::from_residuals_px(vec![
             Some(1.0),
             Some(1.0),
             Some(1.0),
@@ -9167,7 +9159,7 @@ mod tests {
             Some(1.0),
             None,
         ]);
-        let visual_ba = PoseReprojectionMetrics::from_errors(vec![
+        let visual_ba = PoseReprojectionMetrics::from_residuals_px(vec![
             None,
             Some(0.1),
             Some(0.1),
