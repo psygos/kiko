@@ -249,6 +249,8 @@ pub struct ProjectedMatcherConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ProjectedMatcherConfigError {
     InvalidSearchRadius { value: f32 },
+    SearchRadiusSquaredUnderflow { value: f32 },
+    SearchRadiusExceedsSafeSquaredDistance { value: f32 },
     InvalidDescriptorDotProduct { value: f32 },
     TooFewMatches { value: usize, minimum: usize },
     TooFewInliers { value: usize, minimum: usize },
@@ -264,6 +266,14 @@ impl std::fmt::Display for ProjectedMatcherConfigError {
                     "projected matcher search radius must be finite and > 0, got {value}"
                 )
             }
+            Self::SearchRadiusSquaredUnderflow { value } => write!(
+                f,
+                "projected matcher search radius {value} px is too small for normal squared pixel-distance arithmetic"
+            ),
+            Self::SearchRadiusExceedsSafeSquaredDistance { value } => write!(
+                f,
+                "projected matcher search radius {value} px is too large to guarantee finite squared pixel-distance arithmetic"
+            ),
             Self::InvalidDescriptorDotProduct { value } => write!(
                 f,
                 "projected matcher minimum raw descriptor dot product must be finite, got {value}"
@@ -286,7 +296,68 @@ impl std::fmt::Display for ProjectedMatcherConfigError {
 
 impl std::error::Error for ProjectedMatcherConfigError {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraFrameAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl std::fmt::Display for CameraFrameAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::X => "x",
+            Self::Y => "y",
+            Self::Z => "z",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImagePlaneAxis {
+    U,
+    V,
+}
+
+impl std::fmt::Display for ImagePlaneAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::U => "u",
+            Self::V => "v",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ProjectedTrackingProjectionError {
+    NonFiniteCameraPointMeters { axis: CameraFrameAxis, value: f32 },
+    NonFinitePixelCoordinate { axis: ImagePlaneAxis, value: f32 },
+}
+
+impl std::fmt::Display for ProjectedTrackingProjectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteCameraPointMeters { axis, value } => write!(
+                f,
+                "projected tracking camera-frame {axis} coordinate must be finite in meters, got {value}"
+            ),
+            Self::NonFinitePixelCoordinate { axis, value } => write!(
+                f,
+                "projected tracking pixel coordinate {axis} must be finite in pixels, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectedTrackingProjectionError {}
+
 const MIN_PROJECTED_CORRESPONDENCES: usize = 4;
+const MIN_PROJECTED_RADIUS_SQUARED_PX2: f32 = f32::MIN_POSITIVE;
+// Each accepted axis delta can be as large as the radius. Keeping radius^2 at
+// most MAX/4 leaves a factor-of-two margin after summing both squared deltas.
+const MAX_PROJECTED_RADIUS_SQUARED_PX2: f32 = f32::MAX / 4.0;
+const DEFAULT_PROJECTED_MIN_MATCHES: NonZeroUsize = NonZeroUsize::MIN.saturating_add(31);
+const DEFAULT_PROJECTED_MIN_INLIERS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(23);
 
 impl ProjectedMatcherConfig {
     pub fn new(
@@ -299,6 +370,19 @@ impl ProjectedMatcherConfig {
             return Err(ProjectedMatcherConfigError::InvalidSearchRadius {
                 value: search_radius_px,
             });
+        }
+        let search_radius_squared_px2 = search_radius_px * search_radius_px;
+        if search_radius_squared_px2 < MIN_PROJECTED_RADIUS_SQUARED_PX2 {
+            return Err(ProjectedMatcherConfigError::SearchRadiusSquaredUnderflow {
+                value: search_radius_px,
+            });
+        }
+        if search_radius_squared_px2 > MAX_PROJECTED_RADIUS_SQUARED_PX2 {
+            return Err(
+                ProjectedMatcherConfigError::SearchRadiusExceedsSafeSquaredDistance {
+                    value: search_radius_px,
+                },
+            );
         }
         if !min_descriptor_dot_product.is_finite() {
             return Err(ProjectedMatcherConfigError::InvalidDescriptorDotProduct {
@@ -363,8 +447,8 @@ impl ProjectedMatcherConfig {
         Self {
             search_radius_px: 32.0,
             min_descriptor_dot_product: 0.45,
-            min_matches: NonZeroUsize::new(32).unwrap(),
-            min_inliers: NonZeroUsize::new(24).unwrap(),
+            min_matches: DEFAULT_PROJECTED_MIN_MATCHES,
+            min_inliers: DEFAULT_PROJECTED_MIN_INLIERS,
         }
     }
 }
@@ -1701,6 +1785,7 @@ pub enum TrackerError {
     EssentialGraph(EssentialGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
+    ProjectedTrackingProjection(ProjectedTrackingProjectionError),
     DescriptorMatch(DescriptorMatchError),
     LoopVerification(LoopVerificationError),
     LoopClosure(LoopDetectError),
@@ -1743,6 +1828,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
+            TrackerError::ProjectedTrackingProjection(err) => {
+                write!(f, "projected tracking projection failed: {err}")
+            }
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
@@ -1781,6 +1869,7 @@ impl std::error::Error for TrackerError {
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
+            TrackerError::ProjectedTrackingProjection(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::LoopVerification(source) => Some(source),
             TrackerError::LoopClosure(source) => Some(source),
@@ -2688,19 +2777,36 @@ fn project_world_point(
     pose_world_to_camera: Pose,
     point: Point3,
     intrinsics: PinholeIntrinsics,
-) -> Option<(f32, f32)> {
+) -> Result<Option<(f32, f32)>, ProjectedTrackingProjectionError> {
     let pc = crate::math::transform_point(
         pose_world_to_camera.rotation(),
         pose_world_to_camera.translation(),
         [point.x, point.y, point.z],
     );
-    if pc[2] <= 0.0 {
-        return None;
+    for (axis, value) in [
+        (CameraFrameAxis::X, pc[0]),
+        (CameraFrameAxis::Y, pc[1]),
+        (CameraFrameAxis::Z, pc[2]),
+    ] {
+        if !value.is_finite() {
+            return Err(
+                ProjectedTrackingProjectionError::NonFiniteCameraPointMeters { axis, value },
+            );
+        }
     }
-    Some((
+    if pc[2] <= 0.0 {
+        return Ok(None);
+    }
+    let pixel = (
         intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx(),
         intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy(),
-    ))
+    );
+    for (axis, value) in [(ImagePlaneAxis::U, pixel.0), (ImagePlaneAxis::V, pixel.1)] {
+        if !value.is_finite() {
+            return Err(ProjectedTrackingProjectionError::NonFinitePixelCoordinate { axis, value });
+        }
+    }
+    Ok(Some(pixel))
 }
 
 pub struct SlamTracker {
@@ -4308,10 +4414,11 @@ impl SlamTracker {
             let Some(point_id) = self.global_map.map_point_for_keypoint(keypoint_ref)? else {
                 continue;
             };
-            let Some(point) = self.global_map.point(point_id) else {
-                continue;
-            };
+            let point = self.global_map.point(point_id).ok_or(TrackerError::Map(
+                crate::map::MapError::MapPointNotFound(point_id),
+            ))?;
             let Some((u, v)) = project_world_point(predicted_pose, point.position(), intrinsics)
+                .map_err(TrackerError::ProjectedTrackingProjection)?
             else {
                 continue;
             };
@@ -4329,6 +4436,9 @@ impl SlamTracker {
                 let kp = current_keypoints[current_idx];
                 let dx = kp.x - u;
                 let dy = kp.y - v;
+                if dx.abs() > radius || dy.abs() > radius {
+                    return;
+                }
                 let distance_sq = dx * dx + dy * dy;
                 if distance_sq > radius_sq {
                     return;
@@ -8040,6 +8150,109 @@ mod tests {
             ProjectedMatcherConfig::new(16.0, 0.5, 8, 9),
             Err(ProjectedMatcherConfigError::InliersExceedMatches { .. })
         ));
+
+        let overflow = ProjectedMatcherConfig::new(f32::MAX, 0.5, 8, 4)
+            .expect_err("radius with nonfinite squared pixel distance must fail");
+        assert!(matches!(
+            overflow,
+            ProjectedMatcherConfigError::SearchRadiusExceedsSafeSquaredDistance { value: f32::MAX }
+        ));
+        assert!(overflow.to_string().contains("squared pixel-distance"));
+
+        let underflow = ProjectedMatcherConfig::new(f32::MIN_POSITIVE, 0.5, 8, 4)
+            .expect_err("radius with underflowed squared pixel distance must fail");
+        assert!(matches!(
+            underflow,
+            ProjectedMatcherConfigError::SearchRadiusSquaredUnderflow {
+                value: f32::MIN_POSITIVE
+            }
+        ));
+        assert!(underflow.to_string().contains("too small"));
+
+        let smallest_safe_radius = MIN_PROJECTED_RADIUS_SQUARED_PX2.sqrt() * 1.01;
+        let smallest_safe_config = ProjectedMatcherConfig::new(smallest_safe_radius, 0.5, 8, 4)
+            .expect("radius above squared-distance underflow limit");
+        assert!(
+            smallest_safe_config.search_radius_px() * smallest_safe_config.search_radius_px()
+                >= f32::MIN_POSITIVE
+        );
+
+        let safe_radius = MAX_PROJECTED_RADIUS_SQUARED_PX2.sqrt() * 0.99;
+        let config = ProjectedMatcherConfig::new(safe_radius, 0.5, 8, 4)
+            .expect("radius below squared-distance limit");
+        let radius_sq = config.search_radius_px() * config.search_radius_px();
+        assert!(radius_sq.is_finite());
+        assert!((radius_sq + radius_sq).is_finite());
+    }
+
+    #[test]
+    fn projected_world_point_distinguishes_visibility_from_numerical_failure() {
+        let intrinsics =
+            PinholeIntrinsics::try_new(100.0, 120.0, 10.0, 20.0).expect("finite intrinsics");
+        let visible = project_world_point(
+            Pose::identity(),
+            Point3 {
+                x: 1.0,
+                y: 2.0,
+                z: 2.0,
+            },
+            intrinsics,
+        )
+        .expect("finite projection");
+        assert_eq!(visible, Some((60.0, 140.0)));
+
+        let behind = project_world_point(
+            Pose::identity(),
+            Point3 {
+                x: 0.0,
+                y: 0.0,
+                z: -1.0,
+            },
+            intrinsics,
+        )
+        .expect("negative depth is an ordinary visibility rejection");
+        assert_eq!(behind, None);
+
+        let overflowing_pose = Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]);
+        let camera_error = project_world_point(
+            overflowing_pose,
+            Point3 {
+                x: f32::MAX,
+                y: 0.0,
+                z: 1.0,
+            },
+            intrinsics,
+        )
+        .expect_err("camera-frame overflow must not be treated as non-visibility");
+        assert!(matches!(
+            camera_error,
+            ProjectedTrackingProjectionError::NonFiniteCameraPointMeters {
+                axis: CameraFrameAxis::X,
+                value: f32::INFINITY,
+            }
+        ));
+
+        let pixel_error = project_world_point(
+            Pose::identity(),
+            Point3 {
+                x: 1.0,
+                y: 0.0,
+                z: f32::MIN_POSITIVE,
+            },
+            intrinsics,
+        )
+        .expect_err("pixel overflow must not be treated as non-visibility");
+        assert!(matches!(
+            pixel_error,
+            ProjectedTrackingProjectionError::NonFinitePixelCoordinate {
+                axis: ImagePlaneAxis::U,
+                value: f32::INFINITY,
+            }
+        ));
+
+        let tracker_error = TrackerError::ProjectedTrackingProjection(pixel_error);
+        assert!(tracker_error.to_string().contains("pixels"));
+        assert!(tracker_error.source().is_some());
     }
 
     #[test]

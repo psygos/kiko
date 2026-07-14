@@ -154,10 +154,11 @@ pub use surface_map::{
     SurfaceBeliefMap, SurfaceMapConfig, SurfaceMapConfigError, SurfaceMapSummary,
 };
 pub use tracker::{
-    BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
-    DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError, KeyframeDecision,
-    KeyframeInsertReason, KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx,
-    PoseStatus, ProjectedMatcherConfig, ProjectedMatcherConfigError, RedundancyPolicy,
+    BackendConfig, BackendConfigError, BackendStats, CameraFrameAxis, ComponentHealth,
+    CovisibilityRatio, DegradationLevel, GlobalDescriptorConfig, GlobalDescriptorConfigError,
+    ImagePlaneAxis, KeyframeDecision, KeyframeInsertReason, KeyframePolicy, KeyframePolicyError,
+    LoopSubsystemConfig, ParallaxPx, PoseStatus, ProjectedMatcherConfig,
+    ProjectedMatcherConfigError, ProjectedTrackingProjectionError, RedundancyPolicy,
     RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig, TrackerError,
     TrackerInitError, TrackerOutput, TrackerRuntimeConfig, TrackerRuntimeConfigError,
     TrackingHealth, TrackingMatcher, TrackingPose, VioTelemetry,
