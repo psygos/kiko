@@ -40,9 +40,10 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_TRACK_MIN_INLIERS=8             Min PnP RANSAC inliers
     KIKO_TRACKING_MATCHER=projected      projected or lightglue tracking matcher
     KIKO_PROJECTED_MATCH_RADIUS_PX=32    Projected matcher search radius
-    KIKO_PROJECTED_MATCH_MIN_SIMILARITY=0.45
+    KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT=0.45  Raw descriptor dot-product gate
     KIKO_PROJECTED_MATCH_MIN_MATCHES=32  Fallback to LightGlue below this match count
     KIKO_PROJECTED_MATCH_MIN_INLIERS=24  Fallback to LightGlue below this inlier count
+    KIKO_PROJECTED_MATCH_MIN_SIMILARITY  Deprecated misnamed alias for MIN_DOT_PRODUCT
 
   Loop Closure:
     KIKO_LOOP_CLOSURE=true                   Enable loop closure detection
@@ -666,5 +667,12 @@ mod tests {
         assert!(SLAM_ENV_HELP.contains("KIKO_VIO_WINDOW=5"));
         assert!(SLAM_ENV_HELP.contains("minimum 2"));
         assert!(SLAM_ENV_HELP.contains("KIKO_VIO_ITERS=3"));
+    }
+
+    #[test]
+    fn slam_env_help_names_raw_projected_descriptor_dot_product_truthfully() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT=0.45"));
+        assert!(SLAM_ENV_HELP.contains("Raw descriptor dot-product gate"));
+        assert!(SLAM_ENV_HELP.contains("Deprecated misnamed alias"));
     }
 }

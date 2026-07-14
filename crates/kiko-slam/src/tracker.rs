@@ -241,7 +241,7 @@ impl TrackingMatcher {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProjectedMatcherConfig {
     search_radius_px: f32,
-    min_similarity: f32,
+    min_descriptor_dot_product: f32,
     min_matches: NonZeroUsize,
     min_inliers: NonZeroUsize,
 }
@@ -249,7 +249,7 @@ pub struct ProjectedMatcherConfig {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ProjectedMatcherConfigError {
     InvalidSearchRadius { value: f32 },
-    InvalidSimilarity { value: f32 },
+    InvalidDescriptorDotProduct { value: f32 },
     TooFewMatches { value: usize, minimum: usize },
     TooFewInliers { value: usize, minimum: usize },
     InliersExceedMatches { matches: usize, inliers: usize },
@@ -264,9 +264,9 @@ impl std::fmt::Display for ProjectedMatcherConfigError {
                     "projected matcher search radius must be finite and > 0, got {value}"
                 )
             }
-            Self::InvalidSimilarity { value } => write!(
+            Self::InvalidDescriptorDotProduct { value } => write!(
                 f,
-                "projected matcher minimum similarity must be finite and in [-1, 1], got {value}"
+                "projected matcher minimum raw descriptor dot product must be finite, got {value}"
             ),
             Self::TooFewMatches { value, minimum } => write!(
                 f,
@@ -291,7 +291,7 @@ const MIN_PROJECTED_CORRESPONDENCES: usize = 4;
 impl ProjectedMatcherConfig {
     pub fn new(
         search_radius_px: f32,
-        min_similarity: f32,
+        min_descriptor_dot_product: f32,
         min_matches: usize,
         min_inliers: usize,
     ) -> Result<Self, ProjectedMatcherConfigError> {
@@ -300,9 +300,9 @@ impl ProjectedMatcherConfig {
                 value: search_radius_px,
             });
         }
-        if !min_similarity.is_finite() || !(-1.0..=1.0).contains(&min_similarity) {
-            return Err(ProjectedMatcherConfigError::InvalidSimilarity {
-                value: min_similarity,
+        if !min_descriptor_dot_product.is_finite() {
+            return Err(ProjectedMatcherConfigError::InvalidDescriptorDotProduct {
+                value: min_descriptor_dot_product,
             });
         }
         if min_matches < MIN_PROJECTED_CORRESPONDENCES {
@@ -325,7 +325,7 @@ impl ProjectedMatcherConfig {
         }
         Ok(Self {
             search_radius_px,
-            min_similarity,
+            min_descriptor_dot_product,
             min_matches: NonZeroUsize::new(min_matches).ok_or(
                 ProjectedMatcherConfigError::TooFewMatches {
                     value: min_matches,
@@ -345,8 +345,8 @@ impl ProjectedMatcherConfig {
         self.search_radius_px
     }
 
-    pub fn min_similarity(self) -> f32 {
-        self.min_similarity
+    pub fn min_descriptor_dot_product(self) -> f32 {
+        self.min_descriptor_dot_product
     }
 
     pub fn min_matches(self) -> usize {
@@ -362,7 +362,7 @@ impl ProjectedMatcherConfig {
     pub fn jetson_default() -> Self {
         Self {
             search_radius_px: 32.0,
-            min_similarity: 0.45,
+            min_descriptor_dot_product: 0.45,
             min_matches: NonZeroUsize::new(32).unwrap(),
             min_inliers: NonZeroUsize::new(24).unwrap(),
         }
@@ -2667,7 +2667,7 @@ impl CurrentKeypointGrid {
     }
 }
 
-fn descriptor_similarity(a: &crate::Descriptor, b: &crate::Descriptor) -> f32 {
+fn raw_descriptor_dot_product(a: &crate::Descriptor, b: &crate::Descriptor) -> f32 {
     a.as_slice()
         .iter()
         .zip(b.as_slice())
@@ -4325,12 +4325,13 @@ impl SlamTracker {
                 if distance_sq > radius_sq {
                     return;
                 }
-                let similarity = descriptor_similarity(&current_descriptors[current_idx], key_desc);
-                if similarity < config.min_similarity() {
+                let descriptor_dot_product =
+                    raw_descriptor_dot_product(&current_descriptors[current_idx], key_desc);
+                if descriptor_dot_product < config.min_descriptor_dot_product() {
                     return;
                 }
                 let spatial_penalty = 0.05 * (distance_sq / radius_sq);
-                let score = similarity - spatial_penalty;
+                let score = descriptor_dot_product - spatial_penalty;
                 match best {
                     Some(prev) if prev.score >= score => {}
                     _ => {
@@ -8027,10 +8028,16 @@ mod tests {
             ProjectedMatcherConfig::new(f32::NAN, 0.5, 8, 4),
             Err(ProjectedMatcherConfigError::InvalidSearchRadius { .. })
         ));
-        assert!(matches!(
-            ProjectedMatcherConfig::new(16.0, 1.1, 8, 4),
-            Err(ProjectedMatcherConfigError::InvalidSimilarity { .. })
-        ));
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                ProjectedMatcherConfig::new(16.0, invalid, 8, 4),
+                Err(ProjectedMatcherConfigError::InvalidDescriptorDotProduct { value })
+                    if value.to_bits() == invalid.to_bits()
+            ));
+        }
+        let unbounded_dot_product =
+            ProjectedMatcherConfig::new(16.0, 1.1, 8, 4).expect("finite raw dot product");
+        assert_eq!(unbounded_dot_product.min_descriptor_dot_product(), 1.1);
         assert!(matches!(
             ProjectedMatcherConfig::new(16.0, 0.5, 3, 3),
             Err(ProjectedMatcherConfigError::TooFewMatches { .. })
@@ -8039,6 +8046,23 @@ mod tests {
             ProjectedMatcherConfig::new(16.0, 0.5, 8, 9),
             Err(ProjectedMatcherConfigError::InliersExceedMatches { .. })
         ));
+    }
+
+    #[test]
+    fn projected_matcher_uses_scale_dependent_raw_descriptor_dot_product() {
+        let mut lhs = [0.0; crate::DESCRIPTOR_DIM];
+        lhs[3] = 2.0;
+        let mut rhs = [0.0; crate::DESCRIPTOR_DIM];
+        rhs[3] = 4.0;
+        let mut scaled_rhs = rhs;
+        scaled_rhs[3] *= 3.0;
+
+        let dot = raw_descriptor_dot_product(&crate::Descriptor(lhs), &crate::Descriptor(rhs));
+        let scaled_dot =
+            raw_descriptor_dot_product(&crate::Descriptor(lhs), &crate::Descriptor(scaled_rhs));
+
+        assert_eq!(dot, 8.0);
+        assert_eq!(scaled_dot, 24.0);
     }
 
     #[test]

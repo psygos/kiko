@@ -24,6 +24,7 @@ const DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY: f32 = 0.9;
 #[derive(Debug)]
 enum TrackingMatcherParseError {
     ConflictingAliases { primary: String, legacy: String },
+    ConflictingProjectedDotProductAliases { primary: f32, legacy: f32 },
     Unknown { value: String },
 }
 
@@ -33,6 +34,10 @@ impl std::fmt::Display for TrackingMatcherParseError {
             Self::ConflictingAliases { primary, legacy } => write!(
                 f,
                 "KIKO_TRACKING_MATCHER ({primary:?}) conflicts with legacy KIKO_TRACK_MATCHER ({legacy:?})"
+            ),
+            Self::ConflictingProjectedDotProductAliases { primary, legacy } => write!(
+                f,
+                "KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT ({primary}) conflicts with deprecated, misnamed KIKO_PROJECTED_MATCH_MIN_SIMILARITY ({legacy})"
             ),
             Self::Unknown { value } => write!(
                 f,
@@ -247,8 +252,7 @@ fn tracking_matcher_from_env(
             Ok(TrackingMatcher::Projected(ProjectedMatcherConfig::new(
                 try_env_f32("KIKO_PROJECTED_MATCH_RADIUS_PX")?
                     .unwrap_or(defaults.search_radius_px()),
-                try_env_f32("KIKO_PROJECTED_MATCH_MIN_SIMILARITY")?
-                    .unwrap_or(defaults.min_similarity()),
+                projected_match_min_dot_product_from_env(defaults.min_descriptor_dot_product())?,
                 try_env_usize("KIKO_PROJECTED_MATCH_MIN_MATCHES")?
                     .unwrap_or(defaults.min_matches()),
                 try_env_usize("KIKO_PROJECTED_MATCH_MIN_INLIERS")?
@@ -259,6 +263,39 @@ fn tracking_matcher_from_env(
         _ => Err(Box::new(TrackingMatcherParseError::Unknown {
             value: matcher,
         })),
+    }
+}
+
+fn projected_match_min_dot_product_from_env(
+    default: f32,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    let primary = try_env_f32("KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT")?;
+    let legacy = try_env_f32("KIKO_PROJECTED_MATCH_MIN_SIMILARITY")?;
+    match (primary, legacy) {
+        (Some(primary), Some(legacy))
+            if primary != legacy && !(primary.is_nan() && legacy.is_nan()) =>
+        {
+            Err(Box::new(
+                TrackingMatcherParseError::ConflictingProjectedDotProductAliases {
+                    primary,
+                    legacy,
+                },
+            ))
+        }
+        (Some(primary), Some(_)) => {
+            eprintln!(
+                "warning: KIKO_PROJECTED_MATCH_MIN_SIMILARITY is deprecated and misnamed; the matcher uses a raw descriptor dot product. Use KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT"
+            );
+            Ok(primary)
+        }
+        (Some(primary), None) => Ok(primary),
+        (None, Some(legacy)) => {
+            eprintln!(
+                "warning: KIKO_PROJECTED_MATCH_MIN_SIMILARITY is deprecated and misnamed; treating it as KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT"
+            );
+            Ok(legacy)
+        }
+        (None, None) => Ok(default),
     }
 }
 

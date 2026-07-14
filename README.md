@@ -126,7 +126,8 @@ Most knobs are still available as `KIKO_*` environment variables for experiments
 - `KIKO_CUDA_CONV_SEARCH={heuristic,exhaustive,default}` controls cuDNN conv algorithm selection. Jetson defaults to `heuristic` to avoid multi-second full-resolution autotune.
 - `KIKO_CUDA_PREFER_NHWC` and `KIKO_CUDA_FUSE_CONV_BIAS` are available for experiments but default off on Jetson because they regress or fail on the current full-resolution SuperPoint path.
 - `KIKO_TRACKING_MATCHER={projected,lightglue}` selects topology-aware projected tracking or the legacy global LightGlue tracker.
-- `KIKO_PROJECTED_MATCH_RADIUS_PX`, `KIKO_PROJECTED_MATCH_MIN_SIMILARITY`, `KIKO_PROJECTED_MATCH_MIN_MATCHES`, and `KIKO_PROJECTED_MATCH_MIN_INLIERS` tune the projected matcher.
+- `KIKO_PROJECTED_MATCH_RADIUS_PX`, `KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT`, `KIKO_PROJECTED_MATCH_MIN_MATCHES`, and `KIKO_PROJECTED_MATCH_MIN_INLIERS` tune the projected matcher. The dot-product gate does not normalize descriptors, so its scale is model-dependent; `KIKO_PROJECTED_MATCH_MIN_SIMILARITY` remains only as a warned, deprecated compatibility alias.
+- `KIKO_TRACK_MIN_DOT_PRODUCT` controls the same raw descriptor dot-product gate in Rerun-only feature-track visualization; `KIKO_TRACK_MIN_SIM` is its warned, deprecated compatibility alias.
 - `KIKO_TRT_CACHE_DIR` controls the TensorRT engine cache path.
 
 The Jetson binary should be dynamically linked against `/home/makerspace/work/onnxruntime/build-jetson/Release`. The binary may be built with `ort-tensorrt`, and TensorRT sessions use CUDA fallback for unsupported nodes, but the measured full-resolution SLAM path uses the CUDA backend. Do not force `--backend tensorrt` for normal SLAM unless validating TensorRT-specific model coverage or prebuilt engine caches.

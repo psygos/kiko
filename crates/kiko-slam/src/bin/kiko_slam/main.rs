@@ -240,7 +240,7 @@ mod tests {
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
     use super::{Cli, Command, RerunRecordingInitError, rerun_recording, verify_run_integrity};
     use clap::Parser;
-    use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig};
+    use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig, TrackingMatcher};
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -397,6 +397,82 @@ mod tests {
         assert!(error.to_string().contains("unknown tracking matcher"));
         restore_env(primary, saved_primary);
         restore_env(legacy, saved_legacy);
+    }
+
+    #[test]
+    fn build_tracker_config_reads_truthful_projected_dot_product_setting() {
+        let _guard = env_lock().lock().expect("env lock");
+        let keys = [
+            "KIKO_TRACKING_MATCHER",
+            "KIKO_TRACK_MATCHER",
+            "KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT",
+            "KIKO_PROJECTED_MATCH_MIN_SIMILARITY",
+        ];
+        let saved: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|&key| (key.to_string(), std::env::var_os(key)))
+            .collect();
+        set_env("KIKO_TRACKING_MATCHER", "projected");
+        restore_env("KIKO_TRACK_MATCHER", None);
+        set_env("KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT", "1.25");
+        restore_env("KIKO_PROJECTED_MATCH_MIN_SIMILARITY", None);
+
+        let config = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect("projected matcher configuration");
+
+        let TrackingMatcher::Projected(projected) = config.tracking_matcher else {
+            panic!("projected matcher setting must select projected tracking");
+        };
+        assert_eq!(projected.min_descriptor_dot_product(), 1.25);
+
+        for (key, value) in saved {
+            restore_env(&key, value);
+        }
+    }
+
+    #[test]
+    fn build_tracker_config_rejects_conflicting_projected_dot_product_aliases() {
+        let _guard = env_lock().lock().expect("env lock");
+        let keys = [
+            "KIKO_TRACKING_MATCHER",
+            "KIKO_TRACK_MATCHER",
+            "KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT",
+            "KIKO_PROJECTED_MATCH_MIN_SIMILARITY",
+        ];
+        let saved: Vec<(String, Option<OsString>)> = keys
+            .iter()
+            .map(|&key| (key.to_string(), std::env::var_os(key)))
+            .collect();
+        set_env("KIKO_TRACKING_MATCHER", "projected");
+        restore_env("KIKO_TRACK_MATCHER", None);
+        set_env("KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT", "0.45");
+        set_env("KIKO_PROJECTED_MATCH_MIN_SIMILARITY", "0.8");
+
+        let error = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect_err("conflicting raw-dot-product aliases must fail");
+
+        assert!(error.to_string().contains("conflicts"));
+        assert!(error.to_string().contains("DOT_PRODUCT"));
+
+        for (key, value) in saved {
+            restore_env(&key, value);
+        }
     }
 
     #[test]

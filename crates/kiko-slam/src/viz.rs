@@ -134,8 +134,12 @@ pub enum RerunSinkInitError {
     InvalidTrackDistance {
         value_px: f32,
     },
-    InvalidTrackSimilarity {
+    InvalidTrackDotProductThreshold {
         value: f32,
+    },
+    ConflictingTrackDotProductSettings {
+        primary: f32,
+        legacy: f32,
     },
 }
 
@@ -161,9 +165,13 @@ impl std::fmt::Display for RerunSinkInitError {
                 f,
                 "visualization track distance must be positive and finite, got {value_px} px"
             ),
-            Self::InvalidTrackSimilarity { value } => write!(
+            Self::InvalidTrackDotProductThreshold { value } => write!(
                 f,
-                "visualization track similarity must be finite and in [-1, 1], got {value}"
+                "visualization track minimum raw descriptor dot product must be finite, got {value}"
+            ),
+            Self::ConflictingTrackDotProductSettings { primary, legacy } => write!(
+                f,
+                "KIKO_TRACK_MIN_DOT_PRODUCT ({primary}) conflicts with deprecated, misnamed KIKO_TRACK_MIN_SIM ({legacy})"
             ),
         }
     }
@@ -175,7 +183,9 @@ impl std::error::Error for RerunSinkInitError {
             Self::SurfaceMapConfig { source } => Some(source),
             Self::Environment { source, .. } => Some(source),
             Self::InvalidPoseQualityThreshold { source, .. } => Some(source),
-            Self::InvalidTrackDistance { .. } | Self::InvalidTrackSimilarity { .. } => None,
+            Self::InvalidTrackDistance { .. }
+            | Self::InvalidTrackDotProductThreshold { .. }
+            | Self::ConflictingTrackDotProductSettings { .. } => None,
         }
     }
 }
@@ -1449,24 +1459,27 @@ fn log_pose_variant(
 #[derive(Debug, Clone, Copy)]
 struct TrackConfig {
     max_distance_px: f32,
-    min_similarity: f32,
+    min_descriptor_dot_product: f32,
 }
 
 impl TrackConfig {
-    fn try_new(max_distance_px: f32, min_similarity: f32) -> Result<Self, RerunSinkInitError> {
+    fn try_new(
+        max_distance_px: f32,
+        min_descriptor_dot_product: f32,
+    ) -> Result<Self, RerunSinkInitError> {
         if !max_distance_px.is_finite() || max_distance_px <= 0.0 {
             return Err(RerunSinkInitError::InvalidTrackDistance {
                 value_px: max_distance_px,
             });
         }
-        if !min_similarity.is_finite() || !(-1.0..=1.0).contains(&min_similarity) {
-            return Err(RerunSinkInitError::InvalidTrackSimilarity {
-                value: min_similarity,
+        if !min_descriptor_dot_product.is_finite() {
+            return Err(RerunSinkInitError::InvalidTrackDotProductThreshold {
+                value: min_descriptor_dot_product,
             });
         }
         Ok(Self {
             max_distance_px,
-            min_similarity,
+            min_descriptor_dot_product,
         })
     }
 
@@ -1476,12 +1489,43 @@ impl TrackConfig {
             crate::env::try_env_f32("KIKO_TRACK_MAX_DIST"),
         )?
         .unwrap_or(24.0);
-        let min_similarity = viz_env(
+        let primary = viz_env(
+            "KIKO_TRACK_MIN_DOT_PRODUCT",
+            crate::env::try_env_f32("KIKO_TRACK_MIN_DOT_PRODUCT"),
+        )?;
+        let legacy = viz_env(
             "KIKO_TRACK_MIN_SIM",
             crate::env::try_env_f32("KIKO_TRACK_MIN_SIM"),
-        )?
-        .unwrap_or(0.8);
-        Self::try_new(max_distance_px, min_similarity)
+        )?;
+        let min_descriptor_dot_product = resolve_track_min_descriptor_dot_product(primary, legacy)?;
+        Self::try_new(max_distance_px, min_descriptor_dot_product)
+    }
+}
+
+fn resolve_track_min_descriptor_dot_product(
+    primary: Option<f32>,
+    legacy: Option<f32>,
+) -> Result<f32, RerunSinkInitError> {
+    match (primary, legacy) {
+        (Some(primary), Some(legacy))
+            if primary != legacy && !(primary.is_nan() && legacy.is_nan()) =>
+        {
+            Err(RerunSinkInitError::ConflictingTrackDotProductSettings { primary, legacy })
+        }
+        (Some(primary), Some(_)) => {
+            eprintln!(
+                "warning: KIKO_TRACK_MIN_SIM is deprecated and misnamed; visualization tracking uses a raw descriptor dot product. Use KIKO_TRACK_MIN_DOT_PRODUCT"
+            );
+            Ok(primary)
+        }
+        (Some(primary), None) => Ok(primary),
+        (None, Some(legacy)) => {
+            eprintln!(
+                "warning: KIKO_TRACK_MIN_SIM is deprecated and misnamed; treating it as KIKO_TRACK_MIN_DOT_PRODUCT"
+            );
+            Ok(legacy)
+        }
+        (None, None) => Ok(0.8),
     }
 }
 
@@ -1521,7 +1565,7 @@ impl TrackState {
             for (i, desc) in left.descriptors().iter().enumerate() {
                 let kp = left.keypoints()[i];
                 let mut best_idx = None;
-                let mut best_sim = self.config.min_similarity;
+                let mut best_dot_product = self.config.min_descriptor_dot_product;
 
                 for (j, prev_desc) in prev.descriptors().iter().enumerate() {
                     if used_prev[j] {
@@ -1531,9 +1575,10 @@ impl TrackState {
                     if distance_sq(kp, prev_kp) > max_dist_sq {
                         continue;
                     }
-                    let sim = dot(desc.0.as_slice(), prev_desc.0.as_slice());
-                    if sim > best_sim {
-                        best_sim = sim;
+                    let dot_product =
+                        raw_descriptor_dot_product(desc.0.as_slice(), prev_desc.0.as_slice());
+                    if dot_product > best_dot_product {
+                        best_dot_product = dot_product;
                         best_idx = Some(j);
                     }
                 }
@@ -1653,7 +1698,7 @@ fn log_matches(
     Ok(())
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+fn raw_descriptor_dot_product(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
@@ -1706,7 +1751,8 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 mod tests {
     use super::{
         RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
-        TrackConfig, VizDecimation, VizDecimationError, surface_integration_scalars,
+        TrackConfig, VizDecimation, VizDecimationError, raw_descriptor_dot_product,
+        resolve_track_min_descriptor_dot_product, surface_integration_scalars,
         surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
@@ -1738,14 +1784,51 @@ mod tests {
                 Err(RerunSinkInitError::InvalidTrackDistance { .. })
             ));
         }
-        for invalid in [-1.1, 1.1, f32::NAN, f32::INFINITY] {
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(matches!(
                 TrackConfig::try_new(24.0, invalid),
-                Err(RerunSinkInitError::InvalidTrackSimilarity { .. })
+                Err(RerunSinkInitError::InvalidTrackDotProductThreshold { .. })
             ));
         }
-        assert!(TrackConfig::try_new(24.0, -1.0).is_ok());
-        assert!(TrackConfig::try_new(24.0, 1.0).is_ok());
+        assert!(TrackConfig::try_new(24.0, -2.0).is_ok());
+        assert!(TrackConfig::try_new(24.0, 2.0).is_ok());
+    }
+
+    #[test]
+    fn visualization_tracker_uses_scale_dependent_raw_descriptor_dot_product() {
+        let lhs = [2.0, 0.0];
+        let rhs = [4.0, 0.0];
+        let scaled_rhs = [12.0, 0.0];
+
+        assert_eq!(raw_descriptor_dot_product(&lhs, &rhs), 8.0);
+        assert_eq!(raw_descriptor_dot_product(&lhs, &scaled_rhs), 24.0);
+    }
+
+    #[test]
+    fn visualization_track_dot_product_alias_resolution_is_explicit() {
+        assert_eq!(
+            resolve_track_min_descriptor_dot_product(Some(1.25), None).expect("primary setting"),
+            1.25
+        );
+        assert_eq!(
+            resolve_track_min_descriptor_dot_product(None, Some(0.75))
+                .expect("legacy compatibility setting"),
+            0.75
+        );
+        assert!(matches!(
+            resolve_track_min_descriptor_dot_product(Some(0.5), Some(0.75)),
+            Err(RerunSinkInitError::ConflictingTrackDotProductSettings {
+                primary: 0.5,
+                legacy: 0.75,
+            })
+        ));
+        let nonfinite = resolve_track_min_descriptor_dot_product(Some(f32::NAN), Some(f32::NAN))
+            .expect("identically spelled aliases are resolved before domain parsing");
+        assert!(nonfinite.is_nan());
+        assert!(matches!(
+            TrackConfig::try_new(24.0, nonfinite),
+            Err(RerunSinkInitError::InvalidTrackDotProductThreshold { .. })
+        ));
     }
 
     #[test]
