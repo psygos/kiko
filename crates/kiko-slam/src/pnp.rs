@@ -1322,16 +1322,19 @@ pub(crate) fn reprojection_errors(
 }
 
 pub(crate) fn reprojection_rmse(errors: &[Option<f32>]) -> Option<f32> {
-    let mut sum_sq = 0.0_f32;
+    // Accumulating in f64 keeps the square and sum finite for any addressable
+    // slice of finite f32 residuals; their RMS still fits the f32 input domain.
+    let mut sum_sq = 0.0_f64;
     let mut count = 0usize;
     for &error in errors.iter().flatten() {
-        sum_sq += error * error;
-        count = count.saturating_add(1);
+        let error = f64::from(error);
+        sum_sq = error.mul_add(error, sum_sq);
+        count += 1;
     }
     if count == 0 {
         return None;
     }
-    Some((sum_sq / count as f32).sqrt())
+    Some((sum_sq / count as f64).sqrt() as f32)
 }
 
 pub(crate) fn reprojection_max(errors: &[Option<f32>]) -> Option<f32> {
@@ -1342,14 +1345,14 @@ pub(crate) fn reprojection_mse_per_axis_px2(errors: &[Option<f32>]) -> Option<f6
     let mut sum_sq = 0.0_f64;
     let mut count = 0usize;
     for &error in errors.iter().flatten() {
-        let error = error as f64;
-        sum_sq += error * error;
-        count = count.saturating_add(1);
+        let error = f64::from(error);
+        sum_sq = error.mul_add(error, sum_sq);
+        count += 1;
     }
     if count == 0 {
         return None;
     }
-    Some(sum_sq / (2 * count) as f64)
+    Some(sum_sq / (2.0 * count as f64))
 }
 
 fn pose_from_points(
@@ -2103,6 +2106,18 @@ mod tests {
         let rmse = reprojection_rmse(&errors).expect("rmse");
         let expected = ((3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
         assert!((rmse - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reprojection_statistics_do_not_overflow_on_finite_f32_residuals() {
+        let errors = [Some(f32::MAX), Some(f32::MAX)];
+
+        let rmse = reprojection_rmse(&errors).expect("finite RMSE");
+        assert_eq!(rmse, f32::MAX);
+
+        let mse = reprojection_mse_per_axis_px2(&errors).expect("finite MSE");
+        assert!(mse.is_finite());
+        assert_eq!(mse, f64::from(f32::MAX).powi(2) / 2.0);
     }
 
     #[test]

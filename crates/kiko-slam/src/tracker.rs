@@ -1785,6 +1785,7 @@ pub enum TrackerError {
     MapObservation(MapObservationError),
     TrackingInlierResolution(TrackingInlierResolutionError),
     ProjectedTrackingProjection(ProjectedTrackingProjectionError),
+    DiagnosticMetric(crate::DiagnosticMetricError),
     DescriptorMatch(DescriptorMatchError),
     LoopVerification(LoopVerificationError),
     LoopClosure(LoopDetectError),
@@ -1833,6 +1834,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::ProjectedTrackingProjection(err) => {
                 write!(f, "projected tracking projection failed: {err}")
             }
+            TrackerError::DiagnosticMetric(err) => {
+                write!(f, "tracking diagnostic metric construction failed: {err}")
+            }
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
@@ -1873,6 +1877,7 @@ impl std::error::Error for TrackerError {
             TrackerError::MapObservation(source) => Some(source),
             TrackerError::TrackingInlierResolution(source) => Some(source),
             TrackerError::ProjectedTrackingProjection(source) => Some(source),
+            TrackerError::DiagnosticMetric(source) => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::LoopVerification(source) => Some(source),
             TrackerError::LoopClosure(source) => Some(source),
@@ -1963,6 +1968,12 @@ impl From<MapObservationError> for TrackerError {
 impl From<TrackingInlierResolutionError> for TrackerError {
     fn from(err: TrackingInlierResolutionError) -> Self {
         TrackerError::TrackingInlierResolution(err)
+    }
+}
+
+impl From<crate::DiagnosticMetricError> for TrackerError {
+    fn from(err: crate::DiagnosticMetricError) -> Self {
+        TrackerError::DiagnosticMetric(err)
     }
 }
 
@@ -5223,13 +5234,10 @@ impl SlamTracker {
         // VIO visual correction will be handled by tightly-coupled BA (M2).
 
         let mut diagnostics = self.empty_diagnostics();
-        diagnostics.pnp_inlier_ratio = Some(
-            crate::PnpInlierRatioMetric::new(
-                crate::PnpAcceptedInlierCountMetric::new(result.inliers().len()),
-                crate::PnpTrackedObservationCountMetric::new(tracked_observations.len()),
-            )
-            .expect("tracker must emit a finite inlier ratio over non-empty tracked observations"),
-        );
+        diagnostics.pnp_inlier_ratio = Some(crate::PnpInlierRatioMetric::new(
+            crate::PnpAcceptedInlierCountMetric::new(result.inliers().len()),
+            crate::PnpTrackedObservationCountMetric::new(tracked_observations.len()),
+        )?);
         diagnostics.pnp_tracked_observations = Some(crate::PnpTrackedObservationCountMetric::new(
             tracked_observations.len(),
         ));
@@ -5243,23 +5251,19 @@ impl SlamTracker {
             ));
         diagnostics.ransac_iterations = Some(result.iterations().get());
         diagnostics.pnp_refinement = Some(result.refinement().clone());
-        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px =
-            tracked_metrics.rmse_px().map(|value| {
-                crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
-                    .expect("projectable tracked reprojection RMSE must be finite and non-negative")
-            });
-        diagnostics.pnp_projectable_tracked_observation_reprojection_max_px =
-            tracked_metrics.max_px().map(|value| {
-                crate::PnpProjectableTrackedObservationPixelResidualMetric::new(value)
-                    .expect("projectable tracked reprojection max must be finite and non-negative")
-            });
+        diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px = tracked_metrics
+            .rmse_px()
+            .map(crate::PnpProjectableTrackedObservationPixelResidualMetric::new)
+            .transpose()?;
+        diagnostics.pnp_projectable_tracked_observation_reprojection_max_px = tracked_metrics
+            .max_px()
+            .map(crate::PnpProjectableTrackedObservationPixelResidualMetric::new)
+            .transpose()?;
         diagnostics.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2 =
-            tracked_metrics.mse_per_axis_px2().map(|value| {
-                crate::PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric::new(value)
-                    .expect(
-                        "projectable tracked reprojection MSE per axis must be finite and non-negative",
-                    )
-            });
+            tracked_metrics
+                .mse_per_axis_px2()
+                .map(crate::PnpProjectableTrackedObservationReprojectionMsePerAxisPx2Metric::new)
+                .transpose()?;
         #[cfg(feature = "vio")]
         {
             diagnostics.visual_proposal_projectable_tracked_observations = Some(
@@ -5268,24 +5272,19 @@ impl SlamTracker {
                 ),
             );
             diagnostics.visual_proposal_projectable_tracked_observation_reprojection_rmse_px =
-                visual_proposal_tracked_metrics.rmse_px().map(|value| {
-                    crate::VisualProposalProjectableTrackedObservationPixelResidualMetric::new(
-                        value,
-                    )
-                    .expect(
-                        "visual proposal tracked reprojection RMSE must be finite and non-negative",
-                    )
-                });
+                visual_proposal_tracked_metrics
+                    .rmse_px()
+                    .map(crate::VisualProposalProjectableTrackedObservationPixelResidualMetric::new)
+                    .transpose()?;
             diagnostics.visual_proposal_projectable_accepted_inliers =
                 Some(crate::PnpAcceptedInlierCountMetric::new(
                     visual_proposal_accepted_inlier_metrics.projectable_count(),
                 ));
             diagnostics.visual_proposal_accepted_inlier_reprojection_rmse_px =
-                visual_proposal_accepted_inlier_metrics.rmse_px().map(|value| {
-                    crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
-                        "visual proposal accepted-inlier reprojection RMSE must be finite and non-negative",
-                    )
-                });
+                visual_proposal_accepted_inlier_metrics
+                    .rmse_px()
+                    .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
+                    .transpose()?;
             diagnostics.vio_proposal_disposition = Some(vio_proposal_disposition);
             diagnostics.vio_solve_result = vio_solve_result;
             diagnostics.vio_calibrated_bias_prior_active = match &self.local_estimator {
@@ -5303,14 +5302,12 @@ impl SlamTracker {
                     ),
                 );
                 diagnostics.vio_proposal_projectable_tracked_observation_reprojection_rmse_px =
-                    vio_tracked_metrics.rmse_px().map(|value| {
-                        crate::VioProposalProjectableTrackedObservationPixelResidualMetric::new(
-                            value,
+                    vio_tracked_metrics
+                        .rmse_px()
+                        .map(
+                            crate::VioProposalProjectableTrackedObservationPixelResidualMetric::new,
                         )
-                        .expect(
-                            "VIO proposal tracked reprojection RMSE must be finite and non-negative",
-                        )
-                    });
+                        .transpose()?;
                 diagnostics.shared_projectable_tracked_observations = Some(
                     crate::VisualVsVioSharedProjectableTrackedObservationCountMetric::new(
                         shared_metrics.count,
@@ -5318,24 +5315,20 @@ impl SlamTracker {
                 );
                 diagnostics
                     .visual_proposal_shared_projectable_tracked_observation_reprojection_rmse_px =
-                    shared_metrics.lhs_rmse_px.map(|value| {
-                        crate::VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(
-                            value,
+                    shared_metrics
+                        .lhs_rmse_px
+                        .map(
+                            crate::VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new,
                         )
-                        .expect(
-                            "visual shared tracked reprojection RMSE must be finite and non-negative",
-                        )
-                    });
+                        .transpose()?;
                 diagnostics
                     .vio_proposal_shared_projectable_tracked_observation_reprojection_rmse_px =
-                    shared_metrics.rhs_rmse_px.map(|value| {
-                        crate::VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new(
-                            value,
+                    shared_metrics
+                        .rhs_rmse_px
+                        .map(
+                            crate::VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric::new,
                         )
-                        .expect(
-                            "VIO shared tracked reprojection RMSE must be finite and non-negative",
-                        )
-                    });
+                        .transpose()?;
             }
             if let Some(vio_accepted_inlier_metrics) = vio_proposal_accepted_inlier_metrics.as_ref()
             {
@@ -5346,43 +5339,37 @@ impl SlamTracker {
                         vio_accepted_inlier_metrics.projectable_count(),
                     ));
                 diagnostics.vio_proposal_accepted_inlier_reprojection_rmse_px =
-                    vio_accepted_inlier_metrics.rmse_px().map(|value| {
-                        crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
-                            "VIO proposal accepted-inlier reprojection RMSE must be finite and non-negative",
-                        )
-                    });
+                    vio_accepted_inlier_metrics
+                        .rmse_px()
+                        .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
+                        .transpose()?;
                 diagnostics.shared_projectable_accepted_inliers = Some(
                     crate::PnpAcceptedInlierCountMetric::new(shared_accepted_inlier_metrics.count),
                 );
                 diagnostics.visual_proposal_shared_accepted_inlier_reprojection_rmse_px =
-                    shared_accepted_inlier_metrics.lhs_rmse_px.map(|value| {
-                        crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
-                            "visual proposal shared accepted-inlier reprojection RMSE must be finite and non-negative",
-                        )
-                    });
+                    shared_accepted_inlier_metrics
+                        .lhs_rmse_px
+                        .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
+                        .transpose()?;
                 diagnostics.vio_proposal_shared_accepted_inlier_reprojection_rmse_px =
-                    shared_accepted_inlier_metrics.rhs_rmse_px.map(|value| {
-                        crate::PnpAcceptedInlierPixelResidualMetric::new(value).expect(
-                            "VIO proposal shared accepted-inlier reprojection RMSE must be finite and non-negative",
-                        )
-                    });
+                    shared_accepted_inlier_metrics
+                        .rhs_rmse_px
+                        .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
+                        .transpose()?;
             }
         }
-        diagnostics.pnp_inlier_reprojection_rmse_px =
-            accepted_inlier_metrics.rmse_px().map(|value| {
-                crate::PnpAcceptedInlierPixelResidualMetric::new(value)
-                    .expect("reprojection RMSE must be finite and non-negative")
-            });
-        diagnostics.pnp_inlier_reprojection_max_px =
-            accepted_inlier_metrics.max_px().map(|value| {
-                crate::PnpAcceptedInlierPixelResidualMetric::new(value)
-                    .expect("reprojection max must be finite and non-negative")
-            });
-        diagnostics.pnp_inlier_reprojection_mse_per_axis_px2 =
-            accepted_inlier_metrics.mse_per_axis_px2().map(|value| {
-                crate::PnpAcceptedInlierReprojectionMsePerAxisPx2Metric::new(value)
-                    .expect("PnP inlier reprojection MSE per axis must be finite and non-negative")
-            });
+        diagnostics.pnp_inlier_reprojection_rmse_px = accepted_inlier_metrics
+            .rmse_px()
+            .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
+            .transpose()?;
+        diagnostics.pnp_inlier_reprojection_max_px = accepted_inlier_metrics
+            .max_px()
+            .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
+            .transpose()?;
+        diagnostics.pnp_inlier_reprojection_mse_per_axis_px2 = accepted_inlier_metrics
+            .mse_per_axis_px2()
+            .map(crate::PnpAcceptedInlierReprojectionMsePerAxisPx2Metric::new)
+            .transpose()?;
         diagnostics.parallax_px = parallax_px;
         diagnostics.covisibility = Some(covisibility);
         diagnostics.keyframe_status = keyframe_status;
@@ -5968,6 +5955,21 @@ mod tests {
         let frame = inference.source().expect("frame source");
         assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
         assert!(frame.source().is_none());
+    }
+
+    #[test]
+    fn tracker_error_preserves_diagnostic_metric_source() {
+        let metric_error = crate::PnpAcceptedInlierPixelResidualMetric::new(f32::NAN)
+            .expect_err("nonfinite diagnostic metric");
+        let error = TrackerError::from(metric_error);
+
+        assert!(matches!(
+            error,
+            TrackerError::DiagnosticMetric(crate::DiagnosticMetricError::NonFinite { .. })
+        ));
+        let source = error.source().expect("diagnostic metric source");
+        assert_eq!(source.to_string(), metric_error.to_string());
+        assert!(source.source().is_none());
     }
 
     #[test]
