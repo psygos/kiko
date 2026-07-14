@@ -488,16 +488,10 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 .collect();
                             let surface = kiko_slam::generate_stable_surface_points(
                                 &samples.samples,
-                                stereo.fx(),
-                                stereo.fy(),
-                                stereo.left().cx,
-                                stereo.left().cy,
-                                stereo.baseline_m(),
-                                left.data(),
-                                left.width(),
-                                left.height(),
+                                stereo,
+                                &left,
                                 &dense_config,
-                            );
+                            )?;
                             if let Err(err) = sink.log_surface_observations(
                                 left.timestamp(),
                                 &raw_frame_points,

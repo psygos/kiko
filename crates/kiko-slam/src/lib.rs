@@ -58,8 +58,9 @@ pub use channel::{
 };
 pub use dense_cloud::{
     DenseCloudConfig, DenseCloudConfigError, DenseCloudResult, DenseCloudStats, DensePoint,
-    StableSurfacePoint, StableSurfacePointError, StableSurfaceResult, StableSurfaceStats,
-    generate_dense_cloud, generate_dense_depth_image, generate_stable_surface_points,
+    StableSurfaceGenerationError, StableSurfacePoint, StableSurfacePointError, StableSurfaceResult,
+    StableSurfaceStatistic, StableSurfaceStats, generate_dense_cloud, generate_dense_depth_image,
+    generate_stable_surface_points,
 };
 pub use depth::{
     DepthImage, DepthImageError, DepthProvenance, DepthProvenanceKind, InterpolatedDepth,
