@@ -665,8 +665,57 @@ impl std::fmt::Display for GlobalDescriptorError {
 
 impl std::error::Error for GlobalDescriptorError {}
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CosineSimilarity(f32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CosineSimilarityError {
+    NonFinite { value: f32 },
+    OutOfRange { value: f32 },
+}
+
+impl std::fmt::Display for CosineSimilarityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { value } => {
+                write!(f, "cosine similarity must be finite, got {value}")
+            }
+            Self::OutOfRange { value } => {
+                write!(f, "cosine similarity must be in [-1, 1], got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CosineSimilarityError {}
+
+impl CosineSimilarity {
+    pub fn try_new(value: f32) -> Result<Self, CosineSimilarityError> {
+        if !value.is_finite() {
+            return Err(CosineSimilarityError::NonFinite { value });
+        }
+        if !(-1.0..=1.0).contains(&value) {
+            return Err(CosineSimilarityError::OutOfRange { value });
+        }
+        Ok(Self(value))
+    }
+
+    fn from_computed_clamped(value: f64) -> Self {
+        // Valid descriptor inputs make the quotient finite. Clamp only the
+        // floating-point summation error around the mathematical [-1, 1] domain.
+        Self(value.clamp(-1.0, 1.0) as f32)
+    }
+
+    pub fn value(self) -> f32 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub struct GlobalDescriptor([f32; GLOBAL_DESCRIPTOR_DIM]);
+pub struct GlobalDescriptor {
+    values: [f32; GLOBAL_DESCRIPTOR_DIM],
+    inverse_norm: f64,
+}
 
 impl GlobalDescriptor {
     pub fn try_new(values: [f32; GLOBAL_DESCRIPTOR_DIM]) -> Result<Self, GlobalDescriptorError> {
@@ -687,23 +736,29 @@ impl GlobalDescriptor {
         for v in &mut normalized {
             *v = (f64::from(*v) * inv_norm) as f32;
         }
-        Ok(Self(normalized))
+        // A nonzero input has a normalized component of at least 1/sqrt(DIM),
+        // so conversion to f32 cannot turn every component into zero.
+        let normalized_norm_sq = normalized.iter().fold(0.0_f64, |sum, &value| {
+            let value = f64::from(value);
+            sum + value * value
+        });
+        Ok(Self {
+            values: normalized,
+            inverse_norm: normalized_norm_sq.sqrt().recip(),
+        })
     }
 
     pub fn as_array(&self) -> &[f32; GLOBAL_DESCRIPTOR_DIM] {
-        &self.0
+        &self.values
     }
 
-    pub fn cosine_similarity(&self, other: &Self) -> f32 {
-        let (dot, norm_a, norm_b) = self.0.iter().zip(other.0.iter()).fold(
-            (0.0_f64, 0.0_f64, 0.0_f64),
-            |(dot, na, nb), (&a, &b)| {
-                let a = a as f64;
-                let b = b as f64;
-                (dot + a * b, na + a * a, nb + b * b)
-            },
-        );
-        (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
+    pub fn clamped_cosine_similarity(&self, other: &Self) -> CosineSimilarity {
+        let dot = self
+            .values
+            .iter()
+            .zip(other.values.iter())
+            .fold(0.0_f64, |sum, (&a, &b)| sum + f64::from(a) * f64::from(b));
+        CosineSimilarity::from_computed_clamped(dot * self.inverse_norm * other.inverse_norm)
     }
 
     pub fn from_local_descriptors(
@@ -852,17 +907,41 @@ pub(crate) fn match_quantized_descriptors_for_loop(
     Ok(correspondences)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct PlaceMatch {
-    pub query: KeyframeId,
-    pub candidate: KeyframeId,
-    pub similarity: f32,
+    query: KeyframeId,
+    candidate: KeyframeId,
+    cosine_similarity: CosineSimilarity,
 }
 
-#[derive(Clone, Debug)]
+impl PlaceMatch {
+    pub fn query(self) -> KeyframeId {
+        self.query
+    }
+
+    pub fn candidate(self) -> KeyframeId {
+        self.candidate
+    }
+
+    pub fn cosine_similarity(self) -> CosineSimilarity {
+        self.cosine_similarity
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct RelocalizationMatch {
-    pub candidate: KeyframeId,
-    pub similarity: f32,
+    candidate: KeyframeId,
+    cosine_similarity: CosineSimilarity,
+}
+
+impl RelocalizationMatch {
+    pub fn candidate(self) -> KeyframeId {
+        self.candidate
+    }
+
+    pub fn cosine_similarity(self) -> CosineSimilarity {
+        self.cosine_similarity
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1042,10 +1121,15 @@ impl KeyframeDatabase {
             matches.push(PlaceMatch {
                 query: query_id,
                 candidate: candidate.keyframe_id,
-                similarity: descriptor.cosine_similarity(&candidate_descriptor.value),
+                cosine_similarity: descriptor
+                    .clamped_cosine_similarity(&candidate_descriptor.value),
             });
         }
-        matches.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
+        matches.sort_by(|a, b| {
+            b.cosine_similarity
+                .value()
+                .total_cmp(&a.cosine_similarity.value())
+        });
         matches.truncate(top_k);
         Ok(matches)
     }
@@ -1067,11 +1151,16 @@ impl KeyframeDatabase {
                     .as_ref()
                     .map(|candidate_descriptor| RelocalizationMatch {
                         candidate: entry.keyframe_id,
-                        similarity: descriptor.cosine_similarity(&candidate_descriptor.value),
+                        cosine_similarity: descriptor
+                            .clamped_cosine_similarity(&candidate_descriptor.value),
                     })
             })
             .collect();
-        matches.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
+        matches.sort_by(|a, b| {
+            b.cosine_similarity
+                .value()
+                .total_cmp(&a.cosine_similarity.value())
+        });
         matches.truncate(top_k);
         matches
     }
@@ -1081,19 +1170,6 @@ impl Default for KeyframeDatabase {
     fn default() -> Self {
         Self::new(DEFAULT_TEMPORAL_GAP)
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct LoopCandidate {
-    pub query_kf: KeyframeId,
-    pub match_kf: KeyframeId,
-    pub similarity: f32,
-}
-
-#[derive(Clone, Debug)]
-pub struct RelocalizationCandidate {
-    pub match_kf: KeyframeId,
-    pub similarity: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -1305,7 +1381,7 @@ fn verify_pose_from_keyframe(
     Ok((result.pose(), result.inliers().len()))
 }
 
-impl LoopCandidate {
+impl PlaceMatch {
     pub fn verify(
         &self,
         query_keypoints: &[Keypoint],
@@ -1315,34 +1391,34 @@ impl LoopCandidate {
         ransac_config: RansacConfig,
         min_inliers: usize,
     ) -> Result<VerifiedLoop, LoopVerificationError> {
-        map.keyframe(self.query_kf)
+        map.keyframe(self.query)
             .ok_or(LoopVerificationError::Map(MapError::KeyframeNotFound(
-                self.query_kf,
+                self.query,
             )))?;
-        map.keyframe(self.match_kf)
+        map.keyframe(self.candidate)
             .ok_or(LoopVerificationError::Map(MapError::KeyframeNotFound(
-                self.match_kf,
+                self.candidate,
             )))?;
         let (query_pose_world, inlier_count) = verify_pose_from_keyframe(
             query_keypoints,
             correspondences,
             map,
-            self.match_kf,
+            self.candidate,
             intrinsics,
             ransac_config,
             min_inliers,
         )?;
         Ok(VerifiedLoop {
             map_snapshot: map.snapshot(),
-            query_kf: self.query_kf,
-            match_kf: self.match_kf,
+            query_kf: self.query,
+            match_kf: self.candidate,
             query_pose_world,
             inlier_count,
         })
     }
 }
 
-impl RelocalizationCandidate {
+impl RelocalizationMatch {
     pub fn verify(
         &self,
         query_keypoints: &[Keypoint],
@@ -1356,13 +1432,13 @@ impl RelocalizationCandidate {
             query_keypoints,
             correspondences,
             map,
-            self.match_kf,
+            self.candidate,
             intrinsics,
             ransac_config,
             min_inliers,
         )?;
         Ok(VerifiedRelocalization {
-            match_kf: self.match_kf,
+            match_kf: self.candidate,
             pose_world,
             inlier_count,
         })
@@ -1372,12 +1448,12 @@ impl RelocalizationCandidate {
 #[cfg(test)]
 mod tests {
     use super::{
-        DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
-        KeyframeDatabase, KeyframeDatabaseError, KeyframeDescriptorUpdate, LoopApplyError,
-        LoopApplyErrorKind, LoopCandidate, LoopClosureConfig, LoopClosureConfigInput,
-        LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
-        RelocalizationConfigError, RelocalizationConfigInput, aggregate_global_descriptor,
-        match_descriptors_for_loop,
+        CosineSimilarity, CosineSimilarityError, DescriptorMatchError, DescriptorSource,
+        GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, KeyframeDatabaseError,
+        KeyframeDescriptorUpdate, LoopApplyError, LoopApplyErrorKind, LoopClosureConfig,
+        LoopClosureConfigInput, LoopVerificationError, PlaceMatch, RelocalizationConfig,
+        RelocalizationConfigError, RelocalizationConfigInput, RelocalizationMatch,
+        aggregate_global_descriptor, match_descriptors_for_loop,
     };
     use crate::map::{KeyframeId, MapError, SlamMap};
     use crate::pose_graph::PoseGraphError;
@@ -1402,6 +1478,21 @@ mod tests {
         let mut d = [0.0_f32; 512];
         d[idx] = 1.0;
         GlobalDescriptor::try_new(d).expect("valid basis descriptor")
+    }
+
+    fn place_match(query: KeyframeId, candidate: KeyframeId) -> PlaceMatch {
+        PlaceMatch {
+            query,
+            candidate,
+            cosine_similarity: CosineSimilarity::try_new(0.9).expect("valid similarity"),
+        }
+    }
+
+    fn relocalization_match(candidate: KeyframeId) -> RelocalizationMatch {
+        RelocalizationMatch {
+            candidate,
+            cosine_similarity: CosineSimilarity::try_new(0.9).expect("valid similarity"),
+        }
     }
 
     fn insert_bootstrap(
@@ -1543,8 +1634,81 @@ mod tests {
     #[test]
     fn global_descriptor_identical_similarity_is_one() {
         let d = descriptor_with_basis(3);
-        let sim = d.cosine_similarity(&d);
+        let sim = d.clamped_cosine_similarity(&d).value();
         assert!((sim - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cosine_similarity_parser_rejects_nonfinite_and_out_of_domain_values() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                CosineSimilarity::try_new(value),
+                Err(CosineSimilarityError::NonFinite { .. })
+            ));
+        }
+        for value in [1.0 + f32::EPSILON, -1.0 - f32::EPSILON] {
+            assert_eq!(
+                CosineSimilarity::try_new(value),
+                Err(CosineSimilarityError::OutOfRange { value })
+            );
+        }
+        for value in [-1.0, -0.0, 0.0, 1.0] {
+            assert_eq!(
+                CosineSimilarity::try_new(value)
+                    .expect("bounded finite similarity")
+                    .value(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn computed_cosine_clamping_is_explicit_and_bounded() {
+        assert_eq!(
+            CosineSimilarity::from_computed_clamped(1.0 + f64::EPSILON).value(),
+            1.0
+        );
+        assert_eq!(
+            CosineSimilarity::from_computed_clamped(-1.0 - f64::EPSILON).value(),
+            -1.0
+        );
+    }
+
+    #[test]
+    fn global_descriptor_similarity_is_bounded_and_symmetric_for_generated_inputs() {
+        let mut state = 0x517c_c1b7_2722_0a95_u64;
+        for _case in 0..128 {
+            let mut a = [0.0_f32; super::GLOBAL_DESCRIPTOR_DIM];
+            let mut b = [0.0_f32; super::GLOBAL_DESCRIPTOR_DIM];
+            for (a_value, b_value) in a.iter_mut().zip(&mut b) {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                *a_value =
+                    (f64::from((state >> 32) as u32) / f64::from(u32::MAX) * 2.0 - 1.0) as f32;
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                *b_value =
+                    (f64::from((state >> 32) as u32) / f64::from(u32::MAX) * 2.0 - 1.0) as f32;
+            }
+            let a = GlobalDescriptor::try_new(a).expect("generated descriptor a");
+            let b = GlobalDescriptor::try_new(b).expect("generated descriptor b");
+            let ab = a.clamped_cosine_similarity(&b).value();
+            let ba = b.clamped_cosine_similarity(&a).value();
+            let (dot, norm_a, norm_b) = a.as_array().iter().zip(b.as_array()).fold(
+                (0.0_f64, 0.0_f64, 0.0_f64),
+                |(dot, norm_a, norm_b), (&a, &b)| {
+                    let a = f64::from(a);
+                    let b = f64::from(b);
+                    (dot + a * b, norm_a + a * a, norm_b + b * b)
+                },
+            );
+            let reference = (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32;
+            assert!((-1.0..=1.0).contains(&ab));
+            assert!((ab - ba).abs() <= f32::EPSILON);
+            assert!((ab - reference).abs() <= f32::EPSILON);
+        }
     }
 
     #[test]
@@ -1614,7 +1778,7 @@ mod tests {
         assert!(
             matches
                 .iter()
-                .all(|m| m.candidate == ids[0] || m.candidate == ids[1])
+                .all(|m| m.candidate() == ids[0] || m.candidate() == ids[1])
         );
     }
 
@@ -1637,8 +1801,8 @@ mod tests {
             .query_loop_candidates(ids[3], &query, 2)
             .expect("registered query keyframe");
         assert_eq!(matches.len(), 2);
-        assert!(matches[0].similarity >= matches[1].similarity);
-        assert!(matches.iter().all(|m| m.candidate != ids[2]));
+        assert!(matches[0].cosine_similarity().value() >= matches[1].cosine_similarity().value());
+        assert!(matches.iter().all(|m| m.candidate() != ids[2]));
     }
 
     #[test]
@@ -1675,7 +1839,7 @@ mod tests {
         assert!(
             matches
                 .iter()
-                .all(|m| m.candidate == ids[0] || m.candidate == ids[1])
+                .all(|m| m.candidate() == ids[0] || m.candidate() == ids[1])
         );
     }
 
@@ -1789,7 +1953,7 @@ mod tests {
         assert!(
             matches
                 .iter()
-                .any(|candidate| candidate.candidate == ids[1])
+                .any(|candidate| candidate.candidate() == ids[1])
         );
     }
 
@@ -1820,8 +1984,8 @@ mod tests {
 
         let matches = db.query_for_relocalization(&descriptor_with_basis(0), 4);
         assert_eq!(matches.len(), 4);
-        assert_eq!(matches[0].candidate, ids[0]);
-        assert!(matches[0].similarity >= matches[1].similarity);
+        assert_eq!(matches[0].candidate(), ids[0]);
+        assert!(matches[0].cosine_similarity().value() >= matches[1].cosine_similarity().value());
     }
 
     #[test]
@@ -1872,7 +2036,11 @@ mod tests {
 
         let relocalization = db.query_for_relocalization(&descriptor_with_basis(3), 10);
         assert_eq!(relocalization.len(), 3);
-        assert!(relocalization.iter().all(|m| m.candidate != ids[1]));
+        assert!(
+            relocalization
+                .iter()
+                .all(|match_| match_.candidate() != ids[1])
+        );
     }
 
     #[test]
@@ -1888,8 +2056,8 @@ mod tests {
             .query_loop_candidates(ids[1], &descriptor_with_basis(1), 10)
             .expect("registered query keyframe");
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].query, ids[1]);
-        assert_eq!(matches[0].candidate, ids[0]);
+        assert_eq!(matches[0].query(), ids[1]);
+        assert_eq!(matches[0].candidate(), ids[0]);
     }
 
     #[test]
@@ -1906,11 +2074,11 @@ mod tests {
             .query_loop_candidates(ids[4], &descriptor_with_basis(4), 10)
             .expect("registered query keyframe");
         assert!(!matches.is_empty());
-        assert!(matches.iter().all(|m| m.query == ids[4]));
+        assert!(matches.iter().all(|m| m.query() == ids[4]));
         assert!(
             matches
                 .iter()
-                .all(|m| m.candidate != ids[1] && m.candidate != ids[3])
+                .all(|m| m.candidate() != ids[1] && m.candidate() != ids[3])
         );
     }
 
@@ -1981,7 +2149,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_candidate_verify_succeeds_on_synthetic_geometry() {
+    fn place_match_verify_succeeds_on_synthetic_geometry() {
         let (
             map,
             query_kf,
@@ -1991,11 +2159,7 @@ mod tests {
             intrinsics,
             query_pose_world,
         ) = make_loop_fixture();
-        let candidate = LoopCandidate {
-            query_kf,
-            match_kf,
-            similarity: 0.95,
-        };
+        let candidate = place_match(query_kf, match_kf);
         let verified = candidate
             .verify(
                 &query_keypoints,
@@ -2023,14 +2187,10 @@ mod tests {
     }
 
     #[test]
-    fn loop_candidate_verify_rejects_insufficient_inliers() {
+    fn place_match_verify_rejects_insufficient_inliers() {
         let (map, query_kf, match_kf, query_keypoints, correspondences, intrinsics, _) =
             make_loop_fixture();
-        let candidate = LoopCandidate {
-            query_kf,
-            match_kf,
-            similarity: 0.95,
-        };
+        let candidate = place_match(query_kf, match_kf);
         let err = candidate
             .verify(
                 &query_keypoints,
@@ -2048,13 +2208,9 @@ mod tests {
     }
 
     #[test]
-    fn loop_candidate_verify_propagates_pnp_failure() {
+    fn place_match_verify_propagates_map_failure() {
         let ids = make_keyframe_ids(1);
-        let candidate = LoopCandidate {
-            query_kf: ids[0],
-            match_kf: ids[0],
-            similarity: 0.5,
-        };
+        let candidate = place_match(ids[0], ids[0]);
         let map = SlamMap::new();
         let query_keypoints = vec![Keypoint { x: 10.0, y: 10.0 }; 4];
         let correspondences = vec![(0, 0), (1, 1), (2, 2), (3, 3)];
@@ -2077,15 +2233,11 @@ mod tests {
     }
 
     #[test]
-    fn loop_candidate_verify_rejects_out_of_bounds_query_index() {
+    fn place_match_verify_rejects_out_of_bounds_query_index() {
         let (map, query_kf, match_kf, query_keypoints, mut correspondences, intrinsics, _) =
             make_loop_fixture();
         correspondences[0].0 = query_keypoints.len();
-        let candidate = LoopCandidate {
-            query_kf,
-            match_kf,
-            similarity: 0.95,
-        };
+        let candidate = place_match(query_kf, match_kf);
 
         let error = candidate
             .verify(
@@ -2105,14 +2257,11 @@ mod tests {
     }
 
     #[test]
-    fn relocalization_candidate_verify_succeeds_without_map_mutation() {
+    fn relocalization_match_verify_succeeds_without_map_mutation() {
         let (map, _, match_kf, query_keypoints, correspondences, intrinsics, query_pose_world) =
             make_loop_fixture();
         let before_generation = map.generation();
-        let candidate = RelocalizationCandidate {
-            match_kf,
-            similarity: 0.91,
-        };
+        let candidate = relocalization_match(match_kf);
         let verified = candidate
             .verify(
                 &query_keypoints,
@@ -2139,7 +2288,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_empty_descriptors_returns_zero() {
+    fn aggregate_empty_descriptors_is_rejected() {
         let err = aggregate_global_descriptor(&[]).expect_err("empty descriptor set should fail");
         assert!(matches!(err, GlobalDescriptorError::EmptyInput));
     }
@@ -2177,8 +2326,7 @@ mod tests {
 
         assert!(descriptor.as_array().iter().all(|value| value.is_finite()));
         assert!((norm - 1.0).abs() < 1e-6, "normalized norm was {norm}");
-        let similarity = descriptor.cosine_similarity(&descriptor);
-        assert!(similarity.is_finite());
+        let similarity = descriptor.clamped_cosine_similarity(&descriptor).value();
         assert!((similarity - 1.0).abs() < 1e-6);
     }
 

@@ -595,10 +595,11 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
         DiagnosticEvent::LoopClosureDetected {
             query,
             match_kf,
-            similarity,
+            cosine_similarity,
         } => (
             format!(
-                "loop closure applied: query={query:?}, match={match_kf:?}, similarity={similarity:.3}"
+                "loop closure applied: query={query:?}, match={match_kf:?}, cosine_similarity={:.3}",
+                cosine_similarity.value()
             ),
             rerun::TextLogLevel::INFO,
         ),
@@ -1311,7 +1312,7 @@ mod tests {
         let _ = format_event(&DiagnosticEvent::LoopClosureDetected {
             query: crate::map::KeyframeId::default(),
             match_kf: crate::map::KeyframeId::default(),
-            similarity: 0.8,
+            cosine_similarity: crate::CosineSimilarity::try_new(0.8).expect("valid similarity"),
         });
         let _ = format_event(&DiagnosticEvent::LoopClosureRejected {
             reason: LoopClosureRejectReason::VerificationFailed,

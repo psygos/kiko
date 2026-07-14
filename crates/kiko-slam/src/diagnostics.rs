@@ -591,7 +591,7 @@ pub enum DiagnosticEvent {
     LoopClosureDetected {
         query: KeyframeId,
         match_kf: KeyframeId,
-        similarity: f32,
+        cosine_similarity: crate::CosineSimilarity,
     },
     LoopClosureRejected {
         reason: LoopClosureRejectReason,

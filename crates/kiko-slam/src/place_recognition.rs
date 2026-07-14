@@ -634,7 +634,7 @@ impl PlaceRecognition {
             } else {
                 pending
                     .candidates
-                    .retain(|candidate| candidate.candidate != keyframe_id);
+                    .retain(|candidate| candidate.candidate() != keyframe_id);
                 if pending.candidates.is_empty() {
                     self.pending_loop = None;
                 }
@@ -759,19 +759,23 @@ impl PlaceRecognition {
         self.database
             .set_descriptor(keyframe_id, global_descriptor, DescriptorSource::Bootstrap)
             .map_err(|source| BootstrapDescriptorError::Database { source })?;
-        candidates
-            .retain(|candidate| candidate.similarity >= self.loop_config.similarity_threshold());
+        candidates.retain(|candidate| {
+            candidate.cosine_similarity().value() >= self.loop_config.similarity_threshold()
+        });
 
         if candidates.is_empty() {
             self.loop_streak.clear();
             return Ok(());
         }
 
-        let present: HashSet<KeyframeId> = candidates.iter().map(|m| m.candidate).collect();
+        let present: HashSet<KeyframeId> = candidates
+            .iter()
+            .map(|candidate| candidate.candidate())
+            .collect();
         self.loop_streak
             .retain(|candidate, _| present.contains(candidate));
         for candidate in &candidates {
-            let streak = self.loop_streak.entry(candidate.candidate).or_insert(0);
+            let streak = self.loop_streak.entry(candidate.candidate()).or_insert(0);
             *streak = streak.saturating_add(1);
         }
 
@@ -783,7 +787,7 @@ impl PlaceRecognition {
             .into_iter()
             .filter(|candidate| {
                 self.loop_streak
-                    .get(&candidate.candidate)
+                    .get(&candidate.candidate())
                     .copied()
                     .unwrap_or(0)
                     >= self.loop_config.min_streak()

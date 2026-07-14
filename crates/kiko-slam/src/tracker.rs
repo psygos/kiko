@@ -20,9 +20,8 @@ use crate::frontend::{
 };
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
-    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, RelocalizationCandidate,
-    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
-    match_quantized_descriptors_for_loop,
+    LoopApplyError, LoopClosureConfig, LoopDetectError, RelocalizationConfig, VerifiedLoop,
+    aggregate_global_descriptor, match_quantized_descriptors_for_loop,
 };
 use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
@@ -3546,7 +3545,7 @@ impl SlamTracker {
         for candidate in pending.candidates {
             let correspondences = match match_quantized_descriptors_for_loop(
                 &query_quantized,
-                candidate.candidate,
+                candidate.candidate(),
                 self.global_map.map(),
                 config.descriptor_match_threshold(),
             ) {
@@ -3571,13 +3570,7 @@ impl SlamTracker {
                 continue;
             }
 
-            let loop_candidate = LoopCandidate {
-                query_kf: pending.query_kf,
-                match_kf: candidate.candidate,
-                similarity: candidate.similarity,
-            };
-
-            let verified = match loop_candidate.verify(
+            let verified = match candidate.verify(
                 pending.detections.keypoints(),
                 &correspondences,
                 self.global_map.map(),
@@ -3640,8 +3633,8 @@ impl SlamTracker {
             }
             self.emit_event(DiagnosticEvent::LoopClosureDetected {
                 query: pending.query_kf,
-                match_kf: candidate.candidate,
-                similarity: candidate.similarity,
+                match_kf: candidate.candidate(),
+                cosine_similarity: candidate.cosine_similarity(),
             });
             return Ok(());
         }
@@ -3983,18 +3976,14 @@ impl SlamTracker {
         for candidate in candidates {
             let correspondences = match_quantized_descriptors_for_loop(
                 &query_quantized,
-                candidate.candidate,
+                candidate.candidate(),
                 self.global_map.map(),
                 cfg.descriptor_match_threshold(),
             )?;
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 continue;
             }
-            let relocalization_candidate = RelocalizationCandidate {
-                match_kf: candidate.candidate,
-                similarity: candidate.similarity,
-            };
-            let verified = match relocalization_candidate.verify(
+            let verified = match candidate.verify(
                 current.keypoints(),
                 &correspondences,
                 self.global_map.map(),
@@ -5833,7 +5822,7 @@ mod tests {
         events.push(DiagnosticEvent::LoopClosureDetected {
             query: KeyframeId::default(),
             match_kf: KeyframeId::default(),
-            similarity: 0.9,
+            cosine_similarity: crate::CosineSimilarity::try_new(0.9).expect("valid similarity"),
         });
 
         assert_eq!(
