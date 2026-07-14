@@ -116,11 +116,11 @@ pub use local_ba::{
     ObservationSetError, PoseBaError, PoseBaOutcome, PoseBaRefinement, PoseBaTermination,
 };
 pub use loop_closure::{
-    CosineSimilarity, CosineSimilarityError, DescriptorMatchError, DescriptorSource,
-    GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, KeyframeDatabaseError,
-    KeyframeDescriptorUpdate, LoopApplyError, LoopApplyErrorKind, LoopClosureConfig,
-    LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError, LoopVerificationError,
-    PlaceMatch, RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+    DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
+    KeyframeDatabase, KeyframeDatabaseError, KeyframeDescriptorUpdate, LoopApplyError,
+    LoopApplyErrorKind, LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput,
+    LoopDescriptorMatchResult, LoopDetectError, LoopVerificationError, PlaceMatch,
+    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
     RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
     match_descriptors_for_loop,
 };
@@ -572,6 +572,52 @@ pub struct Keypoint {
 pub const DESCRIPTOR_DIM: usize = 256;
 const U8_SCALE: f32 = 255.0;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CosineSimilarity(f32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CosineSimilarityError {
+    NonFinite { value: f32 },
+    OutOfRange { value: f32 },
+}
+
+impl std::fmt::Display for CosineSimilarityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { value } => {
+                write!(f, "cosine similarity must be finite, got {value}")
+            }
+            Self::OutOfRange { value } => {
+                write!(f, "cosine similarity must be in [-1, 1], got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CosineSimilarityError {}
+
+impl CosineSimilarity {
+    pub fn try_new(value: f32) -> Result<Self, CosineSimilarityError> {
+        if !value.is_finite() {
+            return Err(CosineSimilarityError::NonFinite { value });
+        }
+        if !(-1.0..=1.0).contains(&value) {
+            return Err(CosineSimilarityError::OutOfRange { value });
+        }
+        Ok(Self(value))
+    }
+
+    pub(crate) fn from_computed_clamped(value: f64) -> Self {
+        // Valid descriptor inputs make the quotient finite. Clamp only the
+        // floating-point summation error around the mathematical [-1, 1] domain.
+        Self(value.clamp(-1.0, 1.0) as f32)
+    }
+
+    pub fn value(self) -> f32 {
+        self.0
+    }
+}
+
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Descriptor(pub [f32; DESCRIPTOR_DIM]);
@@ -581,38 +627,66 @@ impl Descriptor {
         &self.0
     }
 
-    pub fn quantize(&self) -> CompactDescriptor {
+    pub fn try_quantize_clamped_unit_interval(
+        &self,
+    ) -> Result<CompactDescriptor, DescriptorQuantizationError> {
         let mut out = [0_u8; DESCRIPTOR_DIM];
         for (idx, value) in self.0.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(DescriptorQuantizationError::NonFiniteComponent {
+                    index: idx,
+                    value: *value,
+                });
+            }
             let clamped = value.clamp(0.0, 1.0);
             out[idx] = (clamped * U8_SCALE).round() as u8;
         }
-        CompactDescriptor(out)
+        Ok(CompactDescriptor(out))
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DescriptorQuantizationError {
+    NonFiniteComponent { index: usize, value: f32 },
+}
+
+impl std::fmt::Display for DescriptorQuantizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteComponent { index, value } => write!(
+                f,
+                "descriptor component {index} must be finite before clamped [0, 1] quantization, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DescriptorQuantizationError {}
 
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactDescriptor(pub [u8; DESCRIPTOR_DIM]);
 
 impl CompactDescriptor {
-    pub fn cosine_similarity(&self, other: &Self) -> f32 {
+    pub fn has_zero_norm(&self) -> bool {
+        self.0.iter().all(|&value| value == 0)
+    }
+
+    pub fn clamped_cosine_similarity(&self, other: &Self) -> Option<CosineSimilarity> {
         let (dot, norm_a, norm_b) = self.0.iter().zip(other.0.iter()).fold(
-            (0_u32, 0_u32, 0_u32),
+            (0_u64, 0_u64, 0_u64),
             |(dot, na, nb), (&a, &b)| {
-                let a = a as u32;
-                let b = b as u32;
-                (
-                    dot.saturating_add(a.saturating_mul(b)),
-                    na.saturating_add(a.saturating_mul(a)),
-                    nb.saturating_add(b.saturating_mul(b)),
-                )
+                let a = u64::from(a);
+                let b = u64::from(b);
+                (dot + a * b, na + a * a, nb + b * b)
             },
         );
         if norm_a == 0 || norm_b == 0 {
-            return 0.0;
+            return None;
         }
-        (dot as f32) / ((norm_a as f32).sqrt() * (norm_b as f32).sqrt())
+        Some(CosineSimilarity::from_computed_clamped(
+            dot as f64 / ((norm_a as f64).sqrt() * (norm_b as f64).sqrt()),
+        ))
     }
 }
 
@@ -1497,10 +1571,10 @@ mod tests {
 
     use super::map::SlamMap;
     use super::{
-        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, DownscaleError,
-        DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError, FrameId,
-        Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches, Point3, Pose, SensorId,
-        Timestamp, U8_SCALE,
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DescriptorQuantizationError, DetectionError,
+        Detections, DownscaleError, DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError,
+        FrameError, FrameId, Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches,
+        Point3, Pose, SensorId, Timestamp, U8_SCALE,
     };
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
@@ -1550,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn quantize_preserves_similarity_ordering() {
+    fn clamped_unit_interval_quantization_preserves_similarity_ordering() {
         let mut base = [0.0_f32; DESCRIPTOR_DIM];
         let mut close = [0.0_f32; DESCRIPTOR_DIM];
         let mut far = [0.0_f32; DESCRIPTOR_DIM];
@@ -1568,12 +1642,59 @@ mod tests {
         let float_far = cosine_f32(&base, &far);
         assert!(float_close > float_far);
 
-        let q_base = base.quantize();
-        let q_close = close.quantize();
-        let q_far = far.quantize();
-        let quant_close = q_base.cosine_similarity(&q_close);
-        let quant_far = q_base.cosine_similarity(&q_far);
+        let q_base = base
+            .try_quantize_clamped_unit_interval()
+            .expect("finite descriptor");
+        let q_close = close
+            .try_quantize_clamped_unit_interval()
+            .expect("finite descriptor");
+        let q_far = far
+            .try_quantize_clamped_unit_interval()
+            .expect("finite descriptor");
+        let quant_close = q_base
+            .clamped_cosine_similarity(&q_close)
+            .expect("nonzero descriptors")
+            .value();
+        let quant_far = q_base
+            .clamped_cosine_similarity(&q_far)
+            .expect("nonzero descriptors")
+            .value();
         assert!(quant_close > quant_far);
+    }
+
+    #[test]
+    fn clamped_unit_interval_quantization_clamps_both_bounds() {
+        let mut values = [0.5; DESCRIPTOR_DIM];
+        values[0] = -0.25;
+        values[1] = 1.25;
+
+        let quantized = Descriptor(values)
+            .try_quantize_clamped_unit_interval()
+            .expect("finite descriptor");
+
+        assert_eq!(quantized.0[0], 0);
+        assert_eq!(quantized.0[1], u8::MAX);
+        assert_eq!(quantized.0[2], 128);
+    }
+
+    #[test]
+    fn clamped_unit_interval_quantization_rejects_nonfinite_components() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut values = [0.5; DESCRIPTOR_DIM];
+            values[17] = value;
+
+            let error = Descriptor(values)
+                .try_quantize_clamped_unit_interval()
+                .expect_err("nonfinite descriptor component must be rejected");
+
+            assert!(matches!(
+                error,
+                DescriptorQuantizationError::NonFiniteComponent {
+                    index: 17,
+                    value: actual
+                } if actual.to_bits() == value.to_bits()
+            ));
+        }
     }
 
     #[test]
@@ -1808,7 +1929,10 @@ mod tests {
         }
         let a = CompactDescriptor(data);
         let b = CompactDescriptor(data);
-        let sim = a.cosine_similarity(&b);
+        let sim = a
+            .clamped_cosine_similarity(&b)
+            .expect("nonzero descriptors")
+            .value();
         assert!((sim - 1.0).abs() < 1e-6, "sim={sim}");
     }
 
@@ -1822,8 +1946,22 @@ mod tests {
         for value in b.iter_mut().skip(128) {
             *value = 255;
         }
-        let sim = CompactDescriptor(a).cosine_similarity(&CompactDescriptor(b));
+        let sim = CompactDescriptor(a)
+            .clamped_cosine_similarity(&CompactDescriptor(b))
+            .expect("nonzero descriptors")
+            .value();
         assert!(sim.abs() < 1e-6, "sim={sim}");
+    }
+
+    #[test]
+    fn compact_descriptor_cosine_is_undefined_for_zero_norm() {
+        let zero = CompactDescriptor([0; DESCRIPTOR_DIM]);
+        let nonzero = CompactDescriptor([1; DESCRIPTOR_DIM]);
+        assert!(zero.has_zero_norm());
+        assert!(!nonzero.has_zero_norm());
+        assert_eq!(zero.clamped_cosine_similarity(&nonzero), None);
+        assert_eq!(nonzero.clamped_cosine_similarity(&zero), None);
+        assert_eq!(zero.clamped_cosine_similarity(&zero), None);
     }
 
     #[test]

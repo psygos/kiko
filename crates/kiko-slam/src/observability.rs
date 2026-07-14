@@ -603,6 +603,16 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             ),
             rerun::TextLogLevel::INFO,
         ),
+        DiagnosticEvent::LoopDescriptorMatchDegraded {
+            candidate_keyframe,
+            zero_norm_query_descriptors,
+            zero_norm_candidate_descriptors,
+        } => (
+            format!(
+                "loop descriptor matching skipped undefined cosine comparisons (candidate={candidate_keyframe:?}, zero_norm_query_descriptors={zero_norm_query_descriptors}, zero_norm_candidate_descriptors={zero_norm_candidate_descriptors})"
+            ),
+            rerun::TextLogLevel::WARN,
+        ),
         DiagnosticEvent::LoopClosureRejected { reason } => {
             let reason_text = match reason {
                 LoopClosureRejectReason::TooFewCorrespondences { count } => {
@@ -1313,6 +1323,11 @@ mod tests {
             query: crate::map::KeyframeId::default(),
             match_kf: crate::map::KeyframeId::default(),
             cosine_similarity: crate::CosineSimilarity::try_new(0.8).expect("valid similarity"),
+        });
+        let _ = format_event(&DiagnosticEvent::LoopDescriptorMatchDegraded {
+            candidate_keyframe: crate::map::KeyframeId::default(),
+            zero_norm_query_descriptors: 1,
+            zero_norm_candidate_descriptors: 2,
         });
         let _ = format_event(&DiagnosticEvent::LoopClosureRejected {
             reason: LoopClosureRejectReason::VerificationFailed,

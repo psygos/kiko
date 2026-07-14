@@ -4,9 +4,10 @@ use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
 use crate::pose_graph::{EssentialGraphError, PoseGraphError};
 use crate::{
-    CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
-    RansacConfig, RansacConfigError, solve_pnp_ransac,
+    CompactDescriptor, Descriptor, DescriptorQuantizationError, Keypoint, Observation,
+    PinholeIntrinsics, PnpError, Pose, RansacConfig, RansacConfigError, solve_pnp_ransac,
 };
+pub use crate::{CosineSimilarity, CosineSimilarityError};
 
 pub(crate) const GLOBAL_DESCRIPTOR_DIM: usize = crate::DESCRIPTOR_DIM * 2;
 
@@ -665,52 +666,6 @@ impl std::fmt::Display for GlobalDescriptorError {
 
 impl std::error::Error for GlobalDescriptorError {}
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CosineSimilarity(f32);
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CosineSimilarityError {
-    NonFinite { value: f32 },
-    OutOfRange { value: f32 },
-}
-
-impl std::fmt::Display for CosineSimilarityError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NonFinite { value } => {
-                write!(f, "cosine similarity must be finite, got {value}")
-            }
-            Self::OutOfRange { value } => {
-                write!(f, "cosine similarity must be in [-1, 1], got {value}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CosineSimilarityError {}
-
-impl CosineSimilarity {
-    pub fn try_new(value: f32) -> Result<Self, CosineSimilarityError> {
-        if !value.is_finite() {
-            return Err(CosineSimilarityError::NonFinite { value });
-        }
-        if !(-1.0..=1.0).contains(&value) {
-            return Err(CosineSimilarityError::OutOfRange { value });
-        }
-        Ok(Self(value))
-    }
-
-    fn from_computed_clamped(value: f64) -> Self {
-        // Valid descriptor inputs make the quotient finite. Clamp only the
-        // floating-point summation error around the mathematical [-1, 1] domain.
-        Self(value.clamp(-1.0, 1.0) as f32)
-    }
-
-    pub fn value(self) -> f32 {
-        self.0
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlobalDescriptor {
     values: [f32; GLOBAL_DESCRIPTOR_DIM],
@@ -800,15 +755,62 @@ pub fn match_descriptors_for_loop(
     candidate_kf: KeyframeId,
     map: &SlamMap,
     similarity_threshold: f32,
-) -> Result<Vec<(usize, usize)>, DescriptorMatchError> {
-    let query_quantized: Vec<CompactDescriptor> =
-        query_descriptors.iter().map(Descriptor::quantize).collect();
+) -> Result<LoopDescriptorMatchResult, DescriptorMatchError> {
+    let query_quantized = quantize_loop_descriptors(query_descriptors)?;
     match_quantized_descriptors_for_loop(&query_quantized, candidate_kf, map, similarity_threshold)
+}
+
+pub(crate) fn quantize_loop_descriptors(
+    descriptors: &[Descriptor],
+) -> Result<Vec<CompactDescriptor>, DescriptorMatchError> {
+    descriptors
+        .iter()
+        .enumerate()
+        .map(|(descriptor_index, descriptor)| {
+            descriptor
+                .try_quantize_clamped_unit_interval()
+                .map_err(|source| DescriptorMatchError::Quantization {
+                    descriptor_index,
+                    source,
+                })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopDescriptorMatchResult {
+    correspondences: Vec<(usize, usize)>,
+    zero_norm_query_descriptors: usize,
+    zero_norm_candidate_descriptors: usize,
+}
+
+impl LoopDescriptorMatchResult {
+    pub fn correspondences(&self) -> &[(usize, usize)] {
+        &self.correspondences
+    }
+
+    pub fn into_correspondences(self) -> Vec<(usize, usize)> {
+        self.correspondences
+    }
+
+    pub fn zero_norm_query_descriptors(&self) -> usize {
+        self.zero_norm_query_descriptors
+    }
+
+    pub fn zero_norm_candidate_descriptors(&self) -> usize {
+        self.zero_norm_candidate_descriptors
+    }
 }
 
 #[derive(Debug)]
 pub enum DescriptorMatchError {
-    InvalidSimilarityThreshold { value: f32 },
+    InvalidSimilarityThreshold {
+        value: f32,
+    },
+    Quantization {
+        descriptor_index: usize,
+        source: DescriptorQuantizationError,
+    },
     Map(MapError),
 }
 
@@ -819,6 +821,13 @@ impl std::fmt::Display for DescriptorMatchError {
                 f,
                 "descriptor similarity threshold must be finite and in (0, 1], got {value}"
             ),
+            Self::Quantization {
+                descriptor_index,
+                source,
+            } => write!(
+                f,
+                "loop query descriptor {descriptor_index} quantization failed: {source}"
+            ),
             Self::Map(source) => write!(f, "descriptor matching map lookup failed: {source}"),
         }
     }
@@ -827,6 +836,7 @@ impl std::fmt::Display for DescriptorMatchError {
 impl std::error::Error for DescriptorMatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Quantization { source, .. } => Some(source),
             Self::Map(source) => Some(source),
             Self::InvalidSimilarityThreshold { .. } => None,
         }
@@ -844,7 +854,7 @@ pub(crate) fn match_quantized_descriptors_for_loop(
     candidate_kf: KeyframeId,
     map: &SlamMap,
     similarity_threshold: f32,
-) -> Result<Vec<(usize, usize)>, DescriptorMatchError> {
+) -> Result<LoopDescriptorMatchResult, DescriptorMatchError> {
     if !similarity_threshold.is_finite()
         || similarity_threshold <= 0.0
         || similarity_threshold > 1.0
@@ -853,22 +863,34 @@ pub(crate) fn match_quantized_descriptors_for_loop(
             value: similarity_threshold,
         });
     }
-    if query_quantized.is_empty() {
-        return Ok(Vec::new());
-    }
+    let zero_norm_query_descriptors = query_quantized
+        .iter()
+        .filter(|descriptor| descriptor.has_zero_norm())
+        .count();
 
     let mut candidate_count = 0usize;
-    map.for_each_keyframe_point_descriptor(candidate_kf, |_, _| {
-        candidate_count = candidate_count.saturating_add(1);
+    let mut zero_norm_candidate_descriptors = 0usize;
+    map.for_each_keyframe_point_descriptor(candidate_kf, |_, descriptor| {
+        candidate_count += 1;
+        if descriptor.has_zero_norm() {
+            zero_norm_candidate_descriptors += 1;
+        }
     })?;
-    if candidate_count == 0 {
-        return Ok(Vec::new());
+    if query_quantized.is_empty() || candidate_count == 0 {
+        return Ok(LoopDescriptorMatchResult {
+            correspondences: Vec::new(),
+            zero_norm_query_descriptors,
+            zero_norm_candidate_descriptors,
+        });
     }
 
     let mut query_best: Vec<Option<(usize, f32)>> = vec![None; query_quantized.len()];
     map.for_each_keyframe_point_descriptor(candidate_kf, |keypoint, descriptor| {
         for (query_idx, query_descriptor) in query_quantized.iter().enumerate() {
-            let similarity = query_descriptor.cosine_similarity(descriptor);
+            let Some(similarity) = query_descriptor.clamped_cosine_similarity(descriptor) else {
+                continue;
+            };
+            let similarity = similarity.value();
             if similarity < similarity_threshold {
                 continue;
             }
@@ -885,7 +907,10 @@ pub(crate) fn match_quantized_descriptors_for_loop(
     map.for_each_keyframe_point_descriptor(candidate_kf, |keypoint, descriptor| {
         let mut best_query: Option<(usize, f32)> = None;
         for (query_idx, query_descriptor) in query_quantized.iter().enumerate() {
-            let similarity = query_descriptor.cosine_similarity(descriptor);
+            let Some(similarity) = query_descriptor.clamped_cosine_similarity(descriptor) else {
+                continue;
+            };
+            let similarity = similarity.value();
             if similarity < similarity_threshold {
                 continue;
             }
@@ -904,7 +929,11 @@ pub(crate) fn match_quantized_descriptors_for_loop(
             correspondences.push((query_idx, keypoint.index()));
         }
     })?;
-    Ok(correspondences)
+    Ok(LoopDescriptorMatchResult {
+        correspondences,
+        zero_norm_query_descriptors,
+        zero_norm_candidate_descriptors,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1448,18 +1477,18 @@ impl RelocalizationMatch {
 #[cfg(test)]
 mod tests {
     use super::{
-        CosineSimilarity, CosineSimilarityError, DescriptorMatchError, DescriptorSource,
-        GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, KeyframeDatabaseError,
-        KeyframeDescriptorUpdate, LoopApplyError, LoopApplyErrorKind, LoopClosureConfig,
-        LoopClosureConfigInput, LoopVerificationError, PlaceMatch, RelocalizationConfig,
-        RelocalizationConfigError, RelocalizationConfigInput, RelocalizationMatch,
-        aggregate_global_descriptor, match_descriptors_for_loop,
+        DescriptorMatchError, DescriptorSource, GlobalDescriptor, GlobalDescriptorError,
+        KeyframeDatabase, KeyframeDatabaseError, KeyframeDescriptorUpdate, LoopApplyError,
+        LoopApplyErrorKind, LoopClosureConfig, LoopClosureConfigInput, LoopVerificationError,
+        PlaceMatch, RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+        RelocalizationMatch, aggregate_global_descriptor, match_descriptors_for_loop,
     };
     use crate::map::{KeyframeId, MapError, SlamMap};
     use crate::pose_graph::PoseGraphError;
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
     use crate::{
-        CompactDescriptor, Descriptor, FrameDimensions, FrameId, Keypoint, Point3, Pose,
+        CompactDescriptor, CosineSimilarity, CosineSimilarityError, Descriptor,
+        DescriptorQuantizationError, FrameDimensions, FrameId, Keypoint, Point3, Pose,
         RansacConfig, Timestamp,
     };
     use std::error::Error as _;
@@ -2373,7 +2402,9 @@ mod tests {
                 y: 0.0,
                 z: 3.0,
             },
-            query[0].quantize(),
+            query[0]
+                .try_quantize_clamped_unit_interval()
+                .expect("finite descriptor"),
             kp0,
         )
         .expect("point0");
@@ -2384,16 +2415,61 @@ mod tests {
                 y: 0.0,
                 z: 3.0,
             },
-            query[1].quantize(),
+            query[1]
+                .try_quantize_clamped_unit_interval()
+                .expect("finite descriptor"),
             kp1,
         )
         .expect("point1");
 
         let matches =
             match_descriptors_for_loop(&query, kf, &map, 0.95).expect("descriptor matches");
-        assert_eq!(matches.len(), 2);
-        assert!(matches.contains(&(0, 0)));
-        assert!(matches.contains(&(1, 1)));
+        assert_eq!(matches.correspondences().len(), 2);
+        assert!(matches.correspondences().contains(&(0, 0)));
+        assert!(matches.correspondences().contains(&(1, 1)));
+        assert_eq!(matches.zero_norm_query_descriptors(), 0);
+        assert_eq!(matches.zero_norm_candidate_descriptors(), 0);
+    }
+
+    #[test]
+    fn match_descriptors_reports_zero_norm_skips_without_fabricating_similarity() {
+        let mut map = SlamMap::new();
+        let image_size = FrameDimensions::try_new(80, 60).expect("image size");
+        let keyframe = map
+            .add_keyframe(
+                FrameId::new(12),
+                Timestamp::from_nanos(12),
+                Pose::identity(),
+                image_size,
+                vec![Keypoint { x: 20.0, y: 20.0 }, Keypoint { x: 40.0, y: 20.0 }],
+            )
+            .expect("keyframe");
+        let zero = Descriptor([0.0; crate::DESCRIPTOR_DIM]);
+        let mut basis_values = [0.0; crate::DESCRIPTOR_DIM];
+        basis_values[7] = 1.0;
+        let basis = Descriptor(basis_values);
+        for (index, descriptor) in [zero, basis].iter().enumerate() {
+            let keypoint = map.keyframe_keypoint(keyframe, index).expect("keypoint");
+            map.add_map_point(
+                Point3 {
+                    x: index as f32 * 0.1,
+                    y: 0.0,
+                    z: 3.0,
+                },
+                descriptor
+                    .try_quantize_clamped_unit_interval()
+                    .expect("finite descriptor"),
+                keypoint,
+            )
+            .expect("map point");
+        }
+
+        let result = match_descriptors_for_loop(&[zero, basis], keyframe, &map, 0.95)
+            .expect("descriptor matching");
+
+        assert_eq!(result.correspondences(), [(1, 1)]);
+        assert_eq!(result.zero_norm_query_descriptors(), 1);
+        assert_eq!(result.zero_norm_candidate_descriptors(), 1);
     }
 
     #[test]
@@ -2430,14 +2506,16 @@ mod tests {
                 y: 0.1,
                 z: 3.0,
             },
-            query[1].quantize(),
+            query[1]
+                .try_quantize_clamped_unit_interval()
+                .expect("finite descriptor"),
             only_observed,
         )
         .expect("point");
 
         let matches =
             match_descriptors_for_loop(&query, kf, &map, 0.95).expect("descriptor matches");
-        assert_eq!(matches, vec![(1, 1)]);
+        assert_eq!(matches.correspondences(), [(1, 1)]);
     }
 
     #[test]
@@ -2453,6 +2531,29 @@ mod tests {
             DescriptorMatchError::Map(MapError::KeyframeNotFound(_))
         ));
         assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn match_descriptors_propagates_quantization_error_with_source() {
+        let map = SlamMap::new();
+        let mut query = [0.0_f32; 256];
+        query[7] = f32::NAN;
+
+        let error =
+            match_descriptors_for_loop(&[Descriptor(query)], KeyframeId::default(), &map, 0.95)
+                .expect_err("nonfinite query descriptor must fail before map lookup");
+
+        assert!(matches!(
+            error,
+            DescriptorMatchError::Quantization {
+                descriptor_index: 0,
+                source: DescriptorQuantizationError::NonFiniteComponent {
+                    index: 7,
+                    value,
+                },
+            } if value.is_nan()
+        ));
+        assert!(error.source().is_some());
     }
 
     #[test]

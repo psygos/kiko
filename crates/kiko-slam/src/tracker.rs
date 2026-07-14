@@ -21,7 +21,7 @@ use crate::frontend::{
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
     LoopApplyError, LoopClosureConfig, LoopDetectError, RelocalizationConfig, VerifiedLoop,
-    aggregate_global_descriptor, match_quantized_descriptors_for_loop,
+    aggregate_global_descriptor, match_quantized_descriptors_for_loop, quantize_loop_descriptors,
 };
 use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
@@ -1701,6 +1701,10 @@ pub enum TrackerError {
     EssentialGraph(EssentialGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
+    DescriptorQuantization {
+        detection_index: usize,
+        source: crate::DescriptorQuantizationError,
+    },
     DescriptorMatch(DescriptorMatchError),
     LoopVerification(LoopVerificationError),
     LoopClosure(LoopDetectError),
@@ -1743,6 +1747,13 @@ impl std::fmt::Display for TrackerError {
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
+            TrackerError::DescriptorQuantization {
+                detection_index,
+                source,
+            } => write!(
+                f,
+                "detection {detection_index} descriptor quantization failed: {source}"
+            ),
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
@@ -1781,6 +1792,7 @@ impl std::error::Error for TrackerError {
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
+            TrackerError::DescriptorQuantization { source, .. } => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::LoopVerification(source) => Some(source),
             TrackerError::LoopClosure(source) => Some(source),
@@ -3534,16 +3546,14 @@ impl SlamTracker {
         let Some(pending) = place_recognition.take_pending_loop() else {
             return Ok(());
         };
-        let query_quantized: Vec<_> = pending
-            .detections
-            .descriptors()
-            .iter()
-            .map(crate::Descriptor::quantize)
-            .collect();
+        let query_quantized =
+            quantize_loop_descriptors(pending.detections.descriptors()).map_err(|source| {
+                LoopDetectError::VerificationFailed(LoopVerificationError::DescriptorMatch(source))
+            })?;
 
         let mut first_rejection: Option<LoopDetectError> = None;
         for candidate in pending.candidates {
-            let correspondences = match match_quantized_descriptors_for_loop(
+            let match_result = match match_quantized_descriptors_for_loop(
                 &query_quantized,
                 candidate.candidate(),
                 self.global_map.map(),
@@ -3560,6 +3570,8 @@ impl SlamTracker {
                     return Err(error);
                 }
             };
+            self.report_loop_descriptor_match_degradation(candidate.candidate(), &match_result);
+            let correspondences = match_result.into_correspondences();
 
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 if first_rejection.is_none() {
@@ -3947,7 +3959,7 @@ impl SlamTracker {
     }
 
     fn relocalization_candidate(
-        &self,
+        &mut self,
         current: &Detections,
         cfg: RelocalizationConfig,
     ) -> Result<Option<crate::loop_closure::VerifiedRelocalization>, TrackerError> {
@@ -3968,18 +3980,16 @@ impl SlamTracker {
         };
         let candidates =
             place_recognition.relocalization_matches(&global_descriptor, cfg.max_candidates());
-        let query_quantized: Vec<_> = current
-            .descriptors()
-            .iter()
-            .map(crate::Descriptor::quantize)
-            .collect();
+        let query_quantized = quantize_loop_descriptors(current.descriptors())?;
         for candidate in candidates {
-            let correspondences = match_quantized_descriptors_for_loop(
+            let match_result = match_quantized_descriptors_for_loop(
                 &query_quantized,
                 candidate.candidate(),
                 self.global_map.map(),
                 cfg.descriptor_match_threshold(),
             )?;
+            self.report_loop_descriptor_match_degradation(candidate.candidate(), &match_result);
+            let correspondences = match_result.into_correspondences();
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 continue;
             }
@@ -3998,6 +4008,23 @@ impl SlamTracker {
             return Ok(Some(verified));
         }
         Ok(None)
+    }
+
+    fn report_loop_descriptor_match_degradation(
+        &mut self,
+        candidate_keyframe: KeyframeId,
+        result: &crate::LoopDescriptorMatchResult,
+    ) {
+        let zero_norm_query_descriptors = result.zero_norm_query_descriptors();
+        let zero_norm_candidate_descriptors = result.zero_norm_candidate_descriptors();
+        if zero_norm_query_descriptors == 0 && zero_norm_candidate_descriptors == 0 {
+            return;
+        }
+        self.emit_event(DiagnosticEvent::LoopDescriptorMatchDegraded {
+            candidate_keyframe,
+            zero_norm_query_descriptors,
+            zero_norm_candidate_descriptors,
+        });
     }
 
     fn relocalization_step(
@@ -5352,7 +5379,12 @@ fn insert_keyframe_into_candidate(
         if map.map_point_for_keypoint(keypoint_ref)?.is_some() {
             continue;
         }
-        let descriptor = keyframe.detections().descriptors()[det_idx].quantize();
+        let descriptor = keyframe.detections().descriptors()[det_idx]
+            .try_quantize_clamped_unit_interval()
+            .map_err(|source| TrackerError::DescriptorQuantization {
+                detection_index: det_idx,
+                source,
+            })?;
         let world = camera_to_world(pose_world, *landmark);
         map.add_map_point(world, descriptor, keypoint_ref)?;
     }
@@ -5653,6 +5685,22 @@ mod tests {
     }
 
     #[test]
+    fn tracker_error_preserves_descriptor_quantization_context_and_source() {
+        let error = TrackerError::DescriptorQuantization {
+            detection_index: 4,
+            source: crate::DescriptorQuantizationError::NonFiniteComponent {
+                index: 17,
+                value: f32::NAN,
+            },
+        };
+
+        assert!(error.to_string().contains("detection 4"));
+        let source = error.source().expect("descriptor quantization source");
+        assert!(source.to_string().contains("component 17"));
+        assert!(source.source().is_none());
+    }
+
+    #[test]
     fn tracker_init_error_preserves_descriptor_thread_source_chain() {
         let error = TrackerInitError::Descriptor {
             source: DescriptorInitError::WorkerThread {
@@ -5919,7 +5967,9 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor().quantize(),
+                make_descriptor()
+                    .try_quantize_clamped_unit_interval()
+                    .expect("finite descriptor"),
                 keypoint,
             )
             .expect("map point");
@@ -5999,7 +6049,9 @@ mod tests {
                 keyframe
                     .landmark_for_detection(det_idx)
                     .expect("landmark for detection"),
-                make_descriptor().quantize(),
+                make_descriptor()
+                    .try_quantize_clamped_unit_interval()
+                    .expect("finite descriptor"),
                 keypoint_ref,
             )
             .expect("map point");
@@ -6119,7 +6171,9 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor().quantize(),
+                make_descriptor()
+                    .try_quantize_clamped_unit_interval()
+                    .expect("finite descriptor"),
                 kp_a,
             )
             .expect("point");

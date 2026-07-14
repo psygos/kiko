@@ -593,6 +593,11 @@ pub enum DiagnosticEvent {
         match_kf: KeyframeId,
         cosine_similarity: crate::CosineSimilarity,
     },
+    LoopDescriptorMatchDegraded {
+        candidate_keyframe: KeyframeId,
+        zero_norm_query_descriptors: usize,
+        zero_norm_candidate_descriptors: usize,
+    },
     LoopClosureRejected {
         reason: LoopClosureRejectReason,
     },
@@ -855,6 +860,11 @@ mod tests {
             DiagnosticEvent::TrackingRecovered,
             DiagnosticEvent::LoopClosureRejected {
                 reason: LoopClosureRejectReason::VerificationFailed,
+            },
+            DiagnosticEvent::LoopDescriptorMatchDegraded {
+                candidate_keyframe: crate::KeyframeId::default(),
+                zero_norm_query_descriptors: 1,
+                zero_norm_candidate_descriptors: 2,
             },
             DiagnosticEvent::BackendWorkerDied {
                 respawn_count: 1,
