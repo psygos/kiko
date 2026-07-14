@@ -1324,6 +1324,13 @@ struct BaFrame {
 #[cfg(feature = "vio")]
 const VIO_STATE_DIM: usize = 15;
 #[cfg(feature = "vio")]
+const DEFAULT_VIO_WINDOW_FRAMES: usize = 5;
+#[cfg(feature = "vio")]
+const DEFAULT_VIO_STATE_DIMENSION: usize = DEFAULT_VIO_WINDOW_FRAMES * VIO_STATE_DIM;
+#[cfg(feature = "vio")]
+const DEFAULT_VIO_MATRIX_ELEMENTS: usize =
+    DEFAULT_VIO_STATE_DIMENSION * DEFAULT_VIO_STATE_DIMENSION;
+#[cfg(feature = "vio")]
 const VIO_REPROJECTION_TRANSLATION_FD_STEP_M: f64 = 1e-4;
 #[cfg(feature = "vio")]
 const VIO_REPROJECTION_ROTATION_FD_STEP_RAD: f64 = 1e-4;
@@ -1453,6 +1460,19 @@ impl VioWindowCapacity {
 
     pub fn frames(self) -> NonZeroUsize {
         self.frames
+    }
+}
+
+#[cfg(feature = "vio")]
+impl Default for VioWindowCapacity {
+    fn default() -> Self {
+        Self {
+            frames: NonZeroUsize::MIN.saturating_add(DEFAULT_VIO_WINDOW_FRAMES - 1),
+            workspace: DenseWorkspaceShape {
+                dimension: DEFAULT_VIO_STATE_DIMENSION,
+                matrix_elements: DEFAULT_VIO_MATRIX_ELEMENTS,
+            },
+        }
     }
 }
 
@@ -7262,6 +7282,11 @@ mod tests {
         assert_eq!(
             capacity.workspace.matrix_elements,
             25 * VIO_STATE_DIM * VIO_STATE_DIM
+        );
+        assert_eq!(
+            VioWindowCapacity::default(),
+            VioWindowCapacity::new(DEFAULT_VIO_WINDOW_FRAMES)
+                .expect("default window must satisfy the public invariant")
         );
     }
 

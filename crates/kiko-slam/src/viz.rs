@@ -773,17 +773,6 @@ struct SurfacePoseQualityGate {
     max_accepted_inlier_reprojection_rmse_px: crate::PnpAcceptedInlierPixelResidualMetric,
 }
 
-impl Default for SurfacePoseQualityGate {
-    fn default() -> Self {
-        Self {
-            min_accepted_inliers: crate::PnpAcceptedInlierCountMetric::new(8),
-            max_accepted_inlier_reprojection_rmse_px:
-                crate::PnpAcceptedInlierPixelResidualMetric::new(1.5)
-                    .expect("default accepted-inlier reprojection RMSE gate must be lawful"),
-        }
-    }
-}
-
 impl SurfacePoseQualityGate {
     fn try_new(
         min_accepted_inliers: usize,
@@ -804,7 +793,7 @@ impl SurfacePoseQualityGate {
     }
 
     fn try_from_env() -> Result<Self, RerunSinkInitError> {
-        let mut gate = Self::default();
+        let mut gate = Self::try_new(8, 1.5)?;
         if let Some(count) = viz_env(
             "KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS",
             crate::env::try_env_usize("KIKO_SURFACE_MIN_PROJECTABLE_TRACKED_OBSERVATIONS"),
@@ -1396,13 +1385,10 @@ struct TrajectoryLog {
 
 impl TrajectoryLog {
     fn push(&mut self, position: [f32; 3]) {
-        if self.strips.last().is_none_or(Vec::is_empty) {
-            self.strips.push(Vec::new());
+        match self.strips.last_mut() {
+            Some(strip) => strip.push(position),
+            None => self.strips.push(vec![position]),
         }
-        self.strips
-            .last_mut()
-            .expect("trajectory strip exists")
-            .push(position);
     }
 
     fn break_strip(&mut self) {
@@ -1746,8 +1732,9 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 mod tests {
     use super::{
         RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
-        TrackConfig, VizDecimation, VizDecimationError, resolve_track_min_descriptor_dot_product,
-        surface_integration_scalars, surface_pose_quality_scalars, surface_summary_scalars,
+        TrackConfig, TrajectoryLog, VizDecimation, VizDecimationError,
+        resolve_track_min_descriptor_dot_product, surface_integration_scalars,
+        surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
         Frame, FrameDiagnostics, FrameId, Pose, RectifiedRowMismatchPx, SensorId,
@@ -1764,6 +1751,25 @@ mod tests {
             RectifiedRowMismatchPx::new(0.0).expect("row mismatch"),
         )
         .expect("stable surface point")
+    }
+
+    fn default_surface_pose_quality_gate() -> SurfacePoseQualityGate {
+        SurfacePoseQualityGate::try_new(8, 1.5).expect("valid test pose-quality gate")
+    }
+
+    #[test]
+    fn trajectory_break_reuses_one_empty_strip() {
+        let mut trajectory = TrajectoryLog::default();
+        trajectory.push([1.0, 2.0, 3.0]);
+        trajectory.break_strip();
+        trajectory.break_strip();
+        trajectory.push([4.0, 5.0, 6.0]);
+
+        assert_eq!(
+            trajectory.strips,
+            vec![vec![[1.0, 2.0, 3.0]], vec![[4.0, 5.0, 6.0]]]
+        );
+        assert!(trajectory.strips.iter().all(|strip| !strip.is_empty()));
     }
 
     #[test]
@@ -1945,7 +1951,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_accepts_low_tracked_reprojection_rmse() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -1959,7 +1965,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_rejects_missing_accepted_inlier_reprojection_rmse() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
 
@@ -1971,7 +1977,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_rejects_missing_accepted_inliers() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let diagnostics = FrameDiagnostics::empty(0, 0);
 
         assert!(matches!(
@@ -1982,7 +1988,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_rejects_low_accepted_inliers() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(4));
 
@@ -1994,7 +2000,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_rejects_high_accepted_inlier_reprojection_rmse() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =
@@ -2008,7 +2014,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_rejects_degenerate_ba_result() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.ba_result = Some(crate::BaResult::Degenerate {
@@ -2027,7 +2033,7 @@ mod tests {
 
     #[test]
     fn surface_pose_quality_gate_rejects_stalled_ba_but_allows_stationary_ba() {
-        let gate = SurfacePoseQualityGate::default();
+        let gate = default_surface_pose_quality_gate();
         let mut diagnostics = FrameDiagnostics::empty(0, 0);
         diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
         diagnostics.pnp_inlier_reprojection_rmse_px =

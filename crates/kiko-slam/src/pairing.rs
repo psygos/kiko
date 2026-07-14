@@ -59,9 +59,17 @@ pub struct PairingStats {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingFramesCapacity(NonZeroUsize);
 
+const DEFAULT_PENDING_FRAMES_PER_SIDE: usize = 64;
+
 impl PendingFramesCapacity {
     pub fn get(self) -> usize {
         self.0.get()
+    }
+}
+
+impl Default for PendingFramesCapacity {
+    fn default() -> Self {
+        Self(NonZeroUsize::MIN.saturating_add(DEFAULT_PENDING_FRAMES_PER_SIDE - 1))
     }
 }
 
@@ -117,10 +125,7 @@ pub struct StereoPairer {
 
 impl StereoPairer {
     pub fn new(window: PairingWindowNs) -> Self {
-        Self::new_with_max_pending(
-            window,
-            PendingFramesCapacity::try_from(64).expect("non-zero default capacity"),
-        )
+        Self::new_with_max_pending(window, PendingFramesCapacity::default())
     }
 
     pub fn new_with_max_pending(
@@ -282,6 +287,15 @@ mod tests {
 
         assert_eq!(pairer.stats().dropped_left, 1);
         assert_eq!(pairer.max_pending_per_side().get(), 2);
+    }
+
+    #[test]
+    fn default_pending_capacity_matches_the_validated_public_constructor() {
+        assert_eq!(
+            PendingFramesCapacity::default(),
+            PendingFramesCapacity::try_from(DEFAULT_PENDING_FRAMES_PER_SIDE)
+                .expect("default capacity must satisfy the public invariant")
+        );
     }
 
     #[test]

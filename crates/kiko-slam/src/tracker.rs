@@ -91,6 +91,10 @@ pub struct TrackerRuntimeConfig {
     vio_max_iterations: NonZeroUsize,
 }
 
+const DEFAULT_CULL_MIN_OBSERVATIONS: NonZeroUsize = NonZeroUsize::MIN;
+#[cfg(feature = "vio")]
+const DEFAULT_VIO_MAX_ITERATIONS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackerRuntimeConfigError {
     RespawnLimitTooLarge {
@@ -161,10 +165,9 @@ impl TrackerRuntimeConfig {
             cull_min_observations: NonZeroUsize::new(cull_min_observations)
                 .ok_or(TrackerRuntimeConfigError::ZeroCullMinimum)?,
             #[cfg(feature = "vio")]
-            vio_window_capacity: crate::VioWindowCapacity::new(5)
-                .expect("default VIO window capacity is valid"),
+            vio_window_capacity: crate::VioWindowCapacity::default(),
             #[cfg(feature = "vio")]
-            vio_max_iterations: NonZeroUsize::new(3).expect("literal is non-zero"),
+            vio_max_iterations: DEFAULT_VIO_MAX_ITERATIONS,
         })
     }
 
@@ -214,12 +217,11 @@ impl Default for TrackerRuntimeConfig {
             backend_max_respawns: 3,
             descriptor_max_respawns: 3,
             trace_transitions: false,
-            cull_min_observations: NonZeroUsize::new(1).expect("literal is non-zero"),
+            cull_min_observations: DEFAULT_CULL_MIN_OBSERVATIONS,
             #[cfg(feature = "vio")]
-            vio_window_capacity: crate::VioWindowCapacity::new(5)
-                .expect("default VIO window capacity is valid"),
+            vio_window_capacity: crate::VioWindowCapacity::default(),
             #[cfg(feature = "vio")]
-            vio_max_iterations: NonZeroUsize::new(3).expect("literal is non-zero"),
+            vio_max_iterations: DEFAULT_VIO_MAX_ITERATIONS,
         }
     }
 }
