@@ -5437,9 +5437,7 @@ mod tests {
             let point_id = map
                 .add_map_point(
                     noisy_point,
-                    descriptor
-                        .try_quantize_clamped_unit_interval()
-                        .expect("finite descriptor"),
+                    descriptor.quantize_clamped_unit_interval(),
                     kp_0,
                 )
                 .expect("insert map point");
@@ -6898,9 +6896,7 @@ mod tests {
             let point_id = map
                 .add_map_point(
                     noisy_point,
-                    descriptor
-                        .try_quantize_clamped_unit_interval()
-                        .expect("finite descriptor"),
+                    descriptor.quantize_clamped_unit_interval(),
                     kp_0,
                 )
                 .expect("insert map point");

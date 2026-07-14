@@ -279,5 +279,5 @@ pub(crate) fn make_depth_image(
 fn indexed_descriptor(index: usize) -> Descriptor {
     let mut data = [0.0_f32; crate::DESCRIPTOR_DIM];
     data[index % crate::DESCRIPTOR_DIM] = 1.0;
-    Descriptor(data)
+    Descriptor::try_new(data).expect("one-hot test descriptor")
 }

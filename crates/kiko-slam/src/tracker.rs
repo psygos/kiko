@@ -1701,10 +1701,6 @@ pub enum TrackerError {
     EssentialGraph(EssentialGraphError),
     RansacConfig(RansacConfigError),
     MapObservation(MapObservationError),
-    DescriptorQuantization {
-        detection_index: usize,
-        source: crate::DescriptorQuantizationError,
-    },
     DescriptorMatch(DescriptorMatchError),
     LoopVerification(LoopVerificationError),
     LoopClosure(LoopDetectError),
@@ -1747,13 +1743,6 @@ impl std::fmt::Display for TrackerError {
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::RansacConfig(err) => write!(f, "RANSAC config error: {err}"),
             TrackerError::MapObservation(err) => write!(f, "map observation error: {err}"),
-            TrackerError::DescriptorQuantization {
-                detection_index,
-                source,
-            } => write!(
-                f,
-                "detection {detection_index} descriptor quantization failed: {source}"
-            ),
             TrackerError::DescriptorMatch(err) => {
                 write!(f, "descriptor matching error: {err}")
             }
@@ -1792,7 +1781,6 @@ impl std::error::Error for TrackerError {
             TrackerError::EssentialGraph(source) => Some(source),
             TrackerError::RansacConfig(source) => Some(source),
             TrackerError::MapObservation(source) => Some(source),
-            TrackerError::DescriptorQuantization { source, .. } => Some(source),
             TrackerError::DescriptorMatch(source) => Some(source),
             TrackerError::LoopVerification(source) => Some(source),
             TrackerError::LoopClosure(source) => Some(source),
@@ -2696,14 +2684,6 @@ impl CurrentKeypointGrid {
     }
 }
 
-fn raw_descriptor_dot_product(a: &crate::Descriptor, b: &crate::Descriptor) -> f32 {
-    a.as_slice()
-        .iter()
-        .zip(b.as_slice())
-        .map(|(lhs, rhs)| lhs * rhs)
-        .sum()
-}
-
 fn project_world_point(
     pose_world_to_camera: Pose,
     point: Point3,
@@ -3575,10 +3555,7 @@ impl SlamTracker {
         let Some(pending) = place_recognition.take_pending_loop() else {
             return Ok(());
         };
-        let query_quantized =
-            quantize_loop_descriptors(pending.detections.descriptors()).map_err(|source| {
-                LoopDetectError::VerificationFailed(LoopVerificationError::DescriptorMatch(source))
-            })?;
+        let query_quantized = quantize_loop_descriptors(pending.detections.descriptors());
 
         let mut first_rejection: Option<LoopDetectError> = None;
         for candidate in pending.candidates {
@@ -4009,7 +3986,7 @@ impl SlamTracker {
         };
         let candidates =
             place_recognition.relocalization_matches(&global_descriptor, cfg.max_candidates());
-        let query_quantized = quantize_loop_descriptors(current.descriptors())?;
+        let query_quantized = quantize_loop_descriptors(current.descriptors());
         for candidate in candidates {
             let match_result = match_quantized_descriptors_for_loop(
                 &query_quantized,
@@ -4357,7 +4334,7 @@ impl SlamTracker {
                     return;
                 }
                 let descriptor_dot_product =
-                    raw_descriptor_dot_product(&current_descriptors[current_idx], key_desc);
+                    current_descriptors[current_idx].raw_dot_product(key_desc);
                 if descriptor_dot_product < config.min_descriptor_dot_product() {
                     return;
                 }
@@ -5423,12 +5400,8 @@ fn insert_keyframe_into_candidate(
         if map.map_point_for_keypoint(keypoint_ref)?.is_some() {
             continue;
         }
-        let descriptor = keyframe.detections().descriptors()[det_idx]
-            .try_quantize_clamped_unit_interval()
-            .map_err(|source| TrackerError::DescriptorQuantization {
-                detection_index: det_idx,
-                source,
-            })?;
+        let descriptor =
+            keyframe.detections().descriptors()[det_idx].quantize_clamped_unit_interval();
         let world = camera_to_world(pose_world, *landmark);
         map.add_map_point(world, descriptor, keypoint_ref)?;
     }
@@ -5651,7 +5624,7 @@ mod tests {
     use crate::{MapFromOdom, Pose64};
 
     fn make_descriptor() -> Descriptor {
-        Descriptor([0.0; 256])
+        Descriptor::ZERO
     }
 
     fn se3_tangent(components: [f64; 6]) -> crate::Se3Tangent64 {
@@ -5726,22 +5699,6 @@ mod tests {
         let frame = inference.source().expect("frame source");
         assert_eq!(frame.to_string(), "dimension mismatch: expected 4, got 3");
         assert!(frame.source().is_none());
-    }
-
-    #[test]
-    fn tracker_error_preserves_descriptor_quantization_context_and_source() {
-        let error = TrackerError::DescriptorQuantization {
-            detection_index: 4,
-            source: crate::DescriptorQuantizationError::NonFiniteComponent {
-                index: 17,
-                value: f32::NAN,
-            },
-        };
-
-        assert!(error.to_string().contains("detection 4"));
-        let source = error.source().expect("descriptor quantization source");
-        assert!(source.to_string().contains("component 17"));
-        assert!(source.source().is_none());
     }
 
     #[test]
@@ -6011,9 +5968,7 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor()
-                    .try_quantize_clamped_unit_interval()
-                    .expect("finite descriptor"),
+                make_descriptor().quantize_clamped_unit_interval(),
                 keypoint,
             )
             .expect("map point");
@@ -6093,9 +6048,7 @@ mod tests {
                 keyframe
                     .landmark_for_detection(det_idx)
                     .expect("landmark for detection"),
-                make_descriptor()
-                    .try_quantize_clamped_unit_interval()
-                    .expect("finite descriptor"),
+                make_descriptor().quantize_clamped_unit_interval(),
                 keypoint_ref,
             )
             .expect("map point");
@@ -6215,9 +6168,7 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor()
-                    .try_quantize_clamped_unit_interval()
-                    .expect("finite descriptor"),
+                make_descriptor().quantize_clamped_unit_interval(),
                 kp_a,
             )
             .expect("point");
@@ -8089,23 +8040,6 @@ mod tests {
             ProjectedMatcherConfig::new(16.0, 0.5, 8, 9),
             Err(ProjectedMatcherConfigError::InliersExceedMatches { .. })
         ));
-    }
-
-    #[test]
-    fn projected_matcher_uses_scale_dependent_raw_descriptor_dot_product() {
-        let mut lhs = [0.0; crate::DESCRIPTOR_DIM];
-        lhs[3] = 2.0;
-        let mut rhs = [0.0; crate::DESCRIPTOR_DIM];
-        rhs[3] = 4.0;
-        let mut scaled_rhs = rhs;
-        scaled_rhs[3] *= 3.0;
-
-        let dot = raw_descriptor_dot_product(&crate::Descriptor(lhs), &crate::Descriptor(rhs));
-        let scaled_dot =
-            raw_descriptor_dot_product(&crate::Descriptor(lhs), &crate::Descriptor(scaled_rhs));
-
-        assert_eq!(dot, 8.0);
-        assert_eq!(scaled_dot, 24.0);
     }
 
     #[test]

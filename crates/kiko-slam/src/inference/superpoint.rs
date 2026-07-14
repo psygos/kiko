@@ -554,7 +554,7 @@ where
     let mut keypoints = Vec::with_capacity(candidates.len());
     let mut scores = Vec::with_capacity(candidates.len());
     let mut descriptors = Vec::with_capacity(candidates.len());
-    for candidate in candidates.iter().copied() {
+    for (descriptor_index, candidate) in candidates.iter().copied().enumerate() {
         let mut x = candidate.x as f32;
         let mut y = candidate.y as f32;
         if let Some(scale) = downscale {
@@ -564,7 +564,7 @@ where
         }
         keypoints.push(Keypoint { x, y });
         scores.push(candidate.score);
-        descriptors.push(sample_dense_descriptor(
+        let descriptor = sample_dense_descriptor(
             desc_data,
             grid_h,
             grid_w,
@@ -572,7 +572,13 @@ where
             input_dimensions.height(),
             candidate.x as f32,
             candidate.y as f32,
-        ));
+        )
+        .map_err(|source| InferenceError::DescriptorOutput {
+            name: "dense_descriptors".to_string(),
+            descriptor_index,
+            source,
+        })?;
+        descriptors.push(descriptor);
     }
 
     Detections::new(
@@ -763,7 +769,7 @@ fn sample_dense_descriptor(
     height: u32,
     x: f32,
     y: f32,
-) -> Descriptor {
+) -> Result<Descriptor, crate::DescriptorError> {
     let gx = ((x - 3.5) / (width as f32 - 4.5)) * (grid_w.saturating_sub(1) as f32);
     let gy = ((y - 3.5) / (height as f32 - 4.5)) * (grid_h.saturating_sub(1) as f32);
     let x0 = gx.floor().clamp(0.0, grid_w.saturating_sub(1) as f32) as usize;
@@ -777,22 +783,48 @@ fn sample_dense_descriptor(
     let w01 = (1.0 - wx) * wy;
     let w11 = wx * wy;
 
+    // Scaled sum-of-squares avoids overflowing on finite model output while
+    // retaining the existing 1e-6 norm floor.
     let mut out = [0.0_f32; DESCRIPTOR_DIM];
-    let mut norm2 = 0.0_f32;
+    let mut scale = 0.0_f32;
+    let mut scaled_sum_squares = 1.0_f32;
     for (channel, value) in out.iter_mut().enumerate() {
         let base = channel * grid_h * grid_w;
         let sample = w00 * desc[base + y0 * grid_w + x0]
             + w10 * desc[base + y0 * grid_w + x1]
             + w01 * desc[base + y1 * grid_w + x0]
             + w11 * desc[base + y1 * grid_w + x1];
+        if !sample.is_finite() {
+            return Err(crate::DescriptorError::NonFiniteComponent {
+                index: channel,
+                value: sample,
+            });
+        }
         *value = sample;
-        norm2 += sample * sample;
+        let magnitude = sample.abs();
+        if magnitude == 0.0 {
+            continue;
+        }
+        if scale < magnitude {
+            let ratio = scale / magnitude;
+            scaled_sum_squares = 1.0 + scaled_sum_squares * ratio * ratio;
+            scale = magnitude;
+        } else {
+            let ratio = magnitude / scale;
+            scaled_sum_squares += ratio * ratio;
+        }
     }
-    let inv_norm = norm2.max(1e-12).sqrt().recip();
-    for value in &mut out {
-        *value *= inv_norm;
+    let scaled_norm = scaled_sum_squares.sqrt();
+    if scale == 0.0 || scale <= 1e-6 / scaled_norm {
+        for value in &mut out {
+            *value *= 1e6;
+        }
+    } else {
+        for value in &mut out {
+            *value = (*value / scale) / scaled_norm;
+        }
     }
-    Descriptor(out)
+    Descriptor::try_new(out)
 }
 
 fn tensor_num_elements(
@@ -821,10 +853,16 @@ fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>,
     }
 
     let mut descriptors = Vec::with_capacity(data.len() / DESCRIPTOR_DIM);
-    for chunk in data.chunks_exact(DESCRIPTOR_DIM) {
+    for (descriptor_index, chunk) in data.chunks_exact(DESCRIPTOR_DIM).enumerate() {
         let mut descriptor = [0.0_f32; DESCRIPTOR_DIM];
         descriptor.copy_from_slice(chunk);
-        descriptors.push(Descriptor(descriptor));
+        descriptors.push(Descriptor::try_new(descriptor).map_err(|source| {
+            InferenceError::DescriptorOutput {
+                name: output_name.to_string(),
+                descriptor_index,
+                source,
+            }
+        })?);
     }
     Ok(descriptors)
 }
@@ -990,6 +1028,7 @@ fn scale_coordinate(value: f32, dim: f32, norm: Normalization) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
 
     fn tensor_outlet(name: &str, ty: TensorElementType) -> Outlet {
         tensor_outlet_with_shape(name, ty, [-1_i64, -1, -1, -1])
@@ -1135,8 +1174,68 @@ mod tests {
         let descriptors = parse_descriptors(&data, "descriptors").expect("complete chunks");
 
         assert_eq!(descriptors.len(), 2);
-        assert_eq!(descriptors[0].0[0], 0.0);
-        assert_eq!(descriptors[1].0[0], DESCRIPTOR_DIM as f32);
+        assert_eq!(descriptors[0].as_slice()[0], 0.0);
+        assert_eq!(descriptors[1].as_slice()[0], DESCRIPTOR_DIM as f32);
+    }
+
+    #[test]
+    fn parse_descriptors_preserves_output_index_and_domain_source() {
+        let mut data = vec![0.0_f32; DESCRIPTOR_DIM * 2];
+        data[DESCRIPTOR_DIM + 7] = f32::NAN;
+
+        let error = parse_descriptors(&data, "descriptors")
+            .expect_err("nonfinite model output must fail at the descriptor boundary");
+        assert!(matches!(
+            &error,
+            InferenceError::DescriptorOutput {
+                name,
+                descriptor_index: 1,
+                source: crate::DescriptorError::NonFiniteComponent { index: 7, value },
+            } if name == "descriptors" && value.is_nan()
+        ));
+        assert!(error.to_string().contains("descriptor 1"));
+        assert!(error.to_string().contains("'descriptors'"));
+        assert!(
+            error
+                .source()
+                .expect("descriptor domain source")
+                .to_string()
+                .contains("component 7")
+        );
+    }
+
+    #[test]
+    fn dense_descriptor_normalization_preserves_regular_and_small_norm_behavior() {
+        let regular: Vec<f32> = (1..=DESCRIPTOR_DIM).map(|value| value as f32).collect();
+        let descriptor = sample_dense_descriptor(&regular, 1, 1, 8, 8, 3.5, 3.5)
+            .expect("regular dense descriptor");
+        let direct_norm = regular
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        for (&actual, &input) in descriptor.as_slice().iter().zip(&regular) {
+            assert!((actual - input / direct_norm).abs() < 1e-6);
+        }
+
+        let small = [1e-8_f32; DESCRIPTOR_DIM];
+        let descriptor = sample_dense_descriptor(&small, 1, 1, 8, 8, 3.5, 3.5)
+            .expect("small-norm dense descriptor");
+        for &value in descriptor.as_slice() {
+            assert!((value - 0.01).abs() < 1e-7);
+        }
+    }
+
+    #[test]
+    fn dense_descriptor_normalization_does_not_overflow_on_extreme_finite_input() {
+        let descriptor = sample_dense_descriptor(&[f32::MAX; DESCRIPTOR_DIM], 1, 1, 8, 8, 3.5, 3.5)
+            .expect("scaled normalization keeps finite dense output representable");
+
+        let expected = (DESCRIPTOR_DIM as f32).sqrt().recip();
+        assert!(descriptor.as_slice().iter().all(|value| value.is_finite()));
+        for &value in descriptor.as_slice() {
+            assert!((value - expected).abs() < 1e-6);
+        }
     }
 
     #[test]

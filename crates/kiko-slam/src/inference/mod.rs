@@ -84,6 +84,11 @@ pub enum InferenceError {
     Frame(crate::FrameError),
     Downscale(crate::DownscaleError),
     Detection(crate::DetectionError),
+    DescriptorOutput {
+        name: String,
+        descriptor_index: usize,
+        source: crate::DescriptorError,
+    },
     Match(crate::MatchError),
     GlobalDescriptor(crate::loop_closure::GlobalDescriptorError),
     ThreadPanic {
@@ -107,6 +112,7 @@ impl std::error::Error for InferenceError {
             InferenceError::Frame(source) => Some(source),
             InferenceError::Downscale(source) => Some(source),
             InferenceError::Detection(source) => Some(source),
+            InferenceError::DescriptorOutput { source, .. } => Some(source),
             InferenceError::Match(source) => Some(source),
             InferenceError::GlobalDescriptor(source) => Some(source),
             InferenceError::Environment(source) => Some(source),
@@ -246,6 +252,14 @@ impl std::fmt::Display for InferenceError {
             InferenceError::Frame(err) => write!(f, "frame error: {err}"),
             InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
             InferenceError::Detection(err) => write!(f, "detection error: {err}"),
+            InferenceError::DescriptorOutput {
+                name,
+                descriptor_index,
+                source,
+            } => write!(
+                f,
+                "invalid descriptor {descriptor_index} in inference output '{name}': {source}"
+            ),
             InferenceError::Match(err) => write!(f, "match error: {err}"),
             InferenceError::GlobalDescriptor(err) => {
                 write!(f, "global descriptor error: {err}")

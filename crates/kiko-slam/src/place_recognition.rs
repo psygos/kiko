@@ -881,7 +881,7 @@ mod tests {
                 2,
                 vec![crate::Keypoint { x: 0.0, y: 0.0 }],
                 vec![1.0],
-                vec![crate::Descriptor([0.0; crate::DESCRIPTOR_DIM])],
+                vec![crate::Descriptor::ZERO],
             )
             .expect("finite zero-norm detections"),
         );

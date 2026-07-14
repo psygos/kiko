@@ -619,50 +619,91 @@ impl CosineSimilarity {
     }
 }
 
+const MAX_DESCRIPTOR_NORM_SQUARED: f64 = f32::MAX as f64 / 4.0;
+
+/// A finite local feature descriptor whose norm is safe for raw `f32` dot products.
+///
+/// Construction validates the complete vector once. The norm limit is deliberately
+/// conservative: Cauchy-Schwarz then bounds the absolute sum of products below
+/// `f32::MAX / 4`, leaving ample rounding headroom for downstream match scores.
+///
+/// The representation is private so callers cannot bypass those invariants.
+///
+/// ```compile_fail
+/// use kiko_slam::{Descriptor, DESCRIPTOR_DIM};
+/// let _forged = Descriptor([f32::NAN; DESCRIPTOR_DIM]);
+/// ```
+///
+/// ```compile_fail
+/// fn require_any_bit_pattern<T: bytemuck::AnyBitPattern>() {}
+/// require_any_bit_pattern::<kiko_slam::Descriptor>();
+/// ```
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Descriptor(pub [f32; DESCRIPTOR_DIM]);
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::NoUninit)]
+pub struct Descriptor([f32; DESCRIPTOR_DIM]);
 
 impl Descriptor {
+    pub const ZERO: Self = Self([0.0; DESCRIPTOR_DIM]);
+
+    pub fn try_new(values: [f32; DESCRIPTOR_DIM]) -> Result<Self, DescriptorError> {
+        let mut norm_squared = 0.0_f64;
+        for (index, &value) in values.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(DescriptorError::NonFiniteComponent { index, value });
+            }
+            let value = f64::from(value);
+            norm_squared = value.mul_add(value, norm_squared);
+        }
+        if norm_squared > MAX_DESCRIPTOR_NORM_SQUARED {
+            return Err(DescriptorError::NormExceedsRawDotProductDomain { norm_squared });
+        }
+        Ok(Self(values))
+    }
+
     pub fn as_slice(&self) -> &[f32] {
         &self.0
     }
 
-    pub fn try_quantize_clamped_unit_interval(
-        &self,
-    ) -> Result<CompactDescriptor, DescriptorQuantizationError> {
+    pub fn raw_dot_product(&self, other: &Self) -> f32 {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .map(|(&lhs, &rhs)| lhs * rhs)
+            .sum()
+    }
+
+    pub fn quantize_clamped_unit_interval(&self) -> CompactDescriptor {
         let mut out = [0_u8; DESCRIPTOR_DIM];
         for (idx, value) in self.0.iter().enumerate() {
-            if !value.is_finite() {
-                return Err(DescriptorQuantizationError::NonFiniteComponent {
-                    index: idx,
-                    value: *value,
-                });
-            }
             let clamped = value.clamp(0.0, 1.0);
             out[idx] = (clamped * U8_SCALE).round() as u8;
         }
-        Ok(CompactDescriptor(out))
+        CompactDescriptor(out)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DescriptorQuantizationError {
+pub enum DescriptorError {
     NonFiniteComponent { index: usize, value: f32 },
+    NormExceedsRawDotProductDomain { norm_squared: f64 },
 }
 
-impl std::fmt::Display for DescriptorQuantizationError {
+impl std::fmt::Display for DescriptorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NonFiniteComponent { index, value } => write!(
                 f,
-                "descriptor component {index} must be finite before clamped [0, 1] quantization, got {value}"
+                "descriptor component {index} must be finite, got {value}"
+            ),
+            Self::NormExceedsRawDotProductDomain { norm_squared } => write!(
+                f,
+                "descriptor squared L2 norm {norm_squared} exceeds the raw f32 dot-product domain maximum {MAX_DESCRIPTOR_NORM_SQUARED}"
             ),
         }
     }
 }
 
-impl std::error::Error for DescriptorQuantizationError {}
+impl std::error::Error for DescriptorError {}
 
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -715,11 +756,6 @@ pub enum DetectionError {
         index: usize,
         value: f32,
     },
-    NonFiniteDescriptor {
-        detection_index: usize,
-        component: usize,
-        value: f32,
-    },
     SelectionIndexOutOfBounds {
         selection_index: usize,
         detection_index: usize,
@@ -757,14 +793,6 @@ impl std::fmt::Display for DetectionError {
             DetectionError::NonFiniteScore { index, value } => {
                 write!(f, "detection {index} has non-finite score {value}")
             }
-            DetectionError::NonFiniteDescriptor {
-                detection_index,
-                component,
-                value,
-            } => write!(
-                f,
-                "detection {detection_index} descriptor component {component} is non-finite: {value}"
-            ),
             DetectionError::SelectionIndexOutOfBounds {
                 selection_index,
                 detection_index,
@@ -785,7 +813,6 @@ impl std::error::Error for DetectionError {
             | DetectionError::NonFiniteKeypoint { .. }
             | DetectionError::KeypointOutOfBounds { .. }
             | DetectionError::NonFiniteScore { .. }
-            | DetectionError::NonFiniteDescriptor { .. }
             | DetectionError::SelectionIndexOutOfBounds { .. } => None,
         }
     }
@@ -896,18 +923,6 @@ impl Detections {
                 return Err(DetectionError::NonFiniteScore { index, value });
             }
         }
-        for (detection_index, descriptor) in descriptors.iter().enumerate() {
-            for (component, &value) in descriptor.0.iter().enumerate() {
-                if !value.is_finite() {
-                    return Err(DetectionError::NonFiniteDescriptor {
-                        detection_index,
-                        component,
-                        value,
-                    });
-                }
-            }
-        }
-
         Ok(Self {
             sensor_id,
             frame_id,
@@ -1572,19 +1587,23 @@ mod tests {
 
     use super::map::SlamMap;
     use super::{
-        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DescriptorQuantizationError, DetectionError,
-        Detections, DownscaleError, DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError,
-        FrameError, FrameId, Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches,
-        Point3, Pose, SensorId, Timestamp, U8_SCALE,
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DescriptorError, DetectionError, Detections,
+        DownscaleError, DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError,
+        FrameId, Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches, Point3, Pose,
+        SensorId, Timestamp, U8_SCALE,
     };
+
+    fn descriptor(values: [f32; DESCRIPTOR_DIM]) -> Descriptor {
+        Descriptor::try_new(values).expect("valid test descriptor")
+    }
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;
         let mut norm_a = 0.0_f32;
         let mut norm_b = 0.0_f32;
         for i in 0..DESCRIPTOR_DIM {
-            let x = a.0[i];
-            let y = b.0[i];
+            let x = a.as_slice()[i];
+            let y = b.as_slice()[i];
             dot += x * y;
             norm_a += x * x;
             norm_b += y * y;
@@ -1610,7 +1629,7 @@ mod tests {
                 24,
                 keypoints,
                 vec![1.0; len],
-                vec![Descriptor([0.0; DESCRIPTOR_DIM]); len],
+                vec![Descriptor::ZERO; len],
             )
             .expect("valid detection batch"),
         )
@@ -1635,23 +1654,17 @@ mod tests {
             close[i] = (t + 0.02).clamp(0.0, 1.0);
             far[i] = if i < 128 { 1.0 } else { 0.0 };
         }
-        let base = Descriptor(base);
-        let close = Descriptor(close);
-        let far = Descriptor(far);
+        let base = descriptor(base);
+        let close = descriptor(close);
+        let far = descriptor(far);
 
         let float_close = cosine_f32(&base, &close);
         let float_far = cosine_f32(&base, &far);
         assert!(float_close > float_far);
 
-        let q_base = base
-            .try_quantize_clamped_unit_interval()
-            .expect("finite descriptor");
-        let q_close = close
-            .try_quantize_clamped_unit_interval()
-            .expect("finite descriptor");
-        let q_far = far
-            .try_quantize_clamped_unit_interval()
-            .expect("finite descriptor");
+        let q_base = base.quantize_clamped_unit_interval();
+        let q_close = close.quantize_clamped_unit_interval();
+        let q_far = far.quantize_clamped_unit_interval();
         let quant_close = q_base
             .clamped_cosine_similarity(&q_close)
             .expect("nonzero descriptors")
@@ -1669,9 +1682,7 @@ mod tests {
         values[0] = -0.25;
         values[1] = 1.25;
 
-        let quantized = Descriptor(values)
-            .try_quantize_clamped_unit_interval()
-            .expect("finite descriptor");
+        let quantized = descriptor(values).quantize_clamped_unit_interval();
 
         assert_eq!(quantized.0[0], 0);
         assert_eq!(quantized.0[1], u8::MAX);
@@ -1679,23 +1690,71 @@ mod tests {
     }
 
     #[test]
-    fn clamped_unit_interval_quantization_rejects_nonfinite_components() {
+    fn descriptor_constructor_rejects_nonfinite_components() {
         for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut values = [0.5; DESCRIPTOR_DIM];
             values[17] = value;
 
-            let error = Descriptor(values)
-                .try_quantize_clamped_unit_interval()
-                .expect_err("nonfinite descriptor component must be rejected");
+            let error = Descriptor::try_new(values)
+                .expect_err("nonfinite descriptor component must be rejected at construction");
 
             assert!(matches!(
                 error,
-                DescriptorQuantizationError::NonFiniteComponent {
+                DescriptorError::NonFiniteComponent {
                     index: 17,
                     value: actual
                 } if actual.to_bits() == value.to_bits()
             ));
         }
+    }
+
+    #[test]
+    fn descriptor_raw_dot_product_preserves_scale_and_domain() {
+        let oversized = Descriptor::try_new([f32::MAX; DESCRIPTOR_DIM])
+            .expect_err("extreme finite descriptor must not reach f32 dot products");
+        assert!(matches!(
+            oversized,
+            DescriptorError::NormExceedsRawDotProductDomain { norm_squared }
+                if norm_squared > super::MAX_DESCRIPTOR_NORM_SQUARED
+        ));
+
+        let component =
+            ((super::MAX_DESCRIPTOR_NORM_SQUARED / DESCRIPTOR_DIM as f64).sqrt() * 0.99) as f32;
+        let near_limit = descriptor([component; DESCRIPTOR_DIM]);
+        assert!(near_limit.raw_dot_product(&near_limit).is_finite());
+
+        let mut lhs = [0.0; DESCRIPTOR_DIM];
+        lhs[3] = 2.0;
+        let mut rhs = [0.0; DESCRIPTOR_DIM];
+        rhs[3] = 4.0;
+        let mut scaled_rhs = rhs;
+        scaled_rhs[3] *= 3.0;
+        let lhs = descriptor(lhs);
+        let rhs = descriptor(rhs);
+        let scaled_rhs = descriptor(scaled_rhs);
+        assert_eq!(lhs.raw_dot_product(&rhs), 8.0);
+        assert_eq!(lhs.raw_dot_product(&scaled_rhs), 24.0);
+    }
+
+    #[test]
+    fn descriptor_wrapper_preserves_flat_zero_copy_layout() {
+        assert_eq!(
+            std::mem::size_of::<Descriptor>(),
+            DESCRIPTOR_DIM * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            std::mem::align_of::<Descriptor>(),
+            std::mem::align_of::<f32>()
+        );
+
+        let detections = detection_batch(SensorId::StereoLeft, 1, 2);
+        assert_eq!(detections.descriptors_flat().len(), DESCRIPTOR_DIM * 2);
+        assert!(
+            detections
+                .descriptors_flat()
+                .iter()
+                .all(|&value| value == 0.0)
+        );
     }
 
     #[test]
@@ -1735,7 +1794,7 @@ mod tests {
                 vec![descriptor],
             )
         };
-        let descriptor = Descriptor([0.0; DESCRIPTOR_DIM]);
+        let descriptor = Descriptor::ZERO;
 
         assert!(matches!(
             Detections::new(
@@ -1769,17 +1828,6 @@ mod tests {
         assert!(matches!(
             make(Keypoint { x: 1.0, y: 1.0 }, f32::INFINITY, descriptor),
             Err(DetectionError::NonFiniteScore { index: 0, .. })
-        ));
-
-        let mut values = [0.0; DESCRIPTOR_DIM];
-        values[7] = f32::NAN;
-        assert!(matches!(
-            make(Keypoint { x: 1.0, y: 1.0 }, 1.0, Descriptor(values)),
-            Err(DetectionError::NonFiniteDescriptor {
-                detection_index: 0,
-                component: 7,
-                ..
-            })
         ));
 
         let batch = detection_batch(SensorId::StereoLeft, 1, 1);

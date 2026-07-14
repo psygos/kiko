@@ -6,8 +6,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::DESCRIPTOR_DIM;
-
 /// End-to-end pipeline model that takes two grayscale images (batch=2)
 /// and outputs keypoints, matches, and match scores in a single call.
 pub struct End2EndPipeline {
@@ -81,7 +79,7 @@ impl End2EndPipeline {
 
         // Build detections with empty descriptors — matching is done internally by the pipeline
         let left_scores = vec![1.0_f32; parsed.left_keypoints.len()];
-        let left_descs = vec![Descriptor([0.0; DESCRIPTOR_DIM]); parsed.left_keypoints.len()];
+        let left_descs = vec![Descriptor::ZERO; parsed.left_keypoints.len()];
         let left_det = Detections::new(
             left.sensor_id(),
             left.frame_id(),
@@ -94,7 +92,7 @@ impl End2EndPipeline {
         .map_err(InferenceError::Detection)?;
 
         let right_scores = vec![1.0_f32; parsed.right_keypoints.len()];
-        let right_descs = vec![Descriptor([0.0; DESCRIPTOR_DIM]); parsed.right_keypoints.len()];
+        let right_descs = vec![Descriptor::ZERO; parsed.right_keypoints.len()];
         let right_det = Detections::new(
             right.sensor_id(),
             right.frame_id(),

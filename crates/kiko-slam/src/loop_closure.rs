@@ -4,8 +4,8 @@ use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
 use crate::pnp::MIN_PNP_POINTS;
 use crate::pose_graph::{EssentialGraphError, PoseGraphError};
 use crate::{
-    CompactDescriptor, Descriptor, DescriptorQuantizationError, Keypoint, Observation,
-    PinholeIntrinsics, PnpError, Pose, RansacConfig, RansacConfigError, solve_pnp_ransac,
+    CompactDescriptor, Descriptor, Keypoint, Observation, PinholeIntrinsics, PnpError, Pose,
+    RansacConfig, RansacConfigError, solve_pnp_ransac,
 };
 pub use crate::{CosineSimilarity, CosineSimilarityError};
 
@@ -726,7 +726,7 @@ impl GlobalDescriptor {
         let mut mean = [0.0_f64; crate::DESCRIPTOR_DIM];
         let mut max = [f32::NEG_INFINITY; crate::DESCRIPTOR_DIM];
         for d in descriptors {
-            for (idx, value) in d.0.iter().copied().enumerate() {
+            for (idx, value) in d.as_slice().iter().copied().enumerate() {
                 mean[idx] += f64::from(value);
                 if value > max[idx] {
                     max[idx] = value;
@@ -756,24 +756,14 @@ pub fn match_descriptors_for_loop(
     map: &SlamMap,
     similarity_threshold: f32,
 ) -> Result<LoopDescriptorMatchResult, DescriptorMatchError> {
-    let query_quantized = quantize_loop_descriptors(query_descriptors)?;
+    let query_quantized = quantize_loop_descriptors(query_descriptors);
     match_quantized_descriptors_for_loop(&query_quantized, candidate_kf, map, similarity_threshold)
 }
 
-pub(crate) fn quantize_loop_descriptors(
-    descriptors: &[Descriptor],
-) -> Result<Vec<CompactDescriptor>, DescriptorMatchError> {
+pub(crate) fn quantize_loop_descriptors(descriptors: &[Descriptor]) -> Vec<CompactDescriptor> {
     descriptors
         .iter()
-        .enumerate()
-        .map(|(descriptor_index, descriptor)| {
-            descriptor
-                .try_quantize_clamped_unit_interval()
-                .map_err(|source| DescriptorMatchError::Quantization {
-                    descriptor_index,
-                    source,
-                })
-        })
+        .map(Descriptor::quantize_clamped_unit_interval)
         .collect()
 }
 
@@ -804,13 +794,7 @@ impl LoopDescriptorMatchResult {
 
 #[derive(Debug)]
 pub enum DescriptorMatchError {
-    InvalidSimilarityThreshold {
-        value: f32,
-    },
-    Quantization {
-        descriptor_index: usize,
-        source: DescriptorQuantizationError,
-    },
+    InvalidSimilarityThreshold { value: f32 },
     Map(MapError),
 }
 
@@ -821,13 +805,6 @@ impl std::fmt::Display for DescriptorMatchError {
                 f,
                 "descriptor similarity threshold must be finite and in (0, 1], got {value}"
             ),
-            Self::Quantization {
-                descriptor_index,
-                source,
-            } => write!(
-                f,
-                "loop query descriptor {descriptor_index} quantization failed: {source}"
-            ),
             Self::Map(source) => write!(f, "descriptor matching map lookup failed: {source}"),
         }
     }
@@ -836,7 +813,6 @@ impl std::fmt::Display for DescriptorMatchError {
 impl std::error::Error for DescriptorMatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Quantization { source, .. } => Some(source),
             Self::Map(source) => Some(source),
             Self::InvalidSimilarityThreshold { .. } => None,
         }
@@ -1487,9 +1463,8 @@ mod tests {
     use crate::pose_graph::PoseGraphError;
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
     use crate::{
-        CompactDescriptor, CosineSimilarity, CosineSimilarityError, Descriptor,
-        DescriptorQuantizationError, FrameDimensions, FrameId, Keypoint, Point3, Pose,
-        RansacConfig, Timestamp,
+        CompactDescriptor, CosineSimilarity, CosineSimilarityError, Descriptor, FrameDimensions,
+        FrameId, Keypoint, Point3, Pose, RansacConfig, Timestamp,
     };
     use std::error::Error as _;
 
@@ -1502,6 +1477,10 @@ mod tests {
         crate::PinholeIntrinsics,
         Pose,
     );
+
+    fn descriptor(values: [f32; crate::DESCRIPTOR_DIM]) -> Descriptor {
+        Descriptor::try_new(values).expect("valid test descriptor")
+    }
 
     fn descriptor_with_basis(idx: usize) -> GlobalDescriptor {
         let mut d = [0.0_f32; 512];
@@ -2328,7 +2307,7 @@ mod tests {
         data[4] = 1.0;
         data[17] = 0.5;
         let descriptor =
-            aggregate_global_descriptor(&[Descriptor(data)]).expect("aggregated descriptor");
+            aggregate_global_descriptor(&[descriptor(data)]).expect("aggregated descriptor");
         let values = descriptor.as_array();
         let norm = values.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(
@@ -2362,8 +2341,8 @@ mod tests {
     #[test]
     fn global_descriptor_max_pool_preserves_all_negative_dimensions() {
         let descriptor = aggregate_global_descriptor(&[
-            Descriptor([-2.0; crate::DESCRIPTOR_DIM]),
-            Descriptor([-1.0; crate::DESCRIPTOR_DIM]),
+            descriptor([-2.0; crate::DESCRIPTOR_DIM]),
+            descriptor([-1.0; crate::DESCRIPTOR_DIM]),
         ])
         .expect("negative finite descriptors remain valid");
 
@@ -2393,7 +2372,7 @@ mod tests {
         q0[7] = 1.0;
         let mut q1 = [0.0_f32; 256];
         q1[23] = 1.0;
-        let query = vec![Descriptor(q0), Descriptor(q1)];
+        let query = vec![descriptor(q0), descriptor(q1)];
 
         let kp0 = map.keyframe_keypoint(kf, 0).expect("kp0");
         map.add_map_point(
@@ -2402,9 +2381,7 @@ mod tests {
                 y: 0.0,
                 z: 3.0,
             },
-            query[0]
-                .try_quantize_clamped_unit_interval()
-                .expect("finite descriptor"),
+            query[0].quantize_clamped_unit_interval(),
             kp0,
         )
         .expect("point0");
@@ -2415,9 +2392,7 @@ mod tests {
                 y: 0.0,
                 z: 3.0,
             },
-            query[1]
-                .try_quantize_clamped_unit_interval()
-                .expect("finite descriptor"),
+            query[1].quantize_clamped_unit_interval(),
             kp1,
         )
         .expect("point1");
@@ -2444,10 +2419,10 @@ mod tests {
                 vec![Keypoint { x: 20.0, y: 20.0 }, Keypoint { x: 40.0, y: 20.0 }],
             )
             .expect("keyframe");
-        let zero = Descriptor([0.0; crate::DESCRIPTOR_DIM]);
+        let zero = Descriptor::ZERO;
         let mut basis_values = [0.0; crate::DESCRIPTOR_DIM];
         basis_values[7] = 1.0;
-        let basis = Descriptor(basis_values);
+        let basis = descriptor(basis_values);
         for (index, descriptor) in [zero, basis].iter().enumerate() {
             let keypoint = map.keyframe_keypoint(keyframe, index).expect("keypoint");
             map.add_map_point(
@@ -2456,9 +2431,7 @@ mod tests {
                     y: 0.0,
                     z: 3.0,
                 },
-                descriptor
-                    .try_quantize_clamped_unit_interval()
-                    .expect("finite descriptor"),
+                descriptor.quantize_clamped_unit_interval(),
                 keypoint,
             )
             .expect("map point");
@@ -2497,7 +2470,7 @@ mod tests {
         q1[8] = 1.0;
         let mut q2 = [0.0_f32; 256];
         q2[13] = 1.0;
-        let query = vec![Descriptor(q0), Descriptor(q1), Descriptor(q2)];
+        let query = vec![descriptor(q0), descriptor(q1), descriptor(q2)];
 
         let only_observed = map.keyframe_keypoint(kf, 1).expect("kp1");
         map.add_map_point(
@@ -2506,9 +2479,7 @@ mod tests {
                 y: 0.1,
                 z: 3.0,
             },
-            query[1]
-                .try_quantize_clamped_unit_interval()
-                .expect("finite descriptor"),
+            query[1].quantize_clamped_unit_interval(),
             only_observed,
         )
         .expect("point");
@@ -2524,36 +2495,13 @@ mod tests {
         let mut query = [0.0_f32; 256];
         query[7] = 1.0;
         let err =
-            match_descriptors_for_loop(&[Descriptor(query)], KeyframeId::default(), &map, 0.95)
+            match_descriptors_for_loop(&[descriptor(query)], KeyframeId::default(), &map, 0.95)
                 .expect_err("missing keyframe should return map error");
         assert!(matches!(
             err,
             DescriptorMatchError::Map(MapError::KeyframeNotFound(_))
         ));
         assert!(err.source().is_some());
-    }
-
-    #[test]
-    fn match_descriptors_propagates_quantization_error_with_source() {
-        let map = SlamMap::new();
-        let mut query = [0.0_f32; 256];
-        query[7] = f32::NAN;
-
-        let error =
-            match_descriptors_for_loop(&[Descriptor(query)], KeyframeId::default(), &map, 0.95)
-                .expect_err("nonfinite query descriptor must fail before map lookup");
-
-        assert!(matches!(
-            error,
-            DescriptorMatchError::Quantization {
-                descriptor_index: 0,
-                source: DescriptorQuantizationError::NonFiniteComponent {
-                    index: 7,
-                    value,
-                },
-            } if value.is_nan()
-        ));
-        assert!(error.source().is_some());
     }
 
     #[test]

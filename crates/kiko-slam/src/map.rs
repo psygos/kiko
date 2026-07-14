@@ -1528,7 +1528,7 @@ mod tests {
             dimensions.height(),
             vec![Keypoint { x: 3.0, y: 2.0 }],
             vec![1.0],
-            vec![Descriptor([0.0; crate::DESCRIPTOR_DIM])],
+            vec![Descriptor::ZERO],
         )
         .expect("detections");
         let mut map = SlamMap::new();

@@ -1575,8 +1575,7 @@ impl TrackState {
                     if distance_sq(kp, prev_kp) > max_dist_sq {
                         continue;
                     }
-                    let dot_product =
-                        raw_descriptor_dot_product(desc.0.as_slice(), prev_desc.0.as_slice());
+                    let dot_product = desc.raw_dot_product(prev_desc);
                     if dot_product > best_dot_product {
                         best_dot_product = dot_product;
                         best_idx = Some(j);
@@ -1698,10 +1697,6 @@ fn log_matches(
     Ok(())
 }
 
-fn raw_descriptor_dot_product(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-}
-
 fn distance_sq(a: Keypoint, b: Keypoint) -> f32 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
@@ -1751,9 +1746,8 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 mod tests {
     use super::{
         RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
-        TrackConfig, VizDecimation, VizDecimationError, raw_descriptor_dot_product,
-        resolve_track_min_descriptor_dot_product, surface_integration_scalars,
-        surface_pose_quality_scalars, surface_summary_scalars,
+        TrackConfig, VizDecimation, VizDecimationError, resolve_track_min_descriptor_dot_product,
+        surface_integration_scalars, surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
         Frame, FrameDiagnostics, FrameId, Pose, RectifiedRowMismatchPx, SensorId,
@@ -1792,16 +1786,6 @@ mod tests {
         }
         assert!(TrackConfig::try_new(24.0, -2.0).is_ok());
         assert!(TrackConfig::try_new(24.0, 2.0).is_ok());
-    }
-
-    #[test]
-    fn visualization_tracker_uses_scale_dependent_raw_descriptor_dot_product() {
-        let lhs = [2.0, 0.0];
-        let rhs = [4.0, 0.0];
-        let scaled_rhs = [12.0, 0.0];
-
-        assert_eq!(raw_descriptor_dot_product(&lhs, &rhs), 8.0);
-        assert_eq!(raw_descriptor_dot_product(&lhs, &scaled_rhs), 24.0);
     }
 
     #[test]
