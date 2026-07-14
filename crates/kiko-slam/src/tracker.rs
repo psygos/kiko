@@ -2830,6 +2830,7 @@ enum TrackingAttemptError {
         verified: usize,
         observations: usize,
         required_inliers: usize,
+        reason: crate::PnpRejection,
     },
     Fatal(TrackerError),
 }
@@ -2856,11 +2857,13 @@ fn projected_fallback_from_attempt_error(
             verified,
             observations,
             required_inliers,
+            reason,
         } => Ok(ProjectedTrackingFallbackReason::PnpRejected {
             matches,
             verified,
             observations,
             required_inliers,
+            reason,
         }),
         TrackingAttemptError::Fatal(error) => Err(error),
     }
@@ -4436,19 +4439,18 @@ impl SlamTracker {
             .solve_tracking_pose(tracked_observations.observations(), tracking_ransac)
         {
             Ok(result) => result,
-            Err(
-                crate::PnpError::NotEnoughPoints { .. }
-                | crate::PnpError::InsufficientObservationsForRequiredInliers { .. }
-                | crate::PnpError::NoSolution,
-            ) => {
-                return Err(TrackingAttemptError::PnpFailed {
-                    matches: match_count,
-                    verified: verified_count,
-                    observations: tracked_observations.len(),
-                    required_inliers: tracking_ransac.min_inliers(),
-                });
+            Err(err) => {
+                if let Some(reason) = err.rejection() {
+                    return Err(TrackingAttemptError::PnpFailed {
+                        matches: match_count,
+                        verified: verified_count,
+                        observations: tracked_observations.len(),
+                        required_inliers: tracking_ransac.min_inliers(),
+                        reason,
+                    });
+                }
+                return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err)));
             }
-            Err(err) => return Err(TrackingAttemptError::Fatal(TrackerError::Pnp(err))),
         };
 
         Ok(TrackingAttempt {
@@ -4783,17 +4785,20 @@ impl SlamTracker {
                             verified,
                             observations,
                             required_inliers,
+                            reason,
                         }) => {
                             if self.trace_transitions {
                                 eprintln!(
-                                    "tracking failure frame={} reason=pnp_failed observations={} matches={} verified={} required_inliers={}",
+                                    "tracking failure frame={} reason=pnp_rejected observations={} matches={} verified={} required_inliers={} solver_reason={}",
                                     frame_id.as_u64(),
                                     observations,
                                     matches,
                                     verified,
                                     required_inliers,
+                                    reason,
                                 );
                             }
+                            self.emit_event(DiagnosticEvent::TrackingPnpRejected { reason });
                             let tracking_health = self.tracking_failure_health();
                             self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
                             let mut diagnostics = self.empty_diagnostics();
@@ -4801,6 +4806,19 @@ impl SlamTracker {
                             diagnostics.features_matched = Some(matches);
                             diagnostics.pnp_tracked_observations =
                                 Some(crate::PnpTrackedObservationCountMetric::new(observations));
+                            diagnostics.pnp_rejection = Some(reason);
+                            if let Some(rejections) = reason.ransac_rejections() {
+                                diagnostics.pnp_ransac_minimal_sample_rejections = Some(
+                                    rejections
+                                        .minimal_sample_rejections()
+                                        .map_or(0, |value| value.count().get()),
+                                );
+                                diagnostics.pnp_ransac_candidate_projection_rejections = Some(
+                                    rejections
+                                        .candidate_projection_rejections()
+                                        .map_or(0, |value| value.count().get()),
+                                );
+                            }
                             diagnostics.tracking_time = Some(tracking_start.elapsed());
                             return self.tracking_failure_output(
                                 frame_id,
@@ -5189,6 +5207,11 @@ impl SlamTracker {
                 projectable_tracked_observations,
             ));
         diagnostics.ransac_iterations = Some(result.iterations().get());
+        diagnostics.pnp_ransac_minimal_sample_rejections = Some(
+            result
+                .minimal_sample_rejections()
+                .map_or(0, |rejections| rejections.count().get()),
+        );
         diagnostics.pnp_ransac_candidate_projection_rejections = Some(
             result
                 .candidate_projection_rejections()
@@ -8564,6 +8587,24 @@ mod tests {
                 required_observations: 4,
             }
         );
+
+        let pnp_reason = crate::PnpRejection::NoSolution;
+        let pnp_fallback = projected_fallback_from_attempt_error(TrackingAttemptError::PnpFailed {
+            matches: 30,
+            verified: 22,
+            observations: 18,
+            required_inliers: 12,
+            reason: pnp_reason,
+        })
+        .expect("recoverable PnP rejection must retain its reason");
+        assert!(matches!(
+            pnp_fallback,
+            ProjectedTrackingFallbackReason::PnpRejected {
+                reason,
+                ..
+            } if reason == pnp_reason
+        ));
+        assert!(pnp_fallback.to_string().contains("no valid pose solution"));
     }
 
     #[test]

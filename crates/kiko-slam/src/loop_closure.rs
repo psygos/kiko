@@ -1259,17 +1259,14 @@ pub enum LoopVerificationError {
 
 impl LoopVerificationError {
     pub fn is_candidate_rejection(&self) -> bool {
-        matches!(
-            self,
-            Self::TooFewMatches { .. }
-                | Self::InsufficientInliers { .. }
-                | Self::PnpFailed(
-                    PnpError::NotEnoughPoints { .. }
-                        | PnpError::InsufficientObservationsForRequiredInliers { .. }
-                        | PnpError::Degenerate { .. }
-                        | PnpError::NoSolution
-                )
-        )
+        match self {
+            Self::TooFewMatches { .. } | Self::InsufficientInliers { .. } => true,
+            Self::PnpFailed(error) => error.rejection().is_some(),
+            Self::QueryIndexOutOfBounds { .. }
+            | Self::DescriptorMatch(_)
+            | Self::Map(_)
+            | Self::InvalidRansacConfig { .. } => false,
+        }
     }
 }
 
@@ -1723,13 +1720,16 @@ mod tests {
     #[test]
     fn loop_detection_error_preserves_verification_and_pnp_sources() {
         let error = super::LoopDetectError::VerificationFailed(
-            super::LoopVerificationError::PnpFailed(crate::PnpError::NoSolution),
+            super::LoopVerificationError::PnpFailed(crate::PnpRejection::NoSolution.into()),
         );
 
         let verification = error.source().expect("verification source");
         let pnp = verification.source().expect("pnp source");
-        assert_eq!(pnp.to_string(), "pnp failed to find a valid pose");
-        assert!(pnp.source().is_none());
+        assert_eq!(pnp.to_string(), "pnp rejected: no valid pose solution");
+        assert_eq!(
+            pnp.source().expect("typed rejection source").to_string(),
+            "no valid pose solution"
+        );
     }
 
     #[test]
@@ -1741,13 +1741,14 @@ mod tests {
                 rotation_deg: 15.0,
             },
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
-                crate::PnpError::NoSolution,
+                crate::PnpRejection::NoSolution.into(),
             )),
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
-                crate::PnpError::InsufficientObservationsForRequiredInliers {
+                crate::PnpRejection::InsufficientObservationsForRequiredInliers {
                     required_inliers: 5,
                     observations: 4,
-                },
+                }
+                .into(),
             )),
             super::LoopDetectError::VerificationFailed(
                 super::LoopVerificationError::InsufficientInliers {
@@ -1770,7 +1771,9 @@ mod tests {
                 },
             )),
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
-                crate::PnpError::CandidateProjectionRejectionCountOverflow,
+                crate::PnpError::RansacRejectionCountOverflow {
+                    kind: crate::PnpRansacRejectionKind::CandidateProjection,
+                },
             )),
             super::LoopDetectError::ApplyFailed(LoopApplyError::from(MapError::KeyframeNotFound(
                 KeyframeId::default(),

@@ -458,7 +458,9 @@ pub struct FrameDiagnostics {
     pub pnp_tracked_observations: Option<PnpTrackedObservationCountMetric>,
     pub pnp_accepted_inliers: Option<PnpAcceptedInlierCountMetric>,
     pub ransac_iterations: Option<usize>,
+    pub pnp_ransac_minimal_sample_rejections: Option<usize>,
     pub pnp_ransac_candidate_projection_rejections: Option<usize>,
+    pub pnp_rejection: Option<crate::PnpRejection>,
     pub pnp_refinement: Option<crate::PnpRefinementStatus>,
     pub tracking_pose_source: Option<TrackingPoseSource>,
     pub pnp_projectable_tracked_observations: Option<PnpProjectableTrackedObservationCountMetric>,
@@ -529,7 +531,9 @@ impl FrameDiagnostics {
             pnp_tracked_observations: None,
             pnp_accepted_inliers: None,
             ransac_iterations: None,
+            pnp_ransac_minimal_sample_rejections: None,
             pnp_ransac_candidate_projection_rejections: None,
+            pnp_rejection: None,
             pnp_refinement: None,
             tracking_pose_source: None,
             pnp_projectable_tracked_observations: None,
@@ -576,7 +580,7 @@ impl FrameDiagnostics {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ProjectedTrackingFallbackReason {
     PosePredictionUnavailable,
     TooFewCandidateMatches {
@@ -598,6 +602,7 @@ pub enum ProjectedTrackingFallbackReason {
         verified: usize,
         observations: usize,
         required_inliers: usize,
+        reason: crate::PnpRejection,
     },
     TooFewInliers {
         matches: usize,
@@ -637,9 +642,10 @@ impl std::fmt::Display for ProjectedTrackingFallbackReason {
                 verified,
                 observations,
                 required_inliers,
+                reason,
             } => write!(
                 f,
-                "projected-match PnP rejected (matches={matches}, verified={verified}, observations={observations}, required_inliers={required_inliers})"
+                "projected-match PnP rejected (matches={matches}, verified={verified}, observations={observations}, required_inliers={required_inliers}, reason={reason})"
             ),
             Self::TooFewInliers {
                 matches,
@@ -663,6 +669,9 @@ pub enum DiagnosticEvent {
     TrackingRecovered,
     ProjectedTrackingFallback {
         reason: ProjectedTrackingFallbackReason,
+    },
+    TrackingPnpRejected {
+        reason: crate::PnpRejection,
     },
     KeyframeCreated {
         keyframe_id: KeyframeId,
@@ -842,7 +851,9 @@ mod tests {
         assert!(diag.pnp_tracked_observations.is_none());
         assert!(diag.pnp_accepted_inliers.is_none());
         assert!(diag.ransac_iterations.is_none());
+        assert!(diag.pnp_ransac_minimal_sample_rejections.is_none());
         assert!(diag.pnp_ransac_candidate_projection_rejections.is_none());
+        assert!(diag.pnp_rejection.is_none());
         assert!(diag.tracking_pose_source.is_none());
         assert!(diag.pnp_projectable_tracked_observations.is_none());
         assert!(

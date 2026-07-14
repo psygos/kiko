@@ -1,5 +1,5 @@
 use std::collections::TryReserveError;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU8, NonZeroUsize};
 
 use crate::dataset::CameraIntrinsics;
 use crate::{Keypoint, Point3, math};
@@ -445,6 +445,281 @@ impl std::fmt::Display for PnpInlierBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpRansacRejectionKind {
+    MinimalSample,
+    CandidateProjection,
+}
+
+impl std::fmt::Display for PnpRansacRejectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::MinimalSample => "minimal-sample",
+            Self::CandidateProjection => "candidate-projection",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpP3pBuffer {
+    RealPolynomialRoots,
+    DistanceRatioRoots,
+    PoseCandidates,
+}
+
+impl std::fmt::Display for PnpP3pBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::RealPolynomialRoots => "real polynomial roots",
+            Self::DistanceRatioRoots => "P3P distance-ratio roots",
+            Self::PoseCandidates => "P3P pose candidates",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PnpWorldTriangleSide {
+    Point2ToPoint3,
+    Point1ToPoint3,
+    Point1ToPoint2,
+}
+
+impl std::fmt::Display for PnpWorldTriangleSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Point2ToPoint3 => "point 2 to point 3",
+            Self::Point1ToPoint3 => "point 1 to point 3",
+            Self::Point1ToPoint2 => "point 1 to point 2",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PnpMinimalSampleRejectionReason {
+    NonFiniteWorldTriangleSideMeters {
+        side: PnpWorldTriangleSide,
+        value: f32,
+    },
+    DegenerateWorldTriangle,
+    NonFiniteQuarticCoefficient {
+        coefficient_index: usize,
+        value: f64,
+    },
+    DegenerateQuartic,
+    RootSolverUnsupportedDegree {
+        degree: usize,
+        maximum_supported_degree: usize,
+    },
+    RootSolverBreakdown {
+        root_iteration: NonZeroU8,
+        root_index: u8,
+        denominator_magnitude: f64,
+    },
+    RootSolverNonFiniteDenominator {
+        root_iteration: NonZeroU8,
+        root_index: u8,
+        real: f64,
+        imaginary: f64,
+    },
+    RootSolverNonFinitePolynomialValue {
+        root_iteration: NonZeroU8,
+        root_index: u8,
+        real: f64,
+        imaginary: f64,
+    },
+    RootSolverDivisionFailed {
+        root_iteration: NonZeroU8,
+        root_index: u8,
+        polynomial_magnitude: f64,
+        denominator_magnitude: f64,
+    },
+    RootSolverNonFiniteUpdatedRoot {
+        root_iteration: NonZeroU8,
+        root_index: u8,
+        updated_real: f64,
+        updated_imaginary: f64,
+    },
+    RootSolverNonFiniteCorrectionMagnitude {
+        root_iteration: NonZeroU8,
+        root_index: u8,
+        correction_real: f64,
+        correction_imaginary: f64,
+    },
+    RootSolverIterationLimit {
+        iterations: NonZeroU8,
+    },
+    NoAdmissibleDistanceRatioRoots,
+    NoGeometricallyAdmissiblePoseCandidates,
+}
+
+impl std::fmt::Display for PnpMinimalSampleRejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteWorldTriangleSideMeters { side, value } => write!(
+                f,
+                "sampled world-triangle side {side} became nonfinite during f32 distance evaluation: {value} m"
+            ),
+            Self::DegenerateWorldTriangle => {
+                write!(
+                    f,
+                    "the sampled world points do not form a nondegenerate triangle"
+                )
+            }
+            Self::NonFiniteQuarticCoefficient {
+                coefficient_index,
+                value,
+            } => write!(
+                f,
+                "P3P quartic coefficient {coefficient_index} is nonfinite: {value}"
+            ),
+            Self::DegenerateQuartic => {
+                write!(f, "the normalized P3P quartic has no nonconstant term")
+            }
+            Self::RootSolverUnsupportedDegree {
+                degree,
+                maximum_supported_degree,
+            } => write!(
+                f,
+                "P3P root solver received degree {degree}, above its fixed maximum of {maximum_supported_degree}"
+            ),
+            Self::RootSolverBreakdown {
+                root_iteration,
+                root_index,
+                denominator_magnitude,
+            } => write!(
+                f,
+                "P3P root solve broke down at iteration {root_iteration}, root {root_index}: Durand-Kerner denominator magnitude {denominator_magnitude} is at or below {ROOT_DENOMINATOR_TOLERANCE}"
+            ),
+            Self::RootSolverNonFiniteDenominator {
+                root_iteration,
+                root_index,
+                real,
+                imaginary,
+            } => write!(
+                f,
+                "P3P root solve produced a nonfinite Durand-Kerner denominator at iteration {root_iteration}, root {root_index}: ({real}, {imaginary})"
+            ),
+            Self::RootSolverNonFinitePolynomialValue {
+                root_iteration,
+                root_index,
+                real,
+                imaginary,
+            } => write!(
+                f,
+                "P3P root solve produced a nonfinite polynomial value at iteration {root_iteration}, root {root_index}: ({real}, {imaginary})"
+            ),
+            Self::RootSolverDivisionFailed {
+                root_iteration,
+                root_index,
+                polynomial_magnitude,
+                denominator_magnitude,
+            } => write!(
+                f,
+                "P3P root solve could not divide polynomial magnitude {polynomial_magnitude} by denominator magnitude {denominator_magnitude} at iteration {root_iteration}, root {root_index} without leaving the finite f64 domain"
+            ),
+            Self::RootSolverNonFiniteUpdatedRoot {
+                root_iteration,
+                root_index,
+                updated_real,
+                updated_imaginary,
+            } => write!(
+                f,
+                "P3P root solve produced a nonfinite updated root at iteration {root_iteration}, root {root_index}: ({updated_real}, {updated_imaginary})"
+            ),
+            Self::RootSolverNonFiniteCorrectionMagnitude {
+                root_iteration,
+                root_index,
+                correction_real,
+                correction_imaginary,
+            } => write!(
+                f,
+                "P3P root solve correction magnitude left the finite f64 domain at iteration {root_iteration}, root {root_index}: correction=({correction_real}, {correction_imaginary})"
+            ),
+            Self::RootSolverIterationLimit { iterations } => write!(
+                f,
+                "P3P root solve reached its {iterations}-iteration limit without convergence"
+            ),
+            Self::NoAdmissibleDistanceRatioRoots => write!(
+                f,
+                "the P3P quartic produced no positive, equation-consistent distance-ratio roots"
+            ),
+            Self::NoGeometricallyAdmissiblePoseCandidates => write!(
+                f,
+                "the P3P distance-ratio roots produced no geometrically admissible rigid pose"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PnpMinimalSampleRejectionReason {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PnpMinimalSampleRejection {
+    ransac_iteration: NonZeroUsize,
+    reason: PnpMinimalSampleRejectionReason,
+}
+
+impl PnpMinimalSampleRejection {
+    pub fn ransac_iteration(self) -> NonZeroUsize {
+        self.ransac_iteration
+    }
+
+    pub fn reason(self) -> PnpMinimalSampleRejectionReason {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for PnpMinimalSampleRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RANSAC minimal sample was rejected at iteration {}: {}",
+            self.ransac_iteration, self.reason
+        )
+    }
+}
+
+impl std::error::Error for PnpMinimalSampleRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.reason)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PnpRansacRejectionSummary<T> {
+    count: NonZeroUsize,
+    first: T,
+}
+
+impl<T: Copy> PnpRansacRejectionSummary<T> {
+    fn first(rejection: T) -> Self {
+        Self {
+            count: NonZeroUsize::MIN,
+            first: rejection,
+        }
+    }
+
+    fn try_record_another(&mut self, kind: PnpRansacRejectionKind) -> Result<(), PnpError> {
+        self.count = self
+            .count
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroUsize::new)
+            .ok_or(PnpError::RansacRejectionCountOverflow { kind })?;
+        Ok(())
+    }
+
+    pub fn count(self) -> NonZeroUsize {
+        self.count
+    }
+
+    pub fn first_rejection(self) -> T {
+        self.first
+    }
+}
+
+pub type PnpMinimalSampleRejections = PnpRansacRejectionSummary<PnpMinimalSampleRejection>;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PnpCandidateProjectionRejection {
     ransac_iteration: NonZeroUsize,
@@ -482,36 +757,145 @@ impl std::error::Error for PnpCandidateProjectionRejection {
     }
 }
 
+pub type PnpCandidateProjectionRejections =
+    PnpRansacRejectionSummary<PnpCandidateProjectionRejection>;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PnpCandidateProjectionRejections {
-    count: NonZeroUsize,
-    first: PnpCandidateProjectionRejection,
+pub struct PnpRansacRejections {
+    inner: PnpRansacRejectionsInner,
 }
 
-impl PnpCandidateProjectionRejections {
-    fn first(rejection: PnpCandidateProjectionRejection) -> Self {
-        Self {
-            count: NonZeroUsize::MIN,
-            first: rejection,
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PnpRansacRejectionsInner {
+    MinimalSamples(PnpMinimalSampleRejections),
+    CandidateProjections(PnpCandidateProjectionRejections),
+    Both {
+        minimal_samples: PnpMinimalSampleRejections,
+        candidate_projections: PnpCandidateProjectionRejections,
+    },
+}
+
+impl PnpRansacRejections {
+    fn try_record_minimal_sample(
+        summary: &mut Option<Self>,
+        rejection: PnpMinimalSampleRejection,
+    ) -> Result<(), PnpError> {
+        match summary {
+            Some(summary) => match &mut summary.inner {
+                PnpRansacRejectionsInner::MinimalSamples(rejections)
+                | PnpRansacRejectionsInner::Both {
+                    minimal_samples: rejections,
+                    ..
+                } => rejections.try_record_another(PnpRansacRejectionKind::MinimalSample),
+                PnpRansacRejectionsInner::CandidateProjections(candidate_projections) => {
+                    summary.inner = PnpRansacRejectionsInner::Both {
+                        minimal_samples: PnpMinimalSampleRejections::first(rejection),
+                        candidate_projections: *candidate_projections,
+                    };
+                    Ok(())
+                }
+            },
+            None => {
+                *summary = Some(Self {
+                    inner: PnpRansacRejectionsInner::MinimalSamples(
+                        PnpMinimalSampleRejections::first(rejection),
+                    ),
+                });
+                Ok(())
+            }
         }
     }
 
-    fn try_record_another(&mut self) -> Result<(), PnpError> {
-        self.count = self
-            .count
-            .get()
-            .checked_add(1)
-            .and_then(NonZeroUsize::new)
-            .ok_or(PnpError::CandidateProjectionRejectionCountOverflow)?;
-        Ok(())
+    fn try_record_candidate_projection(
+        summary: &mut Option<Self>,
+        rejection: PnpCandidateProjectionRejection,
+    ) -> Result<(), PnpError> {
+        match summary {
+            Some(summary) => match &mut summary.inner {
+                PnpRansacRejectionsInner::CandidateProjections(rejections)
+                | PnpRansacRejectionsInner::Both {
+                    candidate_projections: rejections,
+                    ..
+                } => rejections.try_record_another(PnpRansacRejectionKind::CandidateProjection),
+                PnpRansacRejectionsInner::MinimalSamples(minimal_samples) => {
+                    summary.inner = PnpRansacRejectionsInner::Both {
+                        minimal_samples: *minimal_samples,
+                        candidate_projections: PnpCandidateProjectionRejections::first(rejection),
+                    };
+                    Ok(())
+                }
+            },
+            None => {
+                *summary = Some(Self {
+                    inner: PnpRansacRejectionsInner::CandidateProjections(
+                        PnpCandidateProjectionRejections::first(rejection),
+                    ),
+                });
+                Ok(())
+            }
+        }
     }
 
-    pub fn count(self) -> NonZeroUsize {
-        self.count
+    pub fn minimal_sample_rejections(self) -> Option<PnpMinimalSampleRejections> {
+        match self.inner {
+            PnpRansacRejectionsInner::MinimalSamples(rejections)
+            | PnpRansacRejectionsInner::Both {
+                minimal_samples: rejections,
+                ..
+            } => Some(rejections),
+            PnpRansacRejectionsInner::CandidateProjections(_) => None,
+        }
     }
 
-    pub fn first_rejection(self) -> PnpCandidateProjectionRejection {
-        self.first
+    pub fn candidate_projection_rejections(self) -> Option<PnpCandidateProjectionRejections> {
+        match self.inner {
+            PnpRansacRejectionsInner::CandidateProjections(rejections)
+            | PnpRansacRejectionsInner::Both {
+                candidate_projections: rejections,
+                ..
+            } => Some(rejections),
+            PnpRansacRejectionsInner::MinimalSamples(_) => None,
+        }
+    }
+
+    fn first_rejection_error(&self) -> &(dyn std::error::Error + 'static) {
+        match &self.inner {
+            PnpRansacRejectionsInner::MinimalSamples(samples) => &samples.first,
+            PnpRansacRejectionsInner::CandidateProjections(projections) => &projections.first,
+            PnpRansacRejectionsInner::Both {
+                minimal_samples,
+                candidate_projections,
+            } => {
+                if minimal_samples.first.ransac_iteration
+                    <= candidate_projections.first.ransac_iteration
+                {
+                    &minimal_samples.first
+                } else {
+                    &candidate_projections.first
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PnpRansacRejections {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let minimal_samples = self
+            .minimal_sample_rejections()
+            .map_or(0, |value| value.count.get());
+        let candidate_projections = self
+            .candidate_projection_rejections()
+            .map_or(0, |value| value.count.get());
+        write!(
+            f,
+            "{minimal_samples} rejected minimal samples and {candidate_projections} rejected candidate projections"
+        )
+    }
+}
+
+impl std::error::Error for PnpRansacRejections {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.first_rejection_error())
     }
 }
 
@@ -521,7 +905,7 @@ pub struct PnpResult {
     inliers: Vec<usize>,
     iterations: NonZeroUsize,
     refinement: PnpRefinementStatus,
-    candidate_projection_rejections: Option<PnpCandidateProjectionRejections>,
+    ransac_rejections: Option<PnpRansacRejections>,
 }
 
 impl PnpResult {
@@ -542,7 +926,17 @@ impl PnpResult {
     }
 
     pub fn candidate_projection_rejections(&self) -> Option<PnpCandidateProjectionRejections> {
-        self.candidate_projection_rejections
+        self.ransac_rejections
+            .and_then(PnpRansacRejections::candidate_projection_rejections)
+    }
+
+    pub fn minimal_sample_rejections(&self) -> Option<PnpMinimalSampleRejections> {
+        self.ransac_rejections
+            .and_then(PnpRansacRejections::minimal_sample_rejections)
+    }
+
+    pub fn ransac_rejections(&self) -> Option<PnpRansacRejections> {
+        self.ransac_rejections
     }
 }
 
@@ -799,53 +1193,40 @@ impl std::error::Error for PnpRefinementFallback {
 
 #[derive(Debug)]
 pub enum PnpError {
-    NotEnoughPoints {
-        required: usize,
-        actual: usize,
-    },
-    InsufficientObservationsForRequiredInliers {
-        required_inliers: usize,
-        observations: usize,
-    },
+    Rejected(PnpRejection),
     NonFiniteObservation {
         field: &'static str,
         value: f32,
     },
-    Degenerate {
-        message: &'static str,
+    ObservationBearingForwardComponentOutsideF32Domain {
+        value: f64,
     },
     InlierBufferAllocation {
         buffer: PnpInlierBuffer,
         observation_count: usize,
         source: TryReserveError,
     },
-    AllGeneratedCandidatesFailedProjection {
-        rejections: PnpCandidateProjectionRejections,
+    P3pBufferCapacityExceeded {
+        ransac_iteration: NonZeroUsize,
+        buffer: PnpP3pBuffer,
+        capacity: usize,
     },
-    NoConsensusAfterCandidateProjectionFailures {
-        rejections: PnpCandidateProjectionRejections,
+    RansacRejectionCountOverflow {
+        kind: PnpRansacRejectionKind,
     },
-    CandidateProjectionRejectionCountOverflow,
-    NoSolution,
 }
 
 impl std::fmt::Display for PnpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PnpError::NotEnoughPoints { required, actual } => {
-                write!(f, "pnp requires at least {required} points, got {actual}")
-            }
-            PnpError::InsufficientObservationsForRequiredInliers {
-                required_inliers,
-                observations,
-            } => write!(
-                f,
-                "pnp requires {required_inliers} inliers but received only {observations} observations"
-            ),
+            PnpError::Rejected(rejection) => write!(f, "pnp rejected: {rejection}"),
             PnpError::NonFiniteObservation { field, value } => {
                 write!(f, "pnp observation {field} must be finite, got {value}")
             }
-            PnpError::Degenerate { message } => write!(f, "pnp degenerate input: {message}"),
+            PnpError::ObservationBearingForwardComponentOutsideF32Domain { value } => write!(
+                f,
+                "pnp observation unit bearing has positive forward component {value}, which is not representable in f32"
+            ),
             PnpError::InlierBufferAllocation {
                 buffer,
                 observation_count,
@@ -854,21 +1235,17 @@ impl std::fmt::Display for PnpError {
                 f,
                 "failed to allocate {buffer} for {observation_count} PnP observations: {source}"
             ),
-            PnpError::AllGeneratedCandidatesFailedProjection { rejections } => write!(
+            PnpError::P3pBufferCapacityExceeded {
+                ransac_iteration,
+                buffer,
+                capacity,
+            } => write!(
                 f,
-                "all generated PnP candidates failed numerical projection ({} rejected; first: {})",
-                rejections.count, rejections.first
+                "P3P exceeded the fixed {buffer} capacity of {capacity} at RANSAC iteration {ransac_iteration}"
             ),
-            PnpError::NoConsensusAfterCandidateProjectionFailures { rejections } => write!(
-                f,
-                "PnP found no sufficient consensus after rejecting {} candidates for numerical projection failure (first: {})",
-                rejections.count, rejections.first
-            ),
-            PnpError::CandidateProjectionRejectionCountOverflow => write!(
-                f,
-                "PnP candidate projection rejection count exceeded the usize domain"
-            ),
-            PnpError::NoSolution => write!(f, "pnp failed to find a valid pose"),
+            PnpError::RansacRejectionCountOverflow { kind } => {
+                write!(f, "PnP {kind} rejection count exceeded the usize domain")
+            }
         }
     }
 }
@@ -876,18 +1253,99 @@ impl std::fmt::Display for PnpError {
 impl std::error::Error for PnpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Rejected(rejection) => Some(rejection),
             Self::InlierBufferAllocation { source, .. } => Some(source),
-            Self::AllGeneratedCandidatesFailedProjection { rejections } => Some(&rejections.first),
-            Self::NoConsensusAfterCandidateProjectionFailures { rejections } => {
-                Some(&rejections.first)
+            Self::NonFiniteObservation { .. }
+            | Self::ObservationBearingForwardComponentOutsideF32Domain { .. }
+            | Self::P3pBufferCapacityExceeded { .. }
+            | Self::RansacRejectionCountOverflow { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PnpRejection {
+    NotEnoughPoints {
+        required: usize,
+        actual: usize,
+    },
+    InsufficientObservationsForRequiredInliers {
+        required_inliers: usize,
+        observations: usize,
+    },
+    NoUsableRansacCandidate {
+        rejections: PnpRansacRejections,
+    },
+    NoConsensusAfterRansacRejections {
+        rejections: PnpRansacRejections,
+    },
+    NoSolution,
+}
+
+impl std::fmt::Display for PnpRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotEnoughPoints { required, actual } => {
+                write!(f, "requires at least {required} points, got {actual}")
             }
+            Self::InsufficientObservationsForRequiredInliers {
+                required_inliers,
+                observations,
+            } => write!(
+                f,
+                "requires {required_inliers} inliers but received only {observations} observations"
+            ),
+            Self::NoUsableRansacCandidate { rejections } => {
+                write!(f, "no usable RANSAC candidate after {rejections}")
+            }
+            Self::NoConsensusAfterRansacRejections { rejections } => {
+                write!(f, "no sufficient consensus after {rejections}")
+            }
+            Self::NoSolution => write!(f, "no valid pose solution"),
+        }
+    }
+}
+
+impl std::error::Error for PnpRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NoUsableRansacCandidate { rejections }
+            | Self::NoConsensusAfterRansacRejections { rejections } => Some(rejections),
             Self::NotEnoughPoints { .. }
             | Self::InsufficientObservationsForRequiredInliers { .. }
-            | Self::NonFiniteObservation { .. }
-            | Self::Degenerate { .. }
-            | Self::CandidateProjectionRejectionCountOverflow
             | Self::NoSolution => None,
         }
+    }
+}
+
+impl PnpRejection {
+    pub fn ransac_rejections(self) -> Option<PnpRansacRejections> {
+        match self {
+            Self::NoUsableRansacCandidate { rejections }
+            | Self::NoConsensusAfterRansacRejections { rejections } => Some(rejections),
+            Self::NotEnoughPoints { .. }
+            | Self::InsufficientObservationsForRequiredInliers { .. }
+            | Self::NoSolution => None,
+        }
+    }
+}
+
+impl PnpError {
+    pub fn rejection(&self) -> Option<PnpRejection> {
+        match self {
+            Self::Rejected(rejection) => Some(*rejection),
+            Self::NonFiniteObservation { .. }
+            | Self::ObservationBearingForwardComponentOutsideF32Domain { .. }
+            | Self::InlierBufferAllocation { .. }
+            | Self::P3pBufferCapacityExceeded { .. }
+            | Self::RansacRejectionCountOverflow { .. } => None,
+        }
+    }
+}
+
+impl From<PnpRejection> for PnpError {
+    fn from(value: PnpRejection) -> Self {
+        Self::Rejected(value)
     }
 }
 
@@ -897,16 +1355,18 @@ pub fn solve_pnp_ransac(
     config: RansacConfig,
 ) -> Result<PnpResult, PnpError> {
     if observations.len() < MIN_PNP_POINTS {
-        return Err(PnpError::NotEnoughPoints {
+        return Err(PnpRejection::NotEnoughPoints {
             required: MIN_PNP_POINTS,
             actual: observations.len(),
-        });
+        }
+        .into());
     }
     if observations.len() < config.min_inliers() {
-        return Err(PnpError::InsufficientObservationsForRequiredInliers {
+        return Err(PnpRejection::InsufficientObservationsForRequiredInliers {
             required_inliers: config.min_inliers(),
             observations: observations.len(),
-        });
+        }
+        .into());
     }
 
     let mut rng = XorShift64::new(config.seed());
@@ -914,7 +1374,9 @@ pub fn solve_pnp_ransac(
     let mut best_inliers = try_inlier_buffer(PnpInlierBuffer::BestConsensus, observations.len())?;
     let mut candidate_inliers =
         try_inlier_buffer(PnpInlierBuffer::CandidateScratch, observations.len())?;
-    let mut candidate_projection_rejections: Option<PnpCandidateProjectionRejections> = None;
+    let mut p3p_candidates = FixedBuffer::new();
+    let mut ransac_rejections: Option<PnpRansacRejections> = None;
+    let mut saw_generated_candidate = false;
     let mut saw_projection_complete_candidate = false;
 
     let mut ransac_iteration = NonZeroUsize::MIN;
@@ -924,48 +1386,59 @@ pub fn solve_pnp_ransac(
     let threshold_px = f64::from(config.reprojection_threshold_px());
     let threshold_sq_px2 = threshold_px * threshold_px;
     loop {
-        let [a, b, c] = sample_three(&mut rng, total).ok_or(PnpError::NotEnoughPoints {
-            required: 3,
-            actual: total,
+        let [a, b, c] = sample_three(&mut rng, total).ok_or_else(|| {
+            PnpError::from(PnpRejection::NotEnoughPoints {
+                required: 3,
+                actual: total,
+            })
         })?;
 
         let obs = [&observations[a], &observations[b], &observations[c]];
-        let candidates = p3p_solutions(obs);
-        'candidate: for pose in candidates {
-            if let Err(failure) = collect_inliers_into(
-                &mut candidate_inliers,
-                pose,
-                observations,
-                intrinsics,
-                threshold_sq_px2,
-            ) {
-                let rejection = PnpCandidateProjectionRejection {
-                    ransac_iteration,
-                    observation_index: failure.observation_index,
-                    source: failure.source,
-                };
-                match candidate_projection_rejections.as_mut() {
-                    Some(rejections) => rejections.try_record_another()?,
-                    None => {
-                        candidate_projection_rejections =
-                            Some(PnpCandidateProjectionRejections::first(rejection));
-                    }
-                }
-                continue 'candidate;
+        match p3p_solutions(obs, ransac_iteration, &mut p3p_candidates)? {
+            Some(reason) => {
+                PnpRansacRejections::try_record_minimal_sample(
+                    &mut ransac_rejections,
+                    PnpMinimalSampleRejection {
+                        ransac_iteration,
+                        reason,
+                    },
+                )?;
             }
-            saw_projection_complete_candidate = true;
+            None => {
+                saw_generated_candidate = true;
+                'candidate: for pose in p3p_candidates.iter() {
+                    if let Err(failure) = collect_inliers_into(
+                        &mut candidate_inliers,
+                        pose,
+                        observations,
+                        intrinsics,
+                        threshold_sq_px2,
+                    ) {
+                        PnpRansacRejections::try_record_candidate_projection(
+                            &mut ransac_rejections,
+                            PnpCandidateProjectionRejection {
+                                ransac_iteration,
+                                observation_index: failure.observation_index,
+                                source: failure.source,
+                            },
+                        )?;
+                        continue 'candidate;
+                    }
+                    saw_projection_complete_candidate = true;
 
-            if candidate_inliers.len() > best_inliers.len() {
-                best_inliers.clear();
-                best_inliers.extend(candidate_inliers.iter().copied());
-                best_pose = Some(pose);
-                target_iterations = target_iterations.min(adaptive_ransac_iterations(
-                    best_inliers.len(),
-                    total,
-                    RANSAC_CONFIDENCE,
-                ));
-                if best_inliers.len() == total {
-                    break;
+                    if candidate_inliers.len() > best_inliers.len() {
+                        best_inliers.clear();
+                        best_inliers.extend(candidate_inliers.iter().copied());
+                        best_pose = Some(pose);
+                        target_iterations = target_iterations.min(adaptive_ransac_iterations(
+                            best_inliers.len(),
+                            total,
+                            RANSAC_CONFIDENCE,
+                        ));
+                        if best_inliers.len() == total {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -977,16 +1450,16 @@ pub fn solve_pnp_ransac(
 
     let pose = match best_pose {
         Some(pose) => pose,
-        None if !saw_projection_complete_candidate => {
-            if let Some(rejections) = candidate_projection_rejections {
-                return Err(PnpError::AllGeneratedCandidatesFailedProjection { rejections });
+        None if !saw_generated_candidate || !saw_projection_complete_candidate => {
+            if let Some(rejections) = ransac_rejections {
+                return Err(PnpRejection::NoUsableRansacCandidate { rejections }.into());
             }
-            return Err(PnpError::NoSolution);
+            return Err(PnpRejection::NoSolution.into());
         }
-        None => return Err(no_consensus_error(candidate_projection_rejections)),
+        None => return Err(no_consensus_error(ransac_rejections)),
     };
     if best_inliers.len() < config.min_inliers() {
-        return Err(no_consensus_error(candidate_projection_rejections));
+        return Err(no_consensus_error(ransac_rejections));
     }
 
     let (pose, inliers, refinement) =
@@ -1041,16 +1514,14 @@ pub fn solve_pnp_ransac(
         inliers,
         iterations: ransac_iteration,
         refinement,
-        candidate_projection_rejections,
+        ransac_rejections,
     })
 }
 
-fn no_consensus_error(
-    candidate_projection_rejections: Option<PnpCandidateProjectionRejections>,
-) -> PnpError {
-    match candidate_projection_rejections {
-        Some(rejections) => PnpError::NoConsensusAfterCandidateProjectionFailures { rejections },
-        None => PnpError::NoSolution,
+fn no_consensus_error(ransac_rejections: Option<PnpRansacRejections>) -> PnpError {
+    match ransac_rejections {
+        Some(rejections) => PnpRejection::NoConsensusAfterRansacRejections { rejections }.into(),
+        None => PnpRejection::NoSolution.into(),
     }
 }
 
@@ -1313,19 +1784,80 @@ fn decide_refinement_step(
 }
 
 fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
-    let x = (pixel.x - intrinsics.cx()) / intrinsics.fx();
-    let y = (pixel.y - intrinsics.cy()) / intrinsics.fy();
-    let v = [x, y, 1.0];
-    let n = norm(v);
-    if !n.is_finite() || n <= 0.0 {
-        return Err(PnpError::Degenerate {
-            message: "non-finite or zero-length bearing",
-        });
+    let x = (f64::from(pixel.x) - f64::from(intrinsics.cx())) / f64::from(intrinsics.fx());
+    let y = (f64::from(pixel.y) - f64::from(intrinsics.cy())) / f64::from(intrinsics.fy());
+    let norm = x.hypot(y).hypot(1.0);
+    let forward = 1.0 / norm;
+    if forward < f64::from(f32::from_bits(1)) {
+        return Err(
+            PnpError::ObservationBearingForwardComponentOutsideF32Domain { value: forward },
+        );
     }
-    Ok([v[0] / n, v[1] / n, v[2] / n])
+    Ok([(x / norm) as f32, (y / norm) as f32, forward as f32])
 }
 
-fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
+const MAX_P3P_REAL_ROOTS: usize = 4;
+const MAX_P3P_DISTANCE_RATIO_ROOTS: usize = MAX_P3P_REAL_ROOTS * 2;
+const MAX_P3P_POSE_CANDIDATES: usize = MAX_P3P_DISTANCE_RATIO_ROOTS;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FixedBuffer<T: Copy, const CAPACITY: usize> {
+    entries: [Option<T>; CAPACITY],
+    len: usize,
+}
+
+impl<T: Copy, const CAPACITY: usize> FixedBuffer<T, CAPACITY> {
+    fn new() -> Self {
+        Self {
+            entries: [None; CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn try_push(&mut self, value: T) -> Result<(), usize> {
+        let next_len = self.len.checked_add(1).ok_or(CAPACITY)?;
+        let Some(slot) = self.entries.get_mut(self.len) else {
+            return Err(CAPACITY);
+        };
+        *slot = Some(value);
+        self.len = next_len;
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.entries
+            .iter()
+            .take(self.len)
+            .filter_map(|entry| *entry)
+    }
+}
+
+fn p3p_capacity_error(
+    ransac_iteration: NonZeroUsize,
+    buffer: PnpP3pBuffer,
+    capacity: usize,
+) -> PnpError {
+    PnpError::P3pBufferCapacityExceeded {
+        ransac_iteration,
+        buffer,
+        capacity,
+    }
+}
+
+fn p3p_solutions(
+    obs: [&Observation; 3],
+    ransac_iteration: NonZeroUsize,
+    solutions: &mut FixedBuffer<Pose, MAX_P3P_POSE_CANDIDATES>,
+) -> Result<Option<PnpMinimalSampleRejectionReason>, PnpError> {
+    solutions.clear();
     let p1 = vec3_from_point(obs[0].world);
     let p2 = vec3_from_point(obs[1].world);
     let p3 = vec3_from_point(obs[2].world);
@@ -1337,9 +1869,23 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
     let b = norm(sub(p1, p3));
     let c = norm(sub(p1, p2));
 
+    for (side, value) in [
+        (PnpWorldTriangleSide::Point2ToPoint3, a),
+        (PnpWorldTriangleSide::Point1ToPoint3, b),
+        (PnpWorldTriangleSide::Point1ToPoint2, c),
+    ] {
+        if !value.is_finite() {
+            return Ok(Some(
+                PnpMinimalSampleRejectionReason::NonFiniteWorldTriangleSideMeters { side, value },
+            ));
+        }
+    }
+
     let scene_scale = a.max(b).max(c);
-    if !scene_scale.is_finite() || scene_scale <= 0.0 {
-        return Vec::new();
+    if scene_scale <= 0.0 || a <= 0.0 || b <= 0.0 || c <= 0.0 {
+        return Ok(Some(
+            PnpMinimalSampleRejectionReason::DegenerateWorldTriangle,
+        ));
     }
     let normalized_a = a / scene_scale;
     let normalized_b = b / scene_scale;
@@ -1349,27 +1895,34 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
     let cos_beta = dot(f1, f3);
     let cos_gamma = dot(f1, f2);
 
-    let mut solutions = Vec::new();
-    let mut roots = Vec::new();
-    find_roots(
+    let roots = match find_roots(
         cos_alpha,
         cos_beta,
         cos_gamma,
         normalized_a,
         normalized_b,
         normalized_c,
-        &mut roots,
-    );
+        ransac_iteration,
+    )? {
+        P3pRootGeneration::Roots(roots) => roots,
+        P3pRootGeneration::Rejected(reason) => return Ok(Some(reason)),
+    };
 
-    for (x, y) in roots {
+    for (x, y) in roots.iter() {
         let denom = 1.0 + x * x - 2.0 * x * cos_gamma;
-        if denom <= 0.0 {
+        if !denom.is_finite() || denom <= 0.0 {
             continue;
         }
         let d1 = c / denom.sqrt();
         let d2 = x * d1;
         let d3 = y * d1;
-        if d1 <= 0.0 || d2 <= 0.0 || d3 <= 0.0 {
+        if !d1.is_finite()
+            || !d2.is_finite()
+            || !d3.is_finite()
+            || d1 <= 0.0
+            || d2 <= 0.0
+            || d3 <= 0.0
+        {
             continue;
         }
 
@@ -1378,11 +1931,25 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
         let c3 = mul(f3, d3);
 
         if let Some(pose) = pose_from_points(p1, p2, p3, c1, c2, c3) {
-            solutions.push(pose);
+            solutions.try_push(pose).map_err(|capacity| {
+                p3p_capacity_error(ransac_iteration, PnpP3pBuffer::PoseCandidates, capacity)
+            })?;
         }
     }
 
-    solutions
+    if solutions.is_empty() {
+        Ok(Some(
+            PnpMinimalSampleRejectionReason::NoGeometricallyAdmissiblePoseCandidates,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum P3pRootGeneration {
+    Roots(FixedBuffer<(f32, f32), MAX_P3P_DISTANCE_RATIO_ROOTS>),
+    Rejected(PnpMinimalSampleRejectionReason),
 }
 
 fn find_roots(
@@ -1392,8 +1959,8 @@ fn find_roots(
     a: f32,
     b: f32,
     c: f32,
-    roots: &mut Vec<(f32, f32)>,
-) {
+    ransac_iteration: NonZeroUsize,
+) -> Result<P3pRootGeneration, PnpError> {
     let coeffs_meta = P3pCoeffs {
         cos_alpha,
         cos_beta,
@@ -1403,13 +1970,14 @@ fn find_roots(
         c,
     };
     let coeffs = quartic_coeffs(cos_alpha, cos_beta, cos_gamma, a, b, c);
-    let Some(coeffs) = coeffs else {
-        return;
+    let xs = match solve_real_roots(coeffs, ransac_iteration)? {
+        RealRootGeneration::Roots(roots) => roots,
+        RealRootGeneration::Rejected(reason) => return Ok(P3pRootGeneration::Rejected(reason)),
     };
 
-    let xs = solve_real_roots(coeffs);
-    for x in xs {
-        if !x.is_finite() || x <= 0.0 {
+    let mut roots = FixedBuffer::new();
+    for x in xs.iter() {
+        if !x.is_finite() || x <= 0.0 || x > f64::from(f32::MAX) {
             continue;
         }
         let xf = x as f32;
@@ -1424,9 +1992,17 @@ fn find_roots(
                 continue;
             };
             if fx.abs() < P3P_ROOT_TOLERANCE {
-                push_unique_root(roots, (xf, y));
+                push_unique_root(&mut roots, (xf, y), ransac_iteration)?;
             }
         }
+    }
+
+    if roots.is_empty() {
+        Ok(P3pRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::NoAdmissibleDistanceRatioRoots,
+        ))
+    } else {
+        Ok(P3pRootGeneration::Roots(roots))
     }
 }
 
@@ -1474,16 +2050,10 @@ fn quartic_coeffs(
     a: f32,
     b: f32,
     c: f32,
-) -> Option<[f64; 5]> {
-    if a <= 0.0 || b <= 0.0 || c <= 0.0 {
-        return None;
-    }
+) -> [f64; 5] {
     let a2 = (a as f64) * (a as f64);
     let b2 = (b as f64) * (b as f64);
     let c2 = (c as f64) * (c as f64);
-    if !a2.is_finite() || !b2.is_finite() || !c2.is_finite() || c2 <= 0.0 {
-        return None;
-    }
 
     let ca = cos_alpha as f64;
     let cb = cos_beta as f64;
@@ -1492,45 +2062,38 @@ fn quartic_coeffs(
     let n0 = a2 - b2 + c2;
     let n1 = -2.0 * (a2 - b2) * cg;
     let n2 = a2 - b2 - c2;
-    let n = [n0, n1, n2];
-
     let d0 = 2.0 * c2 * cb;
     let d1 = -2.0 * c2 * ca;
-    let d = [d0, d1];
 
     let k_scale = b2 / c2;
     let k0 = 1.0 - k_scale;
     let k1 = 2.0 * k_scale * cg;
     let k2 = -k_scale;
-    let k = [k0, k1, k2];
 
-    let n2_poly = poly_mul(&n, &n);
-    let nd_poly = poly_mul(&n, &d);
-    let d2_poly = poly_mul(&d, &d);
-    let kd2_poly = poly_mul(&k, &d2_poly);
+    let n_squared = [
+        n0 * n0,
+        2.0 * n0 * n1,
+        2.0 * n0 * n2 + n1 * n1,
+        2.0 * n1 * n2,
+        n2 * n2,
+    ];
+    let n_times_d = [n0 * d0, n0 * d1 + n1 * d0, n1 * d1 + n2 * d0, n2 * d1];
+    let d_squared = [d0 * d0, 2.0 * d0 * d1, d1 * d1];
+    let k_times_d_squared = [
+        k0 * d_squared[0],
+        k0 * d_squared[1] + k1 * d_squared[0],
+        k0 * d_squared[2] + k1 * d_squared[1] + k2 * d_squared[0],
+        k1 * d_squared[2] + k2 * d_squared[1],
+        k2 * d_squared[2],
+    ];
 
-    let mut p = vec![0.0_f64; 5];
-    add_scaled(&mut p, &n2_poly, 1.0);
-    add_scaled(&mut p, &nd_poly, -2.0 * cb);
-    add_scaled(&mut p, &kd2_poly, 1.0);
-
-    Some([p[0], p[1], p[2], p[3], p[4]])
-}
-
-fn poly_mul(a: &[f64], b: &[f64]) -> Vec<f64> {
-    let mut out = vec![0.0_f64; a.len() + b.len() - 1];
-    for (i, &ai) in a.iter().enumerate() {
-        for (j, &bj) in b.iter().enumerate() {
-            out[i + j] += ai * bj;
-        }
-    }
-    out
-}
-
-fn add_scaled(dst: &mut [f64], src: &[f64], scale: f64) {
-    for (i, &v) in src.iter().enumerate() {
-        dst[i] += scale * v;
-    }
+    [
+        n_squared[0] - 2.0 * cb * n_times_d[0] + k_times_d_squared[0],
+        n_squared[1] - 2.0 * cb * n_times_d[1] + k_times_d_squared[1],
+        n_squared[2] - 2.0 * cb * n_times_d[2] + k_times_d_squared[2],
+        n_squared[3] - 2.0 * cb * n_times_d[3] + k_times_d_squared[3],
+        n_squared[4] + k_times_d_squared[4],
+    ]
 }
 
 /// Minimum number of point correspondences required for PnP solving (geometric minimum for P3P).
@@ -1542,10 +2105,10 @@ const POLY_RELATIVE_COEFFICIENT_TOLERANCE: f64 = 1e-12;
 const IMAGINARY_TOLERANCE: f64 = 1e-6;
 /// Convergence threshold for the Durand-Kerner root-finding iterations.
 const ROOT_CONVERGENCE_THRESHOLD: f64 = 1e-10;
-/// Denominator magnitude below which a Durand-Kerner correction is skipped.
+/// Denominator magnitude at or below which Durand-Kerner reports root-estimate breakdown.
 const ROOT_DENOMINATOR_TOLERANCE: f64 = 1e-12;
 /// Maximum iterations for the Durand-Kerner root-finding algorithm.
-const MAX_ROOT_ITERATIONS: usize = 64;
+const MAX_ROOT_ITERATIONS: NonZeroU8 = NonZeroU8::MIN.saturating_add(63);
 /// Tolerance for detecting duplicate P3P root solutions.
 const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
 /// Tolerance for accepting the dimensionless P3P equation evaluation as a valid root.
@@ -1561,59 +2124,105 @@ const PNP_REFINEMENT_TRANSLATION_CONVERGENCE_M: f64 = 1e-5;
 /// Rotation-vector convergence threshold for PnP pose refinement, in radians.
 const PNP_REFINEMENT_ROTATION_CONVERGENCE_RAD: f64 = 1e-5;
 
-fn solve_real_roots(coeffs: [f64; 5]) -> Vec<f64> {
-    if coeffs.iter().any(|coefficient| !coefficient.is_finite()) {
-        return Vec::new();
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RealRootGeneration {
+    Roots(FixedBuffer<f64, MAX_P3P_REAL_ROOTS>),
+    Rejected(PnpMinimalSampleRejectionReason),
+}
+
+fn solve_real_roots(
+    coeffs: [f64; 5],
+    ransac_iteration: NonZeroUsize,
+) -> Result<RealRootGeneration, PnpError> {
+    if let Some((coefficient_index, value)) = coeffs
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, coefficient)| !coefficient.is_finite())
+    {
+        return Ok(RealRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::NonFiniteQuarticCoefficient {
+                coefficient_index,
+                value,
+            },
+        ));
     }
     let scale = coeffs
         .iter()
         .map(|coefficient| coefficient.abs())
         .fold(0.0, f64::max);
     if scale == 0.0 {
-        return Vec::new();
+        return Ok(RealRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::DegenerateQuartic,
+        ));
     }
-    let mut coeffs: Vec<f64> = coeffs
-        .into_iter()
-        .map(|coefficient| coefficient / scale)
-        .collect();
-    while coeffs.len() > 1
-        && coeffs.last().copied().unwrap_or(0.0).abs() <= POLY_RELATIVE_COEFFICIENT_TOLERANCE
-    {
-        coeffs.pop();
-    }
-    let degree = coeffs.len().saturating_sub(1);
+    let mut coeffs = coeffs.map(|coefficient| coefficient / scale);
+    let degree = coeffs
+        .iter()
+        .rposition(|coefficient| coefficient.abs() > POLY_RELATIVE_COEFFICIENT_TOLERANCE)
+        .unwrap_or(0);
     if degree == 0 {
-        return Vec::new();
+        return Ok(RealRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::DegenerateQuartic,
+        ));
     }
+
+    let mut real_roots = FixedBuffer::new();
     if degree == 1 {
         let c1 = coeffs[1];
         if c1.abs() <= POLY_RELATIVE_COEFFICIENT_TOLERANCE {
-            return Vec::new();
+            return Ok(RealRootGeneration::Rejected(
+                PnpMinimalSampleRejectionReason::DegenerateQuartic,
+            ));
         }
-        return vec![-coeffs[0] / c1];
+        real_roots.try_push(-coeffs[0] / c1).map_err(|capacity| {
+            p3p_capacity_error(
+                ransac_iteration,
+                PnpP3pBuffer::RealPolynomialRoots,
+                capacity,
+            )
+        })?;
+        return Ok(RealRootGeneration::Roots(real_roots));
     }
 
-    let Some(&lead) = coeffs.last() else {
-        return Vec::new();
+    let Some(&lead) = coeffs.get(degree) else {
+        return Ok(RealRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::DegenerateQuartic,
+        ));
     };
     if lead.abs() <= POLY_RELATIVE_COEFFICIENT_TOLERANCE {
-        return Vec::new();
+        return Ok(RealRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::DegenerateQuartic,
+        ));
     }
-    for c in &mut coeffs {
+    for c in coeffs.iter_mut().take(degree + 1) {
         *c /= lead;
     }
 
-    let roots = durand_kerner(&coeffs);
-    let mut real = Vec::new();
-    for r in roots {
+    let Some(active_coeffs) = coeffs.get(..=degree) else {
+        return Ok(RealRootGeneration::Rejected(
+            PnpMinimalSampleRejectionReason::DegenerateQuartic,
+        ));
+    };
+    let roots = match durand_kerner(active_coeffs, MAX_ROOT_ITERATIONS) {
+        Ok(roots) => roots,
+        Err(reason) => return Ok(RealRootGeneration::Rejected(reason)),
+    };
+    for r in roots.iter().take(degree) {
         if r.im.abs() < IMAGINARY_TOLERANCE {
-            real.push(r.re);
+            real_roots.try_push(r.re).map_err(|capacity| {
+                p3p_capacity_error(
+                    ransac_iteration,
+                    PnpP3pBuffer::RealPolynomialRoots,
+                    capacity,
+                )
+            })?;
         }
     }
-    real
+    Ok(RealRootGeneration::Roots(real_roots))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Complex {
     re: f64,
     im: f64,
@@ -1625,11 +2234,32 @@ impl Complex {
     }
 
     fn abs(self) -> f64 {
-        (self.re * self.re + self.im * self.im).sqrt()
+        self.re.hypot(self.im)
     }
 
     fn from_polar(r: f64, theta: f64) -> Self {
         Self::new(r * theta.cos(), r * theta.sin())
+    }
+
+    fn is_finite(self) -> bool {
+        self.re.is_finite() && self.im.is_finite()
+    }
+
+    fn try_div(self, rhs: Self) -> Option<Self> {
+        let scale = rhs.re.abs().max(rhs.im.abs());
+        if !scale.is_finite() || scale == 0.0 {
+            return None;
+        }
+        let rhs_re = rhs.re / scale;
+        let rhs_im = rhs.im / scale;
+        let denominator = rhs_re.mul_add(rhs_re, rhs_im * rhs_im);
+        let lhs_re = self.re / scale;
+        let lhs_im = self.im / scale;
+        let quotient = Self::new(
+            lhs_re.mul_add(rhs_re, lhs_im * rhs_im) / denominator,
+            lhs_im.mul_add(rhs_re, -(lhs_re * rhs_im)) / denominator,
+        );
+        quotient.is_finite().then_some(quotient)
     }
 }
 
@@ -1657,17 +2287,6 @@ impl std::ops::Mul for Complex {
     }
 }
 
-impl std::ops::Div for Complex {
-    type Output = Self;
-    fn div(self, rhs: Self) -> Self::Output {
-        let denom = rhs.re * rhs.re + rhs.im * rhs.im;
-        Self::new(
-            (self.re * rhs.re + self.im * rhs.im) / denom,
-            (self.im * rhs.re - self.re * rhs.im) / denom,
-        )
-    }
-}
-
 fn poly_eval(coeffs: &[f64], x: Complex) -> Complex {
     let mut acc = Complex::new(0.0, 0.0);
     for &c in coeffs.iter().rev() {
@@ -1676,54 +2295,183 @@ fn poly_eval(coeffs: &[f64], x: Complex) -> Complex {
     acc
 }
 
-fn durand_kerner(coeffs: &[f64]) -> Vec<Complex> {
+fn durand_kerner(
+    coeffs: &[f64],
+    max_iterations: NonZeroU8,
+) -> Result<[Complex; MAX_P3P_REAL_ROOTS], PnpMinimalSampleRejectionReason> {
     let degree = coeffs.len().saturating_sub(1);
-    if degree == 0 {
-        return Vec::new();
+    if degree == 0 || degree > MAX_P3P_REAL_ROOTS {
+        return Err(
+            PnpMinimalSampleRejectionReason::RootSolverUnsupportedDegree {
+                degree,
+                maximum_supported_degree: MAX_P3P_REAL_ROOTS,
+            },
+        );
     }
 
     let radius = 1.0_f64;
-    let mut roots = Vec::with_capacity(degree);
+    let mut roots = [Complex::new(0.0, 0.0); MAX_P3P_REAL_ROOTS];
     for i in 0..degree {
         let theta = (2.0 * std::f64::consts::PI * i as f64) / degree as f64;
-        roots.push(Complex::from_polar(radius, theta));
+        let Some(root) = roots.get_mut(i) else {
+            return Err(
+                PnpMinimalSampleRejectionReason::RootSolverUnsupportedDegree {
+                    degree,
+                    maximum_supported_degree: MAX_P3P_REAL_ROOTS,
+                },
+            );
+        };
+        *root = Complex::from_polar(radius, theta);
     }
 
-    for _ in 0..MAX_ROOT_ITERATIONS {
-        let mut max_delta = 0.0_f64;
-        for i in 0..degree {
-            let mut denom = Complex::new(1.0, 0.0);
-            for j in 0..degree {
-                if i != j {
-                    denom = denom * (roots[i] - roots[j]);
-                }
-            }
-            if denom.abs() < ROOT_DENOMINATOR_TOLERANCE {
-                continue;
-            }
-            let p = poly_eval(coeffs, roots[i]);
-            let delta = p / denom;
-            roots[i] = roots[i] - delta;
-            max_delta = max_delta.max(delta.abs());
-        }
-        if max_delta < ROOT_CONVERGENCE_THRESHOLD {
-            break;
-        }
-    }
-
-    roots
+    durand_kerner_from_roots(coeffs, degree, roots, max_iterations)
 }
 
-fn push_unique_root(roots: &mut Vec<(f32, f32)>, candidate: (f32, f32)) {
+fn durand_kerner_from_roots(
+    coeffs: &[f64],
+    degree: usize,
+    mut roots: [Complex; MAX_P3P_REAL_ROOTS],
+    max_iterations: NonZeroU8,
+) -> Result<[Complex; MAX_P3P_REAL_ROOTS], PnpMinimalSampleRejectionReason> {
+    if degree == 0 || degree > MAX_P3P_REAL_ROOTS || coeffs.len() != degree + 1 {
+        return Err(
+            PnpMinimalSampleRejectionReason::RootSolverUnsupportedDegree {
+                degree,
+                maximum_supported_degree: MAX_P3P_REAL_ROOTS,
+            },
+        );
+    }
+
+    for root_iteration_index in 0..max_iterations.get() {
+        let root_iteration = NonZeroU8::MIN.saturating_add(root_iteration_index);
+        let mut max_delta = 0.0_f64;
+        for root_index in 0..degree {
+            let root_index_u8 = u8::try_from(root_index).map_err(|_| {
+                PnpMinimalSampleRejectionReason::RootSolverUnsupportedDegree {
+                    degree,
+                    maximum_supported_degree: MAX_P3P_REAL_ROOTS,
+                }
+            })?;
+            let Some(&root) = roots.get(root_index) else {
+                return Err(
+                    PnpMinimalSampleRejectionReason::RootSolverUnsupportedDegree {
+                        degree,
+                        maximum_supported_degree: MAX_P3P_REAL_ROOTS,
+                    },
+                );
+            };
+            let mut denom = Complex::new(1.0, 0.0);
+            for (other_index, &other_root) in roots.iter().take(degree).enumerate() {
+                if root_index != other_index {
+                    denom = denom * (root - other_root);
+                }
+            }
+            if !denom.is_finite() {
+                return Err(
+                    PnpMinimalSampleRejectionReason::RootSolverNonFiniteDenominator {
+                        root_iteration,
+                        root_index: root_index_u8,
+                        real: denom.re,
+                        imaginary: denom.im,
+                    },
+                );
+            }
+            let denominator_magnitude = denom.abs();
+            if denominator_magnitude <= ROOT_DENOMINATOR_TOLERANCE {
+                return Err(PnpMinimalSampleRejectionReason::RootSolverBreakdown {
+                    root_iteration,
+                    root_index: root_index_u8,
+                    denominator_magnitude,
+                });
+            }
+            let p = poly_eval(coeffs, root);
+            if !p.is_finite() {
+                return Err(
+                    PnpMinimalSampleRejectionReason::RootSolverNonFinitePolynomialValue {
+                        root_iteration,
+                        root_index: root_index_u8,
+                        real: p.re,
+                        imaginary: p.im,
+                    },
+                );
+            }
+            let Some(delta) = p.try_div(denom) else {
+                return Err(PnpMinimalSampleRejectionReason::RootSolverDivisionFailed {
+                    root_iteration,
+                    root_index: root_index_u8,
+                    polynomial_magnitude: p.abs(),
+                    denominator_magnitude,
+                });
+            };
+            let delta_magnitude =
+                finite_root_correction_magnitude(delta, root_iteration, root_index_u8)?;
+            let updated_root = root - delta;
+            if !updated_root.is_finite() {
+                return Err(
+                    PnpMinimalSampleRejectionReason::RootSolverNonFiniteUpdatedRoot {
+                        root_iteration,
+                        root_index: root_index_u8,
+                        updated_real: updated_root.re,
+                        updated_imaginary: updated_root.im,
+                    },
+                );
+            }
+            let Some(root_slot) = roots.get_mut(root_index) else {
+                return Err(
+                    PnpMinimalSampleRejectionReason::RootSolverUnsupportedDegree {
+                        degree,
+                        maximum_supported_degree: MAX_P3P_REAL_ROOTS,
+                    },
+                );
+            };
+            *root_slot = updated_root;
+            max_delta = max_delta.max(delta_magnitude);
+        }
+        if max_delta < ROOT_CONVERGENCE_THRESHOLD {
+            return Ok(roots);
+        }
+    }
+
+    Err(PnpMinimalSampleRejectionReason::RootSolverIterationLimit {
+        iterations: max_iterations,
+    })
+}
+
+fn finite_root_correction_magnitude(
+    correction: Complex,
+    root_iteration: NonZeroU8,
+    root_index: u8,
+) -> Result<f64, PnpMinimalSampleRejectionReason> {
+    let magnitude = correction.abs();
+    if !magnitude.is_finite() {
+        return Err(
+            PnpMinimalSampleRejectionReason::RootSolverNonFiniteCorrectionMagnitude {
+                root_iteration,
+                root_index,
+                correction_real: correction.re,
+                correction_imaginary: correction.im,
+            },
+        );
+    }
+    Ok(magnitude)
+}
+
+fn push_unique_root(
+    roots: &mut FixedBuffer<(f32, f32), MAX_P3P_DISTANCE_RATIO_ROOTS>,
+    candidate: (f32, f32),
+    ransac_iteration: NonZeroUsize,
+) -> Result<(), PnpError> {
     let (x, y) = candidate;
     let tol = ROOT_UNIQUENESS_TOLERANCE;
     if roots
         .iter()
         .any(|(rx, ry)| (rx - x).abs() < tol && (ry - y).abs() < tol)
     {
-        return;
+        return Ok(());
     }
-    roots.push(candidate);
+    roots.try_push(candidate).map_err(|capacity| {
+        p3p_capacity_error(ransac_iteration, PnpP3pBuffer::DistanceRatioRoots, capacity)
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2165,16 +2913,126 @@ mod tests {
     }
 
     #[test]
+    fn normalize_bearing_avoids_f32_pixel_subtraction_overflow() {
+        let intrinsics = PinholeIntrinsics::try_new(f32::MAX, f32::MAX, -f32::MAX, 0.0)
+            .expect("finite positive intrinsics");
+        let bearing = normalize_bearing(
+            Keypoint {
+                x: f32::MAX,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("the finite normalized coordinate is representable");
+
+        assert!(bearing.into_iter().all(f32::is_finite));
+        assert!(bearing[0] > 0.0);
+        assert!(bearing[2] > 0.0);
+        let norm = bearing
+            .into_iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn normalize_bearing_rejects_forward_component_that_underflows_f32() {
+        let intrinsics = PinholeIntrinsics::try_new(f32::from_bits(1), 1.0, -f32::MAX, 0.0)
+            .expect("finite positive intrinsics");
+        let error = normalize_bearing(
+            Keypoint {
+                x: f32::MAX,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect_err("the positive f64 forward component rounds to zero in f32");
+
+        assert!(matches!(
+            error,
+            PnpError::ObservationBearingForwardComponentOutsideF32Domain { value }
+                if value.is_finite() && value > 0.0 && value < f64::from(f32::from_bits(1))
+        ));
+        assert!(error.rejection().is_none());
+    }
+
+    #[test]
     fn polynomial_roots_are_invariant_to_coefficient_scale() {
         let base = [-6.0, 11.0, -6.0, 1.0, 0.0];
         for scale in [1e-18, 1.0, 1e18] {
-            let mut roots = solve_real_roots(base.map(|coefficient| coefficient * scale));
+            let RealRootGeneration::Roots(roots) = solve_real_roots(
+                base.map(|coefficient| coefficient * scale),
+                NonZeroUsize::MIN,
+            )
+            .expect("fixed root capacity") else {
+                panic!("scaled polynomial must produce real roots")
+            };
+            let mut roots: Vec<_> = roots.iter().collect();
             roots.sort_by(f64::total_cmp);
             assert_eq!(roots.len(), 3, "scale={scale:e}, roots={roots:?}");
             for (actual, expected) in roots.into_iter().zip([1.0, 2.0, 3.0]) {
                 assert!(
                     (actual - expected).abs() < 1e-8,
                     "scale={scale:e}, actual={actual:e}, expected={expected:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stack_quartic_coefficients_match_the_convolution_reference() {
+        fn multiply(lhs: &[f64], rhs: &[f64]) -> Vec<f64> {
+            let mut product = vec![0.0; lhs.len() + rhs.len() - 1];
+            for (lhs_index, lhs_value) in lhs.iter().copied().enumerate() {
+                for (rhs_index, rhs_value) in rhs.iter().copied().enumerate() {
+                    product[lhs_index + rhs_index] += lhs_value * rhs_value;
+                }
+            }
+            product
+        }
+
+        let mut state = 0x5EED_CAFE_D00D_F00D_u64;
+        for _ in 0..256 {
+            let mut next_unit = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                f64::from((state >> 32) as u32) / f64::from(u32::MAX)
+            };
+            let cos_alpha = (next_unit() * 1.8 - 0.9) as f32;
+            let cos_beta = (next_unit() * 1.8 - 0.9) as f32;
+            let cos_gamma = (next_unit() * 1.8 - 0.9) as f32;
+            let a = (0.1 + next_unit() * 0.9) as f32;
+            let b = (0.1 + next_unit() * 0.9) as f32;
+            let c = (0.1 + next_unit() * 0.9) as f32;
+
+            let actual = quartic_coeffs(cos_alpha, cos_beta, cos_gamma, a, b, c);
+            let a2 = f64::from(a).powi(2);
+            let b2 = f64::from(b).powi(2);
+            let c2 = f64::from(c).powi(2);
+            let ca = f64::from(cos_alpha);
+            let cb = f64::from(cos_beta);
+            let cg = f64::from(cos_gamma);
+            let n = [a2 - b2 + c2, -2.0 * (a2 - b2) * cg, a2 - b2 - c2];
+            let d = [2.0 * c2 * cb, -2.0 * c2 * ca];
+            let scale = b2 / c2;
+            let k = [1.0 - scale, 2.0 * scale * cg, -scale];
+            let n_squared = multiply(&n, &n);
+            let n_times_d = multiply(&n, &d);
+            let k_times_d_squared = multiply(&k, &multiply(&d, &d));
+            let mut expected = [0.0; 5];
+            for (index, expected_coefficient) in expected.iter_mut().enumerate() {
+                *expected_coefficient = n_squared.get(index).copied().unwrap_or(0.0)
+                    - 2.0 * cb * n_times_d.get(index).copied().unwrap_or(0.0)
+                    + k_times_d_squared.get(index).copied().unwrap_or(0.0);
+            }
+
+            for (index, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+                let scale = actual.abs().max(expected.abs()).max(1.0);
+                assert!(
+                    (actual - expected).abs() <= 8.0 * f64::EPSILON * scale,
+                    "coefficient {index}: actual={actual:e}, expected={expected:e}"
                 );
             }
         }
@@ -2217,7 +3075,14 @@ mod tests {
             let observations =
                 observations_from_projection(expected, &world, intrinsics).expect("observations");
             assert_eq!(observations.len(), 3);
-            let solutions = p3p_solutions([&observations[0], &observations[1], &observations[2]]);
+            let mut solutions = FixedBuffer::new();
+            let rejection = p3p_solutions(
+                [&observations[0], &observations[1], &observations[2]],
+                NonZeroUsize::MIN,
+                &mut solutions,
+            )
+            .expect("fixed P3P capacity");
+            assert!(rejection.is_none(), "sample rejection: {rejection:?}");
             let matched = solutions.iter().any(|solution| {
                 rot_frob_norm(solution.rotation(), expected.rotation()) < 2e-3
                     && l2(solution.translation(), expected.translation()) / scale < 2e-2
@@ -2227,6 +3092,118 @@ mod tests {
                 "no correct P3P solution at scene scale {scale:e}; candidates={solutions:?}"
             );
         }
+    }
+
+    #[test]
+    fn p3p_distinguishes_f32_distance_overflow_from_geometric_degeneracy() {
+        let observation = |world| Observation {
+            world,
+            pixel: Keypoint { x: 0.0, y: 0.0 },
+            bearing: [0.0, 0.0, 1.0],
+        };
+        let observations = [
+            observation(Point3 {
+                x: f32::MAX,
+                y: 0.0,
+                z: 1.0,
+            }),
+            observation(Point3 {
+                x: -f32::MAX,
+                y: 0.0,
+                z: 1.0,
+            }),
+            observation(Point3 {
+                x: 0.0,
+                y: 1.0,
+                z: 1.0,
+            }),
+        ];
+        let mut candidates = FixedBuffer::new();
+
+        let rejection = p3p_solutions(
+            [&observations[0], &observations[1], &observations[2]],
+            NonZeroUsize::MIN,
+            &mut candidates,
+        )
+        .expect("fixed P3P capacity")
+        .expect("f32 distance overflow must reject the sample explicitly");
+        assert!(matches!(
+            rejection,
+            PnpMinimalSampleRejectionReason::NonFiniteWorldTriangleSideMeters {
+                side: PnpWorldTriangleSide::Point2ToPoint3,
+                value,
+            } if value.is_infinite()
+        ));
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn durand_kerner_iteration_limit_is_not_reported_as_convergence() {
+        let one_iteration = NonZeroU8::MIN;
+        let error = durand_kerner(&[-6.0, 11.0, -6.0, 1.0], one_iteration)
+            .expect_err("a cubic with roots 1, 2, and 3 cannot converge in one update sweep");
+        assert_eq!(
+            error,
+            PnpMinimalSampleRejectionReason::RootSolverIterationLimit {
+                iterations: one_iteration,
+            }
+        );
+    }
+
+    #[test]
+    fn durand_kerner_coincident_estimates_are_breakdown_not_convergence() {
+        let coincident = Complex::new(1.0, 0.0);
+        let roots = [
+            coincident,
+            coincident,
+            Complex::new(0.0, 0.0),
+            Complex::new(0.0, 0.0),
+        ];
+        let error = durand_kerner_from_roots(&[-1.0, 0.0, 1.0], 2, roots, NonZeroU8::MIN)
+            .expect_err("coincident root estimates have a zero Durand-Kerner denominator");
+        assert_eq!(
+            error,
+            PnpMinimalSampleRejectionReason::RootSolverBreakdown {
+                root_iteration: NonZeroU8::MIN,
+                root_index: 0,
+                denominator_magnitude: 0.0,
+            }
+        );
+    }
+
+    #[test]
+    fn complex_division_scales_finite_large_operands_before_squaring() {
+        let component = f64::MAX / 4.0;
+        let quotient = Complex::new(component, component)
+            .try_div(Complex::new(component, component))
+            .expect("finite equal operands must have a finite quotient");
+        assert!((quotient.re - 1.0).abs() <= f64::EPSILON);
+        assert!(quotient.im.abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn finite_root_correction_with_unrepresentable_norm_is_rejected() {
+        let component = f64::MAX * 0.75;
+        let error =
+            finite_root_correction_magnitude(Complex::new(component, component), NonZeroU8::MIN, 2)
+                .expect_err("the correction components are finite but their norm exceeds f64");
+        assert_eq!(
+            error,
+            PnpMinimalSampleRejectionReason::RootSolverNonFiniteCorrectionMagnitude {
+                root_iteration: NonZeroU8::MIN,
+                root_index: 2,
+                correction_real: component,
+                correction_imaginary: component,
+            }
+        );
+    }
+
+    #[test]
+    fn fixed_buffer_reports_capacity_without_allocating_or_panicking() {
+        let mut buffer = FixedBuffer::<u8, 1>::new();
+        buffer.try_push(7).expect("first slot");
+        assert_eq!(buffer.try_push(8), Err(1));
+        assert_eq!(buffer.iter().collect::<Vec<_>>(), vec![7]);
     }
 
     #[test]
@@ -2270,6 +3247,33 @@ mod tests {
         let trans_err = l2(result.pose().translation(), pose_gt.translation());
         assert!(rot_err < 0.03, "rotation error too high: {rot_err}");
         assert!(trans_err < 0.08, "translation error too high: {trans_err}");
+    }
+
+    #[test]
+    fn successful_pnp_retains_earlier_minimal_sample_rejection() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let good = observations_from_projection(
+            Pose::identity(),
+            &synthetic_world_points()[..4],
+            intrinsics,
+        )
+        .expect("observations");
+        let mut observations = vec![good[0]; 4];
+        observations.extend_from_slice(&good);
+
+        let config = RansacConfig::new(2, 1.0, 4, 192).expect("RANSAC config");
+        let result = solve_pnp_ransac(&observations, intrinsics, config)
+            .expect("the first sampled triple is degenerate and the second is valid");
+        let rejections = result
+            .minimal_sample_rejections()
+            .expect("successful solve must retain its earlier degradation");
+
+        assert_eq!(rejections.count().get(), 1);
+        assert_eq!(
+            rejections.first_rejection().reason(),
+            PnpMinimalSampleRejectionReason::DegenerateWorldTriangle
+        );
     }
 
     #[test]
@@ -2388,7 +3392,7 @@ mod tests {
         };
         let mut rejections = PnpCandidateProjectionRejections::first(rejection);
         rejections
-            .try_record_another()
+            .try_record_another(PnpRansacRejectionKind::CandidateProjection)
             .expect("second rejection count");
 
         assert_eq!(rejections.count().get(), 2);
@@ -2402,17 +3406,35 @@ mod tests {
             } if value.is_nan()
         ));
 
-        let error = PnpError::AllGeneratedCandidatesFailedProjection { rejections };
-        let rejection_source = std::error::Error::source(&error).expect("indexed rejection source");
-        assert!(error.to_string().contains("2 rejected"));
+        let summary = PnpRansacRejections {
+            inner: PnpRansacRejectionsInner::CandidateProjections(rejections),
+        };
+        let error = PnpError::from(PnpRejection::NoUsableRansacCandidate {
+            rejections: summary,
+        });
+        let rejection_source = std::error::Error::source(&error).expect("rejection source");
+        let summary_source = rejection_source.source().expect("rejection summary source");
+        let rejection_source = summary_source.source().expect("indexed rejection source");
+        assert!(
+            error
+                .to_string()
+                .contains("2 rejected candidate projections")
+        );
         assert!(rejection_source.to_string().contains("observation 0"));
         let projection_source = rejection_source.source().expect("projection source");
         assert!(projection_source.to_string().contains("camera-frame x"));
+        let recoverable = error.rejection().expect("recoverable no-candidate outcome");
+        assert!(
+            recoverable
+                .to_string()
+                .contains("2 rejected candidate projections")
+        );
+        assert!(std::error::Error::source(&recoverable).is_some());
 
-        let no_consensus = no_consensus_error(Some(rejections));
+        let no_consensus = no_consensus_error(Some(summary));
         assert!(matches!(
             &no_consensus,
-            PnpError::NoConsensusAfterCandidateProjectionFailures { .. }
+            PnpError::Rejected(PnpRejection::NoConsensusAfterRansacRejections { .. })
         ));
         assert!(std::error::Error::source(&no_consensus).is_some());
     }
@@ -2433,8 +3455,29 @@ mod tests {
         };
 
         assert!(matches!(
-            rejections.try_record_another(),
-            Err(PnpError::CandidateProjectionRejectionCountOverflow)
+            rejections.try_record_another(PnpRansacRejectionKind::CandidateProjection),
+            Err(PnpError::RansacRejectionCountOverflow {
+                kind: PnpRansacRejectionKind::CandidateProjection,
+            })
+        ));
+    }
+
+    #[test]
+    fn minimal_sample_rejection_count_overflow_is_explicit() {
+        let first = PnpMinimalSampleRejection {
+            ransac_iteration: NonZeroUsize::MIN,
+            reason: PnpMinimalSampleRejectionReason::DegenerateWorldTriangle,
+        };
+        let mut rejections = PnpMinimalSampleRejections {
+            count: NonZeroUsize::MAX,
+            first,
+        };
+
+        assert!(matches!(
+            rejections.try_record_another(PnpRansacRejectionKind::MinimalSample),
+            Err(PnpError::RansacRejectionCountOverflow {
+                kind: PnpRansacRejectionKind::MinimalSample,
+            })
         ));
     }
 
@@ -2452,6 +3495,7 @@ mod tests {
         ));
         let source = std::error::Error::source(&error).expect("allocation source");
         assert!(!source.to_string().is_empty());
+        assert!(error.rejection().is_none());
     }
 
     #[test]
@@ -2745,7 +3789,7 @@ mod tests {
         let err =
             solve_pnp_ransac(&obs, intrinsics, RansacConfig::default()).expect_err("should reject");
         match err {
-            PnpError::NotEnoughPoints { required, actual } => {
+            PnpError::Rejected(PnpRejection::NotEnoughPoints { required, actual }) => {
                 assert_eq!(required, 4);
                 assert_eq!(actual, 3);
             }
@@ -2769,11 +3813,60 @@ mod tests {
             .expect_err("required consensus larger than input must fail before sampling");
         assert!(matches!(
             error,
-            PnpError::InsufficientObservationsForRequiredInliers {
+            PnpError::Rejected(PnpRejection::InsufficientObservationsForRequiredInliers {
                 required_inliers: actual_required,
                 observations: actual_observations,
-            } if actual_required == required_inliers && actual_observations == observations.len()
+            }) if actual_required == required_inliers && actual_observations == observations.len()
         ));
+    }
+
+    #[test]
+    fn solve_pnp_reports_every_rejected_degenerate_minimal_sample() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
+        let world = Point3 {
+            x: 0.0,
+            y: 0.0,
+            z: 4.0,
+        };
+        let observations: Vec<_> = [
+            Keypoint { x: 300.0, y: 220.0 },
+            Keypoint { x: 340.0, y: 220.0 },
+            Keypoint { x: 300.0, y: 260.0 },
+            Keypoint { x: 340.0, y: 260.0 },
+        ]
+        .into_iter()
+        .map(|pixel| Observation::try_new(world, pixel, intrinsics).expect("finite observation"))
+        .collect();
+        let max_iterations = 7;
+        let config = RansacConfig::new(max_iterations, 2.0, 4, 17).expect("RANSAC configuration");
+
+        let error = solve_pnp_ransac(&observations, intrinsics, config)
+            .expect_err("coincident world points cannot produce a P3P candidate");
+        let PnpError::Rejected(PnpRejection::NoUsableRansacCandidate { rejections }) = &error
+        else {
+            panic!("unexpected error: {error:?}");
+        };
+        let minimal_samples = rejections
+            .minimal_sample_rejections()
+            .expect("minimal-sample rejection summary");
+        assert_eq!(minimal_samples.count().get(), max_iterations);
+        assert_eq!(
+            minimal_samples.first_rejection().ransac_iteration().get(),
+            1
+        );
+        assert_eq!(
+            minimal_samples.first_rejection().reason(),
+            PnpMinimalSampleRejectionReason::DegenerateWorldTriangle
+        );
+        assert!(rejections.candidate_projection_rejections().is_none());
+
+        let rejection_source = std::error::Error::source(&error).expect("rejection source");
+        let summary_source = rejection_source.source().expect("summary source");
+        let sample_source = summary_source.source().expect("indexed sample source");
+        let reason_source = sample_source.source().expect("sample reason source");
+        assert!(sample_source.to_string().contains("iteration 1"));
+        assert!(reason_source.to_string().contains("nondegenerate triangle"));
     }
 
     #[test]

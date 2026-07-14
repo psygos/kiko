@@ -87,8 +87,11 @@ const PATH_TRACKING_VIO_PROPOSAL_REJECTED_CHANGED_SUPPORT: &str =
 const PATH_TRACKING_VIO_PROPOSAL_REJECTED_HIGHER_SHARED_RMSE: &str =
     "diagnostics/tracking/vio_proposal_rejected_higher_shared_accepted_inlier_reprojection_rmse";
 const PATH_TRACKING_RANSAC_ITERATIONS: &str = "diagnostics/tracking/ransac_iterations";
+const PATH_TRACKING_PNP_RANSAC_MINIMAL_SAMPLE_REJECTIONS: &str =
+    "diagnostics/tracking/pnp_ransac_minimal_sample_rejections";
 const PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS: &str =
     "diagnostics/tracking/pnp_ransac_candidate_projection_rejections";
+const PATH_TRACKING_PNP_REJECTED: &str = "diagnostics/tracking/pnp_rejected";
 const PATH_TRACKING_PNP_REFINEMENT_APPLIED: &str = "diagnostics/tracking/pnp_refinement_applied";
 const PATH_TRACKING_PNP_REFINEMENT_ITERATIONS: &str =
     "diagnostics/tracking/pnp_refinement_iterations";
@@ -407,11 +410,17 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     if let Some(v) = diag.ransac_iterations {
         scalars.push((PATH_TRACKING_RANSAC_ITERATIONS, v as f64));
     }
+    if let Some(v) = diag.pnp_ransac_minimal_sample_rejections {
+        scalars.push((PATH_TRACKING_PNP_RANSAC_MINIMAL_SAMPLE_REJECTIONS, v as f64));
+    }
     if let Some(v) = diag.pnp_ransac_candidate_projection_rejections {
         scalars.push((
             PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS,
             v as f64,
         ));
+    }
+    if diag.pnp_rejection.is_some() {
+        scalars.push((PATH_TRACKING_PNP_REJECTED, 1.0));
     }
     if let Some(refinement) = diag.pnp_refinement.as_ref() {
         scalars.push((
@@ -588,6 +597,10 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
         }
         DiagnosticEvent::ProjectedTrackingFallback { reason } => (
             format!("projected tracking fell back to LightGlue: {reason}"),
+            rerun::TextLogLevel::WARN,
+        ),
+        DiagnosticEvent::TrackingPnpRejected { reason } => (
+            format!("tracking PnP rejected the frame: {reason}"),
             rerun::TextLogLevel::WARN,
         ),
         DiagnosticEvent::KeyframeCreated {
@@ -904,7 +917,8 @@ mod tests {
         PATH_MAP_POINTS, PATH_POSE_BA_CONVERGED, PATH_POSE_BA_ITERATIONS,
         PATH_TRACKING_PNP_ACCEPTED_INLIERS, PATH_TRACKING_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
         PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS,
-        PATH_TRACKING_PNP_REFINEMENT_APPLIED, PATH_TRACKING_PNP_REFINEMENT_ITERATIONS,
+        PATH_TRACKING_PNP_RANSAC_MINIMAL_SAMPLE_REJECTIONS, PATH_TRACKING_PNP_REFINEMENT_APPLIED,
+        PATH_TRACKING_PNP_REFINEMENT_ITERATIONS, PATH_TRACKING_PNP_REJECTED,
         PATH_TRACKING_SHARED_PROJECTABLE_ACCEPTED_INLIERS,
         PATH_TRACKING_SHARED_PROJECTABLE_TRACKED_OBSERVATIONS, PATH_TRACKING_VIO_PROPOSAL_ADOPTED,
         PATH_TRACKING_VIO_PROPOSAL_PNP_PROJECTABLE_TRACKED_OBSERVATIONS,
@@ -1015,7 +1029,9 @@ mod tests {
             .expect("ratio"),
         );
         diag.pnp_accepted_inliers = Some(PnpAcceptedInlierCountMetric::new(6));
+        diag.pnp_ransac_minimal_sample_rejections = Some(3);
         diag.pnp_ransac_candidate_projection_rejections = Some(2);
+        diag.pnp_rejection = Some(crate::PnpRejection::NoSolution);
         diag.pnp_refinement = Some(crate::PnpRefinementStatus::Applied {
             termination: crate::PnpRefinementTermination::Converged {
                 iterations: std::num::NonZeroUsize::new(2).expect("literal is non-zero"),
@@ -1120,8 +1136,15 @@ mod tests {
             *path == PATH_POSE_BA_CONVERGED && value.abs() < f64::EPSILON
         }));
         assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_RANSAC_MINIMAL_SAMPLE_REJECTIONS
+                && (*value - 3.0).abs() < f64::EPSILON
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
             *path == PATH_TRACKING_PNP_RANSAC_CANDIDATE_PROJECTION_REJECTIONS
                 && (*value - 2.0).abs() < f64::EPSILON
+        }));
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == PATH_TRACKING_PNP_REJECTED && (*value - 1.0).abs() < f64::EPSILON
         }));
         #[cfg(feature = "vio")]
         assert!(scalars.iter().any(|(path, value)| {
@@ -1298,6 +1321,19 @@ mod tests {
     }
 
     #[test]
+    fn format_event_exposes_tracking_pnp_rejection_reason() {
+        let (text, level) = format_event(&DiagnosticEvent::TrackingPnpRejected {
+            reason: crate::PnpRejection::InsufficientObservationsForRequiredInliers {
+                required_inliers: 8,
+                observations: 6,
+            },
+        });
+        assert!(text.contains("requires 8 inliers"));
+        assert!(text.contains("6 observations"));
+        assert_eq!(level, rerun::TextLogLevel::WARN);
+    }
+
+    #[test]
     fn format_event_maps_worker_death_to_error() {
         let (text, level) = format_event(&DiagnosticEvent::BackendWorkerDied {
             respawn_count: 2,
@@ -1353,6 +1389,9 @@ mod tests {
                 candidates: 12,
                 required: 32,
             },
+        });
+        let _ = format_event(&DiagnosticEvent::TrackingPnpRejected {
+            reason: crate::PnpRejection::NoSolution,
         });
         let _ = format_event(&DiagnosticEvent::KeyframeCreated {
             keyframe_id: crate::map::KeyframeId::default(),
