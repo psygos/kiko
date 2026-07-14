@@ -578,6 +578,10 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
         DiagnosticEvent::TrackingRecovered => {
             ("tracking recovered".to_string(), rerun::TextLogLevel::INFO)
         }
+        DiagnosticEvent::ProjectedTrackingFallback { reason } => (
+            format!("projected tracking fell back to LightGlue: {reason}"),
+            rerun::TextLogLevel::WARN,
+        ),
         DiagnosticEvent::KeyframeCreated {
             keyframe_id,
             landmarks,
@@ -1306,11 +1310,36 @@ mod tests {
     }
 
     #[test]
+    fn format_event_exposes_projected_tracking_fallback() {
+        let (text, level) = format_event(&DiagnosticEvent::ProjectedTrackingFallback {
+            reason: crate::ProjectedTrackingFallbackReason::TooFewInliers {
+                matches: 30,
+                verified: 28,
+                observations: 24,
+                inliers: 18,
+                required_inliers: 24,
+            },
+        });
+
+        assert!(text.contains("fell back to LightGlue"));
+        assert!(text.contains("verified=28"));
+        assert!(text.contains("inliers=18"));
+        assert!(text.contains("required_inliers=24"));
+        assert_eq!(level, rerun::TextLogLevel::WARN);
+    }
+
+    #[test]
     fn format_event_supports_all_variants() {
         let _ = format_event(&DiagnosticEvent::TrackingLost {
             consecutive_failures: 4,
         });
         let _ = format_event(&DiagnosticEvent::TrackingRecovered);
+        let _ = format_event(&DiagnosticEvent::ProjectedTrackingFallback {
+            reason: crate::ProjectedTrackingFallbackReason::TooFewCandidateMatches {
+                candidates: 12,
+                required: 32,
+            },
+        });
         let _ = format_event(&DiagnosticEvent::KeyframeCreated {
             keyframe_id: crate::map::KeyframeId::default(),
             landmarks: 12,

@@ -34,9 +34,9 @@ use crate::{
     FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue,
     LocalBaConfig, LocalBundleAdjuster, LocalBundleAdjusterWorkspaceError, LoopClosureStatus,
     LoopVerificationError, MapFromOdom, MapObservation, MapSnapshot, Matches, Observation,
-    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, RansacConfig, RansacConfigError, Raw,
-    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
-    Verified,
+    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, ProjectedTrackingFallbackReason,
+    RansacConfig, RansacConfigError, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
+    TriangulationError, Triangulator, Verified,
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
@@ -2601,13 +2601,35 @@ enum TrackingAttemptError {
     Fatal(TrackerError),
 }
 
-impl TrackingAttemptError {
-    fn trace_label(&self) -> &'static str {
-        match self {
-            Self::NotEnoughMapPoints { .. } => "not_enough_map_points",
-            Self::PnpFailed { .. } => "pnp_failed",
-            Self::Fatal(_) => "fatal",
-        }
+fn projected_fallback_from_attempt_error(
+    error: TrackingAttemptError,
+) -> Result<ProjectedTrackingFallbackReason, TrackerError> {
+    match error {
+        TrackingAttemptError::NotEnoughMapPoints {
+            matches,
+            verified,
+            observations,
+            required_observations,
+        } => Ok(
+            ProjectedTrackingFallbackReason::TooFewMapPointObservations {
+                matches,
+                verified,
+                observations,
+                required_observations,
+            },
+        ),
+        TrackingAttemptError::PnpFailed {
+            matches,
+            verified,
+            observations,
+            required_inliers,
+        } => Ok(ProjectedTrackingFallbackReason::PnpRejected {
+            matches,
+            verified,
+            observations,
+            required_inliers,
+        }),
+        TrackingAttemptError::Fatal(error) => Err(error),
     }
 }
 
@@ -2618,6 +2640,13 @@ struct ProjectedMatchCandidate {
     score: f32,
     distance_sq: f32,
 }
+
+enum ProjectedMatchOutcome {
+    Matches(Matches<Raw>),
+    Fallback(ProjectedTrackingFallbackReason),
+}
+
+type ProjectedTrackingDecision = Result<TrackingAttempt, ProjectedTrackingFallbackReason>;
 
 struct CurrentKeypointGrid {
     cell_size: f32,
@@ -4280,9 +4309,11 @@ impl SlamTracker {
         keyframe: &Keyframe,
         keyframe_id: KeyframeId,
         config: ProjectedMatcherConfig,
-    ) -> Result<Option<Matches<Raw>>, TrackerError> {
+    ) -> Result<ProjectedMatchOutcome, TrackerError> {
         let Some(predicted_pose) = self.predicted_tracking_pose()? else {
-            return Ok(None);
+            return Ok(ProjectedMatchOutcome::Fallback(
+                ProjectedTrackingFallbackReason::PosePredictionUnavailable,
+            ));
         };
         let radius = config.search_radius_px();
         let radius_sq = radius * radius;
@@ -4350,7 +4381,12 @@ impl SlamTracker {
         }
 
         if candidates.len() < config.min_matches() {
-            return Ok(None);
+            return Ok(ProjectedMatchOutcome::Fallback(
+                ProjectedTrackingFallbackReason::TooFewCandidateMatches {
+                    candidates: candidates.len(),
+                    required: config.min_matches(),
+                },
+            ));
         }
         candidates.sort_unstable_by(|a, b| {
             b.score
@@ -4373,11 +4409,46 @@ impl SlamTracker {
         }
 
         if indices.len() < config.min_matches() {
-            return Ok(None);
+            return Ok(ProjectedMatchOutcome::Fallback(
+                ProjectedTrackingFallbackReason::TooFewUniqueMatches {
+                    matches: indices.len(),
+                    required: config.min_matches(),
+                },
+            ));
         }
         Matches::new(current, Arc::clone(keyframe.detections()), indices, scores)
-            .map(Some)
+            .map(ProjectedMatchOutcome::Matches)
             .map_err(|err| TrackerError::Inference(InferenceError::Match(err)))
+    }
+
+    fn projected_tracking_decision(
+        &self,
+        current: Arc<Detections>,
+        keyframe: &Keyframe,
+        keyframe_id: KeyframeId,
+        config: ProjectedMatcherConfig,
+    ) -> Result<ProjectedTrackingDecision, TrackerError> {
+        let projected_matches =
+            match self.projected_tracking_matches(current, keyframe, keyframe_id, config)? {
+                ProjectedMatchOutcome::Matches(matches) => matches,
+                ProjectedMatchOutcome::Fallback(reason) => {
+                    return Ok(Err(reason));
+                }
+            };
+        let match_count = projected_matches.len();
+        match self.build_tracking_attempt(keyframe, keyframe_id, projected_matches) {
+            Ok(attempt) if attempt.result.inliers().len() >= config.min_inliers() => {
+                Ok(Ok(attempt))
+            }
+            Ok(attempt) => Ok(Err(ProjectedTrackingFallbackReason::TooFewInliers {
+                matches: match_count,
+                verified: attempt.verified.len(),
+                observations: attempt.tracked_observations.len(),
+                inliers: attempt.result.inliers().len(),
+                required_inliers: config.min_inliers(),
+            })),
+            Err(error) => projected_fallback_from_attempt_error(error).map(Err),
+        }
     }
 
     fn track_with_prefetch(
@@ -4416,67 +4487,39 @@ impl SlamTracker {
             diagnostics.tracking_time = Some(tracking_start.elapsed());
             return self.tracking_failure_output(frame_id, tracking_health, diagnostics);
         } else {
-            let mut attempt = None;
-            if let TrackingMatcher::Projected(config) = self.config.tracking_matcher {
-                match self.projected_tracking_matches(
+            let attempt = if let TrackingMatcher::Projected(config) = self.config.tracking_matcher {
+                match self.projected_tracking_decision(
                     current.clone(),
                     keyframe,
                     keyframe_id,
                     config,
                 )? {
-                    Some(projected_matches) => {
-                        let projected_match_count = projected_matches.len();
-                        match self.build_tracking_attempt(keyframe, keyframe_id, projected_matches)
-                        {
-                            Ok(projected_attempt)
-                                if projected_attempt.result.inliers().len()
-                                    >= config.min_inliers() =>
-                            {
-                                if self.trace_transitions {
-                                    eprintln!(
-                                        "projected tracking accepted frame={} matches={} observations={} inliers={}",
-                                        frame_id.as_u64(),
-                                        projected_match_count,
-                                        projected_attempt.tracked_observations.len(),
-                                        projected_attempt.result.inliers().len(),
-                                    );
-                                }
-                                attempt = Some(projected_attempt);
-                            }
-                            Ok(projected_attempt) => {
-                                if self.trace_transitions {
-                                    eprintln!(
-                                        "projected tracking fallback frame={} reason=low_inliers matches={} observations={} inliers={} min_inliers={}",
-                                        frame_id.as_u64(),
-                                        projected_match_count,
-                                        projected_attempt.tracked_observations.len(),
-                                        projected_attempt.result.inliers().len(),
-                                        config.min_inliers(),
-                                    );
-                                }
-                            }
-                            Err(err) => {
-                                if self.trace_transitions {
-                                    eprintln!(
-                                        "projected tracking fallback frame={} reason={} matches={}",
-                                        frame_id.as_u64(),
-                                        err.trace_label(),
-                                        projected_match_count,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    None => {
+                    Ok(projected_attempt) => {
                         if self.trace_transitions {
                             eprintln!(
-                                "projected tracking fallback frame={} reason=not_enough_projected_matches",
+                                "projected tracking accepted frame={} matches={} observations={} inliers={}",
+                                frame_id.as_u64(),
+                                projected_attempt.matches.len(),
+                                projected_attempt.tracked_observations.len(),
+                                projected_attempt.result.inliers().len(),
+                            );
+                        }
+                        Some(projected_attempt)
+                    }
+                    Err(reason) => {
+                        if self.trace_transitions {
+                            eprintln!(
+                                "projected tracking fallback frame={} reason={reason}",
                                 frame_id.as_u64()
                             );
                         }
+                        self.emit_event(DiagnosticEvent::ProjectedTrackingFallback { reason });
+                        None
                     }
                 }
-            }
+            } else {
+                None
+            };
 
             match attempt {
                 Some(attempt) => attempt,
@@ -8063,6 +8106,36 @@ mod tests {
 
         assert_eq!(dot, 8.0);
         assert_eq!(scaled_dot, 24.0);
+    }
+
+    #[test]
+    fn projected_fallback_translation_propagates_fatal_errors() {
+        let fatal = projected_fallback_from_attempt_error(TrackingAttemptError::Fatal(
+            TrackerError::InvariantViolation("forced projected-tracking failure"),
+        ))
+        .expect_err("operational failure must not become a LightGlue fallback");
+        assert!(matches!(
+            fatal,
+            TrackerError::InvariantViolation("forced projected-tracking failure")
+        ));
+
+        let recoverable =
+            projected_fallback_from_attempt_error(TrackingAttemptError::NotEnoughMapPoints {
+                matches: 30,
+                verified: 22,
+                observations: 3,
+                required_observations: 4,
+            })
+            .expect("insufficient geometric support is a valid fallback reason");
+        assert_eq!(
+            recoverable,
+            ProjectedTrackingFallbackReason::TooFewMapPointObservations {
+                matches: 30,
+                verified: 22,
+                observations: 3,
+                required_observations: 4,
+            }
+        );
     }
 
     #[test]

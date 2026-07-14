@@ -574,12 +574,94 @@ impl FrameDiagnostics {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectedTrackingFallbackReason {
+    PosePredictionUnavailable,
+    TooFewCandidateMatches {
+        candidates: usize,
+        required: usize,
+    },
+    TooFewUniqueMatches {
+        matches: usize,
+        required: usize,
+    },
+    TooFewMapPointObservations {
+        matches: usize,
+        verified: usize,
+        observations: usize,
+        required_observations: usize,
+    },
+    PnpRejected {
+        matches: usize,
+        verified: usize,
+        observations: usize,
+        required_inliers: usize,
+    },
+    TooFewInliers {
+        matches: usize,
+        verified: usize,
+        observations: usize,
+        inliers: usize,
+        required_inliers: usize,
+    },
+}
+
+impl std::fmt::Display for ProjectedTrackingFallbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PosePredictionUnavailable => write!(f, "pose prediction unavailable"),
+            Self::TooFewCandidateMatches {
+                candidates,
+                required,
+            } => write!(
+                f,
+                "only {candidates} projected candidate matches; {required} required"
+            ),
+            Self::TooFewUniqueMatches { matches, required } => write!(
+                f,
+                "only {matches} unique projected matches; {required} required"
+            ),
+            Self::TooFewMapPointObservations {
+                matches,
+                verified,
+                observations,
+                required_observations,
+            } => write!(
+                f,
+                "projected matches lack map-point support (matches={matches}, verified={verified}, observations={observations}, required_observations={required_observations})"
+            ),
+            Self::PnpRejected {
+                matches,
+                verified,
+                observations,
+                required_inliers,
+            } => write!(
+                f,
+                "projected-match PnP rejected (matches={matches}, verified={verified}, observations={observations}, required_inliers={required_inliers})"
+            ),
+            Self::TooFewInliers {
+                matches,
+                verified,
+                observations,
+                inliers,
+                required_inliers,
+            } => write!(
+                f,
+                "projected-match PnP produced too few inliers (matches={matches}, verified={verified}, observations={observations}, inliers={inliers}, required_inliers={required_inliers})"
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum DiagnosticEvent {
     TrackingLost {
         consecutive_failures: usize,
     },
     TrackingRecovered,
+    ProjectedTrackingFallback {
+        reason: ProjectedTrackingFallbackReason,
+    },
     KeyframeCreated {
         keyframe_id: KeyframeId,
         landmarks: usize,
@@ -657,7 +739,7 @@ mod tests {
         DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics, LoopClosureRejectReason,
         ObservationSupport, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
         PnpProjectableTrackedObservationPixelResidualMetric, PnpTrackedObservationCountMetric,
-        StableSurfaceRetainedRawPixelResidualMetric,
+        ProjectedTrackingFallbackReason, StableSurfaceRetainedRawPixelResidualMetric,
         VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
     };
     use crate::{DegenerateReason, PnpAcceptedInlierCountMetric};
@@ -858,6 +940,12 @@ mod tests {
                 consecutive_failures: 1,
             },
             DiagnosticEvent::TrackingRecovered,
+            DiagnosticEvent::ProjectedTrackingFallback {
+                reason: ProjectedTrackingFallbackReason::TooFewUniqueMatches {
+                    matches: 8,
+                    required: 32,
+                },
+            },
             DiagnosticEvent::LoopClosureRejected {
                 reason: LoopClosureRejectReason::VerificationFailed,
             },
@@ -923,6 +1011,22 @@ mod tests {
             kinds.insert(discriminant(&event));
         }
         assert_eq!(kinds.len(), event_count);
+    }
+
+    #[test]
+    fn projected_tracking_fallback_reason_reports_exact_support() {
+        let reason = ProjectedTrackingFallbackReason::TooFewMapPointObservations {
+            matches: 28,
+            verified: 20,
+            observations: 3,
+            required_observations: 4,
+        };
+
+        let text = reason.to_string();
+        assert!(text.contains("matches=28"));
+        assert!(text.contains("verified=20"));
+        assert!(text.contains("observations=3"));
+        assert!(text.contains("required_observations=4"));
     }
 
     #[test]
