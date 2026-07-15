@@ -45,6 +45,7 @@ const PATH_TRI_KEPT: &str = "diagnostics/triangulation/kept";
 const PATH_TRI_DROPPED_DISPARITY: &str = "diagnostics/triangulation/dropped_disparity";
 const PATH_TRI_DROPPED_EPIPOLAR: &str = "diagnostics/triangulation/dropped_epipolar";
 const PATH_TRI_DROPPED_DEPTH: &str = "diagnostics/triangulation/dropped_depth";
+const PATH_TRI_DROPPED_UNREPRESENTABLE: &str = "diagnostics/triangulation/dropped_unrepresentable";
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
 const PATH_BA_ITERATIONS: &str = "diagnostics/ba/iterations";
@@ -121,6 +122,10 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_TRI_DROPPED_DISPARITY, stats.dropped_disparity as f64));
         scalars.push((PATH_TRI_DROPPED_EPIPOLAR, stats.dropped_epipolar as f64));
         scalars.push((PATH_TRI_DROPPED_DEPTH, stats.dropped_depth as f64));
+        scalars.push((
+            PATH_TRI_DROPPED_UNREPRESENTABLE,
+            stats.dropped_unrepresentable as f64,
+        ));
     }
 
     if let Some(ba_result) = diag.ba_result.as_ref() {
@@ -433,6 +438,7 @@ mod tests {
             dropped_disparity: 1,
             dropped_epipolar: 0,
             dropped_depth: 1,
+            dropped_unrepresentable: 2,
         });
         let scalars = diagnostics_scalars(&diag);
         assert!(
@@ -455,6 +461,10 @@ mod tests {
                 .iter()
                 .any(|(path, _)| *path == "diagnostics/triangulation/candidates")
         );
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == "diagnostics/triangulation/dropped_unrepresentable"
+                && (*value - 2.0).abs() < f64::EPSILON
+        }));
     }
 
     #[test]

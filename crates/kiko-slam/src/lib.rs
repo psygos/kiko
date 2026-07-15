@@ -86,9 +86,9 @@ pub use tracker::{
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,
-    TriangulationConfig, TriangulationConfigError, TriangulationError, TriangulationResult,
-    TriangulationStats, Triangulator,
+    Keyframe, KeyframeError, KeyframeLandmarkError, RectifiedStereo, RectifiedStereoConfig,
+    RectifiedStereoError, TriangulationConfig, TriangulationConfigError, TriangulationError,
+    TriangulationResult, TriangulationStats, Triangulator,
 };
 pub use viz::{RerunSink, VizConfigError, VizDecimation, VizDecimationError, VizLogError};
 

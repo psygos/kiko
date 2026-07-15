@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
-use crate::{Detections, FrameDimensions, FrameId, Keypoint, Matches, Raw, SensorId};
+use crate::{Detections, FrameDimensions, FrameId, Matches, Raw, SensorId};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RectifiedStereoConfig {
@@ -51,6 +51,27 @@ pub struct RectifiedStereo {
     left: CameraIntrinsics,
     right: CameraIntrinsics,
     baseline_m: f32,
+    arithmetic: RectifiedStereoArithmetic,
+}
+
+/// Exact f32-to-f64 widening of the validated stereo calibration.
+///
+/// Keeping this alongside the public f32 calibration makes the precision used
+/// by triangulation an invariant of `RectifiedStereo`, rather than something
+/// reconstructed independently for every match.
+#[derive(Clone, Debug)]
+struct RectifiedStereoArithmetic {
+    left: CameraIntrinsics64,
+    right: CameraIntrinsics64,
+    baseline_m: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CameraIntrinsics64 {
+    fx: f64,
+    fy: f64,
+    cx: f64,
+    cy: f64,
 }
 
 #[derive(Debug)]
@@ -231,10 +252,13 @@ impl RectifiedStereo {
             });
         }
 
+        let arithmetic = RectifiedStereoArithmetic::new(&left, &right, calibration.baseline_m);
+
         Ok(Self {
             left,
             right,
             baseline_m: calibration.baseline_m,
+            arithmetic,
         })
     }
 
@@ -272,6 +296,31 @@ impl RectifiedStereo {
 
     pub fn cy(&self) -> f32 {
         self.left.cy
+    }
+}
+
+impl RectifiedStereoArithmetic {
+    fn new(left: &CameraIntrinsics, right: &CameraIntrinsics, baseline_m: f32) -> Self {
+        let left = CameraIntrinsics64::from_finite(left);
+        let right = CameraIntrinsics64::from_finite(right);
+        let baseline_m = f64::from(baseline_m);
+
+        Self {
+            left,
+            right,
+            baseline_m,
+        }
+    }
+}
+
+impl CameraIntrinsics64 {
+    fn from_finite(intrinsics: &CameraIntrinsics) -> Self {
+        Self {
+            fx: f64::from(intrinsics.fx),
+            fy: f64::from(intrinsics.fy),
+            cx: f64::from(intrinsics.cx),
+            cy: f64::from(intrinsics.cy),
+        }
     }
 }
 
@@ -382,6 +431,9 @@ pub struct TriangulationStats {
     pub dropped_disparity: usize,
     pub dropped_epipolar: usize,
     pub dropped_depth: usize,
+    /// Geometrically admissible matches whose camera point cannot be
+    /// represented as finite f32 coordinates with strictly positive depth.
+    pub dropped_unrepresentable: usize,
 }
 
 #[derive(Debug)]
@@ -427,11 +479,12 @@ impl std::fmt::Display for TriangulationError {
             TriangulationError::NoLandmarks { stats } => {
                 write!(
                     f,
-                    "triangulation produced no landmarks (candidates={}, dropped_disparity={}, dropped_epipolar={}, dropped_depth={})",
+                    "triangulation produced no landmarks (candidates={}, dropped_disparity={}, dropped_epipolar={}, dropped_depth={}, dropped_unrepresentable={})",
                     stats.candidate_matches,
                     stats.dropped_disparity,
                     stats.dropped_epipolar,
-                    stats.dropped_depth
+                    stats.dropped_depth,
+                    stats.dropped_unrepresentable
                 )
             }
             TriangulationError::InvalidKeyframe(err) => {
@@ -461,12 +514,38 @@ pub struct Keyframe {
     index_to_landmark: Vec<Option<usize>>,
 }
 
+/// Why a camera-frame landmark cannot cross the public `Keyframe` boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyframeLandmarkError {
+    NonFiniteX,
+    NonFiniteY,
+    NonFiniteDepth,
+    NonPositiveDepth,
+}
+
+impl std::fmt::Display for KeyframeLandmarkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteX => write!(f, "x coordinate is not finite"),
+            Self::NonFiniteY => write!(f, "y coordinate is not finite"),
+            Self::NonFiniteDepth => write!(f, "z coordinate is not finite"),
+            Self::NonPositiveDepth => write!(f, "z coordinate is not positive"),
+        }
+    }
+}
+
+impl std::error::Error for KeyframeLandmarkError {}
+
 #[derive(Debug)]
 pub enum KeyframeError {
     Empty,
     LenMismatch {
-        detections: usize,
         landmarks: usize,
+        landmark_indices: usize,
+    },
+    InvalidLandmark {
+        index: usize,
+        cause: KeyframeLandmarkError,
     },
     LandmarkIndexOutOfBounds {
         detections: usize,
@@ -486,12 +565,15 @@ impl std::fmt::Display for KeyframeError {
         match self {
             KeyframeError::Empty => write!(f, "keyframe must contain at least one landmark"),
             KeyframeError::LenMismatch {
-                detections,
                 landmarks,
+                landmark_indices,
             } => write!(
                 f,
-                "keyframe landmarks/indices length mismatch: detections={detections}, landmarks={landmarks}"
+                "keyframe landmarks/indices length mismatch: landmarks={landmarks}, landmark_indices={landmark_indices}"
             ),
+            KeyframeError::InvalidLandmark { index, cause } => {
+                write!(f, "keyframe landmark {index} is invalid: {cause}")
+            }
             KeyframeError::LandmarkIndexOutOfBounds { detections, index } => write!(
                 f,
                 "keyframe landmark index out of bounds: index={index} (detections={detections})"
@@ -509,7 +591,18 @@ impl std::fmt::Display for KeyframeError {
     }
 }
 
-impl std::error::Error for KeyframeError {}
+impl std::error::Error for KeyframeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidLandmark { cause, .. } => Some(cause),
+            Self::Empty
+            | Self::LenMismatch { .. }
+            | Self::LandmarkIndexOutOfBounds { .. }
+            | Self::DuplicateLandmarkIndex { .. }
+            | Self::SensorMismatch { .. } => None,
+        }
+    }
+}
 
 impl Keyframe {
     pub fn new(
@@ -525,13 +618,35 @@ impl Keyframe {
         landmarks: Vec<crate::CameraPoint3>,
         landmark_indices: Vec<usize>,
     ) -> Result<Self, KeyframeError> {
+        Self::validate_shape_and_sensor(&detections, &landmarks, &landmark_indices)?;
+        for (index, &landmark) in landmarks.iter().enumerate() {
+            validate_camera_landmark(landmark)
+                .map_err(|cause| KeyframeError::InvalidLandmark { index, cause })?;
+        }
+        Self::build(detections, landmarks, landmark_indices)
+    }
+
+    fn from_arc_with_validated_landmarks(
+        detections: Arc<Detections>,
+        landmarks: Vec<crate::CameraPoint3>,
+        landmark_indices: Vec<usize>,
+    ) -> Result<Self, KeyframeError> {
+        Self::validate_shape_and_sensor(&detections, &landmarks, &landmark_indices)?;
+        Self::build(detections, landmarks, landmark_indices)
+    }
+
+    fn validate_shape_and_sensor(
+        detections: &Detections,
+        landmarks: &[crate::CameraPoint3],
+        landmark_indices: &[usize],
+    ) -> Result<(), KeyframeError> {
         if detections.is_empty() || landmarks.is_empty() || landmark_indices.is_empty() {
             return Err(KeyframeError::Empty);
         }
         if landmarks.len() != landmark_indices.len() {
             return Err(KeyframeError::LenMismatch {
-                detections: detections.len(),
                 landmarks: landmarks.len(),
+                landmark_indices: landmark_indices.len(),
             });
         }
         if detections.sensor_id() != SensorId::StereoLeft {
@@ -540,7 +655,14 @@ impl Keyframe {
                 actual: detections.sensor_id(),
             });
         }
+        Ok(())
+    }
 
+    fn build(
+        detections: Arc<Detections>,
+        landmarks: Vec<crate::CameraPoint3>,
+        landmark_indices: Vec<usize>,
+    ) -> Result<Self, KeyframeError> {
         let mut index_to_landmark = vec![None; detections.len()];
         for (landmark_idx, &det_idx) in landmark_indices.iter().enumerate() {
             if det_idx >= detections.len() {
@@ -584,6 +706,38 @@ impl Keyframe {
         let landmark_idx = *self.index_to_landmark.get(index)?;
         landmark_idx.map(|idx| self.landmarks[idx])
     }
+}
+
+fn validate_camera_landmark(point: crate::CameraPoint3) -> Result<(), KeyframeLandmarkError> {
+    validate_camera_coordinates(point.x, point.y, point.z)
+}
+
+fn validate_camera_coordinates(x: f32, y: f32, z: f32) -> Result<(), KeyframeLandmarkError> {
+    if !x.is_finite() {
+        return Err(KeyframeLandmarkError::NonFiniteX);
+    }
+    if !y.is_finite() {
+        return Err(KeyframeLandmarkError::NonFiniteY);
+    }
+    if !z.is_finite() {
+        return Err(KeyframeLandmarkError::NonFiniteDepth);
+    }
+    if z <= 0.0 {
+        return Err(KeyframeLandmarkError::NonPositiveDepth);
+    }
+    Ok(())
+}
+
+fn narrow_camera_landmark(
+    x: f64,
+    y: f64,
+    z: f64,
+) -> Result<crate::CameraPoint3, KeyframeLandmarkError> {
+    let x = x as f32;
+    let y = y as f32;
+    let z = z as f32;
+    validate_camera_coordinates(x, y, z)?;
+    Ok(crate::CameraPoint3::new(x, y, z))
 }
 
 #[derive(Debug)]
@@ -633,11 +787,10 @@ impl Triangulator {
             ..TriangulationStats::default()
         };
 
-        let width = self.stereo.width() as f32;
-        let height = self.stereo.height() as f32;
-        let left_intrinsics = self.stereo.left();
-        let right_intrinsics = self.stereo.right();
-        let baseline = self.stereo.baseline_m();
+        let arithmetic = &self.stereo.arithmetic;
+        let min_disparity_px = f64::from(self.config.min_disparity_px);
+        let max_vertical_disparity_px = f64::from(self.config.max_vertical_disparity_px);
+        let max_depth_m = self.config.max_depth_m.map(f64::from);
 
         let mut landmarks = Vec::new();
         let mut landmark_indices = Vec::new();
@@ -645,28 +798,45 @@ impl Triangulator {
         for &(li, ri) in matches.indices() {
             let left_kp = left.keypoints()[li];
             let right_kp = right.keypoints()[ri];
-            debug_assert!(in_bounds(left_kp, width, height));
-            debug_assert!(in_bounds(right_kp, width, height));
 
-            let left_x = (left_kp.x - left_intrinsics.cx) / left_intrinsics.fx;
-            let right_x = (right_kp.x - right_intrinsics.cx) / right_intrinsics.fx;
+            let left_x = (f64::from(left_kp.x) - arithmetic.left.cx) / arithmetic.left.fx;
+            let right_x = (f64::from(right_kp.x) - arithmetic.right.cx) / arithmetic.right.fx;
             let normalized_disparity = left_x - right_x;
-            let disparity_left_px = normalized_disparity * left_intrinsics.fx;
-            if disparity_left_px <= self.config.min_disparity_px {
+            let disparity_left_px = normalized_disparity * arithmetic.left.fx;
+            if !left_x.is_finite()
+                || !right_x.is_finite()
+                || !normalized_disparity.is_finite()
+                || !disparity_left_px.is_finite()
+            {
+                stats.dropped_unrepresentable += 1;
+                continue;
+            }
+            if disparity_left_px <= min_disparity_px {
                 stats.dropped_disparity += 1;
                 continue;
             }
 
-            let left_y = (left_kp.y - left_intrinsics.cy) / left_intrinsics.fy;
-            let right_y = (right_kp.y - right_intrinsics.cy) / right_intrinsics.fy;
-            let vertical_disparity_left_px = (left_y - right_y).abs() * left_intrinsics.fy;
-            if vertical_disparity_left_px > self.config.max_vertical_disparity_px {
+            let left_y = (f64::from(left_kp.y) - arithmetic.left.cy) / arithmetic.left.fy;
+            let right_y = (f64::from(right_kp.y) - arithmetic.right.cy) / arithmetic.right.fy;
+            let vertical_disparity_left_px = (left_y - right_y).abs() * arithmetic.left.fy;
+            if !left_y.is_finite()
+                || !right_y.is_finite()
+                || !vertical_disparity_left_px.is_finite()
+            {
+                stats.dropped_unrepresentable += 1;
+                continue;
+            }
+            if vertical_disparity_left_px > max_vertical_disparity_px {
                 stats.dropped_epipolar += 1;
                 continue;
             }
 
-            let z = baseline / normalized_disparity;
-            if let Some(max_depth) = self.config.max_depth_m
+            let z = arithmetic.baseline_m / normalized_disparity;
+            if !z.is_finite() || z <= 0.0 {
+                stats.dropped_unrepresentable += 1;
+                continue;
+            }
+            if let Some(max_depth) = max_depth_m
                 && z > max_depth
             {
                 stats.dropped_depth += 1;
@@ -676,7 +846,12 @@ impl Triangulator {
             let x = left_x * z;
             let y = left_y * z;
 
-            landmarks.push(crate::CameraPoint3 { x, y, z });
+            let Ok(landmark) = narrow_camera_landmark(x, y, z) else {
+                stats.dropped_unrepresentable += 1;
+                continue;
+            };
+
+            landmarks.push(landmark);
             landmark_indices.push(li);
             stats.kept += 1;
         }
@@ -685,15 +860,14 @@ impl Triangulator {
             return Err(TriangulationError::NoLandmarks { stats });
         }
 
-        let keyframe = Keyframe::from_arc(left, landmarks, landmark_indices)
-            .map_err(TriangulationError::InvalidKeyframe)?;
+        // Every point entered `landmarks` only after `narrow_camera_landmark`
+        // established the same invariant enforced by the public constructor.
+        let keyframe =
+            Keyframe::from_arc_with_validated_landmarks(left, landmarks, landmark_indices)
+                .map_err(TriangulationError::InvalidKeyframe)?;
 
         Ok(TriangulationResult { keyframe, stats })
     }
-}
-
-fn in_bounds(kp: Keypoint, width: f32, height: f32) -> bool {
-    kp.x >= 0.0 && kp.y >= 0.0 && kp.x < width && kp.y < height
 }
 
 #[cfg(test)]
@@ -704,13 +878,26 @@ mod tests {
         make_camera_intrinsics, make_detections, make_pinhole_intrinsics, make_rectified_stereo,
         rectified_stereo_keypoints_from_points,
     };
-    use crate::{FrameId, MatchError, Matches};
+    use crate::{FrameId, Keypoint, MatchError, Matches};
 
     fn assert_stats_accounting(stats: TriangulationStats) {
         assert_eq!(
-            stats.kept + stats.dropped_disparity + stats.dropped_epipolar + stats.dropped_depth,
+            stats.kept
+                + stats.dropped_disparity
+                + stats.dropped_epipolar
+                + stats.dropped_depth
+                + stats.dropped_unrepresentable,
             stats.candidate_matches
         );
+    }
+
+    fn assert_landmarks_are_finite_and_in_front(keyframe: &Keyframe) {
+        for point in keyframe.landmarks() {
+            assert!(point.x.is_finite(), "nonfinite landmark x: {point:?}");
+            assert!(point.y.is_finite(), "nonfinite landmark y: {point:?}");
+            assert!(point.z.is_finite(), "nonfinite landmark z: {point:?}");
+            assert!(point.z > 0.0, "nonpositive landmark depth: {point:?}");
+        }
     }
 
     #[test]
@@ -865,6 +1052,7 @@ mod tests {
         assert_stats_accounting(result.stats);
 
         let keyframe = result.keyframe;
+        assert_landmarks_are_finite_and_in_front(&keyframe);
         assert_eq!(keyframe.landmarks().len(), points.len());
         for (landmark, &det_idx) in keyframe.landmarks().iter().zip(keyframe.landmark_indices()) {
             let expected = points[det_idx];
@@ -913,6 +1101,7 @@ mod tests {
             .triangulate(&matches)
             .expect("calibrated triangulation");
         let point = result.keyframe.landmarks()[0];
+        assert_landmarks_are_finite_and_in_front(&result.keyframe);
         assert!(point.x.abs() < 1e-6, "x={}", point.x);
         assert!(point.y.abs() < 1e-6, "y={}", point.y);
         assert!((point.z - 3.0).abs() < 1e-5, "z={}", point.z);
@@ -1000,6 +1189,215 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn triangulation_widens_tiny_focal_arithmetic_before_computing_landmarks() {
+        let tiny_focal = f32::from_bits(1);
+        let stereo = make_rectified_stereo(2, 2, tiny_focal, tiny_focal, 0.0, 0.0, 1.0)
+            .expect("tiny but positive focal lengths are representable");
+        let triangulator = Triangulator::new(
+            stereo,
+            TriangulationConfig::try_new(0.5, None).expect("triangulation config"),
+        );
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(22),
+            2,
+            2,
+            vec![Keypoint { x: 1.0, y: 1.0 }],
+        )
+        .expect("left");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(23),
+            2,
+            2,
+            vec![Keypoint { x: 0.0, y: 1.0 }],
+        )
+        .expect("right");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let result = triangulator
+            .triangulate(&matches)
+            .expect("f64 rays avoid the former inf-times-zero NaN");
+
+        assert_stats_accounting(result.stats);
+        assert_eq!(result.stats.kept, 1);
+        assert_eq!(result.stats.dropped_unrepresentable, 0);
+        assert_landmarks_are_finite_and_in_front(&result.keyframe);
+        let point = result.keyframe.landmarks()[0];
+        assert_eq!(point, CameraPoint3::new(1.0, 1.0, tiny_focal));
+    }
+
+    #[test]
+    fn triangulation_counts_finite_f64_points_that_do_not_fit_f32() {
+        let stereo =
+            make_rectified_stereo(3, 2, 1.0, 1.0, 0.0, 0.0, f32::MAX).expect("finite calibration");
+        let triangulator = Triangulator::new(
+            stereo,
+            TriangulationConfig::try_new(0.5, None).expect("triangulation config"),
+        );
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(24),
+            3,
+            2,
+            vec![Keypoint { x: 2.0, y: 0.0 }],
+        )
+        .expect("left");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(25),
+            3,
+            2,
+            vec![Keypoint { x: 1.0, y: 0.0 }],
+        )
+        .expect("right");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let error = triangulator
+            .triangulate(&matches)
+            .expect_err("overflowing f32 x must not enter a keyframe");
+
+        let TriangulationError::NoLandmarks { stats } = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert_eq!(stats.dropped_unrepresentable, 1);
+        assert_stats_accounting(stats);
+    }
+
+    #[test]
+    fn every_successful_boundary_scale_triangulation_has_valid_landmarks() {
+        let focal_lengths = [f32::from_bits(1), f32::MIN_POSITIVE, 1.0, 400.0, f32::MAX];
+        let baselines = [f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX];
+        let mut successful_cases = 0;
+
+        for focal in focal_lengths {
+            for baseline in baselines {
+                let stereo = make_rectified_stereo(3, 2, focal, focal, 0.0, 0.0, baseline)
+                    .expect("finite positive boundary calibration");
+                let triangulator = Triangulator::new(
+                    stereo,
+                    TriangulationConfig::try_new(0.5, None).expect("triangulation config"),
+                );
+                let left = make_detections(
+                    SensorId::StereoLeft,
+                    FrameId::new(28),
+                    3,
+                    2,
+                    vec![Keypoint { x: 2.0, y: 1.0 }],
+                )
+                .expect("left");
+                let right = make_detections(
+                    SensorId::StereoRight,
+                    FrameId::new(29),
+                    3,
+                    2,
+                    vec![Keypoint { x: 1.0, y: 1.0 }],
+                )
+                .expect("right");
+                let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+                match triangulator.triangulate(&matches) {
+                    Ok(result) => {
+                        successful_cases += 1;
+                        assert_stats_accounting(result.stats);
+                        assert_landmarks_are_finite_and_in_front(&result.keyframe);
+                    }
+                    Err(TriangulationError::NoLandmarks { stats }) => {
+                        assert_stats_accounting(stats);
+                        assert_eq!(stats.dropped_unrepresentable, 1);
+                    }
+                    Err(error) => panic!("unexpected boundary-scale error: {error:?}"),
+                }
+            }
+        }
+
+        assert!(successful_cases > 0);
+    }
+
+    #[test]
+    fn keyframe_rejects_invalid_camera_landmarks_with_typed_causes() {
+        let cases = [
+            (
+                CameraPoint3::new(f32::NAN, 0.0, 1.0),
+                KeyframeLandmarkError::NonFiniteX,
+            ),
+            (
+                CameraPoint3::new(0.0, f32::INFINITY, 1.0),
+                KeyframeLandmarkError::NonFiniteY,
+            ),
+            (
+                CameraPoint3::new(0.0, 0.0, f32::NAN),
+                KeyframeLandmarkError::NonFiniteDepth,
+            ),
+            (
+                CameraPoint3::new(0.0, 0.0, f32::INFINITY),
+                KeyframeLandmarkError::NonFiniteDepth,
+            ),
+            (
+                CameraPoint3::new(0.0, 0.0, 0.0),
+                KeyframeLandmarkError::NonPositiveDepth,
+            ),
+            (
+                CameraPoint3::new(0.0, 0.0, -1.0),
+                KeyframeLandmarkError::NonPositiveDepth,
+            ),
+        ];
+
+        for (landmark, expected_cause) in cases {
+            let detections = make_detections(
+                SensorId::StereoLeft,
+                FrameId::new(26),
+                2,
+                2,
+                vec![Keypoint { x: 1.0, y: 1.0 }],
+            )
+            .expect("detections");
+
+            let error = Keyframe::from_arc(detections, vec![landmark], vec![0])
+                .expect_err("invalid camera landmark must be rejected");
+            assert!(matches!(
+                error,
+                KeyframeError::InvalidLandmark { index: 0, cause }
+                    if cause == expected_cause
+            ));
+        }
+    }
+
+    #[test]
+    fn keyframe_length_mismatch_reports_the_compared_lengths() {
+        let detections = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(27),
+            4,
+            2,
+            vec![
+                Keypoint { x: 1.0, y: 1.0 },
+                Keypoint { x: 2.0, y: 1.0 },
+                Keypoint { x: 3.0, y: 1.0 },
+            ],
+        )
+        .expect("detections");
+
+        let error = Keyframe::from_arc(
+            detections,
+            vec![
+                CameraPoint3::new(0.0, 0.0, 1.0),
+                CameraPoint3::new(1.0, 0.0, 1.0),
+            ],
+            vec![0],
+        )
+        .expect_err("landmark/index lengths differ");
+
+        assert!(matches!(
+            error,
+            KeyframeError::LenMismatch {
+                landmarks: 2,
+                landmark_indices: 1
+            }
+        ));
     }
 
     #[test]
