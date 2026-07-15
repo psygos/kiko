@@ -36,6 +36,10 @@ impl EigenPlaces {
         backend: InferenceBackend,
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
+        std::fs::metadata(path).map_err(|source| InferenceError::ModelFileUnavailable {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let (session, selected, diagnostics) = build_session(path, backend)?;
         let run_options = build_run_options(selected)?;
         Ok(Self {
@@ -45,17 +49,6 @@ impl EigenPlaces {
             diagnostics,
             scratch: Vec::new(),
         })
-    }
-
-    pub fn try_load(
-        path: impl AsRef<Path>,
-        backend: InferenceBackend,
-    ) -> Result<Option<Self>, InferenceError> {
-        let path_ref = path.as_ref();
-        if !path_ref.exists() {
-            return Ok(None);
-        }
-        Self::new_with_backend(path_ref, backend).map(Some)
     }
 
     pub fn backend(&self) -> InferenceBackend {
@@ -243,21 +236,27 @@ mod tests {
     }
 
     #[test]
-    fn try_load_nonexistent_returns_none() {
+    fn loading_nonexistent_model_preserves_path_and_io_error() {
         let missing = unique_temp_file("missing");
         assert!(!missing.exists());
-        assert!(
-            EigenPlaces::try_load(&missing, InferenceBackend::Cpu)
-                .expect("missing model should not error")
-                .is_none()
-        );
+        let error = match EigenPlaces::new_with_backend(&missing, InferenceBackend::Cpu) {
+            Ok(_) => panic!("missing model must fail with its source"),
+            Err(error) => error,
+        };
+        match error {
+            super::InferenceError::ModelFileUnavailable { path, source } => {
+                assert_eq!(path, missing);
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected model-file error, got {other:?}"),
+        }
     }
 
     #[test]
-    fn try_load_invalid_model_returns_error() {
+    fn loading_invalid_model_returns_error() {
         let invalid = unique_temp_file("invalid");
         fs::write(&invalid, b"not-an-onnx-model").expect("write invalid model");
-        assert!(EigenPlaces::try_load(&invalid, InferenceBackend::Cpu).is_err());
+        assert!(EigenPlaces::new_with_backend(&invalid, InferenceBackend::Cpu).is_err());
         fs::remove_file(&invalid).expect("cleanup invalid model");
     }
 

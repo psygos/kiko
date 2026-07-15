@@ -5862,8 +5862,8 @@ mod tests {
             minimum,
         )
         .expect("fixture observations");
-        let config = LocalBaConfig::new(5, 5, minimum.get(), 2.0, lm(1e-3))
-            .expect("valid BA config");
+        let config =
+            LocalBaConfig::new(5, 5, minimum.get(), 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = make_bundle_adjuster(intrinsics, config);
         let behind_camera = Pose::from_rt(Pose::identity().rotation(), [0.0, 0.0, -10.0]);
 

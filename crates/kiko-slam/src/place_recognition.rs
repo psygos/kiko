@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -16,6 +17,8 @@ use crate::{
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 
 use crate::MapSnapshot;
+
+const EIGENPLACES_MODEL_ENV: &str = "KIKO_EIGENPLACES_MODEL";
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DescriptorStats {
@@ -145,6 +148,9 @@ pub(crate) type DescriptorExtractorFactory =
 
 #[derive(Debug)]
 pub enum DescriptorInitError {
+    EmptyModelPath {
+        variable: &'static str,
+    },
     ModelMissing {
         path: PathBuf,
     },
@@ -160,6 +166,12 @@ pub enum DescriptorInitError {
 impl std::fmt::Display for DescriptorInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::EmptyModelPath { variable } => {
+                write!(
+                    f,
+                    "{variable} must not be empty when learned descriptors are enabled"
+                )
+            }
             Self::ModelMissing { path } => {
                 write!(f, "descriptor model does not exist at {}", path.display())
             }
@@ -180,7 +192,7 @@ impl std::error::Error for DescriptorInitError {
         match self {
             Self::ModelLoad { source, .. } => Some(source),
             Self::WorkerThread { source } => Some(source),
-            Self::ModelMissing { .. } => None,
+            Self::EmptyModelPath { .. } | Self::ModelMissing { .. } => None,
         }
     }
 }
@@ -198,13 +210,24 @@ pub(crate) enum DescriptorWorkerSubmitError {
 }
 
 impl DescriptorWorker {
-    fn model_path() -> PathBuf {
-        if let Some(path) = std::env::var_os("KIKO_EIGENPLACES_MODEL") {
-            return path.into();
+    fn model_path_from_override(
+        override_path: Option<OsString>,
+    ) -> Result<PathBuf, DescriptorInitError> {
+        if let Some(path) = override_path {
+            if path.is_empty() {
+                return Err(DescriptorInitError::EmptyModelPath {
+                    variable: EIGENPLACES_MODEL_ENV,
+                });
+            }
+            return Ok(path.into());
         }
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models")
-            .join("eigenplaces.onnx")
+            .join("eigenplaces.onnx"))
+    }
+
+    fn model_path() -> Result<PathBuf, DescriptorInitError> {
+        Self::model_path_from_override(std::env::var_os(EIGENPLACES_MODEL_ENV))
     }
 
     fn spawn(
@@ -320,24 +343,25 @@ pub(crate) enum DescriptorSupervisorOutput {
 }
 
 impl DescriptorSupervisor {
-    fn default_factory() -> DescriptorExtractorFactory {
-        Arc::new(|| {
-            let path = DescriptorWorker::model_path();
-            let extractor = EigenPlaces::try_load(&path, crate::InferenceBackend::auto())
-                .map_err(|source| DescriptorInitError::ModelLoad {
+    fn default_factory() -> Result<DescriptorExtractorFactory, DescriptorInitError> {
+        let path = DescriptorWorker::model_path()?;
+        let backend = crate::InferenceBackend::auto();
+        Ok(Arc::new(move || {
+            let extractor = EigenPlaces::new_with_backend(&path, backend).map_err(|source| {
+                DescriptorInitError::ModelLoad {
                     path: path.clone(),
                     source,
-                })?
-                .ok_or_else(|| DescriptorInitError::ModelMissing { path })?;
+                }
+            })?;
             Ok(Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>)
-        })
+        }))
     }
 
     fn spawn_with_max_respawns(
         config: GlobalDescriptorConfig,
         max_respawns: u32,
     ) -> Result<Self, DescriptorInitError> {
-        let factory = Self::default_factory();
+        let factory = Self::default_factory()?;
         let worker = Self::spawn_worker(config, &factory)?;
         Ok(Self {
             worker: Some(worker),
@@ -839,6 +863,18 @@ impl PlaceRecognition {
 mod tests {
     use super::*;
     use std::error::Error as _;
+
+    #[test]
+    fn descriptor_model_path_rejects_an_empty_override() {
+        let error = DescriptorWorker::model_path_from_override(Some(OsString::new()))
+            .expect_err("empty model override must fail during initialization");
+        assert!(matches!(
+            error,
+            DescriptorInitError::EmptyModelPath {
+                variable: EIGENPLACES_MODEL_ENV
+            }
+        ));
+    }
 
     fn descriptor_with_basis(index: usize) -> GlobalDescriptor {
         let mut values = [0.0_f32; crate::loop_closure::GLOBAL_DESCRIPTOR_DIM];

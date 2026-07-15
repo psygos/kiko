@@ -27,6 +27,10 @@ pub enum InferenceError {
         path: PathBuf,
         source: OrtError,
     },
+    ModelFileUnavailable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     BackendProbe {
         backend: InferenceBackend,
         source: OrtError,
@@ -111,6 +115,7 @@ impl std::error::Error for InferenceError {
             | InferenceError::InputTensor { source, .. }
             | InferenceError::SessionRun { source, .. }
             | InferenceError::OutputTensor { source, .. } => Some(source),
+            InferenceError::ModelFileUnavailable { source, .. } => Some(source),
             InferenceError::Frame(source) => Some(source),
             InferenceError::Downscale(source) => Some(source),
             InferenceError::Detection(source) => Some(source),
@@ -170,6 +175,11 @@ impl std::fmt::Display for InferenceError {
             InferenceError::LoadFailed { path, source } => {
                 write!(f, "failed to load model at {}: {source}", path.display())
             }
+            InferenceError::ModelFileUnavailable { path, source } => write!(
+                f,
+                "model file is unavailable at {}: {source}",
+                path.display()
+            ),
             InferenceError::BackendProbe { backend, source } => write!(
                 f,
                 "failed to query {backend:?} ONNX Runtime provider availability: {source}"

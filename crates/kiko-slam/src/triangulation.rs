@@ -251,11 +251,9 @@ impl TriangulationConfig {
             }
         }
         if !max_vertical_disparity_px.is_finite() || max_vertical_disparity_px < 0.0 {
-            return Err(
-                TriangulationConfigError::InvalidMaxVerticalDisparityPx {
-                    value: max_vertical_disparity_px,
-                },
-            );
+            return Err(TriangulationConfigError::InvalidMaxVerticalDisparityPx {
+                value: max_vertical_disparity_px,
+            });
         }
         Ok(Self {
             min_disparity_px,
