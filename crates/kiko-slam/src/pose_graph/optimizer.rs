@@ -126,46 +126,59 @@ pub fn compute_edge_error(
     edge: &PoseGraphEdge,
     poses: &[Pose64],
 ) -> Result<[f64; 6], PoseGraphError> {
-    if edge.from >= poses.len() {
-        return Err(PoseGraphError::EdgeFromOutOfBounds {
+    let from_pose = poses
+        .get(edge.from)
+        .copied()
+        .ok_or(PoseGraphError::EdgeFromOutOfBounds {
             from: edge.from,
             pose_count: poses.len(),
-        });
-    }
-    if edge.to >= poses.len() {
-        return Err(PoseGraphError::EdgeToOutOfBounds {
+        })?;
+    let to_pose = poses
+        .get(edge.to)
+        .copied()
+        .ok_or(PoseGraphError::EdgeToOutOfBounds {
             to: edge.to,
             pose_count: poses.len(),
-        });
-    }
-    let t_from_inv = poses[edge.from].inverse();
-    let t_to = poses[edge.to];
-    let predicted = t_to.compose(t_from_inv);
+        })?;
+    Ok(edge_error_from_endpoints(edge, from_pose, to_pose))
+}
+
+fn edge_error_from_endpoints(edge: &PoseGraphEdge, from_pose: Pose64, to_pose: Pose64) -> [f64; 6] {
+    let predicted = to_pose.compose(from_pose.inverse());
     let residual_pose = predicted.compose(edge.measurement.inverse());
-    Ok(se3_log_f64(residual_pose))
+    se3_log_f64(residual_pose)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn numerical_diff_column(
     edge: &PoseGraphEdge,
-    poses: &mut [Pose64],
-    pose_idx: usize,
+    from_pose: Pose64,
+    to_pose: Pose64,
+    perturb_from: bool,
     delta_plus: &[f64; 6],
     delta_minus: &[f64; 6],
     eps: f64,
     jacobian: &mut [[f64; 6]; 6],
     axis: usize,
-) -> Result<(), PoseGraphError> {
-    let original = poses[pose_idx];
-    poses[pose_idx] = se3_exp_f64(*delta_plus).compose(original);
-    let err_plus = compute_edge_error(edge, poses)?;
-    poses[pose_idx] = se3_exp_f64(*delta_minus).compose(original);
-    let err_minus = compute_edge_error(edge, poses)?;
-    poses[pose_idx] = original;
+) {
+    let original = if perturb_from { from_pose } else { to_pose };
+    let plus = se3_exp_f64(*delta_plus).compose(original);
+    let minus = se3_exp_f64(*delta_minus).compose(original);
+    let (from_plus, to_plus) = if perturb_from {
+        (plus, to_pose)
+    } else {
+        (from_pose, plus)
+    };
+    let (from_minus, to_minus) = if perturb_from {
+        (minus, to_pose)
+    } else {
+        (from_pose, minus)
+    };
+    let err_plus = edge_error_from_endpoints(edge, from_plus, to_plus);
+    let err_minus = edge_error_from_endpoints(edge, from_minus, to_minus);
     for row in 0..6 {
         jacobian[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
     }
-    Ok(())
 }
 
 pub fn compute_edge_jacobians(
@@ -175,7 +188,20 @@ pub fn compute_edge_jacobians(
     let eps = NUMERICAL_DIFF_EPS;
     let mut j_from = [[0.0_f64; 6]; 6];
     let mut j_to = [[0.0_f64; 6]; 6];
-    let mut poses_perturbed = poses.to_vec();
+    let from_pose = poses
+        .get(edge.from)
+        .copied()
+        .ok_or(PoseGraphError::EdgeFromOutOfBounds {
+            from: edge.from,
+            pose_count: poses.len(),
+        })?;
+    let to_pose = poses
+        .get(edge.to)
+        .copied()
+        .ok_or(PoseGraphError::EdgeToOutOfBounds {
+            to: edge.to,
+            pose_count: poses.len(),
+        })?;
 
     for axis in 0..6 {
         let delta_plus = perturb_axis(axis, eps);
@@ -183,24 +209,26 @@ pub fn compute_edge_jacobians(
 
         numerical_diff_column(
             edge,
-            &mut poses_perturbed,
-            edge.from,
+            from_pose,
+            to_pose,
+            true,
             &delta_plus,
             &delta_minus,
             eps,
             &mut j_from,
             axis,
-        )?;
+        );
         numerical_diff_column(
             edge,
-            &mut poses_perturbed,
-            edge.to,
+            from_pose,
+            to_pose,
+            false,
             &delta_plus,
             &delta_minus,
             eps,
             &mut j_to,
             axis,
-        )?;
+        );
     }
 
     Ok((j_from, j_to))
