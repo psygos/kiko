@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ const DEFAULT_MAX_RESPAWNS: u32 = 3;
 const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
 const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
+const EIGENPLACES_MODEL_ENV: &str = "KIKO_EIGENPLACES_MODEL";
 
 use crate::loop_closure::{
     DescriptorSource, KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig,
@@ -159,6 +161,42 @@ impl Default for GlobalDescriptorConfig {
     fn default() -> Self {
         Self {
             queue_depth: NonZeroUsize::new(2).unwrap_or(NonZeroUsize::MIN),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum TrackerInitError {
+    EmptyDescriptorModelPath { variable: &'static str },
+    DescriptorModelLoad(InferenceError),
+    DescriptorWorkerSpawn(std::io::Error),
+}
+
+impl std::fmt::Display for TrackerInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyDescriptorModelPath { variable } => {
+                write!(
+                    f,
+                    "{variable} must not be empty when learned descriptors are enabled"
+                )
+            }
+            Self::DescriptorModelLoad(err) => {
+                write!(f, "failed to initialize learned descriptor model: {err}")
+            }
+            Self::DescriptorWorkerSpawn(err) => {
+                write!(f, "failed to spawn learned descriptor worker: {err}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TrackerInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::EmptyDescriptorModelPath { .. } => None,
+            Self::DescriptorModelLoad(err) => Some(err),
+            Self::DescriptorWorkerSpawn(err) => Some(err),
         }
     }
 }
@@ -322,7 +360,7 @@ enum SubmitDescriptorError {
 }
 
 type DescriptorExtractorFactory =
-    Arc<dyn Fn() -> Option<Box<dyn PlaceDescriptorExtractor>> + Send + Sync>;
+    Arc<dyn Fn() -> Result<Box<dyn PlaceDescriptorExtractor>, InferenceError> + Send + Sync>;
 
 struct DescriptorWorker {
     tx: Sender<DescriptorRequest>,
@@ -331,13 +369,24 @@ struct DescriptorWorker {
 }
 
 impl DescriptorWorker {
-    fn model_path() -> PathBuf {
-        if let Ok(path) = std::env::var("KIKO_EIGENPLACES_MODEL") {
-            return PathBuf::from(path);
+    fn model_path_from_override(
+        override_path: Option<OsString>,
+    ) -> Result<PathBuf, TrackerInitError> {
+        if let Some(path) = override_path {
+            if path.is_empty() {
+                return Err(TrackerInitError::EmptyDescriptorModelPath {
+                    variable: EIGENPLACES_MODEL_ENV,
+                });
+            }
+            return Ok(PathBuf::from(path));
         }
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("models")
-            .join("eigenplaces.onnx")
+            .join("eigenplaces.onnx"))
+    }
+
+    fn model_path() -> Result<PathBuf, TrackerInitError> {
+        Self::model_path_from_override(std::env::var_os(EIGENPLACES_MODEL_ENV))
     }
 
     fn spawn(
@@ -436,54 +485,44 @@ struct DescriptorSupervisor {
 }
 
 impl DescriptorSupervisor {
-    fn default_factory() -> DescriptorExtractorFactory {
-        Arc::new(|| {
-            let path = DescriptorWorker::model_path();
-            EigenPlaces::try_load(path, crate::InferenceBackend::auto())
+    fn default_factory() -> Result<DescriptorExtractorFactory, TrackerInitError> {
+        let path = DescriptorWorker::model_path()?;
+        let backend = crate::InferenceBackend::auto();
+        Ok(Arc::new(move || {
+            EigenPlaces::new_with_backend(&path, backend)
                 .map(|extractor| Box::new(extractor) as Box<dyn PlaceDescriptorExtractor>)
-        })
+        }))
     }
 
-    fn spawn_with_max_respawns(config: GlobalDescriptorConfig, max_respawns: u32) -> Self {
-        Self::with_factory_and_max_respawns(config, Self::default_factory(), max_respawns)
+    fn spawn_with_max_respawns(
+        config: GlobalDescriptorConfig,
+        max_respawns: u32,
+    ) -> Result<Self, TrackerInitError> {
+        Self::try_with_factory_and_max_respawns(config, Self::default_factory()?, max_respawns)
     }
 
-    fn with_factory_and_max_respawns(
+    fn try_with_factory_and_max_respawns(
         config: GlobalDescriptorConfig,
         factory: DescriptorExtractorFactory,
         max_respawns: u32,
-    ) -> Self {
-        let worker = Self::spawn_worker(config, &factory);
-        let spawn_exhausted = worker.is_none() && max_respawns == 0;
-        if worker.is_none() {
-            if spawn_exhausted {
-                eprintln!("descriptor model unavailable; using bootstrap descriptors only");
-            } else {
-                eprintln!("descriptor model unavailable; will retry on demand");
-            }
-        }
-        Self {
-            worker,
+    ) -> Result<Self, TrackerInitError> {
+        let worker = Self::spawn_worker(config, &factory)?;
+        Ok(Self {
+            worker: Some(worker),
             config,
             factory,
             respawn_count: 0,
             max_respawns,
-            spawn_exhausted,
-        }
+            spawn_exhausted: false,
+        })
     }
 
     fn spawn_worker(
         config: GlobalDescriptorConfig,
         factory: &DescriptorExtractorFactory,
-    ) -> Option<DescriptorWorker> {
-        let extractor = factory()?;
-        match DescriptorWorker::spawn(config, extractor) {
-            Ok(worker) => Some(worker),
-            Err(err) => {
-                eprintln!("failed to spawn descriptor worker thread: {err}");
-                None
-            }
-        }
+    ) -> Result<DescriptorWorker, TrackerInitError> {
+        let extractor = factory().map_err(TrackerInitError::DescriptorModelLoad)?;
+        DescriptorWorker::spawn(config, extractor).map_err(TrackerInitError::DescriptorWorkerSpawn)
     }
 
     fn check_health(&mut self) {
@@ -504,7 +543,13 @@ impl DescriptorSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        self.worker = Self::spawn_worker(self.config, &self.factory);
+        self.worker = match Self::spawn_worker(self.config, &self.factory) {
+            Ok(worker) => Some(worker),
+            Err(err) => {
+                eprintln!("descriptor worker respawn failed: {err}");
+                None
+            }
+        };
         self.respawn_count = self.respawn_count.saturating_add(1);
         if self.worker.is_none() && self.respawn_count >= self.max_respawns {
             self.spawn_exhausted = true;
@@ -1605,14 +1650,14 @@ pub struct SlamTracker {
 impl SlamTracker {
     const DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD: u32 = 15;
 
-    pub fn new(
+    pub fn try_new(
         superpoint_left: SuperPoint,
         superpoint_right: SuperPoint,
         lightglue: LightGlue,
         stereo: RectifiedStereo,
         intrinsics: PinholeIntrinsics,
         config: TrackerConfig,
-    ) -> Self {
+    ) -> Result<Self, TrackerInitError> {
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
@@ -1631,15 +1676,15 @@ impl SlamTracker {
         let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
             .and_then(|value| u32::try_from(value).ok())
             .unwrap_or(DEFAULT_MAX_RESPAWNS);
-        let descriptor_worker = if loop_config.is_some() {
-            config.global_descriptor_config().map(|cfg| {
-                DescriptorSupervisor::spawn_with_max_respawns(cfg, descriptor_max_respawns)
-            })
-        } else {
-            None
+        let descriptor_worker = match (loop_config, config.global_descriptor_config()) {
+            (Some(_), Some(cfg)) => Some(DescriptorSupervisor::spawn_with_max_respawns(
+                cfg,
+                descriptor_max_respawns,
+            )?),
+            _ => None,
         };
         let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
-        Self {
+        Ok(Self {
             superpoint_left,
             superpoint_right,
             lightglue,
@@ -1665,7 +1710,7 @@ impl SlamTracker {
             consecutive_tracking_failures: 0,
             last_pose_world: None,
             trace_transitions,
-        }
+        })
     }
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
@@ -4337,6 +4382,48 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_model_path_rejects_explicit_empty_override() {
+        let err = DescriptorWorker::model_path_from_override(Some(OsString::new()))
+            .expect_err("an explicitly empty model path must be rejected");
+        assert!(matches!(
+            err,
+            TrackerInitError::EmptyDescriptorModelPath {
+                variable: EIGENPLACES_MODEL_ENV
+            }
+        ));
+
+        let override_path = OsString::from("custom-eigenplaces.onnx");
+        assert_eq!(
+            DescriptorWorker::model_path_from_override(Some(override_path))
+                .expect("nonempty model path"),
+            PathBuf::from("custom-eigenplaces.onnx")
+        );
+    }
+
+    #[test]
+    fn descriptor_supervisor_propagates_initial_model_error() {
+        let config = GlobalDescriptorConfig::new(2).expect("config");
+        let factory: DescriptorExtractorFactory = Arc::new(|| {
+            Err(InferenceError::InvariantViolation {
+                context: "forced descriptor initialization failure",
+            })
+        });
+
+        let err = match DescriptorSupervisor::try_with_factory_and_max_respawns(config, factory, 2)
+        {
+            Ok(_) => panic!("initial descriptor failure must abort construction"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            TrackerInitError::DescriptorModelLoad(InferenceError::InvariantViolation {
+                context: "forced descriptor initialization failure"
+            })
+        ));
+    }
+
+    #[test]
     fn descriptor_supervisor_recovers_after_worker_panic() {
         let config = GlobalDescriptorConfig::new(2).expect("config");
         let spawn_count = Arc::new(AtomicUsize::new(0));
@@ -4350,9 +4437,9 @@ mod tests {
             Arc::new(move || {
                 let spawn_idx = spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
                 if spawn_idx == 0 {
-                    Some(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
+                    Ok(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
                 } else {
-                    Some(Box::new(StubDescriptorExtractor {
+                    Ok(Box::new(StubDescriptorExtractor {
                         descriptor: descriptor.clone(),
                         calls: Arc::clone(&calls),
                     }) as Box<dyn PlaceDescriptorExtractor>)
@@ -4361,7 +4448,8 @@ mod tests {
         };
 
         let mut supervisor =
-            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
+            DescriptorSupervisor::try_with_factory_and_max_respawns(config, factory, 2)
+                .expect("initial descriptor worker");
         let frame = Frame::new(
             SensorId::StereoLeft,
             FrameId::new(78),
@@ -4437,10 +4525,14 @@ mod tests {
             let descriptor = descriptor.clone();
             Arc::new(move || {
                 let spawn_idx = spawn_count.fetch_add(1, AtomicOrdering::SeqCst);
-                if spawn_idx < 2 {
-                    None
+                if spawn_idx == 0 {
+                    Ok(Box::new(PanicDescriptorExtractor) as Box<dyn PlaceDescriptorExtractor>)
+                } else if spawn_idx == 1 {
+                    Err(InferenceError::InvariantViolation {
+                        context: "forced descriptor respawn failure",
+                    })
                 } else {
-                    Some(Box::new(StubDescriptorExtractor {
+                    Ok(Box::new(StubDescriptorExtractor {
                         descriptor: descriptor.clone(),
                         calls: Arc::new(Mutex::new(0)),
                     }) as Box<dyn PlaceDescriptorExtractor>)
@@ -4448,7 +4540,8 @@ mod tests {
             })
         };
         let mut supervisor =
-            DescriptorSupervisor::with_factory_and_max_respawns(config, factory, 2);
+            DescriptorSupervisor::try_with_factory_and_max_respawns(config, factory, 2)
+                .expect("initial descriptor worker");
         let frame = Frame::new(
             SensorId::StereoLeft,
             FrameId::new(79),
@@ -4459,13 +4552,27 @@ mod tests {
         )
         .expect("frame");
 
-        let first = supervisor.submit(DescriptorRequest {
-            keyframe_id: KeyframeId::default(),
-            source_snapshot: SlamMap::new().snapshot(),
-            frame: frame.clone(),
-        });
-        assert!(matches!(first, Err(SubmitDescriptorError::Disconnected)));
+        supervisor
+            .submit(DescriptorRequest {
+                keyframe_id: KeyframeId::default(),
+                source_snapshot: SlamMap::new().snapshot(),
+                frame: frame.clone(),
+            })
+            .expect("submit panic request");
+        let mut saw_panic = false;
+        for _ in 0..50 {
+            if matches!(
+                supervisor.try_recv(),
+                Some(DescriptorWorkerResponse::WorkerPanic { .. })
+            ) {
+                saw_panic = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(saw_panic, "expected initial worker panic");
         assert_eq!(supervisor.respawn_count(), 1);
+        assert!(!supervisor.has_worker());
         assert!(!supervisor.spawn_exhausted);
 
         supervisor

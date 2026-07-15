@@ -27,7 +27,7 @@ use kiko_slam::dataset::{
 use kiko_slam::{
     ChannelCapacity, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
     PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
-    SystemHealth, bounded_channel, oak_to_depth_image, oak_to_frame,
+    SystemHealth, TrackerInitError, bounded_channel, oak_to_depth_image, oak_to_frame,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -761,12 +761,12 @@ fn build_tracker_config(
     };
 
     eprintln!(
-        "tracker: keyframe_min_points={min_keyframe_points} refresh_inliers={refresh_inliers} parallax_px={parallax_px:.1} min_covisibility={min_covisibility:.2} redundant_covisibility={redundant_covisibility:.2} min_inliers={min_inliers} downscale={} max_keypoints={} loop_closure={} learned_descriptors={} relocalization={}",
+        "tracker requested: keyframe_min_points={min_keyframe_points} refresh_inliers={refresh_inliers} parallax_px={parallax_px:.1} min_covisibility={min_covisibility:.2} redundant_covisibility={redundant_covisibility:.2} min_inliers={min_inliers} downscale={} max_keypoints={} loop_closure_requested={} learned_descriptors_requested={} relocalization_requested={}",
         downscale.get(),
         key_limit.get(),
         loop_closure_enabled,
-        learned_descriptors_enabled && loop_closure_enabled,
-        relocalization_enabled && loop_closure_enabled,
+        learned_descriptors_enabled,
+        relocalization_enabled,
     );
 
     Ok(TrackerConfig {
@@ -781,6 +781,15 @@ fn build_tracker_config(
         backend,
         loop_subsystem,
     })
+}
+
+fn report_tracker_runtime(config: &TrackerConfig, tracker: &SlamTracker) {
+    eprintln!(
+        "tracker runtime: loop_closure_enabled={} learned_descriptors_enabled={} relocalization_enabled={}",
+        config.loop_subsystem.is_enabled(),
+        tracker.system_health().descriptor.is_alive(),
+        config.loop_subsystem.relocalization().is_some(),
+    );
 }
 
 fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -829,14 +838,15 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, decimation);
-    let mut tracker = SlamTracker::new(
+    let mut tracker = SlamTracker::try_new(
         superpoint_left,
         superpoint_right,
         lightglue,
         rectified,
         intrinsics,
         tracker_config,
-    );
+    )?;
+    report_tracker_runtime(&tracker_config, &tracker);
     let dense_enabled = env_bool("KIKO_DENSE").unwrap_or(false);
     let depth_ring_capacity = env_usize("KIKO_OFFLINE_DEPTH_RING_CAPACITY")
         .unwrap_or(8)
@@ -1439,6 +1449,7 @@ enum LiveThreadError {
     VizChannelDisconnected,
     RerunConnect { detail: String },
     InferenceUnavailable { detail: String },
+    TrackerInitialization { source: TrackerInitError },
     FrameProcessingPanic { detail: String },
 }
 
@@ -1453,6 +1464,9 @@ impl std::fmt::Display for LiveThreadError {
             LiveThreadError::InferenceUnavailable { detail } => {
                 write!(f, "inference pipeline is unavailable: {detail}")
             }
+            LiveThreadError::TrackerInitialization { source } => {
+                write!(f, "tracker initialization failed: {source}")
+            }
             LiveThreadError::FrameProcessingPanic { detail } => {
                 write!(f, "inference panic while processing frame: {detail}")
             }
@@ -1461,7 +1475,17 @@ impl std::fmt::Display for LiveThreadError {
 }
 
 #[cfg(feature = "record")]
-impl std::error::Error for LiveThreadError {}
+impl std::error::Error for LiveThreadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TrackerInitialization { source } => Some(source),
+            Self::VizChannelDisconnected
+            | Self::RerunConnect { .. }
+            | Self::InferenceUnavailable { .. }
+            | Self::FrameProcessingPanic { .. } => None,
+        }
+    }
+}
 
 #[cfg(feature = "record")]
 struct LiveThreadExitGuard(Arc<AtomicBool>);
@@ -1627,14 +1651,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let inference_running = Arc::clone(&running);
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let _exit_guard = LiveThreadExitGuard(inference_running);
-        let mut tracker = SlamTracker::new(
+        let mut tracker = SlamTracker::try_new(
             superpoint_left,
             superpoint_right,
             lightglue,
             rectified,
             intrinsics,
             tracker_config,
-        );
+        )
+        .map_err(|source| LiveThreadError::TrackerInitialization { source })?;
+        report_tracker_runtime(&tracker_config, &tracker);
         let depth_rx = depth_rx;
         let depth_enabled_for_diagnostics = depth_rx.is_some();
         let mut depth_ring = DepthRingBuffer::new(depth_ring_capacity);
@@ -1986,7 +2012,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         ))
     })?;
     if let Err(err) = inference_result {
-        return Err(std::io::Error::other(err).into());
+        return Err(Box::new(err));
     }
 
     let viz_result = viz_handle.join().map_err(|payload| {

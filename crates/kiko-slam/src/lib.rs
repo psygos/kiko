@@ -76,7 +76,7 @@ pub use tracker::{
     DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
     KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, PoseStatus,
     RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
-    TrackerError, TrackerOutput, TrackingHealth,
+    TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError,

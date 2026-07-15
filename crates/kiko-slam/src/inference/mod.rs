@@ -35,6 +35,10 @@ pub enum InferenceError {
         path: PathBuf,
         source: OrtError,
     },
+    ModelFileUnavailable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     Execution(OrtError),
 
@@ -74,6 +78,7 @@ impl std::error::Error for InferenceError {
             Self::RuntimeLoadFailed { source, .. }
             | Self::LoadFailed { source, .. }
             | Self::Execution(source) => Some(source),
+            Self::ModelFileUnavailable { source, .. } => Some(source),
             Self::Downscale(source) => Some(source),
             Self::Detection(source) => Some(source),
             Self::Match(source) => Some(source),
@@ -136,6 +141,11 @@ impl std::fmt::Display for InferenceError {
             InferenceError::LoadFailed { path, source } => {
                 write!(f, "failed to load model at {}: {source}", path.display())
             }
+            InferenceError::ModelFileUnavailable { path, source } => write!(
+                f,
+                "model file is unavailable at {}: {source}",
+                path.display()
+            ),
             InferenceError::Execution(e) => write!(f, "execution error: {e}"),
             InferenceError::SessionConfiguration { message } => {
                 write!(f, "session configuration error: {message}")
