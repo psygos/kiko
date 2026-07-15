@@ -134,6 +134,20 @@ impl GlobalMap {
             .add_keyframe(keyframe_id, neighbors.as_ref(), &self.map)
     }
 
+    pub(crate) fn add_keyframe_to_graph_with_verified_parent(
+        &mut self,
+        keyframe_id: KeyframeId,
+        parent: KeyframeId,
+        information: [[f64; 6]; 6],
+    ) -> Result<(), EssentialGraphError> {
+        self.essential_graph.add_keyframe_with_verified_parent(
+            keyframe_id,
+            parent,
+            information,
+            &self.map,
+        )
+    }
+
     pub(crate) fn remove_keyframe_from_graph(
         &mut self,
         keyframe_id: KeyframeId,

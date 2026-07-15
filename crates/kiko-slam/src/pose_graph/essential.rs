@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
 use crate::map::{KeyframeId, SlamMap};
@@ -151,6 +151,41 @@ pub enum EssentialGraphError {
     MissingInsertionFallback {
         registered_keyframes: usize,
     },
+    KeyframeNotRegistered {
+        keyframe_id: KeyframeId,
+    },
+    DuplicateKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    DisconnectedKeyframe {
+        keyframe_id: KeyframeId,
+    },
+    InvalidRootCount {
+        count: usize,
+    },
+    InvalidSpanningEdgeCount {
+        expected: usize,
+        actual: usize,
+    },
+    MissingSpanningEdge {
+        child: KeyframeId,
+        parent: KeyframeId,
+    },
+    DuplicateEdge {
+        a: KeyframeId,
+        b: KeyframeId,
+        kind: EssentialEdgeKind,
+    },
+    ConflictingEdgeKinds {
+        a: KeyframeId,
+        b: KeyframeId,
+        first: EssentialEdgeKind,
+        second: EssentialEdgeKind,
+    },
+    UnexpectedEdgeKind {
+        expected: EssentialEdgeKind,
+        actual: EssentialEdgeKind,
+    },
     EdgeConstruction {
         kind: EssentialEdgeKind,
         source: EssentialEdgeError,
@@ -182,6 +217,47 @@ impl std::fmt::Display for EssentialGraphError {
                 f,
                 "essential graph has {registered_keyframes} registered keyframes but no insertion-order fallback"
             ),
+            EssentialGraphError::KeyframeNotRegistered { keyframe_id } => write!(
+                f,
+                "keyframe is not registered in the essential graph: {keyframe_id:?}"
+            ),
+            EssentialGraphError::DuplicateKeyframe { keyframe_id } => write!(
+                f,
+                "essential graph order contains duplicate keyframe: {keyframe_id:?}"
+            ),
+            EssentialGraphError::DisconnectedKeyframe { keyframe_id } => write!(
+                f,
+                "keyframe has no connection to the essential graph root: {keyframe_id:?}"
+            ),
+            EssentialGraphError::InvalidRootCount { count } => write!(
+                f,
+                "non-empty essential graph must have exactly one root, found {count}"
+            ),
+            EssentialGraphError::InvalidSpanningEdgeCount { expected, actual } => write!(
+                f,
+                "essential graph requires {expected} spanning edges, found {actual}"
+            ),
+            EssentialGraphError::MissingSpanningEdge { child, parent } => write!(
+                f,
+                "essential graph is missing the spanning edge from {parent:?} to {child:?}"
+            ),
+            EssentialGraphError::DuplicateEdge { a, b, kind } => write!(
+                f,
+                "essential graph contains duplicate {kind:?} edge between {a:?} and {b:?}"
+            ),
+            EssentialGraphError::ConflictingEdgeKinds {
+                a,
+                b,
+                first,
+                second,
+            } => write!(
+                f,
+                "essential graph pair {a:?} to {b:?} is both {first:?} and {second:?}"
+            ),
+            EssentialGraphError::UnexpectedEdgeKind { expected, actual } => write!(
+                f,
+                "essential graph expected a {expected:?} edge, got {actual:?}"
+            ),
             EssentialGraphError::EdgeConstruction { kind, source } => {
                 write!(
                     f,
@@ -199,7 +275,16 @@ impl std::error::Error for EssentialGraphError {
             Self::EdgeConstruction { source, .. } => Some(source),
             Self::KeyframeNotFound { .. }
             | Self::RootRemovalDenied { .. }
-            | Self::MissingInsertionFallback { .. } => None,
+            | Self::MissingInsertionFallback { .. }
+            | Self::KeyframeNotRegistered { .. }
+            | Self::DuplicateKeyframe { .. }
+            | Self::DisconnectedKeyframe { .. }
+            | Self::InvalidRootCount { .. }
+            | Self::InvalidSpanningEdgeCount { .. }
+            | Self::MissingSpanningEdge { .. }
+            | Self::DuplicateEdge { .. }
+            | Self::ConflictingEdgeKinds { .. }
+            | Self::UnexpectedEdgeKind { .. } => None,
         }
     }
 }
@@ -250,7 +335,9 @@ impl EssentialGraph {
                 }
                 if strongest
                     .as_ref()
-                    .is_none_or(|(_, best_w): &(KeyframeId, u32)| weight.get() > *best_w)
+                    .is_none_or(|(best_id, best_w): &(KeyframeId, u32)| {
+                        weight.get() > *best_w || (weight.get() == *best_w && neighbor < *best_id)
+                    })
                 {
                     strongest = Some((neighbor, weight.get()));
                 }
@@ -302,6 +389,45 @@ impl EssentialGraph {
         self.order.push(keyframe_id);
         self.parent.insert(keyframe_id, parent);
         self.strong_covis_edges.extend(new_strong_edges);
+        self.spanning_edges.push(spanning_edge);
+        Ok(())
+    }
+
+    /// Register a keyframe using a geometrically verified parent rather than
+    /// inferred covisibility. The edge is constructed before graph mutation,
+    /// so an invalid pose or information matrix leaves this graph unchanged.
+    pub(crate) fn add_keyframe_with_verified_parent(
+        &mut self,
+        keyframe_id: KeyframeId,
+        parent: KeyframeId,
+        information: [[f64; 6]; 6],
+        map: &SlamMap,
+    ) -> Result<(), EssentialGraphError> {
+        let child_pose = map_pose64(map, keyframe_id)?;
+        let parent_pose = map_pose64(map, parent)?;
+        if !self.parent.contains_key(&parent) {
+            return Err(EssentialGraphError::KeyframeNotRegistered {
+                keyframe_id: parent,
+            });
+        }
+        if self.parent.contains_key(&keyframe_id) {
+            return Ok(());
+        }
+        if keyframe_id == parent {
+            return Err(EssentialGraphError::EdgeConstruction {
+                kind: EssentialEdgeKind::SpanningTree,
+                source: EssentialEdgeError::SelfEdge { keyframe_id },
+            });
+        }
+        let spanning_edge = parse_essential_edge(
+            parent,
+            keyframe_id,
+            EssentialEdgeKind::SpanningTree,
+            parent_pose.inverse().compose(child_pose),
+            information,
+        )?;
+        self.order.push(keyframe_id);
+        self.parent.insert(keyframe_id, parent);
         self.spanning_edges.push(spanning_edge);
         Ok(())
     }
@@ -369,15 +495,10 @@ impl EssentialGraph {
         }
 
         let children: Vec<KeyframeId> = self
-            .parent
+            .order
             .iter()
-            .filter_map(|(&child, &child_parent)| {
-                if child_parent == keyframe_id && child != keyframe_id {
-                    Some(child)
-                } else {
-                    None
-                }
-            })
+            .copied()
+            .filter(|&child| child != keyframe_id && self.parent.get(&child) == Some(&keyframe_id))
             .collect();
 
         let mut replacement_edges = Vec::with_capacity(children.len());
@@ -415,7 +536,11 @@ impl EssentialGraph {
         self.loop_edges
             .retain(|edge| edge.a != keyframe_id && edge.b != keyframe_id);
 
-        self.spanning_edges.extend(replacement_edges);
+        for edge in replacement_edges {
+            self.strong_covis_edges
+                .retain(|strong| !same_endpoints(strong.a, strong.b, edge.a, edge.b));
+            self.spanning_edges.push(edge);
+        }
 
         Ok(())
     }
@@ -428,6 +553,117 @@ impl EssentialGraph {
             .chain(self.strong_covis_edges.iter())
             .chain(self.odometry_edges.iter())
             .chain(self.loop_edges.iter())
+    }
+
+    fn validate_topology(&self) -> Result<(), EssentialGraphError> {
+        let mut registered = HashSet::with_capacity(self.order.len());
+        for &keyframe_id in &self.order {
+            if !registered.insert(keyframe_id) {
+                return Err(EssentialGraphError::DuplicateKeyframe { keyframe_id });
+            }
+            if !self.parent.contains_key(&keyframe_id) {
+                return Err(EssentialGraphError::KeyframeNotRegistered { keyframe_id });
+            }
+        }
+        if let Some(keyframe_id) = self
+            .parent
+            .keys()
+            .copied()
+            .filter(|keyframe_id| !registered.contains(keyframe_id))
+            .min()
+        {
+            return Err(EssentialGraphError::KeyframeNotRegistered { keyframe_id });
+        }
+        if registered.is_empty() {
+            if let Some(edge) = self.iter_all_edges().next() {
+                return Err(EssentialGraphError::KeyframeNotRegistered {
+                    keyframe_id: edge.a,
+                });
+            }
+            return Ok(());
+        }
+
+        let roots = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| self.parent.get(id) == Some(id))
+            .collect::<Vec<_>>();
+        if roots.len() != 1 {
+            return Err(EssentialGraphError::InvalidRootCount { count: roots.len() });
+        }
+        let root = roots[0];
+        for &keyframe_id in &self.order {
+            let parent = *self
+                .parent
+                .get(&keyframe_id)
+                .ok_or(EssentialGraphError::KeyframeNotRegistered { keyframe_id })?;
+            if !registered.contains(&parent) {
+                return Err(EssentialGraphError::KeyframeNotRegistered {
+                    keyframe_id: parent,
+                });
+            }
+            let mut cursor = keyframe_id;
+            let mut remaining = registered.len();
+            while cursor != root && remaining > 0 {
+                cursor = *self.parent.get(&cursor).ok_or(
+                    EssentialGraphError::KeyframeNotRegistered {
+                        keyframe_id: cursor,
+                    },
+                )?;
+                remaining -= 1;
+            }
+            if cursor != root {
+                return Err(EssentialGraphError::DisconnectedKeyframe { keyframe_id });
+            }
+        }
+
+        let mut structural_pairs = HashMap::with_capacity(
+            self.spanning_edges
+                .len()
+                .saturating_add(self.strong_covis_edges.len()),
+        );
+        validate_edge_set(
+            &self.spanning_edges,
+            EssentialEdgeKind::SpanningTree,
+            &registered,
+            &mut structural_pairs,
+        )?;
+        validate_edge_set(
+            &self.strong_covis_edges,
+            EssentialEdgeKind::StrongCovisibility,
+            &registered,
+            &mut structural_pairs,
+        )?;
+        let mut odometry_pairs = HashMap::with_capacity(self.odometry_edges.len());
+        validate_edge_set(
+            &self.odometry_edges,
+            EssentialEdgeKind::Odometry,
+            &registered,
+            &mut odometry_pairs,
+        )?;
+        let mut loop_pairs = HashMap::with_capacity(self.loop_edges.len());
+        validate_edge_set(
+            &self.loop_edges,
+            EssentialEdgeKind::Loop,
+            &registered,
+            &mut loop_pairs,
+        )?;
+
+        let expected = registered.len() - 1;
+        if self.spanning_edges.len() != expected {
+            return Err(EssentialGraphError::InvalidSpanningEdgeCount {
+                expected,
+                actual: self.spanning_edges.len(),
+            });
+        }
+        for &child in &self.order {
+            let parent = self.parent[&child];
+            if child != parent && !contains_directed_edge(&self.spanning_edges, parent, child) {
+                return Err(EssentialGraphError::MissingSpanningEdge { child, parent });
+            }
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> EssentialGraphSnapshot {
@@ -443,6 +679,8 @@ impl EssentialGraph {
     }
 
     pub fn pose_graph_input(&self) -> Result<PoseGraphInput, PoseGraphError> {
+        self.validate_topology()
+            .map_err(|source| PoseGraphError::EssentialTopology { source })?;
         let keyframe_ids = self.order.clone();
         let mut id_to_idx = HashMap::with_capacity(keyframe_ids.len());
         for (idx, &id) in keyframe_ids.iter().enumerate() {
@@ -485,6 +723,54 @@ impl EssentialGraph {
     pub fn all_edges(&self) -> Result<Vec<PoseGraphEdge>, PoseGraphError> {
         self.pose_graph_input().map(|input| input.edges)
     }
+
+    #[cfg(test)]
+    pub(crate) fn reverse_spanning_edge_for_test(&mut self, child: KeyframeId) -> bool {
+        let Some(edge) = self.spanning_edges.iter_mut().find(|edge| edge.b == child) else {
+            return false;
+        };
+        std::mem::swap(&mut edge.a, &mut edge.b);
+        true
+    }
+}
+
+fn validate_edge_set(
+    edges: &[EssentialEdge],
+    expected_kind: EssentialEdgeKind,
+    registered: &HashSet<KeyframeId>,
+    seen: &mut HashMap<(KeyframeId, KeyframeId), EssentialEdgeKind>,
+) -> Result<(), EssentialGraphError> {
+    for edge in edges {
+        if edge.kind != expected_kind {
+            return Err(EssentialGraphError::UnexpectedEdgeKind {
+                expected: expected_kind,
+                actual: edge.kind,
+            });
+        }
+        for keyframe_id in [edge.a, edge.b] {
+            if !registered.contains(&keyframe_id) {
+                return Err(EssentialGraphError::KeyframeNotRegistered { keyframe_id });
+            }
+        }
+        let endpoints = canonical_endpoints(edge.a, edge.b);
+        if let Some(first) = seen.insert(endpoints, expected_kind) {
+            return Err(if first == expected_kind {
+                EssentialGraphError::DuplicateEdge {
+                    a: endpoints.0,
+                    b: endpoints.1,
+                    kind: expected_kind,
+                }
+            } else {
+                EssentialGraphError::ConflictingEdgeKinds {
+                    a: endpoints.0,
+                    b: endpoints.1,
+                    first,
+                    second: expected_kind,
+                }
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_essential_edge(
@@ -502,6 +788,14 @@ fn contains_edge(edges: &[EssentialEdge], a: KeyframeId, b: KeyframeId) -> bool 
     edges
         .iter()
         .any(|edge| (edge.a == a && edge.b == b) || (edge.a == b && edge.b == a))
+}
+
+fn contains_directed_edge(edges: &[EssentialEdge], from: KeyframeId, to: KeyframeId) -> bool {
+    edges.iter().any(|edge| edge.a == from && edge.b == to)
+}
+
+fn canonical_endpoints(a: KeyframeId, b: KeyframeId) -> (KeyframeId, KeyframeId) {
+    (a.min(b), a.max(b))
 }
 
 fn same_endpoints(a0: KeyframeId, b0: KeyframeId, a1: KeyframeId, b1: KeyframeId) -> bool {

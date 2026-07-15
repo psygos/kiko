@@ -97,6 +97,9 @@ pub enum PoseGraphError {
         endpoint: &'static str,
         keyframe_id: KeyframeId,
     },
+    EssentialTopology {
+        source: essential::EssentialGraphError,
+    },
     UnconstrainedPoseGraph {
         pose_count: usize,
     },
@@ -342,6 +345,9 @@ impl std::fmt::Display for PoseGraphError {
                 f,
                 "essential graph edge {edge_index} endpoint {endpoint} references unregistered keyframe {keyframe_id:?}"
             ),
+            PoseGraphError::EssentialTopology { source } => {
+                write!(f, "invalid essential graph topology: {source}")
+            }
             PoseGraphError::UnconstrainedPoseGraph { pose_count } => write!(
                 f,
                 "pose graph has {pose_count} poses but no relative-pose constraints"
@@ -402,6 +408,7 @@ impl std::error::Error for PoseGraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::EdgeConstruction { source, .. } => Some(source),
+            Self::EssentialTopology { source } => Some(source),
             _ => None,
         }
     }

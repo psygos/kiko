@@ -636,6 +636,13 @@ impl PlaceRecognition {
         self.loop_streak.clear();
     }
 
+    /// Forget every keyframe belonging to the previous map instance while
+    /// retaining the learned-descriptor worker and its model allocation.
+    pub(crate) fn reset_mapping_session(&mut self) {
+        self.database = KeyframeDatabase::new(self.loop_config.temporal_gap());
+        self.clear_pending();
+    }
+
     pub(crate) fn take_pending_loop(&mut self) -> Option<PendingLoopCandidate> {
         self.pending_loop.take()
     }

@@ -858,6 +858,57 @@ fn essential_graph_builds_spanning_tree_connectivity() {
 }
 
 #[test]
+fn verified_parent_connects_uncovisible_keyframe_in_parent_to_child_direction() {
+    let (map, ids) = make_chain_keyframes(2);
+    let parent = ids[0];
+    let child = ids[1];
+    let mut graph = EssentialGraph::new(2);
+    add_graph_keyframe(&mut graph, parent, None, &map);
+
+    graph
+        .add_keyframe_with_verified_parent(child, parent, scalar_block(7.0), &map)
+        .expect("verified attachment supplies a truthful spanning connection");
+
+    assert_eq!(graph.parent_of(child), Some(parent));
+    let snapshot = graph.snapshot();
+    assert_eq!(snapshot.spanning_edges.len(), 1);
+    assert_eq!(snapshot.spanning_edges[0].endpoint_a(), parent);
+    assert_eq!(snapshot.spanning_edges[0].endpoint_b(), child);
+    assert_eq!(
+        snapshot.spanning_edges[0].information().matrix(),
+        &scalar_block(7.0)
+    );
+    graph
+        .pose_graph_input()
+        .expect("verified parent topology remains connected");
+}
+
+#[test]
+fn essential_graph_rejects_reversed_spanning_direction() {
+    let (map, ids) = make_chain_keyframes(2);
+    let parent = ids[0];
+    let child = ids[1];
+    let mut graph = EssentialGraph::new(2);
+    add_graph_keyframe(&mut graph, parent, None, &map);
+    graph
+        .add_keyframe_with_verified_parent(child, parent, scalar_block(1.0), &map)
+        .expect("verified child");
+    assert!(graph.reverse_spanning_edge_for_test(child));
+
+    assert!(matches!(
+        graph
+            .pose_graph_input()
+            .expect_err("reversed endpoints cannot satisfy directed parentage"),
+        super::PoseGraphError::EssentialTopology {
+            source: EssentialGraphError::MissingSpanningEdge {
+                child: actual_child,
+                parent: actual_parent,
+            },
+        } if actual_child == child && actual_parent == parent
+    ));
+}
+
+#[test]
 fn essential_graph_add_rejects_missing_map_keyframe_without_mutation() {
     let (map, kf0, _kf1, _kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
