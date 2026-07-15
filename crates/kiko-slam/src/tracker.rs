@@ -22,10 +22,10 @@ const TRACK_TRACE_ENV: &str = "KIKO_TRACK_TRACE";
 const EIGENPLACES_MODEL_ENV: &str = "KIKO_EIGENPLACES_MODEL";
 
 use crate::loop_closure::{
-    DescriptorSource, GlobalDescriptorError, KeyframeDatabase, LoopApplyError, LoopCandidate,
-    LoopClosureConfig, LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
-    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
-    try_match_descriptors_for_loop,
+    DescriptorSource, GlobalDescriptorError, KeyframeDatabase, KeyframeDatabaseError,
+    LoopApplyError, LoopCandidate, LoopClosureConfig, LoopDetectError, LoopVerificationError,
+    PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
+    aggregate_global_descriptor, try_match_descriptors_for_loop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
@@ -359,6 +359,12 @@ struct DescriptorResponse {
     keyframe_id: KeyframeId,
     source_snapshot: MapSnapshot,
     descriptor: crate::loop_closure::GlobalDescriptor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DescriptorApplyDisposition {
+    Applied,
+    Stale,
 }
 
 #[derive(Debug, Clone)]
@@ -1312,6 +1318,7 @@ impl RedundancyPolicy {
 pub enum TrackerError {
     Inference(InferenceError),
     GlobalDescriptor(GlobalDescriptorError),
+    KeyframeDatabase(KeyframeDatabaseError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
@@ -1338,6 +1345,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
             TrackerError::GlobalDescriptor(err) => {
                 write!(f, "global descriptor error: {err}")
+            }
+            TrackerError::KeyframeDatabase(err) => {
+                write!(f, "keyframe database error: {err}")
             }
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
@@ -1368,6 +1378,7 @@ impl std::error::Error for TrackerError {
         match self {
             Self::Inference(err) => Some(err),
             Self::GlobalDescriptor(err) => Some(err),
+            Self::KeyframeDatabase(err) => Some(err),
             Self::Triangulation(err) => Some(err),
             Self::Pnp(err) => Some(err),
             Self::Map(err) => Some(err),
@@ -1402,6 +1413,12 @@ impl From<InferenceError> for TrackerError {
 impl From<GlobalDescriptorError> for TrackerError {
     fn from(err: GlobalDescriptorError) -> Self {
         TrackerError::GlobalDescriptor(err)
+    }
+}
+
+impl From<KeyframeDatabaseError> for TrackerError {
+    fn from(err: KeyframeDatabaseError) -> Self {
+        TrackerError::KeyframeDatabase(err)
     }
 }
 
@@ -1879,7 +1896,7 @@ impl SlamTracker {
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
         // Keep drained diagnostics queued until a TrackerOutput can carry them.
         self.drain_backend_responses();
-        self.drain_descriptor_responses();
+        self.drain_descriptor_responses()?;
         if let Err(err) = self.process_pending_loop_closure() {
             match err {
                 LoopDetectError::DescriptorMatchFailed(source)
@@ -2067,26 +2084,25 @@ impl SlamTracker {
         )
     }
 
-    fn enqueue_loop_candidates(&mut self, keyframe_id: KeyframeId, detections: &Arc<Detections>) {
-        let (Some(config), Some(loop_db)) = (self.loop_config, self.loop_db.as_mut()) else {
-            return;
-        };
-
-        let Ok(global_descriptor) = aggregate_global_descriptor(detections.descriptors()) else {
-            return;
-        };
-        loop_db.insert_with_source(
+    fn enqueue_loop_candidates(
+        &mut self,
+        keyframe_id: KeyframeId,
+        detections: &Arc<Detections>,
+    ) -> Result<(), TrackerError> {
+        let Some((config, mut candidates)) = register_bootstrap_loop_descriptor(
+            self.loop_config,
+            self.loop_db.as_mut(),
             keyframe_id,
-            global_descriptor.clone(),
-            DescriptorSource::Bootstrap,
-        );
-
-        let mut candidates = loop_db.query(&global_descriptor, config.max_candidates());
+            detections,
+        )?
+        else {
+            return Ok(());
+        };
         candidates.retain(|candidate| candidate.similarity >= config.similarity_threshold());
 
         if candidates.is_empty() {
             self.loop_streak.clear();
-            return;
+            return Ok(());
         }
 
         let present: HashSet<KeyframeId> = candidates.iter().map(|m| m.candidate).collect();
@@ -2098,7 +2114,7 @@ impl SlamTracker {
         }
 
         if self.pending_loop.is_some() {
-            return;
+            return Ok(());
         }
 
         let promoted: Vec<PlaceMatch> = candidates
@@ -2113,7 +2129,7 @@ impl SlamTracker {
             .collect();
 
         if promoted.is_empty() {
-            return;
+            return Ok(());
         }
 
         self.pending_loop = Some(PendingLoopCandidate {
@@ -2121,6 +2137,7 @@ impl SlamTracker {
             detections: Arc::clone(detections),
             candidates: promoted,
         });
+        Ok(())
     }
 
     fn enqueue_descriptor_request(&mut self, keyframe_id: KeyframeId, frame: &Frame) {
@@ -2150,11 +2167,11 @@ impl SlamTracker {
         }
     }
 
-    fn drain_descriptor_responses(&mut self) {
+    fn drain_descriptor_responses(&mut self) -> Result<(), TrackerError> {
         loop {
             let response = {
                 let Some(supervisor) = self.descriptor_worker.as_mut() else {
-                    return;
+                    return Ok(());
                 };
                 let response = supervisor.try_recv();
                 self.descriptor_stats.respawn_count = supervisor.respawn_count();
@@ -2166,11 +2183,16 @@ impl SlamTracker {
             match response {
                 DescriptorWorkerResponse::Descriptor(response) => {
                     let Some(loop_db) = self.loop_db.as_mut() else {
-                        continue;
+                        return Err(TrackerError::InvariantViolation(
+                            "descriptor worker requires an enabled keyframe database",
+                        ));
                     };
-                    if apply_descriptor_response(&self.map, loop_db, *response) {
-                        self.descriptor_stats.applied =
-                            self.descriptor_stats.applied.saturating_add(1);
+                    match apply_descriptor_response(&self.map, loop_db, *response)? {
+                        DescriptorApplyDisposition::Applied => {
+                            self.descriptor_stats.applied =
+                                self.descriptor_stats.applied.saturating_add(1);
+                        }
+                        DescriptorApplyDisposition::Stale => {}
                     }
                 }
                 DescriptorWorkerResponse::Failure {
@@ -2201,6 +2223,7 @@ impl SlamTracker {
                 }
             }
         }
+        Ok(())
     }
 
     fn process_pending_loop_closure(&mut self) -> Result<Option<VerifiedLoop>, LoopDetectError> {
@@ -3285,20 +3308,22 @@ impl SlamTracker {
         }
 
         let keyframe = Arc::new(result.keyframe);
-        let keyframe_id = insert_keyframe_into_map_and_graph(
-            &mut self.map,
-            &mut self.essential_graph,
+        let (staged_map, staged_graph, keyframe_id) = stage_keyframe_in_map_and_graph(
+            &self.map,
+            &self.essential_graph,
             &keyframe,
             left.timestamp(),
             pose_world,
             &connection,
             self.cull_min_observations,
         )?;
+        self.enqueue_loop_candidates(keyframe_id, keyframe.detections())?;
+        self.map = staged_map;
+        self.essential_graph = staged_graph;
         self.emit_event(DiagnosticEvent::KeyframeCreated {
             keyframe_id,
             landmarks,
         });
-        self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
         self.enqueue_descriptor_request(keyframe_id, &left);
 
         let mut diagnostics = self.empty_diagnostics();
@@ -3322,6 +3347,31 @@ impl SlamTracker {
             keyframe_id,
         ))
     }
+}
+
+fn register_bootstrap_loop_descriptor(
+    config: Option<LoopClosureConfig>,
+    loop_db: Option<&mut KeyframeDatabase>,
+    keyframe_id: KeyframeId,
+    detections: &Detections,
+) -> Result<Option<(LoopClosureConfig, Vec<PlaceMatch>)>, TrackerError> {
+    let (config, loop_db) = match (config, loop_db) {
+        (None, None) => return Ok(None),
+        (Some(config), Some(loop_db)) => (config, loop_db),
+        _ => {
+            return Err(TrackerError::InvariantViolation(
+                "loop configuration and keyframe database must be enabled together",
+            ));
+        }
+    };
+    let descriptor = aggregate_global_descriptor(detections.descriptors())?;
+    let candidates = loop_db.insert_with_source_and_query(
+        keyframe_id,
+        descriptor,
+        DescriptorSource::Bootstrap,
+        config.max_candidates(),
+    )?;
+    Ok(Some((config, candidates)))
 }
 
 fn replace_mapping_session(
@@ -3358,6 +3408,7 @@ fn insert_keyframe_into_map(
     Ok(keyframe_id)
 }
 
+#[cfg(test)]
 fn insert_keyframe_into_map_and_graph(
     map: &mut SlamMap,
     essential_graph: &mut EssentialGraph,
@@ -3367,6 +3418,29 @@ fn insert_keyframe_into_map_and_graph(
     connection: &KeyframeConnection,
     cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
+    let (staged_map, staged_graph, keyframe_id) = stage_keyframe_in_map_and_graph(
+        map,
+        essential_graph,
+        keyframe,
+        timestamp,
+        pose_world,
+        connection,
+        cull_min_observations,
+    )?;
+    *map = staged_map;
+    *essential_graph = staged_graph;
+    Ok(keyframe_id)
+}
+
+fn stage_keyframe_in_map_and_graph(
+    map: &SlamMap,
+    essential_graph: &EssentialGraph,
+    keyframe: &Arc<Keyframe>,
+    timestamp: Timestamp,
+    pose_world: crate::WorldToCamera,
+    connection: &KeyframeConnection,
+    cull_min_observations: NonZeroUsize,
+) -> Result<(SlamMap, EssentialGraph, KeyframeId), TrackerError> {
     if let KeyframeConnection::Relocalization(attachment) = connection {
         let current = map.snapshot();
         if attachment.verified_snapshot != current {
@@ -3403,9 +3477,7 @@ fn insert_keyframe_into_map_and_graph(
         }
     }
 
-    *map = staged_map;
-    *essential_graph = staged_graph;
-    Ok(keyframe_id)
+    Ok((staged_map, staged_graph, keyframe_id))
 }
 
 fn stage_keyframe_in_map(
@@ -3471,11 +3543,14 @@ fn remove_keyframe_from_graph_and_db(
 ) -> Result<(), TrackerError> {
     let mut staged_map = map.clone();
     let mut staged_graph = essential_graph.clone();
-    let staged_db = loop_db.as_deref().map(|database| {
-        let mut staged = database.clone();
-        staged.remove(keyframe_id);
-        staged
-    });
+    let staged_db = match loop_db.as_deref() {
+        Some(database) => {
+            let mut staged = database.clone();
+            staged.remove(keyframe_id)?;
+            Some(staged)
+        }
+        None => None,
+    };
 
     staged_graph.remove_keyframe(keyframe_id, &staged_map)?;
     staged_map.remove_keyframe(keyframe_id)?;
@@ -3612,14 +3687,18 @@ fn apply_descriptor_response(
     map: &SlamMap,
     loop_db: &mut KeyframeDatabase,
     response: DescriptorResponse,
-) -> bool {
-    response.source_snapshot == map.snapshot()
-        && map.keyframe(response.keyframe_id).is_some()
-        && loop_db.replace_descriptor(
-            response.keyframe_id,
-            response.descriptor,
-            DescriptorSource::Learned,
-        )
+) -> Result<DescriptorApplyDisposition, TrackerError> {
+    if response.source_snapshot != map.snapshot() {
+        return Ok(DescriptorApplyDisposition::Stale);
+    }
+    map.keyframe(response.keyframe_id)
+        .ok_or(crate::map::MapError::KeyframeNotFound(response.keyframe_id))?;
+    loop_db.replace_descriptor(
+        response.keyframe_id,
+        response.descriptor,
+        DescriptorSource::Learned,
+    )?;
+    Ok(DescriptorApplyDisposition::Applied)
 }
 
 fn apply_loop_closure_correction(
@@ -3985,6 +4064,13 @@ mod tests {
     }
 
     fn make_single_landmark_keyframe(frame_id: u64) -> Arc<Keyframe> {
+        make_single_landmark_keyframe_with_descriptor(frame_id, make_descriptor())
+    }
+
+    fn make_single_landmark_keyframe_with_descriptor(
+        frame_id: u64,
+        descriptor: Descriptor,
+    ) -> Arc<Keyframe> {
         let detections = Arc::new(
             Detections::new(
                 SensorId::StereoLeft,
@@ -3993,7 +4079,7 @@ mod tests {
                 240,
                 vec![Keypoint { x: 100.0, y: 80.0 }],
                 vec![1.0],
-                vec![make_descriptor()],
+                vec![descriptor],
             )
             .expect("single-landmark detections"),
         );
@@ -4340,6 +4426,87 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_descriptor_failure_leaves_map_graph_and_database_uncommitted() {
+        let map = SlamMap::new();
+        let graph = EssentialGraph::new(2);
+        let keyframe = make_single_landmark_keyframe(32);
+        let map_before = map.snapshot();
+        let graph_before = graph.snapshot();
+        let (staged_map, staged_graph, keyframe_id) = stage_keyframe_in_map_and_graph(
+            &map,
+            &graph,
+            &keyframe,
+            Timestamp::from_nanos(32),
+            crate::WorldToCamera::identity(),
+            &KeyframeConnection::Bootstrap,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect("map and graph staging succeeds");
+        assert_eq!(staged_map.num_keyframes(), 1);
+        assert_eq!(staged_graph.parent_of(keyframe_id), Some(keyframe_id));
+        let mut loop_db = KeyframeDatabase::new(0);
+
+        let error = register_bootstrap_loop_descriptor(
+            Some(LoopClosureConfig::default()),
+            Some(&mut loop_db),
+            keyframe_id,
+            keyframe.detections(),
+        )
+        .expect_err("zero-norm bootstrap descriptor must propagate");
+
+        assert!(matches!(
+            error,
+            TrackerError::GlobalDescriptor(GlobalDescriptorError::ZeroNorm)
+        ));
+        assert_eq!(map.snapshot(), map_before);
+        assert_eq!(graph.snapshot().order, graph_before.order);
+        assert!(loop_db.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_database_failure_leaves_map_and_graph_uncommitted() {
+        let map = SlamMap::new();
+        let graph = EssentialGraph::new(2);
+        let mut descriptor = [0.0; 256];
+        descriptor[0] = 1.0;
+        let keyframe = make_single_landmark_keyframe_with_descriptor(33, Descriptor(descriptor));
+        let map_before = map.snapshot();
+        let graph_before = graph.snapshot();
+        let (_staged_map, _staged_graph, keyframe_id) = stage_keyframe_in_map_and_graph(
+            &map,
+            &graph,
+            &keyframe,
+            Timestamp::from_nanos(33),
+            crate::WorldToCamera::identity(),
+            &KeyframeConnection::Bootstrap,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect("map and graph staging succeeds");
+        let mut loop_db = KeyframeDatabase::new(0);
+        loop_db
+            .insert(keyframe_id, make_global_descriptor_basis(7))
+            .expect("inject existing registration");
+
+        let error = register_bootstrap_loop_descriptor(
+            Some(LoopClosureConfig::default()),
+            Some(&mut loop_db),
+            keyframe_id,
+            keyframe.detections(),
+        )
+        .expect_err("duplicate database registration must propagate");
+
+        assert!(matches!(
+            error,
+            TrackerError::KeyframeDatabase(KeyframeDatabaseError::DuplicateKeyframe {
+                keyframe_id: duplicate
+            }) if duplicate == keyframe_id
+        ));
+        assert_eq!(map.snapshot(), map_before);
+        assert_eq!(graph.snapshot().order, graph_before.order);
+        assert_eq!(loop_db.len(), 1);
+    }
+
+    #[test]
     fn relocalized_keyframe_transaction_attaches_to_verified_candidate_without_covisibility() {
         let mut map = SlamMap::new();
         let mut graph = EssentialGraph::new(2);
@@ -4422,7 +4589,9 @@ mod tests {
             .expect("old graph root");
         let descriptor = make_global_descriptor_basis(5);
         let mut loop_db = KeyframeDatabase::new(17);
-        loop_db.insert(old_keyframe, descriptor.clone());
+        loop_db
+            .insert(old_keyframe, descriptor.clone())
+            .expect("unique keyframe");
         let old_snapshot = map.snapshot();
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(99).expect("non-zero")),
@@ -4451,15 +4620,19 @@ mod tests {
             apply_correction_event(&mut map, &correction),
             Err(ApplyCorrectionError::StaleSnapshot { .. })
         ));
-        assert!(!apply_descriptor_response(
-            &map,
-            &mut loop_db,
-            DescriptorResponse {
-                keyframe_id: old_keyframe,
-                source_snapshot: old_snapshot,
-                descriptor,
-            },
-        ));
+        assert_eq!(
+            apply_descriptor_response(
+                &map,
+                &mut loop_db,
+                DescriptorResponse {
+                    keyframe_id: old_keyframe,
+                    source_snapshot: old_snapshot,
+                    descriptor,
+                },
+            )
+            .expect("stale response is nonfatal"),
+            DescriptorApplyDisposition::Stale
+        );
 
         let fresh_root = insert_keyframe_into_map_and_graph(
             &mut map,
@@ -5031,48 +5204,85 @@ mod tests {
         let bootstrap = make_global_descriptor_basis(1);
         let learned = make_global_descriptor_basis(2);
         let mut loop_db = KeyframeDatabase::new(0);
-        loop_db.insert_with_source(
-            keyframe_id,
-            bootstrap.clone(),
-            crate::loop_closure::DescriptorSource::Bootstrap,
-        );
-
-        assert!(apply_descriptor_response(
-            &map,
-            &mut loop_db,
-            DescriptorResponse {
+        loop_db
+            .insert_with_source(
                 keyframe_id,
-                source_snapshot: map.snapshot(),
-                descriptor: learned.clone(),
-            },
-        ));
+                bootstrap.clone(),
+                crate::loop_closure::DescriptorSource::Bootstrap,
+            )
+            .expect("unique keyframe");
+
+        assert_eq!(
+            apply_descriptor_response(
+                &map,
+                &mut loop_db,
+                DescriptorResponse {
+                    keyframe_id,
+                    source_snapshot: map.snapshot(),
+                    descriptor: learned.clone(),
+                },
+            )
+            .expect("current response"),
+            DescriptorApplyDisposition::Applied
+        );
         assert_eq!(
             loop_db.descriptor_source(keyframe_id),
             Some(crate::loop_closure::DescriptorSource::Learned)
         );
 
-        loop_db.insert_with_source(
-            keyframe_id,
-            bootstrap,
-            crate::loop_closure::DescriptorSource::Bootstrap,
-        );
+        loop_db
+            .replace_descriptor(
+                keyframe_id,
+                bootstrap,
+                crate::loop_closure::DescriptorSource::Bootstrap,
+            )
+            .expect("registered keyframe");
         let stale_snapshot = map.snapshot();
         let pose = map.keyframe(keyframe_id).expect("keyframe").pose();
         map.set_keyframe_pose(keyframe_id, pose)
             .expect("advance map generation");
-        assert!(!apply_descriptor_response(
-            &map,
-            &mut loop_db,
-            DescriptorResponse {
-                keyframe_id,
-                source_snapshot: stale_snapshot,
-                descriptor: learned,
-            },
-        ));
+        assert_eq!(
+            apply_descriptor_response(
+                &map,
+                &mut loop_db,
+                DescriptorResponse {
+                    keyframe_id,
+                    source_snapshot: stale_snapshot,
+                    descriptor: learned,
+                },
+            )
+            .expect("stale response is nonfatal"),
+            DescriptorApplyDisposition::Stale
+        );
         assert_eq!(
             loop_db.descriptor_source(keyframe_id),
             Some(crate::loop_closure::DescriptorSource::Bootstrap)
         );
+    }
+
+    #[test]
+    fn current_descriptor_response_propagates_missing_database_entry() {
+        let (map, keyframe_id, _) = make_map_with_single_point();
+        let mut loop_db = KeyframeDatabase::new(0);
+
+        let error = apply_descriptor_response(
+            &map,
+            &mut loop_db,
+            DescriptorResponse {
+                keyframe_id,
+                source_snapshot: map.snapshot(),
+                descriptor: make_global_descriptor_basis(3),
+            },
+        )
+        .expect_err("current response requires a registered keyframe descriptor");
+
+        assert!(matches!(
+            error,
+            TrackerError::KeyframeDatabase(KeyframeDatabaseError::KeyframeNotFound {
+                keyframe_id: missing
+            }) if missing == keyframe_id
+        ));
+        assert!(loop_db.is_empty());
     }
 
     #[test]
@@ -5609,11 +5819,13 @@ mod tests {
             make_loop_closure_apply_fixture();
         let mut loop_db = KeyframeDatabase::new(0);
         for (idx, (keyframe_id, _)) in map.keyframes().enumerate() {
-            loop_db.insert_with_source(
-                keyframe_id,
-                make_global_descriptor_basis(idx),
-                crate::loop_closure::DescriptorSource::Bootstrap,
-            );
+            loop_db
+                .insert_with_source(
+                    keyframe_id,
+                    make_global_descriptor_basis(idx),
+                    crate::loop_closure::DescriptorSource::Bootstrap,
+                )
+                .expect("unique keyframe");
         }
 
         remove_keyframe_from_graph_and_db(
@@ -5634,15 +5846,44 @@ mod tests {
     }
 
     #[test]
+    fn remove_keyframe_propagates_missing_database_entry_without_mutation() {
+        let (mut map, mut essential_graph, _verified, removed_kf, _before_points) =
+            make_loop_closure_apply_fixture();
+        let mut loop_db = KeyframeDatabase::new(0);
+        let map_before = map.snapshot();
+        let graph_before = essential_graph.snapshot();
+
+        let error = remove_keyframe_from_graph_and_db(
+            &mut map,
+            &mut essential_graph,
+            Some(&mut loop_db),
+            removed_kf,
+        )
+        .expect_err("registered map keyframe requires a database entry");
+
+        assert!(matches!(
+            error,
+            TrackerError::KeyframeDatabase(KeyframeDatabaseError::KeyframeNotFound {
+                keyframe_id
+            }) if keyframe_id == removed_kf
+        ));
+        assert_eq!(map.snapshot(), map_before);
+        assert_eq!(essential_graph.snapshot().order, graph_before.order);
+        assert!(loop_db.is_empty());
+    }
+
+    #[test]
     fn remove_keyframe_rejects_stale_map_without_mutating_graph_or_db() {
         let (mut map, mut essential_graph, _verified, removed_kf, _before_points) =
             make_loop_closure_apply_fixture();
         let mut loop_db = KeyframeDatabase::new(0);
-        loop_db.insert_with_source(
-            removed_kf,
-            make_global_descriptor_basis(0),
-            crate::loop_closure::DescriptorSource::Bootstrap,
-        );
+        loop_db
+            .insert_with_source(
+                removed_kf,
+                make_global_descriptor_basis(0),
+                crate::loop_closure::DescriptorSource::Bootstrap,
+            )
+            .expect("unique keyframe");
         map.remove_keyframe(removed_kf)
             .expect("remove map entry to inject late failure");
         let parent_before = essential_graph.parent_of(removed_kf);
@@ -5803,7 +6044,9 @@ mod tests {
         let current = make_relocalization_detections(descriptor);
         let global = aggregate_global_descriptor(current.descriptors()).expect("global descriptor");
         let mut loop_db = KeyframeDatabase::new(0);
-        loop_db.insert(KeyframeId::default(), global);
+        loop_db
+            .insert(KeyframeId::default(), global)
+            .expect("unique keyframe");
         let intrinsics =
             crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
                 .expect("intrinsics");
