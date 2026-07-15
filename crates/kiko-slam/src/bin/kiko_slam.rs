@@ -21,13 +21,15 @@ use kiko_slam::{CameraPoint3, DenseStats, Frame, Raw, ReconState, WorldToCamera}
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
-    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta, WriteOutcome,
+    Calibration, CameraIntrinsics, DatasetWriteError, DatasetWriter, DepthMeta, ImuMeta, Meta,
+    MonoMeta, WriteOutcome,
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
     ChannelCapacity, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
-    PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
-    SystemHealth, TrackerInitError, bounded_channel, oak_to_depth_image, oak_to_frame,
+    PairError, PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
+    StereoPairer, SystemHealth, TrackerInitError, bounded_channel, oak_to_depth_image,
+    oak_to_frame,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -1219,15 +1221,136 @@ fn load_pairer_max_pending_per_side() -> usize {
 }
 
 #[cfg(feature = "record")]
-fn require_record_write(outcome: WriteOutcome, item: &'static str) -> std::io::Result<()> {
+#[derive(Clone, Copy, Debug)]
+enum RecordItem {
+    DepthFrame,
+    StereoPair,
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for RecordItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DepthFrame => write!(f, "depth frame"),
+            Self::StereoPair => write!(f, "stereo pair"),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum RecordCaptureError {
+    LeftImage {
+        source: ImageError,
+    },
+    RightImage {
+        source: ImageError,
+    },
+    Depth {
+        source: DepthError,
+    },
+    Pairing {
+        source: PairError,
+    },
+    DatasetWrite {
+        item: RecordItem,
+        source: DatasetWriteError,
+    },
+    DatasetDropped {
+        item: RecordItem,
+    },
+    DatasetWriterFailed {
+        item: RecordItem,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for RecordCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LeftImage { source } => write!(f, "left camera capture failed: {source}"),
+            Self::RightImage { source } => write!(f, "right camera capture failed: {source}"),
+            Self::Depth { source } => write!(f, "depth camera capture failed: {source}"),
+            Self::Pairing { source } => write!(f, "stereo pairing failed: {source}"),
+            Self::DatasetWrite { item, source } => {
+                write!(f, "dataset writer rejected {item}: {source}")
+            }
+            Self::DatasetDropped { item } => write!(f, "dataset writer dropped {item}"),
+            Self::DatasetWriterFailed { item } => {
+                write!(f, "dataset writer failed while enqueueing {item}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for RecordCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LeftImage { source } | Self::RightImage { source } => Some(source),
+            Self::Depth { source } => Some(source),
+            Self::Pairing { source } => Some(source),
+            Self::DatasetWrite { source, .. } => Some(source),
+            Self::DatasetDropped { .. } | Self::DatasetWriterFailed { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum RecordError {
+    Capture {
+        source: RecordCaptureError,
+    },
+    Finalization {
+        source: Box<DatasetError>,
+    },
+    CaptureAndFinalization {
+        capture: RecordCaptureError,
+        finalization: Box<DatasetError>,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture { source } => write!(f, "recording failed: {source}"),
+            Self::Finalization { source } => {
+                write!(f, "dataset finalization failed: {source}")
+            }
+            Self::CaptureAndFinalization {
+                capture,
+                finalization,
+            } => write!(
+                f,
+                "recording failed ({capture}); dataset finalization also failed: {finalization}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for RecordError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture { source } => Some(source),
+            Self::Finalization { source } => Some(source.as_ref()),
+            Self::CaptureAndFinalization { capture, .. } => Some(capture),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+fn require_record_write(
+    outcome: Result<WriteOutcome, DatasetWriteError>,
+    item: RecordItem,
+) -> Result<(), RecordCaptureError> {
+    let outcome = outcome.map_err(|source| RecordCaptureError::DatasetWrite { item, source })?;
     match outcome {
         WriteOutcome::Enqueued => Ok(()),
-        WriteOutcome::Dropped => Err(std::io::Error::other(format!(
-            "dataset writer dropped {item}"
-        ))),
-        WriteOutcome::WriterFailed => Err(std::io::Error::other(format!(
-            "dataset writer failed while enqueueing {item}"
-        ))),
+        WriteOutcome::Dropped => Err(RecordCaptureError::DatasetDropped { item }),
+        WriteOutcome::WriterFailed => Err(RecordCaptureError::DatasetWriterFailed { item }),
     }
 }
 
@@ -1308,10 +1431,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             },
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                capture_error = Some(std::io::Error::other(format!(
-                    "left camera capture failed: {e:?}"
-                )));
+            Err(source) => {
+                capture_error = Some(RecordCaptureError::LeftImage { source });
                 break 'capture;
             }
         }
@@ -1331,10 +1452,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                capture_error = Some(std::io::Error::other(format!(
-                    "right camera capture failed: {e:?}"
-                )));
+            Err(source) => {
+                capture_error = Some(RecordCaptureError::RightImage { source });
                 break 'capture;
             }
         }
@@ -1344,7 +1463,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
                     Ok(depth) => {
                         if let Err(err) =
-                            require_record_write(writer.write_depth(&depth), "depth frame")
+                            require_record_write(writer.write_depth(&depth), RecordItem::DepthFrame)
                         {
                             capture_error = Some(err);
                             break 'capture;
@@ -1357,10 +1476,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
-                Err(e) => {
-                    capture_error = Some(std::io::Error::other(format!(
-                        "depth camera capture failed: {e:?}"
-                    )));
+                Err(source) => {
+                    capture_error = Some(RecordCaptureError::Depth { source });
                     break 'capture;
                 }
             }
@@ -1370,14 +1487,13 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             let pair = match pairer.next_pair() {
                 Ok(Some(pair)) => pair,
                 Ok(None) => break,
-                Err(err) => {
-                    capture_error = Some(std::io::Error::other(format!(
-                        "stereo pairing failed: {err}"
-                    )));
+                Err(source) => {
+                    capture_error = Some(RecordCaptureError::Pairing { source });
                     break 'capture;
                 }
             };
-            if let Err(err) = require_record_write(writer.write_pair(pair), "stereo pair") {
+            if let Err(err) = require_record_write(writer.write_pair(pair), RecordItem::StereoPair)
+            {
                 capture_error = Some(err);
                 break 'capture;
             }
@@ -1396,20 +1512,22 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = start.elapsed().as_secs_f64();
     let pairer_stats = pairer.stats();
     drop(writer);
-    let stats = writer_handle.finish()?;
-    eprintln!(
-        "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), written={}, dropped={}",
-        elapsed,
-        pair_count,
-        left_count,
-        left_count as f64 / elapsed,
-        right_count,
-        right_count as f64 / elapsed,
-        depth_count,
-        depth_count as f64 / elapsed,
-        stats.frames_written,
-        stats.frames_dropped
-    );
+    let finalization = writer_handle.finish();
+    if let Ok(stats) = &finalization {
+        eprintln!(
+            "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), written={}, dropped={}",
+            elapsed,
+            pair_count,
+            left_count,
+            left_count as f64 / elapsed,
+            right_count,
+            right_count as f64 / elapsed,
+            depth_count,
+            depth_count as f64 / elapsed,
+            stats.frames_written,
+            stats.frames_dropped
+        );
+    }
     eprintln!(
         "pairer stats: window_ns={} max_pending_per_side={} paired={} dropped_left={} dropped_right={} outside_window={}",
         pairer.window().as_ns(),
@@ -1419,10 +1537,19 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         pairer_stats.dropped_right,
         pairer_stats.outside_window
     );
-    if let Some(err) = capture_error {
-        return Err(err.into());
+    match (capture_error, finalization) {
+        (None, Ok(_)) => Ok(()),
+        (Some(source), Ok(_)) => Err(RecordError::Capture { source }.into()),
+        (None, Err(source)) => Err(RecordError::Finalization {
+            source: Box::new(source),
+        }
+        .into()),
+        (Some(capture), Err(finalization)) => Err(RecordError::CaptureAndFinalization {
+            capture,
+            finalization: Box::new(finalization),
+        }
+        .into()),
     }
-    Ok(())
 }
 
 #[cfg(feature = "record")]
