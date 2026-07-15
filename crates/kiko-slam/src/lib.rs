@@ -577,7 +577,8 @@ pub struct Keypoint {
 }
 
 pub const DESCRIPTOR_DIM: usize = 256;
-const U8_SCALE: f32 = 255.0;
+const SIGNED_DESCRIPTOR_SCALE: f32 = 127.0;
+const COMPACT_DESCRIPTOR_ZERO: i16 = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CosineSimilarity(f32);
@@ -678,11 +679,16 @@ impl Descriptor {
             .sum()
     }
 
-    pub fn quantize_clamped_unit_interval(&self) -> CompactDescriptor {
+    /// Quantize signed local geometry into centered unsigned bytes.
+    ///
+    /// Finite components are clamped to `[-1, 1]`, scaled symmetrically to
+    /// `[-127, 127]`, and biased by 128. Zero is therefore encoded as 128.
+    pub fn quantize(&self) -> CompactDescriptor {
         let mut out = [0_u8; DESCRIPTOR_DIM];
-        for (idx, value) in self.0.iter().enumerate() {
-            let clamped = value.clamp(0.0, 1.0);
-            out[idx] = (clamped * U8_SCALE).round() as u8;
+        for (&value, encoded) in self.0.iter().zip(out.iter_mut()) {
+            let signed = (value.clamp(-1.0, 1.0) * SIGNED_DESCRIPTOR_SCALE).round() as i16;
+            *encoded = u8::try_from(signed + COMPACT_DESCRIPTOR_ZERO)
+                .expect("clamped descriptor component fits centered-u8 encoding");
         }
         CompactDescriptor(out)
     }
@@ -713,27 +719,39 @@ impl std::error::Error for DescriptorError {}
 
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// A signed local descriptor stored as centered unsigned bytes.
+///
+/// Each byte decodes to `code - 128`. Quantization emits codes in `1..=255`;
+/// code 0 remains representable and decodes to -128.
 pub struct CompactDescriptor(pub [u8; DESCRIPTOR_DIM]);
 
 impl CompactDescriptor {
     pub fn has_zero_norm(&self) -> bool {
-        self.0.iter().all(|&value| value == 0)
+        self.0
+            .iter()
+            .all(|&value| i16::from(value) == COMPACT_DESCRIPTOR_ZERO)
     }
 
     pub fn clamped_cosine_similarity(&self, other: &Self) -> Option<CosineSimilarity> {
         let (dot, norm_a, norm_b) = self.0.iter().zip(other.0.iter()).fold(
-            (0_u64, 0_u64, 0_u64),
+            (0_i64, 0_u64, 0_u64),
             |(dot, na, nb), (&a, &b)| {
-                let a = u64::from(a);
-                let b = u64::from(b);
-                (dot + a * b, na + a * a, nb + b * b)
+                let a = i64::from(a) - i64::from(COMPACT_DESCRIPTOR_ZERO);
+                let b = i64::from(b) - i64::from(COMPACT_DESCRIPTOR_ZERO);
+                let a_magnitude = a.unsigned_abs();
+                let b_magnitude = b.unsigned_abs();
+                (
+                    dot + a * b,
+                    na + a_magnitude * a_magnitude,
+                    nb + b_magnitude * b_magnitude,
+                )
             },
         );
         if norm_a == 0 || norm_b == 0 {
             return None;
         }
         Some(CosineSimilarity::from_computed_clamped(
-            dot as f64 / ((norm_a as f64).sqrt() * (norm_b as f64).sqrt()),
+            dot as f64 / ((norm_a as f64) * (norm_b as f64)).sqrt(),
         ))
     }
 }
@@ -1483,7 +1501,7 @@ mod tests {
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DescriptorError, DetectionError, Detections,
         DownscaleError, DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError,
         FrameId, Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches, Point3, Pose,
-        SensorId, Timestamp, U8_SCALE,
+        SensorId, Timestamp,
     };
 
     fn descriptor(values: [f32; DESCRIPTOR_DIM]) -> Descriptor {
@@ -1554,15 +1572,15 @@ mod tests {
     }
 
     #[test]
-    fn clamped_unit_interval_quantization_preserves_similarity_ordering() {
+    fn quantize_preserves_signed_similarity_ordering() {
         let mut base = [0.0_f32; DESCRIPTOR_DIM];
         let mut close = [0.0_f32; DESCRIPTOR_DIM];
         let mut far = [0.0_f32; DESCRIPTOR_DIM];
         for i in 0..DESCRIPTOR_DIM {
-            let t = i as f32 / U8_SCALE;
+            let t = (i as f32 / 127.5) - 1.0;
             base[i] = t;
-            close[i] = (t + 0.02).clamp(0.0, 1.0);
-            far[i] = if i < 128 { 1.0 } else { 0.0 };
+            close[i] = (t + if i % 2 == 0 { 0.01 } else { -0.01 }).clamp(-1.0, 1.0);
+            far[i] = -t;
         }
         let base = descriptor(base);
         let close = descriptor(close);
@@ -1572,9 +1590,9 @@ mod tests {
         let float_far = cosine_f32(&base, &far);
         assert!(float_close > float_far);
 
-        let q_base = base.quantize_clamped_unit_interval();
-        let q_close = close.quantize_clamped_unit_interval();
-        let q_far = far.quantize_clamped_unit_interval();
+        let q_base = base.quantize();
+        let q_close = close.quantize();
+        let q_far = far.quantize();
         let quant_close = q_base
             .clamped_cosine_similarity(&q_close)
             .expect("nonzero descriptors")
@@ -1587,16 +1605,14 @@ mod tests {
     }
 
     #[test]
-    fn clamped_unit_interval_quantization_clamps_both_bounds() {
-        let mut values = [0.5; DESCRIPTOR_DIM];
-        values[0] = -0.25;
-        values[1] = 1.25;
+    fn quantize_uses_symmetric_centered_u8_codes() {
+        let mut values = [0.0; DESCRIPTOR_DIM];
+        values[..5].copy_from_slice(&[-1.0, -0.5, 0.0, 0.5, 1.0]);
 
-        let quantized = descriptor(values).quantize_clamped_unit_interval();
+        let quantized = descriptor(values).quantize();
 
-        assert_eq!(quantized.0[0], 0);
-        assert_eq!(quantized.0[1], u8::MAX);
-        assert_eq!(quantized.0[2], 128);
+        assert_eq!(&quantized.0[..5], &[1, 64, 128, 192, 255]);
+        assert!(quantized.0[5..].iter().all(|&value| value == 128));
     }
 
     #[test]
@@ -1897,14 +1913,10 @@ mod tests {
 
     #[test]
     fn compact_descriptor_cosine_orthogonal_is_zeroish() {
-        let mut a = [0_u8; DESCRIPTOR_DIM];
-        let mut b = [0_u8; DESCRIPTOR_DIM];
-        for value in a.iter_mut().take(128) {
-            *value = 255;
-        }
-        for value in b.iter_mut().skip(128) {
-            *value = 255;
-        }
+        let mut a = [128_u8; DESCRIPTOR_DIM];
+        let mut b = [128_u8; DESCRIPTOR_DIM];
+        a[0] = 255;
+        b[1] = 1;
         let sim = CompactDescriptor(a)
             .clamped_cosine_similarity(&CompactDescriptor(b))
             .expect("nonzero descriptors")
@@ -1914,13 +1926,69 @@ mod tests {
 
     #[test]
     fn compact_descriptor_cosine_is_undefined_for_zero_norm() {
-        let zero = CompactDescriptor([0; DESCRIPTOR_DIM]);
-        let nonzero = CompactDescriptor([1; DESCRIPTOR_DIM]);
+        let zero = CompactDescriptor([128; DESCRIPTOR_DIM]);
+        let mut nonzero = [128; DESCRIPTOR_DIM];
+        nonzero[0] = 255;
+        let nonzero = CompactDescriptor(nonzero);
         assert!(zero.has_zero_norm());
         assert!(!nonzero.has_zero_norm());
         assert_eq!(zero.clamped_cosine_similarity(&nonzero), None);
         assert_eq!(nonzero.clamped_cosine_similarity(&zero), None);
         assert_eq!(zero.clamped_cosine_similarity(&zero), None);
+    }
+
+    #[test]
+    fn compact_descriptor_antipodal_signed_vectors_are_negative_one() {
+        let base = descriptor(std::array::from_fn(|index| {
+            ((index % 127 + 1) as f32 / 127.0) * if index % 2 == 0 { 1.0 } else { -1.0 }
+        }));
+        let antipode = base.0.map(|value| -value);
+        let antipode = descriptor(antipode);
+
+        let similarity = base
+            .quantize()
+            .clamped_cosine_similarity(&antipode.quantize())
+            .expect("nonzero signed descriptors")
+            .value();
+
+        assert!((similarity + 1.0).abs() < 1e-6, "sim={similarity}");
+    }
+
+    #[test]
+    fn compact_descriptor_cosine_is_finite_symmetric_and_bounded() {
+        let mut state = 0x9e37_79b9_u32;
+        for _ in 0..1_024 {
+            let a = CompactDescriptor(std::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            }));
+            let b = CompactDescriptor(std::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            }));
+
+            let ab = a
+                .clamped_cosine_similarity(&b)
+                .expect("arbitrary descriptor is nonzero")
+                .value();
+            let ba = b
+                .clamped_cosine_similarity(&a)
+                .expect("arbitrary descriptor is nonzero")
+                .value();
+            assert!(ab.is_finite());
+            assert!((-1.0..=1.0).contains(&ab));
+            assert_eq!(ab, ba);
+            assert_eq!(
+                a.clamped_cosine_similarity(&a)
+                    .expect("nonzero descriptor")
+                    .value(),
+                1.0
+            );
+        }
     }
 
     #[test]

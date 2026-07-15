@@ -788,10 +788,7 @@ pub fn match_descriptors_for_loop(
 }
 
 pub(crate) fn quantize_loop_descriptors(descriptors: &[Descriptor]) -> Vec<CompactDescriptor> {
-    descriptors
-        .iter()
-        .map(Descriptor::quantize_clamped_unit_interval)
-        .collect()
+    descriptors.iter().map(Descriptor::quantize).collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2483,7 +2480,7 @@ mod tests {
                 y: 0.0,
                 z: 3.0,
             },
-            query[0].quantize_clamped_unit_interval(),
+            query[0].quantize(),
             kp0,
         )
         .expect("point0");
@@ -2494,7 +2491,7 @@ mod tests {
                 y: 0.0,
                 z: 3.0,
             },
-            query[1].quantize_clamped_unit_interval(),
+            query[1].quantize(),
             kp1,
         )
         .expect("point1");
@@ -2533,7 +2530,7 @@ mod tests {
                     y: 0.0,
                     z: 3.0,
                 },
-                descriptor.quantize_clamped_unit_interval(),
+                descriptor.quantize(),
                 keypoint,
             )
             .expect("map point");
@@ -2581,7 +2578,7 @@ mod tests {
                 y: 0.1,
                 z: 3.0,
             },
-            query[1].quantize_clamped_unit_interval(),
+            query[1].quantize(),
             only_observed,
         )
         .expect("point");

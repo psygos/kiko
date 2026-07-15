@@ -5826,8 +5826,7 @@ fn insert_keyframe_into_candidate(
         if map.map_point_for_keypoint(keypoint_ref)?.is_some() {
             continue;
         }
-        let descriptor =
-            keyframe.detections().descriptors()[det_idx].quantize_clamped_unit_interval();
+        let descriptor = keyframe.detections().descriptors()[det_idx].quantize();
         let world = camera_to_world(pose_world, *landmark);
         map.add_map_point(world, descriptor, keypoint_ref)?;
     }
@@ -6473,7 +6472,7 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor().quantize_clamped_unit_interval(),
+                make_descriptor().quantize(),
                 keypoint,
             )
             .expect("map point");
@@ -6553,7 +6552,7 @@ mod tests {
                 keyframe
                     .landmark_for_detection(det_idx)
                     .expect("landmark for detection"),
-                make_descriptor().quantize_clamped_unit_interval(),
+                make_descriptor().quantize(),
                 keypoint_ref,
             )
             .expect("map point");
@@ -6788,7 +6787,7 @@ mod tests {
                     y: 0.0,
                     z: 1.0,
                 },
-                make_descriptor().quantize_clamped_unit_interval(),
+                make_descriptor().quantize(),
                 kp_a,
             )
             .expect("point");
