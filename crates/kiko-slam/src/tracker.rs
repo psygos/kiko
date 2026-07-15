@@ -1231,6 +1231,7 @@ pub enum TrackerError {
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
+    PoseNarrowing(crate::PoseNarrowingError),
     LoopMapSnapshotMismatch {
         verified: crate::map::MapSnapshot,
         current: crate::map::MapSnapshot,
@@ -1250,6 +1251,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
+            TrackerError::PoseNarrowing(err) => write!(f, "pose narrowing error: {err}"),
             TrackerError::LoopMapSnapshotMismatch { verified, current } => write!(
                 f,
                 "verified loop map snapshot mismatch: verified={verified:?}, current={current:?}"
@@ -1273,6 +1275,7 @@ impl std::error::Error for TrackerError {
             Self::Map(err) => Some(err),
             Self::EssentialGraph(err) => Some(err),
             Self::PoseGraph(err) => Some(err),
+            Self::PoseNarrowing(err) => Some(err),
             Self::LoopMapSnapshotMismatch { .. }
             | Self::KeyframeRejected { .. }
             | Self::InvariantViolation(_) => None,
@@ -1324,6 +1327,12 @@ impl From<EssentialGraphError> for TrackerError {
 impl From<PoseGraphError> for TrackerError {
     fn from(err: PoseGraphError) -> Self {
         TrackerError::PoseGraph(err)
+    }
+}
+
+impl From<crate::PoseNarrowingError> for TrackerError {
+    fn from(err: crate::PoseNarrowingError) -> Self {
+        TrackerError::PoseNarrowing(err)
     }
 }
 
@@ -3242,13 +3251,9 @@ fn apply_loop_closure_correction(
         .keyframe_ids
         .iter()
         .copied()
-        .zip(
-            result
-                .corrected_poses
-                .into_iter()
-                .map(|pose| pose.to_pose32()),
-        )
-        .collect();
+        .zip(result.corrected_poses)
+        .map(|(keyframe_id, pose)| pose.try_to_pose32().map(|pose| (keyframe_id, pose)))
+        .collect::<Result<_, _>>()?;
 
     let mut staged_map = map.clone();
     for (keyframe_id, corrected_pose) in &corrected_poses {
@@ -4671,8 +4676,12 @@ mod tests {
 
     #[test]
     fn loop_pose_correction_maps_current_camera_point_to_estimated_camera() {
-        let current = crate::math::se3_exp_f64([0.8, -0.3, 0.2, 0.25, -0.15, 0.1]).to_pose32();
-        let estimate = crate::math::se3_exp_f64([-0.4, 0.7, 0.5, -0.2, 0.12, 0.3]).to_pose32();
+        let current = crate::math::se3_exp_f64([0.8, -0.3, 0.2, 0.25, -0.15, 0.1])
+            .try_to_pose32()
+            .expect("test pose should fit in f32");
+        let estimate = crate::math::se3_exp_f64([-0.4, 0.7, 0.5, -0.2, 0.12, 0.3])
+            .try_to_pose32()
+            .expect("test pose should fit in f32");
         let correction = loop_pose_correction(current, estimate);
         let world_point = [1.3, -0.6, 4.2];
         let point_in_current =
@@ -4831,6 +4840,18 @@ mod tests {
             assert!(error.requires_pipeline_shutdown());
         }
         assert!(!TrackerError::KeyframeRejected { landmarks: 0 }.requires_pipeline_shutdown());
+    }
+
+    #[test]
+    fn tracker_error_preserves_pose_narrowing_error() {
+        let source = crate::PoseNarrowingError::TranslationNotRepresentable {
+            axis: 2,
+            value: f64::MAX,
+        };
+
+        let error = TrackerError::from(source);
+
+        assert!(matches!(error, TrackerError::PoseNarrowing(actual) if actual == source));
     }
 
     #[test]

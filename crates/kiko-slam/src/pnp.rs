@@ -1210,7 +1210,8 @@ mod tests {
         let composed = first.compose(second);
         let composed64 = crate::Pose64::from_pose32(first)
             .compose(crate::Pose64::from_pose32(second))
-            .to_pose32();
+            .try_to_pose32()
+            .expect("test pose should fit in f32");
 
         assert!(rot_frob_norm(composed.rotation(), composed64.rotation()) < 1e-6);
         assert!(l2(composed.translation(), composed64.translation()) < 1e-6);

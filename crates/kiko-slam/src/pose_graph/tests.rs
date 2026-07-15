@@ -633,10 +633,24 @@ fn essential_measurement_maps_from_camera_point_to_to_camera_point() {
     let (mut map, kf0, kf1, _kf2) = make_map_for_essential_graph();
     let from_pose = se3_exp_f64([0.8, -0.3, 0.2, 0.25, -0.15, 0.1]);
     let to_pose = se3_exp_f64([-0.4, 0.7, 0.5, -0.2, 0.12, 0.3]);
-    map.set_keyframe_pose(kf0, WorldToCamera::from_legacy_pose(from_pose.to_pose32()))
-        .expect("from pose");
-    map.set_keyframe_pose(kf1, WorldToCamera::from_legacy_pose(to_pose.to_pose32()))
-        .expect("to pose");
+    map.set_keyframe_pose(
+        kf0,
+        WorldToCamera::from_legacy_pose(
+            from_pose
+                .try_to_pose32()
+                .expect("test pose should fit in f32"),
+        ),
+    )
+    .expect("from pose");
+    map.set_keyframe_pose(
+        kf1,
+        WorldToCamera::from_legacy_pose(
+            to_pose
+                .try_to_pose32()
+                .expect("test pose should fit in f32"),
+        ),
+    )
+    .expect("to pose");
 
     let mut graph = EssentialGraph::new(2);
     graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);

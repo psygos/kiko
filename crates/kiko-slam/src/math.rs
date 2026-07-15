@@ -48,6 +48,36 @@ impl std::fmt::Display for Pose64Error {
 
 impl std::error::Error for Pose64Error {}
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PoseNarrowingError {
+    RotationNotRepresentable {
+        row: usize,
+        column: usize,
+        value: f64,
+    },
+    TranslationNotRepresentable {
+        axis: usize,
+        value: f64,
+    },
+}
+
+impl std::fmt::Display for PoseNarrowingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RotationNotRepresentable { row, column, value } => write!(
+                f,
+                "pose rotation[{row}][{column}] value {value} is not representable as a finite f32"
+            ),
+            Self::TranslationNotRepresentable { axis, value } => write!(
+                f,
+                "pose translation[{axis}] value {value} is not representable as a finite f32"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PoseNarrowingError {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Pose64 {
     rotation: [[f64; 3]; 3],
@@ -144,19 +174,35 @@ impl Pose64 {
         }
     }
 
-    pub fn to_pose32(self) -> Pose {
+    pub fn try_to_pose32(self) -> Result<Pose, PoseNarrowingError> {
         let mut rotation = [[0.0_f32; 3]; 3];
         for (row_idx, row) in rotation.iter_mut().enumerate() {
             for (col_idx, value) in row.iter_mut().enumerate() {
-                *value = self.rotation[row_idx][col_idx] as f32;
+                let source = self.rotation[row_idx][col_idx];
+                let narrowed = source as f32;
+                if !narrowed.is_finite() {
+                    return Err(PoseNarrowingError::RotationNotRepresentable {
+                        row: row_idx,
+                        column: col_idx,
+                        value: source,
+                    });
+                }
+                *value = narrowed;
             }
         }
-        let translation = [
-            self.translation[0] as f32,
-            self.translation[1] as f32,
-            self.translation[2] as f32,
-        ];
-        Pose::from_rt(rotation, translation)
+        let mut translation = [0.0_f32; 3];
+        for (axis, value) in translation.iter_mut().enumerate() {
+            let source = self.translation[axis];
+            let narrowed = source as f32;
+            if !narrowed.is_finite() {
+                return Err(PoseNarrowingError::TranslationNotRepresentable {
+                    axis,
+                    value: source,
+                });
+            }
+            *value = narrowed;
+        }
+        Ok(Pose::from_rt(rotation, translation))
     }
 }
 
@@ -507,8 +553,8 @@ fn mat_transpose_f64(r: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        Pose64, Pose64Error, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_exp_f64,
-        so3_log_f64, so3_right_jacobian_f64,
+        Pose64, Pose64Error, PoseNarrowingError, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64,
+        se3_log_f64, so3_exp_f64, so3_log_f64, so3_right_jacobian_f64,
     };
 
     fn rot_diff_norm(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> f64 {
@@ -644,5 +690,43 @@ mod tests {
         )
         .expect_err("improper rotation must be rejected");
         assert!(matches!(err, Pose64Error::ImproperRotation { .. }));
+    }
+
+    #[test]
+    fn pose64_narrowing_preserves_representable_values() {
+        let pose = Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.25, -2.5, 0.125],
+        )
+        .expect("representable pose");
+
+        let narrowed = pose.try_to_pose32().expect("pose should fit in f32");
+
+        assert_eq!(
+            narrowed.rotation(),
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        );
+        assert_eq!(narrowed.translation(), [1.25, -2.5, 0.125]);
+    }
+
+    #[test]
+    fn pose64_narrowing_rejects_finite_translation_outside_f32_range() {
+        let pose = Pose64::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        )
+        .expect("finite f64 translation is a valid Pose64");
+
+        let err = pose
+            .try_to_pose32()
+            .expect_err("out-of-range translation must not become infinity");
+
+        assert_eq!(
+            err,
+            PoseNarrowingError::TranslationNotRepresentable {
+                axis: 0,
+                value: f64::MAX,
+            }
+        );
     }
 }
