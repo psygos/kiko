@@ -501,7 +501,7 @@ impl std::fmt::Display for PnpWorldTriangleSide {
 pub enum PnpMinimalSampleRejectionReason {
     NonFiniteWorldTriangleSideMeters {
         side: PnpWorldTriangleSide,
-        value: f32,
+        value: f64,
     },
     DegenerateWorldTriangle,
     NonFiniteQuarticCoefficient {
@@ -560,7 +560,7 @@ impl std::fmt::Display for PnpMinimalSampleRejectionReason {
         match self {
             Self::NonFiniteWorldTriangleSideMeters { side, value } => write!(
                 f,
-                "sampled world-triangle side {side} became nonfinite during f32 distance evaluation: {value} m"
+                "sampled world-triangle side {side} became nonfinite during f64 distance evaluation: {value} m"
             ),
             Self::DegenerateWorldTriangle => {
                 write!(
@@ -1864,9 +1864,9 @@ fn p3p_solutions(
     let p1 = vec3_from_point(obs[0].world);
     let p2 = vec3_from_point(obs[1].world);
     let p3 = vec3_from_point(obs[2].world);
-    let f1 = obs[0].bearing;
-    let f2 = obs[1].bearing;
-    let f3 = obs[2].bearing;
+    let f1 = vec3_from_bearing(obs[0].bearing);
+    let f2 = vec3_from_bearing(obs[1].bearing);
+    let f3 = vec3_from_bearing(obs[2].bearing);
 
     let a = norm(sub(p2, p3));
     let b = norm(sub(p1, p3));
@@ -1894,9 +1894,9 @@ fn p3p_solutions(
     let normalized_b = b / scene_scale;
     let normalized_c = c / scene_scale;
 
-    let cos_alpha = dot(f2, f3);
-    let cos_beta = dot(f1, f3);
-    let cos_gamma = dot(f1, f2);
+    let cos_alpha = dot(f2, f3).clamp(-1.0, 1.0);
+    let cos_beta = dot(f1, f3).clamp(-1.0, 1.0);
+    let cos_gamma = dot(f1, f2).clamp(-1.0, 1.0);
 
     let roots = match find_roots(
         cos_alpha,
@@ -1951,17 +1951,17 @@ fn p3p_solutions(
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum P3pRootGeneration {
-    Roots(FixedBuffer<(f32, f32), MAX_P3P_DISTANCE_RATIO_ROOTS>),
+    Roots(FixedBuffer<(f64, f64), MAX_P3P_DISTANCE_RATIO_ROOTS>),
     Rejected(PnpMinimalSampleRejectionReason),
 }
 
 fn find_roots(
-    cos_alpha: f32,
-    cos_beta: f32,
-    cos_gamma: f32,
-    a: f32,
-    b: f32,
-    c: f32,
+    cos_alpha: f64,
+    cos_beta: f64,
+    cos_gamma: f64,
+    a: f64,
+    b: f64,
+    c: f64,
     ransac_iteration: NonZeroUsize,
 ) -> Result<P3pRootGeneration, PnpError> {
     let coeffs_meta = P3pCoeffs {
@@ -1980,22 +1980,21 @@ fn find_roots(
 
     let mut roots = FixedBuffer::new();
     for x in xs.iter() {
-        if !x.is_finite() || x <= 0.0 || x > f64::from(f32::MAX) {
+        if !x.is_finite() || x <= 0.0 {
             continue;
         }
-        let xf = x as f32;
-        for sign in [-1.0_f32, 1.0_f32] {
-            let Some(y) = y_from_x(xf, sign, cos_beta, cos_gamma, b, c) else {
+        for sign in [-1.0_f64, 1.0_f64] {
+            let Some(y) = y_from_x(x, sign, cos_beta, cos_gamma, b, c) else {
                 continue;
             };
-            if y <= 0.0 {
+            if !y.is_finite() || y <= 0.0 {
                 continue;
             }
-            let Some(fx) = f_equation(xf, sign, &coeffs_meta) else {
+            let Some(fx) = f_equation(x, sign, &coeffs_meta) else {
                 continue;
             };
-            if fx.abs() < P3P_ROOT_TOLERANCE {
-                push_unique_root(&mut roots, (xf, y), ransac_iteration)?;
+            if fx.is_finite() && fx.abs() <= P3P_ROOT_TOLERANCE {
+                push_unique_root(&mut roots, (x, y), ransac_iteration)?;
             }
         }
     }
@@ -2010,57 +2009,59 @@ fn find_roots(
 }
 
 struct P3pCoeffs {
-    cos_alpha: f32,
-    cos_beta: f32,
-    cos_gamma: f32,
-    a: f32,
-    b: f32,
-    c: f32,
+    cos_alpha: f64,
+    cos_beta: f64,
+    cos_gamma: f64,
+    a: f64,
+    b: f64,
+    c: f64,
 }
 
-fn f_equation(x: f32, sign: f32, coeffs: &P3pCoeffs) -> Option<f32> {
+fn f_equation(x: f64, sign: f64, coeffs: &P3pCoeffs) -> Option<f64> {
     let denom = 1.0 + x * x - 2.0 * x * coeffs.cos_gamma;
-    if denom <= 0.0 {
+    if !denom.is_finite() || denom <= 0.0 {
         return None;
     }
     let k = (coeffs.b * coeffs.b / (coeffs.c * coeffs.c)) * denom;
     let disc = k + coeffs.cos_beta * coeffs.cos_beta - 1.0;
-    if disc < 0.0 {
+    if !disc.is_finite() || disc < 0.0 {
         return None;
     }
     let y = coeffs.cos_beta + sign * disc.sqrt();
     let num = x * x + y * y - 2.0 * x * y * coeffs.cos_alpha;
-    Some(coeffs.a * coeffs.a - (coeffs.c * coeffs.c) * (num / denom))
+    let residual = coeffs.a * coeffs.a - (coeffs.c * coeffs.c) * (num / denom);
+    residual.is_finite().then_some(residual)
 }
 
-fn y_from_x(x: f32, sign: f32, cos_beta: f32, cos_gamma: f32, b: f32, c: f32) -> Option<f32> {
+fn y_from_x(x: f64, sign: f64, cos_beta: f64, cos_gamma: f64, b: f64, c: f64) -> Option<f64> {
     let denom = 1.0 + x * x - 2.0 * x * cos_gamma;
-    if denom <= 0.0 {
+    if !denom.is_finite() || denom <= 0.0 {
         return None;
     }
     let k = (b * b / (c * c)) * denom;
     let disc = k + cos_beta * cos_beta - 1.0;
-    if disc < 0.0 {
+    if !disc.is_finite() || disc < 0.0 {
         return None;
     }
-    Some(cos_beta + sign * disc.sqrt())
+    let y = cos_beta + sign * disc.sqrt();
+    y.is_finite().then_some(y)
 }
 
 fn quartic_coeffs(
-    cos_alpha: f32,
-    cos_beta: f32,
-    cos_gamma: f32,
-    a: f32,
-    b: f32,
-    c: f32,
+    cos_alpha: f64,
+    cos_beta: f64,
+    cos_gamma: f64,
+    a: f64,
+    b: f64,
+    c: f64,
 ) -> [f64; 5] {
-    let a2 = (a as f64) * (a as f64);
-    let b2 = (b as f64) * (b as f64);
-    let c2 = (c as f64) * (c as f64);
+    let a2 = a * a;
+    let b2 = b * b;
+    let c2 = c * c;
 
-    let ca = cos_alpha as f64;
-    let cb = cos_beta as f64;
-    let cg = cos_gamma as f64;
+    let ca = cos_alpha;
+    let cb = cos_beta;
+    let cg = cos_gamma;
 
     let n0 = a2 - b2 + c2;
     let n1 = -2.0 * (a2 - b2) * cg;
@@ -2113,9 +2114,9 @@ const ROOT_DENOMINATOR_TOLERANCE: f64 = 1e-12;
 /// Maximum iterations for the Durand-Kerner root-finding algorithm.
 const MAX_ROOT_ITERATIONS: NonZeroU8 = NonZeroU8::MIN.saturating_add(63);
 /// Tolerance for detecting duplicate P3P root solutions.
-const ROOT_UNIQUENESS_TOLERANCE: f32 = 1e-3;
+const ROOT_UNIQUENESS_TOLERANCE: f64 = 1e-3;
 /// Tolerance for accepting the dimensionless P3P equation evaluation as a valid root.
-const P3P_ROOT_TOLERANCE: f32 = 1e-3;
+const P3P_ROOT_TOLERANCE: f64 = 1e-3;
 /// Target confidence used to adaptively shorten RANSAC once a strong model exists.
 const RANSAC_CONFIDENCE: f64 = 0.99;
 /// Number of nonlinear pose-only refinement steps on the best inlier set.
@@ -2460,8 +2461,8 @@ fn finite_root_correction_magnitude(
 }
 
 fn push_unique_root(
-    roots: &mut FixedBuffer<(f32, f32), MAX_P3P_DISTANCE_RATIO_ROOTS>,
-    candidate: (f32, f32),
+    roots: &mut FixedBuffer<(f64, f64), MAX_P3P_DISTANCE_RATIO_ROOTS>,
+    candidate: (f64, f64),
     ransac_iteration: NonZeroUsize,
 ) -> Result<(), PnpError> {
     let (x, y) = candidate;
@@ -2511,10 +2512,25 @@ pub enum ReprojectionEvaluationError {
         observation_index: usize,
         source: PinholeProjectionError,
     },
-    ResidualOutsideF32PixelDomain {
-        observation_index: usize,
+    MetricOutsideF32PixelDomain {
+        metric: ReprojectionMetric,
         value_px: f64,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReprojectionMetric {
+    Rmse,
+    Maximum,
+}
+
+impl std::fmt::Display for ReprojectionMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rmse => "RMSE",
+            Self::Maximum => "maximum",
+        })
+    }
 }
 
 impl std::fmt::Display for ReprojectionEvaluationError {
@@ -2534,12 +2550,9 @@ impl std::fmt::Display for ReprojectionEvaluationError {
                 f,
                 "failed to project reprojection observation {observation_index}: {source}"
             ),
-            Self::ResidualOutsideF32PixelDomain {
-                observation_index,
-                value_px,
-            } => write!(
+            Self::MetricOutsideF32PixelDomain { metric, value_px } => write!(
                 f,
-                "reprojection residual magnitude at observation {observation_index} is outside the finite f32 pixel domain: {value_px} px"
+                "reprojection {metric} is outside the finite f32 pixel domain: {value_px} px"
             ),
         }
     }
@@ -2550,7 +2563,7 @@ impl std::error::Error for ReprojectionEvaluationError {
         match self {
             Self::Allocation { source, .. } => Some(source),
             Self::Projection { source, .. } => Some(source),
-            Self::ResidualOutsideF32PixelDomain { .. } => None,
+            Self::MetricOutsideF32PixelDomain { .. } => None,
         }
     }
 }
@@ -2559,7 +2572,7 @@ pub(crate) fn reprojection_residuals_px(
     pose: &Pose,
     observations: &[Observation],
     intrinsics: PinholeIntrinsics,
-) -> Result<Vec<Option<f32>>, ReprojectionEvaluationError> {
+) -> Result<Vec<Option<f64>>, ReprojectionEvaluationError> {
     let mut residuals_px = Vec::new();
     residuals_px
         .try_reserve_exact(observations.len())
@@ -2573,16 +2586,7 @@ pub(crate) fn reprojection_residuals_px(
                 observation_index,
                 source,
             })? {
-            ReprojectionResidual::Projectable { residual_sq_px2 } => {
-                let value_px = residual_sq_px2.sqrt();
-                if value_px > f64::from(f32::MAX) {
-                    return Err(ReprojectionEvaluationError::ResidualOutsideF32PixelDomain {
-                        observation_index,
-                        value_px,
-                    });
-                }
-                Some(value_px as f32)
-            }
+            ReprojectionResidual::Projectable { residual_sq_px2 } => Some(residual_sq_px2.sqrt()),
             ReprojectionResidual::NonPositiveCameraDepth { .. } => None,
         };
         residuals_px.push(residual_px);
@@ -2590,31 +2594,63 @@ pub(crate) fn reprojection_residuals_px(
     Ok(residuals_px)
 }
 
-pub(crate) fn reprojection_rmse_px(residuals_px: &[Option<f32>]) -> Option<f32> {
-    // Accumulating in f64 keeps the square and sum finite for any addressable
-    // slice of finite f32 residuals; their RMS still fits the f32 input domain.
-    let mut sum_sq = 0.0_f64;
+pub(crate) fn reprojection_rmse_px(
+    residuals_px: &[Option<f64>],
+) -> Result<Option<f32>, ReprojectionEvaluationError> {
+    let mut scale = 0.0_f64;
+    let mut scaled_sum_sq = 1.0_f64;
     let mut count = 0usize;
     for &residual_px in residuals_px.iter().flatten() {
-        let residual_px = f64::from(residual_px);
-        sum_sq = residual_px.mul_add(residual_px, sum_sq);
+        if residual_px != 0.0 {
+            if scale < residual_px {
+                let ratio = scale / residual_px;
+                scaled_sum_sq = 1.0 + scaled_sum_sq * ratio * ratio;
+                scale = residual_px;
+            } else {
+                let ratio = residual_px / scale;
+                scaled_sum_sq += ratio * ratio;
+            }
+        }
         count += 1;
     }
     if count == 0 {
-        return None;
+        return Ok(None);
     }
-    Some((sum_sq / count as f64).sqrt() as f32)
+    let rmse_px = if scale == 0.0 {
+        0.0
+    } else {
+        scale * (scaled_sum_sq / count as f64).sqrt()
+    };
+    narrow_reprojection_metric(rmse_px, ReprojectionMetric::Rmse).map(Some)
 }
 
-pub(crate) fn reprojection_max_px(residuals_px: &[Option<f32>]) -> Option<f32> {
-    residuals_px.iter().flatten().copied().reduce(f32::max)
+pub(crate) fn reprojection_max_px(
+    residuals_px: &[Option<f64>],
+) -> Result<Option<f32>, ReprojectionEvaluationError> {
+    residuals_px
+        .iter()
+        .flatten()
+        .copied()
+        .reduce(f64::max)
+        .map(|maximum| narrow_reprojection_metric(maximum, ReprojectionMetric::Maximum))
+        .transpose()
 }
 
-pub(crate) fn reprojection_mse_per_axis_px2(residuals_px: &[Option<f32>]) -> Option<f64> {
+fn narrow_reprojection_metric(
+    value_px: f64,
+    metric: ReprojectionMetric,
+) -> Result<f32, ReprojectionEvaluationError> {
+    let narrowed = value_px as f32;
+    if !value_px.is_finite() || value_px < 0.0 || !narrowed.is_finite() {
+        return Err(ReprojectionEvaluationError::MetricOutsideF32PixelDomain { metric, value_px });
+    }
+    Ok(narrowed)
+}
+
+pub(crate) fn reprojection_mse_per_axis_px2(residuals_px: &[Option<f64>]) -> Option<f64> {
     let mut sum_sq = 0.0_f64;
     let mut count = 0usize;
     for &residual_px in residuals_px.iter().flatten() {
-        let residual_px = f64::from(residual_px);
         sum_sq = residual_px.mul_add(residual_px, sum_sq);
         count += 1;
     }
@@ -2625,12 +2661,12 @@ pub(crate) fn reprojection_mse_per_axis_px2(residuals_px: &[Option<f32>]) -> Opt
 }
 
 fn pose_from_points(
-    w1: [f32; 3],
-    w2: [f32; 3],
-    w3: [f32; 3],
-    c1: [f32; 3],
-    c2: [f32; 3],
-    c3: [f32; 3],
+    w1: [f64; 3],
+    w2: [f64; 3],
+    w3: [f64; 3],
+    c1: [f64; 3],
+    c2: [f64; 3],
+    c3: [f64; 3],
 ) -> Option<Pose> {
     let xw = normalize(sub(w2, w1))?;
     let zw = normalize(cross(xw, sub(w3, w1)))?;
@@ -2646,21 +2682,18 @@ fn pose_from_points(
         r = mat_from_cols(xc, yc, zc_flipped, xw, yw, zw);
     }
 
-    let t = sub(c1, math::mat_mul_vec(r, w1));
-    Some(Pose {
-        rotation: r,
-        translation: t,
-    })
+    let t = sub(c1, mat_mul_vec_f64(r, w1));
+    narrow_pose(r, t)
 }
 
 fn mat_from_cols(
-    xc: [f32; 3],
-    yc: [f32; 3],
-    zc: [f32; 3],
-    xw: [f32; 3],
-    yw: [f32; 3],
-    zw: [f32; 3],
-) -> [[f32; 3]; 3] {
+    xc: [f64; 3],
+    yc: [f64; 3],
+    zc: [f64; 3],
+    xw: [f64; 3],
+    yw: [f64; 3],
+    zw: [f64; 3],
+) -> [[f64; 3]; 3] {
     let mut r = [[0.0; 3]; 3];
     for i in 0..3 {
         r[i][0] = xc[i] * xw[0] + yc[i] * yw[0] + zc[i] * zw[0];
@@ -2670,33 +2703,57 @@ fn mat_from_cols(
     r
 }
 
-fn det(r: [[f32; 3]; 3]) -> f32 {
+fn det(r: [[f64; 3]; 3]) -> f64 {
     r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
         - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
         + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
 }
 
-fn vec3_from_point(p: Point3) -> [f32; 3] {
-    [p.x, p.y, p.z]
+fn narrow_pose(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Option<Pose> {
+    let mut rotation_f32 = [[0.0_f32; 3]; 3];
+    for (source_row, destination_row) in rotation.iter().zip(&mut rotation_f32) {
+        for (&source, destination) in source_row.iter().zip(destination_row) {
+            *destination = narrow_finite_f32(source)?;
+        }
+    }
+    let translation = [
+        narrow_finite_f32(translation[0])?,
+        narrow_finite_f32(translation[1])?,
+        narrow_finite_f32(translation[2])?,
+    ];
+    Some(Pose::from_rt(rotation_f32, translation))
 }
 
-fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+fn narrow_finite_f32(value: f64) -> Option<f32> {
+    let narrowed = value as f32;
+    narrowed.is_finite().then_some(narrowed)
+}
+
+fn vec3_from_point(p: Point3) -> [f64; 3] {
+    [f64::from(p.x), f64::from(p.y), f64::from(p.z)]
+}
+
+fn vec3_from_bearing(bearing: [f32; 3]) -> [f64; 3] {
+    bearing.map(f64::from)
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn norm(a: [f32; 3]) -> f32 {
-    dot(a, a).sqrt()
+fn norm(a: [f64; 3]) -> f64 {
+    a[0].hypot(a[1]).hypot(a[2])
 }
 
-fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-fn mul(a: [f32; 3], s: f32) -> [f32; 3] {
+fn mul(a: [f64; 3], s: f64) -> [f64; 3] {
     [a[0] * s, a[1] * s, a[2] * s]
 }
 
-fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -2704,12 +2761,29 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn normalize(v: [f32; 3]) -> Option<[f32; 3]> {
+fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
     let n = norm(v);
-    if n <= 0.0 {
+    if !n.is_finite() || n <= 0.0 {
         return None;
     }
     Some([v[0] / n, v[1] / n, v[2] / n])
+}
+
+fn mat_mul_vec_f64(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    [
+        matrix[0][0].mul_add(
+            vector[0],
+            matrix[0][1].mul_add(vector[1], matrix[0][2] * vector[2]),
+        ),
+        matrix[1][0].mul_add(
+            vector[0],
+            matrix[1][1].mul_add(vector[1], matrix[1][2] * vector[2]),
+        ),
+        matrix[2][0].mul_add(
+            vector[0],
+            matrix[2][1].mul_add(vector[1], matrix[2][2] * vector[2]),
+        ),
+    ]
 }
 
 #[derive(Debug)]
@@ -3007,20 +3081,20 @@ mod tests {
                     .wrapping_add(1);
                 f64::from((state >> 32) as u32) / f64::from(u32::MAX)
             };
-            let cos_alpha = (next_unit() * 1.8 - 0.9) as f32;
-            let cos_beta = (next_unit() * 1.8 - 0.9) as f32;
-            let cos_gamma = (next_unit() * 1.8 - 0.9) as f32;
-            let a = (0.1 + next_unit() * 0.9) as f32;
-            let b = (0.1 + next_unit() * 0.9) as f32;
-            let c = (0.1 + next_unit() * 0.9) as f32;
+            let cos_alpha = next_unit() * 1.8 - 0.9;
+            let cos_beta = next_unit() * 1.8 - 0.9;
+            let cos_gamma = next_unit() * 1.8 - 0.9;
+            let a = 0.1 + next_unit() * 0.9;
+            let b = 0.1 + next_unit() * 0.9;
+            let c = 0.1 + next_unit() * 0.9;
 
             let actual = quartic_coeffs(cos_alpha, cos_beta, cos_gamma, a, b, c);
-            let a2 = f64::from(a).powi(2);
-            let b2 = f64::from(b).powi(2);
-            let c2 = f64::from(c).powi(2);
-            let ca = f64::from(cos_alpha);
-            let cb = f64::from(cos_beta);
-            let cg = f64::from(cos_gamma);
+            let a2 = a.powi(2);
+            let b2 = b.powi(2);
+            let c2 = c.powi(2);
+            let ca = cos_alpha;
+            let cb = cos_beta;
+            let cg = cos_gamma;
             let n = [a2 - b2 + c2, -2.0 * (a2 - b2) * cg, a2 - b2 - c2];
             let d = [2.0 * c2 * cb, -2.0 * c2 * ca];
             let scale = b2 / c2;
@@ -3069,7 +3143,7 @@ mod tests {
         let base_translation = [0.2, -0.1, 0.3];
         let axis_angle = [0.05, -0.03, 0.02];
 
-        for scale in [1e-3_f32, 1.0, 1e3] {
+        for scale in [1e-23_f32, 1e-3, 1.0, 1e3, 1e20] {
             let world = base_world.map(|point| Point3 {
                 x: point.x * scale,
                 y: point.y * scale,
@@ -3079,8 +3153,26 @@ mod tests {
                 base_translation.map(|component| component * scale),
                 axis_angle,
             );
-            let observations =
-                observations_from_projection(expected, &world, intrinsics).expect("observations");
+            let observations: Vec<_> = world
+                .iter()
+                .map(|&point| {
+                    let PinholeProjectionF64::Projected { u_px, v_px } =
+                        project_world_point_f64_px(expected, point, intrinsics)
+                            .expect("finite projection")
+                    else {
+                        panic!("scaled point must remain in front of the camera");
+                    };
+                    Observation::try_new(
+                        point,
+                        Keypoint {
+                            x: u_px as f32,
+                            y: v_px as f32,
+                        },
+                        intrinsics,
+                    )
+                    .expect("finite observation")
+                })
+                .collect();
             assert_eq!(observations.len(), 3);
             let mut solutions = FixedBuffer::new();
             let rejection = p3p_solutions(
@@ -3091,8 +3183,14 @@ mod tests {
             .expect("fixed P3P capacity");
             assert!(rejection.is_none(), "sample rejection: {rejection:?}");
             let matched = solutions.iter().any(|solution| {
+                let actual_translation = solution.translation().map(f64::from);
+                let expected_translation = expected.translation().map(f64::from);
+                let translation_error = (actual_translation[0] - expected_translation[0])
+                    .abs()
+                    .hypot((actual_translation[1] - expected_translation[1]).abs())
+                    .hypot((actual_translation[2] - expected_translation[2]).abs());
                 rot_frob_norm(solution.rotation(), expected.rotation()) < 2e-3
-                    && l2(solution.translation(), expected.translation()) / scale < 2e-2
+                    && translation_error / f64::from(scale) < 2e-2
             });
             assert!(
                 matched,
@@ -3102,7 +3200,7 @@ mod tests {
     }
 
     #[test]
-    fn p3p_distinguishes_f32_distance_overflow_from_geometric_degeneracy() {
+    fn p3p_world_triangle_distances_do_not_overflow_in_f32_domain() {
         let observation = |world| Observation {
             world,
             pixel: Keypoint { x: 0.0, y: 0.0 },
@@ -3133,13 +3231,10 @@ mod tests {
             &mut candidates,
         )
         .expect("fixed P3P capacity")
-        .expect("f32 distance overflow must reject the sample explicitly");
-        assert!(matches!(
+        .expect("parallel bearings cannot produce an admissible pose");
+        assert!(!matches!(
             rejection,
-            PnpMinimalSampleRejectionReason::NonFiniteWorldTriangleSideMeters {
-                side: PnpWorldTriangleSide::Point2ToPoint3,
-                value,
-            } if value.is_infinite()
+            PnpMinimalSampleRejectionReason::NonFiniteWorldTriangleSideMeters { .. }
         ));
         assert!(candidates.is_empty());
     }
@@ -3525,8 +3620,12 @@ mod tests {
         let refined_residuals_px = reprojection_residuals_px(&refined, &observations, intrinsics)
             .expect("refined reprojection residuals");
 
-        let initial_rmse = reprojection_rmse_px(&initial_residuals_px).expect("initial rmse");
-        let refined_rmse = reprojection_rmse_px(&refined_residuals_px).expect("refined rmse");
+        let initial_rmse = reprojection_rmse_px(&initial_residuals_px)
+            .expect("representable initial rmse")
+            .expect("initial rmse");
+        let refined_rmse = reprojection_rmse_px(&refined_residuals_px)
+            .expect("representable refined rmse")
+            .expect("refined rmse");
         assert!(
             refined_rmse < initial_rmse,
             "expected refinement to improve reprojection error: initial={initial_rmse}, refined={refined_rmse}"
@@ -3943,7 +4042,7 @@ mod tests {
     }
 
     #[test]
-    fn reprojection_residual_rejects_values_outside_f32_pixel_domain() {
+    fn reprojection_residual_retains_f64_until_metric_boundary() {
         let intrinsics =
             PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("finite unit intrinsics");
         let observation = Observation {
@@ -3969,12 +4068,16 @@ mod tests {
         assert!(squared_px2.is_finite());
         assert!(squared_px2 > f64::from(f32::MAX).powi(2));
 
-        let error = reprojection_residuals_px(&Pose::identity(), &[observation], intrinsics)
-            .expect_err("f64 residual outside the f32 diagnostic domain must be explicit");
+        let residuals_px = reprojection_residuals_px(&Pose::identity(), &[observation], intrinsics)
+            .expect("finite f64 residual");
+        let value_px = residuals_px[0].expect("projectable residual");
+        assert!(value_px.is_finite() && value_px > f64::from(f32::MAX));
+        let error = reprojection_rmse_px(&residuals_px)
+            .expect_err("unrepresentable f32 metric must remain explicit");
         assert!(matches!(
             error,
-            ReprojectionEvaluationError::ResidualOutsideF32PixelDomain {
-                observation_index: 0,
+            ReprojectionEvaluationError::MetricOutsideF32PixelDomain {
+                metric: ReprojectionMetric::Rmse,
                 value_px,
             } if value_px.is_finite() && value_px > f64::from(f32::MAX)
         ));
@@ -4000,16 +4103,20 @@ mod tests {
     #[test]
     fn reprojection_rmse_matches_manual() {
         let residuals_px = vec![Some(3.0), None, Some(4.0)];
-        let rmse = reprojection_rmse_px(&residuals_px).expect("rmse");
+        let rmse = reprojection_rmse_px(&residuals_px)
+            .expect("representable rmse")
+            .expect("rmse");
         let expected = ((3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
         assert!((rmse - expected).abs() < 1e-6);
     }
 
     #[test]
     fn reprojection_statistics_do_not_overflow_on_finite_f32_residuals() {
-        let residuals_px = [Some(f32::MAX), Some(f32::MAX)];
+        let residuals_px = [Some(f64::from(f32::MAX)), Some(f64::from(f32::MAX))];
 
-        let rmse = reprojection_rmse_px(&residuals_px).expect("finite RMSE");
+        let rmse = reprojection_rmse_px(&residuals_px)
+            .expect("representable RMSE")
+            .expect("finite RMSE");
         assert_eq!(rmse, f32::MAX);
 
         let mse = reprojection_mse_per_axis_px2(&residuals_px).expect("finite MSE");
@@ -4057,9 +4164,13 @@ mod tests {
             .collect();
         let residuals_px = reprojection_residuals_px(&pose, &observations, intrinsics)
             .expect("reprojection residuals");
-        let rmse = reprojection_rmse_px(&residuals_px).expect("rmse");
+        let rmse = reprojection_rmse_px(&residuals_px)
+            .expect("representable rmse")
+            .expect("rmse");
         assert!((1.5..=2.5).contains(&rmse), "rmse={rmse}");
-        let max = reprojection_max_px(&residuals_px).expect("max");
+        let max = reprojection_max_px(&residuals_px)
+            .expect("representable maximum")
+            .expect("max");
         assert!((1.5..=2.5).contains(&max), "max={max}");
     }
 

@@ -2450,23 +2450,23 @@ fn decide_vio_pose_adoption(
     solve_result: &crate::VioSolveResult,
     visual_metrics: &PoseReprojectionMetrics,
     vio_metrics: &PoseReprojectionMetrics,
-) -> crate::VioProposalDisposition {
+) -> Result<crate::VioProposalDisposition, crate::ReprojectionEvaluationError> {
     if !solve_result.has_improved_estimate() {
-        return crate::VioProposalDisposition::RejectedUnusableSolve;
+        return Ok(crate::VioProposalDisposition::RejectedUnusableSolve);
     }
     if solve_result.last_frame_active_visual_factor_count() == 0 {
-        return crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport;
+        return Ok(crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport);
     }
-    let shared = visual_metrics.shared_with(vio_metrics);
+    let shared = visual_metrics.shared_with(vio_metrics)?;
     if shared.count < MIN_PNP_CORRESPONDENCES {
-        return crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport;
+        return Ok(crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport);
     }
     if shared.count != visual_metrics.projectable_count()
         || shared.count != vio_metrics.projectable_count()
     {
-        return crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability;
+        return Ok(crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability);
     }
-    match (shared.lhs_rmse_px, shared.rhs_rmse_px) {
+    Ok(match (shared.lhs_rmse_px, shared.rhs_rmse_px) {
         (Some(visual_rmse_px), Some(vio_rmse_px)) if vio_rmse_px <= visual_rmse_px => {
             crate::VioProposalDisposition::Adopted
         }
@@ -2474,27 +2474,27 @@ fn decide_vio_pose_adoption(
             crate::VioProposalDisposition::RejectedHigherSharedAcceptedInlierReprojectionRmse
         }
         _ => crate::VioProposalDisposition::RejectedInsufficientSharedAcceptedInlierSupport,
-    }
+    })
 }
 
 #[cfg(feature = "vio")]
 fn should_adopt_visual_ba_proposal(
     visual_metrics: &PoseReprojectionMetrics,
     visual_ba_metrics: &PoseReprojectionMetrics,
-) -> bool {
-    let shared = visual_metrics.shared_with(visual_ba_metrics);
+) -> Result<bool, crate::ReprojectionEvaluationError> {
+    let shared = visual_metrics.shared_with(visual_ba_metrics)?;
     if shared.count < MIN_PNP_CORRESPONDENCES {
-        return false;
+        return Ok(false);
     }
     if shared.count != visual_metrics.projectable_count()
         || shared.count != visual_ba_metrics.projectable_count()
     {
-        return false;
+        return Ok(false);
     }
-    matches!(
+    Ok(matches!(
         (shared.lhs_rmse_px, shared.rhs_rmse_px),
         (Some(visual_rmse_px), Some(visual_ba_rmse_px)) if visual_ba_rmse_px <= visual_rmse_px
-    )
+    ))
 }
 
 #[cfg(feature = "vio")]
@@ -2663,7 +2663,7 @@ struct VioPoseProposal {
 
 #[derive(Clone, Debug)]
 struct PoseReprojectionMetrics {
-    residuals_px: Vec<Option<f32>>,
+    residuals_px: Vec<Option<f64>>,
 }
 
 impl PoseReprojectionMetrics {
@@ -2684,11 +2684,11 @@ impl PoseReprojectionMetrics {
             .count()
     }
 
-    fn rmse_px(&self) -> Option<f32> {
+    fn rmse_px(&self) -> Result<Option<f32>, crate::ReprojectionEvaluationError> {
         crate::pnp::reprojection_rmse_px(&self.residuals_px)
     }
 
-    fn max_px(&self) -> Option<f32> {
+    fn max_px(&self) -> Result<Option<f32>, crate::ReprojectionEvaluationError> {
         crate::pnp::reprojection_max_px(&self.residuals_px)
     }
 
@@ -2697,12 +2697,15 @@ impl PoseReprojectionMetrics {
     }
 
     #[cfg(all(test, feature = "vio"))]
-    fn from_residuals_px(residuals_px: Vec<Option<f32>>) -> Self {
+    fn from_residuals_px(residuals_px: Vec<Option<f64>>) -> Self {
         Self { residuals_px }
     }
 
     #[cfg(feature = "vio")]
-    fn shared_with(&self, other: &Self) -> SharedPoseReprojectionMetrics {
+    fn shared_with(
+        &self,
+        other: &Self,
+    ) -> Result<SharedPoseReprojectionMetrics, crate::ReprojectionEvaluationError> {
         let mut lhs = Vec::new();
         let mut rhs = Vec::new();
         for (lhs_residual_px, rhs_residual_px) in self.residuals_px.iter().zip(&other.residuals_px)
@@ -2712,11 +2715,11 @@ impl PoseReprojectionMetrics {
                 rhs.push(Some(*rhs_px));
             }
         }
-        SharedPoseReprojectionMetrics {
+        Ok(SharedPoseReprojectionMetrics {
             count: lhs.len(),
-            lhs_rmse_px: crate::pnp::reprojection_rmse_px(&lhs),
-            rhs_rmse_px: crate::pnp::reprojection_rmse_px(&rhs),
-        }
+            lhs_rmse_px: crate::pnp::reprojection_rmse_px(&lhs)?,
+            rhs_rmse_px: crate::pnp::reprojection_rmse_px(&rhs)?,
+        })
     }
 }
 
@@ -5102,7 +5105,7 @@ impl SlamTracker {
                 if should_adopt_visual_ba_proposal(
                     &visual_proposal_accepted_inlier_metrics,
                     &visual_ba_accepted_inlier_metrics,
-                ) {
+                )? {
                     let adopted_pose = proposal.pose_world;
                     self.commit_visual_ba_proposal(proposal);
                     self.commit_authoritative_visual_pose(
@@ -5152,7 +5155,7 @@ impl SlamTracker {
                     &proposal.solve_result,
                     &visual_proposal_accepted_inlier_metrics,
                     &vio_accepted_inlier_metrics,
-                );
+                )?;
                 let vio_solve_result = proposal.solve_result.clone();
                 let (adopted_pose, source) = if disposition
                     == crate::VioProposalDisposition::Adopted
@@ -5381,11 +5384,11 @@ impl SlamTracker {
         );
         diagnostics.pnp_refinement = Some(result.refinement().clone());
         diagnostics.pnp_projectable_tracked_observation_reprojection_rmse_px = tracked_metrics
-            .rmse_px()
+            .rmse_px()?
             .map(crate::PnpProjectableTrackedObservationPixelResidualMetric::new)
             .transpose()?;
         diagnostics.pnp_projectable_tracked_observation_reprojection_max_px = tracked_metrics
-            .max_px()
+            .max_px()?
             .map(crate::PnpProjectableTrackedObservationPixelResidualMetric::new)
             .transpose()?;
         diagnostics.pnp_projectable_tracked_observation_reprojection_mse_per_axis_px2 =
@@ -5402,7 +5405,7 @@ impl SlamTracker {
             );
             diagnostics.visual_proposal_projectable_tracked_observation_reprojection_rmse_px =
                 visual_proposal_tracked_metrics
-                    .rmse_px()
+                    .rmse_px()?
                     .map(crate::VisualProposalProjectableTrackedObservationPixelResidualMetric::new)
                     .transpose()?;
             diagnostics.visual_proposal_projectable_accepted_inliers =
@@ -5411,7 +5414,7 @@ impl SlamTracker {
                 ));
             diagnostics.visual_proposal_accepted_inlier_reprojection_rmse_px =
                 visual_proposal_accepted_inlier_metrics
-                    .rmse_px()
+                    .rmse_px()?
                     .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
                     .transpose()?;
             diagnostics.vio_proposal_disposition = Some(vio_proposal_disposition);
@@ -5424,7 +5427,7 @@ impl SlamTracker {
             };
             if let Some(vio_tracked_metrics) = vio_proposal_tracked_metrics.as_ref() {
                 let shared_metrics =
-                    visual_proposal_tracked_metrics.shared_with(vio_tracked_metrics);
+                    visual_proposal_tracked_metrics.shared_with(vio_tracked_metrics)?;
                 diagnostics.vio_proposal_projectable_tracked_observations = Some(
                     crate::VioProposalProjectableTrackedObservationCountMetric::new(
                         vio_tracked_metrics.projectable_count(),
@@ -5432,7 +5435,7 @@ impl SlamTracker {
                 );
                 diagnostics.vio_proposal_projectable_tracked_observation_reprojection_rmse_px =
                     vio_tracked_metrics
-                        .rmse_px()
+                        .rmse_px()?
                         .map(
                             crate::VioProposalProjectableTrackedObservationPixelResidualMetric::new,
                         )
@@ -5462,14 +5465,14 @@ impl SlamTracker {
             if let Some(vio_accepted_inlier_metrics) = vio_proposal_accepted_inlier_metrics.as_ref()
             {
                 let shared_accepted_inlier_metrics = visual_proposal_accepted_inlier_metrics
-                    .shared_with(vio_accepted_inlier_metrics);
+                    .shared_with(vio_accepted_inlier_metrics)?;
                 diagnostics.vio_proposal_projectable_accepted_inliers =
                     Some(crate::PnpAcceptedInlierCountMetric::new(
                         vio_accepted_inlier_metrics.projectable_count(),
                     ));
                 diagnostics.vio_proposal_accepted_inlier_reprojection_rmse_px =
                     vio_accepted_inlier_metrics
-                        .rmse_px()
+                        .rmse_px()?
                         .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
                         .transpose()?;
                 diagnostics.shared_projectable_accepted_inliers = Some(
@@ -5488,11 +5491,11 @@ impl SlamTracker {
             }
         }
         diagnostics.pnp_inlier_reprojection_rmse_px = accepted_inlier_metrics
-            .rmse_px()
+            .rmse_px()?
             .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
             .transpose()?;
         diagnostics.pnp_inlier_reprojection_max_px = accepted_inlier_metrics
-            .max_px()
+            .max_px()?
             .map(crate::PnpAcceptedInlierPixelResidualMetric::new)
             .transpose()?;
         diagnostics.pnp_inlier_reprojection_mse_per_axis_px2 = accepted_inlier_metrics
@@ -9517,7 +9520,7 @@ mod tests {
         ]);
         let solve_result = make_test_vio_solve_result(5, 1);
         assert_eq!(
-            decide_vio_pose_adoption(&solve_result, &visual, &vio),
+            decide_vio_pose_adoption(&solve_result, &visual, &vio).expect("finite metrics"),
             crate::VioProposalDisposition::RejectedChangedAcceptedInlierProjectability
         );
     }
@@ -9540,7 +9543,7 @@ mod tests {
         let solve_result = make_test_vio_solve_result(0, 1);
 
         assert_eq!(
-            decide_vio_pose_adoption(&solve_result, &visual, &vio),
+            decide_vio_pose_adoption(&solve_result, &visual, &vio).expect("finite metrics"),
             crate::VioProposalDisposition::RejectedInsufficientCurrentVioObservationSupport
         );
     }
@@ -9563,7 +9566,7 @@ mod tests {
         let solve_result = make_test_vio_solve_result(4, 0);
 
         assert_eq!(
-            decide_vio_pose_adoption(&solve_result, &visual, &vio),
+            decide_vio_pose_adoption(&solve_result, &visual, &vio).expect("finite metrics"),
             crate::VioProposalDisposition::RejectedUnusableSolve
         );
     }
@@ -9587,7 +9590,7 @@ mod tests {
             Some(0.1),
             Some(0.1),
         ]);
-        assert!(!should_adopt_visual_ba_proposal(&visual, &visual_ba));
+        assert!(!should_adopt_visual_ba_proposal(&visual, &visual_ba).expect("finite metrics"));
     }
 
     #[cfg(feature = "vio")]

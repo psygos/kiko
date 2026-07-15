@@ -150,7 +150,7 @@ pub use pnp::{
     PnpMinimalSampleRejections, PnpP3pBuffer, PnpRansacRejectionKind, PnpRansacRejections,
     PnpRefinementCost, PnpRefinementFallback, PnpRefinementObjectiveStage, PnpRefinementStatus,
     PnpRefinementTermination, PnpRejection, PnpResult, PnpWorldTriangleSide, Pose, RansacConfig,
-    RansacConfigError, ReprojectionEvaluationError, solve_pnp_ransac,
+    RansacConfigError, ReprojectionEvaluationError, ReprojectionMetric, solve_pnp_ransac,
 };
 pub use runtime_imu::{
     RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,
