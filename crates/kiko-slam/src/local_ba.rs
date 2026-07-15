@@ -881,6 +881,7 @@ impl LocalBundleAdjuster {
         }
 
         if !self.optimize(map) {
+            self.reset();
             return None;
         }
         self.frames.last().map(|frame| frame.pose)
@@ -950,10 +951,12 @@ impl LocalBundleAdjuster {
                     Some(set) => set,
                     None => return false,
                 };
+                let mut usable_observations = 0_usize;
                 for obs in resolved.observations() {
                     if let Some((residual, jac)) =
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
                     {
+                        usable_observations += 1;
                         let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
                         let weight = huber_weight(r_norm, huber);
                         let scale = weight.sqrt();
@@ -970,6 +973,9 @@ impl LocalBundleAdjuster {
                             }
                         }
                     }
+                }
+                if usable_observations < self.config.min_observations() {
+                    return false;
                 }
             }
 
@@ -2046,6 +2052,44 @@ mod tests {
                 assert_eq!(actual, 0);
             }
         }
+    }
+
+    #[test]
+    fn push_frame_rejects_unprojectable_observations_and_recovers() {
+        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let min_required = ba.min_observations();
+        let observation_count = map.keyframe(keyframe_id).expect("keyframe").len();
+        let make_observation_set = || {
+            let observations = (0..observation_count)
+                .map(|index| {
+                    let keypoint = map
+                        .keyframe_keypoint(keyframe_id, index)
+                        .expect("keyframe keypoint");
+                    let pixel = map.keypoint(keypoint).expect("keypoint pixel");
+                    MapObservation::new(keypoint, pixel)
+                })
+                .collect();
+            ObservationSet::new(observations, min_required).expect("observation set")
+        };
+
+        let behind_camera = Pose::from_rt(Pose::identity().rotation(), [0.0, 0.0, -10.0]);
+        assert!(
+            ba.push_frame(&map, behind_camera, make_observation_set())
+                .is_none(),
+            "a frame with no usable reprojection factors must be rejected"
+        );
+        assert!(
+            ba.frames.is_empty(),
+            "a rejected frame must not remain in the optimization window"
+        );
+
+        assert!(
+            ba.push_frame(&map, Pose::identity(), make_observation_set())
+                .is_some(),
+            "a valid frame must optimize after the failed window is reset"
+        );
     }
 
     #[test]
