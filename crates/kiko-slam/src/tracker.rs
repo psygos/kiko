@@ -4406,7 +4406,13 @@ impl SlamTracker {
                         frame_id.as_u64()
                     );
                 }
-                return self.create_keyframe(StereoPair::from_parts(left, right), pose_world);
+                // Relocalization already ran the left detector for this frame. Transfer those
+                // detections only on recovery so keyframe bootstrap needs only the right detector.
+                return self.create_keyframe_with_left_detections(
+                    StereoPair::from_parts(left, right),
+                    pose_world,
+                    Some(current),
+                );
             }
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
@@ -5411,11 +5417,20 @@ impl SlamTracker {
         pair: StereoPair,
         pose_world: Pose,
     ) -> Result<TrackerOutput, TrackerError> {
+        self.create_keyframe_with_left_detections(pair, pose_world, None)
+    }
+
+    fn create_keyframe_with_left_detections(
+        &mut self,
+        pair: StereoPair,
+        pose_world: Pose,
+        left_det: Option<Arc<Detections>>,
+    ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
         #[cfg(feature = "vio")]
         let capture_time = left.timestamp();
-        let created = match self.create_keyframe_internal(left, right, pose_world, None, None) {
+        let created = match self.create_keyframe_internal(left, right, pose_world, left_det, None) {
             Ok(value) => value,
             Err(TrackerError::KeyframeRejected { landmarks }) => {
                 if self.trace_transitions {
