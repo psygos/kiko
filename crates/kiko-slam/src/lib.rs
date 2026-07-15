@@ -659,8 +659,11 @@ impl Detections {
         if width == 0 || height == 0 {
             return Err(DetectionError::ZeroDimensions { width, height });
         }
-        let width_f = width as f32;
-        let height_f = height as f32;
+        // Compare in f64 so u32 dimensions above f32's exact-integer range do
+        // not round inward and incorrectly reject their last representable
+        // pixel coordinate.
+        let width_f = f64::from(width);
+        let height_f = f64::from(height);
         for (index, point) in keypoints.iter().enumerate() {
             if !point.x.is_finite() || !point.y.is_finite() {
                 return Err(DetectionError::NonFiniteKeypoint {
@@ -669,7 +672,11 @@ impl Detections {
                     y: point.y,
                 });
             }
-            if point.x < 0.0 || point.y < 0.0 || point.x >= width_f || point.y >= height_f {
+            if point.x < 0.0
+                || point.y < 0.0
+                || f64::from(point.x) >= width_f
+                || f64::from(point.y) >= height_f
+            {
                 return Err(DetectionError::KeypointOutOfBounds {
                     index,
                     x: point.x,
@@ -1130,8 +1137,8 @@ impl<State> VizPacket<State> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Frame, FrameDimensionsError, FrameError,
-        FrameId, SensorId, Timestamp,
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, Frame,
+        FrameDimensionsError, FrameError, FrameId, Keypoint, SensorId, Timestamp,
     };
 
     #[test]
@@ -1170,6 +1177,52 @@ mod tests {
                     width: 0,
                     height: 3
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn detection_bounds_preserve_large_u32_dimensions() {
+        const WIDTH: u32 = 16_777_217;
+        const LAST_REPRESENTABLE_COLUMN: f32 = 16_777_216.0;
+        const NEXT_REPRESENTABLE_COLUMN: f32 = 16_777_218.0;
+
+        Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            WIDTH,
+            1,
+            vec![Keypoint {
+                x: LAST_REPRESENTABLE_COLUMN,
+                y: 0.0,
+            }],
+            vec![1.0],
+            vec![Descriptor([0.0; DESCRIPTOR_DIM])],
+        )
+        .expect("the last representable column below width remains in bounds");
+
+        let error = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(2),
+            WIDTH,
+            1,
+            vec![Keypoint {
+                x: NEXT_REPRESENTABLE_COLUMN,
+                y: 0.0,
+            }],
+            vec![1.0],
+            vec![Descriptor([0.0; DESCRIPTOR_DIM])],
+        )
+        .expect_err("the next representable coordinate is outside the image");
+
+        assert!(matches!(
+            error,
+            DetectionError::KeypointOutOfBounds {
+                index: 0,
+                x: NEXT_REPRESENTABLE_COLUMN,
+                y: 0.0,
+                width: WIDTH,
+                height: 1,
             }
         ));
     }
