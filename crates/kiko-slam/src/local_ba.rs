@@ -42,6 +42,7 @@ pub struct LocalBaConfig {
     huber_delta_px: f32,
     lm: LmConfig,
     motion_prior_weight: f32,
+    motion_prior_weight_squared: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -262,6 +263,9 @@ pub enum LocalBaConfigError {
     TooFewObservations { min: usize },
     NonPositiveHuber { value: f32 },
     NegativeMotionWeight { value: f32 },
+    NonFiniteMotionWeight { value: f32 },
+    MotionWeightTooSmall { value: f32 },
+    MotionWeightTooLarge { value: f32 },
 }
 
 impl std::fmt::Display for LocalBaConfigError {
@@ -281,6 +285,18 @@ impl std::fmt::Display for LocalBaConfigError {
             LocalBaConfigError::NegativeMotionWeight { value } => {
                 write!(f, "local BA motion prior weight must be >= 0 (got {value})")
             }
+            LocalBaConfigError::NonFiniteMotionWeight { value } => write!(
+                f,
+                "local BA motion prior weight must be finite (got {value})"
+            ),
+            LocalBaConfigError::MotionWeightTooSmall { value } => write!(
+                f,
+                "positive local BA motion prior weight must have a nonzero f32 square (got {value})"
+            ),
+            LocalBaConfigError::MotionWeightTooLarge { value } => write!(
+                f,
+                "local BA motion prior weight must have a finite f32 square (got {value})"
+            ),
         }
     }
 }
@@ -311,8 +327,25 @@ impl LocalBaConfig {
                 value: huber_delta_px,
             });
         }
-        if motion_prior_weight < 0.0 || !motion_prior_weight.is_finite() {
+        if !motion_prior_weight.is_finite() {
+            return Err(LocalBaConfigError::NonFiniteMotionWeight {
+                value: motion_prior_weight,
+            });
+        }
+        if motion_prior_weight < 0.0 {
             return Err(LocalBaConfigError::NegativeMotionWeight {
+                value: motion_prior_weight,
+            });
+        }
+        let motion_prior_weight_squared =
+            (motion_prior_weight as f64) * (motion_prior_weight as f64);
+        if motion_prior_weight > 0.0 && (motion_prior_weight_squared as f32) == 0.0 {
+            return Err(LocalBaConfigError::MotionWeightTooSmall {
+                value: motion_prior_weight,
+            });
+        }
+        if motion_prior_weight_squared > f32::MAX as f64 {
+            return Err(LocalBaConfigError::MotionWeightTooLarge {
                 value: motion_prior_weight,
             });
         }
@@ -323,6 +356,7 @@ impl LocalBaConfig {
             huber_delta_px,
             lm,
             motion_prior_weight,
+            motion_prior_weight_squared,
         })
     }
 
@@ -348,6 +382,10 @@ impl LocalBaConfig {
 
     pub fn motion_prior_weight(&self) -> f32 {
         self.motion_prior_weight
+    }
+
+    fn motion_prior_weight_squared(&self) -> f64 {
+        self.motion_prior_weight_squared
     }
 }
 
@@ -934,7 +972,7 @@ impl LocalBundleAdjuster {
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
         let damping = self.config.lm().initial_lambda().max(MIN_POSE_DAMPING);
-        let motion_weight = self.config.motion_prior_weight();
+        let motion_weight_squared = self.config.motion_prior_weight_squared();
 
         for _ in 0..max_iters {
             let a = &mut self.a_buf[..dim * dim];
@@ -980,9 +1018,9 @@ impl LocalBundleAdjuster {
                 }
             }
 
-            if motion_weight > 0.0 && frame_count >= 2 {
+            if motion_weight_squared > 0.0 && frame_count >= 2 {
                 for i in 1..frame_count {
-                    accumulate_motion_prior(
+                    if !accumulate_motion_prior(
                         a,
                         b,
                         dim,
@@ -990,8 +1028,10 @@ impl LocalBundleAdjuster {
                         self.frames[i].pose,
                         (i - 1) * 6,
                         i * 6,
-                        motion_weight,
-                    );
+                        motion_weight_squared,
+                    ) {
+                        return false;
+                    }
                 }
             }
 
@@ -1046,9 +1086,10 @@ impl LocalBundleAdjuster {
         let pose_dim = pose_count * 6;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
-        let motion_weight = self.config.motion_prior_weight();
+        let motion_weight_squared = self.config.motion_prior_weight_squared();
         let lm_config = self.config.lm();
-        let initial_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+        let initial_cost =
+            full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared);
         if !initial_cost.is_finite() {
             return BaResult::Degenerate {
                 reason: DegenerateReason::InvalidProjection,
@@ -1128,9 +1169,9 @@ impl LocalBundleAdjuster {
                 accumulate_scalar_landmark_factor(&mut acc.c, &mut acc.b, jacobian, residual);
             }
 
-            if motion_weight > 0.0 && pose_count >= 2 {
+            if motion_weight_squared > 0.0 && pose_count >= 2 {
                 for i in 1..pose_count {
-                    accumulate_motion_prior(
+                    if !accumulate_motion_prior(
                         s,
                         rhs,
                         pose_dim,
@@ -1138,8 +1179,12 @@ impl LocalBundleAdjuster {
                         problem.poses[i].pose,
                         (i - 1) * 6,
                         i * 6,
-                        motion_weight,
-                    );
+                        motion_weight_squared,
+                    ) {
+                        return BaResult::Degenerate {
+                            reason: DegenerateReason::NumericalFailure,
+                        };
+                    }
                 }
             }
             full_pose_rhs.copy_from_slice(rhs);
@@ -1238,7 +1283,8 @@ impl LocalBundleAdjuster {
                 landmark_var.position.z += delta_landmark[2];
             }
 
-            let candidate_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+            let candidate_cost =
+                full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared);
             let prev_cost = lm_state.prev_cost();
             if max_step == 0.0 && candidate_cost.is_finite() && candidate_cost == prev_cost {
                 return BaResult::Converged {
@@ -1275,9 +1321,15 @@ impl LocalBundleAdjuster {
             }
         }
 
+        let final_cost = lm_state.prev_cost();
+        if !final_cost.is_finite() {
+            return BaResult::Degenerate {
+                reason: DegenerateReason::NumericalFailure,
+            };
+        }
         BaResult::MaxIterations {
             iterations: max_iters,
-            final_cost: lm_state.prev_cost(),
+            final_cost,
         }
     }
 }
@@ -1286,7 +1338,7 @@ fn full_problem_cost(
     problem: &FullBaProblem,
     intrinsics: PinholeIntrinsics,
     huber_delta_px: f32,
-    motion_weight: f32,
+    motion_weight_squared: f64,
 ) -> f64 {
     let mut cost = 0.0_f64;
     let huber = huber_delta_px as f64;
@@ -1321,14 +1373,13 @@ fn full_problem_cost(
         cost += 0.5 * (residual as f64) * (residual as f64);
     }
 
-    if motion_weight > 0.0 {
-        let w2 = (motion_weight as f64) * (motion_weight as f64);
+    if motion_weight_squared > 0.0 {
         for i in 1..problem.poses.len() {
             let prev = pose_to_vec(problem.poses[i - 1].pose);
             let curr = pose_to_vec(problem.poses[i].pose);
             for k in 0..6 {
-                let d = (curr[k] - prev[k]) as f64;
-                cost += 0.5 * w2 * d * d;
+                let d = (curr[k] as f64) - (prev[k] as f64);
+                cost += 0.5 * motion_weight_squared * d * d;
             }
         }
     }
@@ -1585,6 +1636,19 @@ fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
     ]
 }
 
+fn narrow_finite_f32(value: f64) -> Option<f32> {
+    let narrowed = value as f32;
+    narrowed.is_finite().then_some(narrowed)
+}
+
+fn add_finite_f32(target: &mut f32, delta: f64) -> bool {
+    let Some(sum) = narrow_finite_f32((*target as f64) + delta) else {
+        return false;
+    };
+    *target = sum;
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn accumulate_motion_prior(
     hessian: &mut [f32],
@@ -1594,25 +1658,26 @@ fn accumulate_motion_prior(
     curr_pose: Pose,
     base_prev: usize,
     base_curr: usize,
-    weight: f32,
-) {
+    weight_squared: f64,
+) -> bool {
     let r_prev = pose_to_vec(prev_pose);
     let r_curr = pose_to_vec(curr_pose);
-    let mut residual = [0.0_f32; 6];
     for k in 0..6 {
-        residual[k] = r_curr[k] - r_prev[k];
+        let residual = (r_curr[k] as f64) - (r_prev[k] as f64);
+        let weighted_residual = residual * weight_squared;
+        let prev = base_prev + k;
+        let curr = base_curr + k;
+        if !add_finite_f32(&mut rhs[prev], weighted_residual)
+            || !add_finite_f32(&mut rhs[curr], -weighted_residual)
+            || !add_finite_f32(&mut hessian[prev * dim + prev], weight_squared)
+            || !add_finite_f32(&mut hessian[curr * dim + curr], weight_squared)
+            || !add_finite_f32(&mut hessian[prev * dim + curr], -weight_squared)
+            || !add_finite_f32(&mut hessian[curr * dim + prev], -weight_squared)
+        {
+            return false;
+        }
     }
-    let w2 = weight * weight;
-    for k in 0..6 {
-        let r = residual[k] * w2;
-        rhs[base_prev + k] += r;
-        rhs[base_curr + k] -= r;
-
-        hessian[(base_prev + k) * dim + (base_prev + k)] += w2;
-        hessian[(base_curr + k) * dim + (base_curr + k)] += w2;
-        hessian[(base_prev + k) * dim + (base_curr + k)] -= w2;
-        hessian[(base_curr + k) * dim + (base_prev + k)] -= w2;
-    }
+    true
 }
 
 fn huber_weight(r_norm: f32, delta: f32) -> f32 {
@@ -1715,6 +1780,19 @@ fn norm6(v: [f32; 6]) -> f32 {
 }
 
 fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
+    let Some(matrix_len) = n.checked_mul(n) else {
+        return false;
+    };
+    let Some(a) = a.get_mut(..matrix_len) else {
+        return false;
+    };
+    let Some(b) = b.get_mut(..n) else {
+        return false;
+    };
+    if a.iter().chain(b.iter()).any(|value| !value.is_finite()) {
+        return false;
+    }
+
     for i in 0..n {
         let mut max_row = i;
         let mut max_val = a[i * n + i].abs();
@@ -1726,7 +1804,7 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
             }
         }
 
-        if max_val < PIVOT_TOLERANCE {
+        if !max_val.is_finite() || max_val < PIVOT_TOLERANCE {
             return false;
         }
 
@@ -1739,9 +1817,15 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
 
         let diag = a[i * n + i];
         for c in i..n {
-            a[i * n + c] /= diag;
+            let Some(normalized) = narrow_finite_f32((a[i * n + c] as f64) / (diag as f64)) else {
+                return false;
+            };
+            a[i * n + c] = normalized;
         }
-        b[i] /= diag;
+        let Some(normalized_rhs) = narrow_finite_f32((b[i] as f64) / (diag as f64)) else {
+            return false;
+        };
+        b[i] = normalized_rhs;
 
         for r in 0..n {
             if r == i {
@@ -1752,13 +1836,23 @@ fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
                 continue;
             }
             for c in i..n {
-                a[r * n + c] -= factor * a[i * n + c];
+                let Some(reduced) = narrow_finite_f32(
+                    (a[r * n + c] as f64) - (factor as f64) * (a[i * n + c] as f64),
+                ) else {
+                    return false;
+                };
+                a[r * n + c] = reduced;
             }
-            b[r] -= factor * b[i];
+            let Some(reduced_rhs) =
+                narrow_finite_f32((b[r] as f64) - (factor as f64) * (b[i] as f64))
+            else {
+                return false;
+            };
+            b[r] = reduced_rhs;
         }
     }
 
-    true
+    a.iter().chain(b.iter()).all(|value| value.is_finite())
 }
 
 #[cfg(test)]
@@ -2003,6 +2097,25 @@ mod tests {
             LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), -1.0),
             Err(LocalBaConfigError::NegativeMotionWeight { .. })
         ));
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), value),
+                Err(LocalBaConfigError::NonFiniteMotionWeight { .. })
+            ));
+        }
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), f32::MIN_POSITIVE),
+            Err(LocalBaConfigError::MotionWeightTooSmall { .. })
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), f32::MAX),
+            Err(LocalBaConfigError::MotionWeightTooLarge { .. })
+        ));
+
+        let extreme_finite_weight = f32::MAX.sqrt() / 2.0;
+        let config = LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), extreme_finite_weight)
+            .expect("a motion weight with a representable square");
+        assert!(config.motion_prior_weight_squared().is_finite());
     }
 
     #[test]
@@ -2145,6 +2258,34 @@ mod tests {
         let mut a = vec![1.0_f32, 2.0, 2.0, 4.0];
         let mut b = vec![1.0_f32, 2.0];
         assert!(!solve_linear_system(&mut a, &mut b, 2));
+    }
+
+    #[test]
+    fn solve_linear_system_rejects_non_finite_inputs() {
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut a = [non_finite];
+            let mut b = [1.0];
+            assert!(!solve_linear_system(&mut a, &mut b, 1));
+
+            let mut a = [1.0];
+            let mut b = [non_finite];
+            assert!(!solve_linear_system(&mut a, &mut b, 1));
+        }
+    }
+
+    #[test]
+    fn solve_linear_system_rejects_non_finite_solution() {
+        let mut a = [0.5];
+        let mut b = [f32::MAX];
+        assert!(!solve_linear_system(&mut a, &mut b, 1));
+    }
+
+    #[test]
+    fn solve_linear_system_accepts_finite_extreme_scale() {
+        let mut a = [f32::MAX];
+        let mut b = [f32::MAX];
+        assert!(solve_linear_system(&mut a, &mut b, 1));
+        assert_eq!(b, [1.0]);
     }
 
     #[test]
@@ -2361,10 +2502,13 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        assert!(matches!(
-            ba.optimize_full(&mut problem),
-            BaResult::MaxIterations { iterations: 1, .. }
-        ));
+        match ba.optimize_full(&mut problem) {
+            BaResult::MaxIterations {
+                iterations: 1,
+                final_cost,
+            } => assert!(final_cost.is_finite()),
+            other => panic!("expected one finite-cost iteration, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2470,6 +2614,33 @@ mod tests {
     }
 
     #[test]
+    fn full_problem_cost_widens_extreme_supported_motion_weight() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let motion_weight = f32::MAX.sqrt() / 2.0;
+        let problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::from_rt(Pose::identity().rotation(), [4.0, 0.0, 0.0]),
+                },
+            ],
+            landmarks: Vec::new(),
+            factors: Vec::new(),
+            scale_anchor: None,
+        };
+
+        let motion_weight_squared = (motion_weight as f64) * (motion_weight as f64);
+        let cost = full_problem_cost(&problem, intrinsics, 2.0, motion_weight_squared);
+        assert!(cost.is_finite());
+        assert!(cost > f32::MAX as f64);
+    }
+
+    #[test]
     fn optimize_full_preserves_metric_gauge_anchor_distance() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
@@ -2570,10 +2741,28 @@ mod tests {
         );
         let mut hessian_unit = vec![0.0; 12 * 12];
         let mut rhs_unit = vec![0.0; 12];
-        accumulate_motion_prior(&mut hessian_unit, &mut rhs_unit, 12, prev, curr, 0, 6, 1.0);
+        assert!(accumulate_motion_prior(
+            &mut hessian_unit,
+            &mut rhs_unit,
+            12,
+            prev,
+            curr,
+            0,
+            6,
+            1.0,
+        ));
         let mut hessian_half = vec![0.0; 12 * 12];
         let mut rhs_half = vec![0.0; 12];
-        accumulate_motion_prior(&mut hessian_half, &mut rhs_half, 12, prev, curr, 0, 6, 0.5);
+        assert!(accumulate_motion_prior(
+            &mut hessian_half,
+            &mut rhs_half,
+            12,
+            prev,
+            curr,
+            0,
+            6,
+            0.25,
+        ));
 
         for i in 0..12 {
             assert!((rhs_half[i] - 0.25 * rhs_unit[i]).abs() < 1e-7);
@@ -2581,6 +2770,29 @@ mod tests {
         for i in 0..12 * 12 {
             assert!((hessian_half[i] - 0.25 * hessian_unit[i]).abs() < 1e-7);
         }
+    }
+
+    #[test]
+    fn motion_prior_accumulation_stays_finite_for_extreme_supported_weight() {
+        let weight = f32::MAX.sqrt() / 2.0;
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), weight).expect("valid config");
+        let prev = Pose::identity();
+        let curr = Pose::from_rt(Pose::identity().rotation(), [1.0, -1.0, 0.5]);
+        let mut hessian = vec![0.0; 12 * 12];
+        let mut rhs = vec![0.0; 12];
+
+        assert!(accumulate_motion_prior(
+            &mut hessian,
+            &mut rhs,
+            12,
+            prev,
+            curr,
+            0,
+            6,
+            config.motion_prior_weight_squared(),
+        ));
+        assert!(hessian.iter().all(|value| value.is_finite()));
+        assert!(rhs.iter().all(|value| value.is_finite()));
     }
 
     #[test]
