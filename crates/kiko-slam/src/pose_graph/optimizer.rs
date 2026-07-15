@@ -363,31 +363,9 @@ impl PoseGraphOptimizer {
         initial_poses: &mut [Pose64],
     ) -> Result<PoseGraphResult, PoseGraphError> {
         let nposes = initial_poses.len();
-        if nposes == 0 {
-            return Ok(PoseGraphResult {
-                corrected_poses: Vec::new(),
-                iterations: 0,
-                converged: true,
-            });
-        }
+        preflight_topology(edges, nposes)?;
 
         let mut poses = initial_poses.to_vec();
-        let mut converged = false;
-        let mut iters_run = 0;
-        for edge in edges {
-            if edge.from >= nposes {
-                return Err(PoseGraphError::EdgeFromOutOfBounds {
-                    from: edge.from,
-                    pose_count: nposes,
-                });
-            }
-            if edge.to >= nposes {
-                return Err(PoseGraphError::EdgeToOutOfBounds {
-                    to: edge.to,
-                    pose_count: nposes,
-                });
-            }
-        }
         if edges.is_empty() {
             return Ok(PoseGraphResult {
                 corrected_poses: poses,
@@ -396,6 +374,8 @@ impl PoseGraphOptimizer {
             });
         }
 
+        let mut converged = false;
+        let mut iters_run = 0;
         for iter in 0..self.config.max_iterations {
             iters_run = iter + 1;
             let mut h = BlockCsr6x6::new(nposes);
@@ -503,6 +483,72 @@ impl PoseGraphOptimizer {
             converged,
         })
     }
+}
+
+fn preflight_topology(edges: &[PoseGraphEdge], pose_count: usize) -> Result<(), PoseGraphError> {
+    for edge in edges {
+        if edge.from >= pose_count {
+            return Err(PoseGraphError::EdgeFromOutOfBounds {
+                from: edge.from,
+                pose_count,
+            });
+        }
+        if edge.to >= pose_count {
+            return Err(PoseGraphError::EdgeToOutOfBounds {
+                to: edge.to,
+                pose_count,
+            });
+        }
+    }
+
+    if pose_count <= 1 {
+        return Ok(());
+    }
+    if edges.is_empty() {
+        return Err(PoseGraphError::UnconstrainedPoseGraph { pose_count });
+    }
+
+    let mut parents: Vec<usize> = (0..pose_count).collect();
+    for edge in edges {
+        let from_root = find_root(&mut parents, edge.from);
+        let to_root = find_root(&mut parents, edge.to);
+        if from_root != to_root {
+            parents[to_root] = from_root;
+        }
+    }
+
+    let anchor_root = find_root(&mut parents, 0);
+    let mut anchor_component_size = 0;
+    let mut component_count = 0;
+    for pose_index in 0..pose_count {
+        let root = find_root(&mut parents, pose_index);
+        component_count += usize::from(root == pose_index);
+        anchor_component_size += usize::from(root == anchor_root);
+    }
+    if component_count > 1 {
+        return Err(PoseGraphError::DisconnectedPoseGraph {
+            pose_count,
+            component_count,
+            anchor_component_size,
+        });
+    }
+
+    Ok(())
+}
+
+fn find_root(parents: &mut [usize], pose_index: usize) -> usize {
+    let mut root = pose_index;
+    while parents[root] != root {
+        root = parents[root];
+    }
+
+    let mut current = pose_index;
+    while parents[current] != current {
+        let next = parents[current];
+        parents[current] = root;
+        current = next;
+    }
+    root
 }
 
 fn huber_weight(norm: f64, delta: f64) -> f64 {

@@ -448,6 +448,87 @@ fn translation_error(poses: &[Pose64], target: &[Pose64]) -> f64 {
 }
 
 #[test]
+fn pose_graph_optimizer_accepts_one_pose_without_constraints() {
+    let pose = se3_exp_f64([0.4, -0.2, 0.1, 0.03, -0.04, 0.02]);
+    let mut initial = [pose];
+
+    let result = PoseGraphOptimizer::new(PoseGraphConfig::default())
+        .optimize(&[], &mut initial)
+        .expect("one pose is a fully anchored trivial graph");
+
+    assert!(result.converged);
+    assert_eq!(result.iterations, 0);
+    assert_eq!(result.corrected_poses.len(), 1);
+    assert_eq!(result.corrected_poses[0].translation(), pose.translation());
+    assert_eq!(result.corrected_poses[0].rotation(), pose.rotation());
+}
+
+#[test]
+fn pose_graph_optimizer_rejects_multiple_poses_without_constraints() {
+    let mut initial = [Pose64::identity(), Pose64::identity()];
+
+    let error = PoseGraphOptimizer::new(PoseGraphConfig::default())
+        .optimize(&[], &mut initial)
+        .expect_err("multiple poses without constraints are underconstrained");
+
+    assert_eq!(
+        error,
+        super::PoseGraphError::UnconstrainedPoseGraph { pose_count: 2 }
+    );
+}
+
+#[test]
+fn pose_graph_optimizer_rejects_disconnected_components() {
+    let poses = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        se3_exp_f64([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        se3_exp_f64([3.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    let constraints = [
+        edge(0, 1, poses[0], poses[1]),
+        edge(2, 3, poses[2], poses[3]),
+    ];
+    let mut initial = poses;
+
+    let error = PoseGraphOptimizer::new(PoseGraphConfig::default())
+        .optimize(&constraints, &mut initial)
+        .expect_err("each disconnected component has an independent gauge freedom");
+
+    assert_eq!(
+        error,
+        super::PoseGraphError::DisconnectedPoseGraph {
+            pose_count: 4,
+            component_count: 2,
+            anchor_component_size: 2,
+        }
+    );
+}
+
+#[test]
+fn pose_graph_optimizer_accepts_connected_constraint_tree() {
+    let poses = [
+        Pose64::identity(),
+        se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        se3_exp_f64([2.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        se3_exp_f64([3.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    ];
+    let constraints = [
+        edge(1, 0, poses[1], poses[0]),
+        edge(1, 2, poses[1], poses[2]),
+        edge(3, 2, poses[3], poses[2]),
+    ];
+    let mut initial = poses;
+
+    let result = PoseGraphOptimizer::new(PoseGraphConfig::default())
+        .optimize(&constraints, &mut initial)
+        .expect("edge direction must not affect topology connectivity");
+
+    assert!(result.converged);
+    assert_eq!(result.iterations, 1);
+}
+
+#[test]
 fn pose_graph_optimizer_ring_graph_converges() {
     let gt = vec![
         Pose64::identity(),
@@ -612,6 +693,25 @@ fn pose_graph_optimizer_rejects_invalid_edge_endpoints() {
             pose_count: 2
         }
     ));
+}
+
+#[test]
+fn pose_graph_optimizer_validates_edges_before_empty_graph_shortcut() {
+    let edge = PoseGraphEdge::try_new(0, 1, Pose64::identity(), scalar_block(1.0))
+        .expect("edge structure is valid independently of pose array bounds");
+    let mut initial = [];
+
+    let error = PoseGraphOptimizer::new(PoseGraphConfig::default())
+        .optimize(&[edge], &mut initial)
+        .expect_err("an empty pose array must not bypass endpoint validation");
+
+    assert_eq!(
+        error,
+        super::PoseGraphError::EdgeFromOutOfBounds {
+            from: 0,
+            pose_count: 0,
+        }
+    );
 }
 
 #[test]

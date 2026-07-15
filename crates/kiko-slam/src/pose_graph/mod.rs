@@ -50,6 +50,14 @@ pub enum PoseGraphError {
         to: usize,
         pose_count: usize,
     },
+    UnconstrainedPoseGraph {
+        pose_count: usize,
+    },
+    DisconnectedPoseGraph {
+        pose_count: usize,
+        component_count: usize,
+        anchor_component_size: usize,
+    },
 }
 
 impl std::fmt::Display for PoseGraphError {
@@ -110,6 +118,19 @@ impl std::fmt::Display for PoseGraphError {
                     "pose graph edge.to out of bounds: to={to}, pose_count={pose_count}"
                 )
             }
+            PoseGraphError::UnconstrainedPoseGraph { pose_count } => write!(
+                f,
+                "pose graph has {pose_count} poses but no relative-pose constraints"
+            ),
+            PoseGraphError::DisconnectedPoseGraph {
+                pose_count,
+                component_count,
+                anchor_component_size,
+            } => write!(
+                f,
+                "pose graph is disconnected: {pose_count} poses in {component_count} components; \
+                 {anchor_component_size} poses are connected to anchor pose 0"
+            ),
         }
     }
 }
