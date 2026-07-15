@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, SensorId};
+use crate::{DepthImage, Frame, PairingWindowNs, SensorId, StereoPair};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -121,7 +121,14 @@ pub struct WriterStats {
     pub bytes_enqueued: u64,
     pub bytes_written: u64,
     pub bytes_dropped: u64,
+    /// Logical frames belonging to accepted write transactions that failed.
     pub write_failed: u64,
+    /// Bytes belonging to accepted write transactions that failed.
+    pub bytes_write_failed: u64,
+    /// Accepted logical frames that were canceled after another write transaction failed.
+    pub frames_canceled: u64,
+    /// Accepted bytes that were canceled after another write transaction failed.
+    pub bytes_canceled: u64,
     pub spool_frames: u64,
     pub spool_bytes: u64,
     pub spool_max_frames: u64,
@@ -131,13 +138,19 @@ pub struct WriterStats {
 
 impl WriterStats {
     pub fn frames_pending(&self) -> u64 {
-        self.frames_enqueued
-            .saturating_sub(self.frames_written.saturating_add(self.frames_dropped))
+        self.frames_enqueued.saturating_sub(
+            self.frames_written
+                .saturating_add(self.write_failed)
+                .saturating_add(self.frames_canceled),
+        )
     }
 
     pub fn bytes_pending(&self) -> u64 {
-        self.bytes_enqueued
-            .saturating_sub(self.bytes_written.saturating_add(self.bytes_dropped))
+        self.bytes_enqueued.saturating_sub(
+            self.bytes_written
+                .saturating_add(self.bytes_write_failed)
+                .saturating_add(self.bytes_canceled),
+        )
     }
 }
 
@@ -215,6 +228,13 @@ pub enum DatasetError {
     ManifestCountOutOfRange {
         field: &'static str,
         value: u64,
+    },
+    PairOutsideWriterWindow {
+        delta_ns: u64,
+        max_delta_ns: u64,
+    },
+    RecordedPairPayloadMissing {
+        path: PathBuf,
     },
     ThreadSpawn {
         source: std::io::Error,
@@ -338,6 +358,18 @@ impl std::fmt::Display for DatasetError {
                 f,
                 "dataset manifest count {field}={value} exceeds the host address space"
             ),
+            DatasetError::PairOutsideWriterWindow {
+                delta_ns,
+                max_delta_ns,
+            } => write!(
+                f,
+                "stereo pair delta {delta_ns}ns exceeds the dataset writer window {max_delta_ns}ns"
+            ),
+            DatasetError::RecordedPairPayloadMissing { path } => write!(
+                f,
+                "recorded stereo pair payload is missing or invalid: {}",
+                path.display()
+            ),
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
             }
@@ -384,6 +416,8 @@ impl std::error::Error for DatasetError {
             | DatasetError::ManifestPairDeltaMismatch { .. }
             | DatasetError::ManifestPairOutsideWindow { .. }
             | DatasetError::ManifestCountOutOfRange { .. }
+            | DatasetError::PairOutsideWriterWindow { .. }
+            | DatasetError::RecordedPairPayloadMissing { .. }
             | DatasetError::WorkerJoin { .. } => None,
         }
     }
@@ -393,6 +427,13 @@ impl std::error::Error for DatasetError {
 pub struct DatasetWriter {
     config: DatasetWriterConfig,
     state: Arc<WriterState>,
+}
+
+/// A dataset writer whose mono payloads can only be enqueued as validated stereo pairs.
+#[derive(Clone, Debug)]
+pub struct PairedDatasetWriter {
+    inner: DatasetWriter,
+    pairing_window: PairingWindowNs,
 }
 
 #[derive(Debug)]
@@ -425,7 +466,13 @@ impl DatasetWriter {
         meta: &Meta,
         calibration: &Calibration,
     ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
-        Self::create_with_config(path, meta, calibration, DatasetWriterConfig::default())
+        Self::create_internal(
+            path,
+            meta,
+            calibration,
+            DatasetWriterConfig::default(),
+            ManifestMode::InferPairs,
+        )
     }
 
     pub fn create_with_config(
@@ -433,6 +480,59 @@ impl DatasetWriter {
         meta: &Meta,
         calibration: &Calibration,
         config: DatasetWriterConfig,
+    ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
+        Self::create_internal(path, meta, calibration, config, ManifestMode::InferPairs)
+    }
+
+    pub fn create_paired(
+        path: impl Into<PathBuf>,
+        meta: &Meta,
+        calibration: &Calibration,
+        pairing_window: PairingWindowNs,
+    ) -> Result<(PairedDatasetWriter, DatasetWriterHandle), DatasetError> {
+        Self::create_paired_with_config(
+            path,
+            meta,
+            calibration,
+            pairing_window,
+            DatasetWriterConfig::default(),
+        )
+    }
+
+    pub fn create_paired_with_config(
+        path: impl Into<PathBuf>,
+        meta: &Meta,
+        calibration: &Calibration,
+        pairing_window: PairingWindowNs,
+        config: DatasetWriterConfig,
+    ) -> Result<(PairedDatasetWriter, DatasetWriterHandle), DatasetError> {
+        if config.max_spool_frames < 2 {
+            return Err(DatasetError::InvalidConfig {
+                msg: "paired writer max_spool_frames must be >= 2",
+            });
+        }
+        let (inner, handle) = Self::create_internal(
+            path,
+            meta,
+            calibration,
+            config,
+            ManifestMode::PreservePairs { pairing_window },
+        )?;
+        Ok((
+            PairedDatasetWriter {
+                inner,
+                pairing_window,
+            },
+            handle,
+        ))
+    }
+
+    fn create_internal(
+        path: impl Into<PathBuf>,
+        meta: &Meta,
+        calibration: &Calibration,
+        config: DatasetWriterConfig,
+        manifest_mode: ManifestMode,
     ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
         if config.max_spool_frames == 0 {
             return Err(DatasetError::InvalidConfig {
@@ -498,7 +598,12 @@ impl DatasetWriter {
         serde_json::to_writer_pretty(meta_file, meta)
             .map_err(|e| DatasetError::SerializeJson { source: e })?;
 
-        let state = Arc::new(WriterState::new(config, path.clone(), frames_dir.clone()));
+        let state = Arc::new(WriterState::new(
+            config,
+            path.clone(),
+            frames_dir.clone(),
+            manifest_mode,
+        ));
         let state_for_thread = state.clone();
 
         let handle = thread::Builder::new()
@@ -519,41 +624,37 @@ impl DatasetWriter {
         Ok((writer, handle))
     }
 
-    /// Enqueue a frame according to the configured backpressure policy.
+    /// Enqueue one frame according to the configured backpressure policy.
+    ///
+    /// Mono frames written through this legacy boundary are paired by timestamp when the manifest
+    /// is finalized. Use [`DatasetWriter::create_paired`] and
+    /// [`PairedDatasetWriter::write_pair`] to preserve an existing validated pair identity.
     pub fn write_frame(&self, frame: &Frame) -> WriteOutcome {
-        self.write_item(
-            SpoolItem::Mono(frame.clone()),
-            frame.data().len(),
-            "frame exceeds max_spool_bytes",
-        )
+        self.write_item(SpoolItem::Mono(frame.clone()))
     }
 
     /// Enqueue a depth image according to the configured backpressure policy.
     pub fn write_depth(&self, depth: &DepthImage) -> WriteOutcome {
-        let bytes = depth
-            .depth_m()
-            .len()
-            .saturating_mul(std::mem::size_of::<f32>());
-        self.write_item(
-            SpoolItem::Depth(depth.clone()),
-            bytes,
-            "depth image exceeds max_spool_bytes",
-        )
+        self.write_item(SpoolItem::Depth(depth.clone()))
     }
 
-    fn write_item(
-        &self,
-        item: SpoolItem,
-        bytes: usize,
-        oversize_msg: &'static str,
-    ) -> WriteOutcome {
+    fn write_item(&self, item: SpoolItem) -> WriteOutcome {
         if self.state.failed.load(Ordering::Acquire) {
             return WriteOutcome::WriterFailed;
         }
 
+        let frames = item.frame_count();
+        let bytes = item.bytes_len();
+        if frames > self.config.max_spool_frames {
+            self.state.fail(DatasetError::InvalidConfig {
+                msg: item.frame_capacity_error(),
+            });
+            return WriteOutcome::WriterFailed;
+        }
         if bytes > self.config.max_spool_bytes {
-            self.state
-                .fail(DatasetError::InvalidConfig { msg: oversize_msg });
+            self.state.fail(DatasetError::InvalidConfig {
+                msg: item.byte_capacity_error(),
+            });
             return WriteOutcome::WriterFailed;
         }
 
@@ -568,8 +669,10 @@ impl DatasetWriter {
                 if spool.closed || self.state.failed.load(Ordering::Acquire) {
                     return WriteOutcome::WriterFailed;
                 }
-                if !self.state.can_accept(&spool, bytes) {
-                    self.state.dropped.fetch_add(1, Ordering::Relaxed);
+                if !self.state.can_accept(&spool, frames, bytes) {
+                    self.state
+                        .dropped
+                        .fetch_add(frames as u64, Ordering::Relaxed);
                     self.state
                         .bytes_dropped
                         .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -577,7 +680,7 @@ impl DatasetWriter {
                 }
             }
             Backpressure::Block => {
-                while !self.state.can_accept(&spool, bytes) {
+                while !self.state.can_accept(&spool, frames, bytes) {
                     if spool.closed || self.state.failed.load(Ordering::Acquire) {
                         return WriteOutcome::WriterFailed;
                     }
@@ -594,11 +697,13 @@ impl DatasetWriter {
             return WriteOutcome::WriterFailed;
         }
 
-        spool.frames += 1;
+        spool.frames += frames;
         spool.bytes += bytes;
         spool.queue.push_back(item);
 
-        self.state.enqueued.fetch_add(1, Ordering::Relaxed);
+        self.state
+            .enqueued
+            .fetch_add(frames as u64, Ordering::Relaxed);
         self.state
             .bytes_enqueued
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -621,8 +726,46 @@ impl DatasetWriter {
     }
 }
 
+impl PairedDatasetWriter {
+    /// Enqueue both payloads as one spool item.
+    ///
+    /// A successful outcome means both frames were accepted together. The manifest pair is only
+    /// published after both payload writes succeed. If the second payload write fails, the first
+    /// payload can remain on disk unreferenced and `DatasetWriterHandle::finish` reports the typed
+    /// I/O error.
+    pub fn write_pair(&self, pair: StereoPair) -> WriteOutcome {
+        if !self.inner.is_healthy() {
+            return WriteOutcome::WriterFailed;
+        }
+        let delta_ns = pair.timestamp_delta_ns();
+        let max_delta_ns = self.pairing_window.as_ns() as u64;
+        if delta_ns > max_delta_ns {
+            self.inner
+                .state
+                .fail(DatasetError::PairOutsideWriterWindow {
+                    delta_ns,
+                    max_delta_ns,
+                });
+            return WriteOutcome::WriterFailed;
+        }
+        self.inner.write_item(SpoolItem::Pair(pair))
+    }
+
+    pub fn write_depth(&self, depth: &DepthImage) -> WriteOutcome {
+        self.inner.write_depth(depth)
+    }
+
+    pub fn stats(&self) -> WriterStats {
+        self.inner.stats()
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.inner.is_healthy()
+    }
+}
+
 impl DatasetWriterHandle {
-    /// Blocks until the writer thread exits; all DatasetWriter clones must be dropped first.
+    /// Blocks until the writer thread exits; all writer clones must be dropped first.
     pub fn finish(mut self) -> Result<WriterStats, DatasetError> {
         let Some(handle) = self.handle.take() else {
             return Err(DatasetError::InvalidConfig {
@@ -633,13 +776,11 @@ impl DatasetWriterHandle {
             message: panic_message(err),
         })?;
 
-        let writer_error = self.state.take_error();
-        write_manifest(&self.state)?;
-
-        if let Some(err) = writer_error {
+        if let Some(err) = self.state.take_error() {
             return Err(err);
         }
 
+        write_manifest(&self.state)?;
         Ok(self.state.stats())
     }
 
@@ -651,17 +792,45 @@ impl DatasetWriterHandle {
 #[derive(Debug)]
 enum SpoolItem {
     Mono(Frame),
+    Pair(StereoPair),
     Depth(DepthImage),
 }
 
 impl SpoolItem {
+    fn frame_count(&self) -> usize {
+        match self {
+            SpoolItem::Mono(_) | SpoolItem::Depth(_) => 1,
+            SpoolItem::Pair(_) => 2,
+        }
+    }
+
     fn bytes_len(&self) -> usize {
         match self {
             SpoolItem::Mono(frame) => frame.data().len(),
+            SpoolItem::Pair(pair) => pair
+                .left()
+                .data()
+                .len()
+                .saturating_add(pair.right().data().len()),
             SpoolItem::Depth(depth) => depth
                 .depth_m()
                 .len()
                 .saturating_mul(std::mem::size_of::<f32>()),
+        }
+    }
+
+    fn frame_capacity_error(&self) -> &'static str {
+        match self {
+            SpoolItem::Pair(_) => "stereo pair exceeds max_spool_frames",
+            SpoolItem::Mono(_) | SpoolItem::Depth(_) => "frame exceeds max_spool_frames",
+        }
+    }
+
+    fn byte_capacity_error(&self) -> &'static str {
+        match self {
+            SpoolItem::Mono(_) => "frame exceeds max_spool_bytes",
+            SpoolItem::Pair(_) => "stereo pair exceeds max_spool_bytes",
+            SpoolItem::Depth(_) => "depth image exceeds max_spool_bytes",
         }
     }
 }
@@ -685,9 +854,16 @@ impl Spool {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ManifestMode {
+    InferPairs,
+    PreservePairs { pairing_window: PairingWindowNs },
+}
+
 #[derive(Debug)]
 struct WriterState {
     config: DatasetWriterConfig,
+    manifest_mode: ManifestMode,
     dataset_dir: PathBuf,
     frames_dir: PathBuf,
     spool: Mutex<Spool>,
@@ -699,17 +875,27 @@ struct WriterState {
     bytes_written: AtomicU64,
     bytes_dropped: AtomicU64,
     write_failed: AtomicU64,
+    bytes_write_failed: AtomicU64,
+    frames_canceled: AtomicU64,
+    bytes_canceled: AtomicU64,
     spool_frames: AtomicU64,
     spool_bytes: AtomicU64,
     open_writers: AtomicUsize,
     failed: AtomicBool,
     error: Mutex<Option<DatasetError>>,
+    recorded_pairs: Mutex<Vec<RecordedPair>>,
 }
 
 impl WriterState {
-    fn new(config: DatasetWriterConfig, dataset_dir: PathBuf, frames_dir: PathBuf) -> Self {
+    fn new(
+        config: DatasetWriterConfig,
+        dataset_dir: PathBuf,
+        frames_dir: PathBuf,
+        manifest_mode: ManifestMode,
+    ) -> Self {
         Self {
             config,
+            manifest_mode,
             dataset_dir,
             frames_dir,
             spool: Mutex::new(Spool::new()),
@@ -721,16 +907,20 @@ impl WriterState {
             bytes_written: AtomicU64::new(0),
             bytes_dropped: AtomicU64::new(0),
             write_failed: AtomicU64::new(0),
+            bytes_write_failed: AtomicU64::new(0),
+            frames_canceled: AtomicU64::new(0),
+            bytes_canceled: AtomicU64::new(0),
             spool_frames: AtomicU64::new(0),
             spool_bytes: AtomicU64::new(0),
             open_writers: AtomicUsize::new(1),
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
+            recorded_pairs: Mutex::new(Vec::new()),
         }
     }
 
-    fn can_accept(&self, spool: &Spool, bytes: usize) -> bool {
-        let next_frames = spool.frames.saturating_add(1);
+    fn can_accept(&self, spool: &Spool, frames: usize, bytes: usize) -> bool {
+        let next_frames = spool.frames.saturating_add(frames);
         let next_bytes = spool.bytes.saturating_add(bytes);
         next_frames <= self.config.max_spool_frames && next_bytes <= self.config.max_spool_bytes
     }
@@ -756,6 +946,9 @@ impl WriterState {
             bytes_written: self.bytes_written.load(Ordering::Relaxed),
             bytes_dropped: self.bytes_dropped.load(Ordering::Relaxed),
             write_failed: self.write_failed.load(Ordering::Relaxed),
+            bytes_write_failed: self.bytes_write_failed.load(Ordering::Relaxed),
+            frames_canceled: self.frames_canceled.load(Ordering::Relaxed),
+            bytes_canceled: self.bytes_canceled.load(Ordering::Relaxed),
             spool_frames: self.spool_frames.load(Ordering::Relaxed),
             spool_bytes: self.spool_bytes.load(Ordering::Relaxed),
             spool_max_frames: self.config.max_spool_frames as u64,
@@ -777,6 +970,37 @@ impl WriterState {
             .unwrap_or_else(|err| err.into_inner())
             .take()
     }
+
+    fn record_pair(&self, pair: RecordedPair) {
+        self.recorded_pairs
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(pair);
+    }
+
+    fn cancel_unwritten(&self, in_flight: impl IntoIterator<Item = SpoolItem>) {
+        let mut canceled_frames = 0u64;
+        let mut canceled_bytes = 0u64;
+        for item in in_flight {
+            canceled_frames = canceled_frames.saturating_add(item.frame_count() as u64);
+            canceled_bytes = canceled_bytes.saturating_add(item.bytes_len() as u64);
+        }
+
+        let mut spool = self.spool.lock().unwrap_or_else(|err| err.into_inner());
+        while let Some(item) = spool.queue.pop_front() {
+            canceled_frames = canceled_frames.saturating_add(item.frame_count() as u64);
+            canceled_bytes = canceled_bytes.saturating_add(item.bytes_len() as u64);
+        }
+        spool.frames = 0;
+        spool.bytes = 0;
+        self.spool_frames.store(0, Ordering::Relaxed);
+        self.spool_bytes.store(0, Ordering::Relaxed);
+        self.frames_canceled
+            .fetch_add(canceled_frames, Ordering::Relaxed);
+        self.bytes_canceled
+            .fetch_add(canceled_bytes, Ordering::Relaxed);
+        self.spool_cvar.notify_all();
+    }
 }
 
 fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
@@ -795,12 +1019,15 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             }
 
             let mut batch = Vec::new();
+            let mut batch_frames = 0usize;
             while let Some(item) = spool.queue.pop_front() {
                 let bytes = item.bytes_len();
-                spool.frames = spool.frames.saturating_sub(1);
+                let frames = item.frame_count();
+                spool.frames = spool.frames.saturating_sub(frames);
                 spool.bytes = spool.bytes.saturating_sub(bytes);
+                batch_frames = batch_frames.saturating_add(frames);
                 batch.push(item);
-                if batch.len() >= state.config.flush_batch_frames {
+                if batch_frames >= state.config.flush_batch_frames {
                     break;
                 }
             }
@@ -815,24 +1042,58 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             batch
         };
 
-        for item in batch {
+        let mut batch = batch.into_iter();
+        while let Some(item) = batch.next() {
+            let frames = item.frame_count() as u64;
             let bytes = item.bytes_len() as u64;
-            if let Err(err) = write_item_to_dir(&frames_dir, item) {
-                state.write_failed.fetch_add(1, Ordering::Relaxed);
-                state.fail(err);
-                return;
+            let recorded_pair = match write_item_to_dir(&frames_dir, item) {
+                Ok(recorded_pair) => recorded_pair,
+                Err(err) => {
+                    state.write_failed.fetch_add(frames, Ordering::Relaxed);
+                    state.bytes_write_failed.fetch_add(bytes, Ordering::Relaxed);
+                    state.fail(err);
+                    state.cancel_unwritten(batch);
+                    return;
+                }
+            };
+            if let Some(pair) = recorded_pair {
+                state.record_pair(pair);
             }
-            state.written.fetch_add(1, Ordering::Relaxed);
+            state.written.fetch_add(frames, Ordering::Relaxed);
             state.bytes_written.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 }
 
-fn write_item_to_dir(frames_dir: &Path, item: SpoolItem) -> Result<(), DatasetError> {
+fn write_item_to_dir(
+    frames_dir: &Path,
+    item: SpoolItem,
+) -> Result<Option<RecordedPair>, DatasetError> {
     match item {
-        SpoolItem::Mono(frame) => write_frame_to_dir(frames_dir, frame),
-        SpoolItem::Depth(depth) => write_depth_to_dir(frames_dir, depth),
+        SpoolItem::Mono(frame) => {
+            write_frame_to_dir(frames_dir, frame)?;
+            Ok(None)
+        }
+        SpoolItem::Pair(pair) => write_pair_to_dir(frames_dir, pair).map(Some),
+        SpoolItem::Depth(depth) => {
+            write_depth_to_dir(frames_dir, depth)?;
+            Ok(None)
+        }
     }
+}
+
+fn write_pair_to_dir(frames_dir: &Path, pair: StereoPair) -> Result<RecordedPair, DatasetError> {
+    let left_timestamp_ns = pair.left().timestamp().as_nanos();
+    let right_timestamp_ns = pair.right().timestamp().as_nanos();
+    let delta_ns = pair.timestamp_delta_ns();
+    let (left_frame, right_frame) = pair.into_parts();
+    write_frame_to_dir(frames_dir, left_frame)?;
+    write_frame_to_dir(frames_dir, right_frame)?;
+    Ok(RecordedPair {
+        left_timestamp_ns,
+        right_timestamp_ns,
+        delta_ns,
+    })
 }
 
 fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetError> {
@@ -994,6 +1255,13 @@ struct FrameInfo {
     path: String,
 }
 
+#[derive(Debug, Clone)]
+struct RecordedPair {
+    left_timestamp_ns: i64,
+    right_timestamp_ns: i64,
+    delta_ns: u64,
+}
+
 #[derive(Debug)]
 struct FrameSet {
     left: Vec<FrameInfo>,
@@ -1025,14 +1293,23 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
     right.sort_by_key(|f| f.timestamp_ns);
     depth_frames.sort_by_key(|f| f.timestamp_ns);
 
-    let left_period = compute_period_ns(&left);
-    let gate = left_period.map(|p| p / 4).filter(|p| *p > 0);
-    let deltas = collect_deltas(&left, &right, gate);
-    let delta_stats = build_delta_stats(&deltas);
-    let pairing_window_ns = compute_pairing_window_ns(&deltas, delta_stats.as_ref(), left_period);
-
-    let (entries, paired_count, left_orphans, right_orphans, outside_window) =
-        pair_entries(&left, &right, pairing_window_ns);
+    let topology = match state.manifest_mode {
+        ManifestMode::InferPairs => inferred_manifest_topology(&left, &right),
+        ManifestMode::PreservePairs { pairing_window } => {
+            let recorded_pairs = state
+                .recorded_pairs
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            recorded_manifest_topology(
+                &state.dataset_dir,
+                &left,
+                &right,
+                &recorded_pairs,
+                pairing_window,
+            )?
+        }
+    };
 
     let manifest = Manifest {
         header: ManifestHeader {
@@ -1044,25 +1321,25 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
             height: mono.height,
             fps: mono.fps,
             timebase: "device_ns".to_string(),
-            pairing_policy: "time_symmetric".to_string(),
-            pairing_window_ns,
+            pairing_policy: topology.pairing_policy.to_string(),
+            pairing_window_ns: topology.pairing_window_ns,
         },
         stats: ManifestStats {
-            total_left: left.len() as u64,
-            total_right: right.len() as u64,
-            paired_count,
-            left_orphans,
-            right_orphans,
+            total_left: topology.total_left,
+            total_right: topology.total_right,
+            paired_count: topology.paired_count,
+            left_orphans: topology.left_orphans,
+            right_orphans: topology.right_orphans,
             drops_by_reason: DropStats {
                 spool_full: state.dropped.load(Ordering::Relaxed),
                 write_fail: state.write_failed.load(Ordering::Relaxed),
                 parse_fail,
                 size_mismatch,
-                outside_window,
+                outside_window: topology.outside_window,
             },
-            delta_stats,
+            delta_stats: topology.delta_stats,
         },
-        entries,
+        entries: topology.entries,
     };
 
     let manifest_path = state.dataset_dir.join(format::MANIFEST_FILE);
@@ -1074,6 +1351,108 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
     serde_json::to_writer_pretty(manifest_file, &manifest)
         .map_err(|e| DatasetError::SerializeJson { source: e })?;
     Ok(())
+}
+
+struct ManifestTopology {
+    pairing_policy: &'static str,
+    pairing_window_ns: u64,
+    entries: Vec<ManifestEntry>,
+    total_left: u64,
+    total_right: u64,
+    paired_count: u64,
+    left_orphans: u64,
+    right_orphans: u64,
+    outside_window: u64,
+    delta_stats: Option<DeltaStats>,
+}
+
+fn inferred_manifest_topology(left: &[FrameInfo], right: &[FrameInfo]) -> ManifestTopology {
+    let left_period = compute_period_ns(left);
+    let gate = left_period
+        .map(|period| period / 4)
+        .filter(|period| *period > 0);
+    let deltas = collect_deltas(left, right, gate);
+    let delta_stats = build_delta_stats(&deltas);
+    let pairing_window_ns = compute_pairing_window_ns(&deltas, delta_stats.as_ref(), left_period);
+    let (entries, paired_count, left_orphans, right_orphans, outside_window) =
+        pair_entries(left, right, pairing_window_ns);
+    ManifestTopology {
+        pairing_policy: "time_symmetric",
+        pairing_window_ns,
+        entries,
+        total_left: left.len() as u64,
+        total_right: right.len() as u64,
+        paired_count,
+        left_orphans,
+        right_orphans,
+        outside_window,
+        delta_stats,
+    }
+}
+
+fn recorded_manifest_topology(
+    dataset_dir: &Path,
+    left: &[FrameInfo],
+    right: &[FrameInfo],
+    recorded_pairs: &[RecordedPair],
+    pairing_window: PairingWindowNs,
+) -> Result<ManifestTopology, DatasetError> {
+    let available_left: HashSet<i64> = left.iter().map(|frame| frame.timestamp_ns).collect();
+    let available_right: HashSet<i64> = right.iter().map(|frame| frame.timestamp_ns).collect();
+    for pair in recorded_pairs {
+        for (timestamp_ns, sensor, available) in [
+            (pair.left_timestamp_ns, "mono_left", &available_left),
+            (pair.right_timestamp_ns, "mono_right", &available_right),
+        ] {
+            if !available.contains(&timestamp_ns) {
+                return Err(DatasetError::RecordedPairPayloadMissing {
+                    path: dataset_dir.join(frame_path(timestamp_ns, sensor)),
+                });
+            }
+        }
+    }
+
+    let mut entries: Vec<ManifestEntry> = recorded_pairs
+        .iter()
+        .map(|pair| ManifestEntry {
+            left: manifest_frame_ref(pair.left_timestamp_ns, "mono_left"),
+            pairing: ManifestPairing::Paired {
+                right: manifest_frame_ref(pair.right_timestamp_ns, "mono_right"),
+                delta_ns: pair.delta_ns,
+            },
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.left.timestamp_ns);
+
+    let deltas: Vec<u64> = recorded_pairs.iter().map(|pair| pair.delta_ns).collect();
+    let pair_count = recorded_pairs.len() as u64;
+    Ok(ManifestTopology {
+        pairing_policy: "recorded_pairs",
+        pairing_window_ns: pairing_window.as_ns() as u64,
+        entries,
+        total_left: pair_count,
+        total_right: pair_count,
+        paired_count: pair_count,
+        left_orphans: 0,
+        right_orphans: 0,
+        outside_window: 0,
+        delta_stats: build_delta_stats(&deltas),
+    })
+}
+
+fn manifest_frame_ref(timestamp_ns: i64, sensor: &str) -> ManifestFrameRef {
+    ManifestFrameRef {
+        timestamp_ns,
+        path: frame_path(timestamp_ns, sensor),
+    }
+}
+
+fn frame_path(timestamp_ns: i64, sensor: &str) -> String {
+    format!(
+        "{}/{}",
+        format::FRAMES_DIR,
+        format::frame_name(timestamp_ns, sensor)
+    )
 }
 
 fn read_meta(dataset_dir: &Path) -> Result<Meta, DatasetError> {
@@ -1156,7 +1535,7 @@ fn scan_frames_with_depth(
             }
         };
 
-        let rel_path = format!("{}/{}", format::FRAMES_DIR, filename);
+        let rel_path = frame_path(timestamp_ns, &sensor);
         let info = FrameInfo {
             timestamp_ns,
             path: rel_path,
@@ -1495,6 +1874,19 @@ mod tests {
         .expect("valid frame")
     }
 
+    fn stereo_pair(
+        left_timestamp_ns: i64,
+        right_timestamp_ns: i64,
+        validation_window: PairingWindowNs,
+    ) -> StereoPair {
+        StereoPair::try_new(
+            frame(SensorId::StereoLeft, left_timestamp_ns, 1),
+            frame(SensorId::StereoRight, right_timestamp_ns, 2),
+            validation_window,
+        )
+        .expect("valid stereo pair")
+    }
+
     fn write_exact_pairs(path: &Path, timestamps_ns: &[i64]) {
         let (writer, handle) =
             DatasetWriter::create(path, &meta(), &calibration()).expect("create dataset");
@@ -1574,6 +1966,287 @@ mod tests {
             .expect("one pair")
             .expect("valid pair");
         assert_eq!(pair.timestamp_delta_ns(), 0);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn paired_writer_preserves_capture_pair_identity_instead_of_repairing() {
+        let path = unique_dataset_path("recorded-pair-identity");
+        let window = PairingWindowNs::new(1).expect("valid pairing window");
+        let (writer, handle) = DatasetWriter::create_paired(&path, &meta(), &calibration(), window)
+            .expect("create paired dataset");
+
+        for (left_timestamp_ns, right_timestamp_ns) in [(0, 0), (7, 6), (8, 7)] {
+            assert_eq!(
+                writer.write_pair(stereo_pair(left_timestamp_ns, right_timestamp_ns, window)),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        let stats = handle.finish().expect("finish paired dataset");
+        assert_eq!(stats.frames_enqueued, 6);
+        assert_eq!(stats.frames_written, 6);
+
+        let manifest = read_manifest(&path).expect("read manifest");
+        assert_eq!(manifest.header.pairing_policy, "recorded_pairs");
+        assert_eq!(manifest.header.pairing_window_ns, 1);
+        let manifest_pairs: Vec<(i64, i64)> = manifest
+            .entries
+            .iter()
+            .map(|entry| {
+                let ManifestPairing::Paired { right, .. } = &entry.pairing else {
+                    panic!("recorded pair must remain paired");
+                };
+                (entry.left.timestamp_ns, right.timestamp_ns)
+            })
+            .collect();
+        assert_eq!(manifest_pairs, [(0, 0), (7, 6), (8, 7)]);
+
+        let mut reader = DatasetReader::open(&path).expect("open paired dataset");
+        let replayed_pairs: Vec<(i64, i64)> = reader
+            .pairs()
+            .map(|pair| {
+                let pair = pair.expect("read recorded pair");
+                (
+                    pair.left().timestamp().as_nanos(),
+                    pair.right().timestamp().as_nanos(),
+                )
+            })
+            .collect();
+        assert_eq!(replayed_pairs, manifest_pairs);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn paired_writer_rejects_a_pair_outside_its_declared_window() {
+        let path = unique_dataset_path("recorded-pair-window");
+        let exact_window = PairingWindowNs::new(0).expect("valid exact window");
+        let wider_window = PairingWindowNs::new(1).expect("valid wider window");
+        let (writer, handle) =
+            DatasetWriter::create_paired(&path, &meta(), &calibration(), exact_window)
+                .expect("create paired dataset");
+
+        assert_eq!(
+            writer.write_pair(stereo_pair(0, 1, wider_window)),
+            WriteOutcome::WriterFailed
+        );
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("writer window must be enforced"),
+            DatasetError::PairOutsideWriterWindow {
+                delta_ns: 1,
+                max_delta_ns: 0
+            }
+        ));
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn paired_writer_rejects_a_queue_that_cannot_hold_an_atomic_pair() {
+        let path = unique_dataset_path("recorded-pair-capacity");
+        let window = PairingWindowNs::new(0).expect("valid exact window");
+        let config = DatasetWriterConfig {
+            max_spool_frames: 1,
+            max_spool_bytes: 64,
+            flush_batch_frames: 1,
+            backpressure: Backpressure::Block,
+        };
+        let result = DatasetWriter::create_paired_with_config(
+            &path,
+            &meta(),
+            &calibration(),
+            window,
+            config,
+        );
+        assert!(matches!(
+            result.expect_err("undersized queue must fail before creating the dataset"),
+            DatasetError::InvalidConfig {
+                msg: "paired writer max_spool_frames must be >= 2"
+            }
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn paired_writer_drop_newest_never_admits_only_one_side() {
+        let window = PairingWindowNs::new(0).expect("valid exact window");
+        for (max_spool_frames, max_spool_bytes) in [(2, 12), (4, 11)] {
+            let config = DatasetWriterConfig {
+                max_spool_frames,
+                max_spool_bytes,
+                flush_batch_frames: 1,
+                backpressure: Backpressure::DropNewest,
+            };
+            let state = Arc::new(WriterState::new(
+                config,
+                PathBuf::new(),
+                PathBuf::new(),
+                ManifestMode::PreservePairs {
+                    pairing_window: window,
+                },
+            ));
+            {
+                let mut spool = state.spool.lock().expect("lock spool");
+                spool
+                    .queue
+                    .push_back(SpoolItem::Mono(frame(SensorId::StereoLeft, 10, 1)));
+                spool.frames = 1;
+                spool.bytes = 4;
+            }
+            state.enqueued.store(1, Ordering::Relaxed);
+            state.bytes_enqueued.store(4, Ordering::Relaxed);
+            state.spool_frames.store(1, Ordering::Relaxed);
+            state.spool_bytes.store(4, Ordering::Relaxed);
+            let writer = PairedDatasetWriter {
+                inner: DatasetWriter {
+                    config,
+                    state: Arc::clone(&state),
+                },
+                pairing_window: window,
+            };
+
+            assert_eq!(
+                writer.write_pair(stereo_pair(11, 11, window)),
+                WriteOutcome::Dropped
+            );
+            let stats = writer.stats();
+            assert_eq!(stats.frames_enqueued, 1);
+            assert_eq!(stats.bytes_enqueued, 4);
+            assert_eq!(stats.frames_dropped, 2);
+            assert_eq!(stats.bytes_dropped, 8);
+            let spool = state.spool.lock().expect("lock spool");
+            assert_eq!(spool.queue.len(), 1);
+            assert_eq!(spool.frames, 1);
+            assert_eq!(spool.bytes, 4);
+        }
+    }
+
+    #[test]
+    fn pending_writer_stats_exclude_completed_failures_but_not_rejected_work() {
+        let stats = WriterStats {
+            frames_enqueued: 8,
+            frames_written: 2,
+            frames_dropped: 20,
+            bytes_enqueued: 32,
+            bytes_written: 8,
+            bytes_dropped: 80,
+            write_failed: 2,
+            bytes_write_failed: 8,
+            frames_canceled: 2,
+            bytes_canceled: 8,
+            spool_frames: 2,
+            spool_bytes: 8,
+            spool_max_frames: 64,
+            spool_max_bytes: 1024,
+            writer_failed: true,
+        };
+
+        assert_eq!(stats.frames_pending(), 2);
+        assert_eq!(stats.bytes_pending(), 8);
+    }
+
+    #[test]
+    fn writer_failure_cancels_the_rest_of_its_batch_and_queue() {
+        let path = unique_dataset_path("writer-failure-cancels-unwritten");
+        let frames_dir = path.join(format::FRAMES_DIR);
+        std::fs::create_dir_all(&frames_dir).expect("create frames directory");
+        let failed_path = frames_dir.join(format::frame_name(11, "mono_left"));
+        std::fs::write(&failed_path, [9_u8; 4]).expect("occupy first payload path");
+
+        let config = DatasetWriterConfig {
+            max_spool_frames: 3,
+            max_spool_bytes: 12,
+            flush_batch_frames: 2,
+            backpressure: Backpressure::Block,
+        };
+        let state = Arc::new(WriterState::new(
+            config,
+            path.clone(),
+            frames_dir.clone(),
+            ManifestMode::InferPairs,
+        ));
+        {
+            let mut spool = state.spool.lock().expect("lock spool");
+            spool.queue.extend([
+                SpoolItem::Mono(frame(SensorId::StereoLeft, 11, 1)),
+                SpoolItem::Mono(frame(SensorId::StereoRight, 12, 2)),
+                SpoolItem::Mono(frame(SensorId::StereoLeft, 13, 3)),
+            ]);
+            spool.frames = 3;
+            spool.bytes = 12;
+            spool.closed = true;
+        }
+        state.enqueued.store(3, Ordering::Relaxed);
+        state.bytes_enqueued.store(12, Ordering::Relaxed);
+        state.spool_frames.store(3, Ordering::Relaxed);
+        state.spool_bytes.store(12, Ordering::Relaxed);
+
+        writer_loop(frames_dir.clone(), Arc::clone(&state));
+
+        let stats = state.stats();
+        assert_eq!(stats.write_failed, 1);
+        assert_eq!(stats.bytes_write_failed, 4);
+        assert_eq!(stats.frames_canceled, 2);
+        assert_eq!(stats.bytes_canceled, 8);
+        assert_eq!(stats.frames_pending(), 0);
+        assert_eq!(stats.bytes_pending(), 0);
+        assert_eq!(stats.spool_frames, 0);
+        assert_eq!(stats.spool_bytes, 0);
+        assert!(
+            !frames_dir
+                .join(format::frame_name(12, "mono_right"))
+                .exists()
+        );
+        assert!(
+            !frames_dir
+                .join(format::frame_name(13, "mono_left"))
+                .exists()
+        );
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn second_pair_payload_failure_never_publishes_a_half_pair() {
+        let path = unique_dataset_path("recorded-pair-second-write-failure");
+        let window = PairingWindowNs::new(0).expect("valid exact window");
+        let (writer, handle) = DatasetWriter::create_paired(&path, &meta(), &calibration(), window)
+            .expect("create paired dataset");
+        let right_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(11, "mono_right"));
+        std::fs::write(&right_path, [9_u8; 4]).expect("occupy right payload path");
+
+        assert_eq!(
+            writer.write_pair(stereo_pair(11, 11, window)),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        let state = Arc::clone(&handle.state);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("second create_new write must fail"),
+            DatasetError::WriteFile { path: failed_path, .. } if failed_path == right_path
+        ));
+        let stats = state.stats();
+        assert_eq!(stats.write_failed, 2);
+        assert_eq!(stats.bytes_write_failed, 8);
+        assert_eq!(stats.frames_canceled, 0);
+        assert_eq!(stats.bytes_canceled, 0);
+        assert_eq!(stats.frames_pending(), 0);
+        assert_eq!(stats.bytes_pending(), 0);
+
+        assert!(
+            !path.join(format::MANIFEST_FILE).exists(),
+            "a failed pair transaction must not publish a completion manifest"
+        );
+        assert!(
+            path.join(format::FRAMES_DIR)
+                .join(format::frame_name(11, "mono_left"))
+                .exists(),
+            "the first payload may remain as an explicitly unreferenced partial write"
+        );
         std::fs::remove_dir_all(path).expect("remove test directory");
     }
 
