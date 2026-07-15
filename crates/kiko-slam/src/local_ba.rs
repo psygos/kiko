@@ -37,6 +37,8 @@ const MIN_SCALE_ANCHOR_DISTANCE_M: f32 = 1e-6;
 #[derive(Clone, Copy, Debug)]
 pub struct LocalBaConfig {
     window: NonZeroUsize,
+    pose_dimension: usize,
+    normal_matrix_len: usize,
     max_iterations: NonZeroUsize,
     min_observations: NonZeroUsize,
     huber_delta_px: f32,
@@ -258,6 +260,7 @@ impl LmState {
 #[derive(Debug)]
 pub enum LocalBaConfigError {
     ZeroWindow,
+    WindowTooLarge { value: usize },
     ZeroIterations,
     ZeroObservations,
     TooFewObservations { min: usize },
@@ -272,6 +275,10 @@ impl std::fmt::Display for LocalBaConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LocalBaConfigError::ZeroWindow => write!(f, "local BA window must be > 0"),
+            LocalBaConfigError::WindowTooLarge { value } => write!(
+                f,
+                "local BA window {value} is too large for a 6-DoF normal matrix"
+            ),
             LocalBaConfigError::ZeroIterations => write!(f, "local BA iterations must be > 0"),
             LocalBaConfigError::ZeroObservations => {
                 write!(f, "local BA min observations must be > 0")
@@ -313,6 +320,18 @@ impl LocalBaConfig {
         motion_prior_weight: f32,
     ) -> Result<Self, LocalBaConfigError> {
         let window = NonZeroUsize::new(window).ok_or(LocalBaConfigError::ZeroWindow)?;
+        let pose_dimension =
+            window
+                .get()
+                .checked_mul(6)
+                .ok_or(LocalBaConfigError::WindowTooLarge {
+                    value: window.get(),
+                })?;
+        let normal_matrix_len = pose_dimension.checked_mul(pose_dimension).ok_or(
+            LocalBaConfigError::WindowTooLarge {
+                value: window.get(),
+            },
+        )?;
         let max_iterations =
             NonZeroUsize::new(max_iterations).ok_or(LocalBaConfigError::ZeroIterations)?;
         let min_observations =
@@ -351,6 +370,8 @@ impl LocalBaConfig {
         }
         Ok(Self {
             window,
+            pose_dimension,
+            normal_matrix_len,
             max_iterations,
             min_observations,
             huber_delta_px,
@@ -362,6 +383,14 @@ impl LocalBaConfig {
 
     pub fn window(&self) -> usize {
         self.window.get()
+    }
+
+    fn pose_dimension(&self) -> usize {
+        self.pose_dimension
+    }
+
+    fn normal_matrix_len(&self) -> usize {
+        self.normal_matrix_len
     }
 
     pub fn max_iterations(&self) -> usize {
@@ -883,9 +912,8 @@ pub struct LocalBundleAdjuster {
 
 impl LocalBundleAdjuster {
     pub fn new(intrinsics: PinholeIntrinsics, config: LocalBaConfig) -> Self {
-        let dim = config.window().saturating_mul(6);
-        let a_buf = vec![0.0_f32; dim * dim];
-        let b_buf = vec![0.0_f32; dim];
+        let a_buf = vec![0.0_f32; config.normal_matrix_len()];
+        let b_buf = vec![0.0_f32; config.pose_dimension()];
         Self {
             config,
             intrinsics,
@@ -2076,6 +2104,10 @@ mod tests {
         assert!(matches!(
             LocalBaConfig::new(0, 10, 4, 1.0, lm(1e-3), 0.0),
             Err(LocalBaConfigError::ZeroWindow)
+        ));
+        assert!(matches!(
+            LocalBaConfig::new(usize::MAX, 10, 4, 1.0, lm(1e-3), 0.0),
+            Err(LocalBaConfigError::WindowTooLarge { value: usize::MAX })
         ));
         assert!(matches!(
             LocalBaConfig::new(5, 0, 4, 1.0, lm(1e-3), 0.0),
