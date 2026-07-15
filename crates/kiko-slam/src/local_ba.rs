@@ -364,6 +364,7 @@ pub enum DegenerateReason {
     TooFewLandmarks { count: usize },
     NoFactors,
     InvalidProjection,
+    NumericalFailure,
     InvariantViolation,
 }
 
@@ -1047,13 +1048,13 @@ impl LocalBundleAdjuster {
         let huber = self.config.huber_delta_px();
         let motion_weight = self.config.motion_prior_weight();
         let lm_config = self.config.lm();
-        let mut final_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
-        if !final_cost.is_finite() {
+        let initial_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
+        if !initial_cost.is_finite() {
             return BaResult::Degenerate {
                 reason: DegenerateReason::InvalidProjection,
             };
         }
-        let mut lm_state = LmState::new(lm_config, final_cost);
+        let mut lm_state = LmState::new(lm_config, initial_cost);
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
         let mut landmark_backup: Vec<Point3> = Vec::with_capacity(landmark_count);
@@ -1154,9 +1155,8 @@ impl LocalBundleAdjuster {
                     c_row[i] += landmark_damping;
                 }
                 let Some(inv_c) = invert_3x3(c) else {
-                    return BaResult::MaxIterations {
-                        iterations: iter + 1,
-                        final_cost,
+                    return BaResult::Degenerate {
+                        reason: DegenerateReason::NumericalFailure,
                     };
                 };
 
@@ -1189,9 +1189,8 @@ impl LocalBundleAdjuster {
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
 
             if !solve_linear_system(s, rhs, pose_dim) {
-                return BaResult::MaxIterations {
-                    iterations: iter + 1,
-                    final_cost: lm_state.prev_cost(),
+                return BaResult::Degenerate {
+                    reason: DegenerateReason::NumericalFailure,
                 };
             }
 
@@ -1241,16 +1240,21 @@ impl LocalBundleAdjuster {
 
             let candidate_cost = full_problem_cost(problem, self.intrinsics, huber, motion_weight);
             let prev_cost = lm_state.prev_cost();
+            if max_step == 0.0 && candidate_cost.is_finite() && candidate_cost == prev_cost {
+                return BaResult::Converged {
+                    iterations: iter + 1,
+                    final_cost: candidate_cost,
+                };
+            }
             match lm_state.step(candidate_cost, predicted_decrease, lm_config) {
                 LmAction::Accept => {
-                    final_cost = candidate_cost;
                     let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
                     if max_step < STEP_CONVERGENCE_THRESHOLD
                         || (prev_cost - candidate_cost).abs() <= threshold
                     {
                         return BaResult::Converged {
                             iterations: iter + 1,
-                            final_cost,
+                            final_cost: candidate_cost,
                         };
                     }
                 }
@@ -1267,7 +1271,6 @@ impl LocalBundleAdjuster {
                     {
                         landmark_var.position = point;
                     }
-                    final_cost = prev_cost;
                 }
             }
         }
@@ -2214,6 +2217,121 @@ mod tests {
                 reason: DegenerateReason::NoFactors
             }
         ));
+    }
+
+    #[test]
+    fn optimize_full_reports_numerical_failure_for_noninvertible_landmark_block() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, f32::MAX, 1.0, 0.0, 0.0).expect("finite intrinsics");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: Point3::new(0.0, 0.0, 1.0),
+            }],
+            factors: vec![ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(1)),
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 0.0, y: 0.0 },
+            }],
+            scale_anchor: None,
+        };
+
+        assert_eq!(
+            ba.optimize_full(&mut problem),
+            BaResult::Degenerate {
+                reason: DegenerateReason::NumericalFailure
+            }
+        );
+    }
+
+    #[test]
+    fn optimize_full_reports_numerical_failure_for_singular_pose_system() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let lm = LmConfig::new(1e-12, 10.0, 1e-12, 1e4, 0.25, 0.75).expect("valid LM");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm, 0.0).expect("valid config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let point = Point3::new(0.0, 0.0, 2.0);
+        let pixel = project_pixel(Pose::identity(), point, intrinsics);
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: Pose::identity(),
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: point,
+            }],
+            factors: vec![ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(0)),
+                landmark: LandmarkVarIndex(0),
+                pixel,
+            }],
+            scale_anchor: None,
+        };
+
+        assert_eq!(
+            ba.optimize_full(&mut problem),
+            BaResult::Degenerate {
+                reason: DegenerateReason::NumericalFailure
+            }
+        );
+    }
+
+    #[test]
+    fn optimize_full_converges_at_exact_stationary_solution() {
+        let (mut map, intrinsics, kf_0, kf_1, _, points_true) = build_full_ba_fixture([0.0; 6]);
+        for (index, point) in points_true.into_iter().enumerate() {
+            let keypoint = map
+                .keyframe_keypoint(kf_0, index)
+                .expect("keyframe keypoint");
+            let point_id = map
+                .map_point_for_keypoint(keypoint)
+                .expect("map lookup")
+                .expect("map point");
+            map.set_map_point_position(point_id, point)
+                .expect("set exact landmark");
+        }
+
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let mut problem = FullBaProblem::try_from_map(
+            &map,
+            &[kf_0, kf_1],
+            ba.window_size(),
+            ba.min_observations(),
+        )
+        .expect("full BA problem");
+        assert_eq!(
+            full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0),
+            0.0
+        );
+
+        assert_eq!(
+            ba.optimize_full(&mut problem),
+            BaResult::Converged {
+                iterations: 1,
+                final_cost: 0.0
+            }
+        );
     }
 
     #[test]
