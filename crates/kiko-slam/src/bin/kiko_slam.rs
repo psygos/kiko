@@ -3,13 +3,13 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use kiko_slam::dataset::DatasetReader;
+use kiko_slam::dataset::{DatasetError, DatasetReader};
 use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
 use kiko_slam::{
     BackendConfig, DenseCommand, DepthImage, DownscaleFactor, GlobalDescriptorConfig,
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
-    LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, RansacConfig,
-    RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy,
+    LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, PipelineError,
+    RansacConfig, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy,
     RelocalizationConfig, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
     TriangulationError, Triangulator, VizDecimation, VizPacket,
 };
@@ -129,6 +129,50 @@ struct BenchArgs {
     inference: InferenceArgs,
     #[command(flatten)]
     dataset: DatasetArgs,
+}
+
+#[derive(Debug)]
+enum BenchError {
+    Dataset(DatasetError),
+    Pipeline(PipelineError),
+    NoPairsProcessed,
+    NoNonzeroMatches,
+}
+
+impl std::fmt::Display for BenchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dataset(source) => write!(f, "benchmark dataset failure: {source}"),
+            Self::Pipeline(source) => write!(f, "benchmark pipeline failure: {source}"),
+            Self::NoPairsProcessed => write!(f, "benchmark processed no stereo pairs"),
+            Self::NoNonzeroMatches => write!(
+                f,
+                "benchmark produced no nonzero matches; check the models and dataset"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BenchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Dataset(source) => Some(source),
+            Self::Pipeline(source) => Some(source),
+            Self::NoPairsProcessed | Self::NoNonzeroMatches => None,
+        }
+    }
+}
+
+impl From<DatasetError> for BenchError {
+    fn from(source: DatasetError) -> Self {
+        Self::Dataset(source)
+    }
+}
+
+impl From<PipelineError> for BenchError {
+    fn from(source: PipelineError) -> Self {
+        Self::Pipeline(source)
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -965,7 +1009,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let dataset_path = &args.dataset.path;
     let open_start = Instant::now();
-    let mut reader = DatasetReader::open(dataset_path)?;
+    let mut reader = DatasetReader::open(dataset_path).map_err(BenchError::from)?;
     let open_time = open_start.elapsed();
 
     let stats_start = Instant::now();
@@ -994,9 +1038,6 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut processed = 0usize;
     let mut matches_nonzero = 0usize;
     let mut total_matches = 0usize;
-    let mut read_errors = 0usize;
-    let mut pairing_errors = 0usize;
-    let mut inference_errors = 0usize;
     let mut sum_read_left = Duration::ZERO;
     let mut sum_read_right = Duration::ZERO;
     let mut sum_pairing = Duration::ZERO;
@@ -1008,43 +1049,26 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
     for sample in reader.timed_pairs() {
-        let sample = match sample {
-            Ok(sample) => sample,
-            Err(err) => {
-                match err {
-                    kiko_slam::dataset::DatasetError::PairingFailed { .. } => {
-                        pairing_errors += 1;
-                    }
-                    _ => read_errors += 1,
-                }
-                eprintln!("read error: {err}");
-                continue;
-            }
-        };
+        let sample = sample.map_err(BenchError::from)?;
         let pair = sample.pair;
         sum_read_left += sample.timings.left_read;
         sum_read_right += sample.timings.right_read;
         sum_pairing += sample.timings.pairing;
         sum_read_bytes += sample.timings.left_bytes + sample.timings.right_bytes;
 
-        match pipeline.process_pair_timed(pair) {
-            Ok((packet, timings)) => {
-                let matches = packet.matches();
-                if !matches.is_empty() {
-                    matches_nonzero += 1;
-                    total_matches += matches.len();
-                }
-                sum_sp_left += timings.superpoint_left;
-                sum_sp_right += timings.superpoint_right;
-                sum_lightglue += timings.lightglue;
-                sum_total += timings.total;
-                processed += 1;
-            }
-            Err(err) => {
-                inference_errors += 1;
-                eprintln!("inference error: {err}");
-            }
+        let (packet, timings) = pipeline
+            .process_pair_timed(pair)
+            .map_err(BenchError::from)?;
+        let matches = packet.matches();
+        if !matches.is_empty() {
+            matches_nonzero += 1;
+            total_matches += matches.len();
         }
+        sum_sp_left += timings.superpoint_left;
+        sum_sp_right += timings.superpoint_right;
+        sum_lightglue += timings.lightglue;
+        sum_total += timings.total;
+        processed += 1;
 
         if let Some(limit) = args.dataset.max_pairs
             && processed >= limit
@@ -1097,8 +1121,6 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "matching: nonzero_pairs={matches_nonzero}, match_rate={match_rate:.2} avg_matches={avg_matches:.1}"
     );
-    eprintln!("errors: read={read_errors} pairing={pairing_errors} inference={inference_errors}");
-
     if processed > 0 {
         let denom = processed as f64;
         let avg_sp_left_ms = (sum_sp_left.as_secs_f64() * 1000.0) / denom;
@@ -1142,13 +1164,10 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if processed == 0 {
-        return Err("no paired frames processed".into());
+        return Err(BenchError::NoPairsProcessed.into());
     }
     if matches_nonzero == 0 {
-        return Err("no nonzero matches; check models/data".into());
-    }
-    if inference_errors > 0 {
-        return Err("inference errors encountered during run".into());
+        return Err(BenchError::NoNonzeroMatches.into());
     }
 
     Ok(())
@@ -2196,7 +2215,9 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_ba_config;
+    use super::{BenchError, build_ba_config};
+    use kiko_slam::dataset::DatasetError;
+    use kiko_slam::{InferenceError, PipelineError};
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 
@@ -2211,6 +2232,31 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn benchmark_errors_preserve_dataset_and_pipeline_sources() {
+        let dataset = BenchError::from(DatasetError::InvalidManifest {
+            reason: "test manifest failure",
+        });
+        assert!(matches!(&dataset, BenchError::Dataset(_)));
+        assert!(
+            std::error::Error::source(&dataset)
+                .and_then(|source| source.downcast_ref::<DatasetError>())
+                .is_some()
+        );
+
+        let pipeline = BenchError::from(PipelineError::Inference(
+            InferenceError::InvariantViolation {
+                context: "test pipeline failure",
+            },
+        ));
+        assert!(matches!(&pipeline, BenchError::Pipeline(_)));
+        assert!(
+            std::error::Error::source(&pipeline)
+                .and_then(|source| source.downcast_ref::<PipelineError>())
+                .is_some()
+        );
     }
 
     fn set_env(key: &str, value: &str) {
