@@ -17,7 +17,7 @@ clap = { version = "4.5.28", features = ["derive", "env"] }
 crossbeam-channel = "0.5.13"
 libc = "0.2.153"
 ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
-rerun = "=0.27.2"
+rerun = { version = "=0.27.2", default-features = false, features = ["sdk", "server"] }
 re_arrow_util = "=0.27.3"
 re_log_encoding = "=0.27.3"
 serde = "1.0.228"
