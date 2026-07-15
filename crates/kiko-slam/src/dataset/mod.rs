@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, PairingWindowNs, SensorId, StereoPair};
+use crate::{DepthImage, Frame, FrameDimensions, PairingWindowNs, SensorId, StereoPair};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -81,6 +82,223 @@ pub struct CameraIntrinsics {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct MonoImageContract {
+    dimensions: FrameDimensions,
+    nominal_fps_hz: NonZeroU32,
+}
+
+impl MonoImageContract {
+    fn parse(meta: &Meta, calibration: &Calibration) -> Result<Self, DatasetError> {
+        let mono = meta.mono.as_ref().ok_or(DatasetError::MissingMonoConfig)?;
+        let dimensions = parse_image_dimensions("meta.mono", mono.width, mono.height)?;
+        let nominal_fps_hz = NonZeroU32::new(mono.fps).ok_or(DatasetError::InvalidNominalFps {
+            field: "meta.mono.fps",
+            value: mono.fps,
+        })?;
+        let contract = Self {
+            dimensions,
+            nominal_fps_hz,
+        };
+        contract.require_dimensions(
+            "calibration.left",
+            parse_image_dimensions(
+                "calibration.left",
+                calibration.left.width,
+                calibration.left.height,
+            )?,
+        )?;
+        contract.require_dimensions(
+            "calibration.right",
+            parse_image_dimensions(
+                "calibration.right",
+                calibration.right.width,
+                calibration.right.height,
+            )?,
+        )?;
+        crate::PinholeIntrinsics::try_from(&calibration.left).map_err(|source| {
+            DatasetError::InvalidCameraIntrinsics {
+                field: "calibration.left",
+                source,
+            }
+        })?;
+        crate::PinholeIntrinsics::try_from(&calibration.right).map_err(|source| {
+            DatasetError::InvalidCameraIntrinsics {
+                field: "calibration.right",
+                source,
+            }
+        })?;
+        if !calibration.baseline_m.is_finite() || calibration.baseline_m <= 0.0 {
+            return Err(DatasetError::InvalidStereoBaseline {
+                baseline_m: calibration.baseline_m,
+            });
+        }
+        Ok(contract)
+    }
+
+    fn dimensions(self) -> FrameDimensions {
+        self.dimensions
+    }
+
+    fn nominal_fps_hz(self) -> NonZeroU32 {
+        self.nominal_fps_hz
+    }
+
+    fn require_dimensions(
+        self,
+        field: &'static str,
+        actual: FrameDimensions,
+    ) -> Result<(), DatasetError> {
+        if actual != self.dimensions {
+            return Err(DatasetError::ImageDimensionsMismatch {
+                expected_field: "meta.mono",
+                expected: self.dimensions,
+                actual_field: field,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn require_frame(self, frame: &Frame) -> Result<(), DatasetWriteError> {
+        let actual = frame.dimensions();
+        if actual != self.dimensions {
+            return Err(DatasetWriteError::FrameDimensionsMismatch {
+                sensor: frame.sensor_id(),
+                expected: self.dimensions,
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DepthPayloadFormat {
+    F32MetersLe,
+}
+
+impl DepthPayloadFormat {
+    fn parse(value: &str) -> Result<Self, DatasetError> {
+        match value {
+            "f32_meters_le" => Ok(Self::F32MetersLe),
+            _ => Err(DatasetError::UnsupportedDepthEncoding {
+                value: value.to_string(),
+            }),
+        }
+    }
+
+    fn bytes_per_sample(self) -> usize {
+        match self {
+            Self::F32MetersLe => std::mem::size_of::<f32>(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepthImageContract {
+    dimensions: FrameDimensions,
+    _nominal_fps_hz: NonZeroU32,
+    _payload_format: DepthPayloadFormat,
+    expected_payload_len: u64,
+}
+
+impl DepthImageContract {
+    fn parse(meta: &DepthMeta) -> Result<Self, DatasetError> {
+        let dimensions = parse_image_dimensions("meta.depth", meta.width, meta.height)?;
+        let nominal_fps_hz = NonZeroU32::new(meta.fps).ok_or(DatasetError::InvalidNominalFps {
+            field: "meta.depth.fps",
+            value: meta.fps,
+        })?;
+        let payload_format = DepthPayloadFormat::parse(&meta.encoding)?;
+        let expected_payload_len = dimensions
+            .area()
+            .checked_mul(payload_format.bytes_per_sample())
+            .and_then(|len| u64::try_from(len).ok())
+            .ok_or(DatasetError::DepthPayloadSizeOverflow { dimensions })?;
+        Ok(Self {
+            dimensions,
+            _nominal_fps_hz: nominal_fps_hz,
+            _payload_format: payload_format,
+            expected_payload_len,
+        })
+    }
+
+    fn require_image(self, depth: &DepthImage) -> Result<(), DatasetWriteError> {
+        let actual = depth.dimensions();
+        if actual != self.dimensions {
+            return Err(DatasetWriteError::DepthDimensionsMismatch {
+                expected: self.dimensions,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn expected_payload_len(self) -> u64 {
+        self.expected_payload_len
+    }
+}
+
+fn parse_image_dimensions(
+    field: &'static str,
+    width: u32,
+    height: u32,
+) -> Result<FrameDimensions, DatasetError> {
+    FrameDimensions::try_new(width, height)
+        .map_err(|source| DatasetError::InvalidFrameDimensions { field, source })
+}
+
+#[derive(Clone, Debug)]
+struct WriterDatasetContract {
+    created_at: String,
+    device: String,
+    mono: MonoImageContract,
+    depth: Option<DepthImageContract>,
+}
+
+impl WriterDatasetContract {
+    fn parse(meta: &Meta, calibration: &Calibration) -> Result<Self, DatasetError> {
+        Ok(Self {
+            created_at: meta.created.clone(),
+            device: meta.device.clone(),
+            mono: MonoImageContract::parse(meta, calibration)?,
+            depth: meta
+                .depth
+                .as_ref()
+                .map(DepthImageContract::parse)
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WriterSidecars {
+    meta_json: Vec<u8>,
+    calibration_json: Vec<u8>,
+}
+
+impl WriterSidecars {
+    fn require_unchanged(&self, dataset_dir: &Path) -> Result<(), DatasetError> {
+        self.require_file(dataset_dir.join(format::META_FILE), &self.meta_json)?;
+        self.require_file(
+            dataset_dir.join(format::CALIBRATION_FILE),
+            &self.calibration_json,
+        )
+    }
+
+    fn require_file(&self, path: PathBuf, expected: &[u8]) -> Result<(), DatasetError> {
+        let actual = std::fs::read(&path).map_err(|source| DatasetError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        if actual != expected {
+            return Err(DatasetError::SidecarChanged { path });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Backpressure {
     DropNewest,
@@ -89,7 +307,9 @@ pub enum Backpressure {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DatasetWriterConfig {
+    /// Maximum accepted logical frames retained across the queue and in-flight batch.
     pub max_spool_frames: usize,
+    /// Maximum accepted payload bytes retained across the queue and in-flight batch.
     pub max_spool_bytes: usize,
     pub flush_batch_frames: usize,
     pub backpressure: Backpressure,
@@ -113,6 +333,90 @@ pub enum WriteOutcome {
     WriterFailed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DatasetWriteError {
+    FrameDimensionsMismatch {
+        sensor: SensorId,
+        expected: FrameDimensions,
+        actual: FrameDimensions,
+    },
+    DepthStreamNotConfigured,
+    DepthDimensionsMismatch {
+        expected: FrameDimensions,
+        actual: FrameDimensions,
+    },
+    PairOutsideWriterWindow {
+        delta_ns: u64,
+        max_delta_ns: u64,
+    },
+    SpoolFrameCapacityExceeded {
+        item: &'static str,
+        frames: usize,
+        max_frames: usize,
+    },
+    SpoolByteCapacityExceeded {
+        item: &'static str,
+        bytes: usize,
+        max_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for DatasetWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FrameDimensionsMismatch {
+                sensor,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "dataset {:?} frame dimensions must be {}x{}, got {}x{}",
+                sensor,
+                expected.width(),
+                expected.height(),
+                actual.width(),
+                actual.height()
+            ),
+            Self::DepthStreamNotConfigured => {
+                write!(f, "dataset metadata does not configure a depth stream")
+            }
+            Self::DepthDimensionsMismatch { expected, actual } => write!(
+                f,
+                "dataset depth image dimensions must be {}x{}, got {}x{}",
+                expected.width(),
+                expected.height(),
+                actual.width(),
+                actual.height()
+            ),
+            Self::PairOutsideWriterWindow {
+                delta_ns,
+                max_delta_ns,
+            } => write!(
+                f,
+                "stereo pair delta {delta_ns}ns exceeds the dataset writer window {max_delta_ns}ns"
+            ),
+            Self::SpoolFrameCapacityExceeded {
+                item,
+                frames,
+                max_frames,
+            } => write!(
+                f,
+                "dataset {item} requires {frames} spool frame slots, but the configured maximum is {max_frames}"
+            ),
+            Self::SpoolByteCapacityExceeded {
+                item,
+                bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "dataset {item} requires {bytes} spool bytes, but the configured maximum is {max_bytes}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DatasetWriteError {}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WriterStats {
     pub frames_enqueued: u64,
@@ -129,7 +433,9 @@ pub struct WriterStats {
     pub frames_canceled: u64,
     /// Accepted bytes that were canceled after another write transaction failed.
     pub bytes_canceled: u64,
+    /// Accepted logical frames still queued or being written.
     pub spool_frames: u64,
+    /// Accepted payload bytes still queued or being written.
     pub spool_bytes: u64,
     pub spool_max_frames: u64,
     pub spool_max_bytes: u64,
@@ -180,7 +486,37 @@ pub enum DatasetError {
     },
     MissingMonoConfig,
     InvalidFrameDimensions {
+        field: &'static str,
         source: crate::FrameError,
+    },
+    InvalidNominalFps {
+        field: &'static str,
+        value: u32,
+    },
+    ImageDimensionsMismatch {
+        expected_field: &'static str,
+        expected: FrameDimensions,
+        actual_field: &'static str,
+        actual: FrameDimensions,
+    },
+    InvalidCameraIntrinsics {
+        field: &'static str,
+        source: crate::IntrinsicsError,
+    },
+    InvalidStereoBaseline {
+        baseline_m: f32,
+    },
+    UnsupportedDepthEncoding {
+        value: String,
+    },
+    DepthPayloadSizeOverflow {
+        dimensions: FrameDimensions,
+    },
+    SidecarChanged {
+        path: PathBuf,
+    },
+    WriteContract {
+        source: DatasetWriteError,
     },
     InvalidFrameFileType {
         path: PathBuf,
@@ -197,10 +533,40 @@ pub enum DatasetError {
     InvalidManifest {
         reason: &'static str,
     },
+    UnsupportedManifestValue {
+        field: &'static str,
+        value: String,
+    },
+    NominalFpsMismatch {
+        expected_field: &'static str,
+        expected: u32,
+        actual_field: &'static str,
+        actual: u32,
+    },
+    ManifestMetadataMismatch {
+        expected_field: &'static str,
+        expected: String,
+        actual_field: &'static str,
+        actual: String,
+    },
+    ManifestPairingWindowOutOfRange {
+        value: u64,
+    },
+    RecordedPairsDeclareOrphans {
+        left_orphans: u64,
+        right_orphans: u64,
+    },
+    RecordedPairsContainMissingRight {
+        left_timestamp_ns: i64,
+    },
     InvalidManifestStats {
         field: &'static str,
         declared: u64,
         derived: u64,
+    },
+    ManifestDeltaStatsPresenceMismatch {
+        declared: bool,
+        derived: bool,
     },
     ManifestFrameIdentityMismatch {
         declared: String,
@@ -229,12 +595,10 @@ pub enum DatasetError {
         field: &'static str,
         value: u64,
     },
-    PairOutsideWriterWindow {
-        delta_ns: u64,
-        max_delta_ns: u64,
-    },
-    RecordedPairPayloadMissing {
-        path: PathBuf,
+    PublishManifest {
+        temporary_path: PathBuf,
+        manifest_path: PathBuf,
+        source: std::io::Error,
     },
     ThreadSpawn {
         source: std::io::Error,
@@ -244,9 +608,11 @@ pub enum DatasetError {
         source: std::io::Error,
     },
     SerializeJson {
+        document: &'static str,
         source: serde_json::Error,
     },
     DeserializeJson {
+        path: PathBuf,
         source: serde_json::Error,
     },
     WorkerJoin {
@@ -286,8 +652,52 @@ impl std::fmt::Display for DatasetError {
                     "dataset metadata is missing the mono camera configuration"
                 )
             }
-            DatasetError::InvalidFrameDimensions { source } => {
-                write!(f, "invalid dataset frame dimensions: {source}")
+            DatasetError::InvalidFrameDimensions { field, source } => {
+                write!(f, "invalid dataset image dimensions in {field}: {source}")
+            }
+            DatasetError::InvalidNominalFps { field, value } => {
+                write!(
+                    f,
+                    "dataset nominal frame rate {field} must be nonzero, got {value}"
+                )
+            }
+            DatasetError::ImageDimensionsMismatch {
+                expected_field,
+                expected,
+                actual_field,
+                actual,
+            } => write!(
+                f,
+                "dataset image dimensions disagree: {expected_field}={}x{}, {actual_field}={}x{}",
+                expected.width(),
+                expected.height(),
+                actual.width(),
+                actual.height()
+            ),
+            DatasetError::InvalidCameraIntrinsics { field, source } => {
+                write!(f, "invalid dataset camera intrinsics in {field}: {source}")
+            }
+            DatasetError::InvalidStereoBaseline { baseline_m } => write!(
+                f,
+                "dataset stereo baseline must be positive and finite, got {baseline_m}m"
+            ),
+            DatasetError::UnsupportedDepthEncoding { value } => write!(
+                f,
+                "unsupported dataset depth encoding {value:?}; expected \"f32_meters_le\""
+            ),
+            DatasetError::DepthPayloadSizeOverflow { dimensions } => write!(
+                f,
+                "dataset depth payload size overflows the host for {}x{} f32 samples",
+                dimensions.width(),
+                dimensions.height()
+            ),
+            DatasetError::SidecarChanged { path } => write!(
+                f,
+                "dataset sidecar changed after writer creation: {}",
+                path.display()
+            ),
+            DatasetError::WriteContract { source } => {
+                write!(f, "dataset write contract violation: {source}")
             }
             DatasetError::InvalidFrameFileType { path } => write!(
                 f,
@@ -311,6 +721,42 @@ impl std::fmt::Display for DatasetError {
             DatasetError::InvalidManifest { reason } => {
                 write!(f, "invalid dataset manifest: {reason}")
             }
+            DatasetError::UnsupportedManifestValue { field, value } => {
+                write!(f, "unsupported dataset manifest value {field}={value:?}")
+            }
+            DatasetError::NominalFpsMismatch {
+                expected_field,
+                expected,
+                actual_field,
+                actual,
+            } => write!(
+                f,
+                "dataset nominal frame rates disagree: {expected_field}={expected}Hz, {actual_field}={actual}Hz"
+            ),
+            DatasetError::ManifestMetadataMismatch {
+                expected_field,
+                expected,
+                actual_field,
+                actual,
+            } => write!(
+                f,
+                "dataset metadata disagrees: {expected_field}={expected:?}, {actual_field}={actual:?}"
+            ),
+            DatasetError::ManifestPairingWindowOutOfRange { value } => write!(
+                f,
+                "dataset manifest pairing window {value}ns exceeds i64::MAX"
+            ),
+            DatasetError::RecordedPairsDeclareOrphans {
+                left_orphans,
+                right_orphans,
+            } => write!(
+                f,
+                "recorded-pairs manifest cannot declare orphans: left={left_orphans}, right={right_orphans}"
+            ),
+            DatasetError::RecordedPairsContainMissingRight { left_timestamp_ns } => write!(
+                f,
+                "recorded-pairs manifest entry at left={left_timestamp_ns}ns is missing its recorded right frame"
+            ),
             DatasetError::InvalidManifestStats {
                 field,
                 declared,
@@ -318,6 +764,10 @@ impl std::fmt::Display for DatasetError {
             } => write!(
                 f,
                 "invalid dataset manifest statistic {field}: declared {declared}, derived {derived}"
+            ),
+            DatasetError::ManifestDeltaStatsPresenceMismatch { declared, derived } => write!(
+                f,
+                "invalid dataset manifest delta statistics presence: declared={declared}, derived={derived}"
             ),
             DatasetError::ManifestFrameIdentityMismatch { declared, expected } => write!(
                 f,
@@ -358,17 +808,15 @@ impl std::fmt::Display for DatasetError {
                 f,
                 "dataset manifest count {field}={value} exceeds the host address space"
             ),
-            DatasetError::PairOutsideWriterWindow {
-                delta_ns,
-                max_delta_ns,
+            DatasetError::PublishManifest {
+                temporary_path,
+                manifest_path,
+                source,
             } => write!(
                 f,
-                "stereo pair delta {delta_ns}ns exceeds the dataset writer window {max_delta_ns}ns"
-            ),
-            DatasetError::RecordedPairPayloadMissing { path } => write!(
-                f,
-                "recorded stereo pair payload is missing or invalid: {}",
-                path.display()
+                "failed to publish dataset manifest from {} to {}: {source}",
+                temporary_path.display(),
+                manifest_path.display()
             ),
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
@@ -376,11 +824,15 @@ impl std::fmt::Display for DatasetError {
             DatasetError::WriteFile { path, source } => {
                 write!(f, "failed to write file {}: {}", path.display(), source)
             }
-            DatasetError::SerializeJson { source } => {
-                write!(f, "failed to serialize JSON: {source}")
+            DatasetError::SerializeJson { document, source } => {
+                write!(f, "failed to serialize dataset {document}: {source}")
             }
-            DatasetError::DeserializeJson { source } => {
-                write!(f, "failed to deserialize JSON: {source}")
+            DatasetError::DeserializeJson { path, source } => {
+                write!(
+                    f,
+                    "failed to parse dataset JSON {}: {source}",
+                    path.display()
+                )
             }
             DatasetError::WorkerJoin { message } => {
                 write!(f, "writer thread panicked: {message}")
@@ -396,28 +848,41 @@ impl std::error::Error for DatasetError {
             | DatasetError::ReadDirectory { source, .. }
             | DatasetError::ReadFile { source, .. }
             | DatasetError::ThreadSpawn { source }
-            | DatasetError::WriteFile { source, .. } => Some(source),
-            DatasetError::SerializeJson { source } | DatasetError::DeserializeJson { source } => {
-                Some(source)
-            }
-            DatasetError::InvalidFrameDimensions { source }
+            | DatasetError::WriteFile { source, .. }
+            | DatasetError::PublishManifest { source, .. } => Some(source),
+            DatasetError::SerializeJson { source, .. }
+            | DatasetError::DeserializeJson { source, .. } => Some(source),
+            DatasetError::InvalidFrameDimensions { source, .. }
             | DatasetError::InvalidFrameData { source, .. } => Some(source),
+            DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
+            DatasetError::WriteContract { source } => Some(source),
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
             | DatasetError::InvalidFramePath { .. }
             | DatasetError::MissingMonoConfig
+            | DatasetError::InvalidNominalFps { .. }
+            | DatasetError::ImageDimensionsMismatch { .. }
+            | DatasetError::InvalidStereoBaseline { .. }
+            | DatasetError::UnsupportedDepthEncoding { .. }
+            | DatasetError::DepthPayloadSizeOverflow { .. }
+            | DatasetError::SidecarChanged { .. }
             | DatasetError::InvalidFrameFileType { .. }
             | DatasetError::InvalidFrameLength { .. }
             | DatasetError::InvalidManifest { .. }
+            | DatasetError::UnsupportedManifestValue { .. }
+            | DatasetError::NominalFpsMismatch { .. }
+            | DatasetError::ManifestMetadataMismatch { .. }
+            | DatasetError::ManifestPairingWindowOutOfRange { .. }
+            | DatasetError::RecordedPairsDeclareOrphans { .. }
+            | DatasetError::RecordedPairsContainMissingRight { .. }
             | DatasetError::InvalidManifestStats { .. }
+            | DatasetError::ManifestDeltaStatsPresenceMismatch { .. }
             | DatasetError::ManifestFrameIdentityMismatch { .. }
             | DatasetError::DuplicateManifestFrameRef { .. }
             | DatasetError::NonMonotonicManifestEntries { .. }
             | DatasetError::ManifestPairDeltaMismatch { .. }
             | DatasetError::ManifestPairOutsideWindow { .. }
             | DatasetError::ManifestCountOutOfRange { .. }
-            | DatasetError::PairOutsideWriterWindow { .. }
-            | DatasetError::RecordedPairPayloadMissing { .. }
             | DatasetError::WorkerJoin { .. } => None,
         }
     }
@@ -550,6 +1015,19 @@ impl DatasetWriter {
             });
         }
 
+        let dataset_contract = WriterDatasetContract::parse(meta, calibration)?;
+        let meta_json =
+            serde_json::to_vec_pretty(meta).map_err(|source| DatasetError::SerializeJson {
+                document: "metadata",
+                source,
+            })?;
+        let calibration_json = serde_json::to_vec_pretty(calibration).map_err(|source| {
+            DatasetError::SerializeJson {
+                document: "calibration",
+                source,
+            }
+        })?;
+
         let path = path.into();
         if let Some(parent) = path
             .parent()
@@ -579,30 +1057,21 @@ impl DatasetWriter {
             source: e,
         })?;
 
-        let meta_path = path.join(format::META_FILE);
-        let meta_file = std::fs::File::create(&meta_path).map_err(|e| DatasetError::WriteFile {
-            path: meta_path.clone(),
-            source: e,
-        })?;
-
         let calibration_path = path.join(format::CALIBRATION_FILE);
-        let calibration_file =
-            std::fs::File::create(&calibration_path).map_err(|e| DatasetError::WriteFile {
-                path: calibration_path.clone(),
-                source: e,
-            })?;
-
-        serde_json::to_writer_pretty(calibration_file, calibration)
-            .map_err(|e| DatasetError::SerializeJson { source: e })?;
-
-        serde_json::to_writer_pretty(meta_file, meta)
-            .map_err(|e| DatasetError::SerializeJson { source: e })?;
+        write_new_file(&calibration_path, &calibration_json)?;
+        let meta_path = path.join(format::META_FILE);
+        write_new_file(&meta_path, &meta_json)?;
 
         let state = Arc::new(WriterState::new(
             config,
             path.clone(),
             frames_dir.clone(),
             manifest_mode,
+            dataset_contract,
+            WriterSidecars {
+                meta_json,
+                calibration_json,
+            },
         ));
         let state_for_thread = state.clone();
 
@@ -629,33 +1098,58 @@ impl DatasetWriter {
     /// Mono frames written through this legacy boundary are paired by timestamp when the manifest
     /// is finalized. Use [`DatasetWriter::create_paired`] and
     /// [`PairedDatasetWriter::write_pair`] to preserve an existing validated pair identity.
-    pub fn write_frame(&self, frame: &Frame) -> WriteOutcome {
+    /// A returned [`DatasetWriteError`] closes the writer; finalization reports the same contract
+    /// class and does not publish a completion manifest.
+    pub fn write_frame(&self, frame: &Frame) -> Result<WriteOutcome, DatasetWriteError> {
+        if !self.is_healthy() {
+            return Ok(WriteOutcome::WriterFailed);
+        }
+        if let Err(error) = self.state.dataset_contract.mono.require_frame(frame) {
+            return Err(self.reject_write(error));
+        }
         self.write_item(SpoolItem::Mono(frame.clone()))
     }
 
     /// Enqueue a depth image according to the configured backpressure policy.
-    pub fn write_depth(&self, depth: &DepthImage) -> WriteOutcome {
+    ///
+    /// A returned [`DatasetWriteError`] closes the writer and prevents manifest publication.
+    pub fn write_depth(&self, depth: &DepthImage) -> Result<WriteOutcome, DatasetWriteError> {
+        if !self.is_healthy() {
+            return Ok(WriteOutcome::WriterFailed);
+        }
+        let Some(contract) = self.state.dataset_contract.depth else {
+            return Err(self.reject_write(DatasetWriteError::DepthStreamNotConfigured));
+        };
+        if let Err(error) = contract.require_image(depth) {
+            return Err(self.reject_write(error));
+        }
         self.write_item(SpoolItem::Depth(depth.clone()))
     }
 
-    fn write_item(&self, item: SpoolItem) -> WriteOutcome {
+    fn write_item(&self, item: SpoolItem) -> Result<WriteOutcome, DatasetWriteError> {
         if self.state.failed.load(Ordering::Acquire) {
-            return WriteOutcome::WriterFailed;
+            return Ok(WriteOutcome::WriterFailed);
         }
 
         let frames = item.frame_count();
         let bytes = item.bytes_len();
         if frames > self.config.max_spool_frames {
-            self.state.fail(DatasetError::InvalidConfig {
-                msg: item.frame_capacity_error(),
-            });
-            return WriteOutcome::WriterFailed;
+            return Err(
+                self.reject_write(DatasetWriteError::SpoolFrameCapacityExceeded {
+                    item: item.kind(),
+                    frames,
+                    max_frames: self.config.max_spool_frames,
+                }),
+            );
         }
         if bytes > self.config.max_spool_bytes {
-            self.state.fail(DatasetError::InvalidConfig {
-                msg: item.byte_capacity_error(),
-            });
-            return WriteOutcome::WriterFailed;
+            return Err(
+                self.reject_write(DatasetWriteError::SpoolByteCapacityExceeded {
+                    item: item.kind(),
+                    bytes,
+                    max_bytes: self.config.max_spool_bytes,
+                }),
+            );
         }
 
         let mut spool = self
@@ -667,7 +1161,7 @@ impl DatasetWriter {
         match self.config.backpressure {
             Backpressure::DropNewest => {
                 if spool.closed || self.state.failed.load(Ordering::Acquire) {
-                    return WriteOutcome::WriterFailed;
+                    return Ok(WriteOutcome::WriterFailed);
                 }
                 if !self.state.can_accept(&spool, frames, bytes) {
                     self.state
@@ -676,13 +1170,13 @@ impl DatasetWriter {
                     self.state
                         .bytes_dropped
                         .fetch_add(bytes as u64, Ordering::Relaxed);
-                    return WriteOutcome::Dropped;
+                    return Ok(WriteOutcome::Dropped);
                 }
             }
             Backpressure::Block => {
                 while !self.state.can_accept(&spool, frames, bytes) {
                     if spool.closed || self.state.failed.load(Ordering::Acquire) {
-                        return WriteOutcome::WriterFailed;
+                        return Ok(WriteOutcome::WriterFailed);
                     }
                     spool = self
                         .state
@@ -693,8 +1187,8 @@ impl DatasetWriter {
             }
         }
 
-        if spool.closed {
-            return WriteOutcome::WriterFailed;
+        if spool.closed || self.state.failed.load(Ordering::Acquire) {
+            return Ok(WriteOutcome::WriterFailed);
         }
 
         spool.frames += frames;
@@ -714,7 +1208,14 @@ impl DatasetWriter {
             .spool_bytes
             .store(spool.bytes as u64, Ordering::Relaxed);
         self.state.spool_cvar.notify_one();
-        WriteOutcome::Enqueued
+        Ok(WriteOutcome::Enqueued)
+    }
+
+    fn reject_write(&self, error: DatasetWriteError) -> DatasetWriteError {
+        self.state
+            .fail(DatasetError::WriteContract { source: error });
+        self.state.cancel_unwritten(std::iter::empty());
+        error
     }
 
     pub fn stats(&self) -> WriterStats {
@@ -732,26 +1233,35 @@ impl PairedDatasetWriter {
     /// A successful outcome means both frames were accepted together. The manifest pair is only
     /// published after both payload writes succeed. If the second payload write fails, the first
     /// payload can remain on disk unreferenced and `DatasetWriterHandle::finish` reports the typed
-    /// I/O error.
-    pub fn write_pair(&self, pair: StereoPair) -> WriteOutcome {
+    /// I/O error. A returned [`DatasetWriteError`] closes the writer and prevents manifest
+    /// publication.
+    pub fn write_pair(&self, pair: StereoPair) -> Result<WriteOutcome, DatasetWriteError> {
         if !self.inner.is_healthy() {
-            return WriteOutcome::WriterFailed;
+            return Ok(WriteOutcome::WriterFailed);
         }
         let delta_ns = pair.timestamp_delta_ns();
-        let max_delta_ns = self.pairing_window.as_ns() as u64;
+        let max_delta_ns = self.pairing_window.as_u64();
         if delta_ns > max_delta_ns {
-            self.inner
-                .state
-                .fail(DatasetError::PairOutsideWriterWindow {
+            return Err(self
+                .inner
+                .reject_write(DatasetWriteError::PairOutsideWriterWindow {
                     delta_ns,
                     max_delta_ns,
-                });
-            return WriteOutcome::WriterFailed;
+                }));
+        }
+        if let Err(error) = self
+            .inner
+            .state
+            .dataset_contract
+            .mono
+            .require_frame(pair.left())
+        {
+            return Err(self.inner.reject_write(error));
         }
         self.inner.write_item(SpoolItem::Pair(pair))
     }
 
-    pub fn write_depth(&self, depth: &DepthImage) -> WriteOutcome {
+    pub fn write_depth(&self, depth: &DepthImage) -> Result<WriteOutcome, DatasetWriteError> {
         self.inner.write_depth(depth)
     }
 
@@ -819,18 +1329,11 @@ impl SpoolItem {
         }
     }
 
-    fn frame_capacity_error(&self) -> &'static str {
+    fn kind(&self) -> &'static str {
         match self {
-            SpoolItem::Pair(_) => "stereo pair exceeds max_spool_frames",
-            SpoolItem::Mono(_) | SpoolItem::Depth(_) => "frame exceeds max_spool_frames",
-        }
-    }
-
-    fn byte_capacity_error(&self) -> &'static str {
-        match self {
-            SpoolItem::Mono(_) => "frame exceeds max_spool_bytes",
-            SpoolItem::Pair(_) => "stereo pair exceeds max_spool_bytes",
-            SpoolItem::Depth(_) => "depth image exceeds max_spool_bytes",
+            SpoolItem::Mono(_) => "mono frame",
+            SpoolItem::Pair(_) => "stereo pair",
+            SpoolItem::Depth(_) => "depth image",
         }
     }
 }
@@ -860,10 +1363,84 @@ enum ManifestMode {
     PreservePairs { pairing_window: PairingWindowNs },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MonoPayloadFormat {
+    RawGray8,
+}
+
+impl MonoPayloadFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RawGray8 => "raw",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DatasetError> {
+        match value {
+            "raw" => Ok(Self::RawGray8),
+            _ => Err(DatasetError::UnsupportedManifestValue {
+                field: "header.format",
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DatasetTimebase {
+    DeviceNs,
+}
+
+impl DatasetTimebase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceNs => "device_ns",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DatasetError> {
+        match value {
+            "device_ns" => Ok(Self::DeviceNs),
+            _ => Err(DatasetError::UnsupportedManifestValue {
+                field: "header.timebase",
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ManifestPairingPolicy {
+    TimeSymmetric,
+    RecordedPairs,
+}
+
+impl ManifestPairingPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TimeSymmetric => "time_symmetric",
+            Self::RecordedPairs => "recorded_pairs",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, DatasetError> {
+        match value {
+            "time_symmetric" => Ok(Self::TimeSymmetric),
+            "recorded_pairs" => Ok(Self::RecordedPairs),
+            _ => Err(DatasetError::UnsupportedManifestValue {
+                field: "header.pairing_policy",
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct WriterState {
     config: DatasetWriterConfig,
     manifest_mode: ManifestMode,
+    dataset_contract: WriterDatasetContract,
+    sidecars: WriterSidecars,
     dataset_dir: PathBuf,
     frames_dir: PathBuf,
     spool: Mutex<Spool>,
@@ -892,10 +1469,14 @@ impl WriterState {
         dataset_dir: PathBuf,
         frames_dir: PathBuf,
         manifest_mode: ManifestMode,
+        dataset_contract: WriterDatasetContract,
+        sidecars: WriterSidecars,
     ) -> Self {
         Self {
             config,
             manifest_mode,
+            dataset_contract,
+            sidecars,
             dataset_dir,
             frames_dir,
             spool: Mutex::new(Spool::new()),
@@ -1001,9 +1582,31 @@ impl WriterState {
             .fetch_add(canceled_bytes, Ordering::Relaxed);
         self.spool_cvar.notify_all();
     }
+
+    fn record_written(&self, frames: usize, bytes: usize) {
+        self.written.fetch_add(frames as u64, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+
+        let mut spool = self.spool.lock().unwrap_or_else(|err| err.into_inner());
+        spool.frames = spool.frames.saturating_sub(frames);
+        spool.bytes = spool.bytes.saturating_sub(bytes);
+        self.spool_frames
+            .store(spool.frames as u64, Ordering::Relaxed);
+        self.spool_bytes
+            .store(spool.bytes as u64, Ordering::Relaxed);
+        self.spool_cvar.notify_all();
+    }
 }
 
 fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
+    writer_loop_with(state, |item| write_item_to_dir(&frames_dir, item));
+}
+
+fn writer_loop_with(
+    state: Arc<WriterState>,
+    mut write_item: impl FnMut(SpoolItem) -> Result<Option<RecordedPair>, DatasetError>,
+) {
     loop {
         let batch = {
             let mut spool = state.spool.lock().unwrap_or_else(|err| err.into_inner());
@@ -1021,36 +1624,33 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             let mut batch = Vec::new();
             let mut batch_frames = 0usize;
             while let Some(item) = spool.queue.pop_front() {
-                let bytes = item.bytes_len();
                 let frames = item.frame_count();
-                spool.frames = spool.frames.saturating_sub(frames);
-                spool.bytes = spool.bytes.saturating_sub(bytes);
                 batch_frames = batch_frames.saturating_add(frames);
                 batch.push(item);
                 if batch_frames >= state.config.flush_batch_frames {
                     break;
                 }
             }
-
-            state
-                .spool_frames
-                .store(spool.frames as u64, Ordering::Relaxed);
-            state
-                .spool_bytes
-                .store(spool.bytes as u64, Ordering::Relaxed);
-            state.spool_cvar.notify_all();
             batch
         };
 
         let mut batch = batch.into_iter();
         while let Some(item) = batch.next() {
-            let frames = item.frame_count() as u64;
-            let bytes = item.bytes_len() as u64;
-            let recorded_pair = match write_item_to_dir(&frames_dir, item) {
+            if state.failed.load(Ordering::Acquire) {
+                state.cancel_unwritten(std::iter::once(item).chain(batch));
+                return;
+            }
+            let frames = item.frame_count();
+            let bytes = item.bytes_len();
+            let recorded_pair = match write_item(item) {
                 Ok(recorded_pair) => recorded_pair,
                 Err(err) => {
-                    state.write_failed.fetch_add(frames, Ordering::Relaxed);
-                    state.bytes_write_failed.fetch_add(bytes, Ordering::Relaxed);
+                    state
+                        .write_failed
+                        .fetch_add(frames as u64, Ordering::Relaxed);
+                    state
+                        .bytes_write_failed
+                        .fetch_add(bytes as u64, Ordering::Relaxed);
                     state.fail(err);
                     state.cancel_unwritten(batch);
                     return;
@@ -1059,8 +1659,7 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
             if let Some(pair) = recorded_pair {
                 state.record_pair(pair);
             }
-            state.written.fetch_add(frames, Ordering::Relaxed);
-            state.bytes_written.fetch_add(bytes, Ordering::Relaxed);
+            state.record_written(frames, bytes);
         }
     }
 }
@@ -1144,6 +1743,68 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
         })
 }
 
+fn validate_payload_file(path: &Path, expected: u64) -> Result<(), DatasetError> {
+    let metadata = std::fs::metadata(path).map_err(|source| DatasetError::ReadFile {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(DatasetError::InvalidFrameFileType {
+            path: path.to_path_buf(),
+        });
+    }
+    let actual = metadata.len();
+    if actual != expected {
+        return Err(DatasetError::InvalidFrameLength {
+            path: path.to_path_buf(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn publish_manifest(dataset_dir: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
+    const TEMP_FILE: &str = ".manifest.json.tmp";
+
+    let temporary_path = dataset_dir.join(TEMP_FILE);
+    let manifest_path = dataset_dir.join(format::MANIFEST_FILE);
+    let mut temporary_created = false;
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|source| DatasetError::WriteFile {
+                path: temporary_path.clone(),
+                source,
+            })?;
+        temporary_created = true;
+        file.write_all(bytes)
+            .map_err(|source| DatasetError::WriteFile {
+                path: temporary_path.clone(),
+                source,
+            })?;
+        file.sync_all().map_err(|source| DatasetError::WriteFile {
+            path: temporary_path.clone(),
+            source,
+        })?;
+        drop(file);
+        std::fs::rename(&temporary_path, &manifest_path).map_err(|source| {
+            DatasetError::PublishManifest {
+                temporary_path: temporary_path.clone(),
+                manifest_path: manifest_path.clone(),
+                source,
+            }
+        })
+    })();
+
+    if result.is_err() && temporary_created {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
 fn sensor_to_str(id: SensorId) -> &'static str {
     match id {
         SensorId::StereoLeft => "mono_left",
@@ -1194,15 +1855,21 @@ struct ManifestStats {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+/// Diagnostics from distinct pipeline stages, not a partition of mono manifest entries.
 struct DropStats {
+    /// Logical frames of any payload kind rejected by spool backpressure.
     spool_full: u64,
+    /// Reserved write-failure diagnostic; successful publication requires this to be zero.
     write_fail: u64,
+    /// Filesystem entries whose filenames could not be parsed canonically.
     parse_fail: u64,
+    /// Canonically named payload files whose byte length disagreed with metadata.
     size_mismatch: u64,
+    /// Explicit left entries that had no right frame inside the published window.
     outside_window: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DeltaStats {
     min: u64,
     median: u64,
@@ -1266,32 +1933,25 @@ struct RecordedPair {
 struct FrameSet {
     left: Vec<FrameInfo>,
     right: Vec<FrameInfo>,
-    depth: Vec<FrameInfo>,
     parse_fail: u64,
     size_mismatch: u64,
 }
 
 fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
-    let meta = read_meta(&state.dataset_dir)?;
-    let mono = meta.mono.ok_or(DatasetError::InvalidConfig {
-        msg: "meta.json missing mono config",
-    })?;
+    state.sidecars.require_unchanged(&state.dataset_dir)?;
+    let contract = &state.dataset_contract;
+    let mono = contract.mono;
+    let dimensions = mono.dimensions();
 
-    let mut frames = scan_frames_with_depth(
-        &state.frames_dir,
-        mono.width,
-        mono.height,
-        meta.depth.as_ref(),
-    )?;
-    let parse_fail = frames.parse_fail;
-    let size_mismatch = frames.size_mismatch;
-    let mut left = std::mem::take(&mut frames.left);
-    let mut right = std::mem::take(&mut frames.right);
-    let mut depth_frames = std::mem::take(&mut frames.depth);
+    let FrameSet {
+        mut left,
+        mut right,
+        parse_fail,
+        size_mismatch,
+    } = scan_frames_with_depth(&state.frames_dir, dimensions, contract.depth.as_ref())?;
 
     left.sort_by_key(|f| f.timestamp_ns);
     right.sort_by_key(|f| f.timestamp_ns);
-    depth_frames.sort_by_key(|f| f.timestamp_ns);
 
     let topology = match state.manifest_mode {
         ManifestMode::InferPairs => inferred_manifest_topology(&left, &right),
@@ -1303,10 +1963,9 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
                 .clone();
             recorded_manifest_topology(
                 &state.dataset_dir,
-                &left,
-                &right,
                 &recorded_pairs,
                 pairing_window,
+                dimensions,
             )?
         }
     };
@@ -1314,14 +1973,14 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
     let manifest = Manifest {
         header: ManifestHeader {
             dataset_id: dataset_id(&state.dataset_dir),
-            created_at: meta.created,
-            device: meta.device,
-            format: "raw".to_string(),
-            width: mono.width,
-            height: mono.height,
-            fps: mono.fps,
-            timebase: "device_ns".to_string(),
-            pairing_policy: topology.pairing_policy.to_string(),
+            created_at: contract.created_at.clone(),
+            device: contract.device.clone(),
+            format: MonoPayloadFormat::RawGray8.as_str().to_string(),
+            width: dimensions.width(),
+            height: dimensions.height(),
+            fps: mono.nominal_fps_hz().get(),
+            timebase: DatasetTimebase::DeviceNs.as_str().to_string(),
+            pairing_policy: topology.pairing_policy.as_str().to_string(),
             pairing_window_ns: topology.pairing_window_ns,
         },
         stats: ManifestStats {
@@ -1342,19 +2001,16 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         entries: topology.entries,
     };
 
-    let manifest_path = state.dataset_dir.join(format::MANIFEST_FILE);
-    let manifest_file =
-        std::fs::File::create(&manifest_path).map_err(|e| DatasetError::WriteFile {
-            path: manifest_path.clone(),
-            source: e,
+    let bytes =
+        serde_json::to_vec_pretty(&manifest).map_err(|source| DatasetError::SerializeJson {
+            document: "manifest",
+            source,
         })?;
-    serde_json::to_writer_pretty(manifest_file, &manifest)
-        .map_err(|e| DatasetError::SerializeJson { source: e })?;
-    Ok(())
+    publish_manifest(&state.dataset_dir, &bytes)
 }
 
 struct ManifestTopology {
-    pairing_policy: &'static str,
+    pairing_policy: ManifestPairingPolicy,
     pairing_window_ns: u64,
     entries: Vec<ManifestEntry>,
     total_left: u64,
@@ -1371,13 +2027,20 @@ fn inferred_manifest_topology(left: &[FrameInfo], right: &[FrameInfo]) -> Manife
     let gate = left_period
         .map(|period| period / 4)
         .filter(|period| *period > 0);
-    let deltas = collect_deltas(left, right, gate);
-    let delta_stats = build_delta_stats(&deltas);
-    let pairing_window_ns = compute_pairing_window_ns(&deltas, delta_stats.as_ref(), left_period);
+    let mut estimator_deltas = collect_deltas(left, right, gate);
+    let estimator_stats = build_delta_stats(&estimator_deltas);
+    let pairing_window_ns =
+        compute_pairing_window_ns(&estimator_deltas, estimator_stats.as_ref(), left_period);
     let (entries, paired_count, left_orphans, right_orphans, outside_window) =
         pair_entries(left, right, pairing_window_ns);
+    estimator_deltas.clear();
+    estimator_deltas.extend(entries.iter().filter_map(|entry| match &entry.pairing {
+        ManifestPairing::Paired { delta_ns, .. } => Some(*delta_ns),
+        ManifestPairing::MissingRight { .. } => None,
+    }));
+    let delta_stats = build_delta_stats(&estimator_deltas);
     ManifestTopology {
-        pairing_policy: "time_symmetric",
+        pairing_policy: ManifestPairingPolicy::TimeSymmetric,
         pairing_window_ns,
         entries,
         total_left: left.len() as u64,
@@ -1392,23 +2055,18 @@ fn inferred_manifest_topology(left: &[FrameInfo], right: &[FrameInfo]) -> Manife
 
 fn recorded_manifest_topology(
     dataset_dir: &Path,
-    left: &[FrameInfo],
-    right: &[FrameInfo],
     recorded_pairs: &[RecordedPair],
     pairing_window: PairingWindowNs,
+    dimensions: FrameDimensions,
 ) -> Result<ManifestTopology, DatasetError> {
-    let available_left: HashSet<i64> = left.iter().map(|frame| frame.timestamp_ns).collect();
-    let available_right: HashSet<i64> = right.iter().map(|frame| frame.timestamp_ns).collect();
+    let expected_len = dimensions.area() as u64;
     for pair in recorded_pairs {
-        for (timestamp_ns, sensor, available) in [
-            (pair.left_timestamp_ns, "mono_left", &available_left),
-            (pair.right_timestamp_ns, "mono_right", &available_right),
+        for (timestamp_ns, sensor) in [
+            (pair.left_timestamp_ns, "mono_left"),
+            (pair.right_timestamp_ns, "mono_right"),
         ] {
-            if !available.contains(&timestamp_ns) {
-                return Err(DatasetError::RecordedPairPayloadMissing {
-                    path: dataset_dir.join(frame_path(timestamp_ns, sensor)),
-                });
-            }
+            let path = dataset_dir.join(frame_path(timestamp_ns, sensor));
+            validate_payload_file(&path, expected_len)?;
         }
     }
 
@@ -1427,8 +2085,8 @@ fn recorded_manifest_topology(
     let deltas: Vec<u64> = recorded_pairs.iter().map(|pair| pair.delta_ns).collect();
     let pair_count = recorded_pairs.len() as u64;
     Ok(ManifestTopology {
-        pairing_policy: "recorded_pairs",
-        pairing_window_ns: pairing_window.as_ns() as u64,
+        pairing_policy: ManifestPairingPolicy::RecordedPairs,
+        pairing_window_ns: pairing_window.as_u64(),
         entries,
         total_left: pair_count,
         total_right: pair_count,
@@ -1461,7 +2119,10 @@ fn read_meta(dataset_dir: &Path) -> Result<Meta, DatasetError> {
         path: meta_path.clone(),
         source: e,
     })?;
-    serde_json::from_reader(meta_file).map_err(|e| DatasetError::DeserializeJson { source: e })
+    serde_json::from_reader(meta_file).map_err(|source| DatasetError::DeserializeJson {
+        path: meta_path,
+        source,
+    })
 }
 
 fn read_manifest(dataset_dir: &Path) -> Result<Manifest, DatasetError> {
@@ -1471,7 +2132,10 @@ fn read_manifest(dataset_dir: &Path) -> Result<Manifest, DatasetError> {
             path: manifest_path.clone(),
             source: e,
         })?;
-    serde_json::from_reader(manifest_file).map_err(|e| DatasetError::DeserializeJson { source: e })
+    serde_json::from_reader(manifest_file).map_err(|source| DatasetError::DeserializeJson {
+        path: manifest_path,
+        source,
+    })
 }
 
 fn read_calibration(dataset_dir: &Path) -> Result<Calibration, DatasetError> {
@@ -1481,29 +2145,25 @@ fn read_calibration(dataset_dir: &Path) -> Result<Calibration, DatasetError> {
             path: calibration_path.clone(),
             source: e,
         })?;
-    serde_json::from_reader(calibration_file)
-        .map_err(|e| DatasetError::DeserializeJson { source: e })
+    serde_json::from_reader(calibration_file).map_err(|source| DatasetError::DeserializeJson {
+        path: calibration_path,
+        source,
+    })
 }
 
 fn scan_frames_with_depth(
     frames_dir: &Path,
-    width: u32,
-    height: u32,
-    depth: Option<&DepthMeta>,
+    mono_dimensions: FrameDimensions,
+    depth: Option<&DepthImageContract>,
 ) -> Result<FrameSet, DatasetError> {
     let mut frames = FrameSet {
         left: Vec::new(),
         right: Vec::new(),
-        depth: Vec::new(),
         parse_fail: 0,
         size_mismatch: 0,
     };
-    let mono_expected_len = (width as u64).saturating_mul(height as u64);
-    let depth_expected_len = depth.map(|meta| {
-        (meta.width as u64)
-            .saturating_mul(meta.height as u64)
-            .saturating_mul(std::mem::size_of::<f32>() as u64)
-    });
+    let mono_expected_len = mono_dimensions.area() as u64;
+    let depth_expected_len = depth.map(|contract| contract.expected_payload_len());
 
     let entries = std::fs::read_dir(frames_dir).map_err(|e| DatasetError::ReadDirectory {
         path: frames_dir.to_path_buf(),
@@ -1534,45 +2194,41 @@ fn scan_frames_with_depth(
                 continue;
             }
         };
+        if filename != format::frame_name(timestamp_ns, &sensor) {
+            frames.parse_fail = frames.parse_fail.saturating_add(1);
+            continue;
+        }
 
-        let rel_path = frame_path(timestamp_ns, &sensor);
+        let expected_len = match sensor.as_str() {
+            "mono_left" | "mono_right" => mono_expected_len,
+            "depth" => match depth_expected_len {
+                Some(len) => len,
+                None => continue,
+            },
+            _ => {
+                frames.parse_fail = frames.parse_fail.saturating_add(1);
+                continue;
+            }
+        };
+        let metadata = entry.metadata().map_err(|e| DatasetError::ReadFile {
+            path: path.clone(),
+            source: e,
+        })?;
+        if metadata.len() != expected_len {
+            frames.size_mismatch = frames.size_mismatch.saturating_add(1);
+            continue;
+        }
+        if sensor == "depth" {
+            continue;
+        }
         let info = FrameInfo {
             timestamp_ns,
-            path: rel_path,
+            path: frame_path(timestamp_ns, &sensor),
         };
-        match sensor.as_str() {
-            "mono_left" | "mono_right" | "depth" => {
-                let metadata = entry.metadata().map_err(|e| DatasetError::ReadFile {
-                    path: path.clone(),
-                    source: e,
-                })?;
-                let expected_len = match sensor.as_str() {
-                    "mono_left" | "mono_right" => mono_expected_len,
-                    "depth" => match depth_expected_len {
-                        Some(len) => len,
-                        None => continue,
-                    },
-                    _ => {
-                        frames.parse_fail = frames.parse_fail.saturating_add(1);
-                        continue;
-                    }
-                };
-                if metadata.len() != expected_len {
-                    frames.size_mismatch += 1;
-                    continue;
-                }
-                match sensor.as_str() {
-                    "mono_left" => frames.left.push(info),
-                    "mono_right" => frames.right.push(info),
-                    "depth" => frames.depth.push(info),
-                    _ => {
-                        frames.parse_fail = frames.parse_fail.saturating_add(1);
-                    }
-                }
-            }
-            _ => {
-                frames.parse_fail += 1;
-            }
+        if sensor == "mono_left" {
+            frames.left.push(info);
+        } else {
+            frames.right.push(info);
         }
     }
 
@@ -1823,6 +2479,7 @@ mod tests {
     use super::*;
     use crate::{FrameId, Timestamp};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -1862,6 +2519,80 @@ mod tests {
         }
     }
 
+    fn meta_with_depth(width: u32, height: u32) -> Meta {
+        let mut meta = meta();
+        meta.depth = Some(DepthMeta {
+            width,
+            height,
+            fps: 30,
+            encoding: "f32_meters_le".to_string(),
+        });
+        meta
+    }
+
+    fn depth_image(width: u32, height: u32, timestamp_ns: i64) -> DepthImage {
+        let len = usize::try_from(width)
+            .expect("test width fits usize")
+            .checked_mul(usize::try_from(height).expect("test height fits usize"))
+            .expect("test depth area fits usize");
+        DepthImage::new(
+            FrameId::new(0),
+            Timestamp::from_nanos(timestamp_ns),
+            width,
+            height,
+            vec![1.0; len],
+        )
+        .expect("valid depth image")
+    }
+
+    fn writer_contract() -> WriterDatasetContract {
+        WriterDatasetContract::parse(&meta(), &calibration()).expect("valid writer contract")
+    }
+
+    fn writer_sidecars() -> WriterSidecars {
+        WriterSidecars {
+            meta_json: serde_json::to_vec_pretty(&meta()).expect("serialize metadata"),
+            calibration_json: serde_json::to_vec_pretty(&calibration())
+                .expect("serialize calibration"),
+        }
+    }
+
+    fn write_outcome(result: Result<WriteOutcome, DatasetWriteError>) -> WriteOutcome {
+        result.expect("valid dataset write")
+    }
+
+    fn wait_for_written_frames(writer: &PairedDatasetWriter, expected: u64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let stats = writer.stats();
+            if stats.frames_written >= expected {
+                return;
+            }
+            assert!(!stats.writer_failed, "writer failed before test mutation");
+            assert!(
+                Instant::now() < deadline,
+                "writer did not drain test payloads"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn reject_before_filesystem_mutation(
+        test_name: &str,
+        meta: &Meta,
+        calibration: &Calibration,
+    ) -> DatasetError {
+        let root = unique_dataset_path(test_name);
+        let path = root.join("missing-parent").join("dataset");
+        let error = DatasetWriter::create(&path, meta, calibration)
+            .expect_err("invalid contract must reject writer creation");
+        assert!(
+            !root.exists(),
+            "invalid boundary data must not create parent directories"
+        );
+        error
+    }
+
     fn frame(sensor: SensorId, timestamp_ns: i64, value: u8) -> Frame {
         Frame::new(
             sensor,
@@ -1894,11 +2625,19 @@ mod tests {
             let left_value = u8::try_from(index.saturating_mul(2)).expect("small test fixture");
             let right_value = left_value.saturating_add(1);
             assert_eq!(
-                writer.write_frame(&frame(SensorId::StereoLeft, timestamp_ns, left_value)),
+                write_outcome(writer.write_frame(&frame(
+                    SensorId::StereoLeft,
+                    timestamp_ns,
+                    left_value,
+                ))),
                 WriteOutcome::Enqueued
             );
             assert_eq!(
-                writer.write_frame(&frame(SensorId::StereoRight, timestamp_ns, right_value)),
+                write_outcome(writer.write_frame(&frame(
+                    SensorId::StereoRight,
+                    timestamp_ns,
+                    right_value,
+                ))),
                 WriteOutcome::Enqueued
             );
         }
@@ -1918,6 +2657,387 @@ mod tests {
     }
 
     #[test]
+    fn create_parses_the_complete_mono_contract_before_filesystem_mutation() {
+        let mut missing_mono = meta();
+        missing_mono.mono = None;
+        assert!(matches!(
+            reject_before_filesystem_mutation(
+                "contract-missing-mono",
+                &missing_mono,
+                &calibration()
+            ),
+            DatasetError::MissingMonoConfig
+        ));
+
+        let mut zero_width = meta();
+        zero_width.mono.as_mut().expect("mono metadata").width = 0;
+        assert!(matches!(
+            reject_before_filesystem_mutation("contract-zero-width", &zero_width, &calibration()),
+            DatasetError::InvalidFrameDimensions {
+                field: "meta.mono",
+                source: crate::FrameError::ZeroDimensions {
+                    width: 0,
+                    height: 2
+                }
+            }
+        ));
+
+        let mut zero_fps = meta();
+        zero_fps.mono.as_mut().expect("mono metadata").fps = 0;
+        assert!(matches!(
+            reject_before_filesystem_mutation("contract-zero-fps", &zero_fps, &calibration()),
+            DatasetError::InvalidNominalFps {
+                field: "meta.mono.fps",
+                value: 0
+            }
+        ));
+
+        for (test_name, side) in [
+            ("contract-left-dimensions", "calibration.left"),
+            ("contract-right-dimensions", "calibration.right"),
+        ] {
+            let mut mismatched = calibration();
+            let intrinsics = if side == "calibration.left" {
+                &mut mismatched.left
+            } else {
+                &mut mismatched.right
+            };
+            intrinsics.width = 1;
+            intrinsics.height = 4;
+            assert!(matches!(
+                reject_before_filesystem_mutation(test_name, &meta(), &mismatched),
+                DatasetError::ImageDimensionsMismatch {
+                    expected_field: "meta.mono",
+                    actual_field,
+                    ..
+                } if actual_field == side
+            ));
+        }
+
+        let mut non_finite_left = calibration();
+        non_finite_left.left.fx = f32::NAN;
+        assert!(matches!(
+            reject_before_filesystem_mutation(
+                "contract-non-finite-left",
+                &meta(),
+                &non_finite_left
+            ),
+            DatasetError::InvalidCameraIntrinsics {
+                field: "calibration.left",
+                source: crate::IntrinsicsError::NonFinite { .. }
+            }
+        ));
+
+        let mut non_finite_right = calibration();
+        non_finite_right.right.cy = f32::INFINITY;
+        assert!(matches!(
+            reject_before_filesystem_mutation(
+                "contract-non-finite-right",
+                &meta(),
+                &non_finite_right
+            ),
+            DatasetError::InvalidCameraIntrinsics {
+                field: "calibration.right",
+                source: crate::IntrinsicsError::NonFinite { .. }
+            }
+        ));
+
+        for (test_name, baseline_m) in [
+            ("contract-nan-baseline", f32::NAN),
+            ("contract-infinite-baseline", f32::INFINITY),
+            ("contract-zero-baseline", 0.0),
+        ] {
+            let mut invalid = calibration();
+            invalid.baseline_m = baseline_m;
+            assert!(matches!(
+                reject_before_filesystem_mutation(test_name, &meta(), &invalid),
+                DatasetError::InvalidStereoBaseline { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn inferred_delta_stats_describe_only_explicit_manifest_pairs() {
+        let left = [
+            FrameInfo {
+                timestamp_ns: 0,
+                path: "left-0".to_string(),
+            },
+            FrameInfo {
+                timestamp_ns: 1,
+                path: "left-1".to_string(),
+            },
+        ];
+        let right = [
+            FrameInfo {
+                timestamp_ns: 0,
+                path: "right-0".to_string(),
+            },
+            FrameInfo {
+                timestamp_ns: 100,
+                path: "right-100".to_string(),
+            },
+        ];
+
+        let topology = inferred_manifest_topology(&left, &right);
+
+        assert_eq!(topology.pairing_window_ns, 0);
+        assert_eq!(topology.paired_count, 1);
+        assert_eq!(topology.left_orphans, 1);
+        assert_eq!(
+            topology.delta_stats,
+            Some(DeltaStats {
+                min: 0,
+                median: 0,
+                p95: 0,
+                p99: 0,
+                max: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn create_parses_the_depth_contract_before_filesystem_mutation() {
+        let mut zero_dimensions = meta_with_depth(0, 2);
+        assert!(matches!(
+            reject_before_filesystem_mutation(
+                "depth-contract-zero-dimensions",
+                &zero_dimensions,
+                &calibration()
+            ),
+            DatasetError::InvalidFrameDimensions {
+                field: "meta.depth",
+                ..
+            }
+        ));
+
+        zero_dimensions
+            .depth
+            .as_mut()
+            .expect("depth metadata")
+            .width = 2;
+        zero_dimensions.depth.as_mut().expect("depth metadata").fps = 0;
+        assert!(matches!(
+            reject_before_filesystem_mutation(
+                "depth-contract-zero-fps",
+                &zero_dimensions,
+                &calibration()
+            ),
+            DatasetError::InvalidNominalFps {
+                field: "meta.depth.fps",
+                value: 0
+            }
+        ));
+
+        let mut unsupported = meta_with_depth(2, 2);
+        unsupported.depth.as_mut().expect("depth metadata").encoding =
+            "u16_millimeters_le".to_string();
+        assert!(matches!(
+            reject_before_filesystem_mutation(
+                "depth-contract-unsupported-encoding",
+                &unsupported,
+                &calibration()
+            ),
+            DatasetError::UnsupportedDepthEncoding { value }
+                if value == "u16_millimeters_le"
+        ));
+    }
+
+    #[test]
+    fn depth_writes_require_a_configured_exact_shape() {
+        let missing_path = unique_dataset_path("depth-contract-missing");
+        let (writer, handle) = DatasetWriter::create(&missing_path, &meta(), &calibration())
+            .expect("create dataset without depth");
+        assert!(matches!(
+            writer.write_depth(&depth_image(2, 2, 1)),
+            Err(DatasetWriteError::DepthStreamNotConfigured)
+        ));
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("missing depth contract must fail"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::DepthStreamNotConfigured
+            }
+        ));
+        assert!(!missing_path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(missing_path).expect("remove missing-depth dataset");
+
+        let wrong_shape_path = unique_dataset_path("depth-contract-wrong-shape");
+        let depth_meta = meta_with_depth(2, 6);
+        let (writer, handle) =
+            DatasetWriter::create(&wrong_shape_path, &depth_meta, &calibration())
+                .expect("create depth dataset");
+        assert!(matches!(
+            writer.write_depth(&depth_image(3, 4, 2)),
+            Err(DatasetWriteError::DepthDimensionsMismatch { expected, actual })
+                if expected == FrameDimensions::new(2, 6)
+                    && actual == FrameDimensions::new(3, 4)
+        ));
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("wrong depth shape must fail"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::DepthDimensionsMismatch { .. }
+            }
+        ));
+        assert!(!wrong_shape_path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(wrong_shape_path).expect("remove wrong-shape dataset");
+    }
+
+    #[test]
+    fn configured_depth_payload_uses_declared_f32_little_endian_encoding() {
+        let path = unique_dataset_path("depth-contract-valid");
+        let dataset_meta = meta_with_depth(2, 2);
+        let (writer, handle) = DatasetWriter::create(&path, &dataset_meta, &calibration())
+            .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(2, 2, 3))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        let stats = handle.finish().expect("finish depth dataset");
+        assert_eq!(stats.frames_written, 1);
+        assert_eq!(stats.bytes_written, 16);
+        let depth_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(3, "depth"));
+        let payload = std::fs::read(depth_path).expect("read depth payload");
+        assert_eq!(payload, 1.0_f32.to_le_bytes().repeat(4));
+        DatasetReader::open(&path).expect("reader accepts parsed depth contract");
+        let mut invalid_meta = dataset_meta;
+        invalid_meta
+            .depth
+            .as_mut()
+            .expect("depth metadata")
+            .encoding = "u16_millimeters_le".to_string();
+        std::fs::write(
+            path.join(format::META_FILE),
+            serde_json::to_vec_pretty(&invalid_meta).expect("serialize invalid depth metadata"),
+        )
+        .expect("replace depth metadata");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("reader must reject unsupported depth encoding"),
+            DatasetError::UnsupportedDepthEncoding { .. }
+        ));
+        std::fs::remove_dir_all(path).expect("remove valid depth dataset");
+    }
+
+    #[test]
+    fn mono_writers_reject_equal_area_wrong_shape_frames_without_a_manifest() {
+        let mut dataset_meta = meta();
+        let mono = dataset_meta.mono.as_mut().expect("mono metadata");
+        mono.width = 2;
+        mono.height = 6;
+        let mut dataset_calibration = calibration();
+        for intrinsics in [
+            &mut dataset_calibration.left,
+            &mut dataset_calibration.right,
+        ] {
+            intrinsics.width = 2;
+            intrinsics.height = 6;
+        }
+        let wrong_left = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(1),
+            3,
+            4,
+            vec![0; 12],
+        )
+        .expect("valid equal-area frame");
+        let wrong_right = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(2),
+            Timestamp::from_nanos(1),
+            3,
+            4,
+            vec![0; 12],
+        )
+        .expect("valid equal-area frame");
+
+        let legacy_path = unique_dataset_path("legacy-wrong-shape");
+        let (writer, handle) =
+            DatasetWriter::create(&legacy_path, &dataset_meta, &dataset_calibration)
+                .expect("create legacy writer");
+        assert!(matches!(
+            writer.write_frame(&wrong_left),
+            Err(DatasetWriteError::FrameDimensionsMismatch {
+                sensor: SensorId::StereoLeft,
+                expected,
+                actual,
+            }) if (expected.width(), expected.height()) == (2, 6)
+                && (actual.width(), actual.height()) == (3, 4)
+        ));
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("invalid frame must fail finish"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::FrameDimensionsMismatch { .. }
+            }
+        ));
+        assert!(!legacy_path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(legacy_path).expect("remove legacy dataset");
+
+        let paired_path = unique_dataset_path("paired-wrong-shape");
+        let window = PairingWindowNs::new(0).expect("valid exact window");
+        let pair = StereoPair::try_new(wrong_left, wrong_right, window)
+            .expect("valid same-shape stereo pair");
+        let (writer, handle) =
+            DatasetWriter::create_paired(&paired_path, &dataset_meta, &dataset_calibration, window)
+                .expect("create paired writer");
+        assert!(matches!(
+            writer.write_pair(pair),
+            Err(DatasetWriteError::FrameDimensionsMismatch { .. })
+        ));
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("invalid pair must fail finish"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::FrameDimensionsMismatch { .. }
+            }
+        ));
+        assert!(!paired_path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(paired_path).expect("remove paired dataset");
+    }
+
+    #[test]
+    fn oversized_payload_is_a_typed_write_contract_error() {
+        let path = unique_dataset_path("oversized-payload-contract");
+        let config = DatasetWriterConfig {
+            max_spool_frames: 1,
+            max_spool_bytes: 3,
+            flush_batch_frames: 1,
+            backpressure: Backpressure::Block,
+        };
+        let (writer, handle) =
+            DatasetWriter::create_with_config(&path, &meta(), &calibration(), config)
+                .expect("create dataset");
+
+        assert!(matches!(
+            writer.write_frame(&frame(SensorId::StereoLeft, 1, 1)),
+            Err(DatasetWriteError::SpoolByteCapacityExceeded {
+                item: "mono frame",
+                bytes: 4,
+                max_bytes: 3
+            })
+        ));
+        assert!(!writer.is_healthy());
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("contract failure must fail finish"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::SpoolByteCapacityExceeded { .. }
+            }
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
     fn duplicate_timestamp_does_not_overwrite_the_first_frame() {
         let path = unique_dataset_path("duplicate-timestamp");
         let (writer, handle) =
@@ -1925,8 +3045,14 @@ mod tests {
         let first = frame(SensorId::StereoLeft, 7, 1);
         let duplicate = frame(SensorId::StereoLeft, 7, 2);
 
-        assert_eq!(writer.write_frame(&first), WriteOutcome::Enqueued);
-        assert_eq!(writer.write_frame(&duplicate), WriteOutcome::Enqueued);
+        assert_eq!(
+            write_outcome(writer.write_frame(&first)),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_frame(&duplicate)),
+            WriteOutcome::Enqueued
+        );
         drop(writer);
 
         let error = handle.finish().expect_err("duplicate filename must fail");
@@ -1947,11 +3073,11 @@ mod tests {
             DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
 
         assert_eq!(
-            writer.write_frame(&frame(SensorId::StereoLeft, 11, 1)),
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 11, 1))),
             WriteOutcome::Enqueued
         );
         assert_eq!(
-            writer.write_frame(&frame(SensorId::StereoRight, 11, 2)),
+            write_outcome(writer.write_frame(&frame(SensorId::StereoRight, 11, 2))),
             WriteOutcome::Enqueued
         );
         drop(writer);
@@ -1959,6 +3085,7 @@ mod tests {
 
         let manifest = read_manifest(&path).expect("read manifest");
         assert_eq!(manifest.header.pairing_window_ns, 0);
+        assert!(!path.join(".manifest.json.tmp").exists());
         let mut reader = DatasetReader::open(&path).expect("open exact-sync dataset");
         let pair = reader
             .pairs()
@@ -1966,6 +3093,292 @@ mod tests {
             .expect("one pair")
             .expect("valid pair");
         assert_eq!(pair.timestamp_delta_ns(), 0);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn finish_rejects_changed_writer_sidecars_without_reparsing_them() {
+        let mut changed = meta();
+        let mono = changed.mono.as_mut().expect("mono metadata");
+        mono.width = 9;
+        mono.height = 9;
+        mono.fps = 99;
+        let mut changed_calibration = calibration();
+        changed_calibration.left.fx = 200.0;
+
+        for (suffix, filename, replacement) in [
+            (
+                "metadata",
+                format::META_FILE,
+                serde_json::to_vec_pretty(&changed).expect("serialize changed metadata"),
+            ),
+            (
+                "calibration",
+                format::CALIBRATION_FILE,
+                serde_json::to_vec_pretty(&changed_calibration)
+                    .expect("serialize changed calibration"),
+            ),
+        ] {
+            let path = unique_dataset_path(&format!("writer-contract-snapshot-{suffix}"));
+            let (writer, handle) =
+                DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+            let sidecar_path = path.join(filename);
+            std::fs::write(&sidecar_path, replacement).expect("replace sidecar after creation");
+
+            drop(writer);
+            assert!(matches!(
+                handle.finish().expect_err("changed sidecar must fail"),
+                DatasetError::SidecarChanged { path: changed_path }
+                    if changed_path == sidecar_path
+            ));
+            assert!(!path.join(format::MANIFEST_FILE).exists());
+            std::fs::remove_dir_all(path).expect("remove test directory");
+        }
+    }
+
+    #[test]
+    fn manifest_is_not_visible_when_its_private_temporary_path_is_unavailable() {
+        let path = unique_dataset_path("manifest-temp-collision");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        let temporary_path = path.join(".manifest.json.tmp");
+        let sentinel = b"not owned by the writer";
+        std::fs::write(&temporary_path, sentinel).expect("occupy private temporary path");
+
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("temporary collision must fail"),
+            DatasetError::WriteFile { path: failed_path, source }
+                if failed_path == temporary_path
+                    && source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        assert_eq!(
+            std::fs::read(&temporary_path).expect("read untouched sentinel"),
+            sentinel
+        );
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn manifest_scan_ignores_noncanonical_filename_aliases() {
+        let path = unique_dataset_path("noncanonical-frame-alias");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        std::fs::write(
+            path.join(format::FRAMES_DIR).join("01_mono_left.raw"),
+            [0_u8; 4],
+        )
+        .expect("write noncanonical alias");
+
+        drop(writer);
+        handle.finish().expect("finish dataset");
+        let manifest = read_manifest(&path).expect("read manifest");
+        assert!(manifest.entries.is_empty());
+        assert_eq!(manifest.stats.drops_by_reason.parse_fail, 1);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn reader_requires_meta_calibration_and_manifest_dimensions_to_agree() {
+        let calibration_path = unique_dataset_path("reader-calibration-dimensions");
+        write_exact_pairs(&calibration_path, &[0]);
+        let mut mismatched_calibration = calibration();
+        mismatched_calibration.left.width = 1;
+        mismatched_calibration.left.height = 4;
+        std::fs::write(
+            calibration_path.join(format::CALIBRATION_FILE),
+            serde_json::to_vec_pretty(&mismatched_calibration)
+                .expect("serialize calibration fixture"),
+        )
+        .expect("write calibration fixture");
+        assert!(matches!(
+            DatasetReader::open(&calibration_path)
+                .expect_err("calibration dimensions must match metadata"),
+            DatasetError::ImageDimensionsMismatch {
+                expected_field: "meta.mono",
+                actual_field: "calibration.left",
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(calibration_path).expect("remove calibration dataset");
+
+        let manifest_path = unique_dataset_path("reader-manifest-dimensions");
+        write_exact_pairs(&manifest_path, &[0]);
+        let completion_path = manifest_path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&completion_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest["header"]["width"] = serde_json::json!(1);
+        manifest["header"]["height"] = serde_json::json!(4);
+        std::fs::write(
+            &completion_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest fixture"),
+        )
+        .expect("write manifest fixture");
+        assert!(matches!(
+            DatasetReader::open(&manifest_path)
+                .expect_err("manifest dimensions must match metadata"),
+            DatasetError::ImageDimensionsMismatch {
+                expected_field: "meta.mono",
+                actual_field: "manifest.header",
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(manifest_path).expect("remove manifest dataset");
+    }
+
+    #[test]
+    fn reader_parses_manifest_format_timebase_fps_and_window_once() {
+        let path = unique_dataset_path("reader-header-contract");
+        write_exact_pairs(&path, &[0]);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+
+        for (field, value, expected_field) in [
+            ("format", "jpeg", "header.format"),
+            ("timebase", "host_ms", "header.timebase"),
+            ("pairing_policy", "nearest", "header.pairing_policy"),
+        ] {
+            let mut invalid = original.clone();
+            invalid["header"][field] = serde_json::Value::String(value.to_string());
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&invalid).expect("serialize invalid header"),
+            )
+            .expect("write invalid header");
+            assert!(matches!(
+                DatasetReader::open(&path).expect_err("unknown header value must fail"),
+                DatasetError::UnsupportedManifestValue {
+                    field: actual_field,
+                    value: actual_value,
+                } if actual_field == expected_field && actual_value == value
+            ));
+        }
+
+        let mut zero_fps = original.clone();
+        zero_fps["header"]["fps"] = serde_json::json!(0);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&zero_fps).expect("serialize zero fps"),
+        )
+        .expect("write zero fps");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("zero header fps must fail"),
+            DatasetError::InvalidNominalFps {
+                field: "manifest.header.fps",
+                value: 0
+            }
+        ));
+
+        let mut mismatched_fps = original.clone();
+        mismatched_fps["header"]["fps"] = serde_json::json!(31);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&mismatched_fps).expect("serialize mismatched fps"),
+        )
+        .expect("write mismatched fps");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("header fps must match metadata"),
+            DatasetError::NominalFpsMismatch {
+                expected: 30,
+                actual: 31,
+                ..
+            }
+        ));
+
+        let mut mismatched_device = original.clone();
+        mismatched_device["header"]["device"] = serde_json::json!("other-device");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&mismatched_device).expect("serialize mismatched device"),
+        )
+        .expect("write mismatched device");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("header device must match metadata"),
+            DatasetError::ManifestMetadataMismatch {
+                expected_field: "meta.device",
+                expected,
+                actual_field: "manifest.header.device",
+                actual,
+            } if expected == "test-device" && actual == "other-device"
+        ));
+
+        let mut oversized_window = original;
+        oversized_window["header"]["pairing_window_ns"] = serde_json::json!(u64::MAX);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&oversized_window)
+                .expect("serialize oversized pairing window"),
+        )
+        .expect("write oversized pairing window");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("oversized pairing window must fail"),
+            DatasetError::ManifestPairingWindowOutOfRange { value: u64::MAX }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn recorded_pairs_policy_rejects_orphan_topology() {
+        let path = unique_dataset_path("recorded-policy-orphan");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 11, 1))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish orphan dataset");
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        let mut declared_orphans = original.clone();
+        declared_orphans["header"]["pairing_policy"] = serde_json::json!("recorded_pairs");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&declared_orphans).expect("serialize orphan manifest"),
+        )
+        .expect("write orphan manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("recorded pairs cannot declare orphans"),
+            DatasetError::RecordedPairsDeclareOrphans {
+                left_orphans: 1,
+                right_orphans: 0
+            }
+        ));
+
+        let mut missing_right = original;
+        missing_right["header"]["pairing_policy"] = serde_json::json!("recorded_pairs");
+        missing_right["stats"]["left_orphans"] = serde_json::json!(0);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&missing_right).expect("serialize missing-right manifest"),
+        )
+        .expect("write missing-right manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("recorded pair must contain both payloads"),
+            DatasetError::RecordedPairsContainMissingRight {
+                left_timestamp_ns: 11
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn nominal_fps_is_not_compared_with_irregular_observed_timestamps() {
+        let path = unique_dataset_path("irregular-observed-fps");
+        write_exact_pairs(&path, &[0, 1, 2_000_000_000]);
+
+        let reader = DatasetReader::open(&path).expect("nominal fps is metadata, not observation");
+        assert_eq!(reader.stats().left_fps, Some(1.0));
+        assert_eq!(reader.meta().mono.as_ref().expect("mono metadata").fps, 30);
         std::fs::remove_dir_all(path).expect("remove test directory");
     }
 
@@ -1978,7 +3391,11 @@ mod tests {
 
         for (left_timestamp_ns, right_timestamp_ns) in [(0, 0), (7, 6), (8, 7)] {
             assert_eq!(
-                writer.write_pair(stereo_pair(left_timestamp_ns, right_timestamp_ns, window)),
+                write_outcome(writer.write_pair(stereo_pair(
+                    left_timestamp_ns,
+                    right_timestamp_ns,
+                    window,
+                ))),
                 WriteOutcome::Enqueued
             );
         }
@@ -2026,18 +3443,27 @@ mod tests {
             DatasetWriter::create_paired(&path, &meta(), &calibration(), exact_window)
                 .expect("create paired dataset");
 
-        assert_eq!(
-            writer.write_pair(stereo_pair(0, 1, wider_window)),
-            WriteOutcome::WriterFailed
-        );
-        drop(writer);
         assert!(matches!(
-            handle.finish().expect_err("writer window must be enforced"),
-            DatasetError::PairOutsideWriterWindow {
+            writer.write_pair(stereo_pair(0, 1, wider_window)),
+            Err(DatasetWriteError::PairOutsideWriterWindow {
                 delta_ns: 1,
                 max_delta_ns: 0
+            })
+        ));
+        assert!(!writer.is_healthy());
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("writer contract must fail finish"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::PairOutsideWriterWindow {
+                    delta_ns: 1,
+                    max_delta_ns: 0
+                }
             }
         ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
         std::fs::remove_dir_all(path).expect("remove test directory");
     }
 
@@ -2084,6 +3510,8 @@ mod tests {
                 ManifestMode::PreservePairs {
                     pairing_window: window,
                 },
+                writer_contract(),
+                writer_sidecars(),
             ));
             {
                 let mut spool = state.spool.lock().expect("lock spool");
@@ -2106,7 +3534,7 @@ mod tests {
             };
 
             assert_eq!(
-                writer.write_pair(stereo_pair(11, 11, window)),
+                write_outcome(writer.write_pair(stereo_pair(11, 11, window))),
                 WriteOutcome::Dropped
             );
             let stats = writer.stats();
@@ -2119,6 +3547,65 @@ mod tests {
             assert_eq!(spool.frames, 1);
             assert_eq!(spool.bytes, 4);
         }
+    }
+
+    #[test]
+    fn spool_capacity_remains_reserved_while_a_batch_item_is_in_flight() {
+        let config = DatasetWriterConfig {
+            max_spool_frames: 1,
+            max_spool_bytes: 4,
+            flush_batch_frames: 1,
+            backpressure: Backpressure::DropNewest,
+        };
+        let state = Arc::new(WriterState::new(
+            config,
+            PathBuf::new(),
+            PathBuf::new(),
+            ManifestMode::InferPairs,
+            writer_contract(),
+            writer_sidecars(),
+        ));
+        let writer = DatasetWriter {
+            config,
+            state: Arc::clone(&state),
+        };
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 1, 1))),
+            WriteOutcome::Enqueued
+        );
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            writer_loop_with(worker_state, move |_item| {
+                entered_tx.send(()).expect("signal in-flight item");
+                release_rx.recv().expect("release in-flight item");
+                Ok(None)
+            });
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker must enter controlled sink");
+
+        let in_flight = writer.stats();
+        assert_eq!(in_flight.spool_frames, 1);
+        assert_eq!(in_flight.spool_bytes, 4);
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoRight, 2, 2))),
+            WriteOutcome::Dropped
+        );
+        assert_eq!(writer.stats().spool_frames, 1);
+        drop(writer);
+
+        release_tx.send(()).expect("release controlled sink");
+        worker.join().expect("join controlled writer");
+        let completed = state.stats();
+        assert_eq!(completed.frames_enqueued, 1);
+        assert_eq!(completed.frames_written, 1);
+        assert_eq!(completed.frames_dropped, 1);
+        assert_eq!(completed.spool_frames, 0);
+        assert_eq!(completed.spool_bytes, 0);
     }
 
     #[test]
@@ -2164,6 +3651,8 @@ mod tests {
             path.clone(),
             frames_dir.clone(),
             ManifestMode::InferPairs,
+            writer_contract(),
+            writer_sidecars(),
         ));
         {
             let mut spool = state.spool.lock().expect("lock spool");
@@ -2218,7 +3707,7 @@ mod tests {
         std::fs::write(&right_path, [9_u8; 4]).expect("occupy right payload path");
 
         assert_eq!(
-            writer.write_pair(stereo_pair(11, 11, window)),
+            write_outcome(writer.write_pair(stereo_pair(11, 11, window))),
             WriteOutcome::Enqueued
         );
         drop(writer);
@@ -2248,6 +3737,58 @@ mod tests {
             "the first payload may remain as an explicitly unreferenced partial write"
         );
         std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn recorded_pair_finalization_preserves_payload_failure_causes() {
+        let window = PairingWindowNs::new(0).expect("valid exact window");
+
+        let missing_path = unique_dataset_path("recorded-payload-missing");
+        let (writer, handle) =
+            DatasetWriter::create_paired(&missing_path, &meta(), &calibration(), window)
+                .expect("create paired dataset");
+        assert_eq!(
+            write_outcome(writer.write_pair(stereo_pair(21, 21, window))),
+            WriteOutcome::Enqueued
+        );
+        wait_for_written_frames(&writer, 2);
+        let missing_payload = missing_path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(21, "mono_right"));
+        std::fs::remove_file(&missing_payload).expect("remove recorded payload");
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("missing payload must fail finish"),
+            DatasetError::ReadFile { path, source }
+                if path == missing_payload && source.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!missing_path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(missing_path).expect("remove missing-payload dataset");
+
+        let truncated_path = unique_dataset_path("recorded-payload-truncated");
+        let (writer, handle) =
+            DatasetWriter::create_paired(&truncated_path, &meta(), &calibration(), window)
+                .expect("create paired dataset");
+        assert_eq!(
+            write_outcome(writer.write_pair(stereo_pair(22, 22, window))),
+            WriteOutcome::Enqueued
+        );
+        wait_for_written_frames(&writer, 2);
+        let truncated_payload = truncated_path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(22, "mono_right"));
+        std::fs::write(&truncated_payload, [0_u8; 3]).expect("truncate recorded payload");
+        drop(writer);
+        assert!(matches!(
+            handle.finish().expect_err("truncated payload must fail finish"),
+            DatasetError::InvalidFrameLength {
+                path,
+                expected: 4,
+                actual: 3
+            } if path == truncated_payload
+        ));
+        assert!(!truncated_path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(truncated_path).expect("remove truncated-payload dataset");
     }
 
     #[test]
@@ -2335,6 +3876,75 @@ mod tests {
             DatasetError::InvalidManifestStats {
                 field: "paired_count",
                 declared: 2,
+                derived: 1
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_open_rejects_diagnostics_that_disagree_with_explicit_entries() {
+        let path = unique_dataset_path("manifest-diagnostics");
+        write_exact_pairs(&path, &[0, 1_000_000_000]);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+
+        let mut wrong_delta = original.clone();
+        wrong_delta["stats"]["delta_stats"]["max"] = serde_json::json!(1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&wrong_delta).expect("serialize wrong delta stats"),
+        )
+        .expect("write wrong delta stats");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("wrong delta stats must fail"),
+            DatasetError::InvalidManifestStats {
+                field: "delta_stats.max",
+                declared: 1,
+                derived: 0
+            }
+        ));
+
+        let mut missing_delta = original.clone();
+        missing_delta["stats"]["delta_stats"] = serde_json::Value::Null;
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&missing_delta).expect("serialize absent delta stats"),
+        )
+        .expect("write absent delta stats");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("absent delta stats must fail"),
+            DatasetError::ManifestDeltaStatsPresenceMismatch {
+                declared: false,
+                derived: true
+            }
+        ));
+
+        let mut wrong_outside_window = original;
+        let left = wrong_outside_window["entries"][1]["left"].clone();
+        wrong_outside_window["entries"][1] = serde_json::json!({
+            "left": left,
+            "status": "missing_right",
+            "reason": "outside_window"
+        });
+        wrong_outside_window["stats"]["paired_count"] = serde_json::json!(1);
+        wrong_outside_window["stats"]["left_orphans"] = serde_json::json!(1);
+        wrong_outside_window["stats"]["right_orphans"] = serde_json::json!(1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&wrong_outside_window)
+                .expect("serialize wrong outside-window count"),
+        )
+        .expect("write wrong outside-window count");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("wrong outside-window count must fail"),
+            DatasetError::InvalidManifestStats {
+                field: "drops_by_reason.outside_window",
+                declared: 0,
                 derived: 1
             }
         ));
@@ -2523,7 +4133,7 @@ mod tests {
     }
 
     #[test]
-    fn dataset_open_requires_nonzero_mono_dimensions() {
+    fn dataset_open_requires_complete_nonzero_mono_metadata() {
         let path = unique_dataset_path("mono-dimensions");
         write_exact_pairs(&path, &[0]);
         let meta_path = path.join(format::META_FILE);
@@ -2543,7 +4153,7 @@ mod tests {
             DatasetError::MissingMonoConfig
         ));
 
-        let mut zero_width = original;
+        let mut zero_width = original.clone();
         zero_width["mono"]["width"] = serde_json::json!(0);
         std::fs::write(
             &meta_path,
@@ -2556,7 +4166,23 @@ mod tests {
                 source: crate::FrameError::ZeroDimensions {
                     width: 0,
                     height: 2
-                }
+                },
+                ..
+            }
+        ));
+
+        let mut zero_fps = original;
+        zero_fps["mono"]["fps"] = serde_json::json!(0);
+        std::fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&zero_fps).expect("serialize zero-fps metadata"),
+        )
+        .expect("write zero-fps metadata");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("zero nominal fps must fail open"),
+            DatasetError::InvalidNominalFps {
+                field: "meta.mono.fps",
+                value: 0
             }
         ));
 
@@ -2569,11 +4195,11 @@ mod tests {
         let (writer, handle) =
             DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
         assert_eq!(
-            writer.write_frame(&frame(SensorId::StereoLeft, 11, 1)),
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 11, 1))),
             WriteOutcome::Enqueued
         );
         assert_eq!(
-            writer.write_frame(&frame(SensorId::StereoRight, 11, 2)),
+            write_outcome(writer.write_frame(&frame(SensorId::StereoRight, 11, 2))),
             WriteOutcome::Enqueued
         );
         drop(writer);

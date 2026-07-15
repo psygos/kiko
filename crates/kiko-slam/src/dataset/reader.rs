@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 use crate::{Frame, FrameDimensions, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
-    Calibration, DatasetError, Manifest, ManifestFrameRef, ManifestPairing, ManifestStats, format,
-    read_calibration, read_manifest, read_meta, sensor_to_str,
+    Calibration, DatasetError, DatasetTimebase, DeltaStats, DepthImageContract, Manifest,
+    ManifestFrameRef, ManifestHeader, ManifestPairing, ManifestPairingPolicy, ManifestStats,
+    MonoImageContract, MonoPayloadFormat, PairReason, build_delta_stats, format,
+    parse_image_dimensions, read_calibration, read_manifest, read_meta, sensor_to_str,
 };
 
 #[derive(Clone, Debug)]
@@ -25,6 +27,84 @@ struct DatasetEntry {
 struct ParsedManifest {
     entries: Vec<DatasetEntry>,
     stats: DatasetStats,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedManifestContract {
+    image: MonoImageContract,
+    _depth: Option<DepthImageContract>,
+    pairing_policy: ManifestPairingPolicy,
+    pairing_window: PairingWindowNs,
+}
+
+impl ParsedManifestContract {
+    fn parse(
+        header: &ManifestHeader,
+        image: MonoImageContract,
+        meta: &super::Meta,
+    ) -> Result<Self, DatasetError> {
+        MonoPayloadFormat::parse(&header.format)?;
+        DatasetTimebase::parse(&header.timebase)?;
+        let manifest_dimensions =
+            parse_image_dimensions("manifest.header", header.width, header.height)?;
+        image.require_dimensions("manifest.header", manifest_dimensions)?;
+        if header.fps == 0 {
+            return Err(DatasetError::InvalidNominalFps {
+                field: "manifest.header.fps",
+                value: header.fps,
+            });
+        }
+        let expected_fps = image.nominal_fps_hz().get();
+        if header.fps != expected_fps {
+            return Err(DatasetError::NominalFpsMismatch {
+                expected_field: "meta.mono.fps",
+                expected: expected_fps,
+                actual_field: "manifest.header.fps",
+                actual: header.fps,
+            });
+        }
+        for (expected_field, expected, actual_field, actual) in [
+            (
+                "meta.created",
+                meta.created.as_str(),
+                "manifest.header.created_at",
+                header.created_at.as_str(),
+            ),
+            (
+                "meta.device",
+                meta.device.as_str(),
+                "manifest.header.device",
+                header.device.as_str(),
+            ),
+        ] {
+            if actual != expected {
+                return Err(DatasetError::ManifestMetadataMismatch {
+                    expected_field,
+                    expected: expected.to_string(),
+                    actual_field,
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        let pairing_policy = ManifestPairingPolicy::parse(&header.pairing_policy)?;
+        let pairing_window =
+            PairingWindowNs::try_from_u64(header.pairing_window_ns).map_err(|_| {
+                DatasetError::ManifestPairingWindowOutOfRange {
+                    value: header.pairing_window_ns,
+                }
+            })?;
+        let depth = meta
+            .depth
+            .as_ref()
+            .map(DepthImageContract::parse)
+            .transpose()?;
+        Ok(Self {
+            image,
+            _depth: depth,
+            pairing_policy,
+            pairing_window,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -62,27 +142,17 @@ impl DatasetReader {
                 source,
             })?;
         let meta = read_meta(&root)?;
-        let mono = meta.mono.as_ref().ok_or(DatasetError::MissingMonoConfig)?;
-        let dimensions = FrameDimensions::try_new(mono.width, mono.height)
-            .map_err(|source| DatasetError::InvalidFrameDimensions { source })?;
         let calibration = read_calibration(&root)?;
+        let image = MonoImageContract::parse(&meta, &calibration)?;
         let manifest = read_manifest(&root)?;
-        let pairing_window_ns = i64::try_from(manifest.header.pairing_window_ns).map_err(|_| {
-            DatasetError::InvalidConfig {
-                msg: "manifest pairing_window_ns exceeds i64::MAX",
-            }
-        })?;
-        let pairing_window =
-            PairingWindowNs::new(pairing_window_ns).map_err(|_| DatasetError::InvalidConfig {
-                msg: "manifest pairing_window_ns must be non-negative",
-            })?;
-        let parsed = parse_manifest(&root, manifest, dimensions, pairing_window)?;
+        let contract = ParsedManifestContract::parse(&manifest.header, image, &meta)?;
+        let parsed = parse_manifest(&root, manifest, contract)?;
         Ok(Self {
             meta,
             calibration,
             entries: parsed.entries,
             stats: parsed.stats,
-            dimensions,
+            dimensions: contract.image.dimensions(),
             left_seq: 0,
             right_seq: 0,
         })
@@ -242,17 +312,24 @@ impl DatasetReader {
 fn parse_manifest(
     root: &Path,
     manifest: Manifest,
-    dimensions: FrameDimensions,
-    pairing_window: PairingWindowNs,
+    contract: ParsedManifestContract,
 ) -> Result<ParsedManifest, DatasetError> {
     let Manifest { stats, entries, .. } = manifest;
-    let max_delta_ns =
-        u64::try_from(pairing_window.as_ns()).map_err(|_| DatasetError::InvalidManifest {
-            reason: "parsed pairing window is negative",
-        })?;
+    if contract.pairing_policy == ManifestPairingPolicy::RecordedPairs
+        && (stats.left_orphans != 0 || stats.right_orphans != 0)
+    {
+        return Err(DatasetError::RecordedPairsDeclareOrphans {
+            left_orphans: stats.left_orphans,
+            right_orphans: stats.right_orphans,
+        });
+    }
+    let dimensions = contract.image.dimensions();
+    let max_delta_ns = contract.pairing_window.as_u64();
     let mut parsed_entries = Vec::with_capacity(entries.len());
+    let mut paired_deltas = Vec::with_capacity(entries.len());
     let mut seen_paths = HashSet::with_capacity(entries.len().saturating_mul(2));
     let mut previous_left_timestamp_ns = None;
+    let mut outside_window = 0u64;
 
     for entry in entries {
         let left_timestamp_ns = entry.left.timestamp_ns;
@@ -289,19 +366,63 @@ fn parse_manifest(
                         max_delta_ns,
                     });
                 }
+                paired_deltas.push(derived_delta_ns);
                 Some(right)
             }
-            ManifestPairing::MissingRight { .. } => None,
+            ManifestPairing::MissingRight { reason } => {
+                if contract.pairing_policy == ManifestPairingPolicy::RecordedPairs {
+                    return Err(DatasetError::RecordedPairsContainMissingRight {
+                        left_timestamp_ns,
+                    });
+                }
+                if matches!(reason, PairReason::OutsideWindow) {
+                    outside_window = outside_window.saturating_add(1);
+                }
+                None
+            }
         };
         parsed_entries.push(DatasetEntry { left, right });
         previous_left_timestamp_ns = Some(left_timestamp_ns);
     }
 
+    let derived_delta_stats = build_delta_stats(&paired_deltas);
+    validate_manifest_delta_stats(stats.delta_stats.as_ref(), derived_delta_stats.as_ref())?;
+    validate_manifest_stat(
+        "drops_by_reason.outside_window",
+        stats.drops_by_reason.outside_window,
+        outside_window,
+    )?;
     let stats = DatasetStats::from_manifest(&parsed_entries, stats)?;
     Ok(ParsedManifest {
         entries: parsed_entries,
         stats,
     })
+}
+
+fn validate_manifest_delta_stats(
+    declared: Option<&DeltaStats>,
+    derived: Option<&DeltaStats>,
+) -> Result<(), DatasetError> {
+    let (Some(declared), Some(derived)) = (declared, derived) else {
+        if declared.is_some() != derived.is_some() {
+            return Err(DatasetError::ManifestDeltaStatsPresenceMismatch {
+                declared: declared.is_some(),
+                derived: derived.is_some(),
+            });
+        }
+        return Ok(());
+    };
+
+    for (field, declared, derived) in [
+        ("delta_stats.min", declared.min, derived.min),
+        ("delta_stats.median", declared.median, derived.median),
+        ("delta_stats.p95", declared.p95, derived.p95),
+        ("delta_stats.p99", declared.p99, derived.p99),
+        ("delta_stats.max", declared.max, derived.max),
+    ] {
+        validate_manifest_stat(field, declared, derived)?;
+    }
+    Ok(())
 }
 
 fn insert_unique_frame_ref(
