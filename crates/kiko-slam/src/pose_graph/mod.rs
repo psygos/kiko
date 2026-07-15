@@ -97,6 +97,14 @@ pub enum PoseGraphError {
         endpoint: &'static str,
         keyframe_id: KeyframeId,
     },
+    UnconstrainedPoseGraph {
+        pose_count: usize,
+    },
+    DisconnectedPoseGraph {
+        pose_count: usize,
+        component_count: usize,
+        anchor_component_size: usize,
+    },
     InvalidRobustSquaredNorm {
         outer_iteration: usize,
         edge_index: usize,
@@ -333,6 +341,18 @@ impl std::fmt::Display for PoseGraphError {
             } => write!(
                 f,
                 "essential graph edge {edge_index} endpoint {endpoint} references unregistered keyframe {keyframe_id:?}"
+            ),
+            PoseGraphError::UnconstrainedPoseGraph { pose_count } => write!(
+                f,
+                "pose graph has {pose_count} poses but no relative-pose constraints"
+            ),
+            PoseGraphError::DisconnectedPoseGraph {
+                pose_count,
+                component_count,
+                anchor_component_size,
+            } => write!(
+                f,
+                "pose graph is disconnected: {pose_count} poses in {component_count} components; {anchor_component_size} poses are connected to anchor pose 0"
             ),
             PoseGraphError::InvalidRobustSquaredNorm {
                 outer_iteration,

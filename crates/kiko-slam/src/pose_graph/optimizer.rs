@@ -244,7 +244,62 @@ fn validate_optimizer_edges(
         validate_edge_bounds(edge, edge_index, pose_count)?;
         symmetrized_information_count += usize::from(edge.information.was_symmetrized());
     }
+    validate_connected_topology(edges, pose_count)?;
     Ok(symmetrized_information_count)
+}
+
+fn validate_connected_topology(
+    edges: &[PoseGraphEdge],
+    pose_count: usize,
+) -> Result<(), PoseGraphError> {
+    if pose_count <= 1 {
+        return Ok(());
+    }
+    if edges.is_empty() {
+        return Err(PoseGraphError::UnconstrainedPoseGraph { pose_count });
+    }
+
+    let mut parents: Vec<usize> = (0..pose_count).collect();
+    for edge in edges {
+        let from_root = find_root(&mut parents, edge.from);
+        let to_root = find_root(&mut parents, edge.to);
+        if from_root != to_root {
+            parents[to_root] = from_root;
+        }
+    }
+
+    let anchor_root = find_root(&mut parents, 0);
+    let mut anchor_component_size = 0;
+    let mut component_count = 0;
+    for pose_index in 0..pose_count {
+        let root = find_root(&mut parents, pose_index);
+        component_count += usize::from(root == pose_index);
+        anchor_component_size += usize::from(root == anchor_root);
+    }
+    if component_count > 1 {
+        return Err(PoseGraphError::DisconnectedPoseGraph {
+            pose_count,
+            component_count,
+            anchor_component_size,
+        });
+    }
+
+    Ok(())
+}
+
+fn find_root(parents: &mut [usize], pose_index: usize) -> usize {
+    let mut root = pose_index;
+    while parents[root] != root {
+        root = parents[root];
+    }
+
+    let mut current = pose_index;
+    while parents[current] != current {
+        let next = parents[current];
+        parents[current] = root;
+        current = next;
+    }
+    root
 }
 
 fn edge_error_from_endpoints(from_pose: Pose64, to_pose: Pose64, measurement: Pose64) -> [f64; 6] {
