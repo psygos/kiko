@@ -1366,22 +1366,11 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
         sensor_id,
         frame_id: _,
         timestamp,
-        dimensions,
+        dimensions: _,
         data,
     } = frame;
     let filename = format::frame_name(timestamp.as_nanos(), frame_kind(sensor_id));
     let path = frames_dir.join(&filename);
-
-    let expected_len = dimensions.area();
-    if data.len() != expected_len {
-        return Err(DatasetError::WriteFile {
-            path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame data len does not match width * height",
-            ),
-        });
-    }
 
     write_new_file(path, data.as_ref())
 }

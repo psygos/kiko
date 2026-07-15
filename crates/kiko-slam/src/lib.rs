@@ -1603,6 +1603,23 @@ mod tests {
         Descriptor::try_new(values).expect("valid test descriptor")
     }
 
+    #[test]
+    fn frame_stores_the_dimensions_parsed_at_construction() {
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(2),
+            2,
+            3,
+            vec![0; 6],
+        )
+        .expect("valid frame");
+
+        assert_eq!(frame.dimensions().width(), 2);
+        assert_eq!(frame.dimensions().height(), 3);
+        assert_eq!(frame.data().len(), frame.dimensions().area());
+    }
+
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;
         let mut norm_a = 0.0_f32;
