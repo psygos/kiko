@@ -312,10 +312,6 @@ pub enum DownscaleError {
     TooLarge {
         value: usize,
     },
-    ZeroDimensions {
-        width: u32,
-        height: u32,
-    },
     NonDivisible {
         width: u32,
         height: u32,
@@ -329,9 +325,6 @@ impl std::fmt::Display for DownscaleError {
             DownscaleError::Zero => write!(f, "downscale factor must be > 0"),
             DownscaleError::TooLarge { value } => {
                 write!(f, "downscale factor {value} exceeds u32::MAX")
-            }
-            DownscaleError::ZeroDimensions { width, height } => {
-                write!(f, "input dimensions must be nonzero, got {width}x{height}")
             }
             DownscaleError::NonDivisible {
                 width,

@@ -35,9 +35,7 @@ impl SuperPoint {
     }
 
     pub fn detect(&mut self, frame: &Frame) -> Result<Detections, InferenceError> {
-        let expected = (frame.width() as usize) * (frame.height() as usize);
-        self.scratch.resize(expected, 0.0);
-        crate::preprocess::normalise_into(frame.data(), &mut self.scratch);
+        crate::preprocess::normalise_frame_into(frame, &mut self.scratch);
 
         let input_tensor = Tensor::from_array((
             [1, 1, frame.height() as usize, frame.width() as usize],
@@ -63,14 +61,9 @@ impl SuperPoint {
             return self.detect(frame);
         }
 
-        let dimensions = crate::preprocess::normalise_downscale_into(
-            frame.data(),
-            frame.width(),
-            frame.height(),
-            downscale,
-            &mut self.scratch,
-        )
-        .map_err(InferenceError::Downscale)?;
+        let dimensions =
+            crate::preprocess::normalise_downscale_into(frame, downscale, &mut self.scratch)
+                .map_err(InferenceError::Downscale)?;
 
         let input_tensor = Tensor::from_array((
             [
