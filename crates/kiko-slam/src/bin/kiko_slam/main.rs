@@ -967,7 +967,8 @@ mod tests {
             sum_inference_attempt: Duration::from_millis(60),
             ..BenchAccum::default()
         };
-        let summary = summarize_bench(&accum, Duration::from_secs(2));
+        let summary = summarize_bench(&accum, Duration::from_secs(2))
+            .expect("benchmark timing totals are consistent");
 
         assert!((summary.wall_fps - 1.5).abs() < 1e-9);
         assert!((summary.reader_stage_fps - 80.0).abs() < 1e-9);

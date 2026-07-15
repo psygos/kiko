@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use clap::Args;
 
-use kiko_slam::InferencePipeline;
 use kiko_slam::dataset::DatasetReader;
+use kiko_slam::{InferencePipeline, PipelineTimingError, PipelineWallBreakdown};
 
 use crate::args::{DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose};
 use crate::{
@@ -63,9 +63,33 @@ pub(crate) struct BenchPairTimings {
 }
 
 impl BenchPairTimings {
-    fn overhead(self) -> Duration {
-        self.total_success.saturating_sub(
-            self.stereo_superpoint_wall + self.lightglue + self.fused_ort_invocation,
+    fn try_overhead(self) -> Result<Duration, PipelineTimingError> {
+        if self.fused_ort_invocation.is_zero() {
+            return PipelineWallBreakdown::try_from_totals(
+                self.stereo_superpoint_wall,
+                self.lightglue,
+                self.total_success,
+            )
+            .map(PipelineWallBreakdown::overhead);
+        }
+
+        let accounted = self
+            .stereo_superpoint_wall
+            .checked_add(self.lightglue)
+            .ok_or(PipelineTimingError::AccountedDurationOverflow {
+                detector: self.stereo_superpoint_wall,
+                lightglue: self.lightglue,
+            })?
+            .checked_add(self.fused_ort_invocation)
+            .ok_or(PipelineTimingError::AccountedDurationOverflow {
+                detector: self.stereo_superpoint_wall + self.lightglue,
+                lightglue: self.fused_ort_invocation,
+            })?;
+        self.total_success.checked_sub(accounted).ok_or(
+            PipelineTimingError::ComponentsExceedTotal {
+                accounted,
+                total: self.total_success,
+            },
         )
     }
 }
@@ -120,7 +144,10 @@ pub(crate) struct BenchSummary {
     pub pct_overhead: f64,
 }
 
-pub(crate) fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSummary {
+pub(crate) fn summarize_bench(
+    accum: &BenchAccum,
+    elapsed: Duration,
+) -> Result<BenchSummary, PipelineTimingError> {
     let wall_seconds = elapsed.as_secs_f64();
     let wall_fps = if wall_seconds > 0.0 {
         accum.processed as f64 / wall_seconds
@@ -212,9 +239,14 @@ pub(crate) fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSum
     } else {
         0.0
     };
-    let overhead = accum.sum_total_success.saturating_sub(
-        accum.sum_stereo_sp_wall + accum.sum_lightglue + accum.sum_fused_ort_invocation,
-    );
+    let overhead = BenchPairTimings {
+        stereo_superpoint_wall: accum.sum_stereo_sp_wall,
+        lightglue: accum.sum_lightglue,
+        fused_ort_invocation: accum.sum_fused_ort_invocation,
+        total_success: accum.sum_total_success,
+        ..BenchPairTimings::default()
+    }
+    .try_overhead()?;
     let avg_overhead_ms = if accum.processed > 0 {
         (overhead.as_secs_f64() * 1000.0) / denom
     } else {
@@ -227,7 +259,7 @@ pub(crate) fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSum
         (accum.sum_fused_ort_invocation.as_secs_f64() / total_ms) * 100.0;
     let pct_overhead = (overhead.as_secs_f64() / total_ms) * 100.0;
 
-    BenchSummary {
+    Ok(BenchSummary {
         read_samples: accum.read_samples,
         processed: accum.processed,
         wall_seconds,
@@ -255,50 +287,66 @@ pub(crate) fn summarize_bench(accum: &BenchAccum, elapsed: Duration) -> BenchSum
         pct_lightglue,
         pct_fused_ort_invocation,
         pct_overhead,
-    }
+    })
 }
 
 pub(crate) fn summarize_latencies(
     samples: &[BenchPairTimings],
     warmup_pairs: usize,
-) -> Option<BenchLatencySummary> {
-    let measured = samples.get(warmup_pairs..)?;
+) -> Result<Option<BenchLatencySummary>, PipelineTimingError> {
+    let Some(measured) = samples.get(warmup_pairs..) else {
+        return Ok(None);
+    };
     if measured.is_empty() {
-        return None;
+        return Ok(None);
     }
+    let overheads = measured
+        .iter()
+        .copied()
+        .map(BenchPairTimings::try_overhead)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    Some(BenchLatencySummary {
+    Ok(Some(BenchLatencySummary {
         samples: measured.len(),
-        read_pair: duration_percentiles(measured.iter().map(|sample| sample.read_pair))?,
+        read_pair: duration_percentiles(measured.iter().map(|sample| sample.read_pair))
+            .expect("measured benchmark slice is non-empty"),
         inference_attempt: duration_percentiles(
             measured.iter().map(|sample| sample.inference_attempt),
-        )?,
-        superpoint_left: duration_percentiles(
-            measured.iter().map(|sample| sample.superpoint_left),
-        )?,
+        )
+        .expect("measured benchmark slice is non-empty"),
+        superpoint_left: duration_percentiles(measured.iter().map(|sample| sample.superpoint_left))
+            .expect("measured benchmark slice is non-empty"),
         superpoint_right: duration_percentiles(
             measured.iter().map(|sample| sample.superpoint_right),
-        )?,
+        )
+        .expect("measured benchmark slice is non-empty"),
         stereo_superpoint_wall: duration_percentiles(
             measured.iter().map(|sample| sample.stereo_superpoint_wall),
-        )?,
-        lightglue: duration_percentiles(measured.iter().map(|sample| sample.lightglue))?,
+        )
+        .expect("measured benchmark slice is non-empty"),
+        lightglue: duration_percentiles(measured.iter().map(|sample| sample.lightglue))
+            .expect("measured benchmark slice is non-empty"),
         fused_ort_invocation: duration_percentiles(
             measured.iter().map(|sample| sample.fused_ort_invocation),
-        )?,
-        overhead: duration_percentiles(measured.iter().copied().map(BenchPairTimings::overhead))?,
-        total_success: duration_percentiles(measured.iter().map(|sample| sample.total_success))?,
-    })
+        )
+        .expect("measured benchmark slice is non-empty"),
+        overhead: duration_percentiles(overheads.into_iter())
+            .expect("measured benchmark slice is non-empty"),
+        total_success: duration_percentiles(measured.iter().map(|sample| sample.total_success))
+            .expect("measured benchmark slice is non-empty"),
+    }))
 }
 
 fn summarize_steady_stages(
     samples: &[BenchPairTimings],
     warmup_pairs: usize,
     elapsed: Duration,
-) -> Option<BenchSummary> {
-    let measured = samples.get(warmup_pairs..)?;
+) -> Result<Option<BenchSummary>, PipelineTimingError> {
+    let Some(measured) = samples.get(warmup_pairs..) else {
+        return Ok(None);
+    };
     if measured.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut accum = BenchAccum {
         read_samples: measured.len(),
@@ -316,7 +364,7 @@ fn summarize_steady_stages(
         accum.sum_fused_ort_invocation += sample.fused_ort_invocation;
         accum.sum_total_success += sample.total_success;
     }
-    Some(summarize_bench(&accum, elapsed))
+    summarize_bench(&accum, elapsed).map(Some)
 }
 
 pub(crate) fn duration_percentiles(
@@ -599,10 +647,12 @@ pub fn run_bench(args: &BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = start.elapsed();
     let steady_elapsed = steady_start.map(|start| start.elapsed());
     let cpu_end = process_usage();
-    let summary = summarize_bench(&accum, elapsed);
-    let latency_summary = summarize_latencies(&accum.timings, args.warmup_pairs);
-    let steady_stage_summary = steady_elapsed
-        .and_then(|elapsed| summarize_steady_stages(&accum.timings, args.warmup_pairs, elapsed));
+    let summary = summarize_bench(&accum, elapsed)?;
+    let latency_summary = summarize_latencies(&accum.timings, args.warmup_pairs)?;
+    let steady_stage_summary = match steady_elapsed {
+        Some(elapsed) => summarize_steady_stages(&accum.timings, args.warmup_pairs, elapsed)?,
+        None => None,
+    };
     let steady_processed = accum.processed.saturating_sub(args.warmup_pairs);
     let steady_wall_seconds = steady_elapsed.map_or(0.0, |elapsed| elapsed.as_secs_f64());
     let steady_wall_fps = if steady_wall_seconds > 0.0 {
@@ -851,14 +901,16 @@ mod tests {
                     superpoint_left: duration,
                     superpoint_right: duration,
                     stereo_superpoint_wall: duration,
-                    lightglue: duration,
-                    fused_ort_invocation: duration,
+                    lightglue: Duration::ZERO,
+                    fused_ort_invocation: Duration::ZERO,
                     total_success: duration,
                 }
             })
             .collect();
 
-        let summary = summarize_latencies(&samples, 4).expect("28 measured samples");
+        let summary = summarize_latencies(&samples, 4)
+            .expect("consistent timings")
+            .expect("28 measured samples");
         assert_eq!(summary.samples, 28);
         assert_eq!(summary.total_success.median_ms, 18.5);
         assert_eq!(summary.total_success.p95_ms, 31.0);
@@ -883,6 +935,7 @@ mod tests {
             .collect();
 
         let summary = summarize_steady_stages(&samples, 2, Duration::from_millis(80))
+            .expect("consistent timings")
             .expect("four steady samples");
         assert_eq!(summary.processed, 4);
         assert_eq!(summary.read_samples, 4);
@@ -913,6 +966,20 @@ mod tests {
             total_success: Duration::from_millis(12),
             ..BenchPairTimings::default()
         };
-        assert_eq!(sample.overhead(), Duration::from_millis(1));
+        assert_eq!(
+            sample.try_overhead().expect("consistent timing sample"),
+            Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn contradictory_timing_sample_is_rejected() {
+        let sample = BenchPairTimings {
+            stereo_superpoint_wall: Duration::from_millis(10),
+            lightglue: Duration::from_millis(3),
+            total_success: Duration::from_millis(12),
+            ..BenchPairTimings::default()
+        };
+        assert!(sample.try_overhead().is_err());
     }
 }

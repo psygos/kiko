@@ -140,7 +140,8 @@ pub use pairing::{
     PendingFramesCapacity, PendingFramesCapacityError, StereoPairer,
 };
 pub use pipeline::{
-    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
+    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimingError,
+    PipelineTimings, PipelineWallBreakdown,
 };
 pub use place_recognition::{BootstrapDescriptorError, DescriptorInitError, DescriptorStats};
 pub use pnp::{

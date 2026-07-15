@@ -269,11 +269,105 @@ pub struct PipelineTimings {
     pub total: Duration,
 }
 
+impl PipelineTimings {
+    /// Wall time spent on the parallel detector stage.
+    pub fn detector_wall(self) -> Duration {
+        self.stereo_superpoint_wall
+    }
+
+    pub fn try_wall_breakdown(self) -> Result<PipelineWallBreakdown, PipelineTimingError> {
+        PipelineWallBreakdown::try_from_totals(self.detector_wall(), self.lightglue, self.total)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineWallBreakdown {
+    detector: Duration,
+    lightglue: Duration,
+    overhead: Duration,
+    total: Duration,
+}
+
+impl PipelineWallBreakdown {
+    pub fn try_from_totals(
+        detector: Duration,
+        lightglue: Duration,
+        total: Duration,
+    ) -> Result<Self, PipelineTimingError> {
+        let accounted = detector.checked_add(lightglue).ok_or(
+            PipelineTimingError::AccountedDurationOverflow {
+                detector,
+                lightglue,
+            },
+        )?;
+        let overhead = total
+            .checked_sub(accounted)
+            .ok_or(PipelineTimingError::ComponentsExceedTotal { accounted, total })?;
+        Ok(Self {
+            detector,
+            lightglue,
+            overhead,
+            total,
+        })
+    }
+
+    pub fn detector(self) -> Duration {
+        self.detector
+    }
+
+    pub fn lightglue(self) -> Duration {
+        self.lightglue
+    }
+
+    pub fn overhead(self) -> Duration {
+        self.overhead
+    }
+
+    pub fn total(self) -> Duration {
+        self.total
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineTimingError {
+    AccountedDurationOverflow {
+        detector: Duration,
+        lightglue: Duration,
+    },
+    ComponentsExceedTotal {
+        accounted: Duration,
+        total: Duration,
+    },
+}
+
+impl std::fmt::Display for PipelineTimingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AccountedDurationOverflow {
+                detector,
+                lightglue,
+            } => write!(
+                f,
+                "pipeline detector ({detector:?}) and matcher ({lightglue:?}) durations overflow"
+            ),
+            Self::ComponentsExceedTotal { accounted, total } => write!(
+                f,
+                "pipeline wall-time components ({accounted:?}) exceed measured total ({total:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PipelineTimingError {}
+
 #[cfg(test)]
 mod tests {
-    use super::{KeypointLimit, KeypointLimitError, PipelineError};
+    use super::{
+        KeypointLimit, KeypointLimitError, PipelineError, PipelineTimingError, PipelineTimings,
+        PipelineWallBreakdown,
+    };
     use crate::{FrameError, inference::InferenceError};
-    use std::error::Error as _;
+    use std::{error::Error as _, time::Duration};
 
     #[test]
     fn pipeline_error_exposes_inference_and_domain_sources() {
@@ -305,5 +399,44 @@ mod tests {
             "0".parse::<KeypointLimit>(),
             Err(KeypointLimitError::Zero)
         ));
+    }
+
+    #[test]
+    fn wall_breakdown_uses_the_parallel_detector_critical_path() {
+        let timings = PipelineTimings {
+            superpoint_left: Duration::from_millis(7),
+            superpoint_right: Duration::from_millis(5),
+            stereo_superpoint_wall: Duration::from_millis(8),
+            lightglue: Duration::from_millis(3),
+            total: Duration::from_millis(13),
+        };
+
+        let breakdown = timings.try_wall_breakdown().expect("consistent timings");
+
+        assert_eq!(breakdown.detector, Duration::from_millis(8));
+        assert_eq!(breakdown.lightglue, Duration::from_millis(3));
+        assert_eq!(breakdown.overhead, Duration::from_millis(2));
+        assert_eq!(
+            breakdown.detector + breakdown.lightglue + breakdown.overhead,
+            breakdown.total
+        );
+    }
+
+    #[test]
+    fn wall_breakdown_rejects_contradictory_measurements() {
+        let error = PipelineWallBreakdown::try_from_totals(
+            Duration::from_millis(7),
+            Duration::from_millis(3),
+            Duration::from_millis(9),
+        )
+        .expect_err("components cannot exceed total wall time");
+
+        assert_eq!(
+            error,
+            PipelineTimingError::ComponentsExceedTotal {
+                accounted: Duration::from_millis(10),
+                total: Duration::from_millis(9),
+            }
+        );
     }
 }
