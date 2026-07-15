@@ -684,35 +684,6 @@ impl Detections {
     }
 }
 
-pub trait FrameSource {
-    fn next_frame(&mut self) -> Option<Frame>;
-
-    fn frames(self) -> Frames<Self>
-    where
-        Self: Sized,
-    {
-        Frames::new(self)
-    }
-}
-
-pub struct Frames<S> {
-    source: S,
-}
-
-impl<S> Frames<S> {
-    pub fn new(source: S) -> Self {
-        Self { source }
-    }
-}
-
-impl<S: FrameSource> Iterator for Frames<S> {
-    type Item = Frame;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.source.next_frame()
-    }
-}
-
 #[derive(Debug)]
 pub struct StereoPair {
     left: Frame,
@@ -772,90 +743,6 @@ impl StereoPair {
             .timestamp()
             .as_nanos()
             .abs_diff(self.right.timestamp().as_nanos())
-    }
-}
-
-pub trait StereoSource {
-    fn left(&mut self) -> Option<Frame>;
-    fn right(&mut self) -> Option<Frame>;
-
-    fn stereo_pair(&mut self) -> Option<StereoPair> {
-        Some(StereoPair::from_parts(self.left()?, self.right()?))
-    }
-
-    fn stereo_pairs(self) -> StereoPairs<Self>
-    where
-        Self: Sized,
-    {
-        StereoPairs::new(self)
-    }
-
-    fn left_frames(self) -> LeftFrames<Self>
-    where
-        Self: Sized,
-    {
-        LeftFrames::new(self)
-    }
-
-    fn right_frames(self) -> RightFrames<Self>
-    where
-        Self: Sized,
-    {
-        RightFrames::new(self)
-    }
-}
-
-pub struct StereoPairs<S> {
-    source: S,
-}
-
-impl<S> StereoPairs<S> {
-    pub fn new(source: S) -> Self {
-        Self { source }
-    }
-}
-
-impl<S: StereoSource> Iterator for StereoPairs<S> {
-    type Item = StereoPair;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.source.stereo_pair()
-    }
-}
-
-pub struct LeftFrames<S> {
-    source: S,
-}
-
-impl<S> LeftFrames<S> {
-    pub fn new(source: S) -> Self {
-        Self { source }
-    }
-}
-
-impl<S: StereoSource> Iterator for LeftFrames<S> {
-    type Item = Frame;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.source.left()
-    }
-}
-
-pub struct RightFrames<S> {
-    source: S,
-}
-
-impl<S> RightFrames<S> {
-    pub fn new(source: S) -> Self {
-        Self { source }
-    }
-}
-
-impl<S: StereoSource> Iterator for RightFrames<S> {
-    type Item = Frame;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.source.right()
     }
 }
 
