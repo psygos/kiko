@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, PairError, SensorId};
+use crate::{DepthImage, Frame, SensorId};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -189,6 +189,29 @@ pub enum DatasetError {
         declared: u64,
         derived: u64,
     },
+    ManifestFrameIdentityMismatch {
+        declared: String,
+        expected: PathBuf,
+    },
+    DuplicateManifestFrameRef {
+        path: PathBuf,
+    },
+    NonMonotonicManifestEntries {
+        previous_left_timestamp_ns: i64,
+        current_left_timestamp_ns: i64,
+    },
+    ManifestPairDeltaMismatch {
+        left_timestamp_ns: i64,
+        right_timestamp_ns: i64,
+        declared_delta_ns: u64,
+        derived_delta_ns: u64,
+    },
+    ManifestPairOutsideWindow {
+        left_timestamp_ns: i64,
+        right_timestamp_ns: i64,
+        delta_ns: u64,
+        max_delta_ns: u64,
+    },
     ManifestCountOutOfRange {
         field: &'static str,
         value: u64,
@@ -208,9 +231,6 @@ pub enum DatasetError {
     },
     WorkerJoin {
         message: String,
-    },
-    PairingFailed {
-        source: PairError,
     },
 }
 
@@ -279,6 +299,41 @@ impl std::fmt::Display for DatasetError {
                 f,
                 "invalid dataset manifest statistic {field}: declared {declared}, derived {derived}"
             ),
+            DatasetError::ManifestFrameIdentityMismatch { declared, expected } => write!(
+                f,
+                "dataset manifest frame identity {declared:?} does not match canonical path {}",
+                expected.display()
+            ),
+            DatasetError::DuplicateManifestFrameRef { path } => write!(
+                f,
+                "dataset manifest references frame {} more than once",
+                path.display()
+            ),
+            DatasetError::NonMonotonicManifestEntries {
+                previous_left_timestamp_ns,
+                current_left_timestamp_ns,
+            } => write!(
+                f,
+                "dataset manifest left timestamps are not strictly increasing: previous={previous_left_timestamp_ns}ns, current={current_left_timestamp_ns}ns"
+            ),
+            DatasetError::ManifestPairDeltaMismatch {
+                left_timestamp_ns,
+                right_timestamp_ns,
+                declared_delta_ns,
+                derived_delta_ns,
+            } => write!(
+                f,
+                "dataset manifest pair delta is inconsistent for left={left_timestamp_ns}ns, right={right_timestamp_ns}ns: declared={declared_delta_ns}ns, derived={derived_delta_ns}ns"
+            ),
+            DatasetError::ManifestPairOutsideWindow {
+                left_timestamp_ns,
+                right_timestamp_ns,
+                delta_ns,
+                max_delta_ns,
+            } => write!(
+                f,
+                "dataset manifest pair is outside its pairing window for left={left_timestamp_ns}ns, right={right_timestamp_ns}ns: delta={delta_ns}ns, max={max_delta_ns}ns"
+            ),
             DatasetError::ManifestCountOutOfRange { field, value } => write!(
                 f,
                 "dataset manifest count {field}={value} exceeds the host address space"
@@ -298,9 +353,6 @@ impl std::fmt::Display for DatasetError {
             DatasetError::WorkerJoin { message } => {
                 write!(f, "writer thread panicked: {message}")
             }
-            DatasetError::PairingFailed { source } => {
-                write!(f, "dataset pairing failed: {source}")
-            }
         }
     }
 }
@@ -318,7 +370,6 @@ impl std::error::Error for DatasetError {
             }
             DatasetError::InvalidFrameDimensions { source }
             | DatasetError::InvalidFrameData { source, .. } => Some(source),
-            DatasetError::PairingFailed { source } => Some(source),
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
             | DatasetError::InvalidFramePath { .. }
@@ -327,6 +378,11 @@ impl std::error::Error for DatasetError {
             | DatasetError::InvalidFrameLength { .. }
             | DatasetError::InvalidManifest { .. }
             | DatasetError::InvalidManifestStats { .. }
+            | DatasetError::ManifestFrameIdentityMismatch { .. }
+            | DatasetError::DuplicateManifestFrameRef { .. }
+            | DatasetError::NonMonotonicManifestEntries { .. }
+            | DatasetError::ManifestPairDeltaMismatch { .. }
+            | DatasetError::ManifestPairOutsideWindow { .. }
             | DatasetError::ManifestCountOutOfRange { .. }
             | DatasetError::WorkerJoin { .. } => None,
         }
@@ -1607,6 +1663,142 @@ mod tests {
                 field: "paired_count",
                 declared: 2,
                 derived: 1
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_open_rejects_noncanonical_and_duplicate_frame_references() {
+        let path = unique_dataset_path("manifest-frame-identity");
+        write_exact_pairs(&path, &[0, 1_000_000_000]);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+
+        let mut wrong_side = original.clone();
+        wrong_side["entries"][0]["left"]["path"] = original["entries"][0]["right"]["path"].clone();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&wrong_side).expect("serialize wrong-side manifest"),
+        )
+        .expect("write wrong-side manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("left ref to right payload must fail"),
+            DatasetError::ManifestFrameIdentityMismatch { .. }
+        ));
+
+        let mut wrong_timestamp = original.clone();
+        wrong_timestamp["entries"][0]["left"]["timestamp_ns"] = serde_json::json!(1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&wrong_timestamp)
+                .expect("serialize wrong-timestamp manifest"),
+        )
+        .expect("write wrong-timestamp manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("timestamp/path mismatch must fail"),
+            DatasetError::ManifestFrameIdentityMismatch { .. }
+        ));
+
+        let mut duplicate_right = original;
+        duplicate_right["entries"][1]["right"] = duplicate_right["entries"][0]["right"].clone();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&duplicate_right).expect("serialize duplicate-ref manifest"),
+        )
+        .expect("write duplicate-ref manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("duplicate frame ref must fail"),
+            DatasetError::DuplicateManifestFrameRef { .. }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_open_rejects_nonmonotonic_left_entries() {
+        let path = unique_dataset_path("manifest-entry-order");
+        write_exact_pairs(&path, &[0, 1_000_000_000]);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+        manifest["entries"]
+            .as_array_mut()
+            .expect("manifest entries array")
+            .swap(0, 1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize reordered manifest"),
+        )
+        .expect("write reordered manifest");
+
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("decreasing left timestamps must fail"),
+            DatasetError::NonMonotonicManifestEntries {
+                previous_left_timestamp_ns: 1_000_000_000,
+                current_left_timestamp_ns: 0
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_open_parses_declared_pair_delta_and_window_once() {
+        let path = unique_dataset_path("manifest-pair-delta");
+        write_exact_pairs(&path, &[0]);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+
+        let mut inconsistent_delta = original.clone();
+        inconsistent_delta["entries"][0]["delta_ns"] = serde_json::json!(1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&inconsistent_delta)
+                .expect("serialize inconsistent-delta manifest"),
+        )
+        .expect("write inconsistent-delta manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("declared pair delta must be exact"),
+            DatasetError::ManifestPairDeltaMismatch {
+                declared_delta_ns: 1,
+                derived_delta_ns: 0,
+                ..
+            }
+        ));
+
+        let shifted_right_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(1, "mono_right"));
+        std::fs::write(&shifted_right_path, [2_u8; 4]).expect("write shifted right fixture");
+        let mut outside_window = original;
+        outside_window["entries"][0]["right"]["timestamp_ns"] = serde_json::json!(1);
+        outside_window["entries"][0]["right"]["path"] = serde_json::json!(format!(
+            "{}/{}",
+            format::FRAMES_DIR,
+            format::frame_name(1, "mono_right")
+        ));
+        outside_window["entries"][0]["delta_ns"] = serde_json::json!(1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&outside_window).expect("serialize outside-window manifest"),
+        )
+        .expect("write outside-window manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("pair outside declared window must fail open"),
+            DatasetError::ManifestPairOutsideWindow {
+                delta_ns: 1,
+                max_delta_ns: 0,
+                ..
             }
         ));
 

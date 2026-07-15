@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::{Frame, FrameDimensions, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
-    Calibration, DatasetError, Manifest, ManifestFrameRef, ManifestPairing, ManifestStats,
-    read_calibration, read_manifest, read_meta,
+    Calibration, DatasetError, Manifest, ManifestFrameRef, ManifestPairing, ManifestStats, format,
+    read_calibration, read_manifest, read_meta, sensor_to_str,
 };
 
 #[derive(Clone, Debug)]
@@ -33,7 +34,6 @@ pub struct DatasetReader {
     entries: Vec<DatasetEntry>,
     stats: DatasetStats,
     dimensions: FrameDimensions,
-    pairing_window: PairingWindowNs,
     left_seq: u64,
     right_seq: u64,
 }
@@ -76,14 +76,13 @@ impl DatasetReader {
             PairingWindowNs::new(pairing_window_ns).map_err(|_| DatasetError::InvalidConfig {
                 msg: "manifest pairing_window_ns must be non-negative",
             })?;
-        let parsed = parse_manifest(&root, manifest, dimensions)?;
+        let parsed = parse_manifest(&root, manifest, dimensions, pairing_window)?;
         Ok(Self {
             meta,
             calibration,
             entries: parsed.entries,
             stats: parsed.stats,
             dimensions,
-            pairing_window,
             left_seq: 0,
             right_seq: 0,
         })
@@ -160,10 +159,7 @@ impl<'a> Iterator for DatasetPairs<'a> {
                 Err(err) => return Some(Err(err)),
             };
 
-            match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
-                Ok(pair) => return Some(Ok(pair)),
-                Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
-            }
+            return Some(Ok(StereoPair::from_parts(left_frame, right_frame)));
         }
 
         None
@@ -200,11 +196,7 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
             let right_bytes = right_frame.data().len();
 
             let pair_start = Instant::now();
-            let pair =
-                match StereoPair::try_new(left_frame, right_frame, self.reader.pairing_window) {
-                    Ok(pair) => pair,
-                    Err(err) => return Some(Err(DatasetError::PairingFailed { source: err })),
-                };
+            let pair = StereoPair::from_parts(left_frame, right_frame);
             let pairing = pair_start.elapsed();
 
             let timings = DatasetReadTimings {
@@ -251,28 +243,83 @@ fn parse_manifest(
     root: &Path,
     manifest: Manifest,
     dimensions: FrameDimensions,
+    pairing_window: PairingWindowNs,
 ) -> Result<ParsedManifest, DatasetError> {
     let Manifest { stats, entries, .. } = manifest;
-    let entries = entries
-        .into_iter()
-        .map(|entry| {
-            let left = parse_frame_ref(root, entry.left, dimensions)?;
-            let right = match entry.pairing {
-                ManifestPairing::Paired { right, .. } => {
-                    Some(parse_frame_ref(root, right, dimensions)?)
+    let max_delta_ns =
+        u64::try_from(pairing_window.as_ns()).map_err(|_| DatasetError::InvalidManifest {
+            reason: "parsed pairing window is negative",
+        })?;
+    let mut parsed_entries = Vec::with_capacity(entries.len());
+    let mut seen_paths = HashSet::with_capacity(entries.len().saturating_mul(2));
+    let mut previous_left_timestamp_ns = None;
+
+    for entry in entries {
+        let left_timestamp_ns = entry.left.timestamp_ns;
+        if let Some(previous) = previous_left_timestamp_ns
+            && left_timestamp_ns <= previous
+        {
+            return Err(DatasetError::NonMonotonicManifestEntries {
+                previous_left_timestamp_ns: previous,
+                current_left_timestamp_ns: left_timestamp_ns,
+            });
+        }
+
+        let left = parse_frame_ref(root, entry.left, SensorId::StereoLeft, dimensions)?;
+        insert_unique_frame_ref(&mut seen_paths, &left)?;
+        let right = match entry.pairing {
+            ManifestPairing::Paired { right, delta_ns } => {
+                let right = parse_frame_ref(root, right, SensorId::StereoRight, dimensions)?;
+                insert_unique_frame_ref(&mut seen_paths, &right)?;
+
+                let derived_delta_ns = left.timestamp_ns.abs_diff(right.timestamp_ns);
+                if delta_ns != derived_delta_ns {
+                    return Err(DatasetError::ManifestPairDeltaMismatch {
+                        left_timestamp_ns: left.timestamp_ns,
+                        right_timestamp_ns: right.timestamp_ns,
+                        declared_delta_ns: delta_ns,
+                        derived_delta_ns,
+                    });
                 }
-                ManifestPairing::MissingRight { .. } => None,
-            };
-            Ok(DatasetEntry { left, right })
-        })
-        .collect::<Result<Vec<_>, DatasetError>>()?;
-    let stats = DatasetStats::from_manifest(&entries, stats)?;
-    Ok(ParsedManifest { entries, stats })
+                if derived_delta_ns > max_delta_ns {
+                    return Err(DatasetError::ManifestPairOutsideWindow {
+                        left_timestamp_ns: left.timestamp_ns,
+                        right_timestamp_ns: right.timestamp_ns,
+                        delta_ns: derived_delta_ns,
+                        max_delta_ns,
+                    });
+                }
+                Some(right)
+            }
+            ManifestPairing::MissingRight { .. } => None,
+        };
+        parsed_entries.push(DatasetEntry { left, right });
+        previous_left_timestamp_ns = Some(left_timestamp_ns);
+    }
+
+    let stats = DatasetStats::from_manifest(&parsed_entries, stats)?;
+    Ok(ParsedManifest {
+        entries: parsed_entries,
+        stats,
+    })
+}
+
+fn insert_unique_frame_ref(
+    seen_paths: &mut HashSet<PathBuf>,
+    frame_ref: &DatasetFrameRef,
+) -> Result<(), DatasetError> {
+    if !seen_paths.insert(frame_ref.path.clone()) {
+        return Err(DatasetError::DuplicateManifestFrameRef {
+            path: frame_ref.path.clone(),
+        });
+    }
+    Ok(())
 }
 
 fn parse_frame_ref(
     root: &Path,
     frame_ref: ManifestFrameRef,
+    sensor: SensorId,
     dimensions: FrameDimensions,
 ) -> Result<DatasetFrameRef, DatasetError> {
     let relative = Path::new(&frame_ref.path);
@@ -296,6 +343,17 @@ fn parse_frame_ref(
         return Err(DatasetError::InvalidFramePath {
             path: frame_ref.path,
             reason: "resolved path escapes the dataset root",
+        });
+    }
+
+    let expected_relative = Path::new(format::FRAMES_DIR).join(format::frame_name(
+        frame_ref.timestamp_ns,
+        sensor_to_str(sensor),
+    ));
+    if relative != expected_relative {
+        return Err(DatasetError::ManifestFrameIdentityMismatch {
+            declared: frame_ref.path,
+            expected: expected_relative,
         });
     }
 
