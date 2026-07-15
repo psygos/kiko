@@ -919,6 +919,8 @@ impl Detections {
                 descriptors_len: descriptors.len(),
             });
         }
+        let width_f64 = f64::from(width);
+        let height_f64 = f64::from(height);
 
         for (index, keypoint) in keypoints.iter().enumerate() {
             if !keypoint.x.is_finite() || !keypoint.y.is_finite() {
@@ -930,15 +932,15 @@ impl Detections {
             }
             if keypoint.x < 0.0
                 || keypoint.y < 0.0
-                || keypoint.x >= width as f32
-                || keypoint.y >= height as f32
+                || f64::from(keypoint.x) >= width_f64
+                || f64::from(keypoint.y) >= height_f64
             {
                 return Err(DetectionError::KeypointOutOfBounds {
                     index,
                     x: keypoint.x,
                     y: keypoint.y,
-                    width,
-                    height,
+                    width: dimensions.width(),
+                    height: dimensions.height(),
                 });
             }
         }
@@ -1523,6 +1525,52 @@ mod tests {
         assert_eq!(frame.dimensions().width(), 2);
         assert_eq!(frame.dimensions().height(), 3);
         assert_eq!(frame.data().len(), frame.dimensions().area());
+    }
+
+    #[test]
+    fn detection_bounds_preserve_large_u32_dimensions() {
+        const WIDTH: u32 = 16_777_217;
+        const LAST_REPRESENTABLE_COLUMN: f32 = 16_777_216.0;
+        const NEXT_REPRESENTABLE_COLUMN: f32 = 16_777_218.0;
+
+        Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            WIDTH,
+            1,
+            vec![Keypoint {
+                x: LAST_REPRESENTABLE_COLUMN,
+                y: 0.0,
+            }],
+            vec![1.0],
+            vec![Descriptor::ZERO],
+        )
+        .expect("last representable column below width remains in bounds");
+
+        let error = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(2),
+            WIDTH,
+            1,
+            vec![Keypoint {
+                x: NEXT_REPRESENTABLE_COLUMN,
+                y: 0.0,
+            }],
+            vec![1.0],
+            vec![Descriptor::ZERO],
+        )
+        .expect_err("next representable coordinate is outside the image");
+
+        assert!(matches!(
+            error,
+            DetectionError::KeypointOutOfBounds {
+                index: 0,
+                x: NEXT_REPRESENTABLE_COLUMN,
+                y: 0.0,
+                width: WIDTH,
+                height: 1,
+            }
+        ));
     }
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
