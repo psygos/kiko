@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    num::{NonZeroU16, NonZeroUsize},
+    path::{Path, PathBuf},
+};
 
 use clap::{Args, ValueEnum};
 
@@ -101,7 +104,7 @@ pub struct DatasetArgs {
     pub path: PathBuf,
     /// Maximum number of stereo pairs to attempt from the dataset
     #[arg(long, env = "KIKO_MAX_PAIRS")]
-    pub max_pairs: Option<usize>,
+    pub max_pairs: Option<NonZeroUsize>,
     /// Skip the first N frames (camera/IMU settling time)
     #[arg(long, env = "KIKO_SKIP_FRAMES", default_value_t = 0)]
     pub skip_frames: usize,
@@ -122,7 +125,7 @@ impl DatasetArgs {
         };
         let selected_pairs = self
             .max_pairs
-            .map_or(remaining_pairs, |limit| limit.min(remaining_pairs));
+            .map_or(remaining_pairs, |limit| limit.get().min(remaining_pairs));
         if selected_pairs == 0 {
             return Err(DatasetSelectionError {
                 available_pairs,
@@ -139,7 +142,7 @@ impl DatasetArgs {
 pub struct DatasetSelectionError {
     available_pairs: usize,
     skip_frames: usize,
-    max_pairs: Option<usize>,
+    max_pairs: Option<NonZeroUsize>,
     selected_pairs: usize,
 }
 
@@ -201,14 +204,14 @@ pub struct RerunArgs {
     )]
     pub rerun_serve: bool,
     /// Port for the gRPC server when using --rerun-serve (default: 9876)
-    #[arg(long, env = "KIKO_RERUN_PORT", default_value_t = 9876)]
-    pub rerun_port: u16,
+    #[arg(long, env = "KIKO_RERUN_PORT", requires = "rerun_serve")]
+    pub rerun_port: Option<NonZeroU16>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RerunDestination {
     Save(PathBuf),
-    Serve { port: u16 },
+    Serve { port: NonZeroU16 },
     Connect(String),
     ImplicitLocalViewer,
 }
@@ -233,7 +236,7 @@ impl RerunOutput {
             RerunDestination::Save(path.clone())
         } else if args.rerun_serve {
             RerunDestination::Serve {
-                port: args.rerun_port,
+                port: args.rerun_port.unwrap_or_else(default_rerun_port),
             }
         } else if let Some(url) = args.rerun_url.as_ref() {
             RerunDestination::Connect(url.clone())
@@ -259,6 +262,10 @@ impl RerunOutput {
     pub fn has_explicit_destination(&self) -> bool {
         !matches!(self.destination, RerunDestination::ImplicitLocalViewer)
     }
+}
+
+fn default_rerun_port() -> NonZeroU16 {
+    NonZeroU16::new(9876).expect("the default Rerun port is non-zero")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -643,12 +650,14 @@ fn resolve_model_path(
 #[cfg(test)]
 mod tests {
     use super::DatasetArgs;
+    use std::num::NonZeroUsize;
     use std::path::PathBuf;
 
     fn dataset_args(skip_frames: usize, max_pairs: Option<usize>) -> DatasetArgs {
         DatasetArgs {
             path: PathBuf::from("dataset"),
-            max_pairs,
+            max_pairs: max_pairs
+                .map(|limit| NonZeroUsize::new(limit).expect("test pair limits must be non-zero")),
             skip_frames,
         }
     }
@@ -677,7 +686,6 @@ mod tests {
 
     #[test]
     fn dataset_selection_rejects_empty_and_over_skipped_inputs() {
-        assert!(dataset_args(0, Some(0)).selected_pair_count(4).is_err());
         assert!(dataset_args(4, None).selected_pair_count(4).is_err());
         assert!(dataset_args(5, None).selected_pair_count(4).is_err());
     }

@@ -335,12 +335,10 @@ fn rerun_recording(
             Ok(rec)
         }
         args::RerunDestination::Serve { port } => {
+            let port = port.get();
             let rec = rerun::RecordingStreamBuilder::new(name)
-                .serve_grpc_opts("0.0.0.0", *port, Default::default())
-                .map_err(|source| RerunRecordingInitError::Serve {
-                    port: *port,
-                    source,
-                })?;
+                .serve_grpc_opts("0.0.0.0", port, Default::default())
+                .map_err(|source| RerunRecordingInitError::Serve { port, source })?;
             eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
             eprintln!(
                 "rerun: on your laptop run:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
@@ -805,6 +803,41 @@ mod tests {
         .expect_err("conflicting Rerun destinations must be rejected");
 
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn zero_dataset_pair_limit_is_rejected_at_cli_boundary() {
+        let error = Cli::try_parse_from(["kiko-slam", "bench", "--max-pairs", "0", "/tmp/dataset"])
+            .expect_err("a zero pair limit must be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn explicit_rerun_port_requires_server_mode() {
+        let error =
+            Cli::try_parse_from(["kiko-slam", "viz", "--rerun-port", "9877", "/tmp/dataset"])
+                .expect_err("an explicit Rerun port without server mode must be rejected");
+
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    #[test]
+    fn zero_rerun_port_is_rejected_at_cli_boundary() {
+        let error = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--rerun-serve",
+            "--rerun-port",
+            "0",
+            "/tmp/dataset",
+        ])
+        .expect_err("a zero Rerun port must be rejected");
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
