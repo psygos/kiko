@@ -435,7 +435,8 @@ pub struct Keypoint {
 }
 
 pub const DESCRIPTOR_DIM: usize = 256;
-const U8_SCALE: f32 = 255.0;
+const SIGNED_DESCRIPTOR_SCALE: f32 = 127.0;
+const COMPACT_DESCRIPTOR_ZERO: i16 = 128;
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -446,38 +447,59 @@ impl Descriptor {
         &self.0
     }
 
+    /// Quantizes each finite descriptor component into a centered unsigned byte.
+    ///
+    /// Components are clamped to `[-1, 1]`, scaled symmetrically to
+    /// `[-127, 127]`, and biased by 128. Consequently, zero is encoded as 128,
+    /// while -1 and 1 are encoded as 1 and 255 respectively.
     pub fn quantize(&self) -> CompactDescriptor {
         let mut out = [0_u8; DESCRIPTOR_DIM];
-        for (idx, value) in self.0.iter().enumerate() {
-            let clamped = value.clamp(0.0, 1.0);
-            out[idx] = (clamped * U8_SCALE).round() as u8;
+        for (&value, encoded) in self.0.iter().zip(out.iter_mut()) {
+            let signed = (value.clamp(-1.0, 1.0) * SIGNED_DESCRIPTOR_SCALE).round() as i16;
+            *encoded = u8::try_from(signed + COMPACT_DESCRIPTOR_ZERO)
+                .expect("clamped descriptor component must fit centered-u8 encoding");
         }
         CompactDescriptor(out)
     }
 }
 
+/// A signed local descriptor stored in centered-u8 form.
+///
+/// Each byte decodes to the signed component `code - 128`. Quantization emits
+/// codes in `1..=255`; code 0 remains representable for compatibility with the
+/// public byte-array representation and decodes to -128.
 #[repr(transparent)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompactDescriptor(pub [u8; DESCRIPTOR_DIM]);
 
 impl CompactDescriptor {
+    /// Computes cosine similarity after decoding the centered signed values.
+    ///
+    /// The fixed descriptor dimension and byte range allow all dot products and
+    /// squared norms to be accumulated exactly in wide integers. An encoded zero
+    /// vector (all components equal to 128) has no defined cosine; this API uses
+    /// `0.0` as the finite, no-similarity convention when either input is zero.
     pub fn cosine_similarity(&self, other: &Self) -> f32 {
         let (dot, norm_a, norm_b) = self.0.iter().zip(other.0.iter()).fold(
-            (0_u32, 0_u32, 0_u32),
+            (0_i64, 0_u64, 0_u64),
             |(dot, na, nb), (&a, &b)| {
-                let a = a as u32;
-                let b = b as u32;
+                let a = i64::from(a) - i64::from(COMPACT_DESCRIPTOR_ZERO);
+                let b = i64::from(b) - i64::from(COMPACT_DESCRIPTOR_ZERO);
+                let a_magnitude = a.unsigned_abs();
+                let b_magnitude = b.unsigned_abs();
                 (
-                    dot.saturating_add(a.saturating_mul(b)),
-                    na.saturating_add(a.saturating_mul(a)),
-                    nb.saturating_add(b.saturating_mul(b)),
+                    dot + a * b,
+                    na + a_magnitude * a_magnitude,
+                    nb + b_magnitude * b_magnitude,
                 )
             },
         );
         if norm_a == 0 || norm_b == 0 {
             return 0.0;
         }
-        (dot as f32) / ((norm_a as f32).sqrt() * (norm_b as f32).sqrt())
+
+        let denominator = ((norm_a as f64) * (norm_b as f64)).sqrt();
+        ((dot as f64) / denominator).clamp(-1.0, 1.0) as f32
     }
 }
 
@@ -1109,7 +1131,7 @@ impl<State> VizPacket<State> {
 mod tests {
     use super::{
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Frame, FrameDimensionsError, FrameError,
-        FrameId, SensorId, Timestamp, U8_SCALE,
+        FrameId, SensorId, Timestamp,
     };
 
     #[test]
@@ -1170,15 +1192,15 @@ mod tests {
     }
 
     #[test]
-    fn quantize_preserves_similarity_ordering() {
+    fn quantize_preserves_signed_similarity_ordering() {
         let mut base = [0.0_f32; DESCRIPTOR_DIM];
         let mut close = [0.0_f32; DESCRIPTOR_DIM];
         let mut far = [0.0_f32; DESCRIPTOR_DIM];
         for i in 0..DESCRIPTOR_DIM {
-            let t = i as f32 / U8_SCALE;
+            let t = (i as f32 / 127.5) - 1.0;
             base[i] = t;
-            close[i] = (t + 0.02).clamp(0.0, 1.0);
-            far[i] = if i < 128 { 1.0 } else { 0.0 };
+            close[i] = (t + if i % 2 == 0 { 0.01 } else { -0.01 }).clamp(-1.0, 1.0);
+            far[i] = -t;
         }
         let base = Descriptor(base);
         let close = Descriptor(close);
@@ -1197,28 +1219,89 @@ mod tests {
     }
 
     #[test]
-    fn compact_descriptor_cosine_identical_is_one() {
-        let mut data = [0_u8; DESCRIPTOR_DIM];
-        for (idx, value) in data.iter_mut().enumerate() {
-            *value = ((idx * 7) % 251) as u8;
-        }
-        let a = CompactDescriptor(data);
-        let b = CompactDescriptor(data);
-        let sim = a.cosine_similarity(&b);
+    fn quantize_uses_symmetric_centered_u8_codes() {
+        let mut descriptor = Descriptor([0.0; DESCRIPTOR_DIM]);
+        descriptor.0[..5].copy_from_slice(&[-1.0, -0.5, 0.0, 0.5, 1.0]);
+
+        let compact = descriptor.quantize();
+
+        assert_eq!(&compact.0[..5], &[1, 64, 128, 192, 255]);
+        assert!(compact.0[5..].iter().all(|&value| value == 128));
+    }
+
+    #[test]
+    fn compact_descriptor_negative_components_are_self_similar() {
+        let descriptor = Descriptor(std::array::from_fn(|index| {
+            -((index % 127 + 1) as f32 / 127.0)
+        }));
+        let compact = descriptor.quantize();
+
+        assert!(compact.0.iter().all(|&value| value < 128));
+        let sim = compact.cosine_similarity(&compact);
         assert!((sim - 1.0).abs() < 1e-6, "sim={sim}");
     }
 
     #[test]
-    fn compact_descriptor_cosine_orthogonal_is_zeroish() {
-        let mut a = [0_u8; DESCRIPTOR_DIM];
-        let mut b = [0_u8; DESCRIPTOR_DIM];
-        for value in a.iter_mut().take(128) {
-            *value = 255;
-        }
-        for value in b.iter_mut().skip(128) {
-            *value = 255;
-        }
+    fn compact_descriptor_antipodal_signed_vectors_are_negative_one() {
+        let descriptor = Descriptor(std::array::from_fn(|index| {
+            ((index % 127 + 1) as f32 / 127.0) * if index % 2 == 0 { 1.0 } else { -1.0 }
+        }));
+        let antipode = Descriptor(descriptor.0.map(|value| -value));
+
+        let sim = descriptor
+            .quantize()
+            .cosine_similarity(&antipode.quantize());
+
+        assert!((sim + 1.0).abs() < 1e-6, "sim={sim}");
+    }
+
+    #[test]
+    fn compact_descriptor_orthogonal_signed_vectors_are_zero() {
+        let mut a = [128_u8; DESCRIPTOR_DIM];
+        let mut b = [128_u8; DESCRIPTOR_DIM];
+        a[0] = 255;
+        b[1] = 1;
+
         let sim = CompactDescriptor(a).cosine_similarity(&CompactDescriptor(b));
         assert!(sim.abs() < 1e-6, "sim={sim}");
+    }
+
+    #[test]
+    fn compact_descriptor_zero_vector_has_no_similarity() {
+        let zero = CompactDescriptor([128; DESCRIPTOR_DIM]);
+        let mut nonzero = [128; DESCRIPTOR_DIM];
+        nonzero[0] = 255;
+        let nonzero = CompactDescriptor(nonzero);
+
+        assert_eq!(zero.cosine_similarity(&zero), 0.0);
+        assert_eq!(zero.cosine_similarity(&nonzero), 0.0);
+        assert_eq!(nonzero.cosine_similarity(&zero), 0.0);
+    }
+
+    #[test]
+    fn compact_descriptor_cosine_is_finite_symmetric_and_bounded() {
+        let mut state = 0x9e37_79b9_u32;
+        for _ in 0..1_024 {
+            let a = CompactDescriptor(std::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            }));
+            let b = CompactDescriptor(std::array::from_fn(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            }));
+
+            let ab = a.cosine_similarity(&b);
+            let ba = b.cosine_similarity(&a);
+            assert!(ab.is_finite(), "similarity must be finite: {ab}");
+            assert!((-1.0..=1.0).contains(&ab), "similarity out of bounds: {ab}");
+            assert_eq!(ab, ba, "cosine must be symmetric");
+            assert!((a.cosine_similarity(&a) - 1.0).abs() < 1e-6);
+            assert!((b.cosine_similarity(&b) - 1.0).abs() < 1e-6);
+        }
     }
 }
