@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kiko's Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         * {
             margin: 0;
@@ -13,7 +12,7 @@
         }
         
         body {
-            font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
             background: #F6F7F2;
             color: #333;
             height: 100vh;
@@ -216,7 +215,7 @@
             background: #333;
             color: white;
             padding: 8px 12px;
-            font-family: 'Montserrat', sans-serif;
+            font-family: inherit;
             font-size: 11px;
             font-weight: 600;
             text-transform: uppercase;
@@ -226,56 +225,40 @@
             align-items: center;
         }
         
-        .odometry-controls {
-            display: flex;
-            gap: 6px;
-        }
-        
-        .odometry-btn {
-            background: #555;
-            border: none;
-            color: white;
-            padding: 2px 6px;
-            font-size: 9px;
-            cursor: pointer;
-            border-radius: 2px;
-            transition: background 0.2s;
-        }
-        
-        .odometry-btn:hover {
-            background: #777;
-        }
-        
-        .odometry-canvas-container {
+        .odometry-content {
             flex: 1;
             position: relative;
             background: #fff;
+            padding: 18px;
         }
-        
-        .odometry-canvas {
-            width: 100%;
-            height: 100%;
-            display: block;
-            cursor: grab;
+
+        .odometry-values {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+            gap: 14px 24px;
         }
-        
-        .odometry-canvas:active {
-            cursor: grabbing;
+
+        .odometry-values[hidden],
+        .odometry-placeholder[hidden] {
+            display: none;
         }
-        
-        .odometry-info {
-            position: absolute;
-            top: 35px;
-            left: 8px;
-            background: rgba(255,255,255,0.9);
-            border: 1px solid #ddd;
-            padding: 6px 8px;
-            font-family: 'Consolas', monospace;
+
+        .odometry-value {
+            min-width: 0;
+        }
+
+        .odometry-value-label {
+            color: #666;
             font-size: 10px;
-            line-height: 1.2;
-            border-radius: 3px;
-            pointer-events: none;
-            z-index: 10;
+            text-transform: uppercase;
+        }
+
+        .odometry-value-reading {
+            display: block;
+            margin-top: 4px;
+            font-family: 'Consolas', monospace;
+            font-size: 14px;
+            overflow-wrap: anywhere;
         }
         
         .odometry-placeholder {
@@ -316,7 +299,7 @@
             display: flex;
             align-items: center;
             justify-content: center;
-            font-family: 'Montserrat', sans-serif;
+            font-family: inherit;
             font-size: 9px;
             font-weight: 700;
             color: white;
@@ -439,7 +422,7 @@
         }
         
         .control-label {
-            font-family: 'Montserrat', sans-serif;
+            font-family: inherit;
             font-size: 14px;
             font-weight: 600;
             text-transform: uppercase;
@@ -449,85 +432,25 @@
         
 
         
-        .speed-display {
+        .pwm-control {
             width: 100%;
-            height: 20px;
-            background: #333;
-            border: 2px solid #000;
-            position: relative;
             display: flex;
+            align-items: center;
+            gap: 12px;
         }
-        
-        .speed-segment {
+
+        .pwm-control input[type="range"] {
             flex: 1;
-            height: 100%;
-            border-right: 1px solid #000;
-            background: #666;
-            transition: background-color 0.1s ease;
-            cursor: pointer;
+            accent-color: #4964FF;
         }
-        
-        .speed-segment:last-child {
-            border-right: none;
-        }
-        
-        .speed-segment.filled {
-            background: #87a96b;
-            box-shadow: inset 0 0 0 1px #9bb87a;
-        }
-        
-        .speed-segment:hover {
-            background: #9bb87a;
-        }
-        
-        .speed-segment.preview {
-            background: #a8c278;
-        }
-        
-        .speed-text {
-            position: absolute;
-            top: -25px;
-            left: 50%;
-            transform: translateX(-50%);
-            font-family: 'Montserrat', sans-serif;
+
+        .pwm-text {
+            width: 42px;
+            text-align: right;
+            font-family: inherit;
             font-size: 11px;
             font-weight: 600;
             color: #333;
-            letter-spacing: 0.5px;
-        }
-        
-        .video-feeds {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-        }
-        
-        .feed-option {
-            padding: 16px;
-            background: #f5f5f5;
-            border: 2px dashed #ddd;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.2s;
-            font-size: 14px;
-            color: #666;
-        }
-        
-        .feed-option:hover {
-            background: #e8e8e8;
-            border-color: #bbb;
-        }
-        
-        .feed-option.active {
-            background: #87a96b;
-            color: white;
-            border: 2px solid #87a96b;
-        }
-        
-        .feed-option.disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-            border: 2px dotted #ccc;
         }
         
         /* Connection Button */
@@ -536,7 +459,7 @@
             color: white;
             border: 2px solid #F08484;
             padding: 12px 24px;
-            font-family: 'Montserrat', sans-serif;
+            font-family: inherit;
             font-size: 14px;
             font-weight: 600;
             cursor: pointer;
@@ -765,23 +688,37 @@
             <!-- Odometry Box -->
             <div class="odometry-box">
                 <div class="odometry-header">
-                    <span>Robot Path Visualization</span>
-                    <div class="odometry-controls">
-                        <button class="odometry-btn" id="resetPath">Reset</button>
-                        <button class="odometry-btn" id="centerView">Center</button>
-                        <button class="odometry-btn" id="toggleTrail">Trail</button>
-                    </div>
+                    <span>Raw Encoder Odometry</span>
                 </div>
-                <div class="odometry-canvas-container">
-                    <canvas class="odometry-canvas" id="odometryCanvas" width="418" height="252"></canvas>
-                    <div class="odometry-info" id="odometryInfo">
-                        <div>Position: (0.00, 0.00) m</div>
-                        <div>Heading: 0.0°</div>
-                        <div>Speed: 0.00 m/s</div>
-                        <div>Distance: 0.00 m</div>
+                <div class="odometry-content">
+                    <div class="odometry-values" id="odometryValues" hidden>
+                        <div class="odometry-value">
+                            <span class="odometry-value-label">Estimated left extended ticks (wrapping i64)</span>
+                            <span class="odometry-value-reading" id="leftEncoderTicks">0</span>
+                        </div>
+                        <div class="odometry-value">
+                            <span class="odometry-value-label">Estimated right extended ticks (wrapping i64)</span>
+                            <span class="odometry-value-reading" id="rightEncoderTicks">0</span>
+                        </div>
+                        <div class="odometry-value">
+                            <span class="odometry-value-label">Left sample delta (modulo i16)</span>
+                            <span class="odometry-value-reading" id="leftSampleDeltaTicks">0</span>
+                        </div>
+                        <div class="odometry-value">
+                            <span class="odometry-value-label">Right sample delta (modulo i16)</span>
+                            <span class="odometry-value-reading" id="rightSampleDeltaTicks">0</span>
+                        </div>
+                        <div class="odometry-value">
+                            <span class="odometry-value-label">Controller uptime (wrapping ms)</span>
+                            <span class="odometry-value-reading" id="controllerUptimeMs">0</span>
+                        </div>
+                        <div class="odometry-value">
+                            <span class="odometry-value-label">Server receive age (ms)</span>
+                            <span class="odometry-value-reading" id="odometryServerReceiveAgeMs">0</span>
+                        </div>
                     </div>
                     <div class="odometry-placeholder" id="odometryPlaceholder">
-                        Waiting for odometry data...
+                        Waiting for odometry data
                     </div>
                 </div>
             </div>
@@ -795,23 +732,19 @@
                 <div class="direction-indicator">
                     <div id="directionArrow" class="direction-arrow stopped"></div>
                     <div style="font-size: 10px; color: #666;">
-                        <span>L:</span><span id="leftSpeed">0</span>
-                        <span style="margin-left: 8px;">R:</span><span id="rightSpeed">0</span>
+                        <span>Acked cmd L:</span><span id="leftPwm">0</span>
+                        <span style="margin-left: 8px;">R:</span><span id="rightPwm">0</span>
                     </div>
                 </div>
                 
                 <div class="telemetry-stats">
                     <div class="telemetry-item">
-                        <span class="telemetry-label">lat:</span>
+                        <span class="telemetry-label">ack RTT:</span>
                         <span class="telemetry-value" id="latency">0ms</span>
                     </div>
                     <div class="telemetry-item">
-                        <span class="telemetry-label">seq:</span>
+                        <span class="telemetry-label">accepted seq:</span>
                         <span class="telemetry-value" id="sequence">0</span>
-                    </div>
-                    <div class="telemetry-item">
-                        <span class="telemetry-label">bat:</span>
-                        <span class="telemetry-value" id="battery">0.0V</span>
                     </div>
                 </div>
             </div>
@@ -827,27 +760,10 @@
                     </div>
                 </div>
                 <div class="control-section">
-                    <div class="control-label">Speed</div>
-                    <div class="speed-display" id="speedDisplay">
-                        <div class="speed-segment filled"></div>
-                        <div class="speed-segment filled"></div>
-                        <div class="speed-segment filled"></div>
-                        <div class="speed-segment filled"></div>
-                        <div class="speed-segment filled"></div>
-                        <div class="speed-segment"></div>
-                        <div class="speed-segment"></div>
-                        <div class="speed-segment"></div>
-                        <div class="speed-segment"></div>
-                        <div class="speed-segment"></div>
-                        <div class="speed-text" id="speedText">50%</div>
-                    </div>
-                </div>
-                
-                <div class="control-section">
-                    <div class="control-label">Video Feed</div>
-                    <div class="video-feeds">
-                        <div class="feed-option active" data-feed="left">l cam</div>
-                        <div class="feed-option disabled" data-feed="right">r cam</div>
+                    <div class="control-label">PWM command</div>
+                    <div class="pwm-control">
+                        <input id="pwmInput" type="range" min="10" max="100" step="10" value="50" aria-label="PWM command magnitude" />
+                        <output class="pwm-text" id="pwmText" for="pwmInput">50%</output>
                     </div>
                 </div>
                 
@@ -858,69 +774,6 @@
         </div>
     </div>
     
-    <script>
-        let currentSpeed = 50;
-        
-        function updateSpeedDisplay() {
-            const segments = document.querySelectorAll('.speed-segment');
-            const speedText = document.getElementById('speedText');
-            const filledSegments = Math.floor(currentSpeed / 10);
-            
-            segments.forEach((segment, index) => {
-                segment.classList.remove('filled', 'preview');
-                if (index < filledSegments) {
-                    segment.classList.add('filled');
-                }
-            });
-            
-            speedText.textContent = currentSpeed + '%';
-        }
-        
-        function showPreview(hoveredIndex) {
-            const segments = document.querySelectorAll('.speed-segment');
-            const currentFilledSegments = Math.floor(currentSpeed / 10);
-            
-            segments.forEach((segment, index) => {
-                segment.classList.remove('preview');
-                if (index <= hoveredIndex && index >= currentFilledSegments) {
-                    segment.classList.add('preview');
-                }
-            });
-        }
-        
-        function hidePreview() {
-            const segments = document.querySelectorAll('.speed-segment');
-            segments.forEach(segment => {
-                segment.classList.remove('preview');
-            });
-        }
-        
-        document.addEventListener('DOMContentLoaded', function() {
-            const segments = document.querySelectorAll('.speed-segment');
-            
-            segments.forEach((segment, index) => {
-                segment.addEventListener('click', function() {
-                    currentSpeed = (index + 1) * 10;
-                    updateSpeedDisplay();
-                    
-                    // Update the baseSpeed variable for the robot control
-                    if (typeof baseSpeed !== 'undefined') {
-                        baseSpeed = currentSpeed;
-                    }
-                });
-                
-                segment.addEventListener('mouseenter', function() {
-                    showPreview(index);
-                });
-                
-                segment.addEventListener('mouseleave', function() {
-                    hidePreview();
-                });
-            });
-            
-            updateSpeedDisplay();
-        });
-    </script>
     <script src="main.js"></script>
 </body>
 </html>

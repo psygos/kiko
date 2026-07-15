@@ -25,15 +25,106 @@ listen = listen || (() => Promise.reject('Tauri listen not ready'));
 
 // Control state
 let connected = false;
+let activeStreamGenerationDecimal = null;
+let desiredMotorPwm = { left: 0, right: 0 };
+let submittedDesiredMotorPwm = desiredMotorPwm;
+let motorPwmDrain = null;
+let acknowledgedStop = null;
+let motorLeaseRefreshTimer = null;
+let motorLeaseRefreshGeneration = 0;
+let connectionTransitionInProgress = false;
+const pendingConnectionFailures = new Map();
 // Connection settings with persistence
-let host = localStorage.getItem('kiko_host') || '10.42.200.50';
-let udpPort = parseInt(localStorage.getItem('kiko_udp_port') || '8080', 10);
-let httpPort = parseInt(localStorage.getItem('kiko_http_port') || '3030', 10);
-let robotAddress = `${host}:${udpPort}`;
-let currentLeft = 0;
-let currentRight = 0;
-let baseSpeed = 50;
-let sequenceNum = 0;
+const DEFAULT_HOST = '10.42.200.50';
+const DEFAULT_UDP_PORT = 8080;
+const DEFAULT_HTTP_PORT = 3030;
+
+function parsePort(rawValue, fieldName) {
+    const value = String(rawValue).trim();
+    if (!/^\d+$/.test(value)) {
+        throw new Error(`${fieldName} must be an integer from 1 to 65535`);
+    }
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`${fieldName} must be an integer from 1 to 65535`);
+    }
+    return port;
+}
+
+function readStoredSetting(key) {
+    try {
+        return localStorage.getItem(key);
+    } catch (error) {
+        console.warn(`Unable to read persisted setting ${key}:`, error);
+        return null;
+    }
+}
+
+function storeSetting(key, value) {
+    try {
+        localStorage.setItem(key, value);
+    } catch (error) {
+        console.warn(`Unable to persist setting ${key}:`, error);
+    }
+}
+
+function loadStoredPort(key, fallback, fieldName) {
+    const stored = readStoredSetting(key);
+    if (stored === null) return fallback;
+    try {
+        return parsePort(stored, fieldName);
+    } catch (error) {
+        console.warn(`Ignoring invalid stored ${fieldName}:`, error);
+        return fallback;
+    }
+}
+
+function requireHost(rawValue) {
+    const value = String(rawValue).trim();
+    if (!value) throw new Error('Host must not be empty');
+    if (/\s/.test(value) || value.includes('://') || /[/?#]/.test(value)) {
+        throw new Error('Host must be a hostname or IP address without a URL scheme, path, query, or fragment');
+    }
+    const startsBracket = value.startsWith('[');
+    const endsBracket = value.endsWith(']');
+    if (startsBracket !== endsBracket || /[\[\]]/.test(value.slice(1, -1))) {
+        throw new Error('IPv6 host brackets must form one outer pair');
+    }
+    if (startsBracket && !value.slice(1, -1).includes(':')) {
+        throw new Error('Brackets are accepted only around an IPv6 address');
+    }
+    return value;
+}
+
+function loadStoredHost() {
+    const stored = readStoredSetting('kiko_host');
+    if (stored === null) return DEFAULT_HOST;
+    try {
+        return requireHost(stored);
+    } catch (error) {
+        console.warn('Ignoring invalid stored host:', error);
+        return DEFAULT_HOST;
+    }
+}
+
+function udpAddress(hostValue, port) {
+    const unbracketed = hostValue.startsWith('[') && hostValue.endsWith(']')
+        ? hostValue.slice(1, -1)
+        : hostValue;
+    return unbracketed.includes(':')
+        ? `[${unbracketed}]:${port}`
+        : `${unbracketed}:${port}`;
+}
+
+function httpOrigin(hostValue, port) {
+    return `http://${udpAddress(hostValue, port)}`;
+}
+
+let host = loadStoredHost();
+let udpPort = loadStoredPort('kiko_udp_port', DEFAULT_UDP_PORT, 'UDP port');
+let httpPort = loadStoredPort('kiko_http_port', DEFAULT_HTTP_PORT, 'HTTP port');
+let robotAddress = udpAddress(host, udpPort);
+let basePwmPercent = 50;
 
 // Key states for smooth control
 const keys = {
@@ -52,13 +143,20 @@ const keys = {
 const videoStream = document.getElementById('videoStream');
 const videoOffline = document.getElementById('videoOffline');
 const statusIndicator = document.getElementById('statusIndicator');
-const connectionText = document.getElementById('connectionText');
 const directionArrow = document.getElementById('directionArrow');
-const speedDisplay = document.getElementById('speedDisplay');
 const connectBtn = document.getElementById('connectBtn');
+connectBtn.disabled = true;
 const hostInput = document.getElementById('hostInput');
 const udpPortInput = document.getElementById('udpPortInput');
 const httpPortInput = document.getElementById('httpPortInput');
+const connectionSettingInputs = [hostInput, udpPortInput, httpPortInput].filter(Boolean);
+
+function updateConnectionSettingAvailability() {
+    const disabled = connected || connectionTransitionInProgress;
+    connectionSettingInputs.forEach(input => {
+        input.disabled = disabled;
+    });
+}
 // -------------------- DEBUG LOGGING SETUP --------------------
 const debugDiv = document.getElementById('debugLog');
 if (debugDiv) {
@@ -90,14 +188,14 @@ window.addEventListener('error', (e) => pushDebug('Unhandled error:', e.message 
 document.addEventListener('keydown', (e) => {
     if (e.key in keys) {
         keys[e.key] = true;
-        updateMotorSpeeds();
+        updateMotorPwm();
     }
 });
 
 document.addEventListener('keyup', (e) => {
     if (e.key in keys) {
         keys[e.key] = false;
-        updateMotorSpeeds();
+        updateMotorPwm();
     }
 });
 
@@ -108,11 +206,16 @@ window.addEventListener('keydown', (e) => {
     }
 });
 
-// Calculate motor speeds from keyboard input
-function updateMotorSpeeds() {
+function updateMotorPwm() {
     if (!connected) return;
     
-    const speed = keys.Shift ? Math.min(100, Math.floor(baseSpeed * 1.5)) : baseSpeed;
+    const boostedPwmPercentCappedAtDomainMaximum = Math.min(
+        100,
+        Math.floor(basePwmPercent * 1.5)
+    );
+    const pwmMagnitude = keys.Shift
+        ? boostedPwmPercentCappedAtDomainMaximum
+        : basePwmPercent;
     
     let left = 0;
     let right = 0;
@@ -123,61 +226,225 @@ function updateMotorSpeeds() {
     const turnRight = keys.ArrowRight || keys.d;
     
     if (forward && !backward) {
-        left = speed;
-        right = speed;
+        left = pwmMagnitude;
+        right = pwmMagnitude;
         
         if (turnLeft && !turnRight) {
-            left = Math.floor(speed * 0.3);
+            left = Math.floor(pwmMagnitude * 0.3);
         } else if (turnRight && !turnLeft) {
-            right = Math.floor(speed * 0.3);
+            right = Math.floor(pwmMagnitude * 0.3);
         }
     } else if (backward && !forward) {
-        left = -speed;
-        right = -speed;
+        left = -pwmMagnitude;
+        right = -pwmMagnitude;
         
         if (turnLeft && !turnRight) {
-            left = -Math.floor(speed * 0.3);
+            left = -Math.floor(pwmMagnitude * 0.3);
         } else if (turnRight && !turnLeft) {
-            right = -Math.floor(speed * 0.3);
+            right = -Math.floor(pwmMagnitude * 0.3);
         }
     } else if (turnLeft && !turnRight) {
-        left = -Math.floor(speed / 2);
-        right = Math.floor(speed / 2);
+        left = -Math.floor(pwmMagnitude / 2);
+        right = Math.floor(pwmMagnitude / 2);
     } else if (turnRight && !turnLeft) {
-        left = Math.floor(speed / 2);
-        right = -Math.floor(speed / 2);
+        left = Math.floor(pwmMagnitude / 2);
+        right = -Math.floor(pwmMagnitude / 2);
     }
     
     // Send to backend
-    setMotorSpeeds(left, right);
+    queueMotorPwm(left, right);
 }
 
-// Send motor speeds to backend
-async function setMotorSpeeds(left, right) {
-    try {
-        await invoke('set_motor_speeds', { left, right });
-        currentLeft = left;
-        currentRight = right;
-        
-        // Log significant speed changes for debugging
-        if (Math.abs(left) > 50 || Math.abs(right) > 50) {
-            console.log('High speed command:', { left, right });
-        }
-    } catch (err) {
-        console.error('Failed to set motor speeds:', err);
-        // If not connected, try to reconnect
-        if (String(err).includes('Not connected')) {
-            setConnected(false);
-        }
+function sameMotorPwm(first, second) {
+    return first.left === second.left && first.right === second.right;
+}
+
+function stopIsInProgressForGeneration(streamGenerationDecimal) {
+    return streamGenerationDecimal !== null &&
+        acknowledgedStop?.streamGenerationDecimal === streamGenerationDecimal;
+}
+
+function queueMotorPwm(left, right, forceRefresh = false) {
+    if (connected && activeStreamGenerationDecimal === null) {
+        console.error('Connected state has no stream generation');
+        alert('Motor command stream is internally inconsistent and has been closed');
+        setConnected(false);
+        return Promise.resolve();
+    }
+    const next = stopIsInProgressForGeneration(activeStreamGenerationDecimal)
+        ? { left: 0, right: 0 }
+        : { left, right };
+    if (forceRefresh || !sameMotorPwm(desiredMotorPwm, next)) {
+        desiredMotorPwm = next;
+    }
+
+    if (motorPwmDrain === null && connected && submittedDesiredMotorPwm !== desiredMotorPwm) {
+        const generation = activeStreamGenerationDecimal;
+        const drain = (async () => {
+            while (
+                connected &&
+                generation === activeStreamGenerationDecimal &&
+                submittedDesiredMotorPwm !== desiredMotorPwm
+            ) {
+                const requested = desiredMotorPwm;
+                await invoke('set_motor_pwm', {
+                    left: requested.left,
+                    right: requested.right,
+                    stream_generation_decimal: generation
+                });
+                if (!connected || generation !== activeStreamGenerationDecimal) return;
+                submittedDesiredMotorPwm = requested;
+                if (Math.abs(requested.left) > 50 || Math.abs(requested.right) > 50) {
+                    console.log('High PWM command:', requested);
+                }
+            }
+        })();
+        motorPwmDrain = drain;
+        drain.then(
+            () => {
+                if (motorPwmDrain === drain) motorPwmDrain = null;
+                resumeCurrentMotorPwmDrain();
+            },
+            err => {
+                if (motorPwmDrain === drain) motorPwmDrain = null;
+                if (generation !== activeStreamGenerationDecimal) {
+                    console.log(
+                        `Ignored desired-PWM failure from superseded stream generation ${generation}:`,
+                        err
+                    );
+                    resumeCurrentMotorPwmDrain();
+                    return;
+                }
+                console.error('Failed to update desired motor PWM:', err);
+                if (!stopIsInProgressForGeneration(generation)) {
+                    alert('Motor PWM update failed: ' + err);
+                }
+                setConnected(false);
+            }
+        );
+    }
+
+    return motorPwmDrain ?? Promise.resolve();
+}
+
+function resumeCurrentMotorPwmDrain() {
+    if (connected && submittedDesiredMotorPwm !== desiredMotorPwm) {
+        queueMotorPwm(desiredMotorPwm.left, desiredMotorPwm.right);
     }
 }
 
-// Speed is now controlled by the interactive speed bar in the HTML
+function requestAcknowledgedZeroPwm() {
+    if (!connected || activeStreamGenerationDecimal === null) {
+        return Promise.reject(new Error('Not connected'));
+    }
+    const streamGenerationDecimal = activeStreamGenerationDecimal;
+    if (stopIsInProgressForGeneration(streamGenerationDecimal)) {
+        return acknowledgedStop.promise;
+    }
+
+    Object.keys(keys).forEach(key => keys[key] = false);
+    const request = (async () => {
+        await queueMotorPwm(0, 0);
+        if (!connected || activeStreamGenerationDecimal !== streamGenerationDecimal) {
+            throw new Error(
+                `Zero-PWM stop for superseded stream generation ${streamGenerationDecimal} was not sent to the replacement stream`
+            );
+        }
+        await invoke('stop_motors', { stream_generation_decimal: streamGenerationDecimal });
+        if (activeStreamGenerationDecimal === streamGenerationDecimal) {
+            updateDirection(0, 0);
+        }
+    })();
+    const stop = { streamGenerationDecimal, promise: request };
+    acknowledgedStop = stop;
+    request.then(
+        () => {
+            if (acknowledgedStop === stop) acknowledgedStop = null;
+        },
+        () => {
+            if (acknowledgedStop === stop) acknowledgedStop = null;
+        }
+    );
+    return request;
+}
+
+function resetMotorPwmState() {
+    const zero = { left: 0, right: 0 };
+    desiredMotorPwm = zero;
+    submittedDesiredMotorPwm = zero;
+}
+
+function startMotorLeaseRefresh() {
+    stopMotorLeaseRefresh();
+    const refreshGeneration = motorLeaseRefreshGeneration;
+
+    const refresh = async () => {
+        if (!connected || refreshGeneration !== motorLeaseRefreshGeneration) return;
+        if (
+            !stopIsInProgressForGeneration(activeStreamGenerationDecimal) &&
+            (desiredMotorPwm.left !== 0 || desiredMotorPwm.right !== 0)
+        ) {
+            try {
+                await queueMotorPwm(desiredMotorPwm.left, desiredMotorPwm.right, true);
+            } catch (_) {
+                // The queue's single rejection handler reports the exact failure.
+            }
+        }
+        if (connected && refreshGeneration === motorLeaseRefreshGeneration) {
+            motorLeaseRefreshTimer = setTimeout(refresh, 50);
+        }
+    };
+
+    motorLeaseRefreshTimer = setTimeout(refresh, 50);
+}
+
+function stopMotorLeaseRefresh() {
+    motorLeaseRefreshGeneration += 1;
+    if (motorLeaseRefreshTimer !== null) {
+        clearTimeout(motorLeaseRefreshTimer);
+        motorLeaseRefreshTimer = null;
+    }
+}
+
+function reportStopFailure(context, err, streamGenerationDecimal) {
+    if (streamGenerationDecimal !== activeStreamGenerationDecimal) {
+        console.log(
+            `Ignored ${context.toLowerCase()} from superseded stream generation ${streamGenerationDecimal}:`,
+            err
+        );
+        return;
+    }
+    console.error(`${context}:`, err);
+    alert(`${context}: ${err}`);
+    setConnected(false);
+}
+
+function rejectMovementWhileStopping(event) {
+    if (stopIsInProgressForGeneration(activeStreamGenerationDecimal) && event.key in keys) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return true;
+    }
+    return false;
+}
+
+// Ignore movement input until an in-flight acknowledged stop has completed.
+document.addEventListener('keydown', event => {
+    if (rejectMovementWhileStopping(event)) {
+        keys[event.key] = false;
+    }
+}, true);
+
+document.addEventListener('keyup', event => {
+    if (rejectMovementWhileStopping(event)) {
+        keys[event.key] = false;
+    }
+}, true);
 
 // Direction visualization
 function updateDirection(left, right) {
-    const leftElem = document.getElementById('leftSpeed');
-    const rightElem = document.getElementById('rightSpeed');
+    const leftElem = document.getElementById('leftPwm');
+    const rightElem = document.getElementById('rightPwm');
     leftElem.textContent = left;
     rightElem.textContent = right;
     
@@ -203,54 +470,68 @@ function updateDirection(left, right) {
 
 // Connection management
 async function connect() {
+    if (connectionTransitionInProgress) return;
+    connectionTransitionInProgress = true;
+    connectBtn.disabled = true;
+    updateConnectionSettingAvailability();
     try {
         // Build address from inputs and persist
-        host = hostInput?.value?.trim() || host;
-        udpPort = parseInt(udpPortInput?.value || String(udpPort), 10) || udpPort;
-        httpPort = parseInt(httpPortInput?.value || String(httpPort), 10) || httpPort;
-        localStorage.setItem('kiko_host', host);
-        localStorage.setItem('kiko_udp_port', String(udpPort));
-        localStorage.setItem('kiko_http_port', String(httpPort));
-        robotAddress = `${host}:${udpPort}`;
+        host = requireHost(hostInput?.value ?? host);
+        udpPort = parsePort(udpPortInput?.value ?? udpPort, 'UDP port');
+        httpPort = parsePort(httpPortInput?.value ?? httpPort, 'HTTP port');
+        storeSetting('kiko_host', host);
+        storeSetting('kiko_udp_port', String(udpPort));
+        storeSetting('kiko_http_port', String(httpPort));
+        robotAddress = udpAddress(host, udpPort);
 
         console.log('Attempting to connect to:', robotAddress, 'http:', httpPort);
 
-        // Quick sanity check – ping HTTP status endpoint
-        try {
-            const statusUrl = `http://${host}:${httpPort}/status`;
-            console.log('Pinging status endpoint:', statusUrl);
-            const resp = await fetch(statusUrl).catch(e => { throw e; });
-            console.log('Status response:', resp.status, resp.ok);
-        } catch (pingErr) {
-            console.error('Status ping failed (this is okay if server runs on another subnet):', pingErr);
+        const connection = await invoke('connect', { address: robotAddress, http_port: httpPort });
+        if (
+            !connection ||
+            connection.server_addr !== robotAddress ||
+            !/^\d+$/.test(connection.stream_generation_decimal)
+        ) {
+            throw new Error('Connection response does not contain the expected address and stream generation');
         }
-
-        const result = await invoke('connect', { address: robotAddress, http_port: httpPort });
-        console.log('Connection result:', result);
-        
-        // Verify connection status
-        const isConnected = await invoke('get_connection_status');
-        console.log('Connection status verified:', isConnected);
-        
-        if (isConnected) {
-            setConnected(true);
-            console.log('Successfully connected to robot');
-        } else {
-            throw new Error('Connection status check failed');
+        const earlyFailure = pendingConnectionFailures.get(connection.stream_generation_decimal);
+        pendingConnectionFailures.delete(connection.stream_generation_decimal);
+        if (earlyFailure !== undefined) {
+            throw new Error(`Command stream failed during connection: ${earlyFailure}`);
         }
+        activeStreamGenerationDecimal = connection.stream_generation_decimal;
+        resetMotorPwmState();
+        setConnected(true);
+        console.log('Successfully connected to robot stream generation:', activeStreamGenerationDecimal);
     } catch (err) {
         console.error('Connection failed:', err);
         alert('Connection failed: ' + err);
         setConnected(false);
+    } finally {
+        connectionTransitionInProgress = false;
+        connectBtn.disabled = false;
+        updateConnectionSettingAvailability();
     }
 }
 
 async function disconnect() {
+    if (connectionTransitionInProgress) return;
+    connectionTransitionInProgress = true;
+    connectBtn.disabled = true;
+    updateConnectionSettingAvailability();
+    const generation = activeStreamGenerationDecimal;
     try {
-        await invoke('disconnect');
-        setConnected(false);
+        if (generation !== null) {
+            await invoke('disconnect', { stream_generation_decimal: generation });
+        }
     } catch (err) {
         console.error('Disconnect error:', err);
+        alert('Disconnected locally with warning: ' + err);
+    } finally {
+        setConnected(false);
+        connectionTransitionInProgress = false;
+        connectBtn.disabled = false;
+        updateConnectionSettingAvailability();
     }
 }
 
@@ -261,15 +542,20 @@ function setConnected(isConnected) {
         statusIndicator.classList.remove('offline');
         connectBtn.textContent = 'Disconnect';
         connectBtn.classList.add('connected');
+        startMotorLeaseRefresh();
         
         // Start video stream
-        videoStream.src = `http://${host}:${httpPort}/video.mjpeg`;
+        videoStream.src = `${httpOrigin(host, httpPort)}/video.mjpeg`;
         videoStream.style.display = 'block';
         videoOffline.style.display = 'none';
         
         // Start odometry polling
         startOdometryPolling();
     } else {
+        stopMotorLeaseRefresh();
+        activeStreamGenerationDecimal = null;
+        acknowledgedStop = null;
+        resetMotorPwmState();
         statusIndicator.classList.add('offline');
         connectBtn.textContent = 'Connect';
         connectBtn.classList.remove('connected');
@@ -285,12 +571,11 @@ function setConnected(isConnected) {
         // Reset displays
         updateDirection(0, 0);
         updateOdometryDisplay(null);
-        currentLeft = 0;
-        currentRight = 0;
         
         // Clear key states
         Object.keys(keys).forEach(key => keys[key] = false);
     }
+    updateConnectionSettingAvailability();
 }
 
 // Handle connection button
@@ -302,57 +587,95 @@ connectBtn.addEventListener('click', () => {
     }
 });
 
-// Emergency stop on spacebar
+// Send a zero-PWM stop command on spacebar.
 document.addEventListener('keydown', async (e) => {
     if (e.key === ' ' && connected) {
         e.preventDefault();
+        const streamGenerationDecimal = activeStreamGenerationDecimal;
         try {
-            await invoke('emergency_stop');
-            // Clear all key states
-            Object.keys(keys).forEach(key => keys[key] = false);
-            currentLeft = 0;
-            currentRight = 0;
-            updateDirection(0, 0);
+            await requestAcknowledgedZeroPwm();
         } catch (err) {
-            console.error('Emergency stop failed:', err);
+            reportStopFailure('Zero-PWM stop failed', err, streamGenerationDecimal);
         }
     }
 });
 
-// Listen for telemetry updates from backend
-let telemetryListener = null;
+let commandAcknowledgementListener = null;
 let connectionLostListener = null;
 let connectionErrorListener = null;
-let odometryInterval = null;
+let odometryPollTimer = null;
+let odometryPollGeneration = 0;
 
 async function setupEventListeners() {
-    // Telemetry updates
-    telemetryListener = await listen('telemetry-update', (event) => {
+    commandAcknowledgementListener = await listen('command-acknowledgement', (event) => {
         const update = event.payload;
-        console.log('Telemetry update:', update);
+        if (
+            !update ||
+            typeof update.stream_generation_decimal !== 'string' ||
+            !/^\d+$/.test(update.stream_generation_decimal)
+        ) {
+            console.error('Rejected malformed command acknowledgement event:', update);
+            if (connected) {
+                alert('The command stream emitted an invalid acknowledgement and has been closed');
+                setConnected(false);
+            }
+            return;
+        }
+        if (update.stream_generation_decimal !== activeStreamGenerationDecimal) {
+            console.log('Ignored acknowledgement from a superseded command stream:', update);
+            return;
+        }
+        console.log('Command acknowledgement:', update);
         
-        // Update telemetry displays
-        document.getElementById('latency').textContent = update.latency + 'ms';
-        document.getElementById('sequence').textContent = ++sequenceNum;
-        document.getElementById('battery').textContent = 
-            (update.telemetry.battery_mv / 1000).toFixed(1) + 'V';
+        document.getElementById('latency').textContent = update.round_trip_latency_ms + 'ms';
+        document.getElementById('sequence').textContent = update.accepted_sequence;
         
-        // Update direction based on commanded values
-        updateDirection(update.left_command, update.right_command);
+        updateDirection(
+            update.commanded_left_pwm_percent,
+            update.commanded_right_pwm_percent
+        );
     });
     
     // Connection lost
-    connectionLostListener = await listen('connection-lost', () => {
-        console.error('Connection lost event received');
-        setConnected(false);
-        alert('Connection to robot lost');
+    connectionLostListener = await listen('connection-lost', (event) => {
+        const failure = event.payload;
+        if (!recordConnectionFailure(failure)) return;
+        if (failure.stream_generation_decimal === activeStreamGenerationDecimal) {
+            console.error('Connection lost event received:', failure.message);
+            setConnected(false);
+        }
     });
     
     // Connection errors
     connectionErrorListener = await listen('connection-error', (event) => {
-        console.error('Connection error:', event.payload);
-        alert('Connection error: ' + event.payload);
+        const failure = event.payload;
+        if (!recordConnectionFailure(failure)) return;
+        if (failure.stream_generation_decimal === activeStreamGenerationDecimal) {
+            console.error('Connection error:', failure.message);
+            alert('Connection error: ' + failure.message);
+        }
     });
+}
+
+function recordConnectionFailure(failure) {
+    if (
+        !failure ||
+        typeof failure.message !== 'string' ||
+        typeof failure.stream_generation_decimal !== 'string' ||
+        !/^\d+$/.test(failure.stream_generation_decimal)
+    ) {
+        console.error('Rejected malformed connection failure event:', failure);
+        if (connected) {
+            alert('The command stream emitted an invalid failure event and has been closed');
+            setConnected(false);
+        }
+        return false;
+    }
+    pendingConnectionFailures.set(failure.stream_generation_decimal, failure.message);
+    while (pendingConnectionFailures.size > 16) {
+        pendingConnectionFailures.delete(pendingConnectionFailures.keys().next().value);
+    }
+    return true;
 }
 
 // Initialize
@@ -360,30 +683,68 @@ window.addEventListener('DOMContentLoaded', () => {
     console.log('Dashboard loaded – JS initialised');
     // Populate connection inputs and wire persistence
     if (hostInput) hostInput.value = host;
-    if (udpPortInput) udpPortInput.value = isFinite(udpPort) ? udpPort : 8080;
-    if (httpPortInput) httpPortInput.value = isFinite(httpPort) ? httpPort : 3030;
+    if (udpPortInput) udpPortInput.value = udpPort;
+    if (httpPortInput) httpPortInput.value = httpPort;
 
     hostInput?.addEventListener('change', () => {
-        host = hostInput.value.trim();
-        localStorage.setItem('kiko_host', host);
+        try {
+            host = requireHost(hostInput.value);
+            hostInput.setCustomValidity('');
+            storeSetting('kiko_host', host);
+        } catch (error) {
+            hostInput.setCustomValidity(error.message);
+            hostInput.reportValidity();
+            hostInput.value = host;
+        }
     });
     udpPortInput?.addEventListener('change', () => {
-        const v = parseInt(udpPortInput.value, 10);
-        udpPort = isFinite(v) && v > 0 ? v : 8080;
-        udpPortInput.value = udpPort;
-        localStorage.setItem('kiko_udp_port', String(udpPort));
+        try {
+            udpPort = parsePort(udpPortInput.value, 'UDP port');
+            udpPortInput.setCustomValidity('');
+            storeSetting('kiko_udp_port', String(udpPort));
+        } catch (error) {
+            udpPortInput.setCustomValidity(error.message);
+            udpPortInput.reportValidity();
+            udpPortInput.value = udpPort;
+        }
     });
     httpPortInput?.addEventListener('change', () => {
-        const v = parseInt(httpPortInput.value, 10);
-        httpPort = isFinite(v) && v > 0 ? v : 3030;
-        httpPortInput.value = httpPort;
-        localStorage.setItem('kiko_http_port', String(httpPort));
-        if (connected) {
-            videoStream.src = `http://${host}:${httpPort}/video.mjpeg`;
+        try {
+            httpPort = parsePort(httpPortInput.value, 'HTTP port');
+            httpPortInput.setCustomValidity('');
+            storeSetting('kiko_http_port', String(httpPort));
+            if (connected) {
+                videoStream.src = `${httpOrigin(host, httpPort)}/video.mjpeg`;
+            }
+        } catch (error) {
+            httpPortInput.setCustomValidity(error.message);
+            httpPortInput.reportValidity();
+            httpPortInput.value = httpPort;
         }
     });
 
-    setupEventListeners();
+    const pwmInput = document.getElementById('pwmInput');
+    const pwmText = document.getElementById('pwmText');
+    pwmInput?.addEventListener('input', () => {
+        const requested = Number(pwmInput.value);
+        if (!Number.isInteger(requested) || requested < 10 || requested > 100 || requested % 10 !== 0) {
+            console.error('Rejected out-of-domain PWM slider value:', pwmInput.value);
+            pwmInput.value = String(basePwmPercent);
+            return;
+        }
+        basePwmPercent = requested;
+        pwmText.textContent = `${basePwmPercent}%`;
+        updateMotorPwm();
+    });
+
+    setupEventListeners()
+        .then(() => {
+            connectBtn.disabled = false;
+        })
+        .catch(error => {
+            console.error('Failed to register application event listeners:', error);
+            alert('Control event listeners could not be registered; connection controls remain disabled: ' + error);
+        });
     setConnected(false);
     updateDirection(0, 0);
     
@@ -391,472 +752,86 @@ window.addEventListener('DOMContentLoaded', () => {
     window.addEventListener('blur', () => {
         Object.keys(keys).forEach(key => keys[key] = false);
         if (connected) {
-            setMotorSpeeds(0, 0);
+            const streamGenerationDecimal = activeStreamGenerationDecimal;
+            requestAcknowledgedZeroPwm().catch(err => {
+                reportStopFailure(
+                    'Focus-loss zero-PWM stop failed',
+                    err,
+                    streamGenerationDecimal
+                );
+            });
         }
-    });
-    // Responsive canvas sizing
-    resizeOdometryCanvas();
-    window.addEventListener('resize', resizeOdometryCanvas);
-});
-
-// Handle video feed selection
-document.querySelectorAll('.feed-option').forEach(option => {
-    option.addEventListener('click', (e) => {
-        if (e.target.classList.contains('disabled')) return;
-        
-        document.querySelectorAll('.feed-option').forEach(o => 
-            o.classList.remove('active'));
-        e.target.classList.add('active');
-        
-        // In future, this would switch camera feeds
-        console.log('Selected feed:', e.target.dataset.feed);
     });
 });
 
 // Odometry polling functions
 function startOdometryPolling() {
     console.log('Starting odometry polling');
-    stopOdometryPolling(); // Clear any existing interval
-    
-    odometryInterval = setInterval(async () => {
+    stopOdometryPolling();
+    const generation = odometryPollGeneration;
+    const streamGenerationDecimal = activeStreamGenerationDecimal;
+
+    const poll = async () => {
         try {
-            const odometry = await invoke('get_odometry');
-            updateOdometryDisplay(odometry);
+            const odometry = await invoke('get_odometry', {
+                stream_generation_decimal: streamGenerationDecimal
+            });
+            if (connected && generation === odometryPollGeneration) {
+                updateOdometryDisplay(odometry);
+            }
         } catch (err) {
-            console.error('Failed to get odometry:', err);
+            if (connected && generation === odometryPollGeneration) {
+                console.error('Failed to get odometry:', err);
+                showOdometryUnavailable('Odometry request failed', String(err));
+            }
         }
-    }, 100); // 10Hz polling for smoother updates
+
+        if (connected && generation === odometryPollGeneration) {
+            odometryPollTimer = setTimeout(poll, 100);
+        }
+    };
+    poll();
 }
 
 function stopOdometryPolling() {
-    if (odometryInterval) {
-        clearInterval(odometryInterval);
-        odometryInterval = null;
+    odometryPollGeneration += 1;
+    if (odometryPollTimer) {
+        clearTimeout(odometryPollTimer);
+        odometryPollTimer = null;
         console.log('Stopped odometry polling');
     }
 }
 
-// ==================== REAL-TIME PATH VISUALIZATION SYSTEM ====================
+function updateOdometryDisplay(odometry) {
+    if (!odometry) {
+        showOdometryUnavailable('Waiting for odometry data', '');
+        return;
+    }
 
-class RobotPathVisualizer {
-    constructor(canvasId, infoId, placeholderId) {
-        this.canvas = document.getElementById(canvasId);
-        this.ctx = this.canvas.getContext('2d');
-        this.infoDiv = document.getElementById(infoId);
-        this.placeholder = document.getElementById(placeholderId);
-        
-        // Robot physical parameters
-        this.WHEEL_BASE = 0.15; // meters (distance between wheels)
-        this.TICKS_PER_METER = 1000; // encoder ticks per meter (configurable)
-        
-        // Robot state
-        this.position = {x: 0, y: 0}; // meters
-        this.heading = 0; // radians
-        this.totalDistance = 0; // meters
-        this.lastOdometry = null;
-        this.isInitialized = false;
-        
-        // Path history
-        this.pathHistory = [];
-        this.maxPathPoints = 2000; // Limit memory usage
-        this.showTrail = true;
-        
-        // Visualization parameters
-        this.scale = 50; // pixels per meter
-        this.centerOffset = {x: 209, y: 126}; // Canvas center
-        this.panOffset = {x: 0, y: 0}; // Pan offset
-        this.minScale = 10;
-        this.maxScale = 500;
-        
-        // Interaction state
-        this.isDragging = false;
-        this.lastMousePos = {x: 0, y: 0};
-        
-        // Animation
-        this.lastUpdateTime = 0;
-        this.targetPosition = {x: 0, y: 0};
-        this.targetHeading = 0;
-        
-        this.setupEventListeners();
-        this.startRenderLoop();
-        
-        console.log('🤖 Path Visualizer initialized');
-    }
-    
-    setupEventListeners() {
-        // Mouse interactions
-        this.canvas.addEventListener('mousedown', (e) => this.handleMouseDown(e));
-        this.canvas.addEventListener('mousemove', (e) => this.handleMouseMove(e));
-        this.canvas.addEventListener('mouseup', (e) => this.handleMouseUp(e));
-        this.canvas.addEventListener('wheel', (e) => this.handleWheel(e));
-        
-        // Control buttons
-        document.getElementById('resetPath').addEventListener('click', () => this.resetPath());
-        document.getElementById('centerView').addEventListener('click', () => this.centerView());
-        document.getElementById('toggleTrail').addEventListener('click', () => this.toggleTrail());
-        
-        // Prevent context menu
-        this.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    }
-    
-    // ==================== ODOMETRY CALCULATIONS ====================
-    
-    updateOdometry(odometry) {
-        if (!odometry) {
-            this.showPlaceholder(true);
-            return;
-        }
-        
-        this.showPlaceholder(false);
-        
-        if (!this.isInitialized) {
-            this.initializeOdometry(odometry);
-            return;
-        }
-        
-        const dt = (odometry.timestamp_ms - this.lastOdometry.timestamp_ms) / 1000.0; // seconds
-        if (dt <= 0 || dt > 1.0) { // Skip invalid time deltas
-            this.lastOdometry = odometry;
-            return;
-        }
-        
-        // Calculate wheel distances (delta)
-        const leftDelta = (odometry.left_ticks - this.lastOdometry.left_ticks) / this.TICKS_PER_METER;
-        const rightDelta = (odometry.right_ticks - this.lastOdometry.right_ticks) / this.TICKS_PER_METER;
-        
-        // Differential drive kinematics
-        const distance = (leftDelta + rightDelta) / 2.0; // forward distance
-        const deltaHeading = (rightDelta - leftDelta) / this.WHEEL_BASE; // heading change
-        
-        // Update robot state with smooth interpolation
-        const newX = this.position.x + distance * Math.cos(this.heading + deltaHeading / 2.0);
-        const newY = this.position.y + distance * Math.sin(this.heading + deltaHeading / 2.0);
-        const newHeading = this.heading + deltaHeading;
-        
-        // Smooth interpolation for animation
-        this.targetPosition = {x: newX, y: newY};
-        this.targetHeading = newHeading;
-        
-        this.totalDistance += Math.abs(distance);
-        
-        // Add to path history (with decimation for performance)
-        if (this.pathHistory.length === 0 || 
-            Math.abs(newX - this.pathHistory[this.pathHistory.length - 1].x) > 0.01 ||
-            Math.abs(newY - this.pathHistory[this.pathHistory.length - 1].y) > 0.01) {
-            
-            this.pathHistory.push({
-                x: newX, 
-                y: newY, 
-                timestamp: odometry.timestamp_ms,
-                heading: newHeading
-            });
-            
-            // Manage memory
-            if (this.pathHistory.length > this.maxPathPoints) {
-                this.pathHistory.shift();
-            }
-        }
-        
-        this.lastOdometry = odometry;
-        this.updateInfoDisplay(odometry, dt);
-    }
-    
-    initializeOdometry(odometry) {
-        this.lastOdometry = odometry;
-        this.position = {x: 0, y: 0};
-        this.heading = 0;
-        this.totalDistance = 0;
-        this.pathHistory = [{x: 0, y: 0, timestamp: odometry.timestamp_ms, heading: 0}];
-        this.targetPosition = {x: 0, y: 0};
-        this.targetHeading = 0;
-        this.isInitialized = true;
-        console.log('🎯 Odometry initialized');
-    }
-    
-    // ==================== VISUALIZATION ====================
-    
-    startRenderLoop() {
-        const animate = (currentTime) => {
-            this.render(currentTime);
-            requestAnimationFrame(animate);
-        };
-        requestAnimationFrame(animate);
-    }
-    
-    render(currentTime) {
-        const dt = currentTime - this.lastUpdateTime;
-        this.lastUpdateTime = currentTime;
-        
-        // Smooth interpolation (60fps)
-        const alpha = Math.min(dt / 16.67, 1.0); // 16.67ms = 60fps
-        this.position.x += (this.targetPosition.x - this.position.x) * alpha * 0.3;
-        this.position.y += (this.targetPosition.y - this.position.y) * alpha * 0.3;
-        this.heading += this.normalizeAngle(this.targetHeading - this.heading) * alpha * 0.3;
-        
-        this.clearCanvas();
-        this.drawGrid();
-        this.drawPath();
-        this.drawRobot();
-        this.drawOrigin();
-    }
-    
-    clearCanvas() {
-        this.ctx.fillStyle = '#ffffff';
-        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
-    }
-    
-    drawGrid() {
-        const ctx = this.ctx;
-        ctx.strokeStyle = '#f0f0f0';
-        ctx.lineWidth = 1;
-        
-        const gridSize = this.scale; // 1 meter grid
-        const startX = (-this.panOffset.x % gridSize);
-        const startY = (-this.panOffset.y % gridSize);
-        
-        // Vertical lines
-        for (let x = startX; x < this.canvas.width; x += gridSize) {
-            ctx.beginPath();
-            ctx.moveTo(x, 0);
-            ctx.lineTo(x, this.canvas.height);
-            ctx.stroke();
-        }
-        
-        // Horizontal lines
-        for (let y = startY; y < this.canvas.height; y += gridSize) {
-            ctx.beginPath();
-            ctx.moveTo(0, y);
-            ctx.lineTo(this.canvas.width, y);
-            ctx.stroke();
-        }
-    }
-    
-    drawPath() {
-        if (!this.showTrail || this.pathHistory.length < 2) return;
-        
-        const ctx = this.ctx;
-        ctx.strokeStyle = '#2196f3';
-        ctx.lineWidth = 2;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        
-        // Draw path with gradient opacity
-        ctx.beginPath();
-        for (let i = 1; i < this.pathHistory.length; i++) {
-            const point = this.pathHistory[i];
-            const screenPos = this.worldToScreen(point.x, point.y);
-            
-            if (i === 1) {
-                ctx.moveTo(screenPos.x, screenPos.y);
-            } else {
-                ctx.lineTo(screenPos.x, screenPos.y);
-            }
-        }
-        ctx.stroke();
-        
-        // Draw path points (recent ones more opaque)
-        for (let i = Math.max(0, this.pathHistory.length - 50); i < this.pathHistory.length; i++) {
-            const point = this.pathHistory[i];
-            const screenPos = this.worldToScreen(point.x, point.y);
-            const age = (this.pathHistory.length - i) / 50.0;
-            
-            ctx.fillStyle = `rgba(33, 150, 243, ${0.8 - age * 0.6})`;
-            ctx.beginPath();
-            ctx.arc(screenPos.x, screenPos.y, 2, 0, Math.PI * 2);
-            ctx.fill();
-        }
-    }
-    
-    drawRobot() {
-        const screenPos = this.worldToScreen(this.position.x, this.position.y);
-        const ctx = this.ctx;
-        
-        ctx.save();
-        ctx.translate(screenPos.x, screenPos.y);
-        ctx.rotate(this.heading);
-        
-        // Robot body (rectangle)
-        const width = this.scale * 0.08; // 8cm width
-        const height = this.scale * 0.12; // 12cm length
-        
-        ctx.fillStyle = '#4caf50';
-        ctx.strokeStyle = '#2e7d32';
-        ctx.lineWidth = 2;
-        ctx.fillRect(-width/2, -height/2, width, height);
-        ctx.strokeRect(-width/2, -height/2, width, height);
-        
-        // Direction indicator (triangle)
-        ctx.fillStyle = '#fff';
-        ctx.beginPath();
-        ctx.moveTo(height/3, 0);
-        ctx.lineTo(-height/6, -width/4);
-        ctx.lineTo(-height/6, width/4);
-        ctx.closePath();
-        ctx.fill();
-        
-        // Wheels
-        ctx.fillStyle = '#333';
-        const wheelWidth = this.scale * 0.02;
-        const wheelHeight = this.scale * 0.04;
-        const wheelOffset = this.scale * this.WHEEL_BASE / 2;
-        
-        // Left wheel
-        ctx.fillRect(-wheelWidth/2, wheelOffset - wheelHeight/2, wheelWidth, wheelHeight);
-        // Right wheel
-        ctx.fillRect(-wheelWidth/2, -wheelOffset - wheelHeight/2, wheelWidth, wheelHeight);
-        
-        ctx.restore();
-    }
-    
-    drawOrigin() {
-        const originScreen = this.worldToScreen(0, 0);
-        const ctx = this.ctx;
-        
-        // Origin cross
-        ctx.strokeStyle = '#f44336';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(originScreen.x - 8, originScreen.y);
-        ctx.lineTo(originScreen.x + 8, originScreen.y);
-        ctx.moveTo(originScreen.x, originScreen.y - 8);
-        ctx.lineTo(originScreen.x, originScreen.y + 8);
-        ctx.stroke();
-        
-        // Origin label
-        ctx.fillStyle = '#f44336';
-        ctx.font = '10px Consolas';
-        ctx.fillText('(0,0)', originScreen.x + 12, originScreen.y - 4);
-    }
-    
-    // ==================== COORDINATE TRANSFORMS ====================
-    
-    worldToScreen(worldX, worldY) {
-        return {
-            x: (worldX * this.scale) + this.centerOffset.x + this.panOffset.x,
-            y: (-worldY * this.scale) + this.centerOffset.y + this.panOffset.y // Flip Y
-        };
-    }
-    
-    screenToWorld(screenX, screenY) {
-        return {
-            x: (screenX - this.centerOffset.x - this.panOffset.x) / this.scale,
-            y: -((screenY - this.centerOffset.y - this.panOffset.y) / this.scale) // Flip Y
-        };
-    }
-    
-    // ==================== INTERACTION HANDLERS ====================
-    
-    handleMouseDown(e) {
-        this.isDragging = true;
-        this.lastMousePos = {x: e.offsetX, y: e.offsetY};
-        this.canvas.style.cursor = 'grabbing';
-    }
-    
-    handleMouseMove(e) {
-        if (this.isDragging) {
-            const dx = e.offsetX - this.lastMousePos.x;
-            const dy = e.offsetY - this.lastMousePos.y;
-            this.panOffset.x += dx;
-            this.panOffset.y += dy;
-            this.lastMousePos = {x: e.offsetX, y: e.offsetY};
-        }
-    }
-    
-    handleMouseUp(e) {
-        this.isDragging = false;
-        this.canvas.style.cursor = 'grab';
-    }
-    
-    handleWheel(e) {
-        e.preventDefault();
-        const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-        const newScale = Math.max(this.minScale, Math.min(this.maxScale, this.scale * zoomFactor));
-        
-        // Zoom towards mouse position
-        const mouseWorld = this.screenToWorld(e.offsetX, e.offsetY);
-        this.scale = newScale;
-        const newMouseScreen = this.worldToScreen(mouseWorld.x, mouseWorld.y);
-        
-        this.panOffset.x += e.offsetX - newMouseScreen.x;
-        this.panOffset.y += e.offsetY - newMouseScreen.y;
-    }
-    
-    // ==================== CONTROL FUNCTIONS ====================
-    
-    resetPath() {
-        this.position = {x: 0, y: 0};
-        this.heading = 0;
-        this.totalDistance = 0;
-        this.pathHistory = [{x: 0, y: 0, timestamp: Date.now(), heading: 0}];
-        this.targetPosition = {x: 0, y: 0};
-        this.targetHeading = 0;
-        this.centerView();
-        console.log('🔄 Path reset');
-    }
-    
-    centerView() {
-        this.panOffset = {x: 0, y: 0};
-        this.scale = 50;
-        console.log('🎯 View centered');
-    }
-    
-    toggleTrail() {
-        this.showTrail = !this.showTrail;
-        const btn = document.getElementById('toggleTrail');
-        btn.style.background = this.showTrail ? '#777' : '#333';
-        console.log(`👁️ Trail ${this.showTrail ? 'enabled' : 'disabled'}`);
-    }
-    
-    // ==================== UI UPDATES ====================
-    
-    updateInfoDisplay(odometry, dt) {
-        const speed = this.calculateSpeed(odometry, dt);
-        const headingDeg = (this.heading * 180 / Math.PI) % 360;
-        
-        this.infoDiv.innerHTML = `
-            <div>Position: (${this.position.x.toFixed(2)}, ${this.position.y.toFixed(2)}) m</div>
-            <div>Heading: ${headingDeg.toFixed(1)}°</div>
-            <div>Speed: ${speed.toFixed(2)} m/s</div>
-            <div>Distance: ${this.totalDistance.toFixed(2)} m</div>
-        `;
-    }
-    
-    calculateSpeed(odometry, dt) {
-        if (!this.lastOdometry || dt <= 0) return 0;
-        
-        const leftDelta = (odometry.left_ticks - this.lastOdometry.left_ticks) / this.TICKS_PER_METER;
-        const rightDelta = (odometry.right_ticks - this.lastOdometry.right_ticks) / this.TICKS_PER_METER;
-        const distance = (leftDelta + rightDelta) / 2.0;
-        
-        return Math.abs(distance / dt);
-    }
-    
-    showPlaceholder(show) {
-        this.placeholder.style.display = show ? 'block' : 'none';
-        this.infoDiv.style.display = show ? 'none' : 'block';
-    }
-    
-    // ==================== UTILITY FUNCTIONS ====================
-    
-    normalizeAngle(angle) {
-        while (angle > Math.PI) angle -= 2 * Math.PI;
-        while (angle < -Math.PI) angle += 2 * Math.PI;
-        return angle;
-    }
+    document.getElementById('leftEncoderTicks').textContent =
+        odometry.left_estimated_extended_ticks_wrapping_i64;
+    document.getElementById('rightEncoderTicks').textContent =
+        odometry.right_estimated_extended_ticks_wrapping_i64;
+    document.getElementById('leftSampleDeltaTicks').textContent =
+        odometry.left_sample_delta_ticks_modulo_i16;
+    document.getElementById('rightSampleDeltaTicks').textContent =
+        odometry.right_sample_delta_ticks_modulo_i16;
+    document.getElementById('controllerUptimeMs').textContent =
+        odometry.controller_uptime_ms_wrapping;
+    document.getElementById('odometryServerReceiveAgeMs').textContent =
+        odometry.server_receive_age_ms_decimal;
+    document.getElementById('odometryValues').hidden = false;
+    const placeholder = document.getElementById('odometryPlaceholder');
+    placeholder.hidden = true;
+    placeholder.title = '';
 }
 
-// Global path visualizer instance
-let pathVisualizer = null;
-
-function updateOdometryDisplay(odometry) {
-    if (!pathVisualizer) {
-        pathVisualizer = new RobotPathVisualizer('odometryCanvas', 'odometryInfo', 'odometryPlaceholder');
-        const c = document.getElementById('odometryCanvas');
-        if (c) {
-            pathVisualizer.centerOffset = { x: c.width / 2, y: c.height / 2 };
-        }
-    }
-    pathVisualizer.updateOdometry(odometry);
+function showOdometryUnavailable(message, detail) {
+    document.getElementById('odometryValues').hidden = true;
+    const placeholder = document.getElementById('odometryPlaceholder');
+    placeholder.hidden = false;
+    placeholder.textContent = message;
+    placeholder.title = detail;
 }
 
 // Cleanup on window close
@@ -865,25 +840,7 @@ window.addEventListener('beforeunload', () => {
         disconnect();
     }
     stopOdometryPolling();
-    if (telemetryListener) telemetryListener();
+    if (commandAcknowledgementListener) commandAcknowledgementListener();
     if (connectionLostListener) connectionLostListener();
     if (connectionErrorListener) connectionErrorListener();
 });
-
-// Resize odometry canvas to its container and keep visualizer centered
-function resizeOdometryCanvas() {
-    const canvas = document.getElementById('odometryCanvas');
-    if (!canvas) return;
-    const container = canvas.parentElement;
-    if (!container) return;
-    const rect = container.getBoundingClientRect();
-    const newWidth = Math.max(200, Math.floor(rect.width));
-    const newHeight = Math.max(150, Math.floor(rect.height));
-    if (canvas.width !== newWidth || canvas.height !== newHeight) {
-        canvas.width = newWidth;
-        canvas.height = newHeight;
-        if (pathVisualizer) {
-            pathVisualizer.centerOffset = { x: newWidth / 2, y: newHeight / 2 };
-        }
-    }
-}
