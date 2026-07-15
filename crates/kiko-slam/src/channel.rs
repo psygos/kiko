@@ -56,7 +56,12 @@ impl TryFrom<usize> for ChannelCapacity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+/// Monotonic channel event counters. Event counters saturate at `u64::MAX`.
+///
+/// A successful `DroppedOldest` attempt increments both `enqueued` and
+/// `dropped_oldest`: the outcome describes the submitted value, while the
+/// counters also retain the separate eviction event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChannelStats {
     pub enqueued: u64,
     pub dropped_newest: u64,
@@ -115,6 +120,24 @@ impl ChannelStatsInner {
         }
     }
 
+    fn record_enqueued(&self) {
+        saturating_increment(&self.enqueued);
+        self.on_enqueue();
+    }
+
+    fn record_dropped_newest(&self) {
+        saturating_increment(&self.dropped_newest);
+    }
+
+    fn record_dropped_oldest(&self) {
+        saturating_increment(&self.dropped_oldest);
+        self.on_dequeue();
+    }
+
+    fn record_disconnected(&self) {
+        saturating_increment(&self.disconnected);
+    }
+
     fn on_dequeue(&self) {
         let _ = self
             .current_depth
@@ -122,6 +145,12 @@ impl ChannelStatsInner {
                 Some(depth.saturating_sub(1))
             });
     }
+}
+
+fn saturating_increment(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        value.checked_add(1)
+    });
 }
 
 #[derive(Clone, Debug)]
@@ -136,66 +165,74 @@ impl ChannelStatsHandle {
 }
 
 #[derive(Debug)]
+enum SenderBehavior<T> {
+    DropNewest,
+    DropOldest { drop_rx: Receiver<T> },
+}
+
+#[derive(Debug)]
 pub struct DropSender<T> {
     tx: Sender<T>,
-    drop_rx: Receiver<T>,
+    behavior: SenderBehavior<T>,
     receiver_lease: Weak<ReceiverLease>,
-    policy: DropPolicy,
     stats: Arc<ChannelStatsInner>,
 }
 
 impl<T> DropSender<T> {
     pub fn try_send(&self, value: T) -> SendOutcome {
         let Some(_receiver_lease) = self.receiver_lease.upgrade() else {
-            self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+            self.stats.record_disconnected();
             return SendOutcome::Disconnected;
         };
 
         match self.tx.try_send(value) {
             Ok(()) => {
-                self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                self.stats.on_enqueue();
+                self.stats.record_enqueued();
                 SendOutcome::Enqueued
             }
-            Err(TrySendError::Full(value)) => match self.policy {
-                DropPolicy::DropNewest => {
-                    self.stats.dropped_newest.fetch_add(1, Ordering::Relaxed);
+            Err(TrySendError::Full(value)) => match &self.behavior {
+                SenderBehavior::DropNewest => {
+                    self.stats.record_dropped_newest();
                     SendOutcome::DroppedNewest
                 }
-                DropPolicy::DropOldest => {
-                    match self.drop_rx.try_recv() {
+                SenderBehavior::DropOldest { drop_rx } => {
+                    let evicted_oldest = match drop_rx.try_recv() {
                         Ok(_) => {
-                            self.stats.dropped_oldest.fetch_add(1, Ordering::Relaxed);
-                            self.stats.on_dequeue();
+                            self.stats.record_dropped_oldest();
+                            true
                         }
                         Err(TryRecvError::Empty) => {
                             // A racing receiver may have drained between `Full` and this
                             // eviction attempt. Fall through and retry the send.
+                            false
                         }
                         Err(TryRecvError::Disconnected) => {
-                            self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+                            self.stats.record_disconnected();
                             return SendOutcome::Disconnected;
                         }
-                    }
+                    };
                     match self.tx.try_send(value) {
                         Ok(()) => {
-                            self.stats.enqueued.fetch_add(1, Ordering::Relaxed);
-                            self.stats.on_enqueue();
-                            SendOutcome::Enqueued
+                            self.stats.record_enqueued();
+                            if evicted_oldest {
+                                SendOutcome::DroppedOldest
+                            } else {
+                                SendOutcome::Enqueued
+                            }
                         }
                         Err(TrySendError::Full(_)) => {
-                            self.stats.dropped_newest.fetch_add(1, Ordering::Relaxed);
+                            self.stats.record_dropped_newest();
                             SendOutcome::DroppedNewest
                         }
                         Err(TrySendError::Disconnected(_)) => {
-                            self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+                            self.stats.record_disconnected();
                             SendOutcome::Disconnected
                         }
                     }
                 }
             },
             Err(TrySendError::Disconnected(_)) => {
-                self.stats.disconnected.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_disconnected();
                 SendOutcome::Disconnected
             }
         }
@@ -261,12 +298,16 @@ pub fn bounded_channel<T>(
     let receiver_lease = Arc::new(ReceiverLease {
         stats: Arc::clone(&stats),
     });
-    let drop_rx = rx.clone();
+    let behavior = match policy {
+        DropPolicy::DropNewest => SenderBehavior::DropNewest,
+        DropPolicy::DropOldest => SenderBehavior::DropOldest {
+            drop_rx: rx.clone(),
+        },
+    };
     let sender = DropSender {
         tx,
-        drop_rx,
+        behavior,
         receiver_lease: Arc::downgrade(&receiver_lease),
-        policy,
         stats: stats.clone(),
     };
     let receiver = DropReceiver {
@@ -280,7 +321,51 @@ pub fn bounded_channel<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelCapacity, DropPolicy, SendOutcome, bounded_channel};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{
+        ChannelCapacity, ChannelStats, DropPolicy, SendOutcome, bounded_channel,
+        saturating_increment,
+    };
+
+    #[test]
+    fn drop_oldest_reports_the_submitted_values_fate() {
+        let (tx, rx, stats) = bounded_channel(
+            ChannelCapacity::try_from(1).expect("capacity"),
+            DropPolicy::DropOldest,
+        );
+        assert_eq!(tx.try_send(1_u8), SendOutcome::Enqueued);
+        assert_eq!(tx.try_send(2_u8), SendOutcome::DroppedOldest);
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(
+            stats.snapshot(),
+            ChannelStats {
+                enqueued: 2,
+                dropped_oldest: 1,
+                max_depth: 1,
+                ..ChannelStats::default()
+            }
+        );
+    }
+
+    #[test]
+    fn event_counters_saturate_under_contention() {
+        let counter = Arc::new(AtomicU64::new(u64::MAX - 1));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let counter = Arc::clone(&counter);
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..64 {
+                    saturating_increment(&counter);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("counter worker");
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 
     #[test]
     fn channel_stats_track_depth_and_high_water_mark() {
