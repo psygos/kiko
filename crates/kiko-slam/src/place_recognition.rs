@@ -71,6 +71,13 @@ pub(crate) struct PendingLoopCandidate {
     pub(crate) candidates: Vec<PlaceMatch>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedKeyframeRecognition {
+    database: KeyframeDatabase,
+    pending_loop: Option<PendingLoopCandidate>,
+    loop_streak: std::collections::HashMap<KeyframeId, usize>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct DescriptorRequest {
     pub(crate) keyframe_id: KeyframeId,
@@ -656,8 +663,11 @@ impl PlaceRecognition {
             .query_for_relocalization(descriptor, max_candidates)
     }
 
-    pub(crate) fn remove_keyframe(&mut self, keyframe_id: KeyframeId) {
-        self.database.remove(keyframe_id);
+    pub(crate) fn remove_keyframe(
+        &mut self,
+        keyframe_id: KeyframeId,
+    ) -> Result<(), KeyframeDatabaseError> {
+        self.database.remove(keyframe_id)?;
         self.loop_streak.remove(&keyframe_id);
         if let Some(pending) = self.pending_loop.as_mut() {
             if pending.query_kf == keyframe_id {
@@ -671,21 +681,61 @@ impl PlaceRecognition {
                 }
             }
         }
+        Ok(())
     }
 
-    pub(crate) fn on_keyframe(
-        &mut self,
+    pub(crate) fn prepare_keyframe(
+        &self,
         keyframe_id: KeyframeId,
         detections: &Arc<Detections>,
-        frame: &Frame,
-        source_snapshot: MapSnapshot,
-    ) -> Result<(), BootstrapDescriptorError> {
-        self.database
+    ) -> Result<PreparedKeyframeRecognition, BootstrapDescriptorError> {
+        let global_descriptor = aggregate_global_descriptor(detections.descriptors())
+            .map_err(|source| BootstrapDescriptorError::Aggregation { source })?;
+        let mut database = self.database.clone();
+        database
             .register_keyframe(keyframe_id)
             .map_err(|source| BootstrapDescriptorError::Database { source })?;
-        let bootstrap_result = self.enqueue_loop_candidates(keyframe_id, detections);
+        let mut candidates = database
+            .query_loop_candidates(
+                keyframe_id,
+                &global_descriptor,
+                self.loop_config.max_candidates(),
+            )
+            .map_err(|source| BootstrapDescriptorError::Database { source })?;
+        database
+            .set_descriptor(keyframe_id, global_descriptor, DescriptorSource::Bootstrap)
+            .map_err(|source| BootstrapDescriptorError::Database { source })?;
+        candidates.retain(|candidate| {
+            candidate.cosine_similarity().value() >= self.loop_config.similarity_threshold()
+        });
+        let mut pending_loop = self.pending_loop.clone();
+        let mut loop_streak = self.loop_streak.clone();
+        Self::update_loop_candidates(
+            keyframe_id,
+            detections,
+            candidates,
+            self.loop_config,
+            &mut pending_loop,
+            &mut loop_streak,
+        );
+        Ok(PreparedKeyframeRecognition {
+            database,
+            pending_loop,
+            loop_streak,
+        })
+    }
+
+    pub(crate) fn commit_keyframe(
+        &mut self,
+        prepared: PreparedKeyframeRecognition,
+        keyframe_id: KeyframeId,
+        frame: &Frame,
+        source_snapshot: MapSnapshot,
+    ) {
+        self.database = prepared.database;
+        self.pending_loop = prepared.pending_loop;
+        self.loop_streak = prepared.loop_streak;
         self.enqueue_descriptor_request(keyframe_id, frame, source_snapshot);
-        bootstrap_result
     }
 
     pub(crate) fn drain_responses(
@@ -772,69 +822,53 @@ impl PlaceRecognition {
         events
     }
 
-    fn enqueue_loop_candidates(
-        &mut self,
+    fn update_loop_candidates(
         keyframe_id: KeyframeId,
         detections: &Arc<Detections>,
-    ) -> Result<(), BootstrapDescriptorError> {
-        let global_descriptor = aggregate_global_descriptor(detections.descriptors())
-            .map_err(|source| BootstrapDescriptorError::Aggregation { source })?;
-        let mut candidates = self
-            .database
-            .query_loop_candidates(
-                keyframe_id,
-                &global_descriptor,
-                self.loop_config.max_candidates(),
-            )
-            .map_err(|source| BootstrapDescriptorError::Database { source })?;
-        self.database
-            .set_descriptor(keyframe_id, global_descriptor, DescriptorSource::Bootstrap)
-            .map_err(|source| BootstrapDescriptorError::Database { source })?;
-        candidates.retain(|candidate| {
-            candidate.cosine_similarity().value() >= self.loop_config.similarity_threshold()
-        });
-
+        candidates: Vec<PlaceMatch>,
+        loop_config: LoopClosureConfig,
+        pending_loop: &mut Option<PendingLoopCandidate>,
+        loop_streak: &mut std::collections::HashMap<KeyframeId, usize>,
+    ) {
         if candidates.is_empty() {
-            self.loop_streak.clear();
-            return Ok(());
+            loop_streak.clear();
+            return;
         }
 
         let present: HashSet<KeyframeId> = candidates
             .iter()
             .map(|candidate| candidate.candidate())
             .collect();
-        self.loop_streak
-            .retain(|candidate, _| present.contains(candidate));
+        loop_streak.retain(|candidate, _| present.contains(candidate));
         for candidate in &candidates {
-            let streak = self.loop_streak.entry(candidate.candidate()).or_insert(0);
+            let streak = loop_streak.entry(candidate.candidate()).or_insert(0);
             *streak = streak.saturating_add(1);
         }
 
-        if self.pending_loop.is_some() {
-            return Ok(());
+        if pending_loop.is_some() {
+            return;
         }
 
         let promoted: Vec<PlaceMatch> = candidates
             .into_iter()
             .filter(|candidate| {
-                self.loop_streak
+                loop_streak
                     .get(&candidate.candidate())
                     .copied()
                     .unwrap_or(0)
-                    >= self.loop_config.min_streak()
+                    >= loop_config.min_streak()
             })
             .collect();
 
         if promoted.is_empty() {
-            return Ok(());
+            return;
         }
 
-        self.pending_loop = Some(PendingLoopCandidate {
+        *pending_loop = Some(PendingLoopCandidate {
             query_kf: keyframe_id,
             detections: Arc::clone(detections),
             candidates: promoted,
         });
-        Ok(())
     }
 
     fn enqueue_descriptor_request(
@@ -911,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn learned_response_initializes_registered_descriptor_after_bootstrap_failure() {
+    fn bootstrap_failure_is_atomic_and_late_response_reports_index_error() {
         let mut recognition = recognition_without_worker();
         let keyframe_id = KeyframeId::default();
         let source_snapshot = crate::map::SlamMap::new().snapshot();
@@ -928,18 +962,8 @@ mod tests {
             )
             .expect("finite zero-norm detections"),
         );
-        let frame = Frame::new(
-            crate::SensorId::StereoLeft,
-            frame_id,
-            crate::Timestamp::from_nanos(1),
-            2,
-            2,
-            vec![0; 4],
-        )
-        .expect("frame");
-
         let bootstrap_error = recognition
-            .on_keyframe(keyframe_id, &detections, &frame, source_snapshot)
+            .prepare_keyframe(keyframe_id, &detections)
             .expect_err("zero-norm bootstrap descriptor must fail");
         assert!(matches!(
             bootstrap_error,
@@ -947,9 +971,9 @@ mod tests {
                 source: GlobalDescriptorError::ZeroNorm
             }
         ));
-        assert_eq!(recognition.database.registered_len(), 1);
+        assert_eq!(recognition.database.registered_len(), 0);
         assert_eq!(recognition.database.descriptor_len(), 0);
-        assert_eq!(recognition.descriptor_stats().dropped_unavailable, 1);
+        assert_eq!(recognition.descriptor_stats().dropped_unavailable, 0);
 
         recognition.descriptor_worker.pending_outputs.push_back(
             DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(Box::new(
@@ -963,21 +987,68 @@ mod tests {
 
         let events = recognition.drain_responses(source_snapshot, |id| id == keyframe_id);
 
-        assert!(events.is_empty(), "unexpected events: {events:?}");
+        assert!(matches!(
+            events.as_slice(),
+            [PlaceRecognitionEvent::IndexFailed {
+                keyframe_id: failed_id,
+                error: KeyframeDatabaseError::KeyframeNotRegistered { keyframe_id: missing },
+                ..
+            }] if *failed_id == keyframe_id && *missing == keyframe_id
+        ));
+        assert_eq!(recognition.database.registered_len(), 0);
+        assert_eq!(recognition.database.descriptor_len(), 0);
+        assert_eq!(recognition.descriptor_stats().applied, 0);
+    }
+
+    #[test]
+    fn prepared_keyframe_registration_commits_as_one_database_transition() {
+        let mut recognition = recognition_without_worker();
+        let keyframe_id = KeyframeId::default();
+        let frame_id = crate::FrameId::new(2);
+        let mut descriptor = [0.0_f32; crate::DESCRIPTOR_DIM];
+        descriptor[0] = 1.0;
+        let detections = Arc::new(
+            Detections::new(
+                crate::SensorId::StereoLeft,
+                frame_id,
+                2,
+                2,
+                vec![crate::Keypoint { x: 0.0, y: 0.0 }],
+                vec![1.0],
+                vec![crate::Descriptor::try_new(descriptor).expect("finite descriptor")],
+            )
+            .expect("detections"),
+        );
+        let frame = Frame::new(
+            crate::SensorId::StereoLeft,
+            frame_id,
+            crate::Timestamp::from_nanos(2),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("frame");
+        let source_snapshot = crate::map::SlamMap::new().snapshot();
+
+        let prepared = recognition
+            .prepare_keyframe(keyframe_id, &detections)
+            .expect("valid descriptor registration");
+        assert_eq!(recognition.database.registered_len(), 0);
+
+        recognition.commit_keyframe(prepared, keyframe_id, &frame, source_snapshot);
         assert_eq!(recognition.database.registered_len(), 1);
         assert_eq!(recognition.database.descriptor_len(), 1);
         assert_eq!(
             recognition.database.descriptor_source(keyframe_id),
-            Some(DescriptorSource::Learned)
+            Some(DescriptorSource::Bootstrap)
         );
-        assert_eq!(recognition.descriptor_stats().applied, 1);
     }
 
     #[test]
     fn bootstrap_database_error_preserves_source() {
         let error = BootstrapDescriptorError::Database {
             source: KeyframeDatabaseError::SequenceExhausted {
-                next_sequence: usize::MAX,
+                next_sequence: u64::MAX,
             },
         };
 

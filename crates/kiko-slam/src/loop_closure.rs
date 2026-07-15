@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::num::NonZeroUsize;
 
 use crate::map::{KeyframeId, MapError, MapSnapshot, SlamMap};
@@ -991,7 +992,7 @@ pub enum KeyframeDescriptorUpdate {
 pub enum KeyframeDatabaseError {
     KeyframeAlreadyRegistered { keyframe_id: KeyframeId },
     KeyframeNotRegistered { keyframe_id: KeyframeId },
-    SequenceExhausted { next_sequence: usize },
+    SequenceExhausted { next_sequence: u64 },
 }
 
 impl std::fmt::Display for KeyframeDatabaseError {
@@ -1027,7 +1028,14 @@ struct StoredKeyframeDescriptor {
 struct KeyframeDescriptorEntry {
     keyframe_id: KeyframeId,
     descriptor: Option<StoredKeyframeDescriptor>,
-    sequence: usize,
+    sequence: u64,
+}
+
+struct RankedMatch<T> {
+    value: T,
+    candidate_sequence: u64,
+    candidate: KeyframeId,
+    similarity: CosineSimilarity,
 }
 
 const DEFAULT_TEMPORAL_GAP: usize = 30;
@@ -1035,21 +1043,25 @@ const DEFAULT_TEMPORAL_GAP: usize = 30;
 #[derive(Clone, Debug)]
 pub struct KeyframeDatabase {
     entries: Vec<KeyframeDescriptorEntry>,
-    temporal_gap: usize,
-    next_sequence: usize,
+    registered_keyframe_gap: u64,
+    next_sequence: Option<u64>,
 }
 
 impl KeyframeDatabase {
     pub fn new(temporal_gap: usize) -> Self {
         Self {
             entries: Vec::new(),
-            temporal_gap,
-            next_sequence: 0,
+            registered_keyframe_gap: u64::try_from(temporal_gap)
+                .expect("usize fits in u64 on supported macOS and Linux hosts"),
+            next_sequence: Some(0),
         }
     }
 
+    /// Number of immediately preceding registered keyframes excluded from
+    /// loop matching. The retained API name is historical; this is not time.
     pub fn temporal_gap(&self) -> usize {
-        self.temporal_gap
+        usize::try_from(self.registered_keyframe_gap)
+            .expect("registered-keyframe gap originated from usize on this host")
     }
 
     pub fn registered_len(&self) -> usize {
@@ -1067,13 +1079,12 @@ impl KeyframeDatabase {
         if self.entries.iter().any(|entry| entry.keyframe_id == id) {
             return Err(KeyframeDatabaseError::KeyframeAlreadyRegistered { keyframe_id: id });
         }
-        let sequence = self.next_sequence;
-        let next_sequence =
-            sequence
-                .checked_add(1)
-                .ok_or(KeyframeDatabaseError::SequenceExhausted {
-                    next_sequence: sequence,
-                })?;
+        let sequence = self
+            .next_sequence
+            .ok_or(KeyframeDatabaseError::SequenceExhausted {
+                next_sequence: u64::MAX,
+            })?;
+        let next_sequence = sequence.checked_add(1);
         self.entries.push(KeyframeDescriptorEntry {
             keyframe_id: id,
             descriptor: None,
@@ -1106,10 +1117,14 @@ impl KeyframeDatabase {
         Ok(update)
     }
 
-    pub fn remove(&mut self, id: KeyframeId) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.keyframe_id != id);
-        self.entries.len() != before
+    pub fn remove(&mut self, id: KeyframeId) -> Result<(), KeyframeDatabaseError> {
+        let index = self
+            .entries
+            .iter()
+            .position(|entry| entry.keyframe_id == id)
+            .ok_or(KeyframeDatabaseError::KeyframeNotRegistered { keyframe_id: id })?;
+        self.entries.remove(index);
+        Ok(())
     }
 
     pub fn descriptor_source(&self, id: KeyframeId) -> Option<DescriptorSource> {
@@ -1146,23 +1161,24 @@ impl KeyframeDatabase {
             let Some(age) = query_sequence.checked_sub(candidate.sequence) else {
                 continue;
             };
-            if age == 0 || age <= self.temporal_gap {
+            if age == 0 || age <= self.registered_keyframe_gap {
                 continue;
             }
-            matches.push(PlaceMatch {
-                query: query_id,
+            let similarity = descriptor.clamped_cosine_similarity(&candidate_descriptor.value);
+            matches.push(RankedMatch {
+                value: PlaceMatch {
+                    query: query_id,
+                    candidate: candidate.keyframe_id,
+                    cosine_similarity: similarity,
+                },
+                candidate_sequence: candidate.sequence,
                 candidate: candidate.keyframe_id,
-                cosine_similarity: descriptor
-                    .clamped_cosine_similarity(&candidate_descriptor.value),
+                similarity,
             });
         }
-        matches.sort_by(|a, b| {
-            b.cosine_similarity
-                .value()
-                .total_cmp(&a.cosine_similarity.value())
-        });
+        matches.sort_by(compare_ranked_matches);
         matches.truncate(top_k);
-        Ok(matches)
+        Ok(matches.into_iter().map(|ranked| ranked.value).collect())
     }
 
     pub fn query_for_relocalization(
@@ -1173,28 +1189,38 @@ impl KeyframeDatabase {
         if top_k == 0 {
             return Vec::new();
         }
-        let mut matches: Vec<RelocalizationMatch> = self
+        let mut matches: Vec<RankedMatch<RelocalizationMatch>> = self
             .entries
             .iter()
             .filter_map(|entry| {
-                entry
-                    .descriptor
-                    .as_ref()
-                    .map(|candidate_descriptor| RelocalizationMatch {
+                entry.descriptor.as_ref().map(|candidate_descriptor| {
+                    let similarity =
+                        descriptor.clamped_cosine_similarity(&candidate_descriptor.value);
+                    RankedMatch {
+                        value: RelocalizationMatch {
+                            candidate: entry.keyframe_id,
+                            cosine_similarity: similarity,
+                        },
+                        candidate_sequence: entry.sequence,
                         candidate: entry.keyframe_id,
-                        cosine_similarity: descriptor
-                            .clamped_cosine_similarity(&candidate_descriptor.value),
-                    })
+                        similarity,
+                    }
+                })
             })
             .collect();
-        matches.sort_by(|a, b| {
-            b.cosine_similarity
-                .value()
-                .total_cmp(&a.cosine_similarity.value())
-        });
+        matches.sort_by(compare_ranked_matches);
         matches.truncate(top_k);
-        matches
+        matches.into_iter().map(|ranked| ranked.value).collect()
     }
+}
+
+fn compare_ranked_matches<T>(left: &RankedMatch<T>, right: &RankedMatch<T>) -> Ordering {
+    right
+        .similarity
+        .value()
+        .total_cmp(&left.similarity.value())
+        .then_with(|| left.candidate_sequence.cmp(&right.candidate_sequence))
+        .then_with(|| left.candidate.cmp(&right.candidate))
 }
 
 impl Default for KeyframeDatabase {
@@ -1853,6 +1879,23 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_database_similarity_ties_follow_registration_sequence() {
+        let ids = make_keyframe_ids(3);
+        let mut db = KeyframeDatabase::new(0);
+        insert_bootstrap(&mut db, ids[1], descriptor_with_basis(0));
+        insert_bootstrap(&mut db, ids[0], descriptor_with_basis(0));
+        insert_bootstrap(&mut db, ids[2], descriptor_with_basis(0));
+
+        let matches = db
+            .query_loop_candidates(ids[2], &descriptor_with_basis(0), 2)
+            .expect("registered query keyframe");
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].candidate(), ids[1]);
+        assert_eq!(matches[1].candidate(), ids[0]);
+    }
+
+    #[test]
     fn keyframe_database_remove_deletes_entry() {
         let ids = make_keyframe_ids(3);
         let mut db = KeyframeDatabase::new(0);
@@ -1861,10 +1904,14 @@ mod tests {
         insert_bootstrap(&mut db, ids[2], descriptor_with_basis(2));
         assert_eq!(db.registered_len(), 3);
         assert_eq!(db.descriptor_len(), 3);
-        assert!(db.remove(ids[1]));
+        db.remove(ids[1]).expect("registered keyframe");
         assert_eq!(db.registered_len(), 2);
         assert_eq!(db.descriptor_len(), 2);
-        assert!(!db.remove(ids[1]));
+        assert!(matches!(
+            db.remove(ids[1]),
+            Err(KeyframeDatabaseError::KeyframeNotRegistered { keyframe_id })
+                if keyframe_id == ids[1]
+        ));
     }
 
     #[test]
@@ -1876,7 +1923,7 @@ mod tests {
         }
 
         // Remove a middle entry; sequence distance must still be respected.
-        assert!(db.remove(ids[2]));
+        db.remove(ids[2]).expect("registered keyframe");
 
         let matches = db
             .query_loop_candidates(ids[4], &descriptor_with_basis(4), 10)
@@ -1946,24 +1993,27 @@ mod tests {
 
     #[test]
     fn keyframe_database_sequence_exhaustion_is_atomic() {
-        let ids = make_keyframe_ids(2);
+        let ids = make_keyframe_ids(3);
         let mut db = KeyframeDatabase::new(0);
         insert_bootstrap(&mut db, ids[0], descriptor_with_basis(0));
-        db.next_sequence = usize::MAX;
+        db.next_sequence = Some(u64::MAX);
+
+        db.register_keyframe(ids[1])
+            .expect("the final u64 sequence value remains representable");
 
         let error = db
-            .register_keyframe(ids[1])
+            .register_keyframe(ids[2])
             .expect_err("exhausted sequence must reject a new entry");
         assert_eq!(
             error,
             KeyframeDatabaseError::SequenceExhausted {
-                next_sequence: usize::MAX
+                next_sequence: u64::MAX
             }
         );
-        assert_eq!(db.registered_len(), 1);
+        assert_eq!(db.registered_len(), 2);
         assert_eq!(db.descriptor_len(), 1);
-        assert_eq!(db.descriptor_source(ids[1]), None);
-        assert_eq!(db.next_sequence, usize::MAX);
+        assert_eq!(db.descriptor_source(ids[2]), None);
+        assert_eq!(db.next_sequence, None);
 
         assert_eq!(
             db.set_descriptor(ids[0], descriptor_with_basis(2), DescriptorSource::Learned,)
@@ -2064,7 +2114,7 @@ mod tests {
             DescriptorSource::Learned,
         );
 
-        assert!(db.remove(ids[1]));
+        db.remove(ids[1]).expect("registered keyframe");
         assert_eq!(db.registered_len(), 3);
         assert_eq!(db.descriptor_len(), 3);
         assert_eq!(db.descriptor_source(ids[1]), None);
@@ -2098,7 +2148,7 @@ mod tests {
         insert_bootstrap(&mut db, ids[1], descriptor_with_basis(1));
         insert_bootstrap(&mut db, ids[2], descriptor_with_basis(2));
 
-        assert!(db.remove(ids[2]));
+        db.remove(ids[2]).expect("registered keyframe");
         let matches = db
             .query_loop_candidates(ids[1], &descriptor_with_basis(1), 10)
             .expect("registered query keyframe");
@@ -2115,8 +2165,8 @@ mod tests {
             insert_bootstrap(&mut db, *id, descriptor_with_basis(i));
         }
 
-        assert!(db.remove(ids[1]));
-        assert!(db.remove(ids[3]));
+        db.remove(ids[1]).expect("registered keyframe");
+        db.remove(ids[3]).expect("registered keyframe");
         let matches = db
             .query_loop_candidates(ids[4], &descriptor_with_basis(4), 10)
             .expect("registered query keyframe");

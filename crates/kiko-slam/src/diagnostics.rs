@@ -1006,7 +1006,7 @@ mod tests {
                 source_snapshot: crate::map::SlamMap::new().snapshot(),
                 error: std::sync::Arc::new(
                     crate::loop_closure::KeyframeDatabaseError::SequenceExhausted {
-                        next_sequence: usize::MAX,
+                        next_sequence: u64::MAX,
                     },
                 ),
             },

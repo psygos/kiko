@@ -18,12 +18,14 @@ const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 use crate::frontend::{MapObservationError, StereoFrontend, TrackedMapObservations};
 use crate::global_map::GlobalMap;
 use crate::loop_closure::{
-    LoopApplyError, LoopClosureConfig, LoopDetectError, RelocalizationConfig, VerifiedLoop,
-    aggregate_global_descriptor, match_quantized_descriptors_for_loop, quantize_loop_descriptors,
+    KeyframeDatabaseError, LoopApplyError, LoopClosureConfig, LoopDetectError,
+    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
+    match_quantized_descriptors_for_loop, quantize_loop_descriptors,
 };
 use crate::loop_manager::LoopManager;
 use crate::place_recognition::{
-    DescriptorInitError, DescriptorStats, PlaceRecognition, PlaceRecognitionEvent,
+    BootstrapDescriptorError, DescriptorInitError, DescriptorStats, PlaceRecognition,
+    PlaceRecognitionEvent,
 };
 use crate::pose_graph::{EssentialGraphError, PoseGraphConfig};
 use crate::{
@@ -1740,6 +1742,7 @@ pub enum TrackerError {
     BundleAdjusterWorkspace(LocalBundleAdjusterWorkspaceError),
     PoseBa(crate::PoseBaError),
     BaExecution(crate::BaExecutionError),
+    KeyframeDatabase(KeyframeDatabaseError),
     RelocalizationMapSnapshotMismatch {
         verified: MapSnapshot,
         current: MapSnapshot,
@@ -1806,6 +1809,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::BaExecution(err) => {
                 write!(f, "bundle-adjustment execution error: {err}")
             }
+            TrackerError::KeyframeDatabase(err) => {
+                write!(f, "keyframe descriptor database error: {err}")
+            }
             TrackerError::RelocalizationMapSnapshotMismatch { verified, current } => write!(
                 f,
                 "verified relocalization map snapshot mismatch: verified={verified}, current={current}"
@@ -1844,6 +1850,7 @@ impl std::error::Error for TrackerError {
             TrackerError::BundleAdjusterWorkspace(source) => Some(source),
             TrackerError::PoseBa(source) => Some(source),
             TrackerError::BaExecution(source) => Some(source),
+            TrackerError::KeyframeDatabase(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioAccumulator(source) => Some(source),
             #[cfg(feature = "vio")]
@@ -1870,6 +1877,23 @@ impl From<CaptureBundleError> for TrackerError {
 impl From<InferenceError> for TrackerError {
     fn from(err: InferenceError) -> Self {
         TrackerError::Inference(err)
+    }
+}
+
+impl From<KeyframeDatabaseError> for TrackerError {
+    fn from(source: KeyframeDatabaseError) -> Self {
+        Self::KeyframeDatabase(source)
+    }
+}
+
+impl From<BootstrapDescriptorError> for TrackerError {
+    fn from(source: BootstrapDescriptorError) -> Self {
+        match source {
+            BootstrapDescriptorError::Aggregation { source } => {
+                Self::Inference(InferenceError::GlobalDescriptor(source))
+            }
+            BootstrapDescriptorError::Database { source } => Self::KeyframeDatabase(source),
+        }
     }
 }
 
@@ -5214,14 +5238,15 @@ impl SlamTracker {
                         .transpose()?
                         .unwrap_or(false);
                     if redundant {
-                        remove_keyframe_from_graph_and_db(&mut self.global_map, keyframe_id)?;
+                        remove_keyframe_from_graph_and_db(
+                            &mut self.global_map,
+                            self.place_recognition.as_mut(),
+                            keyframe_id,
+                        )?;
                         self.emit_event(DiagnosticEvent::KeyframeRemoved {
                             keyframe_id,
                             reason: KeyframeRemovalReason::Redundant,
                         });
-                        if let Some(place_recognition) = self.place_recognition.as_mut() {
-                            place_recognition.remove_keyframe(keyframe_id);
-                        }
                     } else {
                         let window = self
                             .global_map
@@ -5644,38 +5669,32 @@ impl SlamTracker {
                 ),
             }
         }
-        let keyframe_id = insert_keyframe_into_global_map(
-            &mut self.global_map,
+        let (candidate_global_map, keyframe_id) = stage_keyframe_in_global_map(
+            &self.global_map,
             &keyframe,
             left.timestamp(),
             pose_world,
             &connection,
             self.config.runtime.cull_min_observations(),
         )?;
+        let prepared_recognition = self
+            .place_recognition
+            .as_ref()
+            .map(|place_recognition| {
+                place_recognition.prepare_keyframe(keyframe_id, keyframe.detections())
+            })
+            .transpose()?;
+        let source_snapshot = candidate_global_map.map().snapshot();
+        self.global_map = candidate_global_map;
+        if let (Some(place_recognition), Some(prepared)) =
+            (self.place_recognition.as_mut(), prepared_recognition)
+        {
+            place_recognition.commit_keyframe(prepared, keyframe_id, &left, source_snapshot);
+        }
         self.emit_event(DiagnosticEvent::KeyframeCreated {
             keyframe_id,
             landmarks,
         });
-        let source_snapshot = self.global_map.map().snapshot();
-        let bootstrap_descriptor_error =
-            self.place_recognition
-                .as_mut()
-                .and_then(|place_recognition| {
-                    place_recognition
-                        .on_keyframe(keyframe_id, keyframe.detections(), &left, source_snapshot)
-                        .err()
-                });
-        if let Some(error) = bootstrap_descriptor_error {
-            eprintln!(
-                "bootstrap loop descriptor unavailable (keyframe={keyframe_id:?}, snapshot={source_snapshot}): {error}"
-            );
-            self.emit_event(DiagnosticEvent::BootstrapDescriptorUnavailable {
-                keyframe_id,
-                source_snapshot,
-                error: Arc::new(error),
-            });
-        }
-
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.keyframe_status = Some(KeyframeStatus::Created);
         diagnostics.triangulation = Some(triangulation_stats);
@@ -5703,6 +5722,7 @@ fn requested_inertial_calibration(
     }
 }
 
+#[cfg(test)]
 fn insert_keyframe_into_global_map(
     global_map: &mut GlobalMap,
     keyframe: &Arc<Keyframe>,
@@ -5711,6 +5731,26 @@ fn insert_keyframe_into_global_map(
     connection: &KeyframeConnection,
     cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
+    let (candidate, keyframe_id) = stage_keyframe_in_global_map(
+        global_map,
+        keyframe,
+        timestamp,
+        pose_world,
+        connection,
+        cull_min_observations,
+    )?;
+    *global_map = candidate;
+    Ok(keyframe_id)
+}
+
+fn stage_keyframe_in_global_map(
+    global_map: &GlobalMap,
+    keyframe: &Arc<Keyframe>,
+    timestamp: Timestamp,
+    pose_world: Pose,
+    connection: &KeyframeConnection,
+    cull_min_observations: NonZeroUsize,
+) -> Result<(GlobalMap, KeyframeId), TrackerError> {
     if let KeyframeConnection::Relocalization(attachment) = connection {
         let current = global_map.map().snapshot();
         if attachment.verified_snapshot != current {
@@ -5741,8 +5781,7 @@ fn insert_keyframe_into_global_map(
             )?;
         }
     }
-    *global_map = candidate;
-    Ok(keyframe_id)
+    Ok((candidate, keyframe_id))
 }
 
 fn insert_keyframe_into_candidate(
@@ -5797,11 +5836,15 @@ fn insert_keyframe_into_candidate(
 
 fn remove_keyframe_from_graph_and_db(
     global_map: &mut GlobalMap,
+    place_recognition: Option<&mut PlaceRecognition>,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
     let mut candidate = global_map.clone();
     candidate.remove_keyframe_from_graph(keyframe_id)?;
     candidate.remove_keyframe(keyframe_id)?;
+    if let Some(place_recognition) = place_recognition {
+        place_recognition.remove_keyframe(keyframe_id)?;
+    }
     *global_map = candidate;
     Ok(())
 }
@@ -8524,8 +8567,9 @@ mod tests {
                 .expect("descriptor sequence available");
         }
 
-        remove_keyframe_from_graph_and_db(&mut global_map, removed_kf).expect("remove keyframe");
-        loop_db.remove(removed_kf);
+        remove_keyframe_from_graph_and_db(&mut global_map, None, removed_kf)
+            .expect("remove keyframe");
+        loop_db.remove(removed_kf).expect("registered keyframe");
 
         assert!(global_map.keyframe(removed_kf).is_none());
         assert!(global_map.essential_graph().parent_of(removed_kf).is_none());
