@@ -4,7 +4,9 @@
 
 Kiko is a social robot combining custom SLAM and an expression engine. The SLAM implementation is designed for model hot-swap as vision models improve, and Kiko improves with them. Built entirely in Rust.
 
-**Status:** Early development. Stereo visual odometry with local bundle adjustment is working.
+**Status:** Early development. The host pipeline includes stereo visual odometry, local bundle
+adjustment, map/covisibility maintenance, relocalization, and loop closure. Hardware-backed
+recording and TSDF/ESDF reconstruction still depend on external native components.
 
 ## Structure
 
@@ -56,13 +58,13 @@ cargo run -p kiko-slam -- bench recordings/<name>
 **Inference:**
 
 - `ORT_DYLIB_PATH` — path to an ONNX Runtime 1.24+ shared library; otherwise the platform loader searches for `libonnxruntime.so`, `onnxruntime.dll`, or `libonnxruntime.dylib`
-- `--downscale` / `KIKO_DOWNSCALE` — input downscale factor (1, 2, or 4)
+- `--downscale` / `KIKO_DOWNSCALE` — positive integer input downscale factor; it must divide the input width and height exactly
 - `--max-keypoints` / `KIKO_MAX_KEYPOINTS` — max keypoints per frame (default 1024)
 - `--backend` / `KIKO_BACKEND` — inference backend for both models
-- `--sp-backend` / `KIKO_SUPERPOINT_BACKEND` — SuperPoint backend override
-- `--lg-backend` / `KIKO_LIGHTGLUE_BACKEND` — LightGlue backend override
-- `--sp-model` / `KIKO_SUPERPOINT_MODEL` — custom SuperPoint ONNX path
-- `--lg-model` / `KIKO_LIGHTGLUE_MODEL` — custom LightGlue ONNX path
+- `--superpoint-backend` / `KIKO_SUPERPOINT_BACKEND` — SuperPoint backend override
+- `--lightglue-backend` / `KIKO_LIGHTGLUE_BACKEND` — LightGlue backend override
+- `--superpoint-model` / `KIKO_SUPERPOINT_MODEL` — custom SuperPoint ONNX path
+- `--lightglue-model` / `KIKO_LIGHTGLUE_MODEL` — custom LightGlue ONNX path
 
 **Visualization:**
 
@@ -72,17 +74,22 @@ cargo run -p kiko-slam -- bench recordings/<name>
 **Bundle adjustment:**
 
 - `KIKO_BA_WINDOW` — sliding window size (default 10)
-- `KIKO_BA_ITERS` — Gauss-Newton iterations (default 6)
+- `KIKO_BA_ITERS` — maximum local-BA LM iterations (default 6)
 - `KIKO_BA_MIN_OBS` — minimum observations per frame
 - `KIKO_BA_HUBER_PX` — Huber robust cost threshold in pixels
-- `KIKO_BA_DAMPING` — LM damping factor
+- `KIKO_BA_DAMPING` — initial Levenberg-Marquardt damping value
+- `KIKO_LM_FACTOR` — factor used to increase or decrease LM damping
+- `KIKO_LM_MIN` / `KIKO_LM_MAX` — inclusive LM damping bounds
 - `KIKO_BA_MOTION_WEIGHT` — motion prior weight (0 to disable)
 
 **Keyframe policy:**
 
-- `KIKO_KF_MIN_INLIERS` — inlier count below which a keyframe is forced
-- `KIKO_KF_PARALLAX_PX` — median parallax (px) above which a keyframe is created
-- `KIKO_KF_MIN_COVISIBILITY` — covisibility ratio below which a keyframe is created
+- `KIKO_KEYFRAME_MIN_POINTS` — minimum triangulated landmarks required to accept a keyframe
+- `KIKO_KEYFRAME_REFRESH_INLIERS` — tracked inlier count below which a new keyframe is requested
+- `KIKO_KEYFRAME_PARALLAX_PX` — median parallax (px) above which a new keyframe is requested
+- `KIKO_KEYFRAME_COVISIBILITY` — covisibility ratio below which a new keyframe is requested
+- `KIKO_KEYFRAME_REDUNDANT_COVISIBILITY` — covisibility ratio at or above which a keyframe is eligible for redundancy culling
+- `KIKO_TRACK_MIN_INLIERS` — minimum RANSAC inliers required to accept a tracked pose
 
 ## Models
 
@@ -91,7 +98,12 @@ Default model paths are resolved under `crates/kiko-slam/models/`:
 - `sp.onnx` (SuperPoint)
 - `lg.onnx` (LightGlue)
 
-Override with `--sp-model` / `--lg-model` or `KIKO_SUPERPOINT_MODEL` / `KIKO_LIGHTGLUE_MODEL`.
+Override with `--superpoint-model` / `--lightglue-model` or `KIKO_SUPERPOINT_MODEL` /
+`KIKO_LIGHTGLUE_MODEL`.
+
+Learned place recognition resolves `eigenplaces.onnx` from the same directory. That model is not
+stored in this repository; provide it at that path or set `KIKO_EIGENPLACES_MODEL`. Learned
+descriptors are required when loop closure is enabled.
 
 ## Roadmap
 
@@ -103,9 +115,9 @@ Override with `--sp-model` / `--lg-model` or `KIKO_SUPERPOINT_MODEL` / `KIKO_LIG
 - ~~Frame-to-keyframe tracking (PnP + RANSAC)~~
 - ~~Local bundle adjustment (sliding window Gauss-Newton)~~
 - ~~Parallax + covisibility keyframe policy~~
-- Keyframe database + map point management
-- Covisibility graph
-- Place recognition (NetVLAD / CosPlace ONNX)
-- Loop closure (Sim3 + pose graph correction)
+- ~~Keyframe database + map point management~~
+- ~~Covisibility graph~~
+- ~~Learned place recognition (EigenPlaces ONNX)~~
+- ~~Loop closure (geometric verification + SE(3) pose graph correction)~~
 - Global bundle adjustment
 - Dense mapping via nvblox (TSDF / ESDF on Jetson)
