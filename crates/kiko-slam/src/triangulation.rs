@@ -191,12 +191,16 @@ impl RectifiedStereo {
 pub struct TriangulationConfig {
     min_disparity_px: f32,
     max_depth_m: Option<f32>,
+    max_vertical_disparity_px: f32,
 }
+
+const DEFAULT_MAX_VERTICAL_DISPARITY_PX: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TriangulationConfigError {
     InvalidMinDisparityPx { value: f32 },
     InvalidMaxDepthM { value: f32 },
+    InvalidMaxVerticalDisparityPx { value: f32 },
 }
 
 impl std::fmt::Display for TriangulationConfigError {
@@ -209,6 +213,10 @@ impl std::fmt::Display for TriangulationConfigError {
             TriangulationConfigError::InvalidMaxDepthM { value } => {
                 write!(f, "maximum depth must be positive and finite, got {value}")
             }
+            TriangulationConfigError::InvalidMaxVerticalDisparityPx { value } => write!(
+                f,
+                "maximum vertical disparity must be finite and nonnegative pixels, got {value}"
+            ),
         }
     }
 }
@@ -220,6 +228,18 @@ impl TriangulationConfig {
         min_disparity_px: f32,
         max_depth_m: Option<f32>,
     ) -> Result<Self, TriangulationConfigError> {
+        Self::new_with_vertical_disparity(
+            min_disparity_px,
+            max_depth_m,
+            DEFAULT_MAX_VERTICAL_DISPARITY_PX,
+        )
+    }
+
+    pub fn new_with_vertical_disparity(
+        min_disparity_px: f32,
+        max_depth_m: Option<f32>,
+        max_vertical_disparity_px: f32,
+    ) -> Result<Self, TriangulationConfigError> {
         if !min_disparity_px.is_finite() || min_disparity_px < 0.0 {
             return Err(TriangulationConfigError::InvalidMinDisparityPx {
                 value: min_disparity_px,
@@ -230,9 +250,17 @@ impl TriangulationConfig {
                 return Err(TriangulationConfigError::InvalidMaxDepthM { value });
             }
         }
+        if !max_vertical_disparity_px.is_finite() || max_vertical_disparity_px < 0.0 {
+            return Err(
+                TriangulationConfigError::InvalidMaxVerticalDisparityPx {
+                    value: max_vertical_disparity_px,
+                },
+            );
+        }
         Ok(Self {
             min_disparity_px,
             max_depth_m,
+            max_vertical_disparity_px,
         })
     }
 
@@ -243,6 +271,10 @@ impl TriangulationConfig {
     pub fn max_depth_m(self) -> Option<f32> {
         self.max_depth_m
     }
+
+    pub fn max_vertical_disparity_px(self) -> f32 {
+        self.max_vertical_disparity_px
+    }
 }
 
 impl Default for TriangulationConfig {
@@ -250,6 +282,7 @@ impl Default for TriangulationConfig {
         Self {
             min_disparity_px: 1.0,
             max_depth_m: None,
+            max_vertical_disparity_px: DEFAULT_MAX_VERTICAL_DISPARITY_PX,
         }
     }
 }
@@ -259,6 +292,7 @@ pub struct TriangulationStats {
     pub candidate_matches: usize,
     pub kept: usize,
     pub dropped_disparity: usize,
+    pub dropped_epipolar: usize,
     pub dropped_depth: usize,
     pub dropped_numerical: usize,
     pub dropped_duplicate: usize,
@@ -309,9 +343,10 @@ impl std::fmt::Display for TriangulationError {
             TriangulationError::NoLandmarks { stats } => {
                 write!(
                     f,
-                    "triangulation produced no landmarks (candidates={}, dropped_disparity={}, dropped_depth={}, dropped_numerical={}, dropped_duplicate={})",
+                    "triangulation produced no landmarks (candidates={}, dropped_disparity={}, dropped_epipolar={}, dropped_depth={}, dropped_numerical={}, dropped_duplicate={})",
                     stats.candidate_matches,
                     stats.dropped_disparity,
+                    stats.dropped_epipolar,
                     stats.dropped_depth,
                     stats.dropped_numerical,
                     stats.dropped_duplicate
@@ -674,6 +709,7 @@ struct StereoGeometry {
 #[derive(Clone, Copy, Debug)]
 enum StereoGeometryRejection {
     Disparity,
+    Epipolar,
     Depth,
     Numerical,
 }
@@ -769,6 +805,9 @@ impl Triangulator {
         {
             return Err(StereoGeometryRejection::Numerical);
         }
+        if row_mismatch_px > f64::from(self.config.max_vertical_disparity_px()) {
+            return Err(StereoGeometryRejection::Epipolar);
+        }
 
         let disparity = disparity_px as f32;
         let depth_m = depth_m as f32;
@@ -823,6 +862,7 @@ impl Triangulator {
                     stats.kept += 1;
                 }
                 Err(StereoGeometryRejection::Disparity) => stats.dropped_disparity += 1,
+                Err(StereoGeometryRejection::Epipolar) => stats.dropped_epipolar += 1,
                 Err(StereoGeometryRejection::Depth) => stats.dropped_depth += 1,
                 Err(StereoGeometryRejection::Numerical) => stats.dropped_numerical += 1,
             }
@@ -910,6 +950,7 @@ mod tests {
         assert_eq!(
             stats.kept
                 + stats.dropped_disparity
+                + stats.dropped_epipolar
                 + stats.dropped_depth
                 + stats.dropped_numerical
                 + stats.dropped_duplicate,
@@ -975,6 +1016,12 @@ mod tests {
             TriangulationConfig::new(1.0, Some(0.0)),
             Err(TriangulationConfigError::InvalidMaxDepthM { .. })
         ));
+        for value in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                TriangulationConfig::new_with_vertical_disparity(1.0, None, value),
+                Err(TriangulationConfigError::InvalidMaxVerticalDisparityPx { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1156,6 +1203,39 @@ mod tests {
             triangulator.extract_stereo_samples(&matches),
             Err(TriangulationError::DetectionDimensionsMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn triangulation_rejects_vertical_epipolar_mismatch() {
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
+        let triangulator = Triangulator::new(stereo, TriangulationConfig::default());
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(14),
+            640,
+            480,
+            vec![Keypoint { x: 320.0, y: 0.0 }],
+        )
+        .expect("left detections");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(15),
+            640,
+            480,
+            vec![Keypoint { x: 310.0, y: 479.0 }],
+        )
+        .expect("right detections");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let error = triangulator
+            .triangulate(&matches)
+            .expect_err("skew rectified rays cannot define a landmark");
+        let TriangulationError::NoLandmarks { stats } = error else {
+            panic!("unexpected triangulation error: {error:?}");
+        };
+        assert_eq!(stats.dropped_epipolar, 1);
+        assert_stats_accounting(stats);
     }
 
     #[test]
