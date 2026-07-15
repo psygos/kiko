@@ -266,8 +266,6 @@ pub enum LoopClosureConfigError {
     TooFewMinInliers { value: usize, min: usize },
     NonPositiveMaxCorrectionTranslation { value: f32 },
     InvalidMaxCorrectionRotationDeg { value: f32 },
-    ZeroRansacIterations,
-    NonPositiveRansacThresholdPx { value: f32 },
 }
 
 impl std::fmt::Display for LoopClosureConfigError {
@@ -305,13 +303,6 @@ impl std::fmt::Display for LoopClosureConfigError {
             LoopClosureConfigError::InvalidMaxCorrectionRotationDeg { value } => write!(
                 f,
                 "loop max correction rotation must be in (0, 180], got {value}"
-            ),
-            LoopClosureConfigError::ZeroRansacIterations => {
-                write!(f, "loop ransac max iterations must be > 0")
-            }
-            LoopClosureConfigError::NonPositiveRansacThresholdPx { value } => write!(
-                f,
-                "loop ransac reprojection threshold must be > 0, got {value}"
             ),
         }
     }
@@ -377,16 +368,6 @@ impl LoopClosureConfig {
                 value: max_correction_rotation_deg,
             });
         }
-        if ransac.max_iterations == 0 {
-            return Err(LoopClosureConfigError::ZeroRansacIterations);
-        }
-        if !ransac.reprojection_threshold_px.is_finite() || ransac.reprojection_threshold_px <= 0.0
-        {
-            return Err(LoopClosureConfigError::NonPositiveRansacThresholdPx {
-                value: ransac.reprojection_threshold_px,
-            });
-        }
-
         Ok(Self {
             similarity_threshold,
             descriptor_match_threshold,
@@ -451,9 +432,6 @@ impl Default for LoopClosureConfig {
         debug_assert!(defaults.max_correction_translation > 0.0);
         debug_assert!(defaults.max_correction_rotation_deg > 0.0);
         debug_assert!(defaults.max_correction_rotation_deg <= 180.0);
-        debug_assert!(defaults.ransac.max_iterations > 0);
-        debug_assert!(defaults.ransac.reprojection_threshold_px > 0.0);
-
         Self {
             similarity_threshold: defaults.similarity_threshold.clamp(f32::MIN_POSITIVE, 1.0),
             descriptor_match_threshold: defaults
@@ -467,15 +445,7 @@ impl Default for LoopClosureConfig {
             max_correction_rotation_deg: defaults
                 .max_correction_rotation_deg
                 .clamp(f32::MIN_POSITIVE, 180.0),
-            ransac: RansacConfig {
-                max_iterations: defaults.ransac.max_iterations.max(1),
-                reprojection_threshold_px: defaults
-                    .ransac
-                    .reprojection_threshold_px
-                    .max(f32::MIN_POSITIVE),
-                min_inliers: defaults.ransac.min_inliers,
-                seed: defaults.ransac.seed,
-            },
+            ransac: defaults.ransac,
         }
     }
 }
@@ -1076,14 +1046,11 @@ fn verify_pose_from_keyframe(
     }
 
     let pnp_min_inliers = ransac_config
-        .min_inliers
+        .min_inliers()
         .min(required_inliers)
         .min(observations.len())
         .max(MIN_PNP_POINTS);
-    let pnp_config = RansacConfig {
-        min_inliers: pnp_min_inliers,
-        ..ransac_config
-    };
+    let pnp_config = ransac_config.with_min_inliers(pnp_min_inliers);
 
     let result = solve_pnp_ransac(&observations, intrinsics, pnp_config)
         .map_err(LoopVerificationError::PnpFailed)?;

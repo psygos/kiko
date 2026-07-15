@@ -268,10 +268,11 @@ impl WorldToCamera {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RansacConfig {
-    pub(crate) max_iterations: usize,
-    pub(crate) reprojection_threshold_px: f32,
-    pub(crate) min_inliers: usize,
-    pub(crate) seed: u64,
+    max_iterations: usize,
+    reprojection_threshold_px: f32,
+    reprojection_threshold_sq_px2: f64,
+    min_inliers: usize,
+    seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -323,6 +324,7 @@ impl RansacConfig {
         Ok(Self {
             max_iterations,
             reprojection_threshold_px,
+            reprojection_threshold_sq_px2: f64::from(reprojection_threshold_px).powi(2),
             min_inliers,
             seed,
         })
@@ -336,12 +338,22 @@ impl RansacConfig {
         self.reprojection_threshold_px
     }
 
+    fn reprojection_threshold_sq_px2(self) -> f64 {
+        self.reprojection_threshold_sq_px2
+    }
+
     pub fn min_inliers(self) -> usize {
         self.min_inliers
     }
 
     pub fn seed(self) -> u64 {
         self.seed
+    }
+
+    pub(crate) fn with_min_inliers(mut self, min_inliers: usize) -> Self {
+        assert!(min_inliers >= MIN_PNP_POINTS);
+        self.min_inliers = min_inliers;
+        self
     }
 }
 
@@ -350,6 +362,7 @@ impl Default for RansacConfig {
         Self {
             max_iterations: 200,
             reprojection_threshold_px: 2.0,
+            reprojection_threshold_sq_px2: 4.0,
             min_inliers: 20,
             seed: 0x5EED_u64,
         }
@@ -473,21 +486,6 @@ pub fn solve_pnp_ransac(
             actual: observations.len(),
         });
     }
-    if config.max_iterations == 0 {
-        return Err(PnpError::Degenerate {
-            message: "RANSAC max_iterations must be greater than zero",
-        });
-    }
-    if !config.reprojection_threshold_px.is_finite() || config.reprojection_threshold_px <= 0.0 {
-        return Err(PnpError::Degenerate {
-            message: "RANSAC reprojection threshold must be positive and finite",
-        });
-    }
-    if config.min_inliers < MIN_PNP_POINTS {
-        return Err(PnpError::Degenerate {
-            message: "RANSAC min_inliers must be at least the PnP minimum",
-        });
-    }
     if config.min_inliers > observations.len() {
         return Err(PnpError::NotEnoughPoints {
             required: config.min_inliers,
@@ -502,7 +500,7 @@ pub fn solve_pnp_ransac(
     let mut iterations = 0usize;
     let total = observations.len();
 
-    let threshold_sq = config.reprojection_threshold_px * config.reprojection_threshold_px;
+    let threshold_sq = config.reprojection_threshold_sq_px2();
     while iterations < config.max_iterations {
         iterations += 1;
         let sample = sample_three(&mut rng, total);
@@ -949,20 +947,24 @@ fn reprojection_error_sq_px(
     pose: Pose,
     obs: &Observation,
     intrinsics: PinholeIntrinsics,
-) -> Option<f32> {
+) -> Option<f64> {
     let pc = math::transform_point(
         pose.rotation(),
         pose.translation(),
         vec3_from_point(obs.world),
     );
-    if pc[2] <= 0.0 {
+    if pc.iter().any(|value| !value.is_finite()) || pc[2] <= 0.0 {
         return None;
     }
-    let u = intrinsics.fx() * (pc[0] / pc[2]) + intrinsics.cx();
-    let v = intrinsics.fy() * (pc[1] / pc[2]) + intrinsics.cy();
-    let dx = u - obs.pixel.x;
-    let dy = v - obs.pixel.y;
-    Some(dx * dx + dy * dy)
+    let inverse_depth = 1.0 / f64::from(pc[2]);
+    let u =
+        f64::from(intrinsics.fx()) * f64::from(pc[0]) * inverse_depth + f64::from(intrinsics.cx());
+    let v =
+        f64::from(intrinsics.fy()) * f64::from(pc[1]) * inverse_depth + f64::from(intrinsics.cy());
+    let dx = u - f64::from(obs.pixel.x);
+    let dy = v - f64::from(obs.pixel.y);
+    let error_sq = dx.mul_add(dx, dy * dy);
+    error_sq.is_finite().then_some(error_sq)
 }
 
 pub(crate) fn reprojection_errors(
@@ -972,7 +974,9 @@ pub(crate) fn reprojection_errors(
 ) -> Vec<Option<f32>> {
     observations
         .iter()
-        .map(|obs| reprojection_error_sq_px(*pose, obs, intrinsics).map(f32::sqrt))
+        .map(|obs| {
+            reprojection_error_sq_px(*pose, obs, intrinsics).map(|error_sq| error_sq.sqrt() as f32)
+        })
         .collect()
 }
 
@@ -1232,12 +1236,7 @@ mod tests {
             observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
         assert!(observations.len() >= 20);
 
-        let config = RansacConfig {
-            max_iterations: 700,
-            reprojection_threshold_px: 1.0,
-            min_inliers: 20,
-            seed: 0xBAD5EED,
-        };
+        let config = RansacConfig::try_new(700, 1.0, 20, 0xBAD5EED).expect("config");
         let result = solve_pnp_ransac(&observations, intrinsics, config).expect("pnp");
         assert!(result.inliers.len() >= 20, "insufficient inliers");
 
@@ -1254,12 +1253,7 @@ mod tests {
         let base_world = synthetic_world_points();
         let base_translation = [0.2, -0.1, 0.35];
         let rotation_pose = axis_angle_pose([0.0; 3], [0.08, -0.06, 0.04]);
-        let config = RansacConfig {
-            max_iterations: 700,
-            reprojection_threshold_px: 1.0,
-            min_inliers: 20,
-            seed: 0x51CA1E,
-        };
+        let config = RansacConfig::try_new(700, 1.0, 20, 0x51CA1E).expect("config");
 
         for scale in [1e-3_f32, 1.0, 1e3] {
             let world: Vec<_> = base_world
@@ -1315,12 +1309,7 @@ mod tests {
                 .push(Observation::try_new(obs.world(), pixel, intrinsics).expect("observation"));
         }
 
-        let config = RansacConfig {
-            max_iterations: 1000,
-            reprojection_threshold_px: 2.0,
-            min_inliers: 14,
-            seed: 0x1337,
-        };
+        let config = RansacConfig::try_new(1000, 2.0, 14, 0x1337).expect("config");
         let result = solve_pnp_ransac(&with_outliers, intrinsics, config).expect("pnp");
         assert!(
             result.inliers.len() >= 14,
@@ -1407,6 +1396,11 @@ mod tests {
                 minimum: 4
             })
         ));
+
+        let extreme = RansacConfig::try_new(10, f32::MAX, 4, 1)
+            .expect("every positive finite f32 threshold has a finite f64 square");
+        assert!(extreme.reprojection_threshold_sq_px2().is_finite());
+        assert!(extreme.reprojection_threshold_sq_px2() > f64::from(f32::MAX));
     }
 
     #[test]
