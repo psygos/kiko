@@ -132,19 +132,29 @@ impl Timestamp {
 pub struct FrameDimensions {
     width: NonZeroU32,
     height: NonZeroU32,
+    area: usize,
 }
 
 impl FrameDimensions {
-    pub fn try_new(width: u32, height: u32) -> Result<Self, FrameError> {
+    pub fn try_new(width: u32, height: u32) -> Result<Self, FrameDimensionsError> {
         let Some(width_value) = NonZeroU32::new(width) else {
-            return Err(FrameError::ZeroDimensions { width, height });
+            return Err(FrameDimensionsError::Zero { width, height });
         };
         let Some(height_value) = NonZeroU32::new(height) else {
-            return Err(FrameError::ZeroDimensions { width, height });
+            return Err(FrameDimensionsError::Zero { width, height });
         };
+        let area = usize::try_from(width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or(FrameDimensionsError::TooLarge { width, height })?;
         Ok(Self {
             width: width_value,
             height: height_value,
+            area,
         })
     }
 
@@ -161,21 +171,44 @@ impl FrameDimensions {
     }
 
     pub fn area(self) -> usize {
-        (self.width.get() as usize).saturating_mul(self.height.get() as usize)
+        self.area
     }
 }
 
-// Define these much more concretely
+#[derive(Debug)]
+pub enum FrameDimensionsError {
+    Zero { width: u32, height: u32 },
+    TooLarge { width: u32, height: u32 },
+}
+
+impl std::fmt::Display for FrameDimensionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero { width, height } => {
+                write!(f, "frame dimensions must be nonzero, got {width}x{height}")
+            }
+            Self::TooLarge { width, height } => {
+                write!(
+                    f,
+                    "frame dimensions {width}x{height} exceed addressable memory"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FrameDimensionsError {}
+
 #[derive(Debug)]
 pub enum FrameError {
-    ZeroDimensions { width: u32, height: u32 },
+    InvalidDimensions { source: FrameDimensionsError },
     DimensionMismatch { expected: usize, actual: usize },
 }
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FrameError::ZeroDimensions { width, height } => {
-                write!(f, "frame dimensions must be nonzero, got {width}x{height}")
+            FrameError::InvalidDimensions { source } => {
+                write!(f, "invalid frame dimensions: {source}")
             }
             FrameError::DimensionMismatch { expected, actual } => {
                 write!(f, "dimension mismatch: expected {expected}, got {actual}")
@@ -184,7 +217,20 @@ impl std::fmt::Display for FrameError {
     }
 }
 
-impl std::error::Error for FrameError {}
+impl std::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDimensions { source } => Some(source),
+            Self::DimensionMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<FrameDimensionsError> for FrameError {
+    fn from(source: FrameDimensionsError) -> Self {
+        Self::InvalidDimensions { source }
+    }
+}
 
 #[derive(Debug)]
 pub enum PairError {
@@ -1061,8 +1107,8 @@ impl<State> VizPacket<State> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Frame, FrameId, SensorId, Timestamp,
-        U8_SCALE,
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Frame, FrameDimensionsError, FrameError,
+        FrameId, SensorId, Timestamp, U8_SCALE,
     };
 
     #[test]
@@ -1080,6 +1126,29 @@ mod tests {
         assert_eq!(frame.dimensions().width(), 2);
         assert_eq!(frame.dimensions().height(), 3);
         assert_eq!(frame.data().len(), frame.dimensions().area());
+    }
+
+    #[test]
+    fn frame_preserves_the_typed_dimension_error() {
+        let error = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(2),
+            0,
+            3,
+            Vec::new(),
+        )
+        .expect_err("zero width is outside the frame-dimension domain");
+
+        assert!(matches!(
+            error,
+            FrameError::InvalidDimensions {
+                source: FrameDimensionsError::Zero {
+                    width: 0,
+                    height: 3
+                }
+            }
+        ));
     }
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {

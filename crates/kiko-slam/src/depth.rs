@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{FrameDimensions, FrameId, Timestamp};
+use crate::{FrameDimensions, FrameDimensionsError, FrameId, Timestamp};
 
 #[derive(Debug, Clone)]
 pub struct DepthImage {
@@ -12,7 +12,7 @@ pub struct DepthImage {
 
 #[derive(Debug)]
 pub enum DepthImageError {
-    ZeroDimensions { width: u32, height: u32 },
+    InvalidDimensions { source: FrameDimensionsError },
     DimensionMismatch { expected: usize, actual: usize },
     InvalidDepthMeters { index: usize, value: f32 },
 }
@@ -20,11 +20,8 @@ pub enum DepthImageError {
 impl std::fmt::Display for DepthImageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DepthImageError::ZeroDimensions { width, height } => {
-                write!(
-                    f,
-                    "depth image dimensions must be nonzero, got {width}x{height}"
-                )
+            DepthImageError::InvalidDimensions { source } => {
+                write!(f, "invalid depth image dimensions: {source}")
             }
             DepthImageError::DimensionMismatch { expected, actual } => {
                 write!(
@@ -40,7 +37,14 @@ impl std::fmt::Display for DepthImageError {
     }
 }
 
-impl std::error::Error for DepthImageError {}
+impl std::error::Error for DepthImageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDimensions { source } => Some(source),
+            Self::DimensionMismatch { .. } | Self::InvalidDepthMeters { .. } => None,
+        }
+    }
+}
 
 impl DepthImage {
     pub fn new(
@@ -51,7 +55,7 @@ impl DepthImage {
         depth_m: Vec<f32>,
     ) -> Result<Self, DepthImageError> {
         let dimensions = FrameDimensions::try_new(width, height)
-            .map_err(|_| DepthImageError::ZeroDimensions { width, height })?;
+            .map_err(|source| DepthImageError::InvalidDimensions { source })?;
         let expected = dimensions.area();
         if depth_m.len() != expected {
             return Err(DepthImageError::DimensionMismatch {
@@ -117,10 +121,11 @@ impl DepthImage {
         if x >= self.width() || y >= self.height() {
             return None;
         }
-        let idx = (y as usize)
-            .saturating_mul(self.width() as usize)
-            .saturating_add(x as usize);
-        let depth = *self.depth_m.get(idx)?;
+        let y = usize::try_from(y).expect("parsed depth dimensions fit usize");
+        let width = usize::try_from(self.width()).expect("parsed depth dimensions fit usize");
+        let x = usize::try_from(x).expect("parsed depth dimensions fit usize");
+        let idx = y * width + x;
+        let depth = self.depth_m[idx];
         if depth > 0.0 { Some(depth) } else { None }
     }
 }
@@ -155,9 +160,11 @@ mod tests {
                 .expect_err("zero dimensions are outside the image domain");
         assert!(matches!(
             zero_dimensions,
-            DepthImageError::ZeroDimensions {
-                width: 0,
-                height: 0
+            DepthImageError::InvalidDimensions {
+                source: FrameDimensionsError::Zero {
+                    width: 0,
+                    height: 0
+                }
             }
         ));
 

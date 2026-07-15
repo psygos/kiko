@@ -487,7 +487,7 @@ pub enum DatasetError {
     MissingMonoConfig,
     InvalidFrameDimensions {
         field: &'static str,
-        source: crate::FrameError,
+        source: crate::FrameDimensionsError,
     },
     InvalidNominalFps {
         field: &'static str,
@@ -852,8 +852,8 @@ impl std::error::Error for DatasetError {
             | DatasetError::PublishManifest { source, .. } => Some(source),
             DatasetError::SerializeJson { source, .. }
             | DatasetError::DeserializeJson { source, .. } => Some(source),
-            DatasetError::InvalidFrameDimensions { source, .. }
-            | DatasetError::InvalidFrameData { source, .. } => Some(source),
+            DatasetError::InvalidFrameDimensions { source, .. } => Some(source),
+            DatasetError::InvalidFrameData { source, .. } => Some(source),
             DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
             DatasetError::WriteContract { source } => Some(source),
             DatasetError::AlreadyExists { .. }
@@ -2675,7 +2675,7 @@ mod tests {
             reject_before_filesystem_mutation("contract-zero-width", &zero_width, &calibration()),
             DatasetError::InvalidFrameDimensions {
                 field: "meta.mono",
-                source: crate::FrameError::ZeroDimensions {
+                source: crate::FrameDimensionsError::Zero {
                     width: 0,
                     height: 2
                 }
@@ -4163,7 +4163,7 @@ mod tests {
         assert!(matches!(
             DatasetReader::open(&path).expect_err("zero frame dimension must fail open"),
             DatasetError::InvalidFrameDimensions {
-                source: crate::FrameError::ZeroDimensions {
+                source: crate::FrameDimensionsError::Zero {
                     width: 0,
                     height: 2
                 },
