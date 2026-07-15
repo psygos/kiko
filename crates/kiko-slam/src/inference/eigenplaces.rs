@@ -13,6 +13,9 @@ use super::{
 
 const INPUT_SIZE: usize = 224;
 const INPUT_CHANNELS: usize = 3;
+const INPUT_PLANE_ELEMENTS: usize = INPUT_SIZE * INPUT_SIZE;
+const INPUT_ELEMENTS: usize = INPUT_CHANNELS * INPUT_PLANE_ELEMENTS;
+const INPUT_SHAPE: [usize; 4] = [1, INPUT_CHANNELS, INPUT_SIZE, INPUT_SIZE];
 const U8_SCALE: f32 = 255.0;
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -47,7 +50,7 @@ impl EigenPlaces {
             run_options,
             backend: selected,
             diagnostics,
-            scratch: Vec::new(),
+            scratch: vec![0.0; INPUT_ELEMENTS],
         })
     }
 
@@ -57,14 +60,11 @@ impl EigenPlaces {
 
     pub fn compute(&mut self, frame: &Frame) -> Result<GlobalDescriptor, InferenceError> {
         preprocess_frame_to_nchw(frame, &mut self.scratch);
-        let input_tensor = TensorRef::from_array_view((
-            [1, INPUT_CHANNELS, INPUT_SIZE, INPUT_SIZE],
-            self.scratch.as_slice(),
-        ))
-        .map_err(|source| InferenceError::InputTensor {
-            name: "input",
-            source,
-        })?;
+        let input_tensor = TensorRef::from_array_view((INPUT_SHAPE, self.scratch.as_slice()))
+            .map_err(|source| InferenceError::InputTensor {
+                name: "input",
+                source,
+            })?;
 
         // EigenPlaces ONNX exports use `input` for the image tensor.
         let outputs =
@@ -77,8 +77,7 @@ impl EigenPlaces {
                     })
             })?;
 
-        let raw_descriptor = extract_single_f32_output(&outputs)?;
-        parse_descriptor_output(&raw_descriptor)
+        extract_global_descriptor(&outputs)
     }
 }
 
@@ -88,30 +87,33 @@ impl PlaceDescriptorExtractor for EigenPlaces {
     }
 }
 
-fn preprocess_frame_to_nchw(frame: &Frame, out: &mut Vec<f32>) {
+fn preprocess_frame_to_nchw(frame: &Frame, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), INPUT_ELEMENTS);
     let src_width = frame.width() as usize;
     let src_height = frame.height() as usize;
     let src = frame.data();
-    out.resize(INPUT_CHANNELS * INPUT_SIZE * INPUT_SIZE, 0.0);
 
     for y in 0..INPUT_SIZE {
         let src_y = y * src_height / INPUT_SIZE;
+        let src_row = src_y * src_width;
+        let dst_row = y * INPUT_SIZE;
         for x in 0..INPUT_SIZE {
             let src_x = x * src_width / INPUT_SIZE;
-            let src_idx = src_y * src_width + src_x;
-            let value = src[src_idx] as f32 / U8_SCALE;
+            let value = f32::from(src[src_row + src_x]) / U8_SCALE;
+            let dst = dst_row + x;
             for channel in 0..INPUT_CHANNELS {
-                let dst_idx = channel * INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x;
+                let dst_idx = channel * INPUT_PLANE_ELEMENTS + dst;
                 out[dst_idx] = (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
             }
         }
     }
 }
 
-fn extract_single_f32_output(
+fn extract_global_descriptor(
     outputs: &ort::session::SessionOutputs<'_>,
-) -> Result<Vec<f32>, InferenceError> {
-    let mut found: Option<(String, Vec<f32>)> = None;
+) -> Result<GlobalDescriptor, InferenceError> {
+    let expected_shape = [1, GLOBAL_DESCRIPTOR_DIM as i64];
+    let mut found: Option<(String, GlobalDescriptor)> = None;
     for (name, value) in outputs.iter() {
         if !matches!(
             value.dtype(),
@@ -122,38 +124,49 @@ fn extract_single_f32_output(
         ) {
             continue;
         }
-        let (_, data) = super::extract_tensor::<f32>(&value, name)?;
+        let (shape, data) = super::extract_tensor::<f32>(&value, name)?;
+        if shape.as_ref() != expected_shape || data.len() != GLOBAL_DESCRIPTOR_DIM {
+            continue;
+        }
         if let Some((previous, _)) = &found {
             return Err(InferenceError::UnexpectedOutput {
                 name: "eigenplaces-output".to_string(),
-                expected: "exactly one f32 tensor output".to_string(),
-                actual: format!("multiple f32 outputs: {previous}, {name}"),
+                expected: format!(
+                    "one unambiguous f32 tensor with shape [1, {GLOBAL_DESCRIPTOR_DIM}]"
+                ),
+                actual: format!("multiple matching outputs: {previous}, {name}"),
             });
         }
-        found = Some((name.to_string(), data.to_vec()));
+        let descriptor = parse_descriptor_output(name, &expected_shape, data)?;
+        found = Some((name.to_string(), descriptor));
     }
     found
-        .map(|(_, data)| data)
+        .map(|(_, descriptor)| descriptor)
         .ok_or_else(|| InferenceError::UnexpectedOutput {
             name: "eigenplaces-output".to_string(),
-            expected: "exactly one f32 tensor output".to_string(),
-            actual: "no f32 tensor output".to_string(),
+            expected: format!("one unambiguous f32 tensor with shape [1, {GLOBAL_DESCRIPTOR_DIM}]"),
+            actual: "no matching output".to_string(),
         })
 }
 
-fn parse_descriptor_output(raw_descriptor: &[f32]) -> Result<GlobalDescriptor, InferenceError> {
-    if raw_descriptor.len() != GLOBAL_DESCRIPTOR_DIM {
+fn parse_descriptor_output(
+    output_name: &str,
+    shape: &[i64],
+    raw_descriptor: &[f32],
+) -> Result<GlobalDescriptor, InferenceError> {
+    let expected_shape = [1, GLOBAL_DESCRIPTOR_DIM as i64];
+    if shape != expected_shape {
         return Err(InferenceError::UnexpectedOutput {
-            name: "eigenplaces-output".to_string(),
-            expected: format!("descriptor length {GLOBAL_DESCRIPTOR_DIM}"),
-            actual: format!("descriptor length {}", raw_descriptor.len()),
+            name: output_name.to_string(),
+            expected: format!("tensor shape [1, {GLOBAL_DESCRIPTOR_DIM}]"),
+            actual: format!("tensor shape {shape:?}"),
         });
     }
     let descriptor_array: [f32; GLOBAL_DESCRIPTOR_DIM] =
         raw_descriptor
             .try_into()
             .map_err(|_| InferenceError::UnexpectedOutput {
-                name: "eigenplaces-output".to_string(),
+                name: output_name.to_string(),
                 expected: format!("descriptor length {GLOBAL_DESCRIPTOR_DIM}"),
                 actual: format!("descriptor length {}", raw_descriptor.len()),
             })?;
@@ -166,7 +179,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        EigenPlaces, GLOBAL_DESCRIPTOR_DIM, parse_descriptor_output, preprocess_frame_to_nchw,
+        EigenPlaces, GLOBAL_DESCRIPTOR_DIM, INPUT_ELEMENTS, parse_descriptor_output,
+        preprocess_frame_to_nchw,
     };
     use crate::inference::InferenceError;
     use crate::{Frame, FrameId, InferenceBackend, SensorId, Timestamp};
@@ -192,7 +206,7 @@ mod tests {
             vec![127_u8; 16 * 12],
         )
         .expect("frame");
-        let mut out = Vec::new();
+        let mut out = vec![0.0; INPUT_ELEMENTS];
         preprocess_frame_to_nchw(&frame, &mut out);
         assert_eq!(out.len(), 3 * 224 * 224);
     }
@@ -209,7 +223,7 @@ mod tests {
             data,
         )
         .expect("frame");
-        let mut out = Vec::new();
+        let mut out = vec![0.0; INPUT_ELEMENTS];
         preprocess_frame_to_nchw(&frame, &mut out);
         assert!(out.iter().all(|v| v.is_finite()));
     }
@@ -225,7 +239,7 @@ mod tests {
             vec![200_u8; 8 * 8],
         )
         .expect("frame");
-        let mut out = Vec::new();
+        let mut out = vec![0.0; INPUT_ELEMENTS];
         preprocess_frame_to_nchw(&frame, &mut out);
         let hw = 224 * 224;
         let a = out[0];
@@ -264,10 +278,26 @@ mod tests {
     fn parse_descriptor_output_rejects_non_finite_descriptor() {
         let mut raw = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
         raw[0] = f32::NAN;
-        let err = parse_descriptor_output(&raw).expect_err("non-finite descriptor should fail");
+        let err = parse_descriptor_output("descriptor", &[1, GLOBAL_DESCRIPTOR_DIM as i64], &raw)
+            .expect_err("non-finite descriptor should fail");
         match err {
             InferenceError::GlobalDescriptor(_) => {}
             other => panic!("expected domain error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_descriptor_output_rejects_wrong_shape_even_with_the_right_length() {
+        let raw = [1.0_f32; GLOBAL_DESCRIPTOR_DIM];
+        for shape in [
+            vec![GLOBAL_DESCRIPTOR_DIM as i64],
+            vec![2, (GLOBAL_DESCRIPTOR_DIM / 2) as i64],
+            vec![GLOBAL_DESCRIPTOR_DIM as i64, 1],
+        ] {
+            assert!(matches!(
+                parse_descriptor_output("descriptor", &shape, &raw),
+                Err(InferenceError::UnexpectedOutput { .. })
+            ));
         }
     }
 }

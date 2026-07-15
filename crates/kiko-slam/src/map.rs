@@ -1634,11 +1634,12 @@ mod tests {
                 reference_blend_byte(previous.0[index], next.0[index], weight)
             });
             let mut point = MapPoint {
-                position: Point3 {
+                position: FiniteMapPoint::try_new(Point3 {
                     x: 0.0,
                     y: 0.0,
                     z: 1.0,
-                },
+                })
+                .expect("finite map point"),
                 descriptor: previous.clone(),
                 observations: Vec::new(),
             };
