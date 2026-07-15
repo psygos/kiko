@@ -324,6 +324,16 @@ impl Frame {
         data: Vec<u8>,
     ) -> Result<Self, FrameError> {
         let dimensions = FrameDimensions::try_new(width, height)?;
+        Self::from_dimensions(sensor_id, frame_id, timestamp, dimensions, data)
+    }
+
+    pub(crate) fn from_dimensions(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        timestamp: Timestamp,
+        dimensions: FrameDimensions,
+        data: Vec<u8>,
+    ) -> Result<Self, FrameError> {
         let size = dimensions.area();
 
         if data.len() != size {

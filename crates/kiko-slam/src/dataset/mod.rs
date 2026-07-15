@@ -165,6 +165,22 @@ pub enum DatasetError {
         path: String,
         reason: &'static str,
     },
+    MissingMonoConfig,
+    InvalidFrameDimensions {
+        source: crate::FrameError,
+    },
+    InvalidFrameFileType {
+        path: PathBuf,
+    },
+    InvalidFrameLength {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    InvalidFrameData {
+        path: PathBuf,
+        source: crate::FrameError,
+    },
     InvalidManifest {
         reason: &'static str,
     },
@@ -224,6 +240,34 @@ impl std::fmt::Display for DatasetError {
             DatasetError::InvalidFramePath { path, reason } => {
                 write!(f, "invalid dataset frame path {path:?}: {reason}")
             }
+            DatasetError::MissingMonoConfig => {
+                write!(
+                    f,
+                    "dataset metadata is missing the mono camera configuration"
+                )
+            }
+            DatasetError::InvalidFrameDimensions { source } => {
+                write!(f, "invalid dataset frame dimensions: {source}")
+            }
+            DatasetError::InvalidFrameFileType { path } => write!(
+                f,
+                "dataset frame path is not a regular file: {}",
+                path.display()
+            ),
+            DatasetError::InvalidFrameLength {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "invalid dataset frame length for {}: expected {expected} bytes, got {actual}",
+                path.display()
+            ),
+            DatasetError::InvalidFrameData { path, source } => write!(
+                f,
+                "dataset frame changed after open at {}: {source}",
+                path.display()
+            ),
             DatasetError::InvalidManifest { reason } => {
                 write!(f, "invalid dataset manifest: {reason}")
             }
@@ -272,10 +316,15 @@ impl std::error::Error for DatasetError {
             DatasetError::SerializeJson { source } | DatasetError::DeserializeJson { source } => {
                 Some(source)
             }
+            DatasetError::InvalidFrameDimensions { source }
+            | DatasetError::InvalidFrameData { source, .. } => Some(source),
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
             | DatasetError::InvalidFramePath { .. }
+            | DatasetError::MissingMonoConfig
+            | DatasetError::InvalidFrameFileType { .. }
+            | DatasetError::InvalidFrameLength { .. }
             | DatasetError::InvalidManifest { .. }
             | DatasetError::InvalidManifestStats { .. }
             | DatasetError::ManifestCountOutOfRange { .. }
@@ -1558,6 +1607,91 @@ mod tests {
                 field: "paired_count",
                 declared: 2,
                 derived: 1
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_open_rejects_invalid_and_post_open_frame_lengths() {
+        let path = unique_dataset_path("frame-length");
+        write_exact_pairs(&path, &[0]);
+        let left_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(0, "mono_left"));
+        let right_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(0, "mono_right"));
+
+        std::fs::write(&left_path, [0_u8; 3]).expect("truncate referenced left frame");
+        let error = DatasetReader::open(&path).expect_err("invalid frame length must fail open");
+        assert!(matches!(
+            error,
+            DatasetError::InvalidFrameLength {
+                expected: 4,
+                actual: 3,
+                ..
+            }
+        ));
+
+        std::fs::write(&left_path, [0_u8; 4]).expect("restore referenced left frame");
+        let mut reader = DatasetReader::open(&path).expect("open valid dataset");
+        std::fs::write(&right_path, [0_u8; 3]).expect("truncate right frame after open");
+        let error = reader
+            .pairs()
+            .next()
+            .expect("one manifest pair")
+            .expect_err("post-open frame mutation must fail");
+        assert!(matches!(
+            error,
+            DatasetError::InvalidFrameData {
+                source: crate::FrameError::DimensionMismatch {
+                    expected: 4,
+                    actual: 3
+                },
+                ..
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_open_requires_nonzero_mono_dimensions() {
+        let path = unique_dataset_path("mono-dimensions");
+        write_exact_pairs(&path, &[0]);
+        let meta_path = path.join(format::META_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta_path).expect("read generated metadata"))
+                .expect("parse generated metadata");
+
+        let mut missing = original.clone();
+        missing["mono"] = serde_json::Value::Null;
+        std::fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&missing).expect("serialize missing mono metadata"),
+        )
+        .expect("write missing mono metadata");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("missing mono config must fail open"),
+            DatasetError::MissingMonoConfig
+        ));
+
+        let mut zero_width = original;
+        zero_width["mono"]["width"] = serde_json::json!(0);
+        std::fs::write(
+            &meta_path,
+            serde_json::to_vec_pretty(&zero_width).expect("serialize zero-width metadata"),
+        )
+        .expect("write zero-width metadata");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("zero frame dimension must fail open"),
+            DatasetError::InvalidFrameDimensions {
+                source: crate::FrameError::ZeroDimensions {
+                    width: 0,
+                    height: 2
+                }
             }
         ));
 

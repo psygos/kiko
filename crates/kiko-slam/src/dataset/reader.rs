@@ -1,7 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
+use crate::{Frame, FrameDimensions, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
     Calibration, DatasetError, Manifest, ManifestFrameRef, ManifestPairing, ManifestStats,
@@ -32,6 +32,7 @@ pub struct DatasetReader {
     calibration: Calibration,
     entries: Vec<DatasetEntry>,
     stats: DatasetStats,
+    dimensions: FrameDimensions,
     pairing_window: PairingWindowNs,
     left_seq: u64,
     right_seq: u64,
@@ -61,6 +62,9 @@ impl DatasetReader {
                 source,
             })?;
         let meta = read_meta(&root)?;
+        let mono = meta.mono.as_ref().ok_or(DatasetError::MissingMonoConfig)?;
+        let dimensions = FrameDimensions::try_new(mono.width, mono.height)
+            .map_err(|source| DatasetError::InvalidFrameDimensions { source })?;
         let calibration = read_calibration(&root)?;
         let manifest = read_manifest(&root)?;
         let pairing_window_ns = i64::try_from(manifest.header.pairing_window_ns).map_err(|_| {
@@ -72,12 +76,13 @@ impl DatasetReader {
             PairingWindowNs::new(pairing_window_ns).map_err(|_| DatasetError::InvalidConfig {
                 msg: "manifest pairing_window_ns must be non-negative",
             })?;
-        let parsed = parse_manifest(&root, manifest)?;
+        let parsed = parse_manifest(&root, manifest, dimensions)?;
         Ok(Self {
             meta,
             calibration,
             entries: parsed.entries,
             stats: parsed.stats,
+            dimensions,
             pairing_window,
             left_seq: 0,
             right_seq: 0,
@@ -223,47 +228,39 @@ impl DatasetReader {
         frame_ref: &DatasetFrameRef,
         sensor: SensorId,
     ) -> Result<Frame, DatasetError> {
-        let (width, height) = match self.meta.mono.as_ref() {
-            Some(mono) => (mono.width, mono.height),
-            None => {
-                return Err(DatasetError::InvalidConfig {
-                    msg: "meta.json missing mono config",
-                });
-            }
-        };
         let path = frame_ref.path.clone();
         let data = std::fs::read(&path).map_err(|e| DatasetError::ReadFile {
             path: path.clone(),
             source: e,
         })?;
-        Frame::new(
+        Frame::from_dimensions(
             sensor,
             match sensor {
                 SensorId::StereoLeft => self.next_left_id(),
                 SensorId::StereoRight => self.next_right_id(),
             },
             Timestamp::from_nanos(frame_ref.timestamp_ns),
-            width,
-            height,
+            self.dimensions,
             data,
         )
-        .map_err(|e| DatasetError::InvalidConfig {
-            msg: match e {
-                FrameError::DimensionMismatch { .. } => "frame size mismatch",
-                FrameError::ZeroDimensions { .. } => "frame dimensions must be nonzero",
-            },
-        })
+        .map_err(|source| DatasetError::InvalidFrameData { path, source })
     }
 }
 
-fn parse_manifest(root: &Path, manifest: Manifest) -> Result<ParsedManifest, DatasetError> {
+fn parse_manifest(
+    root: &Path,
+    manifest: Manifest,
+    dimensions: FrameDimensions,
+) -> Result<ParsedManifest, DatasetError> {
     let Manifest { stats, entries, .. } = manifest;
     let entries = entries
         .into_iter()
         .map(|entry| {
-            let left = parse_frame_ref(root, entry.left)?;
+            let left = parse_frame_ref(root, entry.left, dimensions)?;
             let right = match entry.pairing {
-                ManifestPairing::Paired { right, .. } => Some(parse_frame_ref(root, right)?),
+                ManifestPairing::Paired { right, .. } => {
+                    Some(parse_frame_ref(root, right, dimensions)?)
+                }
                 ManifestPairing::MissingRight { .. } => None,
             };
             Ok(DatasetEntry { left, right })
@@ -276,6 +273,7 @@ fn parse_manifest(root: &Path, manifest: Manifest) -> Result<ParsedManifest, Dat
 fn parse_frame_ref(
     root: &Path,
     frame_ref: ManifestFrameRef,
+    dimensions: FrameDimensions,
 ) -> Result<DatasetFrameRef, DatasetError> {
     let relative = Path::new(&frame_ref.path);
     if relative.as_os_str().is_empty()
@@ -298,6 +296,23 @@ fn parse_frame_ref(
         return Err(DatasetError::InvalidFramePath {
             path: frame_ref.path,
             reason: "resolved path escapes the dataset root",
+        });
+    }
+
+    let metadata = std::fs::metadata(&resolved).map_err(|source| DatasetError::ReadFile {
+        path: resolved.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(DatasetError::InvalidFrameFileType { path: resolved });
+    }
+    let expected = u64::from(dimensions.width()) * u64::from(dimensions.height());
+    let actual = metadata.len();
+    if actual != expected {
+        return Err(DatasetError::InvalidFrameLength {
+            path: resolved,
+            expected,
+            actual,
         });
     }
 
