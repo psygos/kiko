@@ -1,7 +1,5 @@
 use std::fs;
 
-use crate::env::env_bool;
-
 #[cfg(any(feature = "ort-coreml", feature = "ort-cuda", feature = "ort-tensorrt"))]
 use ort::ep::ExecutionProvider;
 use ort::ep::{CPU, ExecutionProviderDispatch};
@@ -23,14 +21,23 @@ impl InferenceBackend {
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_lowercase().as_str() {
-            "auto" => Some(InferenceBackend::Auto),
-            "cpu" => Some(InferenceBackend::Cpu),
-            "coreml" | "coreml-gpu" => Some(InferenceBackend::CoreMLGpu),
-            "cuda" => Some(InferenceBackend::Cuda),
-            "tensorrt" => Some(InferenceBackend::TensorRT),
-            _ => None,
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("auto") {
+            return Some(Self::Auto);
         }
+        if value.eq_ignore_ascii_case("cpu") {
+            return Some(Self::Cpu);
+        }
+        if value.eq_ignore_ascii_case("coreml") || value.eq_ignore_ascii_case("coreml-gpu") {
+            return Some(Self::CoreMLGpu);
+        }
+        if value.eq_ignore_ascii_case("cuda") {
+            return Some(Self::Cuda);
+        }
+        if value.eq_ignore_ascii_case("tensorrt") {
+            return Some(Self::TensorRT);
+        }
+        None
     }
 }
 
@@ -57,6 +64,7 @@ impl BackendSelection {
 
 pub(crate) fn select_backend(
     requested: InferenceBackend,
+    use_cpu_arena: bool,
 ) -> Result<BackendSelection, InferenceError> {
     let explicit = requested != InferenceBackend::Auto;
     let desired = match requested {
@@ -109,7 +117,6 @@ pub(crate) fn select_backend(
 
     let strict_accelerator = explicit && selected != InferenceBackend::Cpu;
     if !strict_accelerator {
-        let use_cpu_arena = env_bool("KIKO_ORT_CPU_ARENA").unwrap_or(true);
         providers.push(CPU::default().with_arena_allocator(use_cpu_arena).build());
     }
 
@@ -207,5 +214,28 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
     #[cfg(not(feature = "ort-tensorrt"))]
     {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::InferenceBackend;
+
+    #[test]
+    fn backend_parser_is_ascii_case_insensitive() {
+        assert_eq!(
+            InferenceBackend::parse(" AUTO "),
+            Some(InferenceBackend::Auto)
+        );
+        assert_eq!(InferenceBackend::parse("Cpu"), Some(InferenceBackend::Cpu));
+        assert_eq!(
+            InferenceBackend::parse("COREML-GPU"),
+            Some(InferenceBackend::CoreMLGpu)
+        );
+        assert_eq!(
+            InferenceBackend::parse("TensorRT"),
+            Some(InferenceBackend::TensorRT)
+        );
+        assert_eq!(InferenceBackend::parse("gpu"), None);
     }
 }

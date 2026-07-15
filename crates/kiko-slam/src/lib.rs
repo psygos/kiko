@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub use inference::{
     EigenPlaces, InferenceBackend, InferenceError, LightGlue, PlaceDescriptorExtractor, SuperPoint,
+    WatchdogConfigError,
 };
 mod channel;
 pub mod dataset;
@@ -42,7 +43,7 @@ pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
 };
-pub use env::{env_bool, env_f32, env_usize};
+pub use env::{EnvError, env_bool, env_f32, env_u32, env_u64, env_usize};
 pub use geometry::{CameraFrame, CameraPoint3, CoordinateFrame, Point3, WorldFrame, WorldPoint3};
 pub use local_ba::{
     BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
@@ -83,7 +84,7 @@ pub use triangulation::{
     TriangulationConfig, TriangulationConfigError, TriangulationError, TriangulationResult,
     TriangulationStats, Triangulator,
 };
-pub use viz::{RerunSink, VizDecimation, VizDecimationError, VizLogError};
+pub use viz::{RerunSink, VizConfigError, VizDecimation, VizDecimationError, VizLogError};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {

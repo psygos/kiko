@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 use crate::{DepthImage, Timestamp};
 
@@ -9,19 +10,34 @@ use crate::{DepthImage, Timestamp};
 /// to the stereo pair timestamp (within a configurable window).
 pub struct DepthRingBuffer {
     entries: VecDeque<DepthImage>,
-    capacity: usize,
+    capacity: NonZeroUsize,
     /// Track severe reorder events for diagnostics.
     reorder_warnings: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthRingBufferError {
+    ZeroCapacity,
+}
+
+impl std::fmt::Display for DepthRingBufferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroCapacity => write!(f, "depth ring buffer capacity must be > 0"),
+        }
+    }
+}
+
+impl std::error::Error for DepthRingBufferError {}
+
 impl DepthRingBuffer {
-    pub fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        Self {
-            entries: VecDeque::with_capacity(capacity),
+    pub fn try_new(capacity: usize) -> Result<Self, DepthRingBufferError> {
+        let capacity = NonZeroUsize::new(capacity).ok_or(DepthRingBufferError::ZeroCapacity)?;
+        Ok(Self {
+            entries: VecDeque::with_capacity(capacity.get()),
             capacity,
             reorder_warnings: 0,
-        }
+        })
     }
 
     pub fn push(&mut self, depth: DepthImage) {
@@ -32,7 +48,7 @@ impl DepthRingBuffer {
             self.reorder_warnings = self.reorder_warnings.saturating_add(1);
         }
 
-        if self.entries.len() >= self.capacity {
+        if self.entries.len() >= self.capacity.get() {
             self.entries.pop_front();
         }
         self.entries.push_back(depth);
@@ -98,15 +114,19 @@ mod tests {
         make_depth_image(FrameId::new(0), ts(t_ns), 2, 2, 1.0)
     }
 
+    fn buffer(capacity: usize) -> DepthRingBuffer {
+        DepthRingBuffer::try_new(capacity).expect("nonzero test capacity")
+    }
+
     #[test]
     fn empty_returns_none() {
-        let buf = DepthRingBuffer::new(4);
+        let buf = buffer(4);
         assert!(buf.find_closest(ts(100), 10).is_none());
     }
 
     #[test]
     fn single_entry_within_window() {
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = buffer(4);
         buf.push(depth_at(100));
         let result = buf.find_closest(ts(105), 10);
         assert!(result.is_some());
@@ -115,14 +135,14 @@ mod tests {
 
     #[test]
     fn single_entry_outside_window() {
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = buffer(4);
         buf.push(depth_at(100));
         assert!(buf.find_closest(ts(200), 10).is_none());
     }
 
     #[test]
     fn picks_closest_of_two() {
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = buffer(4);
         buf.push(depth_at(100));
         buf.push(depth_at(200));
         let result = buf.find_closest(ts(160), 100).unwrap();
@@ -131,7 +151,7 @@ mod tests {
 
     #[test]
     fn boundary_exact_match() {
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = buffer(4);
         buf.push(depth_at(100));
         let result = buf.find_closest(ts(100), 0).unwrap();
         assert_eq!(result.timestamp().as_nanos(), 100);
@@ -139,7 +159,7 @@ mod tests {
 
     #[test]
     fn boundary_at_window_edge() {
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = buffer(4);
         buf.push(depth_at(100));
         // query at 110, window 10 => delta=10, should be found (inclusive)
         assert!(buf.find_closest(ts(110), 10).is_some());
@@ -149,7 +169,7 @@ mod tests {
 
     #[test]
     fn eviction_at_capacity() {
-        let mut buf = DepthRingBuffer::new(3);
+        let mut buf = buffer(3);
         buf.push(depth_at(100));
         buf.push(depth_at(200));
         buf.push(depth_at(300));
@@ -164,7 +184,7 @@ mod tests {
 
     #[test]
     fn out_of_order_allowed_with_warning() {
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = buffer(4);
         buf.push(depth_at(200));
         buf.push(depth_at(100));
         assert_eq!(buf.reorder_warnings(), 1);
@@ -175,15 +195,23 @@ mod tests {
 
     #[test]
     fn large_timestamp_delta_does_not_overflow() {
-        let mut buf = DepthRingBuffer::new(2);
+        let mut buf = buffer(2);
         buf.push(depth_at(i64::MIN + 1));
         assert!(buf.find_closest(ts(i64::MAX), i64::MAX).is_none());
     }
 
     #[test]
     fn negative_window_is_rejected() {
-        let mut buf = DepthRingBuffer::new(2);
+        let mut buf = buffer(2);
         buf.push(depth_at(100));
         assert!(buf.find_closest(ts(100), -1).is_none());
+    }
+
+    #[test]
+    fn zero_capacity_is_rejected_instead_of_clamped() {
+        assert!(matches!(
+            DepthRingBuffer::try_new(0),
+            Err(DepthRingBufferError::ZeroCapacity)
+        ));
     }
 }

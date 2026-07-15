@@ -1,3 +1,4 @@
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,12 @@ use kiko_slam::{
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
 
+#[cfg(any(feature = "record", test))]
+use kiko_slam::ChannelCapacity;
+
+#[cfg(feature = "record")]
+use kiko_slam::env::{EnvError, env_u64};
+
 #[cfg(feature = "record")]
 use kiko_slam::{CameraPoint3, DenseStats, Frame, Raw, ReconState, WorldToCamera};
 
@@ -26,9 +33,9 @@ use kiko_slam::dataset::{
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
-    ChannelCapacity, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
-    PairError, PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
-    StereoPairer, SystemHealth, TrackerInitError, bounded_channel, oak_to_depth_image,
+    DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId, PairError,
+    PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
+    SystemHealth, TrackerInitError, VizConfigError, bounded_channel, oak_to_depth_image,
     oak_to_frame,
 };
 #[cfg(feature = "record")]
@@ -59,6 +66,58 @@ const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
 const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
 const DEFAULT_KEYFRAME_COVISIBILITY: f32 = 0.6;
 const DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY: f32 = 0.9;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepthRingCapacityError {
+    key: &'static str,
+    value: usize,
+}
+
+impl std::fmt::Display for DepthRingCapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "environment variable {} must be at least {}, got {}",
+            self.key,
+            DepthRingCapacity::MINIMUM,
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for DepthRingCapacityError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DepthRingCapacity(NonZeroUsize);
+
+impl DepthRingCapacity {
+    const MINIMUM: usize = 4;
+
+    fn try_new(key: &'static str, value: usize) -> Result<Self, DepthRingCapacityError> {
+        if value < Self::MINIMUM {
+            return Err(DepthRingCapacityError { key, value });
+        }
+        Ok(Self(
+            NonZeroUsize::new(value).expect("capacity at or above four is nonzero"),
+        ))
+    }
+
+    fn minimum() -> Self {
+        Self(NonZeroUsize::new(Self::MINIMUM).expect("minimum depth ring capacity is nonzero"))
+    }
+
+    fn get(self) -> usize {
+        self.0.get()
+    }
+
+    #[cfg(any(feature = "record", test))]
+    fn from_queue_capacity(capacity: ChannelCapacity) -> Self {
+        Self(
+            NonZeroUsize::new(capacity.get().max(Self::MINIMUM))
+                .expect("typed queue capacity is nonzero"),
+        )
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "kiko-slam", about = "Kiko SLAM tools")]
@@ -515,7 +574,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let rec = build_recording(args, "kiko-slam-dataset")?;
-    let mut sink = RerunSink::new(rec, decimation);
+    let mut sink = RerunSink::new(rec, decimation)?;
 
     let mut pipeline = inference.into_pipeline();
 
@@ -715,15 +774,15 @@ fn build_tracker_config(
     downscale: DownscaleFactor,
 ) -> Result<TrackerConfig, Box<dyn std::error::Error>> {
     let min_keyframe_points =
-        env_usize("KIKO_KEYFRAME_MIN_POINTS").unwrap_or(defaults.min_keyframe_points);
+        env_usize("KIKO_KEYFRAME_MIN_POINTS")?.unwrap_or(defaults.min_keyframe_points);
     let refresh_inliers =
-        env_usize("KIKO_KEYFRAME_REFRESH_INLIERS").unwrap_or(defaults.refresh_inliers);
-    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX").unwrap_or(DEFAULT_KEYFRAME_PARALLAX_PX);
+        env_usize("KIKO_KEYFRAME_REFRESH_INLIERS")?.unwrap_or(defaults.refresh_inliers);
+    let parallax_px = env_f32("KIKO_KEYFRAME_PARALLAX_PX")?.unwrap_or(DEFAULT_KEYFRAME_PARALLAX_PX);
     let min_covisibility =
-        env_f32("KIKO_KEYFRAME_COVISIBILITY").unwrap_or(DEFAULT_KEYFRAME_COVISIBILITY);
-    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY")
+        env_f32("KIKO_KEYFRAME_COVISIBILITY")?.unwrap_or(DEFAULT_KEYFRAME_COVISIBILITY);
+    let redundant_covisibility = env_f32("KIKO_KEYFRAME_REDUNDANT_COVISIBILITY")?
         .unwrap_or(DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY);
-    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS").unwrap_or(defaults.min_inliers);
+    let min_inliers = env_usize("KIKO_TRACK_MIN_INLIERS")?.unwrap_or(defaults.min_inliers);
     let ransac_defaults = RansacConfig::default();
     let ransac = RansacConfig::try_new(
         ransac_defaults.max_iterations(),
@@ -734,31 +793,34 @@ fn build_tracker_config(
     let ba_config = build_ba_config()?;
     let keyframe_policy = KeyframePolicy::new(refresh_inliers, parallax_px, min_covisibility)?;
     let redundancy = Some(RedundancyPolicy::new(redundant_covisibility)?);
-    let backend = if env_bool("KIKO_BACKEND_ASYNC").unwrap_or(true) {
+    let backend = if env_bool("KIKO_BACKEND_ASYNC")?.unwrap_or(true) {
         Some(BackendConfig::new(
-            env_usize("KIKO_BACKEND_QUEUE_DEPTH").unwrap_or(2),
+            env_usize("KIKO_BACKEND_QUEUE_DEPTH")?.unwrap_or(2),
         )?)
     } else {
         None
     };
-    let loop_closure_enabled = env_bool("KIKO_LOOP_CLOSURE").unwrap_or(true);
-    let learned_descriptors_enabled = env_bool("KIKO_LEARNED_DESCRIPTORS").unwrap_or(true);
-    let relocalization_enabled = env_bool("KIKO_RELOCALIZATION").unwrap_or(true);
+    let loop_closure_enabled = env_bool("KIKO_LOOP_CLOSURE")?.unwrap_or(true);
+    let learned_descriptors_enabled = if loop_closure_enabled {
+        env_bool("KIKO_LEARNED_DESCRIPTORS")?.unwrap_or(true)
+    } else {
+        false
+    };
+    let relocalization_enabled = if loop_closure_enabled {
+        env_bool("KIKO_RELOCALIZATION")?.unwrap_or(true)
+    } else {
+        false
+    };
     let loop_subsystem = if loop_closure_enabled {
         if !learned_descriptors_enabled {
             return Err("invalid tracker config: loop closure requires learned descriptors".into());
         }
         let loop_cfg = LoopClosureConfig::default();
         let descriptor_cfg =
-            GlobalDescriptorConfig::new(env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH").unwrap_or(2))?;
+            GlobalDescriptorConfig::new(env_usize("KIKO_DESCRIPTOR_QUEUE_DEPTH")?.unwrap_or(2))?;
         let relocalization = relocalization_enabled.then_some(RelocalizationConfig::default());
         LoopSubsystemConfig::enabled(loop_cfg, descriptor_cfg, relocalization)
     } else {
-        if relocalization_enabled {
-            eprintln!(
-                "relocalization requested but loop closure is disabled; disabling relocalization"
-            );
-        }
         LoopSubsystemConfig::Disabled
     };
 
@@ -839,7 +901,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
-    let mut sink = RerunSink::new(rec, decimation);
+    let mut sink = RerunSink::new(rec, decimation)?;
     let mut tracker = SlamTracker::try_new(
         superpoint_left,
         superpoint_right,
@@ -849,11 +911,16 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         tracker_config,
     )?;
     report_tracker_runtime(&tracker_config, &tracker);
-    let dense_enabled = env_bool("KIKO_DENSE").unwrap_or(false);
-    let depth_ring_capacity = env_usize("KIKO_OFFLINE_DEPTH_RING_CAPACITY")
-        .unwrap_or(8)
-        .max(4);
-    let mut depth_ring = DepthRingBuffer::new(depth_ring_capacity);
+    let dense_enabled = env_bool("KIKO_DENSE")?.unwrap_or(false);
+    let depth_ring_capacity = if dense_enabled {
+        DepthRingCapacity::try_new(
+            "KIKO_OFFLINE_DEPTH_RING_CAPACITY",
+            env_usize("KIKO_OFFLINE_DEPTH_RING_CAPACITY")?.unwrap_or(8),
+        )?
+    } else {
+        DepthRingCapacity::minimum()
+    };
+    let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
     let mut depth_cursor = if dense_enabled {
         match OfflineDepthCursor::new(&args.dataset.path, reader.meta().depth.as_ref()) {
             Ok(cursor) => cursor,
@@ -871,7 +938,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "offline dense enabled: depth_stream={} ring_capacity={}",
             depth_cursor.is_some(),
-            depth_ring_capacity
+            depth_ring_capacity.get()
         );
     }
 
@@ -1186,38 +1253,61 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "record")]
-const DEFAULT_PAIRING_WINDOW_NS: i64 = 5_000_000;
+const DEFAULT_PAIRING_WINDOW_NS: u64 = 5_000_000;
 #[cfg(feature = "record")]
 const DEFAULT_PAIRER_MAX_PENDING_PER_SIDE: usize = 64;
 
 #[cfg(feature = "record")]
-fn load_pairing_window() -> Result<PairingWindowNs, PairingConfigError> {
-    let window_ns = match env_usize("KIKO_PAIRING_WINDOW_NS") {
-        Some(raw) => match i64::try_from(raw) {
-            Ok(value) => value,
-            Err(_) => {
-                eprintln!(
-                    "invalid KIKO_PAIRING_WINDOW_NS={raw}, exceeds i64::MAX, using default {DEFAULT_PAIRING_WINDOW_NS}"
-                );
-                DEFAULT_PAIRING_WINDOW_NS
-            }
-        },
-        None => DEFAULT_PAIRING_WINDOW_NS,
-    };
-    match PairingWindowNs::new(window_ns) {
-        Ok(window) => Ok(window),
-        Err(err) => {
-            eprintln!("invalid pairing window from env ({err}); using default");
-            PairingWindowNs::new(DEFAULT_PAIRING_WINDOW_NS)
+#[derive(Debug)]
+enum PairingWindowLoadError {
+    Environment(EnvError),
+    InvalidWindow(PairingConfigError),
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for PairingWindowLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment(source) => write!(f, "invalid pairing environment: {source}"),
+            Self::InvalidWindow(source) => write!(f, "invalid pairing window: {source}"),
         }
     }
 }
 
 #[cfg(feature = "record")]
-fn load_pairer_max_pending_per_side() -> usize {
-    env_usize("KIKO_PAIRER_MAX_PENDING_PER_SIDE")
-        .unwrap_or(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE)
-        .max(1)
+impl std::error::Error for PairingWindowLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Environment(source) => Some(source),
+            Self::InvalidWindow(source) => Some(source),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl From<EnvError> for PairingWindowLoadError {
+    fn from(source: EnvError) -> Self {
+        Self::Environment(source)
+    }
+}
+
+#[cfg(feature = "record")]
+impl From<PairingConfigError> for PairingWindowLoadError {
+    fn from(source: PairingConfigError) -> Self {
+        Self::InvalidWindow(source)
+    }
+}
+
+#[cfg(feature = "record")]
+fn load_pairing_window() -> Result<PairingWindowNs, PairingWindowLoadError> {
+    let window_ns = env_u64("KIKO_PAIRING_WINDOW_NS")?.unwrap_or(DEFAULT_PAIRING_WINDOW_NS);
+    Ok(PairingWindowNs::try_from_u64(window_ns)?)
+}
+
+#[cfg(feature = "record")]
+fn load_pairer_max_pending_per_side() -> Result<usize, EnvError> {
+    Ok(env_usize("KIKO_PAIRER_MAX_PENDING_PER_SIDE")?
+        .unwrap_or(DEFAULT_PAIRER_MAX_PENDING_PER_SIDE))
 }
 
 #[cfg(feature = "record")]
@@ -1371,7 +1461,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: args.camera.fps,
         rectified: args.camera.rectified,
     };
-    let depth_enabled = env_bool("KIKO_RECORD_DEPTH").unwrap_or(false);
+    let depth_enabled = env_bool("KIKO_RECORD_DEPTH")?.unwrap_or(false);
     let depth_config = depth_enabled.then_some(DepthConfig {
         width: mono_config.width,
         height: mono_config.height,
@@ -1408,8 +1498,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut depth_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
-    let pairer_max_pending = load_pairer_max_pending_per_side();
-    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
+    let pairer_max_pending = load_pairer_max_pending_per_side()?;
+    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
     let start = Instant::now();
     let mut capture_error = None;
 
@@ -1499,7 +1589,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             pair_count += 1;
 
-            if pair_count % 30 == 0 {
+            if pair_count.is_multiple_of(30) {
                 eprintln!("captured {pair_count} stereo pairs");
             }
         }
@@ -1571,6 +1661,7 @@ struct LiveVizMsg {
 enum LiveThreadError {
     VizChannelDisconnected,
     RerunConnect { detail: String },
+    VisualizationConfiguration { source: VizConfigError },
     InferenceUnavailable { detail: String },
     TrackerInitialization { source: TrackerInitError },
     FrameProcessingPanic { detail: String },
@@ -1583,6 +1674,9 @@ impl std::fmt::Display for LiveThreadError {
             LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
             LiveThreadError::RerunConnect { detail } => {
                 write!(f, "failed to connect to rerun viewer: {detail}")
+            }
+            LiveThreadError::VisualizationConfiguration { source } => {
+                write!(f, "invalid live visualization configuration: {source}")
             }
             LiveThreadError::InferenceUnavailable { detail } => {
                 write!(f, "inference pipeline is unavailable: {detail}")
@@ -1601,6 +1695,7 @@ impl std::fmt::Display for LiveThreadError {
 impl std::error::Error for LiveThreadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::VisualizationConfiguration { source } => Some(source),
             Self::TrackerInitialization { source } => Some(source),
             Self::VizChannelDisconnected
             | Self::RerunConnect { .. }
@@ -1640,9 +1735,17 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: args.camera.fps,
         rectified: args.camera.rectified,
     };
-    let depth_enabled = env_bool("KIKO_LIVE_DEPTH").unwrap_or(false);
-    let depth_queue_depth = env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH").unwrap_or(8);
-    let depth_ring_capacity = depth_queue_depth.max(4);
+    let depth_enabled = env_bool("KIKO_LIVE_DEPTH")?.unwrap_or(false);
+    let depth_queue_capacity = if depth_enabled {
+        Some(ChannelCapacity::try_from(
+            env_usize("KIKO_LIVE_DEPTH_QUEUE_DEPTH")?.unwrap_or(8),
+        )?)
+    } else {
+        None
+    };
+    let depth_ring_capacity = depth_queue_capacity
+        .map(DepthRingCapacity::from_queue_capacity)
+        .unwrap_or_else(DepthRingCapacity::minimum);
 
     let config = DeviceConfig {
         rgb: None,
@@ -1664,25 +1767,25 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut device = Device::connect("", config)?;
 
     let pairing_window = load_pairing_window()?;
-    let pairer_max_pending = load_pairer_max_pending_per_side();
-    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
+    let pairer_max_pending = load_pairer_max_pending_per_side()?;
+    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
 
-    let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH").unwrap_or(12);
+    let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH")?.unwrap_or(12);
     let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
     let (pair_tx, pair_rx, pair_stats) =
         bounded_channel::<StereoPair>(pair_capacity, DropPolicy::DropOldest);
 
-    let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH").unwrap_or(12);
+    let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
     let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
     let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
-    let (depth_tx, depth_rx, depth_stats_handle) = if depth_enabled {
-        let depth_capacity = ChannelCapacity::try_from(depth_queue_depth)?;
-        let (depth_tx, depth_rx, depth_stats) =
-            bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
-        (Some(depth_tx), Some(depth_rx), Some(depth_stats))
-    } else {
-        (None, None, None)
-    };
+    let (depth_tx, depth_rx, depth_stats_handle) =
+        if let Some(depth_capacity) = depth_queue_capacity {
+            let (depth_tx, depth_rx, depth_stats) =
+                bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
+            (Some(depth_tx), Some(depth_rx), Some(depth_stats))
+        } else {
+            (None, None, None)
+        };
 
     let inference = InferenceConfig::from_args(&args.inference)?;
     let InferenceConfig {
@@ -1712,17 +1815,25 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         pair_queue_depth,
         viz_queue_depth,
         depth_enabled,
-        depth_queue_depth,
+        depth_queue_capacity.map_or(0, ChannelCapacity::get),
         pairer.window().as_ns(),
         pairer.max_pending_per_side()
     );
 
     // Dense reconstruction channels and worker thread.
-    let dense_enabled = depth_enabled && env_bool("KIKO_DENSE").unwrap_or(false);
-    let dense_data_queue_depth = env_usize("KIKO_DENSE_DATA_QUEUE_DEPTH").unwrap_or(4);
-    let dense_ctrl_queue_depth = env_usize("KIKO_DENSE_CTRL_QUEUE_DEPTH")
-        .unwrap_or(64)
-        .max(1);
+    let dense_enabled = if depth_enabled {
+        env_bool("KIKO_DENSE")?.unwrap_or(false)
+    } else {
+        false
+    };
+    let dense_capacities = if dense_enabled {
+        Some((
+            ChannelCapacity::try_from(env_usize("KIKO_DENSE_DATA_QUEUE_DEPTH")?.unwrap_or(4))?,
+            ChannelCapacity::try_from(env_usize("KIKO_DENSE_CTRL_QUEUE_DEPTH")?.unwrap_or(64))?,
+        ))
+    } else {
+        None
+    };
 
     // Create dense channels. Control is bounded (to avoid unbounded memory growth),
     // data uses DropNewest backpressure for IntegrateKeyframe.
@@ -1736,9 +1847,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut dense_stats_tx_for_worker: Option<kiko_slam::DropSender<DenseStats>> = None;
     let mut dense_stats_rx: Option<kiko_slam::DropReceiver<DenseStats>> = None;
 
-    if dense_enabled {
-        let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(dense_ctrl_queue_depth);
-        let data_cap = ChannelCapacity::try_from(dense_data_queue_depth)?;
+    if let Some((data_cap, ctrl_cap)) = dense_capacities {
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(ctrl_cap.get());
         let (data_tx, data_rx, data_stats) = bounded_channel(data_cap, DropPolicy::DropNewest);
         let stats_cap = ChannelCapacity::try_from(1_usize)?;
         let (stats_tx, stats_rx_inner, _stats_handle) =
@@ -1771,6 +1881,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
     let inference_running = Arc::clone(&running);
     let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
         let _exit_guard = LiveThreadExitGuard(inference_running);
@@ -1786,7 +1897,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         report_tracker_runtime(&tracker_config, &tracker);
         let depth_rx = depth_rx;
         let depth_enabled_for_diagnostics = depth_rx.is_some();
-        let mut depth_ring = DepthRingBuffer::new(depth_ring_capacity);
         let mut dense_generation: u64 = 0;
         let mut dense_ctrl_tx = dense_ctrl_tx;
         let mut dense_data_tx = dense_data_tx;
@@ -1878,13 +1988,13 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         None
                     };
-                    if let Some(ref stats) = dense_stats {
-                        if stats.state == ReconState::Down {
-                            dense_active = false;
-                            dense_ctrl_tx = None;
-                            dense_data_tx = None;
-                            eprintln!("dense worker entered Down state; disabling dense");
-                        }
+                    if let Some(ref stats) = dense_stats
+                        && stats.state == ReconState::Down
+                    {
+                        dense_active = false;
+                        dense_ctrl_tx = None;
+                        dense_data_tx = None;
+                        eprintln!("dense worker entered Down state; disabling dense");
                     }
 
                     if depth_enabled_for_diagnostics {
@@ -1926,32 +2036,31 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             detail: err.to_string(),
                         });
                     }
-                    if dense_active {
-                        if let Some(correction) = tracker.take_pending_loop_correction() {
-                            dense_generation = dense_generation.saturating_add(1);
-                            let rebuild_cmd = DenseCommand::RebuildFromSnapshot {
-                                corrected_poses: correction,
-                                generation: dense_generation,
-                            };
-                            if let Some(ref tx) = dense_ctrl_tx {
-                                match tx.send_timeout(rebuild_cmd, Duration::from_millis(5)) {
-                                    Ok(()) => {}
-                                    Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                                        dense_active = false;
-                                        dense_ctrl_tx = None;
-                                        dense_data_tx = None;
-                                        eprintln!(
-                                            "dense control queue saturated after tracker error; disabling dense"
-                                        );
-                                    }
-                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                        dense_active = false;
-                                        dense_ctrl_tx = None;
-                                        dense_data_tx = None;
-                                        eprintln!(
-                                            "dense control disconnected after tracker error; disabling dense"
-                                        );
-                                    }
+                    if dense_active && let Some(correction) = tracker.take_pending_loop_correction()
+                    {
+                        dense_generation = dense_generation.saturating_add(1);
+                        let rebuild_cmd = DenseCommand::RebuildFromSnapshot {
+                            corrected_poses: correction,
+                            generation: dense_generation,
+                        };
+                        if let Some(ref tx) = dense_ctrl_tx {
+                            match tx.send_timeout(rebuild_cmd, Duration::from_millis(5)) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                                    dense_active = false;
+                                    dense_ctrl_tx = None;
+                                    dense_data_tx = None;
+                                    eprintln!(
+                                        "dense control queue saturated after tracker error; disabling dense"
+                                    );
+                                }
+                                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                    dense_active = false;
+                                    dense_ctrl_tx = None;
+                                    dense_data_tx = None;
+                                    eprintln!(
+                                        "dense control disconnected after tracker error; disabling dense"
+                                    );
                                 }
                             }
                         }
@@ -1977,10 +2086,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let decimation = args.rerun_decimation.get();
     let viz_running = Arc::clone(&running);
     let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
+        let _exit_guard = LiveThreadExitGuard(viz_running);
         let rec = match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc() {
             Ok(rec) => rec,
             Err(err) => {
-                viz_running.store(false, Ordering::SeqCst);
                 eprintln!("failed to connect to rerun viewer: {err}");
                 return Err(LiveThreadError::RerunConnect {
                     detail: err.to_string(),
@@ -1988,7 +2097,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let mut sink = RerunSink::new(rec, decimation);
+        let mut sink = RerunSink::new(rec, decimation)
+            .map_err(|source| LiveThreadError::VisualizationConfiguration { source })?;
         for msg in viz_rx.iter() {
             if let Some(packet) = msg.packet.as_ref() {
                 if let Err(err) = sink.log_with_points(packet, msg.points.as_deref()) {
@@ -1997,16 +2107,16 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
                 eprintln!("rerun log error: {err}");
             }
-            if let Some(depth) = msg.depth.as_ref() {
-                if let Err(err) = sink.log_depth(depth) {
-                    eprintln!("rerun log error: {err}");
-                }
+            if let Some(depth) = msg.depth.as_ref()
+                && let Err(err) = sink.log_depth(depth)
+            {
+                eprintln!("rerun log error: {err}");
             }
 
-            if let Some(pose) = msg.pose.as_ref() {
-                if let Err(err) = sink.log_pose(msg.left.timestamp(), pose) {
-                    eprintln!("rerun log error: {err}");
-                }
+            if let Some(pose) = msg.pose.as_ref()
+                && let Err(err) = sink.log_pose(msg.left.timestamp(), pose)
+            {
+                eprintln!("rerun log error: {err}");
             }
             if let Err(err) = sink.log_system_health(msg.left.timestamp(), &msg.health) {
                 eprintln!("rerun health error: {err}");
@@ -2019,10 +2129,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("rerun event error: {err}");
                 }
             }
-            if let Some(ref dense_stats) = msg.dense_stats {
-                if let Err(err) = sink.log_dense_stats(msg.left.timestamp(), dense_stats) {
-                    eprintln!("rerun dense stats error: {err}");
-                }
+            if let Some(ref dense_stats) = msg.dense_stats
+                && let Err(err) = sink.log_dense_stats(msg.left.timestamp(), dense_stats)
+            {
+                eprintln!("rerun dense stats error: {err}");
             }
         }
         Ok(())
@@ -2084,10 +2194,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
                     Ok(depth_image) => {
                         got_any = true;
-                        if let Some(depth_tx) = depth_tx.as_ref() {
-                            if matches!(depth_tx.try_send(depth_image), SendOutcome::Disconnected) {
-                                break;
-                            }
+                        if let Some(depth_tx) = depth_tx.as_ref()
+                            && matches!(depth_tx.try_send(depth_image), SendOutcome::Disconnected)
+                        {
+                            break;
                         }
                     }
                     Err(err) => {
@@ -2261,26 +2371,53 @@ fn build_calibration(device: &Device, baseline_m: f32, config: &MonoConfig) -> C
     }
 }
 
-fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
-    let window = env_usize("KIKO_BA_WINDOW").unwrap_or(DEFAULT_BA_WINDOW);
-    let iters = env_usize("KIKO_BA_ITERS").unwrap_or(DEFAULT_BA_ITERS);
-    let min_obs = env_usize("KIKO_BA_MIN_OBS").unwrap_or(DEFAULT_BA_MIN_OBS);
-    let huber = env_f32("KIKO_BA_HUBER_PX").unwrap_or(DEFAULT_BA_HUBER_PX);
-    let initial_lambda = env_f32("KIKO_BA_DAMPING").unwrap_or(DEFAULT_BA_DAMPING);
-    let lambda_factor = env_f32("KIKO_LM_FACTOR").unwrap_or(DEFAULT_LM_FACTOR);
-    let min_lambda = env_f32("KIKO_LM_MIN").unwrap_or(DEFAULT_LM_MIN);
-    let max_lambda = env_f32("KIKO_LM_MAX").unwrap_or(DEFAULT_LM_MAX);
-    let motion = env_f32("KIKO_BA_MOTION_WEIGHT").unwrap_or(DEFAULT_BA_MOTION_WEIGHT);
+#[derive(Clone, Copy, Debug)]
+struct BaConfigValues {
+    window: usize,
+    iterations: usize,
+    min_observations: usize,
+    huber_delta_px: f32,
+    initial_lambda: f32,
+    lambda_factor: f32,
+    min_lambda: f32,
+    max_lambda: f32,
+    motion_prior_weight: f32,
+}
+
+fn build_ba_config_from_values(
+    values: BaConfigValues,
+) -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
     let default_lm = LmConfig::default();
     let lm = LmConfig::new(
-        initial_lambda,
-        lambda_factor,
-        min_lambda,
-        max_lambda,
+        values.initial_lambda,
+        values.lambda_factor,
+        values.min_lambda,
+        values.max_lambda,
         default_lm.rho_accept(),
         default_lm.rho_good(),
     )?;
-    let config = LocalBaConfig::new(window, iters, min_obs, huber, lm, motion)?;
+    Ok(LocalBaConfig::new(
+        values.window,
+        values.iterations,
+        values.min_observations,
+        values.huber_delta_px,
+        lm,
+        values.motion_prior_weight,
+    )?)
+}
+
+fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
+    let config = build_ba_config_from_values(BaConfigValues {
+        window: env_usize("KIKO_BA_WINDOW")?.unwrap_or(DEFAULT_BA_WINDOW),
+        iterations: env_usize("KIKO_BA_ITERS")?.unwrap_or(DEFAULT_BA_ITERS),
+        min_observations: env_usize("KIKO_BA_MIN_OBS")?.unwrap_or(DEFAULT_BA_MIN_OBS),
+        huber_delta_px: env_f32("KIKO_BA_HUBER_PX")?.unwrap_or(DEFAULT_BA_HUBER_PX),
+        initial_lambda: env_f32("KIKO_BA_DAMPING")?.unwrap_or(DEFAULT_BA_DAMPING),
+        lambda_factor: env_f32("KIKO_LM_FACTOR")?.unwrap_or(DEFAULT_LM_FACTOR),
+        min_lambda: env_f32("KIKO_LM_MIN")?.unwrap_or(DEFAULT_LM_MIN),
+        max_lambda: env_f32("KIKO_LM_MAX")?.unwrap_or(DEFAULT_LM_MAX),
+        motion_prior_weight: env_f32("KIKO_BA_MOTION_WEIGHT")?.unwrap_or(DEFAULT_BA_MOTION_WEIGHT),
+    })?;
     eprintln!(
         "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={} motion_weight={}",
         config.window(),
@@ -2364,11 +2501,9 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BenchError, build_ba_config};
+    use super::{BaConfigValues, BenchError, DepthRingCapacity, build_ba_config_from_values};
     use kiko_slam::dataset::DatasetError;
     use kiko_slam::{InferenceError, PipelineError};
-    use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
 
     #[cfg(feature = "record")]
     use super::LiveThreadExitGuard;
@@ -2377,11 +2512,6 @@ mod tests {
         Arc,
         atomic::{AtomicBool, Ordering},
     };
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     #[test]
     fn benchmark_errors_preserve_dataset_and_pipeline_sources() {
@@ -2408,55 +2538,46 @@ mod tests {
         );
     }
 
-    fn set_env(key: &str, value: &str) {
-        // Safety: tests hold a process-wide lock while mutating environment vars.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var(key, value);
-        }
-    }
-
-    fn restore_env(key: &str, value: Option<OsString>) {
-        // Safety: tests hold a process-wide lock while mutating environment vars.
-        #[allow(unsafe_code)]
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
+    #[test]
+    fn capacity_minimum_is_rejected_instead_of_clamped() {
+        let error = DepthRingCapacity::try_new("TEST_CAPACITY", 3)
+            .expect_err("undersized capacity must fail");
+        assert_eq!(error.key, "TEST_CAPACITY");
+        assert_eq!(error.value, 3);
+        assert_eq!(
+            DepthRingCapacity::try_new("TEST_CAPACITY", 4).map(DepthRingCapacity::get),
+            Ok(4)
+        );
+        assert_eq!(
+            DepthRingCapacity::from_queue_capacity(
+                kiko_slam::ChannelCapacity::try_from(1).expect("nonzero queue capacity")
+            )
+            .get(),
+            4
+        );
+        assert_eq!(
+            DepthRingCapacity::from_queue_capacity(
+                kiko_slam::ChannelCapacity::try_from(8).expect("nonzero queue capacity")
+            )
+            .get(),
+            8
+        );
     }
 
     #[test]
-    fn build_ba_config_reads_lm_env_settings() {
-        let _guard = env_lock().lock().expect("env lock");
-        let keys = [
-            "KIKO_BA_WINDOW",
-            "KIKO_BA_ITERS",
-            "KIKO_BA_MIN_OBS",
-            "KIKO_BA_HUBER_PX",
-            "KIKO_BA_DAMPING",
-            "KIKO_LM_FACTOR",
-            "KIKO_LM_MIN",
-            "KIKO_LM_MAX",
-            "KIKO_BA_MOTION_WEIGHT",
-        ];
-        let saved: Vec<(String, Option<OsString>)> = keys
-            .iter()
-            .map(|&key| (key.to_string(), std::env::var_os(key)))
-            .collect();
-
-        set_env("KIKO_BA_WINDOW", "12");
-        set_env("KIKO_BA_ITERS", "7");
-        set_env("KIKO_BA_MIN_OBS", "9");
-        set_env("KIKO_BA_HUBER_PX", "2.5");
-        set_env("KIKO_BA_DAMPING", "0.002");
-        set_env("KIKO_LM_FACTOR", "12.0");
-        set_env("KIKO_LM_MIN", "0.000001");
-        set_env("KIKO_LM_MAX", "5000");
-        set_env("KIKO_BA_MOTION_WEIGHT", "0.25");
-
-        let config = build_ba_config().expect("build config");
+    fn build_ba_config_from_parsed_values_preserves_lm_settings() {
+        let config = build_ba_config_from_values(BaConfigValues {
+            window: 12,
+            iterations: 7,
+            min_observations: 9,
+            huber_delta_px: 2.5,
+            initial_lambda: 0.002,
+            lambda_factor: 12.0,
+            min_lambda: 0.000_001,
+            max_lambda: 5000.0,
+            motion_prior_weight: 0.25,
+        })
+        .expect("build config");
         assert_eq!(config.window(), 12);
         assert_eq!(config.max_iterations(), 7);
         assert_eq!(config.min_observations(), 9);
@@ -2466,10 +2587,6 @@ mod tests {
         assert!((config.lm().min_lambda() - 1e-6).abs() < 1e-12);
         assert!((config.lm().max_lambda() - 5000.0).abs() < 1e-6);
         assert!((config.motion_prior_weight() - 0.25).abs() < 1e-6);
-
-        for (key, value) in saved {
-            restore_env(&key, value);
-        }
     }
 
     #[cfg(feature = "record")]

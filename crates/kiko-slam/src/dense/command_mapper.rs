@@ -107,6 +107,10 @@ mod tests {
         make_depth_image(FrameId::new(0), ts(t_ns), 2, 2, 1.0)
     }
 
+    fn depth_buffer() -> DepthRingBuffer {
+        DepthRingBuffer::try_new(4).expect("nonzero test capacity")
+    }
+
     fn kf_id() -> KeyframeId {
         KeyframeId::for_test(0)
     }
@@ -148,7 +152,7 @@ mod tests {
     #[test]
     fn keyframe_created_with_depth_emits_integrate() {
         let kf = kf_id();
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = depth_buffer();
         buf.push(depth_at(100));
 
         let output = base_output(vec![DiagnosticEvent::KeyframeCreated {
@@ -167,7 +171,7 @@ mod tests {
     #[test]
     fn keyframe_removed_emits_remove() {
         let kf = kf_id();
-        let buf = DepthRingBuffer::new(4);
+        let buf = depth_buffer();
 
         let output = base_output(vec![DiagnosticEvent::KeyframeRemoved {
             keyframe_id: kf,
@@ -184,7 +188,7 @@ mod tests {
 
     #[test]
     fn loop_correction_emits_rebuild() {
-        let buf = DepthRingBuffer::new(4);
+        let buf = depth_buffer();
         let output = base_output(vec![]);
 
         let correction = vec![(kf_id(), Pose::identity())];
@@ -202,7 +206,7 @@ mod tests {
     #[test]
     fn no_command_when_no_depth_available() {
         let kf = kf_id();
-        let buf = DepthRingBuffer::new(4); // empty
+        let buf = depth_buffer(); // empty
 
         let output = base_output(vec![DiagnosticEvent::KeyframeCreated {
             keyframe_id: kf,
@@ -217,7 +221,7 @@ mod tests {
     #[test]
     fn no_integrate_when_tracking_lost() {
         let kf = kf_id();
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = depth_buffer();
         buf.push(depth_at(100));
 
         let mut output = base_output(vec![DiagnosticEvent::KeyframeCreated {
@@ -237,7 +241,7 @@ mod tests {
     #[test]
     fn no_integrate_with_stale_fallback_pose() {
         let kf = kf_id();
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = depth_buffer();
         buf.push(depth_at(100));
         let mut output = base_output(vec![DiagnosticEvent::KeyframeCreated {
             keyframe_id: kf,
@@ -254,7 +258,7 @@ mod tests {
     #[test]
     fn coalesce_create_and_remove_same_frame() {
         let kf = kf_id();
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = depth_buffer();
         buf.push(depth_at(100));
 
         let output = base_output(vec![
@@ -278,7 +282,7 @@ mod tests {
     #[test]
     fn depth_outside_window_not_associated() {
         let kf = kf_id();
-        let mut buf = DepthRingBuffer::new(4);
+        let mut buf = depth_buffer();
         buf.push(depth_at(0)); // very old
 
         let output = base_output(vec![DiagnosticEvent::KeyframeCreated {
@@ -299,7 +303,7 @@ mod tests {
 
     #[test]
     fn generation_increments_on_successive_corrections() {
-        let buf = DepthRingBuffer::new(4);
+        let buf = depth_buffer();
         let output = base_output(vec![]);
         let correction = vec![(kf_id(), Pose::identity())];
         let mut gen_ = 0;

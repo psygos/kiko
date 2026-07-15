@@ -14,7 +14,11 @@ const DEFAULT_MAX_RESPAWNS: u32 = 3;
 /// Minimum keyframes required for multi-frame optimization (BA or pose graph).
 const MIN_OPTIMIZATION_KEYFRAMES: usize = 2;
 /// Default minimum observations per map point to survive culling.
-const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
+const DEFAULT_CULL_MIN_OBSERVATIONS: NonZeroUsize = NonZeroUsize::MIN;
+const BACKEND_MAX_RESPAWNS_ENV: &str = "KIKO_BACKEND_MAX_RESPAWNS";
+const DESCRIPTOR_MAX_RESPAWNS_ENV: &str = "KIKO_DESCRIPTOR_MAX_RESPAWNS";
+const MAP_CULL_MIN_OBSERVATIONS_ENV: &str = "KIKO_MAP_CULL_MIN_OBSERVATIONS";
+const TRACK_TRACE_ENV: &str = "KIKO_TRACK_TRACE";
 const EIGENPLACES_MODEL_ENV: &str = "KIKO_EIGENPLACES_MODEL";
 
 use crate::loop_closure::{
@@ -168,7 +172,10 @@ impl Default for GlobalDescriptorConfig {
 
 #[derive(Debug)]
 pub enum TrackerInitError {
+    Environment(crate::env::EnvError),
+    ZeroMapCullMinObservations { variable: &'static str },
     EmptyDescriptorModelPath { variable: &'static str },
+    BackendWorkerSpawn(std::io::Error),
     DescriptorModelLoad(InferenceError),
     DescriptorWorkerSpawn(std::io::Error),
 }
@@ -176,11 +183,18 @@ pub enum TrackerInitError {
 impl std::fmt::Display for TrackerInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Environment(err) => write!(f, "invalid tracker environment: {err}"),
+            Self::ZeroMapCullMinObservations { variable } => {
+                write!(f, "{variable} must be greater than zero")
+            }
             Self::EmptyDescriptorModelPath { variable } => {
                 write!(
                     f,
                     "{variable} must not be empty when learned descriptors are enabled"
                 )
+            }
+            Self::BackendWorkerSpawn(err) => {
+                write!(f, "failed to spawn backend worker: {err}")
             }
             Self::DescriptorModelLoad(err) => {
                 write!(f, "failed to initialize learned descriptor model: {err}")
@@ -195,10 +209,18 @@ impl std::fmt::Display for TrackerInitError {
 impl std::error::Error for TrackerInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::EmptyDescriptorModelPath { .. } => None,
+            Self::Environment(err) => Some(err),
+            Self::BackendWorkerSpawn(err) => Some(err),
             Self::DescriptorModelLoad(err) => Some(err),
             Self::DescriptorWorkerSpawn(err) => Some(err),
+            Self::ZeroMapCullMinObservations { .. } | Self::EmptyDescriptorModelPath { .. } => None,
         }
+    }
+}
+
+impl From<crate::env::EnvError> for TrackerInitError {
+    fn from(value: crate::env::EnvError) -> Self {
+        Self::Environment(value)
     }
 }
 
@@ -1013,7 +1035,7 @@ struct BackendSupervisor {
 }
 
 impl BackendSupervisor {
-    fn spawn_worker(
+    fn respawn_worker(
         config: BackendConfig,
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
@@ -1032,25 +1054,41 @@ impl BackendSupervisor {
         intrinsics: PinholeIntrinsics,
         ba_config: LocalBaConfig,
         max_respawns: u32,
-    ) -> Self {
-        let worker = Self::spawn_worker(config, intrinsics, ba_config);
-        let spawn_exhausted = worker.is_none() && max_respawns == 0;
-        if worker.is_none() {
-            if spawn_exhausted {
-                eprintln!("backend worker unavailable at startup; backend optimization disabled");
-            } else {
-                eprintln!("backend worker unavailable at startup; will retry on demand");
-            }
-        }
-        Self {
-            worker,
+    ) -> Result<Self, TrackerInitError> {
+        Self::spawn_initial_with(
+            config,
+            intrinsics,
+            ba_config,
+            max_respawns,
+            BackendWorker::spawn,
+        )
+    }
+
+    fn spawn_initial_with<F>(
+        config: BackendConfig,
+        intrinsics: PinholeIntrinsics,
+        ba_config: LocalBaConfig,
+        max_respawns: u32,
+        spawn: F,
+    ) -> Result<Self, TrackerInitError>
+    where
+        F: FnOnce(
+            BackendConfig,
+            PinholeIntrinsics,
+            LocalBaConfig,
+        ) -> Result<BackendWorker, std::io::Error>,
+    {
+        let worker =
+            spawn(config, intrinsics, ba_config).map_err(TrackerInitError::BackendWorkerSpawn)?;
+        Ok(Self {
+            worker: Some(worker),
             config,
             intrinsics,
             ba_config,
             respawn_count: 0,
             max_respawns,
-            spawn_exhausted,
-        }
+            spawn_exhausted: false,
+        })
     }
 
     #[cfg(test)]
@@ -1061,6 +1099,7 @@ impl BackendSupervisor {
         max_respawns: u32,
     ) -> Self {
         Self::spawn_with_max_respawns(config, intrinsics, ba_config, max_respawns)
+            .expect("spawn initial backend worker")
     }
 
     fn check_health(&mut self) {
@@ -1082,7 +1121,7 @@ impl BackendSupervisor {
             self.respawn_count + 1,
             self.max_respawns
         );
-        self.worker = Self::spawn_worker(self.config, self.intrinsics, self.ba_config);
+        self.worker = Self::respawn_worker(self.config, self.intrinsics, self.ba_config);
         self.respawn_count = self.respawn_count.saturating_add(1);
         if self.worker.is_none() && self.respawn_count >= self.max_respawns {
             self.spawn_exhausted = true;
@@ -1649,6 +1688,68 @@ struct PendingLoopCandidate {
     candidates: Vec<PlaceMatch>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TrackerEnvironment {
+    backend_max_respawns: u32,
+    descriptor_max_respawns: u32,
+    cull_min_observations: NonZeroUsize,
+    trace_transitions: bool,
+}
+
+fn load_when_enabled<T, E>(
+    enabled: bool,
+    default: T,
+    load: impl FnOnce() -> Result<Option<T>, E>,
+) -> Result<T, E> {
+    if enabled {
+        Ok(load()?.unwrap_or(default))
+    } else {
+        Ok(default)
+    }
+}
+
+impl TrackerEnvironment {
+    fn parse(backend_enabled: bool, descriptor_enabled: bool) -> Result<Self, TrackerInitError> {
+        let backend_max_respawns =
+            load_when_enabled(backend_enabled, DEFAULT_MAX_RESPAWNS, || {
+                crate::env::env_u32(BACKEND_MAX_RESPAWNS_ENV)
+            })?;
+        let descriptor_max_respawns =
+            load_when_enabled(descriptor_enabled, DEFAULT_MAX_RESPAWNS, || {
+                crate::env::env_u32(DESCRIPTOR_MAX_RESPAWNS_ENV)
+            })?;
+        Self::from_parsed(
+            backend_max_respawns,
+            descriptor_max_respawns,
+            crate::env::env_usize(MAP_CULL_MIN_OBSERVATIONS_ENV)?,
+            crate::env::env_bool(TRACK_TRACE_ENV)?,
+        )
+    }
+
+    fn from_parsed(
+        backend_max_respawns: u32,
+        descriptor_max_respawns: u32,
+        cull_min_observations: Option<usize>,
+        trace_transitions: Option<bool>,
+    ) -> Result<Self, TrackerInitError> {
+        let cull_min_observations = match cull_min_observations {
+            Some(value) => {
+                NonZeroUsize::new(value).ok_or(TrackerInitError::ZeroMapCullMinObservations {
+                    variable: MAP_CULL_MIN_OBSERVATIONS_ENV,
+                })?
+            }
+            None => DEFAULT_CULL_MIN_OBSERVATIONS,
+        };
+
+        Ok(Self {
+            backend_max_respawns,
+            descriptor_max_respawns,
+            cull_min_observations,
+            trace_transitions: trace_transitions.unwrap_or(false),
+        })
+    }
+}
+
 pub struct SlamTracker {
     superpoint_left: SuperPoint,
     superpoint_right: SuperPoint,
@@ -1674,6 +1775,7 @@ pub struct SlamTracker {
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
+    cull_min_observations: NonZeroUsize,
     trace_transitions: bool,
 }
 
@@ -1688,32 +1790,30 @@ impl SlamTracker {
         intrinsics: PinholeIntrinsics,
         config: TrackerConfig,
     ) -> Result<Self, TrackerInitError> {
+        let environment = TrackerEnvironment::parse(
+            config.backend.is_some(),
+            config.global_descriptor_config().is_some(),
+        )?;
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
-        let backend_max_respawns = crate::env::env_usize("KIKO_BACKEND_MAX_RESPAWNS")
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(DEFAULT_MAX_RESPAWNS);
-        let backend = config.backend.map(|backend_cfg| {
-            BackendSupervisor::spawn_with_max_respawns(
+        let backend = match config.backend {
+            Some(backend_cfg) => Some(BackendSupervisor::spawn_with_max_respawns(
                 backend_cfg,
                 intrinsics,
                 config.ba,
-                backend_max_respawns,
-            )
-        });
+                environment.backend_max_respawns,
+            )?),
+            None => None,
+        };
         let loop_config = config.loop_closure_config();
         let loop_db = loop_config.map(|cfg| KeyframeDatabase::new(cfg.temporal_gap()));
-        let descriptor_max_respawns = crate::env::env_usize("KIKO_DESCRIPTOR_MAX_RESPAWNS")
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(DEFAULT_MAX_RESPAWNS);
         let descriptor_worker = match (loop_config, config.global_descriptor_config()) {
             (Some(_), Some(cfg)) => Some(DescriptorSupervisor::spawn_with_max_respawns(
                 cfg,
-                descriptor_max_respawns,
+                environment.descriptor_max_respawns,
             )?),
             _ => None,
         };
-        let trace_transitions = crate::env::env_bool("KIKO_TRACK_TRACE").unwrap_or(false);
         Ok(Self {
             superpoint_left,
             superpoint_right,
@@ -1739,7 +1839,8 @@ impl SlamTracker {
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
-            trace_transitions,
+            cull_min_observations: environment.cull_min_observations,
+            trace_transitions: environment.trace_transitions,
         })
     }
 
@@ -3099,6 +3200,7 @@ impl SlamTracker {
             left.timestamp(),
             pose_world,
             shared.as_ref(),
+            self.cull_min_observations,
         )?;
         self.emit_event(DiagnosticEvent::KeyframeCreated {
             keyframe_id,
@@ -3141,6 +3243,7 @@ fn insert_keyframe_into_map(
     timestamp: Timestamp,
     pose_world: crate::WorldToCamera,
     shared: Option<&SharedMatches>,
+    cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
     let mut staged = map.clone();
     let keyframe_id = staged.add_keyframe_from_detections(
@@ -3163,13 +3266,10 @@ fn insert_keyframe_into_map(
     }
 
     // Keep singleton points by default so active keyframes retain enough
-    // point associations for robust PnP. Enable stronger culling only via env.
-    let cull_min_observations = crate::env::env_usize("KIKO_MAP_CULL_MIN_OBSERVATIONS")
-        .unwrap_or(DEFAULT_CULL_MIN_OBSERVATIONS)
-        .max(DEFAULT_CULL_MIN_OBSERVATIONS);
-    if cull_min_observations > 1 && staged.num_points() > 0 {
+    // point associations for robust PnP.
+    if cull_min_observations.get() > 1 && staged.num_points() > 0 {
         let points_before = staged.num_points();
-        let culled_points = staged.cull_points(cull_min_observations);
+        let culled_points = staged.cull_points(cull_min_observations.get());
         debug_assert!(
             culled_points <= points_before,
             "culled more points than existed"
@@ -3646,6 +3746,67 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
 
+    #[test]
+    fn tracker_environment_defaults_only_absent_values() {
+        assert_eq!(
+            TrackerEnvironment::from_parsed(
+                DEFAULT_MAX_RESPAWNS,
+                DEFAULT_MAX_RESPAWNS,
+                None,
+                None,
+            )
+            .expect("default tracker environment"),
+            TrackerEnvironment {
+                backend_max_respawns: DEFAULT_MAX_RESPAWNS,
+                descriptor_max_respawns: DEFAULT_MAX_RESPAWNS,
+                cull_min_observations: DEFAULT_CULL_MIN_OBSERVATIONS,
+                trace_transitions: false,
+            }
+        );
+    }
+
+    #[test]
+    fn tracker_environment_preserves_typed_values() {
+        assert_eq!(
+            TrackerEnvironment::from_parsed(u32::MAX, 0, Some(7), Some(true))
+                .expect("explicit tracker environment"),
+            TrackerEnvironment {
+                backend_max_respawns: u32::MAX,
+                descriptor_max_respawns: 0,
+                cull_min_observations: NonZeroUsize::new(7).expect("non-zero threshold"),
+                trace_transitions: true,
+            }
+        );
+    }
+
+    #[test]
+    fn disabled_setting_does_not_invoke_its_parser() {
+        let value = load_when_enabled(
+            false,
+            DEFAULT_MAX_RESPAWNS,
+            || -> Result<Option<u32>, std::convert::Infallible> {
+                panic!("disabled setting parser must not run")
+            },
+        )
+        .expect("disabled setting uses its typed default");
+        assert_eq!(value, DEFAULT_MAX_RESPAWNS);
+    }
+
+    #[test]
+    fn tracker_environment_rejects_zero_cull_threshold() {
+        assert!(matches!(
+            TrackerEnvironment::from_parsed(
+                DEFAULT_MAX_RESPAWNS,
+                DEFAULT_MAX_RESPAWNS,
+                Some(0),
+                None
+            ),
+            Err(TrackerInitError::ZeroMapCullMinObservations {
+                variable: MAP_CULL_MIN_OBSERVATIONS_ENV
+            })
+        ));
+    }
+
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
     }
@@ -3851,6 +4012,7 @@ mod tests {
             Timestamp::from_nanos(42),
             crate::WorldToCamera::identity(),
             None,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
         )
         .expect("insert keyframe");
         assert_map_invariants(&map).expect("post-insertion invariants");
@@ -3913,6 +4075,7 @@ mod tests {
             Timestamp::from_nanos(20),
             crate::WorldToCamera::identity(),
             Some(&invalid_shared),
+            DEFAULT_CULL_MIN_OBSERVATIONS,
         )
         .expect_err("invalid shared keyframe must fail insertion");
 
@@ -4187,6 +4350,31 @@ mod tests {
                 panic!("unexpected worker panic");
             }
         }
+    }
+
+    #[test]
+    fn backend_supervisor_propagates_initial_spawn_failure() {
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
+        let error = BackendSupervisor::spawn_initial_with(
+            BackendConfig::new(1).expect("backend config"),
+            intrinsics,
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+                .expect("ba config"),
+            3,
+            |_, _, _| -> Result<BackendWorker, std::io::Error> {
+                Err(std::io::Error::other("forced initial spawn failure"))
+            },
+        )
+        .expect_err("initial spawn failure must abort tracker initialization");
+
+        assert!(matches!(error, TrackerInitError::BackendWorkerSpawn(_)));
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some()
+        );
     }
 
     #[test]

@@ -2,7 +2,8 @@ use std::num::NonZeroUsize;
 
 use crate::{
     CameraPoint3, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Pose, Raw,
-    Timestamp, VizPacket, WorldToCamera, env::env_f32,
+    Timestamp, VizPacket, WorldToCamera,
+    env::{EnvError, env_f32},
 };
 
 use std::collections::HashMap;
@@ -45,6 +46,43 @@ impl std::fmt::Display for VizDecimationError {
 }
 
 impl std::error::Error for VizDecimationError {}
+
+#[derive(Debug)]
+pub enum VizConfigError {
+    Environment(EnvError),
+    InvalidTrackMaxDistance { value: f32 },
+    InvalidTrackMinSimilarity { value: f32 },
+}
+
+impl std::fmt::Display for VizConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Environment(err) => write!(f, "invalid visualization environment: {err}"),
+            Self::InvalidTrackMaxDistance { value } => write!(
+                f,
+                "KIKO_TRACK_MAX_DIST must be finite and nonnegative, got {value}"
+            ),
+            Self::InvalidTrackMinSimilarity { value } => {
+                write!(f, "KIKO_TRACK_MIN_SIM must be in [-1, 1], got {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VizConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Environment(err) => Some(err),
+            Self::InvalidTrackMaxDistance { .. } | Self::InvalidTrackMinSimilarity { .. } => None,
+        }
+    }
+}
+
+impl From<EnvError> for VizConfigError {
+    fn from(err: EnvError) -> Self {
+        Self::Environment(err)
+    }
+}
 
 impl TryFrom<usize> for VizDecimation {
     type Error = VizDecimationError;
@@ -95,16 +133,20 @@ pub struct RerunSink {
 }
 
 impl RerunSink {
-    pub fn new(rec: rerun::RecordingStream, decimation: VizDecimation) -> Self {
-        Self {
+    pub fn new(
+        rec: rerun::RecordingStream,
+        decimation: VizDecimation,
+    ) -> Result<Self, VizConfigError> {
+        let track_config = TrackConfig::load()?;
+        Ok(Self {
             rec,
             decimation,
             frame_index: 0,
             depth_index: 0,
-            tracks: TrackState::new(),
+            tracks: TrackState::new(track_config),
             trajectory: Vec::new(),
             logged_world: false,
-        }
+        })
     }
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {
@@ -177,7 +219,7 @@ impl RerunSink {
 
         let left = packet.left();
         let right = packet.right();
-        let track_ids = self.tracks.assign_tracks(packet.matches().source_a());
+        let track_ids = self.tracks.assign_tracks(packet.matches().source_a_arc());
 
         self.set_time(left.timestamp());
 
@@ -310,40 +352,70 @@ fn pose_position(pose: Pose) -> [f32; 3] {
 
 #[derive(Debug, Clone, Copy)]
 struct TrackConfig {
-    max_distance_px: f32,
-    min_similarity: f32,
+    max_distance_sq: f64,
+    min_similarity: f64,
 }
 
 impl TrackConfig {
-    fn load() -> Self {
-        let max_distance_px = env_f32("KIKO_TRACK_MAX_DIST").unwrap_or(24.0);
-        let min_similarity = env_f32("KIKO_TRACK_MIN_SIM").unwrap_or(0.8);
-        Self {
-            max_distance_px,
-            min_similarity,
+    const DEFAULT_MAX_DISTANCE_PX: f32 = 24.0;
+    const DEFAULT_MIN_SIMILARITY: f32 = 0.8;
+
+    fn load() -> Result<Self, VizConfigError> {
+        Self::from_parsed(
+            env_f32("KIKO_TRACK_MAX_DIST")?,
+            env_f32("KIKO_TRACK_MIN_SIM")?,
+        )
+    }
+
+    fn from_parsed(
+        max_distance_px: Option<f32>,
+        min_similarity: Option<f32>,
+    ) -> Result<Self, VizConfigError> {
+        Self::try_new(
+            max_distance_px.unwrap_or(Self::DEFAULT_MAX_DISTANCE_PX),
+            min_similarity.unwrap_or(Self::DEFAULT_MIN_SIMILARITY),
+        )
+    }
+
+    fn try_new(max_distance_px: f32, min_similarity: f32) -> Result<Self, VizConfigError> {
+        if !max_distance_px.is_finite() || max_distance_px < 0.0 {
+            return Err(VizConfigError::InvalidTrackMaxDistance {
+                value: max_distance_px,
+            });
         }
+        if !min_similarity.is_finite() || !(-1.0..=1.0).contains(&min_similarity) {
+            return Err(VizConfigError::InvalidTrackMinSimilarity {
+                value: min_similarity,
+            });
+        }
+
+        let max_distance_px = f64::from(max_distance_px);
+        Ok(Self {
+            max_distance_sq: max_distance_px * max_distance_px,
+            min_similarity: f64::from(min_similarity),
+        })
     }
 }
 
 #[derive(Debug)]
 struct TrackState {
     config: TrackConfig,
-    prev_left: Option<Detections>,
+    prev_left: Option<std::sync::Arc<Detections>>,
     prev_track_ids: Vec<u64>,
     next_track_id: u64,
 }
 
 impl TrackState {
-    fn new() -> Self {
+    fn new(config: TrackConfig) -> Self {
         Self {
-            config: TrackConfig::load(),
+            config,
             prev_left: None,
             prev_track_ids: Vec::new(),
             next_track_id: 0,
         }
     }
 
-    fn assign_tracks(&mut self, left: &Detections) -> Vec<u64> {
+    fn assign_tracks(&mut self, left: std::sync::Arc<Detections>) -> Vec<u64> {
         let count = left.len();
         let mut track_ids = vec![0u64; count];
 
@@ -356,29 +428,33 @@ impl TrackState {
 
         if let Some(prev) = prev_left {
             let mut used_prev = vec![false; prev.len()];
-            let max_dist_sq = self.config.max_distance_px * self.config.max_distance_px;
 
             for (i, desc) in left.descriptors().iter().enumerate() {
                 let kp = left.keypoints()[i];
-                let mut best_idx = None;
-                let mut best_sim = self.config.min_similarity;
+                let mut best: Option<(usize, f64)> = None;
 
                 for (j, prev_desc) in prev.descriptors().iter().enumerate() {
                     if used_prev[j] {
                         continue;
                     }
                     let prev_kp = prev.keypoints()[j];
-                    if distance_sq(kp, prev_kp) > max_dist_sq {
+                    if distance_sq(kp, prev_kp) > self.config.max_distance_sq {
                         continue;
                     }
-                    let sim = dot(desc.0.as_slice(), prev_desc.0.as_slice());
-                    if sim > best_sim {
-                        best_sim = sim;
-                        best_idx = Some(j);
+                    let Some(similarity) =
+                        cosine_similarity(desc.0.as_slice(), prev_desc.0.as_slice())
+                    else {
+                        continue;
+                    };
+                    if similarity < self.config.min_similarity {
+                        continue;
+                    }
+                    if best.is_none_or(|(_, best_similarity)| similarity > best_similarity) {
+                        best = Some((j, similarity));
                     }
                 }
 
-                if let Some(j) = best_idx {
+                if let Some((j, _)) = best {
                     track_ids[i] = prev_ids[j];
                     used_prev[j] = true;
                 } else {
@@ -393,7 +469,7 @@ impl TrackState {
             }
         }
 
-        self.prev_left = Some(left.clone());
+        self.prev_left = Some(left);
         self.prev_track_ids = track_ids.clone();
 
         track_ids
@@ -493,13 +569,27 @@ fn log_matches(
     Ok(())
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let (dot, norm_a_sq, norm_b_sq) = a.iter().zip(b).fold(
+        (0.0_f64, 0.0_f64, 0.0_f64),
+        |(dot, norm_a_sq, norm_b_sq), (&a, &b)| {
+            let a = f64::from(a);
+            let b = f64::from(b);
+            (dot + a * b, norm_a_sq + a * a, norm_b_sq + b * b)
+        },
+    );
+    if norm_a_sq == 0.0 || norm_b_sq == 0.0 {
+        return None;
+    }
+    Some((dot / (norm_a_sq.sqrt() * norm_b_sq.sqrt())).clamp(-1.0, 1.0))
 }
 
-fn distance_sq(a: Keypoint, b: Keypoint) -> f32 {
-    let dx = a.x - b.x;
-    let dy = a.y - b.y;
+fn distance_sq(a: Keypoint, b: Keypoint) -> f64 {
+    let dx = f64::from(a.x) - f64::from(b.x);
+    let dy = f64::from(a.y) - f64::from(b.y);
     dx * dx + dy * dy
 }
 
@@ -540,4 +630,146 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
     }
 
     (out, out_width, out_height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Descriptor, FrameId, SensorId};
+
+    #[test]
+    fn track_config_rejects_negative_max_distance() {
+        let error = TrackConfig::try_new(-0.25, 0.8).expect_err("negative distance");
+        assert!(matches!(
+            error,
+            VizConfigError::InvalidTrackMaxDistance { value } if value == -0.25
+        ));
+    }
+
+    #[test]
+    fn track_config_rejects_nonfinite_max_distance() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                TrackConfig::try_new(value, 0.8),
+                Err(VizConfigError::InvalidTrackMaxDistance { value: actual })
+                    if actual.to_bits() == value.to_bits()
+            ));
+        }
+    }
+
+    #[test]
+    fn track_config_rejects_similarity_outside_cosine_range() {
+        for value in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1.000_001,
+            1.000_001,
+        ] {
+            assert!(matches!(
+                TrackConfig::try_new(24.0, value),
+                Err(VizConfigError::InvalidTrackMinSimilarity { value: actual })
+                    if actual.to_bits() == value.to_bits()
+            ));
+        }
+    }
+
+    #[test]
+    fn track_config_accepts_zero_max_distance() {
+        let config = TrackConfig::try_new(0.0, 0.8).expect("zero distance is exact matching");
+        assert_eq!(config.max_distance_sq, 0.0);
+    }
+
+    #[test]
+    fn large_finite_distance_is_squared_without_f32_overflow() {
+        let config = TrackConfig::try_new(f32::MAX, 0.8).expect("finite distance");
+        let max_distance = f64::from(f32::MAX);
+        assert_eq!(config.max_distance_sq, max_distance * max_distance);
+        assert!(config.max_distance_sq.is_finite());
+
+        let separated = distance_sq(
+            Keypoint {
+                x: f32::MAX,
+                y: f32::MAX,
+            },
+            Keypoint {
+                x: -f32::MAX,
+                y: -f32::MAX,
+            },
+        );
+        assert!(separated.is_finite());
+        assert!(separated > config.max_distance_sq);
+    }
+
+    #[test]
+    fn track_config_uses_defaults_only_for_absent_values() {
+        let config = TrackConfig::from_parsed(None, None).expect("default track configuration");
+        assert_eq!(
+            config.max_distance_sq,
+            f64::from(TrackConfig::DEFAULT_MAX_DISTANCE_PX).powi(2)
+        );
+        assert_eq!(
+            config.min_similarity,
+            f64::from(TrackConfig::DEFAULT_MIN_SIMILARITY)
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_is_stable_for_extreme_finite_descriptors() {
+        let positive = [f32::MAX; crate::DESCRIPTOR_DIM];
+        let negative = [-f32::MAX; crate::DESCRIPTOR_DIM];
+        let zero = [0.0; crate::DESCRIPTOR_DIM];
+
+        assert_eq!(cosine_similarity(&positive, &positive), Some(1.0));
+        assert_eq!(cosine_similarity(&positive, &negative), Some(-1.0));
+        assert_eq!(cosine_similarity(&positive, &zero), None);
+    }
+
+    #[test]
+    fn minimum_similarity_threshold_is_inclusive() {
+        fn detections(frame_id: u64) -> Detections {
+            let mut descriptor = [0.0; crate::DESCRIPTOR_DIM];
+            descriptor[0] = 1.0;
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(frame_id),
+                8,
+                8,
+                vec![Keypoint { x: 1.0, y: 1.0 }],
+                vec![1.0],
+                vec![Descriptor(descriptor)],
+            )
+            .expect("valid test detection")
+        }
+
+        let mut tracks = TrackState::new(
+            TrackConfig::try_new(0.0, 1.0).expect("exact-match track configuration"),
+        );
+        assert_eq!(
+            tracks.assign_tracks(std::sync::Arc::new(detections(1))),
+            vec![0]
+        );
+        assert_eq!(
+            tracks.assign_tracks(std::sync::Arc::new(detections(2))),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn environment_error_is_preserved_as_typed_source() {
+        let source = EnvError::InvalidF32 {
+            key: "KIKO_TRACK_MAX_DIST".to_owned(),
+            value: "twenty-four".to_owned(),
+            source: "twenty-four"
+                .parse::<f32>()
+                .expect_err("invalid test float"),
+        };
+        let error = VizConfigError::from(source);
+        assert!(matches!(error, VizConfigError::Environment(_)));
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<EnvError>())
+                .is_some()
+        );
+    }
 }
