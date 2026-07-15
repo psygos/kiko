@@ -112,10 +112,23 @@ pub enum RelocalizationConfigError {
     ZeroMinInliers,
     ZeroMaxCandidates,
     ZeroMinConfirmations,
-    TooFewMinInliers { value: usize, min: usize },
-    DescriptorMatchThresholdOutOfRange { value: f32 },
-    NonPositiveMaxTranslationDelta { value: f32 },
-    InvalidMaxRotationDeltaDeg { value: f32 },
+    TooFewMaxAttempts {
+        max_attempts: usize,
+        min_confirmations: usize,
+    },
+    TooFewMinInliers {
+        value: usize,
+        min: usize,
+    },
+    DescriptorMatchThresholdOutOfRange {
+        value: f32,
+    },
+    NonPositiveMaxTranslationDelta {
+        value: f32,
+    },
+    InvalidMaxRotationDeltaDeg {
+        value: f32,
+    },
 }
 
 impl std::fmt::Display for RelocalizationConfigError {
@@ -133,6 +146,13 @@ impl std::fmt::Display for RelocalizationConfigError {
             RelocalizationConfigError::ZeroMinConfirmations => {
                 write!(f, "relocalization min confirmations must be > 0")
             }
+            RelocalizationConfigError::TooFewMaxAttempts {
+                max_attempts,
+                min_confirmations,
+            } => write!(
+                f,
+                "relocalization max attempts must be >= min confirmations ({min_confirmations}), got {max_attempts}"
+            ),
             RelocalizationConfigError::TooFewMinInliers { value, min } => {
                 write!(
                     f,
@@ -176,6 +196,12 @@ impl RelocalizationConfig {
             .ok_or(RelocalizationConfigError::ZeroMaxCandidates)?;
         let min_confirmations = NonZeroUsize::new(min_confirmations)
             .ok_or(RelocalizationConfigError::ZeroMinConfirmations)?;
+        if max_attempts < min_confirmations {
+            return Err(RelocalizationConfigError::TooFewMaxAttempts {
+                max_attempts: max_attempts.get(),
+                min_confirmations: min_confirmations.get(),
+            });
+        }
         if min_inliers.get() < MIN_PNP_POINTS {
             return Err(RelocalizationConfigError::TooFewMinInliers {
                 value: min_inliers.get(),
@@ -2111,6 +2137,19 @@ mod tests {
         })
         .expect_err("zero attempts");
         assert!(matches!(err, RelocalizationConfigError::ZeroMaxAttempts));
+        let err = RelocalizationConfig::new(RelocalizationConfigInput {
+            max_attempts: 1,
+            min_confirmations: 2,
+            ..RelocalizationConfigInput::default()
+        })
+        .expect_err("confirmation requirement exceeds attempt budget");
+        assert!(matches!(
+            err,
+            RelocalizationConfigError::TooFewMaxAttempts {
+                max_attempts: 1,
+                min_confirmations: 2,
+            }
+        ));
         let err = RelocalizationConfig::new(RelocalizationConfigInput {
             max_attempts: 10,
             min_inliers: 3,

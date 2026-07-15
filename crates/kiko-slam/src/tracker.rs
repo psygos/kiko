@@ -2260,14 +2260,32 @@ enum RelocalizationPhase {
 struct RelocalizationSession {
     attempts: usize,
     phase: RelocalizationPhase,
-    last_detections: Arc<Detections>,
     reference_cam_from_odom: Option<Pose64>,
+}
+
+#[derive(Debug)]
+struct RelocalizationAttempt {
+    session: RelocalizationSession,
+    is_final: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RelocalizationEvidence {
+    NoCandidate,
+    Verified {
+        candidate: KeyframeId,
+        pose_world: Pose,
+    },
 }
 
 #[derive(Debug)]
 enum RelocalizationStep {
     Continue(RelocalizationSession),
-    Recovered { pose_world: Pose },
+    Recovered {
+        candidate: KeyframeId,
+        pose_world: Pose,
+    },
+    Exhausted,
 }
 
 #[derive(Debug)]
@@ -4075,11 +4093,7 @@ impl SlamTracker {
         health
     }
 
-    fn maybe_enter_relocalization(
-        &mut self,
-        tracking_health: TrackingHealth,
-        detections: Arc<Detections>,
-    ) {
+    fn maybe_enter_relocalization(&mut self, tracking_health: TrackingHealth) {
         if tracking_health != TrackingHealth::Lost {
             return;
         }
@@ -4090,7 +4104,6 @@ impl SlamTracker {
         if let Some(session) = Self::initial_relocalization_session(
             tracking_health,
             self.config.relocalization_config().is_some(),
-            detections,
             reference_cam_from_odom,
         ) {
             #[cfg(feature = "vio")]
@@ -4116,7 +4129,6 @@ impl SlamTracker {
     fn initial_relocalization_session(
         tracking_health: TrackingHealth,
         relocalization_enabled: bool,
-        detections: Arc<Detections>,
         reference_cam_from_odom: Option<Pose64>,
     ) -> Option<RelocalizationSession> {
         if tracking_health != TrackingHealth::Lost || !relocalization_enabled {
@@ -4125,7 +4137,6 @@ impl SlamTracker {
         Some(RelocalizationSession {
             attempts: 0,
             phase: RelocalizationPhase::Searching,
-            last_detections: detections,
             reference_cam_from_odom,
         })
     }
@@ -4153,44 +4164,27 @@ impl SlamTracker {
         )
     }
 
-    fn fail_relocalization(
-        &mut self,
-        frame_id: FrameId,
+    fn begin_relocalization_attempt(
+        mut session: RelocalizationSession,
         cfg: RelocalizationConfig,
-        session: RelocalizationSession,
-        current: Arc<Detections>,
-    ) -> Result<TrackerOutput, TrackerError> {
-        let next_attempts = session.attempts.saturating_add(1);
-        if self.trace_transitions {
-            eprintln!(
-                "relocalization failure frame={} attempt={}/{}",
-                frame_id.as_u64(),
-                next_attempts,
-                cfg.max_attempts()
-            );
+    ) -> Option<RelocalizationAttempt> {
+        if session.attempts >= cfg.max_attempts() {
+            return None;
         }
-        let next_state = Self::next_state_after_relocalization_failure(cfg, session, current);
-        if matches!(next_state, TrackerState::NeedKeyframe) {
-            #[cfg(feature = "vio")]
-            self.reset_inertial_runtime_continuity();
-        }
-        self.state = next_state;
-        self.relocalization_output(frame_id, TrackingHealth::Lost)
+        session.attempts += 1;
+        Some(RelocalizationAttempt {
+            is_final: session.attempts == cfg.max_attempts(),
+            session,
+        })
     }
 
-    fn next_state_after_relocalization_failure(
-        cfg: RelocalizationConfig,
-        mut session: RelocalizationSession,
-        current: Arc<Detections>,
-    ) -> TrackerState {
-        session.attempts = session.attempts.saturating_add(1);
-        session.phase = RelocalizationPhase::Searching;
-        session.last_detections = current;
-        if session.attempts >= cfg.max_attempts() {
-            TrackerState::NeedKeyframe
-        } else {
-            TrackerState::Relocalizing(session)
+    fn relocalization_fallback_state(attempt: &RelocalizationAttempt) -> TrackerState {
+        if attempt.is_final {
+            return TrackerState::NeedKeyframe;
         }
+        let mut session = attempt.session.clone();
+        session.phase = RelocalizationPhase::Searching;
+        TrackerState::Relocalizing(session)
     }
 
     fn relocalization_candidate(
@@ -4263,57 +4257,67 @@ impl SlamTracker {
     }
 
     fn relocalization_step(
-        session: RelocalizationSession,
-        candidate_id: KeyframeId,
-        pose_world: Pose,
+        attempt: RelocalizationAttempt,
+        evidence: RelocalizationEvidence,
         cfg: RelocalizationConfig,
     ) -> Result<RelocalizationStep, crate::Se3TangentError> {
-        let required_confirmations = cfg.min_confirmations();
-        if let RelocalizationPhase::Confirming {
-            candidate,
-            confirmations,
-            pose_world: previous_pose,
-        } = session.phase
-        {
-            if candidate == candidate_id
-                && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg)?
-            {
-                let next_confirmations = confirmations.saturating_add(1);
-                if next_confirmations.get() >= required_confirmations {
-                    return Ok(RelocalizationStep::Recovered { pose_world });
-                }
-                return Ok(RelocalizationStep::Continue(RelocalizationSession {
-                    attempts: session.attempts,
-                    phase: RelocalizationPhase::Confirming {
+        let RelocalizationAttempt {
+            mut session,
+            is_final,
+        } = attempt;
+        let next_phase = match evidence {
+            RelocalizationEvidence::NoCandidate => RelocalizationPhase::Searching,
+            RelocalizationEvidence::Verified {
+                candidate: candidate_id,
+                pose_world,
+            } => {
+                let required_confirmations = cfg.min_confirmations();
+                if let RelocalizationPhase::Confirming {
+                    candidate,
+                    confirmations,
+                    pose_world: previous_pose,
+                } = session.phase
+                    && candidate == candidate_id
+                    && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg)?
+                {
+                    let next_confirmations = confirmations.saturating_add(1);
+                    if next_confirmations.get() >= required_confirmations {
+                        return Ok(RelocalizationStep::Recovered {
+                            candidate,
+                            pose_world,
+                        });
+                    }
+                    RelocalizationPhase::Confirming {
                         candidate,
                         confirmations: next_confirmations,
                         pose_world,
-                    },
-                    last_detections: session.last_detections,
-                    reference_cam_from_odom: session.reference_cam_from_odom,
-                }));
+                    }
+                } else if required_confirmations <= 1 {
+                    return Ok(RelocalizationStep::Recovered {
+                        candidate: candidate_id,
+                        pose_world,
+                    });
+                } else {
+                    RelocalizationPhase::Confirming {
+                        candidate: candidate_id,
+                        confirmations: NonZeroUsize::MIN,
+                        pose_world,
+                    }
+                }
             }
-        }
-        if required_confirmations <= 1 {
-            Ok(RelocalizationStep::Recovered { pose_world })
+        };
+        if is_final {
+            Ok(RelocalizationStep::Exhausted)
         } else {
-            Ok(RelocalizationStep::Continue(RelocalizationSession {
-                attempts: session.attempts,
-                phase: RelocalizationPhase::Confirming {
-                    candidate: candidate_id,
-                    confirmations: NonZeroUsize::MIN,
-                    pose_world,
-                },
-                last_detections: session.last_detections,
-                reference_cam_from_odom: session.reference_cam_from_odom,
-            }))
+            session.phase = next_phase;
+            Ok(RelocalizationStep::Continue(session))
         }
     }
 
     fn relocalize(
         &mut self,
         pair: StereoPair,
-        mut session: RelocalizationSession,
+        session: RelocalizationSession,
     ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
@@ -4323,40 +4327,60 @@ impl SlamTracker {
             self.state = TrackerState::NeedKeyframe;
             return self.relocalization_output(frame_id, TrackingHealth::Lost);
         };
+        let Some(attempt) = Self::begin_relocalization_attempt(session, cfg) else {
+            #[cfg(feature = "vio")]
+            self.reset_inertial_runtime_continuity();
+            self.state = TrackerState::NeedKeyframe;
+            return self.relocalization_output(frame_id, TrackingHealth::Lost);
+        };
+        let attempt_number = attempt.session.attempts;
+        #[cfg(feature = "vio")]
+        let reference_cam_from_odom = attempt.session.reference_cam_from_odom;
+        // Establish the post-failure state before any fallible inference or search operation so
+        // every entered attempt consumes exactly one slot, even when an error is propagated.
+        self.state = Self::relocalization_fallback_state(&attempt);
 
         let current =
             self.frontend
                 .detect(&left, self.config.downscale, self.config.max_keypoints())?;
 
-        if current.is_empty() {
-            return self.fail_relocalization(frame_id, cfg, session, Arc::clone(&current));
-        }
-
-        if self.place_recognition.is_none() {
-            #[cfg(feature = "vio")]
-            self.reset_inertial_runtime_continuity();
-            self.state = TrackerState::NeedKeyframe;
-            return self.relocalization_output(frame_id, TrackingHealth::Lost);
-        }
-
-        let Some(verified) = self.relocalization_candidate(current.as_ref(), cfg)? else {
-            return self.fail_relocalization(frame_id, cfg, session, current);
+        let evidence = if current.is_empty() {
+            RelocalizationEvidence::NoCandidate
+        } else {
+            if self.place_recognition.is_none() {
+                #[cfg(feature = "vio")]
+                self.reset_inertial_runtime_continuity();
+                self.state = TrackerState::NeedKeyframe;
+                return self.relocalization_output(frame_id, TrackingHealth::Lost);
+            }
+            match self.relocalization_candidate(current.as_ref(), cfg)? {
+                Some(verified) => {
+                    let candidate = verified.match_kf();
+                    if self.trace_transitions {
+                        eprintln!(
+                            "relocalization candidate frame={} candidate={candidate:?} inliers={}",
+                            frame_id.as_u64(),
+                            verified.inlier_count()
+                        );
+                    }
+                    RelocalizationEvidence::Verified {
+                        candidate,
+                        pose_world: verified.pose_world(),
+                    }
+                }
+                None => RelocalizationEvidence::NoCandidate,
+            }
         };
-        let candidate_id = verified.match_kf();
-        let pose_world = verified.pose_world();
-        if self.trace_transitions {
-            eprintln!(
-                "relocalization candidate frame={} candidate={candidate_id:?} inliers={}",
-                frame_id.as_u64(),
-                verified.inlier_count()
-            );
-        }
+        let pending_health = match evidence {
+            RelocalizationEvidence::NoCandidate => TrackingHealth::Lost,
+            RelocalizationEvidence::Verified { .. } => TrackingHealth::Degraded,
+        };
 
-        session.last_detections = current;
-        #[cfg(feature = "vio")]
-        let reference_cam_from_odom = session.reference_cam_from_odom;
-        match Self::relocalization_step(session, candidate_id, pose_world, cfg)? {
-            RelocalizationStep::Recovered { pose_world } => {
+        match Self::relocalization_step(attempt, evidence, cfg)? {
+            RelocalizationStep::Recovered {
+                candidate,
+                pose_world,
+            } => {
                 #[cfg(feature = "vio")]
                 {
                     if let Some(reference_cam_from_odom) =
@@ -4370,7 +4394,7 @@ impl SlamTracker {
                     self.reset_inertial_runtime_continuity();
                 }
                 self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
-                    keyframe_id: candidate_id,
+                    keyframe_id: candidate,
                 });
                 if let Some(place_recognition) = self.place_recognition.as_mut() {
                     place_recognition.clear_pending();
@@ -4378,7 +4402,7 @@ impl SlamTracker {
                 self.state = TrackerState::NeedKeyframe;
                 if self.trace_transitions {
                     eprintln!(
-                        "relocalization recovered frame={} candidate={candidate_id:?}; creating bootstrap keyframe from recovered pose",
+                        "relocalization recovered frame={} candidate={candidate:?}; creating bootstrap keyframe from recovered pose",
                         frame_id.as_u64()
                     );
                 }
@@ -4387,14 +4411,38 @@ impl SlamTracker {
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
                 if self.trace_transitions {
-                    eprintln!(
-                        "relocalization confirmation pending frame={}",
-                        frame_id.as_u64()
-                    );
+                    match evidence {
+                        RelocalizationEvidence::NoCandidate => eprintln!(
+                            "relocalization failure frame={} attempt={}/{}",
+                            frame_id.as_u64(),
+                            attempt_number,
+                            cfg.max_attempts()
+                        ),
+                        RelocalizationEvidence::Verified { .. } => eprintln!(
+                            "relocalization confirmation pending frame={} attempt={}/{}",
+                            frame_id.as_u64(),
+                            attempt_number,
+                            cfg.max_attempts()
+                        ),
+                    }
                 }
             }
+            RelocalizationStep::Exhausted => {
+                #[cfg(feature = "vio")]
+                self.reset_inertial_runtime_continuity();
+                self.state = TrackerState::NeedKeyframe;
+                if self.trace_transitions {
+                    eprintln!(
+                        "relocalization exhausted frame={} attempt={}/{}",
+                        frame_id.as_u64(),
+                        cfg.max_attempts(),
+                        cfg.max_attempts()
+                    );
+                }
+                return self.relocalization_output(frame_id, TrackingHealth::Lost);
+            }
         }
-        self.relocalization_output(frame_id, TrackingHealth::Degraded)
+        self.relocalization_output(frame_id, pending_health)
     }
 
     fn build_tracking_attempt(
@@ -4698,7 +4746,7 @@ impl SlamTracker {
                 );
             }
             let tracking_health = self.tracking_failure_health();
-            self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
+            self.maybe_enter_relocalization(tracking_health);
             let mut diagnostics = self.empty_diagnostics();
             diagnostics.features_detected = Some(current.len());
             diagnostics.features_matched = Some(0);
@@ -4769,7 +4817,7 @@ impl SlamTracker {
                                 );
                             }
                             let tracking_health = self.tracking_failure_health();
-                            self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
+                            self.maybe_enter_relocalization(tracking_health);
                             let mut diagnostics = self.empty_diagnostics();
                             diagnostics.features_detected = Some(current.len());
                             diagnostics.features_matched = Some(matches);
@@ -4800,7 +4848,7 @@ impl SlamTracker {
                             }
                             self.emit_event(DiagnosticEvent::TrackingPnpRejected { reason });
                             let tracking_health = self.tracking_failure_health();
-                            self.maybe_enter_relocalization(tracking_health, Arc::clone(&current));
+                            self.maybe_enter_relocalization(tracking_health);
                             let mut diagnostics = self.empty_diagnostics();
                             diagnostics.features_detected = Some(current.len());
                             diagnostics.features_matched = Some(matches);
@@ -8651,33 +8699,16 @@ mod tests {
 
     #[test]
     fn relocalization_initial_session_requires_lost_tracking_and_enabled_config() {
-        let detections = make_test_detections(900);
         assert!(
-            SlamTracker::initial_relocalization_session(
-                TrackingHealth::Good,
-                true,
-                Arc::clone(&detections),
-                None,
-            )
-            .is_none()
+            SlamTracker::initial_relocalization_session(TrackingHealth::Good, true, None).is_none()
         );
         assert!(
-            SlamTracker::initial_relocalization_session(
-                TrackingHealth::Lost,
-                false,
-                Arc::clone(&detections),
-                None,
-            )
-            .is_none()
+            SlamTracker::initial_relocalization_session(TrackingHealth::Lost, false, None)
+                .is_none()
         );
 
-        let session = SlamTracker::initial_relocalization_session(
-            TrackingHealth::Lost,
-            true,
-            Arc::clone(&detections),
-            None,
-        )
-        .expect("lost tracking should create relocalization session");
+        let session = SlamTracker::initial_relocalization_session(TrackingHealth::Lost, true, None)
+            .expect("lost tracking should create relocalization session");
         assert_eq!(session.attempts, 0);
         assert!(matches!(session.phase, RelocalizationPhase::Searching));
     }
@@ -8685,42 +8716,37 @@ mod tests {
     #[cfg(feature = "vio")]
     #[test]
     fn relocalization_initial_session_preserves_reference_cam_from_odom() {
-        let detections = make_test_detections(9001);
         let reference = Some(Pose64::from_pose32(Pose::from_rt(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [0.3, -0.2, 1.4],
         )));
 
-        let session = SlamTracker::initial_relocalization_session(
-            TrackingHealth::Lost,
-            true,
-            detections,
-            reference,
-        )
-        .expect("session");
+        let session =
+            SlamTracker::initial_relocalization_session(TrackingHealth::Lost, true, reference)
+                .expect("session");
 
         assert_eq!(session.reference_cam_from_odom, reference);
     }
 
     #[test]
-    fn relocalization_failure_transitions_respect_max_attempts() {
+    fn relocalization_attempts_advance_before_work_and_bound_fallbacks() {
         let cfg = RelocalizationConfig::new(crate::loop_closure::RelocalizationConfigInput {
             max_attempts: 2,
             ..crate::loop_closure::RelocalizationConfigInput::default()
         })
         .expect("relocalization config");
-        let detections = make_test_detections(901);
-
-        let keep_trying = SlamTracker::next_state_after_relocalization_failure(
-            cfg,
+        let first = SlamTracker::begin_relocalization_attempt(
             RelocalizationSession {
                 attempts: 0,
                 phase: RelocalizationPhase::Searching,
-                last_detections: Arc::clone(&detections),
                 reference_cam_from_odom: None,
             },
-            Arc::clone(&detections),
-        );
+            cfg,
+        )
+        .expect("first attempt");
+        assert_eq!(first.session.attempts, 1);
+        assert!(!first.is_final);
+        let keep_trying = SlamTracker::relocalization_fallback_state(&first);
         assert!(matches!(keep_trying, TrackerState::Relocalizing(_)));
         let TrackerState::Relocalizing(updated) = keep_trying else {
             panic!("expected relocalizing state")
@@ -8728,16 +8754,17 @@ mod tests {
         assert_eq!(updated.attempts, 1);
         assert!(matches!(updated.phase, RelocalizationPhase::Searching));
 
-        let give_up = SlamTracker::next_state_after_relocalization_failure(
-            cfg,
+        let final_attempt = SlamTracker::begin_relocalization_attempt(
             RelocalizationSession {
                 attempts: 1,
                 phase: RelocalizationPhase::Searching,
-                last_detections: Arc::clone(&detections),
                 reference_cam_from_odom: None,
             },
-            detections,
-        );
+            cfg,
+        )
+        .expect("final attempt");
+        assert!(final_attempt.is_final);
+        let give_up = SlamTracker::relocalization_fallback_state(&final_attempt);
         assert!(matches!(give_up, TrackerState::NeedKeyframe));
     }
 
@@ -8755,7 +8782,6 @@ mod tests {
         let session = RelocalizationSession {
             attempts: 0,
             phase: RelocalizationPhase::Searching,
-            last_detections: make_test_detections(9002),
             reference_cam_from_odom: Some(session_reference),
         };
 
@@ -8769,18 +8795,21 @@ mod tests {
     fn relocalization_step_requires_confirmation_before_recovery() {
         let cfg = RelocalizationConfig::default();
         let candidate = KeyframeId::default();
-        let detections = make_test_detections(902);
         let pose = Pose::identity();
 
         let step = SlamTracker::relocalization_step(
-            RelocalizationSession {
-                attempts: 0,
-                phase: RelocalizationPhase::Searching,
-                last_detections: detections,
-                reference_cam_from_odom: None,
+            RelocalizationAttempt {
+                session: RelocalizationSession {
+                    attempts: 1,
+                    phase: RelocalizationPhase::Searching,
+                    reference_cam_from_odom: None,
+                },
+                is_final: false,
             },
-            candidate,
-            pose,
+            RelocalizationEvidence::Verified {
+                candidate,
+                pose_world: pose,
+            },
             cfg,
         )
         .expect("finite relocalization tangent");
@@ -8803,27 +8832,49 @@ mod tests {
     fn relocalization_step_recovers_after_consistent_confirmation() {
         let cfg = RelocalizationConfig::default();
         let candidate = KeyframeId::default();
-        let detections = make_test_detections(903);
         let pose = Pose::identity();
 
         let step = SlamTracker::relocalization_step(
-            RelocalizationSession {
-                attempts: 2,
-                phase: RelocalizationPhase::Confirming {
-                    candidate,
-                    confirmations: NonZeroUsize::new(1).expect("non-zero"),
-                    pose_world: pose,
+            RelocalizationAttempt {
+                session: RelocalizationSession {
+                    attempts: cfg.max_attempts(),
+                    phase: RelocalizationPhase::Confirming {
+                        candidate,
+                        confirmations: NonZeroUsize::new(1).expect("non-zero"),
+                        pose_world: pose,
+                    },
+                    reference_cam_from_odom: None,
                 },
-                last_detections: detections,
-                reference_cam_from_odom: None,
+                is_final: true,
             },
-            candidate,
-            pose,
+            RelocalizationEvidence::Verified {
+                candidate,
+                pose_world: pose,
+            },
             cfg,
         )
         .expect("finite relocalization tangent");
 
         assert!(matches!(step, RelocalizationStep::Recovered { .. }));
+    }
+
+    #[test]
+    fn final_relocalization_attempt_without_confirmation_exhausts() {
+        let cfg = RelocalizationConfig::default();
+        let step = SlamTracker::relocalization_step(
+            RelocalizationAttempt {
+                session: RelocalizationSession {
+                    attempts: cfg.max_attempts(),
+                    phase: RelocalizationPhase::Searching,
+                    reference_cam_from_odom: None,
+                },
+                is_final: true,
+            },
+            RelocalizationEvidence::NoCandidate,
+            cfg,
+        )
+        .expect("no pose arithmetic is required");
+        assert!(matches!(step, RelocalizationStep::Exhausted));
     }
 
     #[test]
