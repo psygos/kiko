@@ -854,6 +854,11 @@ pub enum Matrix3InverseError {
         column: usize,
         value: f64,
     },
+    UnrepresentableOutput {
+        row: usize,
+        column: usize,
+        value: f64,
+    },
 }
 
 impl std::fmt::Display for Matrix3InverseError {
@@ -872,6 +877,10 @@ impl std::fmt::Display for Matrix3InverseError {
             Self::NonFiniteOutput { row, column, value } => write!(
                 f,
                 "3x3 inverse output [{row},{column}] is non-finite: {value}"
+            ),
+            Self::UnrepresentableOutput { row, column, value } => write!(
+                f,
+                "3x3 inverse output [{row},{column}] cannot be represented as finite f32: {value}"
             ),
         }
     }
@@ -3916,7 +3925,7 @@ impl LocalBundleAdjuster {
                     schur.b[2] - coupling[2],
                 ];
                 let delta_landmark = math::mat_mul_vec(schur.inv_c, rhs_landmark);
-                all_steps_converged &= norm3(delta_landmark) < LANDMARK_STEP_CONVERGENCE_M;
+                all_steps_converged &= norm3_is_below(delta_landmark, LANDMARK_STEP_CONVERGENCE_M);
                 for (axis, d) in delta_landmark.iter().enumerate() {
                     let d = *d as f64;
                     let gradient = schur.b[axis] as f64;
@@ -5113,20 +5122,43 @@ fn invert_3x3(m: [[f32; 3]; 3]) -> Result<[[f32; 3]; 3], Matrix3InverseError> {
             }
         }
     }
-    Ok([
-        [inv[0][0] as f32, inv[0][1] as f32, inv[0][2] as f32],
-        [inv[1][0] as f32, inv[1][1] as f32, inv[1][2] as f32],
-        [inv[2][0] as f32, inv[2][1] as f32, inv[2][2] as f32],
-    ])
+    let mut narrowed = [[0.0_f32; 3]; 3];
+    for (row, values) in inv.iter().enumerate() {
+        for (column, value) in values.iter().copied().enumerate() {
+            let candidate = value as f32;
+            if !candidate.is_finite() {
+                return Err(Matrix3InverseError::UnrepresentableOutput { row, column, value });
+            }
+            narrowed[row][column] = candidate;
+        }
+    }
+    Ok(narrowed)
 }
 
-fn norm3(v: [f32; 3]) -> f32 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+fn finite_norm<const N: usize>(values: [f32; N]) -> Option<f64> {
+    let mut sum_squared = 0.0_f64;
+    for value in values {
+        if !value.is_finite() {
+            return None;
+        }
+        sum_squared += f64::from(value) * f64::from(value);
+    }
+    let norm = sum_squared.sqrt();
+    norm.is_finite().then_some(norm)
+}
+
+fn norm3_is_below(v: [f32; 3], threshold: f32) -> bool {
+    finite_norm(v).is_some_and(|norm| norm < f64::from(threshold))
 }
 
 fn se3_step_is_converged(delta: [f32; 6]) -> bool {
-    norm3([delta[0], delta[1], delta[2]]) < POSE_TRANSLATION_STEP_CONVERGENCE_M
-        && norm3([delta[3], delta[4], delta[5]]) < POSE_ROTATION_STEP_CONVERGENCE_RAD
+    norm3_is_below(
+        [delta[0], delta[1], delta[2]],
+        POSE_TRANSLATION_STEP_CONVERGENCE_M,
+    ) && norm3_is_below(
+        [delta[3], delta[4], delta[5]],
+        POSE_ROTATION_STEP_CONVERGENCE_RAD,
+    )
 }
 
 pub(crate) fn solve_linear_system(
@@ -6020,6 +6052,24 @@ mod tests {
             0.0,
             0.0,
         ]));
+        assert!(!se3_step_is_converged([f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0,]));
+    }
+
+    #[test]
+    fn finite_norm_avoids_f32_intermediate_overflow() {
+        let component = f32::MAX / 4.0;
+        let norm = finite_norm([component; 6]).expect("finite f32 vector has a finite f64 norm");
+        assert!(norm.is_finite());
+        assert!(finite_norm([f32::INFINITY, 0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn inverse_rejects_f64_result_that_cannot_narrow_to_f32() {
+        let matrix = [[1e20, 0.0, 0.0], [0.0, 1e20, 0.0], [0.0, 0.0, 1e-40]];
+        assert!(matches!(
+            invert_3x3(matrix),
+            Err(Matrix3InverseError::UnrepresentableOutput { .. })
+        ));
     }
 
     #[test]
