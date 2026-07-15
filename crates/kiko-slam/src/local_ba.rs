@@ -1126,6 +1126,12 @@ pub enum PoseBaError {
     NoProjectableFactors {
         iteration: usize,
     },
+    InsufficientProjectableFactors {
+        iteration: usize,
+        frame_index: usize,
+        required: usize,
+        actual: usize,
+    },
     LinearSolve {
         iteration: usize,
         source: LinearSolveError,
@@ -1149,6 +1155,15 @@ impl std::fmt::Display for PoseBaError {
             Self::NoProjectableFactors { iteration } => write!(
                 f,
                 "pose-only BA has no projectable factors at iteration {iteration}"
+            ),
+            Self::InsufficientProjectableFactors {
+                iteration,
+                frame_index,
+                required,
+                actual,
+            } => write!(
+                f,
+                "pose-only BA frame {frame_index} has {actual} projectable factors at iteration {iteration}; required {required}"
             ),
             Self::LinearSolve { iteration, source } => write!(
                 f,
@@ -1175,7 +1190,9 @@ impl std::error::Error for PoseBaError {
             Self::Observation { source } => Some(source),
             Self::LinearSolve { source, .. } => Some(source),
             Self::InvalidPoseUpdate { source, .. } => Some(source),
-            Self::NoProjectableFactors { .. } | Self::InvariantViolation { .. } => None,
+            Self::NoProjectableFactors { .. }
+            | Self::InsufficientProjectableFactors { .. }
+            | Self::InvariantViolation { .. } => None,
         }
     }
 }
@@ -3583,11 +3600,13 @@ impl LocalBundleAdjuster {
             let mut projectable_factors = 0usize;
             for (idx, (frame, observations)) in self.frames.iter().zip(resolved).enumerate() {
                 let base = idx * POSE_TANGENT_DIMENSION;
+                let mut frame_projectable_factors = 0usize;
                 for obs in observations.observations() {
                     if let Some((residual, jac)) =
                         reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
                     {
                         projectable_factors = projectable_factors.saturating_add(1);
+                        frame_projectable_factors = frame_projectable_factors.saturating_add(1);
                         let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
                         let weight = huber_weight(r_norm, huber);
                         let scale = weight.sqrt();
@@ -3604,6 +3623,15 @@ impl LocalBundleAdjuster {
                             }
                         }
                     }
+                }
+                let required = self.config.min_observations();
+                if frame_projectable_factors < required {
+                    return Err(PoseBaError::InsufficientProjectableFactors {
+                        iteration: iter + 1,
+                        frame_index: idx,
+                        required,
+                        actual: frame_projectable_factors,
+                    });
                 }
             }
             if projectable_factors == 0 {
@@ -5815,6 +5843,48 @@ mod tests {
                 if keypoint == removed_keypoint
         ));
         assert!(ba.frames.is_empty(), "failed push must be transactional");
+    }
+
+    #[test]
+    fn push_frame_rejects_unprojectable_observations_and_recovers() {
+        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let minimum = NonZeroUsize::new(4).expect("nonzero minimum");
+        let observations = ObservationSet::new(
+            (0..minimum.get())
+                .map(|index| {
+                    let keypoint = map
+                        .keyframe_keypoint(keyframe_id, index)
+                        .expect("fixture keypoint");
+                    let pixel = map.keypoint(keypoint).expect("fixture pixel");
+                    MapObservation::new(keypoint, pixel)
+                })
+                .collect(),
+            minimum,
+        )
+        .expect("fixture observations");
+        let config = LocalBaConfig::new(5, 5, minimum.get(), 2.0, lm(1e-3))
+            .expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
+        let behind_camera = Pose::from_rt(Pose::identity().rotation(), [0.0, 0.0, -10.0]);
+
+        let error = ba
+            .push_frame(&map, behind_camera, observations.clone())
+            .expect_err("a frame with no usable reprojection factors must be rejected");
+        assert!(matches!(
+            error,
+            PoseBaError::InsufficientProjectableFactors {
+                iteration: 1,
+                frame_index: 0,
+                required: 4,
+                actual: 0,
+            }
+        ));
+        assert!(ba.frames.is_empty(), "failed push must be transactional");
+
+        let outcome = ba
+            .push_frame(&map, Pose::identity(), observations)
+            .expect("a valid frame must optimize after the rejected frame");
+        assert!(matches!(outcome, PoseBaOutcome::Refined(_)));
     }
 
     #[test]
