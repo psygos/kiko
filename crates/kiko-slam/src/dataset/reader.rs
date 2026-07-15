@@ -1,19 +1,31 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
-    Calibration, DatasetError, FrameInfo, Manifest, format, read_calibration, read_manifest,
-    read_meta, scan_frames,
+    Calibration, DatasetError, FrameInfo, Manifest, ManifestFrameRef, ManifestPairing, format,
+    read_calibration, read_manifest, read_meta, scan_frames,
 };
+
+#[derive(Clone, Debug)]
+struct DatasetFrameRef {
+    timestamp_ns: i64,
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct DatasetEntry {
+    left: DatasetFrameRef,
+    right: Option<DatasetFrameRef>,
+}
 
 #[derive(Debug)]
 pub struct DatasetReader {
     root: PathBuf,
     meta: super::Meta,
     calibration: Calibration,
-    manifest: Manifest,
+    entries: Vec<DatasetEntry>,
     pairing_window: PairingWindowNs,
     left_seq: u64,
     right_seq: u64,
@@ -36,7 +48,12 @@ pub struct TimedPair {
 
 impl DatasetReader {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, DatasetError> {
-        let root = path.into();
+        let requested_root = path.into();
+        let root =
+            std::fs::canonicalize(&requested_root).map_err(|source| DatasetError::ReadFile {
+                path: requested_root,
+                source,
+            })?;
         let meta = read_meta(&root)?;
         let calibration = read_calibration(&root)?;
         let manifest = read_manifest(&root)?;
@@ -49,11 +66,12 @@ impl DatasetReader {
             PairingWindowNs::new(pairing_window_ns).map_err(|_| DatasetError::InvalidConfig {
                 msg: "manifest pairing_window_ns must be non-negative",
             })?;
+        let entries = parse_manifest_entries(&root, manifest)?;
         Ok(Self {
             root,
             meta,
             calibration,
-            manifest,
+            entries,
             pairing_window,
             left_seq: 0,
             right_seq: 0,
@@ -117,13 +135,13 @@ impl<'a> Iterator for DatasetPairs<'a> {
     type Item = Result<StereoPair, DatasetError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.reader.manifest.entries.len() {
-            let entry = self.reader.manifest.entries[self.index].clone();
+        while self.index < self.reader.entries.len() {
+            let entry = self.reader.entries[self.index].clone();
             self.index += 1;
 
-            let right = match entry.pairing {
-                super::ManifestPairing::Paired { right, .. } => right,
-                super::ManifestPairing::MissingRight { .. } => continue,
+            let right = match entry.right {
+                Some(right) => right,
+                None => continue,
             };
 
             let left_frame = match self.reader.read_frame(&entry.left, SensorId::StereoLeft) {
@@ -149,13 +167,13 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
     type Item = Result<TimedPair, DatasetError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < self.reader.manifest.entries.len() {
-            let entry = self.reader.manifest.entries[self.index].clone();
+        while self.index < self.reader.entries.len() {
+            let entry = self.reader.entries[self.index].clone();
             self.index += 1;
 
-            let right = match entry.pairing {
-                super::ManifestPairing::Paired { right, .. } => right,
-                super::ManifestPairing::MissingRight { .. } => continue,
+            let right = match entry.right {
+                Some(right) => right,
+                None => continue,
             };
 
             let left_start = Instant::now();
@@ -200,7 +218,7 @@ impl<'a> Iterator for DatasetTimedPairs<'a> {
 impl DatasetReader {
     fn read_frame(
         &mut self,
-        frame_ref: &super::ManifestFrameRef,
+        frame_ref: &DatasetFrameRef,
         sensor: SensorId,
     ) -> Result<Frame, DatasetError> {
         let (width, height) = match self.meta.mono.as_ref() {
@@ -211,7 +229,7 @@ impl DatasetReader {
                 });
             }
         };
-        let path = self.root.join(&frame_ref.path);
+        let path = frame_ref.path.clone();
         let data = std::fs::read(&path).map_err(|e| DatasetError::ReadFile {
             path: path.clone(),
             source: e,
@@ -234,6 +252,58 @@ impl DatasetReader {
             },
         })
     }
+}
+
+fn parse_manifest_entries(
+    root: &Path,
+    manifest: Manifest,
+) -> Result<Vec<DatasetEntry>, DatasetError> {
+    manifest
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let left = parse_frame_ref(root, entry.left)?;
+            let right = match entry.pairing {
+                ManifestPairing::Paired { right, .. } => Some(parse_frame_ref(root, right)?),
+                ManifestPairing::MissingRight { .. } => None,
+            };
+            Ok(DatasetEntry { left, right })
+        })
+        .collect()
+}
+
+fn parse_frame_ref(
+    root: &Path,
+    frame_ref: ManifestFrameRef,
+) -> Result<DatasetFrameRef, DatasetError> {
+    let relative = Path::new(&frame_ref.path);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(DatasetError::InvalidFramePath {
+            path: frame_ref.path,
+            reason: "path must be a non-empty normalized relative path",
+        });
+    }
+
+    let candidate = root.join(relative);
+    let resolved = std::fs::canonicalize(&candidate).map_err(|source| DatasetError::ReadFile {
+        path: candidate,
+        source,
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(DatasetError::InvalidFramePath {
+            path: frame_ref.path,
+            reason: "resolved path escapes the dataset root",
+        });
+    }
+
+    Ok(DatasetFrameRef {
+        timestamp_ns: frame_ref.timestamp_ns,
+        path: resolved,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]

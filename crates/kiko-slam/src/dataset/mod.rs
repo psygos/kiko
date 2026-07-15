@@ -161,6 +161,10 @@ pub enum DatasetError {
     InvalidConfig {
         msg: &'static str,
     },
+    InvalidFramePath {
+        path: String,
+        reason: &'static str,
+    },
     ThreadSpawn {
         source: std::io::Error,
     },
@@ -205,6 +209,9 @@ impl std::fmt::Display for DatasetError {
             DatasetError::InvalidConfig { msg } => {
                 write!(f, "invalid dataset writer config: {msg}")
             }
+            DatasetError::InvalidFramePath { path, reason } => {
+                write!(f, "invalid dataset frame path {path:?}: {reason}")
+            }
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
             }
@@ -241,6 +248,7 @@ impl std::error::Error for DatasetError {
             DatasetError::PairingFailed { source } => Some(source),
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
+            | DatasetError::InvalidFramePath { .. }
             | DatasetError::WorkerJoin { .. } => None,
         }
     }
@@ -1416,6 +1424,80 @@ mod tests {
             .expect("one pair")
             .expect("valid pair");
         assert_eq!(pair.timestamp_delta_ns(), 0);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn manifest_frame_paths_are_confined_to_the_dataset_root() {
+        let path = unique_dataset_path("confined-manifest-paths");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        assert_eq!(
+            writer.write_frame(&frame(SensorId::StereoLeft, 11, 1)),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            writer.write_frame(&frame(SensorId::StereoRight, 11, 2)),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+
+        for invalid in [
+            "../outside.raw".to_string(),
+            path.with_extension("outside.raw")
+                .to_string_lossy()
+                .into_owned(),
+        ] {
+            let mut manifest = original.clone();
+            manifest["entries"][0]["left"]["path"] = serde_json::Value::String(invalid);
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("serialize modified manifest"),
+            )
+            .expect("write modified manifest");
+
+            let error = DatasetReader::open(&path)
+                .expect_err("escaping manifest path must fail while opening the dataset");
+            assert!(matches!(error, DatasetError::InvalidFramePath { .. }));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let outside = path.with_extension("outside.raw");
+            std::fs::write(&outside, [0_u8; 4]).expect("write outside fixture");
+            let link = path.join(format::FRAMES_DIR).join("outside-link.raw");
+            symlink(&outside, &link).expect("create escaping symlink");
+            let mut manifest = original.clone();
+            manifest["entries"][0]["left"]["path"] =
+                serde_json::Value::String("frames/outside-link.raw".to_string());
+            std::fs::write(
+                &manifest_path,
+                serde_json::to_vec_pretty(&manifest).expect("serialize symlink manifest"),
+            )
+            .expect("write symlink manifest");
+
+            let error = DatasetReader::open(&path)
+                .expect_err("a normalized symlink must not escape the dataset root");
+            assert!(matches!(error, DatasetError::InvalidFramePath { .. }));
+            std::fs::remove_file(outside).expect("remove outside fixture");
+        }
+
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&original).expect("serialize original manifest"),
+        )
+        .expect("restore original manifest");
+        DatasetReader::open(&path).expect("normalized in-root manifest path remains valid");
+
         std::fs::remove_dir_all(path).expect("remove test directory");
     }
 }
