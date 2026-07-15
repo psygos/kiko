@@ -711,17 +711,12 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
 fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), DatasetError> {
     let filename = format::frame_name(depth.timestamp().as_nanos(), "depth");
     let path = frames_dir.join(&filename);
-    let expected = (depth.width() as usize).saturating_mul(depth.height() as usize);
-    if depth.depth_m().len() != expected {
-        return Err(DatasetError::WriteFile {
-            path,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "depth data len does not match width * height",
-            ),
-        });
-    }
-    let mut bytes = Vec::with_capacity(expected.saturating_mul(std::mem::size_of::<f32>()));
+    let mut bytes = Vec::with_capacity(
+        depth
+            .depth_m()
+            .len()
+            .saturating_mul(std::mem::size_of::<f32>()),
+    );
     for value in depth.depth_m() {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
