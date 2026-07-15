@@ -10,9 +10,10 @@ use kiko_slam::{
     BackendConfig, DenseCommand, DepthImage, DownscaleFactor, GlobalDescriptorConfig,
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
     LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, PipelineError,
-    RansacConfig, RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy,
-    RelocalizationConfig, RerunSink, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
-    TriangulationError, Triangulator, VizDecimation, VizPacket,
+    PipelineTimingError, PipelineWallBreakdown, RansacConfig, RectifiedStereo,
+    RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy, RelocalizationConfig, RerunSink,
+    SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
+    VizDecimation, VizPacket,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
@@ -197,6 +198,7 @@ struct BenchArgs {
 enum BenchError {
     Dataset(DatasetError),
     Pipeline(PipelineError),
+    Timing(PipelineTimingError),
     NoPairsProcessed,
     NoNonzeroMatches,
 }
@@ -206,6 +208,7 @@ impl std::fmt::Display for BenchError {
         match self {
             Self::Dataset(source) => write!(f, "benchmark dataset failure: {source}"),
             Self::Pipeline(source) => write!(f, "benchmark pipeline failure: {source}"),
+            Self::Timing(source) => write!(f, "benchmark timing failure: {source}"),
             Self::NoPairsProcessed => write!(f, "benchmark processed no stereo pairs"),
             Self::NoNonzeroMatches => write!(
                 f,
@@ -220,6 +223,7 @@ impl std::error::Error for BenchError {
         match self {
             Self::Dataset(source) => Some(source),
             Self::Pipeline(source) => Some(source),
+            Self::Timing(source) => Some(source),
             Self::NoPairsProcessed | Self::NoNonzeroMatches => None,
         }
     }
@@ -234,6 +238,12 @@ impl From<DatasetError> for BenchError {
 impl From<PipelineError> for BenchError {
     fn from(source: PipelineError) -> Self {
         Self::Pipeline(source)
+    }
+}
+
+impl From<PipelineTimingError> for BenchError {
+    fn from(source: PipelineTimingError) -> Self {
+        Self::Timing(source)
     }
 }
 
@@ -1126,6 +1136,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut sum_read_bytes = 0usize;
     let mut sum_sp_left = Duration::ZERO;
     let mut sum_sp_right = Duration::ZERO;
+    let mut sum_detector_wall = Duration::ZERO;
     let mut sum_lightglue = Duration::ZERO;
     let mut sum_total = Duration::ZERO;
 
@@ -1148,6 +1159,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         sum_sp_left += timings.superpoint_left;
         sum_sp_right += timings.superpoint_right;
+        sum_detector_wall += timings.detector_wall();
         sum_lightglue += timings.lightglue;
         sum_total += timings.total;
         processed += 1;
@@ -1207,21 +1219,23 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         let denom = processed as f64;
         let avg_sp_left_ms = (sum_sp_left.as_secs_f64() * 1000.0) / denom;
         let avg_sp_right_ms = (sum_sp_right.as_secs_f64() * 1000.0) / denom;
-        let avg_lightglue_ms = (sum_lightglue.as_secs_f64() * 1000.0) / denom;
-        let avg_total_ms = (sum_total.as_secs_f64() * 1000.0) / denom;
-        let overhead = sum_total.saturating_sub(sum_sp_left + sum_sp_right + sum_lightglue);
-        let avg_overhead_ms = (overhead.as_secs_f64() * 1000.0) / denom;
-        let total_ms = sum_total.as_secs_f64().max(1e-9);
-        let pct_sp_left = (sum_sp_left.as_secs_f64() / total_ms) * 100.0;
-        let pct_sp_right = (sum_sp_right.as_secs_f64() / total_ms) * 100.0;
-        let pct_lightglue = (sum_lightglue.as_secs_f64() / total_ms) * 100.0;
-        let pct_overhead = (overhead.as_secs_f64() / total_ms) * 100.0;
+        let breakdown =
+            PipelineWallBreakdown::try_from_totals(sum_detector_wall, sum_lightglue, sum_total)
+                .map_err(BenchError::from)?;
+        let avg_detector_ms = (breakdown.detector().as_secs_f64() * 1000.0) / denom;
+        let avg_lightglue_ms = (breakdown.lightglue().as_secs_f64() * 1000.0) / denom;
+        let avg_overhead_ms = (breakdown.overhead().as_secs_f64() * 1000.0) / denom;
+        let avg_total_ms = (breakdown.total().as_secs_f64() * 1000.0) / denom;
+        let total_seconds = breakdown.total().as_secs_f64().max(f64::MIN_POSITIVE);
+        let pct_detector = (breakdown.detector().as_secs_f64() / total_seconds) * 100.0;
+        let pct_lightglue = (breakdown.lightglue().as_secs_f64() / total_seconds) * 100.0;
+        let pct_overhead = (breakdown.overhead().as_secs_f64() / total_seconds) * 100.0;
 
         eprintln!(
-            "timings avg ms: sp_left={avg_sp_left_ms:.2} sp_right={avg_sp_right_ms:.2} lightglue={avg_lightglue_ms:.2} overhead={avg_overhead_ms:.2} total={avg_total_ms:.2}"
+            "timings avg ms: sp_left_worker={avg_sp_left_ms:.2} sp_right_worker={avg_sp_right_ms:.2} detector_wall={avg_detector_ms:.2} lightglue={avg_lightglue_ms:.2} overhead={avg_overhead_ms:.2} total={avg_total_ms:.2}"
         );
         eprintln!(
-            "timings pct: sp_left={pct_sp_left:.1}% sp_right={pct_sp_right:.1}% lightglue={pct_lightglue:.1}% overhead={pct_overhead:.1}%"
+            "timings wall pct: detector={pct_detector:.1}% lightglue={pct_lightglue:.1}% overhead={pct_overhead:.1}%"
         );
     }
 
@@ -2482,7 +2496,8 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 mod tests {
     use super::{BaConfigValues, BenchError, DepthRingCapacity, build_ba_config_from_values};
     use kiko_slam::dataset::DatasetError;
-    use kiko_slam::{InferenceError, PipelineError};
+    use kiko_slam::{InferenceError, PipelineError, PipelineTimingError};
+    use std::time::Duration;
 
     #[cfg(feature = "record")]
     use super::LiveThreadExitGuard;
@@ -2513,6 +2528,18 @@ mod tests {
         assert!(
             std::error::Error::source(&pipeline)
                 .and_then(|source| source.downcast_ref::<PipelineError>())
+                .is_some()
+        );
+
+        let timing_source = PipelineTimingError::ComponentsExceedTotal {
+            accounted: Duration::from_millis(2),
+            total: Duration::from_millis(1),
+        };
+        let timing = BenchError::from(timing_source);
+        assert!(matches!(&timing, BenchError::Timing(source) if *source == timing_source));
+        assert!(
+            std::error::Error::source(&timing)
+                .and_then(|source| source.downcast_ref::<PipelineTimingError>())
                 .is_some()
         );
     }

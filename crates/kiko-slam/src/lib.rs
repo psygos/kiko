@@ -71,7 +71,8 @@ pub use math::{Pose64, Pose64Error, PoseNarrowingError};
 pub use oak::{oak_to_depth_image, oak_to_frame};
 pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
 pub use pipeline::{
-    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimings,
+    InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimingError,
+    PipelineTimings, PipelineWallBreakdown,
 };
 pub use pnp::{
     CameraToWorld, IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose,
