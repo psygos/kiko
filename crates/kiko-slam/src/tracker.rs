@@ -1322,6 +1322,10 @@ pub enum TrackerError {
         verified: crate::map::MapSnapshot,
         current: crate::map::MapSnapshot,
     },
+    RelocalizationMapSnapshotMismatch {
+        verified: crate::map::MapSnapshot,
+        current: crate::map::MapSnapshot,
+    },
     KeyframeRejected {
         landmarks: usize,
     },
@@ -1345,6 +1349,10 @@ impl std::fmt::Display for TrackerError {
                 f,
                 "verified loop map snapshot mismatch: verified={verified:?}, current={current:?}"
             ),
+            TrackerError::RelocalizationMapSnapshotMismatch { verified, current } => write!(
+                f,
+                "verified relocalization map snapshot mismatch: verified={verified:?}, current={current:?}"
+            ),
             TrackerError::KeyframeRejected { landmarks } => {
                 write!(f, "keyframe rejected: only {landmarks} landmarks")
             }
@@ -1367,6 +1375,7 @@ impl std::error::Error for TrackerError {
             Self::PoseGraph(err) => Some(err),
             Self::PoseNarrowing(err) => Some(err),
             Self::LoopMapSnapshotMismatch { .. }
+            | Self::RelocalizationMapSnapshotMismatch { .. }
             | Self::KeyframeRejected { .. }
             | Self::InvariantViolation(_) => None,
         }
@@ -1660,7 +1669,7 @@ struct RelocalizationAttempt {
 enum RelocalizationEvidence {
     NoCandidate,
     Verified {
-        candidate: KeyframeId,
+        attachment: RelocalizationAttachment,
         pose_world: Pose,
     },
 }
@@ -1669,16 +1678,39 @@ enum RelocalizationEvidence {
 enum RelocalizationStep {
     Continue(RelocalizationSession),
     Recovered {
-        candidate: KeyframeId,
+        attachment: RelocalizationAttachment,
         pose_world: Pose,
     },
     Exhausted,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RelocalizationAttachment {
+    candidate: KeyframeId,
+    verified_snapshot: MapSnapshot,
+    inlier_count: NonZeroUsize,
 }
 
 #[derive(Debug)]
 struct SharedMatches {
     keyframe_id: KeyframeId,
     pairs: Vec<(usize, usize)>,
+}
+
+#[derive(Debug)]
+enum KeyframeConnection {
+    Bootstrap,
+    Covisibility(SharedMatches),
+    Relocalization(RelocalizationAttachment),
+}
+
+impl KeyframeConnection {
+    fn shared_matches(&self) -> Option<&SharedMatches> {
+        match self {
+            Self::Covisibility(shared) => Some(shared),
+            Self::Bootstrap | Self::Relocalization(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2549,9 +2581,6 @@ impl SlamTracker {
     }
 
     fn relocalization_fallback_state(attempt: &RelocalizationAttempt) -> TrackerState {
-        if attempt.is_final {
-            return TrackerState::NeedKeyframe;
-        }
         let mut session = attempt.session.clone();
         session.phase = RelocalizationPhase::Searching;
         TrackerState::Relocalizing(session)
@@ -2569,9 +2598,10 @@ impl SlamTracker {
         let next_phase = match evidence {
             RelocalizationEvidence::NoCandidate => RelocalizationPhase::Searching,
             RelocalizationEvidence::Verified {
-                candidate: candidate_id,
+                attachment,
                 pose_world,
             } => {
+                let candidate_id = attachment.candidate;
                 let required_confirmations = cfg.min_confirmations();
                 match session.phase {
                     RelocalizationPhase::Confirming {
@@ -2584,7 +2614,7 @@ impl SlamTracker {
                         let next_confirmations = confirmations.get().saturating_add(1);
                         if next_confirmations >= required_confirmations {
                             return RelocalizationStep::Recovered {
-                                candidate,
+                                attachment,
                                 pose_world,
                             };
                         }
@@ -2597,7 +2627,7 @@ impl SlamTracker {
                     }
                     _ if required_confirmations <= 1 => {
                         return RelocalizationStep::Recovered {
-                            candidate: candidate_id,
+                            attachment,
                             pose_world,
                         };
                     }
@@ -2617,6 +2647,22 @@ impl SlamTracker {
         }
     }
 
+    fn reset_mapping_session(&mut self) {
+        replace_mapping_session(
+            &mut self.map,
+            &mut self.essential_graph,
+            self.loop_db.as_mut(),
+            Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD,
+        );
+        self.state = TrackerState::NeedKeyframe;
+        self.ba.reset();
+        self.pending_loop = None;
+        self.loop_streak.clear();
+        self.pending_loop_correction = None;
+        self.consecutive_tracking_failures = 0;
+        self.last_pose_world = None;
+    }
+
     fn relocalize(
         &mut self,
         pair: StereoPair,
@@ -2625,11 +2671,11 @@ impl SlamTracker {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
         let Some(cfg) = self.config.relocalization_config() else {
-            self.state = TrackerState::NeedKeyframe;
+            self.reset_mapping_session();
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
         };
         let Some(attempt) = Self::begin_relocalization_attempt(session, cfg) else {
-            self.state = TrackerState::NeedKeyframe;
+            self.reset_mapping_session();
             return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
         };
         let attempt_number = attempt.session.attempts;
@@ -2644,9 +2690,10 @@ impl SlamTracker {
             RelocalizationEvidence::NoCandidate
         } else {
             let Some(loop_db) = self.loop_db.as_ref() else {
-                self.state = TrackerState::NeedKeyframe;
+                self.reset_mapping_session();
                 return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
             };
+            let verified_snapshot = self.map.snapshot();
             match Self::relocalization_candidate(
                 &current,
                 cfg,
@@ -2657,6 +2704,11 @@ impl SlamTracker {
             )? {
                 Some(verified) => {
                     let candidate = verified.match_kf();
+                    let inlier_count = NonZeroUsize::new(verified.inlier_count()).ok_or(
+                        TrackerError::InvariantViolation(
+                            "verified relocalization reported zero inliers",
+                        ),
+                    )?;
                     if self.trace_transitions {
                         eprintln!(
                             "relocalization candidate frame={} candidate={candidate:?} inliers={}",
@@ -2665,7 +2717,11 @@ impl SlamTracker {
                         );
                     }
                     RelocalizationEvidence::Verified {
-                        candidate,
+                        attachment: RelocalizationAttachment {
+                            candidate,
+                            verified_snapshot,
+                            inlier_count,
+                        },
                         pose_world: verified.pose_world(),
                     }
                 }
@@ -2679,29 +2735,34 @@ impl SlamTracker {
 
         match Self::relocalization_step(attempt, evidence, cfg) {
             RelocalizationStep::Recovered {
-                candidate,
+                attachment,
                 pose_world,
             } => {
-                self.last_pose_world = Some(pose_world);
-                self.emit_event(DiagnosticEvent::RelocalizationSucceeded {
-                    keyframe_id: candidate,
-                });
+                let candidate = attachment.candidate;
                 self.pending_loop = None;
                 self.loop_streak.clear();
-                self.state = TrackerState::NeedKeyframe;
                 if self.trace_transitions {
                     eprintln!(
-                        "relocalization recovered frame={} candidate={candidate:?}; creating bootstrap keyframe from recovered pose",
+                        "relocalization recovered frame={} candidate={candidate:?}; attaching keyframe at recovered pose",
                         frame_id.as_u64()
                     );
                 }
                 // Relocalization already ran the left detector for this frame. Transfer those
-                // detections only on recovery so keyframe bootstrap needs only the right detector.
-                return self.create_keyframe_with_left_detections(
+                // detections only on recovery so keyframe creation needs only the right detector.
+                let mut output = self.create_keyframe_with_left_detections(
                     StereoPair::from_parts(left, right),
                     pose_world,
                     Some(Arc::new(current)),
-                );
+                    Some(attachment),
+                )?;
+                if output.diagnostics.keyframe_created {
+                    output
+                        .events
+                        .push(DiagnosticEvent::RelocalizationSucceeded {
+                            keyframe_id: candidate,
+                        });
+                }
+                return Ok(output);
             }
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
@@ -2723,7 +2784,6 @@ impl SlamTracker {
                 }
             }
             RelocalizationStep::Exhausted => {
-                self.state = TrackerState::NeedKeyframe;
                 if self.trace_transitions {
                     eprintln!(
                         "relocalization exhausted frame={} attempt={}/{}",
@@ -2732,6 +2792,7 @@ impl SlamTracker {
                         cfg.max_attempts()
                     );
                 }
+                self.reset_mapping_session();
                 return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
             }
         }
@@ -2908,7 +2969,7 @@ impl SlamTracker {
                 right,
                 new_pose,
                 Some(current.clone()),
-                Some(shared),
+                KeyframeConnection::Covisibility(shared),
             ) {
                 Ok(value) => Some(value),
                 Err(TrackerError::KeyframeRejected { .. }) => None,
@@ -3050,7 +3111,7 @@ impl SlamTracker {
         pair: StereoPair,
         pose_world: Pose,
     ) -> Result<TrackerOutput, TrackerError> {
-        self.create_keyframe_with_left_detections(pair, pose_world, None)
+        self.create_keyframe_with_left_detections(pair, pose_world, None, None)
     }
 
     fn create_keyframe_with_left_detections(
@@ -3058,24 +3119,47 @@ impl SlamTracker {
         pair: StereoPair,
         pose_world: Pose,
         left_det: Option<Arc<Detections>>,
+        relocalization: Option<RelocalizationAttachment>,
     ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
+        let is_relocalization = relocalization.is_some();
+        let connection = relocalization.map_or(
+            KeyframeConnection::Bootstrap,
+            KeyframeConnection::Relocalization,
+        );
         let (output, keyframe_id) = match self.create_keyframe_internal(
             left,
             right,
             crate::WorldToCamera::from_legacy_pose(pose_world),
             left_det,
-            None,
+            connection,
         ) {
             Ok(value) => value,
             Err(TrackerError::KeyframeRejected { landmarks }) => {
+                if is_relocalization {
+                    // This stereo pair did not form a keyframe, but the old map
+                    // remains valid. Re-verify a later frame instead of entering
+                    // generic bootstrap against a non-empty graph.
+                    self.state = TrackerState::Relocalizing(RelocalizationSession {
+                        attempts: 0,
+                        phase: RelocalizationPhase::Searching,
+                    });
+                }
                 if self.trace_transitions {
-                    eprintln!(
-                        "keyframe bootstrap rejected frame={} landmarks={} -> staying in NeedKeyframe",
-                        frame_id.as_u64(),
-                        landmarks
-                    );
+                    if is_relocalization {
+                        eprintln!(
+                            "relocalization keyframe rejected frame={} landmarks={}; retrying verification",
+                            frame_id.as_u64(),
+                            landmarks
+                        );
+                    } else {
+                        eprintln!(
+                            "keyframe bootstrap rejected frame={} landmarks={} -> staying in NeedKeyframe",
+                            frame_id.as_u64(),
+                            landmarks
+                        );
+                    }
                 }
                 let mut diagnostics = self.empty_diagnostics();
                 diagnostics.keyframe_created = false;
@@ -3087,10 +3171,17 @@ impl SlamTracker {
             }
             Err(err) => {
                 if self.trace_transitions {
-                    eprintln!(
-                        "keyframe bootstrap rejected frame={} error={err}",
-                        frame_id.as_u64()
-                    );
+                    if is_relocalization {
+                        eprintln!(
+                            "relocalization keyframe failed frame={} error={err}",
+                            frame_id.as_u64()
+                        );
+                    } else {
+                        eprintln!(
+                            "keyframe bootstrap rejected frame={} error={err}",
+                            frame_id.as_u64()
+                        );
+                    }
                 }
                 return Err(err);
             }
@@ -3125,7 +3216,7 @@ impl SlamTracker {
         right: Frame,
         pose_world: crate::WorldToCamera,
         left_det: Option<Arc<Detections>>,
-        shared: Option<SharedMatches>,
+        connection: KeyframeConnection,
     ) -> Result<(TrackerOutput, KeyframeId), TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
@@ -3194,23 +3285,19 @@ impl SlamTracker {
         }
 
         let keyframe = Arc::new(result.keyframe);
-        let keyframe_id = insert_keyframe_into_map(
+        let keyframe_id = insert_keyframe_into_map_and_graph(
             &mut self.map,
+            &mut self.essential_graph,
             &keyframe,
             left.timestamp(),
             pose_world,
-            shared.as_ref(),
+            &connection,
             self.cull_min_observations,
         )?;
         self.emit_event(DiagnosticEvent::KeyframeCreated {
             keyframe_id,
             landmarks,
         });
-        self.essential_graph.add_keyframe(
-            keyframe_id,
-            self.map.covisibility().neighbors(keyframe_id),
-            &self.map,
-        );
         self.enqueue_loop_candidates(keyframe_id, keyframe.detections());
         self.enqueue_descriptor_request(keyframe_id, &left);
 
@@ -3237,6 +3324,20 @@ impl SlamTracker {
     }
 }
 
+fn replace_mapping_session(
+    map: &mut SlamMap,
+    essential_graph: &mut EssentialGraph,
+    loop_db: Option<&mut KeyframeDatabase>,
+    strong_threshold: u32,
+) {
+    *map = SlamMap::new();
+    *essential_graph = EssentialGraph::new(strong_threshold);
+    if let Some(loop_db) = loop_db {
+        *loop_db = KeyframeDatabase::new(loop_db.temporal_gap());
+    }
+}
+
+#[cfg(test)]
 fn insert_keyframe_into_map(
     map: &mut SlamMap,
     keyframe: &Arc<Keyframe>,
@@ -3245,6 +3346,76 @@ fn insert_keyframe_into_map(
     shared: Option<&SharedMatches>,
     cull_min_observations: NonZeroUsize,
 ) -> Result<KeyframeId, TrackerError> {
+    let (staged, keyframe_id) = stage_keyframe_in_map(
+        map,
+        keyframe,
+        timestamp,
+        pose_world,
+        shared,
+        cull_min_observations,
+    )?;
+    *map = staged;
+    Ok(keyframe_id)
+}
+
+fn insert_keyframe_into_map_and_graph(
+    map: &mut SlamMap,
+    essential_graph: &mut EssentialGraph,
+    keyframe: &Arc<Keyframe>,
+    timestamp: Timestamp,
+    pose_world: crate::WorldToCamera,
+    connection: &KeyframeConnection,
+    cull_min_observations: NonZeroUsize,
+) -> Result<KeyframeId, TrackerError> {
+    if let KeyframeConnection::Relocalization(attachment) = connection {
+        let current = map.snapshot();
+        if attachment.verified_snapshot != current {
+            return Err(TrackerError::RelocalizationMapSnapshotMismatch {
+                verified: attachment.verified_snapshot,
+                current,
+            });
+        }
+    }
+    let (staged_map, keyframe_id) = stage_keyframe_in_map(
+        map,
+        keyframe,
+        timestamp,
+        pose_world,
+        connection.shared_matches(),
+        cull_min_observations,
+    )?;
+    let mut staged_graph = essential_graph.clone();
+    match connection {
+        KeyframeConnection::Relocalization(attachment) => {
+            staged_graph.add_keyframe_with_verified_parent(
+                keyframe_id,
+                attachment.candidate,
+                loop_information_matrix(attachment.inlier_count.get()),
+                &staged_map,
+            )?;
+        }
+        KeyframeConnection::Bootstrap | KeyframeConnection::Covisibility(_) => {
+            staged_graph.add_keyframe(
+                keyframe_id,
+                staged_map.covisibility().neighbors(keyframe_id),
+                &staged_map,
+            )?;
+        }
+    }
+
+    *map = staged_map;
+    *essential_graph = staged_graph;
+    Ok(keyframe_id)
+}
+
+fn stage_keyframe_in_map(
+    map: &SlamMap,
+    keyframe: &Arc<Keyframe>,
+    timestamp: Timestamp,
+    pose_world: crate::WorldToCamera,
+    shared: Option<&SharedMatches>,
+    cull_min_observations: NonZeroUsize,
+) -> Result<(SlamMap, KeyframeId), TrackerError> {
     let mut staged = map.clone();
     let keyframe_id = staged.add_keyframe_from_detections(
         keyframe.detections().as_ref(),
@@ -3289,8 +3460,7 @@ fn insert_keyframe_into_map(
         let world = camera_to_world(pose_world, *landmark);
         staged.add_map_point(world, descriptor, keypoint_ref)?;
     }
-    *map = staged;
-    Ok(keyframe_id)
+    Ok((staged, keyframe_id))
 }
 
 fn remove_keyframe_from_graph_and_db(
@@ -3478,15 +3648,18 @@ fn apply_loop_closure_correction(
         .compose(crate::Pose64::from_pose32(match_pose.into_legacy_pose()).inverse());
 
     let mut staged_graph = essential_graph.clone();
-    staged_graph.add_loop_edge(EssentialEdge::try_new(
-        match_kf,
-        query_kf,
-        EssentialEdgeKind::Loop,
-        loop_relative,
-        loop_information_matrix(verified.inlier_count()),
-    )?);
+    staged_graph.add_loop_edge(
+        EssentialEdge::try_new(
+            match_kf,
+            query_kf,
+            EssentialEdgeKind::Loop,
+            loop_relative,
+            loop_information_matrix(verified.inlier_count()),
+        )?,
+        map,
+    )?;
 
-    let input = staged_graph.pose_graph_input();
+    let input = staged_graph.pose_graph_input(map)?;
     if input.keyframe_ids.len() < MIN_OPTIMIZATION_KEYFRAMES || input.edges.is_empty() {
         *essential_graph = staged_graph;
         return Ok(Vec::new());
@@ -3811,6 +3984,33 @@ mod tests {
         Descriptor([0.0; 256])
     }
 
+    fn make_single_landmark_keyframe(frame_id: u64) -> Arc<Keyframe> {
+        let detections = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(frame_id),
+                320,
+                240,
+                vec![Keypoint { x: 100.0, y: 80.0 }],
+                vec![1.0],
+                vec![make_descriptor()],
+            )
+            .expect("single-landmark detections"),
+        );
+        Arc::new(
+            Keyframe::from_arc(
+                detections,
+                vec![Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                }],
+                vec![0],
+            )
+            .expect("single-landmark keyframe"),
+        )
+    }
+
     fn make_relocalization_detections(descriptor: Descriptor) -> Detections {
         Detections::new(
             SensorId::StereoLeft,
@@ -3822,6 +4022,15 @@ mod tests {
             vec![descriptor],
         )
         .expect("valid relocalization detections")
+    }
+
+    fn make_relocalization_attachment(candidate: KeyframeId) -> RelocalizationAttachment {
+        RelocalizationAttachment {
+            candidate,
+            verified_snapshot: SlamMap::new().snapshot(),
+            inlier_count: NonZeroUsize::new(MIN_PNP_CORRESPONDENCES)
+                .expect("PnP correspondence minimum is nonzero"),
+        }
     }
 
     fn make_global_descriptor_basis(idx: usize) -> crate::loop_closure::GlobalDescriptor {
@@ -4087,6 +4296,183 @@ mod tests {
         assert_eq!(map.num_points(), 0);
         assert_eq!(map.generation(), generation_before);
         assert_map_invariants(&map).expect("rolled-back map invariants");
+    }
+
+    #[test]
+    fn keyframe_insertion_rolls_back_map_and_graph_when_topology_is_disconnected() {
+        let mut map = SlamMap::new();
+        let mut graph = EssentialGraph::new(2);
+        insert_keyframe_into_map_and_graph(
+            &mut map,
+            &mut graph,
+            &make_single_landmark_keyframe(30),
+            Timestamp::from_nanos(30),
+            crate::WorldToCamera::identity(),
+            &KeyframeConnection::Bootstrap,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect("first keyframe establishes the root");
+        let map_before = map.snapshot();
+        let points_before = map.num_points();
+        let graph_before = graph.snapshot();
+
+        let error = insert_keyframe_into_map_and_graph(
+            &mut map,
+            &mut graph,
+            &make_single_landmark_keyframe(31),
+            Timestamp::from_nanos(31),
+            crate::WorldToCamera::identity(),
+            &KeyframeConnection::Bootstrap,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect_err("an isolated second keyframe must abort both staged updates");
+
+        assert!(matches!(
+            error,
+            TrackerError::EssentialGraph(EssentialGraphError::DisconnectedKeyframe { .. })
+        ));
+        assert_eq!(map.snapshot(), map_before);
+        assert_eq!(map.num_keyframes(), 1);
+        assert_eq!(map.num_points(), points_before);
+        assert_eq!(graph.snapshot().order, graph_before.order);
+        assert_eq!(graph.snapshot().parent, graph_before.parent);
+        assert_map_invariants(&map).expect("rolled-back map invariants");
+    }
+
+    #[test]
+    fn relocalized_keyframe_transaction_attaches_to_verified_candidate_without_covisibility() {
+        let mut map = SlamMap::new();
+        let mut graph = EssentialGraph::new(2);
+        let root = insert_keyframe_into_map_and_graph(
+            &mut map,
+            &mut graph,
+            &make_single_landmark_keyframe(40),
+            Timestamp::from_nanos(40),
+            crate::WorldToCamera::identity(),
+            &KeyframeConnection::Bootstrap,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect("root keyframe");
+        let verified_snapshot = map.snapshot();
+        let inlier_count = NonZeroUsize::new(9).expect("non-zero inlier count");
+        let attachment = RelocalizationAttachment {
+            candidate: root,
+            verified_snapshot,
+            inlier_count,
+        };
+        let recovered_pose = crate::WorldToCamera::from_legacy_pose(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.5, -0.1, 0.2],
+        ));
+
+        let recovered = insert_keyframe_into_map_and_graph(
+            &mut map,
+            &mut graph,
+            &make_single_landmark_keyframe(41),
+            Timestamp::from_nanos(41),
+            recovered_pose,
+            &KeyframeConnection::Relocalization(attachment),
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect("verified relocalization must attach without invented observations");
+
+        assert!(map.covisibility().neighbors(recovered).is_none());
+        assert_eq!(graph.parent_of(recovered), Some(root));
+        let snapshot = graph.snapshot();
+        let edge = snapshot
+            .spanning_edges
+            .iter()
+            .find(|edge| edge.b() == recovered)
+            .expect("relocalization spanning edge");
+        assert_eq!(edge.a(), root);
+        assert_eq!(
+            edge.information(),
+            loop_information_matrix(inlier_count.get())
+        );
+        graph
+            .pose_graph_input(&map)
+            .expect("relocalized graph is connected");
+
+        let map_before_stale_attempt = map.snapshot();
+        let graph_before_stale_attempt = graph.snapshot();
+        let error = insert_keyframe_into_map_and_graph(
+            &mut map,
+            &mut graph,
+            &make_single_landmark_keyframe(42),
+            Timestamp::from_nanos(42),
+            recovered_pose,
+            &KeyframeConnection::Relocalization(attachment),
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect_err("attachment snapshot cannot cross a map generation");
+        assert!(matches!(
+            error,
+            TrackerError::RelocalizationMapSnapshotMismatch { .. }
+        ));
+        assert_eq!(map.snapshot(), map_before_stale_attempt);
+        assert_eq!(graph.snapshot().order, graph_before_stale_attempt.order);
+    }
+
+    #[test]
+    fn exhausted_relocalization_starts_fresh_session_and_rejects_old_async_results() {
+        let (mut map, old_keyframe, old_point) = make_map_with_single_point();
+        let mut graph = EssentialGraph::new(2);
+        graph
+            .add_keyframe(old_keyframe, None, &map)
+            .expect("old graph root");
+        let descriptor = make_global_descriptor_basis(5);
+        let mut loop_db = KeyframeDatabase::new(17);
+        loop_db.insert(old_keyframe, descriptor.clone());
+        let old_snapshot = map.snapshot();
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::new(99).expect("non-zero")),
+            source_snapshot: old_snapshot,
+            trigger_keyframe: old_keyframe,
+            correction: BaCorrection {
+                pose_deltas: vec![(old_keyframe, [0.0; 6])],
+                landmark_deltas: vec![(old_point, [0.0; 3])],
+                result: BaResult::Converged {
+                    iterations: 1,
+                    final_cost: 0.0,
+                },
+            },
+        };
+
+        replace_mapping_session(&mut map, &mut graph, Some(&mut loop_db), 2);
+
+        let fresh_snapshot = map.snapshot();
+        assert_ne!(fresh_snapshot.instance_id(), old_snapshot.instance_id());
+        assert_eq!(map.num_keyframes(), 0);
+        assert_eq!(map.num_points(), 0);
+        assert!(graph.snapshot().order.is_empty());
+        assert!(loop_db.is_empty());
+        assert_eq!(loop_db.temporal_gap(), 17);
+        assert!(matches!(
+            apply_correction_event(&mut map, &correction),
+            Err(ApplyCorrectionError::StaleSnapshot { .. })
+        ));
+        assert!(!apply_descriptor_response(
+            &map,
+            &mut loop_db,
+            DescriptorResponse {
+                keyframe_id: old_keyframe,
+                source_snapshot: old_snapshot,
+                descriptor,
+            },
+        ));
+
+        let fresh_root = insert_keyframe_into_map_and_graph(
+            &mut map,
+            &mut graph,
+            &make_single_landmark_keyframe(43),
+            Timestamp::from_nanos(43),
+            crate::WorldToCamera::identity(),
+            &KeyframeConnection::Bootstrap,
+            DEFAULT_CULL_MIN_OBSERVATIONS,
+        )
+        .expect("fresh session must permit a new identity-frame root");
+        assert_eq!(graph.parent_of(fresh_root), Some(fresh_root));
+        assert_ne!(fresh_root.map_instance_id(), old_keyframe.map_instance_id());
     }
 
     #[test]
@@ -4985,9 +5371,15 @@ mod tests {
             .collect();
 
         let mut essential_graph = EssentialGraph::new(1);
-        essential_graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-        essential_graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-        essential_graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+        essential_graph
+            .add_keyframe(kf0, map.covisibility().neighbors(kf0), &map)
+            .expect("register kf0");
+        essential_graph
+            .add_keyframe(kf1, map.covisibility().neighbors(kf1), &map)
+            .expect("register kf1");
+        essential_graph
+            .add_keyframe(kf2, map.covisibility().neighbors(kf2), &map)
+            .expect("register kf2");
 
         let verified = crate::loop_closure::VerifiedLoop::from_parts(
             kf2,
@@ -5070,6 +5462,32 @@ mod tests {
         let snapshot = essential_graph.snapshot();
         assert_eq!(snapshot.loop_edges.len(), 1);
         assert_eq!(snapshot.loop_edges[0].kind(), EssentialEdgeKind::Loop);
+    }
+
+    #[test]
+    fn loop_closure_rejects_unregistered_endpoint_before_optimizer_input() {
+        let (mut map, mut essential_graph, verified, query_kf, _before_points) =
+            make_loop_closure_apply_fixture();
+        essential_graph
+            .remove_keyframe(query_kf, &map)
+            .expect("inject graph/map topology mismatch");
+        let map_before = map.snapshot();
+        let graph_before = essential_graph.snapshot();
+        let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+
+        let error =
+            apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
+                .expect_err("loop endpoint must already be registered");
+
+        assert!(matches!(
+            error,
+            TrackerError::EssentialGraph(EssentialGraphError::KeyframeNotRegistered {
+                keyframe_id
+            }) if keyframe_id == query_kf
+        ));
+        assert_eq!(map.snapshot(), map_before);
+        assert_eq!(essential_graph.snapshot().order, graph_before.order);
+        assert!(essential_graph.snapshot().loop_edges.is_empty());
     }
 
     #[test]
@@ -5209,12 +5627,14 @@ mod tests {
         assert!(map.keyframe(removed_kf).is_none());
         assert!(essential_graph.parent_of(removed_kf).is_none());
         assert!(loop_db.descriptor_source(removed_kf).is_none());
-        let input = essential_graph.pose_graph_input();
+        let input = essential_graph
+            .pose_graph_input(&map)
+            .expect("pose graph input");
         assert!(input.keyframe_ids.iter().all(|&id| id != removed_kf));
     }
 
     #[test]
-    fn remove_keyframe_rolls_back_graph_and_db_when_map_commit_fails() {
+    fn remove_keyframe_rejects_stale_map_without_mutating_graph_or_db() {
         let (mut map, mut essential_graph, _verified, removed_kf, _before_points) =
             make_loop_closure_apply_fixture();
         let mut loop_db = KeyframeDatabase::new(0);
@@ -5233,11 +5653,13 @@ mod tests {
             Some(&mut loop_db),
             removed_kf,
         )
-        .expect_err("missing map keyframe must abort staged removal");
+        .expect_err("missing map keyframe must fail graph preflight");
 
         assert!(matches!(
             error,
-            TrackerError::Map(crate::map::MapError::KeyframeNotFound(id)) if id == removed_kf
+            TrackerError::EssentialGraph(EssentialGraphError::KeyframeNotFound {
+                keyframe_id
+            }) if keyframe_id == removed_kf
         ));
         assert_eq!(essential_graph.parent_of(removed_kf), parent_before);
         assert!(loop_db.descriptor_source(removed_kf).is_some());
@@ -5477,7 +5899,10 @@ mod tests {
         assert!(final_attempt.is_final);
         assert!(matches!(
             SlamTracker::relocalization_fallback_state(&final_attempt),
-            TrackerState::NeedKeyframe
+            TrackerState::Relocalizing(RelocalizationSession {
+                attempts: 2,
+                phase: RelocalizationPhase::Searching,
+            })
         ));
         let give_up = SlamTracker::relocalization_step(
             final_attempt,
@@ -5514,7 +5939,7 @@ mod tests {
         let step = SlamTracker::relocalization_step(
             attempt,
             RelocalizationEvidence::Verified {
-                candidate,
+                attachment: make_relocalization_attachment(candidate),
                 pose_world: pose,
             },
             cfg,
@@ -5561,7 +5986,7 @@ mod tests {
         let step = SlamTracker::relocalization_step(
             attempt,
             RelocalizationEvidence::Verified {
-                candidate,
+                attachment: make_relocalization_attachment(candidate),
                 pose_world: pose,
             },
             cfg,
@@ -5596,7 +6021,7 @@ mod tests {
         let different_candidate = SlamTracker::relocalization_step(
             different_candidate_attempt,
             RelocalizationEvidence::Verified {
-                candidate: second_candidate,
+                attachment: make_relocalization_attachment(second_candidate),
                 pose_world: pose,
             },
             cfg,
@@ -5612,7 +6037,7 @@ mod tests {
         let inconsistent_pose = SlamTracker::relocalization_step(
             inconsistent_pose_attempt,
             RelocalizationEvidence::Verified {
-                candidate: first_candidate,
+                attachment: make_relocalization_attachment(first_candidate),
                 pose_world: inconsistent_pose,
             },
             cfg,

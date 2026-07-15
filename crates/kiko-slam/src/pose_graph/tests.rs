@@ -7,7 +7,7 @@ use super::{
     solve_pcg,
 };
 use crate::Pose64;
-use crate::map::{ImageSize, SlamMap};
+use crate::map::{ImageSize, KeyframeId, SlamMap};
 use crate::math::se3_exp_f64;
 use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp, WorldToCamera};
 
@@ -193,6 +193,27 @@ fn make_chain_keyframes(count: usize) -> (SlamMap, Vec<crate::map::KeyframeId>) 
         ids.push(id);
     }
     (map, ids)
+}
+
+fn register_keyframe(
+    graph: &mut EssentialGraph,
+    keyframe_id: crate::map::KeyframeId,
+    covisibility: Option<&HashMap<crate::map::KeyframeId, NonZeroU32>>,
+    map: &SlamMap,
+) {
+    graph
+        .add_keyframe(keyframe_id, covisibility, map)
+        .expect("register keyframe in essential graph");
+}
+
+fn contains_pair(
+    edges: &[EssentialEdge],
+    a: crate::map::KeyframeId,
+    b: crate::map::KeyframeId,
+) -> bool {
+    edges
+        .iter()
+        .any(|edge| (edge.a() == a && edge.b() == b) || (edge.a() == b && edge.b() == a))
 }
 
 #[test]
@@ -718,14 +739,216 @@ fn pose_graph_optimizer_validates_edges_before_empty_graph_shortcut() {
 fn essential_graph_builds_spanning_tree_connectivity() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
 
     assert_eq!(graph.parent_of(kf0), Some(kf0));
     assert_eq!(graph.parent_of(kf1), Some(kf0));
     assert_eq!(graph.parent_of(kf2), Some(kf1));
-    assert!(graph.all_edges().len() >= 2);
+    assert!(graph.all_edges(&map).expect("pose graph input").len() >= 2);
+}
+
+#[test]
+fn verified_parent_connects_uncovisible_keyframe_in_parent_to_child_direction() {
+    let (map, ids) = make_chain_keyframes(2);
+    let parent = ids[0];
+    let child = ids[1];
+    assert!(map.covisibility().neighbors(child).is_none());
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, parent, None, &map);
+
+    graph
+        .add_keyframe_with_verified_parent(child, parent, scalar_block(7.0), &map)
+        .expect("verified attachment supplies a truthful spanning connection");
+
+    assert_eq!(graph.parent_of(child), Some(parent));
+    let snapshot = graph.snapshot();
+    assert_eq!(snapshot.spanning_edges.len(), 1);
+    assert_eq!(snapshot.spanning_edges[0].a(), parent);
+    assert_eq!(snapshot.spanning_edges[0].b(), child);
+    assert_eq!(snapshot.spanning_edges[0].information(), scalar_block(7.0));
+    graph
+        .pose_graph_input(&map)
+        .expect("verified parent topology remains connected");
+}
+
+#[test]
+fn essential_graph_rejects_reversed_spanning_direction() {
+    let (map, ids) = make_chain_keyframes(2);
+    let parent = ids[0];
+    let child = ids[1];
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, parent, None, &map);
+    graph
+        .add_keyframe_with_verified_parent(child, parent, scalar_block(1.0), &map)
+        .expect("verified child");
+    assert!(graph.reverse_spanning_edge_for_test(child));
+
+    assert_eq!(
+        graph
+            .pose_graph_input(&map)
+            .expect_err("unordered endpoints cannot satisfy directed parentage"),
+        EssentialGraphError::MissingSpanningEdge { child, parent }
+    );
+}
+
+#[test]
+fn essential_graph_rejects_map_missing_keyframe_without_mutation() {
+    let (map, _kf0, _kf1, _kf2) = make_map_for_essential_graph();
+    let foreign_id = KeyframeId::default();
+    let mut graph = EssentialGraph::new(2);
+
+    let error = graph
+        .add_keyframe(foreign_id, None, &map)
+        .expect_err("a keyframe ID from outside the map cannot become the graph root");
+
+    assert_eq!(
+        error,
+        EssentialGraphError::KeyframeNotFound {
+            keyframe_id: foreign_id,
+        }
+    );
+    assert!(graph.snapshot().order.is_empty());
+}
+
+#[test]
+fn essential_graph_rejects_a_second_unconnected_root_without_mutation() {
+    let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, kf0, None, &map);
+
+    let error = graph
+        .add_keyframe(kf1, None, &map)
+        .expect_err("only the first keyframe may establish a root");
+
+    assert_eq!(
+        error,
+        EssentialGraphError::DisconnectedKeyframe { keyframe_id: kf1 }
+    );
+    let snapshot = graph.snapshot();
+    assert_eq!(snapshot.order, vec![kf0]);
+    assert_eq!(snapshot.parent.len(), 1);
+    assert_eq!(snapshot.parent.get(&kf0), Some(&kf0));
+}
+
+#[test]
+fn essential_graph_rejects_unregistered_loop_endpoint_without_auto_registration() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, kf0, None, &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    let edge = EssentialEdge::try_new(
+        kf0,
+        kf2,
+        EssentialEdgeKind::Loop,
+        Pose64::identity(),
+        scalar_block(1.0),
+    )
+    .expect("valid loop edge payload");
+
+    let error = graph
+        .add_loop_edge(edge, &map)
+        .expect_err("loop endpoints must already belong to the essential graph");
+
+    assert_eq!(
+        error,
+        EssentialGraphError::KeyframeNotRegistered { keyframe_id: kf2 }
+    );
+    let snapshot = graph.snapshot();
+    assert!(!snapshot.order.contains(&kf2));
+    assert!(snapshot.loop_edges.is_empty());
+}
+
+#[test]
+fn essential_graph_rejects_self_loop_and_mislabeled_loop_edge() {
+    let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+    assert!(matches!(
+        EssentialEdge::try_new(
+            kf0,
+            kf0,
+            EssentialEdgeKind::Loop,
+            Pose64::identity(),
+            scalar_block(1.0),
+        ),
+        Err(EssentialGraphError::SelfEdge { keyframe_id }) if keyframe_id == kf0
+    ));
+
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, kf0, None, &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    let mislabeled = EssentialEdge::try_new(
+        kf0,
+        kf1,
+        EssentialEdgeKind::StrongCovisibility,
+        Pose64::identity(),
+        scalar_block(1.0),
+    )
+    .expect("valid non-loop edge payload");
+
+    assert_eq!(
+        graph
+            .add_loop_edge(mislabeled, &map)
+            .expect_err("loop collection must preserve its typed edge kind"),
+        EssentialGraphError::UnexpectedEdgeKind {
+            expected: EssentialEdgeKind::Loop,
+            actual: EssentialEdgeKind::StrongCovisibility,
+        }
+    );
+}
+
+#[test]
+fn essential_graph_rejects_duplicate_unordered_loop_pair() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, kf0, None, &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
+    let loop_edge = |a, b| {
+        EssentialEdge::try_new(
+            a,
+            b,
+            EssentialEdgeKind::Loop,
+            Pose64::identity(),
+            scalar_block(1.0),
+        )
+        .expect("valid loop edge")
+    };
+    graph
+        .add_loop_edge(loop_edge(kf2, kf0), &map)
+        .expect("first loop pair");
+
+    let error = graph
+        .add_loop_edge(loop_edge(kf0, kf2), &map)
+        .expect_err("reversed endpoints identify the same loop pair");
+
+    assert_eq!(
+        error,
+        EssentialGraphError::DuplicateEdge {
+            a: kf0.min(kf2),
+            b: kf0.max(kf2),
+            kind: EssentialEdgeKind::Loop,
+        }
+    );
+    assert_eq!(graph.snapshot().loop_edges.len(), 1);
+}
+
+#[test]
+fn pose_graph_input_rejects_stale_map_keyframe_before_indexing_edges() {
+    let (mut map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, kf0, None, &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    map.remove_keyframe(kf1).expect("inject stale graph ID");
+
+    let error = graph
+        .pose_graph_input(&map)
+        .expect_err("stale map identity must fail before optimizer input is produced");
+
+    assert_eq!(
+        error,
+        EssentialGraphError::KeyframeNotFound { keyframe_id: kf1 }
+    );
 }
 
 #[test]
@@ -753,9 +976,9 @@ fn essential_measurement_maps_from_camera_point_to_to_camera_point() {
     .expect("to pose");
 
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-    let input = graph.pose_graph_input();
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    let input = graph.pose_graph_input(&map).expect("pose graph input");
     let from_idx = input
         .keyframe_ids
         .iter()
@@ -792,12 +1015,12 @@ fn essential_measurement_maps_from_camera_point_to_to_camera_point() {
 fn essential_graph_respects_strong_edge_threshold() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(1);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
     let mut neighbors = HashMap::new();
     neighbors.insert(kf0, NonZeroU32::new(1).expect("nonzero"));
     neighbors.insert(kf1, NonZeroU32::new(2).expect("nonzero"));
-    graph.add_keyframe(kf2, Some(&neighbors), &map);
+    register_keyframe(&mut graph, kf2, Some(&neighbors), &map);
     let snapshot = graph.snapshot();
     assert_eq!(snapshot.strong_covis_edges.len(), 1);
     let strong = &snapshot.strong_covis_edges[0];
@@ -807,12 +1030,27 @@ fn essential_graph_respects_strong_edge_threshold() {
 }
 
 #[test]
+fn essential_graph_breaks_equal_parent_weights_by_keyframe_identity() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(100);
+    register_keyframe(&mut graph, kf0, None, &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    let mut neighbors = HashMap::new();
+    neighbors.insert(kf0, NonZeroU32::new(1).expect("nonzero"));
+    neighbors.insert(kf1, NonZeroU32::new(1).expect("nonzero"));
+
+    register_keyframe(&mut graph, kf2, Some(&neighbors), &map);
+
+    assert_eq!(graph.parent_of(kf2), Some(kf0.min(kf1)));
+}
+
+#[test]
 fn essential_graph_does_not_duplicate_spanning_pairs_as_strong_edges() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(1);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
     let snapshot = graph.snapshot();
 
     for spanning in &snapshot.spanning_edges {
@@ -827,20 +1065,23 @@ fn essential_graph_does_not_duplicate_spanning_pairs_as_strong_edges() {
 fn essential_graph_snapshot_is_independent_copy() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
     let snapshot = graph.snapshot();
-    graph.add_loop_edge(
-        EssentialEdge::try_new(
-            kf2,
-            kf0,
-            EssentialEdgeKind::Loop,
-            Pose64::identity(),
-            scalar_block(1.0),
+    graph
+        .add_loop_edge(
+            EssentialEdge::try_new(
+                kf2,
+                kf0,
+                EssentialEdgeKind::Loop,
+                Pose64::identity(),
+                scalar_block(1.0),
+            )
+            .expect("loop edge"),
+            &map,
         )
-        .expect("loop edge"),
-    );
+        .expect("register loop edge");
     assert_eq!(snapshot.loop_edges.len(), 0);
     assert_eq!(graph.snapshot().loop_edges.len(), 1);
 }
@@ -849,9 +1090,9 @@ fn essential_graph_snapshot_is_independent_copy() {
 fn essential_graph_remove_keyframe_reparents_children() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
     assert_eq!(graph.parent_of(kf2), Some(kf1));
 
     graph
@@ -867,16 +1108,45 @@ fn essential_graph_remove_keyframe_reparents_children() {
             .iter()
             .all(|edge| edge.a() != kf1 && edge.b() != kf1)
     );
-    let input = graph.pose_graph_input();
+    let input = graph.pose_graph_input(&map).expect("pose graph input");
     assert!(input.keyframe_ids.iter().all(|&id| id != kf1));
+}
+
+#[test]
+fn essential_graph_reparenting_replaces_conflicting_strong_edge() {
+    let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
+    let mut graph = EssentialGraph::new(1);
+    register_keyframe(&mut graph, kf0, None, &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    let mut neighbors = HashMap::new();
+    neighbors.insert(kf0, NonZeroU32::new(1).expect("nonzero"));
+    neighbors.insert(kf1, NonZeroU32::new(2).expect("nonzero"));
+    register_keyframe(&mut graph, kf2, Some(&neighbors), &map);
+    assert!(contains_pair(
+        &graph.snapshot().strong_covis_edges,
+        kf0,
+        kf2
+    ));
+
+    graph
+        .remove_keyframe(kf1, &map)
+        .expect("reparent through existing strong pair");
+
+    let snapshot = graph.snapshot();
+    assert_eq!(graph.parent_of(kf2), Some(kf0));
+    assert!(contains_pair(&snapshot.spanning_edges, kf0, kf2));
+    assert!(!contains_pair(&snapshot.strong_covis_edges, kf0, kf2));
+    graph
+        .pose_graph_input(&map)
+        .expect("reparented topology remains valid");
 }
 
 #[test]
 fn essential_graph_remove_keyframe_rejects_root() {
     let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
 
     let err = graph
         .remove_keyframe(kf0, &map)
@@ -891,7 +1161,7 @@ fn essential_graph_remove_keyframe_rejects_root() {
 fn essential_graph_remove_keyframe_rejects_missing_id() {
     let (map, kf0, kf1, _kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
 
     let err = graph
         .remove_keyframe(kf1, &map)
@@ -906,19 +1176,22 @@ fn essential_graph_remove_keyframe_rejects_missing_id() {
 fn essential_graph_remove_keyframe_purges_incident_loop_edges() {
     let (map, kf0, kf1, kf2) = make_map_for_essential_graph();
     let mut graph = EssentialGraph::new(2);
-    graph.add_keyframe(kf0, map.covisibility().neighbors(kf0), &map);
-    graph.add_keyframe(kf1, map.covisibility().neighbors(kf1), &map);
-    graph.add_keyframe(kf2, map.covisibility().neighbors(kf2), &map);
-    graph.add_loop_edge(
-        EssentialEdge::try_new(
-            kf2,
-            kf0,
-            EssentialEdgeKind::Loop,
-            Pose64::identity(),
-            scalar_block(1.0),
+    register_keyframe(&mut graph, kf0, map.covisibility().neighbors(kf0), &map);
+    register_keyframe(&mut graph, kf1, map.covisibility().neighbors(kf1), &map);
+    register_keyframe(&mut graph, kf2, map.covisibility().neighbors(kf2), &map);
+    graph
+        .add_loop_edge(
+            EssentialEdge::try_new(
+                kf2,
+                kf0,
+                EssentialEdgeKind::Loop,
+                Pose64::identity(),
+                scalar_block(1.0),
+            )
+            .expect("loop edge"),
+            &map,
         )
-        .expect("loop edge"),
-    );
+        .expect("register loop edge");
     assert_eq!(graph.snapshot().loop_edges.len(), 1);
 
     graph
@@ -947,11 +1220,11 @@ fn essential_graph_random_remove_preserves_connectivity_invariants() {
     let mut graph = EssentialGraph::new(100);
     for (idx, &id) in ids.iter().enumerate() {
         if idx == 0 {
-            graph.add_keyframe(id, None, &map);
+            register_keyframe(&mut graph, id, None, &map);
         } else {
             let mut covis = HashMap::new();
             covis.insert(ids[idx - 1], NonZeroU32::new(10).expect("non-zero"));
-            graph.add_keyframe(id, Some(&covis), &map);
+            register_keyframe(&mut graph, id, Some(&covis), &map);
         }
     }
 
@@ -991,7 +1264,7 @@ fn essential_graph_random_remove_preserves_connectivity_invariants() {
             assert!(alive_set.contains(&edge.b()));
         }
 
-        let input = graph.pose_graph_input();
+        let input = graph.pose_graph_input(&map).expect("pose graph input");
         let input_set: HashSet<_> = input.keyframe_ids.iter().copied().collect();
         assert!(input_set.is_subset(&alive_set));
         for edge in &input.edges {
