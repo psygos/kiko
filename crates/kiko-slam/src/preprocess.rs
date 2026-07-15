@@ -33,7 +33,7 @@ pub fn normalise_downscale_into(
         return Err(crate::DownscaleError::ZeroDimensions { width, height });
     }
     let factor_u32 = factor.get_u32();
-    if width % factor_u32 != 0 || height % factor_u32 != 0 {
+    if !width.is_multiple_of(factor_u32) || !height.is_multiple_of(factor_u32) {
         return Err(crate::DownscaleError::NonDivisible {
             width,
             height,

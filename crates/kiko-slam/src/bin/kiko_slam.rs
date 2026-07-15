@@ -515,10 +515,10 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if let Some(limit) = args.dataset.max_pairs {
-            if processed >= limit {
-                break;
-            }
+        if let Some(limit) = args.dataset.max_pairs
+            && processed >= limit
+        {
+            break;
         }
     }
 
@@ -824,12 +824,12 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let left = pair.left().clone();
         let right = pair.right().clone();
-        if let Some(cursor) = depth_cursor.as_mut() {
-            if let Err(err) = cursor.push_until(left.timestamp(), &mut depth_ring) {
-                eprintln!("offline depth decode failed; disabling dense: {err}");
-                depth_cursor = None;
-                dense_state = None;
-            }
+        if let Some(cursor) = depth_cursor.as_mut()
+            && let Err(err) = cursor.push_until(left.timestamp(), &mut depth_ring)
+        {
+            eprintln!("offline depth decode failed; disabling dense: {err}");
+            depth_cursor = None;
+            dense_state = None;
         }
 
         match tracker.process(pair) {
@@ -856,20 +856,19 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 };
                 if let Some(depth) =
                     depth_ring.find_closest(timestamp, command_mapper::MAX_ASSOCIATION_WINDOW_NS)
+                    && let Err(err) = sink.log_depth(&depth)
                 {
-                    if let Err(err) = sink.log_depth(&depth) {
-                        eprintln!("rerun depth error: {err}");
-                    }
+                    eprintln!("rerun depth error: {err}");
                 }
                 if let Some(matches) = output.take_stereo_matches() {
                     let points = output
                         .keyframe()
                         .map(|kf| kf.landmarks())
                         .filter(|pts| !pts.is_empty());
-                    if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches) {
-                        if let Err(err) = sink.log_with_points(&packet, points) {
-                            eprintln!("rerun log error: {err}");
-                        }
+                    if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches)
+                        && let Err(err) = sink.log_with_points(&packet, points)
+                    {
+                        eprintln!("rerun log error: {err}");
                     }
                     if output.keyframe().is_some() {
                         keyframes += 1;
@@ -900,38 +899,38 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                         eprintln!("rerun event error: {err}");
                     }
                 }
-                if let Some(stats) = dense_stats.as_ref() {
-                    if let Err(err) = sink.log_dense_stats(timestamp, stats) {
-                        eprintln!("rerun dense stats error: {err}");
-                    }
+                if let Some(stats) = dense_stats.as_ref()
+                    && let Err(err) = sink.log_dense_stats(timestamp, stats)
+                {
+                    eprintln!("rerun dense stats error: {err}");
                 }
                 processed += 1;
             }
             Err(err) => {
                 inference_errors += 1;
-                if let Some(state) = dense_state.as_mut() {
-                    if let Some(correction) = tracker.take_pending_loop_correction() {
-                        dense_generation = dense_generation.saturating_add(1);
-                        let stats = dense::process_dense_command(
-                            state,
-                            DenseCommand::RebuildFromSnapshot {
-                                corrected_poses: correction,
-                                generation: dense_generation,
-                            },
-                        );
-                        if let Err(log_err) = sink.log_dense_stats(left.timestamp(), &stats) {
-                            eprintln!("rerun dense stats error: {log_err}");
-                        }
+                if let Some(state) = dense_state.as_mut()
+                    && let Some(correction) = tracker.take_pending_loop_correction()
+                {
+                    dense_generation = dense_generation.saturating_add(1);
+                    let stats = dense::process_dense_command(
+                        state,
+                        DenseCommand::RebuildFromSnapshot {
+                            corrected_poses: correction,
+                            generation: dense_generation,
+                        },
+                    );
+                    if let Err(log_err) = sink.log_dense_stats(left.timestamp(), &stats) {
+                        eprintln!("rerun dense stats error: {log_err}");
                     }
                 }
                 eprintln!("tracker error: {err}");
             }
         }
 
-        if let Some(limit) = args.dataset.max_pairs {
-            if processed >= limit {
-                break;
-            }
+        if let Some(limit) = args.dataset.max_pairs
+            && processed >= limit
+        {
+            break;
         }
     }
 
@@ -1026,10 +1025,10 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if let Some(limit) = args.dataset.max_pairs {
-            if processed >= limit {
-                break;
-            }
+        if let Some(limit) = args.dataset.max_pairs
+            && processed >= limit
+        {
+            break;
         }
     }
     let elapsed = start.elapsed();

@@ -1194,10 +1194,10 @@ impl KeyframePolicy {
         if inliers < self.min_inliers.get() {
             return true;
         }
-        if let Some(parallax) = parallax_px {
-            if parallax > self.parallax_px.0 {
-                return true;
-            }
+        if let Some(parallax) = parallax_px
+            && parallax > self.parallax_px.0
+        {
+            return true;
         }
         if covisibility < self.min_covisibility.0 {
             return true;

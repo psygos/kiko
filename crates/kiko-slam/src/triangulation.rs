@@ -622,11 +622,11 @@ impl Triangulator {
             }
 
             let z = fx * baseline / disparity;
-            if let Some(max_depth) = self.config.max_depth_m {
-                if z > max_depth {
-                    stats.dropped_depth += 1;
-                    continue;
-                }
+            if let Some(max_depth) = self.config.max_depth_m
+                && z > max_depth
+            {
+                stats.dropped_depth += 1;
+                continue;
             }
 
             let x = (left_kp.x - cx) * z / fx;

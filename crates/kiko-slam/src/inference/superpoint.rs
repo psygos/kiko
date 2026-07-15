@@ -171,7 +171,7 @@ fn run_inference(
 }
 
 fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>, InferenceError> {
-    if data.len() % DESCRIPTOR_DIM != 0 {
+    if !data.len().is_multiple_of(DESCRIPTOR_DIM) {
         return Err(InferenceError::UnexpectedOutput {
             name: output_name.to_string(),
             expected: format!(
@@ -211,7 +211,7 @@ fn parse_keypoint_pairs(
         });
     }
 
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err(InferenceError::UnexpectedOutput {
             name: output_name.to_string(),
             expected: "even-sized tensor".to_string(),

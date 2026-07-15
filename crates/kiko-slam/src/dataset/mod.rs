@@ -1111,10 +1111,10 @@ fn collect_deltas(left: &[FrameInfo], right: &[FrameInfo], gate: Option<u64>) ->
                 continue;
             }
             let delta = right[idx].timestamp_ns.abs_diff(left_frame.timestamp_ns);
-            if let Some(gate_ns) = gate {
-                if delta > gate_ns {
-                    continue;
-                }
+            if let Some(gate_ns) = gate
+                && delta > gate_ns
+            {
+                continue;
             }
             if best.is_none_or(|b| delta < b) {
                 best = Some(delta);
@@ -1164,10 +1164,10 @@ fn compute_pairing_window_ns(
         .map(|s| s.p99)
         .unwrap_or_else(|| sorted.last().copied().unwrap_or(0));
     let mut window = p99.max(median.saturating_add(6_u64.saturating_mul(mad)));
-    if let Some(period) = left_period {
-        if period > 0 {
-            window = window.min(period / 4);
-        }
+    if let Some(period) = left_period
+        && period > 0
+    {
+        window = window.min(period / 4);
     }
     window.min(i64::MAX as u64)
 }

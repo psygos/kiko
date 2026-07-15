@@ -517,10 +517,10 @@ pub fn solve_pnp_ransac(
         for pose in candidates {
             let mut inliers = Vec::new();
             for (idx, obs) in observations.iter().enumerate() {
-                if let Some(err_sq) = reprojection_error_sq_px(pose, obs, intrinsics) {
-                    if err_sq <= threshold_sq {
-                        inliers.push(idx);
-                    }
+                if let Some(err_sq) = reprojection_error_sq_px(pose, obs, intrinsics)
+                    && err_sq <= threshold_sq
+                {
+                    inliers.push(idx);
                 }
             }
 

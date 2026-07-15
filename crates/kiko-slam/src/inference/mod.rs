@@ -474,15 +474,20 @@ fn apply_session_config(
     let mem_pattern = env_bool("KIKO_ORT_MEM_PATTERN").unwrap_or(true);
     let parallel_exec = env_bool("KIKO_ORT_PARALLEL_EXEC").unwrap_or(false);
 
-    builder
+    let configure = |err: ort::Error<_>| InferenceError::SessionConfiguration {
+        message: err.to_string(),
+    };
+    let builder = builder
         .with_optimization_level(opt_level)
-        .and_then(|b| b.with_memory_pattern(mem_pattern))
-        .and_then(|b| b.with_intra_threads(intra))
-        .and_then(|b| b.with_inter_threads(inter))
-        .and_then(|b| b.with_parallel_execution(parallel_exec))
-        .map_err(|err| InferenceError::SessionConfiguration {
-            message: err.to_string(),
-        })
+        .map_err(configure)?;
+    let builder = builder
+        .with_memory_pattern(mem_pattern)
+        .map_err(configure)?;
+    let builder = builder.with_intra_threads(intra).map_err(configure)?;
+    let builder = builder.with_inter_threads(inter).map_err(configure)?;
+    builder
+        .with_parallel_execution(parallel_exec)
+        .map_err(configure)
 }
 
 fn env_opt_level(key: &str) -> Option<GraphOptimizationLevel> {

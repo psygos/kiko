@@ -49,18 +49,13 @@ pub enum ReconState {
     Down,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RebuildPolicy {
     /// Rebuild only when every corrected keyframe still has a stored depth image.
+    #[default]
     Strict,
     /// Rebuild when enough corrected keyframes have depth coverage.
     BestEffort { min_coverage_percent: u8 },
-}
-
-impl Default for RebuildPolicy {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 #[derive(Debug)]

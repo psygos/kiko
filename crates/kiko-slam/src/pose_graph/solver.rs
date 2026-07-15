@@ -160,8 +160,8 @@ fn invert_6x6(a: [[f64; 6]; 6]) -> Option<[[f64; 6]; 6]> {
         }
 
         let pivot_val = aug[pivot][pivot];
-        for col in 0..12 {
-            aug[pivot][col] /= pivot_val;
+        for value in &mut aug[pivot] {
+            *value /= pivot_val;
         }
 
         for row in 0..6 {
@@ -172,8 +172,9 @@ fn invert_6x6(a: [[f64; 6]; 6]) -> Option<[[f64; 6]; 6]> {
             if factor.abs() < NEAR_ZERO {
                 continue;
             }
-            for col in 0..12 {
-                aug[row][col] -= factor * aug[pivot][col];
+            let pivot_values = aug[pivot];
+            for (value, pivot_value) in aug[row].iter_mut().zip(pivot_values) {
+                *value -= factor * pivot_value;
             }
         }
     }

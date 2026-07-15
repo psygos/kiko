@@ -26,10 +26,10 @@ impl DepthRingBuffer {
 
     pub fn push(&mut self, depth: DepthImage) {
         // Warn on severe out-of-order delivery but do not reject.
-        if let Some(last) = self.entries.back() {
-            if depth.timestamp().as_nanos() < last.timestamp().as_nanos() {
-                self.reorder_warnings = self.reorder_warnings.saturating_add(1);
-            }
+        if let Some(last) = self.entries.back()
+            && depth.timestamp().as_nanos() < last.timestamp().as_nanos()
+        {
+            self.reorder_warnings = self.reorder_warnings.saturating_add(1);
         }
 
         if self.entries.len() >= self.capacity {

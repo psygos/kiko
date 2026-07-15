@@ -21,7 +21,7 @@ impl VizDecimation {
 
     fn should_log(self, index: u64) -> bool {
         let n = self.0.get() as u64;
-        index % n == 0
+        index.is_multiple_of(n)
     }
 }
 
@@ -211,12 +211,12 @@ impl RerunSink {
 
         log_matches(&self.rec, packet, left.width() as f32, &track_ids)?;
 
-        if let Some(points) = points {
-            if !points.is_empty() {
-                let positions: Vec<[f32; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
-                let cloud = rerun::Points3D::new(positions);
-                self.rec.log("world/camera/points", &cloud)?;
-            }
+        if let Some(points) = points
+            && !points.is_empty()
+        {
+            let positions: Vec<[f32; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+            let cloud = rerun::Points3D::new(positions);
+            self.rec.log("world/camera/points", &cloud)?;
         }
 
         Ok(())

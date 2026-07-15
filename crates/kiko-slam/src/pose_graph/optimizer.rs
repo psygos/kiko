@@ -92,16 +92,13 @@ impl PoseGraphEdge {
 fn validate_information(information: [[f64; 6]; 6]) -> Result<(), PoseGraphEdgeError> {
     const SYMMETRY_TOLERANCE: f64 = 1e-12;
 
-    for row in 0..6 {
-        for col in 0..6 {
-            if !information[row][col].is_finite() {
+    for (row, values) in information.iter().enumerate() {
+        for (col, value) in values.iter().copied().enumerate() {
+            if !value.is_finite() {
                 return Err(PoseGraphEdgeError::NonFiniteInformation { row, col });
             }
-            let scale = information[row][col]
-                .abs()
-                .max(information[col][row].abs())
-                .max(1.0);
-            if (information[row][col] - information[col][row]).abs() > SYMMETRY_TOLERANCE * scale {
+            let scale = value.abs().max(information[col][row].abs()).max(1.0);
+            if (value - information[col][row]).abs() > SYMMETRY_TOLERANCE * scale {
                 return Err(PoseGraphEdgeError::NonSymmetricInformation { row, col });
             }
         }
