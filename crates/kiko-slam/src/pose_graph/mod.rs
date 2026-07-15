@@ -9,7 +9,9 @@ const POSE_GRAPH_CONVERGENCE: f64 = 1e-6;
 /// Near-zero threshold in Huber weight to avoid division by zero.
 const HUBER_NEAR_ZERO: f64 = 1e-12;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use crate::Pose64Error;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PoseGraphError {
     CsrIndexOutOfBounds {
         row: usize,
@@ -57,6 +59,15 @@ pub enum PoseGraphError {
         pose_count: usize,
         component_count: usize,
         anchor_component_size: usize,
+    },
+    PoseComputation(Pose64Error),
+    NonFiniteEdgeResidual {
+        component: usize,
+    },
+    NonFiniteEdgeJacobian {
+        pose_index: usize,
+        row: usize,
+        column: usize,
     },
 }
 
@@ -131,11 +142,39 @@ impl std::fmt::Display for PoseGraphError {
                 "pose graph is disconnected: {pose_count} poses in {component_count} components; \
                  {anchor_component_size} poses are connected to anchor pose 0"
             ),
+            PoseGraphError::PoseComputation(err) => {
+                write!(f, "pose graph pose computation failed: {err}")
+            }
+            PoseGraphError::NonFiniteEdgeResidual { component } => write!(
+                f,
+                "pose graph edge residual component {component} is non-finite"
+            ),
+            PoseGraphError::NonFiniteEdgeJacobian {
+                pose_index,
+                row,
+                column,
+            } => write!(
+                f,
+                "pose graph edge Jacobian for pose {pose_index} is non-finite at ({row}, {column})"
+            ),
         }
     }
 }
 
-impl std::error::Error for PoseGraphError {}
+impl std::error::Error for PoseGraphError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PoseComputation(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<Pose64Error> for PoseGraphError {
+    fn from(err: Pose64Error) -> Self {
+        Self::PoseComputation(err)
+    }
+}
 
 pub(crate) fn scaled_identity6(scale: f64) -> [[f64; 6]; 6] {
     let mut out = [[0.0_f64; 6]; 6];

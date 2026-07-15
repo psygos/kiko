@@ -28,6 +28,9 @@ pub enum Pose64Error {
     NonFinite,
     NonOrthonormal { max_error: f64 },
     ImproperRotation { determinant: f64 },
+    ComposeRotationNonFinite { row: usize, column: usize },
+    ComposeTranslationNonFinite { axis: usize },
+    InverseTranslationNonFinite { axis: usize },
 }
 
 impl std::fmt::Display for Pose64Error {
@@ -41,6 +44,18 @@ impl std::fmt::Display for Pose64Error {
             Self::ImproperRotation { determinant } => write!(
                 f,
                 "pose rotation determinant must be +1 (got {determinant})"
+            ),
+            Self::ComposeRotationNonFinite { row, column } => write!(
+                f,
+                "pose composition produced a non-finite rotation at [{row}][{column}]"
+            ),
+            Self::ComposeTranslationNonFinite { axis } => write!(
+                f,
+                "pose composition produced a non-finite translation on axis {axis}"
+            ),
+            Self::InverseTranslationNonFinite { axis } => write!(
+                f,
+                "pose inversion produced a non-finite translation on axis {axis}"
             ),
         }
     }
@@ -136,30 +151,37 @@ impl Pose64 {
     }
 
     /// Compose two poses: `self ∘ other`.
-    pub fn compose(self, other: Self) -> Self {
+    pub fn try_compose(self, other: Self) -> Result<Self, Pose64Error> {
         let rotation = mat_mul_f64(self.rotation, other.rotation);
+        for (row, values) in rotation.iter().enumerate() {
+            for (column, value) in values.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(Pose64Error::ComposeRotationNonFinite { row, column });
+                }
+            }
+        }
         let rt = mat_mul_vec_f64(self.rotation, other.translation);
         let translation = [
             rt[0] + self.translation[0],
             rt[1] + self.translation[1],
             rt[2] + self.translation[2],
         ];
-        Self {
-            rotation,
-            translation,
+        if let Some(axis) = translation.iter().position(|value| !value.is_finite()) {
+            return Err(Pose64Error::ComposeTranslationNonFinite { axis });
         }
+        Self::from_rt(rotation, translation)
     }
 
-    pub fn inverse(self) -> Self {
+    pub fn try_inverse(self) -> Result<Self, Pose64Error> {
         let r_t = mat_transpose_f64(self.rotation);
         let t = mat_mul_vec_f64(r_t, self.translation);
-        Self {
-            rotation: r_t,
-            translation: [-t[0], -t[1], -t[2]],
+        if let Some(axis) = t.iter().position(|value| !value.is_finite()) {
+            return Err(Pose64Error::InverseTranslationNonFinite { axis });
         }
+        Self::from_rt(r_t, [-t[0], -t[1], -t[2]])
     }
 
-    pub fn from_pose32(pose: Pose) -> Self {
+    pub fn try_from_pose32(pose: Pose) -> Result<Self, Pose64Error> {
         let pose_rotation = pose.rotation();
         let mut rotation = [[0.0_f64; 3]; 3];
         for (row_idx, row) in rotation.iter_mut().enumerate() {
@@ -168,10 +190,7 @@ impl Pose64 {
             }
         }
         let t = pose.translation();
-        Self {
-            rotation,
-            translation: [t[0] as f64, t[1] as f64, t[2] as f64],
-        }
+        Self::from_rt(rotation, [t[0] as f64, t[1] as f64, t[2] as f64])
     }
 
     pub fn try_to_pose32(self) -> Result<Pose, PoseNarrowingError> {
@@ -552,9 +571,11 @@ fn mat_transpose_f64(r: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 
 #[cfg(test)]
 mod tests {
+    use crate::Pose;
+
     use super::{
-        Pose64, Pose64Error, PoseNarrowingError, mat_mul_f64, mat_mul_vec_f64, se3_exp_f64,
-        se3_log_f64, so3_exp_f64, so3_log_f64, so3_right_jacobian_f64,
+        Pose64, Pose64Error, PoseNarrowingError, identity3_f64, mat_mul_f64, mat_mul_vec_f64,
+        se3_exp_f64, se3_log_f64, so3_exp_f64, so3_log_f64, so3_right_jacobian_f64,
     };
 
     fn rot_diff_norm(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> f64 {
@@ -570,6 +591,21 @@ mod tests {
 
     fn vec_norm(v: [f64; 3]) -> f64 {
         (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+    }
+
+    fn assert_pose_near(actual: Pose64, expected: Pose64, tolerance: f64) {
+        let rotation_error = rot_diff_norm(actual.rotation(), expected.rotation());
+        let actual_t = actual.translation();
+        let expected_t = expected.translation();
+        let translation_error = vec_norm([
+            actual_t[0] - expected_t[0],
+            actual_t[1] - expected_t[1],
+            actual_t[2] - expected_t[2],
+        ]);
+        assert!(
+            rotation_error <= tolerance && translation_error <= tolerance,
+            "pose mismatch: rotation_error={rotation_error}, translation_error={translation_error}, tolerance={tolerance}"
+        );
     }
 
     #[test]
@@ -690,6 +726,95 @@ mod tests {
         )
         .expect_err("improper rotation must be rejected");
         assert!(matches!(err, Pose64Error::ImproperRotation { .. }));
+    }
+
+    #[test]
+    fn pose64_upgrade_rejects_malformed_pose32() {
+        let nonfinite = Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, f32::NAN, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        );
+        assert_eq!(
+            Pose64::try_from_pose32(nonfinite).expect_err("NaN pose must be rejected"),
+            Pose64Error::NonFinite
+        );
+
+        let scaled = Pose::from_rt(
+            [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        );
+        assert!(matches!(
+            Pose64::try_from_pose32(scaled),
+            Err(Pose64Error::NonOrthonormal { .. })
+        ));
+    }
+
+    #[test]
+    fn pose64_compose_rejects_finite_translation_overflow() {
+        let pose = Pose64::from_rt(identity3_f64(), [f64::MAX, 0.0, 0.0])
+            .expect("finite translation is valid");
+
+        assert_eq!(
+            pose.try_compose(pose)
+                .expect_err("MAX + MAX must not produce an invalid pose"),
+            Pose64Error::ComposeTranslationNonFinite { axis: 0 }
+        );
+    }
+
+    #[test]
+    fn pose64_inverse_rejects_rotated_translation_overflow() {
+        let c = std::f64::consts::FRAC_1_SQRT_2;
+        let pose = Pose64::from_rt(
+            [[c, -c, 0.0], [c, c, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, f64::MAX, 0.0],
+        )
+        .expect("finite rotated pose is valid");
+
+        assert_eq!(
+            pose.try_inverse()
+                .expect_err("rotated MAX translation must not overflow silently"),
+            Pose64Error::InverseTranslationNonFinite { axis: 0 }
+        );
+    }
+
+    #[test]
+    fn pose64_operations_are_closed_for_deterministic_bounded_inputs() {
+        for sample in 0..512 {
+            let phase = sample as f64 + 1.0;
+            let a = se3_exp_f64([
+                20.0 * (phase * 0.17).sin(),
+                20.0 * (phase * 0.31).cos(),
+                20.0 * (phase * 0.43).sin(),
+                0.5 * (phase * 0.11).sin(),
+                0.5 * (phase * 0.13).cos(),
+                0.5 * (phase * 0.19).sin(),
+            ]);
+            let b = se3_exp_f64([
+                10.0 * (phase * 0.23).cos(),
+                10.0 * (phase * 0.29).sin(),
+                10.0 * (phase * 0.37).cos(),
+                0.4 * (phase * 0.07).cos(),
+                0.4 * (phase * 0.09).sin(),
+                0.4 * (phase * 0.15).cos(),
+            ]);
+
+            let inverse = a.try_inverse().expect("bounded inverse must be valid");
+            let recovered = inverse
+                .try_inverse()
+                .expect("bounded double inverse must be valid");
+            assert_pose_near(recovered, a, 1e-12);
+
+            let product = a
+                .try_compose(b)
+                .expect("bounded composition must remain valid");
+            Pose64::from_rt(product.rotation(), product.translation())
+                .expect("composition result must satisfy Pose64 invariants");
+
+            let identity = a
+                .try_compose(inverse)
+                .expect("pose and inverse must compose");
+            assert_pose_near(identity, Pose64::identity(), 2e-12);
+        }
     }
 
     #[test]

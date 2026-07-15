@@ -1324,6 +1324,7 @@ pub enum TrackerError {
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
+    Pose64(crate::Pose64Error),
     PoseNarrowing(crate::PoseNarrowingError),
     LoopMapSnapshotMismatch {
         verified: crate::map::MapSnapshot,
@@ -1354,6 +1355,7 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
+            TrackerError::Pose64(err) => write!(f, "64-bit pose error: {err}"),
             TrackerError::PoseNarrowing(err) => write!(f, "pose narrowing error: {err}"),
             TrackerError::LoopMapSnapshotMismatch { verified, current } => write!(
                 f,
@@ -1384,6 +1386,7 @@ impl std::error::Error for TrackerError {
             Self::Map(err) => Some(err),
             Self::EssentialGraph(err) => Some(err),
             Self::PoseGraph(err) => Some(err),
+            Self::Pose64(err) => Some(err),
             Self::PoseNarrowing(err) => Some(err),
             Self::LoopMapSnapshotMismatch { .. }
             | Self::RelocalizationMapSnapshotMismatch { .. }
@@ -1449,6 +1452,12 @@ impl From<EssentialGraphError> for TrackerError {
 impl From<PoseGraphError> for TrackerError {
     fn from(err: PoseGraphError) -> Self {
         TrackerError::PoseGraph(err)
+    }
+}
+
+impl From<crate::Pose64Error> for TrackerError {
+    fn from(err: crate::Pose64Error) -> Self {
+        TrackerError::Pose64(err)
     }
 }
 
@@ -3730,8 +3739,9 @@ fn apply_loop_closure_correction(
         )))?
         .pose();
     let query_pose_estimate = verified.query_pose_world();
-    let loop_relative = crate::Pose64::from_pose32(query_pose_estimate)
-        .compose(crate::Pose64::from_pose32(match_pose.into_legacy_pose()).inverse());
+    let loop_relative = crate::Pose64::try_from_pose32(query_pose_estimate)?.try_compose(
+        crate::Pose64::try_from_pose32(match_pose.into_legacy_pose())?.try_inverse()?,
+    )?;
 
     let mut staged_graph = essential_graph.clone();
     staged_graph.add_loop_edge(
@@ -3762,7 +3772,7 @@ fn apply_loop_closure_correction(
             .pose();
         let legacy_pose = pose.into_legacy_pose();
         old_poses.insert(keyframe_id, legacy_pose);
-        initial_poses.push(crate::Pose64::from_pose32(legacy_pose));
+        initial_poses.push(crate::Pose64::try_from_pose32(legacy_pose)?);
     }
 
     let result = optimizer.optimize(&input.edges, &mut initial_poses)?;
@@ -3864,8 +3874,11 @@ fn loop_apply_error_kind(error: &TrackerError) -> LoopApplyError {
             LoopApplyError::MissingMapPoint
         }
         TrackerError::Map(_) => LoopApplyError::MapMutation,
+        TrackerError::EssentialGraph(_) => LoopApplyError::EssentialGraph,
+        TrackerError::PoseGraph(_) => LoopApplyError::PoseOptimization,
+        TrackerError::Pose64(_) | TrackerError::PoseNarrowing(_) => LoopApplyError::PoseConversion,
         TrackerError::InvariantViolation(_) => LoopApplyError::InvariantViolation,
-        _ => LoopApplyError::MapMutation,
+        _ => LoopApplyError::UnexpectedFailure,
     }
 }
 
@@ -5939,6 +5952,35 @@ mod tests {
         let error = TrackerError::from(source);
 
         assert!(matches!(error, TrackerError::PoseNarrowing(actual) if actual == source));
+    }
+
+    #[test]
+    fn tracker_error_preserves_pose64_error() {
+        let source = crate::Pose64Error::ComposeTranslationNonFinite { axis: 1 };
+
+        let error = TrackerError::from(source);
+
+        assert!(matches!(error, TrackerError::Pose64(actual) if actual == source));
+    }
+
+    #[test]
+    fn loop_apply_error_classification_does_not_alias_pose_failures_to_map_mutation() {
+        assert_eq!(
+            loop_apply_error_kind(&TrackerError::Pose64(
+                crate::Pose64Error::ComposeTranslationNonFinite { axis: 0 }
+            )),
+            LoopApplyError::PoseConversion
+        );
+        assert_eq!(
+            loop_apply_error_kind(&TrackerError::PoseGraph(
+                PoseGraphError::PcgNonFiniteResidual
+            )),
+            LoopApplyError::PoseOptimization
+        );
+        assert_eq!(
+            loop_apply_error_kind(&TrackerError::InvariantViolation("test")),
+            LoopApplyError::InvariantViolation
+        );
     }
 
     #[test]

@@ -140,13 +140,21 @@ pub fn compute_edge_error(
             to: edge.to,
             pose_count: poses.len(),
         })?;
-    Ok(edge_error_from_endpoints(edge, from_pose, to_pose))
+    edge_error_from_endpoints(edge, from_pose, to_pose)
 }
 
-fn edge_error_from_endpoints(edge: &PoseGraphEdge, from_pose: Pose64, to_pose: Pose64) -> [f64; 6] {
-    let predicted = to_pose.compose(from_pose.inverse());
-    let residual_pose = predicted.compose(edge.measurement.inverse());
-    se3_log_f64(residual_pose)
+fn edge_error_from_endpoints(
+    edge: &PoseGraphEdge,
+    from_pose: Pose64,
+    to_pose: Pose64,
+) -> Result<[f64; 6], PoseGraphError> {
+    let predicted = to_pose.try_compose(from_pose.try_inverse()?)?;
+    let residual_pose = predicted.try_compose(edge.measurement.try_inverse()?)?;
+    let residual = se3_log_f64(residual_pose);
+    if let Some(component) = residual.iter().position(|value| !value.is_finite()) {
+        return Err(PoseGraphError::NonFiniteEdgeResidual { component });
+    }
+    Ok(residual)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -160,10 +168,11 @@ fn numerical_diff_column(
     eps: f64,
     jacobian: &mut [[f64; 6]; 6],
     axis: usize,
-) {
+    pose_index: usize,
+) -> Result<(), PoseGraphError> {
     let original = if perturb_from { from_pose } else { to_pose };
-    let plus = se3_exp_f64(*delta_plus).compose(original);
-    let minus = se3_exp_f64(*delta_minus).compose(original);
+    let plus = se3_exp_f64(*delta_plus).try_compose(original)?;
+    let minus = se3_exp_f64(*delta_minus).try_compose(original)?;
     let (from_plus, to_plus) = if perturb_from {
         (plus, to_pose)
     } else {
@@ -174,11 +183,20 @@ fn numerical_diff_column(
     } else {
         (from_pose, minus)
     };
-    let err_plus = edge_error_from_endpoints(edge, from_plus, to_plus);
-    let err_minus = edge_error_from_endpoints(edge, from_minus, to_minus);
+    let err_plus = edge_error_from_endpoints(edge, from_plus, to_plus)?;
+    let err_minus = edge_error_from_endpoints(edge, from_minus, to_minus)?;
     for row in 0..6 {
-        jacobian[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
+        let value = (err_plus[row] - err_minus[row]) / (2.0 * eps);
+        if !value.is_finite() {
+            return Err(PoseGraphError::NonFiniteEdgeJacobian {
+                pose_index,
+                row,
+                column: axis,
+            });
+        }
+        jacobian[row][axis] = value;
     }
+    Ok(())
 }
 
 pub fn compute_edge_jacobians(
@@ -217,7 +235,8 @@ pub fn compute_edge_jacobians(
             eps,
             &mut j_from,
             axis,
-        );
+            edge.from,
+        )?;
         numerical_diff_column(
             edge,
             from_pose,
@@ -228,7 +247,8 @@ pub fn compute_edge_jacobians(
             eps,
             &mut j_to,
             axis,
-        );
+            edge.to,
+        )?;
     }
 
     Ok((j_from, j_to))
@@ -238,6 +258,28 @@ fn perturb_axis(axis: usize, magnitude: f64) -> [f64; 6] {
     let mut delta = [0.0_f64; 6];
     delta[axis] = magnitude;
     delta
+}
+
+pub(super) fn clamp_step(xi: &mut [f64; 6], pose_index: usize) -> Result<f64, PoseGraphError> {
+    if xi.iter().any(|value| !value.is_finite()) {
+        return Err(PoseGraphError::PcgNonFiniteStep { pose_index });
+    }
+    let step_norm = xi.iter().fold(0.0_f64, |norm, value| norm.hypot(*value));
+    if step_norm <= MAX_STEP_NORM {
+        return Ok(step_norm);
+    }
+
+    let max_component = xi
+        .iter()
+        .fold(0.0_f64, |max_value, value| max_value.max(value.abs()));
+    let normalized_norm = xi
+        .iter()
+        .fold(0.0_f64, |norm, value| norm.hypot(*value / max_component));
+    let scale = (MAX_STEP_NORM / max_component) / normalized_norm;
+    for value in xi {
+        *value *= scale;
+    }
+    Ok(MAX_STEP_NORM)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -384,7 +426,7 @@ impl PoseGraphOptimizer {
             for edge in edges {
                 let error = compute_edge_error(edge, &poses)?;
                 let (j_from, j_to) = compute_edge_jacobians(edge, &poses)?;
-                let e_norm = error.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let e_norm = error.iter().fold(0.0_f64, |norm, value| norm.hypot(*value));
                 let weight = huber_weight(e_norm, self.config.huber_delta);
                 let mut information = edge.information;
                 for row in &mut information {
@@ -453,21 +495,9 @@ impl PoseGraphOptimizer {
                     xi_slice[4],
                     xi_slice[5],
                 ];
-                let mut step_norm = xi.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if !step_norm.is_finite() {
-                    return Err(PoseGraphError::PcgNonFiniteStep {
-                        pose_index: pose_idx,
-                    });
-                }
-                if step_norm > MAX_STEP_NORM {
-                    let scale = MAX_STEP_NORM / step_norm;
-                    for v in &mut xi {
-                        *v *= scale;
-                    }
-                    step_norm = MAX_STEP_NORM;
-                }
+                let step_norm = clamp_step(&mut xi, pose_idx)?;
                 max_step = max_step.max(step_norm);
-                *pose = se3_exp_f64(xi).compose(*pose);
+                *pose = se3_exp_f64(xi).try_compose(*pose)?;
             }
 
             if max_step < POSE_GRAPH_CONVERGENCE {

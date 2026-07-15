@@ -486,13 +486,17 @@ impl Default for LoopClosureConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoopApplyError {
     StaleCorrection,
     MissingKeyframe,
     MissingMapPoint,
     MapMutation,
+    EssentialGraph,
+    PoseOptimization,
+    PoseConversion,
     InvariantViolation,
+    UnexpectedFailure,
 }
 
 impl std::error::Error for LoopApplyError {}
@@ -504,7 +508,11 @@ impl std::fmt::Display for LoopApplyError {
             LoopApplyError::MissingKeyframe => write!(f, "missing keyframe"),
             LoopApplyError::MissingMapPoint => write!(f, "missing map point"),
             LoopApplyError::MapMutation => write!(f, "map mutation failed"),
+            LoopApplyError::EssentialGraph => write!(f, "essential graph update failed"),
+            LoopApplyError::PoseOptimization => write!(f, "pose optimization failed"),
+            LoopApplyError::PoseConversion => write!(f, "pose conversion failed"),
             LoopApplyError::InvariantViolation => write!(f, "invariant violation"),
+            LoopApplyError::UnexpectedFailure => write!(f, "unexpected loop application failure"),
         }
     }
 }

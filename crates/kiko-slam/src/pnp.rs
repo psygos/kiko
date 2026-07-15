@@ -1449,8 +1449,12 @@ mod tests {
         let first = axis_angle_pose([0.3, -0.2, 0.7], [0.1, -0.05, 0.08]);
         let second = axis_angle_pose([-0.1, 0.4, 0.2], [-0.03, 0.09, 0.02]);
         let composed = first.compose(second);
-        let composed64 = crate::Pose64::from_pose32(first)
-            .compose(crate::Pose64::from_pose32(second))
+        let composed64 = crate::Pose64::try_from_pose32(first)
+            .expect("first pose should be valid")
+            .try_compose(
+                crate::Pose64::try_from_pose32(second).expect("second pose should be valid"),
+            )
+            .expect("composition should remain finite")
             .try_to_pose32()
             .expect("test pose should fit in f32");
 

@@ -6,10 +6,12 @@ use super::{
     PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, compute_edge_error, compute_edge_jacobians,
     solve_pcg,
 };
-use crate::Pose64;
 use crate::map::{ImageSize, KeyframeId, SlamMap};
 use crate::math::se3_exp_f64;
 use crate::{CompactDescriptor, FrameId, Keypoint, Point3, Pose, Timestamp, WorldToCamera};
+use crate::{Pose64, Pose64Error};
+
+use super::optimizer::clamp_step;
 
 #[derive(Clone, Debug)]
 struct Lcg {
@@ -77,9 +79,13 @@ fn raw_left_increment_central_difference(
         let mut minus = poses.to_vec();
         let mut delta = [0.0_f64; 6];
         delta[axis] = eps;
-        plus[pose_idx] = se3_exp_f64(delta).compose(plus[pose_idx]);
+        plus[pose_idx] = se3_exp_f64(delta)
+            .try_compose(plus[pose_idx])
+            .expect("positive perturbation must stay valid");
         delta[axis] = -eps;
-        minus[pose_idx] = se3_exp_f64(delta).compose(minus[pose_idx]);
+        minus[pose_idx] = se3_exp_f64(delta)
+            .try_compose(minus[pose_idx])
+            .expect("negative perturbation must stay valid");
         let error_plus = compute_edge_error(edge, &plus).expect("positive perturbation");
         let error_minus = compute_edge_error(edge, &minus).expect("negative perturbation");
         for row in 0..6 {
@@ -362,7 +368,9 @@ fn pcg_zero_rhs_returns_zero_solution() {
 fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
     let pose_a = Pose64::identity();
     let pose_b = se3_exp_f64([0.2, -0.1, 0.05, 0.03, -0.02, 0.01]);
-    let measurement = pose_b.compose(pose_a.inverse());
+    let measurement = pose_b
+        .try_compose(pose_a.try_inverse().expect("inverse"))
+        .expect("measurement");
     let edge = PoseGraphEdge::try_new(0, 1, measurement, scalar_block(1.0)).expect("edge");
     let error = compute_edge_error(&edge, &[pose_a, pose_b]).expect("edge error");
     let norm: f64 = error.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -370,12 +378,58 @@ fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
 }
 
 #[test]
+fn pose_graph_edge_error_reports_pose_arithmetic_overflow() {
+    let from_pose = Pose64::from_rt(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [-f64::MAX, 0.0, 0.0],
+    )
+    .expect("finite from pose");
+    let to_pose = Pose64::from_rt(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [f64::MAX, 0.0, 0.0],
+    )
+    .expect("finite to pose");
+    let edge =
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), scalar_block(1.0)).expect("valid edge");
+
+    assert!(matches!(
+        compute_edge_error(&edge, &[from_pose, to_pose]),
+        Err(super::PoseGraphError::PoseComputation(
+            Pose64Error::ComposeTranslationNonFinite { axis: 0 }
+        ))
+    ));
+    assert!(
+        compute_edge_jacobians(&edge, &[from_pose, to_pose]).is_err(),
+        "Jacobian computation must not return non-finite values"
+    );
+}
+
+#[test]
+fn pose_graph_edge_error_rejects_nonfinite_log_residual() {
+    let to_pose = Pose64::from_rt(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        [f64::MAX, f64::MAX, 0.0],
+    )
+    .expect("finite pose");
+    let edge =
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), scalar_block(1.0)).expect("valid edge");
+
+    assert_eq!(
+        compute_edge_error(&edge, &[Pose64::identity(), to_pose])
+            .expect_err("SE(3) log overflow must be typed"),
+        super::PoseGraphError::NonFiniteEdgeResidual { component: 0 }
+    );
+}
+
+#[test]
 fn pose_graph_edge_jacobians_match_finite_difference() {
     let pose_a = se3_exp_f64([0.1, 0.05, -0.02, 0.02, -0.01, 0.03]);
     let pose_b = se3_exp_f64([0.3, -0.08, 0.12, -0.02, 0.03, -0.01]);
     let measurement = pose_b
-        .compose(pose_a.inverse())
-        .compose(se3_exp_f64([0.1, -0.05, 0.02, 0.25, -0.18, 0.12]));
+        .try_compose(pose_a.try_inverse().expect("inverse"))
+        .expect("relative pose")
+        .try_compose(se3_exp_f64([0.1, -0.05, 0.02, 0.25, -0.18, 0.12]))
+        .expect("perturbed measurement");
     let edge = PoseGraphEdge::try_new(0, 1, measurement, scalar_block(1.0)).expect("edge");
     let poses = [pose_a, pose_b];
     let (j_from, j_to) = compute_edge_jacobians(&edge, &poses).expect("jacobians");
@@ -449,8 +503,25 @@ fn pose_graph_config_rejects_invalid_solver_limits() {
     }
 }
 
+#[test]
+fn pose_graph_step_clamps_large_finite_components_without_square_overflow() {
+    let mut step = [1e300, -1e300, 5e299, 0.0, 0.0, 0.0];
+
+    let reported_norm = clamp_step(&mut step, 7).expect("finite step must be clamped");
+    let actual_norm = step.iter().fold(0.0_f64, |norm, value| norm.hypot(*value));
+
+    assert_eq!(reported_norm, 1.0);
+    assert!(
+        (actual_norm - 1.0).abs() < 1e-15,
+        "actual norm={actual_norm}"
+    );
+    assert!(step.iter().all(|value| value.is_finite()));
+}
+
 fn edge(from: usize, to: usize, from_pose: Pose64, to_pose: Pose64) -> PoseGraphEdge {
-    let measurement = to_pose.compose(from_pose.inverse());
+    let measurement = to_pose
+        .try_compose(from_pose.try_inverse().expect("inverse"))
+        .expect("measurement");
     PoseGraphEdge::try_new(from, to, measurement, scalar_block(1.0)).expect("edge")
 }
 
@@ -628,7 +699,9 @@ fn pose_graph_optimizer_keeps_anchor_pose_fixed() {
 fn pose_graph_optimizer_uses_a_hard_anchor_at_high_information() {
     let anchor = Pose64::identity();
     let target = se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-    let measurement = target.compose(anchor.inverse());
+    let measurement = target
+        .try_compose(anchor.try_inverse().expect("inverse"))
+        .expect("measurement");
     let high_information = scalar_block(1e12);
     let edge = PoseGraphEdge::try_new(0, 1, measurement, high_information)
         .expect("positive definite high-information edge");
@@ -697,7 +770,9 @@ fn pose_graph_optimizer_rejects_invalid_edge_endpoints() {
     let bad_edge = PoseGraphEdge::try_new(
         0,
         poses.len(),
-        poses[1].compose(poses[0].inverse()),
+        poses[1]
+            .try_compose(poses[0].try_inverse().expect("inverse"))
+            .expect("measurement"),
         scalar_block(1.0),
     )
     .expect("edge structure is valid independently of pose array bounds");
@@ -1009,6 +1084,31 @@ fn essential_measurement_maps_from_camera_point_to_to_camera_point() {
         error.iter().map(|value| value * value).sum::<f64>().sqrt() < 2e-6,
         "physical relative measurement must have zero graph residual"
     );
+}
+
+#[test]
+fn essential_graph_reports_malformed_map_pose_without_mutation() {
+    let (mut map, kf0, kf1, _kf2) = make_map_for_essential_graph();
+    map.set_keyframe_pose(
+        kf1,
+        WorldToCamera::from_legacy_pose(Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, f32::NAN, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        )),
+    )
+    .expect("inject malformed legacy pose");
+    let mut graph = EssentialGraph::new(2);
+    register_keyframe(&mut graph, kf0, None, &map);
+
+    let error = graph
+        .add_keyframe(kf1, map.covisibility().neighbors(kf1), &map)
+        .expect_err("malformed legacy pose must not enter the graph");
+
+    assert_eq!(
+        error,
+        EssentialGraphError::PoseComputation(Pose64Error::NonFinite)
+    );
+    assert_eq!(graph.parent_of(kf1), None);
 }
 
 #[test]

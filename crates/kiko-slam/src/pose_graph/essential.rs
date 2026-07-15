@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 
-use crate::Pose64;
 use crate::map::{KeyframeId, SlamMap};
+use crate::{Pose64, Pose64Error};
 
 use super::{PoseGraphEdge, PoseGraphEdgeError, scaled_identity6};
 
@@ -92,7 +92,7 @@ pub struct EssentialGraph {
     strong_threshold: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EssentialGraphError {
     KeyframeNotFound {
         keyframe_id: KeyframeId,
@@ -139,6 +139,7 @@ pub enum EssentialGraphError {
         keyframe_id: KeyframeId,
     },
     InvalidEdge(PoseGraphEdgeError),
+    PoseComputation(Pose64Error),
 }
 
 impl std::fmt::Display for EssentialGraphError {
@@ -203,6 +204,9 @@ impl std::fmt::Display for EssentialGraphError {
             EssentialGraphError::InvalidEdge(err) => {
                 write!(f, "invalid essential graph edge: {err}")
             }
+            EssentialGraphError::PoseComputation(err) => {
+                write!(f, "essential graph pose computation failed: {err}")
+            }
         }
     }
 }
@@ -211,6 +215,7 @@ impl std::error::Error for EssentialGraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidEdge(err) => Some(err),
+            Self::PoseComputation(err) => Some(err),
             Self::KeyframeNotFound { .. }
             | Self::KeyframeNotRegistered { .. }
             | Self::DisconnectedKeyframe { .. }
@@ -224,6 +229,12 @@ impl std::error::Error for EssentialGraphError {
             | Self::RootRemovalDenied { .. }
             | Self::SelfEdge { .. } => None,
         }
+    }
+}
+
+impl From<Pose64Error> for EssentialGraphError {
+    fn from(err: Pose64Error) -> Self {
+        Self::PoseComputation(err)
     }
 }
 
@@ -707,7 +718,7 @@ fn relative_pose(
         .keyframe(to)
         .ok_or(EssentialGraphError::KeyframeNotFound { keyframe_id: to })?
         .pose();
-    let from_64 = Pose64::from_pose32(from_pose.into_legacy_pose());
-    let to_64 = Pose64::from_pose32(to_pose.into_legacy_pose());
-    Ok(to_64.compose(from_64.inverse()))
+    let from_64 = Pose64::try_from_pose32(from_pose.into_legacy_pose())?;
+    let to_64 = Pose64::try_from_pose32(to_pose.into_legacy_pose())?;
+    Ok(to_64.try_compose(from_64.try_inverse()?)?)
 }
