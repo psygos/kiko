@@ -1461,6 +1461,7 @@ struct WriterState {
     failed: AtomicBool,
     error: Mutex<Option<DatasetError>>,
     recorded_pairs: Mutex<Vec<RecordedPair>>,
+    recorded_depth: Mutex<Vec<RecordedDepth>>,
 }
 
 impl WriterState {
@@ -1497,6 +1498,7 @@ impl WriterState {
             failed: AtomicBool::new(false),
             error: Mutex::new(None),
             recorded_pairs: Mutex::new(Vec::new()),
+            recorded_depth: Mutex::new(Vec::new()),
         }
     }
 
@@ -1559,6 +1561,13 @@ impl WriterState {
             .push(pair);
     }
 
+    fn record_depth(&self, depth: RecordedDepth) {
+        self.recorded_depth
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(depth);
+    }
+
     fn cancel_unwritten(&self, in_flight: impl IntoIterator<Item = SpoolItem>) {
         let mut canceled_frames = 0u64;
         let mut canceled_bytes = 0u64;
@@ -1605,7 +1614,7 @@ fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
 
 fn writer_loop_with(
     state: Arc<WriterState>,
-    mut write_item: impl FnMut(SpoolItem) -> Result<Option<RecordedPair>, DatasetError>,
+    mut write_item: impl FnMut(SpoolItem) -> Result<WrittenManifestItem, DatasetError>,
 ) {
     loop {
         let batch = {
@@ -1642,8 +1651,8 @@ fn writer_loop_with(
             }
             let frames = item.frame_count();
             let bytes = item.bytes_len();
-            let recorded_pair = match write_item(item) {
-                Ok(recorded_pair) => recorded_pair,
+            let written_manifest_item = match write_item(item) {
+                Ok(written_manifest_item) => written_manifest_item,
                 Err(err) => {
                     state
                         .write_failed
@@ -1656,8 +1665,10 @@ fn writer_loop_with(
                     return;
                 }
             };
-            if let Some(pair) = recorded_pair {
-                state.record_pair(pair);
+            match written_manifest_item {
+                WrittenManifestItem::None => {}
+                WrittenManifestItem::Pair(pair) => state.record_pair(pair),
+                WrittenManifestItem::Depth(depth) => state.record_depth(depth),
             }
             state.record_written(frames, bytes);
         }
@@ -1667,16 +1678,15 @@ fn writer_loop_with(
 fn write_item_to_dir(
     frames_dir: &Path,
     item: SpoolItem,
-) -> Result<Option<RecordedPair>, DatasetError> {
+) -> Result<WrittenManifestItem, DatasetError> {
     match item {
         SpoolItem::Mono(frame) => {
             write_frame_to_dir(frames_dir, frame)?;
-            Ok(None)
+            Ok(WrittenManifestItem::None)
         }
-        SpoolItem::Pair(pair) => write_pair_to_dir(frames_dir, pair).map(Some),
+        SpoolItem::Pair(pair) => write_pair_to_dir(frames_dir, pair).map(WrittenManifestItem::Pair),
         SpoolItem::Depth(depth) => {
-            write_depth_to_dir(frames_dir, depth)?;
-            Ok(None)
+            write_depth_to_dir(frames_dir, depth).map(WrittenManifestItem::Depth)
         }
     }
 }
@@ -1711,8 +1721,9 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
     Ok(())
 }
 
-fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), DatasetError> {
-    let filename = format::frame_name(depth.timestamp().as_nanos(), "depth");
+fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<RecordedDepth, DatasetError> {
+    let timestamp_ns = depth.timestamp().as_nanos();
+    let filename = format::frame_name(timestamp_ns, "depth");
     let path = frames_dir.join(&filename);
     let mut bytes = Vec::with_capacity(
         depth
@@ -1724,7 +1735,7 @@ fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<(), Datase
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     write_new_file(&path, &bytes)?;
-    Ok(())
+    Ok(RecordedDepth { timestamp_ns })
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
@@ -1827,6 +1838,10 @@ struct Manifest {
     header: ManifestHeader,
     stats: ManifestStats,
     entries: Vec<ManifestEntry>,
+    /// `None` is the legacy/unconfigured representation; `Some([])` records a configured stream
+    /// that completed without writing any depth payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    depth_entries: Option<Vec<ManifestFrameRef>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1929,6 +1944,18 @@ struct RecordedPair {
     delta_ns: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecordedDepth {
+    timestamp_ns: i64,
+}
+
+#[derive(Debug)]
+enum WrittenManifestItem {
+    None,
+    Pair(RecordedPair),
+    Depth(RecordedDepth),
+}
+
 #[derive(Debug)]
 struct FrameSet {
     left: Vec<FrameInfo>,
@@ -1970,6 +1997,22 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         }
     };
 
+    let depth_entries = match contract.depth {
+        Some(depth_contract) => {
+            let recorded_depth = state
+                .recorded_depth
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .clone();
+            Some(recorded_depth_entries(
+                &state.dataset_dir,
+                &recorded_depth,
+                depth_contract,
+            )?)
+        }
+        None => None,
+    };
+
     let manifest = Manifest {
         header: ManifestHeader {
             dataset_id: dataset_id(&state.dataset_dir),
@@ -1999,6 +2042,7 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
             delta_stats: topology.delta_stats,
         },
         entries: topology.entries,
+        depth_entries,
     };
 
     let bytes =
@@ -2007,6 +2051,29 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
             source,
         })?;
     publish_manifest(&state.dataset_dir, &bytes)
+}
+
+fn recorded_depth_entries(
+    dataset_dir: &Path,
+    recorded_depth: &[RecordedDepth],
+    contract: DepthImageContract,
+) -> Result<Vec<ManifestFrameRef>, DatasetError> {
+    let mut recorded_depth = recorded_depth.to_vec();
+    recorded_depth.sort_by_key(|depth| depth.timestamp_ns);
+
+    let mut entries = Vec::with_capacity(recorded_depth.len());
+    for depth in recorded_depth {
+        let frame_ref = manifest_frame_ref(depth.timestamp_ns, "depth");
+        let path = dataset_dir.join(&frame_ref.path);
+        if entries.last().is_some_and(|previous: &ManifestFrameRef| {
+            previous.timestamp_ns == frame_ref.timestamp_ns
+        }) {
+            return Err(DatasetError::DuplicateManifestFrameRef { path });
+        }
+        validate_payload_file(&path, contract.expected_payload_len())?;
+        entries.push(frame_ref);
+    }
+    Ok(entries)
 }
 
 struct ManifestTopology {
@@ -2925,6 +2992,166 @@ mod tests {
     }
 
     #[test]
+    fn manifest_depth_entries_are_sorted_successful_writer_identities() {
+        let path = unique_dataset_path("depth-manifest-identities");
+        let dataset_meta = meta_with_depth(2, 2);
+        let (writer, handle) = DatasetWriter::create(&path, &dataset_meta, &calibration())
+            .expect("create depth dataset");
+        for timestamp_ns in [30, 10, 20] {
+            assert_eq!(
+                write_outcome(writer.write_depth(&depth_image(2, 2, timestamp_ns))),
+                WriteOutcome::Enqueued
+            );
+        }
+
+        let unrecorded_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(15, "depth"));
+        std::fs::write(&unrecorded_path, [0_u8; 16])
+            .expect("write valid but unrecorded depth payload");
+
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let manifest = read_manifest(&path).expect("read depth manifest");
+        let depth_entries = manifest
+            .depth_entries
+            .expect("configured depth stream must be represented");
+        let identities: Vec<(i64, String)> = depth_entries
+            .into_iter()
+            .map(|entry| (entry.timestamp_ns, entry.path))
+            .collect();
+        assert_eq!(
+            identities,
+            [
+                (10, frame_path(10, "depth")),
+                (20, frame_path(20, "depth")),
+                (30, frame_path(30, "depth")),
+            ]
+        );
+        assert!(unrecorded_path.exists());
+
+        std::fs::remove_dir_all(path).expect("remove depth identity dataset");
+    }
+
+    #[test]
+    fn depth_manifest_distinguishes_configured_empty_legacy_and_unconfigured_streams() {
+        let configured_path = unique_dataset_path("depth-manifest-empty");
+        let (writer, handle) =
+            DatasetWriter::create(&configured_path, &meta_with_depth(2, 2), &calibration())
+                .expect("create configured depth dataset");
+        drop(writer);
+        handle.finish().expect("finish empty depth dataset");
+
+        let manifest_path = configured_path.join(format::MANIFEST_FILE);
+        let mut serialized: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read configured depth manifest"),
+        )
+        .expect("parse configured depth manifest");
+        assert_eq!(serialized["depth_entries"], serde_json::json!([]));
+        assert!(
+            read_manifest(&configured_path)
+                .expect("read configured depth manifest")
+                .depth_entries
+                .is_some_and(|entries| entries.is_empty())
+        );
+
+        serialized
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("depth_entries");
+        let legacy: Manifest =
+            serde_json::from_value(serialized).expect("legacy manifest remains deserializable");
+        assert!(legacy.depth_entries.is_none());
+        std::fs::remove_dir_all(configured_path).expect("remove empty depth dataset");
+
+        let unconfigured_path = unique_dataset_path("depth-manifest-unconfigured");
+        let (writer, handle) = DatasetWriter::create(&unconfigured_path, &meta(), &calibration())
+            .expect("create unconfigured dataset");
+        drop(writer);
+        handle.finish().expect("finish unconfigured dataset");
+        let serialized: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(unconfigured_path.join(format::MANIFEST_FILE))
+                .expect("read unconfigured manifest"),
+        )
+        .expect("parse unconfigured manifest");
+        assert!(serialized.get("depth_entries").is_none());
+        std::fs::remove_dir_all(unconfigured_path).expect("remove unconfigured dataset");
+    }
+
+    #[test]
+    fn changed_recorded_depth_payload_prevents_manifest_publication() {
+        let path = unique_dataset_path("depth-manifest-mutated-payload");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(2, 2, 7))),
+            WriteOutcome::Enqueued
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while writer.stats().frames_written < 1 {
+            assert!(writer.is_healthy(), "writer failed before payload mutation");
+            assert!(
+                Instant::now() < deadline,
+                "writer did not persist the depth payload"
+            );
+            std::thread::yield_now();
+        }
+        let depth_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(7, "depth"));
+        std::fs::write(&depth_path, [0_u8; 12]).expect("truncate recorded depth payload");
+
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("changed recorded depth must fail finalization"),
+            DatasetError::InvalidFrameLength {
+                path: failed_path,
+                expected: 16,
+                actual: 12,
+            } if failed_path == depth_path
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove mutated depth dataset");
+    }
+
+    #[test]
+    fn failed_depth_write_never_records_a_manifest_identity() {
+        let path = unique_dataset_path("depth-manifest-failed-write");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        let depth_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(9, "depth"));
+        std::fs::write(&depth_path, [0_u8; 16]).expect("occupy depth payload path");
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(2, 2, 9))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        let state = Arc::clone(&handle.state);
+
+        assert!(matches!(
+            handle.finish().expect_err("occupied depth path must fail"),
+            DatasetError::WriteFile { path: failed_path, source }
+                if failed_path == depth_path
+                    && source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(
+            state
+                .recorded_depth
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .is_empty()
+        );
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove failed depth dataset");
+    }
+
+    #[test]
     fn mono_writers_reject_equal_area_wrong_shape_frames_without_a_manifest() {
         let mut dataset_meta = meta();
         let mono = dataset_meta.mono.as_mut().expect("mono metadata");
@@ -3581,7 +3808,7 @@ mod tests {
             writer_loop_with(worker_state, move |_item| {
                 entered_tx.send(()).expect("signal in-flight item");
                 release_rx.recv().expect("release in-flight item");
-                Ok(None)
+                Ok(WrittenManifestItem::None)
             });
         });
         entered_rx
