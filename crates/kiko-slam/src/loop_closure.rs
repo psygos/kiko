@@ -549,11 +549,12 @@ pub struct GlobalDescriptor([f32; GLOBAL_DESCRIPTOR_DIM]);
 
 impl GlobalDescriptor {
     pub fn try_new(values: [f32; GLOBAL_DESCRIPTOR_DIM]) -> Result<Self, GlobalDescriptorError> {
-        let mut norm_sq = 0.0_f32;
+        let mut norm_sq = 0.0_f64;
         for (idx, &value) in values.iter().enumerate() {
             if !value.is_finite() {
                 return Err(GlobalDescriptorError::NonFiniteValue { index: idx, value });
             }
+            let value = f64::from(value);
             norm_sq += value * value;
         }
         if norm_sq <= 0.0 {
@@ -563,7 +564,7 @@ impl GlobalDescriptor {
         let inv_norm = 1.0 / norm_sq.sqrt();
         let mut normalized = values;
         for v in &mut normalized {
-            *v *= inv_norm;
+            *v = (f64::from(*v) * inv_norm) as f32;
         }
         Ok(Self(normalized))
     }
@@ -594,19 +595,21 @@ impl GlobalDescriptor {
             return Err(GlobalDescriptorError::EmptyInput);
         }
 
-        let mut out = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
-        let count = descriptors.len() as f32;
+        let mut sums = [0.0_f64; crate::DESCRIPTOR_DIM];
+        let mut maxima = [f32::NEG_INFINITY; crate::DESCRIPTOR_DIM];
         for d in descriptors {
             for (idx, value) in d.0.iter().copied().enumerate() {
-                out[idx] += value;
-                let max_slot = &mut out[crate::DESCRIPTOR_DIM + idx];
-                if value > *max_slot {
-                    *max_slot = value;
+                sums[idx] += f64::from(value);
+                if value > maxima[idx] {
+                    maxima[idx] = value;
                 }
             }
         }
-        for value in &mut out[..crate::DESCRIPTOR_DIM] {
-            *value /= count;
+        let count = descriptors.len() as f64;
+        let mut out = [0.0_f32; GLOBAL_DESCRIPTOR_DIM];
+        for idx in 0..crate::DESCRIPTOR_DIM {
+            out[idx] = (sums[idx] / count) as f32;
+            out[crate::DESCRIPTOR_DIM + idx] = maxima[idx];
         }
 
         Self::try_new(out)
@@ -1139,6 +1142,22 @@ mod tests {
         GlobalDescriptor::try_new(d).expect("valid basis descriptor")
     }
 
+    #[test]
+    fn global_descriptor_normalizes_extreme_finite_magnitudes() {
+        for magnitude in [f32::from_bits(1), f32::MAX] {
+            let descriptor = GlobalDescriptor::try_new([magnitude; 512])
+                .expect("every nonzero finite descriptor is normalizable");
+            assert!(descriptor.as_array().iter().all(|value| value.is_finite()));
+            let norm = descriptor
+                .as_array()
+                .iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!((norm - 1.0).abs() < 1e-6, "normalized norm={norm}");
+        }
+    }
+
     fn make_keyframe_ids(n: usize) -> Vec<KeyframeId> {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(320, 240).expect("size");
@@ -1594,6 +1613,26 @@ mod tests {
         );
         assert!(values[4] > 0.0);
         assert!(values[256 + 4] > 0.0);
+    }
+
+    #[test]
+    fn aggregate_preserves_negative_maxima_and_extreme_finite_values() {
+        let negative = aggregate_global_descriptor(&[Descriptor([-1.0; 256])])
+            .expect("negative finite descriptors are valid");
+        assert!(negative.as_array()[256..].iter().all(|value| *value < 0.0));
+
+        let extreme = aggregate_global_descriptor(&[
+            Descriptor([f32::MAX; 256]),
+            Descriptor([f32::MAX; 256]),
+        ])
+        .expect("finite descriptor aggregation must not overflow");
+        let norm = extreme
+            .as_array()
+            .iter()
+            .map(|&value| f64::from(value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-6, "normalized norm={norm}");
     }
 
     #[test]
