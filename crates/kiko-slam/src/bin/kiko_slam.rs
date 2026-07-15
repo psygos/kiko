@@ -1273,9 +1273,11 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let meta = build_meta(&mono_config, depth_config.as_ref(), None);
     let calibration = build_calibration(&device, baseline_m, &mono_config);
+    let pairing_window = load_pairing_window()?;
 
     eprintln!("creating dataset at {}", output_path.display());
-    let (writer, writer_handle) = DatasetWriter::create(output_path, &meta, &calibration)?;
+    let (writer, writer_handle) =
+        DatasetWriter::create_paired(output_path, &meta, &calibration, pairing_window)?;
 
     let mut pair_count = 0u64;
     let mut left_count = 0u64;
@@ -1283,7 +1285,6 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut depth_count = 0u64;
     let mut left_seq = 0u64;
     let mut right_seq = 0u64;
-    let pairing_window = load_pairing_window()?;
     let pairer_max_pending = load_pairer_max_pending_per_side();
     let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending);
     let start = Instant::now();
@@ -1376,12 +1377,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                     break 'capture;
                 }
             };
-            if let Err(err) = require_record_write(writer.write_frame(pair.left()), "left frame") {
-                capture_error = Some(err);
-                break 'capture;
-            }
-            if let Err(err) = require_record_write(writer.write_frame(pair.right()), "right frame")
-            {
+            if let Err(err) = require_record_write(writer.write_pair(pair), "stereo pair") {
                 capture_error = Some(err);
                 break 'capture;
             }
