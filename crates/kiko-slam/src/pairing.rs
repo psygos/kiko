@@ -13,14 +13,25 @@ impl PairingWindowNs {
         Ok(Self(window_ns))
     }
 
+    pub fn try_from_u64(window_ns: u64) -> Result<Self, PairingConfigError> {
+        let window_ns = i64::try_from(window_ns)
+            .map_err(|_| PairingConfigError::WindowTooLarge { window_ns })?;
+        Ok(Self(window_ns))
+    }
+
     pub fn as_ns(&self) -> i64 {
         self.0
+    }
+
+    pub fn as_u64(&self) -> u64 {
+        self.0 as u64
     }
 }
 
 #[derive(Debug)]
 pub enum PairingConfigError {
     NegativeWindow { window_ns: i64 },
+    WindowTooLarge { window_ns: u64 },
 }
 
 impl std::fmt::Display for PairingConfigError {
@@ -29,6 +40,10 @@ impl std::fmt::Display for PairingConfigError {
             PairingConfigError::NegativeWindow { window_ns } => {
                 write!(f, "pairing window must be non-negative, got {window_ns}")
             }
+            PairingConfigError::WindowTooLarge { window_ns } => write!(
+                f,
+                "pairing window must fit the signed timestamp domain, got {window_ns}"
+            ),
         }
     }
 }
@@ -96,7 +111,7 @@ impl StereoPairer {
                 None => return Ok(None),
             };
 
-            if best_delta <= self.window.as_ns() as u64 {
+            if best_delta <= self.window.as_u64() {
                 let Some(left) = self.left.pop_front() else {
                     return Ok(None);
                 };
@@ -209,6 +224,21 @@ mod tests {
         };
         assert_eq!(delta_ns, u64::MAX);
         assert_eq!(max_delta_ns, i64::MAX as u64);
+    }
+
+    #[test]
+    fn unsigned_pairing_window_parser_rejects_values_above_i64_max() {
+        assert_eq!(
+            PairingWindowNs::try_from_u64(i64::MAX as u64)
+                .expect("maximum signed window")
+                .as_ns(),
+            i64::MAX
+        );
+        assert!(matches!(
+            PairingWindowNs::try_from_u64(i64::MAX as u64 + 1),
+            Err(PairingConfigError::WindowTooLarge { window_ns })
+                if window_ns == i64::MAX as u64 + 1
+        ));
     }
 
     #[test]

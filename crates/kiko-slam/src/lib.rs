@@ -710,10 +710,10 @@ impl StereoPair {
             .timestamp()
             .as_nanos()
             .abs_diff(right.timestamp().as_nanos());
-        if delta > window.as_ns() as u64 {
+        if delta > window.as_u64() {
             return Err(PairError::TimestampDelta {
                 delta_ns: delta,
-                max_delta_ns: window.as_ns() as u64,
+                max_delta_ns: window.as_u64(),
             });
         }
 
