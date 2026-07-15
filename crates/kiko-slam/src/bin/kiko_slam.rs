@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU16, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -52,6 +52,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 const DEFAULT_MAX_KEYPOINTS: usize = 1024;
+const DEFAULT_RERUN_PORT: u16 = 9876;
 
 // BA defaults (overridable via KIKO_BA_* / KIKO_LM_* env vars)
 const DEFAULT_BA_WINDOW: usize = 10;
@@ -161,7 +162,7 @@ struct DatasetArgs {
     #[arg(value_name = "DATASET_PATH")]
     path: PathBuf,
     #[arg(value_name = "MAX_PAIRS")]
-    max_pairs: Option<usize>,
+    max_pairs: Option<PairLimitArg>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -170,14 +171,14 @@ struct VizArgs {
     inference: InferenceArgs,
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value_t = VizDecimationArg::default())]
     rerun_decimation: VizDecimationArg,
-    #[arg(long, env = "KIKO_RERUN_SAVE")]
+    #[arg(long, env = "KIKO_RERUN_SAVE", conflicts_with = "rerun_serve")]
     save_rrd: Option<PathBuf>,
     /// Start a gRPC server on 0.0.0.0:<port> so remote Rerun viewers can connect.
     #[arg(long, env = "KIKO_RERUN_SERVE", default_value_t = false)]
     rerun_serve: bool,
     /// Port for gRPC server (used with --rerun-serve). Default: 9876.
-    #[arg(long, env = "KIKO_RERUN_PORT", default_value_t = 9876)]
-    rerun_port: u16,
+    #[arg(long, env = "KIKO_RERUN_PORT", requires = "rerun_serve")]
+    rerun_port: Option<NonZeroU16>,
     #[arg(long, env = "KIKO_VIZ_ODOMETRY", default_value_t = false)]
     odometry: bool,
     #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
@@ -382,6 +383,29 @@ impl std::fmt::Display for KeypointLimitArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PairLimitArg(NonZeroUsize);
+
+impl std::str::FromStr for PairLimitArg {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let value = raw
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| format!("invalid maximum pair count: {raw}"))?;
+        NonZeroUsize::new(value)
+            .map(PairLimitArg)
+            .ok_or_else(|| "maximum pair count must be nonzero".to_owned())
+    }
+}
+
+impl PairLimitArg {
+    fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct VizDecimationArg(VizDecimation);
 
@@ -531,7 +555,7 @@ fn build_recording(
         let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
         Ok(rec)
     } else if args.rerun_serve {
-        let port = args.rerun_port;
+        let port = args.rerun_port.map_or(DEFAULT_RERUN_PORT, NonZeroU16::get);
         eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
         eprintln!(
             "rerun: connect from laptop with:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
@@ -639,7 +663,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(limit) = args.dataset.max_pairs
-            && processed >= limit
+            && processed >= limit.get()
         {
             break;
         }
@@ -1078,7 +1102,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(limit) = args.dataset.max_pairs
-            && processed >= limit
+            && processed >= limit.get()
         {
             break;
         }
@@ -1165,7 +1189,7 @@ fn run_bench(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         processed += 1;
 
         if let Some(limit) = args.dataset.max_pairs
-            && processed >= limit
+            && processed >= limit.get()
         {
             break;
         }
@@ -2498,7 +2522,8 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaConfigValues, BenchError, DepthRingCapacity, build_ba_config_from_values};
+    use super::{BaConfigValues, BenchError, Cli, DepthRingCapacity, build_ba_config_from_values};
+    use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::DatasetError;
     use kiko_slam::{InferenceError, PipelineError, PipelineTimingError};
     use std::time::Duration;
@@ -2572,6 +2597,49 @@ mod tests {
             .get(),
             8
         );
+    }
+
+    #[test]
+    fn cli_rejects_zero_pair_limits_at_the_boundary() {
+        let error = Cli::try_parse_from(["kiko-slam", "bench", "/tmp/dataset", "0"])
+            .expect_err("zero pair limit must be rejected");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_rerun_destinations() {
+        let error = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--save-rrd",
+            "/tmp/output.rrd",
+            "--rerun-serve",
+            "/tmp/dataset",
+        ])
+        .expect_err("save and serve destinations must conflict");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn cli_requires_serving_for_an_explicit_rerun_port() {
+        let error =
+            Cli::try_parse_from(["kiko-slam", "viz", "--rerun-port", "9877", "/tmp/dataset"])
+                .expect_err("an explicit port without serving must be rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn cli_rejects_ephemeral_rerun_port_zero() {
+        let error = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--rerun-serve",
+            "--rerun-port",
+            "0",
+            "/tmp/dataset",
+        ])
+        .expect_err("port zero would make the announced endpoint untruthful");
+        assert_eq!(error.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]
