@@ -136,8 +136,8 @@ pub use math::{Pose64, Pose64Error};
 #[cfg(feature = "record")]
 pub use oak::{OakImuError, oak_to_depth_image, oak_to_frame, oak_to_imu_batch};
 pub use pairing::{
-    PairingConfigError, PairingDropReason, PairingOutcome, PairingStats, PairingWindowNs,
-    PendingFramesCapacity, PendingFramesCapacityError, StereoPairer,
+    PairingConfigError, PairingDropReason, PairingInputError, PairingOutcome, PairingStats,
+    PairingWindowNs, PendingFramesCapacity, PendingFramesCapacityError, StereoPairer,
 };
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimingError,

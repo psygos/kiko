@@ -150,8 +150,8 @@ enum LiveCaptureError {
     ImuTimestampShift {
         source: kiko_slam::ImuTimestampShiftError,
     },
-    Pairing {
-        source: kiko_slam::PairError,
+    PairingInput {
+        source: kiko_slam::PairingInputError,
     },
     ImuBatch {
         source: kiko_slam::ImuBatchError,
@@ -185,7 +185,9 @@ impl std::fmt::Display for LiveCaptureError {
             Self::ImuTimestampShift { source } => {
                 write!(f, "IMU timestamp calibration failed: {source}")
             }
-            Self::Pairing { source } => write!(f, "stereo pairing failed: {source}"),
+            Self::PairingInput { source } => {
+                write!(f, "stereo pairing input failed: {source}")
+            }
             Self::ImuBatch { source } => write!(f, "capture IMU batch is invalid: {source}"),
             Self::ImuAccumulator { source } => {
                 write!(f, "capture IMU stream ordering is invalid: {source}")
@@ -210,7 +212,7 @@ impl std::error::Error for LiveCaptureError {
             Self::Imu { source } => Some(source),
             Self::OakImu { source } => Some(source),
             Self::ImuTimestampShift { source } => Some(source),
-            Self::Pairing { source } => Some(source),
+            Self::PairingInput { source } => Some(source),
             Self::ImuBatch { source } => Some(source),
             Self::ImuAccumulator { source } => Some(source),
             Self::CaptureInterval { source } => Some(source),
@@ -605,7 +607,9 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(PairingOutcome::Dropped {
                                 sensor: SensorId::StereoLeft,
                                 reason: PairingDropReason::PendingCapacity,
-                            }) = pairer.push_left(frame)
+                            }) = pairer
+                                .push_left(frame)
+                                .map_err(|source| LiveCaptureError::PairingInput { source })?
                             {
                                 pending_capacity_left_drops =
                                     pending_capacity_left_drops.saturating_add(1);
@@ -637,7 +641,9 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(PairingOutcome::Dropped {
                                 sensor: SensorId::StereoRight,
                                 reason: PairingDropReason::PendingCapacity,
-                            }) = pairer.push_right(frame)
+                            }) = pairer
+                                .push_right(frame)
+                                .map_err(|source| LiveCaptureError::PairingInput { source })?
                             {
                                 pending_capacity_right_drops =
                                     pending_capacity_right_drops.saturating_add(1);
@@ -710,10 +716,7 @@ pub fn run_live(args: &LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             loop {
-                match pairer
-                    .next_outcome()
-                    .map_err(|source| LiveCaptureError::Pairing { source })?
-                {
+                match pairer.next_outcome() {
                     PairingOutcome::Produced(pair) => {
                         let capture_time = pair.capture_time();
                         let interval =

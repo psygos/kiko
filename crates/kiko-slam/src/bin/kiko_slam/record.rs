@@ -80,8 +80,8 @@ enum RecordCaptureError {
     OakImu {
         source: kiko_slam::OakImuError,
     },
-    Pairing {
-        source: kiko_slam::PairError,
+    PairingInput {
+        source: kiko_slam::PairingInputError,
     },
     WriterDropped {
         item: &'static str,
@@ -104,7 +104,9 @@ impl std::fmt::Display for RecordCaptureError {
             Self::DepthImage { source } => write!(f, "depth frame conversion failed: {source}"),
             Self::Imu { source } => write!(f, "IMU stream failed: {source}"),
             Self::OakImu { source } => write!(f, "IMU sample conversion failed: {source}"),
-            Self::Pairing { source } => write!(f, "stereo pairing failed: {source}"),
+            Self::PairingInput { source } => {
+                write!(f, "stereo pairing input failed: {source}")
+            }
             Self::WriterDropped { item } => {
                 write!(f, "dataset writer dropped {item} due to backpressure")
             }
@@ -122,7 +124,7 @@ impl std::error::Error for RecordCaptureError {
             Self::DepthImage { source } => Some(source),
             Self::Imu { source } => Some(source),
             Self::OakImu { source } => Some(source),
-            Self::Pairing { source } => Some(source),
+            Self::PairingInput { source } => Some(source),
             Self::WriterDropped { .. } | Self::WriterFailed { .. } => None,
         }
     }
@@ -254,7 +256,9 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(PairingOutcome::Dropped {
                                 sensor: SensorId::StereoLeft,
                                 reason: PairingDropReason::PendingCapacity,
-                            }) = pairer.push_left(frame)
+                            }) = pairer
+                                .push_left(frame)
+                                .map_err(|source| RecordCaptureError::PairingInput { source })?
                             {
                                 pending_capacity_left_drops =
                                     pending_capacity_left_drops.saturating_add(1);
@@ -287,7 +291,9 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                             if let Some(PairingOutcome::Dropped {
                                 sensor: SensorId::StereoRight,
                                 reason: PairingDropReason::PendingCapacity,
-                            }) = pairer.push_right(frame)
+                            }) = pairer
+                                .push_right(frame)
+                                .map_err(|source| RecordCaptureError::PairingInput { source })?
                             {
                                 pending_capacity_right_drops =
                                     pending_capacity_right_drops.saturating_add(1);
@@ -350,10 +356,7 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             loop {
-                match pairer
-                    .next_outcome()
-                    .map_err(|source| RecordCaptureError::Pairing { source })?
-                {
+                match pairer.next_outcome() {
                     PairingOutcome::Produced(pair) => {
                         require_enqueued(writer.write_stereo_pair(&pair), "stereo pair")?;
                         pair_count = pair_count.saturating_add(1);
