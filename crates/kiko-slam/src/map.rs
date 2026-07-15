@@ -509,7 +509,11 @@ impl MapGeneration {
     }
 
     fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        Self(
+            self.0
+                .checked_add(1)
+                .expect("map generation space exhausted"),
+        )
     }
 
     pub fn as_u64(self) -> u64 {
@@ -592,10 +596,6 @@ impl SlamMap {
         }
     }
 
-    fn bump_generation(&mut self) {
-        self.generation = self.generation.next();
-    }
-
     fn raw_keyframe_id(&self, id: KeyframeId) -> Result<RawKeyframeId, MapError> {
         id.raw_for(self.instance_id)
             .ok_or(MapError::KeyframeNotFound(id))
@@ -663,9 +663,10 @@ impl SlamMap {
             keypoints,
         };
 
+        let next_generation = self.generation.next();
         let kf_id = KeyframeId::new(self.instance_id, self.keyframes.insert(entry));
         self.frame_to_keyframe.insert(frame_id, kf_id);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(kf_id)
     }
 
@@ -723,6 +724,7 @@ impl SlamMap {
             });
         }
 
+        let next_generation = self.generation.next();
         let point_id = MapPointId::new(
             self.instance_id,
             self.points.insert(MapPoint {
@@ -737,7 +739,7 @@ impl SlamMap {
             .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         entry.set_point_ref(first_obs.index, point_id);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(point_id)
     }
 
@@ -779,6 +781,7 @@ impl SlamMap {
             point.observations.iter().map(|o| o.keyframe_id).collect()
         };
 
+        let next_generation = self.generation.next();
         for other in other_keyframes {
             self.covisibility.increment_pair(obs.keyframe_id, other);
         }
@@ -794,7 +797,7 @@ impl SlamMap {
             .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         entry.set_point_ref(obs.index, point_id);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -809,8 +812,9 @@ impl SlamMap {
             .points
             .get_mut(raw_point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
+        let next_generation = self.generation.next();
         point.update_descriptor(new_desc, blend);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -824,8 +828,9 @@ impl SlamMap {
             .points
             .get_mut(raw_point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
+        let next_generation = self.generation.next();
         point.set_position(position);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -839,17 +844,22 @@ impl SlamMap {
             .keyframes
             .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+        let next_generation = self.generation.next();
         entry.set_pose(pose);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
     pub fn remove_map_point(&mut self, point_id: MapPointId) -> Result<(), MapError> {
         let raw_point_id = self.raw_point_id(point_id)?;
+        if !self.points.contains_key(raw_point_id) {
+            return Err(MapError::MapPointNotFound(point_id));
+        }
+        let next_generation = self.generation.next();
         let point = self
             .points
             .remove(raw_point_id)
-            .ok_or(MapError::MapPointNotFound(point_id))?;
+            .expect("map point existence validated before mutation");
 
         for obs in &point.observations {
             let Some(raw_keyframe_id) = obs.keyframe_id.raw_for(self.instance_id) else {
@@ -861,16 +871,20 @@ impl SlamMap {
         }
         self.covisibility
             .remove_point_observations(&point.observations);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
     pub fn remove_keyframe(&mut self, keyframe_id: KeyframeId) -> Result<(), MapError> {
         let raw_keyframe_id = self.raw_keyframe_id(keyframe_id)?;
+        if !self.keyframes.contains_key(raw_keyframe_id) {
+            return Err(MapError::KeyframeNotFound(keyframe_id));
+        }
+        let next_generation = self.generation.next();
         let entry = self
             .keyframes
             .remove(raw_keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+            .expect("keyframe existence validated before mutation");
         self.frame_to_keyframe.remove(&entry.frame_id);
         self.covisibility.remove_keyframe(keyframe_id);
 
@@ -893,7 +907,7 @@ impl SlamMap {
                 "point scheduled for removal was missing from map"
             );
         }
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -1520,6 +1534,143 @@ mod tests {
         CompactDescriptor([128; 256])
     }
 
+    fn assert_generation_exhaustion<T>(operation: impl FnOnce() -> T) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        let Err(payload) = result else {
+            panic!("generation exhaustion must panic before mutation");
+        };
+        assert_eq!(
+            crate::panic_payload_to_string(payload.as_ref()),
+            "map generation space exhausted"
+        );
+    }
+
+    struct GenerationExhaustionFixture {
+        map: SlamMap,
+        snapshot: MapSnapshot,
+        first_keyframe: KeyframeId,
+        second_keyframe: KeyframeId,
+        point_id: MapPointId,
+        first_observation: KeyframeKeypoint,
+        first_free_keypoint: KeyframeKeypoint,
+        second_free_keypoint: KeyframeKeypoint,
+        original_position: WorldPoint3,
+        original_descriptor: CompactDescriptor,
+        original_pose: WorldToCamera,
+    }
+
+    impl GenerationExhaustionFixture {
+        fn new() -> Self {
+            let mut map = SlamMap::new();
+            let size = ImageSize::try_new(640, 480).expect("valid size");
+            let original_pose = WorldToCamera::identity();
+            let first_keyframe = map
+                .add_keyframe(
+                    FrameId::new(1),
+                    Timestamp::from_nanos(1),
+                    original_pose,
+                    size,
+                    make_keypoints(2),
+                )
+                .expect("first keyframe");
+            let second_keyframe = map
+                .add_keyframe(
+                    FrameId::new(2),
+                    Timestamp::from_nanos(2),
+                    original_pose,
+                    size,
+                    make_keypoints(1),
+                )
+                .expect("second keyframe");
+            let first_observation = map
+                .keyframe_keypoint(first_keyframe, 0)
+                .expect("first observation");
+            let first_free_keypoint = map
+                .keyframe_keypoint(first_keyframe, 1)
+                .expect("first free keypoint");
+            let second_free_keypoint = map
+                .keyframe_keypoint(second_keyframe, 0)
+                .expect("second free keypoint");
+            let original_position = WorldPoint3::new(0.0, 0.0, 1.0);
+            let original_descriptor = make_descriptor();
+            let point_id = map
+                .add_map_point(
+                    original_position,
+                    original_descriptor.clone(),
+                    first_observation,
+                )
+                .expect("map point");
+
+            map.generation = MapGeneration(u64::MAX);
+            let snapshot = map.snapshot();
+            Self {
+                map,
+                snapshot,
+                first_keyframe,
+                second_keyframe,
+                point_id,
+                first_observation,
+                first_free_keypoint,
+                second_free_keypoint,
+                original_position,
+                original_descriptor,
+                original_pose,
+            }
+        }
+
+        fn assert_unchanged(&self) {
+            assert_eq!(self.map.snapshot(), self.snapshot);
+            assert_eq!(self.map.num_keyframes(), 2);
+            assert_eq!(self.map.num_points(), 1);
+            assert_eq!(
+                self.map.keyframe_by_frame(FrameId::new(1)),
+                Some(self.first_keyframe)
+            );
+            assert_eq!(
+                self.map.keyframe_by_frame(FrameId::new(2)),
+                Some(self.second_keyframe)
+            );
+
+            let point = self.map.point(self.point_id).expect("original map point");
+            assert_eq!(point.position(), self.original_position);
+            assert_eq!(point.descriptor(), &self.original_descriptor);
+            assert_eq!(point.observations(), &[self.first_observation]);
+            assert_eq!(
+                self.map
+                    .map_point_for_keypoint(self.first_observation)
+                    .expect("associated keypoint"),
+                Some(self.point_id)
+            );
+            assert_eq!(
+                self.map
+                    .map_point_for_keypoint(self.first_free_keypoint)
+                    .expect("first free keypoint"),
+                None
+            );
+            assert_eq!(
+                self.map
+                    .map_point_for_keypoint(self.second_free_keypoint)
+                    .expect("second free keypoint"),
+                None
+            );
+            assert_eq!(
+                self.map
+                    .covisibility()
+                    .covisibility_count(self.first_keyframe, self.second_keyframe),
+                0
+            );
+
+            let pose = self
+                .map
+                .keyframe(self.first_keyframe)
+                .expect("first keyframe")
+                .pose();
+            assert_eq!(pose.rotation(), self.original_pose.rotation());
+            assert_eq!(pose.translation(), self.original_pose.translation());
+            assert_map_invariants(&self.map).expect("map invariants after rejected mutation");
+        }
+    }
+
     fn reference_blend_byte(previous: u8, next: u8, weight: u16) -> u8 {
         let inverse = BLEND_SCALE - weight;
         let numerator = u64::from(previous) * u64::from(inverse)
@@ -1727,6 +1878,74 @@ mod tests {
         )
         .expect("map point");
         assert_eq!(map.generation().as_u64(), 2);
+    }
+
+    #[test]
+    fn map_generation_exhaustion_precedes_every_map_mutation() {
+        let mut fixture = GenerationExhaustionFixture::new();
+
+        assert_generation_exhaustion(|| {
+            fixture.map.add_keyframe(
+                FrameId::new(3),
+                Timestamp::from_nanos(3),
+                WorldToCamera::identity(),
+                ImageSize::try_new(640, 480).expect("valid size"),
+                make_keypoints(1),
+            )
+        });
+        fixture.assert_unchanged();
+
+        let first_free_keypoint = fixture.first_free_keypoint;
+        assert_generation_exhaustion(|| {
+            fixture.map.add_map_point(
+                WorldPoint3::new(1.0, 2.0, 3.0),
+                CompactDescriptor([255; 256]),
+                first_free_keypoint,
+            )
+        });
+        fixture.assert_unchanged();
+
+        let point_id = fixture.point_id;
+        let second_free_keypoint = fixture.second_free_keypoint;
+        assert_generation_exhaustion(|| {
+            fixture.map.add_observation(point_id, second_free_keypoint)
+        });
+        fixture.assert_unchanged();
+
+        assert_generation_exhaustion(|| {
+            fixture.map.update_map_point_descriptor(
+                point_id,
+                &CompactDescriptor([255; 256]),
+                DescriptorBlend::try_new(1.0).expect("full replacement"),
+            )
+        });
+        fixture.assert_unchanged();
+
+        assert_generation_exhaustion(|| {
+            fixture
+                .map
+                .set_map_point_position(point_id, WorldPoint3::new(1.0, 2.0, 3.0))
+        });
+        fixture.assert_unchanged();
+
+        let first_keyframe = fixture.first_keyframe;
+        let changed_pose = WorldToCamera::from_legacy_pose(crate::Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 2.0, 3.0],
+        ));
+        assert_generation_exhaustion(|| {
+            fixture.map.set_keyframe_pose(first_keyframe, changed_pose)
+        });
+        fixture.assert_unchanged();
+
+        assert_generation_exhaustion(|| fixture.map.remove_map_point(point_id));
+        fixture.assert_unchanged();
+
+        assert_generation_exhaustion(|| fixture.map.remove_keyframe(first_keyframe));
+        fixture.assert_unchanged();
+
+        assert_generation_exhaustion(|| fixture.map.cull_points(2));
+        fixture.assert_unchanged();
     }
 
     #[test]
