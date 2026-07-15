@@ -38,7 +38,7 @@ pub use channel::{
 pub use dense::backend::{
     Mesh, TsdfBackend, TsdfBackendFactory, TsdfConfig, TsdfConfigError, TsdfError,
 };
-pub use dense::{DenseCommand, DenseConfig, DenseStats, ReconState};
+pub use dense::{DenseCommand, DenseConfig, DenseConfigError, DenseStats, ReconState};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,

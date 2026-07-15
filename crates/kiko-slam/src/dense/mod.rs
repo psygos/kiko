@@ -3,6 +3,7 @@ pub mod command_mapper;
 pub mod ring_buffer;
 
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 
 use crate::dense::backend::{TsdfBackend, TsdfBackendFactory, TsdfConfig};
 use crate::map::KeyframeId;
@@ -156,20 +157,49 @@ impl Default for DenseStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseConfigError {
+    ZeroMaxStoredKeyframes,
+}
+
+impl std::fmt::Display for DenseConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroMaxStoredKeyframes => {
+                write!(f, "maximum stored keyframes must be nonzero")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DenseConfigError {}
+
 #[derive(Debug)]
 pub struct DenseConfig {
-    /// Maximum number of depth keyframes to store. LRU eviction kicks in
-    /// when this limit is reached (safety net for exploration trajectories
-    /// where the tracker never culls keyframes).
-    pub max_stored_keyframes: usize,
+    /// Maximum number of depth keyframes to store. Insertion-order eviction
+    /// kicks in when this limit is reached (a safety net for exploration
+    /// trajectories where the tracker never culls keyframes).
+    pub max_stored_keyframes: NonZeroUsize,
     /// Dense reconstruction mode.
     pub mode: DenseMode,
+}
+
+impl DenseConfig {
+    pub fn try_new(max_stored_keyframes: usize, mode: DenseMode) -> Result<Self, DenseConfigError> {
+        let max_stored_keyframes = NonZeroUsize::new(max_stored_keyframes)
+            .ok_or(DenseConfigError::ZeroMaxStoredKeyframes)?;
+        Ok(Self {
+            max_stored_keyframes,
+            mode,
+        })
+    }
 }
 
 impl Default for DenseConfig {
     fn default() -> Self {
         Self {
-            max_stored_keyframes: 300,
+            max_stored_keyframes: NonZeroUsize::new(300)
+                .expect("default dense store capacity is nonzero"),
             mode: DenseMode::DepthStoreOnly,
         }
     }
@@ -182,21 +212,21 @@ impl Default for DenseConfig {
 /// Bounded store of depth images keyed by keyframe ID.
 ///
 /// Primary eviction is via `RemoveKeyframe` commands (driven by
-/// `DiagnosticEvent::KeyframeRemoved`). The LRU cap is a safety net
-/// for unbounded growth in exploration scenarios.
+/// `DiagnosticEvent::KeyframeRemoved`). The insertion-order cap is a safety
+/// net for unbounded growth in exploration scenarios. Updating an existing
+/// keyframe does not change its eviction position.
 #[derive(Debug)]
 pub(crate) struct DepthStore {
     map: HashMap<KeyframeId, DepthImage>,
     order: VecDeque<KeyframeId>,
-    cap: usize,
+    cap: NonZeroUsize,
 }
 
 impl DepthStore {
-    pub fn new(cap: usize) -> Self {
-        let cap = cap.max(1);
+    pub fn new(cap: NonZeroUsize) -> Self {
         Self {
-            map: HashMap::with_capacity(cap.min(64)),
-            order: VecDeque::with_capacity(cap.min(64)),
+            map: HashMap::with_capacity(cap.get().min(64)),
+            order: VecDeque::with_capacity(cap.get().min(64)),
             cap,
         }
     }
@@ -209,8 +239,8 @@ impl DepthStore {
             return;
         }
 
-        // LRU eviction if at cap.
-        while self.map.len() >= self.cap {
+        // Insertion-order eviction if at cap.
+        while self.map.len() >= self.cap.get() {
             if let Some(oldest) = self.order.pop_front() {
                 self.map.remove(&oldest);
             } else {
@@ -618,10 +648,7 @@ mod tests {
     }
 
     fn make_config(cap: usize) -> DenseConfig {
-        DenseConfig {
-            max_stored_keyframes: cap,
-            mode: DenseMode::DepthStoreOnly,
-        }
+        DenseConfig::try_new(cap, DenseMode::DepthStoreOnly).expect("test dense config")
     }
 
     fn make_tsdf_config(policy: RebuildPolicy) -> DenseConfig {
@@ -636,10 +663,7 @@ mod tests {
         .expect("test intrinsics");
         let mode = TsdfModeConfig::try_new(TsdfConfig::default(), intrinsics, policy)
             .expect("test TSDF config");
-        DenseConfig {
-            max_stored_keyframes: 10,
-            mode: DenseMode::Tsdf(mode),
-        }
+        DenseConfig::try_new(10, DenseMode::Tsdf(mode)).expect("test dense config")
     }
 
     fn test_intrinsics() -> PinholeIntrinsics {
@@ -658,11 +682,23 @@ mod tests {
         make_depth_image(FrameId::new(0), Timestamp::from_nanos(0), 2, 2, 1.0)
     }
 
+    fn depth_store(capacity: usize) -> DepthStore {
+        DepthStore::new(NonZeroUsize::new(capacity).expect("nonzero test capacity"))
+    }
+
     // -- DepthStore tests --
 
     #[test]
+    fn dense_config_rejects_zero_store_capacity() {
+        assert_eq!(
+            DenseConfig::try_new(0, DenseMode::DepthStoreOnly).unwrap_err(),
+            DenseConfigError::ZeroMaxStoredKeyframes
+        );
+    }
+
+    #[test]
     fn depth_store_insert_and_retrieve() {
-        let mut store = DepthStore::new(10);
+        let mut store = depth_store(10);
         let id = kf(0);
         let depth = dummy_depth();
         store.insert(id, depth.clone());
@@ -671,24 +707,28 @@ mod tests {
     }
 
     #[test]
-    fn depth_store_cap_evicts_oldest() {
-        let mut store = DepthStore::new(2);
+    fn depth_store_capacity_two_evicts_by_insertion_order() {
+        let mut store = depth_store(2);
         let id1 = kf(0);
         let id2 = kf(1);
         let id3 = kf(2);
         store.insert(id1, dummy_depth());
         store.insert(id2, dummy_depth());
         assert_eq!(store.len(), 2);
+        store.insert(id1, dummy_depth());
         store.insert(id3, dummy_depth());
         assert_eq!(store.len(), 2);
-        assert!(store.get(id1).is_none(), "oldest should be evicted");
+        assert!(
+            store.get(id1).is_none(),
+            "updating the oldest entry must not change its eviction position"
+        );
         assert!(store.get(id2).is_some());
         assert!(store.get(id3).is_some());
     }
 
     #[test]
     fn remove_keyframe_known_id() {
-        let mut store = DepthStore::new(10);
+        let mut store = depth_store(10);
         let id = kf(0);
         store.insert(id, dummy_depth());
         assert_eq!(store.len(), 1);
@@ -699,7 +739,7 @@ mod tests {
 
     #[test]
     fn remove_keyframe_unknown_id_is_noop() {
-        let mut store = DepthStore::new(10);
+        let mut store = depth_store(10);
         let id_in = kf(0);
         let id_out = kf(1);
         store.insert(id_in, dummy_depth());
@@ -708,8 +748,8 @@ mod tests {
     }
 
     #[test]
-    fn depth_store_cap_one() {
-        let mut store = DepthStore::new(1);
+    fn depth_store_capacity_one_keeps_only_latest_insertion() {
+        let mut store = depth_store(1);
         let id1 = kf(0);
         let id2 = kf(1);
         store.insert(id1, dummy_depth());
