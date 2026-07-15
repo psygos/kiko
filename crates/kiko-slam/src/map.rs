@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use slotmap::{SlotMap, new_key_type};
@@ -11,6 +11,8 @@ use crate::{
 
 /// Fixed-point scale factor for descriptor blending (8-bit precision).
 const BLEND_SCALE: u16 = 256;
+/// Smallest requested blend that rounds to a non-zero fixed-point weight.
+const MIN_BLEND_ALPHA: f32 = 0.5 / BLEND_SCALE as f32;
 /// Rounding bias for fixed-point descriptor blending (half of BLEND_SCALE).
 const BLEND_ROUND: u32 = (BLEND_SCALE / 2) as u32;
 static NEXT_MAP_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
@@ -158,12 +160,19 @@ impl KeyframeKeypoint {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct DescriptorBlend(f32);
+/// A descriptor blend parsed into a nonzero fixed-point weight with `1 / 256` resolution.
+///
+/// [`DescriptorBlend::try_new`] rounds a requested coefficient to the nearest
+/// multiple of `1 / 256`; exact half steps round upward because coefficients
+/// are positive. [`DescriptorBlend::alpha`] reports that effective coefficient,
+/// not the pre-quantization request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorBlend(NonZeroU16);
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BlendError {
     OutOfRange { alpha: f32 },
+    BelowResolution { alpha: f32, minimum: f32 },
 }
 
 impl std::fmt::Display for BlendError {
@@ -172,6 +181,10 @@ impl std::fmt::Display for BlendError {
             BlendError::OutOfRange { alpha } => {
                 write!(f, "descriptor blend must be in (0, 1], got {alpha}")
             }
+            BlendError::BelowResolution { alpha, minimum } => write!(
+                f,
+                "descriptor blend {alpha} is below the fixed-point rounding threshold {minimum}"
+            ),
         }
     }
 }
@@ -180,15 +193,25 @@ impl std::error::Error for BlendError {}
 
 impl DescriptorBlend {
     pub fn try_new(alpha: f32) -> Result<Self, BlendError> {
-        if alpha > 0.0 && alpha <= 1.0 {
-            Ok(Self(alpha))
-        } else {
-            Err(BlendError::OutOfRange { alpha })
+        if !(alpha > 0.0 && alpha <= 1.0) {
+            return Err(BlendError::OutOfRange { alpha });
         }
+
+        let weight = (alpha * f32::from(BLEND_SCALE)).round() as u16;
+        let weight = NonZeroU16::new(weight).ok_or(BlendError::BelowResolution {
+            alpha,
+            minimum: MIN_BLEND_ALPHA,
+        })?;
+        Ok(Self(weight))
     }
 
+    /// Returns the effective coefficient after fixed-point quantization.
     pub fn alpha(self) -> f32 {
-        self.0
+        f32::from(self.0.get()) / f32::from(BLEND_SCALE)
+    }
+
+    fn weight(self) -> u16 {
+        self.0.get()
     }
 }
 
@@ -235,9 +258,8 @@ impl MapPoint {
 
     fn update_descriptor(&mut self, new_desc: &CompactDescriptor, blend: DescriptorBlend) {
         // Use fixed-point blending so descriptor updates stay bounded and deterministic.
-        let scale = BLEND_SCALE as f32;
-        let alpha_scaled = (blend.alpha() * scale).round().clamp(1.0, scale) as u16;
-        let inv_scaled = BLEND_SCALE.saturating_sub(alpha_scaled);
+        let alpha_scaled = blend.weight();
+        let inv_scaled = BLEND_SCALE - alpha_scaled;
         for (dst, &src) in self.descriptor.0.iter_mut().zip(new_desc.0.iter()) {
             let prev = *dst as u32;
             let next = src as u32;
@@ -1496,6 +1518,113 @@ mod tests {
 
     fn make_descriptor() -> CompactDescriptor {
         CompactDescriptor([128; 256])
+    }
+
+    fn reference_blend_byte(previous: u8, next: u8, weight: u16) -> u8 {
+        let inverse = BLEND_SCALE - weight;
+        let numerator = u64::from(previous) * u64::from(inverse)
+            + u64::from(next) * u64::from(weight)
+            + u64::from(BLEND_SCALE / 2);
+        u8::try_from(numerator / u64::from(BLEND_SCALE))
+            .expect("a convex combination of bytes remains a byte")
+    }
+
+    #[test]
+    fn descriptor_blend_rejects_non_finite_and_out_of_range_requests() {
+        let requests = [
+            f32::NEG_INFINITY,
+            -1.0,
+            -0.0,
+            0.0,
+            f32::from_bits(1.0_f32.to_bits() + 1),
+            f32::INFINITY,
+            f32::NAN,
+        ];
+
+        for requested in requests {
+            let BlendError::OutOfRange { alpha } =
+                DescriptorBlend::try_new(requested).expect_err("request must be rejected")
+            else {
+                panic!("unexpected blend error for {requested:?}");
+            };
+            assert_eq!(alpha.to_bits(), requested.to_bits());
+        }
+    }
+
+    #[test]
+    fn descriptor_blend_rejects_weights_below_fixed_point_resolution() {
+        let just_below = f32::from_bits(MIN_BLEND_ALPHA.to_bits() - 1);
+        for requested in [f32::from_bits(1), just_below] {
+            let BlendError::BelowResolution { alpha, minimum } =
+                DescriptorBlend::try_new(requested).expect_err("request must round to zero")
+            else {
+                panic!("unexpected blend error for {requested:?}");
+            };
+            assert_eq!(alpha.to_bits(), requested.to_bits());
+            assert_eq!(minimum, MIN_BLEND_ALPHA);
+        }
+    }
+
+    #[test]
+    fn descriptor_blend_rounds_once_and_reports_its_effective_alpha() {
+        let minimum = DescriptorBlend::try_new(MIN_BLEND_ALPHA).expect("half step rounds upward");
+        assert_eq!(minimum.weight(), 1);
+        assert_eq!(minimum.alpha(), 1.0 / f32::from(BLEND_SCALE));
+
+        let second_half_step = 1.5 / f32::from(BLEND_SCALE);
+        let just_below = f32::from_bits(second_half_step.to_bits() - 1);
+        assert_eq!(
+            DescriptorBlend::try_new(just_below)
+                .expect("positive representable blend")
+                .weight(),
+            1
+        );
+        assert_eq!(
+            DescriptorBlend::try_new(second_half_step)
+                .expect("exact half step rounds upward")
+                .weight(),
+            2
+        );
+
+        let off_grid = DescriptorBlend::try_new(0.1).expect("in-range blend");
+        assert_eq!(off_grid.weight(), 26);
+        assert_eq!(off_grid.alpha(), 26.0 / f32::from(BLEND_SCALE));
+
+        let full = DescriptorBlend::try_new(1.0).expect("full replacement");
+        assert_eq!(full.weight(), BLEND_SCALE);
+        assert_eq!(full.alpha(), 1.0);
+    }
+
+    #[test]
+    fn descriptor_blend_matches_integer_reference_for_every_fixed_point_weight() {
+        let previous = CompactDescriptor(std::array::from_fn(|index| {
+            u8::try_from(index).expect("descriptor index fits in a byte")
+        }));
+        let next = CompactDescriptor(std::array::from_fn(|index| {
+            let value = (index * 73 + 19) % 256;
+            u8::try_from(value).expect("value is reduced modulo 256")
+        }));
+
+        for weight in 1..=BLEND_SCALE {
+            let blend = DescriptorBlend::try_new(f32::from(weight) / f32::from(BLEND_SCALE))
+                .expect("fixed-point grid value");
+            assert_eq!(blend.weight(), weight);
+
+            let expected = std::array::from_fn(|index| {
+                reference_blend_byte(previous.0[index], next.0[index], weight)
+            });
+            let mut point = MapPoint {
+                position: Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                descriptor: previous.clone(),
+                observations: Vec::new(),
+            };
+            point.update_descriptor(&next, blend);
+            assert_eq!(point.descriptor.0, expected, "weight {weight}");
+        }
     }
 
     #[test]
