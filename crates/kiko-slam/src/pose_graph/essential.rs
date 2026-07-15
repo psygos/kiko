@@ -148,6 +148,10 @@ pub enum EssentialGraphError {
         keyframe_id: KeyframeId,
         source: Pose64Error,
     },
+    PoseComputation {
+        operation: &'static str,
+        source: Pose64Error,
+    },
     MissingInsertionFallback {
         registered_keyframes: usize,
     },
@@ -211,6 +215,9 @@ impl std::fmt::Display for EssentialGraphError {
                 f,
                 "essential graph keyframe {keyframe_id:?} has an invalid pose: {source}"
             ),
+            EssentialGraphError::PoseComputation { operation, source } => {
+                write!(f, "essential graph {operation} failed: {source}")
+            }
             EssentialGraphError::MissingInsertionFallback {
                 registered_keyframes,
             } => write!(
@@ -272,6 +279,7 @@ impl std::error::Error for EssentialGraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidPose { source, .. } => Some(source),
+            Self::PoseComputation { source, .. } => Some(source),
             Self::EdgeConstruction { source, .. } => Some(source),
             Self::KeyframeNotFound { .. }
             | Self::RootRemovalDenied { .. }
@@ -356,7 +364,13 @@ impl EssentialGraph {
         };
 
         let parent_pose = map_pose64(map, parent)?;
-        let spanning_relative_pose = parent_pose.inverse().compose(keyframe_pose);
+        let spanning_relative_pose = parent_pose
+            .try_inverse()
+            .and_then(|inverse| inverse.try_compose(keyframe_pose))
+            .map_err(|source| EssentialGraphError::PoseComputation {
+                operation: "spanning-edge relative-pose construction",
+                source,
+            })?;
         let spanning_edge = parse_essential_edge(
             parent,
             keyframe_id,
@@ -366,7 +380,12 @@ impl EssentialGraph {
         )?;
         let mut new_strong_edges = Vec::new();
         if selected_by_covisibility && let Some(neighbors) = covisibility {
-            let keyframe_pose_inverse = keyframe_pose.inverse();
+            let keyframe_pose_inverse = keyframe_pose.try_inverse().map_err(|source| {
+                EssentialGraphError::PoseComputation {
+                    operation: "strong-covisibility source-pose inversion",
+                    source,
+                }
+            })?;
             for (&neighbor, &weight) in neighbors {
                 if weight.get() >= self.strong_threshold
                     && neighbor != parent
@@ -378,7 +397,12 @@ impl EssentialGraph {
                         keyframe_id,
                         neighbor,
                         EssentialEdgeKind::StrongCovisibility,
-                        keyframe_pose_inverse.compose(neighbor_pose),
+                        keyframe_pose_inverse
+                            .try_compose(neighbor_pose)
+                            .map_err(|source| EssentialGraphError::PoseComputation {
+                                operation: "strong-covisibility relative-pose construction",
+                                source,
+                            })?,
                         scaled_identity6(f64::from(weight.get())),
                     )?);
                 }
@@ -423,7 +447,13 @@ impl EssentialGraph {
             parent,
             keyframe_id,
             EssentialEdgeKind::SpanningTree,
-            parent_pose.inverse().compose(child_pose),
+            parent_pose
+                .try_inverse()
+                .and_then(|inverse| inverse.try_compose(child_pose))
+                .map_err(|source| EssentialGraphError::PoseComputation {
+                    operation: "verified-parent relative-pose construction",
+                    source,
+                })?,
             information,
         )?;
         self.order.push(keyframe_id);
@@ -809,7 +839,13 @@ fn relative_pose(
 ) -> Result<Pose64, EssentialGraphError> {
     let from_64 = map_pose64(map, from)?;
     let to_64 = map_pose64(map, to)?;
-    Ok(from_64.inverse().compose(to_64))
+    from_64
+        .try_inverse()
+        .and_then(|inverse| inverse.try_compose(to_64))
+        .map_err(|source| EssentialGraphError::PoseComputation {
+            operation: "map relative-pose construction",
+            source,
+        })
 }
 
 fn map_pose64(map: &SlamMap, keyframe_id: KeyframeId) -> Result<Pose64, EssentialGraphError> {

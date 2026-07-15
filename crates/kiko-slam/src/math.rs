@@ -37,6 +37,9 @@ pub enum Pose64Error {
     RotationNotOrthonormal { max_error: f64 },
     ImproperRotation { determinant: f64 },
     TranslationOutOfF32Range { axis: usize, value: f64 },
+    ComposeRotationNonFinite { row: usize, col: usize, value: f64 },
+    ComposeTranslationNonFinite { axis: usize, value: f64 },
+    InverseTranslationNonFinite { axis: usize, value: f64 },
 }
 
 impl std::fmt::Display for Pose64Error {
@@ -59,6 +62,18 @@ impl std::fmt::Display for Pose64Error {
             Pose64Error::TranslationOutOfF32Range { axis, value } => write!(
                 f,
                 "translation axis {axis} cannot be represented as finite f32, got {value}"
+            ),
+            Pose64Error::ComposeRotationNonFinite { row, col, value } => write!(
+                f,
+                "pose composition produced non-finite rotation[{row}][{col}]={value}"
+            ),
+            Pose64Error::ComposeTranslationNonFinite { axis, value } => write!(
+                f,
+                "pose composition produced non-finite translation axis {axis}: {value}"
+            ),
+            Pose64Error::InverseTranslationNonFinite { axis, value } => write!(
+                f,
+                "pose inversion produced non-finite translation axis {axis}: {value}"
             ),
         }
     }
@@ -137,28 +152,59 @@ impl Pose64 {
         self.translation
     }
 
-    /// Compose transforms as `self ∘ other`.
-    pub fn compose(self, other: Self) -> Self {
+    /// Compose transforms as `self ∘ other`, rejecting arithmetic that leaves
+    /// the finite SE(3) domain.
+    pub fn try_compose(self, other: Self) -> Result<Self, Pose64Error> {
         let rotation = mat_mul_f64(self.rotation, other.rotation);
+        for (row, values) in rotation.iter().enumerate() {
+            for (col, value) in values.iter().copied().enumerate() {
+                if !value.is_finite() {
+                    return Err(Pose64Error::ComposeRotationNonFinite { row, col, value });
+                }
+            }
+        }
         let rt = mat_mul_vec_f64(self.rotation, other.translation);
         let translation = [
             rt[0] + self.translation[0],
             rt[1] + self.translation[1],
             rt[2] + self.translation[2],
         ];
-        Self {
-            rotation,
-            translation,
+        if let Some((axis, value)) = translation
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(Pose64Error::ComposeTranslationNonFinite { axis, value });
         }
+        Self::try_from_rt(rotation, translation)
     }
 
-    pub fn inverse(self) -> Self {
+    pub fn try_inverse(self) -> Result<Self, Pose64Error> {
         let r_t = mat_transpose_f64(self.rotation);
         let t = mat_mul_vec_f64(r_t, self.translation);
-        Self {
-            rotation: r_t,
-            translation: [-t[0], -t[1], -t[2]],
+        let translation = [-t[0], -t[1], -t[2]];
+        if let Some((axis, value)) = translation
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(Pose64Error::InverseTranslationNonFinite { axis, value });
         }
+        Self::try_from_rt(r_t, translation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compose(self, other: Self) -> Self {
+        self.try_compose(other)
+            .expect("test pose composition must remain in finite SE(3)")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inverse(self) -> Self {
+        self.try_inverse()
+            .expect("test pose inversion must remain in finite SE(3)")
     }
 
     pub fn try_from_pose32(pose: Pose) -> Result<Self, Pose64Error> {
@@ -740,6 +786,54 @@ mod tests {
             large_translation.try_to_pose32(),
             Err(Pose64Error::TranslationOutOfF32Range { axis: 0, .. })
         ));
+    }
+
+    #[test]
+    fn pose64_compose_rejects_finite_translation_overflow() {
+        let pose = Pose64::try_from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        )
+        .expect("finite translation is valid");
+
+        assert!(matches!(
+            pose.try_compose(pose),
+            Err(Pose64Error::ComposeTranslationNonFinite { axis: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn pose64_inverse_rejects_rotated_translation_overflow() {
+        let c = std::f64::consts::FRAC_1_SQRT_2;
+        let pose = Pose64::try_from_rt(
+            [[c, -c, 0.0], [c, c, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, f64::MAX, 0.0],
+        )
+        .expect("finite rotated pose is valid");
+
+        assert!(matches!(
+            pose.try_inverse(),
+            Err(Pose64Error::InverseTranslationNonFinite { .. })
+        ));
+    }
+
+    #[test]
+    fn pose64_operations_are_closed_for_bounded_inputs() {
+        for sample in 0..512 {
+            let phase = f64::from(sample) + 1.0;
+            let pose = se3_exp_f64([
+                20.0 * (phase * 0.17).sin(),
+                20.0 * (phase * 0.31).cos(),
+                20.0 * (phase * 0.43).sin(),
+                0.5 * (phase * 0.11).sin(),
+                0.5 * (phase * 0.13).cos(),
+                0.5 * (phase * 0.19).sin(),
+            ]);
+            let inverse = pose.try_inverse().expect("bounded inverse");
+            let identity = pose.try_compose(inverse).expect("bounded composition");
+            assert!(rot_diff_norm(identity.rotation(), Pose64::identity().rotation()) < 2e-12);
+            assert!(vec_norm(identity.translation()) < 2e-12);
+        }
     }
 
     #[test]

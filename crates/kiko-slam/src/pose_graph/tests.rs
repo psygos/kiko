@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::num::NonZeroU32;
 
+use super::optimizer::scale_vector_to_norm;
 use super::{
     BlockCsr6x6, EssentialEdgeError, EssentialEdgeKind, EssentialGraph, EssentialGraphError,
     PcgStopReason, PoseGraphConfig, PoseGraphEdge, PoseGraphOptimizer, PoseGraphTermination,
@@ -394,6 +395,54 @@ fn pose_graph_edge_error_is_zero_for_consistent_measurement() {
 }
 
 #[test]
+fn pose_graph_edge_error_reports_pose_arithmetic_overflow() {
+    let from_pose = Pose64::try_from_rt(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [-f64::MAX, 0.0, 0.0],
+    )
+    .expect("finite source pose");
+    let to_pose = Pose64::try_from_rt(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [f64::MAX, 0.0, 0.0],
+    )
+    .expect("finite destination pose");
+    let edge =
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), scalar_block(1.0)).expect("valid edge");
+
+    assert!(matches!(
+        compute_edge_error(&edge, &[from_pose, to_pose]),
+        Err(super::PoseGraphError::PoseComputation { .. })
+    ));
+    assert!(compute_edge_jacobians(&edge, &[from_pose, to_pose]).is_err());
+}
+
+#[test]
+fn pose_graph_edge_error_rejects_nonfinite_log_residual() {
+    let to_pose = Pose64::try_from_rt(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        [f64::MAX, f64::MAX, 0.0],
+    )
+    .expect("finite pose");
+    let edge =
+        PoseGraphEdge::try_new(0, 1, Pose64::identity(), scalar_block(1.0)).expect("valid edge");
+
+    assert!(matches!(
+        compute_edge_error(&edge, &[Pose64::identity(), to_pose]),
+        Err(super::PoseGraphError::NonFiniteEdgeResidual { component: 0, .. })
+    ));
+}
+
+#[test]
+fn pose_graph_step_clamp_handles_extreme_finite_components() {
+    let mut step = [1e300, -1e300, 5e299];
+    scale_vector_to_norm(&mut step, 1.0);
+    let actual_norm = step.into_iter().fold(0.0_f64, f64::hypot);
+
+    assert!((actual_norm - 1.0).abs() < 1e-15);
+    assert!(step.into_iter().all(f64::is_finite));
+}
+
+#[test]
 fn pose_graph_edge_jacobians_match_finite_difference() {
     let pose_a = se3_exp_f64([0.1, 0.05, -0.02, 0.02, -0.01, 0.03]);
     let pose_b = se3_exp_f64([0.3, -0.08, 0.12, -0.02, 0.03, -0.01]);
@@ -480,16 +529,13 @@ fn pose_graph_edge_parses_measurement_and_information_once() {
         [f64::MAX, 0.0, 0.0],
     )
     .expect("finite test pose");
-    let overflowed_measurement = huge_translation.compose(huge_translation);
-    let measurement_error = PoseGraphEdge::try_new(0, 1, overflowed_measurement, scalar_block(1.0))
-        .expect_err("arithmetic-overflowed measurement must be reparsed");
+    let measurement_error = huge_translation
+        .try_compose(huge_translation)
+        .expect_err("arithmetic-overflowed measurement must be rejected at its source");
     assert!(matches!(
         measurement_error,
-        super::PoseGraphEdgeError::Measurement {
-            source: crate::Pose64Error::NonFiniteTranslation { axis: 0, .. },
-        }
+        crate::Pose64Error::ComposeTranslationNonFinite { axis: 0, .. }
     ));
-    assert!(measurement_error.source().is_some());
 
     let mut nonfinite = scalar_block(1.0);
     nonfinite[1][4] = f64::NAN;
@@ -1103,20 +1149,13 @@ fn essential_graph_parses_external_edge_payload_before_mutation() {
         [f64::MAX, 0.0, 0.0],
     )
     .expect("finite test pose");
-    let overflowed_relative_pose = huge_translation.compose(huge_translation);
-    let pose_error = graph
-        .add_loop_edge(kf0, kf1, overflowed_relative_pose, scalar_block(1.0))
-        .expect_err("arithmetic-overflowed relative pose must be reparsed");
+    let pose_error = huge_translation
+        .try_compose(huge_translation)
+        .expect_err("arithmetic-overflowed relative pose must be rejected at its source");
     assert!(matches!(
         pose_error,
-        EssentialGraphError::EdgeConstruction {
-            kind: EssentialEdgeKind::Loop,
-            source: EssentialEdgeError::RelativePose {
-                source: crate::Pose64Error::NonFiniteTranslation { axis: 0, .. },
-            },
-        }
+        crate::Pose64Error::ComposeTranslationNonFinite { axis: 0, .. }
     ));
-    assert!(pose_error.source().is_some());
     assert!(graph.snapshot().loop_edges.is_empty());
 }
 

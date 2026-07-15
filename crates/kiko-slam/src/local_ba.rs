@@ -4781,7 +4781,24 @@ fn vio_cam_from_map_pose32(
     frame_index: usize,
 ) -> Result<Pose, VioSolveError> {
     let VioEvaluation { stage, iteration } = evaluation;
-    let cam_from_odom = camera_from_body.compose(state.pose_odom_from_body().inverse());
+    let cam_from_odom = camera_from_body
+        .try_compose(
+            state
+                .pose_odom_from_body()
+                .try_inverse()
+                .map_err(|source| VioSolveError::PoseConversion {
+                    stage,
+                    iteration,
+                    frame_index,
+                    source,
+                })?,
+        )
+        .map_err(|source| VioSolveError::PoseConversion {
+            stage,
+            iteration,
+            frame_index,
+            source,
+        })?;
     let cam_from_map = map_from_odom
         .try_odom_to_map(cam_from_odom)
         .map_err(|source| VioSolveError::MapFrameTransform {

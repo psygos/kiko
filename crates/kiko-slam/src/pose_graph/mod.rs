@@ -121,6 +121,20 @@ pub enum PoseGraphError {
         outer_iteration: usize,
         pose_index: usize,
     },
+    PoseComputation {
+        operation: &'static str,
+        source: crate::Pose64Error,
+    },
+    NonFiniteEdgeResidual {
+        component: usize,
+        value: f64,
+    },
+    NonFiniteEdgeJacobian {
+        pose_index: usize,
+        row: usize,
+        col: usize,
+        value: f64,
+    },
     PcgDidNotConverge {
         outer_iteration: usize,
         pcg_iterations: usize,
@@ -382,6 +396,22 @@ impl std::fmt::Display for PoseGraphError {
                 f,
                 "pose graph step became non-finite at outer iteration {outer_iteration} for pose {pose_index}"
             ),
+            PoseGraphError::PoseComputation { operation, source } => {
+                write!(f, "pose graph {operation} failed: {source}")
+            }
+            PoseGraphError::NonFiniteEdgeResidual { component, value } => write!(
+                f,
+                "pose graph edge residual component {component} must be finite, got {value}"
+            ),
+            PoseGraphError::NonFiniteEdgeJacobian {
+                pose_index,
+                row,
+                col,
+                value,
+            } => write!(
+                f,
+                "pose graph edge Jacobian for pose {pose_index} at ({row}, {col}) must be finite, got {value}"
+            ),
             PoseGraphError::PcgDidNotConverge {
                 outer_iteration,
                 pcg_iterations,
@@ -409,6 +439,7 @@ impl std::error::Error for PoseGraphError {
         match self {
             Self::EdgeConstruction { source, .. } => Some(source),
             Self::EssentialTopology { source } => Some(source),
+            Self::PoseComputation { source, .. } => Some(source),
             _ => None,
         }
     }

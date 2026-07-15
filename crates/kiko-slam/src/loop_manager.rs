@@ -218,7 +218,7 @@ impl LoopManager {
     ) -> Result<Pose64, crate::Pose64Error> {
         let match_pose = Pose64::try_from_pose32(match_pose)?;
         let query_pose_world = Pose64::try_from_pose32(query_pose_world)?;
-        Ok(match_pose.inverse().compose(query_pose_world))
+        match_pose.try_inverse()?.try_compose(query_pose_world)
     }
 
     fn try_pose_correction64(
@@ -227,7 +227,7 @@ impl LoopManager {
     ) -> Result<Pose64, crate::Pose64Error> {
         let current_pose_world = Pose64::try_from_pose32(current_pose_world)?;
         let estimated_pose_world = Pose64::try_from_pose32(estimated_pose_world)?;
-        Ok(estimated_pose_world.compose(current_pose_world.inverse()))
+        estimated_pose_world.try_compose(current_pose_world.try_inverse()?)
     }
 }
 

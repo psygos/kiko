@@ -302,10 +302,48 @@ fn find_root(parents: &mut [usize], pose_index: usize) -> usize {
     root
 }
 
-fn edge_error_from_endpoints(from_pose: Pose64, to_pose: Pose64, measurement: Pose64) -> [f64; 6] {
-    let predicted = from_pose.inverse().compose(to_pose);
-    let residual_pose = predicted.compose(measurement.inverse());
-    se3_log_f64(residual_pose)
+fn edge_error_from_endpoints(
+    from_pose: Pose64,
+    to_pose: Pose64,
+    measurement: Pose64,
+) -> Result<[f64; 6], PoseGraphError> {
+    let from_inverse =
+        from_pose
+            .try_inverse()
+            .map_err(|source| PoseGraphError::PoseComputation {
+                operation: "edge source-pose inversion",
+                source,
+            })?;
+    let predicted =
+        from_inverse
+            .try_compose(to_pose)
+            .map_err(|source| PoseGraphError::PoseComputation {
+                operation: "edge predicted relative pose",
+                source,
+            })?;
+    let measurement_inverse =
+        measurement
+            .try_inverse()
+            .map_err(|source| PoseGraphError::PoseComputation {
+                operation: "edge measurement inversion",
+                source,
+            })?;
+    let residual_pose = predicted
+        .try_compose(measurement_inverse)
+        .map_err(|source| PoseGraphError::PoseComputation {
+            operation: "edge residual pose",
+            source,
+        })?;
+    let residual = se3_log_f64(residual_pose);
+    if let Some((component, value)) = residual
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(PoseGraphError::NonFiniteEdgeResidual { component, value });
+    }
+    Ok(residual)
 }
 
 pub fn compute_edge_error(
@@ -313,11 +351,7 @@ pub fn compute_edge_error(
     poses: &[Pose64],
 ) -> Result<[f64; 6], PoseGraphError> {
     validate_edge_bounds(edge, 0, poses.len())?;
-    Ok(edge_error_from_endpoints(
-        poses[edge.from],
-        poses[edge.to],
-        edge.measurement,
-    ))
+    edge_error_from_endpoints(poses[edge.from], poses[edge.to], edge.measurement)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -331,10 +365,21 @@ fn numerical_diff_column(
     eps: f64,
     jacobian: &mut [[f64; 6]; 6],
     axis: usize,
-) {
+    pose_index: usize,
+) -> Result<(), PoseGraphError> {
     let original = if perturb_from { from_pose } else { to_pose };
-    let plus = se3_exp_f64(*delta_plus).compose(original);
-    let minus = se3_exp_f64(*delta_minus).compose(original);
+    let plus = se3_exp_f64(*delta_plus)
+        .try_compose(original)
+        .map_err(|source| PoseGraphError::PoseComputation {
+            operation: "positive numerical Jacobian perturbation",
+            source,
+        })?;
+    let minus = se3_exp_f64(*delta_minus)
+        .try_compose(original)
+        .map_err(|source| PoseGraphError::PoseComputation {
+            operation: "negative numerical Jacobian perturbation",
+            source,
+        })?;
     let (from_plus, to_plus) = if perturb_from {
         (plus, to_pose)
     } else {
@@ -345,18 +390,30 @@ fn numerical_diff_column(
     } else {
         (from_pose, minus)
     };
-    let err_plus = edge_error_from_endpoints(from_plus, to_plus, measurement);
-    let err_minus = edge_error_from_endpoints(from_minus, to_minus, measurement);
+    let err_plus = edge_error_from_endpoints(from_plus, to_plus, measurement)?;
+    let err_minus = edge_error_from_endpoints(from_minus, to_minus, measurement)?;
     for row in 0..6 {
-        jacobian[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
+        let value = (err_plus[row] - err_minus[row]) / (2.0 * eps);
+        if !value.is_finite() {
+            return Err(PoseGraphError::NonFiniteEdgeJacobian {
+                pose_index,
+                row,
+                col: axis,
+                value,
+            });
+        }
+        jacobian[row][axis] = value;
     }
+    Ok(())
 }
 
 fn compute_edge_jacobians_from_endpoints(
     from_pose: Pose64,
     to_pose: Pose64,
     measurement: Pose64,
-) -> EdgeJacobians {
+    from_index: usize,
+    to_index: usize,
+) -> Result<EdgeJacobians, PoseGraphError> {
     let mut j_from = [[0.0_f64; 6]; 6];
     let mut j_to = [[0.0_f64; 6]; 6];
 
@@ -379,7 +436,8 @@ fn compute_edge_jacobians_from_endpoints(
             eps,
             &mut j_from,
             axis,
-        );
+            from_index,
+        )?;
         numerical_diff_column(
             from_pose,
             to_pose,
@@ -390,10 +448,11 @@ fn compute_edge_jacobians_from_endpoints(
             eps,
             &mut j_to,
             axis,
-        );
+            to_index,
+        )?;
     }
 
-    (j_from, j_to)
+    Ok((j_from, j_to))
 }
 
 pub fn compute_edge_jacobians(
@@ -401,11 +460,13 @@ pub fn compute_edge_jacobians(
     poses: &[Pose64],
 ) -> Result<EdgeJacobians, PoseGraphError> {
     validate_edge_bounds(edge, 0, poses.len())?;
-    Ok(compute_edge_jacobians_from_endpoints(
+    compute_edge_jacobians_from_endpoints(
         poses[edge.from],
         poses[edge.to],
         edge.measurement,
-    ))
+        edge.from,
+        edge.to,
+    )
 }
 
 fn perturb_axis(axis: usize, magnitude: f64) -> [f64; 6] {
@@ -607,9 +668,14 @@ impl PoseGraphOptimizer {
             for (edge_index, edge) in edges.iter().enumerate() {
                 let from_pose = poses[edge.from];
                 let to_pose = poses[edge.to];
-                let error = edge_error_from_endpoints(from_pose, to_pose, edge.measurement);
-                let (j_from, j_to) =
-                    compute_edge_jacobians_from_endpoints(from_pose, to_pose, edge.measurement);
+                let error = edge_error_from_endpoints(from_pose, to_pose, edge.measurement)?;
+                let (j_from, j_to) = compute_edge_jacobians_from_endpoints(
+                    from_pose,
+                    to_pose,
+                    edge.measurement,
+                    edge.from,
+                    edge.to,
+                )?;
                 let robust_squared_norm = squared_mahalanobis_norm(error, edge.information.matrix);
                 if !robust_squared_norm.is_finite() || robust_squared_norm < 0.0 {
                     return Err(PoseGraphError::InvalidRobustSquaredNorm {
@@ -705,24 +771,23 @@ impl PoseGraphOptimizer {
                     });
                 }
                 if translation_step_m > MAX_TRANSLATION_STEP_M {
-                    let scale = MAX_TRANSLATION_STEP_M / translation_step_m;
-                    for v in &mut xi[..3] {
-                        *v *= scale;
-                    }
+                    scale_vector_to_norm(&mut xi[..3], MAX_TRANSLATION_STEP_M);
                     translation_step_m = MAX_TRANSLATION_STEP_M;
                     clamped_translation_step_count += 1;
                 }
                 if rotation_step_rad > MAX_ROTATION_STEP_RAD {
-                    let scale = MAX_ROTATION_STEP_RAD / rotation_step_rad;
-                    for v in &mut xi[3..] {
-                        *v *= scale;
-                    }
+                    scale_vector_to_norm(&mut xi[3..], MAX_ROTATION_STEP_RAD);
                     rotation_step_rad = MAX_ROTATION_STEP_RAD;
                     clamped_rotation_step_count += 1;
                 }
                 last_max_translation_step_m = last_max_translation_step_m.max(translation_step_m);
                 last_max_rotation_step_rad = last_max_rotation_step_rad.max(rotation_step_rad);
-                *pose = se3_exp_f64(xi).compose(*pose);
+                *pose = se3_exp_f64(xi).try_compose(*pose).map_err(|source| {
+                    PoseGraphError::PoseComputation {
+                        operation: "optimizer left pose update",
+                        source,
+                    }
+                })?;
             }
 
             if last_max_translation_step_m < TRANSLATION_STEP_CONVERGENCE_M
@@ -752,6 +817,22 @@ impl PoseGraphOptimizer {
 
 fn norm3(vector: [f64; 3]) -> f64 {
     vector[0].hypot(vector[1]).hypot(vector[2])
+}
+
+pub(super) fn scale_vector_to_norm(vector: &mut [f64], target_norm: f64) {
+    let max_component = vector
+        .iter()
+        .copied()
+        .fold(0.0_f64, |maximum, value| maximum.max(value.abs()));
+    debug_assert!(max_component.is_finite() && max_component > 0.0);
+    let normalized_norm = vector
+        .iter()
+        .copied()
+        .fold(0.0_f64, |norm, value| norm.hypot(value / max_component));
+    let scale = (target_norm / max_component) / normalized_norm;
+    for value in vector {
+        *value *= scale;
+    }
 }
 
 fn squared_mahalanobis_norm(error: [f64; 6], information: [[f64; 6]; 6]) -> f64 {

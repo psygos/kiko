@@ -5,10 +5,26 @@ pub type NavTangent = [f64; 15];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NavStateError {
-    NonFinitePoseTranslation { axis: usize, value: f64 },
-    NonFinitePoseRotation { row: usize, col: usize, value: f64 },
-    NonFiniteVelocity { axis: usize, value: f64 },
-    InvalidBias { source: ImuBiasError },
+    NonFinitePoseTranslation {
+        axis: usize,
+        value: f64,
+    },
+    NonFinitePoseRotation {
+        row: usize,
+        col: usize,
+        value: f64,
+    },
+    NonFiniteVelocity {
+        axis: usize,
+        value: f64,
+    },
+    InvalidBias {
+        source: ImuBiasError,
+    },
+    PoseComputation {
+        operation: &'static str,
+        source: crate::Pose64Error,
+    },
 }
 
 impl std::fmt::Display for NavStateError {
@@ -32,6 +48,9 @@ impl std::fmt::Display for NavStateError {
             NavStateError::InvalidBias { source } => {
                 write!(f, "invalid navigation-state imu bias: {source}")
             }
+            NavStateError::PoseComputation { operation, source } => {
+                write!(f, "navigation-state {operation} failed: {source}")
+            }
         }
     }
 }
@@ -40,6 +59,7 @@ impl std::error::Error for NavStateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidBias { source } => Some(source),
+            Self::PoseComputation { source, .. } => Some(source),
             Self::NonFinitePoseTranslation { .. }
             | Self::NonFinitePoseRotation { .. }
             | Self::NonFiniteVelocity { .. } => None,
@@ -105,7 +125,12 @@ impl NavState {
     pub fn retract(&self, delta: &NavTangent) -> Result<Self, NavStateError> {
         let mut pose_delta = [0.0_f64; 6];
         pose_delta.copy_from_slice(&delta[..6]);
-        let pose_odom_from_body = se3_exp_f64(pose_delta).compose(self.pose_odom_from_body);
+        let pose_odom_from_body = se3_exp_f64(pose_delta)
+            .try_compose(self.pose_odom_from_body)
+            .map_err(|source| NavStateError::PoseComputation {
+                operation: "retraction pose update",
+                source,
+            })?;
         let velocity_odom_mps = [
             self.velocity_odom_mps[0] + delta[6],
             self.velocity_odom_mps[1] + delta[7],
@@ -121,13 +146,22 @@ impl NavState {
         Self::try_new(pose_odom_from_body, velocity_odom_mps, bias)
     }
 
-    pub fn local_coordinates(&self, other: &Self) -> NavTangent {
+    pub fn local_coordinates(&self, other: &Self) -> Result<NavTangent, NavStateError> {
         let mut tangent = [0.0_f64; 15];
-        let pose_delta = se3_log_f64(
-            other
-                .pose_odom_from_body
-                .compose(self.pose_odom_from_body.inverse()),
-        );
+        let self_inverse = self.pose_odom_from_body.try_inverse().map_err(|source| {
+            NavStateError::PoseComputation {
+                operation: "local-coordinate source-pose inversion",
+                source,
+            }
+        })?;
+        let relative = other
+            .pose_odom_from_body
+            .try_compose(self_inverse)
+            .map_err(|source| NavStateError::PoseComputation {
+                operation: "local-coordinate relative pose",
+                source,
+            })?;
+        let pose_delta = se3_log_f64(relative);
         tangent[..6].copy_from_slice(&pose_delta);
         tangent[6] = other.velocity_odom_mps[0] - self.velocity_odom_mps[0];
         tangent[7] = other.velocity_odom_mps[1] - self.velocity_odom_mps[1];
@@ -142,7 +176,7 @@ impl NavState {
         tangent[12] = other_gyro_bias_radps[0] - self_gyro_bias_radps[0];
         tangent[13] = other_gyro_bias_radps[1] - self_gyro_bias_radps[1];
         tangent[14] = other_gyro_bias_radps[2] - self_gyro_bias_radps[2];
-        tangent
+        Ok(tangent)
     }
 }
 
@@ -230,7 +264,7 @@ mod tests {
             0.0007, -0.0009,
         ];
         let moved = state.retract(&delta).expect("retract");
-        let recovered = state.local_coordinates(&moved);
+        let recovered = state.local_coordinates(&moved).expect("local coordinates");
         for i in 0..15 {
             assert!((recovered[i] - delta[i]).abs() < 1e-9, "index {i}");
         }

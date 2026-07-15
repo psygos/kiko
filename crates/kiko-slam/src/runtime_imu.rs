@@ -569,7 +569,12 @@ fn basalt_into_imu_calibration(
             path: path.to_path_buf(),
             source,
         })?;
-    let t_cam_imu = t_imu_cam.inverse();
+    let t_cam_imu = t_imu_cam.try_inverse().map_err(|source| {
+        RuntimeImuCalibrationError::BasaltInvalidPose {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
 
     Ok(ImuCalibration {
         noise: ImuNoiseMeta {

@@ -47,6 +47,10 @@ pub enum GeometryError {
         axis: usize,
         value: f64,
     },
+    InvalidPose {
+        operation: &'static str,
+        source: Pose64Error,
+    },
 }
 
 impl std::fmt::Display for GeometryError {
@@ -83,11 +87,21 @@ impl std::fmt::Display for GeometryError {
                 f,
                 "{operation} produced non-finite translation axis {axis}={value}"
             ),
+            GeometryError::InvalidPose { operation, source } => {
+                write!(f, "{operation} produced an invalid rigid pose: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for GeometryError {}
+impl std::error::Error for GeometryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidPose { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub struct PositiveF64(f64);
@@ -354,8 +368,13 @@ impl<To, From> Transform3d<To, From> {
     }
 
     pub fn try_inverse(self) -> Result<Transform3d<From, To>, GeometryError> {
-        let pose = self.pose.inverse();
-        validate_pose_is_finite(pose, "frame-typed transform inversion")?;
+        let pose = self
+            .pose
+            .try_inverse()
+            .map_err(|source| GeometryError::InvalidPose {
+                operation: "frame-typed transform inversion",
+                source,
+            })?;
         Ok(Transform3d {
             pose,
             _to: PhantomData,
@@ -367,8 +386,13 @@ impl<To, From> Transform3d<To, From> {
         self,
         other: Transform3d<From, Source>,
     ) -> Result<Transform3d<To, Source>, GeometryError> {
-        let pose = self.pose.compose(other.pose);
-        validate_pose_is_finite(pose, "frame-typed transform composition")?;
+        let pose =
+            self.pose
+                .try_compose(other.pose)
+                .map_err(|source| GeometryError::InvalidPose {
+                    operation: "frame-typed transform composition",
+                    source,
+                })?;
         Ok(Transform3d {
             pose,
             _to: PhantomData,
@@ -509,7 +533,19 @@ impl Se3Tangent64 {
             operation: "SE(3) logarithm destination pose",
             source,
         })?;
-        Self::try_from_meters_radians(se3_log_f64(to.compose(from.inverse())))
+        let relative = to
+            .try_compose(
+                from.try_inverse()
+                    .map_err(|source| Se3TangentError::InvalidPose {
+                        operation: "SE(3) logarithm source pose inversion",
+                        source,
+                    })?,
+            )
+            .map_err(|source| Se3TangentError::InvalidPose {
+                operation: "SE(3) logarithm relative pose",
+                source,
+            })?;
+        Self::try_from_meters_radians(se3_log_f64(relative))
     }
 
     pub fn components_m_rad(self) -> [f64; 6] {
@@ -548,7 +584,11 @@ impl Se3Tangent64 {
                 source,
             })?;
         se3_exp_f64(self.components_m_rad())
-            .compose(pose)
+            .try_compose(pose)
+            .map_err(|source| Se3TangentError::InvalidPose {
+                operation: "SE(3) left-update composition",
+                source,
+            })?
             .try_to_pose32()
             .map_err(|source| Se3TangentError::InvalidPose {
                 operation: "SE(3) left-update result",

@@ -2501,16 +2501,18 @@ fn should_adopt_visual_ba_proposal(
 fn pose_odom_from_body_from_camera_pose(
     camera_from_odom: Pose64,
     camera_from_body: Pose64,
-) -> Pose64 {
-    camera_from_odom.inverse().compose(camera_from_body)
+) -> Result<Pose64, crate::Pose64Error> {
+    camera_from_odom
+        .try_inverse()?
+        .try_compose(camera_from_body)
 }
 
 #[cfg(feature = "vio")]
 fn camera_from_odom_from_pose_odom_from_body(
     pose_odom_from_body: Pose64,
     camera_from_body: Pose64,
-) -> Pose64 {
-    camera_from_body.compose(pose_odom_from_body.inverse())
+) -> Result<Pose64, crate::Pose64Error> {
+    camera_from_body.try_compose(pose_odom_from_body.try_inverse()?)
 }
 
 #[cfg(feature = "vio")]
@@ -3310,7 +3312,7 @@ impl SlamTracker {
         let pose_world_64 = Pose64::try_from_pose32(pose_world)?;
         let camera_odom = self.map_from_odom.try_map_to_odom(pose_world_64)?;
         let body_odom =
-            pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
+            pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body)?;
         let visual_velocity_seed = vio_runtime.visual_velocity_seed(body_odom, capture_time);
         let prev_vel = vio_runtime.velocity_seed(body_odom, capture_time);
         let prev_bias = vio_runtime.bias_seed();
@@ -3378,7 +3380,7 @@ impl SlamTracker {
                 let cam_from_odom = camera_from_odom_from_pose_odom_from_body(
                     optimized.pose_odom_from_body(),
                     vio_runtime.camera_from_body,
-                );
+                )?;
                 let cam_from_map = self
                     .map_from_odom
                     .try_odom_to_map(cam_from_odom)?
@@ -3487,7 +3489,7 @@ impl SlamTracker {
         let cam_from_odom = camera_from_odom_from_pose_odom_from_body(
             optimized.pose_odom_from_body(),
             vio_runtime.camera_from_body,
-        );
+        )?;
         let cam_from_map = self
             .map_from_odom
             .try_odom_to_map(cam_from_odom)?
@@ -3561,7 +3563,7 @@ impl SlamTracker {
         let pose_world_64 = Pose64::try_from_pose32(pose_world)?;
         let camera_odom = self.map_from_odom.try_map_to_odom(pose_world_64)?;
         let body_odom =
-            pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body);
+            pose_odom_from_body_from_camera_pose(camera_odom, vio_runtime.camera_from_body)?;
         let observations =
             ObservationSet::when_sufficient(map_observations.to_vec(), self.ba.min_observations());
         vio_runtime.commit_authoritative_pose(capture_time, body_odom, observations);
@@ -3656,7 +3658,14 @@ impl SlamTracker {
         // After loop closure, corrected_poses contains updated map-frame poses.
         // Use the most recent one to realign map_from_odom so that the odom
         // trajectory remains continuous while the map frame absorbs the correction.
-        let Some(cam_from_odom) = self.current_odom_pose() else {
+        let Some(cam_from_odom) =
+            self.current_odom_pose()
+                .map_err(|source| LoopApplyError::PoseConversion {
+                    operation: "current odometry-pose construction",
+                    keyframe_id: None,
+                    source,
+                })?
+        else {
             return Ok(());
         };
         // Use the last corrected pose (most recent keyframe) as the alignment target
@@ -3677,17 +3686,19 @@ impl SlamTracker {
     }
 
     #[cfg(feature = "vio")]
-    fn current_odom_pose(&self) -> Option<Pose64> {
+    fn current_odom_pose(&self) -> Result<Option<Pose64>, crate::Pose64Error> {
         match &self.local_estimator {
-            LocalEstimator::VisualOnly => None,
-            LocalEstimator::Inertial(vio_runtime) => {
-                vio_runtime.predicted_state.as_ref().map(|state| {
+            LocalEstimator::VisualOnly => Ok(None),
+            LocalEstimator::Inertial(vio_runtime) => vio_runtime
+                .predicted_state
+                .as_ref()
+                .map(|state| {
                     camera_from_odom_from_pose_odom_from_body(
                         state.pose_odom_from_body(),
                         vio_runtime.camera_from_body,
                     )
                 })
-            }
+                .transpose(),
         }
     }
 
@@ -3731,7 +3742,7 @@ impl SlamTracker {
         diagnostics: FrameDiagnostics,
     ) -> Result<TrackerOutput, TrackerError> {
         #[cfg(feature = "vio")]
-        let current_odom_pose = self.current_odom_pose();
+        let current_odom_pose = self.current_odom_pose()?;
         #[cfg(not(feature = "vio"))]
         let current_odom_pose = None;
         let pose = classify_pose_status(
@@ -4174,7 +4185,7 @@ impl SlamTracker {
             return Ok(());
         }
         #[cfg(feature = "vio")]
-        let reference_cam_from_odom = self.current_odom_pose();
+        let reference_cam_from_odom = self.current_odom_pose()?;
         #[cfg(not(feature = "vio"))]
         let reference_cam_from_odom = None;
         if let Some(session) = Self::initial_relocalization_session(
@@ -4488,9 +4499,11 @@ impl SlamTracker {
                 let candidate = attachment.candidate;
                 #[cfg(feature = "vio")]
                 {
-                    if let Some(reference_cam_from_odom) =
-                        reference_cam_from_odom.or_else(|| self.current_odom_pose())
-                    {
+                    let reference_cam_from_odom = match reference_cam_from_odom {
+                        Some(reference) => Some(reference),
+                        None => self.current_odom_pose()?,
+                    };
+                    if let Some(reference_cam_from_odom) = reference_cam_from_odom {
                         self.map_from_odom.try_align_to_pose(
                             Pose64::try_from_pose32(pose_world)?,
                             reference_cam_from_odom,
@@ -4662,7 +4675,7 @@ impl SlamTracker {
 
     fn predicted_tracking_pose(&self) -> Result<Option<Pose>, TrackerError> {
         #[cfg(feature = "vio")]
-        if let Some(cam_from_odom) = self.current_odom_pose() {
+        if let Some(cam_from_odom) = self.current_odom_pose()? {
             return Ok(Some(
                 self.map_from_odom
                     .try_odom_to_map(cam_from_odom)?
@@ -5553,7 +5566,7 @@ impl SlamTracker {
                 Err(TrackerError::KeyframeRejected { landmarks }) => {
                     if is_relocalization {
                         #[cfg(feature = "vio")]
-                        let reference_cam_from_odom = self.current_odom_pose();
+                        let reference_cam_from_odom = self.current_odom_pose()?;
                         #[cfg(not(feature = "vio"))]
                         let reference_cam_from_odom = None;
                         self.state = TrackerState::Relocalizing(RelocalizationSession {
@@ -9432,9 +9445,11 @@ mod tests {
             [1.5, -2.0, 0.3],
         ));
         let pose_odom_from_body =
-            pose_odom_from_body_from_camera_pose(cam_from_odom, Pose64::identity());
+            pose_odom_from_body_from_camera_pose(cam_from_odom, Pose64::identity())
+                .expect("body pose");
         let recovered =
-            camera_from_odom_from_pose_odom_from_body(pose_odom_from_body, Pose64::identity());
+            camera_from_odom_from_pose_odom_from_body(pose_odom_from_body, Pose64::identity())
+                .expect("camera pose");
 
         assert_eq!(
             recovered.to_pose32().translation(),
@@ -9458,9 +9473,11 @@ mod tests {
             [0.04, -0.01, 0.02],
         ));
         let pose_odom_from_body =
-            pose_odom_from_body_from_camera_pose(cam_from_odom, camera_from_body);
+            pose_odom_from_body_from_camera_pose(cam_from_odom, camera_from_body)
+                .expect("body pose");
         let recovered =
-            camera_from_odom_from_pose_odom_from_body(pose_odom_from_body, camera_from_body);
+            camera_from_odom_from_pose_odom_from_body(pose_odom_from_body, camera_from_body)
+                .expect("camera pose");
 
         assert_eq!(
             recovered.to_pose32().translation(),
