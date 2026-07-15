@@ -479,7 +479,16 @@ impl MapGeneration {
     }
 
     fn next(self) -> Self {
-        Self(self.0.saturating_add(1))
+        self.advance_by(1)
+    }
+
+    fn advance_by(self, steps: usize) -> Self {
+        let steps = u64::try_from(steps).expect("map generation space exhausted");
+        Self(
+            self.0
+                .checked_add(steps)
+                .expect("map generation space exhausted"),
+        )
     }
 
     pub fn as_u64(self) -> u64 {
@@ -559,10 +568,6 @@ impl SlamMap {
         }
     }
 
-    fn bump_generation(&mut self) {
-        self.generation = self.generation.next();
-    }
-
     pub fn instance_id(&self) -> MapInstanceId {
         self.instance_id
     }
@@ -636,9 +641,10 @@ impl SlamMap {
             keypoints,
         };
 
+        let next_generation = self.generation.next();
         let kf_id = self.keyframes.insert(entry);
         self.frame_to_keyframe.insert(frame_id, kf_id);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(kf_id)
     }
 
@@ -698,6 +704,7 @@ impl SlamMap {
         }
 
         let position = FiniteMapPoint::try_new(position)?;
+        let next_generation = self.generation.next();
 
         let point_id = self.points.insert(MapPoint {
             position,
@@ -708,9 +715,9 @@ impl SlamMap {
         let entry = self
             .keyframes
             .get_mut(first_obs.keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
+            .expect("keyframe existence validated before mutation");
         entry.set_point_ref(first_obs.index, point_id);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(point_id)
     }
 
@@ -751,6 +758,7 @@ impl SlamMap {
             point.observations.iter().map(|o| o.keyframe_id).collect()
         };
 
+        let next_generation = self.generation.next();
         for other in other_keyframes {
             self.covisibility.increment_pair(obs.keyframe_id, other);
         }
@@ -758,15 +766,15 @@ impl SlamMap {
         let point = self
             .points
             .get_mut(point_id)
-            .ok_or(MapError::MapPointNotFound(point_id))?;
+            .expect("map point existence validated before mutation");
         point.add_observation(obs);
 
         let entry = self
             .keyframes
             .get_mut(obs.keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
+            .expect("keyframe existence validated before mutation");
         entry.set_point_ref(obs.index, point_id);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -776,12 +784,16 @@ impl SlamMap {
         new_desc: &CompactDescriptor,
         blend: DescriptorBlend,
     ) -> Result<(), MapError> {
+        if !self.points.contains_key(point_id) {
+            return Err(MapError::MapPointNotFound(point_id));
+        }
+        let next_generation = self.generation.next();
         let point = self
             .points
             .get_mut(point_id)
-            .ok_or(MapError::MapPointNotFound(point_id))?;
+            .expect("map point existence validated before mutation");
         point.update_descriptor(new_desc, blend);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -791,12 +803,16 @@ impl SlamMap {
         position: Point3,
     ) -> Result<(), MapError> {
         let position = FiniteMapPoint::try_new(position)?;
+        if !self.points.contains_key(point_id) {
+            return Err(MapError::MapPointNotFound(point_id));
+        }
+        let next_generation = self.generation.next();
         let point = self
             .points
             .get_mut(point_id)
-            .ok_or(MapError::MapPointNotFound(point_id))?;
+            .expect("map point existence validated before mutation");
         point.set_position(position);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -806,12 +822,16 @@ impl SlamMap {
         pose: Pose,
     ) -> Result<(), MapError> {
         validate_map_pose(pose)?;
+        if !self.keyframes.contains_key(keyframe_id) {
+            return Err(MapError::KeyframeNotFound(keyframe_id));
+        }
+        let next_generation = self.generation.next();
         let entry = self
             .keyframes
             .get_mut(keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+            .expect("keyframe existence validated before mutation");
         entry.set_pose(pose);
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -836,31 +856,45 @@ impl SlamMap {
             validated_points.push((point_id, position));
         }
 
+        let next_generation =
+            (!pose_updates.is_empty() || !point_updates.is_empty()).then(|| self.generation.next());
         // Every fallible condition is checked above while the map is unchanged.
         for &(keyframe_id, pose) in pose_updates {
-            let Some(entry) = self.keyframes.get_mut(keyframe_id) else {
-                return Err(MapError::KeyframeNotFound(keyframe_id));
-            };
+            let entry = self
+                .keyframes
+                .get_mut(keyframe_id)
+                .expect("keyframe existence validated before mutation");
             entry.set_pose(pose);
         }
         for (point_id, position) in validated_points {
-            let Some(point) = self.points.get_mut(point_id) else {
-                return Err(MapError::MapPointNotFound(point_id));
-            };
+            let point = self
+                .points
+                .get_mut(point_id)
+                .expect("map point existence validated before mutation");
             point.set_position(position);
         }
 
-        if !pose_updates.is_empty() || !point_updates.is_empty() {
-            self.bump_generation();
+        if let Some(next_generation) = next_generation {
+            self.generation = next_generation;
         }
         Ok(())
     }
 
     pub fn remove_map_point(&mut self, point_id: MapPointId) -> Result<(), MapError> {
+        if !self.points.contains_key(point_id) {
+            return Err(MapError::MapPointNotFound(point_id));
+        }
+        let next_generation = self.generation.next();
+        self.remove_map_point_without_generation(point_id);
+        self.generation = next_generation;
+        Ok(())
+    }
+
+    fn remove_map_point_without_generation(&mut self, point_id: MapPointId) {
         let point = self
             .points
             .remove(point_id)
-            .ok_or(MapError::MapPointNotFound(point_id))?;
+            .expect("map point existence validated before mutation");
 
         for obs in &point.observations {
             if let Some(entry) = self.keyframes.get_mut(obs.keyframe_id) {
@@ -869,15 +903,17 @@ impl SlamMap {
         }
         self.covisibility
             .remove_point_observations(&point.observations);
-        self.bump_generation();
-        Ok(())
     }
 
     pub fn remove_keyframe(&mut self, keyframe_id: KeyframeId) -> Result<(), MapError> {
+        if !self.keyframes.contains_key(keyframe_id) {
+            return Err(MapError::KeyframeNotFound(keyframe_id));
+        }
+        let next_generation = self.generation.next();
         let entry = self
             .keyframes
             .remove(keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
+            .expect("keyframe existence validated before mutation");
         self.frame_to_keyframe.remove(&entry.frame_id);
         self.covisibility.remove_keyframe(keyframe_id);
 
@@ -897,7 +933,7 @@ impl SlamMap {
                 "point scheduled for removal was missing from map"
             );
         }
-        self.bump_generation();
+        self.generation = next_generation;
         Ok(())
     }
 
@@ -909,10 +945,14 @@ impl SlamMap {
             .map(|(id, _)| id)
             .collect();
         let count = to_remove.len();
-        for id in to_remove {
-            let removed = self.remove_map_point(id);
-            debug_assert!(removed.is_ok(), "map point missing during cull");
+        if count == 0 {
+            return 0;
         }
+        let final_generation = self.generation.advance_by(count);
+        for id in to_remove {
+            self.remove_map_point_without_generation(id);
+        }
+        self.generation = final_generation;
         count
     }
 
@@ -1540,6 +1580,13 @@ mod tests {
         CompactDescriptor([128; 256])
     }
 
+    fn assert_generation_exhaustion(operation: impl FnOnce()) {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err(),
+            "generation exhaustion must fail before mutation"
+        );
+    }
+
     fn reference_blend_byte(previous: u8, next: u8, weight: u16) -> u8 {
         let inverse = BLEND_SCALE - weight;
         let numerator = u64::from(previous) * u64::from(inverse)
@@ -2045,6 +2092,141 @@ mod tests {
         )
         .expect("map point");
         assert_eq!(map.generation().as_u64(), 2);
+    }
+
+    #[test]
+    fn map_generation_exhaustion_precedes_every_map_mutation() {
+        let dimensions = FrameDimensions::try_new(640, 480).expect("dimensions");
+        let mut map = SlamMap::new();
+        let first = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                dimensions,
+                make_keypoints(2),
+            )
+            .expect("first keyframe");
+        let second = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                Pose::identity(),
+                dimensions,
+                make_keypoints(1),
+            )
+            .expect("second keyframe");
+        let first_observation = map.keyframe_keypoint(first, 0).expect("observation");
+        let first_free = map.keyframe_keypoint(first, 1).expect("free keypoint");
+        let second_free = map.keyframe_keypoint(second, 0).expect("free keypoint");
+        let point = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                first_observation,
+            )
+            .expect("map point");
+        map.generation = MapGeneration(u64::MAX);
+        let snapshot = map.snapshot();
+
+        assert_generation_exhaustion(|| {
+            let _ = map.add_keyframe(
+                FrameId::new(3),
+                Timestamp::from_nanos(3),
+                Pose::identity(),
+                dimensions,
+                make_keypoints(1),
+            );
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.add_map_point(
+                Point3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                first_free,
+            );
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.add_observation(point, second_free);
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.update_map_point_descriptor(
+                point,
+                &CompactDescriptor([255; 256]),
+                DescriptorBlend::try_new(1.0).expect("blend"),
+            );
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.set_map_point_position(
+                point,
+                Point3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
+            );
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.set_keyframe_pose(
+                first,
+                Pose::from_rt(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [1.0, 0.0, 0.0],
+                ),
+            );
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.apply_geometry_updates(
+                &[(first, Pose::identity())],
+                &[(
+                    point,
+                    Point3 {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 2.0,
+                    },
+                )],
+            );
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.remove_map_point(point);
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.remove_keyframe(first);
+        });
+        assert_generation_exhaustion(|| {
+            let _ = map.cull_points(2);
+        });
+
+        assert_eq!(map.snapshot(), snapshot);
+        assert_eq!(map.num_keyframes(), 2);
+        assert_eq!(map.num_points(), 1);
+        assert_eq!(
+            map.map_point_for_keypoint(first_observation)
+                .expect("association"),
+            Some(point)
+        );
+        assert_eq!(
+            map.map_point_for_keypoint(first_free)
+                .expect("free keypoint"),
+            None
+        );
+        assert_eq!(
+            map.map_point_for_keypoint(second_free)
+                .expect("free keypoint"),
+            None
+        );
+        let stored = map.point(point).expect("point retained");
+        assert_eq!(stored.position().z, 1.0);
+        assert_eq!(stored.descriptor(), &make_descriptor());
+        assert_map_invariants(&map).expect("unchanged map invariants");
     }
 
     #[test]
