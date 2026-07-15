@@ -1,5 +1,5 @@
 use std::collections::TryReserveError;
-use std::num::{NonZeroU8, NonZeroUsize};
+use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize};
 
 use crate::dataset::CameraIntrinsics;
 use crate::{Keypoint, Point3, math};
@@ -335,12 +335,13 @@ pub struct RansacConfig {
     max_iterations: NonZeroUsize,
     reprojection_threshold_px: f32,
     min_inliers: usize,
-    seed: u64,
+    seed: NonZeroU64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RansacConfigError {
     ZeroMaxIterations,
+    ZeroSeed,
     InvalidReprojectionThresholdPx { value: f32 },
     TooFewMinInliers { value: usize, minimum: usize },
 }
@@ -351,6 +352,7 @@ impl std::fmt::Display for RansacConfigError {
             RansacConfigError::ZeroMaxIterations => {
                 write!(f, "RANSAC max iterations must be greater than zero")
             }
+            RansacConfigError::ZeroSeed => write!(f, "RANSAC seed must be nonzero"),
             RansacConfigError::InvalidReprojectionThresholdPx { value } => write!(
                 f,
                 "RANSAC reprojection threshold must be positive and finite, got {value}"
@@ -374,6 +376,7 @@ impl RansacConfig {
     ) -> Result<Self, RansacConfigError> {
         let max_iterations =
             NonZeroUsize::new(max_iterations).ok_or(RansacConfigError::ZeroMaxIterations)?;
+        let seed = NonZeroU64::new(seed).ok_or(RansacConfigError::ZeroSeed)?;
         if !reprojection_threshold_px.is_finite() || reprojection_threshold_px <= 0.0 {
             return Err(RansacConfigError::InvalidReprojectionThresholdPx {
                 value: reprojection_threshold_px,
@@ -406,7 +409,7 @@ impl RansacConfig {
     }
 
     pub fn seed(self) -> u64 {
-        self.seed
+        self.seed.get()
     }
 
     pub fn try_with_min_inliers(self, min_inliers: usize) -> Result<Self, RansacConfigError> {
@@ -414,7 +417,7 @@ impl RansacConfig {
             self.max_iterations(),
             self.reprojection_threshold_px,
             min_inliers,
-            self.seed,
+            self.seed.get(),
         )
     }
 }
@@ -425,7 +428,7 @@ impl Default for RansacConfig {
             max_iterations: NonZeroUsize::MIN.saturating_add(199),
             reprojection_threshold_px: 2.0,
             min_inliers: 20,
-            seed: 0x5EED_u64,
+            seed: NonZeroU64::new(0x5EED_u64).expect("default RANSAC seed is nonzero"),
         }
     }
 }
@@ -1369,7 +1372,7 @@ pub fn solve_pnp_ransac(
         .into());
     }
 
-    let mut rng = XorShift64::new(config.seed());
+    let mut rng = XorShift64::new(config.seed);
     let mut best_pose = None;
     let mut best_inliers = try_inlier_buffer(PnpInlierBuffer::BestConsensus, observations.len())?;
     let mut candidate_inliers =
@@ -2715,8 +2718,8 @@ struct XorShift64 {
 }
 
 impl XorShift64 {
-    fn new(seed: u64) -> Self {
-        Self { state: seed.max(1) }
+    fn new(seed: NonZeroU64) -> Self {
+        Self { state: seed.get() }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -2794,6 +2797,10 @@ mod tests {
         assert!(matches!(
             RansacConfig::new(0, 1.0, MIN_PNP_POINTS, 1),
             Err(RansacConfigError::ZeroMaxIterations)
+        ));
+        assert!(matches!(
+            RansacConfig::new(1, 1.0, MIN_PNP_POINTS, 0),
+            Err(RansacConfigError::ZeroSeed)
         ));
         assert!(matches!(
             RansacConfig::new(1, f32::NAN, MIN_PNP_POINTS, 1),
@@ -3208,7 +3215,8 @@ mod tests {
 
     #[test]
     fn sample_three_returns_distinct_indices() {
-        let mut rng = XorShift64::new(0xDEADBEEF);
+        let mut rng =
+            XorShift64::new(NonZeroU64::new(0xDEADBEEF).expect("test RANSAC seed is nonzero"));
         for _ in 0..500 {
             let sample = sample_three(&mut rng, 17).expect("sample");
             assert!(sample[0] < 17 && sample[1] < 17 && sample[2] < 17);
