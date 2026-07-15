@@ -1,53 +1,52 @@
 #![no_std]
 #![no_main]
 
+use core::{
+    cell::{Cell, RefCell},
+    fmt::Write,
+    num::NonZeroU32,
+};
+use cortex_m::interrupt::Mutex;
 use cortex_m_rt::entry;
-use heapless::String;
+use embedded::{encoder_wraps_with_pending_direction_assumption, pwm_duty};
+use heapless::{String, Vec, spsc::Queue};
 use panic_halt as _;
+use robot_protocol::{
+    ControllerError, ControllerEvent, ControllerUptimeMsWrapping, EstimatedWrappingEncoderTicks,
+    ModuloEncoderDeltaTicks, PwmPercent, RobotOdometry, WrappingMillisClock,
+    parse_serial_pwm_command,
+};
 use stm32f4xx_hal::{
+    dwt::{Instant as CycleInstant, MonoTimer},
     pac,
     prelude::*,
     serial::{Event, Serial, config::Config},
     timer::{Channel1, Channel2, pwm::PwmExt},
 };
 
-// Ring buffer for incoming UART data
+const MAIN_LOOP_MIN_DELAY_MS: u32 = 5;
+const ODOMETRY_SAMPLE_MIN_INTERVAL_MS: u32 = 10;
+const ODOMETRY_REPORT_MIN_INTERVAL_MS: u32 = 100;
+
 const RX_BUFFER_SIZE: usize = 128;
-static mut RX_BUFFER: [u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE];
-static mut RX_HEAD: usize = 0;
-static mut RX_TAIL: usize = 0;
+static RX_QUEUE: Mutex<RefCell<Queue<u8, RX_BUFFER_SIZE>>> = Mutex::new(RefCell::new(Queue::new()));
+static RX_STREAM_INVALIDATED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
-// Ring buffer for outgoing UART data
 const TX_BUFFER_SIZE: usize = 128;
-static mut TX_BUFFER: [u8; TX_BUFFER_SIZE] = [0; TX_BUFFER_SIZE];
-static mut TX_HEAD: usize = 0;
-static mut TX_TAIL: usize = 0;
+static TX_QUEUE: Mutex<RefCell<Queue<u8, TX_BUFFER_SIZE>>> = Mutex::new(RefCell::new(Queue::new()));
+static TX_RECORD_DROPPED: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
 
-// Global serial handle for ISR
-static mut SERIAL: Option<stm32f4xx_hal::serial::Serial<pac::USART2>> = None;
+static SERIAL: Mutex<RefCell<Option<stm32f4xx_hal::serial::Serial<pac::USART2>>>> =
+    Mutex::new(RefCell::new(None));
 
-// Encoder state - volatile for ISR access
-static mut LEFT_OVERFLOW_COUNT: i32 = 0;
-static mut RIGHT_OVERFLOW_COUNT: i32 = 0;
-static mut LAST_LEFT_COUNT: u16 = 0;
-static mut LAST_RIGHT_COUNT: u16 = 0;
-
-// Odometry state
-struct OdometryData {
-    left_ticks: i64,
-    right_ticks: i64,
-    left_velocity: i16,  // ticks/100ms
-    right_velocity: i16, // ticks/100ms
-    timestamp: u32,      // milliseconds
+#[derive(Clone, Copy)]
+struct ActiveCommandLease {
+    started_at: CycleInstant,
+    duration_ticks: NonZeroU32,
 }
 
-static mut ODOMETRY: OdometryData = OdometryData {
-    left_ticks: 0,
-    right_ticks: 0,
-    left_velocity: 0,
-    right_velocity: 0,
-    timestamp: 0,
-};
+static LEFT_ENCODER_WRAPS: Mutex<Cell<i64>> = Mutex::new(Cell::new(0));
+static RIGHT_ENCODER_WRAPS: Mutex<Cell<i64>> = Mutex::new(Cell::new(0));
 
 #[entry]
 fn main() -> ! {
@@ -65,11 +64,21 @@ fn main() -> ! {
             .freeze();
 
         let mut delay = cp.SYST.delay(&clocks);
+        let monotonic = MonoTimer::new(cp.DWT, cp.DCB, &clocks);
         let gpioa = dp.GPIOA.split();
         let gpiob = dp.GPIOB.split();
 
         // Status LED
         let mut led = gpioa.pa5.into_push_pull_output();
+        let timer_frequency_hz = match NonZeroU32::new(monotonic.frequency().raw()) {
+            Some(frequency) => frequency,
+            None => {
+                led.set_high();
+                loop {
+                    cortex_m::asm::wfi();
+                }
+            }
+        };
 
         // Configure encoder pins first
         let _pa8_enc = gpioa.pa8.into_alternate::<1>(); // TIM1 CH1
@@ -81,7 +90,7 @@ fn main() -> ! {
         let tx = gpioa.pa2.into_alternate::<7>();
         let rx = gpioa.pa3.into_alternate::<7>();
 
-        let mut serial = Serial::new(
+        let mut serial = match Serial::new(
             dp.USART2,
             (tx, rx),
             Config::default()
@@ -89,16 +98,20 @@ fn main() -> ! {
                 .wordlength_8()
                 .parity_none(),
             &clocks,
-        )
-        .unwrap();
+        ) {
+            Ok(serial) => serial,
+            Err(_) => {
+                led.set_high();
+                loop {
+                    cortex_m::asm::wfi();
+                }
+            }
+        };
 
         // Enable RXNE interrupt
         serial.listen(Event::RxNotEmpty);
 
-        // Store serial in global for ISR access
-        unsafe {
-            SERIAL = Some(serial);
-        }
+        cortex_m::interrupt::free(|cs| SERIAL.borrow(cs).replace(Some(serial)));
 
         // Enable USART2 interrupt in NVIC
         unsafe {
@@ -123,7 +136,8 @@ fn main() -> ! {
         let (mut right_ch1, mut right_ch2) =
             dp.TIM3.pwm_hz(right_channels, 20.kHz(), &clocks).split();
 
-        let max_duty = left_ch1.get_max_duty();
+        let left_max_duty = left_ch1.get_max_duty();
+        let right_max_duty = right_ch1.get_max_duty();
 
         // Enable all PWM channels
         left_ch1.enable();
@@ -143,352 +157,329 @@ fn main() -> ! {
             cortex_m::peripheral::NVIC::unmask(pac::Interrupt::TIM4);
         }
 
-        // Send startup message
-        queue_tx_string(b"STM32 Motor Controller Ready with Encoders\r\n");
+        send_controller_event(ControllerEvent::Ready);
 
         // Control state
-        let mut left_speed: i8 = 0;
-        let mut right_speed: i8 = 0;
-        let mut timeout_counter: u32 = 0;
-        let mut telemetry_counter: u32 = 0;
-        let mut odometry_counter: u32 = 0;
-        let mut system_time_ms: u32 = 0;
+        let mut left_pwm = PwmPercent::ZERO;
+        let mut right_pwm = PwmPercent::ZERO;
+        let mut active_lease = None;
+        let mut controller_clock =
+            WrappingMillisClock::new(timer_frequency_hz, cortex_m::peripheral::DWT::cycle_count());
+        let mut last_odometry_sample_ms = ControllerUptimeMsWrapping::new(0);
+        let mut last_odometry_report_ms = ControllerUptimeMsWrapping::new(0);
+        let mut last_left_count = 0;
+        let mut last_right_count = 0;
+        let mut odometry = None;
 
-        // Parser state machine
-        enum ParserState {
-            Idle,
-            GotC,
-            GotCM,
-            ReadingCommand,
-            ReadingLeft,
-            ReadingRight,
-            ReadingTimeout,
-        }
-
-        let mut parser_state = ParserState::Idle;
-        let mut parse_buffer = String::<32>::new();
+        let mut command_line = Vec::<u8, 32>::new();
+        let mut discard_until_line_end = false;
 
         loop {
-            // Process received bytes from ring buffer
+            let controller_uptime_ms_wrapping =
+                controller_clock.advance_to(cortex_m::peripheral::DWT::cycle_count());
+
+            if take_rx_stream_invalidated() {
+                command_line.clear();
+                discard_until_line_end = true;
+                active_lease = None;
+                left_pwm = PwmPercent::ZERO;
+                right_pwm = PwmPercent::ZERO;
+                stop_motors(&mut left_ch1, &mut left_ch2, &mut right_ch1, &mut right_ch2);
+                send_controller_error(ControllerError::ReceiveOverrun);
+            }
+
             while let Some(byte) = dequeue_rx() {
-                let mut reset_parser = false;
+                if byte == b'\n' || byte == b'\r' {
+                    if discard_until_line_end {
+                        discard_until_line_end = false;
+                        command_line.clear();
+                        continue;
+                    }
+                    if command_line.is_empty() {
+                        continue;
+                    }
 
-                match parser_state {
-                    ParserState::Idle => {
-                        if byte == b'C' {
-                            parser_state = ParserState::GotC;
-                            parse_buffer.clear();
-                        }
-                    }
-                    ParserState::GotC => {
-                        if byte == b'M' {
-                            parser_state = ParserState::GotCM;
-                        } else {
-                            reset_parser = true;
-                        }
-                    }
-                    ParserState::GotCM => {
-                        if byte == b'D' {
-                            parser_state = ParserState::ReadingCommand;
-                        } else {
-                            reset_parser = true;
-                        }
-                    }
-                    ParserState::ReadingCommand => {
-                        if byte == b',' {
-                            parser_state = ParserState::ReadingLeft;
-                            parse_buffer.clear();
-                        } else {
-                            reset_parser = true;
-                        }
-                    }
-                    ParserState::ReadingLeft => {
-                        if byte == b',' {
-                            if let Ok(speed) = parse_buffer.parse::<i8>() {
-                                left_speed = speed.clamp(-100, 100);
-                                parser_state = ParserState::ReadingRight;
-                                parse_buffer.clear();
-                            } else {
-                                reset_parser = true;
-                            }
-                        } else if byte.is_ascii_digit() || byte == b'-' {
-                            let _ = parse_buffer.push(byte as char);
-                        } else {
-                            reset_parser = true;
-                        }
-                    }
-                    ParserState::ReadingRight => {
-                        if byte == b',' {
-                            if let Ok(speed) = parse_buffer.parse::<i8>() {
-                                right_speed = speed.clamp(-100, 100);
-                                parser_state = ParserState::ReadingTimeout;
-                                parse_buffer.clear();
-                            } else {
-                                reset_parser = true;
-                            }
-                        } else if byte.is_ascii_digit() || byte == b'-' {
-                            let _ = parse_buffer.push(byte as char);
-                        } else {
-                            reset_parser = true;
-                        }
-                    }
-                    ParserState::ReadingTimeout => {
-                        if byte == b'\n' || byte == b'\r' {
-                            if let Ok(timeout) = parse_buffer.parse::<u32>() {
-                                // Command complete! Apply motor speeds
-                                timeout_counter = timeout.saturating_mul(200); // ~200Hz loop
+                    let parsed = match parse_serial_pwm_command(&command_line) {
+                        Ok(command) => command
+                            .lease_ms()
+                            .wrapping_timer_ticks_ceil(timer_frequency_hz)
+                            .map(|duration_ticks| (command, duration_ticks))
+                            .map_err(|_| ControllerError::LeaseTimerDomain),
+                        Err(_) => Err(ControllerError::InvalidCommand),
+                    };
+                    command_line.clear();
 
-                                apply_motor_speed(
-                                    &mut left_ch1,
-                                    &mut left_ch2,
-                                    left_speed,
-                                    max_duty,
-                                );
-                                apply_motor_speed(
-                                    &mut right_ch1,
-                                    &mut right_ch2,
-                                    right_speed,
-                                    max_duty,
-                                );
-
-                                led.toggle();
-
-                                // Send immediate ACK telemetry
-                                send_telemetry(left_speed, right_speed);
-                            }
-                            reset_parser = true;
-                        } else if byte.is_ascii_digit() {
-                            let _ = parse_buffer.push(byte as char);
-                        } else {
-                            reset_parser = true;
+                    match parsed {
+                        Ok((command, duration_ticks)) => {
+                            left_pwm = command.left_pwm_percent();
+                            right_pwm = command.right_pwm_percent();
+                            apply_motor_pwm(&mut left_ch1, &mut left_ch2, left_pwm, left_max_duty);
+                            apply_motor_pwm(
+                                &mut right_ch1,
+                                &mut right_ch2,
+                                right_pwm,
+                                right_max_duty,
+                            );
+                            active_lease =
+                                if left_pwm == PwmPercent::ZERO && right_pwm == PwmPercent::ZERO {
+                                    None
+                                } else {
+                                    Some(ActiveCommandLease {
+                                        started_at: monotonic.now(),
+                                        duration_ticks,
+                                    })
+                                };
+                            led.toggle();
+                            send_unsequenced_applied_pwm_report(left_pwm, right_pwm);
+                        }
+                        Err(error) => {
+                            active_lease = None;
+                            left_pwm = PwmPercent::ZERO;
+                            right_pwm = PwmPercent::ZERO;
+                            stop_motors(
+                                &mut left_ch1,
+                                &mut left_ch2,
+                                &mut right_ch1,
+                                &mut right_ch2,
+                            );
+                            send_controller_error(error);
                         }
                     }
-                }
-
-                if reset_parser {
-                    parser_state = ParserState::Idle;
-                    parse_buffer.clear();
+                } else if !discard_until_line_end && command_line.push(byte).is_err() {
+                    command_line.clear();
+                    discard_until_line_end = true;
+                    active_lease = None;
+                    left_pwm = PwmPercent::ZERO;
+                    right_pwm = PwmPercent::ZERO;
+                    stop_motors(&mut left_ch1, &mut left_ch2, &mut right_ch1, &mut right_ch2);
+                    send_controller_error(ControllerError::CommandTooLong);
                 }
             }
 
-            // Safety timeout
-            if timeout_counter > 0 {
-                timeout_counter = timeout_counter.saturating_sub(1);
-            } else if left_speed != 0 || right_speed != 0 {
-                // Timeout expired, stop motors
-                left_speed = 0;
-                right_speed = 0;
-                left_ch1.set_duty(0);
-                left_ch2.set_duty(0);
-                right_ch1.set_duty(0);
-                right_ch2.set_duty(0);
+            if active_lease.is_some_and(|lease: ActiveCommandLease| {
+                lease.started_at.elapsed() >= lease.duration_ticks.get()
+            }) {
+                active_lease = None;
+                if left_pwm != PwmPercent::ZERO || right_pwm != PwmPercent::ZERO {
+                    left_pwm = PwmPercent::ZERO;
+                    right_pwm = PwmPercent::ZERO;
+                    stop_motors(&mut left_ch1, &mut left_ch2, &mut right_ch1, &mut right_ch2);
+                    send_controller_event(ControllerEvent::CommandLeaseExpired);
+                }
             }
 
-            // Update odometry at 100Hz (every 10ms)
-            odometry_counter += 1;
-            if odometry_counter >= 10 {
-                odometry_counter = 0;
-                update_odometry(system_time_ms);
+            if controller_uptime_ms_wrapping.wrapping_elapsed_since(last_odometry_sample_ms)
+                >= ODOMETRY_SAMPLE_MIN_INTERVAL_MS
+            {
+                last_odometry_sample_ms = controller_uptime_ms_wrapping;
+                odometry = Some(sample_odometry(
+                    controller_uptime_ms_wrapping,
+                    &mut last_left_count,
+                    &mut last_right_count,
+                ));
             }
 
-            // Periodic telemetry (non-blocking)
-            telemetry_counter += 1;
-            if telemetry_counter >= 200 {
-                // 10Hz telemetry
-                telemetry_counter = 0;
-                send_odometry_telemetry();
+            if controller_uptime_ms_wrapping.wrapping_elapsed_since(last_odometry_report_ms)
+                >= ODOMETRY_REPORT_MIN_INTERVAL_MS
+            {
+                last_odometry_report_ms = controller_uptime_ms_wrapping;
+                if let Some(odometry) = odometry {
+                    send_odometry_report(odometry);
+                }
             }
 
-            // Service TX buffer
-            service_tx();
+            report_dropped_tx_record();
 
-            // Small delay for ~200Hz loop rate
-            delay.delay_us(5000_u32);
-            system_time_ms = system_time_ms.wrapping_add(5);
+            delay.delay_ms(MAIN_LOOP_MIN_DELAY_MS);
         }
     }
 
     loop {
-        cortex_m::asm::nop();
+        cortex_m::asm::wfi();
     }
 }
 
 // TIM1 Update interrupt handler (left encoder overflow)
 #[interrupt]
 fn TIM1_UP_TIM10() {
-    unsafe {
-        let tim1 = &(*pac::TIM1::ptr());
+    cortex_m::interrupt::free(|cs| unsafe {
+        let tim1 = &*pac::TIM1::ptr();
 
-        // Check if update interrupt flag is set
         if tim1.sr.read().uif().bit_is_set() {
-            // Clear the flag
             tim1.sr.modify(|_, w| w.uif().clear_bit());
-
-            // Check direction
+            let wraps = LEFT_ENCODER_WRAPS.borrow(cs);
             if tim1.cr1.read().dir().bit_is_set() {
-                // Counting down
-                LEFT_OVERFLOW_COUNT -= 1;
+                wraps.set(wraps.get().wrapping_sub(1));
             } else {
-                // Counting up
-                LEFT_OVERFLOW_COUNT += 1;
+                wraps.set(wraps.get().wrapping_add(1));
             }
         }
-    }
+    });
 }
 
 // TIM4 interrupt handler (right encoder overflow)
 #[interrupt]
 fn TIM4() {
-    unsafe {
-        let tim4 = &(*pac::TIM4::ptr());
+    cortex_m::interrupt::free(|cs| unsafe {
+        let tim4 = &*pac::TIM4::ptr();
 
         if tim4.sr.read().uif().bit_is_set() {
             tim4.sr.modify(|_, w| w.uif().clear_bit());
-
+            let wraps = RIGHT_ENCODER_WRAPS.borrow(cs);
             if tim4.cr1.read().dir().bit_is_set() {
-                RIGHT_OVERFLOW_COUNT -= 1;
+                wraps.set(wraps.get().wrapping_sub(1));
             } else {
-                RIGHT_OVERFLOW_COUNT += 1;
+                wraps.set(wraps.get().wrapping_add(1));
             }
         }
-    }
+    });
 }
 
 // USART2 interrupt handler
 #[interrupt]
 fn USART2() {
-    unsafe {
-        let serial_ptr = &raw mut SERIAL;
-        if let Some(serial) = &mut *serial_ptr {
-            // Check for RX data
+    cortex_m::interrupt::free(|cs| {
+        if let Some(serial) = SERIAL.borrow(cs).borrow_mut().as_mut() {
             if serial.is_rx_not_empty() {
-                if let Ok(byte) = serial.read() {
-                    // Add to ring buffer
-                    let next_head = (RX_HEAD + 1) % RX_BUFFER_SIZE;
-                    if next_head != RX_TAIL {
-                        RX_BUFFER[RX_HEAD] = byte;
-                        RX_HEAD = next_head;
+                match serial.read() {
+                    Ok(byte) => {
+                        if RX_QUEUE.borrow(cs).borrow_mut().enqueue(byte).is_err() {
+                            RX_STREAM_INVALIDATED.borrow(cs).set(true);
+                        }
                     }
-                    // Silently drop on buffer full (could set overflow flag)
+                    Err(nb::Error::WouldBlock) => {}
+                    Err(nb::Error::Other(_)) => RX_STREAM_INVALIDATED.borrow(cs).set(true),
                 }
             }
 
-            // Check if we can transmit
-            if serial.is_tx_empty() && TX_HEAD != TX_TAIL {
-                let byte = TX_BUFFER[TX_TAIL];
-                TX_TAIL = (TX_TAIL + 1) % TX_BUFFER_SIZE;
-                let _ = serial.write(byte);
+            if serial.is_tx_empty() {
+                let mut tx_queue = TX_QUEUE.borrow(cs).borrow_mut();
+                if let Some(byte) = tx_queue.peek().copied() {
+                    match serial.write(byte) {
+                        Ok(()) => {
+                            tx_queue.dequeue();
+                        }
+                        Err(nb::Error::WouldBlock) => {}
+                        Err(nb::Error::Other(_)) => {
+                            while tx_queue.dequeue().is_some() {}
+                            TX_RECORD_DROPPED.borrow(cs).set(true);
+                            serial.unlisten(Event::TxEmpty);
+                        }
+                    }
+                } else {
+                    serial.unlisten(Event::TxEmpty);
+                }
             }
         }
-    }
+    });
 }
 
 fn dequeue_rx() -> Option<u8> {
-    unsafe {
-        if RX_HEAD != RX_TAIL {
-            let byte = RX_BUFFER[RX_TAIL];
-            RX_TAIL = (RX_TAIL + 1) % RX_BUFFER_SIZE;
-            Some(byte)
-        } else {
-            None
+    cortex_m::interrupt::free(|cs| RX_QUEUE.borrow(cs).borrow_mut().dequeue())
+}
+
+fn take_rx_stream_invalidated() -> bool {
+    cortex_m::interrupt::free(|cs| {
+        let invalidated = RX_STREAM_INVALIDATED.borrow(cs).replace(false);
+        if invalidated {
+            let mut queue = RX_QUEUE.borrow(cs).borrow_mut();
+            while queue.dequeue().is_some() {}
         }
-    }
+        invalidated
+    })
 }
 
-fn queue_tx(byte: u8) -> bool {
-    unsafe {
-        let next_head = (TX_HEAD + 1) % TX_BUFFER_SIZE;
-        if next_head != TX_TAIL {
-            TX_BUFFER[TX_HEAD] = byte;
-            TX_HEAD = next_head;
-            true
-        } else {
-            false // Buffer full
+fn try_queue_tx_record(record: &[u8]) -> bool {
+    cortex_m::interrupt::free(|cs| {
+        let mut serial_slot = SERIAL.borrow(cs).borrow_mut();
+        let Some(serial) = serial_slot.as_mut() else {
+            return false;
+        };
+        let mut queue = TX_QUEUE.borrow(cs).borrow_mut();
+        if record.len() > queue.capacity() - queue.len() {
+            return false;
         }
-    }
-}
 
-fn queue_tx_string(s: &[u8]) {
-    for &byte in s {
-        queue_tx(byte);
-    }
-}
-
-fn service_tx() {
-    unsafe {
-        cortex_m::interrupt::free(|_| {
-            let serial_ptr = &raw mut SERIAL;
-            if let Some(serial) = &mut *serial_ptr {
-                if serial.is_tx_empty() && TX_HEAD != TX_TAIL {
-                    let byte = TX_BUFFER[TX_TAIL];
-                    TX_TAIL = (TX_TAIL + 1) % TX_BUFFER_SIZE;
-                    let _ = serial.write(byte);
-                }
+        for &byte in record {
+            if queue.enqueue(byte).is_err() {
+                return false;
             }
-        });
+        }
+        serial.listen(Event::TxEmpty);
+        true
+    })
+}
+
+fn queue_tx_record(record: &[u8]) {
+    if !try_queue_tx_record(record) {
+        cortex_m::interrupt::free(|cs| TX_RECORD_DROPPED.borrow(cs).set(true));
     }
 }
 
-fn send_telemetry(left: i8, right: i8) {
-    queue_tx_string(b"TEL,");
-
-    // Simple integer to string conversion
-    if left < 0 {
-        queue_tx(b'-');
-        let pos = -left;
-        if pos >= 100 {
-            queue_tx(b'1');
-            queue_tx(b'0' + (pos % 100 / 10) as u8);
-        } else if pos >= 10 {
-            queue_tx(b'0' + (pos / 10) as u8);
-        }
-        queue_tx(b'0' + (pos % 10) as u8);
-    } else {
-        if left >= 100 {
-            queue_tx(b'1');
-            queue_tx(b'0' + (left % 100 / 10) as u8);
-        } else if left >= 10 {
-            queue_tx(b'0' + (left / 10) as u8);
-        }
-        queue_tx(b'0' + (left % 10) as u8);
+fn queue_formatted_tx_record(arguments: core::fmt::Arguments<'_>) {
+    let mut record = String::<96>::new();
+    if record.write_fmt(arguments).is_err() {
+        cortex_m::interrupt::free(|cs| TX_RECORD_DROPPED.borrow(cs).set(true));
+        return;
     }
-
-    queue_tx(b',');
-
-    if right < 0 {
-        queue_tx(b'-');
-        let pos = -right;
-        if pos >= 100 {
-            queue_tx(b'1');
-            queue_tx(b'0' + (pos % 100 / 10) as u8);
-        } else if pos >= 10 {
-            queue_tx(b'0' + (pos / 10) as u8);
-        }
-        queue_tx(b'0' + (pos % 10) as u8);
-    } else {
-        if right >= 100 {
-            queue_tx(b'1');
-            queue_tx(b'0' + (right % 100 / 10) as u8);
-        } else if right >= 10 {
-            queue_tx(b'0' + (right / 10) as u8);
-        }
-        queue_tx(b'0' + (right % 10) as u8);
-    }
-
-    queue_tx_string(b",0\r\n");
+    queue_tx_record(record.as_bytes());
 }
 
-fn apply_motor_speed<T, U>(ch1: &mut T, ch2: &mut U, speed: i8, max_duty: u16)
+fn send_controller_error(error: ControllerError) {
+    queue_formatted_tx_record(format_args!("ERR,{}\r\n", error.code()));
+}
+
+fn send_controller_event(event: ControllerEvent) {
+    queue_formatted_tx_record(format_args!("EVT,{}\r\n", event.code()));
+}
+
+fn try_queue_controller_error(error: ControllerError) -> bool {
+    let mut record = String::<48>::new();
+    record
+        .write_fmt(format_args!("\r\nERR,{}\r\n", error.code()))
+        .is_ok()
+        && try_queue_tx_record(record.as_bytes())
+}
+
+fn report_dropped_tx_record() {
+    let pending = cortex_m::interrupt::free(|cs| TX_RECORD_DROPPED.borrow(cs).replace(false));
+    if pending && !try_queue_controller_error(ControllerError::TransmitRecordDropped) {
+        cortex_m::interrupt::free(|cs| TX_RECORD_DROPPED.borrow(cs).set(true));
+    }
+}
+
+fn send_unsequenced_applied_pwm_report(left: PwmPercent, right: PwmPercent) {
+    queue_formatted_tx_record(format_args!("PWM,{},{}\r\n", left.get(), right.get()));
+}
+
+fn stop_motors<L1, L2, R1, R2>(
+    left_ch1: &mut L1,
+    left_ch2: &mut L2,
+    right_ch1: &mut R1,
+    right_ch2: &mut R2,
+) where
+    L1: embedded_hal::PwmPin<Duty = u16>,
+    L2: embedded_hal::PwmPin<Duty = u16>,
+    R1: embedded_hal::PwmPin<Duty = u16>,
+    R2: embedded_hal::PwmPin<Duty = u16>,
+{
+    left_ch1.set_duty(0);
+    left_ch2.set_duty(0);
+    right_ch1.set_duty(0);
+    right_ch2.set_duty(0);
+}
+
+fn apply_motor_pwm<T, U>(ch1: &mut T, ch2: &mut U, pwm_percent: PwmPercent, max_duty: u16)
 where
     T: embedded_hal::PwmPin<Duty = u16>,
     U: embedded_hal::PwmPin<Duty = u16>,
 {
-    if speed > 0 {
-        let duty = (speed as u32 * max_duty as u32 / 100) as u16;
+    let value = pwm_percent.get();
+    let duty = pwm_duty(pwm_percent, max_duty);
+    if value > 0 {
         ch1.set_duty(duty);
         ch2.set_duty(0);
-    } else if speed < 0 {
-        let duty = ((-speed) as u32 * max_duty as u32 / 100) as u16;
+    } else if value < 0 {
         ch1.set_duty(0);
         ch2.set_duty(duty);
     } else {
@@ -591,134 +582,56 @@ fn configure_encoder_tim4(tim4: pac::TIM4) {
     }
 }
 
-// Update odometry data (called at 100Hz)
-fn update_odometry(timestamp_ms: u32) {
-    unsafe {
-        cortex_m::interrupt::free(|_| {
-            // Read current encoder counts
-            let left_count = (*pac::TIM1::ptr()).cnt.read().cnt().bits();
-            let right_count = (*pac::TIM4::ptr()).cnt.read().cnt().bits();
+fn sample_odometry(
+    controller_uptime_ms_wrapping: ControllerUptimeMsWrapping,
+    previous_left_count: &mut u16,
+    previous_right_count: &mut u16,
+) -> RobotOdometry {
+    let (left_count, right_count, left_overflows, right_overflows) =
+        cortex_m::interrupt::free(|cs| unsafe {
+            let left_timer = &*pac::TIM1::ptr();
+            let right_timer = &*pac::TIM4::ptr();
+            let left_count = left_timer.cnt.read().cnt().bits();
+            let right_count = right_timer.cnt.read().cnt().bits();
 
-            // Calculate delta ticks (handle wraparound)
-            let left_delta = left_count.wrapping_sub(LAST_LEFT_COUNT) as i16;
-            let right_delta = right_count.wrapping_sub(LAST_RIGHT_COUNT) as i16;
-
-            // Update total position
-            let left_total = (LEFT_OVERFLOW_COUNT as i64) * 65536 + left_count as i64;
-            let right_total = (RIGHT_OVERFLOW_COUNT as i64) * 65536 + right_count as i64;
-
-            ODOMETRY.left_ticks = left_total;
-            ODOMETRY.right_ticks = right_total;
-            ODOMETRY.left_velocity = left_delta;
-            ODOMETRY.right_velocity = right_delta;
-            ODOMETRY.timestamp = timestamp_ms;
-
-            // Debug: Send raw encoder counts every 50 updates (0.5 seconds)
-            static mut DEBUG_COUNTER: u32 = 0;
-            DEBUG_COUNTER += 1;
-            if DEBUG_COUNTER >= 50 {
-                DEBUG_COUNTER = 0;
-                // Send debug info outside interrupt context
-                queue_tx_string(b"DBG,");
-                send_u32(left_count as u32);
-                queue_tx(b',');
-                send_u32(right_count as u32);
-                queue_tx_string(b"\r\n");
-            }
-
-            // Store for next iteration
-            LAST_LEFT_COUNT = left_count;
-            LAST_RIGHT_COUNT = right_count;
+            // An update can become pending immediately before interrupts are
+            // masked for this snapshot. Account for that single pending wrap;
+            // the ISR will commit it to the persistent counter after exit.
+            let left_overflows = encoder_wraps_with_pending_direction_assumption(
+                LEFT_ENCODER_WRAPS.borrow(cs).get(),
+                left_timer.sr.read().uif().bit_is_set(),
+                left_timer.cr1.read().dir().bit_is_set(),
+            );
+            let right_overflows = encoder_wraps_with_pending_direction_assumption(
+                RIGHT_ENCODER_WRAPS.borrow(cs).get(),
+                right_timer.sr.read().uif().bit_is_set(),
+                right_timer.cr1.read().dir().bit_is_set(),
+            );
+            (left_count, right_count, left_overflows, right_overflows)
         });
-    }
+
+    let odometry = RobotOdometry::new(
+        EstimatedWrappingEncoderTicks::from_extended_16_bit_counter(left_overflows, left_count),
+        EstimatedWrappingEncoderTicks::from_extended_16_bit_counter(right_overflows, right_count),
+        ModuloEncoderDeltaTicks::from_wrapping_counts(*previous_left_count, left_count),
+        ModuloEncoderDeltaTicks::from_wrapping_counts(*previous_right_count, right_count),
+        controller_uptime_ms_wrapping,
+    );
+
+    *previous_left_count = left_count;
+    *previous_right_count = right_count;
+    odometry
 }
 
-// Send odometry telemetry
-fn send_odometry_telemetry() {
-    unsafe {
-        let (left_ticks, right_ticks, left_vel, right_vel, timestamp) =
-            cortex_m::interrupt::free(|_| {
-                (
-                    ODOMETRY.left_ticks,
-                    ODOMETRY.right_ticks,
-                    ODOMETRY.left_velocity,
-                    ODOMETRY.right_velocity,
-                    ODOMETRY.timestamp,
-                )
-            });
-
-        queue_tx_string(b"ODO,");
-        send_i64(left_ticks);
-        queue_tx(b',');
-        send_i64(right_ticks);
-        queue_tx(b',');
-        send_i16(left_vel);
-        queue_tx(b',');
-        send_i16(right_vel);
-        queue_tx(b',');
-        send_u32(timestamp);
-        queue_tx_string(b"\r\n");
-    }
-}
-
-// Helper functions for number to string conversion
-fn send_i64(mut n: i64) {
-    if n < 0 {
-        queue_tx(b'-');
-        n = -n;
-    }
-    send_u64(n as u64);
-}
-
-fn send_u64(mut n: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = 0;
-
-    if n == 0 {
-        queue_tx(b'0');
-        return;
-    }
-
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-
-    while i > 0 {
-        i -= 1;
-        queue_tx(buf[i]);
-    }
-}
-
-fn send_i16(n: i16) {
-    if n < 0 {
-        queue_tx(b'-');
-        send_u32((-n) as u32);
-    } else {
-        send_u32(n as u32);
-    }
-}
-
-fn send_u32(mut n: u32) {
-    let mut buf = [0u8; 10];
-    let mut i = 0;
-
-    if n == 0 {
-        queue_tx(b'0');
-        return;
-    }
-
-    while n > 0 {
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-
-    while i > 0 {
-        i -= 1;
-        queue_tx(buf[i]);
-    }
+fn send_odometry_report(odometry: RobotOdometry) {
+    queue_formatted_tx_record(format_args!(
+        "ODO,{},{},{},{},{}\r\n",
+        odometry.left_estimated_extended_ticks_wrapping_i64().get(),
+        odometry.right_estimated_extended_ticks_wrapping_i64().get(),
+        odometry.left_sample_delta_ticks_modulo_i16().get(),
+        odometry.right_sample_delta_ticks_modulo_i16().get(),
+        odometry.controller_uptime_ms_wrapping().get(),
+    ));
 }
 
 // Interrupt imports
