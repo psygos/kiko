@@ -43,6 +43,7 @@ const PATH_DEPTH_REORDER_WARNINGS: &str = "diagnostics/depth/reorder_warnings";
 const PATH_TRI_CANDIDATES: &str = "diagnostics/triangulation/candidates";
 const PATH_TRI_KEPT: &str = "diagnostics/triangulation/kept";
 const PATH_TRI_DROPPED_DISPARITY: &str = "diagnostics/triangulation/dropped_disparity";
+const PATH_TRI_DROPPED_EPIPOLAR: &str = "diagnostics/triangulation/dropped_epipolar";
 const PATH_TRI_DROPPED_DEPTH: &str = "diagnostics/triangulation/dropped_depth";
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
@@ -118,6 +119,7 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_TRI_CANDIDATES, stats.candidate_matches as f64));
         scalars.push((PATH_TRI_KEPT, stats.kept as f64));
         scalars.push((PATH_TRI_DROPPED_DISPARITY, stats.dropped_disparity as f64));
+        scalars.push((PATH_TRI_DROPPED_EPIPOLAR, stats.dropped_epipolar as f64));
         scalars.push((PATH_TRI_DROPPED_DEPTH, stats.dropped_depth as f64));
     }
 
@@ -421,6 +423,7 @@ mod tests {
             candidate_matches: 10,
             kept: 8,
             dropped_disparity: 1,
+            dropped_epipolar: 0,
             dropped_depth: 1,
         });
         let scalars = diagnostics_scalars(&diag);
