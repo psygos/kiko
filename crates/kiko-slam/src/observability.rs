@@ -111,6 +111,7 @@ const PATH_TRI_DROPPED_DISPARITY: &str = "diagnostics/triangulation/dropped_disp
 const PATH_TRI_DROPPED_EPIPOLAR: &str = "diagnostics/triangulation/dropped_epipolar";
 const PATH_TRI_DROPPED_DEPTH: &str = "diagnostics/triangulation/dropped_depth";
 const PATH_TRI_DROPPED_NUMERICAL: &str = "diagnostics/triangulation/dropped_numerical";
+const PATH_TRI_DROPPED_UNREPRESENTABLE: &str = "diagnostics/triangulation/dropped_unrepresentable";
 const PATH_TRI_DROPPED_DUPLICATE: &str = "diagnostics/triangulation/dropped_duplicate";
 
 const PATH_BA_FINAL_COST: &str = "diagnostics/ba/final_cost";
@@ -452,6 +453,10 @@ fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
         scalars.push((PATH_TRI_DROPPED_EPIPOLAR, stats.dropped_epipolar as f64));
         scalars.push((PATH_TRI_DROPPED_DEPTH, stats.dropped_depth as f64));
         scalars.push((PATH_TRI_DROPPED_NUMERICAL, stats.dropped_numerical as f64));
+        scalars.push((
+            PATH_TRI_DROPPED_UNREPRESENTABLE,
+            stats.dropped_unrepresentable as f64,
+        ));
         scalars.push((PATH_TRI_DROPPED_DUPLICATE, stats.dropped_duplicate as f64));
     }
 
@@ -1134,12 +1139,13 @@ mod tests {
         diag.depth_reorder_warnings = Some(3);
         diag.features_detected = Some(400);
         diag.triangulation = Some(TriangulationStats {
-            candidate_matches: 10,
+            candidate_matches: 12,
             kept: 8,
             dropped_disparity: 1,
             dropped_epipolar: 0,
             dropped_depth: 1,
             dropped_numerical: 0,
+            dropped_unrepresentable: 2,
             dropped_duplicate: 0,
         });
         let scalars = diagnostics_scalars(&diag);
@@ -1323,6 +1329,10 @@ mod tests {
                 .iter()
                 .any(|(path, _)| *path == "diagnostics/triangulation/candidates")
         );
+        assert!(scalars.iter().any(|(path, value)| {
+            *path == "diagnostics/triangulation/dropped_unrepresentable"
+                && (*value - 2.0).abs() < f64::EPSILON
+        }));
     }
 
     #[test]

@@ -170,10 +170,10 @@ pub use tracker::{
     TrackingPose, VioTelemetry,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, Point3, RectifiedRowMismatchError, RectifiedRowMismatchPx,
-    RectifiedStereo, RectifiedStereoError, SparseStereoSample, SparseStereoSamples,
-    TriangulationConfig, TriangulationConfigError, TriangulationError, TriangulationResult,
-    TriangulationStats, Triangulator,
+    Keyframe, KeyframeError, KeyframeLandmarkError, Point3, RectifiedRowMismatchError,
+    RectifiedRowMismatchPx, RectifiedStereo, RectifiedStereoError, SparseStereoSample,
+    SparseStereoSamples, TriangulationConfig, TriangulationConfigError, TriangulationError,
+    TriangulationResult, TriangulationStats, Triangulator,
 };
 #[cfg(feature = "vio")]
 pub use vio::{
