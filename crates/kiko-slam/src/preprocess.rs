@@ -28,36 +28,23 @@ pub fn normalise_into(data: &[u8], out: &mut [f32]) -> Result<(), crate::FrameEr
     Ok(())
 }
 
+pub fn normalise_frame_into(frame: &crate::Frame, out: &mut Vec<f32>) {
+    out.resize(frame.dimensions().area(), 0.0);
+    for (dst, &src) in out.iter_mut().zip(frame.data()) {
+        *dst = LUT[src as usize];
+    }
+}
+
 pub fn normalise_downscale_into(
-    data: &[u8],
-    width: u32,
-    height: u32,
+    frame: &crate::Frame,
     factor: crate::DownscaleFactor,
     out: &mut Vec<f32>,
 ) -> Result<crate::FrameDimensions, crate::DownscaleError> {
-    let input_dims = crate::FrameDimensions::try_new(width, height)
-        .map_err(crate::DownscaleError::InvalidDimensions)?;
-    let expected_len = input_dims.area();
-    if data.len() != expected_len {
-        return Err(crate::DownscaleError::InputLenMismatch {
-            expected: expected_len,
-            actual: data.len(),
-        });
-    }
-
-    let factor_u32 = factor.as_u32();
-    if width % factor_u32 != 0 || height % factor_u32 != 0 {
-        return Err(crate::DownscaleError::NonDivisible {
-            width,
-            height,
-            factor: factor.get(),
-        });
-    }
-
-    let out_width = width / factor_u32;
-    let out_height = height / factor_u32;
-    let out_dims = crate::FrameDimensions::try_new(out_width, out_height)
-        .map_err(crate::DownscaleError::InvalidDimensions)?;
+    let input_dims = frame.dimensions();
+    let out_dims = input_dims.try_downscale(factor)?;
+    let width = input_dims.width();
+    let out_width = out_dims.width();
+    let out_height = out_dims.height();
     let out_len = out_dims.area();
     out.resize(out_len, 0.0);
 
@@ -71,7 +58,7 @@ pub fn normalise_downscale_into(
         for x in 0..out_width as usize {
             let src_x = x * step;
             let idx = row + src_x;
-            out[out_idx] = LUT[data[idx] as usize];
+            out[out_idx] = LUT[frame.data()[idx] as usize];
             out_idx += 1;
         }
     }
@@ -80,35 +67,15 @@ pub fn normalise_downscale_into(
 }
 
 pub fn downscale_u8_into(
-    data: &[u8],
-    width: u32,
-    height: u32,
+    frame: &crate::Frame,
     factor: crate::DownscaleFactor,
     out: &mut Vec<u8>,
 ) -> Result<crate::FrameDimensions, crate::DownscaleError> {
-    let input_dims = crate::FrameDimensions::try_new(width, height)
-        .map_err(crate::DownscaleError::InvalidDimensions)?;
-    let expected_len = input_dims.area();
-    if data.len() != expected_len {
-        return Err(crate::DownscaleError::InputLenMismatch {
-            expected: expected_len,
-            actual: data.len(),
-        });
-    }
-
-    let factor_u32 = factor.as_u32();
-    if width % factor_u32 != 0 || height % factor_u32 != 0 {
-        return Err(crate::DownscaleError::NonDivisible {
-            width,
-            height,
-            factor: factor.get(),
-        });
-    }
-
-    let out_width = width / factor_u32;
-    let out_height = height / factor_u32;
-    let out_dims = crate::FrameDimensions::try_new(out_width, out_height)
-        .map_err(crate::DownscaleError::InvalidDimensions)?;
+    let input_dims = frame.dimensions();
+    let out_dims = input_dims.try_downscale(factor)?;
+    let width = input_dims.width();
+    let out_width = out_dims.width();
+    let out_height = out_dims.height();
     out.resize(out_dims.area(), 0);
 
     let stride = width as usize;
@@ -118,7 +85,7 @@ pub fn downscale_u8_into(
         let src_y = y * step;
         let row = src_y * stride;
         for x in 0..out_width as usize {
-            out[out_idx] = data[row + x * step];
+            out[out_idx] = frame.data()[row + x * step];
             out_idx += 1;
         }
     }
@@ -129,6 +96,19 @@ pub fn downscale_u8_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Frame, FrameId, SensorId, Timestamp};
+
+    fn frame(width: u32, height: u32, data: Vec<u8>) -> Frame {
+        Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(0),
+            width,
+            height,
+            data,
+        )
+        .expect("valid test frame")
+    }
 
     #[test]
     fn normalise_into_rejects_length_mismatch() {
@@ -144,31 +124,39 @@ mod tests {
     }
 
     #[test]
-    fn normalise_downscale_into_rejects_input_length_mismatch() {
-        let err = normalise_downscale_into(
-            &[0; 3],
-            2,
-            2,
-            crate::DownscaleFactor::try_from(1).expect("factor"),
-            &mut Vec::new(),
-        )
-        .expect_err("length mismatch");
+    fn normalise_frame_resizes_and_overwrites_the_complete_destination() {
+        let frame = frame(2, 2, vec![0, 64, 128, 255]);
+        for mut output in [vec![42.0], vec![42.0; 8]] {
+            normalise_frame_into(&frame, &mut output);
+            assert_eq!(output, vec![0.0, 64.0 / U8_SCALE, 128.0 / U8_SCALE, 1.0]);
+        }
+    }
+
+    #[test]
+    fn downscale_dimension_error_does_not_mutate_destination() {
+        let frame = frame(3, 2, (0_u8..6).collect());
+        let factor = crate::DownscaleFactor::try_from(2).expect("factor");
+        let mut output = vec![42.0, 43.0];
+        let before = output.clone();
+        let err = normalise_downscale_into(&frame, factor, &mut output)
+            .expect_err("nondivisible dimensions");
         assert!(matches!(
             err,
-            crate::DownscaleError::InputLenMismatch {
-                expected: 4,
-                actual: 3
+            crate::DownscaleError::NonDivisible {
+                width: 3,
+                height: 2,
+                factor: 2
             }
         ));
+        assert_eq!(output, before);
     }
 
     #[test]
     fn downscale_u8_into_samples_expected_pixels() {
         let mut out = Vec::new();
+        let frame = frame(3, 3, (0_u8..9).collect());
         let dims = downscale_u8_into(
-            &[0, 1, 2, 3, 4, 5, 6, 7, 8],
-            3,
-            3,
+            &frame,
             crate::DownscaleFactor::try_from(3).expect("factor"),
             &mut out,
         )

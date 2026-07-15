@@ -107,9 +107,7 @@ impl SuperPoint {
     ) -> Result<Detections, InferenceError> {
         match self.input_kind {
             SuperPointInputKind::Float32 => {
-                let expected = frame.dimensions().area();
-                self.scratch.resize(expected, 0.0);
-                crate::preprocess::normalise_into(frame.data(), &mut self.scratch)?;
+                crate::preprocess::normalise_frame_into(frame, &mut self.scratch);
 
                 let input_tensor = TensorRef::from_array_view((
                     [1, 1, frame.height() as usize, frame.width() as usize],
@@ -182,9 +180,7 @@ impl SuperPoint {
         match self.input_kind {
             SuperPointInputKind::Float32 => {
                 let dimensions = crate::preprocess::normalise_downscale_into(
-                    frame.data(),
-                    frame.width(),
-                    frame.height(),
+                    frame,
                     downscale,
                     &mut self.scratch,
                 )
@@ -219,14 +215,9 @@ impl SuperPoint {
                 )
             }
             SuperPointInputKind::Uint8 => {
-                let dimensions = crate::preprocess::downscale_u8_into(
-                    frame.data(),
-                    frame.width(),
-                    frame.height(),
-                    downscale,
-                    &mut self.scratch_u8,
-                )
-                .map_err(InferenceError::from)?;
+                let dimensions =
+                    crate::preprocess::downscale_u8_into(frame, downscale, &mut self.scratch_u8)
+                        .map_err(InferenceError::from)?;
 
                 let input_tensor = TensorRef::from_array_view((
                     [

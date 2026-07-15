@@ -304,6 +304,48 @@ impl FrameDimensions {
     pub fn area(self) -> usize {
         self.area.get()
     }
+
+    pub fn try_downscale(self, factor: DownscaleFactor) -> Result<Self, DownscaleError> {
+        let factor_u32 = factor.as_u32();
+        let width = self.width();
+        let height = self.height();
+        if !width.is_multiple_of(factor_u32) || !height.is_multiple_of(factor_u32) {
+            return Err(DownscaleError::NonDivisible {
+                width,
+                height,
+                factor: factor.get(),
+            });
+        }
+        let downscaled_width = width / factor_u32;
+        let downscaled_height = height / factor_u32;
+        let downscaled_area = self.area() / factor.get() / factor.get();
+        let Some(width) = NonZeroU32::new(downscaled_width) else {
+            return Err(DownscaleError::NonDivisible {
+                width: self.width(),
+                height: self.height(),
+                factor: factor.get(),
+            });
+        };
+        let Some(height) = NonZeroU32::new(downscaled_height) else {
+            return Err(DownscaleError::NonDivisible {
+                width: self.width(),
+                height: self.height(),
+                factor: factor.get(),
+            });
+        };
+        let Some(area) = NonZeroUsize::new(downscaled_area) else {
+            return Err(DownscaleError::NonDivisible {
+                width: self.width(),
+                height: self.height(),
+                factor: factor.get(),
+            });
+        };
+        Ok(Self {
+            width,
+            height,
+            area,
+        })
+    }
 }
 
 // Define these much more concretely
@@ -418,11 +460,6 @@ pub enum DownscaleError {
     TooLarge {
         value: usize,
     },
-    InvalidDimensions(FrameDimensionsError),
-    InputLenMismatch {
-        expected: usize,
-        actual: usize,
-    },
     NonDivisible {
         width: u32,
         height: u32,
@@ -440,15 +477,6 @@ impl std::fmt::Display for DownscaleError {
             DownscaleError::TooLarge { value } => {
                 write!(f, "downscale factor {value} exceeds u32::MAX")
             }
-            DownscaleError::InvalidDimensions(source) => {
-                write!(f, "invalid downscale dimensions: {source}")
-            }
-            DownscaleError::InputLenMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "downscale input length mismatch: expected {expected}, got {actual}"
-                )
-            }
             DownscaleError::NonDivisible {
                 width,
                 height,
@@ -465,10 +493,8 @@ impl std::error::Error for DownscaleError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             DownscaleError::InvalidInteger { source, .. } => Some(source),
-            DownscaleError::InvalidDimensions(source) => Some(source),
             DownscaleError::Zero
             | DownscaleError::TooLarge { .. }
-            | DownscaleError::InputLenMismatch { .. }
             | DownscaleError::NonDivisible { .. } => None,
         }
     }
