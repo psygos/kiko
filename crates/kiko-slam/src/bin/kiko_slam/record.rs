@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 use clap::Args;
 
 use kiko_slam::dataset::{
-    Calibration, CameraIntrinsics, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta, WriteOutcome,
+    Calibration, CameraIntrinsics, DatasetError, DatasetWriter, DepthMeta, ImuMeta, Meta, MonoMeta,
+    WriteOutcome,
 };
 use kiko_slam::env::{try_env_bool, try_env_i64, try_env_u32, try_env_usize};
 use kiko_slam::{
@@ -123,6 +124,46 @@ impl std::error::Error for RecordCaptureError {
             Self::OakImu { source } => Some(source),
             Self::Pairing { source } => Some(source),
             Self::WriterDropped { .. } | Self::WriterFailed { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RecordError {
+    Capture {
+        source: RecordCaptureError,
+    },
+    Finalization {
+        source: Box<DatasetError>,
+    },
+    CaptureAndFinalization {
+        capture: RecordCaptureError,
+        finalization: Box<DatasetError>,
+    },
+}
+
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture { source } => write!(f, "recording failed: {source}"),
+            Self::Finalization { source } => write!(f, "dataset finalization failed: {source}"),
+            Self::CaptureAndFinalization {
+                capture,
+                finalization,
+            } => write!(
+                f,
+                "recording failed ({capture}); dataset finalization also failed: {finalization}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RecordError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture { source } => Some(source),
+            Self::Finalization { source } => Some(source.as_ref()),
+            Self::CaptureAndFinalization { capture, .. } => Some(capture),
         }
     }
 }
@@ -336,31 +377,24 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
     let elapsed = start.elapsed().as_secs_f64();
     let pairer_stats = pairer.stats();
     drop(writer);
-    let writer_result = writer_handle.finish();
-    let stats = match writer_result {
-        Ok(stats) => stats,
-        Err(error) => {
-            if let Err(capture_error) = capture_result {
-                eprintln!("secondary recording capture error: {capture_error}");
-            }
-            return Err(Box::new(error));
-        }
-    };
-    eprintln!(
-        "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), imu_batches={} imu_samples={}, written={}, dropped={}",
-        elapsed,
-        pair_count,
-        left_count,
-        left_count as f64 / elapsed,
-        right_count,
-        right_count as f64 / elapsed,
-        depth_count,
-        depth_count as f64 / elapsed,
-        imu_batch_count,
-        imu_sample_count,
-        stats.frames_written,
-        stats.frames_dropped
-    );
+    let finalization = writer_handle.finish();
+    if let Ok(stats) = &finalization {
+        eprintln!(
+            "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), imu_batches={} imu_samples={}, written={}, dropped={}",
+            elapsed,
+            pair_count,
+            left_count,
+            left_count as f64 / elapsed,
+            right_count,
+            right_count as f64 / elapsed,
+            depth_count,
+            depth_count as f64 / elapsed,
+            imu_batch_count,
+            imu_sample_count,
+            stats.frames_written,
+            stats.frames_dropped
+        );
+    }
     eprintln!(
         "pairer stats: window_ns={} max_pending_per_side={} paired={} dropped_left={} dropped_right={} outside_window={}",
         pairer.window().as_ns(),
@@ -375,10 +409,19 @@ pub fn run_record(args: &RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             "pairer pending-capacity drops: left={pending_capacity_left_drops} right={pending_capacity_right_drops}"
         );
     }
-    if let Err(error) = capture_result {
-        return Err(Box::new(error));
+    match (capture_result, finalization) {
+        (Ok(()), Ok(_)) => Ok(()),
+        (Err(source), Ok(_)) => Err(RecordError::Capture { source }.into()),
+        (Ok(()), Err(source)) => Err(RecordError::Finalization {
+            source: Box::new(source),
+        }
+        .into()),
+        (Err(capture), Err(finalization)) => Err(RecordError::CaptureAndFinalization {
+            capture,
+            finalization: Box::new(finalization),
+        }
+        .into()),
     }
-    Ok(())
 }
 
 fn build_meta(
