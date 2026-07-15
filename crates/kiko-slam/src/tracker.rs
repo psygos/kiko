@@ -18,9 +18,10 @@ const DEFAULT_CULL_MIN_OBSERVATIONS: usize = 1;
 const EIGENPLACES_MODEL_ENV: &str = "KIKO_EIGENPLACES_MODEL";
 
 use crate::loop_closure::{
-    DescriptorSource, KeyframeDatabase, LoopApplyError, LoopCandidate, LoopClosureConfig,
-    LoopDetectError, PlaceMatch, RelocalizationCandidate, RelocalizationConfig, VerifiedLoop,
-    aggregate_global_descriptor, match_descriptors_for_loop,
+    DescriptorSource, GlobalDescriptorError, KeyframeDatabase, LoopApplyError, LoopCandidate,
+    LoopClosureConfig, LoopDetectError, LoopVerificationError, PlaceMatch, RelocalizationCandidate,
+    RelocalizationConfig, VerifiedLoop, aggregate_global_descriptor,
+    try_match_descriptors_for_loop,
 };
 use crate::pose_graph::{
     EssentialEdge, EssentialEdgeKind, EssentialGraph, EssentialGraphError, PoseGraphConfig,
@@ -1271,6 +1272,7 @@ impl RedundancyPolicy {
 #[derive(Debug)]
 pub enum TrackerError {
     Inference(InferenceError),
+    GlobalDescriptor(GlobalDescriptorError),
     Triangulation(TriangulationError),
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
@@ -1291,6 +1293,9 @@ impl std::fmt::Display for TrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TrackerError::Inference(err) => write!(f, "inference error: {err}"),
+            TrackerError::GlobalDescriptor(err) => {
+                write!(f, "global descriptor error: {err}")
+            }
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
             TrackerError::Map(err) => write!(f, "map error: {err}"),
@@ -1315,6 +1320,7 @@ impl std::error::Error for TrackerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Inference(err) => Some(err),
+            Self::GlobalDescriptor(err) => Some(err),
             Self::Triangulation(err) => Some(err),
             Self::Pnp(err) => Some(err),
             Self::Map(err) => Some(err),
@@ -1342,6 +1348,12 @@ impl TrackerError {
 impl From<InferenceError> for TrackerError {
     fn from(err: InferenceError) -> Self {
         TrackerError::Inference(err)
+    }
+}
+
+impl From<GlobalDescriptorError> for TrackerError {
+    fn from(err: GlobalDescriptorError) -> Self {
+        TrackerError::GlobalDescriptor(err)
     }
 }
 
@@ -1736,7 +1748,16 @@ impl SlamTracker {
         self.drain_backend_responses();
         self.drain_descriptor_responses();
         if let Err(err) = self.process_pending_loop_closure() {
-            eprintln!("loop closure: {err}");
+            match err {
+                LoopDetectError::DescriptorMatchFailed(source)
+                | LoopDetectError::VerificationFailed(LoopVerificationError::Map(source)) => {
+                    return Err(source.into());
+                }
+                LoopDetectError::VerificationFailed(LoopVerificationError::InvariantViolation(
+                    message,
+                )) => return Err(TrackerError::InvariantViolation(message)),
+                rejection => eprintln!("loop closure: {rejection}"),
+            }
         }
         let tracking = match &self.state {
             TrackerState::NeedKeyframe => None,
@@ -2061,12 +2082,13 @@ impl SlamTracker {
 
         let mut first_error: Option<LoopDetectError> = None;
         for candidate in pending.candidates {
-            let correspondences = match_descriptors_for_loop(
+            let correspondences = try_match_descriptors_for_loop(
                 pending.detections.descriptors(),
                 candidate.candidate,
                 &self.map,
                 config.descriptor_match_threshold(),
-            );
+            )
+            .map_err(LoopDetectError::DescriptorMatchFailed)?;
 
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 if first_error.is_none() {
@@ -2091,6 +2113,10 @@ impl SlamTracker {
                 config.min_inliers(),
             ) {
                 Ok(value) => value,
+                Err(
+                    err @ (LoopVerificationError::Map(_)
+                    | LoopVerificationError::InvariantViolation(_)),
+                ) => return Err(LoopDetectError::VerificationFailed(err)),
                 Err(err) => {
                     if first_error.is_none() {
                         first_error = Some(LoopDetectError::VerificationFailed(err));
@@ -2351,20 +2377,22 @@ impl SlamTracker {
     }
 
     fn relocalization_candidate(
-        &self,
         current: &Detections,
         cfg: RelocalizationConfig,
         loop_db: &KeyframeDatabase,
-    ) -> Option<crate::loop_closure::VerifiedRelocalization> {
-        let global_descriptor = aggregate_global_descriptor(current.descriptors()).ok()?;
+        map: &SlamMap,
+        intrinsics: PinholeIntrinsics,
+        ransac: RansacConfig,
+    ) -> Result<Option<crate::loop_closure::VerifiedRelocalization>, TrackerError> {
+        let global_descriptor = aggregate_global_descriptor(current.descriptors())?;
         let candidates = loop_db.query_for_relocalization(&global_descriptor, cfg.max_candidates());
         for candidate in candidates {
-            let correspondences = match_descriptors_for_loop(
+            let correspondences = try_match_descriptors_for_loop(
                 current.descriptors(),
                 candidate.candidate,
-                &self.map,
+                map,
                 cfg.descriptor_match_threshold(),
-            );
+            )?;
             if correspondences.len() < MIN_PNP_CORRESPONDENCES {
                 continue;
             }
@@ -2374,17 +2402,35 @@ impl SlamTracker {
             let verified = match relocalization_candidate.verify(
                 current.keypoints(),
                 &correspondences,
-                &self.map,
-                self.intrinsics,
-                self.config.ransac,
+                map,
+                intrinsics,
+                ransac,
                 cfg.min_inliers(),
             ) {
                 Ok(value) => value,
-                Err(_) => continue,
+                Err(error) => {
+                    Self::classify_relocalization_verification_failure(error)?;
+                    continue;
+                }
             };
-            return Some(verified);
+            return Ok(Some(verified));
         }
-        None
+        Ok(None)
+    }
+
+    fn classify_relocalization_verification_failure(
+        error: LoopVerificationError,
+    ) -> Result<(), TrackerError> {
+        match error {
+            LoopVerificationError::TooFewMatches { .. }
+            | LoopVerificationError::PnpFailed(crate::PnpError::NoSolution)
+            | LoopVerificationError::InsufficientInliers { .. } => Ok(()),
+            LoopVerificationError::PnpFailed(source) => Err(source.into()),
+            LoopVerificationError::Map(source) => Err(source.into()),
+            LoopVerificationError::InvariantViolation(message) => {
+                Err(TrackerError::InvariantViolation(message))
+            }
+        }
     }
 
     fn begin_relocalization_attempt(
@@ -2500,7 +2546,14 @@ impl SlamTracker {
                 self.state = TrackerState::NeedKeyframe;
                 return Ok(self.relocalization_output(frame_id, TrackingHealth::Lost));
             };
-            match self.relocalization_candidate(&current, cfg, loop_db) {
+            match Self::relocalization_candidate(
+                &current,
+                cfg,
+                loop_db,
+                &self.map,
+                self.intrinsics,
+                self.config.ransac,
+            )? {
                 Some(verified) => {
                     let candidate = verified.match_kf();
                     if self.trace_transitions {
@@ -2541,7 +2594,13 @@ impl SlamTracker {
                         frame_id.as_u64()
                     );
                 }
-                return self.create_keyframe(StereoPair::from_parts(left, right), pose_world);
+                // Relocalization already ran the left detector for this frame. Transfer those
+                // detections only on recovery so keyframe bootstrap needs only the right detector.
+                return self.create_keyframe_with_left_detections(
+                    StereoPair::from_parts(left, right),
+                    pose_world,
+                    Some(Arc::new(current)),
+                );
             }
             RelocalizationStep::Continue(next_session) => {
                 self.state = TrackerState::Relocalizing(next_session);
@@ -2890,13 +2949,22 @@ impl SlamTracker {
         pair: StereoPair,
         pose_world: Pose,
     ) -> Result<TrackerOutput, TrackerError> {
+        self.create_keyframe_with_left_detections(pair, pose_world, None)
+    }
+
+    fn create_keyframe_with_left_detections(
+        &mut self,
+        pair: StereoPair,
+        pose_world: Pose,
+        left_det: Option<Arc<Detections>>,
+    ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
         let (output, keyframe_id) = match self.create_keyframe_internal(
             left,
             right,
             crate::WorldToCamera::from_legacy_pose(pose_world),
-            None,
+            left_det,
             None,
         ) {
             Ok(value) => value,
@@ -3447,6 +3515,7 @@ fn loop_reject_reason(error: &LoopDetectError) -> LoopClosureRejectReason {
         LoopDetectError::TooFewCorrespondences { count } => {
             LoopClosureRejectReason::TooFewCorrespondences { count: *count }
         }
+        LoopDetectError::DescriptorMatchFailed(_) => LoopClosureRejectReason::VerificationFailed,
         LoopDetectError::VerificationFailed(_) => LoopClosureRejectReason::VerificationFailed,
         LoopDetectError::CorrectionTooLarge {
             translation,
@@ -3579,6 +3648,19 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor([0.0; 256])
+    }
+
+    fn make_relocalization_detections(descriptor: Descriptor) -> Detections {
+        Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            320,
+            240,
+            vec![Keypoint { x: 160.0, y: 120.0 }],
+            vec![1.0],
+            vec![descriptor],
+        )
+        .expect("valid relocalization detections")
     }
 
     fn make_global_descriptor_basis(idx: usize) -> crate::loop_closure::GlobalDescriptor {
@@ -5078,6 +5160,87 @@ mod tests {
             .expect("lost tracking should create relocalization session");
         assert_eq!(session.attempts, 0);
         assert!(matches!(session.phase, RelocalizationPhase::Searching));
+    }
+
+    #[test]
+    fn relocalization_candidate_propagates_global_descriptor_error() {
+        let current = make_relocalization_detections(Descriptor([0.0; 256]));
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
+
+        let error = SlamTracker::relocalization_candidate(
+            &current,
+            RelocalizationConfig::default(),
+            &KeyframeDatabase::new(0),
+            &SlamMap::new(),
+            intrinsics,
+            RansacConfig::default(),
+        )
+        .expect_err("zero-norm aggregate descriptor must propagate");
+
+        assert!(matches!(
+            error,
+            TrackerError::GlobalDescriptor(GlobalDescriptorError::ZeroNorm)
+        ));
+    }
+
+    #[test]
+    fn relocalization_candidate_propagates_descriptor_map_error() {
+        let mut descriptor = [0.0; 256];
+        descriptor[0] = 1.0;
+        let descriptor = Descriptor(descriptor);
+        let current = make_relocalization_detections(descriptor);
+        let global = aggregate_global_descriptor(current.descriptors()).expect("global descriptor");
+        let mut loop_db = KeyframeDatabase::new(0);
+        loop_db.insert(KeyframeId::default(), global);
+        let intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
+                .expect("intrinsics");
+
+        let error = SlamTracker::relocalization_candidate(
+            &current,
+            RelocalizationConfig::default(),
+            &loop_db,
+            &SlamMap::new(),
+            intrinsics,
+            RansacConfig::default(),
+        )
+        .expect_err("missing descriptor keyframe must propagate");
+
+        assert!(matches!(
+            error,
+            TrackerError::Map(crate::map::MapError::KeyframeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn relocalization_verification_classifies_only_geometric_rejections_as_expected() {
+        for expected in [
+            LoopVerificationError::TooFewMatches { count: 3 },
+            LoopVerificationError::PnpFailed(crate::PnpError::NoSolution),
+            LoopVerificationError::InsufficientInliers {
+                inliers: 3,
+                required: 4,
+            },
+        ] {
+            SlamTracker::classify_relocalization_verification_failure(expected)
+                .expect("expected geometric rejection");
+        }
+
+        let error = SlamTracker::classify_relocalization_verification_failure(
+            LoopVerificationError::PnpFailed(crate::PnpError::Degenerate {
+                message: "invalid map geometry",
+            }),
+        )
+        .expect_err("non-solver PnP errors must propagate");
+
+        assert!(matches!(
+            error,
+            TrackerError::Pnp(crate::PnpError::Degenerate {
+                message: "invalid map geometry"
+            })
+        ));
     }
 
     #[test]

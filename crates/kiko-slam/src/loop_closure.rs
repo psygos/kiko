@@ -503,6 +503,7 @@ impl std::fmt::Display for LoopApplyError {
 #[derive(Debug)]
 pub enum LoopDetectError {
     TooFewCorrespondences { count: usize },
+    DescriptorMatchFailed(MapError),
     VerificationFailed(LoopVerificationError),
     CorrectionTooLarge { translation: f32, rotation_deg: f32 },
     ApplyFailed(LoopApplyError),
@@ -516,6 +517,9 @@ impl std::fmt::Display for LoopDetectError {
                     f,
                     "loop closure rejected: too few correspondences ({count})"
                 )
+            }
+            LoopDetectError::DescriptorMatchFailed(err) => {
+                write!(f, "loop closure descriptor matching failed: {err}")
             }
             LoopDetectError::VerificationFailed(err) => {
                 write!(f, "loop closure verification failed: {err}")
@@ -537,6 +541,7 @@ impl std::fmt::Display for LoopDetectError {
 impl std::error::Error for LoopDetectError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::DescriptorMatchFailed(err) => Some(err),
             Self::VerificationFailed(err) => Some(err),
             Self::ApplyFailed(err) => Some(err),
             Self::TooFewCorrespondences { .. } | Self::CorrectionTooLarge { .. } => None,
@@ -647,22 +652,6 @@ pub fn aggregate_global_descriptor(
     descriptors: &[Descriptor],
 ) -> Result<GlobalDescriptor, GlobalDescriptorError> {
     GlobalDescriptor::from_local_descriptors(descriptors)
-}
-
-pub fn match_descriptors_for_loop(
-    query_descriptors: &[Descriptor],
-    candidate_kf: KeyframeId,
-    map: &SlamMap,
-    similarity_threshold: f32,
-) -> Vec<(usize, usize)> {
-    match try_match_descriptors_for_loop(query_descriptors, candidate_kf, map, similarity_threshold)
-    {
-        Ok(correspondences) => correspondences,
-        Err(err) => {
-            eprintln!("loop descriptor matching skipped for candidate {candidate_kf:?}: {err}");
-            Vec::new()
-        }
-    }
 }
 
 fn brute_force_best_match(
@@ -1005,6 +994,8 @@ pub enum LoopVerificationError {
     TooFewMatches { count: usize },
     PnpFailed(PnpError),
     InsufficientInliers { inliers: usize, required: usize },
+    Map(MapError),
+    InvariantViolation(&'static str),
 }
 
 impl std::fmt::Display for LoopVerificationError {
@@ -1020,6 +1011,12 @@ impl std::fmt::Display for LoopVerificationError {
                 f,
                 "loop verification inliers below threshold: inliers={inliers}, required={required}"
             ),
+            LoopVerificationError::Map(err) => {
+                write!(f, "loop verification map lookup failed: {err}")
+            }
+            LoopVerificationError::InvariantViolation(message) => {
+                write!(f, "loop verification invariant violated: {message}")
+            }
         }
     }
 }
@@ -1028,7 +1025,10 @@ impl std::error::Error for LoopVerificationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PnpFailed(err) => Some(err),
-            Self::TooFewMatches { .. } | Self::InsufficientInliers { .. } => None,
+            Self::Map(err) => Some(err),
+            Self::TooFewMatches { .. }
+            | Self::InsufficientInliers { .. }
+            | Self::InvariantViolation(_) => None,
         }
     }
 }
@@ -1052,18 +1052,26 @@ fn verify_pose_from_keyframe(
 
     let mut observations = Vec::with_capacity(correspondences.len());
     for &(query_idx, match_idx) in correspondences {
-        let Some(&pixel) = query_keypoints.get(query_idx) else {
-            continue;
-        };
-        let Ok(match_ref) = map.keyframe_keypoint(match_kf, match_idx) else {
-            continue;
-        };
-        let Some(point_id) = map.map_point_for_keypoint(match_ref).ok().flatten() else {
-            continue;
-        };
-        let Some(point) = map.point(point_id) else {
-            continue;
-        };
+        let pixel =
+            *query_keypoints
+                .get(query_idx)
+                .ok_or(LoopVerificationError::InvariantViolation(
+                    "descriptor correspondence query index is out of bounds",
+                ))?;
+        let match_ref = map
+            .keyframe_keypoint(match_kf, match_idx)
+            .map_err(LoopVerificationError::Map)?;
+        let point_id = map
+            .map_point_for_keypoint(match_ref)
+            .map_err(LoopVerificationError::Map)?
+            .ok_or(LoopVerificationError::InvariantViolation(
+                "descriptor correspondence has no associated map point",
+            ))?;
+        let point = map
+            .point(point_id)
+            .ok_or(LoopVerificationError::InvariantViolation(
+                "descriptor correspondence references a missing map point",
+            ))?;
         let obs = Observation::try_new(point.position(), pixel, intrinsics)
             .map_err(LoopVerificationError::PnpFailed)?;
         observations.push(obs);
@@ -1155,7 +1163,7 @@ mod tests {
         DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase, LoopCandidate,
         LoopClosureConfig, LoopVerificationError, RelocalizationCandidate, RelocalizationConfig,
         RelocalizationConfigError, RelocalizationConfigInput, aggregate_global_descriptor,
-        match_descriptors_for_loop, try_match_descriptors_for_loop,
+        try_match_descriptors_for_loop,
     };
     use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -1585,7 +1593,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_candidate_verify_propagates_pnp_failure() {
+    fn loop_candidate_verify_propagates_missing_keyframe() {
         let ids = make_keyframe_ids(1);
         let candidate = LoopCandidate {
             query_kf: ids[0],
@@ -1605,10 +1613,38 @@ mod tests {
                 RansacConfig::default(),
                 4,
             )
-            .expect_err("expected pnp failure");
+            .expect_err("missing match keyframe must be preserved");
         assert!(matches!(
             err,
-            LoopVerificationError::PnpFailed(_) | LoopVerificationError::TooFewMatches { .. }
+            LoopVerificationError::Map(MapError::KeyframeNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn loop_candidate_verify_rejects_out_of_bounds_query_correspondence_as_invariant() {
+        let (map, match_kf, query_keypoints, mut correspondences, intrinsics) = make_loop_fixture();
+        correspondences[0].0 = query_keypoints.len();
+        let candidate = LoopCandidate {
+            query_kf: match_kf,
+            match_kf,
+        };
+
+        let err = candidate
+            .verify(
+                &query_keypoints,
+                &correspondences,
+                &map,
+                intrinsics,
+                RansacConfig::default(),
+                4,
+            )
+            .expect_err("invalid matcher output must not be treated as geometric rejection");
+
+        assert!(matches!(
+            err,
+            LoopVerificationError::InvariantViolation(
+                "descriptor correspondence query index is out of bounds"
+            )
         ));
     }
 
@@ -1719,7 +1755,8 @@ mod tests {
         )
         .expect("point1");
 
-        let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
+        let matches = try_match_descriptors_for_loop(&query, kf, &map, 0.95)
+            .expect("descriptor matching should succeed");
         assert_eq!(matches.len(), 2);
         assert!(matches.contains(&(0, 0)));
         assert!(matches.contains(&(1, 1)));
@@ -1764,7 +1801,8 @@ mod tests {
         )
         .expect("point");
 
-        let matches = match_descriptors_for_loop(&query, kf, &map, 0.95);
+        let matches = try_match_descriptors_for_loop(&query, kf, &map, 0.95)
+            .expect("descriptor matching should succeed");
         assert_eq!(matches, vec![(1, 1)]);
     }
 

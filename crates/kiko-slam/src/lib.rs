@@ -53,7 +53,7 @@ pub use loop_closure::{
     LoopClosureConfig, LoopClosureConfigError, LoopClosureConfigInput, LoopDetectError,
     LoopVerificationError, PlaceMatch, RelocalizationConfig, RelocalizationConfigError,
     RelocalizationConfigInput, RelocalizationMatch, VerifiedLoop, VerifiedRelocalization,
-    aggregate_global_descriptor, match_descriptors_for_loop,
+    aggregate_global_descriptor, try_match_descriptors_for_loop,
 };
 pub use map::{
     CovisibilityEdge, CovisibilityNode, CovisibilitySnapshot, MapGeneration, MapInstanceId,
