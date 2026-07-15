@@ -2,8 +2,8 @@ use crate::Pose64;
 use crate::math::{se3_exp_f64, se3_log_f64};
 
 use super::{
-    ANCHOR_REGULARIZATION, BlockCsr6x6, HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS,
-    POSE_GRAPH_CONVERGENCE, PoseGraphError, scaled_identity6, solve_pcg,
+    BlockCsr6x6, HUBER_NEAR_ZERO, MAX_STEP_NORM, NUMERICAL_DIFF_EPS, POSE_GRAPH_CONVERGENCE,
+    PoseGraphError, scaled_identity6, solve_pcg,
 };
 
 type Jacobian6 = [[f64; 6]; 6];
@@ -385,28 +385,33 @@ impl PoseGraphOptimizer {
                     }
                 }
 
-                let h_ff = jt_info_j(j_from, information, j_from);
-                let h_ft = jt_info_j(j_from, information, j_to);
-                let h_tf = jt_info_j(j_to, information, j_from);
-                let h_tt = jt_info_j(j_to, information, j_to);
-                h.add_to(edge.from, edge.from, h_ff)?;
-                h.add_to(edge.from, edge.to, h_ft)?;
-                h.add_to(edge.to, edge.from, h_tf)?;
-                h.add_to(edge.to, edge.to, h_tt)?;
+                let from_is_anchor = edge.from == 0;
+                let to_is_anchor = edge.to == 0;
 
-                let g_from = jt_info_vec(j_from, information, error);
-                let g_to = jt_info_vec(j_to, information, error);
-                for k in 0..6 {
-                    b[edge.from * 6 + k] += g_from[k];
-                    b[edge.to * 6 + k] += g_to[k];
+                if !from_is_anchor {
+                    h.add_to(edge.from, edge.from, jt_info_j(j_from, information, j_from))?;
+                    let gradient = jt_info_vec(j_from, information, error);
+                    for (value, contribution) in b[edge.from * 6..][..6].iter_mut().zip(gradient) {
+                        *value += contribution;
+                    }
+                }
+                if !to_is_anchor {
+                    h.add_to(edge.to, edge.to, jt_info_j(j_to, information, j_to))?;
+                    let gradient = jt_info_vec(j_to, information, error);
+                    for (value, contribution) in b[edge.to * 6..][..6].iter_mut().zip(gradient) {
+                        *value += contribution;
+                    }
+                }
+                if !from_is_anchor && !to_is_anchor {
+                    h.add_to(edge.from, edge.to, jt_info_j(j_from, information, j_to))?;
+                    h.add_to(edge.to, edge.from, jt_info_j(j_to, information, j_from))?;
                 }
             }
 
-            // Anchor the first pose to remove gauge freedom.
-            h.add_to(0, 0, scaled_identity6(ANCHOR_REGULARIZATION))?;
-            for v in b.iter_mut().take(6) {
-                *v = 0.0;
-            }
+            // Eliminate the first pose from the normal equations. Its identity
+            // block keeps the full-sized sparse system nonsingular while the
+            // zero right-hand side makes its update exactly zero.
+            h.insert(0, 0, scaled_identity6(1.0))?;
 
             let rhs: Vec<f64> = b.into_iter().map(|v| -v).collect();
             let mut delta = vec![0.0_f64; nposes * 6];

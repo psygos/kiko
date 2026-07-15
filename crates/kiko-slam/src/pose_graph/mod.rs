@@ -2,8 +2,6 @@
 const NEAR_ZERO: f64 = 1e-18;
 /// Step size for numerical Jacobian computation via central differences.
 const NUMERICAL_DIFF_EPS: f64 = 1e-6;
-/// Anchor regularization weight to remove gauge freedom in pose graph optimization.
-const ANCHOR_REGULARIZATION: f64 = 1e9;
 /// Maximum SE3 step norm; larger steps are clamped for stability.
 const MAX_STEP_NORM: f64 = 1.0;
 /// Step convergence threshold for the pose graph optimizer.

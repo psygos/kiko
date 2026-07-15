@@ -523,6 +523,39 @@ fn pose_graph_optimizer_keeps_anchor_pose_fixed() {
 }
 
 #[test]
+fn pose_graph_optimizer_uses_a_hard_anchor_at_high_information() {
+    let anchor = Pose64::identity();
+    let target = se3_exp_f64([1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    let measurement = target.compose(anchor.inverse());
+    let high_information = scalar_block(1e12);
+    let edge = PoseGraphEdge::try_new(0, 1, measurement, high_information)
+        .expect("positive definite high-information edge");
+    let mut initial = vec![anchor, se3_exp_f64([1.1, 0.0, 0.0, 0.0, 0.0, 0.0])];
+    let defaults = PoseGraphConfig::default();
+    let one_iteration = PoseGraphConfig::new_unchecked_for_test(
+        1,
+        defaults.pcg_max_iters(),
+        defaults.pcg_tol(),
+        defaults.huber_delta(),
+    );
+
+    let result = PoseGraphOptimizer::new(one_iteration)
+        .optimize(&[edge], &mut initial)
+        .expect("hard-anchored optimization");
+
+    assert_eq!(
+        result.corrected_poses[0].translation(),
+        anchor.translation()
+    );
+    assert_eq!(result.corrected_poses[0].rotation(), anchor.rotation());
+    let corrected_x = result.corrected_poses[1].translation()[0];
+    assert!(
+        (corrected_x - 1.0).abs() < 1e-6,
+        "hard-anchor step should recover x=1 without soft-prior overshoot, got {corrected_x}"
+    );
+}
+
+#[test]
 fn pose_graph_optimizer_rejects_unconverged_pcg_step() {
     let target = [
         Pose64::identity(),
