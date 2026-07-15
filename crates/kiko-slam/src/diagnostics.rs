@@ -4,9 +4,54 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::local_ba::{BaResult, DegenerateReason};
-use crate::map::{KeyframeId, MapSnapshot};
+use crate::map::{KeyframeId, MapInstanceId, MapSnapshot};
 use crate::triangulation::TriangulationStats;
 use crate::{DescriptorInitError, InferenceError};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappingSessionTransition {
+    old_map: MapInstanceId,
+    new_map: MapInstanceId,
+}
+
+impl MappingSessionTransition {
+    pub fn try_new(
+        old_map: MapInstanceId,
+        new_map: MapInstanceId,
+    ) -> Result<Self, MappingSessionTransitionError> {
+        if old_map == new_map {
+            return Err(MappingSessionTransitionError::SameMap(old_map));
+        }
+        Ok(Self { old_map, new_map })
+    }
+
+    pub fn old_map(self) -> MapInstanceId {
+        self.old_map
+    }
+
+    pub fn new_map(self) -> MapInstanceId {
+        self.new_map
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingSessionTransitionError {
+    SameMap(MapInstanceId),
+}
+
+impl std::fmt::Display for MappingSessionTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameMap(map) => write!(
+                f,
+                "mapping-session transition must change map instance (map={})",
+                map.as_u64()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MappingSessionTransitionError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationSupport {
@@ -681,6 +726,9 @@ pub enum DiagnosticEvent {
         keyframe_id: KeyframeId,
         reason: KeyframeRemovalReason,
     },
+    MappingSessionReset {
+        transition: MappingSessionTransition,
+    },
     LoopClosureDetected {
         query: KeyframeId,
         match_kf: KeyframeId,
@@ -748,7 +796,8 @@ mod tests {
 
     use super::{
         DiagnosticEvent, DiagnosticMetricError, FrameDiagnostics, LoopClosureRejectReason,
-        ObservationSupport, PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
+        MappingSessionTransition, MappingSessionTransitionError, ObservationSupport,
+        PnpAcceptedInlierPixelResidualMetric, PnpInlierRatioMetric,
         PnpProjectableTrackedObservationPixelResidualMetric, PnpTrackedObservationCountMetric,
         ProjectedTrackingFallbackReason, StableSurfaceRetainedRawPixelResidualMetric,
         VisualVsVioSharedProjectableTrackedObservationPixelResidualMetric,
@@ -960,6 +1009,13 @@ mod tests {
                     required: 32,
                 },
             },
+            DiagnosticEvent::MappingSessionReset {
+                transition: MappingSessionTransition::try_new(
+                    crate::map::SlamMap::new().snapshot().instance_id(),
+                    crate::map::SlamMap::new().snapshot().instance_id(),
+                )
+                .expect("distinct test maps"),
+            },
             DiagnosticEvent::LoopClosureRejected {
                 reason: LoopClosureRejectReason::VerificationFailed,
             },
@@ -1025,6 +1081,15 @@ mod tests {
             kinds.insert(discriminant(&event));
         }
         assert_eq!(kinds.len(), event_count);
+    }
+
+    #[test]
+    fn mapping_session_transition_rejects_an_unchanged_map() {
+        let map = crate::map::SlamMap::new().snapshot().instance_id();
+        assert_eq!(
+            MappingSessionTransition::try_new(map, map),
+            Err(MappingSessionTransitionError::SameMap(map))
+        );
     }
 
     #[test]

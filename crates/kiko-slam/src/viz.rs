@@ -240,6 +240,11 @@ impl RerunSink {
         self.log_with_points(packet, None)
     }
 
+    pub(crate) fn reset_mapping_session_surface(&mut self) -> Result<(), VizLogError> {
+        self.surface_map = crate::SurfaceBeliefMap::new(self.surface_map.config());
+        self.log_surface_map_state()
+    }
+
     pub fn log_frames(&mut self, left: &Frame, right: &Frame) -> Result<(), VizLogError> {
         let index = self.frame_index;
         self.frame_index = self.frame_index.saturating_add(1);
@@ -2404,6 +2409,42 @@ mod tests {
         .expect("surface logging");
 
         assert_eq!(sink.surface_map.num_voxels(), 1);
+        assert!(storage.num_msgs() > 0);
+    }
+
+    #[test]
+    fn mapping_session_reset_discards_accumulated_surface_belief() {
+        let (rec, storage) = rerun::RecordingStreamBuilder::new("kiko-slam-viz-test")
+            .memory()
+            .expect("in-memory rerun stream");
+        let mut sink =
+            RerunSink::try_new(rec, VizDecimation::default()).expect("rerun sink configuration");
+        let mut diagnostics = FrameDiagnostics::empty(0, 0);
+        diagnostics.pnp_accepted_inliers = Some(crate::PnpAcceptedInlierCountMetric::new(12));
+        diagnostics.pnp_inlier_reprojection_rmse_px =
+            Some(crate::PnpAcceptedInlierPixelResidualMetric::new(1.0).expect("rmse"));
+
+        sink.log_surface_observations(
+            Timestamp::from_nanos(1),
+            &[[0.0, 0.0, 2.0]],
+            &[stable_surface_point()],
+            &StableSurfaceStats {
+                input_samples: 1,
+                points_generated: 1,
+                ..StableSurfaceStats::default()
+            },
+            Pose::identity(),
+            &diagnostics,
+            true,
+            true,
+        )
+        .expect("surface logging");
+        assert_eq!(sink.surface_map.num_voxels(), 1);
+
+        sink.reset_mapping_session_surface()
+            .expect("mapping-session reset");
+
+        assert_eq!(sink.surface_map.num_voxels(), 0);
         assert!(storage.num_msgs() > 0);
     }
 

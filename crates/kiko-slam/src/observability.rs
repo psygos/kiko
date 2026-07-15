@@ -619,6 +619,14 @@ fn format_event(event: &DiagnosticEvent) -> (String, &'static str) {
             format!("keyframe {keyframe_id:?} removed ({reason:?})"),
             rerun::TextLogLevel::INFO,
         ),
+        DiagnosticEvent::MappingSessionReset { transition } => (
+            format!(
+                "mapping session reset: old_map={}, new_map={}",
+                transition.old_map().as_u64(),
+                transition.new_map().as_u64()
+            ),
+            rerun::TextLogLevel::WARN,
+        ),
         DiagnosticEvent::LoopClosureDetected {
             query,
             match_kf,
@@ -801,10 +809,13 @@ impl RerunSink {
     }
 
     pub fn log_event(
-        &self,
+        &mut self,
         timestamp: Timestamp,
         event: &DiagnosticEvent,
     ) -> Result<(), VizLogError> {
+        if matches!(event, DiagnosticEvent::MappingSessionReset { .. }) {
+            self.reset_mapping_session_surface()?;
+        }
         let rec = self.recording();
         set_capture_time(rec, timestamp);
         let (message, level) = format_event(event);
@@ -1403,6 +1414,13 @@ mod tests {
         let _ = format_event(&DiagnosticEvent::KeyframeRemoved {
             keyframe_id: crate::map::KeyframeId::default(),
             reason: KeyframeRemovalReason::Redundant,
+        });
+        let _ = format_event(&DiagnosticEvent::MappingSessionReset {
+            transition: crate::MappingSessionTransition::try_new(
+                crate::map::SlamMap::new().snapshot().instance_id(),
+                crate::map::SlamMap::new().snapshot().instance_id(),
+            )
+            .expect("distinct test maps"),
         });
         let _ = format_event(&DiagnosticEvent::LoopClosureDetected {
             query: crate::map::KeyframeId::default(),

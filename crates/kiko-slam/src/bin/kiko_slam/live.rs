@@ -293,6 +293,16 @@ fn map_viz_log(
 
 fn log_live_viz_message(sink: &mut RerunSink, msg: &LiveVizMsg) -> Result<(), LiveThreadError> {
     let timestamp = msg.left.timestamp();
+    // A mapping-session reset invalidates every surface observation from the old map.
+    // Apply that boundary before logging any output carried by the new session.
+    for event in msg.events.iter().filter(|event| {
+        matches!(
+            event,
+            kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
+        )
+    }) {
+        map_viz_log("mapping-session reset", sink.log_event(timestamp, event))?;
+    }
     if let Some(packet) = msg.packet.as_ref() {
         map_viz_log(
             "stereo matches",
@@ -330,7 +340,12 @@ fn log_live_viz_message(sink: &mut RerunSink, msg: &LiveVizMsg) -> Result<(), Li
         "frame diagnostics",
         sink.log_diagnostics(timestamp, &msg.diagnostics),
     )?;
-    for event in &msg.events {
+    for event in msg.events.iter().filter(|event| {
+        !matches!(
+            event,
+            kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
+        )
+    }) {
         map_viz_log("diagnostic event", sink.log_event(timestamp, event))?;
     }
     Ok(())

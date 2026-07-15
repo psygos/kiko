@@ -33,10 +33,11 @@ use crate::{
     DescriptorMatchError, Detections, DiagnosticEvent, DownscaleFactor, Frame, FrameDiagnostics,
     FrameId, Keyframe, KeyframeRemovalReason, KeyframeStatus, KeypointLimit, LightGlue,
     LocalBaConfig, LocalBundleAdjuster, LocalBundleAdjusterWorkspaceError, LoopClosureStatus,
-    LoopVerificationError, MapFromOdom, MapObservation, MapSnapshot, Matches, Observation,
-    ObservationSet, PinholeIntrinsics, Point3, Pose, Pose64, ProjectedTrackingFallbackReason,
-    RansacConfig, RansacConfigError, Raw, StereoPair, SuperPoint, Timestamp, TriangulationConfig,
-    TriangulationError, Triangulator, Verified,
+    LoopVerificationError, MapFromOdom, MapObservation, MapSnapshot, MappingSessionTransition,
+    MappingSessionTransitionError, Matches, Observation, ObservationSet, PinholeIntrinsics, Point3,
+    Pose, Pose64, ProjectedTrackingFallbackReason, RansacConfig, RansacConfigError, Raw,
+    StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError, Triangulator,
+    Verified,
     map::{KeyframeId, MapPointId, SlamMap},
 };
 #[cfg(feature = "vio")]
@@ -1743,6 +1744,7 @@ pub enum TrackerError {
     PoseBa(crate::PoseBaError),
     BaExecution(crate::BaExecutionError),
     KeyframeDatabase(KeyframeDatabaseError),
+    MappingSessionTransition(MappingSessionTransitionError),
     RelocalizationMapSnapshotMismatch {
         verified: MapSnapshot,
         current: MapSnapshot,
@@ -1812,6 +1814,9 @@ impl std::fmt::Display for TrackerError {
             TrackerError::KeyframeDatabase(err) => {
                 write!(f, "keyframe descriptor database error: {err}")
             }
+            TrackerError::MappingSessionTransition(err) => {
+                write!(f, "mapping-session transition error: {err}")
+            }
             TrackerError::RelocalizationMapSnapshotMismatch { verified, current } => write!(
                 f,
                 "verified relocalization map snapshot mismatch: verified={verified}, current={current}"
@@ -1851,6 +1856,7 @@ impl std::error::Error for TrackerError {
             TrackerError::PoseBa(source) => Some(source),
             TrackerError::BaExecution(source) => Some(source),
             TrackerError::KeyframeDatabase(source) => Some(source),
+            TrackerError::MappingSessionTransition(source) => Some(source),
             #[cfg(feature = "vio")]
             TrackerError::VioAccumulator(source) => Some(source),
             #[cfg(feature = "vio")]
@@ -1883,6 +1889,12 @@ impl From<InferenceError> for TrackerError {
 impl From<KeyframeDatabaseError> for TrackerError {
     fn from(source: KeyframeDatabaseError) -> Self {
         Self::KeyframeDatabase(source)
+    }
+}
+
+impl From<MappingSessionTransitionError> for TrackerError {
+    fn from(source: MappingSessionTransitionError) -> Self {
+        Self::MappingSessionTransition(source)
     }
 }
 
@@ -4151,9 +4163,12 @@ impl SlamTracker {
         health
     }
 
-    fn maybe_enter_relocalization(&mut self, tracking_health: TrackingHealth) {
+    fn maybe_enter_relocalization(
+        &mut self,
+        tracking_health: TrackingHealth,
+    ) -> Result<(), TrackerError> {
         if tracking_health != TrackingHealth::Lost {
-            return;
+            return Ok(());
         }
         #[cfg(feature = "vio")]
         let reference_cam_from_odom = self.current_odom_pose();
@@ -4177,11 +4192,12 @@ impl SlamTracker {
         } else {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
-            self.reset_mapping_session();
+            self.reset_mapping_session()?;
             if self.trace_transitions {
                 eprintln!("tracking lost without relocalization; starting a fresh mapping session");
             }
         }
+        Ok(())
     }
 
     fn initial_relocalization_session(
@@ -4370,8 +4386,14 @@ impl SlamTracker {
         }
     }
 
-    fn reset_mapping_session(&mut self) {
-        self.global_map = GlobalMap::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD);
+    fn reset_mapping_session(&mut self) -> Result<(), TrackerError> {
+        let old_map = self.global_map.map().snapshot().instance_id();
+        let fresh_global_map = GlobalMap::new(Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD);
+        let transition = MappingSessionTransition::try_new(
+            old_map,
+            fresh_global_map.map().snapshot().instance_id(),
+        )?;
+        self.global_map = fresh_global_map;
         self.ba.reset();
         if let Some(place_recognition) = self.place_recognition.as_mut() {
             place_recognition.reset_mapping_session();
@@ -4379,6 +4401,8 @@ impl SlamTracker {
         self.state = TrackerState::NeedKeyframe;
         self.consecutive_tracking_failures = 0;
         self.last_accepted_pose = None;
+        self.emit_event(DiagnosticEvent::MappingSessionReset { transition });
+        Ok(())
     }
 
     fn relocalize(
@@ -4391,13 +4415,13 @@ impl SlamTracker {
         let Some(cfg) = self.config.relocalization_config() else {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
-            self.reset_mapping_session();
+            self.reset_mapping_session()?;
             return self.relocalization_output(frame_id, TrackingHealth::Lost);
         };
         let Some(attempt) = Self::begin_relocalization_attempt(session, cfg) else {
             #[cfg(feature = "vio")]
             self.reset_inertial_runtime_continuity();
-            self.reset_mapping_session();
+            self.reset_mapping_session()?;
             return self.relocalization_output(frame_id, TrackingHealth::Lost);
         };
         let attempt_number = attempt.session.attempts;
@@ -4417,7 +4441,7 @@ impl SlamTracker {
             if self.place_recognition.is_none() {
                 #[cfg(feature = "vio")]
                 self.reset_inertial_runtime_continuity();
-                self.reset_mapping_session();
+                self.reset_mapping_session()?;
                 return self.relocalization_output(frame_id, TrackingHealth::Lost);
             }
             let verified_snapshot = self.global_map.map().snapshot();
@@ -4527,7 +4551,7 @@ impl SlamTracker {
                         cfg.max_attempts()
                     );
                 }
-                self.reset_mapping_session();
+                self.reset_mapping_session()?;
                 return self.relocalization_output(frame_id, TrackingHealth::Lost);
             }
         }
@@ -4835,7 +4859,7 @@ impl SlamTracker {
                 );
             }
             let tracking_health = self.tracking_failure_health();
-            self.maybe_enter_relocalization(tracking_health);
+            self.maybe_enter_relocalization(tracking_health)?;
             let mut diagnostics = self.empty_diagnostics();
             diagnostics.features_detected = Some(current.len());
             diagnostics.features_matched = Some(0);
@@ -4906,7 +4930,7 @@ impl SlamTracker {
                                 );
                             }
                             let tracking_health = self.tracking_failure_health();
-                            self.maybe_enter_relocalization(tracking_health);
+                            self.maybe_enter_relocalization(tracking_health)?;
                             let mut diagnostics = self.empty_diagnostics();
                             diagnostics.features_detected = Some(current.len());
                             diagnostics.features_matched = Some(matches);
@@ -4937,7 +4961,7 @@ impl SlamTracker {
                             }
                             self.emit_event(DiagnosticEvent::TrackingPnpRejected { reason });
                             let tracking_health = self.tracking_failure_health();
-                            self.maybe_enter_relocalization(tracking_health);
+                            self.maybe_enter_relocalization(tracking_health)?;
                             let mut diagnostics = self.empty_diagnostics();
                             diagnostics.features_detected = Some(current.len());
                             diagnostics.features_matched = Some(matches);

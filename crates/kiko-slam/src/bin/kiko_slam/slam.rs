@@ -548,6 +548,26 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 let timestamp = left.timestamp();
+                // A new mapping-session identity is a causal boundary for the
+                // accumulated surface map, so clear it before logging any output
+                // that belongs to the new session.
+                if let Some(sink) = sink.as_mut() {
+                    for event in output.events.iter().filter(|event| {
+                        matches!(
+                            event,
+                            kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
+                        )
+                    }) {
+                        if let Err(err) = sink.log_event(timestamp, event) {
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun mapping-session reset error",
+                                err,
+                            );
+                        }
+                    }
+                }
                 let loop_applied = output.events.iter().any(|event| {
                     matches!(
                         event,
@@ -703,7 +723,12 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             err,
                         );
                     }
-                    for event in &output.events {
+                    for event in output.events.iter().filter(|event| {
+                        !matches!(
+                            event,
+                            kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
+                        )
+                    }) {
                         if let Err(err) = sink.log_event(timestamp, event) {
                             failure_sources.report_and_record(
                                 &mut visualization_errors,
