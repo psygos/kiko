@@ -310,8 +310,7 @@ pub struct Frame {
     sensor_id: SensorId,
     frame_id: FrameId,
     timestamp: Timestamp,
-    width: u32,
-    height: u32,
+    dimensions: FrameDimensions,
     data: Arc<[u8]>,
 }
 
@@ -324,10 +323,8 @@ impl Frame {
         height: u32,
         data: Vec<u8>,
     ) -> Result<Self, FrameError> {
-        if width == 0 || height == 0 {
-            return Err(FrameError::ZeroDimensions { width, height });
-        }
-        let size = (width as usize) * (height as usize);
+        let dimensions = FrameDimensions::try_new(width, height)?;
+        let size = dimensions.area();
 
         if data.len() != size {
             return Err(FrameError::DimensionMismatch {
@@ -340,21 +337,20 @@ impl Frame {
             sensor_id,
             frame_id,
             timestamp,
-            width,
-            height,
+            dimensions,
             data: Arc::from(data.into_boxed_slice()),
         })
     }
 
     pub fn width(&self) -> u32 {
-        self.width
+        self.dimensions.width()
     }
     pub fn height(&self) -> u32 {
-        self.height
+        self.dimensions.height()
     }
 
     pub fn dimensions(&self) -> FrameDimensions {
-        FrameDimensions::new(self.width, self.height)
+        self.dimensions
     }
     pub fn data(&self) -> &[u8] {
         self.data.as_ref()
@@ -1166,7 +1162,27 @@ impl<State> VizPacket<State> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompactDescriptor, DESCRIPTOR_DIM, Descriptor, U8_SCALE};
+    use super::{
+        CompactDescriptor, DESCRIPTOR_DIM, Descriptor, Frame, FrameId, SensorId, Timestamp,
+        U8_SCALE,
+    };
+
+    #[test]
+    fn frame_stores_the_dimensions_parsed_at_construction() {
+        let frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(2),
+            2,
+            3,
+            vec![0; 6],
+        )
+        .expect("valid frame");
+
+        assert_eq!(frame.dimensions().width(), 2);
+        assert_eq!(frame.dimensions().height(), 3);
+        assert_eq!(frame.data().len(), frame.dimensions().area());
+    }
 
     fn cosine_f32(a: &Descriptor, b: &Descriptor) -> f32 {
         let mut dot = 0.0_f32;
