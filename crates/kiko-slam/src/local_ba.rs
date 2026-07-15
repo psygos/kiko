@@ -1071,18 +1071,24 @@ impl LocalBundleAdjuster {
                 return false;
             }
 
-            let mut max_step = 0.0_f32;
+            let mut max_step = 0.0_f64;
             for i in 0..frame_count {
                 let step = extract_se3_delta(b, i * 6);
-                let step_norm = norm6(step);
+                let Some(step_norm) = finite_norm(step) else {
+                    return false;
+                };
                 if step_norm > max_step {
                     max_step = step_norm;
                 }
                 let pose = self.frames[i].pose;
-                self.frames[i].pose = apply_se3_delta(pose, step);
+                let candidate = apply_se3_delta(pose, step);
+                if !pose_is_finite(candidate) {
+                    return false;
+                }
+                self.frames[i].pose = candidate;
             }
 
-            if max_step < STEP_CONVERGENCE_THRESHOLD {
+            if max_step < f64::from(STEP_CONVERGENCE_THRESHOLD) {
                 break;
             }
         }
@@ -1268,11 +1274,16 @@ impl LocalBundleAdjuster {
             }
 
             let mut predicted_decrease = 0.0_f64;
-            let mut max_step = 0.0_f32;
+            let mut max_step = 0.0_f64;
             for (pose_i, pose_var) in problem.poses.iter_mut().enumerate() {
                 let base = pose_i * 6;
                 let delta = extract_se3_delta(rhs, base);
-                max_step = max_step.max(norm6(delta));
+                let Some(step_norm) = finite_norm(delta) else {
+                    return BaResult::Degenerate {
+                        reason: DegenerateReason::NumericalFailure,
+                    };
+                };
+                max_step = max_step.max(step_norm);
                 for k in 0..6 {
                     let d = delta[k] as f64;
                     let gradient = full_pose_rhs[base + k] as f64;
@@ -1299,7 +1310,12 @@ impl LocalBundleAdjuster {
                     schur.b[2] - coupling[2],
                 ];
                 let delta_landmark = math::mat_mul_vec(schur.inv_c, rhs_landmark);
-                max_step = max_step.max(norm3(delta_landmark));
+                let Some(step_norm) = finite_norm(delta_landmark) else {
+                    return BaResult::Degenerate {
+                        reason: DegenerateReason::NumericalFailure,
+                    };
+                };
+                max_step = max_step.max(step_norm);
                 for (axis, d) in delta_landmark.iter().enumerate() {
                     let d = *d as f64;
                     let gradient = schur.b[axis] as f64;
@@ -1323,7 +1339,7 @@ impl LocalBundleAdjuster {
             match lm_state.step(candidate_cost, predicted_decrease, lm_config) {
                 LmAction::Accept => {
                     let threshold = RELATIVE_COST_TOLERANCE * prev_cost.abs().max(COST_FLOOR);
-                    if max_step < STEP_CONVERGENCE_THRESHOLD
+                    if max_step < f64::from(STEP_CONVERGENCE_THRESHOLD)
                         || (prev_cost - candidate_cost).abs() <= threshold
                     {
                         return BaResult::Converged {
@@ -1793,18 +1809,48 @@ fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
         return None;
     }
     Some([
-        [inv[0][0] as f32, inv[0][1] as f32, inv[0][2] as f32],
-        [inv[1][0] as f32, inv[1][1] as f32, inv[1][2] as f32],
-        [inv[2][0] as f32, inv[2][1] as f32, inv[2][2] as f32],
+        [
+            narrow_finite_f32(inv[0][0])?,
+            narrow_finite_f32(inv[0][1])?,
+            narrow_finite_f32(inv[0][2])?,
+        ],
+        [
+            narrow_finite_f32(inv[1][0])?,
+            narrow_finite_f32(inv[1][1])?,
+            narrow_finite_f32(inv[1][2])?,
+        ],
+        [
+            narrow_finite_f32(inv[2][0])?,
+            narrow_finite_f32(inv[2][1])?,
+            narrow_finite_f32(inv[2][2])?,
+        ],
     ])
 }
 
 fn norm3(v: [f32; 3]) -> f32 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+    finite_norm(v)
+        .and_then(narrow_finite_f32)
+        .unwrap_or(f32::INFINITY)
 }
 
-fn norm6(v: [f32; 6]) -> f32 {
-    (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3] + v[4] * v[4] + v[5] * v[5]).sqrt()
+fn finite_norm<const N: usize>(values: [f32; N]) -> Option<f64> {
+    let mut sum_squared = 0.0_f64;
+    for value in values {
+        if !value.is_finite() {
+            return None;
+        }
+        sum_squared += f64::from(value) * f64::from(value);
+    }
+    let norm = sum_squared.sqrt();
+    norm.is_finite().then_some(norm)
+}
+
+fn pose_is_finite(pose: Pose) -> bool {
+    pose.rotation()
+        .iter()
+        .flatten()
+        .chain(pose.translation().iter())
+        .all(|value| value.is_finite())
 }
 
 fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
@@ -2318,6 +2364,23 @@ mod tests {
         let mut b = [f32::MAX];
         assert!(solve_linear_system(&mut a, &mut b, 1));
         assert_eq!(b, [1.0]);
+    }
+
+    #[test]
+    fn inverse_rejects_f64_result_that_cannot_narrow_to_f32() {
+        let matrix = [[1e20, 0.0, 0.0], [0.0, 1e20, 0.0], [0.0, 0.0, 1e-40]];
+        assert!(invert_3x3(matrix).is_none());
+    }
+
+    #[test]
+    fn finite_norm_avoids_f32_intermediate_overflow() {
+        let component = f32::MAX / 4.0;
+        let norm = finite_norm([component; 6]).expect("finite f32 vector has an f64 norm");
+        assert!(norm.is_finite());
+        assert!(norm <= f64::from(f32::MAX));
+
+        assert!(finite_norm([f32::NAN, 0.0, 0.0]).is_none());
+        assert!(finite_norm([f32::INFINITY, 0.0, 0.0]).is_none());
     }
 
     #[test]
