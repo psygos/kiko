@@ -553,16 +553,15 @@ pub fn solve_pnp(
 }
 
 fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
-    let x = (pixel.x - intrinsics.cx()) / intrinsics.fx();
-    let y = (pixel.y - intrinsics.cy()) / intrinsics.fy();
-    let v = [x, y, 1.0];
-    let n = norm(v);
-    if n <= 0.0 {
+    let x = (f64::from(pixel.x) - f64::from(intrinsics.cx())) / f64::from(intrinsics.fx());
+    let y = (f64::from(pixel.y) - f64::from(intrinsics.cy())) / f64::from(intrinsics.fy());
+    let norm = x.hypot(y).hypot(1.0);
+    if !norm.is_finite() || norm <= 0.0 {
         return Err(PnpError::Degenerate {
-            message: "zero-length bearing",
+            message: "bearing coordinates must be finite",
         });
     }
-    Ok([v[0] / n, v[1] / n, v[2] / n])
+    Ok([(x / norm) as f32, (y / norm) as f32, (1.0 / norm) as f32])
 }
 
 fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
@@ -1181,6 +1180,52 @@ mod tests {
         let b = normalize_bearing(pixel, intrinsics).expect("bearing");
         let n = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
         assert!((n - 1.0).abs() < 1e-6, "bearing norm must be 1, got {n}");
+    }
+
+    #[test]
+    fn normalize_bearing_stays_finite_for_extreme_finite_inputs() {
+        let smallest_positive_f32 = f32::from_bits(1);
+        let intrinsics = make_pinhole_intrinsics(
+            1,
+            1,
+            smallest_positive_f32,
+            smallest_positive_f32,
+            -f32::MAX,
+            f32::MAX,
+        )
+        .expect("intrinsics");
+        let pixel = Keypoint {
+            x: f32::MAX,
+            y: -f32::MAX,
+        };
+
+        let bearing = normalize_bearing(pixel, intrinsics).expect("finite bearing");
+        assert!(bearing.into_iter().all(f32::is_finite));
+        let norm = f64::from(bearing[0])
+            .hypot(f64::from(bearing[1]))
+            .hypot(f64::from(bearing[2]));
+        assert!(
+            (norm - 1.0).abs() <= 2.0 * f64::from(f32::EPSILON),
+            "narrowed bearing norm must remain one, got {norm}"
+        );
+        assert!(bearing[0].is_sign_positive());
+        assert!(bearing[1].is_sign_negative());
+    }
+
+    #[test]
+    fn normalize_bearing_preserves_center_and_image_axis_signs() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 100.0, 100.0, 320.0, 240.0).expect("intrinsics");
+
+        let center =
+            normalize_bearing(Keypoint { x: 320.0, y: 240.0 }, intrinsics).expect("center bearing");
+        assert_eq!(center, [0.0, 0.0, 1.0]);
+
+        let left_and_down = normalize_bearing(Keypoint { x: 220.0, y: 340.0 }, intrinsics)
+            .expect("off-center bearing");
+        assert!(left_and_down[0].is_sign_negative());
+        assert!(left_and_down[1].is_sign_positive());
+        assert!(left_and_down[2].is_sign_positive());
     }
 
     #[test]
