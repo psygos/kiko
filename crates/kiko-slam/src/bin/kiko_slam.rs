@@ -33,10 +33,11 @@ use kiko_slam::dataset::{
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
-    DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId, PairError,
-    PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer,
-    SystemHealth, TrackerInitError, VizConfigError, bounded_channel, oak_to_depth_image,
-    oak_to_frame,
+    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSendOutcome,
+    DenseCommandSender, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
+    PairError, PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
+    StereoPairer, SystemHealth, TrackerInitError, VizConfigError, bounded_channel,
+    dense_command_channel, oak_to_depth_image, oak_to_frame,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -1048,7 +1049,9 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(state) = dense_state.as_mut()
                     && let Some(correction) = tracker.take_pending_loop_correction()
                 {
-                    dense_generation = dense_generation.saturating_add(1);
+                    dense_generation = dense_generation
+                        .checked_add(1)
+                        .expect("dense rebuild generation space exhausted");
                     let stats = dense::process_dense_command(
                         state,
                         DenseCommand::RebuildFromSnapshot {
@@ -1835,47 +1838,35 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Create dense channels. Control is bounded (to avoid unbounded memory growth),
-    // data uses DropNewest backpressure for IntegrateKeyframe.
-    let mut dense_ctrl_tx: Option<crossbeam_channel::Sender<kiko_slam::DenseCommand>> = None;
-    let mut dense_ctrl_rx_for_worker: Option<crossbeam_channel::Receiver<kiko_slam::DenseCommand>> =
-        None;
-    let mut dense_data_tx: Option<kiko_slam::DropSender<kiko_slam::DenseCommand>> = None;
-    let mut dense_data_rx_for_worker: Option<kiko_slam::DropReceiver<kiko_slam::DenseCommand>> =
-        None;
-    let mut dense_data_stats_handle: Option<kiko_slam::ChannelStatsHandle> = None;
+    // Use one FIFO so reset/rebuild commands cannot overtake or be overtaken
+    // by causally adjacent integrations and removals. The data quota reserves
+    // the configured control headroom within the bounded queue.
+    let mut dense_command_tx: Option<DenseCommandSender> = None;
+    let mut dense_command_rx_for_worker: Option<DenseCommandReceiver> = None;
+    let mut dense_command_stats_handle: Option<DenseCommandQueueStatsHandle> = None;
     let mut dense_stats_tx_for_worker: Option<kiko_slam::DropSender<DenseStats>> = None;
     let mut dense_stats_rx: Option<kiko_slam::DropReceiver<DenseStats>> = None;
 
     if let Some((data_cap, ctrl_cap)) = dense_capacities {
-        let (ctrl_tx, ctrl_rx) = crossbeam_channel::bounded(ctrl_cap.get());
-        let (data_tx, data_rx, data_stats) = bounded_channel(data_cap, DropPolicy::DropNewest);
+        let (command_tx, command_rx, command_stats) =
+            dense_command_channel(data_cap, ctrl_cap, Duration::from_millis(5))?;
         let stats_cap = ChannelCapacity::try_from(1_usize)?;
         let (stats_tx, stats_rx_inner, _stats_handle) =
             bounded_channel(stats_cap, DropPolicy::DropNewest);
-        dense_ctrl_tx = Some(ctrl_tx);
-        dense_ctrl_rx_for_worker = Some(ctrl_rx);
-        dense_data_tx = Some(data_tx);
-        dense_data_rx_for_worker = Some(data_rx);
-        dense_data_stats_handle = Some(data_stats);
+        dense_command_tx = Some(command_tx);
+        dense_command_rx_for_worker = Some(command_rx);
+        dense_command_stats_handle = Some(command_stats);
         dense_stats_tx_for_worker = Some(stats_tx);
         dense_stats_rx = Some(stats_rx_inner);
     }
 
-    let dense_handle = if let (Some(ctrl_rx), Some(data_rx), stats_tx) = (
-        dense_ctrl_rx_for_worker.take(),
-        dense_data_rx_for_worker.take(),
+    let dense_handle = if let (Some(command_rx), stats_tx) = (
+        dense_command_rx_for_worker.take(),
         dense_stats_tx_for_worker.take(),
     ) {
         let cfg = DenseConfig::default();
         Some(thread::spawn(move || {
-            kiko_slam::dense::run_dense_worker(
-                &cfg,
-                &ctrl_rx,
-                data_rx.as_receiver(),
-                None,
-                stats_tx.as_ref(),
-            );
+            kiko_slam::dense::run_dense_worker(&cfg, &command_rx, None, stats_tx.as_ref());
         }))
     } else {
         None
@@ -1898,11 +1889,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let depth_rx = depth_rx;
         let depth_enabled_for_diagnostics = depth_rx.is_some();
         let mut dense_generation: u64 = 0;
-        let mut dense_ctrl_tx = dense_ctrl_tx;
-        let mut dense_data_tx = dense_data_tx;
+        let mut dense_command_tx = dense_command_tx;
         let dense_stats_rx = dense_stats_rx;
         let mut dense_active = dense_enabled;
-        let mut dense_data_dropped_newest: u64 = 0;
+        let mut dense_integrations_dropped_newest: u64 = 0;
         let mut depth_reorder_warnings_seen: u64 = 0;
 
         for pair in pair_rx.iter() {
@@ -1936,45 +1926,26 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                             &mut dense_generation,
                         );
                         for cmd in cmds {
-                            if cmd.is_control() {
-                                if let Some(ref tx) = dense_ctrl_tx {
-                                    match tx.send_timeout(cmd, Duration::from_millis(5)) {
-                                        Ok(()) => {}
-                                        Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
-                                            dense_active = false;
-                                            dense_ctrl_tx = None;
-                                            dense_data_tx = None;
-                                            eprintln!(
-                                                "dense control queue saturated; disabling dense"
-                                            );
-                                            break;
-                                        }
-                                        Err(crossbeam_channel::SendTimeoutError::Disconnected(
-                                            _,
-                                        )) => {
-                                            dense_active = false;
-                                            dense_ctrl_tx = None;
-                                            dense_data_tx = None;
-                                            eprintln!(
-                                                "dense control channel disconnected; disabling dense"
-                                            );
-                                            break;
-                                        }
+                            if let Some(ref tx) = dense_command_tx {
+                                match tx.route(cmd) {
+                                    DenseCommandSendOutcome::Enqueued => {}
+                                    DenseCommandSendOutcome::IntegrationDroppedNewest => {
+                                        dense_integrations_dropped_newest =
+                                            dense_integrations_dropped_newest.saturating_add(1);
                                     }
-                                }
-                            } else if let Some(ref tx) = dense_data_tx {
-                                match tx.try_send(cmd) {
-                                    SendOutcome::Enqueued | SendOutcome::DroppedOldest => {}
-                                    SendOutcome::DroppedNewest => {
-                                        dense_data_dropped_newest =
-                                            dense_data_dropped_newest.saturating_add(1);
-                                    }
-                                    SendOutcome::Disconnected => {
+                                    DenseCommandSendOutcome::ControlTimedOut => {
                                         dense_active = false;
-                                        dense_ctrl_tx = None;
-                                        dense_data_tx = None;
+                                        dense_command_tx = None;
                                         eprintln!(
-                                            "dense data channel disconnected; disabling dense"
+                                            "dense ordered command queue timed out accepting control; disabling dense"
+                                        );
+                                        break;
+                                    }
+                                    DenseCommandSendOutcome::Disconnected => {
+                                        dense_active = false;
+                                        dense_command_tx = None;
+                                        eprintln!(
+                                            "dense ordered command queue disconnected; disabling dense"
                                         );
                                         break;
                                     }
@@ -1992,8 +1963,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         && stats.state == ReconState::Down
                     {
                         dense_active = false;
-                        dense_ctrl_tx = None;
-                        dense_data_tx = None;
+                        dense_command_tx = None;
                         eprintln!("dense worker entered Down state; disabling dense");
                     }
 
@@ -2038,28 +2008,35 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if dense_active && let Some(correction) = tracker.take_pending_loop_correction()
                     {
-                        dense_generation = dense_generation.saturating_add(1);
+                        dense_generation = dense_generation
+                            .checked_add(1)
+                            .expect("dense rebuild generation space exhausted");
                         let rebuild_cmd = DenseCommand::RebuildFromSnapshot {
                             corrected_poses: correction,
                             generation: dense_generation,
                         };
-                        if let Some(ref tx) = dense_ctrl_tx {
-                            match tx.send_timeout(rebuild_cmd, Duration::from_millis(5)) {
-                                Ok(()) => {}
-                                Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                        if let Some(ref tx) = dense_command_tx {
+                            match tx.route(rebuild_cmd) {
+                                DenseCommandSendOutcome::Enqueued => {}
+                                DenseCommandSendOutcome::ControlTimedOut => {
                                     dense_active = false;
-                                    dense_ctrl_tx = None;
-                                    dense_data_tx = None;
+                                    dense_command_tx = None;
                                     eprintln!(
-                                        "dense control queue saturated after tracker error; disabling dense"
+                                        "dense ordered command queue timed out accepting rebuild after tracker error; disabling dense"
                                     );
                                 }
-                                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                DenseCommandSendOutcome::Disconnected => {
                                     dense_active = false;
-                                    dense_ctrl_tx = None;
-                                    dense_data_tx = None;
+                                    dense_command_tx = None;
                                     eprintln!(
-                                        "dense control disconnected after tracker error; disabling dense"
+                                        "dense ordered command queue disconnected after tracker error; disabling dense"
+                                    );
+                                }
+                                DenseCommandSendOutcome::IntegrationDroppedNewest => {
+                                    dense_active = false;
+                                    dense_command_tx = None;
+                                    eprintln!(
+                                        "dense command router rejected a rebuild as integration data; disabling dense"
                                     );
                                 }
                             }
@@ -2074,8 +2051,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        if dense_data_dropped_newest > 0 {
-            eprintln!("dense data dropped_newest (inference view): {dense_data_dropped_newest}");
+        if dense_integrations_dropped_newest > 0 {
+            eprintln!(
+                "dense integrations dropped_newest (inference view): {dense_integrations_dropped_newest}"
+            );
         }
         if depth_reorder_warnings_seen > 0 {
             eprintln!("depth reorder warnings observed: {depth_reorder_warnings_seen}");
@@ -2294,14 +2273,14 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             depth_snapshot.disconnected
         );
     }
-    if let Some(dense_data_stats_handle) = dense_data_stats_handle {
-        let dense_data_snapshot = dense_data_stats_handle.snapshot();
+    if let Some(dense_command_stats_handle) = dense_command_stats_handle {
+        let dense_command_snapshot = dense_command_stats_handle.snapshot();
         eprintln!(
-            "dense data queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
-            dense_data_snapshot.enqueued,
-            dense_data_snapshot.dropped_oldest,
-            dense_data_snapshot.dropped_newest,
-            dense_data_snapshot.disconnected
+            "dense ordered command queue stats: commands_enqueued={}, integrations_dropped_newest={}, controls_timed_out={}, disconnected={}",
+            dense_command_snapshot.commands_enqueued,
+            dense_command_snapshot.integrations_dropped_newest,
+            dense_command_snapshot.controls_timed_out,
+            dense_command_snapshot.disconnected
         );
     }
     let pairer_stats = pairer.stats();

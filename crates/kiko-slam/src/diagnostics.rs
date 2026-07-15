@@ -1,8 +1,53 @@
 use std::time::Duration;
 
 use crate::local_ba::{BaResult, DegenerateReason};
-use crate::map::KeyframeId;
+use crate::map::{KeyframeId, MapInstanceId};
 use crate::triangulation::TriangulationStats;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappingSessionTransition {
+    old_map: MapInstanceId,
+    new_map: MapInstanceId,
+}
+
+impl MappingSessionTransition {
+    pub fn try_new(
+        old_map: MapInstanceId,
+        new_map: MapInstanceId,
+    ) -> Result<Self, MappingSessionTransitionError> {
+        if old_map == new_map {
+            return Err(MappingSessionTransitionError::SameMap(old_map));
+        }
+        Ok(Self { old_map, new_map })
+    }
+
+    pub fn old_map(self) -> MapInstanceId {
+        self.old_map
+    }
+
+    pub fn new_map(self) -> MapInstanceId {
+        self.new_map
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingSessionTransitionError {
+    SameMap(MapInstanceId),
+}
+
+impl std::fmt::Display for MappingSessionTransitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameMap(map) => write!(
+                f,
+                "mapping-session transition must change map instance (map={})",
+                map.as_u64()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MappingSessionTransitionError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyframeRemovalReason {
@@ -83,6 +128,10 @@ pub enum DiagnosticEvent {
         keyframe_id: KeyframeId,
         reason: KeyframeRemovalReason,
     },
+    /// The tracker discarded one map and started a distinct mapping session.
+    MappingSessionReset {
+        transition: MappingSessionTransition,
+    },
     LoopClosureDetected {
         query: KeyframeId,
         match_kf: KeyframeId,
@@ -113,9 +162,10 @@ mod tests {
 
     use super::{
         DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
+        MappingSessionTransition, MappingSessionTransitionError,
     };
     use crate::DegenerateReason;
-    use crate::map::KeyframeId;
+    use crate::map::{KeyframeId, SlamMap};
 
     #[test]
     fn empty_diagnostics_has_all_none() {
@@ -161,6 +211,13 @@ mod tests {
                 keyframe_id: kf,
                 reason: KeyframeRemovalReason::Redundant,
             },
+            DiagnosticEvent::MappingSessionReset {
+                transition: MappingSessionTransition::try_new(
+                    SlamMap::new().snapshot().instance_id(),
+                    SlamMap::new().snapshot().instance_id(),
+                )
+                .expect("distinct test maps"),
+            },
             DiagnosticEvent::LoopClosureDetected {
                 query: kf,
                 match_kf: kf,
@@ -181,7 +238,16 @@ mod tests {
         for event in variants {
             uniq.insert(discriminant(&event));
         }
-        assert_eq!(uniq.len(), 11);
+        assert_eq!(uniq.len(), 12);
+    }
+
+    #[test]
+    fn mapping_session_transition_rejects_an_unchanged_map() {
+        let map = SlamMap::new().snapshot().instance_id();
+        assert_eq!(
+            MappingSessionTransition::try_new(map, map),
+            Err(MappingSessionTransitionError::SameMap(map))
+        );
     }
 
     #[test]

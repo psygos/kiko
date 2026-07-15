@@ -38,10 +38,15 @@ pub use channel::{
 pub use dense::backend::{
     Mesh, TsdfBackend, TsdfBackendFactory, TsdfConfig, TsdfConfigError, TsdfError,
 };
-pub use dense::{DenseCommand, DenseConfig, DenseConfigError, DenseStats, ReconState};
+pub use dense::{
+    DenseCommand, DenseCommandChannelError, DenseCommandQueueStats, DenseCommandQueueStatsHandle,
+    DenseCommandReceiver, DenseCommandSendOutcome, DenseCommandSender, DenseConfig,
+    DenseConfigError, DenseStats, ReconState, dense_command_channel,
+};
 pub use depth::{DepthImage, DepthImageError};
 pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
+    MappingSessionTransition, MappingSessionTransitionError,
 };
 pub use env::{EnvError, env_bool, env_f32, env_u32, env_u64, env_usize};
 pub use geometry::{CameraFrame, CameraPoint3, CoordinateFrame, Point3, WorldFrame, WorldPoint3};
@@ -53,8 +58,8 @@ pub use loop_closure::{
     DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase,
     KeyframeDatabaseError, LoopApplyError, LoopClosureConfig, LoopClosureConfigError,
     LoopClosureConfigInput, LoopDetectError, LoopVerificationError, PlaceMatch,
-    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput, RelocalizationMatch,
-    VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
+    RelocalizationConfig, RelocalizationConfigError, RelocalizationConfigInput,
+    RelocalizationMatch, VerifiedLoop, VerifiedRelocalization, aggregate_global_descriptor,
     try_match_descriptors_for_loop,
 };
 pub use map::{

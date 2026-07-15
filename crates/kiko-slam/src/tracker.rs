@@ -34,10 +34,10 @@ use crate::pose_graph::{
 use crate::{
     BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor, EigenPlaces, Frame,
     FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit, LightGlue,
-    LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation, Matches,
-    ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor, Point3, Pose, RansacConfig, Raw,
-    RectifiedStereo, StereoPair, SuperPoint, Timestamp, TriangulationConfig, TriangulationError,
-    Triangulator, Verified,
+    LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
+    MappingSessionTransition, Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor,
+    Point3, Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
+    TriangulationConfig, TriangulationError, Triangulator, Verified,
     map::{KeyframeId, MapPointId, MapSnapshot, SlamMap},
     solve_pnp_ransac,
 };
@@ -2671,12 +2671,16 @@ impl SlamTracker {
     }
 
     fn reset_mapping_session(&mut self) {
-        replace_mapping_session(
+        let transition = replace_mapping_session(
             &mut self.map,
             &mut self.essential_graph,
             self.loop_db.as_mut(),
             Self::DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD,
         );
+        // Publish the boundary before any subsequent frame can create a
+        // keyframe in the fresh map. Downstream state must never mix map
+        // instances merely because sparse relocalization was exhausted.
+        self.emit_event(DiagnosticEvent::MappingSessionReset { transition });
         self.state = TrackerState::NeedKeyframe;
         self.ba.reset();
         self.pending_loop = None;
@@ -3379,12 +3383,15 @@ fn replace_mapping_session(
     essential_graph: &mut EssentialGraph,
     loop_db: Option<&mut KeyframeDatabase>,
     strong_threshold: u32,
-) {
+) -> MappingSessionTransition {
+    let old_map = map.snapshot().instance_id();
     *map = SlamMap::new();
     *essential_graph = EssentialGraph::new(strong_threshold);
     if let Some(loop_db) = loop_db {
         *loop_db = KeyframeDatabase::new(loop_db.temporal_gap());
     }
+    MappingSessionTransition::try_new(old_map, map.snapshot().instance_id())
+        .expect("a fresh SlamMap has a distinct map instance ID")
 }
 
 #[cfg(test)]
@@ -4607,9 +4614,11 @@ mod tests {
             },
         };
 
-        replace_mapping_session(&mut map, &mut graph, Some(&mut loop_db), 2);
+        let transition = replace_mapping_session(&mut map, &mut graph, Some(&mut loop_db), 2);
 
         let fresh_snapshot = map.snapshot();
+        assert_eq!(transition.old_map(), old_snapshot.instance_id());
+        assert_eq!(transition.new_map(), fresh_snapshot.instance_id());
         assert_ne!(fresh_snapshot.instance_id(), old_snapshot.instance_id());
         assert_eq!(map.num_keyframes(), 0);
         assert_eq!(map.num_points(), 0);

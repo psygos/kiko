@@ -18,6 +18,8 @@ pub const MAX_ASSOCIATION_WINDOW_NS: i64 = 20_000_000;
 ///   has an associated depth frame and whose keyframe was NOT also removed
 ///   in the same frame.
 /// - `RemoveKeyframe` is emitted for each `KeyframeRemoved` event.
+/// - `ResetMappingSession` is emitted before every other command when the
+///   output contains a mapping-session boundary.
 /// - `RebuildFromSnapshot` is emitted when `correction` is `Some`.
 /// - No `IntegrateKeyframe` commands are emitted when tracking is `Lost`.
 pub fn map_output_to_dense_commands(
@@ -28,6 +30,21 @@ pub fn map_output_to_dense_commands(
     generation: &mut u64,
 ) -> Vec<DenseCommand> {
     let mut commands = Vec::new();
+
+    // A reset must be sent on the control path before any data command from
+    // the new session. Advancing the rebuild generation makes every reset a
+    // sequencing barrier for already queued rebuild requests.
+    let mut output_map = None;
+    for event in &output.events {
+        if let DiagnosticEvent::MappingSessionReset { transition } = event {
+            let reset_generation = next_generation(generation);
+            commands.push(DenseCommand::ResetMappingSession {
+                transition: *transition,
+                generation: reset_generation,
+            });
+            output_map = Some(transition.new_map());
+        }
+    }
 
     // Collect KeyframeIds that were removed this frame so we can suppress
     // IntegrateKeyframe for the same id (coalesce create+remove).
@@ -47,6 +64,9 @@ pub fn map_output_to_dense_commands(
     for event in &output.events {
         match event {
             DiagnosticEvent::KeyframeCreated { keyframe_id, .. } => {
+                if output_map.is_some_and(|map| map != keyframe_id.map_instance_id()) {
+                    continue;
+                }
                 if !tracking_ok {
                     continue;
                 }
@@ -67,6 +87,9 @@ pub fn map_output_to_dense_commands(
                 }
             }
             DiagnosticEvent::KeyframeRemoved { keyframe_id, .. } => {
+                if output_map.is_some_and(|map| map != keyframe_id.map_instance_id()) {
+                    continue;
+                }
                 commands.push(DenseCommand::RemoveKeyframe {
                     keyframe_id: *keyframe_id,
                 });
@@ -77,14 +100,22 @@ pub fn map_output_to_dense_commands(
 
     // Emit rebuild if loop correction is available.
     if let Some(poses) = correction {
-        *generation = generation.saturating_add(1);
+        let rebuild_generation = next_generation(generation);
         commands.push(DenseCommand::RebuildFromSnapshot {
             corrected_poses: poses.to_vec(),
-            generation: *generation,
+            generation: rebuild_generation,
         });
     }
 
     commands
+}
+
+fn next_generation(generation: &mut u64) -> u64 {
+    let next = generation
+        .checked_add(1)
+        .expect("dense rebuild generation space exhausted");
+    *generation = next;
+    next
 }
 
 #[cfg(test)]
@@ -92,6 +123,7 @@ mod tests {
     use super::*;
     use crate::dense::ring_buffer::DepthRingBuffer;
     use crate::diagnostics::KeyframeRemovalReason;
+    use crate::map::SlamMap;
     use crate::test_helpers::make_depth_image;
     use crate::tracker::BackendStats;
     use crate::{
@@ -313,5 +345,54 @@ mod tests {
 
         map_output_to_dense_commands(&output, Some(&correction), &buf, ts(200), &mut gen_);
         assert_eq!(gen_, 2);
+    }
+
+    #[test]
+    fn mapping_session_reset_is_first_and_advances_rebuild_order() {
+        let old_map = SlamMap::new().snapshot().instance_id();
+        let new_map = SlamMap::new().snapshot().instance_id();
+        let transition =
+            crate::MappingSessionTransition::try_new(old_map, new_map).expect("distinct test maps");
+        let output = base_output(vec![DiagnosticEvent::MappingSessionReset { transition }]);
+        let correction = vec![(kf_id(), Pose::identity())];
+        let mut generation = 0;
+
+        let commands = map_output_to_dense_commands(
+            &output,
+            Some(&correction),
+            &depth_buffer(),
+            ts(100),
+            &mut generation,
+        );
+
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            commands[0],
+            DenseCommand::ResetMappingSession {
+                transition: actual,
+                generation: 1,
+            } if actual == transition
+        ));
+        assert!(matches!(
+            commands[1],
+            DenseCommand::RebuildFromSnapshot { generation: 2, .. }
+        ));
+        assert_eq!(generation, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "dense rebuild generation space exhausted")]
+    fn generation_exhaustion_does_not_alias_a_stale_rebuild() {
+        let output = base_output(Vec::new());
+        let correction = Vec::new();
+        let mut generation = u64::MAX;
+
+        let _ = map_output_to_dense_commands(
+            &output,
+            Some(&correction),
+            &depth_buffer(),
+            ts(100),
+            &mut generation,
+        );
     }
 }
