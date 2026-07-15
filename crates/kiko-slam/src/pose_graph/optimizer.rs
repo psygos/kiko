@@ -247,8 +247,8 @@ fn validate_optimizer_edges(
     Ok(symmetrized_information_count)
 }
 
-fn edge_error_unchecked(from: usize, to: usize, measurement: Pose64, poses: &[Pose64]) -> [f64; 6] {
-    let predicted = poses[from].inverse().compose(poses[to]);
+fn edge_error_from_endpoints(from_pose: Pose64, to_pose: Pose64, measurement: Pose64) -> [f64; 6] {
+    let predicted = from_pose.inverse().compose(to_pose);
     let residual_pose = predicted.compose(measurement.inverse());
     se3_log_f64(residual_pose)
 }
@@ -258,43 +258,49 @@ pub fn compute_edge_error(
     poses: &[Pose64],
 ) -> Result<[f64; 6], PoseGraphError> {
     validate_edge_bounds(edge, 0, poses.len())?;
-    Ok(edge_error_unchecked(
-        edge.from,
-        edge.to,
+    Ok(edge_error_from_endpoints(
+        poses[edge.from],
+        poses[edge.to],
         edge.measurement,
-        poses,
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn numerical_diff_column(
-    from: usize,
-    to: usize,
+    from_pose: Pose64,
+    to_pose: Pose64,
     measurement: Pose64,
-    poses: &mut [Pose64],
-    pose_idx: usize,
+    perturb_from: bool,
     delta_plus: &[f64; 6],
     delta_minus: &[f64; 6],
     eps: f64,
     jacobian: &mut [[f64; 6]; 6],
     axis: usize,
 ) {
-    let original = poses[pose_idx];
-    poses[pose_idx] = se3_exp_f64(*delta_plus).compose(original);
-    let err_plus = edge_error_unchecked(from, to, measurement, poses);
-    poses[pose_idx] = se3_exp_f64(*delta_minus).compose(original);
-    let err_minus = edge_error_unchecked(from, to, measurement, poses);
-    poses[pose_idx] = original;
+    let original = if perturb_from { from_pose } else { to_pose };
+    let plus = se3_exp_f64(*delta_plus).compose(original);
+    let minus = se3_exp_f64(*delta_minus).compose(original);
+    let (from_plus, to_plus) = if perturb_from {
+        (plus, to_pose)
+    } else {
+        (from_pose, plus)
+    };
+    let (from_minus, to_minus) = if perturb_from {
+        (minus, to_pose)
+    } else {
+        (from_pose, minus)
+    };
+    let err_plus = edge_error_from_endpoints(from_plus, to_plus, measurement);
+    let err_minus = edge_error_from_endpoints(from_minus, to_minus, measurement);
     for row in 0..6 {
         jacobian[row][axis] = (err_plus[row] - err_minus[row]) / (2.0 * eps);
     }
 }
 
-fn compute_edge_jacobians_with_buffer(
-    from: usize,
-    to: usize,
+fn compute_edge_jacobians_from_endpoints(
+    from_pose: Pose64,
+    to_pose: Pose64,
     measurement: Pose64,
-    poses_perturbed: &mut [Pose64],
 ) -> EdgeJacobians {
     let mut j_from = [[0.0_f64; 6]; 6];
     let mut j_to = [[0.0_f64; 6]; 6];
@@ -309,11 +315,10 @@ fn compute_edge_jacobians_with_buffer(
         let delta_minus = perturb_axis(axis, -eps);
 
         numerical_diff_column(
-            from,
-            to,
+            from_pose,
+            to_pose,
             measurement,
-            poses_perturbed,
-            from,
+            true,
             &delta_plus,
             &delta_minus,
             eps,
@@ -321,11 +326,10 @@ fn compute_edge_jacobians_with_buffer(
             axis,
         );
         numerical_diff_column(
-            from,
-            to,
+            from_pose,
+            to_pose,
             measurement,
-            poses_perturbed,
-            to,
+            false,
             &delta_plus,
             &delta_minus,
             eps,
@@ -342,12 +346,10 @@ pub fn compute_edge_jacobians(
     poses: &[Pose64],
 ) -> Result<EdgeJacobians, PoseGraphError> {
     validate_edge_bounds(edge, 0, poses.len())?;
-    let mut poses_perturbed = poses.to_vec();
-    Ok(compute_edge_jacobians_with_buffer(
-        edge.from,
-        edge.to,
+    Ok(compute_edge_jacobians_from_endpoints(
+        poses[edge.from],
+        poses[edge.to],
         edge.measurement,
-        &mut poses_perturbed,
     ))
 }
 
@@ -542,22 +544,17 @@ impl PoseGraphOptimizer {
                 symmetrized_edge_information_count,
             });
         }
-        let mut numerical_diff_poses = poses.clone();
-
         for iter in 0..self.config.max_outer_iterations() {
             iters_run = iter + 1;
             let mut h = BlockCsr6x6::new(nposes);
             let mut b = vec![0.0_f64; nposes * 6];
 
-            numerical_diff_poses.copy_from_slice(&poses);
             for (edge_index, edge) in edges.iter().enumerate() {
-                let error = edge_error_unchecked(edge.from, edge.to, edge.measurement, &poses);
-                let (j_from, j_to) = compute_edge_jacobians_with_buffer(
-                    edge.from,
-                    edge.to,
-                    edge.measurement,
-                    &mut numerical_diff_poses,
-                );
+                let from_pose = poses[edge.from];
+                let to_pose = poses[edge.to];
+                let error = edge_error_from_endpoints(from_pose, to_pose, edge.measurement);
+                let (j_from, j_to) =
+                    compute_edge_jacobians_from_endpoints(from_pose, to_pose, edge.measurement);
                 let robust_squared_norm = squared_mahalanobis_norm(error, edge.information.matrix);
                 if !robust_squared_norm.is_finite() || robust_squared_norm < 0.0 {
                     return Err(PoseGraphError::InvalidRobustSquaredNorm {
