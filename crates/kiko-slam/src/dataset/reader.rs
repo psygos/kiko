@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use crate::{Frame, FrameError, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
 
 use super::{
-    Calibration, DatasetError, FrameInfo, Manifest, ManifestFrameRef, ManifestPairing, format,
-    read_calibration, read_manifest, read_meta, scan_frames,
+    Calibration, DatasetError, Manifest, ManifestFrameRef, ManifestPairing, ManifestStats,
+    read_calibration, read_manifest, read_meta,
 };
 
 #[derive(Clone, Debug)]
@@ -21,11 +21,17 @@ struct DatasetEntry {
 }
 
 #[derive(Debug)]
+struct ParsedManifest {
+    entries: Vec<DatasetEntry>,
+    stats: DatasetStats,
+}
+
+#[derive(Debug)]
 pub struct DatasetReader {
-    root: PathBuf,
     meta: super::Meta,
     calibration: Calibration,
     entries: Vec<DatasetEntry>,
+    stats: DatasetStats,
     pairing_window: PairingWindowNs,
     left_seq: u64,
     right_seq: u64,
@@ -66,12 +72,12 @@ impl DatasetReader {
             PairingWindowNs::new(pairing_window_ns).map_err(|_| DatasetError::InvalidConfig {
                 msg: "manifest pairing_window_ns must be non-negative",
             })?;
-        let entries = parse_manifest_entries(&root, manifest)?;
+        let parsed = parse_manifest(&root, manifest)?;
         Ok(Self {
-            root,
             meta,
             calibration,
-            entries,
+            entries: parsed.entries,
+            stats: parsed.stats,
             pairing_window,
             left_seq: 0,
             right_seq: 0,
@@ -86,12 +92,8 @@ impl DatasetReader {
         &self.calibration
     }
 
-    pub fn stats(&self) -> Result<DatasetStats, DatasetError> {
-        let mono = self.meta.mono.as_ref().ok_or(DatasetError::InvalidConfig {
-            msg: "meta.json missing mono config",
-        })?;
-        let frames = scan_frames(&self.root.join(format::FRAMES_DIR), mono.width, mono.height)?;
-        Ok(DatasetStats::from_frames(&frames))
+    pub fn stats(&self) -> DatasetStats {
+        self.stats
     }
 
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
@@ -254,12 +256,9 @@ impl DatasetReader {
     }
 }
 
-fn parse_manifest_entries(
-    root: &Path,
-    manifest: Manifest,
-) -> Result<Vec<DatasetEntry>, DatasetError> {
-    manifest
-        .entries
+fn parse_manifest(root: &Path, manifest: Manifest) -> Result<ParsedManifest, DatasetError> {
+    let Manifest { stats, entries, .. } = manifest;
+    let entries = entries
         .into_iter()
         .map(|entry| {
             let left = parse_frame_ref(root, entry.left)?;
@@ -269,7 +268,9 @@ fn parse_manifest_entries(
             };
             Ok(DatasetEntry { left, right })
         })
-        .collect()
+        .collect::<Result<Vec<_>, DatasetError>>()?;
+    let stats = DatasetStats::from_manifest(&entries, stats)?;
+    Ok(ParsedManifest { entries, stats })
 }
 
 fn parse_frame_ref(
@@ -306,65 +307,128 @@ fn parse_frame_ref(
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Statistics for the manifest-defined replay stream.
+///
+/// `right_count` includes declared right orphans. Because the current manifest
+/// does not record their timestamps, `right_fps` is unavailable whenever any
+/// right orphan exists.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DatasetStats {
     pub left_count: usize,
     pub right_count: usize,
     pub paired_count: usize,
+    pub left_orphan_count: usize,
+    pub right_orphan_count: usize,
     pub left_fps: Option<f64>,
     pub right_fps: Option<f64>,
     pub paired_fps: Option<f64>,
 }
 
 impl DatasetStats {
-    fn from_frames(frames: &super::FrameSet) -> Self {
-        let left_fps = fps_from_frames(&frames.left);
-        let right_fps = fps_from_frames(&frames.right);
-        let paired_fps = fps_from_pairs(&frames.left, &frames.right);
-        Self {
-            left_count: frames.left.len(),
-            right_count: frames.right.len(),
-            paired_count: frames.left.len().min(frames.right.len()),
+    fn from_manifest(
+        entries: &[DatasetEntry],
+        declared: ManifestStats,
+    ) -> Result<Self, DatasetError> {
+        let left_count = entries.len();
+        let paired_count = entries.iter().filter(|entry| entry.right.is_some()).count();
+        let left_orphan_count = left_count - paired_count;
+        let left_count_u64 =
+            u64::try_from(left_count).map_err(|_| DatasetError::InvalidManifest {
+                reason: "left entry count exceeds the manifest count representation",
+            })?;
+        let paired_count_u64 =
+            u64::try_from(paired_count).map_err(|_| DatasetError::InvalidManifest {
+                reason: "paired entry count exceeds the manifest count representation",
+            })?;
+        let left_orphan_count_u64 =
+            u64::try_from(left_orphan_count).map_err(|_| DatasetError::InvalidManifest {
+                reason: "left orphan count exceeds the manifest count representation",
+            })?;
+
+        validate_manifest_stat("total_left", declared.total_left, left_count_u64)?;
+        validate_manifest_stat("paired_count", declared.paired_count, paired_count_u64)?;
+        validate_manifest_stat("left_orphans", declared.left_orphans, left_orphan_count_u64)?;
+        let derived_right_count = paired_count_u64.checked_add(declared.right_orphans).ok_or(
+            DatasetError::InvalidManifest {
+                reason: "paired and right-orphan counts overflow u64",
+            },
+        )?;
+        validate_manifest_stat("total_right", declared.total_right, derived_right_count)?;
+
+        let right_count = usize::try_from(declared.total_right).map_err(|_| {
+            DatasetError::ManifestCountOutOfRange {
+                field: "total_right",
+                value: declared.total_right,
+            }
+        })?;
+        let right_orphan_count = usize::try_from(declared.right_orphans).map_err(|_| {
+            DatasetError::ManifestCountOutOfRange {
+                field: "right_orphans",
+                value: declared.right_orphans,
+            }
+        })?;
+
+        let left_fps = fps_from_timestamps(entries.iter().map(|entry| entry.left.timestamp_ns));
+        let paired_fps = fps_from_timestamps(
+            entries
+                .iter()
+                .filter(|entry| entry.right.is_some())
+                .map(|entry| entry.left.timestamp_ns),
+        );
+        let right_fps = if right_orphan_count == 0 {
+            fps_from_timestamps(
+                entries
+                    .iter()
+                    .filter_map(|entry| entry.right.as_ref())
+                    .map(|right| right.timestamp_ns),
+            )
+        } else {
+            None
+        };
+
+        Ok(Self {
+            left_count,
+            right_count,
+            paired_count,
+            left_orphan_count,
+            right_orphan_count,
             left_fps,
             right_fps,
             paired_fps,
-        }
+        })
     }
 }
 
-fn fps_from_frames(frames: &[FrameInfo]) -> Option<f64> {
-    if frames.len() < 2 {
-        return None;
+fn validate_manifest_stat(
+    field: &'static str,
+    declared: u64,
+    derived: u64,
+) -> Result<(), DatasetError> {
+    if declared != derived {
+        return Err(DatasetError::InvalidManifestStats {
+            field,
+            declared,
+            derived,
+        });
     }
-    let (min_ts, max_ts) = min_max_ts(frames);
-    let span_ns = max_ts.abs_diff(min_ts) as f64;
-    if span_ns <= 0.0 {
-        return None;
-    }
-    let span_s = span_ns / 1_000_000_000.0;
-    Some(frames.len() as f64 / span_s)
+    Ok(())
 }
 
-fn fps_from_pairs(left: &[FrameInfo], right: &[FrameInfo]) -> Option<f64> {
-    if left.is_empty() || right.is_empty() {
-        return None;
-    }
-    let (left_min, left_max) = min_max_ts(left);
-    let (right_min, right_max) = min_max_ts(right);
-    let span_ns = left_max.max(right_max).abs_diff(left_min.min(right_min)) as f64;
-    if span_ns <= 0.0 {
-        return None;
-    }
-    let span_s = span_ns / 1_000_000_000.0;
-    Some(left.len().min(right.len()) as f64 / span_s)
-}
-
-fn min_max_ts(frames: &[FrameInfo]) -> (i64, i64) {
+fn fps_from_timestamps(timestamps: impl IntoIterator<Item = i64>) -> Option<f64> {
+    let mut count = 0usize;
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
-    for frame in frames {
-        min_ts = min_ts.min(frame.timestamp_ns);
-        max_ts = max_ts.max(frame.timestamp_ns);
+    for timestamp_ns in timestamps {
+        count = count.saturating_add(1);
+        min_ts = min_ts.min(timestamp_ns);
+        max_ts = max_ts.max(timestamp_ns);
     }
-    (min_ts, max_ts)
+    if count < 2 {
+        return None;
+    }
+    let span_ns = max_ts.abs_diff(min_ts);
+    if span_ns == 0 {
+        return None;
+    }
+    Some((count - 1) as f64 * 1_000_000_000.0 / span_ns as f64)
 }

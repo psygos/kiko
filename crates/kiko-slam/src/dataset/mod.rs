@@ -165,6 +165,18 @@ pub enum DatasetError {
         path: String,
         reason: &'static str,
     },
+    InvalidManifest {
+        reason: &'static str,
+    },
+    InvalidManifestStats {
+        field: &'static str,
+        declared: u64,
+        derived: u64,
+    },
+    ManifestCountOutOfRange {
+        field: &'static str,
+        value: u64,
+    },
     ThreadSpawn {
         source: std::io::Error,
     },
@@ -207,11 +219,26 @@ impl std::fmt::Display for DatasetError {
                 write!(f, "failed to read file {}: {}", path.display(), source)
             }
             DatasetError::InvalidConfig { msg } => {
-                write!(f, "invalid dataset writer config: {msg}")
+                write!(f, "invalid dataset config: {msg}")
             }
             DatasetError::InvalidFramePath { path, reason } => {
                 write!(f, "invalid dataset frame path {path:?}: {reason}")
             }
+            DatasetError::InvalidManifest { reason } => {
+                write!(f, "invalid dataset manifest: {reason}")
+            }
+            DatasetError::InvalidManifestStats {
+                field,
+                declared,
+                derived,
+            } => write!(
+                f,
+                "invalid dataset manifest statistic {field}: declared {declared}, derived {derived}"
+            ),
+            DatasetError::ManifestCountOutOfRange { field, value } => write!(
+                f,
+                "dataset manifest count {field}={value} exceeds the host address space"
+            ),
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
             }
@@ -249,6 +276,9 @@ impl std::error::Error for DatasetError {
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
             | DatasetError::InvalidFramePath { .. }
+            | DatasetError::InvalidManifest { .. }
+            | DatasetError::InvalidManifestStats { .. }
+            | DatasetError::ManifestCountOutOfRange { .. }
             | DatasetError::WorkerJoin { .. } => None,
         }
     }
@@ -971,10 +1001,6 @@ fn read_calibration(dataset_dir: &Path) -> Result<Calibration, DatasetError> {
         .map_err(|e| DatasetError::DeserializeJson { source: e })
 }
 
-fn scan_frames(frames_dir: &Path, width: u32, height: u32) -> Result<FrameSet, DatasetError> {
-    scan_frames_with_depth(frames_dir, width, height, None)
-}
-
 fn scan_frames_with_depth(
     frames_dir: &Path,
     width: u32,
@@ -1364,6 +1390,25 @@ mod tests {
         .expect("valid frame")
     }
 
+    fn write_exact_pairs(path: &Path, timestamps_ns: &[i64]) {
+        let (writer, handle) =
+            DatasetWriter::create(path, &meta(), &calibration()).expect("create dataset");
+        for (index, &timestamp_ns) in timestamps_ns.iter().enumerate() {
+            let left_value = u8::try_from(index.saturating_mul(2)).expect("small test fixture");
+            let right_value = left_value.saturating_add(1);
+            assert_eq!(
+                writer.write_frame(&frame(SensorId::StereoLeft, timestamp_ns, left_value)),
+                WriteOutcome::Enqueued
+            );
+            assert_eq!(
+                writer.write_frame(&frame(SensorId::StereoRight, timestamp_ns, right_value)),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish dataset");
+    }
+
     #[test]
     fn create_rejects_an_existing_dataset_path() {
         let path = unique_dataset_path("existing-path");
@@ -1424,6 +1469,98 @@ mod tests {
             .expect("one pair")
             .expect("valid pair");
         assert_eq!(pair.timestamp_delta_ns(), 0);
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_stats_follow_manifest_topology_and_sample_intervals() {
+        let path = unique_dataset_path("manifest-stats");
+        write_exact_pairs(&path, &[0, 1_000_000_000]);
+
+        for sensor in ["mono_left", "mono_right"] {
+            std::fs::write(
+                path.join(format::FRAMES_DIR)
+                    .join(format::frame_name(2_000_000_000, sensor)),
+                [0_u8; 4],
+            )
+            .expect("write unreferenced frame");
+        }
+
+        let reader = DatasetReader::open(&path).expect("open dataset");
+        let stats = reader.stats();
+        assert_eq!(stats.left_count, 2);
+        assert_eq!(stats.right_count, 2);
+        assert_eq!(stats.paired_count, 2);
+        assert_eq!(stats.left_orphan_count, 0);
+        assert_eq!(stats.right_orphan_count, 0);
+        assert_eq!(stats.left_fps, Some(1.0));
+        assert_eq!(stats.right_fps, Some(1.0));
+        assert_eq!(stats.paired_fps, Some(1.0));
+
+        std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn dataset_stats_count_explicit_pairs_and_reject_inconsistent_aggregates() {
+        let path = unique_dataset_path("manifest-orphans");
+        write_exact_pairs(&path, &[0, 1_000_000_000]);
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+        let left = manifest["entries"][1]["left"].clone();
+        manifest["entries"][1] = serde_json::json!({
+            "left": left,
+            "status": "missing_right",
+            "reason": "outside_window"
+        });
+        manifest["stats"]["paired_count"] = serde_json::json!(1);
+        manifest["stats"]["left_orphans"] = serde_json::json!(1);
+        manifest["stats"]["right_orphans"] = serde_json::json!(1);
+        manifest["stats"]["drops_by_reason"]["outside_window"] = serde_json::json!(1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize modified manifest"),
+        )
+        .expect("write modified manifest");
+
+        let mut reader = DatasetReader::open(&path).expect("open consistent orphan manifest");
+        let stats = reader.stats();
+        assert_eq!(stats.left_count, 2);
+        assert_eq!(stats.right_count, 2);
+        assert_eq!(stats.paired_count, 1);
+        assert_eq!(stats.left_orphan_count, 1);
+        assert_eq!(stats.right_orphan_count, 1);
+        assert_eq!(stats.left_fps, Some(1.0));
+        assert_eq!(stats.right_fps, None);
+        assert_eq!(stats.paired_fps, None);
+        assert_eq!(
+            reader
+                .pairs()
+                .collect::<Result<Vec<_>, DatasetError>>()
+                .expect("read manifest pairs")
+                .len(),
+            stats.paired_count
+        );
+
+        manifest["stats"]["paired_count"] = serde_json::json!(2);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize inconsistent manifest"),
+        )
+        .expect("write inconsistent manifest");
+        let error = DatasetReader::open(&path).expect_err("inconsistent aggregate must fail");
+        assert!(matches!(
+            error,
+            DatasetError::InvalidManifestStats {
+                field: "paired_count",
+                declared: 2,
+                derived: 1
+            }
+        ));
+
         std::fs::remove_dir_all(path).expect("remove test directory");
     }
 
