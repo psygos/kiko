@@ -3110,8 +3110,8 @@ impl SlamTracker {
             Some(result.inliers.len() as f32 / observations.len().max(1) as f32);
         diagnostics.pnp_observations = Some(observations.len());
         diagnostics.ransac_iterations = Some(result.iterations);
-        diagnostics.reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors);
-        diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors);
+        diagnostics.reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors)?;
+        diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors)?;
         diagnostics.parallax_px = parallax_px;
         diagnostics.covisibility = Some(covisibility);
         diagnostics.keyframe_created = keyframe_created;
