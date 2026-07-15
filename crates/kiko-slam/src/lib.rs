@@ -69,7 +69,9 @@ pub use map::{
 pub use math::{Pose64, Pose64Error, PoseNarrowingError};
 #[cfg(feature = "record")]
 pub use oak::{oak_to_depth_image, oak_to_frame};
-pub use pairing::{PairingConfigError, PairingStats, PairingWindowNs, StereoPairer};
+pub use pairing::{
+    PairingConfigError, PairingInputError, PairingStats, PairingWindowNs, StereoPairer,
+};
 pub use pipeline::{
     InferencePipeline, KeypointLimit, KeypointLimitError, PipelineError, PipelineTimingError,
     PipelineTimings, PipelineWallBreakdown,

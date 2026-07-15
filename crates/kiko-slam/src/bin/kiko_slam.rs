@@ -36,7 +36,7 @@ use kiko_slam::dataset::{
 use kiko_slam::{
     DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSendOutcome,
     DenseCommandSender, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
-    PairError, PairingConfigError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
+    PairingConfigError, PairingInputError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
     StereoPairer, SystemHealth, TrackerInitError, VizConfigError, bounded_channel,
     dense_command_channel, oak_to_depth_image, oak_to_frame,
 };
@@ -1356,8 +1356,8 @@ enum RecordCaptureError {
     Depth {
         source: DepthError,
     },
-    Pairing {
-        source: PairError,
+    PairingInput {
+        source: PairingInputError,
     },
     DatasetWrite {
         item: RecordItem,
@@ -1378,7 +1378,9 @@ impl std::fmt::Display for RecordCaptureError {
             Self::LeftImage { source } => write!(f, "left camera capture failed: {source}"),
             Self::RightImage { source } => write!(f, "right camera capture failed: {source}"),
             Self::Depth { source } => write!(f, "depth camera capture failed: {source}"),
-            Self::Pairing { source } => write!(f, "stereo pairing failed: {source}"),
+            Self::PairingInput { source } => {
+                write!(f, "stereo pairing input failed: {source}")
+            }
             Self::DatasetWrite { item, source } => {
                 write!(f, "dataset writer rejected {item}: {source}")
             }
@@ -1396,7 +1398,7 @@ impl std::error::Error for RecordCaptureError {
         match self {
             Self::LeftImage { source } | Self::RightImage { source } => Some(source),
             Self::Depth { source } => Some(source),
-            Self::Pairing { source } => Some(source),
+            Self::PairingInput { source } => Some(source),
             Self::DatasetWrite { source, .. } => Some(source),
             Self::DatasetDropped { .. } | Self::DatasetWriterFailed { .. } => None,
         }
@@ -1528,7 +1530,10 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         match device.mono_left(0) {
             Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
                 Ok(frame) => {
-                    pairer.push_left(frame);
+                    if let Err(source) = pairer.push_left(frame) {
+                        capture_error = Some(RecordCaptureError::PairingInput { source });
+                        break 'capture;
+                    }
                     left_count += 1;
                     left_seq += 1;
                     got_any = true;
@@ -1548,7 +1553,10 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             Ok(frame) => {
                 match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
                     Ok(frame) => {
-                        pairer.push_right(frame);
+                        if let Err(source) = pairer.push_right(frame) {
+                            capture_error = Some(RecordCaptureError::PairingInput { source });
+                            break 'capture;
+                        }
                         right_count += 1;
                         right_seq += 1;
                         got_any = true;
@@ -1592,12 +1600,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         loop {
             let pair = match pairer.next_pair() {
-                Ok(Some(pair)) => pair,
-                Ok(None) => break,
-                Err(source) => {
-                    capture_error = Some(RecordCaptureError::Pairing { source });
-                    break 'capture;
-                }
+                Some(pair) => pair,
+                None => break,
             };
             if let Err(err) = require_record_write(writer.write_pair(pair), RecordItem::StereoPair)
             {
@@ -2143,7 +2147,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         match device.mono_left(0) {
             Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
                 Ok(frame) => {
-                    pairer.push_left(frame);
+                    if let Err(error) = pairer.push_left(frame) {
+                        capture_error = Some(std::io::Error::other(error));
+                        break 'capture;
+                    }
                     left_seq += 1;
                     got_any = true;
                 }
@@ -2164,7 +2171,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             Ok(frame) => {
                 match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
                     Ok(frame) => {
-                        pairer.push_right(frame);
+                        if let Err(error) = pairer.push_right(frame) {
+                            capture_error = Some(std::io::Error::other(error));
+                            break 'capture;
+                        }
                         right_seq += 1;
                         got_any = true;
                     }
@@ -2209,14 +2219,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         loop {
             let pair = match pairer.next_pair() {
-                Ok(Some(pair)) => pair,
-                Ok(None) => break,
-                Err(err) => {
-                    capture_error = Some(std::io::Error::other(format!(
-                        "stereo pairing failed: {err}"
-                    )));
-                    break 'capture;
-                }
+                Some(pair) => pair,
+                None => break,
             };
             if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
                 running.store(false, Ordering::SeqCst);
