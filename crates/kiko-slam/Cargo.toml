@@ -33,5 +33,9 @@ path = "src/bin/kiko_slam.rs"
 name = "pose_graph_jacobians"
 harness = false
 
+[[bench]]
+name = "descriptor_matching"
+harness = false
+
 [lints]
 workspace = true
