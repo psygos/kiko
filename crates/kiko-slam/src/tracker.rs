@@ -2980,7 +2980,6 @@ impl SlamTracker {
             keyframe_id,
             &verified,
             current.as_ref(),
-            self.intrinsics,
         ) {
             Ok(obs) => obs,
             Err(crate::PnpError::NotEnoughPoints { .. }) => {
@@ -4020,7 +4019,6 @@ fn build_map_observations(
     keyframe_id: KeyframeId,
     matches: &Matches<Verified>,
     current: &Detections,
-    intrinsics: PinholeIntrinsics,
 ) -> Result<ResolvedMapObservations, crate::PnpError> {
     let mut observations = Vec::with_capacity(matches.len());
     let mut match_indices = Vec::with_capacity(matches.len());
@@ -4043,7 +4041,7 @@ fn build_map_observations(
             .point(point_id)
             .ok_or(crate::map::MapError::MapPointNotFound(point_id))?;
         let pixel = current.keypoints()[ci];
-        let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
+        let obs = crate::Observation::try_new(point.position(), pixel)?;
         observations.push(obs);
         match_indices.push(match_index);
     }
@@ -4823,19 +4821,8 @@ mod tests {
             vec![1.0; 5],
         )
         .expect("verified matches");
-        let intrinsics = PinholeIntrinsics::try_from(&crate::dataset::CameraIntrinsics {
-            fx: 200.0,
-            fy: 200.0,
-            cx: 160.0,
-            cy: 120.0,
-            width: 320,
-            height: 240,
-        })
-        .expect("intrinsics");
-
-        let batch =
-            build_map_observations(&map, keyframe_id, &matches, current.as_ref(), intrinsics)
-                .expect("resolved observations");
+        let batch = build_map_observations(&map, keyframe_id, &matches, current.as_ref())
+            .expect("resolved observations");
 
         assert_eq!(batch.observations.len(), 4);
         assert_eq!(batch.match_indices, vec![1, 2, 3, 4]);
@@ -4855,7 +4842,6 @@ mod tests {
                 foreign_keyframe,
                 &matches,
                 current.as_ref(),
-                intrinsics,
             ),
             Err(crate::PnpError::Map(
                 crate::map::MapError::KeyframeNotFound(id)
@@ -6225,7 +6211,6 @@ mod tests {
                 crate::Observation::try_new(
                     Point3::new(0.0, 0.0, depth),
                     Keypoint { x: 0.0, y: 0.0 },
-                    intrinsics,
                 )
                 .expect("finite observation")
             })
@@ -6260,15 +6245,11 @@ mod tests {
         let extreme_visible = crate::Observation::try_new(
             Point3::new(f32::MAX, 0.0, f32::from_bits(1)),
             Keypoint { x: 0.0, y: 0.0 },
-            extreme_intrinsics,
         )
         .expect("visible extreme observation");
-        let hidden = crate::Observation::try_new(
-            Point3::new(0.0, 0.0, -1.0),
-            Keypoint { x: 0.0, y: 0.0 },
-            extreme_intrinsics,
-        )
-        .expect("hidden observation");
+        let hidden =
+            crate::Observation::try_new(Point3::new(0.0, 0.0, -1.0), Keypoint { x: 0.0, y: 0.0 })
+                .expect("hidden observation");
         let partial = [
             extreme_visible,
             extreme_visible,
@@ -6454,16 +6435,18 @@ mod tests {
         }
 
         let error = SlamTracker::classify_relocalization_verification_failure(
-            LoopVerificationError::PnpFailed(crate::PnpError::Degenerate {
-                message: "invalid map geometry",
+            LoopVerificationError::PnpFailed(crate::PnpError::Numerical {
+                operation: "testing relocalization classification",
+                value: f64::MAX,
             }),
         )
         .expect_err("non-solver PnP errors must propagate");
 
         assert!(matches!(
             error,
-            TrackerError::Pnp(crate::PnpError::Degenerate {
-                message: "invalid map geometry"
+            TrackerError::Pnp(crate::PnpError::Numerical {
+                operation: "testing relocalization classification",
+                value: f64::MAX,
             })
         ));
     }

@@ -1248,15 +1248,10 @@ fn verify_pose_from_keyframe(
             .ok_or(LoopVerificationError::InvariantViolation(
                 "descriptor correspondence references a missing map point",
             ))?;
-        let obs = Observation::try_new(point.position(), pixel, intrinsics)
+        let obs = Observation::try_new(point.position(), pixel)
+            .map_err(PnpError::from)
             .map_err(LoopVerificationError::PnpFailed)?;
         observations.push(obs);
-    }
-
-    if observations.len() < MIN_PNP_POINTS {
-        return Err(LoopVerificationError::TooFewMatches {
-            count: observations.len(),
-        });
     }
 
     let pnp_min_inliers = ransac_config

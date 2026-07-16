@@ -9,6 +9,10 @@ use crate::{
 
 const POSE_ROTATION_VALIDATION_TOLERANCE: f64 = 1e-6;
 
+/// Finite pinhole projection coefficients, expressed in pixels.
+///
+/// Camera coordinates follow the image convention used throughout Kiko: `+x`
+/// points right, `+y` points down, and `+z` points forward.
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {
     fx: f32,
@@ -102,11 +106,43 @@ impl PinholeIntrinsics {
     }
 }
 
+/// A finite correspondence between a world-frame point and an image pixel.
+///
+/// This type is deliberately calibration-neutral. A PnP solve applies one
+/// authoritative [`PinholeIntrinsics`] value to every observation, so a ray
+/// cannot be generated with one camera model and scored with another.
 #[derive(Clone, Copy, Debug)]
 pub struct Observation {
     world: WorldPoint3,
     pixel: Keypoint,
-    bearing: [f32; 3],
+}
+
+/// Failure to parse weakly typed coordinates into an [`Observation`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ObservationError {
+    InvalidWorldPoint(crate::Point3Error),
+    NonFinitePixel { axis: usize, value: f32 },
+}
+
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidWorldPoint(err) => write!(f, "invalid observation world point: {err}"),
+            Self::NonFinitePixel { axis, value } => write!(
+                f,
+                "observation pixel coordinate on axis {axis} must be finite, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidWorldPoint(err) => Some(err),
+            Self::NonFinitePixel { .. } => None,
+        }
+    }
 }
 
 impl Observation {
@@ -118,31 +154,16 @@ impl Observation {
         self.pixel
     }
 
-    pub fn bearing(&self) -> [f32; 3] {
-        self.bearing
-    }
-
-    pub fn try_new(
-        world: WorldPoint3,
-        pixel: Keypoint,
-        intrinsics: PinholeIntrinsics,
-    ) -> Result<Self, PnpError> {
-        if !world.x.is_finite()
-            || !world.y.is_finite()
-            || !world.z.is_finite()
-            || !pixel.x.is_finite()
-            || !pixel.y.is_finite()
-        {
-            return Err(PnpError::Degenerate {
-                message: "observation coordinates must be finite",
-            });
+    pub fn try_new(world: WorldPoint3, pixel: Keypoint) -> Result<Self, ObservationError> {
+        let world = world
+            .validate()
+            .map_err(ObservationError::InvalidWorldPoint)?;
+        for (axis, value) in [pixel.x, pixel.y].into_iter().enumerate() {
+            if !value.is_finite() {
+                return Err(ObservationError::NonFinitePixel { axis, value });
+            }
         }
-        let bearing = normalize_bearing(pixel, intrinsics)?;
-        Ok(Self {
-            world,
-            pixel,
-            bearing,
-        })
+        Ok(Self { world, pixel })
     }
 }
 
@@ -576,8 +597,14 @@ impl Default for RansacConfig {
 
 #[derive(Debug)]
 pub struct PnpResult {
+    /// Estimated transform from the observations' world frame into the camera frame.
+    /// Translation uses the same length unit as the supplied world points.
     pub pose: WorldToCamera,
+    /// Zero-based indices into the exact observation slice passed to
+    /// [`solve_pnp_ransac`].
     pub inliers: Vec<usize>,
+    /// Three-point RANSAC sampling iterations performed. The current
+    /// fixed-budget solver always reports [`RansacConfig::max_iterations`].
     pub iterations: usize,
 }
 
@@ -596,9 +623,7 @@ pub enum PnpError {
     MissingLandmark {
         keyframe_index: usize,
     },
-    Degenerate {
-        message: &'static str,
-    },
+    Observation(ObservationError),
     Numerical {
         operation: &'static str,
         value: f64,
@@ -627,7 +652,7 @@ impl std::fmt::Display for PnpError {
                 f,
                 "pnp match references missing landmark for keyframe index {keyframe_index}"
             ),
-            PnpError::Degenerate { message } => write!(f, "pnp degenerate input: {message}"),
+            PnpError::Observation(err) => write!(f, "invalid pnp observation: {err}"),
             PnpError::Numerical { operation, value } => write!(
                 f,
                 "pnp numerical failure while {operation}: {value} is not representable as a finite f32"
@@ -642,10 +667,17 @@ impl std::fmt::Display for PnpError {
 impl std::error::Error for PnpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Observation(err) => Some(err),
             Self::Map(err) => Some(err),
             Self::Transform(err) => Some(err),
             _ => None,
         }
+    }
+}
+
+impl From<ObservationError> for PnpError {
+    fn from(error: ObservationError) -> Self {
+        Self::Observation(error)
     }
 }
 
@@ -661,11 +693,11 @@ impl From<TransformError> for PnpError {
     }
 }
 
+/// Build finite, calibration-neutral correspondences in verified-match order.
 pub fn build_observations(
     keyframe: &Keyframe,
     matches: &Matches<Verified>,
     keyframe_to_world: CameraToWorld,
-    intrinsics: PinholeIntrinsics,
 ) -> Result<Vec<Observation>, PnpError> {
     let current = matches.source_a();
     if current.is_empty() || keyframe.landmarks().is_empty() {
@@ -701,12 +733,17 @@ pub fn build_observations(
             .landmark_for_detection(ki)
             .ok_or(PnpError::MissingLandmark { keyframe_index: ki })?;
         let world = keyframe_to_world.try_transform_point(camera)?;
-        observations.push(Observation::try_new(world, pixel, intrinsics)?);
+        observations.push(Observation::try_new(world, pixel)?);
     }
 
     Ok(observations)
 }
 
+/// Estimate one world-to-camera pose from finite 2D-3D correspondences.
+///
+/// `intrinsics` is the sole camera model used both to construct P3P rays and
+/// to score pixel reprojection residuals. Returned inlier indices refer to
+/// `observations`.
 pub fn solve_pnp_ransac(
     observations: &[Observation],
     intrinsics: PinholeIntrinsics,
@@ -725,6 +762,8 @@ pub fn solve_pnp_ransac(
         });
     }
 
+    let problem = CalibratedPnpProblem::parse(observations, intrinsics);
+
     let mut rng = XorShift64::new(config.seed);
     let mut best_pose = None;
     // Grow lazily so degenerate inputs do not reserve two full observation-sized buffers before
@@ -741,17 +780,16 @@ pub fn solve_pnp_ransac(
         let sample = sample_three(&mut rng, total);
         let Some([a, b, c]) = sample else { continue };
 
-        let obs = [&observations[a], &observations[b], &observations[c]];
-        let candidates = p3p_solutions(obs);
+        let candidates = p3p_solutions(problem.sample([a, b, c]));
         if candidates.is_empty() {
             continue;
         }
 
         for pose in candidates {
             candidate_inliers.clear();
-            for (idx, obs) in observations.iter().enumerate() {
+            for idx in 0..problem.len() {
                 if let ReprojectionOutcome::Projected(residual) =
-                    reprojection_residual_px(pose, obs, intrinsics)
+                    problem.reprojection_residual_px(pose, idx)
                     && residual.is_within_threshold(threshold)
                 {
                     candidate_inliers.push(idx);
@@ -777,6 +815,7 @@ pub fn solve_pnp_ransac(
     })
 }
 
+/// Build correspondences from verified matches and estimate their pose.
 pub fn solve_pnp(
     keyframe: &Keyframe,
     matches: &Matches<Verified>,
@@ -784,29 +823,88 @@ pub fn solve_pnp(
     intrinsics: PinholeIntrinsics,
     config: RansacConfig,
 ) -> Result<PnpResult, PnpError> {
-    let observations = build_observations(keyframe, matches, keyframe_to_world, intrinsics)?;
+    let observations = build_observations(keyframe, matches, keyframe_to_world)?;
     solve_pnp_ransac(&observations, intrinsics, config)
 }
 
-fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
-    let x = (f64::from(pixel.x) - f64::from(intrinsics.cx())) / f64::from(intrinsics.fx());
-    let y = (f64::from(pixel.y) - f64::from(intrinsics.cy())) / f64::from(intrinsics.fy());
-    let norm = x.hypot(y).hypot(1.0);
-    if !norm.is_finite() || norm <= 0.0 {
-        return Err(PnpError::Degenerate {
-            message: "bearing coordinates must be finite",
-        });
+#[derive(Clone, Copy, Debug)]
+struct UnitBearing([f64; 3]);
+
+impl UnitBearing {
+    fn from_pixel(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Self {
+        let x = (f64::from(pixel.x) - f64::from(intrinsics.cx())) / f64::from(intrinsics.fx());
+        let y = (f64::from(pixel.y) - f64::from(intrinsics.cy())) / f64::from(intrinsics.fy());
+        let norm = x.hypot(y).hypot(1.0);
+
+        // Pixel coordinates and intrinsics have already been parsed as finite
+        // f32 values and both focal lengths are positive. Their largest
+        // possible quotient is below 2^279, so `norm` is finite and at least
+        // one; the normalized forward component is therefore strictly positive.
+        debug_assert!(norm.is_finite() && norm >= 1.0);
+        let bearing = [x / norm, y / norm, 1.0 / norm];
+        debug_assert!(bearing.into_iter().all(f64::is_finite));
+        debug_assert!(bearing[2] > 0.0);
+        Self(bearing)
     }
-    Ok([(x / norm) as f32, (y / norm) as f32, (1.0 / norm) as f32])
+
+    fn into_array(self) -> [f64; 3] {
+        self.0
+    }
 }
 
-fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
-    let p1 = vec3_from_world_point(obs[0].world);
-    let p2 = vec3_from_world_point(obs[1].world);
-    let p3 = vec3_from_world_point(obs[2].world);
-    let f1 = vec3_from_bearing(obs[0].bearing);
-    let f2 = vec3_from_bearing(obs[1].bearing);
-    let f3 = vec3_from_bearing(obs[2].bearing);
+struct CalibratedPnpProblem<'a> {
+    observations: &'a [Observation],
+    bearings: Vec<UnitBearing>,
+    intrinsics: PinholeIntrinsics,
+}
+
+impl<'a> CalibratedPnpProblem<'a> {
+    fn parse(observations: &'a [Observation], intrinsics: PinholeIntrinsics) -> Self {
+        let bearings = observations
+            .iter()
+            .map(|observation| UnitBearing::from_pixel(observation.pixel, intrinsics))
+            .collect();
+        Self {
+            observations,
+            bearings,
+            intrinsics,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.observations.len()
+    }
+
+    fn sample(&self, indices: [usize; 3]) -> [CalibratedPnpObservation<'_>; 3] {
+        indices.map(|index| CalibratedPnpObservation {
+            observation: &self.observations[index],
+            bearing: self.bearings[index],
+        })
+    }
+
+    fn reprojection_residual_px(&self, pose: Pose, index: usize) -> ReprojectionOutcome {
+        reprojection_residual_px(pose, &self.observations[index], self.intrinsics)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CalibratedPnpObservation<'a> {
+    observation: &'a Observation,
+    bearing: UnitBearing,
+}
+
+#[cfg(test)]
+fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> [f64; 3] {
+    UnitBearing::from_pixel(pixel, intrinsics).into_array()
+}
+
+fn p3p_solutions(obs: [CalibratedPnpObservation<'_>; 3]) -> Vec<Pose> {
+    let p1 = vec3_from_world_point(obs[0].observation.world);
+    let p2 = vec3_from_world_point(obs[1].observation.world);
+    let p3 = vec3_from_world_point(obs[2].observation.world);
+    let f1 = obs[0].bearing.into_array();
+    let f2 = obs[1].bearing.into_array();
+    let f3 = obs[2].bearing.into_array();
 
     // Compute the scene scale in f64 before normalization. Squaring f32 world
     // coordinates here used to overflow above roughly 1e19 and underflow below
@@ -821,9 +919,8 @@ fn p3p_solutions(obs: [&Observation; 3]) -> Vec<Pose> {
         return Vec::new();
     };
 
-    // Bearings are parsed from finite pixels and normalized before storage.
-    // Clamp their f64 dot products to the cosine domain to absorb only the
-    // final f32 storage rounding at that boundary.
+    // Bearings are parsed once from finite pixels and normalized in f64.
+    // Clamp their dot products to absorb only the final f64 rounding.
     let cos_alpha = dot(f2, f3).clamp(-1.0, 1.0);
     let cos_beta = dot(f1, f3).clamp(-1.0, 1.0);
     let cos_gamma = dot(f1, f2).clamp(-1.0, 1.0);
@@ -1551,10 +1648,6 @@ fn vec3_from_world_point(point: WorldPoint3) -> [f64; 3] {
     [f64::from(point.x), f64::from(point.y), f64::from(point.z)]
 }
 
-fn vec3_from_bearing(bearing: [f32; 3]) -> [f64; 3] {
-    bearing.map(f64::from)
-}
-
 fn vec3_from_f32(vector: [f32; 3]) -> [f64; 3] {
     vector.map(f64::from)
 }
@@ -1713,9 +1806,12 @@ mod tests {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
         let pixel = Keypoint { x: 369.0, y: 211.0 };
-        let b = normalize_bearing(pixel, intrinsics).expect("bearing");
+        let b = normalize_bearing(pixel, intrinsics);
         let n = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
-        assert!((n - 1.0).abs() < 1e-6, "bearing norm must be 1, got {n}");
+        assert!(
+            (n - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "bearing norm must be 1, got {n}"
+        );
     }
 
     #[test]
@@ -1735,17 +1831,16 @@ mod tests {
             y: -f32::MAX,
         };
 
-        let bearing = normalize_bearing(pixel, intrinsics).expect("finite bearing");
-        assert!(bearing.into_iter().all(f32::is_finite));
-        let norm = f64::from(bearing[0])
-            .hypot(f64::from(bearing[1]))
-            .hypot(f64::from(bearing[2]));
+        let bearing = normalize_bearing(pixel, intrinsics);
+        assert!(bearing.into_iter().all(f64::is_finite));
+        let norm = bearing[0].hypot(bearing[1]).hypot(bearing[2]);
         assert!(
-            (norm - 1.0).abs() <= 2.0 * f64::from(f32::EPSILON),
-            "narrowed bearing norm must remain one, got {norm}"
+            (norm - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "bearing norm must remain one, got {norm}"
         );
         assert!(bearing[0].is_sign_positive());
         assert!(bearing[1].is_sign_negative());
+        assert!(bearing[2] > 0.0);
     }
 
     #[test]
@@ -1753,15 +1848,129 @@ mod tests {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 100.0, 100.0, 320.0, 240.0).expect("intrinsics");
 
-        let center =
-            normalize_bearing(Keypoint { x: 320.0, y: 240.0 }, intrinsics).expect("center bearing");
+        let center = normalize_bearing(Keypoint { x: 320.0, y: 240.0 }, intrinsics);
         assert_eq!(center, [0.0, 0.0, 1.0]);
 
-        let left_and_down = normalize_bearing(Keypoint { x: 220.0, y: 340.0 }, intrinsics)
-            .expect("off-center bearing");
+        let left_and_down = normalize_bearing(Keypoint { x: 220.0, y: 340.0 }, intrinsics);
         assert!(left_and_down[0].is_sign_negative());
         assert!(left_and_down[1].is_sign_positive());
         assert!(left_and_down[2].is_sign_positive());
+    }
+
+    #[test]
+    fn normalize_bearing_preserves_distinct_extreme_finite_rays() {
+        let tiny = f32::from_bits(1);
+        let intrinsics =
+            make_pinhole_intrinsics(5, 5, f32::MAX, tiny, 0.0, 0.0).expect("intrinsics");
+        let first = normalize_bearing(Keypoint { x: tiny, y: 4.0 }, intrinsics);
+        let second = normalize_bearing(
+            Keypoint {
+                x: 2.0 * tiny,
+                y: 4.0,
+            },
+            intrinsics,
+        );
+
+        assert!(first.into_iter().all(f64::is_finite));
+        assert!(second.into_iter().all(f64::is_finite));
+        assert!(first[0] > 0.0);
+        assert!(second[0] > first[0]);
+        assert!(first[2] > 0.0 && second[2] > 0.0);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn normalize_bearing_is_finite_unit_and_forward_over_f32_extremes() {
+        let focal_values = [f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX];
+        let coordinate_values = [-f32::MAX, -0.0, 0.0, f32::from_bits(1), f32::MAX];
+
+        for fx in focal_values {
+            for fy in focal_values {
+                for cx in coordinate_values {
+                    for cy in coordinate_values {
+                        let intrinsics = make_pinhole_intrinsics(1, 1, fx, fy, cx, cy)
+                            .expect("finite positive intrinsics");
+                        for x in coordinate_values {
+                            for y in coordinate_values {
+                                let bearing = normalize_bearing(Keypoint { x, y }, intrinsics);
+                                assert!(bearing.into_iter().all(f64::is_finite));
+                                assert!(bearing[2] > 0.0);
+                                let norm = bearing[0].hypot(bearing[1]).hypot(bearing[2]);
+                                assert!(
+                                    (norm - 1.0).abs() <= 4.0 * f64::EPSILON,
+                                    "fx={fx} fy={fy} cx={cx} cy={cy} x={x} y={y} norm={norm}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observation_reports_the_exact_invalid_coordinate() {
+        let valid_world = WorldPoint3::new(1.0, 2.0, 3.0);
+        for (axis, value) in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .enumerate()
+        {
+            let mut coordinates = valid_world.to_array();
+            coordinates[axis] = value;
+            assert!(matches!(
+                Observation::try_new(
+                    WorldPoint3::from_array(coordinates),
+                    Keypoint { x: 4.0, y: 5.0 },
+                ),
+                Err(ObservationError::InvalidWorldPoint(
+                    crate::Point3Error::NonFinite {
+                        axis: error_axis,
+                        value: error_value,
+                    }
+                )) if error_axis == axis && error_value.to_bits() == value.to_bits()
+            ));
+        }
+
+        for (axis, value) in [f32::NAN, f32::INFINITY].into_iter().enumerate() {
+            let mut pixel = Keypoint { x: 4.0, y: 5.0 };
+            if axis == 0 {
+                pixel.x = value;
+            } else {
+                pixel.y = value;
+            }
+            assert!(matches!(
+                Observation::try_new(valid_world, pixel),
+                Err(ObservationError::NonFinitePixel {
+                    axis: error_axis,
+                    value: error_value,
+                }) if error_axis == axis && error_value.to_bits() == value.to_bits()
+            ));
+        }
+    }
+
+    #[test]
+    fn calibrated_problem_binds_bearing_and_scoring_to_one_camera_model() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 200.0, 200.0, 320.0, 240.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            WorldPoint3::new(1.0, 0.0, 2.0),
+            Keypoint { x: 420.0, y: 240.0 },
+        )
+        .expect("finite observation");
+        let observations = [observation];
+        let problem = CalibratedPnpProblem::parse(&observations, intrinsics);
+        let bearing = problem.bearings[0].into_array();
+
+        assert!((bearing[0] - 0.5_f64 / 1.25_f64.sqrt()).abs() < 4.0 * f64::EPSILON);
+        assert_eq!(bearing[1].to_bits(), 0.0_f64.to_bits());
+        assert!((bearing[2] - 1.0_f64 / 1.25_f64.sqrt()).abs() < 4.0 * f64::EPSILON);
+        let ReprojectionOutcome::Projected(residual) =
+            problem.reprojection_residual_px(Pose::identity(), 0)
+        else {
+            panic!("positive-depth observation must project");
+        };
+        assert_eq!(residual.dx_px.to_bits(), 0.0_f64.to_bits());
+        assert_eq!(residual.dy_px.to_bits(), 0.0_f64.to_bits());
     }
 
     #[test]
@@ -1778,8 +1987,6 @@ mod tests {
 
     #[test]
     fn build_observations_rejects_nonfinite_transformed_landmarks() {
-        let intrinsics =
-            make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
         let keypoints = vec![
             Keypoint { x: 10.0, y: 10.0 },
             Keypoint { x: 20.0, y: 20.0 },
@@ -1825,7 +2032,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            build_observations(&keyframe, &matches, keyframe_to_world, intrinsics),
+            build_observations(&keyframe, &matches, keyframe_to_world),
             Err(PnpError::Transform(
                 TransformError::OutputNotRepresentable { axis: 0, value }
             )) if value > f64::from(f32::MAX)
@@ -2041,12 +2248,8 @@ mod tests {
             let observations: Vec<_> = world
                 .iter()
                 .map(|&point| {
-                    Observation::try_new(
-                        point,
-                        project_pixel_from_pose(pose, point, intrinsics),
-                        intrinsics,
-                    )
-                    .expect("finite scale-invariance observation")
+                    Observation::try_new(point, project_pixel_from_pose(pose, point, intrinsics))
+                        .expect("finite scale-invariance observation")
                 })
                 .collect();
             let result = solve_pnp_ransac(&observations, intrinsics, config)
@@ -2080,8 +2283,7 @@ mod tests {
                 pixel.x += 120.0;
                 pixel.y -= 85.0;
             }
-            with_outliers
-                .push(Observation::try_new(obs.world(), pixel, intrinsics).expect("observation"));
+            with_outliers.push(Observation::try_new(obs.world(), pixel).expect("observation"));
         }
 
         let config = RansacConfig::try_new(1000, 2.0, 14, 0x1337).expect("config");
@@ -2116,7 +2318,6 @@ mod tests {
                     z: 3.0,
                 },
                 Keypoint { x: 320.0, y: 240.0 },
-                intrinsics,
             )
             .expect("obs"),
             Observation::try_new(
@@ -2126,7 +2327,6 @@ mod tests {
                     z: 3.5,
                 },
                 Keypoint { x: 342.0, y: 252.0 },
-                intrinsics,
             )
             .expect("obs"),
             Observation::try_new(
@@ -2136,7 +2336,6 @@ mod tests {
                     z: 2.9,
                 },
                 Keypoint { x: 290.0, y: 266.0 },
-                intrinsics,
             )
             .expect("obs"),
         ];
@@ -2232,7 +2431,7 @@ mod tests {
             z: 4.2,
         };
         let pixel = project_pixel_from_pose(pose, point, intrinsics);
-        let observation = Observation::try_new(point, pixel, intrinsics).expect("observation");
+        let observation = Observation::try_new(point, pixel).expect("observation");
         let residual = expect_projected_residual(pose, &observation, intrinsics);
         let error_sq = residual
             .dx_px
@@ -2263,24 +2462,12 @@ mod tests {
     fn reprojection_metrics_count_nonpositive_depth_separately() {
         let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
         let observations = [
-            Observation::try_new(
-                Point3::new(0.0, 0.0, 1.0),
-                Keypoint { x: -3.0, y: 0.0 },
-                intrinsics,
-            )
-            .expect("three-pixel observation"),
-            Observation::try_new(
-                Point3::new(0.0, 0.0, -1.0),
-                Keypoint { x: 0.0, y: 0.0 },
-                intrinsics,
-            )
-            .expect("nonpositive-depth observation"),
-            Observation::try_new(
-                Point3::new(0.0, 0.0, 1.0),
-                Keypoint { x: -4.0, y: 0.0 },
-                intrinsics,
-            )
-            .expect("four-pixel observation"),
+            Observation::try_new(Point3::new(0.0, 0.0, 1.0), Keypoint { x: -3.0, y: 0.0 })
+                .expect("three-pixel observation"),
+            Observation::try_new(Point3::new(0.0, 0.0, -1.0), Keypoint { x: 0.0, y: 0.0 })
+                .expect("nonpositive-depth observation"),
+            Observation::try_new(Point3::new(0.0, 0.0, 1.0), Keypoint { x: -4.0, y: 0.0 })
+                .expect("four-pixel observation"),
         ];
 
         assert_eq!(
@@ -2310,12 +2497,11 @@ mod tests {
         assert_eq!(empty_metrics.projected_count(), 0);
         assert_eq!(empty_metrics.not_in_front_count(), 0);
 
-        let not_in_front = [Observation::try_new(
-            Point3::new(0.0, 0.0, 0.0),
-            Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
-        )
-        .expect("zero-depth observation")];
+        let not_in_front =
+            [
+                Observation::try_new(Point3::new(0.0, 0.0, 0.0), Keypoint { x: 0.0, y: 0.0 })
+                    .expect("zero-depth observation"),
+            ];
         let hidden_metrics = reprojection_metrics(&Pose::identity(), &not_in_front, intrinsics);
         assert_eq!(hidden_metrics.rmse_px(), None);
         assert_eq!(hidden_metrics.max_px(), None);
@@ -2333,7 +2519,6 @@ mod tests {
                     x: -error_px,
                     y: 0.0,
                 },
-                intrinsics,
             )
             .expect("finite error observation")
         };
@@ -2372,7 +2557,6 @@ mod tests {
                     x: -f32::MAX,
                     y: 0.0,
                 },
-                intrinsics,
             )
             .expect("first extreme observation"),
             Observation::try_new(
@@ -2381,7 +2565,6 @@ mod tests {
                     x: -f32::MAX,
                     y: 0.0,
                 },
-                intrinsics,
             )
             .expect("second extreme observation"),
         ];
@@ -2438,7 +2621,6 @@ mod tests {
                 z: f32::from_bits(1),
             },
             Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
         )
         .expect("finite observation");
 
@@ -2485,7 +2667,7 @@ mod tests {
             .map(|&point| {
                 let mut pixel = project_pixel_from_pose(pose, point, intrinsics);
                 pixel.x += 2.0;
-                Observation::try_new(point, pixel, intrinsics).expect("observation")
+                Observation::try_new(point, pixel).expect("observation")
             })
             .collect();
         let metrics = reprojection_metrics(&pose, &observations, intrinsics);
@@ -2508,7 +2690,6 @@ mod tests {
                     z: 2.5,
                 },
                 Keypoint { x: 300.0, y: 240.0 },
-                intrinsics,
             )
             .expect("observation"),
             Observation::try_new(
@@ -2518,7 +2699,6 @@ mod tests {
                     z: 3.0,
                 },
                 Keypoint { x: 340.0, y: 240.0 },
-                intrinsics,
             )
             .expect("observation"),
         ];
@@ -2543,7 +2723,6 @@ mod tests {
         let observation = Observation::try_new(
             Point3::new(-f32::MAX, f32::MAX, 1.0),
             Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
         )
         .expect("observation");
 
@@ -2573,8 +2752,8 @@ mod tests {
             vec3_from_world_point(point),
         );
         let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
-        let observation = Observation::try_new(point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
-            .expect("observation");
+        let observation =
+            Observation::try_new(point, Keypoint { x: 0.0, y: 0.0 }).expect("observation");
 
         assert!((camera[2] - f64::from(inverse_sqrt_3)).abs() < f64::EPSILON);
         assert!(matches!(
@@ -2597,7 +2776,6 @@ mod tests {
                 x: observed_x_px,
                 y: 0.0,
             },
-            intrinsics,
         )
         .expect("observation");
 
@@ -2625,7 +2803,6 @@ mod tests {
                 x: observed_x_px,
                 y: 0.0,
             },
-            intrinsics,
         )
         .expect("observation");
 
@@ -2651,7 +2828,6 @@ mod tests {
                 x: camera_x_m,
                 y: 0.0,
             },
-            intrinsics,
         )
         .expect("observation");
 
@@ -2679,7 +2855,6 @@ mod tests {
                 x: f32::MAX,
                 y: 0.0,
             },
-            intrinsics,
         )
         .expect("observation");
         let camera = transform_point(
@@ -2705,7 +2880,6 @@ mod tests {
         let observation = Observation::try_new(
             Point3::new(f32::MAX, 0.0, tiny),
             Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
         )
         .expect("observation");
 
@@ -2753,7 +2927,6 @@ mod tests {
         let observation = Observation::try_new(
             Point3::new(0.0, tiny, f32::MAX),
             Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
         )
         .expect("observation");
         let residual = expect_projected_residual(Pose::identity(), &observation, intrinsics);

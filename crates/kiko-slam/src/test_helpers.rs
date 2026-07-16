@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
     CameraPoint3, Descriptor, DetectionError, Detections, FrameId, IntrinsicsError, Keypoint,
-    MatchError, Matches, Observation, PinholeIntrinsics, PnpError, Point3, Pose, Raw,
+    MatchError, Matches, Observation, ObservationError, PinholeIntrinsics, Point3, Pose, Raw,
     RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, SensorId, Timestamp, math,
 };
 
@@ -15,7 +15,7 @@ pub(crate) enum TestHelperError {
     InvalidRectifiedStereo(RectifiedStereoError),
     InvalidDetections(DetectionError),
     InvalidMatches(MatchError),
-    Observation(PnpError),
+    Observation(ObservationError),
     NonPositiveSpacing { spacing: f32 },
     NonPositiveDepth { depth: f32 },
 }
@@ -64,8 +64,8 @@ impl From<MatchError> for TestHelperError {
     }
 }
 
-impl From<PnpError> for TestHelperError {
-    fn from(value: PnpError) -> Self {
+impl From<ObservationError> for TestHelperError {
+    fn from(value: ObservationError) -> Self {
         Self::Observation(value)
     }
 }
@@ -191,7 +191,7 @@ pub(crate) fn observations_from_projection(
     let mut observations = Vec::new();
     for point in points_world {
         if let Some(pixel) = project_world_point(pose_world_to_camera, *point, intrinsics) {
-            observations.push(Observation::try_new(*point, pixel, intrinsics)?);
+            observations.push(Observation::try_new(*point, pixel)?);
         }
     }
     Ok(observations)

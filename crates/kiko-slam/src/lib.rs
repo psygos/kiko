@@ -79,9 +79,9 @@ pub use pipeline::{
     PipelineTimings, PipelineWallBreakdown,
 };
 pub use pnp::{
-    CameraToWorld, IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose,
-    PoseError, RansacConfig, RansacConfigError, Transform, TransformError, WorldToCamera,
-    build_observations, solve_pnp, solve_pnp_ransac,
+    CameraToWorld, IntrinsicsError, Observation, ObservationError, PinholeIntrinsics, PnpError,
+    PnpResult, Pose, PoseError, RansacConfig, RansacConfigError, Transform, TransformError,
+    WorldToCamera, build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,

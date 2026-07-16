@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use crate::{
-    Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
+    Keypoint, Observation, ObservationError, PinholeIntrinsics, Point3, Pose,
     map::{KeyframeId, KeyframeKeypoint, MapError, MapPointId, SlamMap},
     math,
 };
@@ -464,7 +464,7 @@ impl std::error::Error for ObservationSetError {}
 pub enum LocalBaError {
     ObservationSet(ObservationSetError),
     Map(MapError),
-    Pnp(crate::PnpError),
+    Observation(ObservationError),
     Pose(crate::PoseError),
     MissingMapPointAssociation {
         keyframe_id: KeyframeId,
@@ -485,7 +485,7 @@ impl std::fmt::Display for LocalBaError {
         match self {
             Self::ObservationSet(err) => write!(f, "invalid BA observation set: {err}"),
             Self::Map(err) => write!(f, "BA map access failed: {err}"),
-            Self::Pnp(err) => write!(f, "BA observation parsing failed: {err}"),
+            Self::Observation(err) => write!(f, "BA observation parsing failed: {err}"),
             Self::Pose(err) => write!(f, "BA pose update failed: {err}"),
             Self::MissingMapPointAssociation {
                 keyframe_id,
@@ -511,7 +511,7 @@ impl std::error::Error for LocalBaError {
         match self {
             Self::ObservationSet(err) => Some(err),
             Self::Map(err) => Some(err),
-            Self::Pnp(err) => Some(err),
+            Self::Observation(err) => Some(err),
             Self::Pose(err) => Some(err),
             Self::MissingMapPointAssociation { .. }
             | Self::InsufficientUsableObservations { .. }
@@ -533,9 +533,9 @@ impl From<MapError> for LocalBaError {
     }
 }
 
-impl From<crate::PnpError> for LocalBaError {
-    fn from(err: crate::PnpError) -> Self {
-        Self::Pnp(err)
+impl From<ObservationError> for LocalBaError {
+    fn from(err: ObservationError) -> Self {
+        Self::Observation(err)
     }
 }
 
@@ -594,7 +594,6 @@ impl ObservationSet {
     fn resolve(
         &self,
         map: &SlamMap,
-        intrinsics: PinholeIntrinsics,
         min_required: NonZeroUsize,
     ) -> Result<ResolvedObservationSet, LocalBaError> {
         let mut resolved = Vec::with_capacity(self.observations.len());
@@ -610,7 +609,7 @@ impl ObservationSet {
                 .point(point_id)
                 .ok_or(MapError::MapPointNotFound(point_id))?
                 .position();
-            resolved.push(Observation::try_new(world, obs.pixel(), intrinsics)?);
+            resolved.push(Observation::try_new(world, obs.pixel())?);
         }
         if resolved.len() < min_required.get() {
             return Err(LocalBaError::InsufficientUsableObservations {
@@ -1098,6 +1097,20 @@ impl LocalBundleAdjuster {
             return Err(LocalBaError::EmptyOptimizedWindow);
         }
 
+        // The map is immutable for this complete optimization call. Resolve
+        // map associations and parse finite correspondences once, rather than
+        // repeating the same lookups and allocations at every iteration and
+        // again during final-state validation.
+        let resolved_frames: Vec<_> = self
+            .frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .observations
+                    .resolve(map, self.config.min_observations)
+            })
+            .collect::<Result<_, _>>()?;
+
         let dim = frame_count * 6;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
@@ -1110,13 +1123,8 @@ impl LocalBundleAdjuster {
             a.fill(0.0);
             b.fill(0.0);
 
-            for (idx, frame) in self.frames.iter().enumerate() {
+            for (idx, (frame, resolved)) in self.frames.iter().zip(&resolved_frames).enumerate() {
                 let base = idx * 6;
-                let resolved = frame.observations.resolve(
-                    map,
-                    self.intrinsics,
-                    self.config.min_observations,
-                )?;
                 let mut usable_observations = 0_usize;
                 for observation in resolved.observations() {
                     let linearization = match reprojection_linearization(
@@ -1213,15 +1221,15 @@ impl LocalBundleAdjuster {
         // The last accepted step has not yet served as a linearization point. Re-check it before
         // exposing the pose so a final update cannot leave the window below its configured factor
         // support or defer a numerical failure until the next frame.
-        self.validate_final_incremental_window(map)
+        self.validate_final_incremental_window_resolved(&resolved_frames)
     }
 
-    fn validate_final_incremental_window(&self, map: &SlamMap) -> Result<(), LocalBaError> {
-        for frame in &self.frames {
-            let resolved =
-                frame
-                    .observations
-                    .resolve(map, self.intrinsics, self.config.min_observations)?;
+    fn validate_final_incremental_window_resolved(
+        &self,
+        resolved_frames: &[ResolvedObservationSet],
+    ) -> Result<(), LocalBaError> {
+        debug_assert_eq!(self.frames.len(), resolved_frames.len());
+        for (frame, resolved) in self.frames.iter().zip(resolved_frames) {
             let mut usable_observations = 0_usize;
             for observation in resolved.observations() {
                 match reprojection_linearization(
@@ -1247,6 +1255,20 @@ impl LocalBundleAdjuster {
             }
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn validate_final_incremental_window(&self, map: &SlamMap) -> Result<(), LocalBaError> {
+        let resolved_frames = self
+            .frames
+            .iter()
+            .map(|frame| {
+                frame
+                    .observations
+                    .resolve(map, self.config.min_observations)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_final_incremental_window_resolved(&resolved_frames)
     }
 
     fn optimize_full(&mut self, problem: &mut FullBaProblem) -> Result<BaResult, LocalBaError> {
@@ -2974,6 +2996,38 @@ mod tests {
     }
 
     #[test]
+    fn push_frame_preserves_observation_error_and_resets_window() {
+        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let observations = (0..ba.min_observations().get())
+            .map(|index| {
+                let keypoint = map
+                    .keyframe_keypoint(keyframe_id, index)
+                    .expect("keyframe keypoint");
+                let mut pixel = map.keypoint(keypoint).expect("pixel");
+                if index == 0 {
+                    pixel.x = f32::NAN;
+                }
+                MapObservation::new(keypoint, pixel)
+            })
+            .collect();
+        let observation_set =
+            ObservationSet::new(observations, ba.min_observations()).expect("observation set");
+
+        assert!(matches!(
+            ba.push_frame(&map, Pose::identity(), observation_set),
+            Err(LocalBaError::Observation(
+                ObservationError::NonFinitePixel {
+                    axis: 0,
+                    value,
+                }
+            )) if value.is_nan()
+        ));
+        assert!(ba.frames.is_empty());
+    }
+
+    #[test]
     fn so3_exp_log_round_trip_for_small_rotation() {
         let w = [0.18, -0.06, 0.11];
         let r = math::so3_exp(w);
@@ -4489,7 +4543,7 @@ mod tests {
         pixel.x += 1.7;
         pixel.y -= 0.9;
 
-        let obs = Observation::try_new(point, pixel, intrinsics).expect("observation");
+        let obs = Observation::try_new(point, pixel).expect("observation");
         let linearization = reprojection_linearization(pose, obs.world(), obs.pixel(), intrinsics)
             .expect("jacobian");
         let jac = linearization.pose_jacobian;
