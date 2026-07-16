@@ -54,13 +54,12 @@ impl LightGlue {
 
         self.session.run("lightglue", |session| {
             let run_options = RunOptions::new().map_err(InferenceError::Execution)?;
-            let inference = session
-                .run_async(
+            let outputs = super::run_with_watchdog("lightglue", || {
+                session.run_async(
                     ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor],
                     &run_options,
                 )
-                .map_err(InferenceError::Execution)?;
-            let outputs = super::run_with_watchdog("lightglue", inference)?;
+            })?;
         let matches_raw = outputs
             .get("matches0")
             .ok_or_else(|| InferenceError::UnexpectedOutput {

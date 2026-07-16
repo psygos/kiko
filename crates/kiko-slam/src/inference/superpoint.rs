@@ -96,10 +96,9 @@ fn run_inference(
 ) -> Result<Detections, InferenceError> {
     session.run("superpoint", |session| {
         let run_options = RunOptions::new().map_err(InferenceError::Execution)?;
-        let inference = session
-            .run_async(ort::inputs!["image" => input_tensor], &run_options)
-            .map_err(InferenceError::Execution)?;
-        let outputs = super::run_with_watchdog("superpoint", inference)?;
+        let outputs = super::run_with_watchdog("superpoint", || {
+            session.run_async(ort::inputs!["image" => input_tensor], &run_options)
+        })?;
 
         let keypoints_value =
             outputs

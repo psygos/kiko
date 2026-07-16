@@ -66,6 +66,8 @@ cargo run -p kiko-slam -- bench recordings/<name>
 - `--superpoint-model` / `KIKO_SUPERPOINT_MODEL` — custom SuperPoint ONNX path
 - `--lightglue-model` / `KIKO_LIGHTGLUE_MODEL` — custom LightGlue ONNX path
 - `KIKO_ORT_INTRA_THREADS` — ONNX intra-op threads; unset or `0` selects `max(2, available_parallelism / 2)` for CPU sessions and 2 for accelerator sessions, while an explicit count must be at least 2 because Kiko uses asynchronous inference
+- `KIKO_ORT_RUN_WARN_MS` — slow-inference warning threshold in milliseconds (default 200); `0` warns for every nonzero observed duration
+- `KIKO_ORT_RUN_TIMEOUT_MS` — strict inference deadline in milliseconds (default 5000, must be greater than zero and at least the warning threshold); successful completion observed at or after the deadline returns an error but leaves the session usable, while a run still pending at the deadline makes that session fail-stop because ONNX Runtime cancellation is nonblocking
 
 **Visualization:**
 

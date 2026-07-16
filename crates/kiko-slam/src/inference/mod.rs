@@ -83,6 +83,14 @@ pub enum InferenceError {
         model: &'static str,
         timeout_ms: u64,
     },
+    WatchdogDeadlineExceeded {
+        model: &'static str,
+        timeout_ms: u64,
+    },
+    WatchdogDeadlineUnavailable {
+        model: &'static str,
+        timeout_ms: u64,
+    },
     SessionQuarantined {
         model: &'static str,
     },
@@ -115,6 +123,8 @@ impl std::error::Error for InferenceError {
             | Self::AsyncIntraThreadCountTooSmall { .. }
             | Self::BackendUnavailable { .. }
             | Self::WatchdogTimeout { .. }
+            | Self::WatchdogDeadlineExceeded { .. }
+            | Self::WatchdogDeadlineUnavailable { .. }
             | Self::SessionQuarantined { .. }
             | Self::ThreadPanic { .. }
             | Self::InvariantViolation { .. } => None,
@@ -245,6 +255,14 @@ impl std::fmt::Display for InferenceError {
                     "ONNX inference timed out: model={model} timeout_ms={timeout_ms}"
                 )
             }
+            InferenceError::WatchdogDeadlineExceeded { model, timeout_ms } => write!(
+                f,
+                "ONNX inference completed at or after its deadline: model={model} timeout_ms={timeout_ms}"
+            ),
+            InferenceError::WatchdogDeadlineUnavailable { model, timeout_ms } => write!(
+                f,
+                "cannot represent ONNX inference deadline: model={model} timeout_ms={timeout_ms}"
+            ),
             InferenceError::SessionQuarantined { model } => {
                 write!(
                     f,
@@ -312,9 +330,22 @@ pub use lightglue::LightGlue;
 pub use superpoint::SuperPoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchdogDuration(u64);
+
+impl WatchdogDuration {
+    fn duration(self) -> Duration {
+        Duration::from_millis(self.0)
+    }
+
+    fn milliseconds(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WatchdogLimits {
-    warn_after: Duration,
-    timeout: Duration,
+    warn_after: WatchdogDuration,
+    timeout: WatchdogDuration,
 }
 
 impl WatchdogLimits {
@@ -366,7 +397,7 @@ fn checked_watchdog_duration(
     now: Instant,
     key: &str,
     milliseconds: u64,
-) -> Result<Duration, WatchdogConfigError> {
+) -> Result<WatchdogDuration, WatchdogConfigError> {
     let duration = Duration::from_millis(milliseconds);
     if now.checked_add(duration).is_none() {
         return Err(WatchdogConfigError::DurationOutOfRange {
@@ -374,7 +405,7 @@ fn checked_watchdog_duration(
             milliseconds,
         });
     }
-    Ok(duration)
+    Ok(WatchdogDuration(milliseconds))
 }
 
 std::thread_local! {
@@ -435,7 +466,10 @@ impl ManagedSession {
     }
 }
 
-pub(super) fn run_with_watchdog<T, F>(model: &'static str, future: F) -> Result<T, InferenceError>
+pub(super) fn run_with_watchdog<T, F>(
+    model: &'static str,
+    start_inference: impl FnOnce() -> Result<F, OrtError>,
+) -> Result<T, InferenceError>
 where
     F: Future<Output = Result<T, OrtError>>,
 {
@@ -445,12 +479,18 @@ where
             .ok_or(InferenceError::InvariantViolation {
                 context: "watchdog limits are unavailable outside ManagedSession::run",
             })?;
-    run_with_limits(model, limits.warn_after, limits.timeout, future)
+    run_with_limits(model, limits, start_inference)
 }
 
 struct WatchdogWake {
     ready: Mutex<bool>,
     wake: Condvar,
+}
+
+enum WatchdogRunOutcome<T> {
+    CompletedOnTime(Result<T, OrtError>),
+    CompletedLate(Result<T, OrtError>),
+    PendingAtDeadline,
 }
 
 impl Wake for WatchdogWake {
@@ -469,74 +509,102 @@ impl Wake for WatchdogWake {
 
 fn run_with_limits<T, F>(
     model: &'static str,
-    warn_after: Duration,
-    timeout: Duration,
-    future: F,
+    limits: WatchdogLimits,
+    start_inference: impl FnOnce() -> Result<F, OrtError>,
+) -> Result<T, InferenceError>
+where
+    F: Future<Output = Result<T, OrtError>>,
+{
+    let start = Instant::now();
+    run_with_limits_at(model, limits, start, Instant::now, start_inference)
+}
+
+fn run_with_limits_at<T, F>(
+    model: &'static str,
+    limits: WatchdogLimits,
+    start: Instant,
+    mut now: impl FnMut() -> Instant,
+    start_inference: impl FnOnce() -> Result<F, OrtError>,
 ) -> Result<T, InferenceError>
 where
     F: Future<Output = Result<T, OrtError>>,
 {
     const REPOLL_INTERVAL: Duration = Duration::from_millis(10);
 
-    let start = Instant::now();
-    let deadline = start
-        .checked_add(timeout)
-        .ok_or(InferenceError::InvariantViolation {
-            context: "parsed watchdog timeout is not representable by the monotonic clock",
-        })?;
+    let deadline = start.checked_add(limits.timeout.duration()).ok_or(
+        InferenceError::WatchdogDeadlineUnavailable {
+            model,
+            timeout_ms: limits.timeout.milliseconds(),
+        },
+    )?;
     let notify = Arc::new(WatchdogWake {
         ready: Mutex::new(false),
         wake: Condvar::new(),
     });
     let waker = Waker::from(Arc::clone(&notify));
     let mut context = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
+    // No fallible watchdog setup remains after this call. Once an async future
+    // exists, every path either observes completion or returns WatchdogTimeout
+    // while still pending, causing ManagedSession to quarantine that
+    // non-synchronously cancelled run.
+    let mut future = Box::pin(start_inference().map_err(InferenceError::Execution)?);
 
-    let result = loop {
+    let outcome = loop {
         *notify
             .ready
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
         if let Poll::Ready(result) = future.as_mut().poll(&mut context) {
-            break Some(result);
+            break if now() < deadline {
+                WatchdogRunOutcome::CompletedOnTime(result)
+            } else {
+                WatchdogRunOutcome::CompletedLate(result)
+            };
         }
 
-        let now = Instant::now();
-        if now >= deadline {
-            break None;
+        let observed_at = now();
+        if observed_at >= deadline {
+            break match future.as_mut().poll(&mut context) {
+                Poll::Ready(result) => WatchdogRunOutcome::CompletedLate(result),
+                Poll::Pending => WatchdogRunOutcome::PendingAtDeadline,
+            };
         }
-        let remaining = deadline.saturating_duration_since(now);
+        let remaining = deadline.saturating_duration_since(observed_at);
         let wait_for = remaining.min(REPOLL_INTERVAL);
         let ready = notify
             .ready
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (ready, wait) = notify
+        let (ready, _) = notify
             .wake
             .wait_timeout_while(ready, wait_for, |ready| !*ready)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if wait.timed_out() && !*ready {
-            if Instant::now() >= deadline {
-                break None;
-            }
-            continue;
-        }
+        drop(ready);
     };
 
-    let elapsed = start.elapsed();
-    if elapsed > warn_after {
+    // Dropping an incomplete ort future requests cancellation. Do it before
+    // logging and before exposing the timeout to the session quarantine layer.
+    drop(future);
+
+    let elapsed = now().saturating_duration_since(start);
+    if elapsed > limits.warn_after.duration() {
         eprintln!(
             "slow ONNX inference: model={model} elapsed_ms={:.1} threshold_ms={}",
             elapsed.as_secs_f64() * 1000.0,
-            warn_after.as_millis()
+            limits.warn_after.milliseconds()
         );
     }
 
-    match result {
-        Some(result) => result.map_err(InferenceError::Execution),
-        None => Err(InferenceError::WatchdogTimeout {
+    match outcome {
+        WatchdogRunOutcome::CompletedOnTime(result) => result.map_err(InferenceError::Execution),
+        WatchdogRunOutcome::CompletedLate(Err(source)) => Err(InferenceError::Execution(source)),
+        WatchdogRunOutcome::CompletedLate(Ok(_)) => Err(InferenceError::WatchdogDeadlineExceeded {
             model,
-            timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            timeout_ms: limits.timeout.milliseconds(),
+        }),
+        WatchdogRunOutcome::PendingAtDeadline => Err(InferenceError::WatchdogTimeout {
+            model,
+            timeout_ms: limits.timeout.milliseconds(),
         }),
     }
 }
@@ -897,14 +965,30 @@ fn parse_opt_level(key: &str, raw: String) -> Result<GraphOptimizationLevel, Inf
 mod tests {
     use super::{
         ACTIVE_WATCHDOG_LIMITS, AsyncIntraThreadPolicy, InferenceBackend, InferenceError,
-        OrtThreadCount, WatchdogConfigError, WatchdogLimits, WatchdogScope,
+        OrtThreadCount, WatchdogConfigError, WatchdogDuration, WatchdogLimits, WatchdogScope,
         cpu_provider_may_be_configured, parse_opt_level, preflight_ort_runtime, run_with_limits,
-        run_with_watchdog,
+        run_with_limits_at, run_with_watchdog,
     };
     use ort::session::builder::GraphOptimizationLevel;
     use std::cell::Cell;
     use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
+
+    fn watchdog_limits(warning_ms: u64, timeout_ms: u64) -> WatchdogLimits {
+        WatchdogLimits::try_from_millis("WARN", warning_ms, "TIMEOUT", timeout_ms)
+            .expect("valid watchdog fixture")
+    }
+
+    fn instant_that_cannot_add(duration: Duration) -> Instant {
+        let mut base = Instant::now();
+        for _ in 0..4_096 {
+            let Some(next) = base.checked_add(duration) else {
+                return base;
+            };
+            base = next;
+        }
+        panic!("monotonic clock accepted more than 4096 maximum-duration steps");
+    }
 
     #[test]
     fn optimization_level_parser_accepts_aliases_without_normalizing() {
@@ -1080,66 +1164,199 @@ mod tests {
                 timeout_ms: 10,
             })
         );
-        assert!(WatchdogLimits::try_from_millis("WARN", 10, "TIMEOUT", 10).is_ok());
+        let limits = WatchdogLimits::try_from_millis("WARN", 10, "TIMEOUT", 10)
+            .expect("equal warning and timeout are valid");
+        assert_eq!(limits.warn_after.milliseconds(), 10);
+        assert_eq!(limits.warn_after.duration(), Duration::from_millis(10));
+        assert_eq!(limits.timeout.milliseconds(), 10);
+        assert_eq!(limits.timeout.duration(), Duration::from_millis(10));
     }
 
     #[test]
     fn watchdog_domain_rejects_unrepresentable_deadlines() {
         let step = Duration::from_millis(u64::MAX);
-        let mut base = Instant::now();
-        for _ in 0..4_096 {
-            let Some(next) = base.checked_add(step) else {
-                assert_eq!(
-                    WatchdogLimits::try_from_millis_at(base, "WARN", 0, "TIMEOUT", u64::MAX,),
-                    Err(WatchdogConfigError::DurationOutOfRange {
-                        key: "TIMEOUT".to_owned(),
-                        milliseconds: u64::MAX,
-                    })
-                );
-                return;
-            };
-            base = next;
-        }
-        panic!("monotonic clock accepted more than 4096 maximum-millisecond steps");
+        let base = instant_that_cannot_add(step);
+        assert_eq!(
+            WatchdogLimits::try_from_millis_at(base, "WARN", 0, "TIMEOUT", u64::MAX,),
+            Err(WatchdogConfigError::DurationOutOfRange {
+                key: "TIMEOUT".to_owned(),
+                milliseconds: u64::MAX,
+            })
+        );
     }
 
     #[test]
     fn watchdog_limits_are_scoped_to_a_managed_run() {
-        let limits = WatchdogLimits {
-            warn_after: Duration::from_millis(10),
-            timeout: Duration::from_millis(20),
-        };
+        let limits = watchdog_limits(10, 20);
         assert_eq!(ACTIVE_WATCHDOG_LIMITS.with(Cell::get), None);
         {
             let _scope = WatchdogScope::enter(limits);
             assert_eq!(ACTIVE_WATCHDOG_LIMITS.with(Cell::get), Some(limits));
         }
         assert_eq!(ACTIVE_WATCHDOG_LIMITS.with(Cell::get), None);
+        let started = Cell::new(false);
         assert!(matches!(
-            run_with_watchdog("unmanaged", std::future::ready(Ok(()))),
+            run_with_watchdog("unmanaged", || {
+                started.set(true);
+                Ok(std::future::ready(Ok(())))
+            }),
             Err(InferenceError::InvariantViolation { .. })
+        ));
+        assert!(!started.get());
+    }
+
+    #[test]
+    fn watchdog_runtime_deadline_failure_does_not_start_inference() {
+        let timeout = Duration::from_millis(u64::MAX);
+        let start = instant_that_cannot_add(timeout);
+        let limits = WatchdogLimits {
+            warn_after: WatchdogDuration(0),
+            timeout: WatchdogDuration(u64::MAX),
+        };
+        let started = Cell::new(false);
+        let result = run_with_limits_at(
+            "deadline-test",
+            limits,
+            start,
+            || panic!("clock is not observed when deadline setup fails"),
+            || {
+                started.set(true);
+                Ok(std::future::ready(Ok(())))
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(InferenceError::WatchdogDeadlineUnavailable {
+                model: "deadline-test",
+                timeout_ms: u64::MAX,
+            })
+        ));
+        assert!(!started.get());
+    }
+
+    #[test]
+    fn watchdog_deadline_is_strict() {
+        let start = Instant::now();
+        let limits = watchdog_limits(1, 1);
+        let deadline = start
+            .checked_add(limits.timeout.duration())
+            .expect("small test deadline");
+        let at_deadline = run_with_limits_at(
+            "tie-test",
+            limits,
+            start,
+            || deadline,
+            || Ok(std::future::ready(Ok(()))),
+        );
+        assert!(matches!(
+            at_deadline,
+            Err(InferenceError::WatchdogDeadlineExceeded {
+                model: "tie-test",
+                timeout_ms: 1,
+            })
+        ));
+
+        let before_deadline = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("deadline follows start");
+        let completed = run_with_limits_at(
+            "before-deadline-test",
+            limits,
+            start,
+            || before_deadline,
+            || Ok(std::future::ready(Ok(()))),
+        );
+        assert!(completed.is_ok());
+    }
+
+    #[test]
+    fn watchdog_repolls_before_classifying_a_wait_timeout() {
+        let start = Instant::now();
+        let limits = watchdog_limits(1, 1);
+        let deadline = start
+            .checked_add(limits.timeout.duration())
+            .expect("small test deadline");
+        let polls = Cell::new(0_usize);
+        let inference = std::future::poll_fn(|_| {
+            let poll = polls.get();
+            polls.set(poll + 1);
+            if poll == 0 {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        });
+        let observations = Cell::new(0_usize);
+        let result = run_with_limits_at(
+            "repoll-test",
+            limits,
+            start,
+            || {
+                let observation = observations.get();
+                observations.set(observation + 1);
+                if observation == 0 { start } else { deadline }
+            },
+            || Ok(inference),
+        );
+
+        assert_eq!(polls.get(), 2);
+        assert!(matches!(
+            result,
+            Err(InferenceError::WatchdogDeadlineExceeded {
+                model: "repoll-test",
+                timeout_ms: 1,
+            })
         ));
     }
 
     #[test]
-    fn watchdog_timeout_does_not_poison_the_next_run() {
-        let timed_out = run_with_limits(
-            "pending-test",
-            Duration::ZERO,
-            Duration::from_millis(1),
-            std::future::pending::<Result<(), ort::Error>>(),
+    fn watchdog_repolls_before_classifying_the_first_deadline_observation() {
+        let start = Instant::now();
+        let limits = watchdog_limits(1, 1);
+        let deadline = start
+            .checked_add(limits.timeout.duration())
+            .expect("small test deadline");
+        let polls = Cell::new(0_usize);
+        let inference = std::future::poll_fn(|_| {
+            let poll = polls.get();
+            polls.set(poll + 1);
+            if poll == 0 {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        });
+        let result = run_with_limits_at(
+            "first-deadline-observation-test",
+            limits,
+            start,
+            || deadline,
+            || Ok(inference),
         );
+
+        assert_eq!(polls.get(), 2);
+        assert!(matches!(
+            result,
+            Err(InferenceError::WatchdogDeadlineExceeded {
+                model: "first-deadline-observation-test",
+                timeout_ms: 1,
+            })
+        ));
+    }
+
+    #[test]
+    fn watchdog_timeout_does_not_affect_the_next_independent_run() {
+        let timed_out = run_with_limits("pending-test", watchdog_limits(1, 1), || {
+            Ok(std::future::pending::<Result<(), ort::Error>>())
+        });
         assert!(matches!(
             timed_out,
             Err(InferenceError::WatchdogTimeout { .. })
         ));
 
-        let completed = run_with_limits(
-            "ready-test",
-            Duration::ZERO,
-            Duration::from_millis(50),
-            std::future::ready(Ok(())),
-        );
+        let completed = run_with_limits("ready-test", watchdog_limits(50, 50), || {
+            Ok(std::future::ready(Ok(())))
+        });
         assert!(completed.is_ok());
     }
 

@@ -66,10 +66,9 @@ impl EigenPlaces {
 
             // EigenPlaces ONNX exports use `input` for the image tensor.
             let run_options = RunOptions::new().map_err(InferenceError::Execution)?;
-            let inference = session
-                .run_async(ort::inputs!["input" => &*input], &run_options)
-                .map_err(InferenceError::Execution)?;
-            let outputs = super::run_with_watchdog("eigenplaces", inference)?;
+            let outputs = super::run_with_watchdog("eigenplaces", || {
+                session.run_async(ort::inputs!["input" => &*input], &run_options)
+            })?;
 
             // Exporters may expose auxiliary tensors. Identify the descriptor
             // by its complete contract instead of relying on output order or

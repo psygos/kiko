@@ -6132,6 +6132,13 @@ mod tests {
         ] {
             assert!(error.requires_pipeline_shutdown());
         }
+        assert!(
+            !TrackerError::Inference(InferenceError::WatchdogDeadlineExceeded {
+                model: "test",
+                timeout_ms: 1,
+            })
+            .requires_pipeline_shutdown()
+        );
         assert!(!TrackerError::KeyframeRejected { landmarks: 0 }.requires_pipeline_shutdown());
     }
 
