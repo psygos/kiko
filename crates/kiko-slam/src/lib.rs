@@ -186,7 +186,9 @@ pub use vio::{
     PreintegrationInformationError, PreintegrationQuantity, RegularizedImuResidualInformation,
     VioFactorError,
 };
-pub use viz::{RerunSink, RerunSinkInitError, VizDecimation, VizDecimationError, VizLogError};
+pub use viz::{
+    RerunSink, RerunSinkInitError, VizDecimation, VizDecimationError, VizFlushError, VizLogError,
+};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {

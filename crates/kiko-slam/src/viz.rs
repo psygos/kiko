@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, time::Duration};
 
 use crate::{
     CovisibilitySnapshot, DepthImage, Detections, Frame, FrameDiagnostics, ImuBatch, Keypoint,
@@ -198,6 +198,33 @@ fn viz_env<T>(
 }
 
 #[derive(Debug)]
+pub enum VizFlushError {
+    Rerun(rerun::sink::SinkFlushError),
+}
+
+impl std::fmt::Display for VizFlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rerun(source) => write!(f, "rerun flush error: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for VizFlushError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rerun(source) => Some(source),
+        }
+    }
+}
+
+impl From<rerun::sink::SinkFlushError> for VizFlushError {
+    fn from(source: rerun::sink::SinkFlushError) -> Self {
+        Self::Rerun(source)
+    }
+}
+
+#[derive(Debug)]
 pub struct RerunSink {
     rec: rerun::RecordingStream,
     decimation: VizDecimation,
@@ -238,6 +265,15 @@ impl RerunSink {
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {
         self.log_with_points(packet, None)
+    }
+
+    /// Flushes this sink and consumes it so no later visualization data can be logged through it.
+    ///
+    /// Rerun guarantees that operations previously issued by the calling thread have reached the
+    /// underlying sink when this succeeds. Operations through clones on other threads can still be
+    /// in flight. A disabled recording is an SDK-defined successful no-op.
+    pub fn finish_with_timeout(self, timeout: Duration) -> Result<(), VizFlushError> {
+        self.rec.flush_with_timeout(timeout).map_err(Into::into)
     }
 
     pub(crate) fn reset_mapping_session_surface(&mut self) -> Result<(), VizLogError> {
@@ -1737,7 +1773,7 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 mod tests {
     use super::{
         RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
-        TrackConfig, TrajectoryLog, VizDecimation, VizDecimationError,
+        TrackConfig, TrajectoryLog, VizDecimation, VizDecimationError, VizFlushError,
         resolve_track_min_descriptor_dot_product, surface_integration_scalars,
         surface_pose_quality_scalars, surface_summary_scalars,
     };
@@ -1746,7 +1782,87 @@ mod tests {
         StableSurfacePoint, StableSurfaceStats, Timestamp,
         surface_map::{SurfaceBatchIntegrationSummary, SurfaceMapSummary},
     };
-    use std::error::Error as _;
+    use std::{error::Error as _, time::Duration};
+
+    #[derive(Clone, Copy)]
+    enum TestFlushResult {
+        Failed(&'static str),
+        Timeout,
+    }
+
+    struct TestLogSink {
+        flush_result: TestFlushResult,
+    }
+
+    impl rerun::sink::LogSink for TestLogSink {
+        fn send(&self, _msg: rerun::log::LogMsg) {}
+
+        fn flush_blocking(&self, _timeout: Duration) -> Result<(), rerun::sink::SinkFlushError> {
+            match self.flush_result {
+                TestFlushResult::Failed(message) => {
+                    Err(rerun::sink::SinkFlushError::failed(message))
+                }
+                TestFlushResult::Timeout => Err(rerun::sink::SinkFlushError::Timeout),
+            }
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn rerun_sink_with_flush_result(flush_result: TestFlushResult) -> RerunSink {
+        let (enabled, store_info, recording_info, batcher_config, batcher_hooks) =
+            rerun::RecordingStreamBuilder::new("kiko_viz_flush_test")
+                .enabled(true)
+                .send_properties(false)
+                .into_args();
+        assert!(enabled);
+        let rec = rerun::RecordingStream::new(
+            store_info,
+            recording_info,
+            batcher_config,
+            batcher_hooks,
+            Box::new(TestLogSink { flush_result }),
+        )
+        .expect("test recording stream");
+        RerunSink::try_new(rec, VizDecimation::default()).expect("test Rerun sink")
+    }
+
+    #[test]
+    fn finish_preserves_rerun_sink_failure_as_typed_source() {
+        let error = rerun_sink_with_flush_result(TestFlushResult::Failed("test delivery failure"))
+            .finish_with_timeout(Duration::from_secs(1))
+            .expect_err("sink failure must be reported");
+
+        assert!(matches!(
+            &error,
+            VizFlushError::Rerun(rerun::sink::SinkFlushError::Failed { message })
+                if message == "test delivery failure"
+        ));
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<rerun::sink::SinkFlushError>())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn finish_preserves_rerun_timeout_and_disabled_noop() {
+        let error = rerun_sink_with_flush_result(TestFlushResult::Timeout)
+            .finish_with_timeout(Duration::from_secs(1))
+            .expect_err("sink timeout must be reported");
+        assert!(matches!(
+            error,
+            VizFlushError::Rerun(rerun::sink::SinkFlushError::Timeout)
+        ));
+
+        let sink = RerunSink::try_new(rerun::RecordingStream::disabled(), VizDecimation::default())
+            .expect("disabled Rerun sink");
+        sink.finish_with_timeout(Duration::ZERO)
+            .expect("disabled recording flush is an SDK-defined no-op");
+    }
 
     fn stable_surface_point() -> StableSurfacePoint {
         StableSurfacePoint::try_new(
