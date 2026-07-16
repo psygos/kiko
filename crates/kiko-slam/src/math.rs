@@ -270,6 +270,7 @@ pub(crate) fn mat_transpose(r: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     ]
 }
 
+#[cfg(test)]
 pub(crate) fn transform_point(r: [[f32; 3]; 3], t: [f32; 3], v: [f32; 3]) -> [f32; 3] {
     let rv = mat_mul_vec(r, v);
     [rv[0] + t[0], rv[1] + t[1], rv[2] + t[2]]

@@ -15,6 +15,12 @@ const RELATIVE_COST_TOLERANCE: f64 = 1e-6;
 const COST_FLOOR: f64 = 1e-12;
 /// Minimum camera-frame depth in metres for valid reprojection.
 const MIN_PROJECTION_DEPTH_M: f32 = 1e-6;
+/// Maximum relative deviation accepted from the ordinary f32 summation path.
+/// This leaves compatibility headroom above well-conditioned affine-row roundoff while routing
+/// materially degraded contributions through the coherent f64 factor path.
+const F32_SUM_MAX_RELATIVE_ERROR: f64 = 128.0 * f32::EPSILON as f64;
+/// Maximum fraction of a smaller summand that ordinary f32 addition may lose.
+const F32_SUM_MAX_RELATIVE_CONTRIBUTION_LOSS: f64 = 1.0e-3;
 /// Minimum landmark Schur complement damping.
 const MIN_LANDMARK_DAMPING: f32 = 1e-6;
 /// Minimum pose damping floor for simple BA (`optimize()`).
@@ -1730,13 +1736,18 @@ fn reprojection_linearization(
     let pw = [world.x, world.y, world.z];
     let rotation = pose.rotation();
     let translation = pose.translation();
-    let pc_f32 = math::transform_point(rotation, translation, pw);
+    let (pc_f32, pc_widened, transform_precision_risk) =
+        transform_point_f32_with_risk(rotation, translation, pw);
     let f32_camera_is_valid =
         pc_f32.into_iter().all(f32::is_finite) && pc_f32[2] > MIN_PROJECTION_DEPTH_M;
-    // Keep ordinary valid f32 transform semantics. A non-finite or invalid-depth result may be a
-    // transient f32 overflow/cancellation, so re-evaluate it before classifying the factor.
-    if !f32_camera_is_valid {
-        let pc_widened = transform_point_widened(rotation, translation, pw)?;
+    let widened_camera_is_valid = pc_widened.into_iter().all(f64::is_finite)
+        && pc_widened[2] > f64::from(MIN_PROJECTION_DEPTH_M);
+    // Keep ordinary valid f32 transform semantics. Re-evaluate non-finite, invalid-depth, or
+    // precision-sensitive results coherently before classifying the factor.
+    if !f32_camera_is_valid
+        || transform_precision_risk
+        || f32_camera_is_valid != widened_camera_is_valid
+    {
         return reprojection_linearization_widened(pc_widened, pixel, intrinsics, rotation);
     }
     let pc = pc_f32;
@@ -1748,8 +1759,20 @@ fn reprojection_linearization(
     let normalized_y = y / z;
     let projected_x = intrinsics.fx() * normalized_x;
     let projected_y = intrinsics.fy() * normalized_y;
-    let u = projected_x + intrinsics.cx();
-    let v = projected_y + intrinsics.cy();
+    let widened_normalized_x = pc_widened[0] / pc_widened[2];
+    let widened_normalized_y = pc_widened[1] / pc_widened[2];
+    let widened_projected_x = f64::from(intrinsics.fx()) * widened_normalized_x;
+    let widened_projected_y = f64::from(intrinsics.fy()) * widened_normalized_y;
+    let u_sum = f32_sum_with_precision_risk(
+        F32SumTerm::new(projected_x, widened_projected_x),
+        [F32SumTerm::from_f32(intrinsics.cx())],
+    );
+    let v_sum = f32_sum_with_precision_risk(
+        F32SumTerm::new(projected_y, widened_projected_y),
+        [F32SumTerm::from_f32(intrinsics.cy())],
+    );
+    let u = u_sum.rounded;
+    let v = v_sum.rounded;
     let residual = [pixel.x - u, pixel.y - v];
 
     let inv_z = 1.0 / z;
@@ -1767,6 +1790,24 @@ fn reprojection_linearization(
     let b1 = dv_dx;
     let b2 = dv_dy;
     let b3 = dv_dz;
+    let widened_inv_z = 1.0 / pc_widened[2];
+    let widened_inv_z2 = widened_inv_z * widened_inv_z;
+    let widened_a1 = f64::from(intrinsics.fx()) * widened_inv_z;
+    let widened_a2 = 0.0;
+    let widened_a3 = -f64::from(intrinsics.fx()) * pc_widened[0] * widened_inv_z2;
+    let widened_b1 = 0.0;
+    let widened_b2 = f64::from(intrinsics.fy()) * widened_inv_z;
+    let widened_b3 = -f64::from(intrinsics.fy()) * pc_widened[1] * widened_inv_z2;
+    // A subnormal intermediate product can be re-amplified into a normal derivative. Compare
+    // the completed base derivatives as well as checking their final f32 classifications.
+    let projection_jacobian_precision_risk = [
+        (a1, widened_a1),
+        (a3, widened_a3),
+        (b2, widened_b2),
+        (b3, widened_b3),
+    ]
+    .into_iter()
+    .any(|(rounded, widened)| f32_value_requires_widened(rounded, widened));
 
     let mut pose_jacobian = [[0.0_f32; 6]; 2];
 
@@ -1786,21 +1827,43 @@ fn reprojection_linearization(
     pose_jacobian[1][5] = -b1 * y + b2 * x;
 
     let mut landmark_jacobian = [[0.0_f32; 3]; 2];
-    let mut landmark_underflow_risk = false;
+    let mut landmark_precision_risk = false;
     for col in 0..3 {
-        landmark_jacobian[0][col] =
-            a1 * rotation[0][col] + a2 * rotation[1][col] + a3 * rotation[2][col];
-        landmark_jacobian[1][col] =
-            b1 * rotation[0][col] + b2 * rotation[1][col] + b3 * rotation[2][col];
-        let u_has_nonzero_source = (a1 != 0.0 && rotation[0][col] != 0.0)
-            || (a2 != 0.0 && rotation[1][col] != 0.0)
-            || (a3 != 0.0 && rotation[2][col] != 0.0);
-        let v_has_nonzero_source = (b1 != 0.0 && rotation[0][col] != 0.0)
-            || (b2 != 0.0 && rotation[1][col] != 0.0)
-            || (b3 != 0.0 && rotation[2][col] != 0.0);
-        landmark_underflow_risk |=
-            underflow_sensitive(landmark_jacobian[0][col], u_has_nonzero_source)
-                || underflow_sensitive(landmark_jacobian[1][col], v_has_nonzero_source);
+        let u_sum = f32_sum_with_precision_risk(
+            F32SumTerm::new(
+                a1 * rotation[0][col],
+                widened_a1 * f64::from(rotation[0][col]),
+            ),
+            [
+                F32SumTerm::new(
+                    a2 * rotation[1][col],
+                    widened_a2 * f64::from(rotation[1][col]),
+                ),
+                F32SumTerm::new(
+                    a3 * rotation[2][col],
+                    widened_a3 * f64::from(rotation[2][col]),
+                ),
+            ],
+        );
+        let v_sum = f32_sum_with_precision_risk(
+            F32SumTerm::new(
+                b1 * rotation[0][col],
+                widened_b1 * f64::from(rotation[0][col]),
+            ),
+            [
+                F32SumTerm::new(
+                    b2 * rotation[1][col],
+                    widened_b2 * f64::from(rotation[1][col]),
+                ),
+                F32SumTerm::new(
+                    b3 * rotation[2][col],
+                    widened_b3 * f64::from(rotation[2][col]),
+                ),
+            ],
+        );
+        landmark_jacobian[0][col] = u_sum.rounded;
+        landmark_jacobian[1][col] = v_sum.rounded;
+        landmark_precision_risk |= u_sum.requires_widened_value() || v_sum.requires_widened_value();
     }
 
     // The Jacobian above is for projected pixel coordinates [u, v].
@@ -1820,28 +1883,26 @@ fn reprojection_linearization(
         || underflow_sensitive(normalized_y, y != 0.0)
         || underflow_sensitive(projected_x, x != 0.0)
         || underflow_sensitive(projected_y, y != 0.0)
+        || u_sum.requires_widened_sum()
+        || v_sum.requires_widened_sum()
+        || projection_jacobian_precision_risk
         || underflow_sensitive(inv_z, true)
         || underflow_sensitive(inv_z2, x != 0.0 || y != 0.0)
-        || underflow_sensitive(du_dx, true)
-        || underflow_sensitive(dv_dy, true)
-        || underflow_sensitive(du_dz, x != 0.0)
-        || underflow_sensitive(dv_dz, y != 0.0)
         || underflow_sensitive(pose_jacobian[0][3], x != 0.0 && y != 0.0)
         || underflow_sensitive(pose_jacobian[0][4], true)
         || underflow_sensitive(pose_jacobian[0][5], y != 0.0)
         || underflow_sensitive(pose_jacobian[1][3], true)
         || underflow_sensitive(pose_jacobian[1][4], x != 0.0 && y != 0.0)
         || underflow_sensitive(pose_jacobian[1][5], x != 0.0)
-        || landmark_underflow_risk;
+        || landmark_precision_risk;
     let fast_path = ReprojectionLinearization::try_new(residual, pose_jacobian, landmark_jacobian);
     if let Ok(linearization) = fast_path {
         // Ordinary factors retain the historical f32 bits. A coherent f64 factor is used only
-        // when f32 underflow may have erased information from the residual or Jacobians.
+        // when f32 arithmetic may have erased information from the residual or Jacobians.
         if !needs_widened_fallback {
             return Ok(linearization);
         }
-        let widened =
-            reprojection_linearization_widened(pc.map(f64::from), pixel, intrinsics, rotation)?;
+        let widened = reprojection_linearization_widened(pc_widened, pixel, intrinsics, rotation)?;
         return if linearization.has_same_values(&widened) {
             Ok(linearization)
         } else {
@@ -1849,28 +1910,168 @@ fn reprojection_linearization(
         };
     }
 
-    reprojection_linearization_widened(pc.map(f64::from), pixel, intrinsics, rotation)
+    reprojection_linearization_widened(pc_widened, pixel, intrinsics, rotation)
 }
 
 fn underflow_sensitive(value: f32, mathematically_nonzero: bool) -> bool {
     mathematically_nonzero && (value == 0.0 || value.is_subnormal())
 }
 
+fn f32_value_requires_widened(rounded: f32, widened: f64) -> bool {
+    underflow_sensitive(rounded, widened != 0.0)
+        || f32_relative_error_exceeds_limit(rounded, widened)
+}
+
+#[derive(Clone, Copy)]
+struct F32SumTerm {
+    /// Value produced by the historical f32 operation sequence.
+    rounded: f32,
+    /// Same source operation evaluated before narrowing or stepwise f32 accumulation.
+    widened: f64,
+}
+
+impl F32SumTerm {
+    fn new(rounded: f32, widened: f64) -> Self {
+        Self { rounded, widened }
+    }
+
+    fn product(left: f32, right: f32) -> Self {
+        Self::new(left * right, f64::from(left) * f64::from(right))
+    }
+
+    fn from_f32(value: f32) -> Self {
+        Self::new(value, f64::from(value))
+    }
+
+    fn has_nonzero_source(self) -> bool {
+        self.widened != 0.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct F32SumAnalysis {
+    rounded: f32,
+    widened: f64,
+    source_underflow: bool,
+    material_addition_loss: bool,
+    excessive_relative_error: bool,
+}
+
+impl F32SumAnalysis {
+    fn requires_widened_value(self) -> bool {
+        !self.rounded.is_finite()
+            || !self.widened.is_finite()
+            || self.source_underflow
+            || self.excessive_relative_error
+    }
+
+    fn requires_widened_sum(self) -> bool {
+        self.requires_widened_value() || self.material_addition_loss
+    }
+}
+
+fn f32_sum_with_precision_risk<const N: usize>(
+    first_term: F32SumTerm,
+    remaining_terms: [F32SumTerm; N],
+) -> F32SumAnalysis {
+    let mut rounded_sum = first_term.rounded;
+    let mut widened_sum = first_term.widened;
+    let mut widened_compensation = 0.0_f64;
+    let mut source_underflow =
+        underflow_sensitive(first_term.rounded, first_term.has_nonzero_source());
+    let mut material_addition_loss = false;
+    let mut excessive_relative_error = f32_relative_error_exceeds_limit(rounded_sum, widened_sum);
+
+    for term in remaining_terms {
+        source_underflow |= underflow_sensitive(term.rounded, term.has_nonzero_source());
+
+        let exact_sum_of_rounded_terms = f64::from(rounded_sum) + f64::from(term.rounded);
+        let next = rounded_sum + term.rounded;
+        let addition_error = (f64::from(next) - exact_sum_of_rounded_terms).abs();
+        let smaller_contribution = f64::from(rounded_sum)
+            .abs()
+            .min(f64::from(term.rounded).abs());
+        material_addition_loss |= (smaller_contribution > 0.0
+            && addition_error > smaller_contribution * F32_SUM_MAX_RELATIVE_CONTRIBUTION_LOSS)
+            || (term.has_nonzero_source() && term.rounded != 0.0 && next == rounded_sum)
+            || (rounded_sum != 0.0 && next == term.rounded);
+        rounded_sum = next;
+
+        compensated_add(&mut widened_sum, &mut widened_compensation, term.widened);
+        // Check every prefix because a later term can mask cancellation in an earlier one.
+        excessive_relative_error |=
+            f32_relative_error_exceeds_limit(rounded_sum, widened_sum + widened_compensation);
+    }
+
+    let widened = widened_sum + widened_compensation;
+    // Exact cancellation to a true zero is not underflow.
+    source_underflow |= underflow_sensitive(rounded_sum, widened != 0.0);
+
+    F32SumAnalysis {
+        rounded: rounded_sum,
+        widened,
+        source_underflow,
+        material_addition_loss,
+        excessive_relative_error,
+    }
+}
+
+fn f32_relative_error_exceeds_limit(rounded: f32, widened: f64) -> bool {
+    let absolute_error = (f64::from(rounded) - widened).abs();
+    !rounded.is_finite()
+        || !widened.is_finite()
+        || if widened == 0.0 {
+            absolute_error != 0.0
+        } else {
+            absolute_error > widened.abs() * F32_SUM_MAX_RELATIVE_ERROR
+        }
+}
+
+fn transform_point_f32_with_risk(
+    rotation: [[f32; 3]; 3],
+    translation: [f32; 3],
+    point: [f32; 3],
+) -> ([f32; 3], [f64; 3], bool) {
+    let mut transformed_f32 = [0.0_f32; 3];
+    let mut transformed_widened = [0.0_f64; 3];
+    let mut precision_risk = false;
+    for row in 0..3 {
+        let sum = f32_sum_with_precision_risk(
+            F32SumTerm::product(rotation[row][0], point[0]),
+            [
+                F32SumTerm::product(rotation[row][1], point[1]),
+                F32SumTerm::product(rotation[row][2], point[2]),
+                F32SumTerm::from_f32(translation[row]),
+            ],
+        );
+        transformed_f32[row] = sum.rounded;
+        transformed_widened[row] = sum.widened;
+        precision_risk |= sum.requires_widened_sum();
+    }
+    (transformed_f32, transformed_widened, precision_risk)
+}
+
+fn compensated_add(sum: &mut f64, compensation: &mut f64, term: f64) {
+    let next = *sum + term;
+    *compensation += if sum.abs() >= term.abs() {
+        (*sum - next) + term
+    } else {
+        (term - next) + *sum
+    };
+    *sum = next;
+}
+
+#[cfg(test)]
 fn compensated_sum<const N: usize>(terms: [f64; N]) -> f64 {
     let mut sum = 0.0_f64;
     let mut compensation = 0.0_f64;
     for term in terms {
-        let next = sum + term;
-        compensation += if sum.abs() >= term.abs() {
-            (sum - next) + term
-        } else {
-            (term - next) + sum
-        };
-        sum = next;
+        compensated_add(&mut sum, &mut compensation, term);
     }
     sum + compensation
 }
 
+#[cfg(test)]
 fn transform_point_widened(
     rotation: [[f32; 3]; 3],
     translation: [f32; 3],
@@ -3596,6 +3797,55 @@ mod tests {
     }
 
     #[test]
+    fn widened_reprojection_recovers_re_amplified_subnormal_jacobian_product() {
+        let inverse_sqrt_2 = 1.0 / 2.0_f32.sqrt();
+        let inverse_sqrt_3 = 1.0 / 3.0_f32.sqrt();
+        let inverse_sqrt_6 = 1.0 / 6.0_f32.sqrt();
+        let rotation = [
+            [inverse_sqrt_3; 3],
+            [inverse_sqrt_2, -inverse_sqrt_2, 0.0],
+            [inverse_sqrt_6, inverse_sqrt_6, -2.0 * inverse_sqrt_6],
+        ];
+        let camera_x_m = 1.0e-14_f32;
+        let camera_z_m = 1.1e-6_f32;
+        let pose = Pose::try_from_rt(rotation, [camera_x_m, 0.0, camera_z_m])
+            .expect("valid proper rotation");
+        let focal_px = 1.0e-28_f32;
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let rounded_product = focal_px * camera_x_m;
+        assert!(rounded_product.is_subnormal());
+        let inverse_depth = 1.0 / camera_z_m;
+        let legacy_pose_derivative = rounded_product * (inverse_depth * inverse_depth);
+        assert!(legacy_pose_derivative.is_normal());
+        let widened_inverse_depth = 1.0 / f64::from(camera_z_m);
+        let expected_pose_derivative = narrow_finite_f32(
+            (f64::from(focal_px) * widened_inverse_depth)
+                * (f64::from(camera_x_m) * widened_inverse_depth),
+        )
+        .expect("representable widened pose derivative");
+        let relative_error = ((f64::from(legacy_pose_derivative)
+            - f64::from(expected_pose_derivative))
+            / f64::from(expected_pose_derivative))
+        .abs();
+        assert!(relative_error > F32_SUM_MAX_RELATIVE_ERROR);
+
+        let linearization = reprojection_linearization(
+            pose,
+            Point3::new(0.0, 0.0, 0.0),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened re-amplified Jacobian product");
+
+        assert_eq!(
+            linearization.pose_jacobian[0][2].to_bits(),
+            expected_pose_derivative.to_bits()
+        );
+    }
+
+    #[test]
     fn widened_reprojection_recovers_projection_ratio_overflow() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, f32::from_bits(1), f32::from_bits(1), 0.0, 0.0)
@@ -3625,6 +3875,97 @@ mod tests {
                 .iter()
                 .flatten()
                 .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
+    fn widened_projection_recovers_principal_point_absorbed_by_projected_coordinate() {
+        let principal_x_px = 1.0e-5_f32;
+        let focal_px = 512.0_f32;
+        let legacy_u = focal_px + principal_x_px;
+        assert_eq!(legacy_u, focal_px);
+        let expected_residual = narrow_finite_f32(
+            f64::from(focal_px) - (f64::from(focal_px) + f64::from(principal_x_px)),
+        )
+        .expect("representable widened residual");
+        let intrinsics = make_pinhole_intrinsics(640, 480, focal_px, 1.0, principal_x_px, 0.0)
+            .expect("intrinsics");
+
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(1.0, 0.0, 1.0),
+            Keypoint {
+                x: focal_px,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("widened principal-point absorption recovery");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_projection_recovers_partially_absorbed_principal_point() {
+        let principal_x_px = 4.0e-5_f32;
+        let focal_px = 512.0_f32;
+        let observed_x_px = focal_px + principal_x_px;
+        assert_ne!(observed_x_px, focal_px);
+        let expected_residual = narrow_finite_f32(
+            f64::from(observed_x_px) - (f64::from(focal_px) + f64::from(principal_x_px)),
+        )
+        .expect("representable widened residual");
+        let intrinsics = make_pinhole_intrinsics(640, 480, focal_px, 1.0, principal_x_px, 0.0)
+            .expect("intrinsics");
+
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(1.0, 0.0, 1.0),
+            Keypoint {
+                x: observed_x_px,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("widened partial-absorption recovery");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_projection_recovers_product_rounding_hidden_by_principal_point_cancellation() {
+        let camera_x = f32::from_bits(1.0_f32.to_bits() - 1);
+        let focal_px = 1.0e8_f32;
+        let projected_x = focal_px * camera_x;
+        let principal_x_px = -projected_x;
+        assert_eq!(projected_x + principal_x_px, 0.0);
+        let expected_residual = narrow_finite_f32(
+            -(f64::from(focal_px) * f64::from(camera_x) + f64::from(principal_x_px)),
+        )
+        .expect("representable widened residual");
+        let intrinsics = make_pinhole_intrinsics(640, 480, focal_px, 1.0, principal_x_px, 0.0)
+            .expect("intrinsics");
+
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(camera_x, 0.0, 1.0),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened principal-point cancellation recovery");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
         );
     }
 
@@ -3666,6 +4007,321 @@ mod tests {
 
         assert_eq!(large + small - large, 0.0);
         assert_eq!(compensated_sum([large, small, -large]), small);
+    }
+
+    #[test]
+    fn widened_transform_recovers_lateral_coordinate_erased_by_f32_cancellation() {
+        let cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [cosine, cosine, 0.0],
+            [-cosine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [-70_710_680.0, 0.0, 0.0]).expect("valid pose");
+        let point = Point3::new(1.0e8, 0.0, 1.0);
+        let f32_camera = math::transform_point(rotation, pose.translation(), point.to_array());
+        assert_eq!(f32_camera[0], 0.0);
+
+        let widened_camera =
+            transform_point_widened(rotation, pose.translation(), point.to_array())
+                .expect("finite widened camera point");
+        assert_ne!(widened_camera[0], 0.0);
+        let expected_residual = narrow_finite_f32(-widened_camera[0] / widened_camera[2])
+            .expect("representable widened residual");
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened cancellation recovery");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_transform_recovers_nonzero_severe_f32_cancellation() {
+        let cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [cosine, cosine, 0.0],
+            [-cosine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [-70_710_672.0, 0.0, 0.0]).expect("valid pose");
+        let point = Point3::new(1.0e8, 0.0, 1.0);
+        let f32_camera = math::transform_point(rotation, pose.translation(), point.to_array());
+        assert_eq!(f32_camera[0], 8.0);
+
+        let widened_camera =
+            transform_point_widened(rotation, pose.translation(), point.to_array())
+                .expect("finite widened camera point");
+        let expected_residual = narrow_finite_f32(-widened_camera[0] / widened_camera[2])
+            .expect("representable widened residual");
+        let legacy_residual = -f32_camera[0] / f32_camera[2];
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened cancellation recovery");
+
+        assert_ne!(expected_residual.to_bits(), legacy_residual.to_bits());
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn downstream_fallback_uses_camera_point_before_transform_product_rounding() {
+        let sine_cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [sine_cosine, -sine_cosine, 0.0],
+            [sine_cosine, sine_cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid pose");
+        let point = Point3::new(1.1, 0.0, 1.0);
+        let (f32_camera, widened_camera, transform_precision_risk) =
+            transform_point_f32_with_risk(rotation, pose.translation(), point.to_array());
+        assert!(!transform_precision_risk);
+        let principal_x_px = -f32_camera[0];
+        assert_eq!(f32_camera[0] + principal_x_px, 0.0);
+        let expected_residual = narrow_finite_f32(-(widened_camera[0] + f64::from(principal_x_px)))
+            .expect("representable widened residual");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 1.0, 1.0, principal_x_px, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("coherent downstream fallback");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_transform_recovers_cancellation_masked_by_translation() {
+        let cosine = 3.0_f32.sqrt() * 0.5;
+        let rotation = [[cosine, -0.5, 0.0], [0.5, cosine, 0.0], [0.0, 0.0, 1.0]];
+        let pose = Pose::try_from_rt(rotation, [1.0, 0.0, 0.0]).expect("valid pose");
+        let point_x = 1.1_f32;
+        let rounded_product = cosine * point_x;
+        let point = Point3::new(point_x, 2.0 * rounded_product, 1.0);
+        let (f32_camera, widened_camera, transform_precision_risk) =
+            transform_point_f32_with_risk(rotation, pose.translation(), point.to_array());
+        assert!(transform_precision_risk);
+        assert_eq!(f32_camera[0], 1.0);
+        let focal_px = 1.0e8_f32;
+        let expected_residual = narrow_finite_f32(
+            f64::from(focal_px) - f64::from(focal_px) * (widened_camera[0] / widened_camera[2]),
+        )
+        .expect("representable widened residual");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization = reprojection_linearization(
+            pose,
+            point,
+            Keypoint {
+                x: focal_px,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("coherent masked-cancellation fallback");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn exact_transform_cancellation_is_not_a_precision_risk() {
+        let sine_cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [sine_cosine, -sine_cosine, 0.0],
+            [sine_cosine, sine_cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid pose");
+        let point: Point3 = Point3::new(1.0, 1.0, 1.0);
+
+        let (f32_camera, widened_camera, transform_precision_risk) =
+            transform_point_f32_with_risk(rotation, pose.translation(), point.to_array());
+
+        assert_eq!(f32_camera[0], 0.0);
+        assert_eq!(widened_camera[0], 0.0);
+        assert!(!transform_precision_risk);
+    }
+
+    #[test]
+    fn widened_transform_recovers_translation_absorbed_by_large_coordinate() {
+        let pose =
+            Pose::try_from_rt(Pose::identity().rotation(), [1.0, 0.0, 0.0]).expect("valid pose");
+        let point = Point3::new(1.0e8, 0.0, 1.0);
+        let (f32_camera, widened_camera, transform_precision_risk) =
+            transform_point_f32_with_risk(pose.rotation(), pose.translation(), point.to_array());
+        assert_eq!(f32_camera[0], 1.0e8);
+        assert_eq!(widened_camera[0], 100_000_001.0);
+        assert!(transform_precision_risk);
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 1.0e8, y: 0.0 }, intrinsics)
+                .expect("widened absorbed-translation recovery");
+
+        assert_eq!(linearization.residual[0].to_bits(), (-1.0_f32).to_bits());
+    }
+
+    #[test]
+    fn widened_transform_rejects_material_error_above_relative_fast_path_contract() {
+        let rotation = [
+            [0.002_435_259_8, -0.743_477_7, 0.668_756_25],
+            [0.999_997, 0.001_810_566_8, -0.001_628_600_1],
+            [0.0, 0.668_758_2, 0.743_479_9],
+        ];
+        let pose = Pose::try_from_rt(rotation, [5.267_919e-7, 0.0, 0.0]).expect("valid pose");
+        let point = Point3::new(-1.231_799_3e-5, 1.027_565_4e-5, 1.068_088_9e-5);
+        let (f32_camera, widened_camera, transform_precision_risk) =
+            transform_point_f32_with_risk(rotation, pose.translation(), point.to_array());
+        assert!(transform_precision_risk);
+        let relative_error =
+            ((f64::from(f32_camera[0]) - widened_camera[0]) / widened_camera[0]).abs();
+        assert!(relative_error > 0.07);
+
+        let focal_px = 1.0e8_f32;
+        let expected_residual =
+            narrow_finite_f32(-f64::from(focal_px) * (widened_camera[0] / widened_camera[2]))
+                .expect("representable widened residual");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened relative-error recovery");
+
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_reprojection_recovers_landmark_jacobian_cancellation() {
+        let cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [cosine, 0.0, cosine],
+            [0.0, 1.0, 0.0],
+            [-cosine, 0.0, cosine],
+        ];
+        let camera_x = f32::from_bits(1.0_f32.to_bits() - 1);
+        let pose = Pose::try_from_rt(rotation, [camera_x, 0.0, 1.0]).expect("valid pose");
+        let focal_px = 1.0e8_f32;
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let a1 = focal_px;
+        let a3 = -focal_px * camera_x;
+        let legacy_landmark_derivative = -(a1 * cosine + a3 * cosine);
+        assert_eq!(legacy_landmark_derivative, -8.0);
+        let expected_landmark_derivative = narrow_finite_f32(
+            -f64::from(focal_px) * f64::from(cosine) * (1.0 - f64::from(camera_x)),
+        )
+        .expect("representable widened derivative");
+
+        let linearization = reprojection_linearization(
+            pose,
+            Point3::new(0.0, 0.0, 0.0),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened landmark cancellation recovery");
+
+        assert_ne!(
+            expected_landmark_derivative.to_bits(),
+            legacy_landmark_derivative.to_bits()
+        );
+        assert_eq!(
+            linearization.landmark_jacobian[0][2].to_bits(),
+            expected_landmark_derivative.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_transform_recovers_product_underflow_hidden_by_normal_sum() {
+        let tiny = f32::from_bits(1);
+        let rotation = [[1.0, -tiny, 0.0], [tiny, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let pose = Pose::try_from_rt(rotation, [f32::MIN_POSITIVE, 0.0, 0.0]).expect("valid pose");
+        let point = Point3::new(0.0, 0.25, 1.0);
+        let f32_camera = math::transform_point(rotation, pose.translation(), point.to_array());
+        assert_eq!(f32_camera[0].to_bits(), f32::MIN_POSITIVE.to_bits());
+
+        let focal_px = f32::MAX;
+        let principal_x_px = -(focal_px * f32::MIN_POSITIVE);
+        let legacy_residual = -(focal_px * (f32_camera[0] / f32_camera[2]) + principal_x_px);
+        assert_eq!(legacy_residual, 0.0);
+        let widened_camera =
+            transform_point_widened(rotation, pose.translation(), point.to_array())
+                .expect("finite widened camera point");
+        let expected_residual = narrow_finite_f32(
+            -(f64::from(focal_px) * (widened_camera[0] / widened_camera[2])
+                + f64::from(principal_x_px)),
+        )
+        .expect("representable widened residual");
+        let intrinsics = make_pinhole_intrinsics(640, 480, focal_px, 1.0, principal_x_px, 0.0)
+            .expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened product-underflow recovery");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_transform_keeps_sub_f32_coordinate_amplified_by_focal_length() {
+        let cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [0.5, 0.5, cosine],
+            [-cosine, cosine, 0.0],
+            [-0.5, -0.5, cosine],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0, 1.0, 1.0]).expect("valid pose");
+        let point = Point3::new(f32::from_bits(1), 0.0, 0.0);
+        let f32_camera = math::transform_point(rotation, pose.translation(), point.to_array());
+        assert_eq!(f32_camera[0], 0.0);
+
+        let widened_camera =
+            transform_point_widened(rotation, pose.translation(), point.to_array())
+                .expect("finite widened camera point");
+        assert!(widened_camera[0] > 0.0);
+        assert_eq!(widened_camera[0] as f32, 0.0);
+        let expected_residual =
+            narrow_finite_f32(-f64::from(f32::MAX) * (widened_camera[0] / widened_camera[2]))
+                .expect("representable widened residual");
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, f32::MAX, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened sub-f32 coordinate recovery");
+
+        assert_ne!(expected_residual, 0.0);
+        assert_eq!(
+            linearization.residual[0].to_bits(),
+            expected_residual.to_bits()
+        );
     }
 
     #[test]
