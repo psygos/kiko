@@ -479,7 +479,6 @@ impl WorldToCamera {
 pub struct RansacConfig {
     max_iterations: usize,
     reprojection_threshold_px: f32,
-    reprojection_threshold_sq_px2: f64,
     min_inliers: usize,
     seed: NonZeroU64,
 }
@@ -536,7 +535,6 @@ impl RansacConfig {
         Ok(Self {
             max_iterations,
             reprojection_threshold_px,
-            reprojection_threshold_sq_px2: f64::from(reprojection_threshold_px).powi(2),
             min_inliers,
             seed,
         })
@@ -548,10 +546,6 @@ impl RansacConfig {
 
     pub fn reprojection_threshold_px(self) -> f32 {
         self.reprojection_threshold_px
-    }
-
-    fn reprojection_threshold_sq_px2(self) -> f64 {
-        self.reprojection_threshold_sq_px2
     }
 
     pub fn min_inliers(self) -> usize {
@@ -574,7 +568,6 @@ impl Default for RansacConfig {
         Self {
             max_iterations: 200,
             reprojection_threshold_px: 2.0,
-            reprojection_threshold_sq_px2: 4.0,
             min_inliers: 20,
             seed: NonZeroU64::new(0x5EED_u64).expect("default RANSAC seed is nonzero"),
         }
@@ -734,12 +727,15 @@ pub fn solve_pnp_ransac(
 
     let mut rng = XorShift64::new(config.seed);
     let mut best_pose = None;
-    let mut best_inliers: Vec<usize> = Vec::new();
+    // Grow lazily so degenerate inputs do not reserve two full observation-sized buffers before
+    // P3P has produced a candidate. Capacities are still reused across every candidate.
+    let mut best_inliers = Vec::new();
+    let mut candidate_inliers = Vec::new();
 
     let mut iterations = 0usize;
     let total = observations.len();
 
-    let threshold_sq = config.reprojection_threshold_sq_px2();
+    let threshold = ReprojectionThresholdPx::from_config(config);
     while iterations < config.max_iterations {
         iterations += 1;
         let sample = sample_three(&mut rng, total);
@@ -752,17 +748,18 @@ pub fn solve_pnp_ransac(
         }
 
         for pose in candidates {
-            let mut inliers = Vec::new();
+            candidate_inliers.clear();
             for (idx, obs) in observations.iter().enumerate() {
-                if let Some(err_sq) = reprojection_error_sq_px(pose, obs, intrinsics)
-                    && err_sq <= threshold_sq
+                if let ReprojectionOutcome::Projected(residual) =
+                    reprojection_residual_px(pose, obs, intrinsics)
+                    && residual.is_within_threshold(threshold)
                 {
-                    inliers.push(idx);
+                    candidate_inliers.push(idx);
                 }
             }
 
-            if inliers.len() > best_inliers.len() {
-                best_inliers = inliers;
+            if candidate_inliers.len() > best_inliers.len() {
+                std::mem::swap(&mut best_inliers, &mut candidate_inliers);
                 best_pose = Some(pose);
             }
         }
@@ -1199,103 +1196,283 @@ fn push_unique_root(roots: &mut Vec<(f64, f64)>, candidate: (f64, f64)) {
     roots.push(candidate);
 }
 
-fn reprojection_error_sq_px(
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReprojectionOutcome {
+    /// Camera-space depth is zero or negative, so pinhole projection is undefined.
+    NotInFront,
+    Projected(ReprojectionResidualPx),
+}
+
+/// A parsed positive finite pixel threshold and its sole derived squared value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReprojectionThresholdPx {
+    value: f64,
+    squared: f64,
+}
+
+impl ReprojectionThresholdPx {
+    fn from_config(config: RansacConfig) -> Self {
+        let value = f64::from(config.reprojection_threshold_px());
+        let squared = value * value;
+        debug_assert!(value.is_finite() && value > 0.0 && squared.is_finite());
+        Self { value, squared }
+    }
+}
+
+/// Finite signed pixel residuals (`projected - observed`) from parsed f32 inputs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReprojectionResidualPx {
+    dx_px: f64,
+    dy_px: f64,
+}
+
+impl ReprojectionResidualPx {
+    fn magnitude_px(self) -> f64 {
+        self.dx_px.hypot(self.dy_px)
+    }
+
+    fn is_within_threshold(self, threshold: ReprojectionThresholdPx) -> bool {
+        let abs_dx = self.dx_px.abs();
+        let abs_dy = self.dy_px.abs();
+
+        // A component outside the positive threshold cannot be an inlier. Guarding first bounds
+        // every remaining square by f32::MAX^2, far below f64 overflow.
+        if abs_dx > threshold.value || abs_dy > threshold.value {
+            return false;
+        }
+
+        // A nonzero orthogonal component makes a residual strictly outside the circle when the
+        // other component lies exactly on its boundary, even if that contribution is too small
+        // to change a rounded f64 square sum.
+        if abs_dx == threshold.value {
+            return abs_dy == 0.0;
+        }
+        if abs_dy == threshold.value {
+            return abs_dx == 0.0;
+        }
+
+        let dx_squared = abs_dx * abs_dx;
+        let dy_squared = abs_dy * abs_dy;
+        let threshold_roundoff = threshold.value.mul_add(threshold.value, -threshold.squared);
+        let squared_difference = math::compensated_sum([
+            dx_squared,
+            abs_dx.mul_add(abs_dx, -dx_squared),
+            dy_squared,
+            abs_dy.mul_add(abs_dy, -dy_squared),
+            -threshold.squared,
+            -threshold_roundoff,
+        ]);
+        squared_difference <= 0.0
+    }
+}
+
+fn compensated_projection_residual_px(
+    focal_px: f32,
+    camera_axis: f64,
+    principal_px: f32,
+    observed_px: f32,
+    depth: f64,
+) -> f64 {
+    let focal = f64::from(focal_px);
+    let principal = f64::from(principal_px);
+    let observed = f64::from(observed_px);
+    let offset = principal - observed;
+    let observed_virtual = principal - offset;
+    let principal_virtual = offset + observed_virtual;
+    let offset_roundoff = (principal - principal_virtual) + (observed_virtual - observed);
+    let focal_coordinate = focal * camera_axis;
+    let offset_depth = offset * depth;
+    let offset_roundoff_depth = offset_roundoff * depth;
+
+    // Cancel in the homogeneous numerator before the sole division. The exact two-limb f32
+    // principal/observation difference avoids manufacturing two large products, while an
+    // expansion preserves every product limb across staged cancellation.
+    math::expansion_sum([
+        focal_coordinate,
+        focal.mul_add(camera_axis, -focal_coordinate),
+        offset_depth,
+        offset.mul_add(depth, -offset_depth),
+        offset_roundoff_depth,
+        offset_roundoff.mul_add(depth, -offset_roundoff_depth),
+    ]) / depth
+}
+
+fn reprojection_residual_px(
     pose: Pose,
-    obs: &Observation,
+    observation: &Observation,
     intrinsics: PinholeIntrinsics,
-) -> Option<f64> {
-    let pc = transform_point(
+) -> ReprojectionOutcome {
+    let camera = transform_point(
         mat3_from_f32(pose.rotation()),
         vec3_from_f32(pose.translation()),
-        vec3_from_world_point(obs.world),
+        vec3_from_world_point(observation.world),
     );
-    if pc.iter().any(|value| !value.is_finite()) || pc[2] <= 0.0 {
-        return None;
+    // PnP cheirality is the geometric z > 0 condition. Local BA deliberately applies its
+    // separate 1e-6 m conditioning floor when differentiating a projection.
+    if camera[2] <= 0.0 {
+        return ReprojectionOutcome::NotInFront;
     }
-    let inverse_depth = 1.0 / pc[2];
-    let u = f64::from(intrinsics.fx()) * pc[0] * inverse_depth + f64::from(intrinsics.cx());
-    let v = f64::from(intrinsics.fy()) * pc[1] * inverse_depth + f64::from(intrinsics.cy());
-    let dx = u - f64::from(obs.pixel.x);
-    let dy = v - f64::from(obs.pixel.y);
-    let error_sq = dx.mul_add(dx, dy * dy);
-    error_sq.is_finite().then_some(error_sq)
+
+    let dx_px = compensated_projection_residual_px(
+        intrinsics.fx(),
+        camera[0],
+        intrinsics.cx(),
+        observation.pixel.x,
+        camera[2],
+    );
+    let dy_px = compensated_projection_residual_px(
+        intrinsics.fy(),
+        camera[1],
+        intrinsics.cy(),
+        observation.pixel.y,
+        camera[2],
+    );
+
+    // Parsed poses, observations, and intrinsics contain only finite f32 values. A validated
+    // rotation bounds each coefficient, and the smallest nonzero exact f32 product is about
+    // 2^-298; therefore the complete transform, projection, and residual remain finite in f64.
+    debug_assert!(camera.into_iter().all(f64::is_finite));
+    debug_assert!(dx_px.is_finite() && dy_px.is_finite());
+    ReprojectionOutcome::Projected(ReprojectionResidualPx { dx_px, dy_px })
 }
 
-/// Parsed per-observation reprojection residuals in pixels.
+/// One-pass diagnostics over the projected subset of the supplied observations.
 ///
-/// `None` means the point cannot be projected in front of the camera. Every
-/// present value is finite, nonnegative, and retained in f64 until a public
-/// f32 diagnostic is requested.
-#[derive(Debug)]
-pub(crate) struct ReprojectionErrors {
-    values_px: Vec<Option<f64>>,
+/// Counts retain nonpositive-depth outcomes instead of disguising them as missing arithmetic.
+/// RMSE uses the number of projected observations as its denominator, and both metrics remain in
+/// f64 until their public f32 diagnostic boundary.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReprojectionMetrics {
+    values_px: Option<ReprojectionMetricValuesPx>,
+    projected_count: usize,
+    not_in_front_count: usize,
 }
 
-impl ReprojectionErrors {
-    fn iter(&self) -> impl Iterator<Item = Option<f64>> + '_ {
-        self.values_px.iter().copied()
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReprojectionMetricValuesPx {
+    rmse_px: f64,
+    max_px: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CompleteReprojectionMetricsPx {
+    rmse_px: f32,
+    max_px: f32,
+}
+
+impl CompleteReprojectionMetricsPx {
+    pub(crate) fn rmse_px(self) -> f32 {
+        self.rmse_px
+    }
+
+    pub(crate) fn max_px(self) -> f32 {
+        self.max_px
+    }
+}
+
+impl ReprojectionMetrics {
+    #[cfg(test)]
+    fn rmse_px(self) -> Option<f64> {
+        self.values_px.map(|values| values.rmse_px)
     }
 
     #[cfg(test)]
-    fn len(&self) -> usize {
-        self.values_px.len()
+    fn max_px(self) -> Option<f64> {
+        self.values_px.map(|values| values.max_px)
+    }
+
+    pub(crate) fn projected_count(self) -> usize {
+        self.projected_count
+    }
+
+    pub(crate) fn not_in_front_count(self) -> usize {
+        self.not_in_front_count
+    }
+
+    pub(crate) fn complete_px(self) -> Result<Option<CompleteReprojectionMetricsPx>, PnpError> {
+        if self.not_in_front_count != 0 {
+            return Ok(None);
+        }
+        let Some(values) = self.values_px else {
+            return Ok(None);
+        };
+
+        Ok(Some(CompleteReprojectionMetricsPx {
+            rmse_px: narrow_reprojection_metric(values.rmse_px, "computing reprojection RMSE")?,
+            max_px: narrow_reprojection_metric(
+                values.max_px,
+                "computing maximum reprojection error",
+            )?,
+        }))
     }
 }
 
-pub(crate) fn reprojection_errors(
+pub(crate) fn reprojection_metrics<'a>(
     pose: &Pose,
-    observations: &[Observation],
+    observations: impl IntoIterator<Item = &'a Observation>,
     intrinsics: PinholeIntrinsics,
-) -> ReprojectionErrors {
-    let values_px = observations
-        .iter()
-        .map(|obs| reprojection_error_sq_px(*pose, obs, intrinsics).map(f64::sqrt))
-        .collect();
-    ReprojectionErrors { values_px }
-}
-
-pub(crate) fn reprojection_rmse(errors: &ReprojectionErrors) -> Result<Option<f32>, PnpError> {
-    // Scaled sum-of-squares avoids overflow and underflow even if the residual
-    // domain later widens beyond values derived from f32 camera inputs.
+) -> ReprojectionMetrics {
+    // Scaled sum-of-squares avoids overflow and underflow across both residual components.
     let mut scale = 0.0_f64;
     let mut scaled_sum_sq = 1.0_f64;
-    let mut count = 0usize;
-    for error in errors.iter().flatten() {
-        if error != 0.0 {
-            if scale < error {
-                let ratio = scale / error;
-                scaled_sum_sq = 1.0 + scaled_sum_sq * ratio * ratio;
-                scale = error;
-            } else {
-                let ratio = error / scale;
-                scaled_sum_sq += ratio * ratio;
+    let mut maximum = 0.0_f64;
+    let mut projected_count = 0usize;
+    let mut not_in_front_count = 0usize;
+
+    for observation in observations {
+        let ReprojectionOutcome::Projected(residual) =
+            reprojection_residual_px(*pose, observation, intrinsics)
+        else {
+            not_in_front_count += 1;
+            continue;
+        };
+
+        for component in [residual.dx_px, residual.dy_px] {
+            let component = component.abs();
+            if component != 0.0 {
+                if scale < component {
+                    let ratio = scale / component;
+                    scaled_sum_sq = 1.0 + scaled_sum_sq * ratio * ratio;
+                    scale = component;
+                } else {
+                    let ratio = component / scale;
+                    scaled_sum_sq += ratio * ratio;
+                }
             }
         }
-        count += 1;
+        maximum = maximum.max(residual.magnitude_px());
+        projected_count += 1;
     }
-    if count == 0 {
-        return Ok(None);
-    }
-    let rmse = if scale == 0.0 {
-        0.0
-    } else {
-        scale * (scaled_sum_sq / count as f64).sqrt()
-    };
-    narrow_reprojection_metric(rmse, "computing reprojection RMSE").map(Some)
-}
 
-pub(crate) fn reprojection_max(errors: &ReprojectionErrors) -> Result<Option<f32>, PnpError> {
-    errors
-        .iter()
-        .flatten()
-        .reduce(f64::max)
-        .map(|maximum| narrow_reprojection_metric(maximum, "computing maximum reprojection error"))
-        .transpose()
+    let values_px = if projected_count == 0 {
+        None
+    } else {
+        let rmse = if scale == 0.0 {
+            0.0
+        } else {
+            scale * (scaled_sum_sq / projected_count as f64).sqrt()
+        };
+        Some(ReprojectionMetricValuesPx {
+            rmse_px: rmse,
+            max_px: maximum,
+        })
+    };
+
+    ReprojectionMetrics {
+        values_px,
+        projected_count,
+        not_in_front_count,
+    }
 }
 
 fn narrow_reprojection_metric(value: f64, operation: &'static str) -> Result<f32, PnpError> {
     let narrowed = value as f32;
-    if !value.is_finite() || value < 0.0 || !narrowed.is_finite() {
+    if !value.is_finite()
+        || value < 0.0
+        || value > f64::from(f32::MAX)
+        || !narrowed.is_finite()
+        || (value > 0.0 && narrowed == 0.0)
+    {
         return Err(PnpError::Numerical { operation, value });
     }
     Ok(narrowed)
@@ -1432,12 +1609,14 @@ fn mat_mul_vec(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
 }
 
 fn transform_point(rotation: [[f64; 3]; 3], translation: [f64; 3], point: [f64; 3]) -> [f64; 3] {
-    let rotated = mat_mul_vec(rotation, point);
-    [
-        rotated[0] + translation[0],
-        rotated[1] + translation[1],
-        rotated[2] + translation[2],
-    ]
+    std::array::from_fn(|axis| {
+        math::compensated_sum([
+            rotation[axis][0] * point[0],
+            rotation[axis][1] * point[1],
+            rotation[axis][2] * point[2],
+            translation[axis],
+        ])
+    })
 }
 
 #[derive(Debug)]
@@ -1998,9 +2177,10 @@ mod tests {
         ));
 
         let extreme = RansacConfig::try_new(10, f32::MAX, 4, 1)
-            .expect("every positive finite f32 threshold has a finite f64 square");
-        assert!(extreme.reprojection_threshold_sq_px2().is_finite());
-        assert!(extreme.reprojection_threshold_sq_px2() > f64::from(f32::MAX));
+            .expect("every positive finite f32 threshold is accepted");
+        let threshold_px = f64::from(extreme.reprojection_threshold_px());
+        assert!(threshold_px.powi(2).is_finite());
+        assert!(threshold_px.powi(2) > f64::from(f32::MAX));
     }
 
     #[test]
@@ -2024,8 +2204,25 @@ mod tests {
         ));
     }
 
+    fn expect_projected_residual(
+        pose: Pose,
+        observation: &Observation,
+        intrinsics: PinholeIntrinsics,
+    ) -> ReprojectionResidualPx {
+        match reprojection_residual_px(pose, observation, intrinsics) {
+            ReprojectionOutcome::Projected(residual) => residual,
+            ReprojectionOutcome::NotInFront => panic!("expected point in front of the camera"),
+        }
+    }
+
+    fn parsed_reprojection_threshold(value: f32) -> ReprojectionThresholdPx {
+        ReprojectionThresholdPx::from_config(
+            RansacConfig::try_new(1, value, MIN_PNP_POINTS, 1).expect("valid threshold"),
+        )
+    }
+
     #[test]
-    fn reprojection_error_is_zero_for_exact_projection() {
+    fn reprojection_residual_is_zero_for_exact_projection() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
         let pose = axis_angle_pose([0.0, 0.0, 0.0], [0.05, -0.03, 0.01]);
@@ -2035,103 +2232,203 @@ mod tests {
             z: 4.2,
         };
         let pixel = project_pixel_from_pose(pose, point, intrinsics);
-        let obs = Observation::try_new(point, pixel, intrinsics).expect("obs");
-        let err_sq = reprojection_error_sq_px(pose, &obs, intrinsics).expect("error");
-        assert!(err_sq < 1e-8, "expected exact reprojection, got {err_sq}");
+        let observation = Observation::try_new(point, pixel, intrinsics).expect("observation");
+        let residual = expect_projected_residual(pose, &observation, intrinsics);
+        let error_sq = residual
+            .dx_px
+            .mul_add(residual.dx_px, residual.dy_px * residual.dy_px);
+        assert!(
+            error_sq < 1e-8,
+            "expected exact reprojection, got {residual:?}"
+        );
     }
 
     #[test]
-    fn reprojection_errors_zero_for_exact_projection() {
+    fn reprojection_metrics_are_zero_for_exact_projection() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let pose = Pose::identity();
         let world = synthetic_world_points();
         let observations =
             observations_from_projection(pose, &world, intrinsics).expect("synthetic observations");
-        let errors = reprojection_errors(&pose, &observations, intrinsics);
-        assert_eq!(errors.len(), observations.len());
-        assert!(
-            errors
-                .iter()
-                .all(|error| error.is_some_and(|value| value < 1e-4))
-        );
+        let metrics = reprojection_metrics(&pose, &observations, intrinsics);
+
+        assert_eq!(metrics.projected_count(), observations.len());
+        assert_eq!(metrics.not_in_front_count(), 0);
+        assert!(metrics.rmse_px().is_some_and(|value| value < 1e-4));
+        assert!(metrics.max_px().is_some_and(|value| value < 1e-4));
     }
 
     #[test]
-    fn reprojection_errors_none_for_behind_camera() {
-        let intrinsics =
-            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let observation = Observation::try_new(
-            Point3 {
-                x: 0.0,
-                y: 0.0,
-                z: 2.0,
-            },
-            Keypoint { x: 320.0, y: 240.0 },
+    fn reprojection_metrics_count_nonpositive_depth_separately() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let observations = [
+            Observation::try_new(
+                Point3::new(0.0, 0.0, 1.0),
+                Keypoint { x: -3.0, y: 0.0 },
+                intrinsics,
+            )
+            .expect("three-pixel observation"),
+            Observation::try_new(
+                Point3::new(0.0, 0.0, -1.0),
+                Keypoint { x: 0.0, y: 0.0 },
+                intrinsics,
+            )
+            .expect("nonpositive-depth observation"),
+            Observation::try_new(
+                Point3::new(0.0, 0.0, 1.0),
+                Keypoint { x: -4.0, y: 0.0 },
+                intrinsics,
+            )
+            .expect("four-pixel observation"),
+        ];
+
+        assert_eq!(
+            reprojection_residual_px(Pose::identity(), &observations[1], intrinsics),
+            ReprojectionOutcome::NotInFront
+        );
+        let metrics = reprojection_metrics(&Pose::identity(), &observations, intrinsics);
+        let expected_rmse = ((3.0_f64 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
+
+        assert_eq!(metrics.projected_count(), 2);
+        assert_eq!(metrics.not_in_front_count(), 1);
+        assert!(
+            metrics
+                .rmse_px()
+                .is_some_and(|value| (value - expected_rmse).abs() < 1e-6)
+        );
+        assert_eq!(metrics.max_px(), Some(4.0));
+    }
+
+    #[test]
+    fn reprojection_metrics_define_empty_and_all_not_in_front_batches() {
+        let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let empty: [Observation; 0] = [];
+        let empty_metrics = reprojection_metrics(&Pose::identity(), &empty, intrinsics);
+        assert_eq!(empty_metrics.rmse_px(), None);
+        assert_eq!(empty_metrics.max_px(), None);
+        assert_eq!(empty_metrics.projected_count(), 0);
+        assert_eq!(empty_metrics.not_in_front_count(), 0);
+
+        let not_in_front = [Observation::try_new(
+            Point3::new(0.0, 0.0, 0.0),
+            Keypoint { x: 0.0, y: 0.0 },
             intrinsics,
         )
-        .expect("observation");
-        let behind_pose = Pose::from_rt(
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            [0.0, 0.0, -3.0],
-        );
-        let errors = reprojection_errors(&behind_pose, &[observation], intrinsics);
-        assert_eq!(errors.values_px, vec![None]);
+        .expect("zero-depth observation")];
+        let hidden_metrics = reprojection_metrics(&Pose::identity(), &not_in_front, intrinsics);
+        assert_eq!(hidden_metrics.rmse_px(), None);
+        assert_eq!(hidden_metrics.max_px(), None);
+        assert_eq!(hidden_metrics.projected_count(), 0);
+        assert_eq!(hidden_metrics.not_in_front_count(), 1);
     }
 
     #[test]
-    fn reprojection_rmse_matches_manual() {
-        let errors = ReprojectionErrors {
-            values_px: vec![Some(3.0), None, Some(4.0)],
+    fn reprojection_metrics_are_order_and_power_of_two_scale_stable() {
+        let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let make_observation = |error_px: f32| {
+            Observation::try_new(
+                Point3::new(0.0, 0.0, 1.0),
+                Keypoint {
+                    x: -error_px,
+                    y: 0.0,
+                },
+                intrinsics,
+            )
+            .expect("finite error observation")
         };
-        let rmse = reprojection_rmse(&errors)
-            .expect("valid metric")
-            .expect("rmse");
-        let expected = ((3.0_f32 * 3.0 + 4.0 * 4.0) / 2.0).sqrt();
-        assert!((rmse - expected).abs() < 1e-6);
+        let observations = [
+            make_observation(3.0),
+            make_observation(4.0),
+            make_observation(12.0),
+        ];
+        let reversed = [observations[2], observations[1], observations[0]];
+        let metrics = reprojection_metrics(&Pose::identity(), &observations, intrinsics);
+        let reversed_metrics = reprojection_metrics(&Pose::identity(), &reversed, intrinsics);
+        let rmse = metrics.rmse_px().expect("rmse");
+
+        assert_eq!(metrics, reversed_metrics);
+        assert!((3.0..=12.0).contains(&rmse));
+        assert_eq!(metrics.max_px(), Some(12.0));
+
+        let scale = 2.0_f32.powi(20);
+        let scaled = [
+            make_observation(3.0 * scale),
+            make_observation(4.0 * scale),
+            make_observation(12.0 * scale),
+        ];
+        let scaled_metrics = reprojection_metrics(&Pose::identity(), &scaled, intrinsics);
+        assert_eq!(scaled_metrics.rmse_px(), Some(rmse * f64::from(scale)));
+        assert_eq!(scaled_metrics.max_px(), Some(12.0 * f64::from(scale)));
     }
 
     #[test]
     fn reprojection_metrics_keep_large_finite_residuals_finite() {
-        let errors = ReprojectionErrors {
-            values_px: vec![Some(f64::from(f32::MAX)), Some(f64::from(f32::MAX))],
-        };
+        let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let observations = [
+            Observation::try_new(
+                Point3::new(0.0, 0.0, 1.0),
+                Keypoint {
+                    x: -f32::MAX,
+                    y: 0.0,
+                },
+                intrinsics,
+            )
+            .expect("first extreme observation"),
+            Observation::try_new(
+                Point3::new(0.0, 0.0, 1.0),
+                Keypoint {
+                    x: -f32::MAX,
+                    y: 0.0,
+                },
+                intrinsics,
+            )
+            .expect("second extreme observation"),
+        ];
+        let metrics = reprojection_metrics(&Pose::identity(), &observations, intrinsics);
 
-        assert_eq!(
-            reprojection_rmse(&errors).expect("representable RMSE"),
-            Some(f32::MAX)
-        );
-        assert_eq!(
-            reprojection_max(&errors).expect("representable maximum"),
-            Some(f32::MAX)
-        );
+        assert_eq!(metrics.rmse_px(), Some(f64::from(f32::MAX)));
+        assert_eq!(metrics.max_px(), Some(f64::from(f32::MAX)));
+        let complete = metrics
+            .complete_px()
+            .expect("representable metrics")
+            .expect("nonempty complete metrics");
+        assert_eq!(complete.rmse_px(), f32::MAX);
+        assert_eq!(complete.max_px(), f32::MAX);
     }
 
     #[test]
-    fn reprojection_metrics_report_unrepresentable_f32_results() {
+    fn reprojection_metric_narrowing_rejects_range_overflow_and_underflow() {
         let residual = 2.0 * f64::from(f32::MAX);
-        let errors = ReprojectionErrors {
-            values_px: vec![Some(residual)],
-        };
-
         assert!(matches!(
-            reprojection_rmse(&errors),
+            narrow_reprojection_metric(residual, "computing reprojection RMSE"),
             Err(PnpError::Numerical {
                 operation: "computing reprojection RMSE",
                 value,
             }) if value == residual
         ));
+
+        let rounds_down_to_max = f64::from(f32::MAX) + 2.0_f64.powi(102);
         assert!(matches!(
-            reprojection_max(&errors),
+            narrow_reprojection_metric(rounds_down_to_max, "computing reprojection RMSE"),
+            Err(PnpError::Numerical {
+                operation: "computing reprojection RMSE",
+                value,
+            }) if value == rounds_down_to_max
+        ));
+
+        let rounds_to_zero = 0.25 * f64::from(f32::from_bits(1));
+        assert!(matches!(
+            narrow_reprojection_metric(rounds_to_zero, "computing maximum reprojection error"),
             Err(PnpError::Numerical {
                 operation: "computing maximum reprojection error",
                 value,
-            }) if value == residual
+            }) if value == rounds_to_zero
         ));
     }
 
     #[test]
-    fn reprojection_errors_retain_large_finite_residuals_until_metric_boundary() {
+    fn reprojection_metrics_retain_large_finite_residuals_until_metric_boundary() {
         let intrinsics =
             make_pinhole_intrinsics(1, 1, f32::MAX, 1.0, 0.0, 0.0).expect("intrinsics");
         let observation = Observation::try_new(
@@ -2145,25 +2442,24 @@ mod tests {
         )
         .expect("finite observation");
 
-        let errors = reprojection_errors(&Pose::identity(), &[observation], intrinsics);
-        let residual = errors
-            .iter()
-            .next()
-            .flatten()
-            .expect("point projects in front of the camera");
-        assert!(residual.is_finite());
-        assert!(residual > f64::from(f32::MAX));
+        let residual = expect_projected_residual(Pose::identity(), &observation, intrinsics);
+        let magnitude = residual.magnitude_px();
+        assert!(magnitude.is_finite());
+        assert!(magnitude > f64::from(f32::MAX));
+        let metrics = reprojection_metrics(&Pose::identity(), [&observation], intrinsics);
+        assert_eq!(metrics.rmse_px(), Some(magnitude));
+        assert_eq!(metrics.max_px(), Some(magnitude));
         assert!(matches!(
-            reprojection_rmse(&errors),
+            metrics.complete_px(),
             Err(PnpError::Numerical {
                 operation: "computing reprojection RMSE",
                 value,
-            }) if value == residual
+            }) if value == magnitude
         ));
     }
 
     #[test]
-    fn reprojection_errors_with_known_perturbation() {
+    fn reprojection_metrics_match_known_perturbation() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let pose = Pose::identity();
@@ -2192,19 +2488,15 @@ mod tests {
                 Observation::try_new(point, pixel, intrinsics).expect("observation")
             })
             .collect();
-        let errors = reprojection_errors(&pose, &observations, intrinsics);
-        let rmse = reprojection_rmse(&errors)
-            .expect("valid metric")
-            .expect("rmse");
+        let metrics = reprojection_metrics(&pose, &observations, intrinsics);
+        let rmse = metrics.rmse_px().expect("rmse");
         assert!((1.5..=2.5).contains(&rmse), "rmse={rmse}");
-        let max = reprojection_max(&errors)
-            .expect("valid metric")
-            .expect("max");
+        let max = metrics.max_px().expect("max");
         assert!((1.5..=2.5).contains(&max), "max={max}");
     }
 
     #[test]
-    fn reprojection_errors_len_matches_input() {
+    fn reprojection_metric_counts_match_input_cardinality() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let pose = Pose::identity();
@@ -2230,8 +2522,247 @@ mod tests {
             )
             .expect("observation"),
         ];
-        let errors = reprojection_errors(&pose, &observations, intrinsics);
-        assert_eq!(errors.len(), observations.len());
+        let metrics = reprojection_metrics(&pose, &observations, intrinsics);
+        assert_eq!(
+            metrics.projected_count() + metrics.not_in_front_count(),
+            observations.len()
+        );
+    }
+
+    #[test]
+    fn compensated_transform_recovers_pixel_residual_erased_by_f64_cancellation() {
+        let sine_cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [0.5, 0.5, sine_cosine],
+            [0.5, 0.5, -sine_cosine],
+            [-sine_cosine, sine_cosine, 0.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid rotation");
+        let intrinsics =
+            make_pinhole_intrinsics(1, 1, f32::MAX, f32::MAX, 0.0, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3::new(-f32::MAX, f32::MAX, 1.0),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("observation");
+
+        let residual = expect_projected_residual(pose, &observation, intrinsics);
+
+        assert!((residual.dx_px - 0.5).abs() < 1e-15);
+        assert!((residual.dy_px + 0.5).abs() < 1e-15);
+        assert!((residual.magnitude_px() - std::f64::consts::FRAC_1_SQRT_2).abs() < 1e-15);
+        assert!(!residual.is_within_threshold(parsed_reprojection_threshold(0.25)));
+    }
+
+    #[test]
+    fn compensated_transform_recovers_positive_depth_erased_by_f64_cancellation() {
+        let inverse_sqrt_2 = 1.0 / 2.0_f32.sqrt();
+        let inverse_sqrt_6 = 1.0 / 6.0_f32.sqrt();
+        let inverse_sqrt_3 = 1.0 / 3.0_f32.sqrt();
+        let rotation = [
+            [inverse_sqrt_2, -inverse_sqrt_2, 0.0],
+            [inverse_sqrt_6, inverse_sqrt_6, -2.0 * inverse_sqrt_6],
+            [inverse_sqrt_3; 3],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid rotation");
+        let point = Point3::new(f32::MAX, -f32::MAX, 1.0);
+        let camera = transform_point(
+            mat3_from_f32(rotation),
+            [0.0; 3],
+            vec3_from_world_point(point),
+        );
+        let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+            .expect("observation");
+
+        assert!((camera[2] - f64::from(inverse_sqrt_3)).abs() < f64::EPSILON);
+        assert!(matches!(
+            reprojection_residual_px(pose, &observation, intrinsics),
+            ReprojectionOutcome::Projected(_)
+        ));
+    }
+
+    #[test]
+    fn direct_projection_division_avoids_reciprocal_rounding_residual() {
+        let focal_px = f32::from_bits(0x640e_6030);
+        let camera_x_m = f32::from_bits(0xbb3f_0274);
+        let camera_z_m = f32::from_bits(0x3cfe_adf0);
+        let observed_x_px = f32::from_bits(0xe255_9048);
+        let intrinsics =
+            make_pinhole_intrinsics(1, 1, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3::new(camera_x_m, 0.0, camera_z_m),
+            Keypoint {
+                x: observed_x_px,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("observation");
+
+        let reciprocal_first = (f64::from(focal_px) * f64::from(camera_x_m))
+            * (1.0 / f64::from(camera_z_m))
+            - f64::from(observed_x_px);
+        let residual = expect_projected_residual(Pose::identity(), &observation, intrinsics);
+
+        assert_eq!(reciprocal_first, -131_072.0);
+        assert_eq!(residual.dx_px.to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn homogeneous_projection_cancels_before_division_rounding() {
+        let focal_px = f32::from_bits(0x4103_95df);
+        let camera_x_m = f32::from_bits(0xe22a_24de);
+        let camera_z_m = f32::from_bits(0x47d1_b958);
+        let principal_x_px = f32::from_bits(0x3ff7_7e81);
+        let observed_x_px = f32::from_bits(0xdb55_8111);
+        let intrinsics =
+            make_pinhole_intrinsics(1, 1, focal_px, 1.0, principal_x_px, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3::new(camera_x_m, 0.0, camera_z_m),
+            Keypoint {
+                x: observed_x_px,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("observation");
+
+        let quotient_first = math::compensated_sum([
+            (f64::from(focal_px) * f64::from(camera_x_m)) / f64::from(camera_z_m),
+            f64::from(principal_x_px),
+            -f64::from(observed_x_px),
+        ]);
+        let residual = expect_projected_residual(Pose::identity(), &observation, intrinsics);
+        let exact_source_residual = 6_251.671_327_761_643_f64;
+
+        assert!((quotient_first - exact_source_residual).abs() > 1.7);
+        assert!((residual.dx_px - exact_source_residual).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compensated_residual_retains_absorbed_principal_point() {
+        let camera_x_m = 1.0e20_f32;
+        let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, 1.0, 1.0, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3::new(camera_x_m, 0.0, 1.0),
+            Keypoint {
+                x: camera_x_m,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("observation");
+
+        let residual = expect_projected_residual(Pose::identity(), &observation, intrinsics);
+
+        assert_eq!(residual.dx_px, 1.0);
+    }
+
+    #[test]
+    fn expansion_residual_retains_term_below_canceling_product_roundoff() {
+        let tiny = f32::from_bits(1);
+        let cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [1.0, 0.0, 0.0],
+            [0.0, cosine, -cosine],
+            [0.0, cosine, cosine],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid rotation");
+        let point = Point3::new(tiny, 1.0, 0.1);
+        let intrinsics =
+            make_pinhole_intrinsics(1, 1, tiny, 1.0, f32::MAX, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            point,
+            Keypoint {
+                x: f32::MAX,
+                y: 0.0,
+            },
+            intrinsics,
+        )
+        .expect("observation");
+        let camera = transform_point(
+            mat3_from_f32(rotation),
+            [0.0; 3],
+            vec3_from_world_point(point),
+        );
+
+        let residual = expect_projected_residual(pose, &observation, intrinsics);
+        let expected = (f64::from(tiny) * f64::from(tiny)) / camera[2];
+
+        assert!(expected > 0.0);
+        assert_eq!(residual.dx_px.to_bits(), expected.to_bits());
+    }
+
+    #[test]
+    fn finite_reprojection_norm_survives_squared_overflow() {
+        let tiny = f32::from_bits(1);
+        let rotation = [[1.0, 0.0, 0.0], [0.0, tiny, -1.0], [0.0, 1.0, tiny]];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid rotation");
+        let intrinsics =
+            make_pinhole_intrinsics(1, 1, f32::MAX, tiny, 0.0, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3::new(f32::MAX, 0.0, tiny),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("observation");
+
+        let residual = expect_projected_residual(pose, &observation, intrinsics);
+        let magnitude = residual.magnitude_px();
+        let threshold = parsed_reprojection_threshold(f32::MAX);
+
+        assert!(
+            residual
+                .dx_px
+                .mul_add(residual.dx_px, residual.dy_px * residual.dy_px)
+                .is_infinite()
+        );
+        assert!(magnitude.is_finite());
+        assert!(magnitude > threshold.value);
+        assert!(!residual.is_within_threshold(threshold));
+        let metrics = reprojection_metrics(&pose, [&observation], intrinsics);
+        assert_eq!(metrics.rmse_px(), Some(magnitude));
+        assert!(matches!(
+            metrics.complete_px(),
+            Err(PnpError::Numerical {
+                operation: "computing reprojection RMSE",
+                value,
+            }) if value == magnitude
+        ));
+    }
+
+    #[test]
+    fn reprojection_threshold_is_inclusive_without_unbounded_squaring() {
+        let residual = ReprojectionResidualPx {
+            dx_px: 3.0,
+            dy_px: 4.0,
+        };
+        let threshold = parsed_reprojection_threshold(5.0);
+
+        assert!(residual.is_within_threshold(threshold));
+        let below_threshold = f32::from_bits(5.0_f32.to_bits() - 1);
+        assert!(!residual.is_within_threshold(parsed_reprojection_threshold(below_threshold)));
+    }
+
+    #[test]
+    fn reprojection_threshold_rejects_nonzero_orthogonal_boundary_component() {
+        let tiny = f32::from_bits(1);
+        let intrinsics = make_pinhole_intrinsics(1, 1, 1.0, tiny, 1.0, 0.0).expect("intrinsics");
+        let observation = Observation::try_new(
+            Point3::new(0.0, tiny, f32::MAX),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("observation");
+        let residual = expect_projected_residual(Pose::identity(), &observation, intrinsics);
+        let threshold = parsed_reprojection_threshold(1.0);
+
+        assert_eq!(residual.dx_px, threshold.value);
+        assert!(residual.dy_px > 0.0);
+        assert_eq!(residual.magnitude_px(), threshold.value);
+        assert!(!residual.is_within_threshold(threshold));
     }
 
     fn project_pixel_from_pose(

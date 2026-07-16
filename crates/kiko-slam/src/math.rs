@@ -262,6 +262,80 @@ pub(crate) fn mat_mul_vec_f64(r: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// Add one term to a Neumaier-compensated sum.
+///
+/// The caller must keep the input, running sum, compensation, and their intermediate additions
+/// finite. Current callers satisfy that precondition with bounds derived from parsed f32 values.
+pub(crate) fn compensated_add(sum: &mut f64, compensation: &mut f64, term: f64) {
+    debug_assert!(sum.is_finite() && compensation.is_finite() && term.is_finite());
+    let next = *sum + term;
+    debug_assert!(next.is_finite());
+    *compensation += if sum.abs() >= term.abs() {
+        (*sum - next) + term
+    } else {
+        (term - next) + *sum
+    };
+    debug_assert!(compensation.is_finite());
+    *sum = next;
+}
+
+/// Sum fixed terms while retaining contributions hidden by cancellation.
+///
+/// Every term, partial sum, compensation, and the final compensated sum must remain finite.
+pub(crate) fn compensated_sum<const N: usize>(terms: [f64; N]) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    for term in terms {
+        compensated_add(&mut sum, &mut compensation, term);
+    }
+    let result = sum + compensation;
+    debug_assert!(result.is_finite());
+    result
+}
+
+/// Sum bounded finite terms through a nonoverlapping floating-point expansion.
+///
+/// Every term and every implementation-level sum and difference must remain finite. This is more
+/// expensive than a single compensation accumulator, but preserves multiple low limbs across
+/// staged cancellation. Current PnP callers satisfy the stronger precondition with f32-derived
+/// product bounds.
+pub(crate) fn expansion_sum<const N: usize>(terms: [f64; N]) -> f64 {
+    let mut expansion = [0.0_f64; N];
+    let mut len = 0_usize;
+
+    for term in terms {
+        debug_assert!(term.is_finite());
+        let mut accumulator = term;
+        let mut next_len = 0_usize;
+
+        for index in 0..len {
+            let component = expansion[index];
+            let sum = accumulator + component;
+            debug_assert!(sum.is_finite());
+            let component_virtual = sum - accumulator;
+            let accumulator_virtual = sum - component_virtual;
+            let component_roundoff = component - component_virtual;
+            let accumulator_roundoff = accumulator - accumulator_virtual;
+            let roundoff = accumulator_roundoff + component_roundoff;
+            if roundoff != 0.0 {
+                expansion[next_len] = roundoff;
+                next_len += 1;
+            }
+            accumulator = sum;
+        }
+
+        if accumulator != 0.0 || next_len == 0 {
+            expansion[next_len] = accumulator;
+            next_len += 1;
+        }
+        len = next_len;
+    }
+
+    let result = expansion[..len].iter().copied().sum::<f64>();
+    debug_assert!(result.is_finite());
+    result
+}
+
 pub(crate) fn mat_transpose(r: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     [
         [r[0][0], r[1][0], r[2][0]],
@@ -576,9 +650,21 @@ mod tests {
     use crate::Pose;
 
     use super::{
-        Pose64, Pose64Error, PoseNarrowingError, identity3_f64, mat_mul_f64, mat_mul_vec_f64,
-        se3_exp_f64, se3_log_f64, so3_exp_f64, so3_log_f64, so3_right_jacobian_f64,
+        Pose64, Pose64Error, PoseNarrowingError, expansion_sum, identity3_f64, mat_mul_f64,
+        mat_mul_vec_f64, se3_exp_f64, se3_log_f64, so3_exp_f64, so3_log_f64,
+        so3_right_jacobian_f64,
     };
+
+    #[test]
+    fn expansion_sum_preserves_multiple_limbs_through_staged_cancellation() {
+        let large = 2.0_f64.powi(200);
+        let medium = 2.0_f64.powi(100);
+        let small = 1.0_f64;
+        let terms = [small, large, medium, -large, -medium];
+
+        assert_ne!(terms.into_iter().sum::<f64>(), small);
+        assert_eq!(expansion_sum(terms), small);
+    }
 
     fn rot_diff_norm(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> f64 {
         let mut sum = 0.0;

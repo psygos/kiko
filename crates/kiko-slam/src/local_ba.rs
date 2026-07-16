@@ -610,8 +610,7 @@ impl ObservationSet {
                 .point(point_id)
                 .ok_or(MapError::MapPointNotFound(point_id))?
                 .position();
-            let observation = Observation::try_new(world, obs.pixel(), intrinsics)?;
-            resolved.push(observation);
+            resolved.push(Observation::try_new(world, obs.pixel(), intrinsics)?);
         }
         if resolved.len() < min_required.get() {
             return Err(LocalBaError::InsufficientUsableObservations {
@@ -1119,11 +1118,11 @@ impl LocalBundleAdjuster {
                     self.config.min_observations,
                 )?;
                 let mut usable_observations = 0_usize;
-                for obs in resolved.observations() {
+                for observation in resolved.observations() {
                     let linearization = match reprojection_linearization(
                         frame.pose,
-                        obs.world(),
-                        obs.pixel(),
+                        observation.world(),
+                        observation.pixel(),
                         self.intrinsics,
                     ) {
                         Ok(linearization) => linearization,
@@ -1211,6 +1210,42 @@ impl LocalBundleAdjuster {
             }
         }
 
+        // The last accepted step has not yet served as a linearization point. Re-check it before
+        // exposing the pose so a final update cannot leave the window below its configured factor
+        // support or defer a numerical failure until the next frame.
+        self.validate_final_incremental_window(map)
+    }
+
+    fn validate_final_incremental_window(&self, map: &SlamMap) -> Result<(), LocalBaError> {
+        for frame in &self.frames {
+            let resolved =
+                frame
+                    .observations
+                    .resolve(map, self.intrinsics, self.config.min_observations)?;
+            let mut usable_observations = 0_usize;
+            for observation in resolved.observations() {
+                match reprojection_linearization(
+                    frame.pose,
+                    observation.world(),
+                    observation.pixel(),
+                    self.intrinsics,
+                ) {
+                    Ok(_) => usable_observations += 1,
+                    Err(ProjectionLinearizationError::InvalidDepth) => {}
+                    Err(ProjectionLinearizationError::NumericalFailure) => {
+                        return Err(LocalBaError::NumericalFailure {
+                            operation: "validating final incremental reprojection factors",
+                        });
+                    }
+                }
+            }
+            if usable_observations < self.config.min_observations() {
+                return Err(LocalBaError::InsufficientUsableObservations {
+                    required: self.config.min_observations(),
+                    actual: usable_observations,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1997,7 +2032,7 @@ fn f32_sum_with_precision_risk<const N: usize>(
             || (rounded_sum != 0.0 && next == term.rounded);
         rounded_sum = next;
 
-        compensated_add(&mut widened_sum, &mut widened_compensation, term.widened);
+        math::compensated_add(&mut widened_sum, &mut widened_compensation, term.widened);
         // Check every prefix because a later term can mask cancellation in an earlier one.
         excessive_relative_error |=
             f32_relative_error_exceeds_limit(rounded_sum, widened_sum + widened_compensation);
@@ -2051,26 +2086,6 @@ fn transform_point_f32_with_risk(
     (transformed_f32, transformed_widened, precision_risk)
 }
 
-fn compensated_add(sum: &mut f64, compensation: &mut f64, term: f64) {
-    let next = *sum + term;
-    *compensation += if sum.abs() >= term.abs() {
-        (*sum - next) + term
-    } else {
-        (term - next) + *sum
-    };
-    *sum = next;
-}
-
-#[cfg(test)]
-fn compensated_sum<const N: usize>(terms: [f64; N]) -> f64 {
-    let mut sum = 0.0_f64;
-    let mut compensation = 0.0_f64;
-    for term in terms {
-        compensated_add(&mut sum, &mut compensation, term);
-    }
-    sum + compensation
-}
-
 #[cfg(test)]
 fn transform_point_widened(
     rotation: [[f32; 3]; 3],
@@ -2079,7 +2094,7 @@ fn transform_point_widened(
 ) -> Result<[f64; 3], ProjectionLinearizationError> {
     let mut transformed = [0.0_f64; 3];
     for (row, target) in transformed.iter_mut().enumerate() {
-        *target = compensated_sum([
+        *target = math::compensated_sum([
             f64::from(rotation[row][0]) * f64::from(point[0]),
             f64::from(rotation[row][1]) * f64::from(point[1]),
             f64::from(rotation[row][2]) * f64::from(point[2]),
@@ -2806,12 +2821,12 @@ mod tests {
 
     #[test]
     fn push_frame_rejects_unprojectable_observations_and_recovers() {
-        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
         let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let min_required = ba.min_observations();
         let observation_count = map.keyframe(keyframe_id).expect("keyframe").len();
-        let make_observation_set = || {
+        let make_observation_set = |map: &SlamMap| {
             let observations = (0..observation_count)
                 .map(|index| {
                     let keypoint = map
@@ -2827,7 +2842,7 @@ mod tests {
         let behind_camera = Pose::from_rt(Pose::identity().rotation(), [0.0, 0.0, -10.0]);
         assert!(
             matches!(
-                ba.push_frame(&map, behind_camera, make_observation_set()),
+                ba.push_frame(&map, behind_camera, make_observation_set(&map)),
                 Err(LocalBaError::InsufficientUsableObservations { actual: 0, .. })
             ),
             "a frame with no usable reprojection factors must be rejected"
@@ -2837,11 +2852,81 @@ mod tests {
             "a rejected frame must not remain in the optimization window"
         );
 
+        let hidden_keypoint = map
+            .keyframe_keypoint(keyframe_id, 0)
+            .expect("first keypoint");
+        let hidden_point = map
+            .map_point_for_keypoint(hidden_keypoint)
+            .expect("map lookup")
+            .expect("associated point");
+        let position = map.point(hidden_point).expect("point lookup").position();
+        map.set_map_point_position(
+            hidden_point,
+            crate::WorldPoint3::new(position.x, position.y, -1.0),
+        )
+        .expect("finite hidden point");
+
         assert!(
-            ba.push_frame(&map, Pose::identity(), make_observation_set())
+            ba.push_frame(&map, Pose::identity(), make_observation_set(&map))
                 .is_ok(),
-            "a valid frame must optimize after the failed window is reset"
+            "a frame with seven usable factors must optimize after the failed window is reset"
         );
+
+        for index in 1..5 {
+            let keypoint = map.keyframe_keypoint(keyframe_id, index).expect("keypoint");
+            let point_id = map
+                .map_point_for_keypoint(keypoint)
+                .expect("map lookup")
+                .expect("associated point");
+            let position = map.point(point_id).expect("point lookup").position();
+            map.set_map_point_position(
+                point_id,
+                crate::WorldPoint3::new(position.x, position.y, -1.0),
+            )
+            .expect("finite hidden point");
+        }
+
+        assert!(matches!(
+            ba.push_frame(&map, Pose::identity(), make_observation_set(&map)),
+            Err(LocalBaError::InsufficientUsableObservations {
+                required: 4,
+                actual: 3,
+            })
+        ));
+        assert!(
+            ba.frames.is_empty(),
+            "a below-minimum final window must not remain accepted"
+        );
+    }
+
+    #[test]
+    fn final_incremental_validation_rejects_a_staged_depth_threshold_crossing() {
+        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let observations = (0..map.keyframe(keyframe_id).expect("keyframe").len())
+            .map(|index| {
+                let keypoint = map.keyframe_keypoint(keyframe_id, index).expect("keypoint");
+                MapObservation::new(keypoint, map.keypoint(keypoint).expect("pixel"))
+            })
+            .collect();
+        ba.frames.push(BaFrame {
+            pose: Pose::identity(),
+            observations: ObservationSet::new(observations, ba.min_observations())
+                .expect("observation set"),
+        });
+
+        ba.validate_final_incremental_window(&map)
+            .expect("initial pose has complete projection support");
+        ba.frames[0].pose = Pose::from_rt(Pose::identity().rotation(), [0.0, 0.0, -10.0]);
+
+        assert!(matches!(
+            ba.validate_final_incremental_window(&map),
+            Err(LocalBaError::InsufficientUsableObservations {
+                required: 4,
+                actual: 0,
+            })
+        ));
     }
 
     #[test]
@@ -4006,7 +4091,7 @@ mod tests {
         let large = f64::from(2.0_f32.powi(99));
 
         assert_eq!(large + small - large, 0.0);
-        assert_eq!(compensated_sum([large, small, -large]), small);
+        assert_eq!(math::compensated_sum([large, small, -large]), small);
     }
 
     #[test]

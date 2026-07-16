@@ -1475,6 +1475,45 @@ impl From<crate::PnpError> for TrackerError {
     }
 }
 
+/// Publishable post-BA metrics either cover the complete claimed-inlier set or are absent.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PostBaReprojectionDiagnostics {
+    NotAllProjectable,
+    Complete { rmse_px: f32, max_px: f32 },
+}
+
+fn post_ba_reprojection_diagnostics<'a>(
+    pose: Pose,
+    observations: impl ExactSizeIterator<Item = &'a crate::Observation>,
+    intrinsics: PinholeIntrinsics,
+) -> Result<PostBaReprojectionDiagnostics, TrackerError> {
+    let claimed_inliers = observations.len();
+    if claimed_inliers == 0 {
+        return Err(TrackerError::InvariantViolation(
+            "post-BA reprojection diagnostics require at least one claimed PnP inlier",
+        ));
+    }
+    let metrics = crate::pnp::reprojection_metrics(&pose, observations, intrinsics);
+    if metrics.projected_count() + metrics.not_in_front_count() != claimed_inliers {
+        return Err(TrackerError::InvariantViolation(
+            "post-BA reprojection accounting did not cover every claimed PnP inlier",
+        ));
+    }
+    if metrics.not_in_front_count() != 0 {
+        return Ok(PostBaReprojectionDiagnostics::NotAllProjectable);
+    }
+
+    let complete = metrics
+        .complete_px()?
+        .ok_or(TrackerError::InvariantViolation(
+            "nonempty projectable PnP inlier set produced no reprojection metrics",
+        ))?;
+    Ok(PostBaReprojectionDiagnostics::Complete {
+        rmse_px: complete.rmse_px(),
+        max_px: complete.max_px(),
+    })
+}
+
 impl From<crate::map::MapError> for TrackerError {
     fn from(err: crate::map::MapError) -> Self {
         TrackerError::Map(err)
@@ -2994,15 +3033,21 @@ impl SlamTracker {
             .inliers
             .iter()
             .map(|&observation_idx| {
-                observation_batch
+                let match_index = observation_batch
                     .match_indices
                     .get(observation_idx)
                     .copied()
+                    .ok_or(TrackerError::InvariantViolation(
+                        "PnP inlier index out of observation batch bounds",
+                    ))?;
+                observations
+                    .get(observation_idx)
+                    .ok_or(TrackerError::InvariantViolation(
+                        "PnP inlier index out of observation bounds",
+                    ))?;
+                Ok(match_index)
             })
-            .collect::<Option<_>>()
-            .ok_or(TrackerError::InvariantViolation(
-                "PnP inlier index out of observation batch bounds",
-            ))?;
+            .collect::<Result<_, TrackerError>>()?;
 
         let mut map_observations = Vec::with_capacity(result.inliers.len());
         for &match_idx in &inlier_match_indices {
@@ -3039,6 +3084,20 @@ impl SlamTracker {
             .push_frame(&self.map, pose_world_legacy, observation_set)?;
 
         let pose_world = crate::WorldToCamera::from_legacy_pose(refined_world);
+        // This is the last fallible acceptance check before recovery events or tracker/map/backend
+        // mutations. If it rejects the refined frame, discard the already-mutated BA window just
+        // as LocalBundleAdjuster::push_frame does when its own optimization fails.
+        let reprojection_diagnostics = match post_ba_reprojection_diagnostics(
+            refined_world,
+            result.inliers.iter().map(|&idx| &observations[idx]),
+            self.intrinsics,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(err) => {
+                self.ba.reset();
+                return Err(err);
+            }
+        };
         if self.consecutive_tracking_failures > 0 {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
@@ -3161,24 +3220,17 @@ impl SlamTracker {
             }
         }
 
-        let inlier_observations: Vec<_> = result
-            .inliers
-            .iter()
-            .filter_map(|&idx| observations.get(idx).copied())
-            .collect();
-        let inlier_errors = crate::pnp::reprojection_errors(
-            &pose_world.into_legacy_pose(),
-            &inlier_observations,
-            self.intrinsics,
-        );
-
         let mut diagnostics = self.empty_diagnostics();
         diagnostics.inlier_ratio =
             Some(result.inliers.len() as f32 / observations.len().max(1) as f32);
         diagnostics.pnp_observations = Some(observations.len());
         diagnostics.ransac_iterations = Some(result.iterations);
-        diagnostics.reprojection_rmse_px = crate::pnp::reprojection_rmse(&inlier_errors)?;
-        diagnostics.reprojection_max_px = crate::pnp::reprojection_max(&inlier_errors)?;
+        if let PostBaReprojectionDiagnostics::Complete { rmse_px, max_px } =
+            reprojection_diagnostics
+        {
+            diagnostics.reprojection_rmse_px = Some(rmse_px);
+            diagnostics.reprojection_max_px = Some(max_px);
+        }
         diagnostics.parallax_px = parallax_px;
         diagnostics.covisibility = Some(covisibility);
         diagnostics.keyframe_created = keyframe_created;
@@ -6161,6 +6213,75 @@ mod tests {
         let error = TrackerError::from(source);
 
         assert!(matches!(error, TrackerError::Pose64(actual) if actual == source));
+    }
+
+    #[test]
+    fn post_ba_diagnostics_accept_partially_unprojectable_inliers_without_subset_metrics() {
+        let intrinsics = crate::test_helpers::make_pinhole_intrinsics(1, 1, 1.0, 1.0, 0.0, 0.0)
+            .expect("intrinsics");
+        let observations: Vec<_> = [1.0, 1.0, 1.0, 1.0, -1.0]
+            .into_iter()
+            .map(|depth| {
+                crate::Observation::try_new(
+                    Point3::new(0.0, 0.0, depth),
+                    Keypoint { x: 0.0, y: 0.0 },
+                    intrinsics,
+                )
+                .expect("finite observation")
+            })
+            .collect();
+
+        let diagnostics =
+            post_ba_reprojection_diagnostics(Pose::identity(), observations.iter(), intrinsics)
+                .expect("individual hidden factors are valid BA output");
+
+        assert_eq!(
+            diagnostics,
+            PostBaReprojectionDiagnostics::NotAllProjectable
+        );
+
+        let complete = post_ba_reprojection_diagnostics(
+            Pose::identity(),
+            observations[..4].iter(),
+            intrinsics,
+        )
+        .expect("complete projectable set");
+        assert_eq!(
+            complete,
+            PostBaReprojectionDiagnostics::Complete {
+                rmse_px: 0.0,
+                max_px: 0.0,
+            }
+        );
+
+        let extreme_intrinsics =
+            crate::test_helpers::make_pinhole_intrinsics(1, 1, f32::MAX, 1.0, 0.0, 0.0)
+                .expect("extreme intrinsics");
+        let extreme_visible = crate::Observation::try_new(
+            Point3::new(f32::MAX, 0.0, f32::from_bits(1)),
+            Keypoint { x: 0.0, y: 0.0 },
+            extreme_intrinsics,
+        )
+        .expect("visible extreme observation");
+        let hidden = crate::Observation::try_new(
+            Point3::new(0.0, 0.0, -1.0),
+            Keypoint { x: 0.0, y: 0.0 },
+            extreme_intrinsics,
+        )
+        .expect("hidden observation");
+        let partial = [
+            extreme_visible,
+            extreme_visible,
+            extreme_visible,
+            extreme_visible,
+            hidden,
+        ];
+
+        assert_eq!(
+            post_ba_reprojection_diagnostics(Pose::identity(), partial.iter(), extreme_intrinsics,)
+                .expect("discarded subset metrics must not be narrowed"),
+            PostBaReprojectionDiagnostics::NotAllProjectable
+        );
     }
 
     #[test]

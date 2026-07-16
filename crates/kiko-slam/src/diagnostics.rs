@@ -72,7 +72,13 @@ pub struct FrameDiagnostics {
     pub inlier_ratio: Option<f32>,
     pub pnp_observations: Option<usize>,
     pub ransac_iterations: Option<usize>,
+    /// Pixel RMSE over all claimed PnP inliers under the post-BA pose.
+    ///
+    /// This is `None` when any claimed inlier is not projectable at positive camera depth.
     pub reprojection_rmse_px: Option<f32>,
+    /// Maximum pixel error over all claimed PnP inliers under the post-BA pose.
+    ///
+    /// This is `None` when any claimed inlier is not projectable at positive camera depth.
     pub reprojection_max_px: Option<f32>,
     pub parallax_px: Option<f32>,
     pub covisibility: Option<f32>,
