@@ -1,6 +1,8 @@
-use super::{InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session};
+use super::{
+    InferenceBackend, InferenceError, InferenceRunDiagnostics, build_run_options, build_session,
+};
 use crate::{Descriptor, Detections, Frame, FrameDimensions, Keypoint, Matches, Raw};
-use ort::session::Session;
+use ort::session::{RunOptions, Session};
 use ort::value::TensorRef;
 use std::path::Path;
 use std::sync::Arc;
@@ -10,12 +12,16 @@ use std::time::{Duration, Instant};
 /// and outputs keypoints, matches, and match scores in a single call.
 pub struct End2EndPipeline {
     session: Session,
+    run_options: RunOptions,
     backend: InferenceBackend,
     diagnostics: InferenceRunDiagnostics,
     scratch: Vec<f32>,
 }
 
 pub struct End2EndTimings {
+    /// ONNX Runtime's `Session::run` invocation only.
+    pub ort_invocation: Duration,
+    /// Successful `match_pair` wall time, including preprocessing and output parsing.
     pub total: Duration,
 }
 
@@ -23,8 +29,10 @@ impl End2EndPipeline {
     pub fn new(path: impl AsRef<Path>, backend: InferenceBackend) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let (session, selected, diagnostics) = build_session(path, backend)?;
+        let run_options = build_run_options(selected)?;
         Ok(Self {
             session,
+            run_options,
             backend: selected,
             diagnostics,
             scratch: Vec::new(),
@@ -43,6 +51,7 @@ impl End2EndPipeline {
         right: &Frame,
         max_keypoints: usize,
     ) -> Result<(Matches<Raw>, End2EndTimings), InferenceError> {
+        let total_start = Instant::now();
         let dimensions = left.dimensions();
         let batch_elements = stereo_batch_element_count(dimensions, right.dimensions())?;
         let w = dimensions.width() as usize;
@@ -63,13 +72,13 @@ impl End2EndPipeline {
         let start = Instant::now();
         let outputs = super::run_with_slow_call_diagnostics(self.diagnostics, "pipeline", || {
             self.session
-                .run(ort::inputs!["images" => input_tensor])
+                .run_with_options(ort::inputs!["images" => input_tensor], &self.run_options)
                 .map_err(|source| InferenceError::SessionRun {
                     model: "end-to-end-superpoint-lightglue",
                     source,
                 })
         })?;
-        let total = start.elapsed();
+        let ort_invocation = start.elapsed();
 
         let parsed = if outputs.get("keypoints0").is_some() {
             parse_stereo_fused_outputs(&outputs, max_keypoints)?
@@ -115,7 +124,13 @@ impl End2EndPipeline {
         )
         .map_err(InferenceError::Match)?;
 
-        Ok((matches, End2EndTimings { total }))
+        Ok((
+            matches,
+            End2EndTimings {
+                ort_invocation,
+                total: total_start.elapsed(),
+            },
+        ))
     }
 }
 

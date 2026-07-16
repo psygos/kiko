@@ -107,6 +107,54 @@ pub struct DatasetArgs {
     pub skip_frames: usize,
 }
 
+impl DatasetArgs {
+    pub fn selected_pair_count(
+        &self,
+        available_pairs: usize,
+    ) -> Result<usize, DatasetSelectionError> {
+        let Some(remaining_pairs) = available_pairs.checked_sub(self.skip_frames) else {
+            return Err(DatasetSelectionError {
+                available_pairs,
+                skip_frames: self.skip_frames,
+                max_pairs: self.max_pairs,
+                selected_pairs: 0,
+            });
+        };
+        let selected_pairs = self
+            .max_pairs
+            .map_or(remaining_pairs, |limit| limit.min(remaining_pairs));
+        if selected_pairs == 0 {
+            return Err(DatasetSelectionError {
+                available_pairs,
+                skip_frames: self.skip_frames,
+                max_pairs: self.max_pairs,
+                selected_pairs,
+            });
+        }
+        Ok(selected_pairs)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatasetSelectionError {
+    available_pairs: usize,
+    skip_frames: usize,
+    max_pairs: Option<usize>,
+    selected_pairs: usize,
+}
+
+impl std::fmt::Display for DatasetSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dataset selection contains no pairs: available={}, skip_frames={}, max_pairs={:?}, selected={}",
+            self.available_pairs, self.skip_frames, self.max_pairs, self.selected_pairs
+        )
+    }
+}
+
+impl std::error::Error for DatasetSelectionError {}
+
 #[derive(Args, Clone, Debug)]
 pub struct RerunArgs {
     /// Log every Nth frame to Rerun (1 = every frame)
@@ -258,8 +306,11 @@ pub enum BackendArg {
     Auto,
     #[value(name = "cpu")]
     Cpu,
-    #[value(name = "coreml-gpu", alias = "coreml")]
-    CoremlGpu,
+    #[value(
+        name = "coreml-cpu-gpu",
+        aliases = ["coreml", "coreml-gpu"]
+    )]
+    CoremlCpuAndGpu,
     #[value(name = "cuda")]
     Cuda,
     #[value(name = "tensorrt", alias = "trt")]
@@ -271,7 +322,7 @@ impl From<BackendArg> for InferenceBackend {
         match value {
             BackendArg::Auto => InferenceBackend::Auto,
             BackendArg::Cpu => InferenceBackend::Cpu,
-            BackendArg::CoremlGpu => InferenceBackend::CoreMLGpu,
+            BackendArg::CoremlCpuAndGpu => InferenceBackend::CoreMLCpuAndGpu,
             BackendArg::Cuda => InferenceBackend::Cuda,
             BackendArg::TensorRt => InferenceBackend::TensorRT,
         }
@@ -314,6 +365,28 @@ pub enum PrefetchSession<T> {
     },
 }
 
+#[derive(Debug)]
+pub struct RequiredPrefetchUnavailableError {
+    component: &'static str,
+    source: kiko_slam::InferenceError,
+}
+
+impl std::fmt::Display for RequiredPrefetchUnavailableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "required inference prefetch session is unavailable: component={}: {}",
+            self.component, self.source
+        )
+    }
+}
+
+impl std::error::Error for RequiredPrefetchUnavailableError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl<T> PrefetchSession<T> {
     fn from_result(component: &'static str, result: Result<T, kiko_slam::InferenceError>) -> Self {
         match result {
@@ -340,6 +413,18 @@ impl<T> PrefetchSession<T> {
                     nested = cause.source();
                 }
                 None
+            }
+        }
+    }
+
+    pub fn require_ready_if_applicable(
+        self,
+    ) -> Result<Option<T>, RequiredPrefetchUnavailableError> {
+        match self {
+            Self::Ready(session) => Ok(Some(session)),
+            Self::NotApplicable => Ok(None),
+            Self::Unavailable { component, source } => {
+                Err(RequiredPrefetchUnavailableError { component, source })
             }
         }
     }
@@ -377,7 +462,10 @@ impl InferenceConfig {
             let pipeline_path = resolve_model_path(&model_dir, Some(pipeline_path), "");
             eprintln!("pipeline model: {}", pipeline_path.display());
             let pipeline = End2EndPipeline::new(&pipeline_path, default_backend)?;
-            eprintln!("pipeline backend: {:?}", pipeline.backend());
+            eprintln!(
+                "pipeline configured primary backend: {:?}",
+                pipeline.backend()
+            );
             Some(pipeline)
         } else {
             None
@@ -411,7 +499,7 @@ impl InferenceConfig {
         };
 
         eprintln!(
-            "inference backend: superpoint={:?}, lightglue={:?}",
+            "configured inference primary backends: superpoint={:?}, lightglue={:?}",
             superpoint.backend(),
             lightglue.backend()
         );
@@ -549,5 +637,48 @@ fn resolve_model_path(
             }
         }
         None => model_dir.join(default_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DatasetArgs;
+    use std::path::PathBuf;
+
+    fn dataset_args(skip_frames: usize, max_pairs: Option<usize>) -> DatasetArgs {
+        DatasetArgs {
+            path: PathBuf::from("dataset"),
+            max_pairs,
+            skip_frames,
+        }
+    }
+
+    #[test]
+    fn dataset_selection_applies_skip_then_maximum_once() {
+        assert_eq!(
+            dataset_args(0, None)
+                .selected_pair_count(2_084)
+                .expect("full dataset"),
+            2_084
+        );
+        assert_eq!(
+            dataset_args(10, Some(300))
+                .selected_pair_count(2_084)
+                .expect("bounded selection"),
+            300
+        );
+        assert_eq!(
+            dataset_args(2_000, Some(300))
+                .selected_pair_count(2_084)
+                .expect("limit is capped by remaining data"),
+            84
+        );
+    }
+
+    #[test]
+    fn dataset_selection_rejects_empty_and_over_skipped_inputs() {
+        assert!(dataset_args(0, Some(0)).selected_pair_count(4).is_err());
+        assert!(dataset_args(4, None).selected_pair_count(4).is_err());
+        assert!(dataset_args(5, None).selected_pair_count(4).is_err());
     }
 }

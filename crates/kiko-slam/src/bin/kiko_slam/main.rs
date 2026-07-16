@@ -10,7 +10,7 @@ mod record;
 mod slam;
 mod viz;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct RunIntegrityError {
     command: &'static str,
     successful_item: &'static str,
@@ -18,6 +18,7 @@ struct RunIntegrityError {
     total_failures: u128,
     first_failed_stage: Option<&'static str>,
     first_stage_failures: usize,
+    first_source: Option<Box<dyn std::error::Error>>,
 }
 
 impl std::fmt::Display for RunIntegrityError {
@@ -43,15 +44,106 @@ impl std::fmt::Display for RunIntegrityError {
     }
 }
 
-impl std::error::Error for RunIntegrityError {}
+impl std::error::Error for RunIntegrityError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.first_source.as_deref()
+    }
+}
+
+#[derive(Debug)]
+struct RunFailure {
+    stage: &'static str,
+    source: Box<dyn std::error::Error>,
+}
+
+#[derive(Debug, Default)]
+struct RunFailureCapture {
+    first: Option<RunFailure>,
+}
+
+#[derive(Debug)]
+struct SkippedDatasetEntryError {
+    command: &'static str,
+    entry_number: usize,
+    requested_skip: usize,
+    source: kiko_slam::dataset::DatasetError,
+}
+
+impl std::fmt::Display for SkippedDatasetEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to read skipped {} dataset entry {} of {}: {}",
+            self.command, self.entry_number, self.requested_skip, self.source
+        )
+    }
+}
+
+impl std::error::Error for SkippedDatasetEntryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl RunFailureCapture {
+    fn record<E>(&mut self, stage: &'static str, source: E)
+    where
+        E: std::error::Error + 'static,
+    {
+        if self.first.is_none() {
+            self.first = Some(RunFailure {
+                stage,
+                source: Box::new(source),
+            });
+        }
+    }
+
+    fn report_and_record<E>(
+        &mut self,
+        failure_count: &mut usize,
+        stage: &'static str,
+        context: &str,
+        source: E,
+    ) where
+        E: std::error::Error + 'static,
+    {
+        *failure_count = failure_count.saturating_add(1);
+        report_error_chain(context, &source);
+        self.record(stage, source);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunMetricsStatus {
+    Valid,
+    InvalidPartial,
+}
+
+impl RunMetricsStatus {
+    fn from_outcome(integrity_ok: bool, exact_completion: bool, usable_output: bool) -> Self {
+        if integrity_ok && exact_completion && usable_output {
+            Self::Valid
+        } else {
+            Self::InvalidPartial
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::InvalidPartial => "invalid_partial",
+        }
+    }
+}
 
 fn verify_run_integrity(
     command: &'static str,
     successful_item: &'static str,
     successful_items: usize,
     failures: &[(&'static str, usize)],
+    failure_capture: RunFailureCapture,
 ) -> Result<(), RunIntegrityError> {
-    let first_failure = failures.iter().copied().find(|(_, count)| *count > 0);
+    let first_counted_failure = failures.iter().copied().find(|(_, count)| *count > 0);
     let total_failures = failures
         .iter()
         .map(|(_, count)| *count as u128)
@@ -59,14 +151,56 @@ fn verify_run_integrity(
     if successful_items > 0 && total_failures == 0 {
         return Ok(());
     }
+    let captured = failure_capture.first;
+    let first_failed_stage = captured
+        .as_ref()
+        .map(|failure| failure.stage)
+        .or_else(|| first_counted_failure.map(|(stage, _)| stage));
+    let first_stage_failures = first_failed_stage
+        .and_then(|stage| {
+            failures
+                .iter()
+                .find_map(|(candidate, count)| (*candidate == stage).then_some(*count))
+        })
+        .unwrap_or(0);
     Err(RunIntegrityError {
         command,
         successful_item,
         successful_items,
         total_failures,
-        first_failed_stage: first_failure.map(|(stage, _)| stage),
-        first_stage_failures: first_failure.map_or(0, |(_, count)| count),
+        first_failed_stage,
+        first_stage_failures,
+        first_source: captured.map(|failure| failure.source),
     })
+}
+
+fn report_error_chain(context: &str, error: &(dyn std::error::Error + 'static)) {
+    eprintln!("{context}: {error}");
+    let mut nested = error.source();
+    while let Some(cause) = nested {
+        eprintln!("  caused by: {cause}");
+        nested = cause.source();
+    }
+}
+
+fn next_selected_success<I, T, E>(
+    entries: &mut I,
+    entries_consumed: &mut usize,
+    selected_entry_count: usize,
+    mut on_error: impl FnMut(E),
+) -> Option<T>
+where
+    I: Iterator<Item = Result<T, E>>,
+{
+    while *entries_consumed < selected_entry_count {
+        let entry = entries.next()?;
+        *entries_consumed += 1;
+        match entry {
+            Ok(value) => return Some(value),
+            Err(error) => on_error(error),
+        }
+    }
+    None
 }
 
 #[derive(Parser, Debug)]
@@ -238,9 +372,14 @@ mod tests {
     use super::args::{PrefetchSession, RerunArgsError, RerunDestination, RerunOutput};
     use super::bench::{BenchAccum, summarize_bench};
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
-    use super::{Cli, Command, RerunRecordingInitError, rerun_recording, verify_run_integrity};
+    use super::{
+        Cli, Command, RerunRecordingInitError, RunFailureCapture, RunMetricsStatus,
+        rerun_recording, verify_run_integrity,
+    };
     use clap::Parser;
-    use kiko_slam::{DownscaleFactor, KeypointLimit, LoopSubsystemConfig, TrackingMatcher};
+    use kiko_slam::{
+        DownscaleFactor, InferenceError, KeypointLimit, LoopSubsystemConfig, TrackingMatcher,
+    };
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
@@ -253,29 +392,103 @@ mod tests {
 
     #[test]
     fn run_integrity_requires_success_and_zero_stage_failures() {
-        verify_run_integrity("bench", "pairs", 3, &[("read", 0), ("inference", 0)])
-            .expect("clean run");
+        verify_run_integrity(
+            "bench",
+            "pairs",
+            3,
+            &[("read", 0), ("inference", 0)],
+            RunFailureCapture::default(),
+        )
+        .expect("clean run");
 
-        let partial = verify_run_integrity("bench", "pairs", 2, &[("read", 1), ("inference", 2)])
-            .expect_err("partial run");
+        let partial = verify_run_integrity(
+            "bench",
+            "pairs",
+            2,
+            &[("read", 1), ("inference", 2)],
+            RunFailureCapture::default(),
+        )
+        .expect_err("partial run");
         assert_eq!(partial.total_failures, 3);
         assert_eq!(partial.first_failed_stage, Some("read"));
         assert_eq!(partial.first_stage_failures, 1);
 
-        let empty = verify_run_integrity("bench", "pairs", 0, &[]).expect_err("empty run");
+        let empty = verify_run_integrity("bench", "pairs", 0, &[], RunFailureCapture::default())
+            .expect_err("empty run");
         assert_eq!(empty.total_failures, 0);
         assert_eq!(empty.first_failed_stage, None);
     }
 
     #[test]
-    fn prefetch_session_distinguishes_ready_from_not_applicable() {
+    fn run_integrity_preserves_first_failure_as_source() {
+        #[derive(Debug)]
+        struct ReadFailure;
+        impl std::fmt::Display for ReadFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("read failure")
+            }
+        }
+        impl std::error::Error for ReadFailure {}
+
+        let mut failures = RunFailureCapture::default();
+        failures.record("read", ReadFailure);
+        let error = verify_run_integrity("bench", "pairs", 1, &[("read", 1)], failures)
+            .expect_err("failed run");
+        assert_eq!(error.first_failed_stage, Some("read"));
+        assert_eq!(
+            std::error::Error::source(&error)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("read failure")
+        );
+    }
+
+    #[test]
+    fn metrics_are_valid_only_for_complete_usable_runs() {
+        assert_eq!(
+            RunMetricsStatus::from_outcome(true, true, true),
+            RunMetricsStatus::Valid
+        );
+        for outcome in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert_eq!(
+                RunMetricsStatus::from_outcome(outcome.0, outcome.1, outcome.2),
+                RunMetricsStatus::InvalidPartial
+            );
+        }
+    }
+
+    #[test]
+    fn prefetch_session_distinguishes_ready_not_applicable_and_required_failure() {
         let ready = PrefetchSession::Ready(42_u8);
         assert!(ready.is_ready());
         assert_eq!(ready.into_option(), Some(42));
 
         let not_applicable = PrefetchSession::<u8>::NotApplicable;
         assert!(!not_applicable.is_ready());
-        assert_eq!(not_applicable.into_option(), None);
+        assert_eq!(
+            not_applicable
+                .require_ready_if_applicable()
+                .expect("not-applicable prefetch"),
+            None
+        );
+
+        let unavailable = PrefetchSession::<u8>::Unavailable {
+            component: "stereo_superpoint",
+            source: InferenceError::InvalidSetting {
+                key: "TEST_SETTING",
+                value: "invalid".to_string(),
+                expected: "valid",
+            },
+        };
+        let error = unavailable
+            .require_ready_if_applicable()
+            .expect_err("required prefetch failure must propagate");
+        assert!(error.to_string().contains("stereo_superpoint"));
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     fn set_env(key: &str, value: &str) {
@@ -591,6 +804,37 @@ mod tests {
         ])
         .expect_err("conflicting Rerun destinations must be rejected");
 
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn explicit_headless_slam_rejects_rerun_destinations() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "run",
+            "--profile",
+            "jetson",
+            "--visual-only",
+            "--headless",
+            "--warmup-pairs",
+            "4",
+            "/tmp/dataset",
+        ])
+        .expect("explicitly headless SLAM command");
+        let Command::Slam(args) = cli.command else {
+            panic!("expected SLAM command");
+        };
+        assert!(args.headless);
+
+        let error = Cli::try_parse_from([
+            "kiko-slam",
+            "run",
+            "--headless",
+            "--save-rrd",
+            "/tmp/debug.rrd",
+            "/tmp/dataset",
+        ])
+        .expect_err("headless and Rerun output must be mutually exclusive");
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 

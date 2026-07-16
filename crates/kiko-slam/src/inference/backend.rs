@@ -13,7 +13,7 @@ use super::{InferenceError, inference_env};
 pub enum InferenceBackend {
     Auto,
     Cpu,
-    CoreMLGpu,
+    CoreMLCpuAndGpu,
     Cuda,
     TensorRT,
 }
@@ -27,7 +27,7 @@ impl InferenceBackend {
         match value.trim().to_lowercase().as_str() {
             "auto" => Some(InferenceBackend::Auto),
             "cpu" => Some(InferenceBackend::Cpu),
-            "coreml" | "coreml-gpu" => Some(InferenceBackend::CoreMLGpu),
+            "coreml" | "coreml-gpu" | "coreml-cpu-gpu" => Some(InferenceBackend::CoreMLCpuAndGpu),
             "cuda" => Some(InferenceBackend::Cuda),
             "tensorrt" => Some(InferenceBackend::TensorRT),
             _ => None,
@@ -39,6 +39,8 @@ impl InferenceBackend {
 pub struct BackendSelection {
     selected: InferenceBackend,
     providers: Vec<ExecutionProviderDispatch>,
+    provider_names: Vec<&'static str>,
+    strict_accelerator: bool,
 }
 
 impl BackendSelection {
@@ -49,42 +51,66 @@ impl BackendSelection {
     pub fn providers(&self) -> &[ExecutionProviderDispatch] {
         &self.providers
     }
+
+    pub fn provider_names(&self) -> &[&'static str] {
+        &self.provider_names
+    }
+
+    pub fn strict_accelerator(&self) -> bool {
+        self.strict_accelerator
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackendPolicy {
+    strict_accelerator: bool,
 }
 
 pub(crate) fn select_backend(
     requested: InferenceBackend,
 ) -> Result<BackendSelection, InferenceError> {
+    let jetson = is_jetson();
     let desired = match requested {
         InferenceBackend::Auto => detect_backend(),
         other => other,
     };
+    let allow_fallback =
+        inference_env(crate::env::try_env_bool("KIKO_ALLOW_BACKEND_FALLBACK"))?.unwrap_or(false);
 
     let mut providers = Vec::new();
+    let mut provider_names = Vec::new();
     let mut selected = InferenceBackend::Cpu;
 
     match desired {
-        InferenceBackend::CoreMLGpu => {
+        InferenceBackend::CoreMLCpuAndGpu => {
             if let Some(ep) = coreml_provider()? {
                 providers.push(ep);
-                selected = InferenceBackend::CoreMLGpu;
+                provider_names.push("CoreML(CPUAndGPU)");
+                selected = InferenceBackend::CoreMLCpuAndGpu;
             }
         }
         InferenceBackend::Cuda => {
-            if let Some(ep) = cuda_provider()? {
+            if let Some(ep) = cuda_provider(jetson)? {
                 providers.push(ep);
+                provider_names.push("CUDA");
                 selected = InferenceBackend::Cuda;
             }
         }
         InferenceBackend::TensorRT => {
             if let Some(ep) = tensorrt_provider()? {
                 providers.push(ep);
+                provider_names.push("TensorRT");
                 selected = InferenceBackend::TensorRT;
-                if let Some(ep) = cuda_provider()? {
+                if let Some(ep) = cuda_provider(jetson)? {
                     providers.push(ep);
+                    provider_names.push("CUDA");
                 }
-            } else if let Some(ep) = cuda_provider()? {
-                providers.push(ep);
-                selected = InferenceBackend::Cuda;
+            } else if requested == InferenceBackend::Auto || allow_fallback {
+                if let Some(ep) = cuda_provider(jetson)? {
+                    providers.push(ep);
+                    provider_names.push("CUDA");
+                    selected = InferenceBackend::Cuda;
+                }
             }
         }
         InferenceBackend::Cpu => {
@@ -99,22 +125,39 @@ pub(crate) fn select_backend(
         selected = InferenceBackend::Cpu;
     }
 
-    let use_cpu_arena =
-        inference_env(crate::env::try_env_bool("KIKO_ORT_CPU_ARENA"))?.unwrap_or(true);
-    providers.push(
-        CPUExecutionProvider::default()
-            .with_arena_allocator(use_cpu_arena)
-            .build(),
-    );
-
-    let allow_fallback =
-        inference_env(crate::env::try_env_bool("KIKO_ALLOW_BACKEND_FALLBACK"))?.unwrap_or(false);
-    validate_backend_selection(requested, desired, selected, allow_fallback, is_jetson())?;
+    let policy = validate_backend_selection(requested, desired, selected, allow_fallback, jetson)?;
+    providers = configure_provider_registration(providers, policy.strict_accelerator);
+    if !policy.strict_accelerator {
+        let use_cpu_arena =
+            inference_env(crate::env::try_env_bool("KIKO_ORT_CPU_ARENA"))?.unwrap_or(true);
+        providers.push(
+            CPUExecutionProvider::default()
+                .with_arena_allocator(use_cpu_arena)
+                .build(),
+        );
+        provider_names.push("CPU");
+    }
 
     Ok(BackendSelection {
         selected,
         providers,
+        provider_names,
+        strict_accelerator: policy.strict_accelerator,
     })
+}
+
+fn configure_provider_registration(
+    providers: Vec<ExecutionProviderDispatch>,
+    strict_accelerator: bool,
+) -> Vec<ExecutionProviderDispatch> {
+    if strict_accelerator {
+        providers
+            .into_iter()
+            .map(ExecutionProviderDispatch::error_on_failure)
+            .collect()
+    } else {
+        providers
+    }
 }
 
 fn validate_backend_selection(
@@ -123,44 +166,41 @@ fn validate_backend_selection(
     selected: InferenceBackend,
     allow_fallback: bool,
     jetson: bool,
-) -> Result<(), InferenceError> {
-    if allow_fallback || selected == InferenceBackend::Cpu && desired == InferenceBackend::Cpu {
-        return Ok(());
-    }
-
+) -> Result<BackendPolicy, InferenceError> {
     let explicit_accelerator = matches!(
         requested,
-        InferenceBackend::CoreMLGpu | InferenceBackend::Cuda | InferenceBackend::TensorRT
+        InferenceBackend::CoreMLCpuAndGpu | InferenceBackend::Cuda | InferenceBackend::TensorRT
     );
     let auto_jetson_accelerator =
         requested == InferenceBackend::Auto && jetson && desired != InferenceBackend::Cpu;
 
-    if explicit_accelerator && selected != requested {
+    if explicit_accelerator && selected != requested && !allow_fallback {
         return Err(InferenceError::BackendUnavailable {
             requested,
             selected,
         });
     }
 
-    if auto_jetson_accelerator && selected == InferenceBackend::Cpu {
+    if auto_jetson_accelerator && selected == InferenceBackend::Cpu && !allow_fallback {
         return Err(InferenceError::BackendUnavailable {
             requested: desired,
             selected,
         });
     }
 
-    Ok(())
+    Ok(BackendPolicy {
+        strict_accelerator: (explicit_accelerator || auto_jetson_accelerator)
+            && selected != InferenceBackend::Cpu
+            && !allow_fallback,
+    })
 }
 
 fn detect_backend() -> InferenceBackend {
     if cfg!(target_vendor = "apple") {
-        return InferenceBackend::CoreMLGpu;
+        return InferenceBackend::CoreMLCpuAndGpu;
     }
 
     if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        if is_jetson() {
-            return InferenceBackend::Cuda;
-        }
         return InferenceBackend::Cuda;
     }
 
@@ -181,17 +221,17 @@ fn is_jetson() -> bool {
 fn coreml_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> {
     #[cfg(feature = "ort-coreml")]
     {
-        use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
+        use ort::execution_providers::CoreML;
+        use ort::execution_providers::coreml::ComputeUnits;
 
-        let ep =
-            CoreMLExecutionProvider::default().with_compute_units(CoreMLComputeUnits::CPUAndGPU);
+        let ep = CoreML::default().with_compute_units(ComputeUnits::CPUAndGPU);
         if !ep.supported_by_platform() {
             return Ok(None);
         }
         if !ep
             .is_available()
             .map_err(|source| InferenceError::BackendProbe {
-                backend: InferenceBackend::CoreMLGpu,
+                backend: InferenceBackend::CoreMLCpuAndGpu,
                 source,
             })?
         {
@@ -206,16 +246,12 @@ fn coreml_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError
     }
 }
 
-fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> {
+fn cuda_provider(jetson: bool) -> Result<Option<ExecutionProviderDispatch>, InferenceError> {
     #[cfg(feature = "ort-cuda")]
     {
         use ort::execution_providers::CUDAExecutionProvider;
 
-        let default_conv_search = if is_jetson() {
-            "heuristic"
-        } else {
-            "exhaustive"
-        };
+        let default_conv_search = if jetson { "heuristic" } else { "exhaustive" };
         let conv_search_raw = inference_env(crate::env::try_env_string("KIKO_CUDA_CONV_SEARCH"))?
             .unwrap_or_else(|| default_conv_search.to_string());
         let conv_search = match conv_search_raw.trim().to_lowercase().as_str() {
@@ -261,6 +297,7 @@ fn cuda_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceError> 
 
     #[cfg(not(feature = "ort-cuda"))]
     {
+        let _ = jetson;
         Ok(None)
     }
 }
@@ -270,10 +307,9 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
     {
         use ort::execution_providers::TensorRTExecutionProvider;
 
-        let cache_dir = PathBuf::from(
-            inference_env(crate::env::try_env_string("KIKO_TRT_CACHE_DIR"))?
-                .unwrap_or_else(|| "/home/makerspace/.cache/kiko-trt-engines".to_string()),
-        );
+        let cache_dir_value = inference_env(crate::env::try_env_string("KIKO_TRT_CACHE_DIR"))?
+            .unwrap_or_else(|| "/home/makerspace/.cache/kiko-trt-engines".to_string());
+        let cache_dir = PathBuf::from(&cache_dir_value);
         std::fs::create_dir_all(&cache_dir).map_err(|source| InferenceError::CacheDirectory {
             path: cache_dir.clone(),
             source,
@@ -289,9 +325,9 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
         let ep = TensorRTExecutionProvider::default()
             .with_fp16(true)
             .with_engine_cache(true)
-            .with_engine_cache_path(&cache_dir)
+            .with_engine_cache_path(&cache_dir_value)
             .with_timing_cache(true)
-            .with_timing_cache_path(&cache_dir)
+            .with_timing_cache_path(&cache_dir_value)
             .with_build_heuristics(true)
             .with_builder_optimization_level(5)
             .with_cuda_graph(cuda_graph)
@@ -325,7 +361,9 @@ fn tensorrt_provider() -> Result<Option<ExecutionProviderDispatch>, InferenceErr
 
 #[cfg(test)]
 mod tests {
-    use super::{InferenceBackend, validate_backend_selection};
+    #[cfg(not(feature = "ort-cuda"))]
+    use super::configure_provider_registration;
+    use super::{BackendPolicy, InferenceBackend, validate_backend_selection};
     use crate::inference::InferenceError;
 
     #[test]
@@ -345,6 +383,93 @@ mod tests {
                 selected: InferenceBackend::Cpu,
             }
         ));
+    }
+
+    #[test]
+    fn explicit_unavailable_backend_rejects_fallback_without_opt_in() {
+        let err = validate_backend_selection(
+            InferenceBackend::Cuda,
+            InferenceBackend::Cuda,
+            InferenceBackend::Cpu,
+            false,
+            true,
+        )
+        .expect_err("an explicit unavailable backend must fail");
+        assert!(matches!(
+            err,
+            InferenceError::BackendUnavailable {
+                requested: InferenceBackend::Cuda,
+                selected: InferenceBackend::Cpu,
+            }
+        ));
+    }
+
+    #[test]
+    fn selected_accelerators_are_strict_without_fallback_opt_in() {
+        for backend in [
+            InferenceBackend::CoreMLCpuAndGpu,
+            InferenceBackend::Cuda,
+            InferenceBackend::TensorRT,
+        ] {
+            assert_eq!(
+                validate_backend_selection(backend, backend, backend, false, true)
+                    .expect("available explicit accelerator"),
+                BackendPolicy {
+                    strict_accelerator: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn selected_accelerator_allows_cpu_fallback_only_with_opt_in() {
+        assert_eq!(
+            validate_backend_selection(
+                InferenceBackend::Cuda,
+                InferenceBackend::Cuda,
+                InferenceBackend::Cuda,
+                true,
+                true,
+            )
+            .expect("available explicit accelerator"),
+            BackendPolicy {
+                strict_accelerator: false,
+            }
+        );
+    }
+
+    #[test]
+    fn jetson_auto_accelerator_is_strict_without_fallback_opt_in() {
+        assert_eq!(
+            validate_backend_selection(
+                InferenceBackend::Auto,
+                InferenceBackend::Cuda,
+                InferenceBackend::Cuda,
+                false,
+                true,
+            )
+            .expect("available auto-selected Jetson accelerator"),
+            BackendPolicy {
+                strict_accelerator: true,
+            }
+        );
+    }
+
+    #[test]
+    fn non_jetson_auto_accelerator_retains_cpu_fallback() {
+        assert_eq!(
+            validate_backend_selection(
+                InferenceBackend::Auto,
+                InferenceBackend::CoreMLCpuAndGpu,
+                InferenceBackend::CoreMLCpuAndGpu,
+                false,
+                false,
+            )
+            .expect("available auto-selected non-Jetson accelerator"),
+            BackendPolicy {
+                strict_accelerator: false,
+            }
+        );
     }
 
     #[test]
@@ -368,13 +493,30 @@ mod tests {
 
     #[test]
     fn fallback_opt_in_allows_backend_downgrade() {
-        validate_backend_selection(
+        let policy = validate_backend_selection(
             InferenceBackend::TensorRT,
             InferenceBackend::TensorRT,
             InferenceBackend::Cpu,
             true,
             true,
         )
-        .expect("fallback opt-in should allow downgrade");
+        .expect("auto fallback opt-in should allow downgrade");
+        assert_eq!(
+            policy,
+            BackendPolicy {
+                strict_accelerator: false,
+            }
+        );
+    }
+
+    #[cfg(not(feature = "ort-cuda"))]
+    #[test]
+    fn strict_dispatch_surfaces_provider_registration_failure() {
+        use ort::execution_providers::CUDAExecutionProvider;
+
+        let providers =
+            configure_provider_registration(vec![CUDAExecutionProvider::default().build()], true);
+        let builder = ort::session::Session::builder().expect("session builder");
+        assert!(builder.with_execution_providers(providers).is_err());
     }
 }

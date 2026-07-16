@@ -1,7 +1,9 @@
 use ort::Error as OrtError;
-use ort::session::Session;
+use ort::logging::LogLevel;
 use ort::session::builder::GraphOptimizationLevel;
+use ort::session::{RunOptions, Session};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod backend;
@@ -396,6 +398,17 @@ fn build_session(
 
     let selection = backend::select_backend(backend)?;
     builder = apply_session_config(builder, selection.selected())?;
+    let disable_cpu_ep_fallback =
+        inference_env(crate::env::try_env_bool("KIKO_ORT_DISABLE_CPU_EP_FALLBACK"))?
+            .unwrap_or(false);
+    if disable_cpu_ep_fallback {
+        builder = builder.with_disable_cpu_fallback().map_err(|source| {
+            InferenceError::SessionConfiguration {
+                backend: selection.selected(),
+                source: source.into(),
+            }
+        })?;
+    }
     if !selection.providers().is_empty() {
         builder = builder
             .with_execution_providers(selection.providers())
@@ -404,13 +417,21 @@ fn build_session(
                 source: source.into(),
             })?;
     }
-
     let session = builder
         .commit_from_file(path)
         .map_err(|e| InferenceError::LoadFailed {
             path: path.to_path_buf(),
             source: e,
         })?;
+
+    eprintln!(
+        "ort session policy: model={} requested_backend={backend:?} configured_primary_backend={:?} configured_providers=[{}] strict_backend_registration={} ort_cpu_ep_fallback_disabled={} session_committed=true",
+        path.display(),
+        selection.selected(),
+        selection.provider_names().join(","),
+        selection.strict_accelerator(),
+        disable_cpu_ep_fallback
+    );
 
     Ok((session, selection.selected(), diagnostics))
 }
@@ -448,8 +469,10 @@ fn apply_session_config(
         inference_env(crate::env::try_env_bool("KIKO_ORT_MEM_PATTERN"))?.unwrap_or(true);
     let parallel_exec =
         inference_env(crate::env::try_env_bool("KIKO_ORT_PARALLEL_EXEC"))?.unwrap_or(false);
+    let log_level = env_log_level("KIKO_ORT_LOG_LEVEL")?;
+    let log_verbosity = env_log_verbosity("KIKO_ORT_LOG_VERBOSITY")?;
 
-    builder
+    let mut builder = builder
         .with_optimization_level(opt_level)
         .and_then(|b| b.with_memory_pattern(mem_pattern))
         .and_then(|b| b.with_intra_threads(intra))
@@ -458,7 +481,102 @@ fn apply_session_config(
         .map_err(|source| InferenceError::SessionConfiguration {
             backend: selected,
             source: source.into(),
+        })?;
+    if let Some(level) = log_level {
+        builder = builder
+            .with_logger(Arc::new(
+                |level, category, id, code_location, message| {
+                    let placement_summary = message.contains("Node placements")
+                        || message.contains("Node(s) placed on")
+                        || message.contains("All nodes placed on");
+                    if placement_summary
+                        || matches!(
+                            level,
+                            LogLevel::Warning | LogLevel::Error | LogLevel::Fatal
+                        )
+                    {
+                        eprintln!(
+                            "ort[{level:?}] category={category} id={id} location={code_location} {message}"
+                        );
+                    }
+                },
+            ))
+            .and_then(|builder| builder.with_log_level(level))
+            .map_err(|source| InferenceError::SessionConfiguration {
+                backend: selected,
+                source: source.into(),
+            })?;
+    }
+    if let Some(verbosity) = log_verbosity {
+        builder = builder.with_log_verbosity(verbosity).map_err(|source| {
+            InferenceError::SessionConfiguration {
+                backend: selected,
+                source: source.into(),
+            }
+        })?;
+    }
+    Ok(builder)
+}
+
+pub(super) fn build_run_options(selected: InferenceBackend) -> Result<RunOptions, InferenceError> {
+    let mut options = RunOptions::new().map_err(|source| InferenceError::SessionConfiguration {
+        backend: selected,
+        source,
+    })?;
+    if let Some(level) = env_log_level("KIKO_ORT_RUN_LOG_LEVEL")? {
+        options
+            .set_log_level(level)
+            .map_err(|source| InferenceError::SessionConfiguration {
+                backend: selected,
+                source,
+            })?;
+    }
+    if let Some(verbosity) = env_log_verbosity("KIKO_ORT_RUN_LOG_VERBOSITY")? {
+        options.set_log_verbosity(verbosity).map_err(|source| {
+            InferenceError::SessionConfiguration {
+                backend: selected,
+                source,
+            }
+        })?;
+    }
+    Ok(options)
+}
+
+fn env_log_level(key: &'static str) -> Result<Option<LogLevel>, InferenceError> {
+    let Some(raw) = inference_env(crate::env::try_env_string(key))? else {
+        return Ok(None);
+    };
+    parse_log_level(key, raw).map(Some)
+}
+
+fn env_log_verbosity(key: &'static str) -> Result<Option<i32>, InferenceError> {
+    inference_env(crate::env::try_env_usize(key))?
+        .map(|value| {
+            i32::try_from(value).map_err(|_| InferenceError::InvalidSetting {
+                key,
+                value: value.to_string(),
+                expected: "a non-negative integer within i32 range",
+            })
         })
+        .transpose()
+}
+
+fn parse_log_level(key: &'static str, raw: String) -> Result<LogLevel, InferenceError> {
+    let level = match raw.trim().to_ascii_lowercase().as_str() {
+        "verbose" => LogLevel::Verbose,
+        "info" => LogLevel::Info,
+        "warning" | "warn" => LogLevel::Warning,
+        "error" => LogLevel::Error,
+        "fatal" => LogLevel::Fatal,
+        _ => {
+            return Err(InferenceError::InvalidSetting {
+                key,
+                value: raw,
+                expected: "verbose, info, warning/warn, error, or fatal",
+            });
+        }
+    };
+    Ok(level)
 }
 
 fn env_opt_level(key: &'static str) -> Result<Option<GraphOptimizationLevel>, InferenceError> {
@@ -506,9 +624,10 @@ fn invalid_setting(
 #[cfg(test)]
 mod tests {
     use super::{
-        InferenceError, exact_i64_output_f32, output_record_count, parse_opt_level,
-        require_output_elements,
+        InferenceError, exact_i64_output_f32, output_record_count, parse_log_level,
+        parse_opt_level, require_output_elements,
     };
+    use ort::logging::LogLevel;
 
     #[test]
     fn required_output_elements_rejects_truncated_tensors() {
@@ -534,6 +653,22 @@ mod tests {
                 value,
                 ..
             }) if value == "fastest"
+        ));
+    }
+
+    #[test]
+    fn session_log_level_parser_is_explicit_and_fail_closed() {
+        assert_eq!(
+            parse_log_level("KIKO_ORT_LOG_LEVEL", "verbose".to_string()).expect("verbose level"),
+            LogLevel::Verbose
+        );
+        assert!(matches!(
+            parse_log_level("KIKO_ORT_LOG_LEVEL", "debug".to_string()),
+            Err(InferenceError::InvalidSetting {
+                key: "KIKO_ORT_LOG_LEVEL",
+                value,
+                ..
+            }) if value == "debug"
         ));
     }
 

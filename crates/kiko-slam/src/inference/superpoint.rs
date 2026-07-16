@@ -1,8 +1,9 @@
 use super::{
-    InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session, inference_env,
+    InferenceBackend, InferenceError, InferenceRunDiagnostics, build_run_options, build_session,
+    inference_env,
 };
 use crate::{Descriptor, Detections, DownscaleFactor, Frame, FrameDimensions, Keypoint};
-use ort::session::Session;
+use ort::session::{RunOptions, Session};
 use ort::value::Outlet;
 use ort::value::PrimitiveTensorElementType;
 use ort::value::TensorElementType;
@@ -15,6 +16,7 @@ use crate::DESCRIPTOR_DIM;
 
 pub struct SuperPoint {
     session: Session,
+    run_options: RunOptions,
     backend: InferenceBackend,
     diagnostics: InferenceRunDiagnostics,
     kind: SuperPointModelKind,
@@ -62,6 +64,7 @@ impl SuperPoint {
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let (session, selected, diagnostics) = build_session(path, backend)?;
+        let run_options = build_run_options(selected)?;
         let (kind, input_kind) =
             parse_superpoint_model_interface(session.inputs(), session.outputs())?;
         let dense_candidate_cap =
@@ -76,6 +79,7 @@ impl SuperPoint {
                 .transpose()?;
         Ok(Self {
             session,
+            run_options,
             backend: selected,
             diagnostics,
             kind,
@@ -118,6 +122,7 @@ impl SuperPoint {
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
+                    &self.run_options,
                     frame,
                     input_tensor,
                     frame.dimensions(),
@@ -141,6 +146,7 @@ impl SuperPoint {
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
+                    &self.run_options,
                     frame,
                     input_tensor,
                     frame.dimensions(),
@@ -200,6 +206,7 @@ impl SuperPoint {
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
+                    &self.run_options,
                     frame,
                     input_tensor,
                     dimensions,
@@ -237,6 +244,7 @@ impl SuperPoint {
                 run_with_tensor(
                     self.kind,
                     &mut self.session,
+                    &self.run_options,
                     frame,
                     input_tensor,
                     dimensions,
@@ -343,6 +351,7 @@ fn unsupported_superpoint_interface(inputs: &[Outlet], outputs: &[Outlet]) -> In
 fn run_with_tensor<T>(
     kind: SuperPointModelKind,
     session: &mut Session,
+    run_options: &RunOptions,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
     input_dimensions: FrameDimensions,
@@ -359,6 +368,7 @@ where
     match kind {
         SuperPointModelKind::SparseOutputs(keypoint_kind) => run_sparse_inference(
             session,
+            run_options,
             frame,
             input_tensor,
             keypoint_kind,
@@ -368,6 +378,7 @@ where
         ),
         SuperPointModelKind::DenseHeads => run_dense_inference(
             session,
+            run_options,
             frame,
             input_tensor,
             input_dimensions,
@@ -383,6 +394,7 @@ where
 
 fn run_sparse_inference<T>(
     session: &mut Session,
+    run_options: &RunOptions,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
     keypoint_kind: SparseKeypointKind,
@@ -395,7 +407,7 @@ where
 {
     let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
-            .run(ort::inputs!["image" => input_tensor])
+            .run_with_options(ort::inputs!["image" => input_tensor], run_options)
             .map_err(|source| InferenceError::SessionRun {
                 model: "superpoint-sparse",
                 source,
@@ -486,6 +498,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn run_dense_inference<T>(
     session: &mut Session,
+    run_options: &RunOptions,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
     input_dimensions: FrameDimensions,
@@ -501,7 +514,7 @@ where
 {
     let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
-            .run(ort::inputs!["image" => input_tensor])
+            .run_with_options(ort::inputs!["image" => input_tensor], run_options)
             .map_err(|source| InferenceError::SessionRun {
                 model: "superpoint-dense",
                 source,

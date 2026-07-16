@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use ort::session::Session;
+use ort::session::{RunOptions, Session};
 use ort::value::{TensorElementType, TensorRef, ValueType};
 
 use crate::Frame;
@@ -8,7 +8,7 @@ use crate::loop_closure::{GLOBAL_DESCRIPTOR_DIM, GlobalDescriptor};
 
 use super::{
     InferenceBackend, InferenceError, InferenceRunDiagnostics, PlaceDescriptorExtractor,
-    build_session,
+    build_run_options, build_session,
 };
 
 const INPUT_SIZE: usize = 224;
@@ -20,6 +20,7 @@ const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 pub struct EigenPlaces {
     session: Session,
+    run_options: RunOptions,
     backend: InferenceBackend,
     diagnostics: InferenceRunDiagnostics,
     scratch: Vec<f32>,
@@ -36,8 +37,10 @@ impl EigenPlaces {
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let (session, selected, diagnostics) = build_session(path, backend)?;
+        let run_options = build_run_options(selected)?;
         Ok(Self {
             session,
+            run_options,
             backend: selected,
             diagnostics,
             scratch: Vec::new(),
@@ -74,7 +77,7 @@ impl EigenPlaces {
         let outputs =
             super::run_with_slow_call_diagnostics(self.diagnostics, "eigenplaces", || {
                 self.session
-                    .run(ort::inputs!["input" => input_tensor])
+                    .run_with_options(ort::inputs!["input" => input_tensor], &self.run_options)
                     .map_err(|source| InferenceError::SessionRun {
                         model: "eigenplaces",
                         source,

@@ -176,6 +176,7 @@ impl InferencePipeline {
         let downscale = self.downscale;
         let max_keypoints = self.max_keypoints.get();
 
+        let stereo_superpoint_start = Instant::now();
         let (left_det, left_time, right_det, right_time) =
             if let Some(sp_right) = &mut self.superpoint_right {
                 // Parallel SP: run left and right on separate threads
@@ -221,6 +222,7 @@ impl InferencePipeline {
 
                 (left_det, left_time, right_det, right_time)
             };
+        let stereo_superpoint_wall = stereo_superpoint_start.elapsed();
 
         let left = Arc::new(left_det);
         let right = Arc::new(right_det);
@@ -240,6 +242,7 @@ impl InferencePipeline {
         let timings = PipelineTimings {
             superpoint_left: left_time,
             superpoint_right: right_time,
+            stereo_superpoint_wall,
             lightglue: match_time,
             total,
         };
@@ -250,9 +253,19 @@ impl InferencePipeline {
 
 #[derive(Debug, Clone, Copy)]
 pub struct PipelineTimings {
+    /// Successful left detection-call wall time, including preprocessing,
+    /// ONNX Runtime execution, and output parsing. With parallel stereo
+    /// inference this overlaps `superpoint_right` and is not additive.
     pub superpoint_left: Duration,
+    /// Successful right detection-call wall time, with the same boundaries as
+    /// `superpoint_left`. It may overlap `superpoint_left`.
     pub superpoint_right: Duration,
+    /// Wall time from starting stereo feature extraction until both sides
+    /// complete, whether the two invocations run concurrently or sequentially.
+    pub stereo_superpoint_wall: Duration,
+    /// Successful matching-call wall time, including input/output handling.
     pub lightglue: Duration,
+    /// Successful `process_pair_timed` wall time.
     pub total: Duration,
 }
 

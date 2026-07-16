@@ -1,15 +1,18 @@
-use super::{InferenceBackend, InferenceError, InferenceRunDiagnostics, build_session};
+use super::{
+    InferenceBackend, InferenceError, InferenceRunDiagnostics, build_run_options, build_session,
+};
 use crate::DESCRIPTOR_DIM;
 use crate::Detections;
 use crate::Matches;
 use crate::Raw;
-use ort::session::Session;
+use ort::session::{RunOptions, Session};
 use ort::value::TensorRef;
 use std::path::Path;
 use std::sync::Arc;
 
 pub struct LightGlue {
     session: Session,
+    run_options: RunOptions,
     backend: InferenceBackend,
     diagnostics: InferenceRunDiagnostics,
     keypoints_0: Vec<f32>,
@@ -27,9 +30,11 @@ impl LightGlue {
     ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let (session, selected, diagnostics) = build_session(path, backend)?;
+        let run_options = build_run_options(selected)?;
 
         Ok(Self {
             session,
+            run_options,
             backend: selected,
             diagnostics,
             keypoints_0: Vec::new(),
@@ -82,7 +87,7 @@ impl LightGlue {
                 "lightglue",
                 || {
                     self.session
-                    .run(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor])
+                    .run_with_options(ort::inputs!["kpts0" => kpts_0_tensor, "kpts1" => kpts_1_tensor, "desc0" => desc_0_tensor, "desc1" => desc_1_tensor], &self.run_options)
                     .map_err(|source| InferenceError::SessionRun {
                         model: "lightglue",
                         source,

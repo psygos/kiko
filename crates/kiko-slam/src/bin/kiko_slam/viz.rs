@@ -8,7 +8,10 @@ use kiko_slam::{RerunSink, TriangulationConfig, TriangulationError, Triangulator
 use crate::args::{
     DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
 };
-use crate::{rerun_recording, verify_run_integrity};
+use crate::{
+    RunFailureCapture, RunMetricsStatus, SkippedDatasetEntryError, next_selected_success,
+    rerun_recording, verify_run_integrity,
+};
 
 #[derive(Args, Clone, Debug)]
 #[command(about = "Visualize stereo feature matches on a recorded dataset")]
@@ -31,6 +34,11 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         "camera fps: left={:.2?} right={:.2?} paired={:.2?} (left={}, right={})",
         stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count
     );
+    let expected_pairs = args.dataset.selected_pair_count(stats.paired_count)?;
+    eprintln!(
+        "visualization selection: available_pairs={} skip_frames={} expected_pairs={}",
+        stats.paired_count, args.dataset.skip_frames, expected_pairs
+    );
 
     let inference = InferenceConfig::from_args(&args.inference, InferencePurpose::Visualization)?;
 
@@ -42,8 +50,35 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pipeline = inference.into_pipeline()?;
 
+    let mut pairs = reader.pairs();
+    for skipped in 0..args.dataset.skip_frames {
+        match pairs.next() {
+            Some(Ok(_)) => {}
+            Some(Err(source)) => {
+                return Err(Box::new(SkippedDatasetEntryError {
+                    command: "visualization",
+                    entry_number: skipped + 1,
+                    requested_skip: args.dataset.skip_frames,
+                    source,
+                }));
+            }
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "visualization dataset ended while skipping entry {} of {}",
+                        skipped + 1,
+                        args.dataset.skip_frames
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+
     let start = Instant::now();
-    let mut attempted = 0usize;
+    let mut entries_consumed = 0usize;
+    let mut inference_attempts = 0usize;
     let mut processed = 0usize;
     let mut inference_errors = 0usize;
     let mut read_errors = 0usize;
@@ -51,17 +86,20 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut triangulation_errors = 0usize;
     let mut triangulated_points = 0usize;
     let mut total_matches = 0usize;
+    let mut failure_sources = RunFailureCapture::default();
 
-    for pair in reader.pairs() {
-        let pair = match pair {
-            Ok(pair) => pair,
-            Err(err) => {
-                read_errors += 1;
-                eprintln!("read error: {err}");
-                continue;
-            }
-        };
-        attempted += 1;
+    let mut next_pair =
+        next_selected_success(&mut pairs, &mut entries_consumed, expected_pairs, |err| {
+            failure_sources.report_and_record(
+                &mut read_errors,
+                "dataset_read",
+                "visualization input error",
+                err,
+            );
+        });
+
+    while let Some(pair) = next_pair.take() {
+        inference_attempts += 1;
 
         match pipeline.process_pair(pair) {
             Ok(packet) => {
@@ -76,8 +114,12 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                         triangulation_empty += 1;
                     }
                     Err(err) => {
-                        triangulation_errors += 1;
-                        eprintln!("triangulation error: {err}");
+                        failure_sources.report_and_record(
+                            &mut triangulation_errors,
+                            "triangulation",
+                            "triangulation error",
+                            err,
+                        );
                     }
                 };
 
@@ -86,16 +128,24 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
                 processed += 1;
             }
             Err(err) => {
-                inference_errors += 1;
-                eprintln!("inference error: {err}");
+                failure_sources.report_and_record(
+                    &mut inference_errors,
+                    "inference",
+                    "visualization inference error",
+                    err,
+                );
             }
         }
 
-        if let Some(limit) = args.dataset.max_pairs {
-            if attempted >= limit {
-                break;
-            }
-        }
+        next_pair =
+            next_selected_success(&mut pairs, &mut entries_consumed, expected_pairs, |err| {
+                failure_sources.report_and_record(
+                    &mut read_errors,
+                    "dataset_read",
+                    "visualization input error",
+                    err,
+                );
+            });
     }
 
     let elapsed = start.elapsed().as_secs_f64();
@@ -115,12 +165,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         0.0
     };
 
-    eprintln!(
-        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, triangulated_points={triangulated_points}"
-    );
-    eprintln!("summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}");
-
-    verify_run_integrity(
+    let integrity = verify_run_integrity(
         "viz",
         "pairs",
         processed,
@@ -129,7 +174,28 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
             ("inference", inference_errors),
             ("triangulation", triangulation_errors),
         ],
-    )?;
+        failure_sources,
+    );
+    let exact_completion = entries_consumed == expected_pairs
+        && inference_attempts == expected_pairs
+        && processed == expected_pairs;
+    let metrics_status = RunMetricsStatus::from_outcome(integrity.is_ok(), exact_completion, true);
+    eprintln!("visualization metrics status: {}", metrics_status.as_str());
+    eprintln!(
+        "done: expected={expected_pairs}, entries_consumed={entries_consumed}, inference_attempts={inference_attempts}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, inference_errors={inference_errors}, triangulation_empty={triangulation_empty}, triangulation_errors={triangulation_errors}, triangulated_points={triangulated_points}"
+    );
+    eprintln!("summary: avg_matches={avg_matches:.1}, avg_triangulated={avg_triangulated:.1}");
+
+    integrity?;
+    if !exact_completion {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "visualization did not consume the selected dataset exactly: expected_pairs={expected_pairs}, entries_consumed={entries_consumed}, inference_attempts={inference_attempts}, processed={processed}"
+            ),
+        )
+        .into());
+    }
 
     Ok(())
 }

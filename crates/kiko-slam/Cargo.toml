@@ -18,7 +18,7 @@ crossbeam-channel = "0.5.13"
 image = "0.25.9"
 libc = "0.2.153"
 ndarray = "0.17.1"
-ort = { version = "2.0.0-rc.10", features = ["ndarray"] }
+ort = { version = "=2.0.0-rc.12", features = ["ndarray"] }
 rerun = "=0.27.2"
 re_arrow_util = "=0.27.3"
 re_log_encoding = "=0.27.3"

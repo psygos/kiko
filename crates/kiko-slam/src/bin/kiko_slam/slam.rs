@@ -10,8 +10,10 @@ use crate::args::{
     DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
     RunProfileArg,
 };
+use crate::bench::duration_percentiles;
 use crate::config::{TrackerDefaults, TrackerOverrides, build_tracker_config_with_overrides};
-use crate::{rerun_recording, verify_run_integrity};
+use crate::{RunFailureCapture, RunMetricsStatus, SkippedDatasetEntryError};
+use crate::{next_selected_success, rerun_recording, verify_run_integrity};
 
 const SLAM_ENV_HELP: &str = "\
 ENVIRONMENT VARIABLES (expert tuning):
@@ -107,13 +109,70 @@ pub struct SlamArgs {
     /// Force visual-only tracking even if a profile or env enables VIO.
     #[arg(long, default_value_t = false)]
     pub visual_only: bool,
+    /// Disable Rerun output without attempting to spawn or connect to a viewer.
+    #[arg(
+        long,
+        env = "KIKO_HEADLESS",
+        default_value_t = false,
+        conflicts_with_all = ["save_rrd", "rerun_url", "rerun_laptop", "rerun_serve"]
+    )]
+    pub headless: bool,
     #[command(flatten)]
     pub inference: InferenceArgs,
     #[command(flatten)]
     pub rerun: RerunArgs,
     #[command(flatten)]
     pub dataset: DatasetArgs,
+    /// Successful pipeline pairs processed for warm-up but excluded from steady-state metrics
+    #[arg(long, env = "KIKO_SLAM_WARMUP_PAIRS", default_value_t = 4)]
+    pub warmup_pairs: usize,
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PoseOutcomeCounts {
+    current: usize,
+    predicted: usize,
+    stale: usize,
+    unavailable: usize,
+}
+
+impl PoseOutcomeCounts {
+    fn record(&mut self, status: &kiko_slam::PoseStatus) {
+        let count = match status {
+            kiko_slam::PoseStatus::Current(_) => &mut self.current,
+            kiko_slam::PoseStatus::Predicted(_) => &mut self.predicted,
+            kiko_slam::PoseStatus::Stale { .. } => &mut self.stale,
+            kiko_slam::PoseStatus::Unavailable => &mut self.unavailable,
+        };
+        *count = count.saturating_add(1);
+    }
+
+    fn all_have_current_estimates(self, expected: usize) -> bool {
+        expected > 0 && self.current.checked_add(self.predicted) == Some(expected)
+    }
+}
+
+#[derive(Debug)]
+struct UnusableSteadyPoseStreamError {
+    steady_processed: usize,
+    outcomes: PoseOutcomeCounts,
+}
+
+impl std::fmt::Display for UnusableSteadyPoseStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "steady SLAM output did not provide a current estimate for every processed pair: processed={}, current={}, predicted={}, stale={}, unavailable={}",
+            self.steady_processed,
+            self.outcomes.current,
+            self.outcomes.predicted,
+            self.outcomes.stale,
+            self.outcomes.unavailable
+        )
+    }
+}
+
+impl std::error::Error for UnusableSteadyPoseStreamError {}
 
 fn vio_enabled(args: &SlamArgs) -> bool {
     (args.vio || args.profile == RunProfileArg::Jetson) && !args.visual_only
@@ -159,9 +218,34 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         "camera fps: left={:.2?} right={:.2?} paired={:.2?} (left={}, right={})",
         stats.left_fps, stats.right_fps, stats.paired_fps, stats.left_count, stats.right_count
     );
+    let expected_pairs = args.dataset.selected_pair_count(stats.paired_count)?;
+    if args.warmup_pairs >= expected_pairs {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "SLAM warm-up must leave at least one steady-state pair: selected={expected_pairs}, warmup_pairs={}",
+                args.warmup_pairs
+            ),
+        )
+        .into());
+    }
+    eprintln!(
+        "slam selection: available_pairs={} skip_frames={} expected_pairs={} warmup_pairs={} steady_pairs={}",
+        stats.paired_count,
+        args.dataset.skip_frames,
+        expected_pairs,
+        args.warmup_pairs,
+        expected_pairs - args.warmup_pairs
+    );
 
     let inference_args = args.inference.with_profile_defaults(args.profile)?;
+    let inference_init_start = Instant::now();
     let inference = InferenceConfig::from_args(&inference_args, InferencePurpose::Slam)?;
+    let inference_init = inference_init_start.elapsed();
+    eprintln!(
+        "inference session initialization: {:.2}ms",
+        inference_init.as_secs_f64() * 1000.0
+    );
 
     let calibration = reader.calibration().clone();
     let rectified = calibration.stereo().clone();
@@ -196,8 +280,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         key_limit,
         downscale,
     } = inference;
-    let superpoint_right = superpoint_right.into_option();
-    let lightglue_prefetch = lightglue_prefetch.into_option();
+    let superpoint_right = superpoint_right.require_ready_if_applicable()?;
+    let lightglue_prefetch = lightglue_prefetch.require_ready_if_applicable()?;
 
     let tracker_config = build_tracker_config_with_overrides(
         TrackerDefaults {
@@ -210,14 +294,19 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         tracker_overrides(args, vio_enabled),
     )?;
     let use_speculative_lg = tracker_config.tracking_matcher.uses_speculative_lightglue();
-    let mut sink = match rerun_recording(rerun_output.destination(), "kiko-slam-dataset-odometry") {
-        Ok(rec) => Some(RerunSink::try_new(rec, rerun_output.decimation())?),
-        Err(err) => {
-            if rerun_output.has_explicit_destination() {
-                return Err(Box::new(err));
+    let mut sink = if args.headless {
+        eprintln!("rerun: disabled explicitly (--headless)");
+        None
+    } else {
+        match rerun_recording(rerun_output.destination(), "kiko-slam-dataset-odometry") {
+            Ok(rec) => Some(RerunSink::try_new(rec, rerun_output.decimation())?),
+            Err(err) => {
+                if rerun_output.has_explicit_destination() {
+                    return Err(Box::new(err));
+                }
+                eprintln!("local Rerun viewer unavailable; continuing headless: {err}");
+                None
             }
-            eprintln!("local Rerun viewer unavailable; continuing headless: {err}");
-            None
         }
     };
     let mut tracker = SlamTracker::try_new(superpoint, lightglue, calibration, tracker_config)?;
@@ -246,8 +335,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     );
 
-    let start = Instant::now();
-    let mut attempted = 0usize;
+    let mut entries_consumed = 0usize;
+    let mut tracker_attempts = 0usize;
     let mut processed = 0usize;
     let mut tracker_errors = 0usize;
     let mut prefetch_fallbacks = 0usize;
@@ -256,6 +345,10 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut visualization_fallbacks = 0usize;
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
+    let mut service_intervals = Vec::with_capacity(expected_pairs);
+    let mut failure_sources = RunFailureCapture::default();
+    let mut pose_outcomes = PoseOutcomeCounts::default();
+    let mut steady_pose_outcomes = PoseOutcomeCounts::default();
 
     // Prefetch pipeline: overlap SP(N+1) + speculative LG(N+1) with frame N.
     enum PrefetchInferenceOutcome {
@@ -290,8 +383,12 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             match bundles_iter.next() {
                 Some(Ok(_)) => {}
                 Some(Err(err)) => {
-                    read_errors = read_errors.saturating_add(1);
-                    report_error_chain("read error while skipping a frame", &err);
+                    return Err(Box::new(SkippedDatasetEntryError {
+                        command: "SLAM",
+                        entry_number: skipped + 1,
+                        requested_skip: skip,
+                        source: err,
+                    }));
                 }
                 None => {
                     return Err(std::io::Error::new(
@@ -305,21 +402,22 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    let start = Instant::now();
+    let mut steady_start = (args.warmup_pairs == 0).then(Instant::now);
     // Read-ahead: grab the first bundle
-    let mut next_bundle: Option<kiko_slam::CaptureBundle> = loop {
-        match bundles_iter.next() {
-            Some(Ok(b)) => break Some(b),
-            Some(Err(err)) => {
-                read_errors += 1;
-                eprintln!("read error: {err}");
-                continue;
-            }
-            None => break None,
-        }
-    };
+    let mut next_bundle = next_selected_success(
+        &mut bundles_iter,
+        &mut entries_consumed,
+        expected_pairs,
+        |err| {
+            failure_sources.report_and_record(&mut read_errors, "dataset_read", "read error", err);
+        },
+    );
 
     while let Some(bundle) = next_bundle.take() {
-        attempted += 1;
+        let service_interval_start = Instant::now();
+        let processed_before = processed;
+        tracker_attempts += 1;
         let left = bundle.pair().left().clone();
         let right = bundle.pair().right().clone();
         let imu = bundle.imu().batch().cloned();
@@ -340,10 +438,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             let speculative_matches = match speculative_matches {
                                 Ok(matches) => matches,
                                 Err(source) => {
-                                    prefetch_fallbacks = prefetch_fallbacks.saturating_add(1);
-                                    report_error_chain(
+                                    failure_sources.report_and_record(
+                                        &mut prefetch_fallbacks,
+                                        "inference_prefetch",
                                         "speculative LightGlue prefetch failed; tracker will match synchronously",
-                                        &source,
+                                        source,
                                     );
                                     None
                                 }
@@ -351,10 +450,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             (Some((result.frame_id, detections)), speculative_matches)
                         }
                         PrefetchInferenceOutcome::DetectionFailed { source } => {
-                            prefetch_fallbacks = prefetch_fallbacks.saturating_add(1);
-                            report_error_chain(
+                            failure_sources.report_and_record(
+                                &mut prefetch_fallbacks,
+                                "inference_prefetch",
                                 "SuperPoint prefetch failed; tracker will detect synchronously",
-                                &source,
+                                source,
                             );
                             (None, None)
                         }
@@ -372,22 +472,23 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             (None, None)
         };
 
-        // Read-ahead: grab the NEXT bundle from the iterator
-        let lookahead_bundle: Option<kiko_slam::CaptureBundle> = loop {
-            match bundles_iter.next() {
-                Some(Ok(b)) => break Some(b),
-                Some(Err(err)) => {
-                    read_errors += 1;
-                    eprintln!("read error: {err}");
-                    continue;
-                }
-                None => break None,
-            }
-        };
+        // Count every iterator entry so a read error cannot move the selected boundary.
+        let lookahead_bundle = next_selected_success(
+            &mut bundles_iter,
+            &mut entries_consumed,
+            expected_pairs,
+            |err| {
+                failure_sources.report_and_record(
+                    &mut read_errors,
+                    "dataset_read",
+                    "read error",
+                    err,
+                );
+            },
+        );
 
         // Launch SP + speculative LG prefetch for the NEXT frame on a background thread
-        let below_pair_limit = should_prefetch_lookahead(attempted, args.dataset.max_pairs);
-        if below_pair_limit && let Some(ref next_b) = lookahead_bundle {
+        if let Some(ref next_b) = lookahead_bundle {
             if let Some(mut sp) = tracker.take_prefetch_sp() {
                 let mut lg = if use_speculative_lg {
                     tracker.take_prefetch_lg()
@@ -429,6 +530,23 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         // Process THIS frame while SP+LG prefetch for NEXT frame runs in parallel.
         match tracker.process_capture_with_prefetch(bundle, prefetched_left, prefetched_matches) {
             Ok(output) => {
+                pose_outcomes.record(&output.pose);
+                if processed >= args.warmup_pairs {
+                    steady_pose_outcomes.record(&output.pose);
+                }
+                if !matches!(
+                    &output.pose,
+                    kiko_slam::PoseStatus::Current(_) | kiko_slam::PoseStatus::Predicted(_)
+                ) {
+                    eprintln!(
+                        "non-current pose: frame_id={:?} pose={:?} health={:?} diagnostics={:?} events={:?}",
+                        output.frame_id,
+                        output.pose,
+                        output.health,
+                        output.diagnostics,
+                        output.events
+                    );
+                }
                 let timestamp = left.timestamp();
                 let loop_applied = output.events.iter().any(|event| {
                     matches!(
@@ -452,18 +570,28 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                         match VizPacket::try_new(left.clone(), right.clone(), matches) {
                             Ok(packet) => {
                                 if let Err(err) = sink.log_with_points(&packet, points) {
-                                    visualization_errors = visualization_errors.saturating_add(1);
-                                    eprintln!("rerun log error: {err}");
+                                    failure_sources.report_and_record(
+                                        &mut visualization_errors,
+                                        "visualization_output",
+                                        "rerun point log error",
+                                        err,
+                                    );
                                 }
                             }
                             Err(err) => {
-                                visualization_fallbacks = visualization_fallbacks.saturating_add(1);
-                                eprintln!(
-                                    "viz packet error: {err}; falling back to raw stereo views"
+                                failure_sources.report_and_record(
+                                    &mut visualization_fallbacks,
+                                    "visualization_fallback",
+                                    "viz packet error; falling back to raw stereo views",
+                                    err,
                                 );
                                 if let Err(log_err) = sink.log_frames(&left, &right) {
-                                    visualization_errors = visualization_errors.saturating_add(1);
-                                    eprintln!("rerun log error: {log_err}");
+                                    failure_sources.report_and_record(
+                                        &mut visualization_errors,
+                                        "visualization_output",
+                                        "rerun fallback frame log error",
+                                        log_err,
+                                    );
                                 }
                             }
                         }
@@ -488,8 +616,12 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 true,
                                 output.keyframe.is_some(),
                             ) {
-                                visualization_errors = visualization_errors.saturating_add(1);
-                                eprintln!("stable surface: {err}");
+                                failure_sources.report_and_record(
+                                    &mut visualization_errors,
+                                    "visualization_output",
+                                    "stable surface log error",
+                                    err,
+                                );
                             }
                         }
                     }
@@ -502,119 +634,236 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(err) =
                                 sink.log_covisibility_graph(left.timestamp(), &snapshot)
                             {
-                                visualization_errors = visualization_errors.saturating_add(1);
-                                eprintln!("rerun log error: {err}");
+                                failure_sources.report_and_record(
+                                    &mut visualization_errors,
+                                    "visualization_output",
+                                    "rerun covisibility graph log error",
+                                    err,
+                                );
                             }
                         }
                     }
                 } else if let Some(sink) = sink.as_mut() {
                     if let Err(err) = sink.log_frames(&left, &right) {
-                        visualization_errors = visualization_errors.saturating_add(1);
-                        eprintln!("rerun log error: {err}");
+                        failure_sources.report_and_record(
+                            &mut visualization_errors,
+                            "visualization_output",
+                            "rerun frame log error",
+                            err,
+                        );
                     }
                 }
 
                 if let Some(sink) = sink.as_mut() {
                     if let Some(batch) = imu.as_ref() {
                         if let Err(err) = sink.log_imu_batch(batch) {
-                            visualization_errors = visualization_errors.saturating_add(1);
-                            eprintln!("rerun imu log error: {err}");
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun IMU log error",
+                                err,
+                            );
                         }
                     }
                     if let Some(pose) = output.pose.current_estimate() {
                         if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
-                            visualization_errors = visualization_errors.saturating_add(1);
-                            eprintln!("rerun log error: {err}");
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun tracking pose log error",
+                                err,
+                            );
                         } else {
                             poses_logged += 1;
                         }
                     }
                     if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
                         if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
-                            visualization_errors = visualization_errors.saturating_add(1);
-                            eprintln!("rerun imu log error: {err}");
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun VIO telemetry log error",
+                                err,
+                            );
                         }
                     }
                     if let Err(err) = sink.log_system_health(timestamp, &output.health) {
-                        visualization_errors = visualization_errors.saturating_add(1);
-                        eprintln!("rerun health error: {err}");
+                        failure_sources.report_and_record(
+                            &mut visualization_errors,
+                            "visualization_output",
+                            "rerun health log error",
+                            err,
+                        );
                     }
                     if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
-                        visualization_errors = visualization_errors.saturating_add(1);
-                        eprintln!("rerun diagnostics error: {err}");
+                        failure_sources.report_and_record(
+                            &mut visualization_errors,
+                            "visualization_output",
+                            "rerun diagnostics log error",
+                            err,
+                        );
                     }
                     for event in &output.events {
                         if let Err(err) = sink.log_event(timestamp, event) {
-                            visualization_errors = visualization_errors.saturating_add(1);
-                            eprintln!("rerun event error: {err}");
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun event log error",
+                                err,
+                            );
                         }
                     }
                 }
                 processed += 1;
             }
             Err(err) => {
-                tracker_errors = tracker_errors.saturating_add(1);
-                eprintln!("tracker error: {err}");
+                failure_sources.report_and_record(
+                    &mut tracker_errors,
+                    "tracker",
+                    "tracker error",
+                    err,
+                );
             }
         }
 
-        if let Some(limit) = args.dataset.max_pairs {
-            if attempted >= limit {
-                break;
+        if processed > processed_before {
+            service_intervals.push(service_interval_start.elapsed());
+            if processed == args.warmup_pairs {
+                steady_start = Some(Instant::now());
             }
         }
-
         next_bundle = lookahead_bundle;
     }
 
     let elapsed = start.elapsed().as_secs_f64();
+    let steady_elapsed = steady_start.map_or(0.0, |start| start.elapsed().as_secs_f64());
+    let steady_processed = processed.saturating_sub(args.warmup_pairs);
+    let steady_fps = if steady_elapsed > 0.0 {
+        steady_processed as f64 / steady_elapsed
+    } else {
+        0.0
+    };
     let fps = if elapsed > 0.0 {
         processed as f64 / elapsed
     } else {
         0.0
     };
-
-    eprintln!(
-        "done: attempted={attempted}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, read_errors={read_errors}, tracker_errors={tracker_errors}, prefetch_fallbacks={prefetch_fallbacks}, visualization_fallbacks={visualization_fallbacks}, visualization_errors={visualization_errors}, poses_logged={poses_logged}, keyframes={keyframes}"
-    );
-
-    verify_run_integrity(
+    let integrity = verify_run_integrity(
         "slam",
         "pairs",
         processed,
         &[
             ("dataset_read", read_errors),
             ("tracker", tracker_errors),
+            ("inference_prefetch", prefetch_fallbacks),
+            ("visualization_fallback", visualization_fallbacks),
             ("visualization_output", visualization_errors),
         ],
-    )?;
+        failure_sources,
+    );
+    let exact_completion = entries_consumed == expected_pairs
+        && tracker_attempts == expected_pairs
+        && processed == expected_pairs;
+    let usable_pose_output = steady_pose_outcomes.all_have_current_estimates(steady_processed);
+    let metrics_status =
+        RunMetricsStatus::from_outcome(integrity.is_ok(), exact_completion, usable_pose_output);
+    eprintln!("slam metrics status: {}", metrics_status.as_str());
+
+    eprintln!(
+        "done: expected={expected_pairs}, entries_consumed={entries_consumed}, tracker_attempts={tracker_attempts}, processed={processed}, elapsed={elapsed:.2}s, fps={fps:.2}, warmup_processed={}, steady_processed={steady_processed}, steady_elapsed={steady_elapsed:.2}s, steady_fps={steady_fps:.2}, read_errors={read_errors}, tracker_errors={tracker_errors}, prefetch_fallbacks={prefetch_fallbacks}, visualization_fallbacks={visualization_fallbacks}, visualization_errors={visualization_errors}, poses_logged={poses_logged}, keyframes={keyframes}",
+        processed.min(args.warmup_pairs)
+    );
+    eprintln!(
+        "pose outcomes: total_current={} total_predicted={} total_stale={} total_unavailable={} steady_current={} steady_predicted={} steady_stale={} steady_unavailable={}",
+        pose_outcomes.current,
+        pose_outcomes.predicted,
+        pose_outcomes.stale,
+        pose_outcomes.unavailable,
+        steady_pose_outcomes.current,
+        steady_pose_outcomes.predicted,
+        steady_pose_outcomes.stale,
+        steady_pose_outcomes.unavailable
+    );
+    if let Some(measured) = service_intervals.get(args.warmup_pairs..)
+        && !measured.is_empty()
+    {
+        if let Some(latency) = duration_percentiles(measured.iter().copied()) {
+            eprintln!(
+                "steady pipeline service interval ms (median/p95, samples={}): {:.2}/{:.2}",
+                measured.len(),
+                latency.median_ms,
+                latency.p95_ms
+            );
+        }
+    }
+
+    integrity?;
+    if !exact_completion {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!(
+                "SLAM did not consume the selected dataset exactly: expected_pairs={expected_pairs}, entries_consumed={entries_consumed}, tracker_attempts={tracker_attempts}, processed={processed}"
+            ),
+        )
+        .into());
+    }
+    if !usable_pose_output {
+        return Err(Box::new(UnusableSteadyPoseStreamError {
+            steady_processed,
+            outcomes: steady_pose_outcomes,
+        }));
+    }
 
     Ok(())
 }
 
-fn report_error_chain(context: &str, error: &(dyn std::error::Error + 'static)) {
-    eprintln!("{context}: {error}");
-    let mut nested = error.source();
-    while let Some(cause) = nested {
-        eprintln!("  caused by: {cause}");
-        nested = cause.source();
-    }
-}
-
-fn should_prefetch_lookahead(attempted: usize, max_pairs: Option<usize>) -> bool {
-    max_pairs.is_none_or(|limit| attempted < limit)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SLAM_ENV_HELP, should_prefetch_lookahead};
+    use super::{PoseOutcomeCounts, SLAM_ENV_HELP};
+    use crate::next_selected_success;
 
     #[test]
-    fn pair_limit_does_not_spawn_unused_prefetch_work() {
-        assert!(should_prefetch_lookahead(10, None));
-        assert!(should_prefetch_lookahead(9, Some(10)));
-        assert!(!should_prefetch_lookahead(10, Some(10)));
-        assert!(!should_prefetch_lookahead(11, Some(10)));
+    fn selected_entry_limit_counts_errors_and_never_reads_beyond_bound() {
+        let mut entries = [Ok(0), Err("bad entry"), Ok(2), Ok(3)].into_iter();
+        let mut consumed = 0;
+        let mut errors = Vec::new();
+
+        assert_eq!(
+            next_selected_success(&mut entries, &mut consumed, 3, |error| errors.push(error)),
+            Some(0)
+        );
+        assert_eq!(
+            next_selected_success(&mut entries, &mut consumed, 3, |error| errors.push(error)),
+            Some(2)
+        );
+        assert_eq!(
+            next_selected_success(&mut entries, &mut consumed, 3, |error| errors.push(error)),
+            None
+        );
+        assert_eq!(consumed, 3);
+        assert_eq!(errors, ["bad entry"]);
+        assert_eq!(entries.next(), Some(Ok(3)));
+    }
+
+    #[test]
+    fn steady_pose_stream_requires_a_current_estimate_for_every_pair() {
+        assert!(
+            PoseOutcomeCounts {
+                current: 27,
+                predicted: 1,
+                ..PoseOutcomeCounts::default()
+            }
+            .all_have_current_estimates(28)
+        );
+        assert!(
+            !PoseOutcomeCounts {
+                current: 27,
+                stale: 1,
+                ..PoseOutcomeCounts::default()
+            }
+            .all_have_current_estimates(28)
+        );
+        assert!(!PoseOutcomeCounts::default().all_have_current_estimates(0));
     }
 
     #[test]
