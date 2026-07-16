@@ -13,8 +13,8 @@ const STEP_CONVERGENCE_THRESHOLD: f32 = 1e-4;
 const RELATIVE_COST_TOLERANCE: f64 = 1e-6;
 /// Floor for cost magnitude to avoid division-near-zero in relative convergence.
 const COST_FLOOR: f64 = 1e-12;
-/// Minimum projected depth for valid reprojection.
-const MIN_PROJECTION_DEPTH: f32 = 1e-6;
+/// Minimum camera-frame depth in metres for valid reprojection.
+const MIN_PROJECTION_DEPTH_M: f32 = 1e-6;
 /// Minimum landmark Schur complement damping.
 const MIN_LANDMARK_DAMPING: f32 = 1e-6;
 /// Minimum pose damping floor for simple BA (`optimize()`).
@@ -1114,24 +1114,36 @@ impl LocalBundleAdjuster {
                 )?;
                 let mut usable_observations = 0_usize;
                 for obs in resolved.observations() {
-                    if let Some((residual, jac)) =
-                        reprojection_residual_and_jacobian(frame.pose, obs, self.intrinsics)
-                    {
-                        usable_observations += 1;
-                        let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                        let weight = huber_weight(r_norm, huber);
-                        let scale = weight.sqrt();
-                        let r0 = residual[0] * scale;
-                        let r1 = residual[1] * scale;
-                        let j = jac.map(|row| row.map(|v| v * scale));
+                    let linearization = match reprojection_linearization(
+                        frame.pose,
+                        obs.world(),
+                        obs.pixel(),
+                        self.intrinsics,
+                    ) {
+                        Ok(linearization) => linearization,
+                        Err(ProjectionLinearizationError::InvalidDepth) => continue,
+                        Err(ProjectionLinearizationError::NumericalFailure) => {
+                            return Err(LocalBaError::NumericalFailure {
+                                operation: "linearizing an incremental reprojection factor",
+                            });
+                        }
+                    };
 
-                        for c in 0..6 {
-                            let jr = j[0][c] * r0 + j[1][c] * r1;
-                            b[base + c] -= jr;
-                            for d in 0..6 {
-                                let jt_j = j[0][c] * j[0][d] + j[1][c] * j[1][d];
-                                a[(base + c) * dim + (base + d)] += jt_j;
-                            }
+                    usable_observations += 1;
+                    let residual = linearization.residual;
+                    let scale = linearization.huber_sqrt_weight(huber);
+                    let r0 = residual[0] * scale;
+                    let r1 = residual[1] * scale;
+                    let j = linearization
+                        .pose_jacobian
+                        .map(|row| row.map(|value| value * scale));
+
+                    for c in 0..6 {
+                        let jr = j[0][c] * r0 + j[1][c] * r1;
+                        b[base + c] -= jr;
+                        for d in 0..6 {
+                            let jt_j = j[0][c] * j[0][d] + j[1][c] * j[1][d];
+                            a[(base + c) * dim + (base + d)] += jt_j;
                         }
                     }
                 }
@@ -1223,12 +1235,14 @@ impl LocalBundleAdjuster {
         let motion_weight_squared = self.config.motion_prior_weight_squared();
         let lm_config = self.config.lm();
         let initial_cost =
-            full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared);
-        if !initial_cost.is_finite() {
-            return Ok(BaResult::Degenerate {
-                reason: DegenerateReason::InvalidProjection,
-            });
-        }
+            match full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared) {
+                Ok(cost) => cost,
+                Err(error) => {
+                    return Ok(BaResult::Degenerate {
+                        reason: error.degenerate_reason(),
+                    });
+                }
+            };
         let mut lm_state = LmState::new(lm_config, initial_cost);
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
@@ -1263,19 +1277,26 @@ impl LocalBundleAdjuster {
                 };
                 let point = problem.landmarks[landmark_idx.as_usize()].position;
 
-                let Some((residual, j_pose, j_landmark)) =
-                    reprojection_residual_and_jacobians(pose, point, factor.pixel, self.intrinsics)
-                else {
-                    continue;
-                };
+                let linearization =
+                    match reprojection_linearization(pose, point, factor.pixel, self.intrinsics) {
+                        Ok(linearization) => linearization,
+                        Err(error) => {
+                            return Ok(BaResult::Degenerate {
+                                reason: error.degenerate_reason(),
+                            });
+                        }
+                    };
 
-                let r_norm = (residual[0] * residual[0] + residual[1] * residual[1]).sqrt();
-                let weight = huber_weight(r_norm, huber);
-                let scale = weight.sqrt();
+                let residual = linearization.residual;
+                let scale = linearization.huber_sqrt_weight(huber);
 
                 let r_scaled = [residual[0] * scale, residual[1] * scale];
-                let j_pose_scaled = j_pose.map(|row| row.map(|v| v * scale));
-                let j_landmark_scaled = j_landmark.map(|row| row.map(|v| v * scale));
+                let j_pose_scaled = linearization
+                    .pose_jacobian
+                    .map(|row| row.map(|value| value * scale));
+                let j_landmark_scaled = linearization
+                    .landmark_jacobian
+                    .map(|row| row.map(|value| value * scale));
 
                 let acc = &mut landmark_accumulators[landmark_idx.as_usize()];
                 accumulate_landmark_hessian(&mut acc.c, j_landmark_scaled);
@@ -1295,8 +1316,10 @@ impl LocalBundleAdjuster {
                 let Some((residual, jacobian)) =
                     scale_anchor_residual_and_jacobian(anchor, point, self.intrinsics)
                 else {
+                    // Construction validates the anchor, and every accepted candidate passes the
+                    // cost boundary below. Failure while assembling an accepted state is numeric.
                     return Ok(BaResult::Degenerate {
-                        reason: DegenerateReason::InvalidProjection,
+                        reason: DegenerateReason::NumericalFailure,
                     });
                 };
                 let acc = &mut landmark_accumulators[anchor.landmark.as_usize()];
@@ -1428,7 +1451,14 @@ impl LocalBundleAdjuster {
             }
 
             let candidate_cost =
-                full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared);
+                match full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared) {
+                    Ok(cost) => cost,
+                    // Invalid trial states are rejected by LM and restored from the iteration
+                    // backups below. The accepted state was already parsed by `initial_cost` or
+                    // the previous successful candidate-cost evaluation.
+                    Err(ProjectionLinearizationError::InvalidDepth)
+                    | Err(ProjectionLinearizationError::NumericalFailure) => f64::INFINITY,
+                };
             let prev_cost = lm_state.prev_cost();
             if max_step == 0.0 && candidate_cost.is_finite() && candidate_cost == prev_cost {
                 return Ok(BaResult::Converged {
@@ -1483,7 +1513,7 @@ fn full_problem_cost(
     intrinsics: PinholeIntrinsics,
     huber_delta_px: f32,
     motion_weight_squared: f64,
-) -> f64 {
+) -> Result<f64, ProjectionLinearizationError> {
     let mut cost = 0.0_f64;
     let huber = huber_delta_px as f64;
 
@@ -1493,14 +1523,10 @@ fn full_problem_cost(
             FactorPose::Fixed(pose) => pose,
         };
         let point = problem.landmarks[factor.landmark.as_usize()].position;
-        let Some((residual, _, _)) =
-            reprojection_residual_and_jacobians(pose, point, factor.pixel, intrinsics)
-        else {
-            return f64::INFINITY;
-        };
-        let r0 = residual[0] as f64;
-        let r1 = residual[1] as f64;
-        let r_norm = (r0 * r0 + r1 * r1).sqrt();
+        let linearization = reprojection_linearization(pose, point, factor.pixel, intrinsics)?;
+        let r0 = f64::from(linearization.residual[0]);
+        let r1 = f64::from(linearization.residual[1]);
+        let r_norm = r0.hypot(r1);
         cost += if r_norm <= huber {
             0.5 * r_norm * r_norm
         } else {
@@ -1512,7 +1538,7 @@ fn full_problem_cost(
         let point = problem.landmarks[anchor.landmark.as_usize()].position;
         let Some((residual, _)) = scale_anchor_residual_and_jacobian(anchor, point, intrinsics)
         else {
-            return f64::INFINITY;
+            return Err(ProjectionLinearizationError::NumericalFailure);
         };
         cost += 0.5 * (residual as f64) * (residual as f64);
     }
@@ -1528,7 +1554,9 @@ fn full_problem_cost(
         }
     }
 
-    cost
+    cost.is_finite()
+        .then_some(cost)
+        .ok_or(ProjectionLinearizationError::NumericalFailure)
 }
 
 fn camera_center_world(pose: Pose) -> Result<Point3, crate::PoseError> {
@@ -1573,32 +1601,77 @@ fn scale_anchor_residual_and_jacobian(
     Some((residual, jacobian))
 }
 
-fn reprojection_residual_and_jacobian(
-    pose: Pose,
-    obs: &Observation,
-    intrinsics: PinholeIntrinsics,
-) -> Option<([f32; 2], [[f32; 6]; 2])> {
-    let (residual, jac_pose, _) =
-        reprojection_residual_and_jacobians(pose, obs.world(), obs.pixel(), intrinsics)?;
-    Some((residual, jac_pose))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectionLinearizationError {
+    InvalidDepth,
+    NumericalFailure,
 }
 
-type ReprojectionWithJacobians = ([f32; 2], [[f32; 6]; 2], [[f32; 3]; 2]);
+impl ProjectionLinearizationError {
+    fn degenerate_reason(self) -> DegenerateReason {
+        match self {
+            Self::InvalidDepth => DegenerateReason::InvalidProjection,
+            Self::NumericalFailure => DegenerateReason::NumericalFailure,
+        }
+    }
+}
 
-fn reprojection_residual_and_jacobians(
+/// A reprojection factor whose residual and both Jacobians are finite `f32` values.
+#[derive(Clone, Copy, Debug)]
+struct ReprojectionLinearization {
+    residual: [f32; 2],
+    pose_jacobian: [[f32; 6]; 2],
+    landmark_jacobian: [[f32; 3]; 2],
+}
+
+impl ReprojectionLinearization {
+    fn try_new(
+        residual: [f32; 2],
+        pose_jacobian: [[f32; 6]; 2],
+        landmark_jacobian: [[f32; 3]; 2],
+    ) -> Result<Self, ProjectionLinearizationError> {
+        if residual
+            .iter()
+            .chain(pose_jacobian.iter().flatten())
+            .chain(landmark_jacobian.iter().flatten())
+            .any(|value| !value.is_finite())
+        {
+            return Err(ProjectionLinearizationError::NumericalFailure);
+        }
+        Ok(Self {
+            residual,
+            pose_jacobian,
+            landmark_jacobian,
+        })
+    }
+
+    fn huber_sqrt_weight(&self, delta: f32) -> f32 {
+        let r_norm = f64::from(self.residual[0]).hypot(f64::from(self.residual[1]));
+        if r_norm <= f64::from(delta) {
+            1.0
+        } else {
+            (f64::from(delta) / r_norm).sqrt() as f32
+        }
+    }
+}
+
+fn reprojection_linearization(
     pose: Pose,
     world: Point3,
     pixel: Keypoint,
     intrinsics: PinholeIntrinsics,
-) -> Option<ReprojectionWithJacobians> {
+) -> Result<ReprojectionLinearization, ProjectionLinearizationError> {
     let pw = [world.x, world.y, world.z];
     let rotation = pose.rotation();
     let pc = math::transform_point(rotation, pose.translation(), pw);
+    if pc.into_iter().any(|value| !value.is_finite()) {
+        return Err(ProjectionLinearizationError::NumericalFailure);
+    }
     let x = pc[0];
     let y = pc[1];
     let z = pc[2];
-    if z <= MIN_PROJECTION_DEPTH {
-        return None;
+    if z <= MIN_PROJECTION_DEPTH_M {
+        return Err(ProjectionLinearizationError::InvalidDepth);
     }
 
     let u = intrinsics.fx() * (x / z) + intrinsics.cx();
@@ -1621,45 +1694,45 @@ fn reprojection_residual_and_jacobians(
     let b2 = dv_dy;
     let b3 = dv_dz;
 
-    let mut jac_pose = [[0.0_f32; 6]; 2];
+    let mut pose_jacobian = [[0.0_f32; 6]; 2];
 
-    jac_pose[0][0] = a1;
-    jac_pose[0][1] = a2;
-    jac_pose[0][2] = a3;
-    jac_pose[1][0] = b1;
-    jac_pose[1][1] = b2;
-    jac_pose[1][2] = b3;
+    pose_jacobian[0][0] = a1;
+    pose_jacobian[0][1] = a2;
+    pose_jacobian[0][2] = a3;
+    pose_jacobian[1][0] = b1;
+    pose_jacobian[1][1] = b2;
+    pose_jacobian[1][2] = b3;
 
-    jac_pose[0][3] = -(a2 * z - a3 * y);
-    jac_pose[0][4] = a1 * z - a3 * x;
-    jac_pose[0][5] = -a1 * y + a2 * x;
+    pose_jacobian[0][3] = -(a2 * z - a3 * y);
+    pose_jacobian[0][4] = a1 * z - a3 * x;
+    pose_jacobian[0][5] = -a1 * y + a2 * x;
 
-    jac_pose[1][3] = -(b2 * z - b3 * y);
-    jac_pose[1][4] = b1 * z - b3 * x;
-    jac_pose[1][5] = -b1 * y + b2 * x;
+    pose_jacobian[1][3] = -(b2 * z - b3 * y);
+    pose_jacobian[1][4] = b1 * z - b3 * x;
+    pose_jacobian[1][5] = -b1 * y + b2 * x;
 
-    let mut jac_landmark = [[0.0_f32; 3]; 2];
+    let mut landmark_jacobian = [[0.0_f32; 3]; 2];
     for col in 0..3 {
-        jac_landmark[0][col] =
+        landmark_jacobian[0][col] =
             a1 * rotation[0][col] + a2 * rotation[1][col] + a3 * rotation[2][col];
-        jac_landmark[1][col] =
+        landmark_jacobian[1][col] =
             b1 * rotation[0][col] + b2 * rotation[1][col] + b3 * rotation[2][col];
     }
 
     // The Jacobian above is for projected pixel coordinates [u, v].
     // Residual is defined as [pixel.x - u, pixel.y - v], so dr/dx = -du/dx.
-    for row in &mut jac_pose {
+    for row in &mut pose_jacobian {
         for value in row {
             *value = -*value;
         }
     }
-    for row in &mut jac_landmark {
+    for row in &mut landmark_jacobian {
         for value in row {
             *value = -*value;
         }
     }
 
-    Some((residual, jac_pose, jac_landmark))
+    ReprojectionLinearization::try_new(residual, pose_jacobian, landmark_jacobian)
 }
 
 pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Result<Pose, crate::PoseError> {
@@ -1811,10 +1884,6 @@ fn accumulate_motion_prior(
         }
     }
     true
-}
-
-fn huber_weight(r_norm: f32, delta: f32) -> f32 {
-    if r_norm <= delta { 1.0 } else { delta / r_norm }
 }
 
 fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
@@ -2042,9 +2111,9 @@ mod tests {
         obs: &Observation,
         intrinsics: PinholeIntrinsics,
     ) -> [f32; 2] {
-        reprojection_residual_and_jacobian(pose, obs, intrinsics)
+        reprojection_linearization(pose, obs.world(), obs.pixel(), intrinsics)
             .expect("valid reprojection")
-            .0
+            .residual
     }
 
     fn project_pixel(
@@ -2693,7 +2762,7 @@ mod tests {
         .expect("full BA problem");
         assert_eq!(
             full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0),
-            0.0
+            Ok(0.0)
         );
 
         assert_eq!(
@@ -2780,9 +2849,11 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("finite initial cost");
         let result = ba.optimize_full(&mut problem).expect("typed BA result");
-        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("finite final cost");
         assert!(
             after < before,
             "cost did not improve: before={before}, after={after}"
@@ -2806,7 +2877,8 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("finite initial cost");
         let result = ba.optimize_full(&mut problem).expect("typed BA result");
         let final_cost = match result {
             BaResult::Converged { final_cost, .. } | BaResult::MaxIterations { final_cost, .. } => {
@@ -2838,9 +2910,58 @@ mod tests {
             z: -10.0,
         };
 
-        assert!(
-            full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0).is_infinite()
+        assert_eq!(
+            full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0),
+            Err(ProjectionLinearizationError::InvalidDepth)
         );
+    }
+
+    #[test]
+    fn optimize_full_rejects_and_restores_an_invalid_depth_trial() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let initial_pose = Pose::identity();
+        let initial_landmark = Point3::new(1.0, 0.0, 1.0);
+        let mut problem = FullBaProblem {
+            poses: vec![
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: initial_pose,
+                },
+                PoseVariable {
+                    keyframe_id: KeyframeId::default(),
+                    pose: initial_pose,
+                },
+            ],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: initial_landmark,
+            }],
+            factors: vec![ReprojectionFactor {
+                pose: FactorPose::Fixed(initial_pose),
+                landmark: LandmarkVarIndex(0),
+                pixel: Keypoint { x: 100.0, y: 0.0 },
+            }],
+            scale_anchor: None,
+        };
+        let initial_cost = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+            .expect("finite initial cost");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+
+        let result = ba.optimize_full(&mut problem).expect("typed BA result");
+
+        assert!(matches!(
+            result,
+            BaResult::MaxIterations {
+                iterations: 1,
+                final_cost,
+            } if final_cost.to_bits() == initial_cost.to_bits()
+        ));
+        for pose in &problem.poses {
+            assert_eq!(pose.pose.rotation(), initial_pose.rotation());
+            assert_eq!(pose.pose.translation(), initial_pose.translation());
+        }
+        assert_eq!(problem.landmarks[0].position, initial_landmark);
     }
 
     #[test]
@@ -2865,7 +2986,8 @@ mod tests {
         };
 
         let motion_weight_squared = (motion_weight as f64) * (motion_weight as f64);
-        let cost = full_problem_cost(&problem, intrinsics, 2.0, motion_weight_squared);
+        let cost = full_problem_cost(&problem, intrinsics, 2.0, motion_weight_squared)
+            .expect("finite motion-prior cost");
         assert!(cost.is_finite());
         assert!(cost > f32::MAX as f64);
     }
@@ -3026,6 +3148,95 @@ mod tests {
     }
 
     #[test]
+    fn reprojection_linearization_keeps_a_large_finite_robust_factor() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 1.0e30, 1.0, 0.0, 0.0).expect("finite intrinsics");
+        let point = Point3::new(-1.0, 0.0, 1.0);
+        let pixel = Keypoint { x: 0.0, y: 0.0 };
+        let linearization = reprojection_linearization(Pose::identity(), point, pixel, intrinsics)
+            .expect("large finite projection remains representable");
+
+        assert_eq!(linearization.residual[0].to_bits(), 1.0e30_f32.to_bits());
+        let scale = linearization.huber_sqrt_weight(2.0);
+        assert!(scale.is_finite() && scale > 0.0);
+        let scaled_residual = linearization.residual[0] * scale;
+        let scaled_jacobian = linearization.pose_jacobian[0][0] * scale;
+        let hessian_contribution = scaled_jacobian * scaled_jacobian;
+        assert!(scaled_residual.is_finite() && (1.0e15..2.0e15).contains(&scaled_residual));
+        assert!(hessian_contribution.is_finite() && hessian_contribution > 1.0e30);
+
+        let problem = FullBaProblem {
+            poses: vec![PoseVariable {
+                keyframe_id: KeyframeId::default(),
+                pose: Pose::identity(),
+            }],
+            landmarks: vec![LandmarkVariable {
+                point_id: MapPointId::default(),
+                position: point,
+            }],
+            factors: vec![ReprojectionFactor {
+                pose: FactorPose::Variable(PoseVarIndex(0)),
+                landmark: LandmarkVarIndex(0),
+                pixel,
+            }],
+            scale_anchor: None,
+        };
+        let cost =
+            full_problem_cost(&problem, intrinsics, 2.0, 0.0).expect("large finite robust cost");
+        assert!(cost.is_finite());
+        assert!((cost / 2.0e30 - 1.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn huber_sqrt_weight_remains_positive_at_f32_extremes() {
+        let linearization =
+            ReprojectionLinearization::try_new([f32::MAX, f32::MAX], [[0.0; 6]; 2], [[0.0; 3]; 2])
+                .expect("finite residual");
+        let smallest_positive_delta_px = f32::from_bits(1);
+        let scale = linearization.huber_sqrt_weight(smallest_positive_delta_px);
+
+        assert!(scale.is_finite());
+        assert!(scale > 0.0);
+        assert!(scale <= 1.0);
+    }
+
+    #[test]
+    fn reprojection_linearization_distinguishes_invalid_depth_from_numerical_failure() {
+        let ordinary =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 0.0, 0.0).expect("intrinsics");
+        assert!(matches!(
+            reprojection_linearization(
+                Pose::identity(),
+                Point3::new(0.0, 0.0, -1.0),
+                Keypoint { x: 0.0, y: 0.0 },
+                ordinary,
+            ),
+            Err(ProjectionLinearizationError::InvalidDepth)
+        ));
+        assert!(matches!(
+            reprojection_linearization(
+                Pose::identity(),
+                Point3::new(0.0, 0.0, 0.5 * MIN_PROJECTION_DEPTH_M),
+                Keypoint { x: 0.0, y: 0.0 },
+                ordinary,
+            ),
+            Err(ProjectionLinearizationError::InvalidDepth)
+        ));
+
+        let extreme =
+            make_pinhole_intrinsics(640, 480, f32::MAX, 1.0, 0.0, 0.0).expect("finite intrinsics");
+        assert!(matches!(
+            reprojection_linearization(
+                Pose::identity(),
+                Point3::new(2.0, 0.0, 1.0),
+                Keypoint { x: 0.0, y: 0.0 },
+                extreme,
+            ),
+            Err(ProjectionLinearizationError::NumericalFailure)
+        ));
+    }
+
+    #[test]
     fn reprojection_jacobian_matches_finite_difference() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
@@ -3040,8 +3251,9 @@ mod tests {
         pixel.y -= 0.9;
 
         let obs = Observation::try_new(point, pixel, intrinsics).expect("observation");
-        let (_residual, jac) =
-            reprojection_residual_and_jacobian(pose, &obs, intrinsics).expect("jacobian");
+        let linearization = reprojection_linearization(pose, obs.world(), obs.pixel(), intrinsics)
+            .expect("jacobian");
+        let jac = linearization.pose_jacobian;
 
         let eps = 1e-3_f32;
         for col in 0..6 {
