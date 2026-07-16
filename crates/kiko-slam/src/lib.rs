@@ -91,10 +91,11 @@ pub use tracker::{
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
-    Keyframe, KeyframeError, KeyframeLandmarkError, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoError, StereoCameraSide, StereoToleranceKind, TriangulationConfig,
-    TriangulationConfigError, TriangulationError, TriangulationResult, TriangulationStats,
-    Triangulator,
+    Keyframe, KeyframeError, KeyframeLandmarkError, RectifiedStereo,
+    RectifiedStereoCompatibilityError, RectifiedStereoConfig, RectifiedStereoConfigError,
+    RectifiedStereoError, StereoBaselineError, StereoCalibration, StereoCameraSide,
+    StereoToleranceKind, TriangulationConfig, TriangulationConfigError, TriangulationError,
+    TriangulationResult, TriangulationStats, Triangulator,
 };
 pub use viz::{
     RerunSink, RerunSinkConfig, VizConfigError, VizDecimation, VizDecimationError, VizFlushError,

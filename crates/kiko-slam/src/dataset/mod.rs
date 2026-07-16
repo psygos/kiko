@@ -7,7 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::{DepthImage, Frame, FrameDimensions, PairingWindowNs, SensorId, StereoPair};
+use crate::triangulation::{
+    RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, StereoBaselineError,
+    StereoBaselineMeters, StereoCalibration, StereoCameraSide,
+};
+use crate::{
+    DepthImage, Frame, FrameDimensions, PairingWindowNs, PinholeIntrinsics, SensorId, StereoPair,
+};
 
 pub mod format {
     pub const FRAMES_DIR: &str = "frames";
@@ -82,13 +88,102 @@ pub struct CameraIntrinsics {
     pub height: u32,
 }
 
+/// Parse the projection coefficients represented by a serialized camera.
+///
+/// Image dimensions are deliberately outside [`PinholeIntrinsics`]; callers
+/// that own a complete image contract must parse those into a dimensions type
+/// separately.
+impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
+    type Error = crate::IntrinsicsError;
+
+    fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
+        Self::try_new(value.fx, value.fy, value.cx, value.cy)
+    }
+}
+
+/// One camera parsed from the weak serialized calibration carrier.
+#[derive(Clone, Copy, Debug)]
+struct ParsedSerializedCamera {
+    intrinsics: PinholeIntrinsics,
+    dimensions: FrameDimensions,
+}
+
+impl ParsedSerializedCamera {
+    fn parse(
+        camera: StereoCameraSide,
+        value: &CameraIntrinsics,
+    ) -> Result<Self, RectifiedStereoError> {
+        let dimensions = FrameDimensions::try_new(value.width, value.height)
+            .map_err(|source| RectifiedStereoError::InvalidDimensions { camera, source })?;
+        let intrinsics = PinholeIntrinsics::try_from(value)
+            .map_err(|source| RectifiedStereoError::InvalidIntrinsics { camera, source })?;
+        Ok(Self {
+            intrinsics,
+            dimensions,
+        })
+    }
+}
+
+impl RectifiedStereo {
+    /// Parse a weak serialized calibration and apply the default rectification
+    /// compatibility policy.
+    pub fn from_calibration(calibration: &Calibration) -> Result<Self, RectifiedStereoError> {
+        Self::from_calibration_with_config(calibration, RectifiedStereoConfig::default())
+    }
+
+    /// Parse a weak serialized calibration exactly once, then apply the given
+    /// rectification compatibility policy.
+    pub fn from_calibration_with_config(
+        calibration: &Calibration,
+        config: RectifiedStereoConfig,
+    ) -> Result<Self, RectifiedStereoError> {
+        let baseline =
+            StereoBaselineMeters::try_new(calibration.baseline_m).map_err(
+                |source| match source {
+                    StereoBaselineError::NonFinite { baseline_m } => {
+                        RectifiedStereoError::NonFiniteBaseline { baseline_m }
+                    }
+                    StereoBaselineError::NonPositive { baseline_m } => {
+                        RectifiedStereoError::NonPositiveBaseline { baseline_m }
+                    }
+                },
+            )?;
+
+        let left = ParsedSerializedCamera::parse(StereoCameraSide::Left, &calibration.left)?;
+        let right = ParsedSerializedCamera::parse(StereoCameraSide::Right, &calibration.right)?;
+
+        if left.dimensions != right.dimensions {
+            return Err(RectifiedStereoError::DimensionMismatch {
+                left: left.dimensions,
+                right: right.dimensions,
+            });
+        }
+
+        let parsed = StereoCalibration::new(
+            left.intrinsics,
+            right.intrinsics,
+            left.dimensions,
+            baseline,
+            calibration.rectified,
+        );
+
+        Self::from_stereo_calibration_with_config(&parsed, config).map_err(Into::into)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParsedMonoContract {
+    image: MonoImageContract,
+    stereo: StereoCalibration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MonoImageContract {
     dimensions: FrameDimensions,
     nominal_fps_hz: NonZeroU32,
 }
 
-impl MonoImageContract {
+impl ParsedMonoContract {
     fn parse(meta: &Meta, calibration: &Calibration) -> Result<Self, DatasetError> {
         let mono = meta.mono.as_ref().ok_or(DatasetError::MissingMonoConfig)?;
         let dimensions = parse_image_dimensions("meta.mono", mono.width, mono.height)?;
@@ -96,11 +191,11 @@ impl MonoImageContract {
             field: "meta.mono.fps",
             value: mono.fps,
         })?;
-        let contract = Self {
+        let image = MonoImageContract {
             dimensions,
             nominal_fps_hz,
         };
-        contract.require_dimensions(
+        image.require_dimensions(
             "calibration.left",
             parse_image_dimensions(
                 "calibration.left",
@@ -108,7 +203,7 @@ impl MonoImageContract {
                 calibration.left.height,
             )?,
         )?;
-        contract.require_dimensions(
+        image.require_dimensions(
             "calibration.right",
             parse_image_dimensions(
                 "calibration.right",
@@ -116,26 +211,42 @@ impl MonoImageContract {
                 calibration.right.height,
             )?,
         )?;
-        crate::PinholeIntrinsics::try_from(&calibration.left).map_err(|source| {
-            DatasetError::InvalidCameraIntrinsics {
-                field: "calibration.left",
-                source,
-            }
+        let left = PinholeIntrinsics::try_new(
+            calibration.left.fx,
+            calibration.left.fy,
+            calibration.left.cx,
+            calibration.left.cy,
+        )
+        .map_err(|source| DatasetError::InvalidCameraIntrinsics {
+            field: "calibration.left",
+            source,
         })?;
-        crate::PinholeIntrinsics::try_from(&calibration.right).map_err(|source| {
-            DatasetError::InvalidCameraIntrinsics {
-                field: "calibration.right",
-                source,
-            }
+        let right = PinholeIntrinsics::try_new(
+            calibration.right.fx,
+            calibration.right.fy,
+            calibration.right.cx,
+            calibration.right.cy,
+        )
+        .map_err(|source| DatasetError::InvalidCameraIntrinsics {
+            field: "calibration.right",
+            source,
         })?;
-        if !calibration.baseline_m.is_finite() || calibration.baseline_m <= 0.0 {
-            return Err(DatasetError::InvalidStereoBaseline {
-                baseline_m: calibration.baseline_m,
-            });
-        }
-        Ok(contract)
+        let baseline = StereoBaselineMeters::try_new(calibration.baseline_m)
+            .map_err(|source| DatasetError::InvalidStereoBaseline { source })?;
+        Ok(Self {
+            image,
+            stereo: StereoCalibration::new(
+                left,
+                right,
+                dimensions,
+                baseline,
+                calibration.rectified,
+            ),
+        })
     }
+}
 
+impl MonoImageContract {
     fn dimensions(self) -> FrameDimensions {
         self.dimensions
     }
@@ -272,10 +383,11 @@ struct WriterDatasetContract {
 
 impl WriterDatasetContract {
     fn parse(meta: &Meta, calibration: &Calibration) -> Result<Self, DatasetError> {
+        let mono = ParsedMonoContract::parse(meta, calibration)?.image;
         Ok(Self {
             created_at: meta.created.clone(),
             device: meta.device.clone(),
-            mono: MonoImageContract::parse(meta, calibration)?,
+            mono,
             depth: meta
                 .depth
                 .as_ref()
@@ -517,7 +629,7 @@ pub enum DatasetError {
         source: crate::IntrinsicsError,
     },
     InvalidStereoBaseline {
-        baseline_m: f32,
+        source: StereoBaselineError,
     },
     UnsupportedDepthEncoding {
         value: String,
@@ -715,10 +827,9 @@ impl std::fmt::Display for DatasetError {
             DatasetError::InvalidCameraIntrinsics { field, source } => {
                 write!(f, "invalid dataset camera intrinsics in {field}: {source}")
             }
-            DatasetError::InvalidStereoBaseline { baseline_m } => write!(
-                f,
-                "dataset stereo baseline must be positive and finite, got {baseline_m}m"
-            ),
+            DatasetError::InvalidStereoBaseline { source } => {
+                write!(f, "invalid dataset stereo baseline: {source}")
+            }
             DatasetError::UnsupportedDepthEncoding { value } => write!(
                 f,
                 "unsupported dataset depth encoding {value:?}; expected \"f32_meters_le\""
@@ -935,6 +1046,7 @@ impl std::error::Error for DatasetError {
             DatasetError::InvalidFrameData { source, .. } => Some(source),
             DatasetError::InvalidDepthData { source, .. } => Some(source),
             DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
+            DatasetError::InvalidStereoBaseline { source } => Some(source),
             DatasetError::WriteContract { source } => Some(source),
             DatasetError::AlreadyExists { .. }
             | DatasetError::InvalidConfig { .. }
@@ -942,7 +1054,6 @@ impl std::error::Error for DatasetError {
             | DatasetError::MissingMonoConfig
             | DatasetError::InvalidNominalFps { .. }
             | DatasetError::ImageDimensionsMismatch { .. }
-            | DatasetError::InvalidStereoBaseline { .. }
             | DatasetError::UnsupportedDepthEncoding { .. }
             | DatasetError::DepthPayloadSizeOverflow { .. }
             | DatasetError::DepthStreamNotConfigured
@@ -2631,7 +2742,10 @@ fn dataset_id(dataset_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FrameId, Timestamp};
+    use crate::{
+        FrameId, RectifiedStereo, RectifiedStereoCompatibilityError, RectifiedStereoConfig,
+        Timestamp,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
@@ -2900,17 +3014,40 @@ mod tests {
             }
         ));
 
-        for (test_name, baseline_m) in [
-            ("contract-nan-baseline", f32::NAN),
-            ("contract-infinite-baseline", f32::INFINITY),
-            ("contract-zero-baseline", 0.0),
+        for (test_name, baseline_m, non_finite) in [
+            ("contract-nan-baseline", f32::NAN, true),
+            ("contract-infinite-baseline", f32::INFINITY, true),
+            ("contract-zero-baseline", 0.0, false),
+            ("contract-negative-baseline", -1.0, false),
         ] {
             let mut invalid = calibration();
             invalid.baseline_m = baseline_m;
-            assert!(matches!(
-                reject_before_filesystem_mutation(test_name, &meta(), &invalid),
-                DatasetError::InvalidStereoBaseline { .. }
-            ));
+            let error = reject_before_filesystem_mutation(test_name, &meta(), &invalid);
+            assert!(
+                matches!(
+                    (&error, non_finite),
+                    (
+                        DatasetError::InvalidStereoBaseline {
+                            source: StereoBaselineError::NonFinite { baseline_m: actual }
+                        },
+                        true
+                    ) if actual.to_bits() == baseline_m.to_bits()
+                ) || matches!(
+                    (&error, non_finite),
+                    (
+                        DatasetError::InvalidStereoBaseline {
+                            source: StereoBaselineError::NonPositive { baseline_m: actual }
+                        },
+                        false
+                    ) if actual.to_bits() == baseline_m.to_bits()
+                )
+            );
+            assert!(
+                std::error::Error::source(&error)
+                    .and_then(|source| source.downcast_ref::<StereoBaselineError>())
+                    .is_some(),
+                "dataset baseline error must preserve its typed source"
+            );
         }
     }
 
@@ -3979,6 +4116,93 @@ mod tests {
             }
         ));
         std::fs::remove_dir_all(manifest_path).expect("remove manifest dataset");
+    }
+
+    #[test]
+    fn reader_retains_exact_calibration_for_independent_rectification_policies() {
+        let path = unique_dataset_path("reader-typed-calibration");
+        write_exact_pairs(&path, &[0]);
+        let smallest_positive = f32::from_bits(1);
+        let mut calibration = calibration();
+        calibration.left.fx = smallest_positive;
+        calibration.right.fx = smallest_positive;
+        calibration.left.fy = f32::MAX;
+        calibration.right.fy = f32::MAX;
+        calibration.left.cx = 1.0;
+        calibration.right.cx = -smallest_positive;
+        calibration.left.cy = -0.0;
+        calibration.right.cy = 0.0;
+        calibration.baseline_m = smallest_positive;
+        std::fs::write(
+            path.join(format::CALIBRATION_FILE),
+            serde_json::to_vec_pretty(&calibration).expect("serialize calibration fixture"),
+        )
+        .expect("write calibration fixture");
+
+        let reader = DatasetReader::open(&path).expect("open typed calibration");
+        let strict = RectifiedStereoConfig::try_new(1.0, 0.0).expect("strict config");
+        let loose = RectifiedStereoConfig::try_new(f32::from_bits(1.0_f32.to_bits() + 1), 0.0)
+            .expect("loose config");
+
+        for _ in 0..2 {
+            assert!(matches!(
+                RectifiedStereo::from_stereo_calibration_with_config(
+                    reader.stereo_calibration(),
+                    strict,
+                ),
+                Err(RectifiedStereoCompatibilityError::PrincipalPointMismatch {
+                    left_cx: 1.0,
+                    right_cx,
+                    tolerance_px: 1.0,
+                    ..
+                }) if right_cx.to_bits() == (-smallest_positive).to_bits()
+            ));
+
+            let stereo = RectifiedStereo::from_stereo_calibration_with_config(
+                reader.stereo_calibration(),
+                loose,
+            )
+            .expect("loose policy accepts retained calibration");
+            assert_eq!(stereo.left().fx().to_bits(), smallest_positive.to_bits());
+            assert_eq!(stereo.right().fx().to_bits(), smallest_positive.to_bits());
+            assert_eq!(stereo.left().fy().to_bits(), f32::MAX.to_bits());
+            assert_eq!(stereo.right().fy().to_bits(), f32::MAX.to_bits());
+            assert_eq!(stereo.left().cx().to_bits(), 1.0_f32.to_bits());
+            assert_eq!(
+                stereo.right().cx().to_bits(),
+                (-smallest_positive).to_bits()
+            );
+            assert_eq!(stereo.left().cy().to_bits(), (-0.0_f32).to_bits());
+            assert_eq!(stereo.right().cy().to_bits(), 0.0_f32.to_bits());
+            assert_eq!(stereo.baseline_m().to_bits(), smallest_positive.to_bits());
+            assert_eq!(stereo.dimensions(), FrameDimensions::new(2, 2));
+        }
+
+        std::fs::remove_dir_all(path).expect("remove typed calibration dataset");
+    }
+
+    #[test]
+    fn reader_keeps_rectification_policy_out_of_dataset_open() {
+        let path = unique_dataset_path("reader-unrectified-calibration");
+        write_exact_pairs(&path, &[0]);
+        let mut calibration = calibration();
+        calibration.rectified = false;
+        std::fs::write(
+            path.join(format::CALIBRATION_FILE),
+            serde_json::to_vec_pretty(&calibration).expect("serialize calibration fixture"),
+        )
+        .expect("write calibration fixture");
+
+        let reader = DatasetReader::open(&path).expect("unrectified dataset remains readable");
+        assert!(matches!(
+            RectifiedStereo::from_stereo_calibration_with_config(
+                reader.stereo_calibration(),
+                RectifiedStereoConfig::default(),
+            ),
+            Err(RectifiedStereoCompatibilityError::NotRectified)
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove unrectified dataset");
     }
 
     #[test]

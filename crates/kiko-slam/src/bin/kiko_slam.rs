@@ -11,7 +11,7 @@ use kiko_slam::{
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
     LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PipelineError, PipelineTimingError,
     PipelineWallBreakdown, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoError, RedundancyPolicy, RelocalizationConfig, RerunSink, RerunSinkConfig,
+    RectifiedStereoConfigError, RedundancyPolicy, RelocalizationConfig, RerunSink, RerunSinkConfig,
     SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
     VizDecimation, VizError, VizFlushError, VizLogError, VizPacket,
 };
@@ -797,7 +797,7 @@ fn build_recording(
 
 fn build_rectified_stereo_config(
     args: &VizArgs,
-) -> Result<RectifiedStereoConfig, RectifiedStereoError> {
+) -> Result<RectifiedStereoConfig, RectifiedStereoConfigError> {
     let defaults = RectifiedStereoConfig::default();
     RectifiedStereoConfig::try_new(
         args.rectify_tolerance
@@ -829,8 +829,8 @@ fn run_viz_matches(
     let inference = InferenceConfig::from_args(&args.inference)?;
     let decimation = args.rerun_decimation.get();
 
-    let rectified = RectifiedStereo::from_calibration_with_config(
-        reader.calibration(),
+    let rectified = RectifiedStereo::from_stereo_calibration_with_config(
+        reader.stereo_calibration(),
         build_rectified_stereo_config(args)?,
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
@@ -1177,8 +1177,8 @@ fn run_viz_odometry(
     let inference = InferenceConfig::from_args(&args.inference)?;
     let decimation = args.rerun_decimation.get();
 
-    let rectified = RectifiedStereo::from_calibration_with_config(
-        reader.calibration(),
+    let rectified = RectifiedStereo::from_stereo_calibration_with_config(
+        reader.stereo_calibration(),
         build_rectified_stereo_config(args)?,
     )?;
     let InferenceConfig {

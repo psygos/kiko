@@ -4,13 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    DepthImage, Frame, FrameDimensions, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp,
+    DepthImage, Frame, FrameId, PairingWindowNs, SensorId, StereoCalibration, StereoPair, Timestamp,
 };
 
 use super::{
-    Calibration, DatasetError, DatasetTimebase, DeltaStats, DepthImageContract, Manifest,
-    ManifestFrameRef, ManifestHeader, ManifestPairing, ManifestPairingPolicy, ManifestStats,
-    MonoImageContract, MonoPayloadFormat, PairReason, build_delta_stats, format,
+    DatasetError, DatasetTimebase, DeltaStats, DepthImageContract, Manifest, ManifestFrameRef,
+    ManifestHeader, ManifestPairing, ManifestPairingPolicy, ManifestStats, MonoImageContract,
+    MonoPayloadFormat, PairReason, ParsedMonoContract, build_delta_stats, format,
     parse_image_dimensions, read_calibration, read_manifest, read_meta, sensor_to_str,
 };
 
@@ -145,11 +145,10 @@ impl ParsedManifestContract {
 #[derive(Debug)]
 pub struct DatasetReader {
     meta: super::Meta,
-    calibration: Calibration,
+    stereo_calibration: StereoCalibration,
     entries: Vec<DatasetEntry>,
     depth: ParsedDepthStream,
     stats: DatasetStats,
-    dimensions: FrameDimensions,
     left_seq: u64,
     right_seq: u64,
 }
@@ -179,17 +178,17 @@ impl DatasetReader {
             })?;
         let meta = read_meta(&root)?;
         let calibration = read_calibration(&root)?;
-        let image = MonoImageContract::parse(&meta, &calibration)?;
+        let parsed_mono = ParsedMonoContract::parse(&meta, &calibration)?;
+        let image = parsed_mono.image;
         let manifest = read_manifest(&root)?;
         let contract = ParsedManifestContract::parse(&manifest.header, image, &meta)?;
         let parsed = parse_manifest(&root, manifest, contract)?;
         Ok(Self {
             meta,
-            calibration,
+            stereo_calibration: parsed_mono.stereo,
             entries: parsed.entries,
             depth: parsed.depth,
             stats: parsed.stats,
-            dimensions: contract.image.dimensions(),
             left_seq: 0,
             right_seq: 0,
         })
@@ -199,8 +198,10 @@ impl DatasetReader {
         &self.meta
     }
 
-    pub fn calibration(&self) -> &Calibration {
-        &self.calibration
+    /// Structurally parsed stereo calibration retained from the dataset
+    /// boundary. Rectification compatibility remains caller policy.
+    pub fn stereo_calibration(&self) -> &StereoCalibration {
+        &self.stereo_calibration
     }
 
     pub fn stats(&self) -> DatasetStats {
@@ -429,6 +430,7 @@ impl DatasetReader {
             path: path.clone(),
             source: e,
         })?;
+        let dimensions = self.stereo_calibration.dimensions();
         Frame::from_dimensions(
             sensor,
             match sensor {
@@ -436,7 +438,7 @@ impl DatasetReader {
                 SensorId::StereoRight => self.next_right_id(),
             },
             frame_ref.timestamp,
-            self.dimensions,
+            dimensions,
             data,
         )
         .map_err(|source| DatasetError::InvalidFrameData { path, source })

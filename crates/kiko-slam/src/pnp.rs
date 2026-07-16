@@ -1,4 +1,3 @@
-use crate::dataset::CameraIntrinsics;
 use std::marker::PhantomData;
 use std::num::NonZeroU64;
 
@@ -45,19 +44,6 @@ impl std::fmt::Display for IntrinsicsError {
 }
 
 impl std::error::Error for IntrinsicsError {}
-
-/// Parse the projection coefficients represented by a serialized camera.
-///
-/// Image dimensions are deliberately outside [`PinholeIntrinsics`]; callers
-/// that own a complete image contract must parse those into a dimensions type
-/// separately.
-impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
-    type Error = IntrinsicsError;
-
-    fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
-        Self::try_new(value.fx, value.fy, value.cx, value.cy)
-    }
-}
 
 impl PinholeIntrinsics {
     /// Parse finite projection coefficients expressed in pixels.
@@ -1746,6 +1732,7 @@ fn sample_three(rng: &mut XorShift64, max: usize) -> Option<[usize; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataset::CameraIntrinsics;
     use crate::test_helpers::{
         axis_angle_pose, make_detections, make_pinhole_intrinsics, make_raw_matches,
         observations_from_projection,
