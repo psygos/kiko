@@ -36,10 +36,7 @@ pub struct MapInstanceId(u64);
 
 impl MapInstanceId {
     fn fresh() -> Self {
-        Self(
-            allocate_monotonic_id(&NEXT_MAP_INSTANCE_ID)
-                .expect("map instance ID space exhausted"),
-        )
+        Self(allocate_monotonic_id(&NEXT_MAP_INSTANCE_ID).expect("map instance ID space exhausted"))
     }
 
     pub fn as_u64(self) -> u64 {
@@ -52,10 +49,7 @@ struct MapLineageId(u64);
 
 impl MapLineageId {
     fn fresh() -> Self {
-        Self(
-            allocate_monotonic_id(&NEXT_MAP_LINEAGE_ID)
-                .expect("map lineage ID space exhausted"),
-        )
+        Self(allocate_monotonic_id(&NEXT_MAP_LINEAGE_ID).expect("map lineage ID space exhausted"))
     }
 }
 
@@ -284,8 +278,8 @@ impl KeyframeEntry {
         self.point_refs[index.as_usize()] = Some(point_id);
     }
 
-    fn clear_point_ref(&mut self, index: KeypointIndex) {
-        self.point_refs[index.as_usize()] = None;
+    fn clear_point_ref(&mut self, index: KeypointIndex) -> Option<MapPointId> {
+        self.point_refs[index.as_usize()].take()
     }
 
     fn set_pose(&mut self, pose: Pose) {
@@ -955,13 +949,40 @@ impl SlamMap {
     }
 
     pub fn remove_map_point(&mut self, point_id: MapPointId) -> Result<(), MapError> {
-        if !self.points.contains_key(point_id) {
-            return Err(MapError::MapPointNotFound(point_id));
-        }
+        self.validate_map_point_removal(point_id)?;
         let next_generation = self.generation.next();
         self.remove_map_point_without_generation(point_id);
         self.lineage = self.mutation_lineage;
         self.generation = next_generation;
+        Ok(())
+    }
+
+    fn validate_map_point_removal(&self, point_id: MapPointId) -> Result<(), MapError> {
+        let point = self
+            .points
+            .get(point_id)
+            .ok_or(MapError::MapPointNotFound(point_id))?;
+        for (observation_index, obs) in point.observations.iter().enumerate() {
+            assert!(
+                point.observations[..observation_index]
+                    .iter()
+                    .all(|previous| previous.keyframe_id != obs.keyframe_id),
+                "map point contains duplicate keyframe observation"
+            );
+            let entry = self
+                .keyframes
+                .get(obs.keyframe_id)
+                .expect("map point observation keyframe is missing");
+            let index = obs.index.as_usize();
+            assert!(
+                index < entry.keypoints.len(),
+                "map point observation index is out of keyframe bounds"
+            );
+            assert!(
+                entry.point_refs.get(index).copied().flatten() == Some(point_id),
+                "map point observation backreference mismatch"
+            );
+        }
         Ok(())
     }
 
@@ -972,39 +993,90 @@ impl SlamMap {
             .expect("map point existence validated before mutation");
 
         for obs in &point.observations {
-            if let Some(entry) = self.keyframes.get_mut(obs.keyframe_id) {
-                entry.clear_point_ref(obs.index);
-            }
+            let entry = self
+                .keyframes
+                .get_mut(obs.keyframe_id)
+                .expect("map point observation keyframe validated before mutation");
+            assert_eq!(
+                entry.clear_point_ref(obs.index),
+                Some(point_id),
+                "map point backreference changed after validation"
+            );
         }
         self.covisibility
             .remove_point_observations(&point.observations);
     }
 
     pub fn remove_keyframe(&mut self, keyframe_id: KeyframeId) -> Result<(), MapError> {
-        if !self.keyframes.contains_key(keyframe_id) {
-            return Err(MapError::KeyframeNotFound(keyframe_id));
-        }
+        let entry = self
+            .keyframes
+            .get(keyframe_id)
+            .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
         let next_generation = self.generation.next();
+
+        assert_eq!(
+            entry.keypoints.len(),
+            entry.point_refs.len(),
+            "keyframe keypoint and point-reference lengths differ"
+        );
+        assert!(
+            self.frame_to_keyframe.get(&entry.frame_id).copied() == Some(keyframe_id),
+            "keyframe frame index is missing or mismatched"
+        );
+        for (index, maybe_point_id) in entry.point_refs.iter().enumerate() {
+            let Some(point_id) = *maybe_point_id else {
+                continue;
+            };
+            let point = self
+                .points
+                .get(point_id)
+                .expect("keyframe map point is missing");
+            let mut observations = point
+                .observations
+                .iter()
+                .filter(|obs| obs.keyframe_id == keyframe_id);
+            let observation = observations
+                .next()
+                .expect("keyframe map point has no reciprocal observation");
+            assert_eq!(
+                observation.index.as_usize(),
+                index,
+                "keyframe map point observation index mismatch"
+            );
+            assert!(
+                observations.next().is_none(),
+                "keyframe map point has duplicate reciprocal observations"
+            );
+        }
+
         let entry = self
             .keyframes
             .remove(keyframe_id)
             .expect("keyframe existence validated before mutation");
-        self.frame_to_keyframe.remove(&entry.frame_id);
+        assert_eq!(
+            self.frame_to_keyframe.remove(&entry.frame_id),
+            Some(keyframe_id),
+            "keyframe frame index changed after validation"
+        );
         self.covisibility.remove_keyframe(keyframe_id);
 
-        let mut to_remove = Vec::new();
         for point_id in entry.map_point_ids() {
-            if let Some(point) = self.points.get_mut(point_id) {
-                point.remove_observation_for(keyframe_id);
-                if point.observations.is_empty() {
-                    to_remove.push(point_id);
-                }
+            let orphaned = {
+                let point = self
+                    .points
+                    .get_mut(point_id)
+                    .expect("keyframe map point existence validated before mutation");
+                assert!(
+                    point.remove_observation_for(keyframe_id),
+                    "keyframe reciprocal observation changed after validation"
+                );
+                point.observations.is_empty()
+            };
+            if orphaned {
+                self.points
+                    .remove(point_id)
+                    .expect("orphaned map point disappeared during keyframe removal");
             }
-        }
-        for point_id in to_remove {
-            self.points
-                .remove(point_id)
-                .expect("point scheduled for removal was missing from map");
         }
         self.lineage = self.mutation_lineage;
         self.generation = next_generation;
@@ -1023,6 +1095,10 @@ impl SlamMap {
             return 0;
         }
         let final_generation = self.generation.advance_by(count);
+        for &id in &to_remove {
+            self.validate_map_point_removal(id)
+                .expect("map point collected for culling must still exist");
+        }
         for id in to_remove {
             self.remove_map_point_without_generation(id);
         }
@@ -1669,11 +1745,16 @@ mod tests {
         CompactDescriptor([128; 256])
     }
 
+    fn assert_panics_with<T>(expected: &str, operation: impl FnOnce() -> T) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+        let Err(payload) = result else {
+            panic!("operation must panic with {expected:?}");
+        };
+        assert_eq!(crate::panic_payload_to_string(payload.as_ref()), expected);
+    }
+
     fn assert_generation_exhaustion(operation: impl FnOnce()) {
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).is_err(),
-            "generation exhaustion must fail before mutation"
-        );
+        assert_panics_with("map generation space exhausted", operation);
     }
 
     fn reference_blend_byte(previous: u8, next: u8, weight: u16) -> u8 {
@@ -2316,6 +2397,124 @@ mod tests {
         assert_eq!(stored.position().z, 1.0);
         assert_eq!(stored.descriptor(), &make_descriptor());
         assert_map_invariants(&map).expect("unchanged map invariants");
+    }
+
+    #[test]
+    fn removal_backreference_failures_precede_mutation() {
+        let mut map = SlamMap::new();
+        let size = FrameDimensions::try_new(640, 480).expect("valid size");
+        let first_keyframe = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                Pose::identity(),
+                size,
+                make_keypoints(2),
+            )
+            .expect("first keyframe");
+        let second_keyframe = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                Pose::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("second keyframe");
+        let first_shared = map
+            .keyframe_keypoint(first_keyframe, 0)
+            .expect("first shared observation");
+        let second_shared = map
+            .keyframe_keypoint(second_keyframe, 0)
+            .expect("second shared observation");
+        let orphan_observation = map
+            .keyframe_keypoint(first_keyframe, 1)
+            .expect("orphan observation");
+        let shared_point = map
+            .add_map_point(
+                Point3 {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                first_shared,
+            )
+            .expect("shared point");
+        map.add_observation(shared_point, second_shared)
+            .expect("second shared observation");
+        let orphan_point = map
+            .add_map_point(
+                Point3 {
+                    x: 1.0,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                orphan_observation,
+            )
+            .expect("orphan point");
+        assert_map_invariants(&map).expect("valid removal fixture");
+
+        let mut broken_point_backref = map.clone();
+        assert_eq!(
+            broken_point_backref
+                .keyframes
+                .get_mut(second_keyframe)
+                .expect("second keyframe")
+                .clear_point_ref(second_shared.index),
+            Some(shared_point)
+        );
+        let point_snapshot = broken_point_backref.snapshot();
+        assert_panics_with("map point observation backreference mismatch", || {
+            broken_point_backref.remove_map_point(shared_point)
+        });
+        assert_eq!(broken_point_backref.snapshot(), point_snapshot);
+        assert!(broken_point_backref.point(shared_point).is_some());
+        assert_eq!(
+            broken_point_backref
+                .map_point_for_keypoint(first_shared)
+                .expect("first backreference"),
+            Some(shared_point)
+        );
+        assert_eq!(
+            broken_point_backref
+                .map_point_for_keypoint(second_shared)
+                .expect("corrupt second backreference"),
+            None
+        );
+
+        let mut broken_point_observation = map.clone();
+        broken_point_observation
+            .points
+            .get_mut(orphan_point)
+            .expect("orphan point")
+            .observations
+            .clear();
+        let keyframe_snapshot = broken_point_observation.snapshot();
+        assert_panics_with("keyframe map point has no reciprocal observation", || {
+            broken_point_observation.remove_keyframe(first_keyframe)
+        });
+        assert_eq!(broken_point_observation.snapshot(), keyframe_snapshot);
+        assert!(broken_point_observation.keyframe(first_keyframe).is_some());
+        assert!(broken_point_observation.point(shared_point).is_some());
+        assert!(broken_point_observation.point(orphan_point).is_some());
+
+        let mut broken_frame_index = map;
+        assert_eq!(
+            broken_frame_index
+                .frame_to_keyframe
+                .remove(&FrameId::new(1)),
+            Some(first_keyframe)
+        );
+        let frame_snapshot = broken_frame_index.snapshot();
+        assert_panics_with("keyframe frame index is missing or mismatched", || {
+            broken_frame_index.remove_keyframe(first_keyframe)
+        });
+        assert_eq!(broken_frame_index.snapshot(), frame_snapshot);
+        assert!(broken_frame_index.keyframe(first_keyframe).is_some());
+        assert!(broken_frame_index.point(shared_point).is_some());
+        assert!(broken_frame_index.point(orphan_point).is_some());
     }
 
     #[test]
