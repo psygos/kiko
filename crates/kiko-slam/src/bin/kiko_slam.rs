@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use kiko_slam::dataset::{DatasetError, DatasetReader};
+use kiko_slam::dataset::{DatasetDepthCursor, DatasetError, DatasetReader};
 use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
 use kiko_slam::{
-    BackendConfig, DenseCommand, DepthImage, DownscaleFactor, GlobalDescriptorConfig,
+    BackendConfig, DenseCommand, DepthImage, DownscaleFactor, FrameId, GlobalDescriptorConfig,
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
     LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, PipelineError,
     PipelineTimingError, PipelineWallBreakdown, RansacConfig, RectifiedStereo,
@@ -35,7 +35,7 @@ use kiko_slam::dataset::{
 #[cfg(feature = "record")]
 use kiko_slam::{
     DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSendOutcome,
-    DenseCommandSender, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, FrameId,
+    DenseCommandSender, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics,
     PairingConfigError, PairingInputError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
     StereoPairer, SystemHealth, TrackerInitError, VizConfigError, bounded_channel,
     dense_command_channel, oak_to_depth_image, oak_to_frame,
@@ -106,6 +106,7 @@ impl DepthRingCapacity {
         ))
     }
 
+    #[cfg(feature = "record")]
     fn minimum() -> Self {
         Self(NonZeroUsize::new(Self::MINIMUM).expect("minimum depth ring capacity is nonzero"))
     }
@@ -658,7 +659,6 @@ fn run_viz_matches(
         stats.left_orphan_count,
         stats.right_orphan_count
     );
-
     let inference = InferenceConfig::from_args(&args.inference)?;
     let decimation = args.rerun_decimation.get();
 
@@ -754,108 +754,113 @@ fn run_viz_matches(
     Ok(())
 }
 
-struct OfflineDepthCursor {
-    entries: Vec<(i64, PathBuf)>,
-    next: usize,
-    width: u32,
-    height: u32,
-    frame_seq: u64,
+#[derive(Debug, Default)]
+struct OfflineDepthSelector {
+    previous: Option<DepthImage>,
+    lookahead: Option<DepthImage>,
 }
 
-impl OfflineDepthCursor {
-    fn new(
-        dataset_root: &Path,
-        depth_meta: Option<&kiko_slam::dataset::DepthMeta>,
-    ) -> Result<Option<Self>, std::io::Error> {
-        let Some(depth_meta) = depth_meta else {
-            return Ok(None);
-        };
-        let frames_dir = dataset_root.join(kiko_slam::dataset::format::FRAMES_DIR);
-        let mut entries = Vec::new();
-        for dir_entry in std::fs::read_dir(&frames_dir)? {
-            let dir_entry = dir_entry?;
-            let file_name = dir_entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            let Some((timestamp_ns, sensor)) =
-                kiko_slam::dataset::format::parse_frame_filename(file_name.as_ref())
-            else {
-                continue;
-            };
-            if sensor == "depth" {
-                entries.push((timestamp_ns, dir_entry.path()));
-            }
-        }
-        entries.sort_by_key(|(timestamp_ns, _)| *timestamp_ns);
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(Self {
-            entries,
-            next: 0,
-            width: depth_meta.width,
-            height: depth_meta.height,
-            frame_seq: 0,
-        }))
-    }
-
-    fn push_until(
+impl OfflineDepthSelector {
+    fn select(
         &mut self,
         timestamp: kiko_slam::Timestamp,
-        ring: &mut DepthRingBuffer,
-    ) -> Result<(), std::io::Error> {
-        let cutoff = timestamp.as_nanos();
-        while let Some((depth_ts, path)) = self.entries.get(self.next) {
-            if *depth_ts > cutoff {
-                break;
-            }
-            let depth = read_depth_image_file(
-                path,
-                self.width,
-                self.height,
-                kiko_slam::FrameId::new(self.frame_seq),
-                kiko_slam::Timestamp::from_nanos(*depth_ts),
-            )?;
-            self.frame_seq = self.frame_seq.saturating_add(1);
-            ring.push(depth);
-            self.next = self.next.saturating_add(1);
+        mut next_at_or_before: impl FnMut(
+            kiko_slam::Timestamp,
+        ) -> Result<Option<DepthImage>, DatasetError>,
+    ) -> Result<Option<DepthImage>, DatasetError> {
+        // DatasetReader parses left timestamps as strictly increasing, so the
+        // nearest depth can only be the latest predecessor or first successor.
+        if self
+            .lookahead
+            .as_ref()
+            .is_some_and(|depth| depth.timestamp() <= timestamp)
+        {
+            self.previous = self.lookahead.take();
         }
-        Ok(())
+
+        let cutoff_ns = timestamp
+            .as_nanos()
+            .checked_add(command_mapper::MAX_ASSOCIATION_WINDOW_NS)
+            .unwrap_or(i64::MAX);
+        let cutoff = kiko_slam::Timestamp::from_nanos(cutoff_ns);
+        while self.lookahead.is_none() {
+            let Some(depth) = next_at_or_before(cutoff)? else {
+                break;
+            };
+            if depth.timestamp() <= timestamp {
+                self.previous = Some(depth);
+            } else {
+                self.lookahead = Some(depth);
+            }
+        }
+
+        let max_delta = u64::try_from(command_mapper::MAX_ASSOCIATION_WINDOW_NS)
+            .expect("the depth association window is nonnegative");
+        let candidate = match (&self.previous, &self.lookahead) {
+            (Some(previous), Some(lookahead)) => {
+                let previous_delta = previous
+                    .timestamp()
+                    .as_nanos()
+                    .abs_diff(timestamp.as_nanos());
+                let lookahead_delta = lookahead
+                    .timestamp()
+                    .as_nanos()
+                    .abs_diff(timestamp.as_nanos());
+                if previous_delta <= lookahead_delta {
+                    Some((previous, previous_delta))
+                } else {
+                    Some((lookahead, lookahead_delta))
+                }
+            }
+            (Some(previous), None) => Some((
+                previous,
+                previous
+                    .timestamp()
+                    .as_nanos()
+                    .abs_diff(timestamp.as_nanos()),
+            )),
+            (None, Some(lookahead)) => Some((
+                lookahead,
+                lookahead
+                    .timestamp()
+                    .as_nanos()
+                    .abs_diff(timestamp.as_nanos()),
+            )),
+            (None, None) => None,
+        };
+        Ok(candidate
+            .filter(|(_, delta)| *delta <= max_delta)
+            .map(|(depth, _)| depth.clone()))
     }
 }
 
-fn read_depth_image_file(
-    path: &Path,
-    width: u32,
-    height: u32,
-    frame_id: kiko_slam::FrameId,
-    timestamp: kiko_slam::Timestamp,
-) -> Result<DepthImage, std::io::Error> {
-    let bytes = std::fs::read(path)?;
-    let pixel_count = (width as usize).saturating_mul(height as usize);
-    let expected_len = pixel_count.saturating_mul(std::mem::size_of::<f32>());
-    if bytes.len() != expected_len {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "depth file {} length mismatch: expected {expected_len}, got {}",
-                path.display(),
-                bytes.len()
-            ),
-        ));
-    }
+struct OfflineDenseState {
+    cursor: DatasetDepthCursor,
+    selector: OfflineDepthSelector,
+    ring: DepthRingBuffer,
+    state: dense::DenseState,
+    generation: u64,
+    last_buffered_depth: Option<FrameId>,
+}
 
-    let depth_m: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+enum OfflineDenseReplay {
+    Disabled,
+    Enabled(Box<OfflineDenseState>),
+}
 
-    DepthImage::new(frame_id, timestamp, width, height, depth_m).map_err(|err| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid depth image at {}: {err}", path.display()),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EmptyOfflineDepthStream;
+
+impl std::fmt::Display for EmptyOfflineDepthStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "offline dense reconstruction requires at least one manifest-indexed depth frame"
         )
-    })
+    }
 }
+
+impl std::error::Error for EmptyOfflineDepthStream {}
 
 struct TrackerDefaults {
     min_keyframe_points: usize,
@@ -970,6 +975,31 @@ fn run_viz_odometry(
         stats.left_orphan_count,
         stats.right_orphan_count
     );
+    let mut offline_dense = if env_bool("KIKO_DENSE")?.unwrap_or(false) {
+        let depth_ring_capacity = DepthRingCapacity::try_new(
+            "KIKO_OFFLINE_DEPTH_RING_CAPACITY",
+            env_usize("KIKO_OFFLINE_DEPTH_RING_CAPACITY")?.unwrap_or(8),
+        )?;
+        let cursor = reader.depth_cursor()?;
+        if cursor.is_empty() {
+            return Err(EmptyOfflineDepthStream.into());
+        }
+        eprintln!(
+            "offline dense enabled: manifest_depth_frames={} ring_capacity={}",
+            cursor.len(),
+            depth_ring_capacity.get()
+        );
+        OfflineDenseReplay::Enabled(Box::new(OfflineDenseState {
+            cursor,
+            selector: OfflineDepthSelector::default(),
+            ring: DepthRingBuffer::try_new(depth_ring_capacity.get())?,
+            state: dense::DenseState::new(&DenseConfig::default()),
+            generation: 0,
+            last_buffered_depth: None,
+        }))
+    } else {
+        OfflineDenseReplay::Disabled
+    };
 
     let inference = InferenceConfig::from_args(&args.inference)?;
     let decimation = args.rerun_decimation.get();
@@ -1009,36 +1039,6 @@ fn run_viz_odometry(
         tracker_config,
     )?;
     report_tracker_runtime(&tracker_config, &tracker);
-    let dense_enabled = env_bool("KIKO_DENSE")?.unwrap_or(false);
-    let depth_ring_capacity = if dense_enabled {
-        DepthRingCapacity::try_new(
-            "KIKO_OFFLINE_DEPTH_RING_CAPACITY",
-            env_usize("KIKO_OFFLINE_DEPTH_RING_CAPACITY")?.unwrap_or(8),
-        )?
-    } else {
-        DepthRingCapacity::minimum()
-    };
-    let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
-    let mut depth_cursor = if dense_enabled {
-        match OfflineDepthCursor::new(&args.dataset.path, reader.meta().depth.as_ref()) {
-            Ok(cursor) => cursor,
-            Err(err) => {
-                eprintln!("failed to initialize offline depth stream: {err}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let mut dense_state = dense_enabled.then(|| dense::DenseState::new(&DenseConfig::default()));
-    let mut dense_generation = 0_u64;
-    if dense_enabled {
-        eprintln!(
-            "offline dense enabled: depth_stream={} ring_capacity={}",
-            depth_cursor.is_some(),
-            depth_ring_capacity.get()
-        );
-    }
 
     let start = Instant::now();
     let mut processed = 0usize;
@@ -1059,39 +1059,57 @@ fn run_viz_odometry(
 
         let left = pair.left().clone();
         let right = pair.right().clone();
-        if let Some(cursor) = depth_cursor.as_mut()
-            && let Err(err) = cursor.push_until(left.timestamp(), &mut depth_ring)
-        {
-            eprintln!("offline depth decode failed; disabling dense: {err}");
-            depth_cursor = None;
-            dense_state = None;
-        }
+        let selected_depth = match &mut offline_dense {
+            OfflineDenseReplay::Disabled => None,
+            OfflineDenseReplay::Enabled(dense) => {
+                let OfflineDenseState {
+                    cursor,
+                    selector,
+                    ring,
+                    last_buffered_depth,
+                    ..
+                } = dense.as_mut();
+                let depth =
+                    selector.select(left.timestamp(), |cutoff| cursor.next_at_or_before(cutoff))?;
+                if let Some(depth) = depth.as_ref()
+                    && *last_buffered_depth != Some(depth.frame_id())
+                {
+                    ring.push(depth.clone());
+                    *last_buffered_depth = Some(depth.frame_id());
+                }
+                depth
+            }
+        };
 
         match tracker.process(pair) {
             Ok(mut output) => {
                 let timestamp = left.timestamp();
-                if dense_enabled {
-                    output.diagnostics_mut().depth_reorder_warnings =
-                        Some(depth_ring.reorder_warnings());
-                }
-                let dense_stats = if let Some(state) = dense_state.as_mut() {
-                    let correction = tracker.take_pending_loop_correction();
-                    let cmds = command_mapper::map_output_to_dense_commands(
-                        &output,
-                        correction.as_deref(),
-                        &depth_ring,
-                        timestamp,
-                        &mut dense_generation,
-                    );
-                    cmds.into_iter()
-                        .map(|cmd| dense::process_dense_command(state, cmd))
-                        .last()
-                } else {
-                    None
+                let dense_stats = match &mut offline_dense {
+                    OfflineDenseReplay::Disabled => None,
+                    OfflineDenseReplay::Enabled(dense) => {
+                        let OfflineDenseState {
+                            ring,
+                            state,
+                            generation,
+                            ..
+                        } = dense.as_mut();
+                        output.diagnostics_mut().depth_reorder_warnings =
+                            Some(ring.reorder_warnings());
+                        let correction = tracker.take_pending_loop_correction();
+                        let cmds = command_mapper::map_output_to_dense_commands(
+                            &output,
+                            correction.as_deref(),
+                            ring,
+                            timestamp,
+                            generation,
+                        );
+                        cmds.into_iter()
+                            .map(|cmd| dense::process_dense_command(state, cmd))
+                            .last()
+                    }
                 };
-                if let Some(depth) =
-                    depth_ring.find_closest(timestamp, command_mapper::MAX_ASSOCIATION_WINDOW_NS)
-                    && let Err(err) = sink.log_depth(&depth)
+                if let Some(depth) = selected_depth.as_ref()
+                    && let Err(err) = sink.log_depth(depth)
                 {
                     eprintln!("rerun depth error: {err}");
                 }
@@ -1143,17 +1161,19 @@ fn run_viz_odometry(
             }
             Err(err) => {
                 inference_errors += 1;
-                if let Some(state) = dense_state.as_mut()
+                if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense
                     && let Some(correction) = tracker.take_pending_loop_correction()
                 {
-                    dense_generation = dense_generation
+                    let state = &mut dense.state;
+                    let generation = &mut dense.generation;
+                    *generation = generation
                         .checked_add(1)
                         .expect("dense rebuild generation space exhausted");
                     let stats = dense::process_dense_command(
                         state,
                         DenseCommand::RebuildFromSnapshot {
                             corrected_poses: correction,
-                            generation: dense_generation,
+                            generation: *generation,
                         },
                     );
                     if let Err(log_err) = sink.log_dense_stats(left.timestamp(), &stats) {
@@ -2586,12 +2606,15 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaConfigValues, BenchError, Cli, DepthRingCapacity, RerunDestination,
+        BaConfigValues, BenchError, Cli, DepthRingCapacity, OfflineDepthSelector, RerunDestination,
         RerunDestinationError, build_ba_config_from_values,
     };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::DatasetError;
-    use kiko_slam::{InferenceError, PipelineError, PipelineTimingError};
+    use kiko_slam::{
+        DepthImage, FrameId, InferenceError, PipelineError, PipelineTimingError, Timestamp,
+    };
+    use std::collections::VecDeque;
     use std::num::NonZeroU16;
     use std::path::Path;
     use std::time::Duration;
@@ -2728,6 +2751,177 @@ mod tests {
         ])
         .expect_err("port zero would make the announced endpoint untruthful");
         assert_eq!(error.kind(), ErrorKind::ValueValidation);
+    }
+
+    fn test_depth(frame_id: u64, timestamp_ns: i64) -> DepthImage {
+        DepthImage::new(
+            FrameId::new(frame_id),
+            Timestamp::from_nanos(timestamp_ns),
+            1,
+            1,
+            vec![1.0],
+        )
+        .expect("valid test depth")
+    }
+
+    fn select_test_depth(
+        selector: &mut OfflineDepthSelector,
+        entries: &mut VecDeque<DepthImage>,
+        timestamp_ns: i64,
+    ) -> Option<DepthImage> {
+        selector
+            .select(Timestamp::from_nanos(timestamp_ns), |cutoff| {
+                if entries
+                    .front()
+                    .is_some_and(|depth| depth.timestamp() <= cutoff)
+                {
+                    Ok(entries.pop_front())
+                } else {
+                    Ok(None)
+                }
+            })
+            .expect("in-memory depth source")
+    }
+
+    #[test]
+    fn offline_depth_selector_considers_the_first_future_frame() {
+        let mut selector = OfflineDepthSelector::default();
+        let mut entries = VecDeque::from([
+            test_depth(0, -10_000_000),
+            test_depth(1, 5_000_000),
+            test_depth(2, 6_000_000),
+        ]);
+
+        let selected = select_test_depth(&mut selector, &mut entries, 0)
+            .expect("a future frame is closer than the previous frame");
+        assert_eq!(selected.frame_id(), FrameId::new(1));
+        assert_eq!(entries.len(), 1, "only one lookahead frame is decoded");
+
+        let selected = select_test_depth(&mut selector, &mut entries, 5_500_000)
+            .expect("retained lookahead remains a candidate");
+        assert_eq!(selected.frame_id(), FrameId::new(1));
+        let selected = select_test_depth(&mut selector, &mut entries, 6_000_000)
+            .expect("the next query advances to the retained successor");
+        assert_eq!(selected.frame_id(), FrameId::new(2));
+    }
+
+    #[test]
+    fn offline_depth_selector_prefers_the_earlier_frame_on_a_tie() {
+        let mut selector = OfflineDepthSelector::default();
+        let mut entries = VecDeque::from([test_depth(0, -5_000_000), test_depth(1, 5_000_000)]);
+
+        let selected = select_test_depth(&mut selector, &mut entries, 0)
+            .expect("both frames are inside the association window");
+        assert_eq!(selected.frame_id(), FrameId::new(0));
+    }
+
+    #[test]
+    fn offline_depth_selector_handles_the_maximum_timestamp_cutoff() {
+        let mut selector = OfflineDepthSelector::default();
+        let mut entries = VecDeque::from([test_depth(0, i64::MAX)]);
+
+        let selected = select_test_depth(&mut selector, &mut entries, i64::MAX - 1)
+            .expect("the representable upper timestamp remains selectable");
+        assert_eq!(selected.timestamp(), Timestamp::from_nanos(i64::MAX));
+    }
+
+    #[test]
+    fn offline_depth_selector_uses_an_inclusive_association_window() {
+        let window = kiko_slam::dense::command_mapper::MAX_ASSOCIATION_WINDOW_NS;
+        let mut selector = OfflineDepthSelector::default();
+        let mut entries = VecDeque::from([
+            test_depth(0, window),
+            test_depth(1, window.checked_add(1).expect("test timestamp")),
+        ]);
+
+        let selected = select_test_depth(&mut selector, &mut entries, 0)
+            .expect("a frame exactly at the association bound is valid");
+        assert_eq!(selected.frame_id(), FrameId::new(0));
+        assert_eq!(entries.len(), 1, "the out-of-window frame stays unread");
+
+        let mut selector = OfflineDepthSelector::default();
+        let mut entries = VecDeque::from([test_depth(
+            1,
+            window.checked_add(1).expect("test timestamp"),
+        )]);
+        assert!(select_test_depth(&mut selector, &mut entries, 0).is_none());
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn offline_depth_selector_propagates_cursor_errors() {
+        let mut selector = OfflineDepthSelector::default();
+        let error = selector
+            .select(Timestamp::from_nanos(0), |_| {
+                Err(DatasetError::DepthStreamNotConfigured)
+            })
+            .expect_err("cursor errors must not disable dense replay silently");
+        assert!(matches!(error, DatasetError::DepthStreamNotConfigured));
+    }
+
+    #[test]
+    fn offline_depth_selector_matches_nearest_timestamp_oracle_for_all_small_subsets() {
+        let window = kiko_slam::dense::command_mapper::MAX_ASSOCIATION_WINDOW_NS;
+        let candidates = [
+            -30_000_000,
+            -20_000_000,
+            -10_000_000,
+            -1,
+            0,
+            2_000_000,
+            20_000_000,
+            30_000_000,
+        ];
+        let queries = [
+            -25_000_000,
+            -10_000_000,
+            0,
+            5_000_000,
+            20_000_000,
+            35_000_000,
+        ];
+        let max_delta = u64::try_from(window).expect("nonnegative association window");
+
+        for mask in 0_u16..(1_u16 << candidates.len()) {
+            let selected_timestamps: Vec<i64> = candidates
+                .iter()
+                .copied()
+                .enumerate()
+                .filter_map(|(index, timestamp)| (mask & (1 << index) != 0).then_some(timestamp))
+                .collect();
+            let mut entries: VecDeque<_> = selected_timestamps
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(index, timestamp)| {
+                    test_depth(u64::try_from(index).expect("small test index"), timestamp)
+                })
+                .collect();
+            let mut selector = OfflineDepthSelector::default();
+
+            for query in queries {
+                let actual = select_test_depth(&mut selector, &mut entries, query)
+                    .map(|depth| depth.timestamp().as_nanos());
+                let expected = selected_timestamps
+                    .iter()
+                    .copied()
+                    .filter_map(|timestamp| {
+                        let delta = timestamp.abs_diff(query);
+                        (delta <= max_delta).then_some((delta, timestamp))
+                    })
+                    .min_by_key(|&(delta, timestamp)| (delta, timestamp))
+                    .map(|(_, timestamp)| timestamp);
+                assert_eq!(
+                    actual, expected,
+                    "mask={mask:#010b}, query={query}, depths={selected_timestamps:?}"
+                );
+                if let (Some(lookahead), Some(unread)) =
+                    (selector.lookahead.as_ref(), entries.front())
+                {
+                    assert!(lookahead.timestamp() < unread.timestamp());
+                }
+            }
+        }
     }
 
     #[test]
