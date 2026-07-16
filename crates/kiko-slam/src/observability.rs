@@ -4,8 +4,6 @@ use crate::{
     VizLogError,
 };
 
-const TIMELINE_CAPTURE_NS: &str = "capture_ns";
-
 const PATH_HEALTH_PNP_INLIER_RATIO: &str = "diagnostics/health/pnp_inlier_ratio";
 const PATH_HEALTH_VISUAL_PROPOSAL_ACCEPTED_INLIER_REPROJECTION_RMSE: &str =
     "diagnostics/health/visual_proposal_pnp_accepted_inlier_reprojection_rmse_px";
@@ -172,13 +170,6 @@ const PATH_LOOP_CANDIDATES: &str = "diagnostics/loop/candidates";
 const PATH_LOOP_APPLIED: &str = "diagnostics/loop/applied";
 
 const PATH_EVENTS_LOG: &str = "diagnostics/events/log";
-
-fn set_capture_time(rec: &rerun::RecordingStream, timestamp: Timestamp) {
-    rec.set_time(
-        TIMELINE_CAPTURE_NS,
-        rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
-    );
-}
 
 fn diagnostics_scalars(diag: &FrameDiagnostics) -> Vec<(&'static str, f64)> {
     let mut scalars = Vec::new();
@@ -805,8 +796,8 @@ impl RerunSink {
         timestamp: Timestamp,
         diagnostics: &FrameDiagnostics,
     ) -> Result<(), VizLogError> {
+        self.set_time(timestamp)?;
         let rec = self.recording();
-        set_capture_time(rec, timestamp);
         for (path, value) in diagnostics_scalars(diagnostics) {
             rec.log(path, &rerun::Scalars::single(value))?;
         }
@@ -818,11 +809,11 @@ impl RerunSink {
         timestamp: Timestamp,
         event: &DiagnosticEvent,
     ) -> Result<(), VizLogError> {
+        self.set_time(timestamp)?;
         if matches!(event, DiagnosticEvent::MappingSessionReset { .. }) {
             self.reset_mapping_session_surface()?;
         }
         let rec = self.recording();
-        set_capture_time(rec, timestamp);
         let (message, level) = format_event(event);
         let text = rerun::TextLog::new(message).with_level(level);
         rec.log(PATH_EVENTS_LOG, &text)?;
@@ -834,8 +825,8 @@ impl RerunSink {
         timestamp: Timestamp,
         health: &SystemHealth,
     ) -> Result<(), VizLogError> {
+        self.set_time(timestamp)?;
         let rec = self.recording();
-        set_capture_time(rec, timestamp);
         rec.log(
             PATH_HEALTH_TRACKING_STATE,
             &rerun::Scalars::single(tracking_state_scalar(health.tracking)),

@@ -7,6 +7,8 @@ use crate::{
 
 use std::collections::HashMap;
 
+const TIMELINE_CAPTURE_NS: &str = "capture_ns";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
 
@@ -94,12 +96,20 @@ impl std::str::FromStr for VizDecimation {
 #[derive(Debug)]
 pub enum VizLogError {
     Rerun(rerun::RecordingStreamError),
+    TimestampUnrepresentable { timestamp_ns: i64, encoded_ns: i64 },
 }
 
 impl std::fmt::Display for VizLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VizLogError::Rerun(err) => write!(f, "rerun logging error: {err}"),
+            VizLogError::TimestampUnrepresentable {
+                timestamp_ns,
+                encoded_ns,
+            } => write!(
+                f,
+                "capture timestamp {timestamp_ns} ns cannot be represented losslessly by Rerun (encoded as {encoded_ns} ns)"
+            ),
         }
     }
 }
@@ -108,7 +118,35 @@ impl std::error::Error for VizLogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             VizLogError::Rerun(source) => Some(source),
+            VizLogError::TimestampUnrepresentable { .. } => None,
         }
+    }
+}
+
+/// A device-clock nanosecond timestamp proven to survive Rerun's duration encoding exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RerunCaptureTime(rerun::TimeCell);
+
+impl TryFrom<Timestamp> for RerunCaptureTime {
+    type Error = VizLogError;
+
+    fn try_from(timestamp: Timestamp) -> Result<Self, Self::Error> {
+        let timestamp_ns = timestamp.as_nanos();
+        let cell = rerun::TimeCell::from_duration_nanos(timestamp_ns);
+        let encoded_ns = cell.as_i64();
+        if encoded_ns != timestamp_ns {
+            return Err(VizLogError::TimestampUnrepresentable {
+                timestamp_ns,
+                encoded_ns,
+            });
+        }
+        Ok(Self(cell))
+    }
+}
+
+impl RerunCaptureTime {
+    fn set_on(self, rec: &rerun::RecordingStream) {
+        rec.set_time(TIMELINE_CAPTURE_NS, self.0);
     }
 }
 
@@ -315,7 +353,7 @@ impl RerunSink {
             return Ok(());
         }
 
-        self.set_time(left.timestamp());
+        self.set_time(left.timestamp())?;
 
         let left_image = rerun::Image::from_color_model_and_bytes(
             left.data().to_vec(),
@@ -345,7 +383,7 @@ impl RerunSink {
             return Ok(());
         }
 
-        self.set_time(depth.timestamp());
+        self.set_time(depth.timestamp())?;
         // Normalize depth to 0-255 u8 for reliable rendering.
         let max_depth: f32 = 10.0;
         let mut pixels = Vec::with_capacity(depth.depth_m().len());
@@ -381,9 +419,8 @@ impl RerunSink {
 
         let left = packet.left();
         let right = packet.right();
+        self.set_time(left.timestamp())?;
         let track_ids = self.tracks.assign_tracks(packet.matches().source_a());
-
-        self.set_time(left.timestamp());
 
         let left_image = rerun::Image::from_color_model_and_bytes(
             left.data().to_vec(),
@@ -431,7 +468,7 @@ impl RerunSink {
         timestamp: Timestamp,
         pose: &TrackingPose,
     ) -> Result<(), VizLogError> {
-        self.set_time(timestamp);
+        self.set_time(timestamp)?;
         self.ensure_world_logged()?;
 
         log_pose_variant(
@@ -477,7 +514,7 @@ impl RerunSink {
         surface_integration_requested: bool,
         slam_keyframe: bool,
     ) -> Result<(), VizLogError> {
-        self.set_time(timestamp);
+        self.set_time(timestamp)?;
         self.ensure_world_logged()?;
         self.rec.log(
             "diagnostics/surface/input_raw_observations",
@@ -571,7 +608,7 @@ impl RerunSink {
         timestamp: Timestamp,
         telemetry: &VioTelemetry,
     ) -> Result<(), VizLogError> {
-        self.set_time(timestamp);
+        self.set_time(timestamp)?;
         let velocity = telemetry.velocity_odom_mps();
         let accel_bias = telemetry.accel_bias_mps2();
         let gyro_bias = telemetry.gyro_bias_radps();
@@ -616,7 +653,7 @@ impl RerunSink {
 
     pub fn log_imu_batch(&self, batch: &ImuBatch) -> Result<(), VizLogError> {
         for sample in batch.samples() {
-            self.set_time(sample.timestamp());
+            self.set_time(sample.timestamp())?;
             let accel = sample.accel_mps2();
             let gyro = sample.gyro_radps();
             let accel_norm =
@@ -648,7 +685,7 @@ impl RerunSink {
         timestamp: Timestamp,
         snapshot: &CovisibilitySnapshot,
     ) -> Result<(), VizLogError> {
-        self.set_time(timestamp);
+        self.set_time(timestamp)?;
 
         let mut positions: HashMap<crate::map::KeyframeId, [f32; 3]> = HashMap::new();
         for node in &snapshot.nodes {
@@ -694,11 +731,9 @@ impl RerunSink {
         Ok(())
     }
 
-    fn set_time(&self, timestamp: Timestamp) {
-        self.rec.set_time(
-            "capture_ns",
-            rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
-        );
+    pub(crate) fn set_time(&self, timestamp: Timestamp) -> Result<(), VizLogError> {
+        RerunCaptureTime::try_from(timestamp)?.set_on(&self.rec);
+        Ok(())
     }
 
     fn log_surface_points(
@@ -1799,10 +1834,10 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        RerunSink, RerunSinkInitError, SurfacePoseQualityDecision, SurfacePoseQualityGate,
-        TrackConfig, TrajectoryLog, VizDecimation, VizDecimationError, VizFlushError,
-        resolve_track_min_descriptor_dot_product, surface_integration_scalars,
-        surface_pose_quality_scalars, surface_summary_scalars,
+        RerunCaptureTime, RerunSink, RerunSinkInitError, SurfacePoseQualityDecision,
+        SurfacePoseQualityGate, TrackConfig, TrajectoryLog, VizDecimation, VizDecimationError,
+        VizFlushError, VizLogError, resolve_track_min_descriptor_dot_product,
+        surface_integration_scalars, surface_pose_quality_scalars, surface_summary_scalars,
     };
     use crate::{
         Frame, FrameDiagnostics, FrameId, Pose, RectifiedRowMismatchPx, SensorId,
@@ -1810,6 +1845,25 @@ mod tests {
         surface_map::{SurfaceBatchIntegrationSummary, SurfaceMapSummary},
     };
     use std::{error::Error as _, time::Duration};
+
+    #[test]
+    fn rerun_capture_time_rejects_the_reserved_minimum_timestamp() {
+        let error = RerunCaptureTime::try_from(Timestamp::from_nanos(i64::MIN))
+            .expect_err("Rerun reserves i64::MIN and would encode it lossily");
+        assert!(matches!(
+            error,
+            VizLogError::TimestampUnrepresentable {
+                timestamp_ns: i64::MIN,
+                encoded_ns,
+            } if encoded_ns != i64::MIN
+        ));
+
+        for timestamp_ns in [i64::MIN + 1, -1, 0, 1, i64::MAX] {
+            let encoded = RerunCaptureTime::try_from(Timestamp::from_nanos(timestamp_ns))
+                .expect("supported timestamp");
+            assert_eq!(encoded.0.as_i64(), timestamp_ns);
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum TestFlushResult {
