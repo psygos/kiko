@@ -768,7 +768,7 @@ impl SlamMap {
         self.ensure_local_keypoint(first_obs)?;
         let entry = self
             .keyframes
-            .get(first_obs.keyframe_id)
+            .get_mut(first_obs.keyframe_id)
             .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         let idx = first_obs.index.as_usize();
         debug_assert!(
@@ -792,10 +792,6 @@ impl SlamMap {
             observations: vec![first_obs],
         });
 
-        let entry = self
-            .keyframes
-            .get_mut(first_obs.keyframe_id)
-            .expect("keyframe existence validated before mutation");
         entry.set_point_ref(first_obs.index, point_id);
         self.lineage = self.mutation_lineage;
         self.generation = next_generation;
@@ -810,7 +806,7 @@ impl SlamMap {
         self.ensure_local_keypoint(obs)?;
         let entry = self
             .keyframes
-            .get(obs.keyframe_id)
+            .get_mut(obs.keyframe_id)
             .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         let idx = obs.index.as_usize();
         debug_assert!(
@@ -825,35 +821,27 @@ impl SlamMap {
             });
         }
 
-        let other_keyframes: Vec<KeyframeId> = {
-            let point = self
-                .points
-                .get(point_id)
-                .ok_or(MapError::MapPointNotFound(point_id))?;
-            if point.observes_keyframe(obs.keyframe_id) {
-                return Err(MapError::DuplicateObservation {
-                    point_id,
-                    keyframe_id: obs.keyframe_id,
-                });
-            }
-            point.observations.iter().map(|o| o.keyframe_id).collect()
-        };
-
-        let next_generation = self.generation.next();
-        for other in other_keyframes {
-            self.covisibility.increment_pair(obs.keyframe_id, other);
-        }
-
         let point = self
             .points
             .get_mut(point_id)
-            .expect("map point existence validated before mutation");
-        point.add_observation(obs);
+            .ok_or(MapError::MapPointNotFound(point_id))?;
+        if point.observes_keyframe(obs.keyframe_id) {
+            return Err(MapError::DuplicateObservation {
+                point_id,
+                keyframe_id: obs.keyframe_id,
+            });
+        }
 
-        let entry = self
-            .keyframes
-            .get_mut(obs.keyframe_id)
-            .expect("keyframe existence validated before mutation");
+        let next_generation = self.generation.next();
+        for other in point
+            .observations
+            .iter()
+            .map(|existing| existing.keyframe_id)
+        {
+            self.covisibility.increment_pair(obs.keyframe_id, other);
+        }
+
+        point.add_observation(obs);
         entry.set_point_ref(obs.index, point_id);
         self.lineage = self.mutation_lineage;
         self.generation = next_generation;
@@ -1014,11 +1002,9 @@ impl SlamMap {
             }
         }
         for point_id in to_remove {
-            let removed = self.points.remove(point_id);
-            debug_assert!(
-                removed.is_some(),
-                "point scheduled for removal was missing from map"
-            );
+            self.points
+                .remove(point_id)
+                .expect("point scheduled for removal was missing from map");
         }
         self.lineage = self.mutation_lineage;
         self.generation = next_generation;
