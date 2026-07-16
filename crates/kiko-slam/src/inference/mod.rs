@@ -4,6 +4,7 @@ use ort::session::builder::GraphOptimizationLevel;
 use std::cell::Cell;
 use std::ffi::CStr;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
@@ -56,6 +57,14 @@ pub enum InferenceError {
         value: usize,
         maximum: usize,
     },
+    AsyncIntraThreadCountTooSmall {
+        key: String,
+        value: usize,
+        minimum: usize,
+    },
+    HostParallelism {
+        source: std::io::Error,
+    },
     InvalidWatchdog(WatchdogConfigError),
 
     UnexpectedOutput {
@@ -93,6 +102,7 @@ impl std::error::Error for InferenceError {
             | Self::SessionConfiguration { source } => Some(source),
             Self::Environment(source) => Some(source),
             Self::InvalidWatchdog(source) => Some(source),
+            Self::HostParallelism { source } => Some(source),
             Self::ModelFileUnavailable { source, .. } => Some(source),
             Self::Downscale(source) => Some(source),
             Self::Detection(source) => Some(source),
@@ -102,6 +112,7 @@ impl std::error::Error for InferenceError {
             | Self::UnexpectedOutput { .. }
             | Self::InvalidOptimizationLevel { .. }
             | Self::ThreadCountOutOfRange { .. }
+            | Self::AsyncIntraThreadCountTooSmall { .. }
             | Self::BackendUnavailable { .. }
             | Self::WatchdogTimeout { .. }
             | Self::SessionQuarantined { .. }
@@ -191,6 +202,18 @@ impl std::fmt::Display for InferenceError {
                     "environment variable {key} sets ONNX thread count {value}, maximum is {maximum}"
                 )
             }
+            InferenceError::AsyncIntraThreadCountTooSmall {
+                key,
+                value,
+                minimum,
+            } => write!(
+                f,
+                "environment variable {key} sets ONNX intra-op thread count {value}; asynchronous inference requires zero (automatic) or at least {minimum}"
+            ),
+            InferenceError::HostParallelism { source } => write!(
+                f,
+                "failed to determine host parallelism for the ONNX CPU session: {source}"
+            ),
             InferenceError::InvalidWatchdog(source) => {
                 write!(f, "invalid inference watchdog configuration: {source}")
             }
@@ -536,10 +559,6 @@ impl OrtThreadCount {
         Ok(Self(value))
     }
 
-    fn capped_default(value: usize) -> Self {
-        Self(value.min(Self::maximum()))
-    }
-
     fn maximum() -> usize {
         usize::try_from(i32::MAX).expect("i32::MAX must fit usize")
     }
@@ -549,9 +568,79 @@ impl OrtThreadCount {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AsyncIntraThreadCount(OrtThreadCount);
+
+impl AsyncIntraThreadCount {
+    const MINIMUM: usize = 2;
+
+    fn try_from_environment(key: &str, value: usize) -> Result<Self, InferenceError> {
+        if value < Self::MINIMUM {
+            return Err(InferenceError::AsyncIntraThreadCountTooSmall {
+                key: key.to_owned(),
+                value,
+                minimum: Self::MINIMUM,
+            });
+        }
+        OrtThreadCount::try_from_environment(key, value).map(Self)
+    }
+
+    fn cpu_default(parallelism: NonZeroUsize) -> Self {
+        let desired = (parallelism.get() / 2).max(Self::MINIMUM);
+        Self(OrtThreadCount(desired.min(OrtThreadCount::maximum())))
+    }
+
+    fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+// `ort::Session::run_async` requires multiple intra-op threads. Parse the
+// environment into a policy whose resolved count cannot violate that contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncIntraThreadPolicy {
+    Automatic,
+    Exact(AsyncIntraThreadCount),
+}
+
+impl AsyncIntraThreadPolicy {
+    fn try_from_environment(key: &str, value: Option<usize>) -> Result<Self, InferenceError> {
+        match value {
+            None | Some(0) => Ok(Self::Automatic),
+            Some(value) => AsyncIntraThreadCount::try_from_environment(key, value).map(Self::Exact),
+        }
+    }
+
+    fn resolve(self, selected: InferenceBackend) -> Result<AsyncIntraThreadCount, InferenceError> {
+        self.resolve_with(selected, std::thread::available_parallelism)
+    }
+
+    fn resolve_with(
+        self,
+        selected: InferenceBackend,
+        available_parallelism: impl FnOnce() -> std::io::Result<NonZeroUsize>,
+    ) -> Result<AsyncIntraThreadCount, InferenceError> {
+        match (self, selected) {
+            (Self::Exact(count), _) => Ok(count),
+            (Self::Automatic, InferenceBackend::Cpu) => available_parallelism()
+                .map(AsyncIntraThreadCount::cpu_default)
+                .map_err(|source| InferenceError::HostParallelism { source }),
+            (
+                Self::Automatic,
+                InferenceBackend::Auto
+                | InferenceBackend::CoreMLGpu
+                | InferenceBackend::Cuda
+                | InferenceBackend::TensorRT,
+            ) => Ok(AsyncIntraThreadCount(OrtThreadCount(
+                AsyncIntraThreadCount::MINIMUM,
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SessionSettings {
-    intra_threads: Option<OrtThreadCount>,
+    intra_thread_policy: AsyncIntraThreadPolicy,
     inter_threads: OrtThreadCount,
     optimization_level: GraphOptimizationLevel,
     memory_pattern: bool,
@@ -567,9 +656,8 @@ impl SessionSettings {
         const WATCHDOG_WARNING: &str = "KIKO_ORT_RUN_WARN_MS";
         const WATCHDOG_TIMEOUT: &str = "KIKO_ORT_RUN_TIMEOUT_MS";
 
-        let intra_threads = env_usize(INTRA_THREADS)?
-            .map(|value| OrtThreadCount::try_from_environment(INTRA_THREADS, value))
-            .transpose()?;
+        let intra_thread_policy =
+            AsyncIntraThreadPolicy::try_from_environment(INTRA_THREADS, env_usize(INTRA_THREADS)?)?;
         let inter_threads = env_usize(INTER_THREADS)?
             .map(|value| OrtThreadCount::try_from_environment(INTER_THREADS, value))
             .transpose()?
@@ -593,7 +681,7 @@ impl SessionSettings {
         )?;
 
         Ok(Self {
-            intra_threads,
+            intra_thread_policy,
             inter_threads,
             optimization_level,
             memory_pattern,
@@ -758,16 +846,7 @@ fn apply_session_config(
     selected: InferenceBackend,
     settings: &SessionSettings,
 ) -> Result<ort::session::builder::SessionBuilder, InferenceError> {
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let default_intra = match selected {
-        InferenceBackend::Cpu => (cores / 2).max(1),
-        _ => 1,
-    };
-    let intra = settings
-        .intra_threads
-        .unwrap_or_else(|| OrtThreadCount::capped_default(default_intra));
+    let intra = settings.intra_thread_policy.resolve(selected)?;
     let builder = builder
         .with_optimization_level(settings.optimization_level)
         .map_err(session_configuration_error)?;
@@ -817,12 +896,14 @@ fn parse_opt_level(key: &str, raw: String) -> Result<GraphOptimizationLevel, Inf
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_WATCHDOG_LIMITS, InferenceBackend, InferenceError, OrtThreadCount,
-        WatchdogConfigError, WatchdogLimits, WatchdogScope, cpu_provider_may_be_configured,
-        parse_opt_level, preflight_ort_runtime, run_with_limits, run_with_watchdog,
+        ACTIVE_WATCHDOG_LIMITS, AsyncIntraThreadPolicy, InferenceBackend, InferenceError,
+        OrtThreadCount, WatchdogConfigError, WatchdogLimits, WatchdogScope,
+        cpu_provider_may_be_configured, parse_opt_level, preflight_ort_runtime, run_with_limits,
+        run_with_watchdog,
     };
     use ort::session::builder::GraphOptimizationLevel;
     use std::cell::Cell;
+    use std::num::NonZeroUsize;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -860,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn ort_thread_count_preserves_zero_and_rejects_c_int_overflow() {
+    fn ort_thread_count_preserves_ort_default_and_rejects_c_int_overflow() {
         assert_eq!(
             OrtThreadCount::try_from_environment("TEST_THREADS", 0)
                 .expect("zero means ORT default")
@@ -883,6 +964,102 @@ mod tests {
             }) if key == "TEST_THREADS"
                 && value == maximum + 1
                 && error_maximum == maximum
+        ));
+    }
+
+    #[test]
+    fn async_intra_thread_policy_parses_automatic_or_multiple_threads() {
+        assert_eq!(
+            AsyncIntraThreadPolicy::try_from_environment("TEST_THREADS", None)
+                .expect("unset selects the automatic policy"),
+            AsyncIntraThreadPolicy::Automatic
+        );
+        assert_eq!(
+            AsyncIntraThreadPolicy::try_from_environment("TEST_THREADS", Some(0))
+                .expect("zero selects the automatic policy"),
+            AsyncIntraThreadPolicy::Automatic
+        );
+        assert!(matches!(
+            AsyncIntraThreadPolicy::try_from_environment("TEST_THREADS", Some(1)),
+            Err(InferenceError::AsyncIntraThreadCountTooSmall {
+                key,
+                value: 1,
+                minimum: 2,
+            }) if key == "TEST_THREADS"
+        ));
+        assert!(matches!(
+            AsyncIntraThreadPolicy::try_from_environment("TEST_THREADS", Some(2)),
+            Ok(AsyncIntraThreadPolicy::Exact(count)) if count.get() == 2
+        ));
+
+        let maximum = OrtThreadCount::maximum();
+        assert!(matches!(
+            AsyncIntraThreadPolicy::try_from_environment("TEST_THREADS", Some(maximum + 1)),
+            Err(InferenceError::ThreadCountOutOfRange {
+                key,
+                value,
+                maximum: error_maximum,
+            }) if key == "TEST_THREADS"
+                && value == maximum + 1
+                && error_maximum == maximum
+        ));
+    }
+
+    #[test]
+    fn automatic_async_thread_policy_is_multiple_on_every_backend() {
+        let expected = [(1, 2), (2, 2), (3, 2), (4, 2), (8, 4)];
+        for (parallelism, thread_count) in expected {
+            let parallelism = NonZeroUsize::new(parallelism).expect("positive fixture");
+            assert_eq!(
+                AsyncIntraThreadPolicy::Automatic
+                    .resolve_with(InferenceBackend::Cpu, || Ok(parallelism))
+                    .expect("fixture parallelism is available")
+                    .get(),
+                thread_count
+            );
+        }
+
+        for backend in [
+            InferenceBackend::Auto,
+            InferenceBackend::CoreMLGpu,
+            InferenceBackend::Cuda,
+            InferenceBackend::TensorRT,
+        ] {
+            assert_eq!(
+                AsyncIntraThreadPolicy::Automatic
+                    .resolve_with(backend, || panic!(
+                        "accelerators do not query CPU parallelism"
+                    ))
+                    .expect("automatic accelerator count")
+                    .get(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn async_thread_policy_queries_parallelism_only_for_automatic_cpu() {
+        let explicit = AsyncIntraThreadPolicy::try_from_environment("TEST_THREADS", Some(3))
+            .expect("valid exact count");
+        assert_eq!(
+            explicit
+                .resolve_with(InferenceBackend::Cpu, || {
+                    panic!("exact counts do not query host parallelism")
+                })
+                .expect("exact count")
+                .get(),
+            3
+        );
+
+        let error = AsyncIntraThreadPolicy::Automatic
+            .resolve_with(InferenceBackend::Cpu, || {
+                Err(std::io::Error::other("parallelism unavailable"))
+            })
+            .expect_err("automatic CPU policy preserves discovery failure");
+        assert!(matches!(
+            error,
+            InferenceError::HostParallelism { source }
+                if source.to_string() == "parallelism unavailable"
         ));
     }
 

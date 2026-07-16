@@ -65,6 +65,7 @@ cargo run -p kiko-slam -- bench recordings/<name>
 - `--lightglue-backend` / `KIKO_LIGHTGLUE_BACKEND` — LightGlue backend override
 - `--superpoint-model` / `KIKO_SUPERPOINT_MODEL` — custom SuperPoint ONNX path
 - `--lightglue-model` / `KIKO_LIGHTGLUE_MODEL` — custom LightGlue ONNX path
+- `KIKO_ORT_INTRA_THREADS` — ONNX intra-op threads; unset or `0` selects `max(2, available_parallelism / 2)` for CPU sessions and 2 for accelerator sessions, while an explicit count must be at least 2 because Kiko uses asynchronous inference
 
 **Visualization:**
 
