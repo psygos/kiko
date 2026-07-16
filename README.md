@@ -69,6 +69,7 @@ cargo run -p kiko-slam -- bench recordings/<name>
 **Visualization:**
 
 - `--rerun-decimation` / `KIKO_RERUN_DECIMATION` — image decimation for Rerun
+- `--rerun-finish-timeout-ms` / `KIKO_RERUN_FINISH_TIMEOUT_MS` — Rerun sink-flush timeout in milliseconds (default 5000); success confirms the calling thread's prior data reached the configured sink, not that a viewer consumed it
 - `--odometry` / `KIKO_VIZ_ODOMETRY` — enable visual odometry in viz mode
 
 **Bundle adjustment:**

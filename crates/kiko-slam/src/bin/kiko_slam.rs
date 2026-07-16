@@ -12,8 +12,9 @@ use kiko_slam::{
     LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, PipelineError,
     PipelineTimingError, PipelineWallBreakdown, RansacConfig, RectifiedStereo,
     RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy, RelocalizationConfig, RerunSink,
-    SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
-    VizDecimation, VizPacket,
+    RerunSinkConfig, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
+    TriangulationError, Triangulator, VizDecimation, VizError, VizFlushError, VizLogError,
+    VizPacket,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
@@ -181,6 +182,13 @@ struct VizArgs {
     /// Port for gRPC server (used with --rerun-serve). Default: 9876.
     #[arg(long, env = "KIKO_RERUN_PORT")]
     rerun_port: Option<NonZeroU16>,
+    /// Timeout passed to Rerun for the configured sink flush, in milliseconds.
+    #[arg(
+        long,
+        env = "KIKO_RERUN_FINISH_TIMEOUT_MS",
+        default_value_t = RerunFinishTimeout::default()
+    )]
+    rerun_finish_timeout_ms: RerunFinishTimeout,
     #[arg(long, env = "KIKO_VIZ_ODOMETRY", default_value_t = false)]
     odometry: bool,
     #[arg(long, env = "KIKO_RECTIFY_TOLERANCE")]
@@ -217,6 +225,131 @@ impl std::fmt::Display for RerunDestinationError {
 }
 
 impl std::error::Error for RerunDestinationError {}
+
+#[derive(Debug)]
+enum RerunSessionError<P> {
+    Processing(P),
+    Finalization(VizFlushError),
+    ProcessingAndFinalization {
+        processing: P,
+        finalization: VizFlushError,
+    },
+}
+
+impl<P> RerunSessionError<P> {
+    fn processing_error(&self) -> Option<&P> {
+        match self {
+            Self::Processing(source) => Some(source),
+            Self::Finalization(_) => None,
+            Self::ProcessingAndFinalization { processing, .. } => Some(processing),
+        }
+    }
+
+    fn finalization_error(&self) -> Option<&VizFlushError> {
+        match self {
+            Self::Processing(_) => None,
+            Self::Finalization(source) => Some(source),
+            Self::ProcessingAndFinalization { finalization, .. } => Some(finalization),
+        }
+    }
+}
+
+impl<P: std::fmt::Display> std::fmt::Display for RerunSessionError<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Processing(source) => write!(f, "Rerun session processing failed: {source}"),
+            Self::Finalization(source) => write!(f, "Rerun session finalization failed: {source}"),
+            Self::ProcessingAndFinalization {
+                processing,
+                finalization,
+            } => write!(
+                f,
+                "Rerun session processing failed: {processing}; finalization also failed: {finalization}"
+            ),
+        }
+    }
+}
+
+impl<P: std::error::Error + 'static> std::error::Error for RerunSessionError<P> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Some(source) = self.processing_error() {
+            Some(source)
+        } else {
+            self.finalization_error()
+                .map(|source| source as &(dyn std::error::Error + 'static))
+        }
+    }
+}
+
+fn combine_rerun_results<T, P>(
+    processing: Result<T, P>,
+    finalization: Result<(), VizFlushError>,
+) -> Result<T, RerunSessionError<P>> {
+    match (processing, finalization) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(source), Ok(())) => Err(RerunSessionError::Processing(source)),
+        (Ok(_), Err(source)) => Err(RerunSessionError::Finalization(source)),
+        (Err(processing), Err(finalization)) => Err(RerunSessionError::ProcessingAndFinalization {
+            processing,
+            finalization,
+        }),
+    }
+}
+
+fn run_rerun_session<T, P>(
+    mut sink: RerunSink,
+    timeout: RerunFinishTimeout,
+    process: impl FnOnce(&mut RerunSink) -> Result<T, P>,
+) -> Result<T, RerunSessionError<P>> {
+    let processing = process(&mut sink);
+    let finalization = sink.finish_with_timeout(timeout.get());
+    combine_rerun_results(processing, finalization)
+}
+
+#[derive(Debug)]
+enum OdometryVizProcessingError {
+    Dataset(DatasetError),
+    Packet(VizError),
+    Log(VizLogError),
+}
+
+impl std::fmt::Display for OdometryVizProcessingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dataset(source) => write!(f, "offline depth replay failed: {source}"),
+            Self::Packet(source) => write!(f, "visualization packet creation failed: {source}"),
+            Self::Log(source) => write!(f, "visualization logging failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for OdometryVizProcessingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Dataset(source) => Some(source),
+            Self::Packet(source) => Some(source),
+            Self::Log(source) => Some(source),
+        }
+    }
+}
+
+impl From<DatasetError> for OdometryVizProcessingError {
+    fn from(source: DatasetError) -> Self {
+        Self::Dataset(source)
+    }
+}
+
+impl From<VizError> for OdometryVizProcessingError {
+    fn from(source: VizError) -> Self {
+        Self::Packet(source)
+    }
+}
+
+impl From<VizLogError> for OdometryVizProcessingError {
+    fn from(source: VizLogError) -> Self {
+        Self::Log(source)
+    }
+}
 
 impl<'a> RerunDestination<'a> {
     fn parse(
@@ -486,6 +619,39 @@ impl std::fmt::Display for VizDecimationArg {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RerunFinishTimeout(Duration);
+
+impl Default for RerunFinishTimeout {
+    fn default() -> Self {
+        Self(Duration::from_secs(5))
+    }
+}
+
+impl std::str::FromStr for RerunFinishTimeout {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        raw.trim()
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map(Self)
+            .map_err(|_| format!("invalid Rerun finish timeout in milliseconds: {raw}"))
+    }
+}
+
+impl RerunFinishTimeout {
+    fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RerunFinishTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.as_millis())
+    }
+}
+
 struct InferenceConfig {
     superpoint_left: SuperPoint,
     superpoint_right: SuperPoint,
@@ -585,10 +751,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let destination =
         RerunDestination::parse(args.save_rrd.as_deref(), args.rerun_serve, args.rerun_port)?;
+    let sink_config = RerunSinkConfig::from_environment()?;
     if args.odometry {
-        return run_viz_odometry(&args, destination);
+        return run_viz_odometry(&args, destination, sink_config);
     }
-    run_viz_matches(&args, destination)
+    run_viz_matches(&args, destination, sink_config)
 }
 
 fn build_recording(
@@ -643,6 +810,7 @@ fn build_rectified_stereo_config(
 fn run_viz_matches(
     args: &VizArgs,
     destination: RerunDestination<'_>,
+    sink_config: RerunSinkConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats();
@@ -669,7 +837,7 @@ fn run_viz_matches(
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let rec = build_recording(destination, "kiko-slam-dataset")?;
-    let mut sink = RerunSink::new(rec, decimation)?;
+    let sink = RerunSink::from_config(rec, decimation, sink_config);
 
     let mut pipeline = inference.into_pipeline();
 
@@ -682,52 +850,57 @@ fn run_viz_matches(
     let mut triangulated_points = 0usize;
     let mut total_matches = 0usize;
 
-    for pair in reader.pairs() {
-        let pair = match pair {
-            Ok(pair) => pair,
-            Err(err) => {
-                read_errors += 1;
-                eprintln!("read error: {err}");
-                continue;
-            }
-        };
-
-        match pipeline.process_pair(pair) {
-            Ok(packet) => {
-                total_matches += packet.matches().len();
-                let mut keyframe = None;
-                match triangulator.triangulate(packet.matches()) {
-                    Ok(result) => {
-                        triangulated_points += result.keyframe.landmarks().len();
-                        keyframe = Some(result.keyframe);
-                    }
-                    Err(TriangulationError::NoLandmarks { .. }) => {
-                        triangulation_empty += 1;
-                    }
+    run_rerun_session(
+        sink,
+        args.rerun_finish_timeout_ms,
+        |sink| -> Result<(), VizLogError> {
+            for pair in reader.pairs() {
+                let pair = match pair {
+                    Ok(pair) => pair,
                     Err(err) => {
-                        triangulation_errors += 1;
-                        eprintln!("triangulation error: {err}");
+                        read_errors += 1;
+                        eprintln!("read error: {err}");
+                        continue;
                     }
                 };
 
-                let points = keyframe.as_ref().map(|kf| kf.landmarks());
-                if let Err(err) = sink.log_with_points(&packet, points) {
-                    eprintln!("rerun log error: {err}");
-                }
-                processed += 1;
-            }
-            Err(err) => {
-                inference_errors += 1;
-                eprintln!("inference error: {err}");
-            }
-        }
+                match pipeline.process_pair(pair) {
+                    Ok(packet) => {
+                        total_matches += packet.matches().len();
+                        let mut keyframe = None;
+                        match triangulator.triangulate(packet.matches()) {
+                            Ok(result) => {
+                                triangulated_points += result.keyframe.landmarks().len();
+                                keyframe = Some(result.keyframe);
+                            }
+                            Err(TriangulationError::NoLandmarks { .. }) => {
+                                triangulation_empty += 1;
+                            }
+                            Err(err) => {
+                                triangulation_errors += 1;
+                                eprintln!("triangulation error: {err}");
+                            }
+                        };
 
-        if let Some(limit) = args.dataset.max_pairs
-            && processed >= limit.get()
-        {
-            break;
-        }
-    }
+                        let points = keyframe.as_ref().map(|kf| kf.landmarks());
+                        sink.log_with_points(&packet, points)?;
+                        processed += 1;
+                    }
+                    Err(err) => {
+                        inference_errors += 1;
+                        eprintln!("inference error: {err}");
+                    }
+                }
+
+                if let Some(limit) = args.dataset.max_pairs
+                    && processed >= limit.get()
+                {
+                    break;
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let fps = if elapsed > 0.0 {
@@ -959,6 +1132,7 @@ fn report_tracker_runtime(config: &TrackerConfig, tracker: &SlamTracker) {
 fn run_viz_odometry(
     args: &VizArgs,
     destination: RerunDestination<'_>,
+    sink_config: RerunSinkConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats();
@@ -1028,8 +1202,6 @@ fn run_viz_odometry(
         downscale,
     )?;
 
-    let rec = build_recording(destination, "kiko-slam-dataset-odometry")?;
-    let mut sink = RerunSink::new(rec, decimation)?;
     let mut tracker = SlamTracker::try_new(
         superpoint_left,
         superpoint_right,
@@ -1039,6 +1211,8 @@ fn run_viz_odometry(
         tracker_config,
     )?;
     report_tracker_runtime(&tracker_config, &tracker);
+    let rec = build_recording(destination, "kiko-slam-dataset-odometry")?;
+    let sink = RerunSink::from_config(rec, decimation, sink_config);
 
     let start = Instant::now();
     let mut processed = 0usize;
@@ -1047,149 +1221,136 @@ fn run_viz_odometry(
     let mut poses_logged = 0usize;
     let mut keyframes = 0usize;
 
-    for pair in reader.pairs() {
-        let pair = match pair {
-            Ok(pair) => pair,
-            Err(err) => {
-                read_errors += 1;
-                eprintln!("read error: {err}");
-                continue;
-            }
-        };
+    run_rerun_session(
+        sink,
+        args.rerun_finish_timeout_ms,
+        |sink| -> Result<(), OdometryVizProcessingError> {
+            for pair in reader.pairs() {
+                let pair = match pair {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        read_errors += 1;
+                        eprintln!("read error: {err}");
+                        continue;
+                    }
+                };
 
-        let left = pair.left().clone();
-        let right = pair.right().clone();
-        let selected_depth = match &mut offline_dense {
-            OfflineDenseReplay::Disabled => None,
-            OfflineDenseReplay::Enabled(dense) => {
-                let OfflineDenseState {
-                    cursor,
-                    selector,
-                    ring,
-                    last_buffered_depth,
-                    ..
-                } = dense.as_mut();
-                let depth =
-                    selector.select(left.timestamp(), |cutoff| cursor.next_at_or_before(cutoff))?;
-                if let Some(depth) = depth.as_ref()
-                    && *last_buffered_depth != Some(depth.frame_id())
-                {
-                    ring.push(depth.clone());
-                    *last_buffered_depth = Some(depth.frame_id());
-                }
-                depth
-            }
-        };
-
-        match tracker.process(pair) {
-            Ok(mut output) => {
-                let timestamp = left.timestamp();
-                let dense_stats = match &mut offline_dense {
+                let left = pair.left().clone();
+                let right = pair.right().clone();
+                let selected_depth = match &mut offline_dense {
                     OfflineDenseReplay::Disabled => None,
                     OfflineDenseReplay::Enabled(dense) => {
                         let OfflineDenseState {
+                            cursor,
+                            selector,
                             ring,
-                            state,
-                            generation,
+                            last_buffered_depth,
                             ..
                         } = dense.as_mut();
-                        output.diagnostics_mut().depth_reorder_warnings =
-                            Some(ring.reorder_warnings());
-                        let correction = tracker.take_pending_loop_correction();
-                        let cmds = command_mapper::map_output_to_dense_commands(
-                            &output,
-                            correction.as_deref(),
-                            ring,
-                            timestamp,
-                            generation,
-                        );
-                        cmds.into_iter()
-                            .map(|cmd| dense::process_dense_command(state, cmd))
-                            .last()
+                        let depth = selector
+                            .select(left.timestamp(), |cutoff| cursor.next_at_or_before(cutoff))?;
+                        if let Some(depth) = depth.as_ref()
+                            && *last_buffered_depth != Some(depth.frame_id())
+                        {
+                            ring.push(depth.clone());
+                            *last_buffered_depth = Some(depth.frame_id());
+                        }
+                        depth
                     }
                 };
-                if let Some(depth) = selected_depth.as_ref()
-                    && let Err(err) = sink.log_depth(depth)
-                {
-                    eprintln!("rerun depth error: {err}");
-                }
-                if let Some(matches) = output.take_stereo_matches() {
-                    let points = output
-                        .keyframe()
-                        .map(|kf| kf.landmarks())
-                        .filter(|pts| !pts.is_empty());
-                    if let Ok(packet) = VizPacket::try_new(left.clone(), right.clone(), matches)
-                        && let Err(err) = sink.log_with_points(&packet, points)
-                    {
-                        eprintln!("rerun log error: {err}");
-                    }
-                    if output.keyframe().is_some() {
-                        keyframes += 1;
-                        let snapshot = tracker.covisibility_snapshot();
-                        if let Err(err) = sink.log_covisibility_graph(left.timestamp(), &snapshot) {
-                            eprintln!("rerun log error: {err}");
+
+                match tracker.process(pair) {
+                    Ok(mut output) => {
+                        let timestamp = left.timestamp();
+                        let dense_stats = match &mut offline_dense {
+                            OfflineDenseReplay::Disabled => None,
+                            OfflineDenseReplay::Enabled(dense) => {
+                                let OfflineDenseState {
+                                    ring,
+                                    state,
+                                    generation,
+                                    ..
+                                } = dense.as_mut();
+                                output.diagnostics_mut().depth_reorder_warnings =
+                                    Some(ring.reorder_warnings());
+                                let correction = tracker.take_pending_loop_correction();
+                                let cmds = command_mapper::map_output_to_dense_commands(
+                                    &output,
+                                    correction.as_deref(),
+                                    ring,
+                                    timestamp,
+                                    generation,
+                                );
+                                cmds.into_iter()
+                                    .map(|cmd| dense::process_dense_command(state, cmd))
+                                    .last()
+                            }
+                        };
+                        if let Some(depth) = selected_depth.as_ref() {
+                            sink.log_depth(depth)?;
                         }
+                        if let Some(matches) = output.take_stereo_matches() {
+                            let points = output
+                                .keyframe()
+                                .map(|kf| kf.landmarks())
+                                .filter(|pts| !pts.is_empty());
+                            let packet = VizPacket::try_new(left.clone(), right.clone(), matches)?;
+                            sink.log_with_points(&packet, points)?;
+                            if output.keyframe().is_some() {
+                                keyframes += 1;
+                                let snapshot = tracker.covisibility_snapshot();
+                                sink.log_covisibility_graph(left.timestamp(), &snapshot)?;
+                            }
+                        } else {
+                            sink.log_frames(&left, &right)?;
+                        }
+
+                        if let Some(pose) = output.pose() {
+                            sink.log_pose(timestamp, &pose)?;
+                            poses_logged += 1;
+                        }
+                        sink.log_system_health(timestamp, output.health())?;
+                        sink.log_diagnostics(timestamp, output.diagnostics())?;
+                        for event in output.events() {
+                            sink.log_event(timestamp, event)?;
+                        }
+                        if let Some(stats) = dense_stats.as_ref() {
+                            sink.log_dense_stats(timestamp, stats)?;
+                        }
+                        processed += 1;
                     }
-                } else if let Err(err) = sink.log_frames(&left, &right) {
-                    eprintln!("rerun log error: {err}");
+                    Err(err) => {
+                        inference_errors += 1;
+                        if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense
+                            && let Some(correction) = tracker.take_pending_loop_correction()
+                        {
+                            let state = &mut dense.state;
+                            let generation = &mut dense.generation;
+                            *generation = generation
+                                .checked_add(1)
+                                .expect("dense rebuild generation space exhausted");
+                            let stats = dense::process_dense_command(
+                                state,
+                                DenseCommand::RebuildFromSnapshot {
+                                    corrected_poses: correction,
+                                    generation: *generation,
+                                },
+                            );
+                            sink.log_dense_stats(left.timestamp(), &stats)?;
+                        }
+                        eprintln!("tracker error: {err}");
+                    }
                 }
 
-                if let Some(pose) = output.pose() {
-                    if let Err(err) = sink.log_pose(timestamp, &pose) {
-                        eprintln!("rerun log error: {err}");
-                    } else {
-                        poses_logged += 1;
-                    }
-                }
-                if let Err(err) = sink.log_system_health(timestamp, output.health()) {
-                    eprintln!("rerun health error: {err}");
-                }
-                if let Err(err) = sink.log_diagnostics(timestamp, output.diagnostics()) {
-                    eprintln!("rerun diagnostics error: {err}");
-                }
-                for event in output.events() {
-                    if let Err(err) = sink.log_event(timestamp, event) {
-                        eprintln!("rerun event error: {err}");
-                    }
-                }
-                if let Some(stats) = dense_stats.as_ref()
-                    && let Err(err) = sink.log_dense_stats(timestamp, stats)
+                if let Some(limit) = args.dataset.max_pairs
+                    && processed >= limit.get()
                 {
-                    eprintln!("rerun dense stats error: {err}");
+                    break;
                 }
-                processed += 1;
             }
-            Err(err) => {
-                inference_errors += 1;
-                if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense
-                    && let Some(correction) = tracker.take_pending_loop_correction()
-                {
-                    let state = &mut dense.state;
-                    let generation = &mut dense.generation;
-                    *generation = generation
-                        .checked_add(1)
-                        .expect("dense rebuild generation space exhausted");
-                    let stats = dense::process_dense_command(
-                        state,
-                        DenseCommand::RebuildFromSnapshot {
-                            corrected_poses: correction,
-                            generation: *generation,
-                        },
-                    );
-                    if let Err(log_err) = sink.log_dense_stats(left.timestamp(), &stats) {
-                        eprintln!("rerun dense stats error: {log_err}");
-                    }
-                }
-                eprintln!("tracker error: {err}");
-            }
-        }
-
-        if let Some(limit) = args.dataset.max_pairs
-            && processed >= limit.get()
-        {
-            break;
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let fps = if elapsed > 0.0 {
@@ -2606,13 +2767,15 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaConfigValues, BenchError, Cli, DepthRingCapacity, OfflineDepthSelector, RerunDestination,
-        RerunDestinationError, build_ba_config_from_values,
+        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, OfflineDepthSelector,
+        RerunDestination, RerunDestinationError, RerunFinishTimeout, RerunSessionError,
+        build_ba_config_from_values, combine_rerun_results,
     };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::DatasetError;
     use kiko_slam::{
         DepthImage, FrameId, InferenceError, PipelineError, PipelineTimingError, Timestamp,
+        VizFlushError,
     };
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
@@ -2737,6 +2900,83 @@ mod tests {
             RerunDestination::parse(None, false, None),
             Ok(RerunDestination::Connect)
         );
+    }
+
+    #[test]
+    fn rerun_finish_timeout_parses_milliseconds_once_at_the_cli_boundary() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--rerun-finish-timeout-ms",
+            "17",
+            "/tmp/dataset",
+        ])
+        .expect("an exact millisecond timeout is valid");
+        let Command::Viz(args) = cli.command else {
+            panic!("expected visualization command");
+        };
+        assert_eq!(
+            args.rerun_finish_timeout_ms.get(),
+            Duration::from_millis(17)
+        );
+
+        let zero = "0"
+            .parse::<RerunFinishTimeout>()
+            .expect("zero is a valid immediate sink-flush timeout");
+        assert_eq!(zero.get(), Duration::ZERO);
+        assert!("not-a-timeout".parse::<RerunFinishTimeout>().is_err());
+    }
+
+    #[test]
+    fn rerun_result_combiner_preserves_each_failure_outcome() {
+        assert_eq!(
+            combine_rerun_results::<_, DatasetError>(Ok(7_u8), Ok(())).expect("both succeeded"),
+            7
+        );
+
+        let processing =
+            combine_rerun_results::<(), _>(Err(DatasetError::DepthStreamNotConfigured), Ok(()))
+                .expect_err("processing failure must be returned");
+        assert!(matches!(
+            processing,
+            RerunSessionError::Processing(DatasetError::DepthStreamNotConfigured)
+        ));
+
+        let finalization = combine_rerun_results::<(), DatasetError>(
+            Ok(()),
+            Err(VizFlushError::from(rerun::sink::SinkFlushError::Timeout)),
+        )
+        .expect_err("finalization failure must be returned");
+        assert!(matches!(
+            finalization,
+            RerunSessionError::Finalization(VizFlushError::Rerun(
+                rerun::sink::SinkFlushError::Timeout
+            ))
+        ));
+
+        let combined = combine_rerun_results::<(), _>(
+            Err(DatasetError::DepthStreamNotConfigured),
+            Err(VizFlushError::from(rerun::sink::SinkFlushError::Timeout)),
+        )
+        .expect_err("neither failure may hide the other");
+        let display = combined.to_string();
+        assert!(display.contains("dataset metadata does not configure a depth stream"));
+        assert!(display.contains("finalization also failed"));
+        assert!(matches!(
+            combined.processing_error(),
+            Some(DatasetError::DepthStreamNotConfigured)
+        ));
+        assert!(matches!(
+            combined.finalization_error(),
+            Some(VizFlushError::Rerun(rerun::sink::SinkFlushError::Timeout))
+        ));
+        assert!(matches!(
+            combined,
+            RerunSessionError::ProcessingAndFinalization {
+                processing: DatasetError::DepthStreamNotConfigured,
+                finalization: VizFlushError::Rerun(rerun::sink::SinkFlushError::Timeout),
+            }
+        ));
     }
 
     #[test]
