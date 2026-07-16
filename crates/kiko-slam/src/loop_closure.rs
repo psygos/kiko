@@ -1302,7 +1302,8 @@ mod tests {
         DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase,
         KeyframeDatabaseError, LoopCandidate, LoopClosureConfig, LoopVerificationError,
         RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
-        RelocalizationConfigInput, aggregate_global_descriptor, try_match_descriptors_for_loop,
+        RelocalizationConfigInput, aggregate_global_descriptor, brute_force_best_match,
+        try_match_descriptors_for_loop,
     };
     use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -1314,6 +1315,133 @@ mod tests {
         let mut d = [0.0_f32; 512];
         d[idx] = 1.0;
         GlobalDescriptor::try_new(d).expect("valid basis descriptor")
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TwoPassMatchBehavior {
+        query_best: Vec<Option<(usize, u32)>>,
+        candidate_best: Vec<Option<(usize, u32)>>,
+        mutual_matches: Vec<(usize, usize, u32)>,
+    }
+
+    fn match_bits(matches: &[Option<(usize, f32)>]) -> Vec<Option<(usize, u32)>> {
+        matches
+            .iter()
+            .map(|best| best.map(|(index, similarity)| (index, similarity.to_bits())))
+            .collect()
+    }
+
+    fn mutual_match_bits(
+        query_best: &[Option<(usize, f32)>],
+        candidate_best: &[Option<(usize, f32)>],
+    ) -> Vec<(usize, usize, u32)> {
+        query_best
+            .iter()
+            .enumerate()
+            .filter_map(|(query_index, best)| {
+                let (candidate_index, similarity) = best.as_ref()?;
+                let (back_query_index, _) = candidate_best[*candidate_index]?;
+                (back_query_index == query_index).then_some((
+                    query_index,
+                    *candidate_index,
+                    similarity.to_bits(),
+                ))
+            })
+            .collect()
+    }
+
+    fn current_two_pass_behavior(
+        query: &[CompactDescriptor],
+        candidates: &[CompactDescriptor],
+        threshold: f32,
+    ) -> TwoPassMatchBehavior {
+        let query_best = brute_force_best_match(
+            query.len(),
+            candidates.len(),
+            |query_index, candidate_index| {
+                query[query_index].cosine_similarity(&candidates[candidate_index])
+            },
+            threshold,
+        );
+        let candidate_best = brute_force_best_match(
+            candidates.len(),
+            query.len(),
+            |candidate_index, query_index| {
+                query[query_index].cosine_similarity(&candidates[candidate_index])
+            },
+            threshold,
+        );
+        TwoPassMatchBehavior {
+            mutual_matches: mutual_match_bits(&query_best, &candidate_best),
+            query_best: match_bits(&query_best),
+            candidate_best: match_bits(&candidate_best),
+        }
+    }
+
+    fn reference_best_matches(
+        source_len: usize,
+        target_len: usize,
+        threshold: f32,
+        similarity: impl Fn(usize, usize) -> f32,
+    ) -> Vec<Option<(usize, f32)>> {
+        let mut matches = Vec::with_capacity(source_len);
+        for source_index in 0..source_len {
+            let mut best = None;
+            let mut best_similarity = threshold;
+            for target_index in 0..target_len {
+                let candidate_similarity = similarity(source_index, target_index);
+                if candidate_similarity >= best_similarity {
+                    best = Some((target_index, candidate_similarity));
+                    best_similarity = candidate_similarity;
+                }
+            }
+            matches.push(best);
+        }
+        matches
+    }
+
+    fn reference_two_pass_behavior(
+        query: &[CompactDescriptor],
+        candidates: &[CompactDescriptor],
+        threshold: f32,
+    ) -> TwoPassMatchBehavior {
+        let similarities: Vec<Vec<f32>> = query
+            .iter()
+            .map(|query_descriptor| {
+                candidates
+                    .iter()
+                    .map(|candidate| query_descriptor.cosine_similarity(candidate))
+                    .collect()
+            })
+            .collect();
+        let query_best = reference_best_matches(
+            query.len(),
+            candidates.len(),
+            threshold,
+            |query_index, candidate_index| similarities[query_index][candidate_index],
+        );
+        let candidate_best = reference_best_matches(
+            candidates.len(),
+            query.len(),
+            threshold,
+            |candidate_index, query_index| similarities[query_index][candidate_index],
+        );
+        TwoPassMatchBehavior {
+            mutual_matches: mutual_match_bits(&query_best, &candidate_best),
+            query_best: match_bits(&query_best),
+            candidate_best: match_bits(&candidate_best),
+        }
+    }
+
+    fn generated_compact_descriptor(mut state: u64) -> CompactDescriptor {
+        let mut values = [0_u8; crate::DESCRIPTOR_DIM];
+        for value in &mut values {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *value = state.to_be_bytes()[0];
+        }
+        CompactDescriptor(values)
     }
 
     #[test]
@@ -2037,6 +2165,95 @@ mod tests {
     }
 
     #[test]
+    fn local_match_threshold_is_inclusive_and_last_tied_indices_win() {
+        let descriptor = generated_compact_descriptor(7);
+        let query = vec![descriptor.clone(), descriptor.clone()];
+        let candidates = vec![descriptor.clone(), descriptor.clone(), descriptor];
+        let behavior = current_two_pass_behavior(&query, &candidates, 1.0);
+        let identical_similarity = 1.0_f32.to_bits();
+
+        assert_eq!(
+            behavior,
+            TwoPassMatchBehavior {
+                query_best: vec![
+                    Some((2, identical_similarity)),
+                    Some((2, identical_similarity)),
+                ],
+                candidate_best: vec![
+                    Some((1, identical_similarity)),
+                    Some((1, identical_similarity)),
+                    Some((1, identical_similarity)),
+                ],
+                mutual_matches: vec![(1, 2, identical_similarity)],
+            }
+        );
+    }
+
+    #[test]
+    fn local_match_similarity_bits_cover_zero_norm_and_extreme_codes() {
+        let descriptors = [
+            CompactDescriptor([128; crate::DESCRIPTOR_DIM]),
+            CompactDescriptor([0; crate::DESCRIPTOR_DIM]),
+            CompactDescriptor([255; crate::DESCRIPTOR_DIM]),
+        ];
+        let [zero, negative_extreme, positive_extreme] = &descriptors;
+
+        assert_eq!(
+            zero.cosine_similarity(negative_extreme).to_bits(),
+            0.0_f32.to_bits()
+        );
+        assert_eq!(
+            negative_extreme
+                .cosine_similarity(negative_extreme)
+                .to_bits(),
+            1.0_f32.to_bits()
+        );
+        assert_eq!(
+            negative_extreme
+                .cosine_similarity(positive_extreme)
+                .to_bits(),
+            (-1.0_f32).to_bits()
+        );
+
+        let positive_threshold = f32::from_bits(1);
+        assert_eq!(
+            current_two_pass_behavior(&descriptors, &descriptors, positive_threshold),
+            reference_two_pass_behavior(&descriptors, &descriptors, positive_threshold)
+        );
+    }
+
+    #[test]
+    fn local_match_two_passes_match_deterministic_small_case_oracle() {
+        let mut corpus = vec![
+            CompactDescriptor([128; crate::DESCRIPTOR_DIM]),
+            CompactDescriptor([0; crate::DESCRIPTOR_DIM]),
+            CompactDescriptor([255; crate::DESCRIPTOR_DIM]),
+        ];
+        corpus.extend((1..=12).map(generated_compact_descriptor));
+
+        for query_len in 0..=4 {
+            for candidate_len in 0..=4 {
+                for case in 0..8 {
+                    let query: Vec<_> = (0..query_len)
+                        .map(|index| corpus[(case + index * 3) % corpus.len()].clone())
+                        .collect();
+                    let candidates: Vec<_> = (0..candidate_len)
+                        .map(|index| corpus[(case * 2 + index * 5) % corpus.len()].clone())
+                        .collect();
+                    for threshold in [f32::from_bits(1), 0.35, 1.0] {
+                        let actual = current_two_pass_behavior(&query, &candidates, threshold);
+                        let expected = reference_two_pass_behavior(&query, &candidates, threshold);
+                        assert_eq!(
+                            actual, expected,
+                            "query_len={query_len}, candidate_len={candidate_len}, case={case}, threshold={threshold}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn match_descriptors_skips_keypoints_without_map_points() {
         let mut map = SlamMap::new();
         let keypoints = vec![
@@ -2078,6 +2295,51 @@ mod tests {
         let matches = try_match_descriptors_for_loop(&query, kf, &map, 0.95)
             .expect("descriptor matching should succeed");
         assert_eq!(matches, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn match_descriptors_returns_original_sparse_candidate_keypoint_index() {
+        let mut map = SlamMap::new();
+        let keypoints = (0..5)
+            .map(|index| Keypoint {
+                x: 10.0 + index as f32 * 10.0,
+                y: 20.0,
+            })
+            .collect();
+        let image_size = ImageSize::try_new(80, 60).expect("image size");
+        let keyframe = map
+            .add_keyframe(
+                FrameId::new(31),
+                Timestamp::from_nanos(31),
+                crate::WorldToCamera::identity(),
+                image_size,
+                keypoints,
+            )
+            .expect("keyframe");
+        let mut values = [0.0_f32; crate::DESCRIPTOR_DIM];
+        values[17] = 1.0;
+        let descriptor = Descriptor(values);
+
+        for keypoint_index in [1, 4] {
+            let observation = map
+                .keyframe_keypoint(keyframe, keypoint_index)
+                .expect("sparse keypoint");
+            map.add_map_point(
+                Point3 {
+                    x: keypoint_index as f32 * 0.1,
+                    y: 0.0,
+                    z: 3.0,
+                },
+                descriptor.quantize(),
+                observation,
+            )
+            .expect("map point");
+        }
+
+        let matches =
+            try_match_descriptors_for_loop(&[descriptor, descriptor], keyframe, &map, 1.0)
+                .expect("descriptor matching should succeed");
+        assert_eq!(matches, vec![(1, 4)]);
     }
 
     #[test]
