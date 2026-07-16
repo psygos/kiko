@@ -8,6 +8,8 @@ use crate::{
 
 use std::collections::HashMap;
 
+const TIMELINE_CAPTURE_NS: &str = "capture_ns";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
 
@@ -97,6 +99,7 @@ impl TryFrom<usize> for VizDecimation {
 #[derive(Debug)]
 pub enum VizLogError {
     Rerun(rerun::RecordingStreamError),
+    TimestampUnrepresentable { timestamp_ns: i64, encoded_ns: i64 },
     Pose(crate::PoseError),
     Point(crate::Point3Error),
 }
@@ -105,6 +108,13 @@ impl std::fmt::Display for VizLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VizLogError::Rerun(err) => write!(f, "rerun logging error: {err}"),
+            VizLogError::TimestampUnrepresentable {
+                timestamp_ns,
+                encoded_ns,
+            } => write!(
+                f,
+                "capture timestamp {timestamp_ns}ns is not exactly representable on the Rerun duration timeline (the SDK would encode {encoded_ns}ns)"
+            ),
             VizLogError::Pose(err) => write!(f, "visualization pose error: {err}"),
             VizLogError::Point(err) => write!(f, "visualization point error: {err}"),
         }
@@ -115,6 +125,7 @@ impl std::error::Error for VizLogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rerun(err) => Some(err),
+            Self::TimestampUnrepresentable { .. } => None,
             Self::Pose(err) => Some(err),
             Self::Point(err) => Some(err),
         }
@@ -136,6 +147,35 @@ impl From<crate::PoseError> for VizLogError {
 impl From<crate::Point3Error> for VizLogError {
     fn from(err: crate::Point3Error) -> Self {
         Self::Point(err)
+    }
+}
+
+/// A device-clock nanosecond timestamp proven to survive Rerun's duration encoding exactly.
+///
+/// Rerun reserves `i64::MIN` for static data, while Kiko's timestamp domain includes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RerunCaptureTime(rerun::TimeCell);
+
+impl TryFrom<Timestamp> for RerunCaptureTime {
+    type Error = VizLogError;
+
+    fn try_from(timestamp: Timestamp) -> Result<Self, Self::Error> {
+        let timestamp_ns = timestamp.as_nanos();
+        let cell = rerun::TimeCell::from_duration_nanos(timestamp_ns);
+        let encoded_ns = cell.as_i64();
+        if encoded_ns != timestamp_ns {
+            return Err(VizLogError::TimestampUnrepresentable {
+                timestamp_ns,
+                encoded_ns,
+            });
+        }
+        Ok(Self(cell))
+    }
+}
+
+impl RerunCaptureTime {
+    fn set_on(self, rec: &rerun::RecordingStream) {
+        rec.set_time(TIMELINE_CAPTURE_NS, self.0);
     }
 }
 
@@ -237,7 +277,7 @@ impl RerunSink {
             return Ok(());
         }
 
-        self.set_time(left.timestamp());
+        self.set_time(left.timestamp())?;
 
         let left_image = rerun::Image::from_color_model_and_bytes(
             left.data().to_vec(),
@@ -267,7 +307,7 @@ impl RerunSink {
             return Ok(());
         }
 
-        self.set_time(depth.timestamp());
+        self.set_time(depth.timestamp())?;
         let mut bytes = Vec::with_capacity(depth.depth_m().len().saturating_mul(4));
         for sample in depth.depth_m() {
             bytes.extend_from_slice(&sample.to_le_bytes());
@@ -296,9 +336,9 @@ impl RerunSink {
 
         let left = packet.left();
         let right = packet.right();
-        let track_ids = self.tracks.assign_tracks(packet.matches().source_a_arc());
 
-        self.set_time(left.timestamp());
+        self.set_time(left.timestamp())?;
+        let track_ids = self.tracks.assign_tracks(packet.matches().source_a_arc());
 
         let left_image = rerun::Image::from_color_model_and_bytes(
             left.data().to_vec(),
@@ -350,7 +390,7 @@ impl RerunSink {
         timestamp: Timestamp,
         pose: &WorldToCamera,
     ) -> Result<(), VizLogError> {
-        self.set_time(timestamp);
+        self.set_time(timestamp)?;
 
         if !self.logged_world {
             let coords = rerun::archetypes::ViewCoordinates::RDF();
@@ -381,7 +421,7 @@ impl RerunSink {
         timestamp: Timestamp,
         snapshot: &CovisibilitySnapshot,
     ) -> Result<(), VizLogError> {
-        self.set_time(timestamp);
+        self.set_time(timestamp)?;
 
         let mut positions: HashMap<crate::map::KeyframeId, [f32; 3]> = HashMap::new();
         for node in &snapshot.nodes {
@@ -418,11 +458,9 @@ impl RerunSink {
         &self.rec
     }
 
-    fn set_time(&self, timestamp: Timestamp) {
-        self.rec.set_time(
-            "capture_ns",
-            rerun::TimeCell::from_duration_nanos(timestamp.as_nanos()),
-        );
+    pub(crate) fn set_time(&self, timestamp: Timestamp) -> Result<(), VizLogError> {
+        RerunCaptureTime::try_from(timestamp)?.set_on(&self.rec);
+        Ok(())
     }
 }
 
@@ -772,6 +810,33 @@ mod tests {
             trajectory: Vec::new(),
             logged_world: false,
         }
+    }
+
+    #[test]
+    fn rerun_capture_time_preserves_the_complete_supported_boundary_classes() {
+        for timestamp_ns in [i64::MIN + 1, -1, 0, 1, i64::MAX] {
+            let parsed = RerunCaptureTime::try_from(Timestamp::from_nanos(timestamp_ns))
+                .expect("Rerun-supported duration timestamp");
+            assert_eq!(parsed.0.as_i64(), timestamp_ns);
+            assert_eq!(parsed.0.typ(), rerun::time::TimeType::DurationNs);
+        }
+    }
+
+    #[test]
+    fn rerun_capture_time_rejects_minimum_instead_of_aliasing_it() {
+        let sdk_cell = rerun::TimeCell::from_duration_nanos(i64::MIN);
+        assert_eq!(sdk_cell.as_i64(), i64::MIN + 1);
+
+        let error = RerunCaptureTime::try_from(Timestamp::from_nanos(i64::MIN))
+            .expect_err("Rerun reserves the minimum i64 time value");
+        assert!(matches!(
+            &error,
+            VizLogError::TimestampUnrepresentable {
+                timestamp_ns,
+                encoded_ns,
+            } if *timestamp_ns == i64::MIN && *encoded_ns == i64::MIN + 1
+        ));
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     #[test]
