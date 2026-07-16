@@ -1645,6 +1645,72 @@ impl ReprojectionLinearization {
         })
     }
 
+    fn try_from_widened(
+        residual: [f64; 2],
+        pose_jacobian: [[f64; 6]; 2],
+        landmark_jacobian: [[f64; 3]; 2],
+    ) -> Result<Self, ProjectionLinearizationError> {
+        let mut narrowed_residual = [0.0_f32; 2];
+        for (target, source) in narrowed_residual.iter_mut().zip(residual) {
+            *target =
+                narrow_finite_f32(source).ok_or(ProjectionLinearizationError::NumericalFailure)?;
+        }
+
+        let mut narrowed_pose_jacobian = [[0.0_f32; 6]; 2];
+        for (target_row, source_row) in narrowed_pose_jacobian.iter_mut().zip(pose_jacobian) {
+            for (target, source) in target_row.iter_mut().zip(source_row) {
+                *target = narrow_finite_f32(source)
+                    .ok_or(ProjectionLinearizationError::NumericalFailure)?;
+            }
+        }
+
+        let mut narrowed_landmark_jacobian = [[0.0_f32; 3]; 2];
+        for (target_row, source_row) in narrowed_landmark_jacobian.iter_mut().zip(landmark_jacobian)
+        {
+            for (target, source) in target_row.iter_mut().zip(source_row) {
+                *target = narrow_finite_f32(source)
+                    .ok_or(ProjectionLinearizationError::NumericalFailure)?;
+            }
+        }
+
+        Ok(Self {
+            residual: narrowed_residual,
+            pose_jacobian: narrowed_pose_jacobian,
+            landmark_jacobian: narrowed_landmark_jacobian,
+        })
+    }
+
+    fn has_same_values(&self, other: &Self) -> bool {
+        self.residual
+            .iter()
+            .chain(self.pose_jacobian.iter().flatten())
+            .chain(self.landmark_jacobian.iter().flatten())
+            .zip(
+                other
+                    .residual
+                    .iter()
+                    .chain(other.pose_jacobian.iter().flatten())
+                    .chain(other.landmark_jacobian.iter().flatten()),
+            )
+            .all(|(left, right)| left == right)
+    }
+
+    #[cfg(test)]
+    fn has_same_bits(&self, other: &Self) -> bool {
+        self.residual
+            .iter()
+            .chain(self.pose_jacobian.iter().flatten())
+            .chain(self.landmark_jacobian.iter().flatten())
+            .zip(
+                other
+                    .residual
+                    .iter()
+                    .chain(other.pose_jacobian.iter().flatten())
+                    .chain(other.landmark_jacobian.iter().flatten()),
+            )
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+    }
+
     fn huber_sqrt_weight(&self, delta: f32) -> f32 {
         let r_norm = f64::from(self.residual[0]).hypot(f64::from(self.residual[1]));
         if r_norm <= f64::from(delta) {
@@ -1663,19 +1729,27 @@ fn reprojection_linearization(
 ) -> Result<ReprojectionLinearization, ProjectionLinearizationError> {
     let pw = [world.x, world.y, world.z];
     let rotation = pose.rotation();
-    let pc = math::transform_point(rotation, pose.translation(), pw);
-    if pc.into_iter().any(|value| !value.is_finite()) {
-        return Err(ProjectionLinearizationError::NumericalFailure);
+    let translation = pose.translation();
+    let pc_f32 = math::transform_point(rotation, translation, pw);
+    let f32_camera_is_valid =
+        pc_f32.into_iter().all(f32::is_finite) && pc_f32[2] > MIN_PROJECTION_DEPTH_M;
+    // Keep ordinary valid f32 transform semantics. A non-finite or invalid-depth result may be a
+    // transient f32 overflow/cancellation, so re-evaluate it before classifying the factor.
+    if !f32_camera_is_valid {
+        let pc_widened = transform_point_widened(rotation, translation, pw)?;
+        return reprojection_linearization_widened(pc_widened, pixel, intrinsics, rotation);
     }
+    let pc = pc_f32;
     let x = pc[0];
     let y = pc[1];
     let z = pc[2];
-    if z <= MIN_PROJECTION_DEPTH_M {
-        return Err(ProjectionLinearizationError::InvalidDepth);
-    }
 
-    let u = intrinsics.fx() * (x / z) + intrinsics.cx();
-    let v = intrinsics.fy() * (y / z) + intrinsics.cy();
+    let normalized_x = x / z;
+    let normalized_y = y / z;
+    let projected_x = intrinsics.fx() * normalized_x;
+    let projected_y = intrinsics.fy() * normalized_y;
+    let u = projected_x + intrinsics.cx();
+    let v = projected_y + intrinsics.cy();
     let residual = [pixel.x - u, pixel.y - v];
 
     let inv_z = 1.0 / z;
@@ -1712,11 +1786,21 @@ fn reprojection_linearization(
     pose_jacobian[1][5] = -b1 * y + b2 * x;
 
     let mut landmark_jacobian = [[0.0_f32; 3]; 2];
+    let mut landmark_underflow_risk = false;
     for col in 0..3 {
         landmark_jacobian[0][col] =
             a1 * rotation[0][col] + a2 * rotation[1][col] + a3 * rotation[2][col];
         landmark_jacobian[1][col] =
             b1 * rotation[0][col] + b2 * rotation[1][col] + b3 * rotation[2][col];
+        let u_has_nonzero_source = (a1 != 0.0 && rotation[0][col] != 0.0)
+            || (a2 != 0.0 && rotation[1][col] != 0.0)
+            || (a3 != 0.0 && rotation[2][col] != 0.0);
+        let v_has_nonzero_source = (b1 != 0.0 && rotation[0][col] != 0.0)
+            || (b2 != 0.0 && rotation[1][col] != 0.0)
+            || (b3 != 0.0 && rotation[2][col] != 0.0);
+        landmark_underflow_risk |=
+            underflow_sensitive(landmark_jacobian[0][col], u_has_nonzero_source)
+                || underflow_sensitive(landmark_jacobian[1][col], v_has_nonzero_source);
     }
 
     // The Jacobian above is for projected pixel coordinates [u, v].
@@ -1732,7 +1816,133 @@ fn reprojection_linearization(
         }
     }
 
-    ReprojectionLinearization::try_new(residual, pose_jacobian, landmark_jacobian)
+    let needs_widened_fallback = underflow_sensitive(normalized_x, x != 0.0)
+        || underflow_sensitive(normalized_y, y != 0.0)
+        || underflow_sensitive(projected_x, x != 0.0)
+        || underflow_sensitive(projected_y, y != 0.0)
+        || underflow_sensitive(inv_z, true)
+        || underflow_sensitive(inv_z2, x != 0.0 || y != 0.0)
+        || underflow_sensitive(du_dx, true)
+        || underflow_sensitive(dv_dy, true)
+        || underflow_sensitive(du_dz, x != 0.0)
+        || underflow_sensitive(dv_dz, y != 0.0)
+        || underflow_sensitive(pose_jacobian[0][3], x != 0.0 && y != 0.0)
+        || underflow_sensitive(pose_jacobian[0][4], true)
+        || underflow_sensitive(pose_jacobian[0][5], y != 0.0)
+        || underflow_sensitive(pose_jacobian[1][3], true)
+        || underflow_sensitive(pose_jacobian[1][4], x != 0.0 && y != 0.0)
+        || underflow_sensitive(pose_jacobian[1][5], x != 0.0)
+        || landmark_underflow_risk;
+    let fast_path = ReprojectionLinearization::try_new(residual, pose_jacobian, landmark_jacobian);
+    if let Ok(linearization) = fast_path {
+        // Ordinary factors retain the historical f32 bits. A coherent f64 factor is used only
+        // when f32 underflow may have erased information from the residual or Jacobians.
+        if !needs_widened_fallback {
+            return Ok(linearization);
+        }
+        let widened =
+            reprojection_linearization_widened(pc.map(f64::from), pixel, intrinsics, rotation)?;
+        return if linearization.has_same_values(&widened) {
+            Ok(linearization)
+        } else {
+            Ok(widened)
+        };
+    }
+
+    reprojection_linearization_widened(pc.map(f64::from), pixel, intrinsics, rotation)
+}
+
+fn underflow_sensitive(value: f32, mathematically_nonzero: bool) -> bool {
+    mathematically_nonzero && (value == 0.0 || value.is_subnormal())
+}
+
+fn compensated_sum<const N: usize>(terms: [f64; N]) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut compensation = 0.0_f64;
+    for term in terms {
+        let next = sum + term;
+        compensation += if sum.abs() >= term.abs() {
+            (sum - next) + term
+        } else {
+            (term - next) + sum
+        };
+        sum = next;
+    }
+    sum + compensation
+}
+
+fn transform_point_widened(
+    rotation: [[f32; 3]; 3],
+    translation: [f32; 3],
+    point: [f32; 3],
+) -> Result<[f64; 3], ProjectionLinearizationError> {
+    let mut transformed = [0.0_f64; 3];
+    for (row, target) in transformed.iter_mut().enumerate() {
+        *target = compensated_sum([
+            f64::from(rotation[row][0]) * f64::from(point[0]),
+            f64::from(rotation[row][1]) * f64::from(point[1]),
+            f64::from(rotation[row][2]) * f64::from(point[2]),
+            f64::from(translation[row]),
+        ]);
+    }
+    if transformed.iter().any(|value| !value.is_finite()) {
+        return Err(ProjectionLinearizationError::NumericalFailure);
+    }
+    Ok(transformed)
+}
+
+fn reprojection_linearization_widened(
+    camera_point: [f64; 3],
+    pixel: Keypoint,
+    intrinsics: PinholeIntrinsics,
+    rotation: [[f32; 3]; 3],
+) -> Result<ReprojectionLinearization, ProjectionLinearizationError> {
+    let [x, y, z] = camera_point;
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return Err(ProjectionLinearizationError::NumericalFailure);
+    }
+    if z <= f64::from(MIN_PROJECTION_DEPTH_M) {
+        return Err(ProjectionLinearizationError::InvalidDepth);
+    }
+
+    let fx = f64::from(intrinsics.fx());
+    let fy = f64::from(intrinsics.fy());
+    let qx = x / z;
+    let qy = y / z;
+    let sx = fx / z;
+    let sy = fy / z;
+    let residual = [
+        f64::from(pixel.x) - (fx * qx + f64::from(intrinsics.cx())),
+        f64::from(pixel.y) - (fy * qy + f64::from(intrinsics.cy())),
+    ];
+    let pose_jacobian = [
+        [
+            -sx,
+            0.0,
+            sx * qx,
+            fx * qx * qy,
+            -fx * (1.0 + qx * qx),
+            fx * qy,
+        ],
+        [
+            0.0,
+            -sy,
+            sy * qy,
+            fy * (1.0 + qy * qy),
+            -fy * qx * qy,
+            -fy * qx,
+        ],
+    ];
+
+    let mut landmark_jacobian = [[0.0_f64; 3]; 2];
+    for column in 0..3 {
+        landmark_jacobian[0][column] =
+            -sx * (f64::from(rotation[0][column]) - qx * f64::from(rotation[2][column]));
+        landmark_jacobian[1][column] =
+            -sy * (f64::from(rotation[1][column]) - qy * f64::from(rotation[2][column]));
+    }
+
+    ReprojectionLinearization::try_from_widened(residual, pose_jacobian, landmark_jacobian)
 }
 
 pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Result<Pose, crate::PoseError> {
@@ -3237,6 +3447,294 @@ mod tests {
     }
 
     #[test]
+    fn reprojection_linearization_preserves_ordinary_f32_bits() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(0.25, -0.5, 2.0),
+            Keypoint {
+                x: 373.25,
+                y: 134.75,
+            },
+            intrinsics,
+        )
+        .expect("ordinary factor");
+        let expected = ReprojectionLinearization {
+            residual: [0.75, -0.75],
+            pose_jacobian: [
+                [-210.0, -0.0, 26.25, -13.125, -426.5625, -105.0],
+                [-0.0, -209.0, -52.25, 444.125, 13.0625, -52.25],
+            ],
+            landmark_jacobian: [[-210.0, -0.0, 26.25], [-0.0, -209.0, -52.25]],
+        };
+
+        assert!(
+            linearization.has_same_bits(&expected),
+            "ordinary f32 result changed: {linearization:?}"
+        );
+    }
+
+    #[test]
+    fn widened_reprojection_recovers_transient_depth_derivative_overflow() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 1.0e20, 1.0, 0.0, 0.0).expect("intrinsics");
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(1.0e20, 0.0, 1.0e20),
+            Keypoint { x: 1.0e20, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened derivative");
+
+        assert_eq!(linearization.residual, [0.0, 0.0]);
+        assert_eq!(
+            linearization.pose_jacobian[0][2].to_bits(),
+            1.0_f32.to_bits()
+        );
+        assert!((linearization.pose_jacobian[0][4] / -2.0e20 - 1.0).abs() < 1.0e-6);
+        assert_eq!(
+            linearization.landmark_jacobian[0][2].to_bits(),
+            1.0_f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_reprojection_recovers_squared_inverse_depth_underflow() {
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+        let depth_m = 1.0e23_f32;
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(depth_m, 0.0, depth_m),
+            Keypoint { x: 1.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened inverse depth");
+        let expected_depth_derivative =
+            narrow_finite_f32(1.0_f64 / f64::from(depth_m)).expect("representable derivative");
+
+        assert_eq!(linearization.residual, [0.0, 0.0]);
+        assert_eq!(
+            linearization.pose_jacobian[0][2].to_bits(),
+            expected_depth_derivative.to_bits()
+        );
+        assert_eq!(
+            linearization.pose_jacobian[0][4].to_bits(),
+            (-2.0_f32).to_bits()
+        );
+        assert_eq!(
+            linearization.landmark_jacobian[0][2].to_bits(),
+            expected_depth_derivative.to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_reprojection_recovers_rotation_after_focal_depth_underflow() {
+        let focal_px = 1.0e-30_f32;
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(0.0, 0.0, 1.0e30),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened focal/depth derivative");
+
+        assert_eq!(linearization.pose_jacobian[0][0], 0.0);
+        assert_eq!(
+            linearization.pose_jacobian[0][4].to_bits(),
+            (-focal_px).to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_reprojection_recovers_summed_landmark_underflow() {
+        let tiny = f32::from_bits(1);
+        let rotation = [[1.0, tiny, 0.0], [0.0, 1.0, 0.0], [0.0, tiny, 1.0]];
+        let pose = Pose::try_from_rt(rotation, [-1.0, 0.0, 1.0]).expect("valid pose");
+        let intrinsics = make_pinhole_intrinsics(640, 480, 0.5, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization = reprojection_linearization(
+            pose,
+            Point3::new(0.0, 0.0, 0.0),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened landmark underflow");
+
+        assert_eq!(
+            linearization.landmark_jacobian[0][1].to_bits(),
+            (-tiny).to_bits()
+        );
+    }
+
+    #[test]
+    fn widened_reprojection_removes_spurious_pose_jacobian_subnormal() {
+        let focal_px = f32::from_bits(0x1e80_0bd3);
+        let camera_y_m = 2.584_314e-26_f32;
+        let camera_z_m = 0.500_059_4_f32;
+        let legacy = (focal_px * (1.0 / camera_z_m)) * camera_y_m;
+        assert_eq!(legacy.to_bits(), 1);
+        let expected = narrow_finite_f32(
+            f64::from(focal_px) * (f64::from(camera_y_m) / f64::from(camera_z_m)),
+        )
+        .expect("representable widened derivative");
+        assert_eq!(expected, 0.0);
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, focal_px, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(0.0, camera_y_m, camera_z_m),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened pose Jacobian");
+
+        assert_eq!(linearization.pose_jacobian[0][5].to_bits(), 0);
+    }
+
+    #[test]
+    fn widened_reprojection_recovers_projection_ratio_overflow() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, f32::from_bits(1), f32::from_bits(1), 0.0, 0.0)
+                .expect("subnormal focal lengths remain supported");
+        let depth_m = 1.000001e-6_f32;
+        assert!(depth_m > MIN_PROJECTION_DEPTH_M);
+        let linearization = reprojection_linearization(
+            Pose::identity(),
+            Point3::new(1.0e34, 0.0, depth_m),
+            Keypoint { x: 0.0, y: 0.0 },
+            intrinsics,
+        )
+        .expect("widened projection ratio");
+
+        assert!(linearization.residual[0].is_finite());
+        assert!(linearization.residual[0] < 0.0);
+        assert!(
+            linearization
+                .pose_jacobian
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            linearization
+                .landmark_jacobian
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
+    fn widened_transform_recovers_finite_camera_point_after_f32_cancellation() {
+        let cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [cosine, cosine, 0.0],
+            [-cosine, cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [-f32::MAX, 0.0, 0.0]).expect("valid pose");
+        let point = Point3::new(f32::MAX, f32::MAX, 1.0);
+        assert!(
+            !math::transform_point(rotation, pose.translation(), point.to_array())[0].is_finite()
+        );
+        let intrinsics = make_pinhole_intrinsics(640, 480, f32::MIN_POSITIVE, 1.0, 0.0, 0.0)
+            .expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened transform");
+
+        assert!(linearization.residual.iter().all(|value| value.is_finite()));
+        assert!(
+            linearization
+                .pose_jacobian
+                .iter()
+                .flatten()
+                .chain(linearization.landmark_jacobian.iter().flatten())
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
+    fn compensated_sum_keeps_a_small_term_across_large_cancellation() {
+        let small = -f64::from(3.0_f32.sqrt() * 0.5);
+        let large = f64::from(2.0_f32.powi(99));
+
+        assert_eq!(large + small - large, 0.0);
+        assert_eq!(compensated_sum([large, small, -large]), small);
+    }
+
+    #[test]
+    fn widened_transform_recovers_positive_depth_erased_by_f32_cancellation() {
+        let sine_cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [sine_cosine, 0.0, sine_cosine],
+            [0.0, 1.0, 0.0],
+            [-sine_cosine, 0.0, sine_cosine],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0, 0.0, 70_710_680.0]).expect("valid pose");
+        let point = Point3::new(1.0e8, 0.0, 0.0);
+        let f32_camera = math::transform_point(rotation, pose.translation(), point.to_array());
+        assert!(f32_camera[2] <= MIN_PROJECTION_DEPTH_M);
+        let widened_camera =
+            transform_point_widened(rotation, pose.translation(), point.to_array())
+                .expect("finite widened camera point");
+        assert!(widened_camera[2] > f64::from(MIN_PROJECTION_DEPTH_M));
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("widened positive depth");
+
+        assert!(linearization.residual.iter().all(|value| value.is_finite()));
+        assert!(
+            linearization
+                .pose_jacobian
+                .iter()
+                .flatten()
+                .chain(linearization.landmark_jacobian.iter().flatten())
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
+    fn widened_projection_keeps_camera_coordinates_wider_than_f32() {
+        let sine_cosine = std::f32::consts::FRAC_1_SQRT_2;
+        let rotation = [
+            [sine_cosine, sine_cosine, 0.0],
+            [-sine_cosine, sine_cosine, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let pose = Pose::try_from_rt(rotation, [0.0; 3]).expect("valid pose");
+        let point = Point3::new(f32::MAX, f32::MAX, f32::MAX);
+        let f32_camera = math::transform_point(rotation, pose.translation(), point.to_array());
+        assert!(!f32_camera[0].is_finite());
+        let widened_camera =
+            transform_point_widened(rotation, pose.translation(), point.to_array())
+                .expect("finite widened camera point");
+        assert!(widened_camera[0] > f64::from(f32::MAX));
+        let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
+
+        let linearization =
+            reprojection_linearization(pose, point, Keypoint { x: 0.0, y: 0.0 }, intrinsics)
+                .expect("representable factor from widened camera point");
+
+        assert!(linearization.residual.iter().all(|value| value.is_finite()));
+        assert!(
+            linearization
+                .pose_jacobian
+                .iter()
+                .flatten()
+                .chain(linearization.landmark_jacobian.iter().flatten())
+                .all(|value| value.is_finite())
+        );
+    }
+
+    #[test]
     fn reprojection_jacobian_matches_finite_difference() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
@@ -3293,6 +3791,52 @@ mod tests {
                 tol0,
                 tol1
             );
+        }
+    }
+
+    #[test]
+    fn landmark_reprojection_jacobian_matches_finite_difference() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let pose = axis_angle_pose([0.1, -0.05, 0.2], [0.06, -0.04, 0.03]);
+        let point = Point3::new(0.4, -0.2, 3.8);
+        let mut pixel = project_pixel(pose, point, intrinsics);
+        pixel.x += 1.7;
+        pixel.y -= 0.9;
+        let linearization =
+            reprojection_linearization(pose, point, pixel, intrinsics).expect("landmark Jacobian");
+        let jacobian = linearization.landmark_jacobian;
+
+        let epsilon_m = 1e-3_f32;
+        for column in 0..3 {
+            let mut positive = point.to_array();
+            positive[column] += epsilon_m;
+            let mut negative = point.to_array();
+            negative[column] -= epsilon_m;
+            let positive_residual =
+                reprojection_linearization(pose, Point3::from_array(positive), pixel, intrinsics)
+                    .expect("positive landmark perturbation")
+                    .residual;
+            let negative_residual =
+                reprojection_linearization(pose, Point3::from_array(negative), pixel, intrinsics)
+                    .expect("negative landmark perturbation")
+                    .residual;
+            let numeric = [
+                (positive_residual[0] - negative_residual[0]) / (2.0 * epsilon_m),
+                (positive_residual[1] - negative_residual[1]) / (2.0 * epsilon_m),
+            ];
+
+            for row in 0..2 {
+                let error = (numeric[row] - jacobian[row][column]).abs();
+                let tolerance =
+                    4e-2_f32 + 3e-4_f32 * numeric[row].abs().max(jacobian[row][column].abs());
+                assert!(
+                    error < tolerance,
+                    "landmark Jacobian mismatch row={row}, column={column}: analytic={}, numeric={}, error={error}, tolerance={tolerance}",
+                    jacobian[row][column],
+                    numeric[row]
+                );
+            }
         }
     }
 
