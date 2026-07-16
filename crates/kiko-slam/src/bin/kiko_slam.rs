@@ -9,12 +9,11 @@ use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRing
 use kiko_slam::{
     BackendConfig, DenseCommand, DepthImage, DownscaleFactor, FrameId, GlobalDescriptorConfig,
     InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
-    LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics, PipelineError,
-    PipelineTimingError, PipelineWallBreakdown, RansacConfig, RectifiedStereo,
-    RectifiedStereoConfig, RectifiedStereoError, RedundancyPolicy, RelocalizationConfig, RerunSink,
-    RerunSinkConfig, SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig,
-    TriangulationError, Triangulator, VizDecimation, VizError, VizFlushError, VizLogError,
-    VizPacket,
+    LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PipelineError, PipelineTimingError,
+    PipelineWallBreakdown, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
+    RectifiedStereoError, RedundancyPolicy, RelocalizationConfig, RerunSink, RerunSinkConfig,
+    SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
+    VizDecimation, VizError, VizFlushError, VizLogError, VizPacket,
 };
 
 use kiko_slam::env::{env_bool, env_f32, env_usize};
@@ -1182,8 +1181,6 @@ fn run_viz_odometry(
         reader.calibration(),
         build_rectified_stereo_config(args)?,
     )?;
-    let intrinsics = PinholeIntrinsics::try_from(&reader.calibration().left)?;
-
     let InferenceConfig {
         superpoint_left,
         superpoint_right,
@@ -1207,7 +1204,6 @@ fn run_viz_odometry(
         superpoint_right,
         lightglue,
         rectified,
-        intrinsics,
         tracker_config,
     )?;
     report_tracker_runtime(&tracker_config, &tracker);
@@ -2087,8 +2083,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config);
     let rectified = RectifiedStereo::from_calibration(&calibration)?;
-    let intrinsics = PinholeIntrinsics::try_from(&calibration.left)?;
-
     let tracker_config = build_tracker_config(
         TrackerDefaults {
             min_keyframe_points: 80,
@@ -2167,7 +2161,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             superpoint_right,
             lightglue,
             rectified,
-            intrinsics,
             tracker_config,
         )
         .map_err(|source| LiveThreadError::TrackerInitialization { source })?;

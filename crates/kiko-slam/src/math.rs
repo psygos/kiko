@@ -297,8 +297,8 @@ pub(crate) fn compensated_sum<const N: usize>(terms: [f64; N]) -> f64 {
 ///
 /// Every term and every implementation-level sum and difference must remain finite. This is more
 /// expensive than a single compensation accumulator, but preserves multiple low limbs across
-/// staged cancellation. Current PnP callers satisfy the stronger precondition with f32-derived
-/// product bounds.
+/// staged cancellation. Current callers satisfy the stronger precondition with f32-derived
+/// operands and product bounds.
 pub(crate) fn expansion_sum<const N: usize>(terms: [f64; N]) -> f64 {
     let mut expansion = [0.0_f64; N];
     let mut len = 0_usize;

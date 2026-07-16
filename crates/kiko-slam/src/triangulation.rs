@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use crate::dataset::{Calibration, CameraIntrinsics};
-use crate::{Detections, FrameDimensions, FrameId, Matches, Raw, SensorId};
+use crate::{
+    Detections, FrameDimensions, FrameDimensionsError, FrameId, IntrinsicsError, Matches,
+    PinholeIntrinsics, Raw, SensorId, math,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct RectifiedStereoConfig {
@@ -23,12 +26,12 @@ impl RectifiedStereoConfig {
         max_principal_delta_px: f32,
         max_focal_delta_px: f32,
     ) -> Result<Self, RectifiedStereoError> {
-        for (name, value) in [
-            ("principal-point", max_principal_delta_px),
-            ("focal-length", max_focal_delta_px),
+        for (kind, value_px) in [
+            (StereoToleranceKind::PrincipalPoint, max_principal_delta_px),
+            (StereoToleranceKind::FocalLength, max_focal_delta_px),
         ] {
-            if !value.is_finite() || value < 0.0 {
-                return Err(RectifiedStereoError::InvalidTolerance { name, value });
+            if !value_px.is_finite() || value_px < 0.0 {
+                return Err(RectifiedStereoError::InvalidTolerance { kind, value_px });
             }
         }
         Ok(Self {
@@ -46,17 +49,57 @@ impl RectifiedStereoConfig {
     }
 }
 
+/// Camera side named by a rectified-stereo calibration error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoCameraSide {
+    Left,
+    Right,
+}
+
+impl std::fmt::Display for StereoCameraSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Left => f.write_str("left"),
+            Self::Right => f.write_str("right"),
+        }
+    }
+}
+
+/// Rectified-stereo compatibility threshold named by a configuration error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoToleranceKind {
+    PrincipalPoint,
+    FocalLength,
+}
+
+impl std::fmt::Display for StereoToleranceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrincipalPoint => f.write_str("principal-point"),
+            Self::FocalLength => f.write_str("focal-length"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RectifiedStereo {
-    left: CameraIntrinsics,
-    right: CameraIntrinsics,
+    left: PinholeIntrinsics,
+    right: PinholeIntrinsics,
+    dimensions: FrameDimensions,
     baseline_m: f32,
     arithmetic: RectifiedStereoArithmetic,
 }
 
+/// One camera parsed from the weak serialized calibration carrier.
+#[derive(Clone, Copy, Debug)]
+struct ParsedCamera {
+    intrinsics: PinholeIntrinsics,
+    dimensions: FrameDimensions,
+}
+
 /// Exact f32-to-f64 widening of the validated stereo calibration.
 ///
-/// Keeping this alongside the public f32 calibration makes the precision used
+/// Keeping this alongside the parsed f32 calibration makes the precision used
 /// by triangulation an invariant of `RectifiedStereo`, rather than something
 /// reconstructed independently for every match.
 #[derive(Clone, Debug)]
@@ -76,57 +119,59 @@ struct CameraIntrinsics64 {
 
 #[derive(Debug)]
 pub enum RectifiedStereoError {
+    NonFiniteBaseline {
+        baseline_m: f32,
+    },
     NonPositiveBaseline {
         baseline_m: f32,
     },
-    ZeroDimensions {
-        camera: &'static str,
-        width: u32,
-        height: u32,
+    InvalidDimensions {
+        camera: StereoCameraSide,
+        source: FrameDimensionsError,
+    },
+    InvalidIntrinsics {
+        camera: StereoCameraSide,
+        source: IntrinsicsError,
     },
     DimensionMismatch {
         left: FrameDimensions,
         right: FrameDimensions,
     },
-    InvalidFocal {
-        fx: f32,
-        fy: f32,
-    },
-    NonFiniteIntrinsics {
-        camera: &'static str,
-    },
     NotRectified,
     InvalidTolerance {
-        name: &'static str,
-        value: f32,
+        kind: StereoToleranceKind,
+        value_px: f32,
     },
     FocalMismatch {
-        delta_fx: f32,
-        delta_fy: f32,
-        tolerance: f32,
+        left_fx: f32,
+        right_fx: f32,
+        left_fy: f32,
+        right_fy: f32,
+        tolerance_px: f32,
     },
     PrincipalPointMismatch {
-        delta_cx: f32,
-        delta_cy: f32,
-        tolerance: f32,
+        left_cx: f32,
+        right_cx: f32,
+        left_cy: f32,
+        right_cy: f32,
+        tolerance_px: f32,
     },
 }
 
 impl std::fmt::Display for RectifiedStereoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RectifiedStereoError::NonPositiveBaseline { baseline_m } => {
-                write!(f, "baseline must be positive and finite, got {baseline_m}")
+            RectifiedStereoError::NonFiniteBaseline { baseline_m } => {
+                write!(f, "baseline must be finite, got {baseline_m} m")
             }
-            RectifiedStereoError::ZeroDimensions {
-                camera,
-                width,
-                height,
-            } => {
-                write!(
-                    f,
-                    "{camera} camera dimensions must be nonzero, got {width}x{height}"
-                )
+            RectifiedStereoError::NonPositiveBaseline { baseline_m } => {
+                write!(f, "baseline must be positive, got {baseline_m} m")
+            }
+            RectifiedStereoError::InvalidDimensions { camera, source } => {
+                write!(f, "invalid {camera} camera dimensions: {source}")
+            }
+            RectifiedStereoError::InvalidIntrinsics { camera, source } => {
+                write!(f, "invalid {camera} camera intrinsics: {source}")
             }
             RectifiedStereoError::DimensionMismatch { left, right } => {
                 write!(
@@ -138,47 +183,89 @@ impl std::fmt::Display for RectifiedStereoError {
                     right.height()
                 )
             }
-            RectifiedStereoError::InvalidFocal { fx, fy } => {
-                write!(
-                    f,
-                    "rectified stereo requires positive focal lengths: fx={fx}, fy={fy}"
-                )
-            }
-            RectifiedStereoError::NonFiniteIntrinsics { camera } => {
-                write!(f, "{camera} camera intrinsics must be finite")
-            }
             RectifiedStereoError::NotRectified => {
                 write!(f, "calibration is not marked rectified")
             }
-            RectifiedStereoError::InvalidTolerance { name, value } => {
+            RectifiedStereoError::InvalidTolerance { kind, value_px } => {
                 write!(
                     f,
-                    "{name} tolerance must be finite and nonnegative, got {value}"
+                    "{kind} tolerance must be finite and nonnegative, got {value_px} px"
                 )
             }
             RectifiedStereoError::FocalMismatch {
-                delta_fx,
-                delta_fy,
-                tolerance,
+                left_fx,
+                right_fx,
+                left_fy,
+                right_fy,
+                tolerance_px,
             } => write!(
                 f,
-                "rectified focal lengths differ: delta_fx={delta_fx}, delta_fy={delta_fy}, tolerance={tolerance}"
+                "rectified focal lengths differ by more than {tolerance_px} px: left_fx={left_fx}, right_fx={right_fx}, left_fy={left_fy}, right_fy={right_fy}"
             ),
             RectifiedStereoError::PrincipalPointMismatch {
-                delta_cx,
-                delta_cy,
-                tolerance,
+                left_cx,
+                right_cx,
+                left_cy,
+                right_cy,
+                tolerance_px,
             } => {
                 write!(
                     f,
-                    "principal points differ too much: delta_cx={delta_cx}, delta_cy={delta_cy}, tolerance={tolerance}"
+                    "principal points differ by more than {tolerance_px} px: left_cx={left_cx}, right_cx={right_cx}, left_cy={left_cy}, right_cy={right_cy}"
                 )
             }
         }
     }
 }
 
-impl std::error::Error for RectifiedStereoError {}
+impl std::error::Error for RectifiedStereoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDimensions { source, .. } => Some(source),
+            Self::InvalidIntrinsics { source, .. } => Some(source),
+            Self::NonFiniteBaseline { .. }
+            | Self::NonPositiveBaseline { .. }
+            | Self::DimensionMismatch { .. }
+            | Self::NotRectified
+            | Self::InvalidTolerance { .. }
+            | Self::FocalMismatch { .. }
+            | Self::PrincipalPointMismatch { .. } => None,
+        }
+    }
+}
+
+impl ParsedCamera {
+    fn parse(
+        camera: StereoCameraSide,
+        value: &CameraIntrinsics,
+    ) -> Result<Self, RectifiedStereoError> {
+        let dimensions = FrameDimensions::try_new(value.width, value.height)
+            .map_err(|source| RectifiedStereoError::InvalidDimensions { camera, source })?;
+        let intrinsics = PinholeIntrinsics::try_new(value.fx, value.fy, value.cx, value.cy)
+            .map_err(|source| RectifiedStereoError::InvalidIntrinsics { camera, source })?;
+        Ok(Self {
+            intrinsics,
+            dimensions,
+        })
+    }
+}
+
+/// Compare an f32-derived absolute difference to an f32 tolerance without
+/// rounding away a low limb before the comparison.
+fn exact_difference_exceeds_tolerance(left: f32, right: f32, tolerance: f32) -> bool {
+    debug_assert!(left.is_finite());
+    debug_assert!(right.is_finite());
+    debug_assert!(tolerance.is_finite() && tolerance >= 0.0);
+
+    let left = f64::from(left);
+    let right = f64::from(right);
+    let (upper, lower) = if left >= right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    math::expansion_sum([upper, -lower, -f64::from(tolerance)]) > 0.0
+}
 
 impl RectifiedStereo {
     pub fn from_calibration(calibration: &Calibration) -> Result<Self, RectifiedStereoError> {
@@ -189,42 +276,24 @@ impl RectifiedStereo {
         calibration: &Calibration,
         config: RectifiedStereoConfig,
     ) -> Result<Self, RectifiedStereoError> {
-        let left = calibration.left.clone();
-        let right = calibration.right.clone();
-
-        if !calibration.baseline_m.is_finite() || calibration.baseline_m <= 0.0 {
+        if !calibration.baseline_m.is_finite() {
+            return Err(RectifiedStereoError::NonFiniteBaseline {
+                baseline_m: calibration.baseline_m,
+            });
+        }
+        if calibration.baseline_m <= 0.0 {
             return Err(RectifiedStereoError::NonPositiveBaseline {
                 baseline_m: calibration.baseline_m,
             });
         }
 
-        for (camera, intrinsics) in [("left", &left), ("right", &right)] {
-            if intrinsics.width == 0 || intrinsics.height == 0 {
-                return Err(RectifiedStereoError::ZeroDimensions {
-                    camera,
-                    width: intrinsics.width,
-                    height: intrinsics.height,
-                });
-            }
-            if !intrinsics.fx.is_finite()
-                || !intrinsics.fy.is_finite()
-                || !intrinsics.cx.is_finite()
-                || !intrinsics.cy.is_finite()
-            {
-                return Err(RectifiedStereoError::NonFiniteIntrinsics { camera });
-            }
-            if intrinsics.fx <= 0.0 || intrinsics.fy <= 0.0 {
-                return Err(RectifiedStereoError::InvalidFocal {
-                    fx: intrinsics.fx,
-                    fy: intrinsics.fy,
-                });
-            }
-        }
+        let left = ParsedCamera::parse(StereoCameraSide::Left, &calibration.left)?;
+        let right = ParsedCamera::parse(StereoCameraSide::Right, &calibration.right)?;
 
-        if left.width != right.width || left.height != right.height {
+        if left.dimensions != right.dimensions {
             return Err(RectifiedStereoError::DimensionMismatch {
-                left: FrameDimensions::new(left.width, left.height),
-                right: FrameDimensions::new(right.width, right.height),
+                left: left.dimensions,
+                right: right.dimensions,
             });
         }
 
@@ -232,77 +301,90 @@ impl RectifiedStereo {
             return Err(RectifiedStereoError::NotRectified);
         }
 
-        let delta_fx = (left.fx - right.fx).abs();
-        let delta_fy = (left.fy - right.fy).abs();
-        if delta_fx > config.max_focal_delta_px || delta_fy > config.max_focal_delta_px {
+        if exact_difference_exceeds_tolerance(
+            left.intrinsics.fx(),
+            right.intrinsics.fx(),
+            config.max_focal_delta_px,
+        ) || exact_difference_exceeds_tolerance(
+            left.intrinsics.fy(),
+            right.intrinsics.fy(),
+            config.max_focal_delta_px,
+        ) {
             return Err(RectifiedStereoError::FocalMismatch {
-                delta_fx,
-                delta_fy,
-                tolerance: config.max_focal_delta_px,
+                left_fx: left.intrinsics.fx(),
+                right_fx: right.intrinsics.fx(),
+                left_fy: left.intrinsics.fy(),
+                right_fy: right.intrinsics.fy(),
+                tolerance_px: config.max_focal_delta_px,
             });
         }
 
-        let delta_cx = (left.cx - right.cx).abs();
-        let delta_cy = (left.cy - right.cy).abs();
-        if delta_cx > config.max_principal_delta_px || delta_cy > config.max_principal_delta_px {
+        if exact_difference_exceeds_tolerance(
+            left.intrinsics.cx(),
+            right.intrinsics.cx(),
+            config.max_principal_delta_px,
+        ) || exact_difference_exceeds_tolerance(
+            left.intrinsics.cy(),
+            right.intrinsics.cy(),
+            config.max_principal_delta_px,
+        ) {
             return Err(RectifiedStereoError::PrincipalPointMismatch {
-                delta_cx,
-                delta_cy,
-                tolerance: config.max_principal_delta_px,
+                left_cx: left.intrinsics.cx(),
+                right_cx: right.intrinsics.cx(),
+                left_cy: left.intrinsics.cy(),
+                right_cy: right.intrinsics.cy(),
+                tolerance_px: config.max_principal_delta_px,
             });
         }
 
-        let arithmetic = RectifiedStereoArithmetic::new(&left, &right, calibration.baseline_m);
+        let arithmetic = RectifiedStereoArithmetic::new(
+            left.intrinsics,
+            right.intrinsics,
+            calibration.baseline_m,
+        );
 
         Ok(Self {
-            left,
-            right,
+            left: left.intrinsics,
+            right: right.intrinsics,
+            dimensions: left.dimensions,
             baseline_m: calibration.baseline_m,
             arithmetic,
         })
     }
 
-    pub fn left(&self) -> &CameraIntrinsics {
-        &self.left
+    /// Parsed left-camera projection coefficients in pixels.
+    pub fn left(&self) -> PinholeIntrinsics {
+        self.left
     }
 
-    pub fn right(&self) -> &CameraIntrinsics {
-        &self.right
+    /// Parsed right-camera projection coefficients in pixels.
+    pub fn right(&self) -> PinholeIntrinsics {
+        self.right
     }
 
+    /// Positive stereo baseline in metres.
     pub fn baseline_m(&self) -> f32 {
         self.baseline_m
     }
 
     pub fn width(&self) -> u32 {
-        self.left.width
+        self.dimensions.width()
     }
 
     pub fn height(&self) -> u32 {
-        self.left.height
+        self.dimensions.height()
     }
 
-    pub fn fx(&self) -> f32 {
-        self.left.fx
-    }
-
-    pub fn fy(&self) -> f32 {
-        self.left.fy
-    }
-
-    pub fn cx(&self) -> f32 {
-        self.left.cx
-    }
-
-    pub fn cy(&self) -> f32 {
-        self.left.cy
+    /// Shared, nonzero left/right image dimensions.
+    pub fn dimensions(&self) -> FrameDimensions {
+        self.dimensions
     }
 }
 
 impl RectifiedStereoArithmetic {
-    fn new(left: &CameraIntrinsics, right: &CameraIntrinsics, baseline_m: f32) -> Self {
-        let left = CameraIntrinsics64::from_finite(left);
-        let right = CameraIntrinsics64::from_finite(right);
+    fn new(left: PinholeIntrinsics, right: PinholeIntrinsics, baseline_m: f32) -> Self {
+        let left = CameraIntrinsics64::from(left);
+        let right = CameraIntrinsics64::from(right);
         let baseline_m = f64::from(baseline_m);
 
         Self {
@@ -313,13 +395,13 @@ impl RectifiedStereoArithmetic {
     }
 }
 
-impl CameraIntrinsics64 {
-    fn from_finite(intrinsics: &CameraIntrinsics) -> Self {
+impl From<PinholeIntrinsics> for CameraIntrinsics64 {
+    fn from(intrinsics: PinholeIntrinsics) -> Self {
         Self {
-            fx: f64::from(intrinsics.fx),
-            fy: f64::from(intrinsics.fy),
-            cx: f64::from(intrinsics.cx),
-            cy: f64::from(intrinsics.cy),
+            fx: f64::from(intrinsics.fx()),
+            fy: f64::from(intrinsics.fy()),
+            cx: f64::from(intrinsics.cx()),
+            cy: f64::from(intrinsics.cy()),
         }
     }
 }
@@ -771,7 +853,7 @@ impl Triangulator {
             });
         }
 
-        let expected = FrameDimensions::new(self.stereo.width(), self.stereo.height());
+        let expected = self.stereo.dimensions();
         let left_dimensions = FrameDimensions::new(left.width(), left.height());
         let right_dimensions = FrameDimensions::new(right.width(), right.height());
         if left_dimensions != expected || right_dimensions != expected {
@@ -917,6 +999,44 @@ mod tests {
     }
 
     #[test]
+    fn rectified_stereo_preserves_both_camera_bits_and_exact_widening() {
+        let left =
+            make_camera_intrinsics(5, 7, f32::from_bits(1), f32::MAX, -0.0, f32::from_bits(1));
+        let right =
+            make_camera_intrinsics(5, 7, f32::from_bits(2), f32::MAX, 0.0, -f32::from_bits(1));
+        let baseline_m = f32::from_bits(1);
+        let calibration = Calibration {
+            left: left.clone(),
+            right: right.clone(),
+            baseline_m,
+            rectified: true,
+        };
+        let stereo = RectifiedStereo::from_calibration(&calibration).expect("rectified stereo");
+
+        for (parsed, raw) in [(stereo.left(), left), (stereo.right(), right)] {
+            assert_eq!(parsed.fx().to_bits(), raw.fx.to_bits());
+            assert_eq!(parsed.fy().to_bits(), raw.fy.to_bits());
+            assert_eq!(parsed.cx().to_bits(), raw.cx.to_bits());
+            assert_eq!(parsed.cy().to_bits(), raw.cy.to_bits());
+        }
+        assert_eq!(stereo.dimensions(), FrameDimensions::new(5, 7));
+        assert_eq!(stereo.baseline_m().to_bits(), baseline_m.to_bits());
+        for (parsed, raw) in [
+            (&stereo.arithmetic.left, &calibration.left),
+            (&stereo.arithmetic.right, &calibration.right),
+        ] {
+            assert_eq!(parsed.fx.to_bits(), f64::from(raw.fx).to_bits());
+            assert_eq!(parsed.fy.to_bits(), f64::from(raw.fy).to_bits());
+            assert_eq!(parsed.cx.to_bits(), f64::from(raw.cx).to_bits());
+            assert_eq!(parsed.cy.to_bits(), f64::from(raw.cy).to_bits());
+        }
+        assert_eq!(
+            stereo.arithmetic.baseline_m.to_bits(),
+            f64::from(baseline_m).to_bits()
+        );
+    }
+
+    #[test]
     fn rectified_stereo_rejects_nonfinite_and_incompatible_intrinsics() {
         let left = make_camera_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0);
         let mut calibration = Calibration {
@@ -927,7 +1047,14 @@ mod tests {
         };
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
-            Err(RectifiedStereoError::NonPositiveBaseline { .. })
+            Err(RectifiedStereoError::NonFiniteBaseline { baseline_m })
+                if baseline_m.is_nan()
+        ));
+
+        calibration.baseline_m = 0.0;
+        assert!(matches!(
+            RectifiedStereo::from_calibration(&calibration),
+            Err(RectifiedStereoError::NonPositiveBaseline { baseline_m: 0.0 })
         ));
 
         calibration.baseline_m = 0.075;
@@ -941,7 +1068,128 @@ mod tests {
         calibration.right.cx = f32::NAN;
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
-            Err(RectifiedStereoError::NonFiniteIntrinsics { camera: "right" })
+            Err(RectifiedStereoError::InvalidIntrinsics {
+                camera: StereoCameraSide::Right,
+                source: IntrinsicsError::NonFinite { cx, .. },
+            }) if cx.is_nan()
+        ));
+
+        calibration.right.cx = calibration.left.cx;
+        calibration.right.width = 0;
+        assert!(matches!(
+            RectifiedStereo::from_calibration(&calibration),
+            Err(RectifiedStereoError::InvalidDimensions {
+                camera: StereoCameraSide::Right,
+                source: FrameDimensionsError::Zero {
+                    width: 0,
+                    height: 480,
+                },
+            })
+        ));
+
+        calibration.right.width = calibration.left.width;
+        calibration.right.fx = 0.0;
+        assert!(matches!(
+            RectifiedStereo::from_calibration(&calibration),
+            Err(RectifiedStereoError::InvalidIntrinsics {
+                camera: StereoCameraSide::Right,
+                source: IntrinsicsError::NonPositiveFocal { fx: 0.0, .. },
+            })
+        ));
+
+        calibration.right.fx = calibration.left.fx;
+        calibration.right.width = calibration.left.width / 2;
+        assert!(matches!(
+            RectifiedStereo::from_calibration(&calibration),
+            Err(RectifiedStereoError::DimensionMismatch { left, right })
+                if left == FrameDimensions::new(640, 480)
+                    && right == FrameDimensions::new(320, 480)
+        ));
+    }
+
+    #[test]
+    fn rectified_stereo_exposes_typed_boundary_error_sources() {
+        let left = make_camera_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0);
+        let mut calibration = Calibration {
+            left: left.clone(),
+            right: left,
+            baseline_m: 0.075,
+            rectified: true,
+        };
+
+        calibration.right.width = 0;
+        let dimensions_error =
+            RectifiedStereo::from_calibration(&calibration).expect_err("invalid dimensions");
+        assert!(matches!(
+            std::error::Error::source(&dimensions_error)
+                .and_then(|source| source.downcast_ref::<FrameDimensionsError>()),
+            Some(FrameDimensionsError::Zero {
+                width: 0,
+                height: 480,
+            })
+        ));
+
+        calibration.right.width = calibration.left.width;
+        calibration.right.fx = f32::NAN;
+        let intrinsics_error =
+            RectifiedStereo::from_calibration(&calibration).expect_err("invalid intrinsics");
+        assert!(matches!(
+            std::error::Error::source(&intrinsics_error)
+                .and_then(|source| source.downcast_ref::<IntrinsicsError>()),
+            Some(IntrinsicsError::NonFinite { fx, .. }) if fx.is_nan()
+        ));
+    }
+
+    #[test]
+    fn rectified_stereo_reports_extreme_principal_mismatch_with_raw_evidence() {
+        let left = make_camera_intrinsics(640, 480, 400.0, 400.0, f32::MAX, 240.0);
+        let mut right = left.clone();
+        right.cx = -f32::MAX;
+        let calibration = Calibration {
+            left: left.clone(),
+            right,
+            baseline_m: 0.075,
+            rectified: true,
+        };
+        assert!(matches!(
+            RectifiedStereo::from_calibration(&calibration),
+            Err(RectifiedStereoError::PrincipalPointMismatch {
+                left_cx,
+                right_cx,
+                left_cy: 240.0,
+                right_cy: 240.0,
+                tolerance_px,
+            }) if left_cx.to_bits() == f32::MAX.to_bits()
+                && right_cx.to_bits() == (-f32::MAX).to_bits()
+                && tolerance_px.to_bits() == RectifiedStereoConfig::default()
+                    .max_principal_delta_px()
+                    .to_bits()
+        ));
+    }
+
+    #[test]
+    fn rectified_stereo_compares_exact_principal_delta_to_tolerance() {
+        let left = make_camera_intrinsics(640, 480, 400.0, 400.0, 1.0, 240.0);
+        let mut right = left.clone();
+        right.cx = -f32::from_bits(1); // -2^-149
+        let rounded_f64_delta = (f64::from(left.cx) - f64::from(right.cx)).abs();
+        assert_eq!(rounded_f64_delta, 1.0);
+        let calibration = Calibration {
+            left,
+            right,
+            baseline_m: 0.075,
+            rectified: true,
+        };
+        let config = RectifiedStereoConfig::try_new(1.0, 0.0).expect("config");
+
+        assert!(matches!(
+            RectifiedStereo::from_calibration_with_config(&calibration, config),
+            Err(RectifiedStereoError::PrincipalPointMismatch {
+                left_cx: 1.0,
+                right_cx,
+                tolerance_px: 1.0,
+                ..
+            }) if right_cx.to_bits() == (-f32::from_bits(1)).to_bits()
         ));
     }
 

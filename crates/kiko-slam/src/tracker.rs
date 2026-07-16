@@ -1929,18 +1929,23 @@ pub struct SlamTracker {
 impl SlamTracker {
     const DEFAULT_ESSENTIAL_GRAPH_STRONG_THRESHOLD: u32 = 15;
 
+    /// Construct a tracker whose triangulation, PnP, bundle adjustment, loop,
+    /// and backend paths all share `stereo`'s validated left-camera model.
     pub fn try_new(
         superpoint_left: SuperPoint,
         superpoint_right: SuperPoint,
         lightglue: LightGlue,
         stereo: RectifiedStereo,
-        intrinsics: PinholeIntrinsics,
         config: TrackerConfig,
     ) -> Result<Self, TrackerInitError> {
         let environment = TrackerEnvironment::parse(
             config.backend.is_some(),
             config.global_descriptor_config().is_some(),
         )?;
+        // The tracker has one camera-calibration authority. Derive the PnP,
+        // BA, loop, and backend projection from the same parsed left camera
+        // that the triangulator consumes.
+        let intrinsics = stereo.left();
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let ba = LocalBundleAdjuster::new(intrinsics, config.ba);
         let backend = match config.backend {

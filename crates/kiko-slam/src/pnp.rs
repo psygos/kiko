@@ -25,7 +25,6 @@ pub struct PinholeIntrinsics {
 pub enum IntrinsicsError {
     NonFinite { fx: f32, fy: f32, cx: f32, cy: f32 },
     NonPositiveFocal { fx: f32, fy: f32 },
-    ZeroDimensions { width: u32, height: u32 },
 }
 
 impl std::fmt::Display for IntrinsicsError {
@@ -41,54 +40,37 @@ impl std::fmt::Display for IntrinsicsError {
                     "pinhole intrinsics require fx, fy > 0 (fx={fx}, fy={fy})"
                 )
             }
-            IntrinsicsError::ZeroDimensions { width, height } => write!(
-                f,
-                "pinhole image dimensions must be nonzero (width={width}, height={height})"
-            ),
         }
     }
 }
 
 impl std::error::Error for IntrinsicsError {}
 
+/// Parse the projection coefficients represented by a serialized camera.
+///
+/// Image dimensions are deliberately outside [`PinholeIntrinsics`]; callers
+/// that own a complete image contract must parse those into a dimensions type
+/// separately.
 impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
     type Error = IntrinsicsError;
 
     fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
-        if !value.fx.is_finite()
-            || !value.fy.is_finite()
-            || !value.cx.is_finite()
-            || !value.cy.is_finite()
-        {
-            return Err(IntrinsicsError::NonFinite {
-                fx: value.fx,
-                fy: value.fy,
-                cx: value.cx,
-                cy: value.cy,
-            });
-        }
-        if value.fx <= 0.0 || value.fy <= 0.0 {
-            return Err(IntrinsicsError::NonPositiveFocal {
-                fx: value.fx,
-                fy: value.fy,
-            });
-        }
-        if value.width == 0 || value.height == 0 {
-            return Err(IntrinsicsError::ZeroDimensions {
-                width: value.width,
-                height: value.height,
-            });
-        }
-        Ok(Self {
-            fx: value.fx,
-            fy: value.fy,
-            cx: value.cx,
-            cy: value.cy,
-        })
+        Self::try_new(value.fx, value.fy, value.cx, value.cy)
     }
 }
 
 impl PinholeIntrinsics {
+    /// Parse finite projection coefficients expressed in pixels.
+    pub fn try_new(fx: f32, fy: f32, cx: f32, cy: f32) -> Result<Self, IntrinsicsError> {
+        if !fx.is_finite() || !fy.is_finite() || !cx.is_finite() || !cy.is_finite() {
+            return Err(IntrinsicsError::NonFinite { fx, fy, cx, cy });
+        }
+        if fx <= 0.0 || fy <= 0.0 {
+            return Err(IntrinsicsError::NonPositiveFocal { fx, fy });
+        }
+        Ok(Self { fx, fy, cx, cy })
+    }
+
     pub fn fx(&self) -> f32 {
         self.fx
     }
@@ -1799,6 +1781,24 @@ mod tests {
         let dy = f64::from(a[1]) - f64::from(b[1]);
         let dz = f64::from(a[2]) - f64::from(b[2]);
         dx.hypot(dy).hypot(dz)
+    }
+
+    #[test]
+    fn pinhole_conversion_parses_only_represented_projection_coefficients() {
+        let raw = CameraIntrinsics {
+            fx: 400.0,
+            fy: 401.0,
+            cx: 320.0,
+            cy: 240.0,
+            width: 0,
+            height: 0,
+        };
+
+        let parsed = PinholeIntrinsics::try_from(&raw).expect("projection coefficients");
+        assert_eq!(parsed.fx().to_bits(), raw.fx.to_bits());
+        assert_eq!(parsed.fy().to_bits(), raw.fy.to_bits());
+        assert_eq!(parsed.cx().to_bits(), raw.cx.to_bits());
+        assert_eq!(parsed.cy().to_bits(), raw.cy.to_bits());
     }
 
     #[test]
