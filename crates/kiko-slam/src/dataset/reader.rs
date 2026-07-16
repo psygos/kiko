@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::{Frame, FrameDimensions, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp};
+use crate::{
+    DepthImage, Frame, FrameDimensions, FrameId, PairingWindowNs, SensorId, StereoPair, Timestamp,
+};
 
 use super::{
     Calibration, DatasetError, DatasetTimebase, DeltaStats, DepthImageContract, Manifest,
@@ -13,8 +16,23 @@ use super::{
 
 #[derive(Clone, Debug)]
 struct DatasetFrameRef {
-    timestamp_ns: i64,
+    timestamp: Timestamp,
     path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ManifestFrameKind {
+    Mono(SensorId),
+    Depth,
+}
+
+impl ManifestFrameKind {
+    fn sensor_name(self) -> &'static str {
+        match self {
+            Self::Mono(sensor) => sensor_to_str(sensor),
+            Self::Depth => "depth",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -23,16 +41,33 @@ struct DatasetEntry {
     right: Option<DatasetFrameRef>,
 }
 
+#[derive(Clone, Debug)]
+struct DatasetDepthRef {
+    frame_id: FrameId,
+    frame_ref: DatasetFrameRef,
+}
+
+#[derive(Debug)]
+enum ParsedDepthStream {
+    Unconfigured,
+    LegacyUnindexed,
+    Indexed {
+        contract: DepthImageContract,
+        entries: Arc<[DatasetDepthRef]>,
+    },
+}
+
 #[derive(Debug)]
 struct ParsedManifest {
     entries: Vec<DatasetEntry>,
+    depth: ParsedDepthStream,
     stats: DatasetStats,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ParsedManifestContract {
     image: MonoImageContract,
-    _depth: Option<DepthImageContract>,
+    depth: Option<DepthImageContract>,
     pairing_policy: ManifestPairingPolicy,
     pairing_window: PairingWindowNs,
 }
@@ -100,7 +135,7 @@ impl ParsedManifestContract {
             .transpose()?;
         Ok(Self {
             image,
-            _depth: depth,
+            depth,
             pairing_policy,
             pairing_window,
         })
@@ -112,6 +147,7 @@ pub struct DatasetReader {
     meta: super::Meta,
     calibration: Calibration,
     entries: Vec<DatasetEntry>,
+    depth: ParsedDepthStream,
     stats: DatasetStats,
     dimensions: FrameDimensions,
     left_seq: u64,
@@ -151,6 +187,7 @@ impl DatasetReader {
             meta,
             calibration,
             entries: parsed.entries,
+            depth: parsed.depth,
             stats: parsed.stats,
             dimensions: contract.image.dimensions(),
             left_seq: 0,
@@ -168,6 +205,22 @@ impl DatasetReader {
 
     pub fn stats(&self) -> DatasetStats {
         self.stats
+    }
+
+    /// Returns an independent cursor over the manifest-defined depth stream.
+    ///
+    /// Legacy manifests remain available for stereo replay, but depth replay requires explicit
+    /// `depth_entries`; the reader never falls back to scanning the dataset directory.
+    pub fn depth_cursor(&self) -> Result<DatasetDepthCursor, DatasetError> {
+        match &self.depth {
+            ParsedDepthStream::Unconfigured => Err(DatasetError::DepthStreamNotConfigured),
+            ParsedDepthStream::LegacyUnindexed => Err(DatasetError::LegacyDepthManifestUnindexed),
+            ParsedDepthStream::Indexed { contract, entries } => Ok(DatasetDepthCursor {
+                contract: *contract,
+                entries: Arc::clone(entries),
+                next: 0,
+            }),
+        }
     }
 
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
@@ -195,6 +248,87 @@ impl DatasetReader {
         self.right_seq = self.right_seq.saturating_add(1);
         FrameId::new(id)
     }
+}
+
+/// Independent replay cursor over depth payloads named by the dataset manifest.
+///
+/// Replayed frame IDs are the zero-based positions of the entries in that manifest.
+#[derive(Debug)]
+pub struct DatasetDepthCursor {
+    contract: DepthImageContract,
+    entries: Arc<[DatasetDepthRef]>,
+    next: usize,
+}
+
+impl DatasetDepthCursor {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.entries.len() - self.next
+    }
+
+    /// Decodes the next manifest entry when its timestamp is no later than `cutoff`.
+    ///
+    /// A future entry returns `Ok(None)` without consuming it. I/O, length, or sample-domain
+    /// failures also leave the cursor unchanged so callers can report or retry the exact entry.
+    pub fn next_at_or_before(
+        &mut self,
+        cutoff: Timestamp,
+    ) -> Result<Option<DepthImage>, DatasetError> {
+        let Some(entry) = self.entries.get(self.next) else {
+            return Ok(None);
+        };
+        if entry.frame_ref.timestamp > cutoff {
+            return Ok(None);
+        }
+
+        let depth = read_depth_image(entry, self.contract)?;
+        self.next += 1;
+        Ok(Some(depth))
+    }
+}
+
+fn read_depth_image(
+    entry: &DatasetDepthRef,
+    contract: DepthImageContract,
+) -> Result<DepthImage, DatasetError> {
+    let path = &entry.frame_ref.path;
+    let bytes = std::fs::read(path).map_err(|source| DatasetError::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    let actual =
+        u64::try_from(bytes.len()).map_err(|_| DatasetError::DepthPayloadLengthOutOfRange {
+            path: path.clone(),
+            actual: bytes.len(),
+        })?;
+    let expected = contract.expected_payload_len();
+    if actual != expected {
+        return Err(DatasetError::DepthPayloadLengthChanged {
+            path: path.clone(),
+            expected,
+            actual,
+        });
+    }
+
+    let dimensions = contract.dimensions();
+    DepthImage::new(
+        entry.frame_id,
+        entry.frame_ref.timestamp,
+        dimensions.width(),
+        dimensions.height(),
+        contract.decode(&bytes),
+    )
+    .map_err(|source| DatasetError::InvalidDepthData {
+        path: path.clone(),
+        source,
+    })
 }
 
 pub struct DatasetPairs<'a> {
@@ -301,7 +435,7 @@ impl DatasetReader {
                 SensorId::StereoLeft => self.next_left_id(),
                 SensorId::StereoRight => self.next_right_id(),
             },
-            Timestamp::from_nanos(frame_ref.timestamp_ns),
+            frame_ref.timestamp,
             self.dimensions,
             data,
         )
@@ -314,7 +448,12 @@ fn parse_manifest(
     manifest: Manifest,
     contract: ParsedManifestContract,
 ) -> Result<ParsedManifest, DatasetError> {
-    let Manifest { stats, entries, .. } = manifest;
+    let Manifest {
+        stats,
+        entries,
+        depth_entries,
+        ..
+    } = manifest;
     if contract.pairing_policy == ManifestPairingPolicy::RecordedPairs
         && (stats.left_orphans != 0 || stats.right_orphans != 0)
     {
@@ -324,10 +463,19 @@ fn parse_manifest(
         });
     }
     let dimensions = contract.image.dimensions();
+    let mono_payload_len = u64::from(dimensions.width()) * u64::from(dimensions.height());
     let max_delta_ns = contract.pairing_window.as_u64();
     let mut parsed_entries = Vec::with_capacity(entries.len());
     let mut paired_deltas = Vec::with_capacity(entries.len());
-    let mut seen_paths = HashSet::with_capacity(entries.len().saturating_mul(2));
+    let depth_entry_count = depth_entries.as_ref().map_or(0, Vec::len);
+    let frame_ref_capacity = entries
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(depth_entry_count))
+        .ok_or(DatasetError::InvalidManifest {
+            reason: "manifest frame reference count exceeds the host address space",
+        })?;
+    let mut seen_paths = HashSet::with_capacity(frame_ref_capacity);
     let mut previous_left_timestamp_ns = None;
     let mut outside_window = 0u64;
 
@@ -342,26 +490,38 @@ fn parse_manifest(
             });
         }
 
-        let left = parse_frame_ref(root, entry.left, SensorId::StereoLeft, dimensions)?;
+        let left = parse_manifest_frame_ref(
+            root,
+            entry.left,
+            ManifestFrameKind::Mono(SensorId::StereoLeft),
+            mono_payload_len,
+        )?;
         insert_unique_frame_ref(&mut seen_paths, &left)?;
         let right = match entry.pairing {
             ManifestPairing::Paired { right, delta_ns } => {
-                let right = parse_frame_ref(root, right, SensorId::StereoRight, dimensions)?;
+                let right = parse_manifest_frame_ref(
+                    root,
+                    right,
+                    ManifestFrameKind::Mono(SensorId::StereoRight),
+                    mono_payload_len,
+                )?;
                 insert_unique_frame_ref(&mut seen_paths, &right)?;
 
-                let derived_delta_ns = left.timestamp_ns.abs_diff(right.timestamp_ns);
+                let left_timestamp_ns = left.timestamp.as_nanos();
+                let right_timestamp_ns = right.timestamp.as_nanos();
+                let derived_delta_ns = left_timestamp_ns.abs_diff(right_timestamp_ns);
                 if delta_ns != derived_delta_ns {
                     return Err(DatasetError::ManifestPairDeltaMismatch {
-                        left_timestamp_ns: left.timestamp_ns,
-                        right_timestamp_ns: right.timestamp_ns,
+                        left_timestamp_ns,
+                        right_timestamp_ns,
                         declared_delta_ns: delta_ns,
                         derived_delta_ns,
                     });
                 }
                 if derived_delta_ns > max_delta_ns {
                     return Err(DatasetError::ManifestPairOutsideWindow {
-                        left_timestamp_ns: left.timestamp_ns,
-                        right_timestamp_ns: right.timestamp_ns,
+                        left_timestamp_ns,
+                        right_timestamp_ns,
                         delta_ns: derived_delta_ns,
                         max_delta_ns,
                     });
@@ -385,6 +545,8 @@ fn parse_manifest(
         previous_left_timestamp_ns = Some(left_timestamp_ns);
     }
 
+    let depth = parse_depth_stream(root, contract.depth, depth_entries, &mut seen_paths)?;
+
     let derived_delta_stats = build_delta_stats(&paired_deltas);
     validate_manifest_delta_stats(stats.delta_stats.as_ref(), derived_delta_stats.as_ref())?;
     validate_manifest_stat(
@@ -395,7 +557,62 @@ fn parse_manifest(
     let stats = DatasetStats::from_manifest(&parsed_entries, stats)?;
     Ok(ParsedManifest {
         entries: parsed_entries,
+        depth,
         stats,
+    })
+}
+
+fn parse_depth_stream(
+    root: &Path,
+    contract: Option<DepthImageContract>,
+    entries: Option<Vec<ManifestFrameRef>>,
+    seen_paths: &mut HashSet<PathBuf>,
+) -> Result<ParsedDepthStream, DatasetError> {
+    let (contract, entries) = match (contract, entries) {
+        (None, None) => return Ok(ParsedDepthStream::Unconfigured),
+        (Some(_), None) => return Ok(ParsedDepthStream::LegacyUnindexed),
+        (None, Some(entries)) => {
+            return Err(DatasetError::ManifestDepthEntriesWithoutMetadata {
+                entry_count: entries.len(),
+            });
+        }
+        (Some(contract), Some(entries)) => (contract, entries),
+    };
+
+    let mut parsed = Vec::with_capacity(entries.len());
+    let mut previous_depth_timestamp_ns = None;
+    let expected_payload_len = contract.expected_payload_len();
+    for (index, frame_ref) in entries.into_iter().enumerate() {
+        let timestamp_ns = frame_ref.timestamp_ns;
+        if let Some(previous) = previous_depth_timestamp_ns
+            && timestamp_ns <= previous
+        {
+            return Err(DatasetError::NonMonotonicManifestDepthEntries {
+                previous_depth_timestamp_ns: previous,
+                current_depth_timestamp_ns: timestamp_ns,
+            });
+        }
+
+        let frame_ref = parse_manifest_frame_ref(
+            root,
+            frame_ref,
+            ManifestFrameKind::Depth,
+            expected_payload_len,
+        )?;
+        insert_unique_frame_ref(seen_paths, &frame_ref)?;
+        let frame_id = u64::try_from(index)
+            .map(FrameId::new)
+            .map_err(|_| DatasetError::DepthFrameIndexOutOfRange { index })?;
+        parsed.push(DatasetDepthRef {
+            frame_id,
+            frame_ref,
+        });
+        previous_depth_timestamp_ns = Some(timestamp_ns);
+    }
+
+    Ok(ParsedDepthStream::Indexed {
+        contract,
+        entries: Arc::from(parsed.into_boxed_slice()),
     })
 }
 
@@ -437,11 +654,11 @@ fn insert_unique_frame_ref(
     Ok(())
 }
 
-fn parse_frame_ref(
+fn parse_manifest_frame_ref(
     root: &Path,
     frame_ref: ManifestFrameRef,
-    sensor: SensorId,
-    dimensions: FrameDimensions,
+    kind: ManifestFrameKind,
+    expected_payload_len: u64,
 ) -> Result<DatasetFrameRef, DatasetError> {
     let relative = Path::new(&frame_ref.path);
     if relative.as_os_str().is_empty()
@@ -469,7 +686,7 @@ fn parse_frame_ref(
 
     let expected_relative = Path::new(format::FRAMES_DIR).join(format::frame_name(
         frame_ref.timestamp_ns,
-        sensor_to_str(sensor),
+        kind.sensor_name(),
     ));
     if relative != expected_relative {
         return Err(DatasetError::ManifestFrameIdentityMismatch {
@@ -485,18 +702,17 @@ fn parse_frame_ref(
     if !metadata.is_file() {
         return Err(DatasetError::InvalidFrameFileType { path: resolved });
     }
-    let expected = u64::from(dimensions.width()) * u64::from(dimensions.height());
     let actual = metadata.len();
-    if actual != expected {
+    if actual != expected_payload_len {
         return Err(DatasetError::InvalidFrameLength {
             path: resolved,
-            expected,
+            expected: expected_payload_len,
             actual,
         });
     }
 
     Ok(DatasetFrameRef {
-        timestamp_ns: frame_ref.timestamp_ns,
+        timestamp: Timestamp::from_nanos(frame_ref.timestamp_ns),
         path: resolved,
     })
 }
@@ -562,19 +778,20 @@ impl DatasetStats {
             }
         })?;
 
-        let left_fps = fps_from_timestamps(entries.iter().map(|entry| entry.left.timestamp_ns));
+        let left_fps =
+            fps_from_timestamps(entries.iter().map(|entry| entry.left.timestamp.as_nanos()));
         let paired_fps = fps_from_timestamps(
             entries
                 .iter()
                 .filter(|entry| entry.right.is_some())
-                .map(|entry| entry.left.timestamp_ns),
+                .map(|entry| entry.left.timestamp.as_nanos()),
         );
         let right_fps = if right_orphan_count == 0 {
             fps_from_timestamps(
                 entries
                     .iter()
                     .filter_map(|entry| entry.right.as_ref())
-                    .map(|right| right.timestamp_ns),
+                    .map(|right| right.timestamp.as_nanos()),
             )
         } else {
             None

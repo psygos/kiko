@@ -29,7 +29,7 @@ pub mod format {
 }
 
 mod reader;
-pub use reader::{DatasetReadTimings, DatasetReader, DatasetStats, TimedPair};
+pub use reader::{DatasetDepthCursor, DatasetReadTimings, DatasetReader, DatasetStats, TimedPair};
 
 // Meta Structs
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,7 +199,7 @@ impl DepthPayloadFormat {
 struct DepthImageContract {
     dimensions: FrameDimensions,
     _nominal_fps_hz: NonZeroU32,
-    _payload_format: DepthPayloadFormat,
+    payload_format: DepthPayloadFormat,
     expected_payload_len: u64,
 }
 
@@ -219,7 +219,7 @@ impl DepthImageContract {
         Ok(Self {
             dimensions,
             _nominal_fps_hz: nominal_fps_hz,
-            _payload_format: payload_format,
+            payload_format,
             expected_payload_len,
         })
     }
@@ -237,6 +237,19 @@ impl DepthImageContract {
 
     fn expected_payload_len(self) -> u64 {
         self.expected_payload_len
+    }
+
+    fn dimensions(self) -> FrameDimensions {
+        self.dimensions
+    }
+
+    fn decode(self, bytes: &[u8]) -> Vec<f32> {
+        match self.payload_format {
+            DepthPayloadFormat::F32MetersLe => bytes
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect(),
+        }
     }
 }
 
@@ -512,6 +525,23 @@ pub enum DatasetError {
     DepthPayloadSizeOverflow {
         dimensions: FrameDimensions,
     },
+    DepthStreamNotConfigured,
+    LegacyDepthManifestUnindexed,
+    ManifestDepthEntriesWithoutMetadata {
+        entry_count: usize,
+    },
+    DepthFrameIndexOutOfRange {
+        index: usize,
+    },
+    DepthPayloadLengthOutOfRange {
+        path: PathBuf,
+        actual: usize,
+    },
+    DepthPayloadLengthChanged {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
     SidecarChanged {
         path: PathBuf,
     },
@@ -529,6 +559,10 @@ pub enum DatasetError {
     InvalidFrameData {
         path: PathBuf,
         source: crate::FrameError,
+    },
+    InvalidDepthData {
+        path: PathBuf,
+        source: crate::DepthImageError,
     },
     InvalidManifest {
         reason: &'static str,
@@ -578,6 +612,10 @@ pub enum DatasetError {
     NonMonotonicManifestEntries {
         previous_left_timestamp_ns: i64,
         current_left_timestamp_ns: i64,
+    },
+    NonMonotonicManifestDepthEntries {
+        previous_depth_timestamp_ns: i64,
+        current_depth_timestamp_ns: i64,
     },
     ManifestPairDeltaMismatch {
         left_timestamp_ns: i64,
@@ -691,6 +729,35 @@ impl std::fmt::Display for DatasetError {
                 dimensions.width(),
                 dimensions.height()
             ),
+            DatasetError::DepthStreamNotConfigured => {
+                write!(f, "dataset metadata does not configure a depth stream")
+            }
+            DatasetError::LegacyDepthManifestUnindexed => write!(
+                f,
+                "dataset depth stream is not indexed by this legacy manifest"
+            ),
+            DatasetError::ManifestDepthEntriesWithoutMetadata { entry_count } => write!(
+                f,
+                "dataset manifest declares {entry_count} depth entries without depth metadata"
+            ),
+            DatasetError::DepthFrameIndexOutOfRange { index } => write!(
+                f,
+                "dataset depth frame index {index} exceeds the frame-id representation"
+            ),
+            DatasetError::DepthPayloadLengthOutOfRange { path, actual } => write!(
+                f,
+                "dataset depth payload length for {} cannot be represented as u64: {actual} bytes",
+                path.display()
+            ),
+            DatasetError::DepthPayloadLengthChanged {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "dataset depth payload length changed after open at {}: expected {expected} bytes, got {actual}",
+                path.display()
+            ),
             DatasetError::SidecarChanged { path } => write!(
                 f,
                 "dataset sidecar changed after writer creation: {}",
@@ -716,6 +783,11 @@ impl std::fmt::Display for DatasetError {
             DatasetError::InvalidFrameData { path, source } => write!(
                 f,
                 "dataset frame changed after open at {}: {source}",
+                path.display()
+            ),
+            DatasetError::InvalidDepthData { path, source } => write!(
+                f,
+                "dataset depth payload is invalid at {}: {source}",
                 path.display()
             ),
             DatasetError::InvalidManifest { reason } => {
@@ -786,6 +858,13 @@ impl std::fmt::Display for DatasetError {
                 f,
                 "dataset manifest left timestamps are not strictly increasing: previous={previous_left_timestamp_ns}ns, current={current_left_timestamp_ns}ns"
             ),
+            DatasetError::NonMonotonicManifestDepthEntries {
+                previous_depth_timestamp_ns,
+                current_depth_timestamp_ns,
+            } => write!(
+                f,
+                "dataset manifest depth timestamps are not strictly increasing: previous={previous_depth_timestamp_ns}ns, current={current_depth_timestamp_ns}ns"
+            ),
             DatasetError::ManifestPairDeltaMismatch {
                 left_timestamp_ns,
                 right_timestamp_ns,
@@ -854,6 +933,7 @@ impl std::error::Error for DatasetError {
             | DatasetError::DeserializeJson { source, .. } => Some(source),
             DatasetError::InvalidFrameDimensions { source, .. } => Some(source),
             DatasetError::InvalidFrameData { source, .. } => Some(source),
+            DatasetError::InvalidDepthData { source, .. } => Some(source),
             DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
             DatasetError::WriteContract { source } => Some(source),
             DatasetError::AlreadyExists { .. }
@@ -865,6 +945,12 @@ impl std::error::Error for DatasetError {
             | DatasetError::InvalidStereoBaseline { .. }
             | DatasetError::UnsupportedDepthEncoding { .. }
             | DatasetError::DepthPayloadSizeOverflow { .. }
+            | DatasetError::DepthStreamNotConfigured
+            | DatasetError::LegacyDepthManifestUnindexed
+            | DatasetError::ManifestDepthEntriesWithoutMetadata { .. }
+            | DatasetError::DepthFrameIndexOutOfRange { .. }
+            | DatasetError::DepthPayloadLengthOutOfRange { .. }
+            | DatasetError::DepthPayloadLengthChanged { .. }
             | DatasetError::SidecarChanged { .. }
             | DatasetError::InvalidFrameFileType { .. }
             | DatasetError::InvalidFrameLength { .. }
@@ -880,6 +966,7 @@ impl std::error::Error for DatasetError {
             | DatasetError::ManifestFrameIdentityMismatch { .. }
             | DatasetError::DuplicateManifestFrameRef { .. }
             | DatasetError::NonMonotonicManifestEntries { .. }
+            | DatasetError::NonMonotonicManifestDepthEntries { .. }
             | DatasetError::ManifestPairDeltaMismatch { .. }
             | DatasetError::ManifestPairOutsideWindow { .. }
             | DatasetError::ManifestCountOutOfRange { .. }
@@ -2598,6 +2685,10 @@ mod tests {
     }
 
     fn depth_image(width: u32, height: u32, timestamp_ns: i64) -> DepthImage {
+        depth_image_filled(width, height, timestamp_ns, 1.0)
+    }
+
+    fn depth_image_filled(width: u32, height: u32, timestamp_ns: i64, value: f32) -> DepthImage {
         let len = usize::try_from(width)
             .expect("test width fits usize")
             .checked_mul(usize::try_from(height).expect("test height fits usize"))
@@ -2607,7 +2698,7 @@ mod tests {
             Timestamp::from_nanos(timestamp_ns),
             width,
             height,
-            vec![1.0; len],
+            vec![value; len],
         )
         .expect("valid depth image")
     }
@@ -3077,6 +3168,441 @@ mod tests {
         .expect("parse unconfigured manifest");
         assert!(serialized.get("depth_entries").is_none());
         std::fs::remove_dir_all(unconfigured_path).expect("remove unconfigured dataset");
+    }
+
+    #[test]
+    fn depth_cursor_is_manifest_owned_independent_and_handles_signed_timestamp_bounds() {
+        let path = unique_dataset_path("depth-cursor-signed-bounds");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 0, 1))),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoRight, 0, 2))),
+            WriteOutcome::Enqueued
+        );
+        for depth in [
+            depth_image_filled(2, 2, i64::MAX, 2.0),
+            depth_image_filled(2, 2, i64::MIN, 1.0),
+        ] {
+            assert_eq!(
+                write_outcome(writer.write_depth(&depth)),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let unreferenced_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(0, "depth"));
+        std::fs::write(&unreferenced_path, 3.0_f32.to_le_bytes().repeat(4))
+            .expect("write unreferenced depth payload");
+        let manifest = read_manifest(&path).expect("read manifest");
+        let depth_entries = manifest.depth_entries.expect("indexed depth entries");
+        assert_eq!(
+            depth_entries
+                .iter()
+                .map(|entry| (entry.timestamp_ns, entry.path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (i64::MIN, frame_path(i64::MIN, "depth").as_str()),
+                (i64::MAX, frame_path(i64::MAX, "depth").as_str()),
+            ]
+        );
+
+        let mut reader = DatasetReader::open(&path).expect("open depth dataset");
+        let mut first = reader.depth_cursor().expect("first depth cursor");
+        let mut second = reader.depth_cursor().expect("second depth cursor");
+        assert_eq!(first.len(), 2);
+        assert!(!first.is_empty());
+        assert_eq!(first.remaining(), 2);
+
+        let earliest = first
+            .next_at_or_before(Timestamp::from_nanos(i64::MIN))
+            .expect("decode earliest depth")
+            .expect("inclusive cutoff returns earliest depth");
+        assert_eq!(earliest.frame_id(), FrameId::new(0));
+        assert_eq!(earliest.timestamp(), Timestamp::from_nanos(i64::MIN));
+        assert_eq!(earliest.depth_m(), &[1.0; 4]);
+        assert_eq!(first.remaining(), 1);
+        assert!(
+            first
+                .next_at_or_before(Timestamp::from_nanos(0))
+                .expect("future depth remains pending")
+                .is_none()
+        );
+        assert_eq!(first.remaining(), 1);
+
+        let independently_earliest = second
+            .next_at_or_before(Timestamp::from_nanos(i64::MIN))
+            .expect("decode earliest depth through second cursor")
+            .expect("second cursor starts independently");
+        assert_eq!(independently_earliest.frame_id(), FrameId::new(0));
+
+        let pair = reader
+            .pairs()
+            .next()
+            .expect("one stereo pair")
+            .expect("decode stereo pair while cursors remain alive");
+        assert_eq!(pair.left().timestamp(), Timestamp::from_nanos(0));
+        assert_eq!(pair.right().timestamp(), Timestamp::from_nanos(0));
+        drop(reader);
+
+        let latest = first
+            .next_at_or_before(Timestamp::from_nanos(i64::MAX))
+            .expect("decode latest depth")
+            .expect("inclusive upper cutoff returns latest depth");
+        assert_eq!(latest.frame_id(), FrameId::new(1));
+        assert_eq!(latest.timestamp(), Timestamp::from_nanos(i64::MAX));
+        assert_eq!(latest.depth_m(), &[2.0; 4]);
+        assert_eq!(first.remaining(), 0);
+        assert!(
+            first
+                .next_at_or_before(Timestamp::from_nanos(i64::MAX))
+                .expect("exhausted depth cursor")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(path).expect("remove depth cursor dataset");
+    }
+
+    #[test]
+    fn depth_cursor_distinguishes_all_manifest_depth_states() {
+        let indexed_path = unique_dataset_path("depth-cursor-indexed-empty");
+        let (writer, handle) =
+            DatasetWriter::create(&indexed_path, &meta_with_depth(2, 2), &calibration())
+                .expect("create indexed depth dataset");
+        drop(writer);
+        handle.finish().expect("finish indexed depth dataset");
+        let reader = DatasetReader::open(&indexed_path).expect("open indexed depth dataset");
+        let mut cursor = reader.depth_cursor().expect("empty indexed depth cursor");
+        assert_eq!(cursor.len(), 0);
+        assert!(cursor.is_empty());
+        assert_eq!(cursor.remaining(), 0);
+        assert!(
+            cursor
+                .next_at_or_before(Timestamp::from_nanos(i64::MAX))
+                .expect("empty indexed depth stream")
+                .is_none()
+        );
+        std::fs::remove_dir_all(indexed_path).expect("remove indexed depth dataset");
+
+        let unconfigured_path = unique_dataset_path("depth-cursor-unconfigured");
+        let (writer, handle) = DatasetWriter::create(&unconfigured_path, &meta(), &calibration())
+            .expect("create unconfigured dataset");
+        drop(writer);
+        handle.finish().expect("finish unconfigured dataset");
+        let reader = DatasetReader::open(&unconfigured_path).expect("open unconfigured dataset");
+        assert!(matches!(
+            reader.depth_cursor(),
+            Err(DatasetError::DepthStreamNotConfigured)
+        ));
+        std::fs::remove_dir_all(unconfigured_path).expect("remove unconfigured dataset");
+
+        let legacy_path = unique_dataset_path("depth-cursor-legacy");
+        let (writer, handle) =
+            DatasetWriter::create(&legacy_path, &meta_with_depth(2, 2), &calibration())
+                .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 5, 1))),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoRight, 5, 2))),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(2, 2, 5))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish legacy fixture");
+
+        let manifest_path = legacy_path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+        manifest
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("depth_entries");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize legacy manifest"),
+        )
+        .expect("write legacy manifest");
+
+        let mut reader = DatasetReader::open(&legacy_path).expect("open legacy depth manifest");
+        assert!(matches!(
+            reader.depth_cursor(),
+            Err(DatasetError::LegacyDepthManifestUnindexed)
+        ));
+        assert!(
+            reader.pairs().next().expect("legacy stereo pair").is_ok(),
+            "legacy depth manifests must retain stereo replay"
+        );
+        std::fs::remove_dir_all(legacy_path).expect("remove legacy dataset");
+    }
+
+    #[test]
+    fn reader_rejects_incoherent_or_nonmonotonic_depth_manifest_state() {
+        let unconfigured_path = unique_dataset_path("depth-entries-without-meta");
+        let (writer, handle) = DatasetWriter::create(&unconfigured_path, &meta(), &calibration())
+            .expect("create unconfigured dataset");
+        drop(writer);
+        handle.finish().expect("finish unconfigured dataset");
+        let manifest_path = unconfigured_path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+        manifest["depth_entries"] = serde_json::json!([]);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize incoherent manifest"),
+        )
+        .expect("write incoherent manifest");
+        assert!(matches!(
+            DatasetReader::open(&unconfigured_path)
+                .expect_err("depth entries without metadata must fail"),
+            DatasetError::ManifestDepthEntriesWithoutMetadata { entry_count: 0 }
+        ));
+        std::fs::remove_dir_all(unconfigured_path).expect("remove incoherent dataset");
+
+        let reordered_path = unique_dataset_path("depth-entry-order");
+        let (writer, handle) =
+            DatasetWriter::create(&reordered_path, &meta_with_depth(2, 2), &calibration())
+                .expect("create depth dataset");
+        for timestamp_ns in [10, 20] {
+            assert_eq!(
+                write_outcome(writer.write_depth(&depth_image(2, 2, timestamp_ns))),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+        let manifest_path = reordered_path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+
+        let mut duplicate = original.clone();
+        duplicate["depth_entries"][1]["timestamp_ns"] = serde_json::json!(10);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&duplicate).expect("serialize duplicate manifest"),
+        )
+        .expect("write duplicate manifest");
+        assert!(matches!(
+            DatasetReader::open(&reordered_path).expect_err("duplicate depth timestamps must fail"),
+            DatasetError::NonMonotonicManifestDepthEntries {
+                previous_depth_timestamp_ns: 10,
+                current_depth_timestamp_ns: 10
+            }
+        ));
+
+        let mut reordered = original;
+        reordered["depth_entries"]
+            .as_array_mut()
+            .expect("depth entries array")
+            .swap(0, 1);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&reordered).expect("serialize reordered manifest"),
+        )
+        .expect("write reordered manifest");
+        assert!(matches!(
+            DatasetReader::open(&reordered_path)
+                .expect_err("decreasing depth timestamps must fail"),
+            DatasetError::NonMonotonicManifestDepthEntries {
+                previous_depth_timestamp_ns: 20,
+                current_depth_timestamp_ns: 10
+            }
+        ));
+        std::fs::remove_dir_all(reordered_path).expect("remove reordered dataset");
+    }
+
+    #[test]
+    fn reader_validates_depth_reference_topology_at_open() {
+        let path = unique_dataset_path("depth-reference-topology");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(2, 2, 7))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path).expect("read generated manifest"),
+        )
+        .expect("parse generated manifest");
+        let frames = path.join(format::FRAMES_DIR);
+        std::fs::write(
+            frames.join(format::frame_name(8, "depth")),
+            1.0_f32.to_le_bytes().repeat(4),
+        )
+        .expect("write alternate in-root payload");
+
+        let mut wrong_identity = original.clone();
+        wrong_identity["depth_entries"][0]["path"] =
+            serde_json::Value::String(frame_path(8, "depth"));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&wrong_identity).expect("serialize wrong identity"),
+        )
+        .expect("write wrong identity");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("timestamp/path identity mismatch must fail"),
+            DatasetError::ManifestFrameIdentityMismatch { .. }
+        ));
+
+        let mut escaping = original.clone();
+        escaping["depth_entries"][0]["path"] =
+            serde_json::Value::String("../outside.raw".to_string());
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&escaping).expect("serialize escaping identity"),
+        )
+        .expect("write escaping identity");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("escaping depth identity must fail"),
+            DatasetError::InvalidFramePath { .. }
+        ));
+
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&original).expect("serialize original manifest"),
+        )
+        .expect("restore original manifest");
+        let payload_path = frames.join(format::frame_name(7, "depth"));
+        std::fs::remove_file(&payload_path).expect("remove depth payload");
+        std::fs::create_dir(&payload_path).expect("replace depth payload with directory");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("non-regular depth identity must fail"),
+            DatasetError::InvalidFrameFileType { .. }
+        ));
+
+        std::fs::remove_dir(&payload_path).expect("remove depth payload directory");
+        std::fs::write(&payload_path, [0_u8; 12]).expect("write short depth payload");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("wrong depth payload length must fail"),
+            DatasetError::InvalidFrameLength {
+                expected: 16,
+                actual: 12,
+                ..
+            }
+        ));
+
+        std::fs::remove_dir_all(path).expect("remove topology dataset");
+    }
+
+    #[test]
+    fn depth_cursor_retries_length_and_decode_failures_without_advancing() {
+        let path = unique_dataset_path("depth-cursor-retry");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(2, 2, 7))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let reader = DatasetReader::open(&path).expect("open depth dataset");
+        let mut cursor = reader.depth_cursor().expect("depth cursor");
+        let payload_path = path
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(7, "depth"));
+        std::fs::write(&payload_path, [0_u8; 12]).expect("truncate payload after open");
+        assert!(matches!(
+            cursor
+                .next_at_or_before(Timestamp::from_nanos(7))
+                .expect_err("post-open length change must fail"),
+            DatasetError::DepthPayloadLengthChanged {
+                expected: 16,
+                actual: 12,
+                ..
+            }
+        ));
+        assert_eq!(cursor.remaining(), 1);
+
+        let mut invalid_payload = Vec::with_capacity(16);
+        for value in [f32::NAN, 0.0, 0.0, 0.0] {
+            invalid_payload.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&payload_path, invalid_payload).expect("write invalid depth payload");
+        let error = cursor
+            .next_at_or_before(Timestamp::from_nanos(7))
+            .expect_err("invalid sample domain must fail");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidDepthData {
+                source: crate::DepthImageError::InvalidDepthMeters { index: 0, value },
+                ..
+            } if value.is_nan()
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .is_some_and(|source| source.downcast_ref::<crate::DepthImageError>().is_some()),
+            "dataset error must preserve the DepthImage validation source"
+        );
+        assert_eq!(cursor.remaining(), 1);
+
+        std::fs::write(&payload_path, 4.0_f32.to_le_bytes().repeat(4))
+            .expect("restore valid depth payload");
+        let depth = cursor
+            .next_at_or_before(Timestamp::from_nanos(7))
+            .expect("retry valid depth payload")
+            .expect("pending entry remains available after failures");
+        assert_eq!(depth.frame_id(), FrameId::new(0));
+        assert_eq!(depth.timestamp(), Timestamp::from_nanos(7));
+        assert_eq!(depth.depth_m(), &[4.0; 4]);
+        assert_eq!(cursor.remaining(), 0);
+        std::fs::remove_dir_all(path).expect("remove retry dataset");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_tracks_resolved_frame_paths_across_stereo_and_depth_streams() {
+        use std::os::unix::fs::symlink;
+
+        let path = unique_dataset_path("shared-stereo-depth-path");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(1, 1), &calibration())
+            .expect("create depth dataset");
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 5, 1))),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoRight, 5, 2))),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_depth(&depth_image(1, 1, 5))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let frames = path.join(format::FRAMES_DIR);
+        let left_path = frames.join(format::frame_name(5, "mono_left"));
+        let depth_path = frames.join(format::frame_name(5, "depth"));
+        std::fs::remove_file(&depth_path).expect("remove original depth payload");
+        symlink(&left_path, &depth_path).expect("alias depth identity to stereo payload");
+
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("cross-stream path alias must fail"),
+            DatasetError::DuplicateManifestFrameRef { .. }
+        ));
+        std::fs::remove_dir_all(path).expect("remove aliased dataset");
     }
 
     #[test]
