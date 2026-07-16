@@ -261,28 +261,30 @@ impl StereoPairer {
         };
 
         if best_delta <= self.window.as_ns() {
+            self.discard_right_prefix(best_idx, false);
             let left = self
                 .left
                 .pop_front()
                 .expect("front frame observed immediately before removal");
             let right = self
                 .right
-                .remove(best_idx)
-                .expect("best right index came from the same private queue");
+                .pop_front()
+                .expect("selected right remained after discarding its strict prefix");
             self.stats.paired = self.stats.paired.saturating_add(1);
             return PairingOutcome::Produced(StereoPair::from_parts(left, right));
         }
 
         let sensor = if best_ts < left_ts {
-            self.right.remove(best_idx);
-            self.stats.dropped_right = self.stats.dropped_right.saturating_add(1);
+            // Every preceding right is older and no closer to this left frame. Future left
+            // timestamps can only make that prefix less useful, so account for it in one step.
+            self.discard_right_prefix(best_idx + 1, true);
             SensorId::StereoRight
         } else {
             self.left.pop_front();
             self.stats.dropped_left = self.stats.dropped_left.saturating_add(1);
+            self.stats.outside_window = self.stats.outside_window.saturating_add(1);
             SensorId::StereoLeft
         };
-        self.stats.outside_window = self.stats.outside_window.saturating_add(1);
         PairingOutcome::Dropped {
             sensor,
             reason: PairingDropReason::OutsideWindow,
@@ -360,6 +362,19 @@ impl StereoPairer {
         }
 
         Some((best_idx, best_delta, best_ts))
+    }
+
+    fn discard_right_prefix(&mut self, count: usize, outside_window: bool) {
+        debug_assert!(count <= self.right.len());
+        for _ in 0..count {
+            self.right
+                .pop_front()
+                .expect("discard count was derived from the same private queue");
+            self.stats.dropped_right = self.stats.dropped_right.saturating_add(1);
+            if outside_window {
+                self.stats.outside_window = self.stats.outside_window.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -451,6 +466,64 @@ mod tests {
             .push_left(frame(SensorId::StereoLeft, 10, 1))
             .expect("left frame");
         assert!(pairer.next_pair().is_none());
+    }
+
+    #[test]
+    fn selected_later_right_supersedes_earlier_rights_without_crossing() {
+        let window = PairingWindowNs::new(10).expect("valid pairing window");
+        let mut pairer = StereoPairer::new(window);
+        for (timestamp_ns, frame_id) in [(8, 1), (10, 2)] {
+            pairer
+                .push_left(frame(SensorId::StereoLeft, timestamp_ns, frame_id))
+                .expect("monotonic left frame");
+        }
+        for (timestamp_ns, frame_id) in [(0, 3), (9, 4)] {
+            pairer
+                .push_right(frame(SensorId::StereoRight, timestamp_ns, frame_id))
+                .expect("monotonic right frame");
+        }
+
+        let first = pairer.next_pair().expect("nearest pending pair");
+        assert_eq!(first.left().timestamp().as_nanos(), 8);
+        assert_eq!(first.right().timestamp().as_nanos(), 9);
+        assert!(
+            pairer.next_pair().is_none(),
+            "superseded right must not cross"
+        );
+        assert_eq!(pairer.stats().dropped_right, 1);
+
+        pairer
+            .push_right(frame(SensorId::StereoRight, 11, 5))
+            .expect("future monotonic right frame");
+        let second = pairer.next_pair().expect("monotonic continuation");
+        assert_eq!(second.left().timestamp().as_nanos(), 10);
+        assert_eq!(second.right().timestamp().as_nanos(), 11);
+    }
+
+    #[test]
+    fn old_out_of_window_prefix_is_counted_per_discarded_frame() {
+        let window = PairingWindowNs::new(1).expect("valid pairing window");
+        let mut pairer = StereoPairer::new(window);
+        pairer
+            .push_left(frame(SensorId::StereoLeft, 10, 1))
+            .expect("left frame");
+        for (timestamp_ns, frame_id) in [(0, 2), (1, 3), (2, 4)] {
+            pairer
+                .push_right(frame(SensorId::StereoRight, timestamp_ns, frame_id))
+                .expect("monotonic right frame");
+        }
+
+        assert!(pairer.next_pair().is_none());
+        assert_eq!(pairer.stats().dropped_right, 3);
+        assert_eq!(pairer.stats().outside_window, 3);
+
+        pairer
+            .push_right(frame(SensorId::StereoRight, 10, 5))
+            .expect("future monotonic right frame");
+        assert!(
+            pairer.next_pair().is_some(),
+            "left frame must remain pending"
+        );
     }
 
     #[test]
