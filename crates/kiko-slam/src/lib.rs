@@ -95,7 +95,9 @@ pub use triangulation::{
     RectifiedStereoError, TriangulationConfig, TriangulationConfigError, TriangulationError,
     TriangulationResult, TriangulationStats, Triangulator,
 };
-pub use viz::{RerunSink, VizConfigError, VizDecimation, VizDecimationError, VizLogError};
+pub use viz::{
+    RerunSink, VizConfigError, VizDecimation, VizDecimationError, VizFlushError, VizLogError,
+};
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(msg) = payload.downcast_ref::<&'static str>() {
