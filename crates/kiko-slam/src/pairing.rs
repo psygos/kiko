@@ -57,9 +57,15 @@ impl std::error::Error for PairingConfigError {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PairingStats {
+    /// Stereo pairs emitted by this pairer.
     pub paired: u64,
+    /// Left frames discarded by capacity or because no pending right was in the window.
     pub dropped_left: u64,
+    /// Right frames discarded by capacity, an out-of-window decision, or supersession by a
+    /// closer pending right.
     pub dropped_right: u64,
+    /// Frames discarded specifically because the nearest pending cross-stream timestamp was
+    /// outside the configured window.
     pub outside_window: u64,
 }
 
@@ -188,6 +194,11 @@ impl StereoPairer {
         Ok(())
     }
 
+    /// Match the oldest left frame to its nearest currently pending right frame.
+    ///
+    /// Ties select the earlier right timestamp. Rights before a selected match are superseded and
+    /// discarded so emitted timestamps remain strictly increasing on both streams. This method
+    /// cannot promise the globally nearest right because future arrivals are not yet observable.
     pub fn next_pair(&mut self) -> Option<StereoPair> {
         loop {
             let left = self.left.front()?;
@@ -196,14 +207,15 @@ impl StereoPairer {
             let (best_idx, best_delta, best_ts) = self.best_right(left_ts)?;
 
             if best_delta <= self.window.as_u64() {
+                self.discard_right_prefix(best_idx, false);
                 let left = self
                     .left
                     .pop_front()
                     .expect("front frame observed immediately before removal");
                 let right = self
                     .right
-                    .remove(best_idx)
-                    .expect("best right index came from the same private queue");
+                    .pop_front()
+                    .expect("selected right remained after discarding its strict prefix");
                 let pair = StereoPair::from_parts(left, right);
                 self.stats.paired = self.stats.paired.saturating_add(1);
                 return Some(pair);
@@ -211,13 +223,15 @@ impl StereoPairer {
 
             // No match in window: drop the older frame to advance.
             if best_ts < left_ts {
-                self.right.remove(best_idx);
-                self.stats.dropped_right = self.stats.dropped_right.saturating_add(1);
+                // Every preceding right is still older and at least as far from this left frame.
+                // Future left timestamps can only make that prefix less useful, so discard it in
+                // one decision while retaining the existing per-frame diagnostics.
+                self.discard_right_prefix(best_idx + 1, true);
             } else {
                 self.left.pop_front();
                 self.stats.dropped_left = self.stats.dropped_left.saturating_add(1);
+                self.stats.outside_window = self.stats.outside_window.saturating_add(1);
             }
-            self.stats.outside_window = self.stats.outside_window.saturating_add(1);
         }
     }
 
@@ -273,25 +287,38 @@ impl StereoPairer {
     }
 
     fn best_right(&self, left_ts: i64) -> Option<(usize, u64, i64)> {
-        if self.right.is_empty() {
-            return None;
-        }
-
+        let first = self.right.front()?;
         let mut best_idx = 0usize;
-        let mut best_delta = u64::MAX;
-        let mut best_ts = 0i64;
+        let mut best_ts = first.timestamp().as_nanos();
+        let mut best_delta = best_ts.abs_diff(left_ts);
 
-        for (idx, right) in self.right.iter().enumerate() {
+        // Strictly increasing right timestamps make absolute distance unimodal. Stop once the
+        // distance no longer improves; equality deliberately preserves the earlier timestamp.
+        for (idx, right) in self.right.iter().enumerate().skip(1) {
             let right_ts = right.timestamp().as_nanos();
             let delta = right_ts.abs_diff(left_ts);
-            if delta < best_delta {
-                best_delta = delta;
-                best_idx = idx;
-                best_ts = right_ts;
+            if delta >= best_delta {
+                break;
             }
+            best_delta = delta;
+            best_idx = idx;
+            best_ts = right_ts;
         }
 
         Some((best_idx, best_delta, best_ts))
+    }
+
+    fn discard_right_prefix(&mut self, count: usize, outside_window: bool) {
+        debug_assert!(count <= self.right.len());
+        for _ in 0..count {
+            self.right
+                .pop_front()
+                .expect("discard count was derived from the same private queue");
+            self.stats.dropped_right = self.stats.dropped_right.saturating_add(1);
+            if outside_window {
+                self.stats.outside_window = self.stats.outside_window.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -320,6 +347,52 @@ mod tests {
             vec![0; (width * height) as usize],
         )
         .expect("valid frame")
+    }
+
+    fn reference_pairing(
+        left: &[i64],
+        right: &[i64],
+        window_ns: u64,
+    ) -> (Vec<(i64, i64)>, PairingStats, usize, usize) {
+        let mut pairs = Vec::new();
+        let mut stats = PairingStats::default();
+        let mut left_idx = 0usize;
+        let mut right_idx = 0usize;
+
+        while left_idx < left.len() && right_idx < right.len() {
+            let left_ts = left[left_idx];
+            let mut best_offset = 0usize;
+            let mut best_ts = right[right_idx];
+            let mut best_delta = best_ts.abs_diff(left_ts);
+            for (offset, &right_ts) in right[right_idx + 1..].iter().enumerate() {
+                let delta = right_ts.abs_diff(left_ts);
+                if delta < best_delta {
+                    best_offset = offset + 1;
+                    best_ts = right_ts;
+                    best_delta = delta;
+                }
+            }
+
+            if best_delta <= window_ns {
+                stats.dropped_right += u64::try_from(best_offset).expect("small reference count");
+                right_idx += best_offset + 1;
+                left_idx += 1;
+                stats.paired += 1;
+                pairs.push((left_ts, best_ts));
+            } else if best_ts < left_ts {
+                let discarded = best_offset + 1;
+                let discarded = u64::try_from(discarded).expect("small reference count");
+                right_idx += best_offset + 1;
+                stats.dropped_right += discarded;
+                stats.outside_window += discarded;
+            } else {
+                left_idx += 1;
+                stats.dropped_left += 1;
+                stats.outside_window += 1;
+            }
+        }
+
+        (pairs, stats, left.len() - left_idx, right.len() - right_idx)
     }
 
     #[test]
@@ -421,6 +494,196 @@ mod tests {
             .push_left(frame(SensorId::StereoLeft, 10, 1))
             .expect("left frame");
         assert!(pairer.next_pair().is_none());
+    }
+
+    #[test]
+    fn selected_later_right_supersedes_earlier_rights_without_crossing() {
+        let window = PairingWindowNs::new(10).expect("valid pairing window");
+        let mut pairer = StereoPairer::new(window);
+        for (timestamp_ns, frame_id) in [(8, 1), (10, 2)] {
+            pairer
+                .push_left(frame(SensorId::StereoLeft, timestamp_ns, frame_id))
+                .expect("monotonic left frame");
+        }
+        for (timestamp_ns, frame_id) in [(0, 3), (9, 4)] {
+            pairer
+                .push_right(frame(SensorId::StereoRight, timestamp_ns, frame_id))
+                .expect("monotonic right frame");
+        }
+
+        let first = pairer.next_pair().expect("nearest pending pair");
+        assert_eq!(first.left().timestamp().as_nanos(), 8);
+        assert_eq!(first.right().timestamp().as_nanos(), 9);
+        assert!(
+            pairer.next_pair().is_none(),
+            "superseded right must not cross"
+        );
+        assert_eq!(
+            pairer.stats(),
+            PairingStats {
+                paired: 1,
+                dropped_left: 0,
+                dropped_right: 1,
+                outside_window: 0,
+            }
+        );
+
+        pairer
+            .push_right(frame(SensorId::StereoRight, 11, 5))
+            .expect("future monotonic right frame");
+        let second = pairer.next_pair().expect("monotonic continuation");
+        assert_eq!(second.left().timestamp().as_nanos(), 10);
+        assert_eq!(second.right().timestamp().as_nanos(), 11);
+    }
+
+    #[test]
+    fn old_out_of_window_prefix_is_counted_per_discarded_frame() {
+        let window = PairingWindowNs::new(1).expect("valid pairing window");
+        let mut pairer = StereoPairer::new(window);
+        pairer
+            .push_left(frame(SensorId::StereoLeft, 10, 1))
+            .expect("left frame");
+        for (timestamp_ns, frame_id) in [(0, 2), (1, 3), (2, 4)] {
+            pairer
+                .push_right(frame(SensorId::StereoRight, timestamp_ns, frame_id))
+                .expect("monotonic right frame");
+        }
+
+        assert!(pairer.next_pair().is_none());
+        assert_eq!(
+            pairer.stats(),
+            PairingStats {
+                paired: 0,
+                dropped_left: 0,
+                dropped_right: 3,
+                outside_window: 3,
+            }
+        );
+
+        pairer
+            .push_right(frame(SensorId::StereoRight, 10, 5))
+            .expect("future monotonic right frame");
+        assert!(
+            pairer.next_pair().is_some(),
+            "left frame must remain pending"
+        );
+    }
+
+    #[test]
+    fn nearest_tie_uses_the_earlier_right_timestamp() {
+        let window = PairingWindowNs::new(5).expect("valid pairing window");
+        let mut pairer = StereoPairer::new(window);
+        pairer
+            .push_left(frame(SensorId::StereoLeft, 0, 1))
+            .expect("left frame");
+        pairer
+            .push_right(frame(SensorId::StereoRight, -5, 2))
+            .expect("earlier right frame");
+        pairer
+            .push_right(frame(SensorId::StereoRight, 5, 3))
+            .expect("later right frame");
+
+        let pair = pairer.next_pair().expect("in-window tie");
+        assert_eq!(pair.right().timestamp().as_nanos(), -5);
+        assert_eq!(pairer.stats().dropped_right, 0);
+    }
+
+    #[test]
+    fn full_range_right_prefix_does_not_overflow_distance_ordering() {
+        let window = PairingWindowNs::new(0).expect("exact pairing window");
+        let mut pairer = StereoPairer::new(window);
+        pairer
+            .push_left(frame(SensorId::StereoLeft, i64::MAX, 1))
+            .expect("left frame");
+        pairer
+            .push_right(frame(SensorId::StereoRight, i64::MIN, 2))
+            .expect("minimum right timestamp");
+        pairer
+            .push_right(frame(SensorId::StereoRight, i64::MAX, 3))
+            .expect("maximum right timestamp");
+
+        let pair = pairer.next_pair().expect("exact maximum timestamp pair");
+        assert_eq!(pair.timestamp_delta_ns(), 0);
+        assert_eq!(pairer.stats().dropped_right, 1);
+        assert_eq!(pairer.stats().outside_window, 0);
+    }
+
+    #[test]
+    fn nearest_pending_policy_matches_exhaustive_small_reference() {
+        const VALUES: [i64; 5] = [-2, -1, 0, 1, 2];
+        for left_mask in 0usize..1 << VALUES.len() {
+            let left: Vec<i64> = VALUES
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| ((left_mask >> index) & 1 == 1).then_some(value))
+                .collect();
+            for right_mask in 0usize..1 << VALUES.len() {
+                let right: Vec<i64> = VALUES
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, &value)| ((right_mask >> index) & 1 == 1).then_some(value))
+                    .collect();
+                for window_ns in 0..=4 {
+                    let window = PairingWindowNs::new(window_ns).expect("small valid window");
+                    let mut pairer = StereoPairer::new(window);
+                    for (frame_id, &timestamp_ns) in left.iter().enumerate() {
+                        pairer
+                            .push_left(frame(
+                                SensorId::StereoLeft,
+                                timestamp_ns,
+                                u64::try_from(frame_id).expect("small frame id"),
+                            ))
+                            .expect("strictly increasing left timestamps");
+                    }
+                    for (frame_id, &timestamp_ns) in right.iter().enumerate() {
+                        pairer
+                            .push_right(frame(
+                                SensorId::StereoRight,
+                                timestamp_ns,
+                                u64::try_from(frame_id).expect("small frame id"),
+                            ))
+                            .expect("strictly increasing right timestamps");
+                    }
+
+                    let mut actual = Vec::new();
+                    while let Some(pair) = pairer.next_pair() {
+                        actual.push((
+                            pair.left().timestamp().as_nanos(),
+                            pair.right().timestamp().as_nanos(),
+                        ));
+                        assert!(pair.timestamp_delta_ns() <= window.as_u64());
+                    }
+                    let (expected, expected_stats, pending_left, pending_right) =
+                        reference_pairing(&left, &right, window.as_u64());
+                    assert_eq!(
+                        actual, expected,
+                        "left={left:?}, right={right:?}, window={window_ns}"
+                    );
+                    assert_eq!(pairer.stats(), expected_stats);
+                    assert_eq!(pairer.left.len(), pending_left);
+                    assert_eq!(pairer.right.len(), pending_right);
+                    assert!(
+                        actual
+                            .windows(2)
+                            .all(|pairs| { pairs[0].0 < pairs[1].0 && pairs[0].1 < pairs[1].1 })
+                    );
+
+                    let paired = actual.len();
+                    assert_eq!(
+                        left.len(),
+                        paired
+                            + usize::try_from(pairer.stats().dropped_left).expect("small counter")
+                            + pairer.left.len()
+                    );
+                    assert_eq!(
+                        right.len(),
+                        paired
+                            + usize::try_from(pairer.stats().dropped_right).expect("small counter")
+                            + pairer.right.len()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

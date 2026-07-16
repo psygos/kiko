@@ -2599,39 +2599,36 @@ fn pair_entries(
     right: &[FrameInfo],
     window_ns: u64,
 ) -> (Vec<ManifestEntry>, u64, u64, u64, u64) {
+    debug_assert!(
+        left.windows(2)
+            .all(|pair| pair[0].timestamp_ns < pair[1].timestamp_ns)
+    );
+    debug_assert!(
+        right
+            .windows(2)
+            .all(|pair| pair[0].timestamp_ns < pair[1].timestamp_ns)
+    );
+
     let mut entries = Vec::with_capacity(left.len());
-    let mut right_used = vec![false; right.len()];
     let mut paired_count = 0u64;
     let mut left_orphans = 0u64;
     let mut outside_window = 0u64;
     let has_right = !right.is_empty();
 
+    // Rights below this floor were paired or superseded by a closer later match. Keeping the floor
+    // monotone prevents inferred pairs from crossing while retaining nearest-eligible semantics.
+    let mut right_floor = 0usize;
     let mut right_idx = 0usize;
     for left_frame in left {
-        while right_idx + 1 < right.len() && right[right_idx].timestamp_ns < left_frame.timestamp_ns
-        {
+        right_idx = right_idx.max(right_floor);
+        while right_idx < right.len() && right[right_idx].timestamp_ns < left_frame.timestamp_ns {
             right_idx += 1;
         }
 
-        let mut left_candidate = right_idx as i64 - 1;
-        while left_candidate >= 0 && right_used[left_candidate as usize] {
-            left_candidate -= 1;
-        }
-        let left_candidate = if left_candidate >= 0 {
-            Some(left_candidate as usize)
-        } else {
-            None
-        };
-
-        let mut right_candidate = right_idx;
-        while right_candidate < right.len() && right_used[right_candidate] {
-            right_candidate += 1;
-        }
-        let right_candidate = if right_candidate < right.len() {
-            Some(right_candidate)
-        } else {
-            None
-        };
+        let left_candidate = right_idx
+            .checked_sub(1)
+            .filter(|&candidate| candidate >= right_floor);
+        let right_candidate = (right_idx < right.len()).then_some(right_idx);
 
         let mut best_idx = None;
         let mut best_delta = None;
@@ -2658,7 +2655,7 @@ fn pair_entries(
                     },
                 }
             } else {
-                right_used[idx] = true;
+                right_floor = idx + 1;
                 paired_count += 1;
                 ManifestEntry {
                     left: ManifestFrameRef {
@@ -2677,6 +2674,8 @@ fn pair_entries(
         } else {
             left_orphans += 1;
             let reason = if has_right {
+                // Earlier unpaired files can still exist below `right_floor`; exhausted means no
+                // order-preserving right remains eligible for this or a later manifest entry.
                 PairReason::RightExhausted
             } else {
                 PairReason::NoRightFrames
@@ -2693,7 +2692,10 @@ fn pair_entries(
         entries.push(entry);
     }
 
-    let right_orphans = right_used.iter().filter(|used| !**used).count() as u64;
+    let total_right = u64::try_from(right.len()).expect("supported host usize fits u64 counters");
+    let right_orphans = total_right
+        .checked_sub(paired_count)
+        .expect("one-to-one pairing cannot exceed the right input count");
     (
         entries,
         paired_count,
@@ -2750,6 +2752,100 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum PairEntrySignature {
+        Paired {
+            right_timestamp_ns: i64,
+            delta_ns: u64,
+        },
+        OutsideWindow,
+        NoRightFrames,
+        RightExhausted,
+    }
+
+    fn pair_entry_signatures(entries: &[ManifestEntry]) -> Vec<PairEntrySignature> {
+        entries
+            .iter()
+            .map(|entry| match &entry.pairing {
+                ManifestPairing::Paired { right, delta_ns } => PairEntrySignature::Paired {
+                    right_timestamp_ns: right.timestamp_ns,
+                    delta_ns: *delta_ns,
+                },
+                ManifestPairing::MissingRight {
+                    reason: PairReason::OutsideWindow,
+                } => PairEntrySignature::OutsideWindow,
+                ManifestPairing::MissingRight {
+                    reason: PairReason::NoRightFrames,
+                } => PairEntrySignature::NoRightFrames,
+                ManifestPairing::MissingRight {
+                    reason: PairReason::RightExhausted,
+                } => PairEntrySignature::RightExhausted,
+            })
+            .collect()
+    }
+
+    fn reference_pair_entries(
+        left: &[FrameInfo],
+        right: &[FrameInfo],
+        window_ns: u64,
+    ) -> (Vec<PairEntrySignature>, u64, u64, u64, u64) {
+        let mut signatures = Vec::with_capacity(left.len());
+        let mut right_floor = 0usize;
+        let mut paired_count = 0u64;
+        let mut outside_window = 0u64;
+
+        for left_frame in left {
+            let mut best = None;
+            for (index, right_frame) in right.iter().enumerate().skip(right_floor) {
+                let delta = right_frame.timestamp_ns.abs_diff(left_frame.timestamp_ns);
+                if best.is_none_or(|(_, best_delta)| delta < best_delta) {
+                    best = Some((index, delta));
+                }
+            }
+
+            match best {
+                Some((index, delta_ns)) if delta_ns <= window_ns => {
+                    right_floor = index + 1;
+                    paired_count += 1;
+                    signatures.push(PairEntrySignature::Paired {
+                        right_timestamp_ns: right[index].timestamp_ns,
+                        delta_ns,
+                    });
+                }
+                Some(_) => {
+                    outside_window += 1;
+                    signatures.push(PairEntrySignature::OutsideWindow);
+                }
+                None if right.is_empty() => {
+                    signatures.push(PairEntrySignature::NoRightFrames);
+                }
+                None => {
+                    signatures.push(PairEntrySignature::RightExhausted);
+                }
+            }
+        }
+
+        let total_left = u64::try_from(left.len()).expect("small reference count");
+        let total_right = u64::try_from(right.len()).expect("small reference count");
+        (
+            signatures,
+            paired_count,
+            total_left - paired_count,
+            total_right - paired_count,
+            outside_window,
+        )
+    }
+
+    fn frame_infos(timestamps: &[i64], stream: &str) -> Vec<FrameInfo> {
+        timestamps
+            .iter()
+            .map(|&timestamp_ns| FrameInfo {
+                timestamp_ns,
+                path: format!("{stream}-{timestamp_ns}"),
+            })
+            .collect()
+    }
 
     fn unique_dataset_path(test_name: &str) -> PathBuf {
         let id = NEXT_PATH_ID.fetch_add(1, Ordering::Relaxed);
@@ -3089,6 +3185,130 @@ mod tests {
                 max: 0,
             })
         );
+    }
+
+    #[test]
+    fn inferred_pairing_supersedes_earlier_right_instead_of_crossing() {
+        let left = frame_infos(&[6, 7], "left");
+        let right = frame_infos(&[0, 7], "right");
+
+        let (entries, paired, left_orphans, right_orphans, outside_window) =
+            pair_entries(&left, &right, 7);
+
+        assert_eq!(
+            pair_entry_signatures(&entries),
+            vec![
+                PairEntrySignature::Paired {
+                    right_timestamp_ns: 7,
+                    delta_ns: 1,
+                },
+                PairEntrySignature::RightExhausted,
+            ]
+        );
+        assert_eq!(
+            (paired, left_orphans, right_orphans, outside_window),
+            (1, 1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn inferred_pairing_tie_keeps_the_successor_eligible() {
+        let left = frame_infos(&[5, 6], "left");
+        let right = frame_infos(&[4, 6], "right");
+
+        let (entries, paired, left_orphans, right_orphans, outside_window) =
+            pair_entries(&left, &right, 1);
+
+        assert_eq!(
+            pair_entry_signatures(&entries),
+            vec![
+                PairEntrySignature::Paired {
+                    right_timestamp_ns: 4,
+                    delta_ns: 1,
+                },
+                PairEntrySignature::Paired {
+                    right_timestamp_ns: 6,
+                    delta_ns: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            (paired, left_orphans, right_orphans, outside_window),
+            (2, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn inferred_pairing_outside_window_does_not_consume_a_future_match() {
+        let left = frame_infos(&[0, 9], "left");
+        let right = frame_infos(&[10], "right");
+
+        let (entries, paired, left_orphans, right_orphans, outside_window) =
+            pair_entries(&left, &right, 1);
+
+        assert_eq!(
+            pair_entry_signatures(&entries),
+            vec![
+                PairEntrySignature::OutsideWindow,
+                PairEntrySignature::Paired {
+                    right_timestamp_ns: 10,
+                    delta_ns: 1,
+                },
+            ]
+        );
+        assert_eq!(
+            (paired, left_orphans, right_orphans, outside_window),
+            (1, 1, 0, 1)
+        );
+    }
+
+    #[test]
+    fn inferred_pairing_matches_exhaustive_monotone_floor_reference() {
+        const VALUES: [i64; 5] = [-4, -1, 0, 1, 4];
+        for left_mask in 0usize..1 << VALUES.len() {
+            let left_timestamps: Vec<i64> = VALUES
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| ((left_mask >> index) & 1 == 1).then_some(value))
+                .collect();
+            let left = frame_infos(&left_timestamps, "left");
+            for right_mask in 0usize..1 << VALUES.len() {
+                let right_timestamps: Vec<i64> = VALUES
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, &value)| ((right_mask >> index) & 1 == 1).then_some(value))
+                    .collect();
+                let right = frame_infos(&right_timestamps, "right");
+                for window_ns in 0..=4 {
+                    let actual = pair_entries(&left, &right, window_ns);
+                    let expected = reference_pair_entries(&left, &right, window_ns);
+                    assert_eq!(
+                        (
+                            pair_entry_signatures(&actual.0),
+                            actual.1,
+                            actual.2,
+                            actual.3,
+                            actual.4,
+                        ),
+                        expected,
+                        "left={left_timestamps:?}, right={right_timestamps:?}, window={window_ns}"
+                    );
+
+                    let paired_rights: Vec<i64> = actual
+                        .0
+                        .iter()
+                        .filter_map(|entry| match &entry.pairing {
+                            ManifestPairing::Paired { right, .. } => Some(right.timestamp_ns),
+                            ManifestPairing::MissingRight { .. } => None,
+                        })
+                        .collect();
+                    assert!(
+                        paired_rights.windows(2).all(|pair| pair[0] < pair[1]),
+                        "paired right timestamps must be strict: {paired_rights:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
