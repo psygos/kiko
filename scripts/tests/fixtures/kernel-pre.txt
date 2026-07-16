@@ -1,0 +1,2 @@
+[    0.000000] Booting Linux
+[    1.000000] nvgpu initialized

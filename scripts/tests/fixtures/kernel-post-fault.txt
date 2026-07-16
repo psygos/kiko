@@ -1,0 +1,6 @@
+[    0.000000] Booting Linux
+[    1.000000] nvgpu initialized
+[  100.000000] NVRM: Xid 31, MMU fault
+[  101.000000] Out of memory: Killed process 42 (kiko-slam)
+[  102.000000] soctherm: thermal critical shutdown
+[  103.000000] regulator: brownout power fault
