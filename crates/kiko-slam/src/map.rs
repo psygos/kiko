@@ -16,6 +16,15 @@ const MIN_BLEND_ALPHA: f32 = 0.5 / BLEND_SCALE as f32;
 /// Rounding bias for fixed-point descriptor blending (half of BLEND_SCALE).
 const BLEND_ROUND: u32 = (BLEND_SCALE / 2) as u32;
 static NEXT_MAP_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MAP_LINEAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_monotonic_id(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+}
 
 new_key_type! {
     struct RawMapPointId;
@@ -562,11 +571,8 @@ pub struct MapInstanceId(u64);
 
 impl MapInstanceId {
     fn next() -> Self {
-        let value = NEXT_MAP_INSTANCE_ID
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("map instance ID space exhausted");
+        let value =
+            allocate_monotonic_id(&NEXT_MAP_INSTANCE_ID).expect("map instance ID space exhausted");
         Self(value)
     }
 
@@ -576,9 +582,49 @@ impl MapInstanceId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MapLineageId(u64);
+
+impl MapLineageId {
+    fn next() -> Self {
+        let value =
+            allocate_monotonic_id(&NEXT_MAP_LINEAGE_ID).expect("map lineage ID space exhausted");
+        Self(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MapVersion {
+    generation: MapGeneration,
+    lineage: MapLineageId,
+}
+
+impl MapVersion {
+    fn initial(lineage: MapLineageId) -> Self {
+        Self {
+            generation: MapGeneration::initial(),
+            lineage,
+        }
+    }
+
+    fn next(self, mutation_lineage: MapLineageId) -> Self {
+        Self {
+            generation: self.generation.next(),
+            lineage: mutation_lineage,
+        }
+    }
+}
+
+/// A process-local freshness token for one exact [`SlamMap`] revision.
+///
+/// Clones compare equal until either copy mutates. The generation remains a
+/// useful monotonic counter within one branch, but snapshot equality also
+/// distinguishes independently mutated branches at the same generation. This
+/// is not a structural content hash: equivalent mutations can produce unequal
+/// snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MapSnapshot {
     instance_id: MapInstanceId,
-    generation: MapGeneration,
+    version: MapVersion,
 }
 
 impl MapSnapshot {
@@ -587,18 +633,37 @@ impl MapSnapshot {
     }
 
     pub fn generation(self) -> MapGeneration {
-        self.generation
+        self.version.generation
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SlamMap {
     instance_id: MapInstanceId,
     points: SlotMap<RawMapPointId, MapPoint>,
     keyframes: SlotMap<RawKeyframeId, KeyframeEntry>,
     covisibility: CovisibilityGraph,
     frame_to_keyframe: HashMap<FrameId, KeyframeId>,
-    generation: MapGeneration,
+    version: MapVersion,
+    mutation_lineage: MapLineageId,
+}
+
+impl Clone for SlamMap {
+    fn clone(&self) -> Self {
+        let mutation_lineage = MapLineageId::next();
+        Self {
+            instance_id: self.instance_id,
+            points: self.points.clone(),
+            keyframes: self.keyframes.clone(),
+            covisibility: self.covisibility.clone(),
+            frame_to_keyframe: self.frame_to_keyframe.clone(),
+            version: self.version,
+            // The clone still represents exactly the source state. Reserve a
+            // distinct lineage only for its future successful mutations so
+            // asynchronous snapshots of an unmodified clone remain equal.
+            mutation_lineage,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -622,13 +687,15 @@ pub struct CovisibilitySnapshot {
 
 impl SlamMap {
     pub fn new() -> Self {
+        let lineage = MapLineageId::next();
         Self {
             instance_id: MapInstanceId::next(),
             points: SlotMap::with_key(),
             keyframes: SlotMap::with_key(),
             covisibility: CovisibilityGraph::default(),
             frame_to_keyframe: HashMap::new(),
-            generation: MapGeneration::initial(),
+            version: MapVersion::initial(lineage),
+            mutation_lineage: lineage,
         }
     }
 
@@ -694,10 +761,10 @@ impl SlamMap {
             keypoints,
         };
 
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         let kf_id = KeyframeId::new(self.instance_id, self.keyframes.insert(entry));
         self.frame_to_keyframe.insert(frame_id, kf_id);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(kf_id)
     }
 
@@ -758,7 +825,7 @@ impl SlamMap {
             });
         }
 
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         let point_id = MapPointId::new(
             self.instance_id,
             self.points.insert(MapPoint {
@@ -773,7 +840,7 @@ impl SlamMap {
             .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         entry.set_point_ref(first_obs.index, point_id);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(point_id)
     }
 
@@ -815,7 +882,7 @@ impl SlamMap {
             point.observations.iter().map(|o| o.keyframe_id).collect()
         };
 
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         for other in other_keyframes {
             self.covisibility.increment_pair(obs.keyframe_id, other);
         }
@@ -831,7 +898,7 @@ impl SlamMap {
             .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         entry.set_point_ref(obs.index, point_id);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(())
     }
 
@@ -846,9 +913,9 @@ impl SlamMap {
             .points
             .get_mut(raw_point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         point.update_descriptor(new_desc, blend);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(())
     }
 
@@ -865,9 +932,9 @@ impl SlamMap {
             .points
             .get_mut(raw_point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         point.set_position(position);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(())
     }
 
@@ -881,9 +948,9 @@ impl SlamMap {
             .keyframes
             .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(keyframe_id))?;
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         entry.set_pose(pose);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(())
     }
 
@@ -892,7 +959,7 @@ impl SlamMap {
         if !self.points.contains_key(raw_point_id) {
             return Err(MapError::MapPointNotFound(point_id));
         }
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         let point = self
             .points
             .remove(raw_point_id)
@@ -908,7 +975,7 @@ impl SlamMap {
         }
         self.covisibility
             .remove_point_observations(&point.observations);
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(())
     }
 
@@ -917,7 +984,7 @@ impl SlamMap {
         if !self.keyframes.contains_key(raw_keyframe_id) {
             return Err(MapError::KeyframeNotFound(keyframe_id));
         }
-        let next_generation = self.generation.next();
+        let next_version = self.version.next(self.mutation_lineage);
         let entry = self
             .keyframes
             .remove(raw_keyframe_id)
@@ -944,7 +1011,7 @@ impl SlamMap {
                 "point scheduled for removal was missing from map"
             );
         }
-        self.generation = next_generation;
+        self.version = next_version;
         Ok(())
     }
 
@@ -1157,13 +1224,13 @@ impl SlamMap {
     }
 
     pub fn generation(&self) -> MapGeneration {
-        self.generation
+        self.version.generation
     }
 
     pub fn snapshot(&self) -> MapSnapshot {
         MapSnapshot {
             instance_id: self.instance_id,
-            generation: self.generation,
+            version: self.version,
         }
     }
 
@@ -1596,6 +1663,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn monotonic_id_allocator_exhausts_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_monotonic_id(&counter), Some(u64::MAX - 1));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(allocate_monotonic_id(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+
     struct GenerationExhaustionFixture {
         map: SlamMap,
         snapshot: MapSnapshot,
@@ -1652,7 +1728,7 @@ mod tests {
                 )
                 .expect("map point");
 
-            map.generation = MapGeneration(u64::MAX);
+            map.version.generation = MapGeneration(u64::MAX);
             let snapshot = map.snapshot();
             Self {
                 map,
@@ -2071,6 +2147,106 @@ mod tests {
         assert_ne!(
             SlamMap::new().snapshot().instance_id(),
             map.snapshot().instance_id()
+        );
+    }
+
+    #[test]
+    fn independently_mutated_clones_have_distinct_snapshots() {
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                ImageSize::try_new(640, 480).expect("valid size"),
+                make_keypoints(1),
+            )
+            .expect("keyframe");
+        let source_snapshot = map.snapshot();
+        let mut first = map.clone();
+        let mut second = map.clone();
+
+        assert_eq!(first.snapshot(), source_snapshot);
+        assert_eq!(second.snapshot(), source_snapshot);
+
+        let first_pose = WorldToCamera::from_legacy_pose(crate::Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [1.0, 0.0, 0.0],
+        ));
+        let second_pose = WorldToCamera::from_legacy_pose(crate::Pose::from_rt(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0, 1.0, 0.0],
+        ));
+        first
+            .set_keyframe_pose(keyframe_id, first_pose)
+            .expect("mutate first branch");
+        second
+            .set_keyframe_pose(keyframe_id, second_pose)
+            .expect("mutate second branch");
+
+        assert_eq!(first.generation(), second.generation());
+        assert_eq!(
+            first.snapshot().instance_id(),
+            second.snapshot().instance_id()
+        );
+        assert_ne!(first.snapshot(), second.snapshot());
+        assert_ne!(
+            first
+                .keyframe(keyframe_id)
+                .expect("first keyframe")
+                .pose()
+                .translation(),
+            second
+                .keyframe(keyframe_id)
+                .expect("second keyframe")
+                .pose()
+                .translation()
+        );
+    }
+
+    #[test]
+    fn concurrent_clone_mutations_have_unique_snapshots() {
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                ImageSize::try_new(640, 480).expect("valid size"),
+                make_keypoints(1),
+            )
+            .expect("keyframe");
+
+        let snapshots: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|index| {
+                    let source = &map;
+                    scope.spawn(move || {
+                        let mut branch = source.clone();
+                        let pose = WorldToCamera::from_legacy_pose(crate::Pose::from_rt(
+                            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                            [index as f32 + 1.0, 0.0, 0.0],
+                        ));
+                        branch
+                            .set_keyframe_pose(keyframe_id, pose)
+                            .expect("mutate branch");
+                        branch.snapshot()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("clone worker"))
+                .collect()
+        });
+
+        assert!(snapshots.iter().all(|snapshot| {
+            snapshot.instance_id() == map.snapshot().instance_id()
+                && snapshot.generation().as_u64() == map.generation().as_u64() + 1
+        }));
+        assert_eq!(
+            snapshots.iter().copied().collect::<HashSet<_>>().len(),
+            snapshots.len()
         );
     }
 

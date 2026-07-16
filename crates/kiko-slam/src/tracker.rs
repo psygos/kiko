@@ -4893,6 +4893,92 @@ mod tests {
     }
 
     #[test]
+    fn correction_apply_rejects_divergent_clone_at_same_generation() {
+        let (base, first_keyframe, second_keyframe) =
+            make_map_with_two_keyframes_one_shared_point();
+        let keypoint = base.keyframe_keypoint(first_keyframe, 0).expect("keypoint");
+        let point_id = base
+            .map_point_for_keypoint(keypoint)
+            .expect("map lookup")
+            .expect("shared point");
+        let mut correction_source = base.clone();
+        let mut current = base.clone();
+        correction_source
+            .set_map_point_position(point_id, crate::WorldPoint3::new(1.0, 2.0, 3.0))
+            .expect("mutate correction branch");
+        current
+            .set_map_point_position(point_id, crate::WorldPoint3::new(-1.0, -2.0, 4.0))
+            .expect("mutate current branch");
+
+        assert_eq!(correction_source.generation(), current.generation());
+        assert_eq!(
+            correction_source.snapshot().instance_id(),
+            current.snapshot().instance_id()
+        );
+        assert_ne!(correction_source.snapshot(), current.snapshot());
+
+        let event = KeyframeEvent::try_new(
+            BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
+            second_keyframe,
+            BackendWindow::try_new(vec![first_keyframe, second_keyframe]).expect("window"),
+            correction_source.clone(),
+        )
+        .expect("backend event");
+        assert_eq!(event.source_snapshot, correction_source.snapshot());
+        let mut optimized = correction_source.clone();
+        optimized
+            .set_map_point_position(point_id, crate::WorldPoint3::new(5.0, 6.0, 7.0))
+            .expect("optimize correction branch");
+        let correction = CorrectionEvent::from_optimized_map(
+            &event,
+            &optimized,
+            BaResult::Converged {
+                iterations: 1,
+                final_cost: 0.0,
+            },
+        )
+        .expect("build correction");
+        let snapshot_before = current.snapshot();
+        let position_before = current.point(point_id).expect("current point").position();
+        let first_pose_before = current
+            .keyframe(first_keyframe)
+            .expect("first keyframe")
+            .pose()
+            .translation();
+        let second_pose_before = current
+            .keyframe(second_keyframe)
+            .expect("second keyframe")
+            .pose()
+            .translation();
+
+        assert!(matches!(
+            apply_correction_event(&mut current, &correction),
+            Err(ApplyCorrectionError::StaleSnapshot { .. })
+        ));
+        assert_eq!(current.snapshot(), snapshot_before);
+        assert_eq!(
+            current.point(point_id).expect("current point").position(),
+            position_before
+        );
+        assert_eq!(
+            current
+                .keyframe(first_keyframe)
+                .expect("first keyframe")
+                .pose()
+                .translation(),
+            first_pose_before
+        );
+        assert_eq!(
+            current
+                .keyframe(second_keyframe)
+                .expect("second keyframe")
+                .pose()
+                .translation(),
+            second_pose_before
+        );
+    }
+
+    #[test]
     fn correction_apply_rejects_different_map_instance() {
         let (map, keyframe_id, point_id) = make_map_with_single_point();
         let correction = CorrectionEvent {
