@@ -32,11 +32,11 @@ use crate::pose_graph::{
     PoseGraphError, PoseGraphOptimizer,
 };
 use crate::{
-    BaCorrection, BaResult, Detections, DiagnosticEvent, DownscaleFactor, EigenPlaces, Frame,
-    FrameDiagnostics, FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit, LightGlue,
-    LocalBaConfig, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
+    BaResult, Detections, DiagnosticEvent, DownscaleFactor, EigenPlaces, Frame, FrameDiagnostics,
+    FrameId, Keyframe, KeyframeRemovalReason, KeypointLimit, LightGlue, LocalBaConfig,
+    LocalBaError, LocalBundleAdjuster, LoopClosureRejectReason, MapObservation,
     MappingSessionTransition, Matches, ObservationSet, PinholeIntrinsics, PlaceDescriptorExtractor,
-    Point3, Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
+    Pose, RansacConfig, Raw, RectifiedStereo, StereoPair, SuperPoint, Timestamp,
     TriangulationConfig, TriangulationError, Triangulator, Verified,
     map::{KeyframeId, MapPointId, MapSnapshot, SlamMap},
     solve_pnp_ransac,
@@ -698,13 +698,21 @@ struct CorrectionEvent {
     request_id: BackendRequestId,
     source_snapshot: MapSnapshot,
     trigger_keyframe: KeyframeId,
-    correction: BaCorrection,
+    correction: BackendCorrection,
+}
+
+#[derive(Debug)]
+struct BackendCorrection {
+    corrected_poses: Vec<(KeyframeId, crate::WorldToCamera)>,
+    corrected_landmarks: Vec<(MapPointId, crate::WorldPoint3)>,
+    result: BaResult,
 }
 
 #[derive(Debug)]
 enum CorrectionBuildError {
     MissingKeyframe { keyframe_id: KeyframeId },
     MissingMapPoint { point_id: MapPointId },
+    Map(crate::map::MapError),
 }
 
 impl std::fmt::Display for CorrectionBuildError {
@@ -716,11 +724,30 @@ impl std::fmt::Display for CorrectionBuildError {
             CorrectionBuildError::MissingMapPoint { point_id } => {
                 write!(f, "optimized map missing map point {point_id:?}")
             }
+            CorrectionBuildError::Map(err) => {
+                write!(
+                    f,
+                    "optimized map lookup failed while building correction: {err}"
+                )
+            }
         }
     }
 }
 
-impl std::error::Error for CorrectionBuildError {}
+impl std::error::Error for CorrectionBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map(err) => Some(err),
+            Self::MissingKeyframe { .. } | Self::MissingMapPoint { .. } => None,
+        }
+    }
+}
+
+impl From<crate::map::MapError> for CorrectionBuildError {
+    fn from(err: crate::map::MapError) -> Self {
+        Self::Map(err)
+    }
+}
 
 impl CorrectionEvent {
     fn from_optimized_map(
@@ -728,9 +755,9 @@ impl CorrectionEvent {
         optimized_map: &SlamMap,
         result: BaResult,
     ) -> Result<Self, CorrectionBuildError> {
-        let mut correction = BaCorrection {
-            pose_deltas: Vec::new(),
-            landmark_deltas: Vec::new(),
+        let mut correction = BackendCorrection {
+            corrected_poses: Vec::new(),
+            corrected_landmarks: Vec::new(),
             result: result.clone(),
         };
 
@@ -738,42 +765,31 @@ impl CorrectionEvent {
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
         ) {
-            correction.pose_deltas = Vec::with_capacity(event.window.as_slice().len());
+            correction.corrected_poses = Vec::with_capacity(event.window.as_slice().len());
             for &keyframe_id in event.window.as_slice() {
-                let before = event
+                event
                     .map_snapshot
                     .keyframe(keyframe_id)
                     .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
                 let after = optimized_map
                     .keyframe(keyframe_id)
                     .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
-                let delta = crate::local_ba::se3_delta_between(
-                    before.pose().into_legacy_pose(),
-                    after.pose().into_legacy_pose(),
-                );
-                correction.pose_deltas.push((keyframe_id, delta));
+                correction.corrected_poses.push((keyframe_id, after.pose()));
             }
 
             let point_ids = collect_window_points(optimized_map, &event.window)?;
-            correction.landmark_deltas = Vec::with_capacity(point_ids.len());
+            correction.corrected_landmarks = Vec::with_capacity(point_ids.len());
             for point_id in point_ids {
-                let before = event
+                event
                     .map_snapshot
                     .point(point_id)
                     .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
                 let after = optimized_map
                     .point(point_id)
                     .ok_or(CorrectionBuildError::MissingMapPoint { point_id })?;
-                let before_pos = before.position();
-                let after_pos = after.position();
-                correction.landmark_deltas.push((
-                    point_id,
-                    [
-                        after_pos.x - before_pos.x,
-                        after_pos.y - before_pos.y,
-                        after_pos.z - before_pos.z,
-                    ],
-                ));
+                correction
+                    .corrected_landmarks
+                    .push((point_id, after.position()));
             }
         }
 
@@ -789,6 +805,7 @@ impl CorrectionEvent {
 #[derive(Debug)]
 enum BackendWorkerError {
     BuildCorrection(CorrectionBuildError),
+    BundleAdjustment(LocalBaError),
 }
 
 impl std::fmt::Display for BackendWorkerError {
@@ -796,6 +813,9 @@ impl std::fmt::Display for BackendWorkerError {
         match self {
             BackendWorkerError::BuildCorrection(err) => {
                 write!(f, "backend correction build failed: {err}")
+            }
+            BackendWorkerError::BundleAdjustment(err) => {
+                write!(f, "backend bundle adjustment failed: {err}")
             }
         }
     }
@@ -805,6 +825,7 @@ impl std::error::Error for BackendWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::BuildCorrection(err) => Some(err),
+            Self::BundleAdjustment(err) => Some(err),
         }
     }
 }
@@ -951,8 +972,10 @@ impl BackendWorker {
                         }
                         let mut optimized_map = event.map_snapshot.clone();
                         let result = ba
-                            .optimize_keyframe_window(&mut optimized_map, event.window.as_slice());
+                            .optimize_keyframe_window(&mut optimized_map, event.window.as_slice())
+                            .map_err(BackendWorkerError::BundleAdjustment)?;
                         CorrectionEvent::from_optimized_map(&event, &optimized_map, result)
+                            .map_err(BackendWorkerError::BuildCorrection)
                     }));
 
                     match processing {
@@ -972,7 +995,7 @@ impl BackendWorker {
                                 .send(BackendResponse::Failure {
                                     request_id,
                                     source_snapshot,
-                                    error: BackendWorkerError::BuildCorrection(err),
+                                    error: err,
                                 })
                                 .is_err()
                             {
@@ -1320,10 +1343,13 @@ pub enum TrackerError {
     GlobalDescriptor(GlobalDescriptorError),
     KeyframeDatabase(KeyframeDatabaseError),
     Triangulation(TriangulationError),
+    LocalBa(LocalBaError),
     Pnp(crate::PnpError),
     Map(crate::map::MapError),
     EssentialGraph(EssentialGraphError),
     PoseGraph(PoseGraphError),
+    Pose(crate::PoseError),
+    Transform(crate::TransformError),
     Pose64(crate::Pose64Error),
     PoseNarrowing(crate::PoseNarrowingError),
     LoopMapSnapshotMismatch {
@@ -1351,10 +1377,13 @@ impl std::fmt::Display for TrackerError {
                 write!(f, "keyframe database error: {err}")
             }
             TrackerError::Triangulation(err) => write!(f, "triangulation error: {err}"),
+            TrackerError::LocalBa(err) => write!(f, "local BA error: {err}"),
             TrackerError::Pnp(err) => write!(f, "pnp error: {err}"),
             TrackerError::Map(err) => write!(f, "map error: {err}"),
             TrackerError::EssentialGraph(err) => write!(f, "essential graph error: {err}"),
             TrackerError::PoseGraph(err) => write!(f, "pose graph error: {err}"),
+            TrackerError::Pose(err) => write!(f, "pose error: {err}"),
+            TrackerError::Transform(err) => write!(f, "coordinate transform error: {err}"),
             TrackerError::Pose64(err) => write!(f, "64-bit pose error: {err}"),
             TrackerError::PoseNarrowing(err) => write!(f, "pose narrowing error: {err}"),
             TrackerError::LoopMapSnapshotMismatch { verified, current } => write!(
@@ -1382,10 +1411,13 @@ impl std::error::Error for TrackerError {
             Self::GlobalDescriptor(err) => Some(err),
             Self::KeyframeDatabase(err) => Some(err),
             Self::Triangulation(err) => Some(err),
+            Self::LocalBa(err) => Some(err),
             Self::Pnp(err) => Some(err),
             Self::Map(err) => Some(err),
             Self::EssentialGraph(err) => Some(err),
             Self::PoseGraph(err) => Some(err),
+            Self::Pose(err) => Some(err),
+            Self::Transform(err) => Some(err),
             Self::Pose64(err) => Some(err),
             Self::PoseNarrowing(err) => Some(err),
             Self::LoopMapSnapshotMismatch { .. }
@@ -1431,6 +1463,12 @@ impl From<TriangulationError> for TrackerError {
     }
 }
 
+impl From<LocalBaError> for TrackerError {
+    fn from(err: LocalBaError) -> Self {
+        TrackerError::LocalBa(err)
+    }
+}
+
 impl From<crate::PnpError> for TrackerError {
     fn from(err: crate::PnpError) -> Self {
         TrackerError::Pnp(err)
@@ -1452,6 +1490,18 @@ impl From<EssentialGraphError> for TrackerError {
 impl From<PoseGraphError> for TrackerError {
     fn from(err: PoseGraphError) -> Self {
         TrackerError::PoseGraph(err)
+    }
+}
+
+impl From<crate::PoseError> for TrackerError {
+    fn from(err: crate::PoseError) -> Self {
+        TrackerError::Pose(err)
+    }
+}
+
+impl From<crate::TransformError> for TrackerError {
+    fn from(err: crate::TransformError) -> Self {
+        TrackerError::Transform(err)
     }
 }
 
@@ -1915,6 +1965,7 @@ impl SlamTracker {
                 LoopDetectError::VerificationFailed(LoopVerificationError::InvariantViolation(
                     message,
                 )) => return Err(TrackerError::InvariantViolation(message)),
+                LoopDetectError::Pose(source) => return Err(source.into()),
                 rejection => eprintln!("loop closure: {rejection}"),
             }
         }
@@ -2301,7 +2352,8 @@ impl SlamTracker {
             let correction = loop_pose_correction(
                 query_keyframe.pose().into_legacy_pose(),
                 verified.query_pose_world(),
-            );
+            )
+            .map_err(LoopDetectError::Pose)?;
             let translation = loop_translation_norm(correction);
             let rotation_deg = loop_rotation_angle_deg(correction);
             if translation > config.max_correction_translation()
@@ -2530,15 +2582,12 @@ impl SlamTracker {
         previous_pose: Pose,
         current_pose: Pose,
         cfg: RelocalizationConfig,
-    ) -> bool {
-        let delta = crate::local_ba::se3_delta_between(previous_pose, current_pose);
-        let translation_delta =
-            (delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]).sqrt();
-        let rotation_delta_deg = (delta[3] * delta[3] + delta[4] * delta[4] + delta[5] * delta[5])
-            .sqrt()
-            .to_degrees();
-        translation_delta <= cfg.max_translation_delta_m()
-            && rotation_delta_deg <= cfg.max_rotation_delta_deg()
+    ) -> Result<bool, crate::PoseError> {
+        let delta = crate::local_ba::se3_delta_between(previous_pose, current_pose)?;
+        let translation_delta = delta[0].hypot(delta[1]).hypot(delta[2]);
+        let rotation_delta_deg = delta[3].hypot(delta[4]).hypot(delta[5]).to_degrees();
+        Ok(translation_delta <= cfg.max_translation_delta_m()
+            && rotation_delta_deg <= cfg.max_rotation_delta_deg())
     }
 
     fn relocalization_candidate(
@@ -2622,7 +2671,7 @@ impl SlamTracker {
         attempt: RelocalizationAttempt,
         evidence: RelocalizationEvidence,
         cfg: RelocalizationConfig,
-    ) -> RelocalizationStep {
+    ) -> Result<RelocalizationStep, crate::PoseError> {
         let RelocalizationAttempt {
             mut session,
             is_final,
@@ -2635,20 +2684,28 @@ impl SlamTracker {
             } => {
                 let candidate_id = attachment.candidate;
                 let required_confirmations = cfg.min_confirmations();
+                let consistent_with_previous = match &session.phase {
+                    RelocalizationPhase::Confirming {
+                        candidate,
+                        pose_world: previous_pose,
+                        ..
+                    } if *candidate == candidate_id => {
+                        Self::relocalization_pose_consistent(*previous_pose, pose_world, cfg)?
+                    }
+                    _ => false,
+                };
                 match session.phase {
                     RelocalizationPhase::Confirming {
                         candidate,
                         confirmations,
-                        pose_world: previous_pose,
-                    } if candidate == candidate_id
-                        && Self::relocalization_pose_consistent(previous_pose, pose_world, cfg) =>
-                    {
+                        pose_world: _,
+                    } if candidate == candidate_id && consistent_with_previous => {
                         let next_confirmations = confirmations.get().saturating_add(1);
                         if next_confirmations >= required_confirmations {
-                            return RelocalizationStep::Recovered {
+                            return Ok(RelocalizationStep::Recovered {
                                 attachment,
                                 pose_world,
-                            };
+                            });
                         }
                         RelocalizationPhase::Confirming {
                             candidate,
@@ -2658,10 +2715,10 @@ impl SlamTracker {
                         }
                     }
                     _ if required_confirmations <= 1 => {
-                        return RelocalizationStep::Recovered {
+                        return Ok(RelocalizationStep::Recovered {
                             attachment,
                             pose_world,
-                        };
+                        });
                     }
                     _ => RelocalizationPhase::Confirming {
                         candidate: candidate_id,
@@ -2672,10 +2729,10 @@ impl SlamTracker {
             }
         };
         if is_final {
-            RelocalizationStep::Exhausted
+            Ok(RelocalizationStep::Exhausted)
         } else {
             session.phase = next_phase;
-            RelocalizationStep::Continue(session)
+            Ok(RelocalizationStep::Continue(session))
         }
     }
 
@@ -2769,7 +2826,7 @@ impl SlamTracker {
             RelocalizationEvidence::Verified { .. } => TrackingHealth::Degraded,
         };
 
-        match Self::relocalization_step(attempt, evidence, cfg) {
+        match Self::relocalization_step(attempt, evidence, cfg)? {
             RelocalizationStep::Recovered {
                 attachment,
                 pose_world,
@@ -2975,12 +3032,13 @@ impl SlamTracker {
 
         let pose_world = result.pose;
         let pose_world_legacy = pose_world.into_legacy_pose();
-        let refined_world = ObservationSet::new(map_observations, self.ba.min_observations())
-            .ok()
-            .and_then(|set| self.ba.push_frame(&self.map, pose_world_legacy, set));
+        let observation_set = ObservationSet::new(map_observations, self.ba.min_observations())
+            .map_err(LocalBaError::from)?;
+        let refined_world = self
+            .ba
+            .push_frame(&self.map, pose_world_legacy, observation_set)?;
 
-        let pose_world =
-            crate::WorldToCamera::from_legacy_pose(refined_world.unwrap_or(pose_world_legacy));
+        let pose_world = crate::WorldToCamera::from_legacy_pose(refined_world);
         if self.consecutive_tracking_failures > 0 {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
@@ -3082,12 +3140,12 @@ impl SlamTracker {
                                         "backend submit failed for keyframe {keyframe_id:?}: {err}"
                                     );
                                     let result =
-                                        self.ba.optimize_keyframe_window(&mut self.map, &window);
-                                    ba_result = Some(result.clone());
+                                        self.ba.optimize_keyframe_window(&mut self.map, &window)?;
+                                    ba_result = Some(result);
                                 }
                             } else {
                                 let result =
-                                    self.ba.optimize_keyframe_window(&mut self.map, &window);
+                                    self.ba.optimize_keyframe_window(&mut self.map, &window)?;
                                 ba_result = Some(result);
                             }
                         }
@@ -3545,7 +3603,7 @@ fn stage_keyframe_in_map(
             continue;
         }
         let descriptor = keyframe.detections().descriptors()[det_idx].quantize();
-        let world = camera_to_world(pose_world, *landmark);
+        let world = camera_to_world(pose_world, *landmark)?;
         staged.add_map_point(world, descriptor, keypoint_ref)?;
     }
     Ok((staged, keyframe_id))
@@ -3582,8 +3640,8 @@ fn remove_keyframe_from_graph_and_db(
 fn camera_to_world(
     pose_world: crate::WorldToCamera,
     point: crate::CameraPoint3,
-) -> crate::WorldPoint3 {
-    pose_world.inverse().transform_point(point)
+) -> Result<crate::WorldPoint3, TrackerError> {
+    Ok(pose_world.try_inverse()?.try_transform_point(point)?)
 }
 
 fn build_shared_matches(
@@ -3628,10 +3686,8 @@ fn collect_window_points(
             .keyframe(keyframe_id)
             .ok_or(CorrectionBuildError::MissingKeyframe { keyframe_id })?;
         for index in 0..keyframe.len() {
-            let keypoint_ref = map
-                .keyframe_keypoint(keyframe_id, index)
-                .map_err(|_| CorrectionBuildError::MissingKeyframe { keyframe_id })?;
-            let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
+            let keypoint_ref = map.keyframe_keypoint(keyframe_id, index)?;
+            let Some(point_id) = map.map_point_for_keypoint(keypoint_ref)? else {
                 continue;
             };
             if seen.insert(point_id) {
@@ -3654,14 +3710,14 @@ fn apply_correction_event(
         });
     }
 
-    for (keyframe_id, _) in &correction.correction.pose_deltas {
+    for (keyframe_id, _) in &correction.correction.corrected_poses {
         if map.keyframe(*keyframe_id).is_none() {
             return Err(ApplyCorrectionError::MissingKeyframe {
                 keyframe_id: *keyframe_id,
             });
         }
     }
-    for (point_id, _) in &correction.correction.landmark_deltas {
+    for (point_id, _) in &correction.correction.corrected_landmarks {
         if map.point(*point_id).is_none() {
             return Err(ApplyCorrectionError::MissingMapPoint {
                 point_id: *point_id,
@@ -3669,33 +3725,14 @@ fn apply_correction_event(
         }
     }
 
-    for (keyframe_id, delta) in &correction.correction.pose_deltas {
-        let current_pose = map
-            .keyframe(*keyframe_id)
-            .ok_or(ApplyCorrectionError::MissingKeyframe {
-                keyframe_id: *keyframe_id,
-            })?
-            .pose();
-        let corrected = crate::local_ba::apply_se3_delta(current_pose.into_legacy_pose(), *delta);
-        map.set_keyframe_pose(
-            *keyframe_id,
-            crate::WorldToCamera::from_legacy_pose(corrected),
-        )?;
+    let mut staged = map.clone();
+    for (keyframe_id, corrected_pose) in &correction.correction.corrected_poses {
+        staged.set_keyframe_pose(*keyframe_id, *corrected_pose)?;
     }
-    for (point_id, delta) in &correction.correction.landmark_deltas {
-        let current = map
-            .point(*point_id)
-            .ok_or(ApplyCorrectionError::MissingMapPoint {
-                point_id: *point_id,
-            })?
-            .position();
-        let corrected = Point3 {
-            x: current.x + delta[0],
-            y: current.y + delta[1],
-            z: current.z + delta[2],
-        };
-        map.set_map_point_position(*point_id, corrected)?;
+    for (point_id, corrected_position) in &correction.correction.corrected_landmarks {
+        staged.set_map_point_position(*point_id, *corrected_position)?;
     }
+    *map = staged;
     Ok(())
 }
 
@@ -3801,8 +3838,7 @@ fn apply_loop_closure_correction(
     let mut point_updates = Vec::new();
     for (point_id, point) in staged_map.points() {
         let world = point.position();
-        let world_vec = [world.x, world.y, world.z];
-        let mut accum = [0.0_f32; 3];
+        let mut accum = [0.0_f64; 3];
         let mut count = 0usize;
 
         for observation in point.observations() {
@@ -3814,35 +3850,34 @@ fn apply_loop_closure_correction(
                 continue;
             };
 
-            let camera = crate::math::transform_point(
-                old_pose.rotation(),
-                old_pose.translation(),
-                world_vec,
-            );
-            let corrected_world = camera_to_world(
-                crate::WorldToCamera::from_legacy_pose(new_pose),
-                crate::CameraPoint3 {
-                    x: camera[0],
-                    y: camera[1],
-                    z: camera[2],
-                },
-            );
-            accum[0] += corrected_world.x;
-            accum[1] += corrected_world.y;
-            accum[2] += corrected_world.z;
-            count = count.saturating_add(1);
+            let camera =
+                crate::WorldToCamera::from_legacy_pose(old_pose).try_transform_point(world)?;
+            let corrected_world =
+                camera_to_world(crate::WorldToCamera::from_legacy_pose(new_pose), camera)?;
+            accum[0] += f64::from(corrected_world.x);
+            accum[1] += f64::from(corrected_world.y);
+            accum[2] += f64::from(corrected_world.z);
+            count = count
+                .checked_add(1)
+                .ok_or(TrackerError::InvariantViolation(
+                    "map-point observation count overflow",
+                ))?;
         }
 
         if count > 0 {
-            let inv_count = 1.0_f32 / count as f32;
-            point_updates.push((
-                point_id,
-                Point3 {
-                    x: accum[0] * inv_count,
-                    y: accum[1] * inv_count,
-                    z: accum[2] * inv_count,
-                },
-            ));
+            let count = u32::try_from(count).map_err(|_| {
+                TrackerError::InvariantViolation(
+                    "map-point observation count exceeds the exact averaging domain",
+                )
+            })?;
+            let inv_count = 1.0_f64 / f64::from(count);
+            let corrected = crate::WorldPoint3::try_from_f64([
+                accum[0] * inv_count,
+                accum[1] * inv_count,
+                accum[2] * inv_count,
+            ])
+            .map_err(crate::map::MapError::InvalidMapPointPosition)?;
+            point_updates.push((point_id, corrected));
         }
     }
 
@@ -3855,13 +3890,16 @@ fn apply_loop_closure_correction(
     Ok(corrected_poses.into_iter().collect())
 }
 
-fn loop_pose_correction(current_query_pose: Pose, estimated_query_pose: Pose) -> Pose {
-    estimated_query_pose.compose(current_query_pose.inverse())
+fn loop_pose_correction(
+    current_query_pose: Pose,
+    estimated_query_pose: Pose,
+) -> Result<Pose, crate::PoseError> {
+    estimated_query_pose.try_compose(current_query_pose.try_inverse()?)
 }
 
 fn loop_translation_norm(pose: Pose) -> f32 {
     let t = pose.translation();
-    (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt()
+    t[0].hypot(t[1]).hypot(t[2])
 }
 
 fn loop_apply_error_kind(error: &TrackerError) -> LoopApplyError {
@@ -3876,7 +3914,10 @@ fn loop_apply_error_kind(error: &TrackerError) -> LoopApplyError {
         TrackerError::Map(_) => LoopApplyError::MapMutation,
         TrackerError::EssentialGraph(_) => LoopApplyError::EssentialGraph,
         TrackerError::PoseGraph(_) => LoopApplyError::PoseOptimization,
-        TrackerError::Pose64(_) | TrackerError::PoseNarrowing(_) => LoopApplyError::PoseConversion,
+        TrackerError::Pose(_)
+        | TrackerError::Transform(_)
+        | TrackerError::Pose64(_)
+        | TrackerError::PoseNarrowing(_) => LoopApplyError::PoseConversion,
         TrackerError::InvariantViolation(_) => LoopApplyError::InvariantViolation,
         _ => LoopApplyError::UnexpectedFailure,
     }
@@ -3889,6 +3930,7 @@ fn loop_reject_reason(error: &LoopDetectError) -> LoopClosureRejectReason {
         }
         LoopDetectError::DescriptorMatchFailed(_) => LoopClosureRejectReason::VerificationFailed,
         LoopDetectError::VerificationFailed(_) => LoopClosureRejectReason::VerificationFailed,
+        LoopDetectError::Pose(_) => LoopClosureRejectReason::ApplyFailed,
         LoopDetectError::CorrectionTooLarge {
             translation,
             rotation_deg,
@@ -3941,16 +3983,13 @@ fn build_map_observations(
                 keyframe_index: ki,
             });
         }
-        let keypoint_ref = match map.keyframe_keypoint(keyframe_id, ki) {
-            Ok(kp) => kp,
-            Err(_) => continue,
-        };
-        let Some(point_id) = map.map_point_for_keypoint(keypoint_ref).ok().flatten() else {
+        let keypoint_ref = map.keyframe_keypoint(keyframe_id, ki)?;
+        let Some(point_id) = map.map_point_for_keypoint(keypoint_ref)? else {
             continue;
         };
-        let Some(point) = map.point(point_id) else {
-            continue;
-        };
+        let point = map
+            .point(point_id)
+            .ok_or(crate::map::MapError::MapPointNotFound(point_id))?;
         let pixel = current.keypoints()[ci];
         let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)?;
         observations.push(obs);
@@ -4617,9 +4656,9 @@ mod tests {
             request_id: BackendRequestId(NonZeroU64::new(99).expect("non-zero")),
             source_snapshot: old_snapshot,
             trigger_keyframe: old_keyframe,
-            correction: BaCorrection {
-                pose_deltas: vec![(old_keyframe, [0.0; 6])],
-                landmark_deltas: vec![(old_point, [0.0; 3])],
+            correction: BackendCorrection {
+                corrected_poses: vec![(old_keyframe, crate::WorldToCamera::identity())],
+                corrected_landmarks: vec![(old_point, crate::WorldPoint3::new(0.0, 0.0, 1.0))],
                 result: BaResult::Converged {
                     iterations: 1,
                     final_cost: 0.0,
@@ -4749,6 +4788,27 @@ mod tests {
         assert_eq!(batch.observations.len(), 4);
         assert_eq!(batch.match_indices, vec![1, 2, 3, 4]);
         assert_eq!(batch.observations[0].world().x, 1.0);
+
+        let mut foreign_map = SlamMap::new();
+        let foreign_keyframe = foreign_map
+            .add_keyframe_from_detections(
+                reference.as_ref(),
+                Timestamp::from_nanos(32),
+                crate::WorldToCamera::identity(),
+            )
+            .expect("foreign keyframe");
+        assert!(matches!(
+            build_map_observations(
+                &map,
+                foreign_keyframe,
+                &matches,
+                current.as_ref(),
+                intrinsics,
+            ),
+            Err(crate::PnpError::Map(
+                crate::map::MapError::KeyframeNotFound(id)
+            )) if id == foreign_keyframe
+        ));
     }
 
     #[test]
@@ -4771,9 +4831,9 @@ mod tests {
             request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
             source_snapshot: map.snapshot(),
             trigger_keyframe: keyframe_id,
-            correction: BaCorrection {
-                pose_deltas: vec![(keyframe_id, [0.0; 6])],
-                landmark_deltas: vec![(point_id, [1.0, 2.0, 3.0])],
+            correction: BackendCorrection {
+                corrected_poses: vec![(keyframe_id, crate::WorldToCamera::identity())],
+                corrected_landmarks: vec![(point_id, crate::WorldPoint3::new(1.0, 2.0, 3.0))],
                 result: BaResult::Converged {
                     iterations: 1,
                     final_cost: 0.0,
@@ -4796,9 +4856,9 @@ mod tests {
             request_id: BackendRequestId(NonZeroU64::new(2).expect("non-zero")),
             source_snapshot: map.snapshot(),
             trigger_keyframe: keyframe_id,
-            correction: BaCorrection {
-                pose_deltas: vec![(keyframe_id, [0.0; 6])],
-                landmark_deltas: vec![(point_id, [0.0; 3])],
+            correction: BackendCorrection {
+                corrected_poses: vec![(keyframe_id, crate::WorldToCamera::identity())],
+                corrected_landmarks: vec![(point_id, crate::WorldPoint3::new(0.0, 0.0, 1.0))],
                 result: BaResult::Converged {
                     iterations: 1,
                     final_cost: 0.0,
@@ -4816,32 +4876,21 @@ mod tests {
     #[test]
     fn correction_apply_updates_pose_and_landmark_atomically() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
-        let corrected_pose = Pose::from_rt(
-            [[1.0, 0.0, 0.0], [0.0, 0.999, -0.01], [0.0, 0.01, 0.999]],
-            [0.2, -0.1, 0.05],
+        let corrected_pose = crate::WorldToCamera::from_legacy_pose(
+            crate::test_helpers::axis_angle_pose([0.2, -0.1, 0.05], [0.01, 0.0, 0.0]),
         );
         let corrected_point: crate::WorldPoint3 = Point3 {
             x: 0.4,
             y: -0.3,
             z: 2.1,
         };
-        let initial_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
-        let pose_delta =
-            crate::local_ba::se3_delta_between(initial_pose.into_legacy_pose(), corrected_pose);
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(3).expect("non-zero")),
             source_snapshot: map.snapshot(),
             trigger_keyframe: keyframe_id,
-            correction: BaCorrection {
-                pose_deltas: vec![(keyframe_id, pose_delta)],
-                landmark_deltas: vec![(
-                    point_id,
-                    [
-                        corrected_point.x,
-                        corrected_point.y,
-                        corrected_point.z - 1.0,
-                    ],
-                )],
+            correction: BackendCorrection {
+                corrected_poses: vec![(keyframe_id, corrected_pose)],
+                corrected_landmarks: vec![(point_id, corrected_point)],
                 result: BaResult::Converged {
                     iterations: 2,
                     final_cost: 0.1,
@@ -4878,6 +4927,140 @@ mod tests {
         assert!((stored_point.x - corrected_point.x).abs() < 1e-6);
         assert!((stored_point.y - corrected_point.y).abs() < 1e-6);
         assert!((stored_point.z - corrected_point.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn correction_apply_preserves_small_absolute_pose_after_large_source_pose() {
+        let (mut map, keyframe_id, _) = make_map_with_single_point();
+        let large_source_pose = crate::WorldToCamera::from_legacy_pose(
+            Pose::try_from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [1.0e20, -1.0e20, 1.0e20],
+            )
+            .expect("large finite source pose"),
+        );
+        map.set_keyframe_pose(keyframe_id, large_source_pose)
+            .expect("store source pose");
+        let corrected_pose = crate::WorldToCamera::from_legacy_pose(
+            Pose::try_from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [1.0, -2.0, 3.0],
+            )
+            .expect("small finite corrected pose"),
+        );
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::new(4).expect("non-zero")),
+            source_snapshot: map.snapshot(),
+            trigger_keyframe: keyframe_id,
+            correction: BackendCorrection {
+                corrected_poses: vec![(keyframe_id, corrected_pose)],
+                corrected_landmarks: Vec::new(),
+                result: BaResult::Converged {
+                    iterations: 1,
+                    final_cost: 0.0,
+                },
+            },
+        };
+
+        apply_correction_event(&mut map, &correction).expect("apply exact corrected pose");
+        assert_eq!(
+            map.keyframe(keyframe_id)
+                .expect("keyframe")
+                .pose()
+                .translation(),
+            [1.0, -2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn correction_apply_rejects_all_updates_when_a_landmark_is_missing() {
+        let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        map.remove_map_point(point_id).expect("remove map point");
+        let before_snapshot = map.snapshot();
+        let before_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
+        let corrected_pose = crate::WorldToCamera::from_legacy_pose(
+            Pose::try_from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [0.1, 0.0, 0.0],
+            )
+            .expect("finite corrected pose"),
+        );
+        let correction = CorrectionEvent {
+            request_id: BackendRequestId(NonZeroU64::new(4).expect("non-zero")),
+            source_snapshot: before_snapshot,
+            trigger_keyframe: keyframe_id,
+            correction: BackendCorrection {
+                corrected_poses: vec![(keyframe_id, corrected_pose)],
+                corrected_landmarks: vec![(point_id, crate::WorldPoint3::new(1.0, 2.0, 3.0))],
+                result: BaResult::Converged {
+                    iterations: 1,
+                    final_cost: 0.0,
+                },
+            },
+        };
+
+        assert!(matches!(
+            apply_correction_event(&mut map, &correction),
+            Err(ApplyCorrectionError::MissingMapPoint { point_id: missing })
+                if missing == point_id
+        ));
+        assert_eq!(map.snapshot(), before_snapshot);
+        assert_eq!(
+            map.keyframe(keyframe_id)
+                .expect("keyframe")
+                .pose()
+                .rotation(),
+            before_pose.rotation()
+        );
+        assert_eq!(
+            map.keyframe(keyframe_id)
+                .expect("keyframe")
+                .pose()
+                .translation(),
+            before_pose.translation()
+        );
+        assert!(map.point(point_id).is_none());
+    }
+
+    #[test]
+    fn correction_build_preserves_large_finite_landmark_exactly() {
+        let (mut map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
+        let keypoint = map.keyframe_keypoint(kf_a, 0).expect("keypoint");
+        let point_id = map
+            .map_point_for_keypoint(keypoint)
+            .expect("map lookup")
+            .expect("shared point");
+        map.set_map_point_position(point_id, crate::WorldPoint3::new(f32::MAX, 0.0, 1.0))
+            .expect("maximum finite point");
+
+        let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
+        let event = KeyframeEvent::try_new(
+            BackendRequestId(NonZeroU64::new(5).expect("non-zero")),
+            kf_b,
+            window,
+            map.clone(),
+        )
+        .expect("event");
+        let mut optimized_map = map;
+        optimized_map
+            .set_map_point_position(point_id, crate::WorldPoint3::new(-f32::MAX, 0.0, 1.0))
+            .expect("negative maximum finite point");
+
+        let correction = CorrectionEvent::from_optimized_map(
+            &event,
+            &optimized_map,
+            BaResult::Converged {
+                iterations: 1,
+                final_cost: 0.0,
+            },
+        )
+        .expect("finite optimized state is directly representable");
+        let mut source_map = event.map_snapshot.clone();
+        apply_correction_event(&mut source_map, &correction).expect("apply exact correction");
+        assert_eq!(
+            source_map.point(point_id).expect("map point").position(),
+            crate::WorldPoint3::new(-f32::MAX, 0.0, 1.0)
+        );
     }
 
     #[test]
@@ -5733,10 +5916,20 @@ mod tests {
             [1_000.1, -500.0, 25.0],
         );
 
-        let correction = loop_pose_correction(current, estimate);
+        let correction = loop_pose_correction(current, estimate).expect("finite loop correction");
 
         assert!((loop_translation_norm(correction) - 0.1).abs() < 1e-4);
         assert!(loop_rotation_angle_deg(correction) < 1e-4);
+    }
+
+    #[test]
+    fn loop_translation_norm_avoids_intermediate_square_overflow() {
+        let component = f32::MAX / 2.0;
+        let pose = Pose::from_rt(Pose::identity().rotation(), [component; 3]);
+        let norm = loop_translation_norm(pose);
+        let expected = (f64::from(component) * 3.0_f64.sqrt()) as f32;
+        assert!(norm.is_finite());
+        assert!((norm - expected).abs() <= expected * 2.0 * f32::EPSILON);
     }
 
     #[test]
@@ -5747,7 +5940,7 @@ mod tests {
         let estimate = crate::math::se3_exp_f64([-0.4, 0.7, 0.5, -0.2, 0.12, 0.3])
             .try_to_pose32()
             .expect("test pose should fit in f32");
-        let correction = loop_pose_correction(current, estimate);
+        let correction = loop_pose_correction(current, estimate).expect("finite loop correction");
         let world_point = [1.3, -0.6, 4.2];
         let point_in_current =
             crate::math::transform_point(current.rotation(), current.translation(), world_point);
@@ -6175,7 +6368,8 @@ mod tests {
             first_attempt,
             RelocalizationEvidence::NoCandidate,
             cfg,
-        );
+        )
+        .expect("finite relocalization poses");
         let RelocalizationStep::Continue(updated) = keep_trying else {
             panic!("expected relocalization to continue")
         };
@@ -6202,7 +6396,8 @@ mod tests {
             final_attempt,
             RelocalizationEvidence::NoCandidate,
             cfg,
-        );
+        )
+        .expect("finite relocalization poses");
         assert!(matches!(give_up, RelocalizationStep::Exhausted));
         assert!(
             SlamTracker::begin_relocalization_attempt(
@@ -6237,7 +6432,8 @@ mod tests {
                 pose_world: pose,
             },
             cfg,
-        );
+        )
+        .expect("finite relocalization poses");
         let RelocalizationStep::Continue(session) = step else {
             panic!("first successful relocalization should begin confirmation")
         };
@@ -6284,7 +6480,8 @@ mod tests {
                 pose_world: pose,
             },
             cfg,
-        );
+        )
+        .expect("finite relocalization poses");
 
         assert!(matches!(step, RelocalizationStep::Recovered { .. }));
     }
@@ -6319,7 +6516,8 @@ mod tests {
                 pose_world: pose,
             },
             cfg,
-        );
+        )
+        .expect("finite relocalization poses");
         assert!(matches!(different_candidate, RelocalizationStep::Exhausted));
 
         let inconsistent_pose = Pose::from_rt(
@@ -6335,7 +6533,8 @@ mod tests {
                 pose_world: inconsistent_pose,
             },
             cfg,
-        );
+        )
+        .expect("finite relocalization poses");
         assert!(matches!(inconsistent_pose, RelocalizationStep::Exhausted));
     }
 
@@ -6348,21 +6547,19 @@ mod tests {
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [cfg.max_translation_delta_m() * 0.5, 0.0, 0.0],
         );
-        assert!(SlamTracker::relocalization_pose_consistent(
-            identity,
-            within_translation,
-            cfg
-        ));
+        assert!(
+            SlamTracker::relocalization_pose_consistent(identity, within_translation, cfg)
+                .expect("finite pose delta")
+        );
 
         let beyond_translation = Pose::from_rt(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             [cfg.max_translation_delta_m() * 1.5, 0.0, 0.0],
         );
-        assert!(!SlamTracker::relocalization_pose_consistent(
-            identity,
-            beyond_translation,
-            cfg
-        ));
+        assert!(
+            !SlamTracker::relocalization_pose_consistent(identity, beyond_translation, cfg)
+                .expect("finite pose delta")
+        );
 
         let half_angle = (cfg.max_rotation_delta_deg() * 0.5).to_radians();
         let within_rotation = Pose::from_rt(
@@ -6373,11 +6570,10 @@ mod tests {
             ],
             [0.0, 0.0, 0.0],
         );
-        assert!(SlamTracker::relocalization_pose_consistent(
-            identity,
-            within_rotation,
-            cfg
-        ));
+        assert!(
+            SlamTracker::relocalization_pose_consistent(identity, within_rotation, cfg)
+                .expect("finite pose delta")
+        );
 
         let over_angle = (cfg.max_rotation_delta_deg() * 1.5).to_radians();
         let beyond_rotation = Pose::from_rt(
@@ -6388,10 +6584,9 @@ mod tests {
             ],
             [0.0, 0.0, 0.0],
         );
-        assert!(!SlamTracker::relocalization_pose_consistent(
-            identity,
-            beyond_rotation,
-            cfg
-        ));
+        assert!(
+            !SlamTracker::relocalization_pose_consistent(identity, beyond_rotation, cfg)
+                .expect("finite pose delta")
+        );
     }
 }

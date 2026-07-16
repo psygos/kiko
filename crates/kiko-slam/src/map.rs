@@ -456,6 +456,7 @@ pub enum MapError {
         expected: SensorId,
         actual: SensorId,
     },
+    InvalidMapPointPosition(crate::Point3Error),
 }
 
 impl std::fmt::Display for MapError {
@@ -494,11 +495,21 @@ impl std::fmt::Display for MapError {
                 f,
                 "keyframe detections must be from {expected:?}, got {actual:?}"
             ),
+            MapError::InvalidMapPointPosition(err) => {
+                write!(f, "invalid map point position: {err}")
+            }
         }
     }
 }
 
-impl std::error::Error for MapError {}
+impl std::error::Error for MapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidMapPointPosition(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MapGeneration(u64);
@@ -706,6 +717,9 @@ impl SlamMap {
         descriptor: CompactDescriptor,
         first_obs: KeyframeKeypoint,
     ) -> Result<MapPointId, MapError> {
+        let position = position
+            .validate()
+            .map_err(MapError::InvalidMapPointPosition)?;
         let raw_keyframe_id = self.raw_keyframe_id(first_obs.keyframe_id)?;
         let entry = self
             .keyframes
@@ -823,6 +837,9 @@ impl SlamMap {
         point_id: MapPointId,
         position: WorldPoint3,
     ) -> Result<(), MapError> {
+        let position = position
+            .validate()
+            .map_err(MapError::InvalidMapPointPosition)?;
         let raw_point_id = self.raw_point_id(point_id)?;
         let point = self
             .points
@@ -1878,6 +1895,57 @@ mod tests {
         )
         .expect("map point");
         assert_eq!(map.generation().as_u64(), 2);
+    }
+
+    #[test]
+    fn nonfinite_map_point_positions_are_rejected_transactionally() {
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                ImageSize::try_new(640, 480).expect("valid size"),
+                make_keypoints(1),
+            )
+            .expect("keyframe");
+        let observation = map
+            .keyframe_keypoint(keyframe_id, 0)
+            .expect("keyframe keypoint");
+        let before_insert = map.snapshot();
+
+        let malformed = WorldPoint3::new(0.0, f32::NAN, 1.0);
+        assert!(matches!(
+            map.add_map_point(malformed, make_descriptor(), observation),
+            Err(MapError::InvalidMapPointPosition(crate::Point3Error::NonFinite {
+                axis: 1,
+                value,
+            })) if value.is_nan()
+        ));
+        assert_eq!(map.snapshot(), before_insert);
+        assert_eq!(map.num_points(), 0);
+        assert_eq!(
+            map.map_point_for_keypoint(observation)
+                .expect("valid keypoint reference"),
+            None
+        );
+
+        let original = WorldPoint3::new(1.0, 2.0, 3.0);
+        let point_id = map
+            .add_map_point(original, make_descriptor(), observation)
+            .expect("valid map point");
+        let before_update = map.snapshot();
+        assert!(matches!(
+            map.set_map_point_position(point_id, WorldPoint3::new(f32::INFINITY, 2.0, 3.0),),
+            Err(MapError::InvalidMapPointPosition(
+                crate::Point3Error::NonFinite {
+                    axis: 0,
+                    value: f32::INFINITY,
+                }
+            ))
+        ));
+        assert_eq!(map.snapshot(), before_update);
+        assert_eq!(map.point(point_id).expect("map point").position(), original);
     }
 
     #[test]

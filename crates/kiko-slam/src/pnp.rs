@@ -7,6 +7,8 @@ use crate::{
     math,
 };
 
+const POSE_ROTATION_VALIDATION_TOLERANCE: f64 = 1e-6;
+
 #[derive(Clone, Copy, Debug)]
 pub struct PinholeIntrinsics {
     fx: f32,
@@ -150,6 +152,103 @@ pub struct Pose {
     translation: [f32; 3],
 }
 
+/// Failure to construct or apply a finite rigid-body pose.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PoseError {
+    NonFiniteRotation {
+        row: usize,
+        column: usize,
+        value: f32,
+    },
+    NonFiniteTranslation {
+        axis: usize,
+        value: f32,
+    },
+    NonOrthonormalRotation {
+        max_error: f64,
+    },
+    ImproperRotation {
+        determinant: f64,
+    },
+    ComposeRotationNotRepresentable {
+        row: usize,
+        column: usize,
+        value: f64,
+    },
+    ComposeTranslationNotRepresentable {
+        axis: usize,
+        value: f64,
+    },
+    InverseTranslationNotRepresentable {
+        axis: usize,
+        value: f64,
+    },
+}
+
+impl std::fmt::Display for PoseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteRotation { row, column, value } => write!(
+                f,
+                "pose rotation[{row}][{column}] must be finite, got {value}"
+            ),
+            Self::NonFiniteTranslation { axis, value } => {
+                write!(f, "pose translation[{axis}] must be finite, got {value}")
+            }
+            Self::NonOrthonormalRotation { max_error } => write!(
+                f,
+                "pose rotation must be orthonormal (maximum error {max_error})"
+            ),
+            Self::ImproperRotation { determinant } => write!(
+                f,
+                "pose rotation determinant must be +1 (got {determinant})"
+            ),
+            Self::ComposeRotationNotRepresentable { row, column, value } => write!(
+                f,
+                "pose composition rotation[{row}][{column}] is not representable as a finite f32: {value}"
+            ),
+            Self::ComposeTranslationNotRepresentable { axis, value } => write!(
+                f,
+                "pose composition translation[{axis}] is not representable as a finite f32: {value}"
+            ),
+            Self::InverseTranslationNotRepresentable { axis, value } => write!(
+                f,
+                "pose inversion translation[{axis}] is not representable as a finite f32: {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PoseError {}
+
+/// Failure to apply a frame-typed transform to a point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TransformError {
+    InvalidInput(crate::geometry::Point3Error),
+    OutputNotRepresentable { axis: usize, value: f64 },
+}
+
+impl std::fmt::Display for TransformError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidInput(err) => write!(f, "invalid transform input: {err}"),
+            Self::OutputNotRepresentable { axis, value } => write!(
+                f,
+                "transformed point coordinate on axis {axis} is not representable as a finite f32: {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TransformError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidInput(err) => Some(err),
+            Self::OutputNotRepresentable { .. } => None,
+        }
+    }
+}
+
 impl Pose {
     pub fn identity() -> Self {
         Self {
@@ -158,6 +257,49 @@ impl Pose {
         }
     }
 
+    pub fn try_from_rt(rotation: [[f32; 3]; 3], translation: [f32; 3]) -> Result<Self, PoseError> {
+        for (row, values) in rotation.iter().enumerate() {
+            for (column, &value) in values.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(PoseError::NonFiniteRotation { row, column, value });
+                }
+            }
+        }
+        if let Some(axis) = translation.iter().position(|value| !value.is_finite()) {
+            return Err(PoseError::NonFiniteTranslation {
+                axis,
+                value: translation[axis],
+            });
+        }
+
+        let rotation_f64 = rotation.map(|row| row.map(f64::from));
+        let mut max_error = 0.0_f64;
+        for row in 0..3 {
+            for column in 0..3 {
+                let dot = (0..3)
+                    .map(|index| rotation_f64[index][row] * rotation_f64[index][column])
+                    .sum::<f64>();
+                let expected = if row == column { 1.0 } else { 0.0 };
+                max_error = max_error.max((dot - expected).abs());
+            }
+        }
+        if max_error > POSE_ROTATION_VALIDATION_TOLERANCE {
+            return Err(PoseError::NonOrthonormalRotation { max_error });
+        }
+
+        let determinant = rotation_determinant(rotation_f64);
+        if (determinant - 1.0).abs() > POSE_ROTATION_VALIDATION_TOLERANCE {
+            return Err(PoseError::ImproperRotation { determinant });
+        }
+
+        Ok(Self {
+            rotation,
+            translation,
+        })
+    }
+
+    /// Construct a deliberately unchecked pose for malformed-input tests.
+    #[cfg(test)]
     pub(crate) fn from_rt(rotation: [[f32; 3]; 3], translation: [f32; 3]) -> Self {
         Self {
             rotation,
@@ -173,33 +315,75 @@ impl Pose {
         self.translation
     }
 
-    pub fn inverse(&self) -> Pose {
+    pub fn try_inverse(self) -> Result<Pose, PoseError> {
         let r_t = math::mat_transpose(self.rotation);
-        let t = self.translation;
-        let t_inv = [
-            -(r_t[0][0] * t[0] + r_t[0][1] * t[1] + r_t[0][2] * t[2]),
-            -(r_t[1][0] * t[0] + r_t[1][1] * t[1] + r_t[1][2] * t[2]),
-            -(r_t[2][0] * t[0] + r_t[2][1] * t[1] + r_t[2][2] * t[2]),
-        ];
-        Pose {
-            rotation: r_t,
-            translation: t_inv,
+        let rotated = mat3_mul_vec_f64(
+            r_t.map(|row| row.map(f64::from)),
+            self.translation.map(f64::from),
+        );
+        let mut translation = [0.0_f32; 3];
+        for (axis, output) in translation.iter_mut().enumerate() {
+            let value = -rotated[axis];
+            *output = narrow_pose_component(value)
+                .ok_or(PoseError::InverseTranslationNotRepresentable { axis, value })?;
         }
+        Self::try_from_rt(r_t, translation)
     }
 
     /// Compose two poses: `self ∘ other`.
-    pub fn compose(self, other: Pose) -> Pose {
-        let r = math::mat_mul(self.rotation, other.rotation);
-        let t = math::mat_mul_vec(self.rotation, other.translation);
-        Pose {
-            rotation: r,
-            translation: [
-                t[0] + self.translation[0],
-                t[1] + self.translation[1],
-                t[2] + self.translation[2],
-            ],
+    pub fn try_compose(self, other: Pose) -> Result<Pose, PoseError> {
+        let rotation_f64 = mat3_mul_f64(
+            self.rotation.map(|row| row.map(f64::from)),
+            other.rotation.map(|row| row.map(f64::from)),
+        );
+        let mut rotation = [[0.0_f32; 3]; 3];
+        for (row, values) in rotation.iter_mut().enumerate() {
+            for (column, output) in values.iter_mut().enumerate() {
+                let value = rotation_f64[row][column];
+                *output = narrow_pose_component(value)
+                    .ok_or(PoseError::ComposeRotationNotRepresentable { row, column, value })?;
+            }
         }
+
+        let rotated_translation = mat3_mul_vec_f64(
+            self.rotation.map(|row| row.map(f64::from)),
+            other.translation.map(f64::from),
+        );
+        let mut translation = [0.0_f32; 3];
+        for (axis, output) in translation.iter_mut().enumerate() {
+            let value = rotated_translation[axis] + f64::from(self.translation[axis]);
+            *output = narrow_pose_component(value)
+                .ok_or(PoseError::ComposeTranslationNotRepresentable { axis, value })?;
+        }
+        Self::try_from_rt(rotation, translation)
     }
+}
+
+fn narrow_pose_component(value: f64) -> Option<f32> {
+    let narrowed = value as f32;
+    (value.is_finite() && narrowed.is_finite()).then_some(narrowed)
+}
+
+fn mat3_mul_vec_f64(matrix: [[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    matrix.map(|row| row[0].mul_add(vector[0], row[1].mul_add(vector[1], row[2] * vector[2])))
+}
+
+fn mat3_mul_f64(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let right_t = [
+        [right[0][0], right[1][0], right[2][0]],
+        [right[0][1], right[1][1], right[2][1]],
+        [right[0][2], right[1][2], right[2][2]],
+    ];
+    left.map(|row| {
+        right_t
+            .map(|column| row[0].mul_add(column[0], row[1].mul_add(column[1], row[2] * column[2])))
+    })
+}
+
+fn rotation_determinant(rotation: [[f64; 3]; 3]) -> f64 {
+    rotation[0][0] * (rotation[1][1] * rotation[2][2] - rotation[1][2] * rotation[2][1])
+        - rotation[0][1] * (rotation[1][0] * rotation[2][2] - rotation[1][2] * rotation[2][0])
+        + rotation[0][2] * (rotation[1][0] * rotation[2][1] - rotation[1][1] * rotation[2][0])
 }
 
 /// A rigid transform whose source and destination frames are checked at compile time.
@@ -235,16 +419,40 @@ where
         self.pose.translation()
     }
 
-    pub fn transform_point(self, point: crate::Point3<From>) -> crate::Point3<To> {
-        crate::Point3::from_array(math::transform_point(
-            self.pose.rotation(),
-            self.pose.translation(),
-            point.to_array(),
-        ))
+    pub fn try_transform_point(
+        self,
+        point: crate::Point3<From>,
+    ) -> Result<crate::Point3<To>, TransformError> {
+        let point = point.validate().map_err(TransformError::InvalidInput)?;
+        let transformed = mat3_mul_vec_f64(
+            self.pose.rotation.map(|row| row.map(f64::from)),
+            point.to_array().map(f64::from),
+        );
+        let translation = self.pose.translation.map(f64::from);
+        let mut output = [0.0_f32; 3];
+        for (axis, destination) in output.iter_mut().enumerate() {
+            let value = transformed[axis] + translation[axis];
+            *destination = narrow_pose_component(value)
+                .ok_or(TransformError::OutputNotRepresentable { axis, value })?;
+        }
+        Ok(crate::Point3::from_array(output))
     }
 
-    pub fn inverse(self) -> Transform<To, From> {
-        Transform::from_legacy_pose(self.pose.inverse())
+    pub fn try_inverse(self) -> Result<Transform<To, From>, PoseError> {
+        self.pose.try_inverse().map(Transform::from_legacy_pose)
+    }
+
+    /// Compose `self` after `other`, preserving both endpoint frames.
+    pub fn try_compose<Source>(
+        self,
+        other: Transform<Source, From>,
+    ) -> Result<Transform<Source, To>, PoseError>
+    where
+        Source: CoordinateFrame<Scalar = f32>,
+    {
+        self.pose
+            .try_compose(other.pose)
+            .map(Transform::from_legacy_pose)
     }
 }
 
@@ -402,6 +610,8 @@ pub enum PnpError {
         operation: &'static str,
         value: f64,
     },
+    Map(crate::map::MapError),
+    Transform(TransformError),
     NoSolution,
 }
 
@@ -429,12 +639,34 @@ impl std::fmt::Display for PnpError {
                 f,
                 "pnp numerical failure while {operation}: {value} is not representable as a finite f32"
             ),
+            PnpError::Map(err) => write!(f, "pnp map observation lookup failed: {err}"),
+            PnpError::Transform(err) => write!(f, "pnp coordinate transform failed: {err}"),
             PnpError::NoSolution => write!(f, "pnp failed to find a valid pose"),
         }
     }
 }
 
-impl std::error::Error for PnpError {}
+impl std::error::Error for PnpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Map(err) => Some(err),
+            Self::Transform(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::map::MapError> for PnpError {
+    fn from(error: crate::map::MapError) -> Self {
+        Self::Map(error)
+    }
+}
+
+impl From<TransformError> for PnpError {
+    fn from(error: TransformError) -> Self {
+        Self::Transform(error)
+    }
+}
 
 pub fn build_observations(
     keyframe: &Keyframe,
@@ -475,7 +707,7 @@ pub fn build_observations(
         let camera = keyframe
             .landmark_for_detection(ki)
             .ok_or(PnpError::MissingLandmark { keyframe_index: ki })?;
-        let world = keyframe_to_world.transform_point(camera);
+        let world = keyframe_to_world.try_transform_point(camera)?;
         observations.push(Observation::try_new(world, pixel, intrinsics)?);
     }
 
@@ -1130,10 +1362,7 @@ fn narrow_pose(rotation: [[f64; 3]; 3], translation: [f64; 3]) -> Option<Pose> {
         narrow_finite_f32(translation[1])?,
         narrow_finite_f32(translation[2])?,
     ];
-    Some(Pose {
-        rotation: rotation_f32,
-        translation,
-    })
+    Pose::try_from_rt(rotation_f32, translation).ok()
 }
 
 fn narrow_finite_f32(value: f64) -> Option<f32> {
@@ -1418,9 +1647,9 @@ mod tests {
 
         assert!(matches!(
             build_observations(&keyframe, &matches, keyframe_to_world, intrinsics),
-            Err(PnpError::Degenerate {
-                message: "observation coordinates must be finite"
-            })
+            Err(PnpError::Transform(
+                TransformError::OutputNotRepresentable { axis: 0, value }
+            )) if value > f64::from(f32::MAX)
         ));
     }
 
@@ -1439,7 +1668,10 @@ mod tests {
     #[test]
     fn pose_inverse_is_involution() {
         let pose = axis_angle_pose([0.3, -0.2, 0.7], [0.1, -0.05, 0.08]);
-        let recovered = pose.inverse().inverse();
+        let recovered = pose
+            .try_inverse()
+            .and_then(Pose::try_inverse)
+            .expect("finite pose remains invertible");
         assert!(rot_frob_norm(pose.rotation(), recovered.rotation()) < 1e-5);
         assert!(l2(pose.translation(), recovered.translation()) < 1e-5);
     }
@@ -1448,7 +1680,9 @@ mod tests {
     fn pose_compose_matches_pose64_ordering() {
         let first = axis_angle_pose([0.3, -0.2, 0.7], [0.1, -0.05, 0.08]);
         let second = axis_angle_pose([-0.1, 0.4, 0.2], [-0.03, 0.09, 0.02]);
-        let composed = first.compose(second);
+        let composed = first
+            .try_compose(second)
+            .expect("finite poses remain composable");
         let composed64 = crate::Pose64::try_from_pose32(first)
             .expect("first pose should be valid")
             .try_compose(
@@ -1469,6 +1703,113 @@ mod tests {
         let actual =
             crate::math::transform_point(composed.rotation(), composed.translation(), point);
         assert!(l2(actual, expected) < 1e-5);
+    }
+
+    #[test]
+    fn pose_constructor_rejects_nonfinite_and_non_so3_inputs() {
+        let identity = Pose::identity().rotation();
+        assert!(matches!(
+            Pose::try_from_rt(identity, [f32::NAN, 0.0, 0.0]),
+            Err(PoseError::NonFiniteTranslation { axis: 0, value }) if value.is_nan()
+        ));
+
+        let mut nonfinite_rotation = identity;
+        nonfinite_rotation[1][2] = f32::INFINITY;
+        assert!(matches!(
+            Pose::try_from_rt(nonfinite_rotation, [0.0; 3]),
+            Err(PoseError::NonFiniteRotation {
+                row: 1,
+                column: 2,
+                value: f32::INFINITY,
+            })
+        ));
+
+        let scaled = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(matches!(
+            Pose::try_from_rt(scaled, [0.0; 3]),
+            Err(PoseError::NonOrthonormalRotation { .. })
+        ));
+
+        let reflection = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(matches!(
+            Pose::try_from_rt(reflection, [0.0; 3]),
+            Err(PoseError::ImproperRotation { determinant }) if determinant == -1.0
+        ));
+    }
+
+    #[test]
+    fn pose_operations_report_finite_f32_overflow() {
+        let maximum_translation =
+            Pose::try_from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0])
+                .expect("maximum finite translation is representable");
+        assert!(matches!(
+            maximum_translation.try_compose(maximum_translation),
+            Err(PoseError::ComposeTranslationNotRepresentable { axis: 0, value })
+                if value > f64::from(f32::MAX)
+        ));
+
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let rotated = Pose::try_from_rt(
+            [[s, -s, 0.0], [s, s, 0.0], [0.0, 0.0, 1.0]],
+            [f32::MAX, f32::MAX, 0.0],
+        )
+        .expect("valid rotated maximum translation");
+        assert!(matches!(
+            rotated.try_inverse(),
+            Err(PoseError::InverseTranslationNotRepresentable { axis: 0, value })
+                if value < -f64::from(f32::MAX)
+        ));
+    }
+
+    #[test]
+    fn typed_transform_reports_point_overflow_without_losing_frames() {
+        let pose = Pose::try_from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0])
+            .expect("finite pose");
+        let world_to_camera = WorldToCamera::from_legacy_pose(pose);
+        assert!(matches!(
+            world_to_camera.try_transform_point(WorldPoint3::new(f32::MAX, 0.0, 1.0)),
+            Err(TransformError::OutputNotRepresentable { axis: 0, value })
+                if value > f64::from(f32::MAX)
+        ));
+
+        let finite = WorldPoint3::new(1.0, -2.0, 3.0);
+        let camera: CameraPoint3 = WorldToCamera::identity()
+            .try_transform_point(finite)
+            .expect("identity transform");
+        assert_eq!(camera.to_array(), finite.to_array());
+    }
+
+    #[test]
+    fn checked_pose_and_typed_transform_round_trips_are_deterministic() {
+        for index in -32_i32..=32 {
+            let scale = index as f32 / 32.0;
+            let pose = Pose::try_from_rt(
+                math::so3_exp([0.17 * scale, -0.11 * scale, 0.07 * scale]),
+                [3.0 * scale, -2.0 * scale, 0.5 * scale],
+            )
+            .expect("bounded deterministic pose");
+            let inverse = pose.try_inverse().expect("bounded pose inverse");
+            let identity = pose.try_compose(inverse).expect("bounded pose closure");
+            assert!(rot_frob_norm(identity.rotation(), Pose::identity().rotation()) < 2e-5);
+            assert!(l2(identity.translation(), [0.0; 3]) < 2e-5);
+
+            let world_to_camera = WorldToCamera::from_legacy_pose(pose);
+            let point = WorldPoint3::new(0.25 + scale, -0.75 * scale, 2.0 - 0.5 * scale);
+            let camera = world_to_camera
+                .try_transform_point(point)
+                .expect("bounded forward transform");
+            let recovered = world_to_camera
+                .try_inverse()
+                .expect("bounded typed inverse")
+                .try_transform_point(camera)
+                .expect("bounded inverse transform");
+            assert!(l2(recovered.to_array(), point.to_array()) < 2e-5);
+
+            let recomposed: WorldToCamera = world_to_camera
+                .try_compose(Transform::<WorldFrame, WorldFrame>::identity())
+                .expect("typed composition closure");
+            assert!(rot_frob_norm(recomposed.rotation(), pose.rotation()) < 2e-5);
+        }
     }
 
     #[test]

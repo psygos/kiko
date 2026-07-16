@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 
 use crate::{
     Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
-    map::{KeyframeId, KeyframeKeypoint, MapPointId, SlamMap},
+    map::{KeyframeId, KeyframeKeypoint, MapError, MapPointId, SlamMap},
     math,
 };
 
@@ -435,13 +435,6 @@ pub enum DegenerateReason {
     InvariantViolation,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct BaCorrection {
-    pub pose_deltas: Vec<(KeyframeId, [f32; 6])>,
-    pub landmark_deltas: Vec<(MapPointId, [f32; 3])>,
-    pub result: BaResult,
-}
-
 #[derive(Debug)]
 pub enum ObservationSetError {
     TooFew { required: usize, actual: usize },
@@ -459,6 +452,92 @@ impl std::fmt::Display for ObservationSetError {
 }
 
 impl std::error::Error for ObservationSetError {}
+
+/// Exact failure returned by the incremental bundle-adjustment boundary.
+#[derive(Debug)]
+pub enum LocalBaError {
+    ObservationSet(ObservationSetError),
+    Map(MapError),
+    Pnp(crate::PnpError),
+    Pose(crate::PoseError),
+    MissingMapPointAssociation {
+        keyframe_id: KeyframeId,
+        keypoint_index: usize,
+    },
+    InsufficientUsableObservations {
+        required: usize,
+        actual: usize,
+    },
+    NumericalFailure {
+        operation: &'static str,
+    },
+    EmptyOptimizedWindow,
+}
+
+impl std::fmt::Display for LocalBaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ObservationSet(err) => write!(f, "invalid BA observation set: {err}"),
+            Self::Map(err) => write!(f, "BA map access failed: {err}"),
+            Self::Pnp(err) => write!(f, "BA observation parsing failed: {err}"),
+            Self::Pose(err) => write!(f, "BA pose update failed: {err}"),
+            Self::MissingMapPointAssociation {
+                keyframe_id,
+                keypoint_index,
+            } => write!(
+                f,
+                "BA keyframe {keyframe_id:?} keypoint {keypoint_index} has no map-point association"
+            ),
+            Self::InsufficientUsableObservations { required, actual } => write!(
+                f,
+                "BA requires {required} usable projected observations, got {actual}"
+            ),
+            Self::NumericalFailure { operation } => {
+                write!(f, "BA numerical failure while {operation}")
+            }
+            Self::EmptyOptimizedWindow => write!(f, "BA optimized frame window is empty"),
+        }
+    }
+}
+
+impl std::error::Error for LocalBaError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ObservationSet(err) => Some(err),
+            Self::Map(err) => Some(err),
+            Self::Pnp(err) => Some(err),
+            Self::Pose(err) => Some(err),
+            Self::MissingMapPointAssociation { .. }
+            | Self::InsufficientUsableObservations { .. }
+            | Self::NumericalFailure { .. }
+            | Self::EmptyOptimizedWindow => None,
+        }
+    }
+}
+
+impl From<ObservationSetError> for LocalBaError {
+    fn from(err: ObservationSetError) -> Self {
+        Self::ObservationSet(err)
+    }
+}
+
+impl From<MapError> for LocalBaError {
+    fn from(err: MapError) -> Self {
+        Self::Map(err)
+    }
+}
+
+impl From<crate::PnpError> for LocalBaError {
+    fn from(err: crate::PnpError) -> Self {
+        Self::Pnp(err)
+    }
+}
+
+impl From<crate::PoseError> for LocalBaError {
+    fn from(err: crate::PoseError) -> Self {
+        Self::Pose(err)
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct MapObservation {
@@ -511,19 +590,30 @@ impl ObservationSet {
         map: &SlamMap,
         intrinsics: PinholeIntrinsics,
         min_required: NonZeroUsize,
-    ) -> Option<ResolvedObservationSet> {
+    ) -> Result<ResolvedObservationSet, LocalBaError> {
         let mut resolved = Vec::with_capacity(self.observations.len());
         for obs in &self.observations {
             let keypoint_ref = obs.keyframe_keypoint();
-            let point_id = map.map_point_for_keypoint(keypoint_ref).ok().flatten()?;
-            let world = map.point(point_id)?.position();
-            let observation = Observation::try_new(world, obs.pixel(), intrinsics).ok()?;
+            let point_id = map.map_point_for_keypoint(keypoint_ref)?.ok_or(
+                LocalBaError::MissingMapPointAssociation {
+                    keyframe_id: keypoint_ref.keyframe_id(),
+                    keypoint_index: keypoint_ref.index(),
+                },
+            )?;
+            let world = map
+                .point(point_id)
+                .ok_or(MapError::MapPointNotFound(point_id))?
+                .position();
+            let observation = Observation::try_new(world, obs.pixel(), intrinsics)?;
             resolved.push(observation);
         }
         if resolved.len() < min_required.get() {
-            return None;
+            return Err(LocalBaError::InsufficientUsableObservations {
+                required: min_required.get(),
+                actual: resolved.len(),
+            });
         }
-        Some(ResolvedObservationSet {
+        Ok(ResolvedObservationSet {
             observations: resolved,
         })
     }
@@ -575,6 +665,7 @@ enum FullBaBuildError {
         required: usize,
         actual: usize,
     },
+    Pose(crate::PoseError),
 }
 
 impl std::fmt::Display for FullBaBuildError {
@@ -628,11 +719,25 @@ impl std::fmt::Display for FullBaBuildError {
                 f,
                 "keyframe {keyframe_id:?} has too few BA observations: required={required}, actual={actual}"
             ),
+            FullBaBuildError::Pose(err) => write!(f, "full BA pose geometry failed: {err}"),
         }
     }
 }
 
-impl std::error::Error for FullBaBuildError {}
+impl std::error::Error for FullBaBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pose(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<crate::PoseError> for FullBaBuildError {
+    fn from(err: crate::PoseError) -> Self {
+        Self::Pose(err)
+    }
+}
 
 fn degenerate_reason_from_build_error(err: &FullBaBuildError) -> DegenerateReason {
     match err {
@@ -645,7 +750,8 @@ fn degenerate_reason_from_build_error(err: &FullBaBuildError) -> DegenerateReaso
         | FullBaBuildError::MissingKeyframe { .. }
         | FullBaBuildError::DuplicateLandmarkObservation { .. }
         | FullBaBuildError::InvalidLandmarkObservation { .. }
-        | FullBaBuildError::InvalidScaleAnchor => DegenerateReason::InvariantViolation,
+        | FullBaBuildError::InvalidScaleAnchor
+        | FullBaBuildError::Pose(_) => DegenerateReason::InvariantViolation,
         FullBaBuildError::PoseHasTooFewObservations { .. } => DegenerateReason::NoFactors,
     }
 }
@@ -701,7 +807,7 @@ struct ReprojectionFactor {
 struct ScaleAnchor {
     landmark: LandmarkVarIndex,
     camera_center: Point3,
-    reference_distance_m: f32,
+    reference_distance_m: f64,
 }
 
 #[derive(Debug)]
@@ -823,10 +929,11 @@ impl FullBaProblem {
             }
         }
 
-        let camera_center = camera_center_world(poses[0].pose);
+        let camera_center = camera_center_world(poses[0].pose)?;
         let anchor_position = landmarks[0].position;
         let reference_distance_m = point_distance(anchor_position, camera_center);
-        if !reference_distance_m.is_finite() || reference_distance_m <= MIN_SCALE_ANCHOR_DISTANCE_M
+        if !reference_distance_m.is_finite()
+            || reference_distance_m <= f64::from(MIN_SCALE_ANCHOR_DISTANCE_M)
         {
             return Err(FullBaBuildError::InvalidScaleAnchor);
         }
@@ -843,27 +950,17 @@ impl FullBaProblem {
         })
     }
 
-    fn write_back(self, map: &mut SlamMap) -> bool {
+    fn write_back(self, map: &mut SlamMap) -> Result<(), MapError> {
         for pose in &self.poses {
-            if map
-                .set_keyframe_pose(
-                    pose.keyframe_id,
-                    crate::WorldToCamera::from_legacy_pose(pose.pose),
-                )
-                .is_err()
-            {
-                return false;
-            }
+            map.set_keyframe_pose(
+                pose.keyframe_id,
+                crate::WorldToCamera::from_legacy_pose(pose.pose),
+            )?;
         }
         for landmark in &self.landmarks {
-            if map
-                .set_map_point_position(landmark.point_id, landmark.position)
-                .is_err()
-            {
-                return false;
-            }
+            map.set_map_point_position(landmark.point_id, landmark.position)?;
         }
-        true
+        Ok(())
     }
 }
 
@@ -940,25 +1037,28 @@ impl LocalBundleAdjuster {
         map: &SlamMap,
         pose: Pose,
         observations: ObservationSet,
-    ) -> Option<Pose> {
+    ) -> Result<Pose, LocalBaError> {
         self.frames.push(BaFrame { pose, observations });
         if self.frames.len() > self.config.window() {
             let excess = self.frames.len() - self.config.window();
             self.frames.drain(0..excess);
         }
 
-        if !self.optimize(map) {
+        if let Err(err) = self.optimize(map) {
             self.reset();
-            return None;
+            return Err(err);
         }
-        self.frames.last().map(|frame| frame.pose)
+        self.frames
+            .last()
+            .map(|frame| frame.pose)
+            .ok_or(LocalBaError::EmptyOptimizedWindow)
     }
 
     pub fn optimize_keyframe_window(
         &mut self,
         map: &mut SlamMap,
         window: &[KeyframeId],
-    ) -> BaResult {
+    ) -> Result<BaResult, LocalBaError> {
         let mut problem = match FullBaProblem::try_from_map(
             map,
             window,
@@ -966,34 +1066,31 @@ impl LocalBundleAdjuster {
             self.config.min_observations,
         ) {
             Ok(problem) => problem,
+            Err(FullBaBuildError::Pose(err)) => return Err(err.into()),
             Err(err) => {
-                return BaResult::Degenerate {
+                return Ok(BaResult::Degenerate {
                     reason: degenerate_reason_from_build_error(&err),
-                };
+                });
             }
         };
 
-        let result = self.optimize_full(&mut problem);
+        let result = self.optimize_full(&mut problem)?;
         if matches!(
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
         ) {
             let mut staged_map = map.clone();
-            if !problem.write_back(&mut staged_map) {
-                return BaResult::Degenerate {
-                    reason: DegenerateReason::InvariantViolation,
-                };
-            }
+            problem.write_back(&mut staged_map)?;
             *map = staged_map;
         }
 
-        result
+        Ok(result)
     }
 
-    fn optimize(&mut self, map: &SlamMap) -> bool {
+    fn optimize(&mut self, map: &SlamMap) -> Result<(), LocalBaError> {
         let frame_count = self.frames.len();
         if frame_count == 0 {
-            return false;
+            return Err(LocalBaError::EmptyOptimizedWindow);
         }
 
         let dim = frame_count * 6;
@@ -1010,14 +1107,11 @@ impl LocalBundleAdjuster {
 
             for (idx, frame) in self.frames.iter().enumerate() {
                 let base = idx * 6;
-                let resolved = match frame.observations.resolve(
+                let resolved = frame.observations.resolve(
                     map,
                     self.intrinsics,
                     self.config.min_observations,
-                ) {
-                    Some(set) => set,
-                    None => return false,
-                };
+                )?;
                 let mut usable_observations = 0_usize;
                 for obs in resolved.observations() {
                     if let Some((residual, jac)) =
@@ -1042,7 +1136,10 @@ impl LocalBundleAdjuster {
                     }
                 }
                 if usable_observations < self.config.min_observations() {
-                    return false;
+                    return Err(LocalBaError::InsufficientUsableObservations {
+                        required: self.config.min_observations(),
+                        actual: usable_observations,
+                    });
                 }
             }
 
@@ -1058,7 +1155,9 @@ impl LocalBundleAdjuster {
                         i * 6,
                         motion_weight_squared,
                     ) {
-                        return false;
+                        return Err(LocalBaError::NumericalFailure {
+                            operation: "accumulating the motion prior",
+                        });
                     }
                 }
             }
@@ -1068,23 +1167,24 @@ impl LocalBundleAdjuster {
             }
 
             if !solve_linear_system(a, b, dim) {
-                return false;
+                return Err(LocalBaError::NumericalFailure {
+                    operation: "solving the incremental normal equations",
+                });
             }
 
             let mut max_step = 0.0_f64;
             for i in 0..frame_count {
                 let step = extract_se3_delta(b, i * 6);
                 let Some(step_norm) = finite_norm(step) else {
-                    return false;
+                    return Err(LocalBaError::NumericalFailure {
+                        operation: "computing the incremental pose step norm",
+                    });
                 };
                 if step_norm > max_step {
                     max_step = step_norm;
                 }
                 let pose = self.frames[i].pose;
-                let candidate = apply_se3_delta(pose, step);
-                if !pose_is_finite(candidate) {
-                    return false;
-                }
+                let candidate = apply_se3_delta(pose, step)?;
                 self.frames[i].pose = candidate;
             }
 
@@ -1093,28 +1193,28 @@ impl LocalBundleAdjuster {
             }
         }
 
-        true
+        Ok(())
     }
 
-    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> BaResult {
+    fn optimize_full(&mut self, problem: &mut FullBaProblem) -> Result<BaResult, LocalBaError> {
         let pose_count = problem.poses.len();
         let landmark_count = problem.landmarks.len();
         if pose_count < MIN_BA_POSES {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::TooFewPoses { count: pose_count },
-            };
+            });
         }
         if landmark_count == 0 {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::TooFewLandmarks {
                     count: landmark_count,
                 },
-            };
+            });
         }
         if problem.factors.is_empty() {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::NoFactors,
-            };
+            });
         }
 
         let pose_dim = pose_count * 6;
@@ -1125,9 +1225,9 @@ impl LocalBundleAdjuster {
         let initial_cost =
             full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared);
         if !initial_cost.is_finite() {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::InvalidProjection,
-            };
+            });
         }
         let mut lm_state = LmState::new(lm_config, initial_cost);
 
@@ -1195,9 +1295,9 @@ impl LocalBundleAdjuster {
                 let Some((residual, jacobian)) =
                     scale_anchor_residual_and_jacobian(anchor, point, self.intrinsics)
                 else {
-                    return BaResult::Degenerate {
+                    return Ok(BaResult::Degenerate {
                         reason: DegenerateReason::InvalidProjection,
-                    };
+                    });
                 };
                 let acc = &mut landmark_accumulators[anchor.landmark.as_usize()];
                 accumulate_scalar_landmark_factor(&mut acc.c, &mut acc.b, jacobian, residual);
@@ -1215,9 +1315,9 @@ impl LocalBundleAdjuster {
                         i * 6,
                         motion_weight_squared,
                     ) {
-                        return BaResult::Degenerate {
+                        return Ok(BaResult::Degenerate {
                             reason: DegenerateReason::NumericalFailure,
-                        };
+                        });
                     }
                 }
             }
@@ -1234,9 +1334,9 @@ impl LocalBundleAdjuster {
                     c_row[i] += landmark_damping;
                 }
                 let Some(inv_c) = invert_3x3(c) else {
-                    return BaResult::Degenerate {
+                    return Ok(BaResult::Degenerate {
                         reason: DegenerateReason::NumericalFailure,
-                    };
+                    });
                 };
 
                 let inv_c_b = math::mat_mul_vec(inv_c, acc.b);
@@ -1268,9 +1368,9 @@ impl LocalBundleAdjuster {
             fix_pose_block(s, rhs, pose_dim, PoseVarIndex(0));
 
             if !solve_linear_system(s, rhs, pose_dim) {
-                return BaResult::Degenerate {
+                return Ok(BaResult::Degenerate {
                     reason: DegenerateReason::NumericalFailure,
-                };
+                });
             }
 
             let mut predicted_decrease = 0.0_f64;
@@ -1279,9 +1379,9 @@ impl LocalBundleAdjuster {
                 let base = pose_i * 6;
                 let delta = extract_se3_delta(rhs, base);
                 let Some(step_norm) = finite_norm(delta) else {
-                    return BaResult::Degenerate {
+                    return Ok(BaResult::Degenerate {
                         reason: DegenerateReason::NumericalFailure,
-                    };
+                    });
                 };
                 max_step = max_step.max(step_norm);
                 for k in 0..6 {
@@ -1289,7 +1389,7 @@ impl LocalBundleAdjuster {
                     let gradient = full_pose_rhs[base + k] as f64;
                     predicted_decrease += 0.5 * d * ((pose_damping as f64) * d + gradient);
                 }
-                pose_var.pose = apply_se3_delta(pose_var.pose, delta);
+                pose_var.pose = apply_se3_delta(pose_var.pose, delta)?;
             }
 
             for (landmark_i, landmark_var) in problem.landmarks.iter_mut().enumerate() {
@@ -1311,9 +1411,9 @@ impl LocalBundleAdjuster {
                 ];
                 let delta_landmark = math::mat_mul_vec(schur.inv_c, rhs_landmark);
                 let Some(step_norm) = finite_norm(delta_landmark) else {
-                    return BaResult::Degenerate {
+                    return Ok(BaResult::Degenerate {
                         reason: DegenerateReason::NumericalFailure,
-                    };
+                    });
                 };
                 max_step = max_step.max(step_norm);
                 for (axis, d) in delta_landmark.iter().enumerate() {
@@ -1331,10 +1431,10 @@ impl LocalBundleAdjuster {
                 full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared);
             let prev_cost = lm_state.prev_cost();
             if max_step == 0.0 && candidate_cost.is_finite() && candidate_cost == prev_cost {
-                return BaResult::Converged {
+                return Ok(BaResult::Converged {
                     iterations: iter + 1,
                     final_cost: candidate_cost,
-                };
+                });
             }
             match lm_state.step(candidate_cost, predicted_decrease, lm_config) {
                 LmAction::Accept => {
@@ -1342,10 +1442,10 @@ impl LocalBundleAdjuster {
                     if max_step < f64::from(STEP_CONVERGENCE_THRESHOLD)
                         || (prev_cost - candidate_cost).abs() <= threshold
                     {
-                        return BaResult::Converged {
+                        return Ok(BaResult::Converged {
                             iterations: iter + 1,
                             final_cost: candidate_cost,
-                        };
+                        });
                     }
                 }
                 LmAction::Reject => {
@@ -1367,14 +1467,14 @@ impl LocalBundleAdjuster {
 
         let final_cost = lm_state.prev_cost();
         if !final_cost.is_finite() {
-            return BaResult::Degenerate {
+            return Ok(BaResult::Degenerate {
                 reason: DegenerateReason::NumericalFailure,
-            };
+            });
         }
-        BaResult::MaxIterations {
+        Ok(BaResult::MaxIterations {
             iterations: max_iters,
             final_cost,
-        }
+        })
     }
 }
 
@@ -1431,18 +1531,15 @@ fn full_problem_cost(
     cost
 }
 
-fn camera_center_world(pose: Pose) -> Point3 {
-    let rotation_t = math::mat_transpose(pose.rotation());
-    let rotated_translation = math::mat_mul_vec(rotation_t, pose.translation());
-    Point3 {
-        x: -rotated_translation[0],
-        y: -rotated_translation[1],
-        z: -rotated_translation[2],
-    }
+fn camera_center_world(pose: Pose) -> Result<Point3, crate::PoseError> {
+    Ok(Point3::from_array(pose.try_inverse()?.translation()))
 }
 
-fn point_distance(a: Point3, b: Point3) -> f32 {
-    norm3([a.x - b.x, a.y - b.y, a.z - b.z])
+fn point_distance(a: Point3, b: Point3) -> f64 {
+    let dx = f64::from(a.x) - f64::from(b.x);
+    let dy = f64::from(a.y) - f64::from(b.y);
+    let dz = f64::from(a.z) - f64::from(b.z);
+    dx.hypot(dy).hypot(dz)
 }
 
 fn scale_anchor_residual_and_jacobian(
@@ -1451,26 +1548,27 @@ fn scale_anchor_residual_and_jacobian(
     intrinsics: PinholeIntrinsics,
 ) -> Option<(f32, [f32; 3])> {
     if !anchor.reference_distance_m.is_finite()
-        || anchor.reference_distance_m <= MIN_SCALE_ANCHOR_DISTANCE_M
+        || anchor.reference_distance_m <= f64::from(MIN_SCALE_ANCHOR_DISTANCE_M)
     {
         return None;
     }
     let delta = [
-        point.x - anchor.camera_center.x,
-        point.y - anchor.camera_center.y,
-        point.z - anchor.camera_center.z,
+        f64::from(point.x) - f64::from(anchor.camera_center.x),
+        f64::from(point.y) - f64::from(anchor.camera_center.y),
+        f64::from(point.z) - f64::from(anchor.camera_center.z),
     ];
-    let distance = norm3(delta);
-    if !distance.is_finite() || distance <= MIN_SCALE_ANCHOR_DISTANCE_M {
+    let distance = delta[0].hypot(delta[1]).hypot(delta[2]);
+    if !distance.is_finite() || distance <= f64::from(MIN_SCALE_ANCHOR_DISTANCE_M) {
         return None;
     }
 
-    let focal_weight = 0.5 * (intrinsics.fx() + intrinsics.fy());
-    let residual = focal_weight * (distance / anchor.reference_distance_m - 1.0);
+    let focal_weight = 0.5 * (f64::from(intrinsics.fx()) + f64::from(intrinsics.fy()));
+    let residual =
+        narrow_finite_f32(focal_weight * (distance / anchor.reference_distance_m - 1.0))?;
     let jacobian_scale = focal_weight / (anchor.reference_distance_m * distance);
-    let jacobian = delta.map(|value| value * jacobian_scale);
-    if !residual.is_finite() || jacobian.iter().any(|value| !value.is_finite()) {
-        return None;
+    let mut jacobian = [0.0_f32; 3];
+    for (axis, value) in jacobian.iter_mut().enumerate() {
+        *value = narrow_finite_f32(delta[axis] * jacobian_scale)?;
     }
     Some((residual, jacobian))
 }
@@ -1564,34 +1662,25 @@ fn reprojection_residual_and_jacobians(
     Some((residual, jac_pose, jac_landmark))
 }
 
-pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Pose {
+pub(crate) fn apply_se3_delta(pose: Pose, delta: [f32; 6]) -> Result<Pose, crate::PoseError> {
     let v = [delta[0], delta[1], delta[2]];
     let w = [delta[3], delta[4], delta[5]];
     let r_delta = math::so3_exp(w);
-    let r = math::mat_mul(r_delta, pose.rotation());
-    let t = math::mat_mul_vec(r_delta, pose.translation());
-    Pose::from_rt(r, [t[0] + v[0], t[1] + v[1], t[2] + v[2]])
+    Pose::try_from_rt(r_delta, v)?.try_compose(pose)
 }
 
-pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> [f32; 6] {
-    let from_rot = from.rotation();
-    let mut from_rot_t = [[0.0_f32; 3]; 3];
-    for (row, row_values) in from_rot_t.iter_mut().enumerate() {
-        for (col, value) in row_values.iter_mut().enumerate() {
-            *value = from_rot[col][row];
-        }
-    }
-
-    let r_delta = math::mat_mul(to.rotation(), from_rot_t);
-    let w = math::so3_log(r_delta);
-    let rotated_from_t = math::mat_mul_vec(r_delta, from.translation());
-    let to_t = to.translation();
-    let v = [
-        to_t[0] - rotated_from_t[0],
-        to_t[1] - rotated_from_t[1],
-        to_t[2] - rotated_from_t[2],
-    ];
-    [v[0], v[1], v[2], w[0], w[1], w[2]]
+pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> Result<[f32; 6], crate::PoseError> {
+    let delta = to.try_compose(from.try_inverse()?)?;
+    let translation = delta.translation();
+    let rotation = math::so3_log(delta.rotation());
+    Ok([
+        translation[0],
+        translation[1],
+        translation[2],
+        rotation[0],
+        rotation[1],
+        rotation[2],
+    ])
 }
 
 fn pose_to_vec(pose: Pose) -> [f32; 6] {
@@ -1827,12 +1916,6 @@ fn invert_3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     ])
 }
 
-fn norm3(v: [f32; 3]) -> f32 {
-    finite_norm(v)
-        .and_then(narrow_finite_f32)
-        .unwrap_or(f32::INFINITY)
-}
-
 fn finite_norm<const N: usize>(values: [f32; N]) -> Option<f64> {
     let mut sum_squared = 0.0_f64;
     for value in values {
@@ -1843,14 +1926,6 @@ fn finite_norm<const N: usize>(values: [f32; N]) -> Option<f64> {
     }
     let norm = sum_squared.sqrt();
     norm.is_finite().then_some(norm)
-}
-
-fn pose_is_finite(pose: Pose) -> bool {
-    pose.rotation()
-        .iter()
-        .flatten()
-        .chain(pose.translation().iter())
-        .all(|value| value.is_finite())
 }
 
 fn solve_linear_system(a: &mut [f32], b: &mut [f32], n: usize) -> bool {
@@ -2034,7 +2109,8 @@ mod tests {
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let true_pose_0 = Pose::identity();
         let true_pose_1 = axis_angle_pose([0.20, -0.02, 0.03], [0.0, 0.03, -0.01]);
-        let noisy_pose_1 = apply_se3_delta(true_pose_1, noisy_pose_delta);
+        let noisy_pose_1 =
+            apply_se3_delta(true_pose_1, noisy_pose_delta).expect("finite test pose update");
 
         let points_true = vec![
             Point3 {
@@ -2270,8 +2346,10 @@ mod tests {
 
         let behind_camera = Pose::from_rt(Pose::identity().rotation(), [0.0, 0.0, -10.0]);
         assert!(
-            ba.push_frame(&map, behind_camera, make_observation_set())
-                .is_none(),
+            matches!(
+                ba.push_frame(&map, behind_camera, make_observation_set()),
+                Err(LocalBaError::InsufficientUsableObservations { actual: 0, .. })
+            ),
             "a frame with no usable reprojection factors must be rejected"
         );
         assert!(
@@ -2281,9 +2359,53 @@ mod tests {
 
         assert!(
             ba.push_frame(&map, Pose::identity(), make_observation_set())
-                .is_some(),
+                .is_ok(),
             "a valid frame must optimize after the failed window is reset"
         );
+    }
+
+    #[test]
+    fn push_frame_preserves_missing_map_point_association_error() {
+        let intrinsics =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
+        let detections = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(700),
+            640,
+            480,
+            vec![Keypoint { x: 10.0, y: 10.0 }; 4],
+        )
+        .expect("detections");
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe_from_detections(
+                detections.as_ref(),
+                Timestamp::from_nanos(1),
+                crate::WorldToCamera::identity(),
+            )
+            .expect("keyframe");
+        let observations = (0..4)
+            .map(|index| {
+                MapObservation::new(
+                    map.keyframe_keypoint(keyframe_id, index)
+                        .expect("keyframe keypoint"),
+                    detections.keypoints()[index],
+                )
+            })
+            .collect();
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let observation_set =
+            ObservationSet::new(observations, ba.min_observations()).expect("observation set");
+
+        assert!(matches!(
+            ba.push_frame(&map, Pose::identity(), observation_set),
+            Err(LocalBaError::MissingMapPointAssociation {
+                keyframe_id: missing_keyframe,
+                keypoint_index: 0,
+            }) if missing_keyframe == keyframe_id
+        ));
+        assert!(ba.frames.is_empty());
     }
 
     #[test]
@@ -2318,8 +2440,20 @@ mod tests {
     #[test]
     fn apply_se3_delta_zero_is_fixpoint() {
         let pose = axis_angle_pose([0.3, -0.4, 0.5], [0.08, -0.05, 0.03]);
-        let out = apply_se3_delta(pose, [0.0; 6]);
+        let out = apply_se3_delta(pose, [0.0; 6]).expect("zero update stays finite");
         assert!(pose_close(pose, out, 1e-7));
+    }
+
+    #[test]
+    fn apply_se3_delta_propagates_translation_overflow() {
+        let pose = Pose::from_rt(Pose::identity().rotation(), [f32::MAX, 0.0, 0.0]);
+        assert!(matches!(
+            apply_se3_delta(pose, [f32::MAX, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            Err(crate::PoseError::ComposeTranslationNotRepresentable {
+                axis: 0,
+                value,
+            }) if value > f64::from(f32::MAX)
+        ));
     }
 
     #[test]
@@ -2397,7 +2531,7 @@ mod tests {
             scale_anchor: None,
         };
         assert!(matches!(
-            ba.optimize_full(&mut no_poses),
+            ba.optimize_full(&mut no_poses).expect("typed BA result"),
             BaResult::Degenerate {
                 reason: DegenerateReason::TooFewPoses { count: 0 }
             }
@@ -2419,7 +2553,8 @@ mod tests {
             scale_anchor: None,
         };
         assert!(matches!(
-            ba.optimize_full(&mut no_landmarks),
+            ba.optimize_full(&mut no_landmarks)
+                .expect("typed BA result"),
             BaResult::Degenerate {
                 reason: DegenerateReason::TooFewLandmarks { count: 0 }
             }
@@ -2448,7 +2583,7 @@ mod tests {
             scale_anchor: None,
         };
         assert!(matches!(
-            ba.optimize_full(&mut no_factors),
+            ba.optimize_full(&mut no_factors).expect("typed BA result"),
             BaResult::Degenerate {
                 reason: DegenerateReason::NoFactors
             }
@@ -2485,7 +2620,7 @@ mod tests {
         };
 
         assert_eq!(
-            ba.optimize_full(&mut problem),
+            ba.optimize_full(&mut problem).expect("typed BA result"),
             BaResult::Degenerate {
                 reason: DegenerateReason::NumericalFailure
             }
@@ -2525,7 +2660,7 @@ mod tests {
         };
 
         assert_eq!(
-            ba.optimize_full(&mut problem),
+            ba.optimize_full(&mut problem).expect("typed BA result"),
             BaResult::Degenerate {
                 reason: DegenerateReason::NumericalFailure
             }
@@ -2562,7 +2697,7 @@ mod tests {
         );
 
         assert_eq!(
-            ba.optimize_full(&mut problem),
+            ba.optimize_full(&mut problem).expect("typed BA result"),
             BaResult::Converged {
                 iterations: 1,
                 final_cost: 0.0
@@ -2597,7 +2732,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        match ba.optimize_full(&mut problem) {
+        match ba.optimize_full(&mut problem).expect("typed BA result") {
             BaResult::MaxIterations {
                 iterations: 1,
                 final_cost,
@@ -2619,7 +2754,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("typed BA result");
         match result {
             BaResult::Converged {
                 iterations,
@@ -2646,7 +2781,7 @@ mod tests {
         )
         .expect("full BA problem");
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("typed BA result");
         let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
         assert!(
             after < before,
@@ -2672,7 +2807,7 @@ mod tests {
         )
         .expect("full BA problem");
         let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0);
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("typed BA result");
         let final_cost = match result {
             BaResult::Converged { final_cost, .. } | BaResult::MaxIterations { final_cost, .. } => {
                 final_cost
@@ -2752,7 +2887,7 @@ mod tests {
         let anchor_before = problem.landmarks[anchor.landmark.as_usize()].position;
         let distance_before = point_distance(anchor_before, anchor.camera_center);
 
-        let result = ba.optimize_full(&mut problem);
+        let result = ba.optimize_full(&mut problem).expect("typed BA result");
 
         assert!(matches!(
             result,
@@ -2915,8 +3050,16 @@ mod tests {
             let mut delta_neg = [0.0_f32; 6];
             delta_neg[col] = -eps;
 
-            let r_plus = projection_residual(apply_se3_delta(pose, delta_pos), &obs, intrinsics);
-            let r_minus = projection_residual(apply_se3_delta(pose, delta_neg), &obs, intrinsics);
+            let r_plus = projection_residual(
+                apply_se3_delta(pose, delta_pos).expect("finite positive perturbation"),
+                &obs,
+                intrinsics,
+            );
+            let r_minus = projection_residual(
+                apply_se3_delta(pose, delta_neg).expect("finite negative perturbation"),
+                &obs,
+                intrinsics,
+            );
             let numeric = [
                 (r_plus[0] - r_minus[0]) / (2.0 * eps),
                 (r_plus[1] - r_minus[1]) / (2.0 * eps),
@@ -2947,7 +3090,8 @@ mod tests {
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let true_pose_0 = Pose::identity();
         let true_pose_1 = axis_angle_pose([0.20, -0.02, 0.03], [0.0, 0.03, -0.01]);
-        let noisy_pose_1 = apply_se3_delta(true_pose_1, [0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
+        let noisy_pose_1 = apply_se3_delta(true_pose_1, [0.08, -0.03, 0.04, 0.015, -0.01, 0.008])
+            .expect("finite test pose update");
 
         let points_true = vec![
             Point3 {
@@ -3064,7 +3208,9 @@ mod tests {
 
         let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
-        let result = ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]);
+        let result = ba
+            .optimize_keyframe_window(&mut map, &[kf_0, kf_1])
+            .expect("valid full BA input");
         assert!(
             matches!(
                 result,
@@ -3088,5 +3234,29 @@ mod tests {
             after_landmark_err < before_landmark_err,
             "landmark error did not improve: before={before_landmark_err}, after={after_landmark_err}"
         );
+    }
+
+    #[test]
+    fn optimize_keyframe_window_propagates_camera_center_overflow() {
+        let (mut map, intrinsics, kf_0, kf_1, _, _) = build_full_ba_fixture([0.0; 6]);
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let pose = Pose::try_from_rt(
+            [[s, -s, 0.0], [s, s, 0.0], [0.0, 0.0, 1.0]],
+            [f32::MAX, f32::MAX, 0.0],
+        )
+        .expect("valid extreme pose");
+        map.set_keyframe_pose(kf_0, crate::WorldToCamera::from_legacy_pose(pose))
+            .expect("set pose");
+        let before = map.snapshot();
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+
+        assert!(matches!(
+            ba.optimize_keyframe_window(&mut map, &[kf_0, kf_1]),
+            Err(LocalBaError::Pose(
+                crate::PoseError::InverseTranslationNotRepresentable { axis: 0, value }
+            )) if value < -f64::from(f32::MAX)
+        ));
+        assert_eq!(map.snapshot(), before);
     }
 }

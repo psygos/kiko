@@ -49,10 +49,12 @@ pub use diagnostics::{
     MappingSessionTransition, MappingSessionTransitionError,
 };
 pub use env::{EnvError, env_bool, env_f32, env_u32, env_u64, env_usize};
-pub use geometry::{CameraFrame, CameraPoint3, CoordinateFrame, Point3, WorldFrame, WorldPoint3};
+pub use geometry::{
+    CameraFrame, CameraPoint3, CoordinateFrame, Point3, Point3Error, WorldFrame, WorldPoint3,
+};
 pub use local_ba::{
-    BaCorrection, BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig,
-    LocalBaConfigError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
+    BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig, LocalBaConfigError,
+    LocalBaError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
 };
 pub use loop_closure::{
     DescriptorSource, GlobalDescriptor, GlobalDescriptorError, KeyframeDatabase,
@@ -78,8 +80,8 @@ pub use pipeline::{
 };
 pub use pnp::{
     CameraToWorld, IntrinsicsError, Observation, PinholeIntrinsics, PnpError, PnpResult, Pose,
-    RansacConfig, RansacConfigError, Transform, WorldToCamera, build_observations, solve_pnp,
-    solve_pnp_ransac,
+    PoseError, RansacConfig, RansacConfigError, Transform, TransformError, WorldToCamera,
+    build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,

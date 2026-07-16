@@ -1,4 +1,4 @@
-use crate::Pose;
+use crate::{Pose, PoseError};
 
 /// Small-angle threshold for first-order Taylor expansion of SO(3) exponential/log maps.
 const SO3_SMALL_ANGLE: f64 = 1e-12;
@@ -74,6 +74,7 @@ pub enum PoseNarrowingError {
         axis: usize,
         value: f64,
     },
+    InvalidNarrowedPose(PoseError),
 }
 
 impl std::fmt::Display for PoseNarrowingError {
@@ -87,11 +88,21 @@ impl std::fmt::Display for PoseNarrowingError {
                 f,
                 "pose translation[{axis}] value {value} is not representable as a finite f32"
             ),
+            Self::InvalidNarrowedPose(err) => {
+                write!(f, "narrowed pose is not a valid rigid transform: {err}")
+            }
         }
     }
 }
 
-impl std::error::Error for PoseNarrowingError {}
+impl std::error::Error for PoseNarrowingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidNarrowedPose(err) => Some(err),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Pose64 {
@@ -221,18 +232,8 @@ impl Pose64 {
             }
             *value = narrowed;
         }
-        Ok(Pose::from_rt(rotation, translation))
+        Pose::try_from_rt(rotation, translation).map_err(PoseNarrowingError::InvalidNarrowedPose)
     }
-}
-
-pub(crate) fn mat_mul(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-    let mut r = [[0.0_f32; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            r[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
-        }
-    }
-    r
 }
 
 pub(crate) fn mat_mul_vec(r: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {

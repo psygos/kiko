@@ -522,6 +522,7 @@ pub enum LoopDetectError {
     TooFewCorrespondences { count: usize },
     DescriptorMatchFailed(MapError),
     VerificationFailed(LoopVerificationError),
+    Pose(crate::PoseError),
     CorrectionTooLarge { translation: f32, rotation_deg: f32 },
     ApplyFailed(LoopApplyError),
 }
@@ -540,6 +541,9 @@ impl std::fmt::Display for LoopDetectError {
             }
             LoopDetectError::VerificationFailed(err) => {
                 write!(f, "loop closure verification failed: {err}")
+            }
+            LoopDetectError::Pose(err) => {
+                write!(f, "loop closure correction pose failed: {err}")
             }
             LoopDetectError::CorrectionTooLarge {
                 translation,
@@ -560,6 +564,7 @@ impl std::error::Error for LoopDetectError {
         match self {
             Self::DescriptorMatchFailed(err) => Some(err),
             Self::VerificationFailed(err) => Some(err),
+            Self::Pose(err) => Some(err),
             Self::ApplyFailed(err) => Some(err),
             Self::TooFewCorrespondences { .. } | Self::CorrectionTooLarge { .. } => None,
         }

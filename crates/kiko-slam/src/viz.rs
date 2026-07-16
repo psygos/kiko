@@ -97,12 +97,16 @@ impl TryFrom<usize> for VizDecimation {
 #[derive(Debug)]
 pub enum VizLogError {
     Rerun(rerun::RecordingStreamError),
+    Pose(crate::PoseError),
+    Point(crate::Point3Error),
 }
 
 impl std::fmt::Display for VizLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VizLogError::Rerun(err) => write!(f, "rerun logging error: {err}"),
+            VizLogError::Pose(err) => write!(f, "visualization pose error: {err}"),
+            VizLogError::Point(err) => write!(f, "visualization point error: {err}"),
         }
     }
 }
@@ -111,6 +115,8 @@ impl std::error::Error for VizLogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rerun(err) => Some(err),
+            Self::Pose(err) => Some(err),
+            Self::Point(err) => Some(err),
         }
     }
 }
@@ -118,6 +124,18 @@ impl std::error::Error for VizLogError {
 impl From<rerun::RecordingStreamError> for VizLogError {
     fn from(err: rerun::RecordingStreamError) -> Self {
         VizLogError::Rerun(err)
+    }
+}
+
+impl From<crate::PoseError> for VizLogError {
+    fn from(err: crate::PoseError) -> Self {
+        Self::Pose(err)
+    }
+}
+
+impl From<crate::Point3Error> for VizLogError {
+    fn from(err: crate::Point3Error) -> Self {
+        Self::Point(err)
     }
 }
 
@@ -256,7 +274,11 @@ impl RerunSink {
         if let Some(points) = points
             && !points.is_empty()
         {
-            let positions: Vec<[f32; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+            let positions: Vec<[f32; 3]> = points
+                .iter()
+                .copied()
+                .map(|point| point.validate().map(|point| point.to_array()))
+                .collect::<Result<_, _>>()?;
             let cloud = rerun::Points3D::new(positions);
             self.rec.log("world/camera/points", &cloud)?;
         }
@@ -277,7 +299,7 @@ impl RerunSink {
             self.logged_world = true;
         }
 
-        let camera_pose = pose.inverse();
+        let camera_pose = pose.try_inverse()?;
         let position = camera_pose.translation();
         let rotation = camera_pose.rotation();
         let quat = quat_from_rotation(rotation);
@@ -304,7 +326,7 @@ impl RerunSink {
 
         let mut positions: HashMap<crate::map::KeyframeId, [f32; 3]> = HashMap::new();
         for node in &snapshot.nodes {
-            let pos = pose_position(node.pose.into_legacy_pose());
+            let pos = pose_position(node.pose.into_legacy_pose())?;
             positions.insert(node.id, pos);
         }
 
@@ -345,9 +367,9 @@ impl RerunSink {
     }
 }
 
-fn pose_position(pose: Pose) -> [f32; 3] {
-    let camera_pose = pose.inverse();
-    camera_pose.translation()
+fn pose_position(pose: Pose) -> Result<[f32; 3], crate::PoseError> {
+    pose.try_inverse()
+        .map(|camera_pose| camera_pose.translation())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -699,6 +721,37 @@ mod tests {
         );
         assert!(separated.is_finite());
         assert!(separated > config.max_distance_sq);
+    }
+
+    #[test]
+    fn pose_position_propagates_rotated_inverse_overflow() {
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let pose = Pose::from_rt(
+            [[s, -s, 0.0], [s, s, 0.0], [0.0, 0.0, 1.0]],
+            [f32::MAX, f32::MAX, 0.0],
+        );
+        assert!(matches!(
+            pose_position(pose),
+            Err(crate::PoseError::InverseTranslationNotRepresentable {
+                axis: 0,
+                value,
+            }) if value < -f64::from(f32::MAX)
+        ));
+    }
+
+    #[test]
+    fn visualization_point_error_preserves_the_boundary_cause() {
+        let point_error = CameraPoint3::new(0.0, f32::NAN, 1.0)
+            .validate()
+            .expect_err("non-finite point");
+        let error = VizLogError::from(point_error);
+        assert!(matches!(
+            error,
+            VizLogError::Point(crate::Point3Error::NonFinite {
+                axis: 1,
+                value,
+            }) if value.is_nan()
+        ));
     }
 
     #[test]
