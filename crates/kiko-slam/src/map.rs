@@ -812,7 +812,7 @@ impl SlamMap {
         let raw_keyframe_id = self.raw_keyframe_id(first_obs.keyframe_id)?;
         let entry = self
             .keyframes
-            .get(raw_keyframe_id)
+            .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         let idx = first_obs.index.as_usize();
         debug_assert!(
@@ -837,10 +837,6 @@ impl SlamMap {
             }),
         );
 
-        let entry = self
-            .keyframes
-            .get_mut(raw_keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(first_obs.keyframe_id))?;
         entry.set_point_ref(first_obs.index, point_id);
         self.version = next_version;
         Ok(point_id)
@@ -854,7 +850,7 @@ impl SlamMap {
         let raw_keyframe_id = self.raw_keyframe_id(obs.keyframe_id)?;
         let entry = self
             .keyframes
-            .get(raw_keyframe_id)
+            .get_mut(raw_keyframe_id)
             .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
         let idx = obs.index.as_usize();
         debug_assert!(
@@ -869,36 +865,30 @@ impl SlamMap {
             });
         }
 
-        let raw_point_id = self.raw_point_id(point_id)?;
-        let other_keyframes: Vec<KeyframeId> = {
-            let point = self
-                .points
-                .get(raw_point_id)
-                .ok_or(MapError::MapPointNotFound(point_id))?;
-            if point.observes_keyframe(obs.keyframe_id) {
-                return Err(MapError::DuplicateObservation {
-                    point_id,
-                    keyframe_id: obs.keyframe_id,
-                });
-            }
-            point.observations.iter().map(|o| o.keyframe_id).collect()
-        };
-
-        let next_version = self.version.next(self.mutation_lineage);
-        for other in other_keyframes {
-            self.covisibility.increment_pair(obs.keyframe_id, other);
-        }
-
+        let raw_point_id = point_id
+            .raw_for(self.instance_id)
+            .ok_or(MapError::MapPointNotFound(point_id))?;
         let point = self
             .points
             .get_mut(raw_point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
-        point.add_observation(obs);
+        if point.observes_keyframe(obs.keyframe_id) {
+            return Err(MapError::DuplicateObservation {
+                point_id,
+                keyframe_id: obs.keyframe_id,
+            });
+        }
 
-        let entry = self
-            .keyframes
-            .get_mut(raw_keyframe_id)
-            .ok_or(MapError::KeyframeNotFound(obs.keyframe_id))?;
+        let next_version = self.version.next(self.mutation_lineage);
+        for other in point
+            .observations
+            .iter()
+            .map(|existing| existing.keyframe_id)
+        {
+            self.covisibility.increment_pair(obs.keyframe_id, other);
+        }
+
+        point.add_observation(obs);
         entry.set_point_ref(obs.index, point_id);
         self.version = next_version;
         Ok(())
@@ -1007,11 +997,9 @@ impl SlamMap {
             }
         }
         for point_id in to_remove {
-            let removed = self.points.remove(point_id);
-            debug_assert!(
-                removed.is_some(),
-                "point scheduled for removal was missing from map"
-            );
+            self.points
+                .remove(point_id)
+                .expect("point scheduled for removal was missing from map");
         }
         self.version = next_version;
         Ok(())
@@ -2134,6 +2122,73 @@ mod tests {
         fixture.assert_unchanged();
 
         assert_generation_exhaustion(|| fixture.map.cull_points(2));
+        fixture.assert_unchanged();
+    }
+
+    #[test]
+    fn map_errors_precede_generation_exhaustion_without_mutation() {
+        let mut fixture = GenerationExhaustionFixture::new();
+        let malformed = WorldPoint3::new(f32::NAN, 0.0, 1.0);
+        assert!(matches!(
+            fixture.map.add_map_point(
+                malformed,
+                make_descriptor(),
+                fixture.first_observation,
+            ),
+            Err(MapError::InvalidMapPointPosition(
+                crate::Point3Error::NonFinite { axis: 0, value }
+            )) if value.is_nan()
+        ));
+        fixture.assert_unchanged();
+
+        assert!(matches!(
+            fixture.map.add_map_point(
+                WorldPoint3::new(1.0, 2.0, 3.0),
+                make_descriptor(),
+                fixture.first_observation,
+            ),
+            Err(MapError::DetectionAlreadyAssociated { existing, .. })
+                if existing == fixture.point_id
+        ));
+        fixture.assert_unchanged();
+
+        let missing_point = MapPointId::default();
+        assert!(matches!(
+            fixture
+                .map
+                .add_observation(missing_point, fixture.first_observation),
+            Err(MapError::DetectionAlreadyAssociated { existing, .. })
+                if existing == fixture.point_id
+        ));
+        fixture.assert_unchanged();
+
+        let stale_point = MapPointId::new(fixture.map.instance_id, RawMapPointId::default());
+        assert!(fixture.map.point(stale_point).is_none());
+        assert!(matches!(
+            fixture
+                .map
+                .add_observation(stale_point, fixture.second_free_keypoint),
+            Err(MapError::MapPointNotFound(id)) if id == stale_point
+        ));
+        fixture.assert_unchanged();
+
+        assert!(matches!(
+            fixture
+                .map
+                .add_observation(missing_point, fixture.second_free_keypoint),
+            Err(MapError::MapPointNotFound(id)) if id == missing_point
+        ));
+        fixture.assert_unchanged();
+
+        assert!(matches!(
+            fixture
+                .map
+                .add_observation(fixture.point_id, fixture.first_free_keypoint),
+            Err(MapError::DuplicateObservation {
+                point_id,
+                keyframe_id,
+            }) if point_id == fixture.point_id && keyframe_id == fixture.first_keyframe
+        ));
         fixture.assert_unchanged();
     }
 
