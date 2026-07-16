@@ -239,28 +239,55 @@ pub struct RerunSink {
     surface_map: crate::SurfaceBeliefMap,
 }
 
+/// Fully parsed visualization settings needed to construct a [`RerunSink`].
+#[derive(Clone, Copy, Debug)]
+pub struct RerunSinkConfig {
+    track: TrackConfig,
+    surface_pose_quality_gate: SurfacePoseQualityGate,
+    surface_map: crate::SurfaceMapConfig,
+}
+
+impl RerunSinkConfig {
+    /// Parses visualization settings without creating or mutating a Rerun recording.
+    pub fn from_environment() -> Result<Self, RerunSinkInitError> {
+        let surface_map = crate::SurfaceMapConfig::try_from_env()
+            .map_err(|source| RerunSinkInitError::SurfaceMapConfig { source })?;
+        Ok(Self {
+            track: TrackConfig::try_from_env()?,
+            surface_pose_quality_gate: SurfacePoseQualityGate::try_from_env()?,
+            surface_map,
+        })
+    }
+}
+
 impl RerunSink {
     pub fn try_new(
         rec: rerun::RecordingStream,
         decimation: VizDecimation,
     ) -> Result<Self, RerunSinkInitError> {
-        let surface_map_config = crate::SurfaceMapConfig::try_from_env()
-            .map_err(|source| RerunSinkInitError::SurfaceMapConfig { source })?;
-        let surface_pose_quality_gate = SurfacePoseQualityGate::try_from_env()?;
-        let track_config = TrackConfig::try_from_env()?;
-        Ok(Self {
+        let config = RerunSinkConfig::from_environment()?;
+        Ok(Self::from_config(rec, decimation, config))
+    }
+
+    /// Constructs a sink infallibly from settings that were already parsed.
+    pub fn from_config(
+        rec: rerun::RecordingStream,
+        decimation: VizDecimation,
+        config: RerunSinkConfig,
+    ) -> Self {
+        Self {
             rec,
             decimation,
             frame_index: 0,
             depth_index: 0,
-            tracks: TrackState::new(track_config),
+            tracks: TrackState::new(config.track),
             odom_trajectory: TrajectoryLog::default(),
             corrected_trajectory: TrajectoryLog::default(),
             visual_measurement_trajectory: TrajectoryLog::default(),
             logged_world: false,
-            surface_pose_quality_gate,
-            surface_map: crate::SurfaceBeliefMap::new(surface_map_config),
-        })
+            surface_pose_quality_gate: config.surface_pose_quality_gate,
+            surface_map: crate::SurfaceBeliefMap::new(config.surface_map),
+        }
     }
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {

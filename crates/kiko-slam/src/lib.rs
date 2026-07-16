@@ -187,7 +187,8 @@ pub use vio::{
     VioFactorError,
 };
 pub use viz::{
-    RerunSink, RerunSinkInitError, VizDecimation, VizDecimationError, VizFlushError, VizLogError,
+    RerunSink, RerunSinkConfig, RerunSinkInitError, VizDecimation, VizDecimationError,
+    VizFlushError, VizLogError,
 };
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
