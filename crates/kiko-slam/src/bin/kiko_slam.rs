@@ -52,7 +52,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 const DEFAULT_MAX_KEYPOINTS: usize = 1024;
-const DEFAULT_RERUN_PORT: u16 = 9876;
+const DEFAULT_RERUN_PORT: NonZeroU16 =
+    NonZeroU16::new(9876).expect("the default Rerun port is nonzero");
 
 // BA defaults (overridable via KIKO_BA_* / KIKO_LM_* env vars)
 const DEFAULT_BA_WINDOW: usize = 10;
@@ -171,13 +172,13 @@ struct VizArgs {
     inference: InferenceArgs,
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value_t = VizDecimationArg::default())]
     rerun_decimation: VizDecimationArg,
-    #[arg(long, env = "KIKO_RERUN_SAVE", conflicts_with = "rerun_serve")]
+    #[arg(long, env = "KIKO_RERUN_SAVE")]
     save_rrd: Option<PathBuf>,
     /// Start a gRPC server on 0.0.0.0:<port> so remote Rerun viewers can connect.
     #[arg(long, env = "KIKO_RERUN_SERVE", default_value_t = false)]
     rerun_serve: bool,
     /// Port for gRPC server (used with --rerun-serve). Default: 9876.
-    #[arg(long, env = "KIKO_RERUN_PORT", requires = "rerun_serve")]
+    #[arg(long, env = "KIKO_RERUN_PORT")]
     rerun_port: Option<NonZeroU16>,
     #[arg(long, env = "KIKO_VIZ_ODOMETRY", default_value_t = false)]
     odometry: bool,
@@ -185,6 +186,55 @@ struct VizArgs {
     rectify_tolerance: Option<f32>,
     #[command(flatten)]
     dataset: DatasetArgs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RerunDestination<'a> {
+    Save(&'a Path),
+    Serve { port: NonZeroU16 },
+    Connect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RerunDestinationError {
+    SaveAndServe,
+    PortWithoutServer,
+}
+
+impl std::fmt::Display for RerunDestinationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SaveAndServe => write!(
+                f,
+                "Rerun output cannot save a recording and serve it at the same time"
+            ),
+            Self::PortWithoutServer => {
+                write!(f, "a Rerun port requires Rerun serving to be enabled")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RerunDestinationError {}
+
+impl<'a> RerunDestination<'a> {
+    fn parse(
+        save_rrd: Option<&'a Path>,
+        rerun_serve: bool,
+        rerun_port: Option<NonZeroU16>,
+    ) -> Result<Self, RerunDestinationError> {
+        match (save_rrd, rerun_serve, rerun_port) {
+            (Some(_), true, _) => Err(RerunDestinationError::SaveAndServe),
+            (Some(path), false, None) => Ok(Self::Save(path)),
+            (Some(_), false, Some(_)) | (None, false, Some(_)) => {
+                Err(RerunDestinationError::PortWithoutServer)
+            }
+            (None, true, port) => Ok(Self::Serve {
+                port: port.unwrap_or(DEFAULT_RERUN_PORT),
+            }),
+            (None, false, None) => Ok(Self::Connect),
+        }
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -532,42 +582,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_viz(args: VizArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let destination =
+        RerunDestination::parse(args.save_rrd.as_deref(), args.rerun_serve, args.rerun_port)?;
     if args.odometry {
-        return run_viz_odometry(&args);
+        return run_viz_odometry(&args, destination);
     }
-    run_viz_matches(&args)
+    run_viz_matches(&args, destination)
 }
 
 fn build_recording(
-    args: &VizArgs,
+    destination: RerunDestination<'_>,
     name: &str,
 ) -> Result<rerun::RecordingStream, Box<dyn std::error::Error>> {
-    if let Some(path) = &args.save_rrd {
-        let path = if path.is_dir() {
-            path.join(format!("{name}.rrd"))
-        } else {
-            path.clone()
-        };
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    match destination {
+        RerunDestination::Save(path) => {
+            let path = if path.is_dir() {
+                path.join(format!("{name}.rrd"))
+            } else {
+                path.to_path_buf()
+            };
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            eprintln!("rerun: saving to {}", path.display());
+            let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
+            Ok(rec)
         }
-        eprintln!("rerun: saving to {}", path.display());
-        let rec = rerun::RecordingStreamBuilder::new(name).save(&path)?;
-        Ok(rec)
-    } else if args.rerun_serve {
-        let port = args.rerun_port.map_or(DEFAULT_RERUN_PORT, NonZeroU16::get);
-        eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
-        eprintln!(
-            "rerun: connect from laptop with:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
-        );
-        let rec = rerun::RecordingStreamBuilder::new(name).serve_grpc_opts(
-            "0.0.0.0",
-            port,
-            Default::default(),
-        )?;
-        Ok(rec)
-    } else {
-        Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc()?)
+        RerunDestination::Serve { port } => {
+            let port = port.get();
+            eprintln!("rerun: serving gRPC on 0.0.0.0:{port}");
+            eprintln!(
+                "rerun: connect from laptop with:  rerun --connect rerun+http://192.168.50.2:{port}/proxy"
+            );
+            let rec = rerun::RecordingStreamBuilder::new(name).serve_grpc_opts(
+                "0.0.0.0",
+                port,
+                Default::default(),
+            )?;
+            Ok(rec)
+        }
+        RerunDestination::Connect => Ok(rerun::RecordingStreamBuilder::new(name).connect_grpc()?),
     }
 }
 
@@ -582,7 +639,10 @@ fn build_rectified_stereo_config(
     )
 }
 
-fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_viz_matches(
+    args: &VizArgs,
+    destination: RerunDestination<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats();
 
@@ -608,7 +668,7 @@ fn run_viz_matches(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
-    let rec = build_recording(args, "kiko-slam-dataset")?;
+    let rec = build_recording(destination, "kiko-slam-dataset")?;
     let mut sink = RerunSink::new(rec, decimation)?;
 
     let mut pipeline = inference.into_pipeline();
@@ -891,7 +951,10 @@ fn report_tracker_runtime(config: &TrackerConfig, tracker: &SlamTracker) {
     );
 }
 
-fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_viz_odometry(
+    args: &VizArgs,
+    destination: RerunDestination<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats();
 
@@ -935,7 +998,7 @@ fn run_viz_odometry(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
     )?;
 
-    let rec = build_recording(args, "kiko-slam-dataset-odometry")?;
+    let rec = build_recording(destination, "kiko-slam-dataset-odometry")?;
     let mut sink = RerunSink::new(rec, decimation)?;
     let mut tracker = SlamTracker::try_new(
         superpoint_left,
@@ -2522,10 +2585,15 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BaConfigValues, BenchError, Cli, DepthRingCapacity, build_ba_config_from_values};
+    use super::{
+        BaConfigValues, BenchError, Cli, DepthRingCapacity, RerunDestination,
+        RerunDestinationError, build_ba_config_from_values,
+    };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::DatasetError;
     use kiko_slam::{InferenceError, PipelineError, PipelineTimingError};
+    use std::num::NonZeroU16;
+    use std::path::Path;
     use std::time::Duration;
 
     #[cfg(feature = "record")]
@@ -2607,25 +2675,45 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_conflicting_rerun_destinations() {
-        let error = Cli::try_parse_from([
-            "kiko-slam",
-            "viz",
-            "--save-rrd",
-            "/tmp/output.rrd",
-            "--rerun-serve",
-            "/tmp/dataset",
-        ])
-        .expect_err("save and serve destinations must conflict");
-        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    fn rerun_destination_rejects_contradictory_weak_fields() {
+        let save_path = Path::new("output.rrd");
+        let port = NonZeroU16::new(9877).expect("nonzero test port");
+
+        assert_eq!(
+            RerunDestination::parse(Some(save_path), true, None),
+            Err(RerunDestinationError::SaveAndServe)
+        );
+        assert_eq!(
+            RerunDestination::parse(None, false, Some(port)),
+            Err(RerunDestinationError::PortWithoutServer)
+        );
+        assert_eq!(
+            RerunDestination::parse(Some(save_path), false, Some(port)),
+            Err(RerunDestinationError::PortWithoutServer)
+        );
     }
 
     #[test]
-    fn cli_requires_serving_for_an_explicit_rerun_port() {
-        let error =
-            Cli::try_parse_from(["kiko-slam", "viz", "--rerun-port", "9877", "/tmp/dataset"])
-                .expect_err("an explicit port without serving must be rejected");
-        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    fn rerun_destination_resolves_each_valid_mode_once() {
+        let save_path = Path::new("output.rrd");
+        let port = NonZeroU16::new(9877).expect("nonzero test port");
+
+        assert_eq!(
+            RerunDestination::parse(Some(save_path), false, None),
+            Ok(RerunDestination::Save(save_path))
+        );
+        assert_eq!(
+            RerunDestination::parse(None, true, Some(port)),
+            Ok(RerunDestination::Serve { port })
+        );
+        assert!(matches!(
+            RerunDestination::parse(None, true, None),
+            Ok(RerunDestination::Serve { port }) if port.get() == 9876
+        ));
+        assert_eq!(
+            RerunDestination::parse(None, false, None),
+            Ok(RerunDestination::Connect)
+        );
     }
 
     #[test]
