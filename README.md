@@ -49,6 +49,11 @@ Current full-resolution visual-only validation on `/home/makerspace/full_slam_la
   `98` keyframes, `downscale=1`, and `max_keypoints=2048`.
 - Evidence:
   `/home/makerspace/kiko-benchmarks/20260716T212612+0530-full-visual-settled-501943`.
+- Jetson-profile VIO invocation: `2084/2084` pairs processed, `19.68` total FPS
+  and `19.91` steady FPS after the same warm-up, `0` tracker errors,
+  `2072/2072` steady current poses, `3` explicitly stale startup poses, and
+  `98` keyframes. Evidence:
+  `/home/makerspace/kiko-benchmarks/20260716T213222+0530-full-vio-settled-504627`.
 
 Use explicit flags to override any profile default:
 
