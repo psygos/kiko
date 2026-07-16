@@ -676,12 +676,20 @@ pub fn aggregate_global_descriptor(
     GlobalDescriptor::from_local_descriptors(descriptors)
 }
 
+type BestDescriptorMatches = Vec<Option<(usize, f32)>>;
+
+struct MutualBestDescriptorMatches {
+    query: BestDescriptorMatches,
+    candidate: BestDescriptorMatches,
+}
+
+#[cfg(test)]
 fn brute_force_best_match(
     source_len: usize,
     target_len: usize,
     similarity_fn: impl Fn(usize, usize) -> f32,
     threshold: f32,
-) -> Vec<Option<(usize, f32)>> {
+) -> BestDescriptorMatches {
     (0..source_len)
         .map(|src| {
             let mut best = threshold;
@@ -696,6 +704,39 @@ fn brute_force_best_match(
             best_target
         })
         .collect()
+}
+
+fn update_best_match(
+    best: &mut Option<(usize, f32)>,
+    target_index: usize,
+    similarity: f32,
+    threshold: f32,
+) {
+    let best_similarity = best.map_or(threshold, |(_, similarity)| similarity);
+    if similarity >= best_similarity {
+        *best = Some((target_index, similarity));
+    }
+}
+
+fn brute_force_mutual_best_matches(
+    query_len: usize,
+    candidate_len: usize,
+    similarity: impl Fn(usize, usize) -> f32,
+    threshold: f32,
+) -> MutualBestDescriptorMatches {
+    let mut query_best = vec![None; query_len];
+    let mut candidate_best = vec![None; candidate_len];
+    for (query_index, query_match) in query_best.iter_mut().enumerate() {
+        for (candidate_index, candidate_match) in candidate_best.iter_mut().enumerate() {
+            let similarity = similarity(query_index, candidate_index);
+            update_best_match(query_match, candidate_index, similarity, threshold);
+            update_best_match(candidate_match, query_index, similarity, threshold);
+        }
+    }
+    MutualBestDescriptorMatches {
+        query: query_best,
+        candidate: candidate_best,
+    }
 }
 
 pub fn try_match_descriptors_for_loop(
@@ -720,17 +761,13 @@ pub fn try_match_descriptors_for_loop(
     let query_quantized: Vec<CompactDescriptor> =
         query_descriptors.iter().map(Descriptor::quantize).collect();
 
-    let query_best = brute_force_best_match(
+    let MutualBestDescriptorMatches {
+        query: query_best,
+        candidate: candidate_best,
+    } = brute_force_mutual_best_matches(
         query_quantized.len(),
         candidate_descriptors.len(),
         |qi, ci| query_quantized[qi].cosine_similarity(&candidate_descriptors[ci].1),
-        similarity_threshold,
-    );
-
-    let candidate_best = brute_force_best_match(
-        candidate_descriptors.len(),
-        query_quantized.len(),
-        |ci, qi| query_quantized[qi].cosine_similarity(&candidate_descriptors[ci].1),
         similarity_threshold,
     );
 
@@ -1303,7 +1340,7 @@ mod tests {
         KeyframeDatabaseError, LoopCandidate, LoopClosureConfig, LoopVerificationError,
         RelocalizationCandidate, RelocalizationConfig, RelocalizationConfigError,
         RelocalizationConfigInput, aggregate_global_descriptor, brute_force_best_match,
-        try_match_descriptors_for_loop,
+        brute_force_mutual_best_matches, try_match_descriptors_for_loop,
     };
     use crate::map::{ImageSize, KeyframeId, MapError, SlamMap};
     use crate::test_helpers::{make_pinhole_intrinsics, project_world_point};
@@ -1318,7 +1355,7 @@ mod tests {
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    struct TwoPassMatchBehavior {
+    struct BidirectionalMatchBehavior {
         query_best: Vec<Option<(usize, u32)>>,
         candidate_best: Vec<Option<(usize, u32)>>,
         mutual_matches: Vec<(usize, usize, u32)>,
@@ -1354,7 +1391,7 @@ mod tests {
         query: &[CompactDescriptor],
         candidates: &[CompactDescriptor],
         threshold: f32,
-    ) -> TwoPassMatchBehavior {
+    ) -> BidirectionalMatchBehavior {
         let query_best = brute_force_best_match(
             query.len(),
             candidates.len(),
@@ -1371,10 +1408,30 @@ mod tests {
             },
             threshold,
         );
-        TwoPassMatchBehavior {
+        BidirectionalMatchBehavior {
             mutual_matches: mutual_match_bits(&query_best, &candidate_best),
             query_best: match_bits(&query_best),
             candidate_best: match_bits(&candidate_best),
+        }
+    }
+
+    fn combined_pass_behavior(
+        query: &[CompactDescriptor],
+        candidates: &[CompactDescriptor],
+        threshold: f32,
+    ) -> BidirectionalMatchBehavior {
+        let best_matches = brute_force_mutual_best_matches(
+            query.len(),
+            candidates.len(),
+            |query_index, candidate_index| {
+                query[query_index].cosine_similarity(&candidates[candidate_index])
+            },
+            threshold,
+        );
+        BidirectionalMatchBehavior {
+            mutual_matches: mutual_match_bits(&best_matches.query, &best_matches.candidate),
+            query_best: match_bits(&best_matches.query),
+            candidate_best: match_bits(&best_matches.candidate),
         }
     }
 
@@ -1404,7 +1461,7 @@ mod tests {
         query: &[CompactDescriptor],
         candidates: &[CompactDescriptor],
         threshold: f32,
-    ) -> TwoPassMatchBehavior {
+    ) -> BidirectionalMatchBehavior {
         let similarities: Vec<Vec<f32>> = query
             .iter()
             .map(|query_descriptor| {
@@ -1426,7 +1483,7 @@ mod tests {
             threshold,
             |candidate_index, query_index| similarities[query_index][candidate_index],
         );
-        TwoPassMatchBehavior {
+        BidirectionalMatchBehavior {
             mutual_matches: mutual_match_bits(&query_best, &candidate_best),
             query_best: match_bits(&query_best),
             candidate_best: match_bits(&candidate_best),
@@ -2169,12 +2226,12 @@ mod tests {
         let descriptor = generated_compact_descriptor(7);
         let query = vec![descriptor.clone(), descriptor.clone()];
         let candidates = vec![descriptor.clone(), descriptor.clone(), descriptor];
-        let behavior = current_two_pass_behavior(&query, &candidates, 1.0);
+        let behavior = combined_pass_behavior(&query, &candidates, 1.0);
         let identical_similarity = 1.0_f32.to_bits();
 
         assert_eq!(
             behavior,
-            TwoPassMatchBehavior {
+            BidirectionalMatchBehavior {
                 query_best: vec![
                     Some((2, identical_similarity)),
                     Some((2, identical_similarity)),
@@ -2216,9 +2273,14 @@ mod tests {
         );
 
         let positive_threshold = f32::from_bits(1);
+        let reference = reference_two_pass_behavior(&descriptors, &descriptors, positive_threshold);
         assert_eq!(
             current_two_pass_behavior(&descriptors, &descriptors, positive_threshold),
-            reference_two_pass_behavior(&descriptors, &descriptors, positive_threshold)
+            reference
+        );
+        assert_eq!(
+            combined_pass_behavior(&descriptors, &descriptors, positive_threshold),
+            reference
         );
     }
 
@@ -2241,11 +2303,16 @@ mod tests {
                         .map(|index| corpus[(case * 2 + index * 5) % corpus.len()].clone())
                         .collect();
                     for threshold in [f32::from_bits(1), 0.35, 1.0] {
-                        let actual = current_two_pass_behavior(&query, &candidates, threshold);
                         let expected = reference_two_pass_behavior(&query, &candidates, threshold);
+                        let two_pass = current_two_pass_behavior(&query, &candidates, threshold);
+                        let combined = combined_pass_behavior(&query, &candidates, threshold);
                         assert_eq!(
-                            actual, expected,
-                            "query_len={query_len}, candidate_len={candidate_len}, case={case}, threshold={threshold}"
+                            two_pass, expected,
+                            "two-pass oracle drift: query_len={query_len}, candidate_len={candidate_len}, case={case}, threshold={threshold}"
+                        );
+                        assert_eq!(
+                            combined, expected,
+                            "combined-pass drift: query_len={query_len}, candidate_len={candidate_len}, case={case}, threshold={threshold}"
                         );
                     }
                 }
