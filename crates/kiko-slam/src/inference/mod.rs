@@ -76,6 +76,18 @@ pub enum InferenceError {
         name: &'static str,
         source: OrtError,
     },
+    InputDimensionsTooSmall {
+        model: &'static str,
+        width: u32,
+        height: u32,
+        minimum: u32,
+    },
+    KeypointCoordinateUnrepresentable {
+        model: &'static str,
+        index: usize,
+        axis: &'static str,
+        coordinate: u32,
+    },
     Downscale(crate::DownscaleError),
     Detection(crate::DetectionError),
     Match(crate::MatchError),
@@ -123,6 +135,8 @@ impl std::error::Error for InferenceError {
             Self::GlobalDescriptor(source) => Some(source),
             Self::RuntimeLibraryUnavailable { .. }
             | Self::UnexpectedOutput { .. }
+            | Self::InputDimensionsTooSmall { .. }
+            | Self::KeypointCoordinateUnrepresentable { .. }
             | Self::InvalidOptimizationLevel { .. }
             | Self::ThreadCountOutOfRange { .. }
             | Self::AsyncIntraThreadCountTooSmall { .. }
@@ -245,6 +259,24 @@ impl std::fmt::Display for InferenceError {
             InferenceError::OutputDecode { name, source } => {
                 write!(f, "failed to decode model output '{name}': {source}")
             }
+            InferenceError::InputDimensionsTooSmall {
+                model,
+                width,
+                height,
+                minimum,
+            } => write!(
+                f,
+                "{model} input dimensions {width}x{height} are smaller than the {minimum}x{minimum} model minimum"
+            ),
+            InferenceError::KeypointCoordinateUnrepresentable {
+                model,
+                index,
+                axis,
+                coordinate,
+            } => write!(
+                f,
+                "{model} keypoint {index} scaled {axis} pixel {coordinate} cannot be represented exactly by the host f32 coordinate domain"
+            ),
             InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
             InferenceError::Detection(err) => write!(f, "detection error: {err}"),
             InferenceError::Match(err) => write!(f, "match error: {err}"),

@@ -103,7 +103,9 @@ Default model paths are resolved under `crates/kiko-slam/models/`:
 - `lg.onnx` (LightGlue)
 
 Override with `--superpoint-model` / `--lightglue-model` or `KIKO_SUPERPOINT_MODEL` /
-`KIKO_LIGHTGLUE_MODEL`.
+`KIKO_LIGHTGLUE_MODEL`. A SuperPoint override must implement Kiko's exact
+[tensor and coordinate profile](crates/kiko-slam/models/README.md); the path option does not infer
+or adapt alternate layouts, units, or axis orders.
 
 Learned place recognition resolves `eigenplaces.onnx` from the same directory. That model is not
 stored in this repository; provide it at that path or set `KIKO_EIGENPLACES_MODEL`. Learned

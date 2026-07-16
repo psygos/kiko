@@ -1,10 +1,58 @@
 use super::{InferenceBackend, InferenceError, ManagedSession, build_session};
-use crate::{Descriptor, Detections, DownscaleFactor, Frame, Keypoint};
+use crate::{Descriptor, Detections, DownscaleFactor, Frame, FrameDimensions, Keypoint};
 use ort::session::RunOptions;
-use ort::value::Tensor;
+use ort::value::{Shape, Tensor};
 use std::path::Path;
 
 use crate::DESCRIPTOR_DIM;
+
+// Fixed by the tracked sp.onnx graph: three stride-2 pools, radius-4 NMS,
+// strict score thresholding, and sorted TopK capped at 512.
+const MAX_OUTPUT_KEYPOINTS: usize = 512;
+const MODEL_STRIDE: u32 = 8;
+const EXCLUDED_BORDER: u32 = 4;
+const SCORE_THRESHOLD: f32 = 0.0005;
+
+#[derive(Clone, Copy, Debug)]
+struct SuperPointInputDomain {
+    scale: u32,
+    effective_width: u32,
+    effective_height: u32,
+}
+
+impl SuperPointInputDomain {
+    fn try_new(
+        model_dimensions: FrameDimensions,
+        frame_dimensions: FrameDimensions,
+        downscale: Option<DownscaleFactor>,
+    ) -> Result<Self, InferenceError> {
+        let width = model_dimensions.width();
+        let height = model_dimensions.height();
+        if width < MODEL_STRIDE || height < MODEL_STRIDE {
+            return Err(InferenceError::InputDimensionsTooSmall {
+                model: "superpoint",
+                width,
+                height,
+                minimum: MODEL_STRIDE,
+            });
+        }
+
+        let scale = downscale.map_or(1, DownscaleFactor::get_u32);
+        if width.checked_mul(scale) != Some(frame_dimensions.width())
+            || height.checked_mul(scale) != Some(frame_dimensions.height())
+        {
+            return Err(InferenceError::InvariantViolation {
+                context: "SuperPoint model dimensions do not map to the frame dimensions",
+            });
+        }
+
+        Ok(Self {
+            scale,
+            effective_width: width / MODEL_STRIDE * MODEL_STRIDE,
+            effective_height: height / MODEL_STRIDE * MODEL_STRIDE,
+        })
+    }
+}
 
 pub struct SuperPoint {
     session: ManagedSession,
@@ -35,6 +83,8 @@ impl SuperPoint {
     }
 
     pub fn detect(&mut self, frame: &Frame) -> Result<Detections, InferenceError> {
+        let input_domain =
+            SuperPointInputDomain::try_new(frame.dimensions(), frame.dimensions(), None)?;
         crate::preprocess::normalise_frame_into(frame, &mut self.scratch);
 
         let input_tensor = Tensor::from_array((
@@ -42,14 +92,7 @@ impl SuperPoint {
             self.scratch.clone(),
         ))?;
 
-        run_inference(
-            &mut self.session,
-            frame,
-            input_tensor,
-            frame.width(),
-            frame.height(),
-            None,
-        )
+        run_inference(&mut self.session, frame, input_tensor, input_domain)
     }
 
     pub fn detect_with_downscale(
@@ -64,6 +107,8 @@ impl SuperPoint {
         let dimensions =
             crate::preprocess::normalise_downscale_into(frame, downscale, &mut self.scratch)
                 .map_err(InferenceError::Downscale)?;
+        let input_domain =
+            SuperPointInputDomain::try_new(dimensions, frame.dimensions(), Some(downscale))?;
 
         let input_tensor = Tensor::from_array((
             [
@@ -75,14 +120,7 @@ impl SuperPoint {
             self.scratch.clone(),
         ))?;
 
-        run_inference(
-            &mut self.session,
-            frame,
-            input_tensor,
-            dimensions.width(),
-            dimensions.height(),
-            Some(downscale),
-        )
+        run_inference(&mut self.session, frame, input_tensor, input_domain)
     }
 }
 
@@ -90,9 +128,7 @@ fn run_inference(
     session: &mut ManagedSession,
     frame: &Frame,
     input_tensor: Tensor<f32>,
-    width: u32,
-    height: u32,
-    downscale: Option<DownscaleFactor>,
+    input_domain: SuperPointInputDomain,
 ) -> Result<Detections, InferenceError> {
     session.run("superpoint", |session| {
         let run_options = RunOptions::new().map_err(InferenceError::Execution)?;
@@ -100,14 +136,18 @@ fn run_inference(
             session.run_async(ort::inputs!["image" => input_tensor], &run_options)
         })?;
 
-        let keypoints_value =
-            outputs
-                .get("keypoints")
-                .ok_or_else(|| InferenceError::UnexpectedOutput {
-                    name: "keypoints".to_string(),
-                    expected: "named output tensor".to_string(),
-                    actual: "missing output".to_string(),
-                })?;
+        let keypoints_raw = outputs
+            .get("keypoints")
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "keypoints".to_string(),
+                expected: "named output tensor".to_string(),
+                actual: "missing output".to_string(),
+            })?
+            .try_extract_tensor::<i64>()
+            .map_err(|source| InferenceError::OutputDecode {
+                name: "keypoints",
+                source,
+            })?;
         let scores_raw = outputs
             .get("scores")
             .ok_or_else(|| InferenceError::UnexpectedOutput {
@@ -115,7 +155,11 @@ fn run_inference(
                 expected: "named output tensor".to_string(),
                 actual: "missing output".to_string(),
             })?
-            .try_extract_tensor::<f32>()?;
+            .try_extract_tensor::<f32>()
+            .map_err(|source| InferenceError::OutputDecode {
+                name: "scores",
+                source,
+            })?;
         let descriptors_raw = outputs
             .get("descriptors")
             .ok_or_else(|| InferenceError::UnexpectedOutput {
@@ -123,229 +167,735 @@ fn run_inference(
                 expected: "named output tensor".to_string(),
                 actual: "missing output".to_string(),
             })?
-            .try_extract_tensor::<f32>()?;
+            .try_extract_tensor::<f32>()
+            .map_err(|source| InferenceError::OutputDecode {
+                name: "descriptors",
+                source,
+            })?;
 
-        let scores = scores_raw.1.to_vec();
-        let keypoints_pairs = if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<f32>()
-        {
-            parse_keypoint_pairs(shape, data, "keypoints")?
-        } else if let Ok((shape, data)) = keypoints_value.try_extract_tensor::<i64>() {
-            let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
-            parse_keypoint_pairs(shape, &data_f32, "keypoints")?
-        } else {
-            return Err(InferenceError::UnexpectedOutput {
-                name: "keypoints".to_string(),
-                expected: "tensor of f32 or i64".to_string(),
-                actual: format!("{:?}", keypoints_value.dtype()),
-            });
-        };
-        let mut keypoints = to_keypoints(&keypoints_pairs, width as f32, height as f32);
-        if let Some(scale) = downscale {
-            let factor = scale.get() as f32;
-            for kp in &mut keypoints {
-                kp.x *= factor;
-                kp.y *= factor;
-            }
-        }
-        let descriptors = parse_descriptors(descriptors_raw.1, "descriptors")?;
+        let parsed = parse_outputs(keypoints_raw, scores_raw, descriptors_raw, input_domain)?;
 
-        Detections::from_dimensions(
+        Ok(Detections::from_parsed_components(
             frame.sensor_id(),
             frame.frame_id(),
             frame.dimensions(),
-            keypoints,
-            scores,
-            descriptors,
-        )
-        .map_err(InferenceError::Detection)
+            parsed.keypoints,
+            parsed.scores,
+            parsed.descriptors,
+        ))
     })
 }
 
-fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>, InferenceError> {
-    if !data.len().is_multiple_of(DESCRIPTOR_DIM) {
+#[derive(Debug)]
+struct ParsedSuperPointOutput {
+    keypoints: Vec<Keypoint>,
+    scores: Vec<f32>,
+    descriptors: Vec<Descriptor>,
+}
+
+fn parse_outputs(
+    keypoints: (&Shape, &[i64]),
+    scores: (&Shape, &[f32]),
+    descriptors: (&Shape, &[f32]),
+    input_domain: SuperPointInputDomain,
+) -> Result<ParsedSuperPointOutput, InferenceError> {
+    let (keypoint_shape, keypoint_data) = keypoints;
+    let count_i64 = match &keypoint_shape[..] {
+        [1, count, 2] if *count >= 0 => *count,
+        _ => {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "keypoints".to_string(),
+                expected: format!(
+                    "i64 tensor shape [1, N, 2] with 0 <= N <= {MAX_OUTPUT_KEYPOINTS}"
+                ),
+                actual: format!("tensor shape {keypoint_shape}"),
+            });
+        }
+    };
+    let count = usize::try_from(count_i64).map_err(|_| InferenceError::UnexpectedOutput {
+        name: "keypoints".to_string(),
+        expected: "keypoint count representable by the host".to_string(),
+        actual: format!("keypoint count {count_i64}"),
+    })?;
+    if count > MAX_OUTPUT_KEYPOINTS {
         return Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: format!(
-                "tensor with element count divisible by {DESCRIPTOR_DIM} (descriptor dimension)"
-            ),
-            actual: format!("tensor with {} elements", data.len()),
+            name: "keypoints".to_string(),
+            expected: format!("at most {MAX_OUTPUT_KEYPOINTS} keypoints"),
+            actual: format!("{count} keypoints"),
         });
     }
 
-    let mut descriptors = Vec::with_capacity(data.len() / DESCRIPTOR_DIM);
-    for chunk in data.chunks_exact(DESCRIPTOR_DIM) {
+    let keypoint_elements =
+        count
+            .checked_mul(2)
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "keypoints".to_string(),
+                expected: "keypoint tensor size representable by the host".to_string(),
+                actual: format!("keypoint count {count}"),
+            })?;
+    require_shape_and_length(
+        "keypoints",
+        keypoint_shape,
+        keypoint_data.len(),
+        &[1, count_i64, 2],
+        keypoint_elements,
+    )?;
+    require_shape_and_length("scores", scores.0, scores.1.len(), &[1, count_i64], count)?;
+    let descriptor_elements =
+        count
+            .checked_mul(DESCRIPTOR_DIM)
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "descriptors".to_string(),
+                expected: "descriptor tensor size representable by the host".to_string(),
+                actual: format!("descriptor count {count}"),
+            })?;
+    require_shape_and_length(
+        "descriptors",
+        descriptors.0,
+        descriptors.1.len(),
+        &[1, count_i64, DESCRIPTOR_DIM as i64],
+        descriptor_elements,
+    )?;
+
+    let mut previous_score = f32::INFINITY;
+    for (index, &score) in scores.1.iter().enumerate() {
+        if !score.is_finite() || score <= SCORE_THRESHOLD || score > 1.0 {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "scores".to_string(),
+                expected: format!(
+                    "finite confidence scores within ({SCORE_THRESHOLD}, 1] in non-increasing order"
+                ),
+                actual: format!("index {index} contains {score}"),
+            });
+        }
+        if score > previous_score {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "scores".to_string(),
+                expected: "confidence scores in non-increasing TopK order".to_string(),
+                actual: format!(
+                    "index {index} contains {score} after {}",
+                    scores.1[index - 1]
+                ),
+            });
+        }
+        previous_score = score;
+    }
+    if let Some((flat_index, &value)) = descriptors
+        .1
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(InferenceError::UnexpectedOutput {
+            name: "descriptors".to_string(),
+            expected: "finite descriptor components".to_string(),
+            actual: format!(
+                "descriptor {} component {} contains {value}",
+                flat_index / DESCRIPTOR_DIM,
+                flat_index % DESCRIPTOR_DIM
+            ),
+        });
+    }
+
+    let mut parsed_keypoints = Vec::with_capacity(count);
+    for (index, pair) in keypoint_data.chunks_exact(2).enumerate() {
+        parsed_keypoints.push(Keypoint {
+            x: parse_coordinate(
+                pair[0],
+                input_domain.effective_width,
+                input_domain.scale,
+                index,
+                "x",
+            )?,
+            y: parse_coordinate(
+                pair[1],
+                input_domain.effective_height,
+                input_domain.scale,
+                index,
+                "y",
+            )?,
+        });
+    }
+
+    let mut parsed_descriptors = Vec::with_capacity(count);
+    for chunk in descriptors.1.chunks_exact(DESCRIPTOR_DIM) {
         let mut descriptor = [0.0_f32; DESCRIPTOR_DIM];
         descriptor.copy_from_slice(chunk);
-        descriptors.push(Descriptor(descriptor));
+        parsed_descriptors.push(Descriptor(descriptor));
     }
-    Ok(descriptors)
+
+    Ok(ParsedSuperPointOutput {
+        keypoints: parsed_keypoints,
+        scores: scores.1.to_vec(),
+        descriptors: parsed_descriptors,
+    })
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Normalization {
-    None,
-    ZeroToOne,
-    NegOneToOne,
-}
-
-fn parse_keypoint_pairs(
-    shape: &ort::value::Shape,
-    data: &[f32],
-    output_name: &str,
-) -> Result<Vec<[f32; 2]>, InferenceError> {
-    let expected_len = shape.num_elements();
-    if expected_len != 0 && expected_len != data.len() {
-        return Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: format!("tensor with {expected_len} elements"),
-            actual: format!("tensor with {} elements", data.len()),
-        });
-    }
-
-    if !data.len().is_multiple_of(2) {
-        return Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: "even-sized tensor".to_string(),
-            actual: format!("tensor with {} elements", data.len()),
-        });
-    }
-
-    let dims = &shape[..];
-    let count = data.len() / 2;
-    let mut pairs = Vec::with_capacity(count);
-
-    if dims.last().copied() == Some(2) {
-        for i in 0..count {
-            pairs.push([data[2 * i], data[2 * i + 1]]);
-        }
-        return Ok(pairs);
-    }
-
-    if dims.first().copied() == Some(2) {
-        let (first, second) = data.split_at(count);
-        for i in 0..count {
-            pairs.push([first[i], second[i]]);
-        }
-        return Ok(pairs);
+fn require_shape_and_length(
+    name: &str,
+    shape: &Shape,
+    actual_length: usize,
+    expected_shape: &[i64],
+    expected_length: usize,
+) -> Result<(), InferenceError> {
+    if &shape[..] == expected_shape && actual_length == expected_length {
+        return Ok(());
     }
 
     Err(InferenceError::UnexpectedOutput {
-        name: output_name.to_string(),
-        expected: "tensor with a leading or trailing dimension of size 2".to_string(),
-        actual: format!("{shape}"),
+        name: name.to_string(),
+        expected: format!("shape {expected_shape:?} with {expected_length} elements"),
+        actual: format!("shape {shape} with {actual_length} elements"),
     })
 }
 
-fn extract_xy(
-    pair: &[f32; 2],
-    width: f32,
-    height: f32,
-    norm: Normalization,
-    swap: bool,
-) -> (f32, f32) {
-    if swap {
-        (
-            scale_coordinate(pair[1], width, norm),
-            scale_coordinate(pair[0], height, norm),
-        )
-    } else {
-        (
-            scale_coordinate(pair[0], width, norm),
-            scale_coordinate(pair[1], height, norm),
-        )
+fn parse_coordinate(
+    value: i64,
+    effective_extent: u32,
+    scale: u32,
+    keypoint_index: usize,
+    axis: &'static str,
+) -> Result<f32, InferenceError> {
+    let upper_bound = effective_extent - EXCLUDED_BORDER;
+    let coordinate = u32::try_from(value)
+        .ok()
+        .filter(|&coordinate| coordinate >= EXCLUDED_BORDER && coordinate < upper_bound)
+        .ok_or_else(|| InferenceError::UnexpectedOutput {
+            name: "keypoints".to_string(),
+            expected: format!(
+                "absolute integer {axis} coordinates within [{EXCLUDED_BORDER}, {upper_bound})"
+            ),
+            actual: format!("keypoint {keypoint_index} contains {axis}={value}"),
+        })?;
+    let scaled = coordinate
+        .checked_mul(scale)
+        .ok_or(InferenceError::InvariantViolation {
+            context: "validated SuperPoint coordinate scaling overflowed",
+        })?;
+    let narrowed = scaled as f32;
+    if f64::from(narrowed) != f64::from(scaled) {
+        return Err(InferenceError::KeypointCoordinateUnrepresentable {
+            model: "superpoint",
+            index: keypoint_index,
+            axis,
+            coordinate: scaled,
+        });
     }
-}
-
-fn to_keypoints(pairs: &[[f32; 2]], width: f32, height: f32) -> Vec<Keypoint> {
-    let norm = detect_normalization(pairs);
-    let score_xy = count_in_bounds(pairs, width, height, norm, false);
-    let score_yx = count_in_bounds(pairs, width, height, norm, true);
-    let swap = score_yx > score_xy;
-
-    pairs
-        .iter()
-        .map(|pair| {
-            let (x, y) = extract_xy(pair, width, height, norm, swap);
-            Keypoint { x, y }
-        })
-        .collect()
-}
-
-fn detect_normalization(pairs: &[[f32; 2]]) -> Normalization {
-    let mut min_value = f32::INFINITY;
-    let mut max_value = f32::NEG_INFINITY;
-
-    for [a, b] in pairs {
-        min_value = min_value.min(*a).min(*b);
-        max_value = max_value.max(*a).max(*b);
-    }
-
-    let epsilon = 1e-3_f32;
-    if min_value >= -epsilon && max_value <= 1.0 + epsilon {
-        return Normalization::ZeroToOne;
-    }
-    if min_value >= -1.0 - epsilon && max_value <= 1.0 + epsilon {
-        return Normalization::NegOneToOne;
-    }
-
-    Normalization::None
-}
-
-fn count_in_bounds(
-    pairs: &[[f32; 2]],
-    width: f32,
-    height: f32,
-    norm: Normalization,
-    swap: bool,
-) -> usize {
-    pairs
-        .iter()
-        .filter(|pair| {
-            let (x, y) = extract_xy(pair, width, height, norm, swap);
-            x >= 0.0 && x < width && y >= 0.0 && y < height
-        })
-        .count()
-}
-
-fn scale_coordinate(value: f32, dim: f32, norm: Normalization) -> f32 {
-    let extent = if dim > 1.0 { dim - 1.0 } else { 1.0 };
-    match norm {
-        Normalization::None => value,
-        Normalization::ZeroToOne => value * extent,
-        Normalization::NegOneToOne => (value + 1.0) * 0.5 * extent,
-    }
+    Ok(narrowed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_descriptors_accepts_complete_chunks() {
-        let data: Vec<f32> = (0..(DESCRIPTOR_DIM * 2)).map(|v| v as f32).collect();
-        let descriptors = parse_descriptors(&data, "descriptors").expect("complete chunks");
-
-        assert_eq!(descriptors.len(), 2);
-        assert_eq!(descriptors[0].0[0], 0.0);
-        assert_eq!(descriptors[1].0[0], DESCRIPTOR_DIM as f32);
+    #[allow(clippy::too_many_arguments)]
+    fn parse_fixture(
+        keypoint_shape: &[i64],
+        keypoint_data: &[i64],
+        score_shape: &[i64],
+        score_data: &[f32],
+        descriptor_shape: &[i64],
+        descriptor_data: &[f32],
+        model_dimensions: FrameDimensions,
+        frame_dimensions: FrameDimensions,
+        downscale: Option<DownscaleFactor>,
+    ) -> Result<ParsedSuperPointOutput, InferenceError> {
+        let keypoint_shape = Shape::new(keypoint_shape.iter().copied());
+        let score_shape = Shape::new(score_shape.iter().copied());
+        let descriptor_shape = Shape::new(descriptor_shape.iter().copied());
+        let input_domain =
+            SuperPointInputDomain::try_new(model_dimensions, frame_dimensions, downscale)?;
+        parse_outputs(
+            (&keypoint_shape, keypoint_data),
+            (&score_shape, score_data),
+            (&descriptor_shape, descriptor_data),
+            input_domain,
+        )
     }
 
-    #[test]
-    fn parse_descriptors_rejects_partial_chunk() {
-        let data: Vec<f32> = (0..(DESCRIPTOR_DIM + 1)).map(|v| v as f32).collect();
-        let err = parse_descriptors(&data, "descriptors").expect_err("partial chunk");
+    fn parse_original_scale(
+        keypoint_shape: &[i64],
+        keypoint_data: &[i64],
+        score_shape: &[i64],
+        score_data: &[f32],
+        descriptor_shape: &[i64],
+        descriptor_data: &[f32],
+    ) -> Result<ParsedSuperPointOutput, InferenceError> {
+        let dimensions = FrameDimensions::new(640, 480);
+        parse_fixture(
+            keypoint_shape,
+            keypoint_data,
+            score_shape,
+            score_data,
+            descriptor_shape,
+            descriptor_data,
+            dimensions,
+            dimensions,
+            None,
+        )
+    }
 
-        match err {
+    fn assert_output_error(
+        result: Result<ParsedSuperPointOutput, InferenceError>,
+        expected_name: &str,
+    ) {
+        assert_unexpected_output(result.expect_err("malformed model output"), expected_name);
+    }
+
+    fn assert_unexpected_output(error: InferenceError, expected_name: &str) {
+        match error {
             InferenceError::UnexpectedOutput {
-                name,
-                expected,
-                actual,
+                name: actual_name, ..
             } => {
-                assert_eq!(name, "descriptors");
-                assert!(expected.contains("divisible"));
-                assert!(actual.contains(&(DESCRIPTOR_DIM + 1).to_string()));
+                assert_eq!(actual_name, expected_name);
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn assert_unrepresentable_coordinate(
+        error: InferenceError,
+        expected_index: usize,
+        expected_axis: &'static str,
+        expected_coordinate: u32,
+    ) {
+        assert!(matches!(
+            error,
+            InferenceError::KeypointCoordinateUnrepresentable {
+                model: "superpoint",
+                index,
+                axis,
+                coordinate,
+            } if index == expected_index
+                && axis == expected_axis
+                && coordinate == expected_coordinate
+        ));
+    }
+
+    #[test]
+    fn input_domain_rejects_only_dimensions_below_the_model_minimum() {
+        for (width, height) in [(7, 8), (8, 7)] {
+            assert!(matches!(
+                SuperPointInputDomain::try_new(
+                    FrameDimensions::new(width, height),
+                    FrameDimensions::new(width, height),
+                    None,
+                ),
+                Err(InferenceError::InputDimensionsTooSmall {
+                    model: "superpoint",
+                    width: actual_width,
+                    height: actual_height,
+                    minimum: MODEL_STRIDE,
+                }) if actual_width == width && actual_height == height
+            ));
+        }
+
+        for (width, height) in [(8, 8), (15, 15), (27, 19)] {
+            SuperPointInputDomain::try_new(
+                FrameDimensions::new(width, height),
+                FrameDimensions::new(width, height),
+                None,
+            )
+            .expect("supported nonzero feature grid");
+        }
+
+        let factor = DownscaleFactor::try_from(2).expect("nonzero scale");
+        assert!(matches!(
+            SuperPointInputDomain::try_new(
+                FrameDimensions::new(7, 7),
+                FrameDimensions::new(14, 14),
+                Some(factor),
+            ),
+            Err(InferenceError::InputDimensionsTooSmall {
+                width: 7,
+                height: 7,
+                minimum: MODEL_STRIDE,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn canonical_outputs_preserve_absolute_xy_and_row_alignment() {
+        let mut descriptor_data = vec![0.125; DESCRIPTOR_DIM];
+        descriptor_data.extend(std::iter::repeat_n(-0.5, DESCRIPTOR_DIM));
+        let parsed = parse_original_scale(
+            &[1, 2, 2],
+            &[4, 4, 17, 9],
+            &[1, 2],
+            &[1.0, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptor_data,
+        )
+        .expect("canonical output contract");
+
+        assert_eq!(parsed.keypoints.len(), 2);
+        assert_eq!((parsed.keypoints[0].x, parsed.keypoints[0].y), (4.0, 4.0));
+        assert_eq!((parsed.keypoints[1].x, parsed.keypoints[1].y), (17.0, 9.0));
+        assert_eq!(parsed.scores, [1.0, 0.5]);
+        assert_eq!(parsed.descriptors[0].0, [0.125; DESCRIPTOR_DIM]);
+        assert_eq!(parsed.descriptors[1].0, [-0.5; DESCRIPTOR_DIM]);
+    }
+
+    #[test]
+    fn canonical_empty_output_is_valid() {
+        let parsed = parse_original_scale(
+            &[1, 0, 2],
+            &[],
+            &[1, 0],
+            &[],
+            &[1, 0, DESCRIPTOR_DIM as i64],
+            &[],
+        )
+        .expect("empty canonical output");
+
+        assert!(parsed.keypoints.is_empty());
+        assert!(parsed.scores.is_empty());
+        assert!(parsed.descriptors.is_empty());
+    }
+
+    #[test]
+    fn downscaled_coordinates_map_to_top_left_source_pixels() {
+        let descriptors = vec![0.0; 2 * DESCRIPTOR_DIM];
+        let factor = DownscaleFactor::try_from(2).expect("nonzero scale");
+        let parsed = parse_fixture(
+            &[1, 2, 2],
+            &[4, 4, 315, 235],
+            &[1, 2],
+            &[0.5, 0.25],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptors,
+            FrameDimensions::new(320, 240),
+            FrameDimensions::new(640, 480),
+            Some(factor),
+        )
+        .expect("integer top-left mapping");
+
+        assert_eq!((parsed.keypoints[0].x, parsed.keypoints[0].y), (8.0, 8.0));
+        assert_eq!(
+            (parsed.keypoints[1].x, parsed.keypoints[1].y),
+            (630.0, 470.0)
+        );
+    }
+
+    #[test]
+    fn downscale_mapping_rejects_a_nonexact_f32_pixel() {
+        const EXACT_MODEL_X: i64 = 5_592_406;
+        const INEXACT_MODEL_X: i64 = EXACT_MODEL_X + 1;
+        let model_dimensions = FrameDimensions::new(5_592_424, 16);
+        let frame_dimensions = FrameDimensions::new(16_777_272, 48);
+        let factor = DownscaleFactor::try_from(3).expect("nonzero scale");
+        let descriptors = [0.0; DESCRIPTOR_DIM];
+
+        let exact = parse_fixture(
+            &[1, 1, 2],
+            &[EXACT_MODEL_X, 4],
+            &[1, 1],
+            &[0.5],
+            &[1, 1, DESCRIPTOR_DIM as i64],
+            &descriptors,
+            model_dimensions,
+            frame_dimensions,
+            Some(factor),
+        )
+        .expect("even pixel above 2^24 remains exactly representable");
+        assert_eq!(exact.keypoints[0].x, 16_777_218.0);
+
+        assert_unrepresentable_coordinate(
+            parse_fixture(
+                &[1, 1, 2],
+                &[INEXACT_MODEL_X, 4],
+                &[1, 1],
+                &[0.5],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &descriptors,
+                model_dimensions,
+                frame_dimensions,
+                Some(factor),
+            )
+            .expect_err("odd scaled pixel beyond f32's exact range"),
+            0,
+            "x",
+            16_777_221,
+        );
+    }
+
+    #[test]
+    fn coordinate_parser_enforces_the_effective_grid_and_excluded_border() {
+        let model_dimensions = FrameDimensions::new(27, 19);
+        let descriptors = vec![0.0; 2 * DESCRIPTOR_DIM];
+        let accepted = parse_fixture(
+            &[1, 2, 2],
+            &[4, 4, 19, 11],
+            &[1, 2],
+            &[1.0, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptors,
+            model_dimensions,
+            model_dimensions,
+            None,
+        )
+        .expect("inclusive lower and exclusive upper graph bounds");
+        assert_eq!(
+            (accepted.keypoints[0].x, accepted.keypoints[0].y),
+            (4.0, 4.0)
+        );
+        assert_eq!(
+            (accepted.keypoints[1].x, accepted.keypoints[1].y),
+            (19.0, 11.0)
+        );
+
+        for [x, y] in [[3, 4], [20, 4], [24, 4], [26, 4], [4, 3], [4, 12], [4, 18]] {
+            assert_output_error(
+                parse_fixture(
+                    &[1, 1, 2],
+                    &[x, y],
+                    &[1, 1],
+                    &[0.5],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &[0.0; DESCRIPTOR_DIM],
+                    model_dimensions,
+                    model_dimensions,
+                    None,
+                ),
+                "keypoints",
+            );
+        }
+    }
+
+    #[test]
+    fn output_parser_requires_exact_aligned_shapes_and_lengths() {
+        let descriptors = vec![0.0; DESCRIPTOR_DIM];
+
+        for shape in [&[1, 2][..], &[2, 1, 2], &[1, 1, 2, 1], &[1, 1, 3]] {
+            assert_output_error(
+                parse_original_scale(
+                    shape,
+                    &[1, 1],
+                    &[1, 1],
+                    &[0.5],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &descriptors,
+                ),
+                "keypoints",
+            );
+        }
+        assert_output_error(
+            parse_original_scale(
+                &[1, 1, 2],
+                &[1],
+                &[1, 1],
+                &[0.5],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &descriptors,
+            ),
+            "keypoints",
+        );
+
+        for (shape, data) in [
+            (&[1, 1, 1][..], &[0.5][..]),
+            (&[1, 2][..], &[0.5, 0.25][..]),
+            (&[1, 1][..], &[][..]),
+        ] {
+            assert_output_error(
+                parse_original_scale(
+                    &[1, 1, 2],
+                    &[1, 1],
+                    shape,
+                    data,
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &descriptors,
+                ),
+                "scores",
+            );
+        }
+
+        for (shape, data) in [
+            (&[1, DESCRIPTOR_DIM as i64, 1][..], descriptors.as_slice()),
+            (
+                &[1, 1, (DESCRIPTOR_DIM - 1) as i64][..],
+                descriptors.as_slice(),
+            ),
+            (&[1, DESCRIPTOR_DIM as i64][..], descriptors.as_slice()),
+            (
+                &[1, 1, DESCRIPTOR_DIM as i64][..],
+                &descriptors[..DESCRIPTOR_DIM - 1],
+            ),
+        ] {
+            assert_output_error(
+                parse_original_scale(&[1, 1, 2], &[1, 1], &[1, 1], &[0.5], shape, data),
+                "descriptors",
+            );
+        }
+    }
+
+    #[test]
+    fn output_keypoint_count_is_bounded_before_copying() {
+        let count = MAX_OUTPUT_KEYPOINTS;
+        let keypoints: Vec<i64> = std::iter::repeat_n([4_i64, 4], count).flatten().collect();
+        let scores = vec![1.0; count];
+        let descriptors = vec![0.0; count * DESCRIPTOR_DIM];
+        let parsed = parse_original_scale(
+            &[1, count as i64, 2],
+            &keypoints,
+            &[1, count as i64],
+            &scores,
+            &[1, count as i64, DESCRIPTOR_DIM as i64],
+            &descriptors,
+        )
+        .expect("canonical model cap is accepted");
+        assert_eq!(parsed.keypoints.len(), MAX_OUTPUT_KEYPOINTS);
+
+        let rejected = (MAX_OUTPUT_KEYPOINTS + 1) as i64;
+        assert_output_error(
+            parse_original_scale(
+                &[1, rejected, 2],
+                &[],
+                &[1, rejected],
+                &[],
+                &[1, rejected, DESCRIPTOR_DIM as i64],
+                &[],
+            ),
+            "keypoints",
+        );
+    }
+
+    #[test]
+    fn coordinate_parser_checks_integer_bounds_before_narrowing() {
+        for value in [-1, 1, 3, i64::MIN, i64::MAX, 636, 640] {
+            assert_output_error(
+                parse_original_scale(
+                    &[1, 1, 2],
+                    &[value, 4],
+                    &[1, 1],
+                    &[0.5],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &[0.0; DESCRIPTOR_DIM],
+                ),
+                "keypoints",
+            );
+        }
+
+        let width = 16_777_217;
+        let dimensions = FrameDimensions::new(width, 16);
+        assert_output_error(
+            parse_fixture(
+                &[1, 1, 2],
+                &[i64::from(width), 4],
+                &[1, 1],
+                &[0.5],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &[0.0; DESCRIPTOR_DIM],
+                dimensions,
+                dimensions,
+                None,
+            ),
+            "keypoints",
+        );
+    }
+
+    #[test]
+    fn coordinate_parser_rejects_only_unrepresentable_f32_integers() {
+        const TWO_POW_24: i64 = 16_777_216;
+        let effective_extent = u32::try_from(TWO_POW_24 + 24).expect("u32 extent");
+
+        assert_eq!(
+            parse_coordinate(TWO_POW_24, effective_extent, 1, 0, "x").expect("exact power of two"),
+            TWO_POW_24 as f32
+        );
+        assert_unrepresentable_coordinate(
+            parse_coordinate(TWO_POW_24 + 1, effective_extent, 1, 0, "x")
+                .expect_err("odd integer beyond f32's exact range"),
+            0,
+            "x",
+            16_777_217,
+        );
+        assert_eq!(
+            parse_coordinate(TWO_POW_24 + 2, effective_extent, 1, 0, "x")
+                .expect("the next even integer remains exact"),
+            (TWO_POW_24 + 2) as f32
+        );
+    }
+
+    #[test]
+    fn score_parser_enforces_threshold_range_and_topk_order() {
+        let descriptors = [0.0; DESCRIPTOR_DIM];
+        for score in [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -f32::from_bits(1),
+            SCORE_THRESHOLD,
+            f32::from_bits(SCORE_THRESHOLD.to_bits() - 1),
+            f32::from_bits(1.0_f32.to_bits() + 1),
+        ] {
+            assert_output_error(
+                parse_original_scale(
+                    &[1, 1, 2],
+                    &[4, 4],
+                    &[1, 1],
+                    &[score],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &descriptors,
+                ),
+                "scores",
+            );
+        }
+
+        for score in [f32::from_bits(SCORE_THRESHOLD.to_bits() + 1), 1.0] {
+            parse_original_scale(
+                &[1, 1, 2],
+                &[4, 4],
+                &[1, 1],
+                &[score],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &descriptors,
+            )
+            .expect("valid selected confidence");
+        }
+
+        let descriptors = [0.0; 2 * DESCRIPTOR_DIM];
+        parse_original_scale(
+            &[1, 2, 2],
+            &[4, 4, 5, 5],
+            &[1, 2],
+            &[0.5, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptors,
+        )
+        .expect("TopK ties remain valid");
+        assert_output_error(
+            parse_original_scale(
+                &[1, 2, 2],
+                &[4, 4, 5, 5],
+                &[1, 2],
+                &[0.5, 0.75],
+                &[1, 2, DESCRIPTOR_DIM as i64],
+                &descriptors,
+            ),
+            "scores",
+        );
+    }
+
+    #[test]
+    fn descriptor_parser_reports_the_exact_nonfinite_component() {
+        let mut descriptors = [0.0; DESCRIPTOR_DIM];
+        descriptors[17] = f32::NAN;
+        let error = parse_original_scale(
+            &[1, 1, 2],
+            &[4, 4],
+            &[1, 1],
+            &[0.5],
+            &[1, 1, DESCRIPTOR_DIM as i64],
+            &descriptors,
+        )
+        .expect_err("nonfinite descriptor");
+
+        assert!(matches!(
+            error,
+            InferenceError::UnexpectedOutput { name, actual, .. }
+                if name == "descriptors"
+                    && actual.contains("descriptor 0 component 17")
+        ));
     }
 }

@@ -700,6 +700,30 @@ impl Detections {
         )
     }
 
+    /// Builds detections from components whose complete domain contract was parsed upstream.
+    ///
+    /// The caller must prove equal lengths, finite values, and keypoint bounds in `dimensions`.
+    /// Public and weakly typed inputs must use [`Self::new`] or [`Self::from_dimensions`].
+    pub(crate) fn from_parsed_components(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        dimensions: FrameDimensions,
+        keypoints: Vec<Keypoint>,
+        scores: Vec<f32>,
+        descriptors: Vec<Descriptor>,
+    ) -> Self {
+        debug_assert_eq!(keypoints.len(), scores.len());
+        debug_assert_eq!(scores.len(), descriptors.len());
+        Self {
+            sensor_id,
+            frame_id,
+            dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        }
+    }
+
     fn require_equal_lengths(
         keypoints: &[Keypoint],
         scores: &[f32],
