@@ -554,11 +554,13 @@ impl MapGeneration {
     }
 
     fn next(self) -> Self {
-        Self(
-            self.0
-                .checked_add(1)
-                .expect("map generation space exhausted"),
-        )
+        self.checked_advance_by(1)
+            .expect("map generation space exhausted")
+    }
+
+    fn checked_advance_by(self, mutations: usize) -> Option<Self> {
+        let mutations = u64::try_from(mutations).ok()?;
+        self.0.checked_add(mutations).map(Self)
     }
 
     pub fn as_u64(self) -> u64 {
@@ -1023,10 +1025,19 @@ impl SlamMap {
             .map(|(id, _)| MapPointId::new(self.instance_id, id))
             .collect();
         let count = to_remove.len();
+        // Each removal advances the generation once. Prove that the complete
+        // batch fits before the first mutation so exhaustion cannot expose a
+        // partially culled map to a caller that catches the panic.
+        let expected_generation = self
+            .version
+            .generation
+            .checked_advance_by(count)
+            .expect("map generation space exhausted");
         for id in to_remove {
-            let removed = self.remove_map_point(id);
-            debug_assert!(removed.is_ok(), "map point missing during cull");
+            self.remove_map_point(id)
+                .expect("map point collected for culling must still exist");
         }
+        debug_assert_eq!(self.generation(), expected_generation);
         count
     }
 
@@ -2124,6 +2135,75 @@ mod tests {
 
         assert_generation_exhaustion(|| fixture.map.cull_points(2));
         fixture.assert_unchanged();
+    }
+
+    #[test]
+    fn cull_points_preflights_the_complete_generation_range() {
+        let mut map = SlamMap::new();
+        let keyframe_id = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                ImageSize::try_new(640, 480).expect("valid size"),
+                make_keypoints(2),
+            )
+            .expect("keyframe");
+        let observations = [
+            map.keyframe_keypoint(keyframe_id, 0)
+                .expect("first observation"),
+            map.keyframe_keypoint(keyframe_id, 1)
+                .expect("second observation"),
+        ];
+        let points = [
+            map.add_map_point(
+                WorldPoint3::new(0.0, 0.0, 1.0),
+                make_descriptor(),
+                observations[0],
+            )
+            .expect("first point"),
+            map.add_map_point(
+                WorldPoint3::new(1.0, 0.0, 1.0),
+                make_descriptor(),
+                observations[1],
+            )
+            .expect("second point"),
+        ];
+        let mut exact_fit = map.clone();
+
+        map.version.generation = MapGeneration(u64::MAX - 1);
+        let before = map.snapshot();
+        assert_generation_exhaustion(|| map.cull_points(2));
+        assert_eq!(map.snapshot(), before);
+        assert_eq!(map.num_points(), 2);
+        for (&point_id, &observation) in points.iter().zip(&observations) {
+            assert!(map.point(point_id).is_some());
+            assert_eq!(
+                map.map_point_for_keypoint(observation)
+                    .expect("keypoint association"),
+                Some(point_id)
+            );
+        }
+        assert_map_invariants(&map).expect("rejected cull preserves invariants");
+
+        exact_fit.version.generation = MapGeneration(u64::MAX - 2);
+        assert_eq!(exact_fit.cull_points(2), 2);
+        assert_eq!(exact_fit.generation(), MapGeneration(u64::MAX));
+        assert_eq!(exact_fit.num_points(), 0);
+        for (&point_id, &observation) in points.iter().zip(&observations) {
+            assert!(exact_fit.point(point_id).is_none());
+            assert_eq!(
+                exact_fit
+                    .map_point_for_keypoint(observation)
+                    .expect("cleared keypoint association"),
+                None
+            );
+        }
+        assert_map_invariants(&exact_fit).expect("exact-fit cull preserves invariants");
+
+        let exhausted = exact_fit.snapshot();
+        assert_eq!(exact_fit.cull_points(2), 0);
+        assert_eq!(exact_fit.snapshot(), exhausted);
     }
 
     #[test]
