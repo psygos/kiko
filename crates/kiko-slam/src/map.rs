@@ -433,6 +433,12 @@ impl CovisibilityGraph {
     }
 }
 
+fn covisibility_ratio_from_counts(shared: u32, denominator: usize) -> f32 {
+    debug_assert_ne!(shared, 0);
+    debug_assert!(shared as usize <= denominator);
+    (f64::from(shared) / denominator as f64) as f32
+}
+
 #[derive(Debug)]
 pub enum MapError {
     KeyframeNotFound(KeyframeId),
@@ -460,6 +466,13 @@ pub enum MapError {
     SensorMismatch {
         expected: SensorId,
         actual: SensorId,
+    },
+    InconsistentCovisibility {
+        a: KeyframeId,
+        b: KeyframeId,
+        shared: u32,
+        a_points: usize,
+        b_points: usize,
     },
     InvalidMapPointPosition(crate::Point3Error),
 }
@@ -496,6 +509,16 @@ impl std::fmt::Display for MapError {
             MapError::SensorMismatch { expected, actual } => write!(
                 f,
                 "keyframe detections must be from {expected:?}, got {actual:?}"
+            ),
+            MapError::InconsistentCovisibility {
+                a,
+                b,
+                shared,
+                a_points,
+                b_points,
+            } => write!(
+                f,
+                "covisibility count {shared} between {a:?} and {b:?} exceeds the smaller keyframe point count ({a_points}, {b_points})"
             ),
             MapError::InvalidMapPointPosition(err) => {
                 write!(f, "invalid map point position: {err}")
@@ -1041,17 +1064,31 @@ impl SlamMap {
         Ok(window)
     }
 
+    /// Returns the shared-point count divided by the smaller associated-point count.
+    ///
+    /// Two valid keyframes without a graph edge, including a self-comparison, have ratio zero.
+    /// Missing keyframes and graph counts that exceed either keyframe's point count are errors.
     pub fn covisibility_ratio(&self, a: KeyframeId, b: KeyframeId) -> Result<f32, MapError> {
-        let count = self.covisibility.covisibility_count(a, b) as f32;
-        if count == 0.0 {
+        let a_entry = self.keyframe(a).ok_or(MapError::KeyframeNotFound(a))?;
+        let b_entry = self.keyframe(b).ok_or(MapError::KeyframeNotFound(b))?;
+        let shared = self.covisibility.covisibility_count(a, b);
+        if shared == 0 {
             return Ok(0.0);
         }
-        let a_points = self.keyframe_point_count(a)? as f32;
-        let b_points = self.keyframe_point_count(b)? as f32;
-        if a_points == 0.0 || b_points == 0.0 {
-            return Ok(0.0);
+
+        let a_points = a_entry.map_point_ids().count();
+        let b_points = b_entry.map_point_ids().count();
+        let denominator = a_points.min(b_points);
+        if shared as usize > denominator {
+            return Err(MapError::InconsistentCovisibility {
+                a,
+                b,
+                shared,
+                a_points,
+                b_points,
+            });
         }
-        Ok(count / a_points.min(b_points))
+        Ok(covisibility_ratio_from_counts(shared, denominator))
     }
 
     pub fn map_point_for_keypoint(
@@ -2171,11 +2208,165 @@ mod tests {
             .expect("second observation");
 
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 1);
+        assert_eq!(map.covisibility_ratio(kf1, kf2).expect("ratio"), 1.0);
+
+        for (keyframe_id, keypoint_index) in [(kf1, 1), (kf2, 1)] {
+            let observation = map
+                .keyframe_keypoint(keyframe_id, keypoint_index)
+                .expect("unique observation");
+            map.add_map_point(
+                Point3 {
+                    x: keypoint_index as f32,
+                    y: 0.0,
+                    z: 1.0,
+                },
+                make_descriptor(),
+                observation,
+            )
+            .expect("unique map point");
+        }
+        for ratio in [
+            map.covisibility_ratio(kf1, kf2).expect("forward ratio"),
+            map.covisibility_ratio(kf2, kf1).expect("reverse ratio"),
+        ] {
+            assert_eq!(ratio, 0.5);
+            assert!((0.0..=1.0).contains(&ratio));
+        }
         assert_map_invariants(&map).expect("after shared observation");
 
         map.remove_map_point(point).expect("remove point");
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 0);
+        assert_eq!(map.covisibility_ratio(kf1, kf2).expect("zero ratio"), 0.0);
         assert_map_invariants(&map).expect("after point removal");
+    }
+
+    #[test]
+    fn covisibility_ratio_preserves_f32_precision_at_the_integer_boundary() {
+        assert_eq!(
+            covisibility_ratio_from_counts(16_777_216, 16_777_217),
+            f32::from_bits(0x3f7f_ffff)
+        );
+    }
+
+    #[test]
+    fn covisibility_ratio_validates_both_keyframes_before_returning_zero() {
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let mut map = SlamMap::new();
+        let first = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("first keyframe");
+        let second = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("second keyframe");
+
+        assert_eq!(
+            map.covisibility_ratio(first, second)
+                .expect("two live non-neighbors"),
+            0.0
+        );
+        assert_eq!(
+            map.covisibility_ratio(first, first)
+                .expect("self-comparison has no graph edge"),
+            0.0
+        );
+
+        let mut other_map = SlamMap::new();
+        let foreign = other_map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("foreign keyframe");
+        for (a, b, missing) in [(foreign, first, foreign), (first, foreign, foreign)] {
+            assert!(matches!(
+                map.covisibility_ratio(a, b),
+                Err(MapError::KeyframeNotFound(id)) if id == missing
+            ));
+        }
+
+        let mut third_map = SlamMap::new();
+        let second_foreign = third_map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("second foreign keyframe");
+        assert!(matches!(
+            map.covisibility_ratio(foreign, second_foreign),
+            Err(MapError::KeyframeNotFound(id)) if id == foreign
+        ));
+
+        map.remove_keyframe(second).expect("remove second keyframe");
+        let replacement = map
+            .add_keyframe(
+                FrameId::new(3),
+                Timestamp::from_nanos(3),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("replacement keyframe");
+        assert!(map.keyframe(replacement).is_some());
+        for (a, b) in [(second, first), (first, second)] {
+            assert!(matches!(
+                map.covisibility_ratio(a, b),
+                Err(MapError::KeyframeNotFound(id)) if id == second
+            ));
+        }
+    }
+
+    #[test]
+    fn covisibility_ratio_reports_inconsistent_graph_counts() {
+        let size = ImageSize::try_new(640, 480).expect("valid size");
+        let mut map = SlamMap::new();
+        let first = map
+            .add_keyframe(
+                FrameId::new(1),
+                Timestamp::from_nanos(1),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("first keyframe");
+        let second = map
+            .add_keyframe(
+                FrameId::new(2),
+                Timestamp::from_nanos(2),
+                WorldToCamera::identity(),
+                size,
+                make_keypoints(1),
+            )
+            .expect("second keyframe");
+
+        map.covisibility.increment_pair(first, second);
+        assert!(matches!(
+            map.covisibility_ratio(first, second),
+            Err(MapError::InconsistentCovisibility {
+                a,
+                b,
+                shared: 1,
+                a_points: 0,
+                b_points: 0,
+            }) if a == first && b == second
+        ));
     }
 
     #[test]
