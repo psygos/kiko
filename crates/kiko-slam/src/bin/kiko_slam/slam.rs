@@ -4,7 +4,7 @@ use clap::Args;
 
 use kiko_slam::dataset::DatasetReader;
 use kiko_slam::{ProjectedMatcherConfig, TrackingMatcher};
-use kiko_slam::{RerunSink, SlamTracker, VizPacket};
+use kiko_slam::{RerunSink, RerunSinkConfig, SlamTracker, VizPacket};
 
 use crate::args::{
     DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
@@ -12,7 +12,7 @@ use crate::args::{
 };
 use crate::bench::duration_percentiles;
 use crate::config::{TrackerDefaults, TrackerOverrides, build_tracker_config_with_overrides};
-use crate::{RunFailureCapture, RunMetricsStatus, SkippedDatasetEntryError};
+use crate::{RunFailureCapture, RunMetricsStatus, SkippedDatasetEntryError, combine_rerun_results};
 use crate::{next_selected_success, rerun_recording, verify_run_integrity};
 
 const SLAM_ENV_HELP: &str = "\
@@ -174,6 +174,47 @@ impl std::fmt::Display for UnusableSteadyPoseStreamError {
 
 impl std::error::Error for UnusableSteadyPoseStreamError {}
 
+#[derive(Debug)]
+enum SlamProcessingError {
+    PrefetchThread(std::io::Error),
+    Triangulation(kiko_slam::TriangulationError),
+    StableSurface(kiko_slam::StableSurfaceGenerationError),
+}
+
+impl std::fmt::Display for SlamProcessingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PrefetchThread(source) => write!(f, "inference prefetch failed: {source}"),
+            Self::Triangulation(source) => write!(f, "stereo sample extraction failed: {source}"),
+            Self::StableSurface(source) => {
+                write!(f, "stable surface generation failed: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SlamProcessingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::PrefetchThread(source) => Some(source),
+            Self::Triangulation(source) => Some(source),
+            Self::StableSurface(source) => Some(source),
+        }
+    }
+}
+
+impl From<kiko_slam::TriangulationError> for SlamProcessingError {
+    fn from(source: kiko_slam::TriangulationError) -> Self {
+        Self::Triangulation(source)
+    }
+}
+
+impl From<kiko_slam::StableSurfaceGenerationError> for SlamProcessingError {
+    fn from(source: kiko_slam::StableSurfaceGenerationError) -> Self {
+        Self::StableSurface(source)
+    }
+}
+
 fn vio_enabled(args: &SlamArgs) -> bool {
     (args.vio || args.profile == RunProfileArg::Jetson) && !args.visual_only
 }
@@ -201,6 +242,11 @@ fn tracker_overrides(args: &SlamArgs, vio_enabled: bool) -> TrackerOverrides {
 
 pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rerun_output = RerunOutput::try_from_args(&args.rerun)?;
+    let rerun_sink_config = if args.headless {
+        None
+    } else {
+        Some(RerunSinkConfig::from_environment()?)
+    };
     let vio_enabled = vio_enabled(args);
     let runtime_imu_override = kiko_slam::load_runtime_imu_calibration_from_env()?;
     let mut reader = DatasetReader::open_with_imu_calibration_override(
@@ -299,7 +345,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     } else {
         match rerun_recording(rerun_output.destination(), "kiko-slam-dataset-odometry") {
-            Ok(rec) => Some(RerunSink::try_new(rec, rerun_output.decimation())?),
+            Ok(rec) => Some(RerunSink::from_config(
+                rec,
+                rerun_output.decimation(),
+                rerun_sink_config.expect("non-headless runs parse Rerun sink settings"),
+            )),
             Err(err) => {
                 if rerun_output.has_explicit_destination() {
                     return Err(Box::new(err));
@@ -414,351 +464,364 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     );
 
-    while let Some(bundle) = next_bundle.take() {
-        let service_interval_start = Instant::now();
-        let processed_before = processed;
-        tracker_attempts += 1;
-        let left = bundle.pair().left().clone();
-        let right = bundle.pair().right().clone();
-        let imu = bundle.imu().batch().cloned();
+    let processing = (|| -> Result<(), SlamProcessingError> {
+        while let Some(bundle) = next_bundle.take() {
+            let service_interval_start = Instant::now();
+            let processed_before = processed;
+            tracker_attempts += 1;
+            let left = bundle.pair().left().clone();
+            let right = bundle.pair().right().clone();
+            let imu = bundle.imu().batch().cloned();
 
-        // Collect prefetched SP+LG for THIS frame (launched during previous iteration)
-        let (prefetched_left, prefetched_matches) = if let Some(handle) = pending_prefetch.take() {
-            match handle.join() {
-                Ok(result) => {
-                    tracker.return_prefetch_sp(result.sp);
-                    if let Some(lg) = result.lg {
-                        tracker.return_prefetch_lg(lg);
-                    }
-                    match result.outcome {
-                        PrefetchInferenceOutcome::Detected {
-                            detections,
-                            speculative_matches,
-                        } => {
-                            let speculative_matches = match speculative_matches {
-                                Ok(matches) => matches,
-                                Err(source) => {
-                                    failure_sources.report_and_record(
+            // Collect prefetched SP+LG for THIS frame (launched during previous iteration)
+            let (prefetched_left, prefetched_matches) = if let Some(handle) =
+                pending_prefetch.take()
+            {
+                match handle.join() {
+                    Ok(result) => {
+                        tracker.return_prefetch_sp(result.sp);
+                        if let Some(lg) = result.lg {
+                            tracker.return_prefetch_lg(lg);
+                        }
+                        match result.outcome {
+                            PrefetchInferenceOutcome::Detected {
+                                detections,
+                                speculative_matches,
+                            } => {
+                                let speculative_matches = match speculative_matches {
+                                    Ok(matches) => matches,
+                                    Err(source) => {
+                                        failure_sources.report_and_record(
                                         &mut prefetch_fallbacks,
                                         "inference_prefetch",
                                         "speculative LightGlue prefetch failed; tracker will match synchronously",
                                         source,
                                     );
-                                    None
-                                }
-                            };
-                            (Some((result.frame_id, detections)), speculative_matches)
-                        }
-                        PrefetchInferenceOutcome::DetectionFailed { source } => {
-                            failure_sources.report_and_record(
-                                &mut prefetch_fallbacks,
-                                "inference_prefetch",
-                                "SuperPoint prefetch failed; tracker will detect synchronously",
-                                source,
-                            );
-                            (None, None)
-                        }
-                    }
-                }
-                Err(payload) => {
-                    return Err(std::io::Error::other(format!(
-                        "inference prefetch thread panicked: {}",
-                        kiko_slam::panic_payload_to_string(payload.as_ref())
-                    ))
-                    .into());
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        // Count every iterator entry so a read error cannot move the selected boundary.
-        let lookahead_bundle = next_selected_success(
-            &mut bundles_iter,
-            &mut entries_consumed,
-            expected_pairs,
-            |err| {
-                failure_sources.report_and_record(
-                    &mut read_errors,
-                    "dataset_read",
-                    "read error",
-                    err,
-                );
-            },
-        );
-
-        // Launch SP + speculative LG prefetch for the NEXT frame on a background thread
-        if let Some(ref next_b) = lookahead_bundle {
-            if let Some(mut sp) = tracker.take_prefetch_sp() {
-                let mut lg = if use_speculative_lg {
-                    tracker.take_prefetch_lg()
-                } else {
-                    None
-                };
-                let keyframe_info = tracker.current_tracking_keyframe_detections();
-                let next_left = next_b.pair().left().clone();
-                let next_fid = next_left.frame_id();
-                pending_prefetch = Some(std::thread::spawn(move || {
-                    let outcome = match sp.detect_with_downscale_limited(&next_left, ds, max_kp) {
-                        Ok(detections) => {
-                            let detections = std::sync::Arc::new(detections.top_k(max_kp));
-                            let speculative_matches = match (&mut lg, &keyframe_info) {
-                                (Some(lg_session), Some((keyframe_id, keyframe_dets))) => {
-                                    lg_session
-                                        .match_these(detections.clone(), keyframe_dets.clone())
-                                        .map(|matches| Some((*keyframe_id, matches)))
-                                }
-                                _ => Ok(None),
-                            };
-                            PrefetchInferenceOutcome::Detected {
-                                detections,
-                                speculative_matches,
+                                        None
+                                    }
+                                };
+                                (Some((result.frame_id, detections)), speculative_matches)
+                            }
+                            PrefetchInferenceOutcome::DetectionFailed { source } => {
+                                failure_sources.report_and_record(
+                                    &mut prefetch_fallbacks,
+                                    "inference_prefetch",
+                                    "SuperPoint prefetch failed; tracker will detect synchronously",
+                                    source,
+                                );
+                                (None, None)
                             }
                         }
-                        Err(source) => PrefetchInferenceOutcome::DetectionFailed { source },
-                    };
-                    PrefetchResult {
-                        sp,
-                        lg,
-                        frame_id: next_fid,
-                        outcome,
                     }
-                }));
-            }
-        }
+                    Err(payload) => {
+                        return Err(SlamProcessingError::PrefetchThread(std::io::Error::other(
+                            format!(
+                                "inference prefetch thread panicked: {}",
+                                kiko_slam::panic_payload_to_string(payload.as_ref())
+                            ),
+                        )));
+                    }
+                }
+            } else {
+                (None, None)
+            };
 
-        // Process THIS frame while SP+LG prefetch for NEXT frame runs in parallel.
-        match tracker.process_capture_with_prefetch(bundle, prefetched_left, prefetched_matches) {
-            Ok(output) => {
-                pose_outcomes.record(&output.pose);
-                if processed >= args.warmup_pairs {
-                    steady_pose_outcomes.record(&output.pose);
-                }
-                if !matches!(
-                    &output.pose,
-                    kiko_slam::PoseStatus::Current(_) | kiko_slam::PoseStatus::Predicted(_)
-                ) {
-                    eprintln!(
-                        "non-current pose: frame_id={:?} pose={:?} health={:?} diagnostics={:?} events={:?}",
-                        output.frame_id,
-                        output.pose,
-                        output.health,
-                        output.diagnostics,
-                        output.events
+            // Count every iterator entry so a read error cannot move the selected boundary.
+            let lookahead_bundle = next_selected_success(
+                &mut bundles_iter,
+                &mut entries_consumed,
+                expected_pairs,
+                |err| {
+                    failure_sources.report_and_record(
+                        &mut read_errors,
+                        "dataset_read",
+                        "read error",
+                        err,
                     );
+                },
+            );
+
+            // Launch SP + speculative LG prefetch for the NEXT frame on a background thread
+            if let Some(ref next_b) = lookahead_bundle {
+                if let Some(mut sp) = tracker.take_prefetch_sp() {
+                    let mut lg = if use_speculative_lg {
+                        tracker.take_prefetch_lg()
+                    } else {
+                        None
+                    };
+                    let keyframe_info = tracker.current_tracking_keyframe_detections();
+                    let next_left = next_b.pair().left().clone();
+                    let next_fid = next_left.frame_id();
+                    pending_prefetch = Some(std::thread::spawn(move || {
+                        let outcome = match sp.detect_with_downscale_limited(&next_left, ds, max_kp)
+                        {
+                            Ok(detections) => {
+                                let detections = std::sync::Arc::new(detections.top_k(max_kp));
+                                let speculative_matches = match (&mut lg, &keyframe_info) {
+                                    (Some(lg_session), Some((keyframe_id, keyframe_dets))) => {
+                                        lg_session
+                                            .match_these(detections.clone(), keyframe_dets.clone())
+                                            .map(|matches| Some((*keyframe_id, matches)))
+                                    }
+                                    _ => Ok(None),
+                                };
+                                PrefetchInferenceOutcome::Detected {
+                                    detections,
+                                    speculative_matches,
+                                }
+                            }
+                            Err(source) => PrefetchInferenceOutcome::DetectionFailed { source },
+                        };
+                        PrefetchResult {
+                            sp,
+                            lg,
+                            frame_id: next_fid,
+                            outcome,
+                        }
+                    }));
                 }
-                let timestamp = left.timestamp();
-                // A new mapping-session identity is a causal boundary for the
-                // accumulated surface map, so clear it before logging any output
-                // that belongs to the new session.
-                if let Some(sink) = sink.as_mut() {
-                    for event in output.events.iter().filter(|event| {
-                        matches!(
-                            event,
-                            kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
-                        )
-                    }) {
-                        if let Err(err) = sink.log_event(timestamp, event) {
-                            failure_sources.report_and_record(
-                                &mut visualization_errors,
-                                "visualization_output",
-                                "rerun mapping-session reset error",
-                                err,
-                            );
+            }
+
+            // Process THIS frame while SP+LG prefetch for NEXT frame runs in parallel.
+            match tracker.process_capture_with_prefetch(bundle, prefetched_left, prefetched_matches)
+            {
+                Ok(output) => {
+                    pose_outcomes.record(&output.pose);
+                    if processed >= args.warmup_pairs {
+                        steady_pose_outcomes.record(&output.pose);
+                    }
+                    if !matches!(
+                        &output.pose,
+                        kiko_slam::PoseStatus::Current(_) | kiko_slam::PoseStatus::Predicted(_)
+                    ) {
+                        eprintln!(
+                            "non-current pose: frame_id={:?} pose={:?} health={:?} diagnostics={:?} events={:?}",
+                            output.frame_id,
+                            output.pose,
+                            output.health,
+                            output.diagnostics,
+                            output.events
+                        );
+                    }
+                    let timestamp = left.timestamp();
+                    // A new mapping-session identity is a causal boundary for the
+                    // accumulated surface map, so clear it before logging any output
+                    // that belongs to the new session.
+                    if let Some(sink) = sink.as_mut() {
+                        for event in output.events.iter().filter(|event| {
+                            matches!(
+                                event,
+                                kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
+                            )
+                        }) {
+                            if let Err(err) = sink.log_event(timestamp, event) {
+                                failure_sources.report_and_record(
+                                    &mut visualization_errors,
+                                    "visualization_output",
+                                    "rerun mapping-session reset error",
+                                    err,
+                                );
+                            }
                         }
                     }
-                }
-                let loop_applied = output.events.iter().any(|event| {
-                    matches!(
-                        event,
-                        kiko_slam::DiagnosticEvent::LoopClosureDetected { .. }
-                    )
-                });
-                if let Some(matches) = output.stereo_matches {
-                    // Extract measured stereo samples before matches are consumed.
-                    let surface_samples = dense_triangulator
-                        .as_ref()
-                        .map(|tri| tri.extract_stereo_samples(&matches))
-                        .transpose()?;
+                    let loop_applied = output.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            kiko_slam::DiagnosticEvent::LoopClosureDetected { .. }
+                        )
+                    });
+                    if let Some(matches) = output.stereo_matches {
+                        // Extract measured stereo samples before matches are consumed.
+                        let surface_samples = dense_triangulator
+                            .as_ref()
+                            .map(|tri| tri.extract_stereo_samples(&matches))
+                            .transpose()?;
 
-                    let points = output
-                        .keyframe
-                        .as_ref()
-                        .map(|kf| kf.landmarks())
-                        .filter(|pts| !pts.is_empty());
-                    if let Some(sink) = sink.as_mut() {
-                        match VizPacket::try_new(left.clone(), right.clone(), matches) {
-                            Ok(packet) => {
-                                if let Err(err) = sink.log_with_points(&packet, points) {
+                        let points = output
+                            .keyframe
+                            .as_ref()
+                            .map(|kf| kf.landmarks())
+                            .filter(|pts| !pts.is_empty());
+                        if let Some(sink) = sink.as_mut() {
+                            match VizPacket::try_new(left.clone(), right.clone(), matches) {
+                                Ok(packet) => {
+                                    if let Err(err) = sink.log_with_points(&packet, points) {
+                                        failure_sources.report_and_record(
+                                            &mut visualization_errors,
+                                            "visualization_output",
+                                            "rerun point log error",
+                                            err,
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    failure_sources.report_and_record(
+                                        &mut visualization_fallbacks,
+                                        "visualization_fallback",
+                                        "viz packet error; falling back to raw stereo views",
+                                        err,
+                                    );
+                                    if let Err(log_err) = sink.log_frames(&left, &right) {
+                                        failure_sources.report_and_record(
+                                            &mut visualization_errors,
+                                            "visualization_output",
+                                            "rerun fallback frame log error",
+                                            log_err,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // Generate stable sparse surface observations for the low-resolution voxel map.
+                        if let Some(sink) = sink.as_mut() {
+                            if let (Some(samples), Some(pose)) =
+                                (surface_samples.as_ref(), output.pose.current_estimate())
+                            {
+                                let surface = kiko_slam::generate_stable_surface_points(
+                                    samples,
+                                    &left,
+                                    &dense_config,
+                                )?;
+                                if let Err(err) = sink.log_surface_observations(
+                                    left.timestamp(),
+                                    &surface.measured_camera_points_m,
+                                    &surface.points,
+                                    &surface.stats,
+                                    pose.cam_from_map_pose32(),
+                                    &output.diagnostics,
+                                    true,
+                                    output.keyframe.is_some(),
+                                ) {
                                     failure_sources.report_and_record(
                                         &mut visualization_errors,
                                         "visualization_output",
-                                        "rerun point log error",
+                                        "stable surface log error",
                                         err,
                                     );
                                 }
                             }
-                            Err(err) => {
-                                failure_sources.report_and_record(
-                                    &mut visualization_fallbacks,
-                                    "visualization_fallback",
-                                    "viz packet error; falling back to raw stereo views",
-                                    err,
-                                );
-                                if let Err(log_err) = sink.log_frames(&left, &right) {
+                        }
+                        if output.keyframe.is_some() {
+                            keyframes += 1;
+                        }
+                        if let Some(sink) = sink.as_mut() {
+                            if output.keyframe.is_some() || loop_applied {
+                                let snapshot = tracker.covisibility_snapshot();
+                                if let Err(err) =
+                                    sink.log_covisibility_graph(left.timestamp(), &snapshot)
+                                {
                                     failure_sources.report_and_record(
                                         &mut visualization_errors,
                                         "visualization_output",
-                                        "rerun fallback frame log error",
-                                        log_err,
+                                        "rerun covisibility graph log error",
+                                        err,
                                     );
                                 }
                             }
                         }
+                    } else if let Some(sink) = sink.as_mut() {
+                        if let Err(err) = sink.log_frames(&left, &right) {
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun frame log error",
+                                err,
+                            );
+                        }
                     }
-                    // Generate stable sparse surface observations for the low-resolution voxel map.
+
                     if let Some(sink) = sink.as_mut() {
-                        if let (Some(samples), Some(pose)) =
-                            (surface_samples.as_ref(), output.pose.current_estimate())
-                        {
-                            let surface = kiko_slam::generate_stable_surface_points(
-                                samples,
-                                &left,
-                                &dense_config,
-                            )?;
-                            if let Err(err) = sink.log_surface_observations(
-                                left.timestamp(),
-                                &surface.measured_camera_points_m,
-                                &surface.points,
-                                &surface.stats,
-                                pose.cam_from_map_pose32(),
-                                &output.diagnostics,
-                                true,
-                                output.keyframe.is_some(),
-                            ) {
+                        if let Some(batch) = imu.as_ref() {
+                            if let Err(err) = sink.log_imu_batch(batch) {
                                 failure_sources.report_and_record(
                                     &mut visualization_errors,
                                     "visualization_output",
-                                    "stable surface log error",
+                                    "rerun IMU log error",
+                                    err,
+                                );
+                            }
+                        }
+                        if let Some(pose) = output.pose.current_estimate() {
+                            if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
+                                failure_sources.report_and_record(
+                                    &mut visualization_errors,
+                                    "visualization_output",
+                                    "rerun tracking pose log error",
+                                    err,
+                                );
+                            } else {
+                                poses_logged += 1;
+                            }
+                        }
+                        if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
+                            if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
+                                failure_sources.report_and_record(
+                                    &mut visualization_errors,
+                                    "visualization_output",
+                                    "rerun VIO telemetry log error",
+                                    err,
+                                );
+                            }
+                        }
+                        if let Err(err) = sink.log_system_health(timestamp, &output.health) {
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun health log error",
+                                err,
+                            );
+                        }
+                        if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
+                            failure_sources.report_and_record(
+                                &mut visualization_errors,
+                                "visualization_output",
+                                "rerun diagnostics log error",
+                                err,
+                            );
+                        }
+                        for event in output.events.iter().filter(|event| {
+                            !matches!(
+                                event,
+                                kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
+                            )
+                        }) {
+                            if let Err(err) = sink.log_event(timestamp, event) {
+                                failure_sources.report_and_record(
+                                    &mut visualization_errors,
+                                    "visualization_output",
+                                    "rerun event log error",
                                     err,
                                 );
                             }
                         }
                     }
-                    if output.keyframe.is_some() {
-                        keyframes += 1;
-                    }
-                    if let Some(sink) = sink.as_mut() {
-                        if output.keyframe.is_some() || loop_applied {
-                            let snapshot = tracker.covisibility_snapshot();
-                            if let Err(err) =
-                                sink.log_covisibility_graph(left.timestamp(), &snapshot)
-                            {
-                                failure_sources.report_and_record(
-                                    &mut visualization_errors,
-                                    "visualization_output",
-                                    "rerun covisibility graph log error",
-                                    err,
-                                );
-                            }
-                        }
-                    }
-                } else if let Some(sink) = sink.as_mut() {
-                    if let Err(err) = sink.log_frames(&left, &right) {
-                        failure_sources.report_and_record(
-                            &mut visualization_errors,
-                            "visualization_output",
-                            "rerun frame log error",
-                            err,
-                        );
-                    }
+                    processed += 1;
                 }
-
-                if let Some(sink) = sink.as_mut() {
-                    if let Some(batch) = imu.as_ref() {
-                        if let Err(err) = sink.log_imu_batch(batch) {
-                            failure_sources.report_and_record(
-                                &mut visualization_errors,
-                                "visualization_output",
-                                "rerun IMU log error",
-                                err,
-                            );
-                        }
-                    }
-                    if let Some(pose) = output.pose.current_estimate() {
-                        if let Err(err) = sink.log_tracking_pose(timestamp, pose) {
-                            failure_sources.report_and_record(
-                                &mut visualization_errors,
-                                "visualization_output",
-                                "rerun tracking pose log error",
-                                err,
-                            );
-                        } else {
-                            poses_logged += 1;
-                        }
-                    }
-                    if let Some(vio_telemetry) = output.vio_telemetry.as_ref() {
-                        if let Err(err) = sink.log_vio_telemetry(timestamp, vio_telemetry) {
-                            failure_sources.report_and_record(
-                                &mut visualization_errors,
-                                "visualization_output",
-                                "rerun VIO telemetry log error",
-                                err,
-                            );
-                        }
-                    }
-                    if let Err(err) = sink.log_system_health(timestamp, &output.health) {
-                        failure_sources.report_and_record(
-                            &mut visualization_errors,
-                            "visualization_output",
-                            "rerun health log error",
-                            err,
-                        );
-                    }
-                    if let Err(err) = sink.log_diagnostics(timestamp, &output.diagnostics) {
-                        failure_sources.report_and_record(
-                            &mut visualization_errors,
-                            "visualization_output",
-                            "rerun diagnostics log error",
-                            err,
-                        );
-                    }
-                    for event in output.events.iter().filter(|event| {
-                        !matches!(
-                            event,
-                            kiko_slam::DiagnosticEvent::MappingSessionReset { .. }
-                        )
-                    }) {
-                        if let Err(err) = sink.log_event(timestamp, event) {
-                            failure_sources.report_and_record(
-                                &mut visualization_errors,
-                                "visualization_output",
-                                "rerun event log error",
-                                err,
-                            );
-                        }
-                    }
+                Err(err) => {
+                    failure_sources.report_and_record(
+                        &mut tracker_errors,
+                        "tracker",
+                        "tracker error",
+                        err,
+                    );
                 }
-                processed += 1;
             }
-            Err(err) => {
-                failure_sources.report_and_record(
-                    &mut tracker_errors,
-                    "tracker",
-                    "tracker error",
-                    err,
-                );
-            }
-        }
 
-        if processed > processed_before {
-            service_intervals.push(service_interval_start.elapsed());
-            if processed == args.warmup_pairs {
-                steady_start = Some(Instant::now());
+            if processed > processed_before {
+                service_intervals.push(service_interval_start.elapsed());
+                if processed == args.warmup_pairs {
+                    steady_start = Some(Instant::now());
+                }
             }
+            next_bundle = lookahead_bundle;
         }
-        next_bundle = lookahead_bundle;
-    }
+        Ok(())
+    })();
+    let finalization = sink
+        .take()
+        .map(|sink| sink.finish_with_timeout(rerun_output.finish_timeout().get()))
+        .unwrap_or(Ok(()));
+    combine_rerun_results(processing, finalization)?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let steady_elapsed = steady_start.map_or(0.0, |start| start.elapsed().as_secs_f64());

@@ -3,14 +3,16 @@ use std::time::Instant;
 use clap::Args;
 
 use kiko_slam::dataset::DatasetReader;
-use kiko_slam::{RerunSink, TriangulationConfig, TriangulationError, Triangulator};
+use kiko_slam::{
+    RerunSink, RerunSinkConfig, TriangulationConfig, TriangulationError, Triangulator, VizLogError,
+};
 
 use crate::args::{
     DatasetArgs, InferenceArgs, InferenceConfig, InferencePurpose, RerunArgs, RerunOutput,
 };
 use crate::{
-    RunFailureCapture, RunMetricsStatus, SkippedDatasetEntryError, next_selected_success,
-    rerun_recording, verify_run_integrity,
+    RunFailureCapture, RunMetricsStatus, SkippedDatasetEntryError, combine_rerun_results,
+    next_selected_success, rerun_recording, verify_run_integrity,
 };
 
 #[derive(Args, Clone, Debug)]
@@ -26,6 +28,7 @@ pub struct VizArgs {
 
 pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rerun_output = RerunOutput::try_from_args(&args.rerun)?;
+    let sink_config = RerunSinkConfig::from_environment()?;
     let mut reader = DatasetReader::open(&args.dataset.path)?;
     let stats = reader.stats();
 
@@ -46,7 +49,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let rec = rerun_recording(rerun_output.destination(), "kiko-slam-dataset")?;
-    let mut sink = RerunSink::try_new(rec, rerun_output.decimation())?;
+    let mut sink = RerunSink::from_config(rec, rerun_output.decimation(), sink_config);
 
     let mut pipeline = inference.into_pipeline()?;
 
@@ -98,55 +101,60 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         });
 
-    while let Some(pair) = next_pair.take() {
-        inference_attempts += 1;
+    let processing = (|| -> Result<(), VizLogError> {
+        while let Some(pair) = next_pair.take() {
+            inference_attempts += 1;
 
-        match pipeline.process_pair(pair) {
-            Ok(packet) => {
-                total_matches += packet.matches().len();
-                let mut keyframe = None;
-                match triangulator.triangulate(packet.matches()) {
-                    Ok(result) => {
-                        triangulated_points += result.keyframe.landmarks().len();
-                        keyframe = Some(result.keyframe);
-                    }
-                    Err(TriangulationError::NoLandmarks { .. }) => {
-                        triangulation_empty += 1;
-                    }
-                    Err(err) => {
-                        failure_sources.report_and_record(
-                            &mut triangulation_errors,
-                            "triangulation",
-                            "triangulation error",
-                            err,
-                        );
-                    }
-                };
+            match pipeline.process_pair(pair) {
+                Ok(packet) => {
+                    total_matches += packet.matches().len();
+                    let mut keyframe = None;
+                    match triangulator.triangulate(packet.matches()) {
+                        Ok(result) => {
+                            triangulated_points += result.keyframe.landmarks().len();
+                            keyframe = Some(result.keyframe);
+                        }
+                        Err(TriangulationError::NoLandmarks { .. }) => {
+                            triangulation_empty += 1;
+                        }
+                        Err(err) => {
+                            failure_sources.report_and_record(
+                                &mut triangulation_errors,
+                                "triangulation",
+                                "triangulation error",
+                                err,
+                            );
+                        }
+                    };
 
-                let points = keyframe.as_ref().map(|kf| kf.landmarks());
-                sink.log_with_points(&packet, points)?;
-                processed += 1;
+                    let points = keyframe.as_ref().map(|kf| kf.landmarks());
+                    sink.log_with_points(&packet, points)?;
+                    processed += 1;
+                }
+                Err(err) => {
+                    failure_sources.report_and_record(
+                        &mut inference_errors,
+                        "inference",
+                        "visualization inference error",
+                        err,
+                    );
+                }
             }
-            Err(err) => {
-                failure_sources.report_and_record(
-                    &mut inference_errors,
-                    "inference",
-                    "visualization inference error",
-                    err,
-                );
-            }
+
+            next_pair =
+                next_selected_success(&mut pairs, &mut entries_consumed, expected_pairs, |err| {
+                    failure_sources.report_and_record(
+                        &mut read_errors,
+                        "dataset_read",
+                        "visualization input error",
+                        err,
+                    );
+                });
         }
-
-        next_pair =
-            next_selected_success(&mut pairs, &mut entries_consumed, expected_pairs, |err| {
-                failure_sources.report_and_record(
-                    &mut read_errors,
-                    "dataset_read",
-                    "visualization input error",
-                    err,
-                );
-            });
-    }
+        Ok(())
+    })();
+    let finalization = sink.finish_with_timeout(rerun_output.finish_timeout().get());
+    combine_rerun_results(processing, finalization)?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let fps = if elapsed > 0.0 {

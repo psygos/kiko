@@ -204,6 +204,7 @@ Use profiles for complete known-good operating modes, and use flags only for del
 - `--rerun-url <URL>` streams to a custom Rerun endpoint.
 - `--rerun-serve` serves from the robot on `0.0.0.0:<port>`.
 - `--save-rrd <PATH>` writes a persistent Rerun recording instead of streaming.
+- `--rerun-finish-timeout-ms <MS>` controls the final sink flush (default 5000 ms); success means the calling thread's prior data reached the configured sink, not that a viewer consumed it.
 
 Inference flags:
 

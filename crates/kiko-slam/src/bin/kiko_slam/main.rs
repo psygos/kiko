@@ -119,6 +119,61 @@ enum RunMetricsStatus {
     InvalidPartial,
 }
 
+#[derive(Debug)]
+enum RerunSessionError<P> {
+    Processing(P),
+    Finalization(kiko_slam::VizFlushError),
+    ProcessingAndFinalization {
+        processing: P,
+        finalization: kiko_slam::VizFlushError,
+    },
+}
+
+impl<P: std::fmt::Display> std::fmt::Display for RerunSessionError<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Processing(source) => write!(f, "Rerun session processing failed: {source}"),
+            Self::Finalization(source) => {
+                write!(f, "Rerun session finalization failed: {source}")
+            }
+            Self::ProcessingAndFinalization {
+                processing,
+                finalization,
+            } => write!(
+                f,
+                "Rerun session processing failed: {processing}; finalization also failed: {finalization}"
+            ),
+        }
+    }
+}
+
+impl<P: std::error::Error + 'static> std::error::Error for RerunSessionError<P> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Processing(source)
+            | Self::ProcessingAndFinalization {
+                processing: source, ..
+            } => Some(source),
+            Self::Finalization(source) => Some(source),
+        }
+    }
+}
+
+fn combine_rerun_results<T, P>(
+    processing: Result<T, P>,
+    finalization: Result<(), kiko_slam::VizFlushError>,
+) -> Result<T, RerunSessionError<P>> {
+    match (processing, finalization) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(source), Ok(())) => Err(RerunSessionError::Processing(source)),
+        (Ok(_), Err(source)) => Err(RerunSessionError::Finalization(source)),
+        (Err(processing), Err(finalization)) => Err(RerunSessionError::ProcessingAndFinalization {
+            processing,
+            finalization,
+        }),
+    }
+}
+
 impl RunMetricsStatus {
     fn from_outcome(integrity_ok: bool, exact_completion: bool, usable_output: bool) -> Self {
         if integrity_ok && exact_completion && usable_output {
@@ -367,12 +422,14 @@ fn rerun_recording(
 
 #[cfg(test)]
 mod tests {
-    use super::args::{PrefetchSession, RerunArgsError, RerunDestination, RerunOutput};
+    use super::args::{
+        PrefetchSession, RerunArgsError, RerunDestination, RerunFinishTimeout, RerunOutput,
+    };
     use super::bench::{BenchAccum, summarize_bench};
     use super::config::{TrackerDefaults, build_ba_config, build_tracker_config};
     use super::{
-        Cli, Command, RerunRecordingInitError, RunFailureCapture, RunMetricsStatus,
-        rerun_recording, verify_run_integrity,
+        Cli, Command, RerunRecordingInitError, RerunSessionError, RunFailureCapture,
+        RunMetricsStatus, combine_rerun_results, rerun_recording, verify_run_integrity,
     };
     use clap::Parser;
     use kiko_slam::{
@@ -786,6 +843,57 @@ mod tests {
             }
             _ => panic!("expected viz command"),
         }
+    }
+
+    #[test]
+    fn rerun_finish_timeout_parses_exact_milliseconds_at_the_cli_boundary() {
+        let cli = Cli::try_parse_from([
+            "kiko-slam",
+            "viz",
+            "--rerun-finish-timeout-ms",
+            "17",
+            "/tmp/dataset",
+        ])
+        .expect("exact millisecond timeout");
+        let Command::Viz(args) = cli.command else {
+            panic!("expected viz command");
+        };
+        let output = RerunOutput::try_from_args(&args.rerun).expect("Rerun output");
+        assert_eq!(output.finish_timeout().get(), Duration::from_millis(17));
+        assert_eq!(
+            "0".parse::<RerunFinishTimeout>()
+                .expect("zero is an immediate timeout")
+                .get(),
+            Duration::ZERO
+        );
+        let malformed = "not-a-timeout"
+            .parse::<RerunFinishTimeout>()
+            .expect_err("malformed timeout");
+        assert!(std::error::Error::source(&malformed).is_some());
+    }
+
+    #[test]
+    fn rerun_result_combiner_preserves_processing_and_finalization_failures() {
+        let processing = std::io::Error::other("processing failed");
+        let combined = combine_rerun_results::<(), _>(
+            Err(processing),
+            Err(kiko_slam::VizFlushError::from(
+                rerun::sink::SinkFlushError::Timeout,
+            )),
+        )
+        .expect_err("both failures must survive");
+        assert!(matches!(
+            &combined,
+            RerunSessionError::ProcessingAndFinalization {
+                processing,
+                finalization: kiko_slam::VizFlushError::Rerun(
+                    rerun::sink::SinkFlushError::Timeout
+                ),
+            } if processing.to_string() == "processing failed"
+        ));
+        let message = combined.to_string();
+        assert!(message.contains("processing failed"));
+        assert!(message.contains("finalization also failed"));
     }
 
     #[test]

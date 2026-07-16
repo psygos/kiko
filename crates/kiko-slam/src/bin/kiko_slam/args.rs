@@ -1,6 +1,7 @@
 use std::{
     num::{NonZeroU16, NonZeroUsize},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use clap::{Args, ValueEnum};
@@ -186,6 +187,71 @@ pub struct RerunArgs {
     /// Port for the gRPC server when using --rerun-serve (default: 9876)
     #[arg(long, env = "KIKO_RERUN_PORT")]
     pub rerun_port: Option<NonZeroU16>,
+    /// Timeout for flushing the configured Rerun sink, in milliseconds.
+    #[arg(
+        long,
+        env = "KIKO_RERUN_FINISH_TIMEOUT_MS",
+        default_value_t = RerunFinishTimeout::default()
+    )]
+    pub rerun_finish_timeout_ms: RerunFinishTimeout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RerunFinishTimeout(Duration);
+
+impl Default for RerunFinishTimeout {
+    fn default() -> Self {
+        Self(Duration::from_secs(5))
+    }
+}
+
+impl RerunFinishTimeout {
+    pub fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RerunFinishTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.as_millis())
+    }
+}
+
+#[derive(Debug)]
+pub struct RerunFinishTimeoutParseError {
+    raw: String,
+    source: std::num::ParseIntError,
+}
+
+impl std::fmt::Display for RerunFinishTimeoutParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid Rerun finish timeout in milliseconds {:?}: {}",
+            self.raw, self.source
+        )
+    }
+}
+
+impl std::error::Error for RerunFinishTimeoutParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl std::str::FromStr for RerunFinishTimeout {
+    type Err = RerunFinishTimeoutParseError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        raw.trim()
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .map(Self)
+            .map_err(|source| RerunFinishTimeoutParseError {
+                raw: raw.to_string(),
+                source,
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -200,6 +266,7 @@ pub enum RerunDestination {
 pub struct RerunOutput {
     destination: RerunDestination,
     decimation: VizDecimation,
+    finish_timeout: RerunFinishTimeout,
 }
 
 impl RerunOutput {
@@ -231,6 +298,7 @@ impl RerunOutput {
         Ok(Self {
             destination,
             decimation: args.rerun_decimation,
+            finish_timeout: args.rerun_finish_timeout_ms,
         })
     }
 
@@ -244,6 +312,10 @@ impl RerunOutput {
 
     pub fn has_explicit_destination(&self) -> bool {
         !matches!(self.destination, RerunDestination::ImplicitLocalViewer)
+    }
+
+    pub fn finish_timeout(&self) -> RerunFinishTimeout {
+        self.finish_timeout
     }
 }
 
