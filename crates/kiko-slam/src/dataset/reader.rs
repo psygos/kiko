@@ -1,15 +1,16 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, Frame, FrameId, ImuBatch, ImuSample,
-    SensorId, StereoPair, Timestamp,
+    CaptureBundle, CaptureId, CaptureImu, CaptureInterval, DepthImage, Frame, FrameId, ImuBatch,
+    ImuSample, SensorId, StereoPair, Timestamp,
 };
 
 use super::{
-    DatasetError, DatasetImuRecordError, DatasetIndex, DatasetIndexFrameRef, DatasetPairIndex,
-    FrameInfo, IMU_RECORD_BYTES, format, read_calibration_with_imu_override, read_manifest,
-    read_meta, require_calibration_dimensions, scan_frames_with_depth,
+    DatasetDepthIndex, DatasetError, DatasetImuRecordError, DatasetIndex, DatasetIndexFrameRef,
+    DatasetPairIndex, FrameInfo, IMU_RECORD_BYTES, format, read_calibration_with_imu_override,
+    read_manifest, read_meta, require_calibration_dimensions, scan_frames_with_depth,
 };
 
 #[derive(Debug)]
@@ -109,6 +110,26 @@ impl DatasetReader {
         self.manifest.stats
     }
 
+    /// Returns an independent cursor over the manifest-defined depth stream.
+    ///
+    /// Legacy manifests remain usable for stereo replay, but depth replay never falls back to
+    /// scanning files that the manifest did not identify.
+    pub fn depth_cursor(&self) -> Result<DatasetDepthCursor, DatasetError> {
+        match &self.manifest.depth {
+            DatasetDepthIndex::Unconfigured => Err(DatasetError::DepthStreamNotConfigured),
+            DatasetDepthIndex::LegacyUnindexed => Err(DatasetError::LegacyDepthManifestUnindexed),
+            DatasetDepthIndex::Indexed {
+                dimensions,
+                entries,
+            } => Ok(DatasetDepthCursor {
+                root: self.root.clone(),
+                dimensions: *dimensions,
+                entries: Arc::clone(entries),
+                next: 0,
+            }),
+        }
+    }
+
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
         DatasetPairs {
             reader: self,
@@ -172,6 +193,83 @@ impl DatasetReader {
             }
         })?;
         Ok(CaptureImu::present(batch))
+    }
+}
+
+/// Transactional replay cursor over depth payloads named by the dataset manifest.
+#[derive(Debug)]
+pub struct DatasetDepthCursor {
+    root: PathBuf,
+    dimensions: crate::FrameDimensions,
+    entries: Arc<[DatasetIndexFrameRef]>,
+    next: usize,
+}
+
+impl DatasetDepthCursor {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.entries.len() - self.next
+    }
+
+    /// Reads the next entry when it is no later than `cutoff`.
+    ///
+    /// Future timestamps and read/validation failures leave the cursor unchanged.
+    pub fn next_at_or_before(
+        &mut self,
+        cutoff: Timestamp,
+    ) -> Result<Option<DepthImage>, DatasetError> {
+        let Some(entry) = self.entries.get(self.next) else {
+            return Ok(None);
+        };
+        if entry.timestamp > cutoff {
+            return Ok(None);
+        }
+        let frame_id = u64::try_from(self.next)
+            .map(FrameId::new)
+            .map_err(|_| DatasetError::DepthFrameIndexOutOfRange { index: self.next })?;
+        let path = self.root.join(entry.path.as_ref());
+        let bytes = std::fs::read(&path).map_err(|source| DatasetError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+        let expected_bytes = self
+            .dimensions
+            .area()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(DatasetError::DepthPayloadSizeOverflow {
+                dimensions: self.dimensions,
+            })?;
+        if bytes.len() != expected_bytes {
+            return Err(DatasetError::DepthPayloadLengthChanged {
+                path,
+                expected_bytes,
+                actual_bytes: bytes.len(),
+            });
+        }
+        let depth_m = bytes
+            .chunks_exact(std::mem::size_of::<f32>())
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        let depth = DepthImage::new(
+            frame_id,
+            entry.timestamp,
+            self.dimensions.width(),
+            self.dimensions.height(),
+            depth_m,
+        )
+        .map_err(|source| DatasetError::InvalidDepth {
+            path: self.root.join(entry.path.as_ref()),
+            source,
+        })?;
+        self.next += 1;
+        Ok(Some(depth))
     }
 }
 
@@ -557,8 +655,8 @@ mod tests {
     use super::*;
     use crate::dataset::{
         Calibration, CameraIntrinsics, DatasetFrameReferenceError, DatasetManifestError,
-        DatasetWriter, ImuCalibration, ImuExtrinsicsMeta, ImuMeta, ImuNoiseMeta, Manifest, Meta,
-        MonoMeta,
+        DatasetWriter, DepthMeta, ImuCalibration, ImuExtrinsicsMeta, ImuMeta, ImuNoiseMeta,
+        Manifest, Meta, MonoMeta, WriteOutcome,
     };
     use crate::{ImuBatch, ImuSample, SensorId};
     use std::error::Error as _;
@@ -734,6 +832,7 @@ mod tests {
                 timestamp_ns: 1_000_000_010,
                 path: "right1.raw".to_string(),
             }],
+            depth: Vec::new(),
         };
         let pairs = vec![DatasetPairIndex {
             left: DatasetIndexFrameRef {
@@ -900,6 +999,100 @@ mod tests {
             depth: None,
             imu: Some(ImuMeta { rate_hz: 200 }),
         }
+    }
+
+    fn meta_with_depth() -> Meta {
+        Meta {
+            created: "now".to_string(),
+            device: "test".to_string(),
+            mono: Some(MonoMeta {
+                width: 2,
+                height: 2,
+                fps: 10,
+            }),
+            depth: Some(DepthMeta {
+                width: 2,
+                height: 2,
+                fps: 10,
+                encoding: "f32_meters_le".to_string(),
+            }),
+            imu: None,
+        }
+    }
+
+    #[test]
+    fn depth_cursor_is_manifest_owned_and_advances_only_after_valid_decode() {
+        let dataset_dir = unique_temp_dir("reader-depth-transactional");
+        let (writer, handle) =
+            DatasetWriter::create(&dataset_dir, &meta_with_depth(), &calibration())
+                .expect("writer");
+        let depth = DepthImage::new(
+            FrameId::new(70),
+            Timestamp::from_nanos(7),
+            2,
+            2,
+            vec![1.0, 2.0, 3.0, 4.0],
+        )
+        .expect("depth image");
+        assert_eq!(writer.write_depth(&depth), WriteOutcome::Enqueued);
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let reader = DatasetReader::open(&dataset_dir).expect("open depth dataset");
+        let mut cursor = reader.depth_cursor().expect("indexed depth cursor");
+        assert_eq!(cursor.len(), 1);
+        assert!(
+            cursor
+                .next_at_or_before(Timestamp::from_nanos(6))
+                .expect("future entry")
+                .is_none()
+        );
+        assert_eq!(cursor.remaining(), 1);
+
+        let payload_path = dataset_dir
+            .join(format::FRAMES_DIR)
+            .join(format::frame_name(7, format::FrameKind::Depth));
+        std::fs::write(&payload_path, [0_u8; 12]).expect("truncate after open");
+        assert!(matches!(
+            cursor.next_at_or_before(Timestamp::from_nanos(7)),
+            Err(DatasetError::DepthPayloadLengthChanged {
+                expected_bytes: 16,
+                actual_bytes: 12,
+                ..
+            })
+        ));
+        assert_eq!(cursor.remaining(), 1);
+
+        let mut invalid = Vec::with_capacity(16);
+        for value in [f32::NAN, 0.0, 0.0, 0.0] {
+            invalid.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&payload_path, invalid).expect("write invalid depth payload");
+        let error = cursor
+            .next_at_or_before(Timestamp::from_nanos(7))
+            .expect_err("invalid depth domain must fail");
+        assert!(matches!(
+            &error,
+            DatasetError::InvalidDepth {
+                source: crate::DepthImageError::InvalidSample { index: 0, value },
+                ..
+            } if value.is_nan()
+        ));
+        assert!(error.source().is_some());
+        assert_eq!(cursor.remaining(), 1);
+
+        std::fs::write(&payload_path, 4.0_f32.to_le_bytes().repeat(4))
+            .expect("restore valid depth payload");
+        let depth = cursor
+            .next_at_or_before(Timestamp::from_nanos(7))
+            .expect("valid retry")
+            .expect("pending depth entry");
+        assert_eq!(depth.frame_id(), FrameId::new(0));
+        assert_eq!(depth.timestamp(), Timestamp::from_nanos(7));
+        assert_eq!(depth.depth_m(), &[4.0; 4]);
+        assert_eq!(cursor.remaining(), 0);
+
+        std::fs::remove_dir_all(dataset_dir).expect("remove depth dataset");
     }
 
     #[test]

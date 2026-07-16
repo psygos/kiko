@@ -130,7 +130,7 @@ pub mod format {
 }
 
 mod reader;
-pub use reader::{DatasetReadTimings, DatasetReader, DatasetStats, TimedPair};
+pub use reader::{DatasetDepthCursor, DatasetReadTimings, DatasetReader, DatasetStats, TimedPair};
 
 // Meta Structs
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,6 +307,7 @@ impl std::error::Error for DatasetImuRecordError {
 pub enum DatasetFrameRole {
     Left,
     Right,
+    Depth,
 }
 
 impl std::fmt::Display for DatasetFrameRole {
@@ -314,6 +315,7 @@ impl std::fmt::Display for DatasetFrameRole {
         match self {
             Self::Left => f.write_str("left"),
             Self::Right => f.write_str("right"),
+            Self::Depth => f.write_str("depth"),
         }
     }
 }
@@ -438,6 +440,20 @@ pub enum DatasetManifestError {
         field: &'static str,
         value: usize,
     },
+    DepthEntriesWithoutMetadata {
+        entry_count: usize,
+    },
+    UnsupportedDepthEncoding {
+        value: String,
+    },
+    InvalidDepthDimensions {
+        source: FrameDimensionsError,
+    },
+    NonIncreasingDepthTimestamp {
+        entry_index: usize,
+        previous_ns: i64,
+        current_ns: i64,
+    },
 }
 
 impl std::fmt::Display for DatasetManifestError {
@@ -523,6 +539,25 @@ impl std::fmt::Display for DatasetManifestError {
                 f,
                 "validated dataset count {field}={value} cannot be represented as u64"
             ),
+            Self::DepthEntriesWithoutMetadata { entry_count } => write!(
+                f,
+                "manifest declares {entry_count} depth entries without configured depth metadata"
+            ),
+            Self::UnsupportedDepthEncoding { value } => write!(
+                f,
+                "manifest depth stream uses unsupported encoding {value:?}; expected \"f32_meters_le\""
+            ),
+            Self::InvalidDepthDimensions { source } => {
+                write!(f, "manifest depth dimensions are invalid: {source}")
+            }
+            Self::NonIncreasingDepthTimestamp {
+                entry_index,
+                previous_ns,
+                current_ns,
+            } => write!(
+                f,
+                "manifest depth entry {entry_index} has non-increasing timestamp {current_ns} after {previous_ns}"
+            ),
         }
     }
 }
@@ -532,6 +567,7 @@ impl std::error::Error for DatasetManifestError {
         match self {
             Self::InvalidPairingWindow { source } => Some(source),
             Self::InvalidFrameReference { source, .. } => Some(source),
+            Self::InvalidDepthDimensions { source } => Some(source),
             Self::MissingMonoConfig
             | Self::HeaderTextMismatch { .. }
             | Self::HeaderNumberMismatch { .. }
@@ -541,7 +577,10 @@ impl std::error::Error for DatasetManifestError {
             | Self::PairOutsideWindow { .. }
             | Self::PairedCountExceedsAvailableRightFrames { .. }
             | Self::CountMismatch { .. }
-            | Self::CountOverflow { .. } => None,
+            | Self::CountOverflow { .. }
+            | Self::DepthEntriesWithoutMetadata { .. }
+            | Self::UnsupportedDepthEncoding { .. }
+            | Self::NonIncreasingDepthTimestamp { .. } => None,
         }
     }
 }
@@ -658,6 +697,23 @@ pub enum DatasetError {
     MissingImuSamples {
         start_ns: Option<i64>,
         end_ns: i64,
+    },
+    DepthStreamNotConfigured,
+    LegacyDepthManifestUnindexed,
+    DepthFrameIndexOutOfRange {
+        index: usize,
+    },
+    DepthPayloadSizeOverflow {
+        dimensions: FrameDimensions,
+    },
+    DepthPayloadLengthChanged {
+        path: PathBuf,
+        expected_bytes: usize,
+        actual_bytes: usize,
+    },
+    InvalidDepth {
+        path: PathBuf,
+        source: crate::DepthImageError,
     },
 }
 
@@ -806,6 +862,37 @@ impl std::fmt::Display for DatasetError {
                     "dataset missing imu samples for interval ({start_ns:?}, {end_ns}]"
                 )
             }
+            DatasetError::DepthStreamNotConfigured => {
+                write!(f, "dataset metadata does not configure a depth stream")
+            }
+            DatasetError::LegacyDepthManifestUnindexed => write!(
+                f,
+                "dataset depth stream is not indexed by this legacy manifest"
+            ),
+            DatasetError::DepthFrameIndexOutOfRange { index } => write!(
+                f,
+                "dataset depth frame index {index} exceeds the frame-id representation"
+            ),
+            DatasetError::DepthPayloadSizeOverflow { dimensions } => write!(
+                f,
+                "dataset depth payload size overflows for {}x{} f32 samples",
+                dimensions.width(),
+                dimensions.height()
+            ),
+            DatasetError::DepthPayloadLengthChanged {
+                path,
+                expected_bytes,
+                actual_bytes,
+            } => write!(
+                f,
+                "dataset depth payload {} changed length after open: expected {expected_bytes} bytes, got {actual_bytes}",
+                path.display()
+            ),
+            DatasetError::InvalidDepth { path, source } => write!(
+                f,
+                "dataset depth payload is invalid at {}: {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -832,6 +919,7 @@ impl std::error::Error for DatasetError {
             DatasetError::InvalidImuSlice { source, .. } => Some(source),
             DatasetError::InvalidFrameFilename { source, .. } => Some(source),
             DatasetError::InvalidFrameDimensions { source, .. } => Some(source),
+            DatasetError::InvalidDepth { source, .. } => Some(source),
             DatasetError::InvalidConfig { .. }
             | DatasetError::OutputAlreadyExists { .. }
             | DatasetError::NonUnicodeFrameFilename { .. }
@@ -843,7 +931,12 @@ impl std::error::Error for DatasetError {
             | DatasetError::FrameSequenceExhausted { .. }
             | DatasetError::CaptureSequenceExhausted
             | DatasetError::WorkerJoin { .. }
-            | DatasetError::MissingImuSamples { .. } => None,
+            | DatasetError::MissingImuSamples { .. }
+            | DatasetError::DepthStreamNotConfigured
+            | DatasetError::LegacyDepthManifestUnindexed
+            | DatasetError::DepthFrameIndexOutOfRange { .. }
+            | DatasetError::DepthPayloadSizeOverflow { .. }
+            | DatasetError::DepthPayloadLengthChanged { .. } => None,
         }
     }
 }
@@ -1574,12 +1667,24 @@ struct FrameSet {
     mono_dimensions: FrameDimensions,
     left: Vec<FrameInfo>,
     right: Vec<FrameInfo>,
+    depth: Vec<FrameInfo>,
 }
 
 #[derive(Debug)]
 struct DatasetIndex {
     stats: DatasetStats,
     pairs: Box<[DatasetPairIndex]>,
+    depth: DatasetDepthIndex,
+}
+
+#[derive(Debug)]
+enum DatasetDepthIndex {
+    Unconfigured,
+    LegacyUnindexed,
+    Indexed {
+        dimensions: FrameDimensions,
+        entries: Arc<[DatasetIndexFrameRef]>,
+    },
 }
 
 #[derive(Debug)]
@@ -1588,7 +1693,7 @@ struct DatasetPairIndex {
     right: DatasetIndexFrameRef,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DatasetIndexFrameRef {
     timestamp: Timestamp,
     path: Arc<str>,
@@ -1648,6 +1753,12 @@ impl DatasetIndex {
                 (
                     frame.path.as_str(),
                     (format::FrameKind::MonoRight, frame.timestamp_ns),
+                )
+            }))
+            .chain(frames.depth.iter().map(|frame| {
+                (
+                    frame.path.as_str(),
+                    (format::FrameKind::Depth, frame.timestamp_ns),
                 )
             }))
             .collect();
@@ -1753,12 +1864,70 @@ impl DatasetIndex {
             count_as_u64("outside_window", outside_window)?,
         )?;
 
+        let depth = parse_manifest_depth(
+            manifest.depth_entries,
+            meta.depth.as_ref(),
+            &available_frames,
+        )?;
         let stats = DatasetStats::from_frames_and_pairs(frames, &pairs);
         Ok(Self {
             stats,
             pairs: pairs.into_boxed_slice(),
+            depth,
         })
     }
+}
+
+fn parse_manifest_depth(
+    entries: Option<Vec<ManifestFrameRef>>,
+    metadata: Option<&DepthMeta>,
+    available_frames: &HashMap<&str, (format::FrameKind, i64)>,
+) -> Result<DatasetDepthIndex, DatasetManifestError> {
+    let (metadata, entries) = match (metadata, entries) {
+        (None, None) => return Ok(DatasetDepthIndex::Unconfigured),
+        (Some(_), None) => return Ok(DatasetDepthIndex::LegacyUnindexed),
+        (None, Some(entries)) => {
+            return Err(DatasetManifestError::DepthEntriesWithoutMetadata {
+                entry_count: entries.len(),
+            });
+        }
+        (Some(metadata), Some(entries)) => (metadata, entries),
+    };
+    if metadata.encoding != "f32_meters_le" {
+        return Err(DatasetManifestError::UnsupportedDepthEncoding {
+            value: metadata.encoding.clone(),
+        });
+    }
+    let dimensions = FrameDimensions::try_new(metadata.width, metadata.height)
+        .map_err(|source| DatasetManifestError::InvalidDepthDimensions { source })?;
+    let mut seen = HashSet::with_capacity(entries.len());
+    let mut previous = None;
+    let mut parsed = Vec::with_capacity(entries.len());
+    for (entry_index, entry) in entries.into_iter().enumerate() {
+        let depth = validate_manifest_frame_ref(
+            entry,
+            format::FrameKind::Depth,
+            available_frames,
+            entry_index,
+            DatasetFrameRole::Depth,
+        )?;
+        insert_unique_frame_ref(&mut seen, &depth, entry_index, DatasetFrameRole::Depth)?;
+        if let Some(previous_ns) = previous
+            && depth.timestamp.as_nanos() <= previous_ns
+        {
+            return Err(DatasetManifestError::NonIncreasingDepthTimestamp {
+                entry_index,
+                previous_ns,
+                current_ns: depth.timestamp.as_nanos(),
+            });
+        }
+        previous = Some(depth.timestamp.as_nanos());
+        parsed.push(depth);
+    }
+    Ok(DatasetDepthIndex::Indexed {
+        dimensions,
+        entries: Arc::from(parsed.into_boxed_slice()),
+    })
 }
 
 fn require_manifest_text(
@@ -1907,6 +2076,7 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         mono_dimensions: _,
         left,
         right,
+        depth: _,
     } = scan_frames_with_depth(
         &state.frames_dir,
         mono.width,
@@ -2100,6 +2270,7 @@ fn scan_frames_with_depth(
         mono_dimensions,
         left: Vec::new(),
         right: Vec::new(),
+        depth: Vec::new(),
     };
     let depth_expected_len = depth
         .map(|meta| {
@@ -2168,7 +2339,7 @@ fn scan_frames_with_depth(
         let target = match parsed.kind() {
             format::FrameKind::MonoLeft => Some(&mut frames.left),
             format::FrameKind::MonoRight => Some(&mut frames.right),
-            format::FrameKind::Depth => None,
+            format::FrameKind::Depth => Some(&mut frames.depth),
         };
         if let Some(target) = target {
             target.push(FrameInfo {
@@ -2484,7 +2655,7 @@ mod tests {
             width: 2,
             height: 2,
             fps: 10,
-            encoding: "f32_m".to_string(),
+            encoding: "f32_meters_le".to_string(),
         });
         meta
     }
@@ -2542,6 +2713,7 @@ mod tests {
                     path: "frames/204_mono_right.raw".to_string(),
                 },
             ],
+            depth: Vec::new(),
         };
         let manifest = Manifest {
             header: ManifestHeader {
