@@ -177,21 +177,43 @@ pub struct RerunSink {
     logged_world: bool,
 }
 
+/// Fully parsed visualization settings needed to construct a [`RerunSink`].
+#[derive(Clone, Copy, Debug)]
+pub struct RerunSinkConfig {
+    track: TrackConfig,
+}
+
+impl RerunSinkConfig {
+    /// Parses the visualization environment once without creating a Rerun recording.
+    pub fn from_environment() -> Result<Self, VizConfigError> {
+        TrackConfig::load().map(|track| Self { track })
+    }
+}
+
 impl RerunSink {
     pub fn new(
         rec: rerun::RecordingStream,
         decimation: VizDecimation,
     ) -> Result<Self, VizConfigError> {
-        let track_config = TrackConfig::load()?;
-        Ok(Self {
+        let config = RerunSinkConfig::from_environment()?;
+        Ok(Self::from_config(rec, decimation, config))
+    }
+
+    /// Constructs a sink infallibly from settings that were already parsed.
+    pub fn from_config(
+        rec: rerun::RecordingStream,
+        decimation: VizDecimation,
+        config: RerunSinkConfig,
+    ) -> Self {
+        Self {
             rec,
             decimation,
             frame_index: 0,
             depth_index: 0,
-            tracks: TrackState::new(track_config),
+            tracks: TrackState::new(config.track),
             trajectory: Vec::new(),
             logged_world: false,
-        })
+        }
     }
 
     pub fn log(&mut self, packet: &VizPacket<Raw>) -> Result<(), VizLogError> {

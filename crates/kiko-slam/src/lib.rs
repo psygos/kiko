@@ -96,7 +96,8 @@ pub use triangulation::{
     TriangulationResult, TriangulationStats, Triangulator,
 };
 pub use viz::{
-    RerunSink, VizConfigError, VizDecimation, VizDecimationError, VizFlushError, VizLogError,
+    RerunSink, RerunSinkConfig, VizConfigError, VizDecimation, VizDecimationError, VizFlushError,
+    VizLogError,
 };
 
 pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
