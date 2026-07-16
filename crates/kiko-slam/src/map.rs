@@ -16,6 +16,15 @@ const MIN_BLEND_ALPHA: f32 = 0.5 / BLEND_SCALE as f32;
 /// Rounding bias for fixed-point descriptor blending (half of BLEND_SCALE).
 const BLEND_ROUND: u32 = (BLEND_SCALE / 2) as u32;
 static NEXT_MAP_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_MAP_LINEAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_monotonic_id(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .ok()
+}
 
 new_key_type! {
     pub struct MapPointId;
@@ -27,11 +36,26 @@ pub struct MapInstanceId(u64);
 
 impl MapInstanceId {
     fn fresh() -> Self {
-        Self(NEXT_MAP_INSTANCE_ID.fetch_add(1, Ordering::Relaxed))
+        Self(
+            allocate_monotonic_id(&NEXT_MAP_INSTANCE_ID)
+                .expect("map instance ID space exhausted"),
+        )
     }
 
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct MapLineageId(u64);
+
+impl MapLineageId {
+    fn fresh() -> Self {
+        Self(
+            allocate_monotonic_id(&NEXT_MAP_LINEAGE_ID)
+                .expect("map lineage ID space exhausted"),
+        )
     }
 }
 
@@ -493,7 +517,7 @@ impl std::error::Error for MapError {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MapGeneration(u64);
 
 impl MapGeneration {
@@ -519,10 +543,16 @@ impl MapGeneration {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A process-local freshness token for one exact [`SlamMap`] revision.
+///
+/// Clones compare equal until either copy mutates. Generation remains monotonic
+/// within one branch, while lineage distinguishes independently mutated clones
+/// at the same generation. This is deliberately not a structural content hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MapSnapshot {
     instance_id: MapInstanceId,
     generation: MapGeneration,
+    lineage: MapLineageId,
 }
 
 impl MapSnapshot {
@@ -535,7 +565,9 @@ impl MapSnapshot {
     }
 
     pub fn is_same_or_older_than(self, current: Self) -> bool {
-        self.instance_id == current.instance_id && self.generation <= current.generation
+        self.instance_id == current.instance_id
+            && self.lineage == current.lineage
+            && self.generation <= current.generation
     }
 }
 
@@ -543,14 +575,15 @@ impl std::fmt::Display for MapSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{}",
+            "{}:{}:{}",
             self.instance_id.as_u64(),
-            self.generation.as_u64()
+            self.generation.as_u64(),
+            self.lineage.0
         )
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SlamMap {
     instance_id: MapInstanceId,
     points: SlotMap<MapPointId, MapPoint>,
@@ -558,6 +591,25 @@ pub struct SlamMap {
     covisibility: CovisibilityGraph,
     frame_to_keyframe: HashMap<FrameId, KeyframeId>,
     generation: MapGeneration,
+    lineage: MapLineageId,
+    mutation_lineage: MapLineageId,
+}
+
+impl Clone for SlamMap {
+    fn clone(&self) -> Self {
+        Self {
+            instance_id: self.instance_id,
+            points: self.points.clone(),
+            keyframes: self.keyframes.clone(),
+            covisibility: self.covisibility.clone(),
+            frame_to_keyframe: self.frame_to_keyframe.clone(),
+            generation: self.generation,
+            lineage: self.lineage,
+            // An untouched clone is the same revision. Its first successful
+            // mutation moves it onto a distinct branch lineage.
+            mutation_lineage: MapLineageId::fresh(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -581,6 +633,7 @@ pub struct CovisibilitySnapshot {
 
 impl SlamMap {
     pub fn new() -> Self {
+        let lineage = MapLineageId::fresh();
         Self {
             instance_id: MapInstanceId::fresh(),
             points: SlotMap::with_key(),
@@ -588,6 +641,8 @@ impl SlamMap {
             covisibility: CovisibilityGraph::default(),
             frame_to_keyframe: HashMap::new(),
             generation: MapGeneration::initial(),
+            lineage,
+            mutation_lineage: lineage,
         }
     }
 
@@ -599,6 +654,7 @@ impl SlamMap {
         MapSnapshot {
             instance_id: self.instance_id,
             generation: self.generation,
+            lineage: self.lineage,
         }
     }
 
@@ -667,6 +723,7 @@ impl SlamMap {
         let next_generation = self.generation.next();
         let kf_id = self.keyframes.insert(entry);
         self.frame_to_keyframe.insert(frame_id, kf_id);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(kf_id)
     }
@@ -740,6 +797,7 @@ impl SlamMap {
             .get_mut(first_obs.keyframe_id)
             .expect("keyframe existence validated before mutation");
         entry.set_point_ref(first_obs.index, point_id);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(point_id)
     }
@@ -797,6 +855,7 @@ impl SlamMap {
             .get_mut(obs.keyframe_id)
             .expect("keyframe existence validated before mutation");
         entry.set_point_ref(obs.index, point_id);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(())
     }
@@ -816,6 +875,7 @@ impl SlamMap {
             .get_mut(point_id)
             .expect("map point existence validated before mutation");
         point.update_descriptor(new_desc, blend);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(())
     }
@@ -835,6 +895,7 @@ impl SlamMap {
             .get_mut(point_id)
             .expect("map point existence validated before mutation");
         point.set_position(position);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(())
     }
@@ -854,6 +915,7 @@ impl SlamMap {
             .get_mut(keyframe_id)
             .expect("keyframe existence validated before mutation");
         entry.set_pose(pose);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(())
     }
@@ -898,6 +960,7 @@ impl SlamMap {
         }
 
         if let Some(next_generation) = next_generation {
+            self.lineage = self.mutation_lineage;
             self.generation = next_generation;
         }
         Ok(())
@@ -909,6 +972,7 @@ impl SlamMap {
         }
         let next_generation = self.generation.next();
         self.remove_map_point_without_generation(point_id);
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(())
     }
@@ -956,6 +1020,7 @@ impl SlamMap {
                 "point scheduled for removal was missing from map"
             );
         }
+        self.lineage = self.mutation_lineage;
         self.generation = next_generation;
         Ok(())
     }
@@ -975,6 +1040,7 @@ impl SlamMap {
         for id in to_remove {
             self.remove_map_point_without_generation(id);
         }
+        self.lineage = self.mutation_lineage;
         self.generation = final_generation;
         count
     }
@@ -2267,11 +2333,11 @@ mod tests {
     }
 
     #[test]
-    fn map_clone_preserves_generation() {
+    fn map_clone_preserves_revision_until_branches_diverge() {
         let mut map = SlamMap::new();
         let size = FrameDimensions::try_new(640, 480).expect("valid size");
         let pose = Pose::identity();
-        let _ = map
+        let keyframe = map
             .add_keyframe(
                 FrameId::new(1),
                 Timestamp::from_nanos(1),
@@ -2281,8 +2347,35 @@ mod tests {
             )
             .expect("keyframe1");
 
-        let cloned = map.clone();
+        let shared_snapshot = map.snapshot();
+        let mut cloned = map.clone();
         assert_eq!(cloned.generation(), map.generation());
+        assert_eq!(cloned.snapshot(), shared_snapshot);
+
+        map.set_keyframe_pose(
+            keyframe,
+            Pose::from_rt(Pose::identity().rotation(), [1.0, 0.0, 0.0]),
+        )
+        .expect("mutate source branch");
+        cloned
+            .set_keyframe_pose(
+                keyframe,
+                Pose::from_rt(Pose::identity().rotation(), [-1.0, 0.0, 0.0]),
+            )
+            .expect("mutate clone branch");
+
+        assert_eq!(cloned.generation(), map.generation());
+        assert_ne!(cloned.snapshot(), map.snapshot());
+        assert!(shared_snapshot.is_same_or_older_than(map.snapshot()));
+        assert!(!shared_snapshot.is_same_or_older_than(cloned.snapshot()));
+    }
+
+    #[test]
+    fn monotonic_id_allocator_exhausts_without_wrapping() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_monotonic_id(&counter), Some(u64::MAX - 1));
+        assert_eq!(allocate_monotonic_id(&counter), None);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 
     #[test]
