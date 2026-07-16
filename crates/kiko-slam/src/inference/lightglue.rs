@@ -110,16 +110,72 @@ impl LightGlue {
 }
 
 fn normalize_keypoints(detections: &Detections) -> Vec<f32> {
-    let width = detections.width() as f32;
-    let height = detections.height() as f32;
+    let dimensions = detections.dimensions();
+    let width = f64::from(dimensions.width());
+    let height = f64::from(dimensions.height());
     let scale = 0.5 * width.max(height);
     let cx = width * 0.5;
     let cy = height * 0.5;
 
     let mut out = Vec::with_capacity(detections.len() * 2);
     for kp in detections.keypoints() {
-        out.push((kp.x - cx) / scale);
-        out.push((kp.y - cy) / scale);
+        // Exact normalized coordinates are in [-1, 1). Final f32 rounding can
+        // reach 1.0, but the model inputs remain finite and within [-1, 1].
+        out.push(((f64::from(kp.x) - cx) / scale) as f32);
+        out.push(((f64::from(kp.y) - cy) / scale) as f32);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DESCRIPTOR_DIM, Descriptor, FrameId, Keypoint, SensorId};
+
+    #[test]
+    fn normalization_does_not_round_large_dimensions_before_arithmetic() {
+        const WIDTH: u32 = 16_777_217;
+        const X: f32 = 16_777_216.0;
+        let detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            WIDTH,
+            1,
+            vec![Keypoint { x: X, y: 0.0 }],
+            vec![1.0],
+            vec![Descriptor([0.0; DESCRIPTOR_DIM])],
+        )
+        .expect("large exact detection domain");
+
+        let normalized = normalize_keypoints(&detections);
+        let rounded_width = WIDTH as f32;
+        let legacy_x = (X - rounded_width * 0.5) / (rounded_width * 0.5);
+
+        assert_eq!(legacy_x, 1.0);
+        assert_eq!(normalized[0].to_bits(), 0x3f7f_fffe);
+        assert!(normalized[0] < 1.0);
+    }
+
+    #[test]
+    fn normalization_documents_final_rounding_at_positive_endpoint() {
+        const WIDTH: u32 = 67_108_865;
+        const X: f32 = 67_108_864.0;
+        let detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            WIDTH,
+            1,
+            vec![Keypoint { x: X, y: 0.0 }],
+            vec![1.0],
+            vec![Descriptor([0.0; DESCRIPTOR_DIM])],
+        )
+        .expect("large exact detection domain");
+
+        let exact = (f64::from(X) - f64::from(WIDTH) * 0.5) / (f64::from(WIDTH) * 0.5);
+        let normalized = normalize_keypoints(&detections);
+
+        assert!(exact < 1.0);
+        assert_eq!(normalized[0], 1.0);
+        assert!(normalized[0].is_finite());
+    }
 }

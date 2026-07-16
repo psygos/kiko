@@ -1947,6 +1947,7 @@ enum LiveThreadError {
     VizChannelDisconnected,
     RerunConnect { detail: String },
     VisualizationConfiguration { source: VizConfigError },
+    VisualizationPacket { source: VizError },
     InferenceUnavailable { detail: String },
     TrackerInitialization { source: TrackerInitError },
     FrameProcessingPanic { detail: String },
@@ -1962,6 +1963,9 @@ impl std::fmt::Display for LiveThreadError {
             }
             LiveThreadError::VisualizationConfiguration { source } => {
                 write!(f, "invalid live visualization configuration: {source}")
+            }
+            LiveThreadError::VisualizationPacket { source } => {
+                write!(f, "invalid live visualization packet: {source}")
             }
             LiveThreadError::InferenceUnavailable { detail } => {
                 write!(f, "inference pipeline is unavailable: {detail}")
@@ -1981,6 +1985,7 @@ impl std::error::Error for LiveThreadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::VisualizationConfiguration { source } => Some(source),
+            Self::VisualizationPacket { source } => Some(source),
             Self::TrackerInitialization { source } => Some(source),
             Self::VizChannelDisconnected
             | Self::RerunConnect { .. }
@@ -2256,11 +2261,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(keyframe) = output.keyframe() {
                             points = Some(keyframe.landmarks().to_vec());
                         }
-                        if let Ok(viz_packet) =
-                            VizPacket::try_new(left.clone(), right.clone(), matches)
-                        {
-                            packet = Some(viz_packet);
-                        }
+                        packet = Some(
+                            VizPacket::try_new(left.clone(), right.clone(), matches).map_err(
+                                |source| LiveThreadError::VisualizationPacket { source },
+                            )?,
+                        );
                     }
                     let (pose, health, diagnostics, events) = output.into_status_parts();
                     let msg = LiveVizMsg {

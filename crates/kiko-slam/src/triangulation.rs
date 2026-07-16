@@ -1018,8 +1018,8 @@ impl Triangulator {
         }
 
         let expected = self.stereo.dimensions();
-        let left_dimensions = FrameDimensions::new(left.width(), left.height());
-        let right_dimensions = FrameDimensions::new(right.width(), right.height());
+        let left_dimensions = left.dimensions();
+        let right_dimensions = right.dimensions();
         if left_dimensions != expected || right_dimensions != expected {
             return Err(TriangulationError::DetectionDimensionMismatch {
                 expected,

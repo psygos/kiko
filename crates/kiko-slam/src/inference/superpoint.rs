@@ -149,11 +149,10 @@ fn run_inference(
         }
         let descriptors = parse_descriptors(descriptors_raw.1, "descriptors")?;
 
-        Detections::new(
+        Detections::from_dimensions(
             frame.sensor_id(),
             frame.frame_id(),
-            frame.width(),
-            frame.height(),
+            frame.dimensions(),
             keypoints,
             scores,
             descriptors,

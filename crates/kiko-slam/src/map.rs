@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use slotmap::{SlotMap, new_key_type};
 
 use crate::{
-    CompactDescriptor, Detections, FrameId, Keypoint, SensorId, Timestamp, WorldPoint3,
-    WorldToCamera,
+    CompactDescriptor, Detections, FrameDimensions, FrameId, Keypoint, SensorId, Timestamp,
+    WorldPoint3, WorldToCamera,
 };
 
 /// Fixed-point scale factor for descriptor blending (8-bit precision).
@@ -128,6 +128,15 @@ impl ImageSize {
 
     pub fn max_dim(self) -> u32 {
         self.width.max(self.height)
+    }
+}
+
+impl From<FrameDimensions> for ImageSize {
+    fn from(dimensions: FrameDimensions) -> Self {
+        Self {
+            width: dimensions.width(),
+            height: dimensions.height(),
+        }
     }
 }
 
@@ -445,10 +454,6 @@ pub enum MapError {
         point_id: MapPointId,
         keyframe_id: KeyframeId,
     },
-    InvalidImageSize {
-        width: u32,
-        height: u32,
-    },
     EmptyKeyframe {
         frame_id: FrameId,
     },
@@ -485,9 +490,6 @@ impl std::fmt::Display for MapError {
                 f,
                 "map point {point_id:?} already observed in keyframe {keyframe_id:?}"
             ),
-            MapError::InvalidImageSize { width, height } => {
-                write!(f, "invalid image size {width}x{height}")
-            }
             MapError::EmptyKeyframe { frame_id } => {
                 write!(f, "keyframe {frame_id:?} has no keypoints")
             }
@@ -630,12 +632,7 @@ impl SlamMap {
             });
         }
 
-        let image_size = ImageSize::try_new(detections.width(), detections.height()).ok_or(
-            MapError::InvalidImageSize {
-                width: detections.width(),
-                height: detections.height(),
-            },
-        )?;
+        let image_size = ImageSize::from(detections.dimensions());
 
         let keypoints = detections.keypoints().to_vec();
         self.add_keyframe(

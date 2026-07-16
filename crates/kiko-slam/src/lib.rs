@@ -518,9 +518,8 @@ pub enum DetectionError {
         scores_len: usize,
         descriptors_len: usize,
     },
-    ZeroDimensions {
-        width: u32,
-        height: u32,
+    InvalidDimensions {
+        source: FrameDimensionsError,
     },
     NonFiniteKeypoint {
         index: usize,
@@ -556,11 +555,8 @@ impl std::fmt::Display for DetectionError {
                 f,
                 "detections shape mismatch: keypoints={keypoints_len}, scores={scores_len}, descriptors={descriptors_len}"
             ),
-            DetectionError::ZeroDimensions { width, height } => {
-                write!(
-                    f,
-                    "detection dimensions must be nonzero, got {width}x{height}"
-                )
+            DetectionError::InvalidDimensions { source } => {
+                write!(f, "invalid detection dimensions: {source}")
             }
             DetectionError::NonFiniteKeypoint { index, x, y } => {
                 write!(f, "detection keypoint {index} is nonfinite: ({x}, {y})")
@@ -590,14 +586,24 @@ impl std::fmt::Display for DetectionError {
     }
 }
 
-impl std::error::Error for DetectionError {}
+impl std::error::Error for DetectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDimensions { source } => Some(source),
+            Self::ShapeMismatch { .. }
+            | Self::NonFiniteKeypoint { .. }
+            | Self::KeypointOutOfBounds { .. }
+            | Self::NonFiniteScore { .. }
+            | Self::NonFiniteDescriptor { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Detections {
     sensor_id: SensorId,
     frame_id: FrameId,
-    width: u32,
-    height: u32,
+    dimensions: FrameDimensions,
     keypoints: Vec<Keypoint>,
     scores: Vec<f32>,
     descriptors: Vec<Descriptor>,
@@ -613,11 +619,15 @@ impl Detections {
     }
 
     pub fn width(&self) -> u32 {
-        self.width
+        self.dimensions.width()
     }
 
     pub fn height(&self) -> u32 {
-        self.height
+        self.dimensions.height()
+    }
+
+    pub fn dimensions(&self) -> FrameDimensions {
+        self.dimensions
     }
 
     pub fn keypoints(&self) -> &[Keypoint] {
@@ -657,6 +667,44 @@ impl Detections {
         scores: Vec<f32>,
         descriptors: Vec<Descriptor>,
     ) -> Result<Self, DetectionError> {
+        Self::require_equal_lengths(&keypoints, &scores, &descriptors)?;
+        let dimensions = FrameDimensions::try_new(width, height)
+            .map_err(|source| DetectionError::InvalidDimensions { source })?;
+        Self::from_validated_shape(
+            sensor_id,
+            frame_id,
+            dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        )
+    }
+
+    /// Build detections in an already-parsed image coordinate domain.
+    pub fn from_dimensions(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        dimensions: FrameDimensions,
+        keypoints: Vec<Keypoint>,
+        scores: Vec<f32>,
+        descriptors: Vec<Descriptor>,
+    ) -> Result<Self, DetectionError> {
+        Self::require_equal_lengths(&keypoints, &scores, &descriptors)?;
+        Self::from_validated_shape(
+            sensor_id,
+            frame_id,
+            dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        )
+    }
+
+    fn require_equal_lengths(
+        keypoints: &[Keypoint],
+        scores: &[f32],
+        descriptors: &[Descriptor],
+    ) -> Result<(), DetectionError> {
         if keypoints.len() != descriptors.len() || descriptors.len() != scores.len() {
             return Err(DetectionError::ShapeMismatch {
                 keypoints_len: keypoints.len(),
@@ -664,12 +712,22 @@ impl Detections {
                 descriptors_len: descriptors.len(),
             });
         }
-        if width == 0 || height == 0 {
-            return Err(DetectionError::ZeroDimensions { width, height });
-        }
+        Ok(())
+    }
+
+    fn from_validated_shape(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        dimensions: FrameDimensions,
+        keypoints: Vec<Keypoint>,
+        scores: Vec<f32>,
+        descriptors: Vec<Descriptor>,
+    ) -> Result<Self, DetectionError> {
         // Compare in f64 so u32 dimensions above f32's exact-integer range do
         // not round inward and incorrectly reject their last representable
         // pixel coordinate.
+        let width = dimensions.width();
+        let height = dimensions.height();
         let width_f = f64::from(width);
         let height_f = f64::from(height);
         for (index, point) in keypoints.iter().enumerate() {
@@ -717,8 +775,7 @@ impl Detections {
         Ok(Self {
             sensor_id,
             frame_id,
-            width,
-            height,
+            dimensions,
             keypoints,
             scores,
             descriptors,
@@ -733,8 +790,7 @@ impl Detections {
         let Detections {
             sensor_id,
             frame_id,
-            width,
-            height,
+            dimensions,
             keypoints,
             scores,
             descriptors,
@@ -760,8 +816,7 @@ impl Detections {
         Self {
             sensor_id,
             frame_id,
-            width,
-            height,
+            dimensions,
             keypoints: new_keypoints,
             scores: new_scores,
             descriptors: new_descriptors,
@@ -1059,6 +1114,12 @@ pub enum VizError {
         matches_left: SensorId,
         matches_right: SensorId,
     },
+    DimensionMismatch {
+        left: FrameDimensions,
+        right: FrameDimensions,
+        matches_left: FrameDimensions,
+        matches_right: FrameDimensions,
+    },
 }
 
 impl std::fmt::Display for VizError {
@@ -1085,6 +1146,23 @@ impl std::fmt::Display for VizError {
             } => write!(
                 f,
                 "viz packet sensor mismatch: left={left:?}, right={right:?}, matches_left={matches_left:?}, matches_right={matches_right:?}"
+            ),
+            VizError::DimensionMismatch {
+                left,
+                right,
+                matches_left,
+                matches_right,
+            } => write!(
+                f,
+                "viz packet dimension mismatch: left={}x{}, right={}x{}, matches_left={}x{}, matches_right={}x{}",
+                left.width(),
+                left.height(),
+                right.width(),
+                right.height(),
+                matches_left.width(),
+                matches_left.height(),
+                matches_right.width(),
+                matches_right.height(),
             ),
         }
     }
@@ -1121,6 +1199,18 @@ impl<State> VizPacket<State> {
                 matches_right: matches_right_sensor,
             });
         }
+        let matches_left_dimensions = matches.source_a().dimensions();
+        let matches_right_dimensions = matches.source_b().dimensions();
+        if left.dimensions() != matches_left_dimensions
+            || right.dimensions() != matches_right_dimensions
+        {
+            return Err(VizError::DimensionMismatch {
+                left: left.dimensions(),
+                right: right.dimensions(),
+                matches_left: matches_left_dimensions,
+                matches_right: matches_right_dimensions,
+            });
+        }
 
         Ok(Self {
             left,
@@ -1146,8 +1236,10 @@ impl<State> VizPacket<State> {
 mod tests {
     use super::{
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, Frame,
-        FrameDimensionsError, FrameError, FrameId, Keypoint, SensorId, Timestamp,
+        FrameDimensions, FrameDimensionsError, FrameError, FrameId, Keypoint, Matches, Raw,
+        SensorId, Timestamp, VizError, VizPacket,
     };
+    use std::sync::Arc;
 
     #[test]
     fn frame_stores_the_dimensions_parsed_at_construction() {
@@ -1187,6 +1279,73 @@ mod tests {
                 }
             }
         ));
+    }
+
+    #[test]
+    fn detections_parse_dimensions_after_shape_and_preserve_the_typed_source() {
+        let shape_error = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            0,
+            0,
+            Vec::new(),
+            vec![1.0],
+            Vec::new(),
+        )
+        .expect_err("shape remains the first boundary error");
+        assert!(matches!(
+            shape_error,
+            DetectionError::ShapeMismatch {
+                keypoints_len: 0,
+                scores_len: 1,
+                descriptors_len: 0,
+            }
+        ));
+
+        let dimension_error = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(2),
+            0,
+            3,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("zero width is outside the dimension domain");
+        assert!(matches!(
+            &dimension_error,
+            DetectionError::InvalidDimensions {
+                source: FrameDimensionsError::Zero {
+                    width: 0,
+                    height: 3,
+                }
+            }
+        ));
+        assert!(
+            std::error::Error::source(&dimension_error)
+                .and_then(|source| source.downcast_ref::<FrameDimensionsError>())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn typed_detection_dimensions_survive_empty_top_k() {
+        let dimensions = FrameDimensions::try_new(5, 7).expect("typed dimensions");
+        let detections = Detections::from_dimensions(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            dimensions,
+            vec![Keypoint { x: 1.0, y: 2.0 }],
+            vec![1.0],
+            vec![Descriptor([0.0; DESCRIPTOR_DIM])],
+        )
+        .expect("typed detections")
+        .top_k(0);
+
+        assert!(detections.is_empty());
+        assert_eq!(detections.dimensions(), dimensions);
+        assert_eq!(detections.width(), 5);
+        assert_eq!(detections.height(), 7);
     }
 
     #[test]
@@ -1232,6 +1391,126 @@ mod tests {
                 width: WIDTH,
                 height: 1,
             }
+        ));
+    }
+
+    #[test]
+    fn detection_bounds_preserve_u32_max_and_signed_zero() {
+        const LAST_REPRESENTABLE_COLUMN: f32 = f32::from_bits(0x4f7f_ffff);
+        const FIRST_OUTSIDE_COLUMN: f32 = f32::from_bits(0x4f80_0000);
+        let detections = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            u32::MAX,
+            1,
+            vec![
+                Keypoint { x: -0.0, y: -0.0 },
+                Keypoint {
+                    x: LAST_REPRESENTABLE_COLUMN,
+                    y: 0.0,
+                },
+            ],
+            vec![1.0, 1.0],
+            vec![
+                Descriptor([0.0; DESCRIPTOR_DIM]),
+                Descriptor([0.0; DESCRIPTOR_DIM]),
+            ],
+        )
+        .expect("all representable coordinates below u32::MAX remain valid");
+        assert_eq!(detections.keypoints()[0].x.to_bits(), (-0.0_f32).to_bits());
+        assert_eq!(detections.keypoints()[0].y.to_bits(), (-0.0_f32).to_bits());
+
+        for (frame_id, point) in [
+            (
+                2,
+                Keypoint {
+                    x: FIRST_OUTSIDE_COLUMN,
+                    y: 0.0,
+                },
+            ),
+            (
+                3,
+                Keypoint {
+                    x: -f32::from_bits(1),
+                    y: 0.0,
+                },
+            ),
+            (4, Keypoint { x: 0.0, y: 1.0 }),
+        ] {
+            assert!(matches!(
+                Detections::new(
+                    SensorId::StereoLeft,
+                    FrameId::new(frame_id),
+                    u32::MAX,
+                    1,
+                    vec![point],
+                    vec![1.0],
+                    vec![Descriptor([0.0; DESCRIPTOR_DIM])],
+                ),
+                Err(DetectionError::KeypointOutOfBounds { index: 0, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn viz_packet_rejects_detection_coordinates_from_another_image_size() {
+        let left_frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("left frame");
+        let right_frame = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(2),
+            Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("right frame");
+        let left_detections = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(1),
+                3,
+                2,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("left detections"),
+        );
+        let right_detections = Arc::new(
+            Detections::new(
+                SensorId::StereoRight,
+                FrameId::new(2),
+                2,
+                2,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("right detections"),
+        );
+        let matches =
+            Matches::<Raw>::new(left_detections, right_detections, Vec::new(), Vec::new())
+                .expect("empty matches");
+
+        assert!(matches!(
+            VizPacket::try_new(left_frame, right_frame, matches),
+            Err(VizError::DimensionMismatch {
+                left,
+                right,
+                matches_left,
+                matches_right,
+            }) if left == FrameDimensions::new(2, 2)
+                && right == FrameDimensions::new(2, 2)
+                && matches_left == FrameDimensions::new(3, 2)
+                && matches_right == FrameDimensions::new(2, 2)
         ));
     }
 
