@@ -72,6 +72,10 @@ pub enum InferenceError {
         expected: String,
         actual: String,
     },
+    OutputDecode {
+        name: &'static str,
+        source: OrtError,
+    },
     Downscale(crate::DownscaleError),
     Detection(crate::DetectionError),
     Match(crate::MatchError),
@@ -107,7 +111,8 @@ impl std::error::Error for InferenceError {
             Self::RuntimeLoadFailed { source, .. }
             | Self::LoadFailed { source, .. }
             | Self::Execution(source)
-            | Self::SessionConfiguration { source } => Some(source),
+            | Self::SessionConfiguration { source }
+            | Self::OutputDecode { source, .. } => Some(source),
             Self::Environment(source) => Some(source),
             Self::InvalidWatchdog(source) => Some(source),
             Self::HostParallelism { source } => Some(source),
@@ -236,6 +241,9 @@ impl std::fmt::Display for InferenceError {
                     f,
                     "unexpected output '{name}': expected {expected}, got {actual}"
                 )
+            }
+            InferenceError::OutputDecode { name, source } => {
+                write!(f, "failed to decode model output '{name}': {source}")
             }
             InferenceError::Downscale(err) => write!(f, "downscale error: {err}"),
             InferenceError::Detection(err) => write!(f, "detection error: {err}"),

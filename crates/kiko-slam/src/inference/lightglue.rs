@@ -4,7 +4,7 @@ use crate::Detections;
 use crate::Matches;
 use crate::Raw;
 use ort::session::RunOptions;
-use ort::value::Tensor;
+use ort::value::{Shape, Tensor};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -60,53 +60,117 @@ impl LightGlue {
                     &run_options,
                 )
             })?;
-        let matches_raw = outputs
-            .get("matches0")
-            .ok_or_else(|| InferenceError::UnexpectedOutput {
-                name: "matches0".to_string(),
-                expected: "named output tensor".to_string(),
-                actual: "missing output".to_string(),
-            })?
-            .try_extract_tensor::<i64>()?;
-        let scores_raw = outputs
-            .get("mscores0")
-            .ok_or_else(|| InferenceError::UnexpectedOutput {
-                name: "mscores0".to_string(),
-                expected: "named output tensor".to_string(),
-                actual: "missing output".to_string(),
-            })?
-            .try_extract_tensor::<f32>()?;
-        let matches_data = matches_raw.1;
-        let scores_data = scores_raw.1;
-
-        let mut indices = Vec::new();
-        let mut scores = Vec::new();
-
-        for (i, &match_idx) in matches_data.iter().enumerate() {
-            if match_idx < 0 {
-                continue;
-            }
-            let Some(&score) = scores_data.get(i) else {
-                return Err(InferenceError::UnexpectedOutput {
-                    name: "mscores0".to_string(),
-                    expected: format!("at least {} elements", matches_data.len()),
-                    actual: format!("{} elements", scores_data.len()),
-                });
-            };
-            let right_idx =
-                usize::try_from(match_idx).map_err(|_| InferenceError::UnexpectedOutput {
+            let matches_raw = outputs
+                .get("matches0")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
                     name: "matches0".to_string(),
-                    expected: "non-negative match indices".to_string(),
-                    actual: format!("index {match_idx}"),
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?
+                .try_extract_tensor::<i64>()
+                .map_err(|source| InferenceError::OutputDecode {
+                    name: "matches0",
+                    source,
                 })?;
-            indices.push((i, right_idx));
-            scores.push(score);
-        }
+            let scores_raw = outputs
+                .get("mscores0")
+                .ok_or_else(|| InferenceError::UnexpectedOutput {
+                    name: "mscores0".to_string(),
+                    expected: "named output tensor".to_string(),
+                    actual: "missing output".to_string(),
+                })?
+                .try_extract_tensor::<f32>()
+                .map_err(|source| InferenceError::OutputDecode {
+                    name: "mscores0",
+                    source,
+                })?;
+            let parsed = parse_outputs(
+                matches_raw.0,
+                matches_raw.1,
+                scores_raw.0,
+                scores_raw.1,
+                len_0,
+            )?;
 
             drop(outputs);
-            Matches::new(dec_1, dec_2, indices, scores).map_err(InferenceError::Match)
+            Matches::new(dec_1, dec_2, parsed.indices, parsed.scores)
+                .map_err(InferenceError::Match)
         })
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct ParsedLightGlueOutput {
+    indices: Vec<(usize, usize)>,
+    scores: Vec<f32>,
+}
+
+fn parse_outputs(
+    matches_shape: &Shape,
+    matches_data: &[i64],
+    scores_shape: &Shape,
+    scores_data: &[f32],
+    source_len: usize,
+) -> Result<ParsedLightGlueOutput, InferenceError> {
+    require_aligned_output("matches0", matches_shape, matches_data.len(), source_len)?;
+    require_aligned_output("mscores0", scores_shape, scores_data.len(), source_len)?;
+
+    let mut indices = Vec::new();
+    for (source_index, &match_index) in matches_data.iter().enumerate() {
+        if match_index == -1 {
+            continue;
+        }
+        if match_index < -1 {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "matches0".to_string(),
+                expected: "-1 for unmatched detections or a non-negative match index".to_string(),
+                actual: format!("index {source_index} contains {match_index}"),
+            });
+        }
+        let matched_index =
+            usize::try_from(match_index).map_err(|_| InferenceError::UnexpectedOutput {
+                name: "matches0".to_string(),
+                expected: "match indices representable by the host".to_string(),
+                actual: format!("index {source_index} contains {match_index}"),
+            })?;
+        indices.push((source_index, matched_index));
+    }
+
+    for (source_index, &score) in scores_data.iter().enumerate() {
+        if !score.is_finite() || score < 0.0 {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "mscores0".to_string(),
+                expected: "finite non-negative scores for every source detection".to_string(),
+                actual: format!("index {source_index} contains {score}"),
+            });
+        }
+    }
+    let scores = indices
+        .iter()
+        .map(|&(source_index, _)| scores_data[source_index])
+        .collect();
+    Ok(ParsedLightGlueOutput { indices, scores })
+}
+
+fn require_aligned_output(
+    name: &str,
+    shape: &Shape,
+    data_len: usize,
+    source_len: usize,
+) -> Result<(), InferenceError> {
+    let aligned_shape = match &shape[..] {
+        [1, count] => usize::try_from(*count).ok() == Some(source_len),
+        _ => false,
+    };
+    if aligned_shape && data_len == source_len {
+        return Ok(());
+    }
+
+    Err(InferenceError::UnexpectedOutput {
+        name: name.to_string(),
+        expected: format!("shape [1, {source_len}] with {source_len} elements"),
+        actual: format!("shape {shape} with {data_len} elements"),
+    })
 }
 
 fn normalize_keypoints(detections: &Detections) -> Vec<f32> {
@@ -131,6 +195,84 @@ fn normalize_keypoints(detections: &Detections) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::{DESCRIPTOR_DIM, Descriptor, FrameId, Keypoint, SensorId};
+
+    #[test]
+    fn output_parser_requires_the_aligned_model_contract() {
+        let matches_shape = Shape::new([1_i64, 4]);
+        let scores_shape = Shape::new([1_i64, 4]);
+        let parsed = parse_outputs(
+            &matches_shape,
+            &[-1, 2, 0, -1],
+            &scores_shape,
+            &[0.0, 0.75, 0.5, 0.0],
+            4,
+        )
+        .expect("exact LightGlue output contract");
+
+        assert_eq!(parsed.indices, vec![(1, 2), (2, 0)]);
+        assert_eq!(parsed.scores, vec![0.75, 0.5]);
+    }
+
+    #[test]
+    fn output_parser_rejects_wrong_rank_and_extra_sentinels() {
+        let scores_shape = Shape::new([1_i64, 2]);
+        for (shape, data) in [
+            (Shape::new([2_i64]), vec![-1, -1]),
+            (Shape::new([1_i64, 3]), vec![-1, -1, -1]),
+        ] {
+            let error = parse_outputs(&shape, &data, &scores_shape, &[0.0, 0.0], 2)
+                .expect_err("malformed matches0 shape");
+            assert!(matches!(
+                error,
+                InferenceError::UnexpectedOutput { ref name, .. } if name == "matches0"
+            ));
+        }
+    }
+
+    #[test]
+    fn output_parser_requires_one_score_per_source_even_if_all_are_unmatched() {
+        let matches_shape = Shape::new([1_i64, 2]);
+        let scores_shape = Shape::new([1_i64, 0]);
+        let error = parse_outputs(&matches_shape, &[-1, -1], &scores_shape, &[], 2)
+            .expect_err("missing aligned scores");
+
+        assert!(matches!(
+            error,
+            InferenceError::UnexpectedOutput { ref name, .. } if name == "mscores0"
+        ));
+    }
+
+    #[test]
+    fn output_parser_rejects_undocumented_negative_match_sentinels() {
+        let shape = Shape::new([1_i64, 1]);
+        for sentinel in [-2, i64::MIN] {
+            let error = parse_outputs(&shape, &[sentinel], &shape, &[0.0], 1)
+                .expect_err("only -1 is the unmatched sentinel");
+
+            assert!(matches!(
+                error,
+                InferenceError::UnexpectedOutput {
+                    ref name,
+                    ref actual,
+                    ..
+                } if name == "matches0" && actual.contains(&sentinel.to_string())
+            ));
+        }
+    }
+
+    #[test]
+    fn output_parser_rejects_invalid_unmatched_scores() {
+        let shape = Shape::new([1_i64, 1]);
+        for score in [f32::NAN, -f32::from_bits(1)] {
+            let error = parse_outputs(&shape, &[-1], &shape, &[score], 1)
+                .expect_err("every model score must be finite and non-negative");
+
+            assert!(matches!(
+                error,
+                InferenceError::UnexpectedOutput { ref name, .. } if name == "mscores0"
+            ));
+        }
+    }
 
     #[test]
     fn normalization_does_not_round_large_dimensions_before_arithmetic() {
