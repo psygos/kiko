@@ -790,7 +790,7 @@ mod tests {
 
     #[test]
     fn rerun_destinations_are_mutually_exclusive_at_cli_boundary() {
-        let error = Cli::try_parse_from([
+        let cli = Cli::try_parse_from([
             "kiko-slam",
             "viz",
             "--backend",
@@ -800,9 +800,16 @@ mod tests {
             "--rerun-serve",
             "/tmp/dataset",
         ])
-        .expect_err("conflicting Rerun destinations must be rejected");
-
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        .expect("weak CLI fields are parsed before typed cross-field validation");
+        let Command::Viz(args) = cli.command else {
+            panic!("expected viz command");
+        };
+        assert_eq!(
+            RerunOutput::try_from_args(&args.rerun),
+            Err(RerunArgsError::ConflictingDestinations {
+                destination_count: 2
+            })
+        );
     }
 
     #[test]
@@ -815,13 +822,14 @@ mod tests {
 
     #[test]
     fn explicit_rerun_port_requires_server_mode() {
-        let error =
-            Cli::try_parse_from(["kiko-slam", "viz", "--rerun-port", "9877", "/tmp/dataset"])
-                .expect_err("an explicit Rerun port without server mode must be rejected");
-
+        let cli = Cli::try_parse_from(["kiko-slam", "viz", "--rerun-port", "9877", "/tmp/dataset"])
+            .expect("port presence is parsed before typed cross-field validation");
+        let Command::Viz(args) = cli.command else {
+            panic!("expected viz command");
+        };
         assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
+            RerunOutput::try_from_args(&args.rerun),
+            Err(RerunArgsError::PortWithoutServer)
         );
     }
 
