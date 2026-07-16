@@ -6,10 +6,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use kiko_slam::map::{ImageSize, KeyframeId, SlamMap};
+use kiko_slam::map::{KeyframeId, SlamMap};
 use kiko_slam::{
-    DESCRIPTOR_DIM, Descriptor, FrameId, Keypoint, Point3, Timestamp, WorldToCamera,
-    try_match_descriptors_for_loop,
+    DESCRIPTOR_DIM, Descriptor, FrameDimensions, FrameId, Keypoint, Point3, Pose, Timestamp,
+    match_descriptors_for_loop,
 };
 
 const THRESHOLD: f32 = 0.95;
@@ -44,7 +44,7 @@ struct Fixture {
 fn basis_descriptor(index: usize) -> Descriptor {
     let mut values = [0.0; DESCRIPTOR_DIM];
     values[index] = 1.0;
-    Descriptor(values)
+    Descriptor::try_new(values).expect("finite basis descriptor")
 }
 
 fn expected_matches(case: &Case) -> Vec<(usize, usize)> {
@@ -52,7 +52,7 @@ fn expected_matches(case: &Case) -> Vec<(usize, usize)> {
         Pattern::Distinct => (0..case.query_count.min(case.candidate_count))
             .map(|index| (index, index))
             .collect(),
-        Pattern::Tie => vec![(case.query_count - 1, case.candidate_count - 1)],
+        Pattern::Tie => vec![(0, 0)],
         Pattern::Reject => Vec::new(),
     }
 }
@@ -96,12 +96,13 @@ fn build_fixture(case: &Case) -> Fixture {
         .collect();
 
     let mut map = SlamMap::new();
-    let image_size = ImageSize::try_new(640, 480).expect("fixed benchmark image size is valid");
+    let image_size =
+        FrameDimensions::try_new(640, 480).expect("fixed benchmark image size is valid");
     let candidate_keyframe = map
         .add_keyframe(
             FrameId::new(1),
             Timestamp::from_nanos(1),
-            WorldToCamera::identity(),
+            Pose::identity(),
             image_size,
             keypoints,
         )
@@ -147,13 +148,14 @@ fn checksum(matches: &[(usize, usize)]) -> u64 {
 }
 
 fn match_once(fixture: &Fixture) -> Vec<(usize, usize)> {
-    try_match_descriptors_for_loop(
+    match_descriptors_for_loop(
         black_box(&fixture.query),
         black_box(fixture.candidate_keyframe),
         black_box(&fixture.map),
         black_box(THRESHOLD),
     )
     .expect("benchmark fixture must remain a valid map")
+    .into_correspondences()
 }
 
 fn run_iterations(fixture: &Fixture, iterations: usize) -> usize {

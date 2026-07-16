@@ -885,7 +885,9 @@ pub(crate) fn match_quantized_descriptors_for_loop(
     }
 
     let mut query_best: Vec<Option<(usize, f32)>> = vec![None; query_quantized.len()];
+    let mut candidate_best = Vec::with_capacity(candidate_count);
     map.for_each_keyframe_point_descriptor(candidate_kf, |keypoint, descriptor| {
+        let mut best_query = None;
         for (query_idx, query_descriptor) in query_quantized.iter().enumerate() {
             let Some(similarity) = query_descriptor.clamped_cosine_similarity(descriptor) else {
                 continue;
@@ -900,35 +902,26 @@ pub(crate) fn match_quantized_descriptors_for_loop(
                     *slot = Some((keypoint.index(), similarity));
                 }
             }
-        }
-    })?;
-
-    let mut correspondences = Vec::new();
-    map.for_each_keyframe_point_descriptor(candidate_kf, |keypoint, descriptor| {
-        let mut best_query: Option<(usize, f32)> = None;
-        for (query_idx, query_descriptor) in query_quantized.iter().enumerate() {
-            let Some(similarity) = query_descriptor.clamped_cosine_similarity(descriptor) else {
-                continue;
-            };
-            let similarity = similarity.value();
-            if similarity < similarity_threshold {
-                continue;
-            }
             match best_query {
                 Some((_, best_similarity)) if best_similarity >= similarity => {}
                 _ => best_query = Some((query_idx, similarity)),
             }
         }
+        candidate_best.push((keypoint.index(), best_query));
+    })?;
+
+    let mut correspondences = Vec::new();
+    for (candidate_index, best_query) in candidate_best {
         let Some((query_idx, _)) = best_query else {
-            return;
+            continue;
         };
         let Some((best_candidate_index, _)) = query_best[query_idx] else {
-            return;
+            continue;
         };
-        if best_candidate_index == keypoint.index() {
-            correspondences.push((query_idx, keypoint.index()));
+        if best_candidate_index == candidate_index {
+            correspondences.push((query_idx, candidate_index));
         }
-    })?;
+    }
     Ok(LoopDescriptorMatchResult {
         correspondences,
         zero_norm_query_descriptors,
