@@ -84,7 +84,10 @@ cargo run -p kiko-slam -- bench recordings/<name>
 - `KIKO_BA_DAMPING` — initial Levenberg-Marquardt damping value
 - `KIKO_LM_FACTOR` — factor used to increase or decrease LM damping
 - `KIKO_LM_MIN` / `KIKO_LM_MAX` — inclusive LM damping bounds
-- `KIKO_BA_MOTION_WEIGHT` — motion prior weight (0 to disable)
+- `KIKO_BA_MOTION_WEIGHT` — shared numerical weight for zero-difference regularization between
+  consecutive incremental frame pose parameters (world-to-camera translation in metres and
+  axis-angle rotation in radians; 0 to disable); it is not a time-normalized motion model and is
+  not applied to covisible keyframe-window BA
 
 **Keyframe policy:**
 

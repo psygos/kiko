@@ -296,19 +296,22 @@ impl std::fmt::Display for LocalBaConfigError {
                 write!(f, "local BA huber delta must be > 0 (got {value})")
             }
             LocalBaConfigError::NegativeMotionWeight { value } => {
-                write!(f, "local BA motion prior weight must be >= 0 (got {value})")
+                write!(
+                    f,
+                    "incremental BA pose-parameter prior weight must be >= 0 (got {value})"
+                )
             }
             LocalBaConfigError::NonFiniteMotionWeight { value } => write!(
                 f,
-                "local BA motion prior weight must be finite (got {value})"
+                "incremental BA pose-parameter prior weight must be finite (got {value})"
             ),
             LocalBaConfigError::MotionWeightTooSmall { value } => write!(
                 f,
-                "positive local BA motion prior weight must have a nonzero f32 square (got {value})"
+                "positive incremental BA pose-parameter prior weight must have a nonzero f32 square (got {value})"
             ),
             LocalBaConfigError::MotionWeightTooLarge { value } => write!(
                 f,
-                "local BA motion prior weight must have a finite f32 square (got {value})"
+                "incremental BA pose-parameter prior weight must have a finite f32 square (got {value})"
             ),
         }
     }
@@ -415,6 +418,11 @@ impl LocalBaConfig {
         self.lm
     }
 
+    /// Shared numerical weight for adjacent incremental pose-parameter differences.
+    ///
+    /// Translation components are world-to-camera metres and rotation components are
+    /// axis-angle radians. This is not a time-normalized physical motion model and does not
+    /// apply to covisible keyframe-window BA.
     pub fn motion_prior_weight(&self) -> f32 {
         self.motion_prior_weight
     }
@@ -1295,17 +1303,15 @@ impl LocalBundleAdjuster {
         let pose_dim = pose_count * 6;
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
-        let motion_weight_squared = self.config.motion_prior_weight_squared();
         let lm_config = self.config.lm();
-        let initial_cost =
-            match full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared) {
-                Ok(cost) => cost,
-                Err(error) => {
-                    return Ok(BaResult::Degenerate {
-                        reason: error.degenerate_reason(),
-                    });
-                }
-            };
+        let initial_cost = match full_problem_cost(problem, self.intrinsics, huber) {
+            Ok(cost) => cost,
+            Err(error) => {
+                return Ok(BaResult::Degenerate {
+                    reason: error.degenerate_reason(),
+                });
+            }
+        };
         let mut lm_state = LmState::new(lm_config, initial_cost);
 
         let mut pose_backup: Vec<Pose> = Vec::with_capacity(pose_count);
@@ -1389,24 +1395,6 @@ impl LocalBundleAdjuster {
                 accumulate_scalar_landmark_factor(&mut acc.c, &mut acc.b, jacobian, residual);
             }
 
-            if motion_weight_squared > 0.0 && pose_count >= 2 {
-                for i in 1..pose_count {
-                    if !accumulate_motion_prior(
-                        s,
-                        rhs,
-                        pose_dim,
-                        problem.poses[i - 1].pose,
-                        problem.poses[i].pose,
-                        (i - 1) * 6,
-                        i * 6,
-                        motion_weight_squared,
-                    ) {
-                        return Ok(BaResult::Degenerate {
-                            reason: DegenerateReason::NumericalFailure,
-                        });
-                    }
-                }
-            }
             full_pose_rhs.copy_from_slice(rhs);
 
             for i in 0..pose_dim {
@@ -1513,15 +1501,14 @@ impl LocalBundleAdjuster {
                 landmark_var.position.z += delta_landmark[2];
             }
 
-            let candidate_cost =
-                match full_problem_cost(problem, self.intrinsics, huber, motion_weight_squared) {
-                    Ok(cost) => cost,
-                    // Invalid trial states are rejected by LM and restored from the iteration
-                    // backups below. The accepted state was already parsed by `initial_cost` or
-                    // the previous successful candidate-cost evaluation.
-                    Err(ProjectionLinearizationError::InvalidDepth)
-                    | Err(ProjectionLinearizationError::NumericalFailure) => f64::INFINITY,
-                };
+            let candidate_cost = match full_problem_cost(problem, self.intrinsics, huber) {
+                Ok(cost) => cost,
+                // Invalid trial states are rejected by LM and restored from the iteration
+                // backups below. The accepted state was already parsed by `initial_cost` or
+                // the previous successful candidate-cost evaluation.
+                Err(ProjectionLinearizationError::InvalidDepth)
+                | Err(ProjectionLinearizationError::NumericalFailure) => f64::INFINITY,
+            };
             let prev_cost = lm_state.prev_cost();
             if max_step == 0.0 && candidate_cost.is_finite() && candidate_cost == prev_cost {
                 return Ok(BaResult::Converged {
@@ -1575,7 +1562,6 @@ fn full_problem_cost(
     problem: &FullBaProblem,
     intrinsics: PinholeIntrinsics,
     huber_delta_px: f32,
-    motion_weight_squared: f64,
 ) -> Result<f64, ProjectionLinearizationError> {
     let mut cost = 0.0_f64;
     let huber = huber_delta_px as f64;
@@ -1604,17 +1590,6 @@ fn full_problem_cost(
             return Err(ProjectionLinearizationError::NumericalFailure);
         };
         cost += 0.5 * (residual as f64) * (residual as f64);
-    }
-
-    if motion_weight_squared > 0.0 {
-        for i in 1..problem.poses.len() {
-            let prev = pose_to_vec(problem.poses[i - 1].pose);
-            let curr = pose_to_vec(problem.poses[i].pose);
-            for k in 0..6 {
-                let d = (curr[k] as f64) - (prev[k] as f64);
-                cost += 0.5 * motion_weight_squared * d * d;
-            }
-        }
     }
 
     cost.is_finite()
@@ -2276,8 +2251,6 @@ fn pose_landmark_cross(j_pose: [[f32; 6]; 2], j_landmark: [[f32; 3]; 2]) -> [[f3
     cross
 }
 
-/// Accumulate motion-prior terms for a consecutive pair of poses into the
-/// normal equations (Hessian `hessian` and right-hand side `rhs`).
 /// Extract a 6-element SE3 delta from a solution vector at the given offset.
 fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
     [
@@ -2304,6 +2277,11 @@ fn add_finite_f32(target: &mut f32, delta: f64) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Accumulate a zero-difference parameter regularizer for consecutive incremental frames.
+///
+/// The first three residuals are world-to-camera translation in metres; the last three are
+/// absolute axis-angle rotation in radians. The shared weight is numerical, not a velocity or
+/// constant-motion model.
 fn accumulate_motion_prior(
     hessian: &mut [f32],
     rhs: &mut [f32],
@@ -2736,6 +2714,36 @@ mod tests {
         }
 
         (map, intrinsics, kf_0, kf_1, true_pose_1, points_true)
+    }
+
+    fn set_fixture_landmarks_exact(map: &mut SlamMap, keyframe_id: KeyframeId, points: &[Point3]) {
+        for (index, &point) in points.iter().enumerate() {
+            let keypoint = map
+                .keyframe_keypoint(keyframe_id, index)
+                .expect("keyframe keypoint");
+            let point_id = map
+                .map_point_for_keypoint(keypoint)
+                .expect("map lookup")
+                .expect("map point");
+            map.set_map_point_position(point_id, point)
+                .expect("set exact landmark");
+        }
+    }
+
+    fn fixture_observation_set(
+        map: &SlamMap,
+        keyframe_id: KeyframeId,
+        min_required: NonZeroUsize,
+    ) -> ObservationSet {
+        let observations = (0..map.keyframe(keyframe_id).expect("keyframe").len())
+            .map(|index| {
+                let keypoint = map
+                    .keyframe_keypoint(keyframe_id, index)
+                    .expect("keyframe keypoint");
+                MapObservation::new(keypoint, map.keypoint(keypoint).expect("keypoint pixel"))
+            })
+            .collect();
+        ObservationSet::new(observations, min_required).expect("observation set")
     }
 
     #[test]
@@ -3287,21 +3295,11 @@ mod tests {
     }
 
     #[test]
-    fn optimize_full_converges_at_exact_stationary_solution() {
+    fn full_keyframe_ba_ignores_incremental_motion_prior_at_exact_solution() {
         let (mut map, intrinsics, kf_0, kf_1, _, points_true) = build_full_ba_fixture([0.0; 6]);
-        for (index, point) in points_true.into_iter().enumerate() {
-            let keypoint = map
-                .keyframe_keypoint(kf_0, index)
-                .expect("keyframe keypoint");
-            let point_id = map
-                .map_point_for_keypoint(keypoint)
-                .expect("map lookup")
-                .expect("map point");
-            map.set_map_point_position(point_id, point)
-                .expect("set exact landmark");
-        }
+        set_fixture_landmarks_exact(&mut map, kf_0, &points_true);
 
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 1.0).expect("valid config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3310,8 +3308,13 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
+        assert_ne!(
+            pose_to_vec(problem.poses[0].pose),
+            pose_to_vec(problem.poses[1].pose),
+            "the exact fixture must contain camera motion"
+        );
         assert_eq!(
-            full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0),
+            full_problem_cost(&problem, intrinsics, config.huber_delta_px()),
             Ok(0.0)
         );
 
@@ -3322,6 +3325,37 @@ mod tests {
                 final_cost: 0.0
             }
         );
+    }
+
+    #[test]
+    fn incremental_ba_retains_configured_pose_parameter_prior() {
+        let (mut map, intrinsics, kf_0, kf_1, true_pose_1, points_true) =
+            build_full_ba_fixture([0.0; 6]);
+        set_fixture_landmarks_exact(&mut map, kf_0, &points_true);
+
+        let optimize = |motion_prior_weight| {
+            let config =
+                LocalBaConfig::new(2, 1, 4, 2.0, lm(1e-3), motion_prior_weight).expect("config");
+            let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+            let min_required = ba.min_observations();
+            ba.push_frame(
+                &map,
+                Pose::identity(),
+                fixture_observation_set(&map, kf_0, min_required),
+            )
+            .expect("first exact frame");
+            ba.push_frame(
+                &map,
+                true_pose_1,
+                fixture_observation_set(&map, kf_1, min_required),
+            )
+            .expect("second exact frame")
+        };
+
+        let unregularized = optimize(0.0);
+        let regularized = optimize(1.0);
+        assert_eq!(pose_to_vec(unregularized), pose_to_vec(true_pose_1));
+        assert_ne!(pose_to_vec(regularized), pose_to_vec(unregularized));
     }
 
     #[test]
@@ -3399,10 +3433,10 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("finite initial cost");
         let result = ba.optimize_full(&mut problem).expect("typed BA result");
-        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let after = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("finite final cost");
         assert!(
             after < before,
@@ -3427,7 +3461,7 @@ mod tests {
             ba.min_observations(),
         )
         .expect("full BA problem");
-        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let before = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("finite initial cost");
         let result = ba.optimize_full(&mut problem).expect("typed BA result");
         let final_cost = match result {
@@ -3461,7 +3495,7 @@ mod tests {
         };
 
         assert_eq!(
-            full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0),
+            full_problem_cost(&problem, intrinsics, config.huber_delta_px()),
             Err(ProjectionLinearizationError::InvalidDepth)
         );
     }
@@ -3494,7 +3528,7 @@ mod tests {
             }],
             scale_anchor: None,
         };
-        let initial_cost = full_problem_cost(&problem, intrinsics, config.huber_delta_px(), 0.0)
+        let initial_cost = full_problem_cost(&problem, intrinsics, config.huber_delta_px())
             .expect("finite initial cost");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
 
@@ -3512,34 +3546,6 @@ mod tests {
             assert_eq!(pose.pose.translation(), initial_pose.translation());
         }
         assert_eq!(problem.landmarks[0].position, initial_landmark);
-    }
-
-    #[test]
-    fn full_problem_cost_widens_extreme_supported_motion_weight() {
-        let intrinsics =
-            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let motion_weight = f32::MAX.sqrt() / 2.0;
-        let problem = FullBaProblem {
-            poses: vec![
-                PoseVariable {
-                    keyframe_id: KeyframeId::default(),
-                    pose: Pose::identity(),
-                },
-                PoseVariable {
-                    keyframe_id: KeyframeId::default(),
-                    pose: Pose::from_rt(Pose::identity().rotation(), [4.0, 0.0, 0.0]),
-                },
-            ],
-            landmarks: Vec::new(),
-            factors: Vec::new(),
-            scale_anchor: None,
-        };
-
-        let motion_weight_squared = (motion_weight as f64) * (motion_weight as f64);
-        let cost = full_problem_cost(&problem, intrinsics, 2.0, motion_weight_squared)
-            .expect("finite motion-prior cost");
-        assert!(cost.is_finite());
-        assert!(cost > f32::MAX as f64);
     }
 
     #[test]
@@ -3731,8 +3737,7 @@ mod tests {
             }],
             scale_anchor: None,
         };
-        let cost =
-            full_problem_cost(&problem, intrinsics, 2.0, 0.0).expect("large finite robust cost");
+        let cost = full_problem_cost(&problem, intrinsics, 2.0).expect("large finite robust cost");
         assert!(cost.is_finite());
         assert!((cost / 2.0e30 - 1.0).abs() < 1.0e-6);
     }

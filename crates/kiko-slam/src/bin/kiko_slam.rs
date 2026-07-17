@@ -2692,7 +2692,7 @@ fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
         motion_prior_weight: env_f32("KIKO_BA_MOTION_WEIGHT")?.unwrap_or(DEFAULT_BA_MOTION_WEIGHT),
     })?;
     eprintln!(
-        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={} motion_weight={}",
+        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={} motion_weight={} motion_prior_scope=incremental_pose_parameters",
         config.window(),
         config.max_iterations(),
         config.min_observations(),
