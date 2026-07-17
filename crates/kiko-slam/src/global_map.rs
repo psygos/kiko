@@ -29,6 +29,14 @@ impl GlobalMap {
         &mut self.map
     }
 
+    /// Stage an all-or-nothing canonical update without turning it into a map fork.
+    pub(crate) fn clone_for_transaction(&self) -> Self {
+        Self {
+            map: self.map.clone_for_transaction(),
+            essential_graph: self.essential_graph.clone(),
+        }
+    }
+
     #[allow(dead_code)]
     pub(crate) fn essential_graph(&self) -> &EssentialGraph {
         &self.essential_graph

@@ -591,6 +591,22 @@ pub struct SlamMap {
 
 impl Clone for SlamMap {
     fn clone(&self) -> Self {
+        self.clone_with_mutation_lineage(MapLineageId::fresh())
+    }
+}
+
+impl SlamMap {
+    /// Clone this revision for an all-or-nothing mutation that will replace it.
+    ///
+    /// The caller must keep the source revision immutable and promote at most
+    /// one candidate. Successful candidate mutations then remain a canonical
+    /// continuation, so older asynchronous work can still be recognized as
+    /// belonging to the same history. Ordinary [`Clone`] remains a true fork.
+    pub(crate) fn clone_for_transaction(&self) -> Self {
+        self.clone_with_mutation_lineage(self.mutation_lineage)
+    }
+
+    fn clone_with_mutation_lineage(&self, mutation_lineage: MapLineageId) -> Self {
         Self {
             instance_id: self.instance_id,
             points: self.points.clone(),
@@ -599,9 +615,7 @@ impl Clone for SlamMap {
             frame_to_keyframe: self.frame_to_keyframe.clone(),
             generation: self.generation,
             lineage: self.lineage,
-            // An untouched clone is the same revision. Its first successful
-            // mutation moves it onto a distinct branch lineage.
-            mutation_lineage: MapLineageId::fresh(),
+            mutation_lineage,
         }
     }
 }
@@ -2553,6 +2567,17 @@ mod tests {
         assert_ne!(cloned.snapshot(), map.snapshot());
         assert!(shared_snapshot.is_same_or_older_than(map.snapshot()));
         assert!(!shared_snapshot.is_same_or_older_than(cloned.snapshot()));
+
+        let transaction_source = map.snapshot();
+        let mut transaction = map.clone_for_transaction();
+        transaction
+            .set_keyframe_pose(
+                keyframe,
+                Pose::from_rt(Pose::identity().rotation(), [2.0, 0.0, 0.0]),
+            )
+            .expect("mutate canonical transaction");
+        assert!(transaction_source.is_same_or_older_than(transaction.snapshot()));
+        assert_ne!(transaction_source, transaction.snapshot());
     }
 
     #[test]

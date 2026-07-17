@@ -44,7 +44,7 @@ impl LoopManager {
                 current,
             });
         }
-        let mut candidate = global_map.clone();
+        let mut candidate = global_map.clone_for_transaction();
         let corrections = self.apply_verified_loop_to_candidate(&mut candidate, verified)?;
         Ok((candidate, corrections))
     }

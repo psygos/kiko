@@ -5800,7 +5800,7 @@ fn stage_keyframe_in_global_map(
             });
         }
     }
-    let mut candidate = global_map.clone();
+    let mut candidate = global_map.clone_for_transaction();
     let keyframe_id = insert_keyframe_into_candidate(
         candidate.map_mut(),
         keyframe,
@@ -5878,7 +5878,7 @@ fn remove_keyframe_from_graph_and_db(
     place_recognition: Option<&mut PlaceRecognition>,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
-    let mut candidate = global_map.clone();
+    let mut candidate = global_map.clone_for_transaction();
     candidate.remove_keyframe_from_graph(keyframe_id)?;
     candidate.remove_keyframe(keyframe_id)?;
     if let Some(place_recognition) = place_recognition {

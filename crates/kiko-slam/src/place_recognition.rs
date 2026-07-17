@@ -1045,6 +1045,78 @@ mod tests {
     }
 
     #[test]
+    fn late_descriptor_crosses_canonical_transaction_but_not_a_true_fork() {
+        let mut recognition = recognition_without_worker();
+        let keyframe_id = KeyframeId::default();
+        recognition
+            .database
+            .register_keyframe(keyframe_id)
+            .expect("register keyframe");
+        recognition
+            .database
+            .set_descriptor(
+                keyframe_id,
+                descriptor_with_basis(0),
+                DescriptorSource::Bootstrap,
+            )
+            .expect("bootstrap descriptor");
+
+        let source_map = crate::map::SlamMap::new();
+        let source_snapshot = source_map.snapshot();
+        let mut continuation = source_map.clone_for_transaction();
+        continuation
+            .add_keyframe(
+                crate::FrameId::new(1),
+                crate::Timestamp::from_nanos(1),
+                crate::Pose::identity(),
+                crate::FrameDimensions::try_new(2, 2).expect("dimensions"),
+                vec![crate::Keypoint { x: 0.0, y: 0.0 }],
+            )
+            .expect("canonical transaction");
+        recognition.descriptor_worker.pending_outputs.push_back(
+            DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(Box::new(
+                DescriptorResponse {
+                    keyframe_id,
+                    source_snapshot,
+                    descriptor: descriptor_with_basis(1),
+                },
+            ))),
+        );
+
+        let events = recognition.drain_responses(continuation.snapshot(), |_| true);
+        assert!(events.is_empty());
+        assert_eq!(recognition.descriptor_stats().applied, 1);
+        assert_eq!(
+            recognition.database.descriptor_source(keyframe_id),
+            Some(DescriptorSource::Learned)
+        );
+
+        let fork_source = continuation.snapshot();
+        let mut fork = continuation.clone();
+        fork.add_keyframe(
+            crate::FrameId::new(2),
+            crate::Timestamp::from_nanos(2),
+            crate::Pose::identity(),
+            crate::FrameDimensions::try_new(2, 2).expect("dimensions"),
+            vec![crate::Keypoint { x: 1.0, y: 1.0 }],
+        )
+        .expect("divergent fork");
+        recognition.descriptor_worker.pending_outputs.push_back(
+            DescriptorSupervisorOutput::Worker(DescriptorWorkerResponse::Descriptor(Box::new(
+                DescriptorResponse {
+                    keyframe_id,
+                    source_snapshot: fork_source,
+                    descriptor: descriptor_with_basis(2),
+                },
+            ))),
+        );
+
+        let events = recognition.drain_responses(fork.snapshot(), |_| true);
+        assert!(events.is_empty());
+        assert_eq!(recognition.descriptor_stats().applied, 1);
+    }
+
+    #[test]
     fn bootstrap_database_error_preserves_source() {
         let error = BootstrapDescriptorError::Database {
             source: KeyframeDatabaseError::SequenceExhausted {
