@@ -882,6 +882,12 @@ pub struct CovisibilitySnapshot {
     pub edges: Vec<CovisibilityEdge>,
 }
 
+fn covisibility_window_rank(
+    &(id, weight): &(KeyframeId, NonZeroU32),
+) -> (std::cmp::Reverse<u32>, KeyframeId) {
+    (std::cmp::Reverse(weight.get()), id)
+}
+
 impl SlamMap {
     pub fn new() -> Self {
         let lineage = MapLineageId::next();
@@ -1419,6 +1425,9 @@ impl SlamMap {
         Ok(entry.map_point_ids().count())
     }
 
+    /// Returns the seed followed by at most `max - 1` covisible keyframes.
+    ///
+    /// Neighbors are ordered by descending shared-point count, then by keyframe identity.
     pub fn covisible_window(
         &self,
         seed: KeyframeId,
@@ -1428,19 +1437,23 @@ impl SlamMap {
         if !self.keyframes.contains_key(raw_seed) {
             return Err(MapError::KeyframeNotFound(seed));
         }
-        let mut window = Vec::with_capacity(max.get());
-        window.push(seed);
+
+        let limit = max.get() - 1;
+        if limit == 0 {
+            return Ok(vec![seed]);
+        }
 
         let neighbors = match self.covisibility.neighbors(seed) {
             Some(neighbors) => neighbors,
-            None => return Ok(window),
+            None => return Ok(vec![seed]),
         };
 
         let mut sorted: Vec<(KeyframeId, NonZeroU32)> =
             neighbors.iter().map(|(&id, &w)| (id, w)).collect();
-        sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1.get()));
+        sorted.sort_unstable_by_key(covisibility_window_rank);
 
-        let limit = max.get().saturating_sub(1);
+        let mut window = Vec::with_capacity(limit.min(sorted.len()) + 1);
+        window.push(seed);
         for (id, _) in sorted.into_iter().take(limit) {
             window.push(id);
         }
@@ -3658,6 +3671,82 @@ mod tests {
         assert_eq!(map.num_keyframes(), 0);
         assert_eq!(map.num_points(), 0);
         assert_map_invariants(&map).expect("after keyframe removal");
+    }
+
+    #[test]
+    fn covisible_window_bounds_capacity_by_available_results() {
+        let mut map = SlamMap::new();
+        let seed = add_test_keyframe(&mut map, 1, 1);
+
+        assert_eq!(
+            map.covisible_window(
+                seed,
+                NonZeroUsize::new(usize::MAX).expect("non-zero maximum"),
+            )
+            .expect("finite covisible window"),
+            vec![seed]
+        );
+    }
+
+    #[test]
+    fn covisible_window_orders_equal_weights_by_keyframe_id() {
+        let mut map = SlamMap::new();
+        let [seed, high_a, high_b, low_a, low_b] = add_test_keyframes(&mut map, 1, [6, 2, 2, 1, 1]);
+        let weighted_neighbors = [(high_a, 2_usize), (high_b, 2), (low_a, 1), (low_b, 1)];
+
+        let mut seed_keypoint_index = 0;
+        for (neighbor, weight) in weighted_neighbors {
+            for neighbor_keypoint_index in 0..weight {
+                let observations = [
+                    map.keyframe_keypoint(seed, seed_keypoint_index)
+                        .expect("seed observation"),
+                    map.keyframe_keypoint(neighbor, neighbor_keypoint_index)
+                        .expect("neighbor observation"),
+                ];
+                add_shared_test_point(&mut map, &observations, seed_keypoint_index as f32);
+                seed_keypoint_index += 1;
+            }
+        }
+
+        let one = NonZeroU32::new(1).expect("non-zero weight");
+        let two = NonZeroU32::new(2).expect("non-zero weight");
+        let mut high_ids = [high_a, high_b];
+        high_ids.sort_unstable();
+        let mut low_ids = [low_a, low_b];
+        low_ids.sort_unstable();
+        let expected_rank = vec![
+            (high_ids[0], two),
+            (high_ids[1], two),
+            (low_ids[0], one),
+            (low_ids[1], one),
+        ];
+
+        let mut forward = vec![(high_a, two), (high_b, two), (low_a, one), (low_b, one)];
+        let mut reverse = forward.clone();
+        reverse.reverse();
+        forward.sort_unstable_by_key(covisibility_window_rank);
+        reverse.sort_unstable_by_key(covisibility_window_rank);
+        assert_eq!(forward, expected_rank);
+        assert_eq!(reverse, expected_rank);
+
+        assert_eq!(
+            map.covisible_window(seed, NonZeroUsize::new(1).expect("non-zero window"))
+                .expect("seed-only covisible window"),
+            vec![seed]
+        );
+        assert_eq!(
+            map.covisible_window(seed, NonZeroUsize::new(4).expect("non-zero window"))
+                .expect("truncated covisible window"),
+            vec![seed, high_ids[0], high_ids[1], low_ids[0]]
+        );
+        assert_eq!(
+            map.covisible_window(
+                seed,
+                NonZeroUsize::new(usize::MAX).expect("non-zero maximum"),
+            )
+            .expect("complete covisible window"),
+            vec![seed, high_ids[0], high_ids[1], low_ids[0], low_ids[1]]
+        );
     }
 
     #[test]
