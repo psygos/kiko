@@ -140,6 +140,7 @@ class TegrastatsTests(unittest.TestCase):
         self.assertTrue(findings["oom"])
         self.assertTrue(findings["thermal"])
         self.assertTrue(findings["power"])
+        self.assertTrue(findings["storage"])
 
     def test_session_policy_requires_structured_marker(self) -> None:
         policies = parse_session_policies(

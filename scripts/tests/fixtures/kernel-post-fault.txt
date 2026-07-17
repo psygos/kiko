@@ -4,3 +4,4 @@
 [  101.000000] Out of memory: Killed process 42 (kiko-slam)
 [  102.000000] soctherm: thermal critical shutdown
 [  103.000000] regulator: brownout power fault
+[  104.000000] nvme nvme0: I/O 384 QID 5 timeout, completion polled

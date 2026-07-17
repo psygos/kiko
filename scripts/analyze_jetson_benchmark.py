@@ -108,6 +108,14 @@ KERNEL_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
         re.compile(r"over[- ]?current|oc alarm", re.IGNORECASE),
         re.compile(r"power.*(?:fault|shutdown)", re.IGNORECASE),
     ),
+    "storage": (
+        re.compile(
+            r"\bnvme\b.*(?:\bI/O\b.*\btimeout\b|\btimeout\b|\breset\b|\babort\b|\bI/O error\b)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"\b(?:buffer|blk_update_request).*\bI/O error\b", re.IGNORECASE),
+        re.compile(r"\b(?:ext4|xfs|btrfs)[- ]fs.*\berror\b", re.IGNORECASE),
+    ),
 }
 
 
