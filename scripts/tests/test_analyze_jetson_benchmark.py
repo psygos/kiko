@@ -15,6 +15,7 @@ from analyze_jetson_benchmark import (  # noqa: E402
     classify_kernel_lines,
     new_kernel_lines,
     parse_command_counts,
+    parse_diagnostic_totals,
     parse_node_placements,
     parse_reported_metrics,
     parse_session_policies,
@@ -27,6 +28,29 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class TegrastatsTests(unittest.TestCase):
+    def test_diagnostic_totals_parser_requires_complete_unique_metrics(self) -> None:
+        line = (
+            "diagnostic totals: frames=2 steady_frames=1 final_map_keyframes=3 "
+            "final_map_points=45 peak_map_points=50 features_detected_samples=2 "
+            "features_detected_total=220 steady_features_detected_samples=1 "
+            "steady_features_detected_total=120 features_matched_samples=2 "
+            "features_matched_total=90 steady_features_matched_samples=1 "
+            "steady_features_matched_total=50 pnp_tracked_observations_samples=2 "
+            "pnp_tracked_observations_total=79 steady_pnp_tracked_observations_samples=1 "
+            "steady_pnp_tracked_observations_total=44 "
+            "pnp_projectable_tracked_observations_samples=2 "
+            "pnp_projectable_tracked_observations_total=73 "
+            "steady_pnp_projectable_tracked_observations_samples=1 "
+            "steady_pnp_projectable_tracked_observations_total=41 "
+            "pnp_accepted_inliers_samples=2 pnp_accepted_inliers_total=64 "
+            "steady_pnp_accepted_inliers_samples=1 steady_pnp_accepted_inliers_total=36\n"
+        )
+        totals = parse_diagnostic_totals(line)
+        self.assertIsNotNone(totals)
+        self.assertEqual(totals["final_map_points"], 45)
+        self.assertEqual(totals["steady_pnp_accepted_inliers_total"], 36)
+        self.assertIsNone(parse_diagnostic_totals("diagnostic totals: frames=2\n"))
+
     def test_parser_reports_gpu_memory_temperature_and_power(self) -> None:
         metrics = parse_tegrastats((FIXTURES / "tegrastats-normal.txt").read_text())
         self.assertEqual(metrics["gr3d_nonzero_samples"], 1)
@@ -234,10 +258,25 @@ class AnalyzeRunTests(unittest.TestCase):
                 "done: expected=2, entries_consumed=2, tracker_attempts=2, processed=2, "
                 "elapsed=1.0s, fps=2.0, "
                 "warmup_processed=1, steady_processed=1, steady_elapsed=0.5s, steady_fps=2.0, "
-                "read_errors=0, tracker_errors=0\n"
+                "read_errors=0, tracker_errors=0, keyframes=1\n"
                 "pose outcomes: total_current=2 total_predicted=0 total_stale=0 "
                 "total_unavailable=0 steady_current=1 steady_predicted=0 "
-                "steady_stale=0 steady_unavailable=0\n",
+                "steady_stale=0 steady_unavailable=0\n"
+                "diagnostic totals: frames=2 steady_frames=1 final_map_keyframes=1 "
+                "final_map_points=30 peak_map_points=30 features_detected_samples=2 "
+                "features_detected_total=220 steady_features_detected_samples=1 "
+                "steady_features_detected_total=120 features_matched_samples=2 "
+                "features_matched_total=90 steady_features_matched_samples=1 "
+                "steady_features_matched_total=50 pnp_tracked_observations_samples=1 "
+                "pnp_tracked_observations_total=40 steady_pnp_tracked_observations_samples=1 "
+                "steady_pnp_tracked_observations_total=40 "
+                "pnp_projectable_tracked_observations_samples=1 "
+                "pnp_projectable_tracked_observations_total=38 "
+                "steady_pnp_projectable_tracked_observations_samples=1 "
+                "steady_pnp_projectable_tracked_observations_total=38 "
+                "pnp_accepted_inliers_samples=1 pnp_accepted_inliers_total=32 "
+                "steady_pnp_accepted_inliers_samples=1 "
+                "steady_pnp_accepted_inliers_total=32\n",
                 encoding="utf-8",
             )
             expected_loaded = [

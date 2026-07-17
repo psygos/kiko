@@ -413,6 +413,72 @@ def parse_pose_outcomes(text: str) -> dict[str, int] | None:
     return dict(zip(keys, (int(value) for value in match.groups()), strict=True))
 
 
+DIAGNOSTIC_TOTAL_KEYS = frozenset(
+    {
+        "frames",
+        "steady_frames",
+        "final_map_keyframes",
+        "final_map_points",
+        "peak_map_points",
+        "features_detected_samples",
+        "features_detected_total",
+        "steady_features_detected_samples",
+        "steady_features_detected_total",
+        "features_matched_samples",
+        "features_matched_total",
+        "steady_features_matched_samples",
+        "steady_features_matched_total",
+        "pnp_tracked_observations_samples",
+        "pnp_tracked_observations_total",
+        "steady_pnp_tracked_observations_samples",
+        "steady_pnp_tracked_observations_total",
+        "pnp_projectable_tracked_observations_samples",
+        "pnp_projectable_tracked_observations_total",
+        "steady_pnp_projectable_tracked_observations_samples",
+        "steady_pnp_projectable_tracked_observations_total",
+        "pnp_accepted_inliers_samples",
+        "pnp_accepted_inliers_total",
+        "steady_pnp_accepted_inliers_samples",
+        "steady_pnp_accepted_inliers_total",
+    }
+)
+
+
+def parse_diagnostic_totals(text: str) -> dict[str, int] | None:
+    match = re.search(r"^diagnostic totals:\s*(.+)$", text, re.MULTILINE)
+    if match is None:
+        return None
+    pairs = re.findall(r"([a-z_]+)=(\d+)", match.group(1))
+    if len(pairs) != len({key for key, _ in pairs}):
+        return None
+    values = {key: int(value) for key, value in pairs}
+    if not DIAGNOSTIC_TOTAL_KEYS.issubset(values):
+        return None
+    return values
+
+
+def diagnostic_total_failures(
+    totals: dict[str, int] | None, counts: dict[str, Any]
+) -> list[str]:
+    if totals is None:
+        return ["missing_diagnostic_totals"]
+    failures: list[str] = []
+    if totals["frames"] != counts.get("processed"):
+        failures.append("diagnostic_frame_count_mismatch")
+    if totals["steady_frames"] != counts.get("steady_processed"):
+        failures.append("steady_diagnostic_frame_count_mismatch")
+    if totals["final_map_keyframes"] != counts.get("keyframes"):
+        failures.append("diagnostic_keyframe_count_mismatch")
+    if totals["final_map_points"] > totals["peak_map_points"]:
+        failures.append("diagnostic_map_point_range_invalid")
+    for metric in ("features_detected", "features_matched"):
+        if totals[f"{metric}_samples"] != totals["frames"]:
+            failures.append(f"{metric}_sample_count_mismatch")
+        if totals[f"steady_{metric}_samples"] != totals["steady_frames"]:
+            failures.append(f"steady_{metric}_sample_count_mismatch")
+    return failures
+
+
 def pose_outcome_failures(
     outcomes: dict[str, int] | None, steady_processed: int | None
 ) -> list[str]:
@@ -626,6 +692,7 @@ def analyze_run(
     placements = parse_node_placements(combined_output)
     counts = parse_command_counts(combined_output)
     pose_outcomes = parse_pose_outcomes(combined_output)
+    diagnostic_totals = parse_diagnostic_totals(combined_output)
     reported_metrics = parse_reported_metrics(combined_output, counts)
     loaded_realpaths = parse_loaded_realpaths(
         _read(run_dir / "process-maps.log"), stderr
@@ -689,6 +756,7 @@ def analyze_run(
         failures.append(f"{counts.get('kind')}_metrics_not_valid")
     if counts and counts.get("kind") == "slam":
         failures.extend(pose_outcome_failures(pose_outcomes, counts.get("steady_processed")))
+        failures.extend(diagnostic_total_failures(diagnostic_totals, counts))
 
     expected_nvpmodel = thresholds.get("expected_nvpmodel")
     minimum_cpu_hz = thresholds.get("min_cpu_hz")
@@ -820,6 +888,7 @@ def analyze_run(
         "loaded_gpu_libraries": loaded_gpu_libraries,
         "command_counts": counts,
         "pose_outcomes": pose_outcomes,
+        "diagnostic_totals": diagnostic_totals,
         "reported_metrics": reported_metrics,
         "comparison_metrics_valid": comparison_metrics_valid,
     }

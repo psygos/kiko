@@ -152,6 +152,130 @@ impl PoseOutcomeCounts {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OptionalCountTotals {
+    samples: usize,
+    total: u128,
+    steady_samples: usize,
+    steady_total: u128,
+}
+
+impl OptionalCountTotals {
+    fn record(
+        &mut self,
+        metric: &'static str,
+        value: Option<usize>,
+        steady: bool,
+    ) -> Result<(), DiagnosticAggregationError> {
+        let Some(value) = value else {
+            return Ok(());
+        };
+        self.samples = self
+            .samples
+            .checked_add(1)
+            .ok_or(DiagnosticAggregationError::Overflow { metric })?;
+        self.total = self
+            .total
+            .checked_add(value as u128)
+            .ok_or(DiagnosticAggregationError::Overflow { metric })?;
+        if steady {
+            self.steady_samples = self
+                .steady_samples
+                .checked_add(1)
+                .ok_or(DiagnosticAggregationError::Overflow { metric })?;
+            self.steady_total = self
+                .steady_total
+                .checked_add(value as u128)
+                .ok_or(DiagnosticAggregationError::Overflow { metric })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DiagnosticTotals {
+    frames: usize,
+    steady_frames: usize,
+    final_map_keyframes: usize,
+    final_map_points: usize,
+    peak_map_points: usize,
+    features_detected: OptionalCountTotals,
+    features_matched: OptionalCountTotals,
+    pnp_tracked_observations: OptionalCountTotals,
+    pnp_projectable_tracked_observations: OptionalCountTotals,
+    pnp_accepted_inliers: OptionalCountTotals,
+}
+
+impl DiagnosticTotals {
+    fn record(
+        &mut self,
+        diagnostics: &kiko_slam::FrameDiagnostics,
+        steady: bool,
+    ) -> Result<(), DiagnosticAggregationError> {
+        self.frames = self
+            .frames
+            .checked_add(1)
+            .ok_or(DiagnosticAggregationError::Overflow {
+                metric: "diagnostic frames",
+            })?;
+        if steady {
+            self.steady_frames =
+                self.steady_frames
+                    .checked_add(1)
+                    .ok_or(DiagnosticAggregationError::Overflow {
+                        metric: "steady diagnostic frames",
+                    })?;
+        }
+        self.final_map_keyframes = diagnostics.map_keyframes;
+        self.final_map_points = diagnostics.map_points;
+        self.peak_map_points = self.peak_map_points.max(diagnostics.map_points);
+        self.features_detected.record(
+            "features detected",
+            diagnostics.features_detected,
+            steady,
+        )?;
+        self.features_matched
+            .record("features matched", diagnostics.features_matched, steady)?;
+        self.pnp_tracked_observations.record(
+            "PnP tracked observations",
+            diagnostics
+                .pnp_tracked_observations
+                .map(|metric| metric.count()),
+            steady,
+        )?;
+        self.pnp_projectable_tracked_observations.record(
+            "PnP projectable tracked observations",
+            diagnostics
+                .pnp_projectable_tracked_observations
+                .map(|metric| metric.count()),
+            steady,
+        )?;
+        self.pnp_accepted_inliers.record(
+            "PnP accepted inliers",
+            diagnostics
+                .pnp_accepted_inliers
+                .map(|metric| metric.count()),
+            steady,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticAggregationError {
+    Overflow { metric: &'static str },
+}
+
+impl std::fmt::Display for DiagnosticAggregationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Overflow { metric } => write!(f, "{metric} aggregate overflowed"),
+        }
+    }
+}
+
+impl std::error::Error for DiagnosticAggregationError {}
+
 #[derive(Debug)]
 struct UnusableSteadyPoseStreamError {
     steady_processed: usize,
@@ -179,6 +303,7 @@ enum SlamProcessingError {
     PrefetchThread(std::io::Error),
     Triangulation(kiko_slam::TriangulationError),
     StableSurface(kiko_slam::StableSurfaceGenerationError),
+    DiagnosticAggregation(DiagnosticAggregationError),
 }
 
 impl std::fmt::Display for SlamProcessingError {
@@ -188,6 +313,9 @@ impl std::fmt::Display for SlamProcessingError {
             Self::Triangulation(source) => write!(f, "stereo sample extraction failed: {source}"),
             Self::StableSurface(source) => {
                 write!(f, "stable surface generation failed: {source}")
+            }
+            Self::DiagnosticAggregation(source) => {
+                write!(f, "SLAM diagnostic aggregation failed: {source}")
             }
         }
     }
@@ -199,6 +327,7 @@ impl std::error::Error for SlamProcessingError {
             Self::PrefetchThread(source) => Some(source),
             Self::Triangulation(source) => Some(source),
             Self::StableSurface(source) => Some(source),
+            Self::DiagnosticAggregation(source) => Some(source),
         }
     }
 }
@@ -212,6 +341,12 @@ impl From<kiko_slam::TriangulationError> for SlamProcessingError {
 impl From<kiko_slam::StableSurfaceGenerationError> for SlamProcessingError {
     fn from(source: kiko_slam::StableSurfaceGenerationError) -> Self {
         Self::StableSurface(source)
+    }
+}
+
+impl From<DiagnosticAggregationError> for SlamProcessingError {
+    fn from(source: DiagnosticAggregationError) -> Self {
+        Self::DiagnosticAggregation(source)
     }
 }
 
@@ -399,6 +534,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut failure_sources = RunFailureCapture::default();
     let mut pose_outcomes = PoseOutcomeCounts::default();
     let mut steady_pose_outcomes = PoseOutcomeCounts::default();
+    let mut diagnostic_totals = DiagnosticTotals::default();
 
     // Prefetch pipeline: overlap SP(N+1) + speculative LG(N+1) with frame N.
     enum PrefetchInferenceOutcome {
@@ -587,9 +723,11 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
             {
                 Ok(output) => {
                     pose_outcomes.record(&output.pose);
-                    if processed >= args.warmup_pairs {
+                    let steady = processed >= args.warmup_pairs;
+                    if steady {
                         steady_pose_outcomes.record(&output.pose);
                     }
+                    diagnostic_totals.record(&output.diagnostics, steady)?;
                     if !matches!(
                         &output.pose,
                         kiko_slam::PoseStatus::Current(_) | kiko_slam::PoseStatus::Predicted(_)
@@ -872,6 +1010,40 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         steady_pose_outcomes.stale,
         steady_pose_outcomes.unavailable
     );
+    eprintln!(
+        "diagnostic totals: frames={} steady_frames={} final_map_keyframes={} final_map_points={} peak_map_points={} features_detected_samples={} features_detected_total={} steady_features_detected_samples={} steady_features_detected_total={} features_matched_samples={} features_matched_total={} steady_features_matched_samples={} steady_features_matched_total={} pnp_tracked_observations_samples={} pnp_tracked_observations_total={} steady_pnp_tracked_observations_samples={} steady_pnp_tracked_observations_total={} pnp_projectable_tracked_observations_samples={} pnp_projectable_tracked_observations_total={} steady_pnp_projectable_tracked_observations_samples={} steady_pnp_projectable_tracked_observations_total={} pnp_accepted_inliers_samples={} pnp_accepted_inliers_total={} steady_pnp_accepted_inliers_samples={} steady_pnp_accepted_inliers_total={}",
+        diagnostic_totals.frames,
+        diagnostic_totals.steady_frames,
+        diagnostic_totals.final_map_keyframes,
+        diagnostic_totals.final_map_points,
+        diagnostic_totals.peak_map_points,
+        diagnostic_totals.features_detected.samples,
+        diagnostic_totals.features_detected.total,
+        diagnostic_totals.features_detected.steady_samples,
+        diagnostic_totals.features_detected.steady_total,
+        diagnostic_totals.features_matched.samples,
+        diagnostic_totals.features_matched.total,
+        diagnostic_totals.features_matched.steady_samples,
+        diagnostic_totals.features_matched.steady_total,
+        diagnostic_totals.pnp_tracked_observations.samples,
+        diagnostic_totals.pnp_tracked_observations.total,
+        diagnostic_totals.pnp_tracked_observations.steady_samples,
+        diagnostic_totals.pnp_tracked_observations.steady_total,
+        diagnostic_totals
+            .pnp_projectable_tracked_observations
+            .samples,
+        diagnostic_totals.pnp_projectable_tracked_observations.total,
+        diagnostic_totals
+            .pnp_projectable_tracked_observations
+            .steady_samples,
+        diagnostic_totals
+            .pnp_projectable_tracked_observations
+            .steady_total,
+        diagnostic_totals.pnp_accepted_inliers.samples,
+        diagnostic_totals.pnp_accepted_inliers.total,
+        diagnostic_totals.pnp_accepted_inliers.steady_samples,
+        diagnostic_totals.pnp_accepted_inliers.steady_total,
+    );
     if let Some(measured) = service_intervals.get(args.warmup_pairs..)
         && !measured.is_empty()
     {
@@ -907,7 +1079,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PoseOutcomeCounts, SLAM_ENV_HELP};
+    use super::{DiagnosticTotals, PoseOutcomeCounts, SLAM_ENV_HELP};
     use crate::next_selected_success;
 
     #[test]
@@ -952,6 +1124,45 @@ mod tests {
             .all_have_current_estimates(28)
         );
         assert!(!PoseOutcomeCounts::default().all_have_current_estimates(0));
+    }
+
+    #[test]
+    fn diagnostic_totals_preserve_optional_support_and_steady_boundary() {
+        let mut warmup = kiko_slam::FrameDiagnostics::empty(2, 30);
+        warmup.features_detected = Some(100);
+        warmup.features_matched = Some(40);
+        warmup.pnp_tracked_observations =
+            Some(kiko_slam::PnpTrackedObservationCountMetric::new(35));
+        warmup.pnp_projectable_tracked_observations = Some(
+            kiko_slam::PnpProjectableTrackedObservationCountMetric::new(32),
+        );
+        warmup.pnp_accepted_inliers = Some(kiko_slam::PnpAcceptedInlierCountMetric::new(28));
+        let mut steady = kiko_slam::FrameDiagnostics::empty(3, 45);
+        steady.features_detected = Some(120);
+        steady.features_matched = Some(50);
+        steady.pnp_tracked_observations =
+            Some(kiko_slam::PnpTrackedObservationCountMetric::new(44));
+        steady.pnp_projectable_tracked_observations = Some(
+            kiko_slam::PnpProjectableTrackedObservationCountMetric::new(41),
+        );
+        steady.pnp_accepted_inliers = Some(kiko_slam::PnpAcceptedInlierCountMetric::new(36));
+
+        let mut totals = DiagnosticTotals::default();
+        totals.record(&warmup, false).expect("warmup totals");
+        totals.record(&steady, true).expect("steady totals");
+
+        assert_eq!(totals.frames, 2);
+        assert_eq!(totals.steady_frames, 1);
+        assert_eq!(totals.final_map_keyframes, 3);
+        assert_eq!(totals.final_map_points, 45);
+        assert_eq!(totals.peak_map_points, 45);
+        assert_eq!(totals.features_detected.total, 220);
+        assert_eq!(totals.features_detected.steady_total, 120);
+        assert_eq!(totals.features_matched.total, 90);
+        assert_eq!(totals.pnp_tracked_observations.total, 79);
+        assert_eq!(totals.pnp_projectable_tracked_observations.total, 73);
+        assert_eq!(totals.pnp_accepted_inliers.total, 64);
+        assert_eq!(totals.pnp_accepted_inliers.steady_total, 36);
     }
 
     #[test]
