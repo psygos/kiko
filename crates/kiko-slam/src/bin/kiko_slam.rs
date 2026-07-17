@@ -4,28 +4,43 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use kiko_slam::dataset::{DatasetDepthCursor, DatasetError, DatasetReader};
-use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
+use kiko_slam::dataset::{
+    DatasetDepthCursor, DatasetError, DatasetReader, DepthOpticalFrame, DepthProjectionContract,
+};
+use kiko_slam::dense::{
+    self, command_mapper,
+    occupancy::{
+        DepthCameraModel, DepthRangeMeters, DepthToTrackingCamera, HeightRangeMeters,
+        OccupancyConfig, OccupancyError, OccupancyEvidenceModel, OccupancyGridGeometry,
+        WorldToOccupancy,
+    },
+    occupancy_runtime::{
+        OccupancyRuntime, OccupancyRuntimeConfig, OccupancyRuntimeError, OccupancySnapshotCadence,
+        TimedOccupancySnapshot,
+    },
+    ring_buffer::DepthRingBuffer,
+};
 use kiko_slam::{
-    BackendConfig, DepthImage, DownscaleFactor, FrameId, GlobalDescriptorConfig, InferenceBackend,
-    InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig, LocalBaConfig,
-    LoopClosureConfig, LoopSubsystemConfig, PipelineError, PipelineTimingError,
-    PipelineWallBreakdown, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
-    RectifiedStereoConfigError, RedundancyPolicy, RelocalizationConfig, RerunSink, RerunSinkConfig,
-    SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
-    VizDecimation, VizError, VizFlushError, VizLogError, VizPacket,
+    BackendConfig, DenseStats, DepthImage, DownscaleFactor, FrameDimensions, FrameId,
+    GlobalDescriptorConfig, InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit,
+    LightGlue, LmConfig, LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PinholeIntrinsics,
+    PipelineError, PipelineTimingError, PipelineWallBreakdown, RansacConfig, RectifiedStereo,
+    RectifiedStereoConfig, RectifiedStereoConfigError, RedundancyPolicy, RelocalizationConfig,
+    RerunSink, RerunSinkConfig, SlamTracker, SuperPoint, TrackerConfig, TrackerError,
+    TriangulationConfig, TriangulationError, Triangulator, VizDecimation, VizError, VizFlushError,
+    VizLogError, VizPacket,
 };
 
-use kiko_slam::env::{env_bool, env_f32, env_string, env_usize};
+use kiko_slam::env::{env_bool, env_f32, env_f64, env_string, env_u32, env_usize};
 
 #[cfg(any(feature = "record", test))]
-use kiko_slam::ChannelCapacity;
+use kiko_slam::{ChannelCapacity, DenseCommandSendOutcome};
 
 #[cfg(feature = "record")]
 use kiko_slam::env::{EnvError, env_u64};
 
 #[cfg(feature = "record")]
-use kiko_slam::{CameraPoint3, DenseStats, Frame, Raw, ReconState, WorldToCamera};
+use kiko_slam::{CameraPoint3, DepthImageError, Frame, FrameError, Raw, ReconState, WorldToCamera};
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
@@ -34,15 +49,18 @@ use kiko_slam::dataset::{
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
-    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSendOutcome,
-    DenseCommandSender, DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics,
-    PairingConfigError, PairingInputError, PairingWindowNs, SendOutcome, SensorId, StereoPair,
-    StereoPairer, SystemHealth, TrackerInitError, VizConfigError, bounded_channel,
-    dense_command_channel, oak_to_depth_image, oak_to_frame,
+    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSender, DiagnosticEvent,
+    DropPolicy, DropReceiver, FrameDiagnostics, PairingConfigError, PairingInputError,
+    PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer, SystemHealth,
+    TrackerInitError, VizConfigError, bounded_channel, dense_command_channel, oak_to_depth_image,
+    oak_to_frame,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
-    DepthConfig, DepthError, Device, DeviceConfig, ImageError, ImuConfig, MonoConfig, QueueConfig,
+    CalibrationError as OakCalibrationError, CloseError as OakCloseError, DepthAlignment,
+    DepthConfig, DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
+    ImageFrame as OakImageFrame, ImuConfig, Intrinsics as OakIntrinsics, MonoConfig, QueueConfig,
+    StreamId as OakStreamId,
 };
 #[cfg(feature = "record")]
 use std::sync::Arc;
@@ -305,9 +323,74 @@ fn run_rerun_session<T, P>(
 }
 
 #[derive(Debug)]
+enum OfflineFatalDenseError {
+    CommandGeneration(command_mapper::DenseCommandGenerationError),
+    Occupancy(OccupancyRuntimeError),
+}
+
+impl std::fmt::Display for OfflineFatalDenseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CommandGeneration(source) => {
+                write!(f, "final dense command sequencing failed: {source}")
+            }
+            Self::Occupancy(source) => write!(f, "final occupancy update failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for OfflineFatalDenseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CommandGeneration(source) => Some(source),
+            Self::Occupancy(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OfflineFatalTrackerError {
+    source: TrackerError,
+    dense_update: Option<OfflineFatalDenseError>,
+    publication: Option<VizLogError>,
+    occupancy_finalization: Option<OccupancyRuntimeError>,
+}
+
+impl std::fmt::Display for OfflineFatalTrackerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "offline tracker failed: {}", self.source)?;
+        if let Some(dense_update) = self.dense_update.as_ref() {
+            write!(f, "; {dense_update}")?;
+        }
+        if let Some(publication) = self.publication.as_ref() {
+            write!(
+                f,
+                "; publishing its final authoritative dense update also failed: {publication}"
+            )?;
+        }
+        if let Some(finalization) = self.occupancy_finalization.as_ref() {
+            write!(
+                f,
+                "; offline occupancy finalization also failed: {finalization}"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for OfflineFatalTrackerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
 enum OdometryVizProcessingError {
     Dataset(DatasetError),
     DenseCommandGeneration(command_mapper::DenseCommandGenerationError),
+    DenseCommandMapping(command_mapper::DenseCommandMappingError),
+    Occupancy(OccupancyRuntimeError),
+    Tracker(Box<OfflineFatalTrackerError>),
     Packet(VizError),
     Log(VizLogError),
 }
@@ -319,6 +402,11 @@ impl std::fmt::Display for OdometryVizProcessingError {
             Self::DenseCommandGeneration(source) => {
                 write!(f, "offline dense command sequencing failed: {source}")
             }
+            Self::DenseCommandMapping(source) => {
+                write!(f, "offline dense command mapping failed: {source}")
+            }
+            Self::Occupancy(source) => write!(f, "offline occupancy mapping failed: {source}"),
+            Self::Tracker(source) => std::fmt::Display::fmt(source, f),
             Self::Packet(source) => write!(f, "visualization packet creation failed: {source}"),
             Self::Log(source) => write!(f, "visualization logging failed: {source}"),
         }
@@ -330,6 +418,9 @@ impl std::error::Error for OdometryVizProcessingError {
         match self {
             Self::Dataset(source) => Some(source),
             Self::DenseCommandGeneration(source) => Some(source),
+            Self::DenseCommandMapping(source) => Some(source),
+            Self::Occupancy(source) => Some(source),
+            Self::Tracker(source) => Some(&source.source),
             Self::Packet(source) => Some(source),
             Self::Log(source) => Some(source),
         }
@@ -345,6 +436,29 @@ impl From<DatasetError> for OdometryVizProcessingError {
 impl From<command_mapper::DenseCommandGenerationError> for OdometryVizProcessingError {
     fn from(source: command_mapper::DenseCommandGenerationError) -> Self {
         Self::DenseCommandGeneration(source)
+    }
+}
+
+impl From<command_mapper::DenseCommandMappingError> for OdometryVizProcessingError {
+    fn from(source: command_mapper::DenseCommandMappingError) -> Self {
+        Self::DenseCommandMapping(source)
+    }
+}
+
+impl From<OccupancyRuntimeError> for OdometryVizProcessingError {
+    fn from(source: OccupancyRuntimeError) -> Self {
+        Self::Occupancy(source)
+    }
+}
+
+impl From<TrackerError> for OdometryVizProcessingError {
+    fn from(source: TrackerError) -> Self {
+        Self::Tracker(Box::new(OfflineFatalTrackerError {
+            source,
+            dense_update: None,
+            publication: None,
+            occupancy_finalization: None,
+        }))
     }
 }
 
@@ -472,6 +586,13 @@ struct LiveArgs {
     inference: InferenceArgs,
     #[arg(long, env = "KIKO_RERUN_DECIMATION", default_value_t = VizDecimationArg::default())]
     rerun_decimation: VizDecimationArg,
+    /// Timeout used to prove final live Rerun delivery, in milliseconds.
+    #[arg(
+        long,
+        env = "KIKO_RERUN_FINISH_TIMEOUT_MS",
+        default_value_t = RerunFinishTimeout::default()
+    )]
+    rerun_finish_timeout_ms: RerunFinishTimeout,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -597,6 +718,172 @@ impl PairLimitArg {
     fn get(self) -> usize {
         self.0.get()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OccupancyProjectionContractError {
+    CameraHeightNotConfigured,
+    LevelOpticalWorldNotDeclared,
+    LegacyOpticalFrameNotDeclared,
+    UnsupportedOpticalFrame(DepthOpticalFrame),
+    DepthCalibrationDimensionsMismatch {
+        depth: FrameDimensions,
+        tracking: FrameDimensions,
+    },
+}
+
+impl std::fmt::Display for OccupancyProjectionContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CameraHeightNotConfigured => write!(
+                f,
+                "2D occupancy requires explicit KIKO_OCCUPANCY_CAMERA_HEIGHT_M because visual SLAM does not establish gravity or a floor"
+            ),
+            Self::LevelOpticalWorldNotDeclared => write!(
+                f,
+                "2D occupancy requires KIKO_OCCUPANCY_ASSUME_LEVEL_OPTICAL_WORLD=true; camera height alone does not establish gravity, floor orientation, pitch, or roll"
+            ),
+            Self::LegacyOpticalFrameNotDeclared => write!(
+                f,
+                "legacy depth metadata does not declare its optical frame; set KIKO_OCCUPANCY_ASSUME_RECTIFIED_LEFT=true only when that physical assumption is known to be correct"
+            ),
+            Self::UnsupportedOpticalFrame(frame) => write!(
+                f,
+                "2D occupancy currently requires rectified_left depth aligned to Kiko's tracking camera, got {frame:?} without a calibrated extrinsic"
+            ),
+            Self::DepthCalibrationDimensionsMismatch { depth, tracking } => write!(
+                f,
+                "depth projection dimensions {}x{} differ from tracking-camera calibration {}x{}; depth-specific scaled intrinsics are not recorded",
+                depth.width(),
+                depth.height(),
+                tracking.width(),
+                tracking.height()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OccupancyProjectionContractError {}
+
+fn require_level_optical_world(
+    assumption_declared: bool,
+    camera_height_m: Option<f64>,
+) -> Result<f64, OccupancyProjectionContractError> {
+    if !assumption_declared {
+        return Err(OccupancyProjectionContractError::LevelOpticalWorldNotDeclared);
+    }
+    camera_height_m.ok_or(OccupancyProjectionContractError::CameraHeightNotConfigured)
+}
+
+fn occupancy_depth_camera(
+    tracking_intrinsics: PinholeIntrinsics,
+    tracking_dimensions: FrameDimensions,
+    depth: DepthProjectionContract,
+    assume_rectified_left: bool,
+) -> Result<DepthCameraModel, OccupancyProjectionContractError> {
+    match depth.optical_frame() {
+        Some(DepthOpticalFrame::RectifiedLeft) => {}
+        None if assume_rectified_left => {}
+        None => return Err(OccupancyProjectionContractError::LegacyOpticalFrameNotDeclared),
+        Some(frame) => {
+            return Err(OccupancyProjectionContractError::UnsupportedOpticalFrame(
+                frame,
+            ));
+        }
+    }
+
+    let depth_dimensions = depth.dimensions();
+    if depth_dimensions != tracking_dimensions {
+        return Err(
+            OccupancyProjectionContractError::DepthCalibrationDimensionsMismatch {
+                depth: depth_dimensions,
+                tracking: tracking_dimensions,
+            },
+        );
+    }
+    Ok(DepthCameraModel::new(
+        tracking_intrinsics,
+        depth_dimensions,
+        DepthToTrackingCamera::identity(),
+    ))
+}
+
+/// Parse occupancy policy once at the process boundary.
+///
+/// This is deliberately geometric and deterministic; no learned occupancy
+/// model or device-specific accelerator is involved.
+fn build_occupancy_runtime_config(
+    tracking_intrinsics: PinholeIntrinsics,
+    tracking_dimensions: FrameDimensions,
+    depth: DepthProjectionContract,
+) -> Result<OccupancyRuntimeConfig, Box<dyn std::error::Error>> {
+    let assume_rectified_left = env_bool("KIKO_OCCUPANCY_ASSUME_RECTIFIED_LEFT")?.unwrap_or(false);
+    let camera = occupancy_depth_camera(
+        tracking_intrinsics,
+        tracking_dimensions,
+        depth,
+        assume_rectified_left,
+    )?;
+    let camera_height_m = require_level_optical_world(
+        env_bool("KIKO_OCCUPANCY_ASSUME_LEVEL_OPTICAL_WORLD")?.unwrap_or(false),
+        env_f64("KIKO_OCCUPANCY_CAMERA_HEIGHT_M")?,
+    )?;
+    let resolution_m = env_f64("KIKO_OCCUPANCY_RESOLUTION_M")?.unwrap_or(0.05);
+    let lower_x_m = env_f64("KIKO_OCCUPANCY_LOWER_X_M")?.unwrap_or(-10.0);
+    let lower_y_m = env_f64("KIKO_OCCUPANCY_LOWER_Y_M")?.unwrap_or(-5.0);
+    let width = env_u32("KIKO_OCCUPANCY_WIDTH_CELLS")?.unwrap_or(400);
+    let height = env_u32("KIKO_OCCUPANCY_HEIGHT_CELLS")?.unwrap_or(400);
+    let maximum_cells = env_usize("KIKO_OCCUPANCY_MAX_CELLS")?.unwrap_or(4_000_000);
+    let minimum_height_m = env_f64("KIKO_OCCUPANCY_MIN_HEIGHT_M")?.unwrap_or(0.05);
+    let maximum_height_m = env_f64("KIKO_OCCUPANCY_MAX_HEIGHT_M")?.unwrap_or(1.8);
+    let minimum_depth_m = env_f64("KIKO_OCCUPANCY_MIN_DEPTH_M")?.unwrap_or(0.2);
+    let maximum_depth_m = env_f64("KIKO_OCCUPANCY_MAX_DEPTH_M")?.unwrap_or(10.0);
+    let sampling_block = env_u32("KIKO_OCCUPANCY_SAMPLE_BLOCK_PX")?.unwrap_or(4);
+    let maximum_keyframes = env_usize("KIKO_OCCUPANCY_MAX_KEYFRAMES")?.unwrap_or(300);
+    let snapshot_cadence = OccupancySnapshotCadence::try_new(
+        env_usize("KIKO_OCCUPANCY_RERUN_EVERY_KEYFRAMES")?.unwrap_or(5),
+    )?;
+
+    let geometry = OccupancyGridGeometry::try_new(
+        resolution_m,
+        [lower_x_m, lower_y_m],
+        width,
+        height,
+        maximum_cells,
+    )?;
+    let world_to_occupancy = WorldToOccupancy::level_optical_world(camera_height_m)?;
+    let height_range = HeightRangeMeters::try_new(minimum_height_m, maximum_height_m)?;
+    let depth_range = DepthRangeMeters::try_new(minimum_depth_m, maximum_depth_m)?;
+    let evidence = OccupancyEvidenceModel::try_new(-1, 3, -2, 2)?;
+    let mapper = OccupancyConfig::try_new(
+        geometry,
+        world_to_occupancy,
+        camera,
+        height_range,
+        depth_range,
+        sampling_block,
+        evidence,
+        maximum_keyframes,
+    )?;
+
+    eprintln!(
+        "occupancy requested: geometric=true learned=false level_optical_world_assumed=true world_axes=[x:right,y:down,z:forward] occupancy_axes=[x:world_x,y:world_z,height:camera_height-world_y] grid={}x{} resolution_m={} lower_xy_m=[{},{}] height_m=[{},{}] depth_m=[{},{}] sample_block_px={} max_keyframes={} rerun_every_keyframes={} camera_height_m={}",
+        width,
+        height,
+        resolution_m,
+        lower_x_m,
+        lower_y_m,
+        minimum_height_m,
+        maximum_height_m,
+        minimum_depth_m,
+        maximum_depth_m,
+        sampling_block,
+        maximum_keyframes,
+        snapshot_cadence.get(),
+        camera_height_m,
+    );
+
+    Ok(OccupancyRuntimeConfig::new(mapper, snapshot_cadence))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -960,9 +1247,11 @@ impl OfflineDepthSelector {
             self.previous = self.lookahead.take();
         }
 
+        let cutoff_delta = i64::try_from(command_mapper::DEPTH_ASSOCIATION_WINDOW.as_nanos())
+            .expect("the 20 ms depth-association policy fits in i64");
         let cutoff_ns = timestamp
             .as_nanos()
-            .checked_add(command_mapper::MAX_ASSOCIATION_WINDOW_NS)
+            .checked_add(cutoff_delta)
             .unwrap_or(i64::MAX);
         let cutoff = kiko_slam::Timestamp::from_nanos(cutoff_ns);
         while self.lookahead.is_none() {
@@ -976,8 +1265,7 @@ impl OfflineDepthSelector {
             }
         }
 
-        let max_delta = u64::try_from(command_mapper::MAX_ASSOCIATION_WINDOW_NS)
-            .expect("the depth association window is nonnegative");
+        let max_delta = command_mapper::DEPTH_ASSOCIATION_WINDOW.as_nanos();
         let candidate = match (&self.previous, &self.lookahead) {
             (Some(previous), Some(lookahead)) => {
                 let previous_delta = previous
@@ -1020,7 +1308,9 @@ struct OfflineDenseState {
     cursor: DatasetDepthCursor,
     selector: OfflineDepthSelector,
     ring: DepthRingBuffer,
-    state: dense::DenseState,
+    runtime: OccupancyRuntime,
+    snapshots_enabled: bool,
+    deferred_snapshot_error: Option<OccupancyError>,
     generation: command_mapper::DenseCommandGeneration,
     last_buffered_depth: Option<FrameId>,
 }
@@ -1028,6 +1318,48 @@ struct OfflineDenseState {
 enum OfflineDenseReplay {
     Disabled,
     Enabled(Box<OfflineDenseState>),
+}
+
+fn process_offline_occupancy_commands(
+    runtime: &mut OccupancyRuntime,
+    snapshots_enabled: &mut bool,
+    deferred_snapshot_error: &mut Option<OccupancyError>,
+    commands: impl IntoIterator<Item = dense::DenseCommand>,
+) -> Result<(Option<DenseStats>, Option<TimedOccupancySnapshot>), OccupancyRuntimeError> {
+    let mut latest_stats = None;
+    let mut latest_snapshot = None;
+    for command in commands {
+        match runtime.process(command, *snapshots_enabled) {
+            Ok(outcome) => {
+                let (stats, snapshot) = outcome.into_parts();
+                latest_stats = Some(stats);
+                if snapshot.is_some() {
+                    latest_snapshot = snapshot;
+                }
+            }
+            Err(OccupancyRuntimeError::Snapshot(error)) => {
+                eprintln!(
+                    "offline occupancy snapshot publication failed; mapping will drain before the failure is returned: {error}"
+                );
+                deferred_snapshot_error.get_or_insert(error);
+                *snapshots_enabled = false;
+                latest_stats = Some(runtime.stats());
+            }
+            Err(error @ OccupancyRuntimeError::Mapping(_)) => {
+                return Err(error.with_deferred_snapshot(deferred_snapshot_error));
+            }
+            Err(error @ OccupancyRuntimeError::MappingAndSnapshot { .. }) => return Err(error),
+        }
+    }
+    Ok((latest_stats, latest_snapshot))
+}
+
+fn take_deferred_offline_snapshot_error(
+    deferred_snapshot_error: &mut Option<OccupancyError>,
+) -> Result<(), OccupancyRuntimeError> {
+    deferred_snapshot_error
+        .take()
+        .map_or(Ok(()), |error| Err(OccupancyRuntimeError::Snapshot(error)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1167,6 +1499,15 @@ fn run_viz_odometry(
         if cursor.is_empty() {
             return Err(EmptyOfflineDepthStream.into());
         }
+        let depth_projection = reader
+            .depth_projection_contract()
+            .ok_or(DatasetError::DepthStreamNotConfigured)?;
+        let stereo_calibration = reader.stereo_calibration();
+        let occupancy_config = build_occupancy_runtime_config(
+            stereo_calibration.left(),
+            stereo_calibration.dimensions(),
+            depth_projection,
+        )?;
         eprintln!(
             "offline dense enabled: manifest_depth_frames={} ring_capacity={}",
             cursor.len(),
@@ -1176,7 +1517,9 @@ fn run_viz_odometry(
             cursor,
             selector: OfflineDepthSelector::default(),
             ring: DepthRingBuffer::try_new(depth_ring_capacity.get())?,
-            state: dense::DenseState::new(&DenseConfig::default()),
+            runtime: OccupancyRuntime::try_new(occupancy_config)?,
+            snapshots_enabled: true,
+            deferred_snapshot_error: None,
             generation: command_mapper::DenseCommandGeneration::default(),
             last_buffered_depth: None,
         }))
@@ -1268,24 +1611,34 @@ fn run_viz_odometry(
                 match tracker.process(pair) {
                     Ok(mut output) => {
                         let timestamp = left.timestamp();
-                        let dense_stats = match &mut offline_dense {
-                            OfflineDenseReplay::Disabled => None,
+                        let (dense_stats, occupancy_snapshot) = match &mut offline_dense {
+                            OfflineDenseReplay::Disabled => (None, None),
                             OfflineDenseReplay::Enabled(dense) => {
                                 let OfflineDenseState {
                                     ring,
-                                    state,
+                                    runtime,
+                                    snapshots_enabled,
+                                    deferred_snapshot_error,
                                     generation,
                                     ..
                                 } = dense.as_mut();
                                 output.diagnostics_mut().depth_reorder_warnings =
                                     Some(ring.reorder_warnings());
-                                let correction = tracker.take_pending_loop_correction();
+                                let pose_updates = tracker.take_pending_dense_pose_updates();
                                 let cmds = command_mapper::map_output_to_dense_commands(
-                                    &output, correction, ring, timestamp, generation,
+                                    &output,
+                                    pose_updates,
+                                    |keyframe_id| tracker.keyframe_pose(keyframe_id),
+                                    ring,
+                                    timestamp,
+                                    generation,
                                 )?;
-                                cmds.into_iter()
-                                    .map(|cmd| dense::process_dense_command(state, cmd))
-                                    .last()
+                                process_offline_occupancy_commands(
+                                    runtime,
+                                    snapshots_enabled,
+                                    deferred_snapshot_error,
+                                    cmds,
+                                )?
                             }
                         };
                         if let Some(depth) = selected_depth.as_ref() {
@@ -1319,20 +1672,109 @@ fn run_viz_odometry(
                         if let Some(stats) = dense_stats.as_ref() {
                             sink.log_dense_stats(timestamp, stats)?;
                         }
+                        if let Some(snapshot) = occupancy_snapshot {
+                            let (snapshot_timestamp, snapshot) = snapshot.into_parts();
+                            sink.log_occupancy(snapshot_timestamp, snapshot)?;
+                        }
                         processed += 1;
                     }
                     Err(err) => {
                         inference_errors += 1;
-                        if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense
-                            && let Some(correction) = tracker.take_pending_loop_correction()
-                        {
-                            let state = &mut dense.state;
+                        let requires_pipeline_shutdown = err.requires_pipeline_shutdown();
+                        let mut dense_update = None;
+                        let mut dense_update_failure = None;
+                        if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense {
+                            let pose_updates = tracker.take_pending_dense_pose_updates();
                             let generation = &mut dense.generation;
-                            let command = command_mapper::rebuild_from_snapshot_command(
-                                correction, generation,
-                            )?;
-                            let stats = dense::process_dense_command(state, command);
-                            sink.log_dense_stats(left.timestamp(), &stats)?;
+                            match command_mapper::apply_pose_updates_command(
+                                pose_updates,
+                                left.timestamp(),
+                                generation,
+                            ) {
+                                Ok(Some(command)) => match process_offline_occupancy_commands(
+                                    &mut dense.runtime,
+                                    &mut dense.snapshots_enabled,
+                                    &mut dense.deferred_snapshot_error,
+                                    [command],
+                                ) {
+                                    Ok(update) => dense_update = Some(update),
+                                    Err(source) if requires_pipeline_shutdown => {
+                                        dense_update_failure =
+                                            Some(OfflineFatalDenseError::Occupancy(source));
+                                    }
+                                    Err(source) => return Err(source.into()),
+                                },
+                                Ok(None) => {}
+                                Err(source) if requires_pipeline_shutdown => {
+                                    dense_update_failure =
+                                        Some(OfflineFatalDenseError::CommandGeneration(source));
+                                }
+                                Err(source) => return Err(source.into()),
+                            }
+                        }
+
+                        if requires_pipeline_shutdown {
+                            // A tracker failure can follow a committed BA correction. The
+                            // correction above is authoritative, so finish and publish its final
+                            // occupancy state before ending the session. Preserve every bounded
+                            // related failure alongside the typed tracker source.
+                            let mut final_snapshot = None;
+                            let mut occupancy_finalization = None;
+                            if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense {
+                                match dense.runtime.finish(dense.snapshots_enabled) {
+                                    Ok(snapshot) => {
+                                        final_snapshot = snapshot;
+                                        occupancy_finalization =
+                                            take_deferred_offline_snapshot_error(
+                                                &mut dense.deferred_snapshot_error,
+                                            )
+                                            .err();
+                                    }
+                                    Err(error) => {
+                                        occupancy_finalization =
+                                            Some(error.with_deferred_snapshot(
+                                                &mut dense.deferred_snapshot_error,
+                                            ));
+                                    }
+                                }
+                            }
+
+                            let (stats, command_snapshot) = dense_update.unwrap_or_default();
+                            debug_assert!(
+                                command_snapshot.is_none() || final_snapshot.is_none(),
+                                "a forced command snapshot must clear occupancy dirtiness"
+                            );
+                            // A finish snapshot, if present, is the latest authoritative revision
+                            // and supersedes an earlier command snapshot.
+                            let snapshot = final_snapshot.or(command_snapshot);
+                            let publication = (|| -> Result<(), VizLogError> {
+                                if let Some(snapshot) = snapshot {
+                                    let (snapshot_timestamp, snapshot) = snapshot.into_parts();
+                                    sink.log_occupancy(snapshot_timestamp, snapshot)?;
+                                }
+                                if let Some(stats) = stats.as_ref() {
+                                    sink.log_dense_stats(left.timestamp(), stats)?;
+                                }
+                                Ok(())
+                            })()
+                            .err();
+                            return Err(OdometryVizProcessingError::Tracker(Box::new(
+                                OfflineFatalTrackerError {
+                                    source: err,
+                                    dense_update: dense_update_failure,
+                                    publication,
+                                    occupancy_finalization,
+                                },
+                            )));
+                        }
+                        if let Some((stats, snapshot)) = dense_update {
+                            if let Some(stats) = stats.as_ref() {
+                                sink.log_dense_stats(left.timestamp(), stats)?;
+                            }
+                            if let Some(snapshot) = snapshot {
+                                let (snapshot_timestamp, snapshot) = snapshot.into_parts();
+                                sink.log_occupancy(snapshot_timestamp, snapshot)?;
+                            }
                         }
                         eprintln!("tracker error: {err}");
                     }
@@ -1343,6 +1785,27 @@ fn run_viz_odometry(
                 {
                     break;
                 }
+            }
+            if let OfflineDenseReplay::Enabled(dense) = &mut offline_dense {
+                match dense.runtime.finish(dense.snapshots_enabled) {
+                    Ok(Some(snapshot)) => {
+                        let (timestamp, snapshot) = snapshot.into_parts();
+                        sink.log_occupancy(timestamp, snapshot)?;
+                    }
+                    Ok(None) => {}
+                    Err(OccupancyRuntimeError::Snapshot(error)) => {
+                        dense.deferred_snapshot_error.get_or_insert(error);
+                    }
+                    Err(error @ OccupancyRuntimeError::Mapping(_)) => {
+                        return Err(error
+                            .with_deferred_snapshot(&mut dense.deferred_snapshot_error)
+                            .into());
+                    }
+                    Err(error @ OccupancyRuntimeError::MappingAndSnapshot { .. }) => {
+                        return Err(error.into());
+                    }
+                }
+                take_deferred_offline_snapshot_error(&mut dense.deferred_snapshot_error)?;
             }
             Ok(())
         },
@@ -1592,6 +2055,389 @@ fn load_pairer_max_pending_per_side() -> Result<usize, EnvError> {
 }
 
 #[cfg(feature = "record")]
+const STEREO_BOOTSTRAP_POLL_TIMEOUT_MS: u32 = 10;
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StereoSide {
+    Left,
+    Right,
+}
+
+#[cfg(feature = "record")]
+impl StereoSide {
+    fn expected_stream(self) -> OakStreamId {
+        match self {
+            Self::Left => OakStreamId::MonoLeft,
+            Self::Right => OakStreamId::MonoRight,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for StereoSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Left => f.write_str("left"),
+            Self::Right => f.write_str("right"),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum StereoBootstrapError {
+    Interrupted,
+    LeftImage {
+        source: ImageError,
+    },
+    RightImage {
+        source: ImageError,
+    },
+    Calibration {
+        source: OakCalibrationError,
+    },
+    UnexpectedStream {
+        side: StereoSide,
+        expected: OakStreamId,
+        actual: OakStreamId,
+    },
+    UnexpectedDimensions {
+        side: StereoSide,
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+    LeftFrame {
+        source: FrameError,
+    },
+    RightFrame {
+        source: FrameError,
+    },
+    PairingInput {
+        side: StereoSide,
+        source: PairingInputError,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for StereoBootstrapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Interrupted => {
+                f.write_str("stereo bootstrap was interrupted before both frames arrived")
+            }
+            Self::LeftImage { source } => {
+                write!(f, "left camera bootstrap capture failed: {source}")
+            }
+            Self::RightImage { source } => {
+                write!(f, "right camera bootstrap capture failed: {source}")
+            }
+            Self::Calibration { source } => {
+                write!(f, "stereo bootstrap calibration failed: {source}")
+            }
+            Self::UnexpectedStream {
+                side,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{side} camera bootstrap returned stream {actual:?}, expected {expected:?}"
+            ),
+            Self::UnexpectedDimensions {
+                side,
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                f,
+                "{side} camera bootstrap returned {actual_width}x{actual_height}, expected configured {expected_width}x{expected_height}"
+            ),
+            Self::LeftFrame { source } => {
+                write!(f, "left bootstrap frame conversion failed: {source}")
+            }
+            Self::RightFrame { source } => {
+                write!(f, "right bootstrap frame conversion failed: {source}")
+            }
+            Self::PairingInput { side, source } => {
+                write!(f, "{side} bootstrap pairing input failed: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for StereoBootstrapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LeftImage { source } | Self::RightImage { source } => Some(source),
+            Self::Calibration { source } => Some(source),
+            Self::LeftFrame { source } | Self::RightFrame { source } => Some(source),
+            Self::PairingInput { source, .. } => Some(source),
+            Self::Interrupted
+            | Self::UnexpectedStream { .. }
+            | Self::UnexpectedDimensions { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+struct StereoBootstrap {
+    calibration: Calibration,
+    rectified_left_intrinsics: OakIntrinsics,
+}
+
+#[cfg(feature = "record")]
+fn require_bootstrap_frame_contract(
+    side: StereoSide,
+    frame: &OakImageFrame,
+    config: &MonoConfig,
+) -> Result<(), StereoBootstrapError> {
+    let expected = side.expected_stream();
+    if frame.stream != expected {
+        return Err(StereoBootstrapError::UnexpectedStream {
+            side,
+            expected,
+            actual: frame.stream,
+        });
+    }
+    if (frame.width, frame.height) != (config.width, config.height) {
+        return Err(StereoBootstrapError::UnexpectedDimensions {
+            side,
+            expected_width: config.width,
+            expected_height: config.height,
+            actual_width: frame.width,
+            actual_height: frame.height,
+        });
+    }
+    Ok(())
+}
+
+/// Establish the runtime stereo contract from the first delivered projections.
+///
+/// Both boundary frames are converted and inserted into the caller's pairer as
+/// frame ID zero, so calibration discovery does not silently consume data.
+#[cfg(feature = "record")]
+fn bootstrap_stereo(
+    device: &mut Device,
+    config: &MonoConfig,
+    running: &AtomicBool,
+    pairer: &mut StereoPairer,
+) -> Result<StereoBootstrap, StereoBootstrapError> {
+    let mut left = None;
+    let mut right = None;
+
+    while left.is_none() || right.is_none() {
+        if !running.load(Ordering::Relaxed) {
+            return Err(StereoBootstrapError::Interrupted);
+        }
+        let mut received_frame = false;
+        if left.is_none() {
+            match device.mono_left(STEREO_BOOTSTRAP_POLL_TIMEOUT_MS) {
+                Ok(frame) => {
+                    left = Some(frame);
+                    received_frame = true;
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => return Err(StereoBootstrapError::LeftImage { source }),
+            }
+        }
+        if right.is_none() {
+            match device.mono_right(STEREO_BOOTSTRAP_POLL_TIMEOUT_MS) {
+                Ok(frame) => {
+                    right = Some(frame);
+                    received_frame = true;
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => return Err(StereoBootstrapError::RightImage { source }),
+            }
+        }
+        if !received_frame {
+            thread::sleep(Duration::from_micros(500));
+        }
+    }
+
+    if !running.load(Ordering::Relaxed) {
+        return Err(StereoBootstrapError::Interrupted);
+    }
+    let left = left.expect("loop exits only after receiving a left frame");
+    let right = right.expect("loop exits only after receiving a right frame");
+    require_bootstrap_frame_contract(StereoSide::Left, &left, config)?;
+    require_bootstrap_frame_contract(StereoSide::Right, &right, config)?;
+
+    let left_intrinsics = left.intrinsics();
+    let right_intrinsics = right.intrinsics();
+    let baseline_m = device
+        .stereo_baseline_m()
+        .map_err(|source| StereoBootstrapError::Calibration { source })?;
+    let calibration = build_calibration(
+        left_intrinsics,
+        right_intrinsics,
+        baseline_m,
+        config.rectified,
+    );
+
+    let left = oak_to_frame(left, SensorId::StereoLeft, FrameId::new(0))
+        .map_err(|source| StereoBootstrapError::LeftFrame { source })?;
+    let right = oak_to_frame(right, SensorId::StereoRight, FrameId::new(0))
+        .map_err(|source| StereoBootstrapError::RightFrame { source })?;
+    pairer
+        .push_left(left)
+        .map_err(|source| StereoBootstrapError::PairingInput {
+            side: StereoSide::Left,
+            source,
+        })?;
+    pairer
+        .push_right(right)
+        .map_err(|source| StereoBootstrapError::PairingInput {
+            side: StereoSide::Right,
+            source,
+        })?;
+
+    Ok(StereoBootstrap {
+        calibration,
+        rectified_left_intrinsics: left_intrinsics,
+    })
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum RectifiedLeftDepthError {
+    DimensionMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+    ProjectionMismatch {
+        expected: [[f32; 3]; 3],
+        actual: [[f32; 3]; 3],
+    },
+    Conversion {
+        source: DepthImageError,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for RectifiedLeftDepthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DimensionMismatch {
+                expected_width,
+                expected_height,
+                actual_width,
+                actual_height,
+            } => write!(
+                f,
+                "depth projection grid {actual_width}x{actual_height} does not match calibrated rectified-left grid {expected_width}x{expected_height}"
+            ),
+            Self::ProjectionMismatch { expected, actual } => write!(
+                f,
+                "depth projection intrinsics {actual:?} do not match calibrated rectified-left intrinsics {expected:?}"
+            ),
+            Self::Conversion { source } => write!(f, "invalid delivered depth frame: {source}"),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for RectifiedLeftDepthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Conversion { source } => Some(source),
+            Self::DimensionMismatch { .. } | Self::ProjectionMismatch { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+fn require_rectified_left_depth_projection(
+    expected: OakIntrinsics,
+    actual: OakIntrinsics,
+) -> Result<(), RectifiedLeftDepthError> {
+    if (actual.width(), actual.height()) != (expected.width(), expected.height()) {
+        return Err(RectifiedLeftDepthError::DimensionMismatch {
+            expected_width: expected.width(),
+            expected_height: expected.height(),
+            actual_width: actual.width(),
+            actual_height: actual.height(),
+        });
+    }
+    if actual.projection_matrix() != expected.projection_matrix() {
+        return Err(RectifiedLeftDepthError::ProjectionMismatch {
+            expected: expected.projection_matrix(),
+            actual: actual.projection_matrix(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "record")]
+fn parse_rectified_left_depth(
+    frame: OakDepthFrame,
+    expected: OakIntrinsics,
+) -> Result<DepthImage, RectifiedLeftDepthError> {
+    require_rectified_left_depth_projection(expected, frame.intrinsics())?;
+    oak_to_depth_image(frame).map_err(|source| RectifiedLeftDepthError::Conversion { source })
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+struct DeviceCloseFailure {
+    source: Box<dyn std::error::Error>,
+}
+
+#[cfg(feature = "record")]
+impl DeviceCloseFailure {
+    fn new(source: impl std::error::Error + 'static) -> Self {
+        Self {
+            source: Box::new(source),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for DeviceCloseFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for DeviceCloseFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+struct OperationAndDeviceCloseError {
+    operation: Box<dyn std::error::Error>,
+    close: DeviceCloseFailure,
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for OperationAndDeviceCloseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "operation failed ({}); OAK device close also failed: {}",
+            self.operation, self.close
+        )
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for OperationAndDeviceCloseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
+#[cfg(feature = "record")]
 #[derive(Clone, Copy, Debug)]
 enum RecordItem {
     DepthFrame,
@@ -1617,8 +2463,17 @@ enum RecordCaptureError {
     RightImage {
         source: ImageError,
     },
+    LeftFrame {
+        source: FrameError,
+    },
+    RightFrame {
+        source: FrameError,
+    },
     Depth {
         source: DepthError,
+    },
+    DepthFrame {
+        source: RectifiedLeftDepthError,
     },
     PairingInput {
         source: PairingInputError,
@@ -1633,6 +2488,13 @@ enum RecordCaptureError {
     DatasetWriterFailed {
         item: RecordItem,
     },
+    DeviceClose {
+        source: DeviceCloseFailure,
+    },
+    CaptureAndDeviceClose {
+        capture: Box<RecordCaptureError>,
+        close: DeviceCloseFailure,
+    },
 }
 
 #[cfg(feature = "record")]
@@ -1641,7 +2503,16 @@ impl std::fmt::Display for RecordCaptureError {
         match self {
             Self::LeftImage { source } => write!(f, "left camera capture failed: {source}"),
             Self::RightImage { source } => write!(f, "right camera capture failed: {source}"),
+            Self::LeftFrame { source } => {
+                write!(f, "left camera returned an invalid frame: {source}")
+            }
+            Self::RightFrame { source } => {
+                write!(f, "right camera returned an invalid frame: {source}")
+            }
             Self::Depth { source } => write!(f, "depth camera capture failed: {source}"),
+            Self::DepthFrame { source } => {
+                write!(f, "depth camera contract failed: {source}")
+            }
             Self::PairingInput { source } => {
                 write!(f, "stereo pairing input failed: {source}")
             }
@@ -1652,6 +2523,10 @@ impl std::fmt::Display for RecordCaptureError {
             Self::DatasetWriterFailed { item } => {
                 write!(f, "dataset writer failed while enqueueing {item}")
             }
+            Self::DeviceClose { source } => write!(f, "OAK device close failed: {source}"),
+            Self::CaptureAndDeviceClose { capture, close } => {
+                write!(f, "{capture}; OAK device close also failed: {close}")
+            }
         }
     }
 }
@@ -1661,12 +2536,39 @@ impl std::error::Error for RecordCaptureError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LeftImage { source } | Self::RightImage { source } => Some(source),
+            Self::LeftFrame { source } | Self::RightFrame { source } => Some(source),
             Self::Depth { source } => Some(source),
+            Self::DepthFrame { source } => Some(source),
             Self::PairingInput { source } => Some(source),
             Self::DatasetWrite { source, .. } => Some(source),
+            Self::DeviceClose { source } => Some(source),
+            Self::CaptureAndDeviceClose { capture, .. } => Some(capture.as_ref()),
             Self::DatasetDropped { .. } | Self::DatasetWriterFailed { .. } => None,
         }
     }
+}
+
+#[cfg(feature = "record")]
+fn record_device_close_error(
+    capture: Option<RecordCaptureError>,
+    close: DeviceCloseFailure,
+) -> RecordCaptureError {
+    match capture {
+        None => RecordCaptureError::DeviceClose { source: close },
+        Some(capture) => RecordCaptureError::CaptureAndDeviceClose {
+            capture: Box::new(capture),
+            close,
+        },
+    }
+}
+
+#[cfg(feature = "record")]
+fn finite_rate_per_second(count: u64, elapsed_seconds: f64) -> f64 {
+    if !elapsed_seconds.is_finite() || elapsed_seconds <= 0.0 {
+        return 0.0;
+    }
+    let rate = count as f64 / elapsed_seconds;
+    if rate.is_finite() { rate } else { 0.0 }
 }
 
 #[cfg(feature = "record")]
@@ -1715,6 +2617,63 @@ impl std::error::Error for RecordError {
 }
 
 #[cfg(feature = "record")]
+impl RecordError {
+    fn with_device_close(self, close: DeviceCloseFailure) -> Self {
+        match self {
+            Self::Capture { source } => Self::Capture {
+                source: record_device_close_error(Some(source), close),
+            },
+            Self::Finalization { source } => Self::CaptureAndFinalization {
+                capture: record_device_close_error(None, close),
+                finalization: source,
+            },
+            Self::CaptureAndFinalization {
+                capture,
+                finalization,
+            } => Self::CaptureAndFinalization {
+                capture: record_device_close_error(Some(capture), close),
+                finalization,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+fn compose_record_errors(
+    capture: Option<RecordCaptureError>,
+    finalization: Option<Box<DatasetError>>,
+) -> Option<RecordError> {
+    match (capture, finalization) {
+        (None, None) => None,
+        (Some(source), None) => Some(RecordError::Capture { source }),
+        (None, Some(source)) => Some(RecordError::Finalization { source }),
+        (Some(capture), Some(finalization)) => Some(RecordError::CaptureAndFinalization {
+            capture,
+            finalization,
+        }),
+    }
+}
+
+#[cfg(feature = "record")]
+fn finish_record_device_session(
+    operation: Result<(), Box<dyn std::error::Error>>,
+    close: Result<(), OakCloseError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (operation, close.map_err(DeviceCloseFailure::new)) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(close)) => Err(RecordError::Capture {
+            source: record_device_close_error(None, close),
+        }
+        .into()),
+        (Err(operation), Err(close)) => match operation.downcast::<RecordError>() {
+            Ok(record) => Err(Box::new((*record).with_device_close(close))),
+            Err(operation) => Err(Box::new(OperationAndDeviceCloseError { operation, close })),
+        },
+    }
+}
+
+#[cfg(feature = "record")]
 fn require_record_write(
     outcome: Result<WriteOutcome, DatasetWriteError>,
     item: RecordItem,
@@ -1749,7 +2708,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         width: mono_config.width,
         height: mono_config.height,
         fps: mono_config.fps,
-        align_to_rgb: false,
+        alignment: DepthAlignment::RectifiedLeft,
     });
 
     let config = DeviceConfig {
@@ -1765,166 +2724,170 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("connecting to oak-d...");
     let mut device = Device::connect("", config)?;
-    let baseline_m = device.stereo_baseline_m();
+    let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let pairing_window = load_pairing_window()?;
+        let pairer_max_pending = load_pairer_max_pending_per_side()?;
+        let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
+        let StereoBootstrap {
+            calibration,
+            rectified_left_intrinsics,
+        } = bootstrap_stereo(&mut device, &mono_config, running.as_ref(), &mut pairer)?;
 
-    let meta = build_meta(&mono_config, depth_config.as_ref(), None);
-    let calibration = build_calibration(&device, baseline_m, &mono_config);
-    let pairing_window = load_pairing_window()?;
+        let meta = build_meta(&mono_config, depth_config.as_ref(), None);
+        eprintln!("creating dataset at {}", output_path.display());
+        let (writer, writer_handle) =
+            DatasetWriter::create_paired(output_path, &meta, &calibration, pairing_window)?;
 
-    eprintln!("creating dataset at {}", output_path.display());
-    let (writer, writer_handle) =
-        DatasetWriter::create_paired(output_path, &meta, &calibration, pairing_window)?;
+        let start = Instant::now();
+        let mut pair_count = 0u64;
+        let mut left_count = 1u64;
+        let mut right_count = 1u64;
+        let mut depth_count = 0u64;
+        let mut left_seq = 1u64;
+        let mut right_seq = 1u64;
+        let mut capture_error = None;
 
-    let mut pair_count = 0u64;
-    let mut left_count = 0u64;
-    let mut right_count = 0u64;
-    let mut depth_count = 0u64;
-    let mut left_seq = 0u64;
-    let mut right_seq = 0u64;
-    let pairer_max_pending = load_pairer_max_pending_per_side()?;
-    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
-    let start = Instant::now();
-    let mut capture_error = None;
+        eprintln!("recording... press ctrl+c to stop");
 
-    eprintln!("recording... press ctrl+c to stop");
+        'capture: while running.load(Ordering::Relaxed) {
+            let mut got_any = false;
 
-    'capture: while running.load(Ordering::Relaxed) {
-        let mut got_any = false;
-
-        match device.mono_left(0) {
-            Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+            match device.mono_left(0) {
                 Ok(frame) => {
-                    if let Err(source) = pairer.push_left(frame) {
-                        capture_error = Some(RecordCaptureError::PairingInput { source });
-                        break 'capture;
-                    }
-                    left_count += 1;
-                    left_seq += 1;
-                    got_any = true;
-                }
-                Err(err) => {
-                    eprintln!("left frame dropped (invalid dimensions): {err}");
-                }
-            },
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(source) => {
-                capture_error = Some(RecordCaptureError::LeftImage { source });
-                break 'capture;
-            }
-        }
-
-        match device.mono_right(0) {
-            Ok(frame) => {
-                match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
-                    Ok(frame) => {
-                        if let Err(source) = pairer.push_right(frame) {
-                            capture_error = Some(RecordCaptureError::PairingInput { source });
+                    match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                        Ok(frame) => {
+                            if let Err(source) = pairer.push_left(frame) {
+                                capture_error = Some(RecordCaptureError::PairingInput { source });
+                                break 'capture;
+                            }
+                            left_count += 1;
+                            left_seq += 1;
+                            got_any = true;
+                        }
+                        Err(source) => {
+                            capture_error = Some(RecordCaptureError::LeftFrame { source });
                             break 'capture;
                         }
-                        right_count += 1;
-                        right_seq += 1;
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("right frame dropped (invalid dimensions): {err}");
                     }
                 }
-            }
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(source) => {
-                capture_error = Some(RecordCaptureError::RightImage { source });
-                break 'capture;
-            }
-        }
-
-        if depth_enabled {
-            match device.depth(0) {
-                Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
-                    Ok(depth) => {
-                        if let Err(err) =
-                            require_record_write(writer.write_depth(&depth), RecordItem::DepthFrame)
-                        {
-                            capture_error = Some(err);
-                            break 'capture;
-                        }
-                        depth_count = depth_count.saturating_add(1);
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("depth frame dropped (invalid dimensions): {err}");
-                    }
-                },
-                Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
                 Err(source) => {
-                    capture_error = Some(RecordCaptureError::Depth { source });
+                    capture_error = Some(RecordCaptureError::LeftImage { source });
                     break 'capture;
                 }
             }
-        }
 
-        loop {
-            let pair = match pairer.next_pair() {
-                Some(pair) => pair,
-                None => break,
-            };
-            if let Err(err) = require_record_write(writer.write_pair(pair), RecordItem::StereoPair)
-            {
-                capture_error = Some(err);
-                break 'capture;
+            match device.mono_right(0) {
+                Ok(frame) => {
+                    match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
+                        Ok(frame) => {
+                            if let Err(source) = pairer.push_right(frame) {
+                                capture_error = Some(RecordCaptureError::PairingInput { source });
+                                break 'capture;
+                            }
+                            right_count += 1;
+                            right_seq += 1;
+                            got_any = true;
+                        }
+                        Err(source) => {
+                            capture_error = Some(RecordCaptureError::RightFrame { source });
+                            break 'capture;
+                        }
+                    }
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    capture_error = Some(RecordCaptureError::RightImage { source });
+                    break 'capture;
+                }
             }
-            pair_count += 1;
 
-            if pair_count.is_multiple_of(30) {
-                eprintln!("captured {pair_count} stereo pairs");
+            if depth_enabled {
+                match device.depth(0) {
+                    Ok(depth_frame) => {
+                        match parse_rectified_left_depth(depth_frame, rectified_left_intrinsics) {
+                            Ok(depth) => {
+                                if let Err(err) = require_record_write(
+                                    writer.write_depth(&depth),
+                                    RecordItem::DepthFrame,
+                                ) {
+                                    capture_error = Some(err);
+                                    break 'capture;
+                                }
+                                depth_count = depth_count.saturating_add(1);
+                                got_any = true;
+                            }
+                            Err(source) => {
+                                capture_error = Some(RecordCaptureError::DepthFrame { source });
+                                break 'capture;
+                            }
+                        }
+                    }
+                    Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                    Err(source) => {
+                        capture_error = Some(RecordCaptureError::Depth { source });
+                        break 'capture;
+                    }
+                }
+            }
+
+            while let Some(pair) = pairer.next_pair() {
+                if let Err(err) =
+                    require_record_write(writer.write_pair(pair), RecordItem::StereoPair)
+                {
+                    capture_error = Some(err);
+                    break 'capture;
+                }
+                pair_count += 1;
+
+                if pair_count.is_multiple_of(30) {
+                    eprintln!("captured {pair_count} stereo pairs");
+                }
+            }
+
+            if !got_any {
+                thread::sleep(Duration::from_micros(500));
             }
         }
 
-        if !got_any {
-            thread::sleep(Duration::from_micros(500));
+        let elapsed = start.elapsed().as_secs_f64();
+        let pairer_stats = pairer.stats();
+        drop(writer);
+        let finalization = writer_handle.finish();
+        if let Ok(stats) = &finalization {
+            let timed_left_count = left_count.saturating_sub(1);
+            let timed_right_count = right_count.saturating_sub(1);
+            eprintln!(
+                "finished timed capture in {:.1}s: pairs={}, left={} (1 bootstrap + {} timed, {:.1} timed fps), right={} (1 bootstrap + {} timed, {:.1} timed fps), depth={} ({:.1}fps), written={}, dropped={}",
+                elapsed,
+                pair_count,
+                left_count,
+                timed_left_count,
+                finite_rate_per_second(timed_left_count, elapsed),
+                right_count,
+                timed_right_count,
+                finite_rate_per_second(timed_right_count, elapsed),
+                depth_count,
+                finite_rate_per_second(depth_count, elapsed),
+                stats.frames_written,
+                stats.frames_dropped
+            );
         }
-    }
-
-    let elapsed = start.elapsed().as_secs_f64();
-    let pairer_stats = pairer.stats();
-    drop(writer);
-    let finalization = writer_handle.finish();
-    if let Ok(stats) = &finalization {
         eprintln!(
-            "finished in {:.1}s: pairs={}, left={} ({:.1}fps), right={} ({:.1}fps), depth={} ({:.1}fps), written={}, dropped={}",
-            elapsed,
-            pair_count,
-            left_count,
-            left_count as f64 / elapsed,
-            right_count,
-            right_count as f64 / elapsed,
-            depth_count,
-            depth_count as f64 / elapsed,
-            stats.frames_written,
-            stats.frames_dropped
+            "pairer stats: window_ns={} max_pending_per_side={} paired={} dropped_left={} dropped_right={} outside_window={}",
+            pairer.window().as_ns(),
+            pairer.max_pending_per_side(),
+            pairer_stats.paired,
+            pairer_stats.dropped_left,
+            pairer_stats.dropped_right,
+            pairer_stats.outside_window
         );
-    }
-    eprintln!(
-        "pairer stats: window_ns={} max_pending_per_side={} paired={} dropped_left={} dropped_right={} outside_window={}",
-        pairer.window().as_ns(),
-        pairer.max_pending_per_side(),
-        pairer_stats.paired,
-        pairer_stats.dropped_left,
-        pairer_stats.dropped_right,
-        pairer_stats.outside_window
-    );
-    match (capture_error, finalization) {
-        (None, Ok(_)) => Ok(()),
-        (Some(source), Ok(_)) => Err(RecordError::Capture { source }.into()),
-        (None, Err(source)) => Err(RecordError::Finalization {
-            source: Box::new(source),
+        match compose_record_errors(capture_error, finalization.err().map(Box::new)) {
+            None => Ok(()),
+            Some(error) => Err(error.into()),
         }
-        .into()),
-        (Some(capture), Err(finalization)) => Err(RecordError::CaptureAndFinalization {
-            capture,
-            finalization: Box::new(finalization),
-        }
-        .into()),
-    }
+    })();
+    finish_record_device_session(operation, device.close())
 }
 
 #[cfg(feature = "record")]
@@ -1942,38 +2905,204 @@ struct LiveVizMsg {
 }
 
 #[cfg(feature = "record")]
+fn log_live_viz_message(sink: &mut RerunSink, msg: LiveVizMsg) -> Result<(), VizLogError> {
+    if let Some(packet) = msg.packet.as_ref() {
+        sink.log_with_points(packet, msg.points.as_deref())?;
+    } else {
+        sink.log_frames(&msg.left, &msg.right)?;
+    }
+    if let Some(depth) = msg.depth.as_ref() {
+        sink.log_depth(depth)?;
+    }
+    if let Some(pose) = msg.pose.as_ref() {
+        sink.log_pose(msg.left.timestamp(), pose)?;
+    }
+    sink.log_system_health(msg.left.timestamp(), &msg.health)?;
+    sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics)?;
+    for event in &msg.events {
+        sink.log_event(msg.left.timestamp(), event)?;
+    }
+    if let Some(ref dense_stats) = msg.dense_stats {
+        sink.log_dense_stats(msg.left.timestamp(), dense_stats)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDenseCommandClass {
+    IntegrationData,
+    OrderedControl,
+}
+
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDenseRouteContext {
+    TrackerOutput,
+    PoseUpdateAfterTrackerError,
+}
+
+#[cfg(any(feature = "record", test))]
+impl std::fmt::Display for LiveDenseRouteContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrackerOutput => f.write_str("tracker output"),
+            Self::PoseUpdateAfterTrackerError => f.write_str("pose update after tracker error"),
+        }
+    }
+}
+
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDenseRouteDisposition {
+    Enqueued,
+    IntegrationDroppedNewest,
+    Disconnected,
+}
+
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDenseRouteError {
+    ControlTimedOut { context: LiveDenseRouteContext },
+    ControlMisclassifiedAsIntegration { context: LiveDenseRouteContext },
+}
+
+#[cfg(any(feature = "record", test))]
+impl std::fmt::Display for LiveDenseRouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ControlTimedOut { context } => {
+                write!(f, "dense ordered control timed out while routing {context}")
+            }
+            Self::ControlMisclassifiedAsIntegration { context } => write!(
+                f,
+                "dense router misclassified ordered control as integration data while routing {context}"
+            ),
+        }
+    }
+}
+
+#[cfg(any(feature = "record", test))]
+impl std::error::Error for LiveDenseRouteError {}
+
+#[cfg(any(feature = "record", test))]
+fn classify_live_dense_route(
+    outcome: DenseCommandSendOutcome,
+    command_class: LiveDenseCommandClass,
+    context: LiveDenseRouteContext,
+) -> Result<LiveDenseRouteDisposition, LiveDenseRouteError> {
+    match outcome {
+        DenseCommandSendOutcome::Enqueued => Ok(LiveDenseRouteDisposition::Enqueued),
+        DenseCommandSendOutcome::IntegrationDroppedNewest => match command_class {
+            LiveDenseCommandClass::IntegrationData => {
+                Ok(LiveDenseRouteDisposition::IntegrationDroppedNewest)
+            }
+            LiveDenseCommandClass::OrderedControl => {
+                Err(LiveDenseRouteError::ControlMisclassifiedAsIntegration { context })
+            }
+        },
+        DenseCommandSendOutcome::ControlTimedOut => {
+            Err(LiveDenseRouteError::ControlTimedOut { context })
+        }
+        DenseCommandSendOutcome::Disconnected => Ok(LiveDenseRouteDisposition::Disconnected),
+    }
+}
+
+#[cfg(feature = "record")]
 #[derive(Debug)]
 enum LiveThreadError {
-    VizChannelDisconnected,
-    RerunConnect { detail: String },
-    VisualizationConfiguration { source: VizConfigError },
-    VisualizationPacket { source: VizError },
+    RerunConnect {
+        source: rerun::RecordingStreamError,
+    },
+    VisualizationConfiguration {
+        source: VizConfigError,
+    },
+    VisualizationLog {
+        source: VizLogError,
+    },
+    VisualizationFinalization {
+        source: VizFlushError,
+    },
+    VisualizationLogAndFinalization {
+        logging: VizLogError,
+        finalization: VizFlushError,
+    },
+    VisualizationPacket {
+        source: VizError,
+    },
     DenseCommandGeneration(command_mapper::DenseCommandGenerationError),
-    InferenceUnavailable { detail: String },
-    TrackerInitialization { source: TrackerInitError },
-    FrameProcessingPanic { detail: String },
+    DenseCommandMapping(command_mapper::DenseCommandMappingError),
+    DenseCommandRoute(LiveDenseRouteError),
+    InferenceUnavailable {
+        source: TrackerError,
+    },
+    DenseCommandRouteAndInferenceUnavailable {
+        routing: LiveDenseRouteError,
+        inference: TrackerError,
+    },
+    DenseCommandGenerationAndInferenceUnavailable {
+        generation: command_mapper::DenseCommandGenerationError,
+        inference: TrackerError,
+    },
+    TrackerInitialization {
+        source: TrackerInitError,
+    },
+    FrameProcessingPanic {
+        detail: String,
+    },
 }
 
 #[cfg(feature = "record")]
 impl std::fmt::Display for LiveThreadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LiveThreadError::VizChannelDisconnected => write!(f, "viz channel disconnected"),
-            LiveThreadError::RerunConnect { detail } => {
-                write!(f, "failed to connect to rerun viewer: {detail}")
+            LiveThreadError::RerunConnect { source } => {
+                write!(f, "failed to connect to rerun viewer: {source}")
             }
             LiveThreadError::VisualizationConfiguration { source } => {
                 write!(f, "invalid live visualization configuration: {source}")
             }
+            LiveThreadError::VisualizationLog { source } => {
+                write!(f, "live visualization logging failed: {source}")
+            }
+            LiveThreadError::VisualizationFinalization { source } => {
+                write!(f, "live visualization finalization failed: {source}")
+            }
+            LiveThreadError::VisualizationLogAndFinalization {
+                logging,
+                finalization,
+            } => write!(
+                f,
+                "live visualization logging failed: {logging}; finalization also failed: {finalization}"
+            ),
             LiveThreadError::VisualizationPacket { source } => {
                 write!(f, "invalid live visualization packet: {source}")
             }
             LiveThreadError::DenseCommandGeneration(source) => {
                 write!(f, "live dense command sequencing failed: {source}")
             }
-            LiveThreadError::InferenceUnavailable { detail } => {
-                write!(f, "inference pipeline is unavailable: {detail}")
+            LiveThreadError::DenseCommandMapping(source) => {
+                write!(f, "live dense command mapping failed: {source}")
             }
+            LiveThreadError::DenseCommandRoute(source) => {
+                write!(f, "live dense command routing failed: {source}")
+            }
+            LiveThreadError::InferenceUnavailable { source } => {
+                write!(f, "inference pipeline is unavailable: {source}")
+            }
+            LiveThreadError::DenseCommandRouteAndInferenceUnavailable { routing, inference } => {
+                write!(
+                    f,
+                    "live dense command routing failed: {routing}; inference pipeline is also unavailable: {inference}"
+                )
+            }
+            LiveThreadError::DenseCommandGenerationAndInferenceUnavailable {
+                generation,
+                inference,
+            } => write!(
+                f,
+                "live dense command sequencing failed: {generation}; inference pipeline is also unavailable: {inference}"
+            ),
             LiveThreadError::TrackerInitialization { source } => {
                 write!(f, "tracker initialization failed: {source}")
             }
@@ -1989,13 +3118,21 @@ impl std::error::Error for LiveThreadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::VisualizationConfiguration { source } => Some(source),
+            Self::VisualizationLog { source } => Some(source),
+            Self::VisualizationFinalization { source } => Some(source),
+            Self::VisualizationLogAndFinalization { logging, .. } => Some(logging),
             Self::VisualizationPacket { source } => Some(source),
             Self::DenseCommandGeneration(source) => Some(source),
+            Self::DenseCommandMapping(source) => Some(source),
+            Self::DenseCommandRoute(source) => Some(source),
+            Self::InferenceUnavailable { source } => Some(source),
+            Self::DenseCommandRouteAndInferenceUnavailable { routing, .. } => Some(routing),
+            Self::DenseCommandGenerationAndInferenceUnavailable { generation, .. } => {
+                Some(generation)
+            }
             Self::TrackerInitialization { source } => Some(source),
-            Self::VizChannelDisconnected
-            | Self::RerunConnect { .. }
-            | Self::InferenceUnavailable { .. }
-            | Self::FrameProcessingPanic { .. } => None,
+            Self::RerunConnect { source } => Some(source),
+            Self::FrameProcessingPanic { .. } => None,
         }
     }
 }
@@ -2008,12 +3145,178 @@ impl From<command_mapper::DenseCommandGenerationError> for LiveThreadError {
 }
 
 #[cfg(feature = "record")]
+impl From<command_mapper::DenseCommandMappingError> for LiveThreadError {
+    fn from(source: command_mapper::DenseCommandMappingError) -> Self {
+        Self::DenseCommandMapping(source)
+    }
+}
+
+#[cfg(feature = "record")]
+impl From<LiveDenseRouteError> for LiveThreadError {
+    fn from(source: LiveDenseRouteError) -> Self {
+        Self::DenseCommandRoute(source)
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum LiveWorkerFailure {
+    Capture(LiveCaptureError),
+    Inference(LiveThreadError),
+    InferencePanic { detail: String },
+    Occupancy(OccupancyRuntimeError),
+    OccupancyPanic { detail: String },
+    Visualization(LiveThreadError),
+    VisualizationPanic { detail: String },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveWorkerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture(source) => write!(f, "live capture failed: {source}"),
+            Self::Inference(source) => write!(f, "live inference worker failed: {source}"),
+            Self::InferencePanic { detail } => {
+                write!(f, "live inference worker panicked: {detail}")
+            }
+            Self::Occupancy(source) => write!(f, "live occupancy worker failed: {source}"),
+            Self::OccupancyPanic { detail } => {
+                write!(f, "live occupancy worker panicked: {detail}")
+            }
+            Self::Visualization(source) => {
+                write!(f, "live visualization worker failed: {source}")
+            }
+            Self::VisualizationPanic { detail } => {
+                write!(f, "live visualization worker panicked: {detail}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveWorkerFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Capture(source) => Some(source),
+            Self::Inference(source) | Self::Visualization(source) => Some(source),
+            Self::Occupancy(source) => Some(source),
+            Self::InferencePanic { .. }
+            | Self::OccupancyPanic { .. }
+            | Self::VisualizationPanic { .. } => None,
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+struct LiveRunError {
+    failures: Vec<LiveWorkerFailure>,
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "live session failed")?;
+        for (index, failure) in self.failures.iter().enumerate() {
+            write!(f, "; failure {}: {failure}", index + 1)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures
+            .first()
+            .map(|failure| failure as &(dyn std::error::Error + 'static))
+    }
+}
+
+#[cfg(feature = "record")]
 struct LiveThreadExitGuard(Arc<AtomicBool>);
 
 #[cfg(feature = "record")]
 impl Drop for LiveThreadExitGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum LiveCaptureError {
+    LeftImage { source: ImageError },
+    RightImage { source: ImageError },
+    LeftFrame { source: FrameError },
+    RightFrame { source: FrameError },
+    PairingInput { source: PairingInputError },
+    Depth { source: DepthError },
+    DepthFrame { source: RectifiedLeftDepthError },
+    DeviceClose { source: DeviceCloseFailure },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveCaptureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LeftImage { source } => write!(f, "left camera capture failed: {source}"),
+            Self::RightImage { source } => write!(f, "right camera capture failed: {source}"),
+            Self::LeftFrame { source } => {
+                write!(f, "left camera returned an invalid frame: {source}")
+            }
+            Self::RightFrame { source } => {
+                write!(f, "right camera returned an invalid frame: {source}")
+            }
+            Self::PairingInput { source } => write!(f, "stereo pairing input failed: {source}"),
+            Self::Depth { source } => write!(f, "depth camera capture failed: {source}"),
+            Self::DepthFrame { source } => write!(f, "depth camera contract failed: {source}"),
+            Self::DeviceClose { source } => write!(f, "OAK device close failed: {source}"),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LeftImage { source } | Self::RightImage { source } => Some(source),
+            Self::LeftFrame { source } | Self::RightFrame { source } => Some(source),
+            Self::PairingInput { source } => Some(source),
+            Self::Depth { source } => Some(source),
+            Self::DepthFrame { source } => Some(source),
+            Self::DeviceClose { source } => Some(source),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+fn finish_live_device_session(
+    operation: Result<(), Box<dyn std::error::Error>>,
+    close: Result<(), OakCloseError>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match (operation, close.map_err(DeviceCloseFailure::new)) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(()), Err(source)) => Err(LiveRunError {
+            failures: vec![LiveWorkerFailure::Capture(LiveCaptureError::DeviceClose {
+                source,
+            })],
+        }
+        .into()),
+        (Err(operation), Err(source)) => match operation.downcast::<LiveRunError>() {
+            Ok(mut live) => {
+                live.failures
+                    .push(LiveWorkerFailure::Capture(LiveCaptureError::DeviceClose {
+                        source,
+                    }));
+                Err(live)
+            }
+            Err(operation) => Err(Box::new(OperationAndDeviceCloseError {
+                operation,
+                close: source,
+            })),
+        },
     }
 }
 
@@ -2056,7 +3359,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             width: mono_config.width,
             height: mono_config.height,
             fps: mono_config.fps,
-            align_to_rgb: false,
+            alignment: DepthAlignment::RectifiedLeft,
         }),
         imu: None,
         queue: QueueConfig {
@@ -2067,529 +3370,661 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("connecting to oak-d...");
     let mut device = Device::connect("", config)?;
+    let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let pairing_window = load_pairing_window()?;
+        let pairer_max_pending = load_pairer_max_pending_per_side()?;
+        let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
+        let StereoBootstrap {
+            calibration,
+            rectified_left_intrinsics,
+        } = bootstrap_stereo(&mut device, &mono_config, running.as_ref(), &mut pairer)?;
 
-    let pairing_window = load_pairing_window()?;
-    let pairer_max_pending = load_pairer_max_pending_per_side()?;
-    let mut pairer = StereoPairer::new_with_max_pending(pairing_window, pairer_max_pending)?;
+        let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH")?.unwrap_or(12);
+        let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
+        let (pair_tx, pair_rx, pair_stats) =
+            bounded_channel::<StereoPair>(pair_capacity, DropPolicy::DropOldest);
 
-    let pair_queue_depth = env_usize("KIKO_LIVE_PAIR_QUEUE_DEPTH")?.unwrap_or(12);
-    let pair_capacity = ChannelCapacity::try_from(pair_queue_depth)?;
-    let (pair_tx, pair_rx, pair_stats) =
-        bounded_channel::<StereoPair>(pair_capacity, DropPolicy::DropOldest);
+        let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
+        let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
+        let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
+        let (depth_tx, depth_rx, depth_stats_handle) =
+            if let Some(depth_capacity) = depth_queue_capacity {
+                let (depth_tx, depth_rx, depth_stats) =
+                    bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
+                (Some(depth_tx), Some(depth_rx), Some(depth_stats))
+            } else {
+                (None, None, None)
+            };
 
-    let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
-    let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
-    let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
-    let (depth_tx, depth_rx, depth_stats_handle) =
-        if let Some(depth_capacity) = depth_queue_capacity {
-            let (depth_tx, depth_rx, depth_stats) =
-                bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
-            (Some(depth_tx), Some(depth_rx), Some(depth_stats))
-        } else {
-            (None, None, None)
-        };
-
-    let inference = InferenceConfig::from_args(&args.inference)?;
-    let InferenceConfig {
-        superpoint_left,
-        superpoint_right,
-        lightglue,
-        key_limit,
-        downscale,
-    } = inference;
-
-    let calibration = build_calibration(&device, device.stereo_baseline_m(), &mono_config);
-    let rectified = RectifiedStereo::from_calibration(&calibration)?;
-    let tracker_config = build_tracker_config(
-        TrackerDefaults {
-            min_keyframe_points: 80,
-            refresh_inliers: 20,
-            min_inliers: 15,
-        },
-        key_limit,
-        downscale,
-    )?;
-
-    eprintln!(
-        "live: pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
-        pair_queue_depth,
-        viz_queue_depth,
-        depth_enabled,
-        depth_queue_capacity.map_or(0, ChannelCapacity::get),
-        pairer.window().as_ns(),
-        pairer.max_pending_per_side()
-    );
-
-    // Dense reconstruction channels and worker thread.
-    let dense_enabled = if depth_enabled {
-        env_bool("KIKO_DENSE")?.unwrap_or(false)
-    } else {
-        false
-    };
-    let dense_capacities = if dense_enabled {
-        Some((
-            ChannelCapacity::try_from(env_usize("KIKO_DENSE_DATA_QUEUE_DEPTH")?.unwrap_or(4))?,
-            ChannelCapacity::try_from(env_usize("KIKO_DENSE_CTRL_QUEUE_DEPTH")?.unwrap_or(64))?,
-        ))
-    } else {
-        None
-    };
-
-    // Use one FIFO so reset/rebuild commands cannot overtake or be overtaken
-    // by causally adjacent integrations and removals. The data quota reserves
-    // the configured control headroom within the bounded queue.
-    let mut dense_command_tx: Option<DenseCommandSender> = None;
-    let mut dense_command_rx_for_worker: Option<DenseCommandReceiver> = None;
-    let mut dense_command_stats_handle: Option<DenseCommandQueueStatsHandle> = None;
-    let mut dense_stats_tx_for_worker: Option<kiko_slam::DropSender<DenseStats>> = None;
-    let mut dense_stats_rx: Option<kiko_slam::DropReceiver<DenseStats>> = None;
-
-    if let Some((data_cap, ctrl_cap)) = dense_capacities {
-        let (command_tx, command_rx, command_stats) =
-            dense_command_channel(data_cap, ctrl_cap, Duration::from_millis(5))?;
-        let stats_cap = ChannelCapacity::try_from(1_usize)?;
-        let (stats_tx, stats_rx_inner, _stats_handle) =
-            bounded_channel(stats_cap, DropPolicy::DropNewest);
-        dense_command_tx = Some(command_tx);
-        dense_command_rx_for_worker = Some(command_rx);
-        dense_command_stats_handle = Some(command_stats);
-        dense_stats_tx_for_worker = Some(stats_tx);
-        dense_stats_rx = Some(stats_rx_inner);
-    }
-
-    let dense_handle = if let (Some(command_rx), stats_tx) = (
-        dense_command_rx_for_worker.take(),
-        dense_stats_tx_for_worker.take(),
-    ) {
-        let cfg = DenseConfig::default();
-        Some(thread::spawn(move || {
-            kiko_slam::dense::run_dense_worker(&cfg, &command_rx, None, stats_tx.as_ref());
-        }))
-    } else {
-        None
-    };
-
-    let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
-    let inference_running = Arc::clone(&running);
-    let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
-        let _exit_guard = LiveThreadExitGuard(inference_running);
-        let mut tracker = SlamTracker::try_new(
+        let inference = InferenceConfig::from_args(&args.inference)?;
+        let InferenceConfig {
             superpoint_left,
             superpoint_right,
             lightglue,
-            rectified,
-            tracker_config,
-        )
-        .map_err(|source| LiveThreadError::TrackerInitialization { source })?;
-        report_tracker_runtime(&tracker_config, &tracker);
-        let depth_rx = depth_rx;
-        let depth_enabled_for_diagnostics = depth_rx.is_some();
-        let mut dense_generation = command_mapper::DenseCommandGeneration::default();
-        let mut dense_command_tx = dense_command_tx;
-        let dense_stats_rx = dense_stats_rx;
-        let mut dense_active = dense_enabled;
-        let mut dense_integrations_dropped_newest: u64 = 0;
-        let mut depth_reorder_warnings_seen: u64 = 0;
+            key_limit,
+            downscale,
+        } = inference;
 
-        for pair in pair_rx.iter() {
-            let left = pair.left().clone();
-            let right = pair.right().clone();
-            let timestamp = left.timestamp();
-            let depth_batch = depth_rx.as_ref().map(drain_depth_batch).unwrap_or_default();
-            let depth = depth_batch.last().cloned();
-            for depth_image in depth_batch {
-                depth_ring.push(depth_image);
-            }
-            let reorder_warnings = depth_ring.reorder_warnings();
-            if reorder_warnings > depth_reorder_warnings_seen {
-                depth_reorder_warnings_seen = reorder_warnings;
-                eprintln!(
-                    "depth ring observed out-of-order timestamps (count={depth_reorder_warnings_seen})"
-                );
-            }
-            let process_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tracker.process(pair)));
-            match process_result {
-                Ok(Ok(mut output)) => {
-                    // Map tracker output to dense commands.
-                    let correction = tracker.take_pending_loop_correction();
-                    let dense_stats = if dense_active {
-                        let cmds = command_mapper::map_output_to_dense_commands(
-                            &output,
-                            correction,
-                            &depth_ring,
-                            timestamp,
-                            &mut dense_generation,
-                        )?;
-                        for cmd in cmds {
-                            if let Some(ref tx) = dense_command_tx {
-                                match tx.route(cmd) {
-                                    DenseCommandSendOutcome::Enqueued => {}
-                                    DenseCommandSendOutcome::IntegrationDroppedNewest => {
-                                        dense_integrations_dropped_newest =
-                                            dense_integrations_dropped_newest.saturating_add(1);
-                                    }
-                                    DenseCommandSendOutcome::ControlTimedOut => {
-                                        dense_active = false;
-                                        dense_command_tx = None;
-                                        eprintln!(
-                                            "dense ordered command queue timed out accepting control; disabling dense"
-                                        );
-                                        break;
-                                    }
-                                    DenseCommandSendOutcome::Disconnected => {
-                                        dense_active = false;
-                                        dense_command_tx = None;
-                                        eprintln!(
-                                            "dense ordered command queue disconnected; disabling dense"
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        // Drain latest dense stats for viz.
-                        dense_stats_rx
-                            .as_ref()
-                            .and_then(|rx| std::iter::from_fn(|| rx.try_recv().ok()).last())
-                    } else {
-                        None
-                    };
-                    if let Some(ref stats) = dense_stats
-                        && stats.state == ReconState::Down
-                    {
-                        dense_active = false;
-                        dense_command_tx = None;
-                        eprintln!("dense worker entered Down state; disabling dense");
-                    }
+        let rectified = RectifiedStereo::from_calibration(&calibration)?;
+        let tracker_config = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 80,
+                refresh_inliers: 20,
+                min_inliers: 15,
+            },
+            key_limit,
+            downscale,
+        )?;
 
-                    if depth_enabled_for_diagnostics {
-                        output.diagnostics_mut().depth_reorder_warnings =
-                            Some(depth_reorder_warnings_seen);
-                    }
-                    let mut packet = None;
-                    let mut points = None;
-                    if let Some(matches) = output.take_stereo_matches() {
-                        if let Some(keyframe) = output.keyframe() {
-                            points = Some(keyframe.landmarks().to_vec());
-                        }
-                        packet = Some(
-                            VizPacket::try_new(left.clone(), right.clone(), matches).map_err(
-                                |source| LiveThreadError::VisualizationPacket { source },
-                            )?,
-                        );
-                    }
-                    let (pose, health, diagnostics, events) = output.into_status_parts();
-                    let msg = LiveVizMsg {
-                        left,
-                        right,
-                        depth,
-                        pose,
-                        packet,
-                        points,
-                        health,
-                        diagnostics,
-                        events,
-                        dense_stats,
-                    };
-                    if matches!(viz_tx.try_send(msg), SendOutcome::Disconnected) {
-                        return Err(LiveThreadError::VizChannelDisconnected);
-                    }
-                }
-                Ok(Err(err)) => {
-                    if err.requires_pipeline_shutdown() {
-                        return Err(LiveThreadError::InferenceUnavailable {
-                            detail: err.to_string(),
-                        });
-                    }
-                    if dense_active && let Some(correction) = tracker.take_pending_loop_correction()
-                    {
-                        let rebuild_cmd = command_mapper::rebuild_from_snapshot_command(
-                            correction,
-                            &mut dense_generation,
-                        )?;
-                        if let Some(ref tx) = dense_command_tx {
-                            match tx.route(rebuild_cmd) {
-                                DenseCommandSendOutcome::Enqueued => {}
-                                DenseCommandSendOutcome::ControlTimedOut => {
-                                    dense_active = false;
-                                    dense_command_tx = None;
-                                    eprintln!(
-                                        "dense ordered command queue timed out accepting rebuild after tracker error; disabling dense"
-                                    );
-                                }
-                                DenseCommandSendOutcome::Disconnected => {
-                                    dense_active = false;
-                                    dense_command_tx = None;
-                                    eprintln!(
-                                        "dense ordered command queue disconnected after tracker error; disabling dense"
-                                    );
-                                }
-                                DenseCommandSendOutcome::IntegrationDroppedNewest => {
-                                    dense_active = false;
-                                    dense_command_tx = None;
-                                    eprintln!(
-                                        "dense command router rejected a rebuild as integration data; disabling dense"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    eprintln!("tracker error: {err}");
-                }
-                Err(payload) => {
-                    return Err(LiveThreadError::FrameProcessingPanic {
-                        detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
-                    });
-                }
-            }
-        }
-        if dense_integrations_dropped_newest > 0 {
-            eprintln!(
-                "dense integrations dropped_newest (inference view): {dense_integrations_dropped_newest}"
+        eprintln!(
+            "live: pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
+            pair_queue_depth,
+            viz_queue_depth,
+            depth_enabled,
+            depth_queue_capacity.map_or(0, ChannelCapacity::get),
+            pairer.window().as_ns(),
+            pairer.max_pending_per_side()
+        );
+
+        // Dense reconstruction channels and worker thread.
+        let dense_enabled = if depth_enabled {
+            env_bool("KIKO_DENSE")?.unwrap_or(false)
+        } else {
+            false
+        };
+        let dense_capacities = if dense_enabled {
+            Some((
+                ChannelCapacity::try_from(env_usize("KIKO_DENSE_DATA_QUEUE_DEPTH")?.unwrap_or(4))?,
+                ChannelCapacity::try_from(env_usize("KIKO_DENSE_CTRL_QUEUE_DEPTH")?.unwrap_or(64))?,
+            ))
+        } else {
+            None
+        };
+        let occupancy_config = if dense_enabled {
+            let depth_projection = DepthProjectionContract::new(
+                rectified.dimensions(),
+                DepthOpticalFrame::RectifiedLeft,
             );
-        }
-        if depth_reorder_warnings_seen > 0 {
-            eprintln!("depth reorder warnings observed: {depth_reorder_warnings_seen}");
-        }
-        Ok(())
-    });
-
-    let decimation = args.rerun_decimation.get();
-    let viz_running = Arc::clone(&running);
-    let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
-        let _exit_guard = LiveThreadExitGuard(viz_running);
-        let rec = match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc() {
-            Ok(rec) => rec,
-            Err(err) => {
-                eprintln!("failed to connect to rerun viewer: {err}");
-                return Err(LiveThreadError::RerunConnect {
-                    detail: err.to_string(),
-                });
-            }
+            Some(build_occupancy_runtime_config(
+                rectified.left(),
+                rectified.dimensions(),
+                depth_projection,
+            )?)
+        } else {
+            None
         };
 
-        let mut sink = RerunSink::new(rec, decimation)
-            .map_err(|source| LiveThreadError::VisualizationConfiguration { source })?;
-        for msg in viz_rx.iter() {
-            if let Some(packet) = msg.packet.as_ref() {
-                if let Err(err) = sink.log_with_points(packet, msg.points.as_deref()) {
-                    eprintln!("rerun log error: {err}");
-                }
-            } else if let Err(err) = sink.log_frames(&msg.left, &msg.right) {
-                eprintln!("rerun log error: {err}");
-            }
-            if let Some(depth) = msg.depth.as_ref()
-                && let Err(err) = sink.log_depth(depth)
-            {
-                eprintln!("rerun log error: {err}");
-            }
+        // Use one FIFO so reset/rebuild commands cannot overtake or be overtaken
+        // by causally adjacent integrations and removals. The data quota reserves
+        // the configured control headroom within the bounded queue.
+        let mut dense_command_tx: Option<DenseCommandSender> = None;
+        let mut dense_command_rx_for_worker: Option<DenseCommandReceiver> = None;
+        let mut dense_command_stats_handle: Option<DenseCommandQueueStatsHandle> = None;
+        let mut dense_stats_tx_for_worker: Option<kiko_slam::DropSender<DenseStats>> = None;
+        let mut dense_stats_rx: Option<kiko_slam::DropReceiver<DenseStats>> = None;
+        let mut occupancy_snapshot_tx_for_worker = None;
+        let mut occupancy_snapshot_rx = None;
+        let mut occupancy_snapshot_stats_handle = None;
 
-            if let Some(pose) = msg.pose.as_ref()
-                && let Err(err) = sink.log_pose(msg.left.timestamp(), pose)
-            {
-                eprintln!("rerun log error: {err}");
-            }
-            if let Err(err) = sink.log_system_health(msg.left.timestamp(), &msg.health) {
-                eprintln!("rerun health error: {err}");
-            }
-            if let Err(err) = sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics) {
-                eprintln!("rerun diagnostics error: {err}");
-            }
-            for event in &msg.events {
-                if let Err(err) = sink.log_event(msg.left.timestamp(), event) {
-                    eprintln!("rerun event error: {err}");
-                }
-            }
-            if let Some(ref dense_stats) = msg.dense_stats
-                && let Err(err) = sink.log_dense_stats(msg.left.timestamp(), dense_stats)
-            {
-                eprintln!("rerun dense stats error: {err}");
-            }
-        }
-        Ok(())
-    });
-
-    let mut left_seq = 0u64;
-    let mut right_seq = 0u64;
-    let mut capture_error = None;
-
-    eprintln!("streaming matches... press ctrl+c to stop");
-
-    'capture: while running.load(Ordering::Relaxed) {
-        let mut got_any = false;
-
-        match device.mono_left(0) {
-            Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
-                Ok(frame) => {
-                    if let Err(error) = pairer.push_left(frame) {
-                        capture_error = Some(std::io::Error::other(error));
-                        break 'capture;
-                    }
-                    left_seq += 1;
-                    got_any = true;
-                }
-                Err(err) => {
-                    eprintln!("left frame dropped (invalid dimensions): {err}");
-                }
-            },
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                capture_error = Some(std::io::Error::other(format!(
-                    "left camera capture failed: {e:?}"
-                )));
-                break 'capture;
-            }
+        if let Some((data_cap, ctrl_cap)) = dense_capacities {
+            let (command_tx, command_rx, command_stats) =
+                dense_command_channel(data_cap, ctrl_cap, Duration::from_millis(5))?;
+            let stats_cap = ChannelCapacity::try_from(1_usize)?;
+            let (stats_tx, stats_rx_inner, _stats_handle) =
+                bounded_channel(stats_cap, DropPolicy::DropOldest);
+            let (snapshot_tx, snapshot_rx, snapshot_stats) =
+                bounded_channel(ChannelCapacity::try_from(1_usize)?, DropPolicy::DropOldest);
+            dense_command_tx = Some(command_tx);
+            dense_command_rx_for_worker = Some(command_rx);
+            dense_command_stats_handle = Some(command_stats);
+            dense_stats_tx_for_worker = Some(stats_tx);
+            dense_stats_rx = Some(stats_rx_inner);
+            occupancy_snapshot_tx_for_worker = Some(snapshot_tx);
+            occupancy_snapshot_rx = Some(snapshot_rx);
+            occupancy_snapshot_stats_handle = Some(snapshot_stats);
         }
 
-        match device.mono_right(0) {
-            Ok(frame) => {
-                match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
-                    Ok(frame) => {
-                        if let Err(error) = pairer.push_right(frame) {
-                            capture_error = Some(std::io::Error::other(error));
-                            break 'capture;
-                        }
-                        right_seq += 1;
-                        got_any = true;
-                    }
-                    Err(err) => {
-                        eprintln!("right frame dropped (invalid dimensions): {err}");
-                    }
-                }
-            }
-            Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
-            Err(e) => {
-                capture_error = Some(std::io::Error::other(format!(
-                    "right camera capture failed: {e:?}"
-                )));
-                break 'capture;
-            }
-        }
+        let dense_handle = if let (Some(config), Some(command_rx), stats_tx, snapshot_tx) = (
+            occupancy_config,
+            dense_command_rx_for_worker.take(),
+            dense_stats_tx_for_worker.take(),
+            occupancy_snapshot_tx_for_worker.take(),
+        ) {
+            Some(thread::spawn(move || {
+                kiko_slam::dense::occupancy_runtime::run_occupancy_worker(
+                    config,
+                    &command_rx,
+                    stats_tx.as_ref(),
+                    snapshot_tx,
+                )
+            }))
+        } else {
+            None
+        };
 
-        if depth_enabled {
-            match device.depth(0) {
-                Ok(depth_frame) => match oak_to_depth_image(depth_frame) {
-                    Ok(depth_image) => {
-                        got_any = true;
-                        if let Some(depth_tx) = depth_tx.as_ref()
-                            && matches!(depth_tx.try_send(depth_image), SendOutcome::Disconnected)
+        let mut depth_ring = DepthRingBuffer::try_new(depth_ring_capacity.get())?;
+        let inference_running = Arc::clone(&running);
+        let inference_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
+            let _exit_guard = LiveThreadExitGuard(inference_running);
+            let mut tracker = SlamTracker::try_new(
+                superpoint_left,
+                superpoint_right,
+                lightglue,
+                rectified,
+                tracker_config,
+            )
+            .map_err(|source| LiveThreadError::TrackerInitialization { source })?;
+            report_tracker_runtime(&tracker_config, &tracker);
+            let depth_rx = depth_rx;
+            let depth_enabled_for_diagnostics = depth_rx.is_some();
+            let mut dense_generation = command_mapper::DenseCommandGeneration::default();
+            let mut dense_command_tx = dense_command_tx;
+            let dense_stats_rx = dense_stats_rx;
+            let mut dense_active = dense_enabled;
+            let mut dense_integrations_dropped_newest: u64 = 0;
+            let mut depth_reorder_warnings_seen: u64 = 0;
+            let mut viz_tx = Some(viz_tx);
+
+            for pair in pair_rx.iter() {
+                let left = pair.left().clone();
+                let right = pair.right().clone();
+                let timestamp = left.timestamp();
+                let depth_batch = depth_rx.as_ref().map(drain_depth_batch).unwrap_or_default();
+                let depth = depth_batch.last().cloned();
+                for depth_image in depth_batch {
+                    depth_ring.push(depth_image);
+                }
+                let reorder_warnings = depth_ring.reorder_warnings();
+                if reorder_warnings > depth_reorder_warnings_seen {
+                    depth_reorder_warnings_seen = reorder_warnings;
+                    eprintln!(
+                        "depth ring observed out-of-order timestamps (count={depth_reorder_warnings_seen})"
+                    );
+                }
+                let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tracker.process(pair)
+                }));
+                match process_result {
+                    Ok(Ok(mut output)) => {
+                        // Map tracker output to dense commands.
+                        let pose_updates = tracker.take_pending_dense_pose_updates();
+                        let dense_stats = if dense_active {
+                            let cmds = command_mapper::map_output_to_dense_commands(
+                                &output,
+                                pose_updates,
+                                |keyframe_id| tracker.keyframe_pose(keyframe_id),
+                                &depth_ring,
+                                timestamp,
+                                &mut dense_generation,
+                            )?;
+                            for cmd in cmds {
+                                if let Some(ref tx) = dense_command_tx {
+                                    let command_class = if matches!(
+                                        &cmd,
+                                        dense::DenseCommand::IntegrateKeyframe { .. }
+                                    ) {
+                                        LiveDenseCommandClass::IntegrationData
+                                    } else {
+                                        LiveDenseCommandClass::OrderedControl
+                                    };
+                                    match classify_live_dense_route(
+                                        tx.route(cmd),
+                                        command_class,
+                                        LiveDenseRouteContext::TrackerOutput,
+                                    )? {
+                                        LiveDenseRouteDisposition::Enqueued => {}
+                                        LiveDenseRouteDisposition::IntegrationDroppedNewest => {
+                                            dense_integrations_dropped_newest =
+                                                dense_integrations_dropped_newest.saturating_add(1);
+                                        }
+                                        LiveDenseRouteDisposition::Disconnected => {
+                                            dense_active = false;
+                                            dense_command_tx = None;
+                                            eprintln!(
+                                                "dense ordered command queue disconnected; disabling dense"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            // Drain latest dense stats for viz.
+                            dense_stats_rx
+                                .as_ref()
+                                .and_then(|rx| std::iter::from_fn(|| rx.try_recv().ok()).last())
+                        } else {
+                            None
+                        };
+                        if let Some(ref stats) = dense_stats
+                            && stats.state == ReconState::Down
                         {
-                            break;
+                            dense_active = false;
+                            dense_command_tx = None;
+                            eprintln!("dense worker entered Down state; disabling dense");
+                        }
+
+                        if depth_enabled_for_diagnostics {
+                            output.diagnostics_mut().depth_reorder_warnings =
+                                Some(depth_reorder_warnings_seen);
+                        }
+                        let mut packet = None;
+                        let mut points = None;
+                        if let Some(matches) = output.take_stereo_matches() {
+                            if let Some(keyframe) = output.keyframe() {
+                                points = Some(keyframe.landmarks().to_vec());
+                            }
+                            packet = Some(
+                                VizPacket::try_new(left.clone(), right.clone(), matches).map_err(
+                                    |source| LiveThreadError::VisualizationPacket { source },
+                                )?,
+                            );
+                        }
+                        let (pose, health, diagnostics, events) = output.into_status_parts();
+                        let msg = LiveVizMsg {
+                            left,
+                            right,
+                            depth,
+                            pose,
+                            packet,
+                            points,
+                            health,
+                            diagnostics,
+                            events,
+                            dense_stats,
+                        };
+                        if let Some(sender) = viz_tx.as_ref()
+                            && matches!(sender.try_send(msg), SendOutcome::Disconnected)
+                        {
+                            eprintln!(
+                                "live visualization consumer disconnected; continuing authoritative tracking and occupancy"
+                            );
+                            viz_tx = None;
                         }
                     }
-                    Err(err) => {
-                        eprintln!("depth frame dropped (invalid dimensions): {err}");
+                    Ok(Err(err)) => {
+                        let requires_pipeline_shutdown = err.requires_pipeline_shutdown();
+                        if dense_active {
+                            let pose_updates = tracker.take_pending_dense_pose_updates();
+                            let pose_update_command =
+                                match command_mapper::apply_pose_updates_command(
+                                    pose_updates,
+                                    timestamp,
+                                    &mut dense_generation,
+                                ) {
+                                    Ok(command) => command,
+                                    Err(generation) if requires_pipeline_shutdown => {
+                                        return Err(LiveThreadError::DenseCommandGenerationAndInferenceUnavailable {
+                                            generation,
+                                            inference: err,
+                                        });
+                                    }
+                                    Err(generation) => return Err(generation.into()),
+                                };
+                            if let Some(pose_update_command) = pose_update_command
+                                && let Some(ref tx) = dense_command_tx
+                            {
+                                let route = classify_live_dense_route(
+                                    tx.route(pose_update_command),
+                                    LiveDenseCommandClass::OrderedControl,
+                                    LiveDenseRouteContext::PoseUpdateAfterTrackerError,
+                                );
+                                let disposition = match route {
+                                    Ok(disposition) => disposition,
+                                    Err(routing) if requires_pipeline_shutdown => {
+                                        return Err(
+                                            LiveThreadError::DenseCommandRouteAndInferenceUnavailable {
+                                                routing,
+                                                inference: err,
+                                            },
+                                        );
+                                    }
+                                    Err(routing) => return Err(routing.into()),
+                                };
+                                match disposition {
+                                    LiveDenseRouteDisposition::Enqueued => {}
+                                    LiveDenseRouteDisposition::Disconnected => {
+                                        dense_active = false;
+                                        dense_command_tx = None;
+                                        eprintln!(
+                                            "dense ordered command queue disconnected after tracker error; disabling dense"
+                                        );
+                                    }
+                                    LiveDenseRouteDisposition::IntegrationDroppedNewest => {
+                                        unreachable!(
+                                            "ordered controls cannot be reported as integration data"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        if requires_pipeline_shutdown {
+                            return Err(LiveThreadError::InferenceUnavailable { source: err });
+                        }
+                        eprintln!("tracker error: {err}");
+                    }
+                    Err(payload) => {
+                        return Err(LiveThreadError::FrameProcessingPanic {
+                            detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+                        });
+                    }
+                }
+            }
+            if dense_integrations_dropped_newest > 0 {
+                eprintln!(
+                    "dense integrations dropped_newest (inference view): {dense_integrations_dropped_newest}"
+                );
+            }
+            if depth_reorder_warnings_seen > 0 {
+                eprintln!("depth reorder warnings observed: {depth_reorder_warnings_seen}");
+            }
+            Ok(())
+        });
+
+        let decimation = args.rerun_decimation.get();
+        let rerun_finish_timeout = args.rerun_finish_timeout_ms.get();
+        let viz_handle = thread::spawn(move || -> Result<(), LiveThreadError> {
+            let mut initialization_error = None;
+            let mut sink = match rerun::RecordingStreamBuilder::new("kiko-slam-live").connect_grpc()
+            {
+                Ok(rec) => match RerunSink::new(rec, decimation) {
+                    Ok(sink) => Some(sink),
+                    Err(source) => {
+                        eprintln!("invalid live Rerun configuration: {source}");
+                        initialization_error =
+                            Some(LiveThreadError::VisualizationConfiguration { source });
+                        None
                     }
                 },
-                Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
-                Err(e) => {
-                    capture_error = Some(std::io::Error::other(format!(
-                        "depth camera capture failed: {e:?}"
-                    )));
+                Err(err) => {
+                    eprintln!("failed to connect to rerun viewer: {err}");
+                    initialization_error = Some(LiveThreadError::RerunConnect { source: err });
+                    None
+                }
+            };
+            let mut logging_error = None;
+            let never_frames = crossbeam_channel::never::<LiveVizMsg>();
+            let never_occupancy = crossbeam_channel::never::<TimedOccupancySnapshot>();
+            let mut frame_rx = Some(viz_rx);
+            let mut map_rx = occupancy_snapshot_rx;
+            if initialization_error.is_some() {
+                // Stop upstream visualization work immediately. Tracking and
+                // occupancy remain authoritative and shut down through their own
+                // channels; this worker still reports the typed initialization
+                // failure after any applicable Rerun finalization.
+                frame_rx = None;
+                map_rx = None;
+            }
+            while frame_rx.is_some() || map_rx.is_some() {
+                let mut close_frames = false;
+                let mut close_maps = false;
+                {
+                    let frame_receiver = frame_rx
+                        .as_ref()
+                        .map_or(&never_frames, kiko_slam::DropReceiver::as_receiver);
+                    let map_receiver = map_rx
+                        .as_ref()
+                        .map_or(&never_occupancy, kiko_slam::DropReceiver::as_receiver);
+                    crossbeam_channel::select! {
+                        recv(frame_receiver) -> message => match message {
+                            Ok(message) => {
+                                if logging_error.is_none()
+                                    && let Some(sink) = sink.as_mut()
+                                    && let Err(error) = log_live_viz_message(sink, message)
+                                {
+                                    eprintln!(
+                                        "live Rerun logging failed; disconnecting visualization producers: {error}"
+                                    );
+                                    logging_error = Some(error);
+                                    close_frames = true;
+                                    close_maps = true;
+                                }
+                            }
+                            Err(_) => close_frames = true,
+                        },
+                        recv(map_receiver) -> snapshot => match snapshot {
+                            Ok(snapshot) => {
+                                if logging_error.is_none()
+                                    && let Some(sink) = sink.as_mut()
+                                {
+                                    let (timestamp, snapshot) = snapshot.into_parts();
+                                    if let Err(error) = sink.log_occupancy(timestamp, snapshot) {
+                                        eprintln!(
+                                            "live Rerun occupancy logging failed; disconnecting visualization producers: {error}"
+                                        );
+                                        logging_error = Some(error);
+                                        close_frames = true;
+                                        close_maps = true;
+                                    }
+                                }
+                            }
+                            Err(_) => close_maps = true,
+                        },
+                    }
+                }
+                if close_frames {
+                    frame_rx = None;
+                }
+                if close_maps {
+                    map_rx = None;
+                }
+            }
+            let finalization_error = sink
+                .map(|sink| sink.finish_with_timeout(rerun_finish_timeout))
+                .and_then(Result::err);
+            match (initialization_error, logging_error, finalization_error) {
+                (Some(error), _, _) => Err(error),
+                (None, Some(logging), Some(finalization)) => {
+                    Err(LiveThreadError::VisualizationLogAndFinalization {
+                        logging,
+                        finalization,
+                    })
+                }
+                (None, Some(source), None) => Err(LiveThreadError::VisualizationLog { source }),
+                (None, None, Some(source)) => {
+                    Err(LiveThreadError::VisualizationFinalization { source })
+                }
+                (None, None, None) => Ok(()),
+            }
+        });
+
+        let mut left_seq = 1u64;
+        let mut right_seq = 1u64;
+        let mut capture_error = None;
+
+        eprintln!("streaming matches... press ctrl+c to stop");
+
+        'capture: while running.load(Ordering::Relaxed) {
+            let mut got_any = false;
+
+            match device.mono_left(0) {
+                Ok(frame) => {
+                    match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
+                        Ok(frame) => {
+                            if let Err(source) = pairer.push_left(frame) {
+                                capture_error = Some(LiveCaptureError::PairingInput { source });
+                                break 'capture;
+                            }
+                            left_seq += 1;
+                            got_any = true;
+                        }
+                        Err(source) => {
+                            capture_error = Some(LiveCaptureError::LeftFrame { source });
+                            break 'capture;
+                        }
+                    }
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    capture_error = Some(LiveCaptureError::LeftImage { source });
                     break 'capture;
                 }
             }
-        }
 
-        loop {
-            let pair = match pairer.next_pair() {
-                Some(pair) => pair,
-                None => break,
-            };
-            if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
-                running.store(false, Ordering::SeqCst);
-                break 'capture;
+            match device.mono_right(0) {
+                Ok(frame) => {
+                    match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
+                        Ok(frame) => {
+                            if let Err(source) = pairer.push_right(frame) {
+                                capture_error = Some(LiveCaptureError::PairingInput { source });
+                                break 'capture;
+                            }
+                            right_seq += 1;
+                            got_any = true;
+                        }
+                        Err(source) => {
+                            capture_error = Some(LiveCaptureError::RightFrame { source });
+                            break 'capture;
+                        }
+                    }
+                }
+                Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
+                Err(source) => {
+                    capture_error = Some(LiveCaptureError::RightImage { source });
+                    break 'capture;
+                }
+            }
+
+            if depth_enabled {
+                match device.depth(0) {
+                    Ok(depth_frame) => {
+                        match parse_rectified_left_depth(depth_frame, rectified_left_intrinsics) {
+                            Ok(depth_image) => {
+                                got_any = true;
+                                if let Some(depth_tx) = depth_tx.as_ref()
+                                    && matches!(
+                                        depth_tx.try_send(depth_image),
+                                        SendOutcome::Disconnected
+                                    )
+                                {
+                                    break;
+                                }
+                            }
+                            Err(source) => {
+                                capture_error = Some(LiveCaptureError::DepthFrame { source });
+                                break 'capture;
+                            }
+                        }
+                    }
+                    Err(DepthError::Timeout { .. } | DepthError::QueueEmpty) => {}
+                    Err(source) => {
+                        capture_error = Some(LiveCaptureError::Depth { source });
+                        break 'capture;
+                    }
+                }
+            }
+
+            while let Some(pair) = pairer.next_pair() {
+                if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
+                    running.store(false, Ordering::SeqCst);
+                    break 'capture;
+                }
+            }
+
+            if !got_any {
+                thread::sleep(Duration::from_micros(500));
             }
         }
 
-        if !got_any {
-            thread::sleep(Duration::from_micros(500));
+        drop(pair_tx);
+        drop(depth_tx);
+        let mut live_failures = capture_error
+            .into_iter()
+            .map(LiveWorkerFailure::Capture)
+            .collect::<Vec<_>>();
+        match inference_handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Inference(error)),
+            Err(payload) => live_failures.push(LiveWorkerFailure::InferencePanic {
+                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+            }),
         }
-    }
 
-    drop(pair_tx);
-    drop(depth_tx);
-    let inference_result = inference_handle.join().map_err(|payload| {
-        std::io::Error::other(format!(
-            "inference thread panicked: {}",
-            kiko_slam::panic_payload_to_string(payload.as_ref())
-        ))
-    })?;
-    if let Err(err) = inference_result {
-        return Err(Box::new(err));
-    }
+        // Inference owns the sole dense-command producer. Joining it first closes
+        // that queue; joining dense next guarantees its dirty final map is sent
+        // before the visualization consumer is allowed to finish and flush.
+        if let Some(handle) = dense_handle {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Occupancy(error)),
+                Err(payload) => live_failures.push(LiveWorkerFailure::OccupancyPanic {
+                    detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+                }),
+            }
+        }
 
-    let viz_result = viz_handle.join().map_err(|payload| {
-        std::io::Error::other(format!(
-            "viz thread panicked: {}",
-            kiko_slam::panic_payload_to_string(payload.as_ref())
-        ))
-    })?;
-    if let Err(err) = viz_result {
-        return Err(std::io::Error::other(err).into());
-    }
+        match viz_handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => live_failures.push(LiveWorkerFailure::Visualization(error)),
+            Err(payload) => live_failures.push(LiveWorkerFailure::VisualizationPanic {
+                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+            }),
+        }
 
-    if let Some(handle) = dense_handle {
-        // Channels are dropped when inference thread exits, causing worker to return.
-        handle.join().map_err(|payload| {
-            std::io::Error::other(format!(
-                "dense thread panicked: {}",
-                kiko_slam::panic_payload_to_string(payload.as_ref())
-            ))
-        })?;
-    }
-
-    let pair_snapshot = pair_stats.snapshot();
-    let viz_snapshot = viz_stats.snapshot();
-    eprintln!(
-        "pair queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
-        pair_snapshot.enqueued,
-        pair_snapshot.dropped_oldest,
-        pair_snapshot.dropped_newest,
-        pair_snapshot.disconnected
-    );
-    eprintln!(
-        "viz queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
-        viz_snapshot.enqueued,
-        viz_snapshot.dropped_oldest,
-        viz_snapshot.dropped_newest,
-        viz_snapshot.disconnected
-    );
-    if let Some(depth_stats_handle) = depth_stats_handle {
-        let depth_snapshot = depth_stats_handle.snapshot();
+        let pair_snapshot = pair_stats.snapshot();
+        let viz_snapshot = viz_stats.snapshot();
         eprintln!(
-            "depth queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
-            depth_snapshot.enqueued,
-            depth_snapshot.dropped_oldest,
-            depth_snapshot.dropped_newest,
-            depth_snapshot.disconnected
+            "pair queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+            pair_snapshot.enqueued,
+            pair_snapshot.dropped_oldest,
+            pair_snapshot.dropped_newest,
+            pair_snapshot.disconnected
         );
-    }
-    if let Some(dense_command_stats_handle) = dense_command_stats_handle {
-        let dense_command_snapshot = dense_command_stats_handle.snapshot();
         eprintln!(
-            "dense ordered command queue stats: commands_enqueued={}, integrations_dropped_newest={}, controls_timed_out={}, disconnected={}",
-            dense_command_snapshot.commands_enqueued,
-            dense_command_snapshot.integrations_dropped_newest,
-            dense_command_snapshot.controls_timed_out,
-            dense_command_snapshot.disconnected
+            "viz queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+            viz_snapshot.enqueued,
+            viz_snapshot.dropped_oldest,
+            viz_snapshot.dropped_newest,
+            viz_snapshot.disconnected
         );
-    }
-    let pairer_stats = pairer.stats();
-    eprintln!(
-        "pairer stats: paired={} dropped_left={} dropped_right={} outside_window={}",
-        pairer_stats.paired,
-        pairer_stats.dropped_left,
-        pairer_stats.dropped_right,
-        pairer_stats.outside_window
-    );
+        if let Some(depth_stats_handle) = depth_stats_handle {
+            let depth_snapshot = depth_stats_handle.snapshot();
+            eprintln!(
+                "depth queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+                depth_snapshot.enqueued,
+                depth_snapshot.dropped_oldest,
+                depth_snapshot.dropped_newest,
+                depth_snapshot.disconnected
+            );
+        }
+        if let Some(dense_command_stats_handle) = dense_command_stats_handle {
+            let dense_command_snapshot = dense_command_stats_handle.snapshot();
+            eprintln!(
+                "dense ordered command queue stats: commands_enqueued={}, integrations_dropped_newest={}, controls_timed_out={}, disconnected={}",
+                dense_command_snapshot.commands_enqueued,
+                dense_command_snapshot.integrations_dropped_newest,
+                dense_command_snapshot.controls_timed_out,
+                dense_command_snapshot.disconnected
+            );
+        }
+        if let Some(snapshot_stats_handle) = occupancy_snapshot_stats_handle {
+            let snapshot = snapshot_stats_handle.snapshot();
+            eprintln!(
+                "occupancy snapshot queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+                snapshot.enqueued,
+                snapshot.dropped_oldest,
+                snapshot.dropped_newest,
+                snapshot.disconnected
+            );
+        }
+        let pairer_stats = pairer.stats();
+        eprintln!(
+            "pairer stats: paired={} dropped_left={} dropped_right={} outside_window={}",
+            pairer_stats.paired,
+            pairer_stats.dropped_left,
+            pairer_stats.dropped_right,
+            pairer_stats.outside_window
+        );
 
-    if let Some(err) = capture_error {
-        return Err(err.into());
-    }
+        if !live_failures.is_empty() {
+            return Err(LiveRunError {
+                failures: live_failures,
+            }
+            .into());
+        }
 
-    Ok(())
+        Ok(())
+    })();
+    finish_live_device_session(operation, device.close())
 }
 
 #[cfg(feature = "record")]
@@ -2611,35 +4046,42 @@ fn build_meta(
             height: c.height,
             fps: c.fps,
             encoding: "f32_meters_le".to_string(),
+            optical_frame: Some(match c.alignment {
+                DepthAlignment::RectifiedLeft => DepthOpticalFrame::RectifiedLeft,
+                DepthAlignment::RectifiedRight => DepthOpticalFrame::RectifiedRight,
+                DepthAlignment::Rgb => DepthOpticalFrame::Rgb,
+            }),
         }),
         imu: imu_config.map(|c| ImuMeta { rate_hz: c.rate_hz }),
     }
 }
 
 #[cfg(feature = "record")]
-fn build_calibration(device: &Device, baseline_m: f32, config: &MonoConfig) -> Calibration {
-    let left = device.left_intrinsics();
-    let right = device.right_intrinsics();
-
+fn build_calibration(
+    left: OakIntrinsics,
+    right: OakIntrinsics,
+    baseline_m: f32,
+    rectified: bool,
+) -> Calibration {
     Calibration {
         left: CameraIntrinsics {
-            fx: left.fx,
-            fy: left.fy,
-            cx: left.cx,
-            cy: left.cy,
-            width: left.width,
-            height: left.height,
+            fx: left.fx(),
+            fy: left.fy(),
+            cx: left.cx(),
+            cy: left.cy(),
+            width: left.width(),
+            height: left.height(),
         },
         right: CameraIntrinsics {
-            fx: right.fx,
-            fy: right.fy,
-            cx: right.cx,
-            cy: right.cy,
-            width: right.width,
-            height: right.height,
+            fx: right.fx(),
+            fy: right.fy(),
+            cx: right.cx(),
+            cy: right.cy(),
+            width: right.width(),
+            height: right.height(),
         },
         baseline_m,
-        rectified: config.rectified,
+        rectified,
     }
 }
 
@@ -2794,16 +4236,22 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, OdometryVizProcessingError,
-        OfflineDepthSelector, RerunDestination, RerunDestinationError, RerunFinishTimeout,
-        RerunSessionError, build_ba_config_from_values, combine_rerun_results,
-        reject_removed_ba_motion_prior,
+        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDenseCommandClass,
+        LiveDenseRouteContext, LiveDenseRouteDisposition, LiveDenseRouteError,
+        OccupancyProjectionContractError, OdometryVizProcessingError, OfflineDepthSelector,
+        OfflineFatalDenseError, OfflineFatalTrackerError, RerunDestination, RerunDestinationError,
+        RerunFinishTimeout, RerunSessionError, build_ba_config_from_values,
+        classify_live_dense_route, combine_rerun_results, occupancy_depth_camera,
+        reject_removed_ba_motion_prior, require_level_optical_world,
+        take_deferred_offline_snapshot_error,
     };
     use clap::{Parser as _, error::ErrorKind};
-    use kiko_slam::dataset::DatasetError;
+    use kiko_slam::dataset::{DatasetError, DepthOpticalFrame, DepthProjectionContract};
+    use kiko_slam::dense::{occupancy::OccupancyError, occupancy_runtime::OccupancyRuntimeError};
     use kiko_slam::{
-        DepthImage, FrameId, InferenceError, PipelineError, PipelineTimingError, Timestamp,
-        VizFlushError,
+        DenseCommandSendOutcome, DepthImage, FrameDimensions, FrameId, InferenceError,
+        PinholeIntrinsics, PipelineError, PipelineTimingError, Timestamp, TrackerError,
+        VizFlushError, VizLogError,
     };
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
@@ -2811,12 +4259,153 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "record")]
-    use super::{LiveThreadError, LiveThreadExitGuard};
+    use super::{
+        DeviceCloseFailure, LiveThreadError, LiveThreadExitGuard, RecordCaptureError, RecordError,
+        RecordItem, RectifiedLeftDepthError, build_calibration, compose_record_errors,
+        finite_rate_per_second, record_device_close_error, require_rectified_left_depth_projection,
+    };
+    #[cfg(feature = "record")]
+    use oak_sys::Intrinsics as OakIntrinsics;
     #[cfg(feature = "record")]
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[cfg(feature = "record")]
+    fn oak_intrinsics(fx: f32, width: u32, height: u32) -> OakIntrinsics {
+        OakIntrinsics::try_from_projection_matrix(
+            [
+                [fx, 0.0, width as f32 * 0.5],
+                [0.0, fx + 1.0, height as f32 * 0.5],
+                [0.0, 0.0, 1.0],
+            ],
+            width,
+            height,
+        )
+        .expect("valid test projection")
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn delivered_depth_must_match_the_exact_rectified_left_projection() {
+        let expected = oak_intrinsics(400.0, 640, 480);
+        assert!(require_rectified_left_depth_projection(expected, expected).is_ok());
+
+        let wrong_dimensions = oak_intrinsics(400.0, 320, 240);
+        assert!(matches!(
+            require_rectified_left_depth_projection(expected, wrong_dimensions),
+            Err(RectifiedLeftDepthError::DimensionMismatch {
+                expected_width: 640,
+                expected_height: 480,
+                actual_width: 320,
+                actual_height: 240,
+            })
+        ));
+
+        let wrong_projection = oak_intrinsics(401.0, 640, 480);
+        assert!(matches!(
+            require_rectified_left_depth_projection(expected, wrong_projection),
+            Err(RectifiedLeftDepthError::ProjectionMismatch { .. })
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn calibration_is_derived_only_from_delivered_projection_types() {
+        let left = oak_intrinsics(400.0, 640, 480);
+        let right = oak_intrinsics(402.0, 640, 480);
+        let calibration = build_calibration(left, right, 0.075, true);
+
+        assert_eq!(calibration.left.fx, left.fx());
+        assert_eq!(calibration.left.fy, left.fy());
+        assert_eq!(calibration.left.cx, left.cx());
+        assert_eq!(calibration.left.cy, left.cy());
+        assert_eq!(
+            (calibration.left.width, calibration.left.height),
+            (left.width(), left.height())
+        );
+        assert_eq!(calibration.right.fx, right.fx());
+        assert_eq!(calibration.baseline_m, 0.075);
+        assert!(calibration.rectified);
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn record_capture_and_close_composition_preserves_both_typed_failures() {
+        let capture = RecordCaptureError::DatasetDropped {
+            item: RecordItem::StereoPair,
+        };
+        let close = DeviceCloseFailure::new(std::io::Error::other("test close failure"));
+        let combined = record_device_close_error(Some(capture), close);
+
+        assert!(matches!(
+            &combined,
+            RecordCaptureError::CaptureAndDeviceClose {
+                capture,
+                close,
+            } if matches!(capture.as_ref(), RecordCaptureError::DatasetDropped {
+                item: RecordItem::StereoPair,
+            }) && std::error::Error::source(close)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some()
+        ));
+        assert!(combined.to_string().contains("test close failure"));
+        assert!(
+            std::error::Error::source(&combined)
+                .and_then(|source| source.downcast_ref::<RecordCaptureError>())
+                .is_some()
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn record_error_composition_preserves_capture_close_and_finalization() {
+        let capture = RecordCaptureError::DatasetDropped {
+            item: RecordItem::DepthFrame,
+        };
+        let finalization = Box::new(DatasetError::InvalidManifest {
+            reason: "test finalization failure",
+        });
+        let initial = compose_record_errors(Some(capture), Some(finalization))
+            .expect("capture and finalization must be retained");
+        let combined = initial.with_device_close(DeviceCloseFailure::new(std::io::Error::other(
+            "test close failure",
+        )));
+
+        assert!(matches!(
+            combined,
+            RecordError::CaptureAndFinalization {
+                capture: RecordCaptureError::CaptureAndDeviceClose {
+                    capture,
+                    close,
+                },
+                finalization,
+            } if matches!(capture.as_ref(), RecordCaptureError::DatasetDropped {
+                item: RecordItem::DepthFrame,
+            }) && std::error::Error::source(&close)
+                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                .is_some()
+                && matches!(finalization.as_ref(), DatasetError::InvalidManifest {
+                    reason: "test finalization failure",
+                })
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn record_summary_rate_is_finite_for_zero_or_invalid_elapsed_time() {
+        assert_eq!(finite_rate_per_second(30, 2.0), 15.0);
+        for elapsed in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let rate = finite_rate_per_second(30, elapsed);
+            assert_eq!(rate, 0.0);
+            assert!(rate.is_finite());
+        }
+
+        let overflow_rate = finite_rate_per_second(u64::MAX, f64::MIN_POSITIVE);
+        assert_eq!(overflow_rate, 0.0);
+        assert!(overflow_rate.is_finite());
+    }
 
     #[test]
     fn benchmark_errors_preserve_dataset_and_pipeline_sources() {
@@ -2859,8 +4448,12 @@ mod tests {
     fn odometry_error_preserves_dense_generation_source() {
         let mut generation =
             kiko_slam::dense::command_mapper::DenseCommandGeneration::from_current(u64::MAX);
-        let source = kiko_slam::dense::command_mapper::rebuild_from_snapshot_command(
-            Vec::new(),
+        let source = kiko_slam::dense::command_mapper::apply_pose_updates_command(
+            vec![kiko_slam::KeyframePoseUpdate::new(
+                kiko_slam::map::KeyframeId::default(),
+                kiko_slam::WorldToCamera::identity(),
+            )],
+            kiko_slam::Timestamp::from_nanos(0),
             &mut generation,
         )
         .expect_err("exhausted generation");
@@ -2873,6 +4466,223 @@ mod tests {
         ));
         assert!(
             std::error::Error::source(&error)
+                .and_then(|source| {
+                    source.downcast_ref::<
+                        kiko_slam::dense::command_mapper::DenseCommandGenerationError,
+                    >()
+                })
+                .is_some_and(|source| source.current() == u64::MAX)
+        );
+    }
+
+    #[test]
+    fn odometry_error_preserves_fatal_tracker_source() {
+        let error = OdometryVizProcessingError::from(TrackerError::Inference(
+            InferenceError::SessionQuarantined {
+                model: "test-offline-model",
+            },
+        ));
+
+        let OdometryVizProcessingError::Tracker(failure) = &error else {
+            panic!("typed tracker failure expected");
+        };
+        assert!(matches!(
+            &failure.source,
+            TrackerError::Inference(InferenceError::SessionQuarantined {
+                model: "test-offline-model"
+            })
+        ));
+        assert!(failure.dense_update.is_none());
+        assert!(failure.publication.is_none());
+        assert!(failure.occupancy_finalization.is_none());
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<TrackerError>())
+                .is_some_and(TrackerError::requires_pipeline_shutdown)
+        );
+    }
+
+    #[test]
+    fn fatal_odometry_error_preserves_publication_and_occupancy_failures() {
+        let publication = VizLogError::TimestampUnrepresentable {
+            timestamp_ns: 1,
+            encoded_ns: 2,
+        };
+        let occupancy_finalization =
+            OccupancyRuntimeError::Snapshot(OccupancyError::RevisionExhausted);
+        let error = OdometryVizProcessingError::Tracker(Box::new(OfflineFatalTrackerError {
+            source: TrackerError::Inference(InferenceError::WatchdogTimeout {
+                model: "test-offline-model",
+                timeout_ms: 5,
+            }),
+            dense_update: Some(OfflineFatalDenseError::Occupancy(
+                OccupancyRuntimeError::Mapping(OccupancyError::RevisionExhausted),
+            )),
+            publication: Some(publication),
+            occupancy_finalization: Some(occupancy_finalization),
+        }));
+
+        let OdometryVizProcessingError::Tracker(failure) = &error else {
+            panic!("typed tracker failure expected");
+        };
+        assert!(matches!(
+            &failure.source,
+            TrackerError::Inference(InferenceError::WatchdogTimeout {
+                model: "test-offline-model",
+                timeout_ms: 5,
+            })
+        ));
+        assert!(matches!(
+            &failure.dense_update,
+            Some(OfflineFatalDenseError::Occupancy(
+                OccupancyRuntimeError::Mapping(OccupancyError::RevisionExhausted)
+            ))
+        ));
+        assert!(matches!(
+            &failure.publication,
+            Some(VizLogError::TimestampUnrepresentable {
+                timestamp_ns: 1,
+                encoded_ns: 2,
+            })
+        ));
+        assert!(matches!(
+            &failure.occupancy_finalization,
+            Some(OccupancyRuntimeError::Snapshot(
+                OccupancyError::RevisionExhausted
+            ))
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<TrackerError>())
+                .is_some_and(TrackerError::requires_pipeline_shutdown)
+        );
+    }
+
+    #[test]
+    fn live_dense_route_keeps_integration_drop_as_data_loss() {
+        assert_eq!(
+            classify_live_dense_route(
+                DenseCommandSendOutcome::IntegrationDroppedNewest,
+                LiveDenseCommandClass::IntegrationData,
+                LiveDenseRouteContext::TrackerOutput,
+            ),
+            Ok(LiveDenseRouteDisposition::IntegrationDroppedNewest)
+        );
+    }
+
+    #[test]
+    fn live_dense_route_surfaces_control_timeout_in_every_context() {
+        for context in [
+            LiveDenseRouteContext::TrackerOutput,
+            LiveDenseRouteContext::PoseUpdateAfterTrackerError,
+        ] {
+            assert_eq!(
+                classify_live_dense_route(
+                    DenseCommandSendOutcome::ControlTimedOut,
+                    LiveDenseCommandClass::OrderedControl,
+                    context,
+                ),
+                Err(LiveDenseRouteError::ControlTimedOut { context })
+            );
+        }
+    }
+
+    #[test]
+    fn live_dense_route_rejects_control_reported_as_integration_drop() {
+        let context = LiveDenseRouteContext::PoseUpdateAfterTrackerError;
+        assert_eq!(
+            classify_live_dense_route(
+                DenseCommandSendOutcome::IntegrationDroppedNewest,
+                LiveDenseCommandClass::OrderedControl,
+                context,
+            ),
+            Err(LiveDenseRouteError::ControlMisclassifiedAsIntegration { context })
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_rerun_connect_error_preserves_typed_source() {
+        let failure = LiveThreadError::RerunConnect {
+            source: rerun::RecordingStreamError::NotAProxyEndpoint,
+        };
+
+        assert!(matches!(
+            &failure,
+            LiveThreadError::RerunConnect {
+                source: rerun::RecordingStreamError::NotAProxyEndpoint,
+            }
+        ));
+        assert!(
+            std::error::Error::source(&failure)
+                .and_then(|source| source.downcast_ref::<rerun::RecordingStreamError>())
+                .is_some_and(|source| {
+                    matches!(source, rerun::RecordingStreamError::NotAProxyEndpoint)
+                })
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_failure_preserves_route_and_fatal_tracker_sources() {
+        let routing = LiveDenseRouteError::ControlTimedOut {
+            context: LiveDenseRouteContext::PoseUpdateAfterTrackerError,
+        };
+        let failure = LiveThreadError::DenseCommandRouteAndInferenceUnavailable {
+            routing,
+            inference: TrackerError::Inference(InferenceError::SessionQuarantined {
+                model: "test-live-model",
+            }),
+        };
+
+        assert!(matches!(
+            &failure,
+            LiveThreadError::DenseCommandRouteAndInferenceUnavailable {
+                routing: actual_routing,
+                inference: TrackerError::Inference(InferenceError::SessionQuarantined {
+                    model: "test-live-model"
+                }),
+            } if *actual_routing == routing
+        ));
+        assert_eq!(
+            std::error::Error::source(&failure)
+                .and_then(|source| source.downcast_ref::<LiveDenseRouteError>()),
+            Some(&routing)
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_failure_preserves_generation_and_fatal_tracker_sources() {
+        let mut sequence =
+            kiko_slam::dense::command_mapper::DenseCommandGeneration::from_current(u64::MAX);
+        let generation = kiko_slam::dense::command_mapper::apply_pose_updates_command(
+            vec![kiko_slam::KeyframePoseUpdate::new(
+                kiko_slam::map::KeyframeId::default(),
+                kiko_slam::WorldToCamera::identity(),
+            )],
+            Timestamp::from_nanos(1),
+            &mut sequence,
+        )
+        .expect_err("exhausted generation");
+        let failure = LiveThreadError::DenseCommandGenerationAndInferenceUnavailable {
+            generation,
+            inference: TrackerError::Inference(InferenceError::SessionQuarantined {
+                model: "test-live-model",
+            }),
+        };
+
+        assert!(matches!(
+            &failure,
+            LiveThreadError::DenseCommandGenerationAndInferenceUnavailable {
+                generation,
+                inference: TrackerError::Inference(InferenceError::SessionQuarantined {
+                    model: "test-live-model"
+                }),
+            } if generation.current() == u64::MAX
+        ));
+        assert!(
+            std::error::Error::source(&failure)
                 .and_then(|source| {
                     source.downcast_ref::<
                         kiko_slam::dense::command_mapper::DenseCommandGenerationError,
@@ -2906,6 +4716,77 @@ mod tests {
             .get(),
             8
         );
+    }
+
+    #[test]
+    fn occupancy_requires_an_explicit_level_world_and_camera_height() {
+        assert_eq!(
+            require_level_optical_world(false, Some(0.5)),
+            Err(OccupancyProjectionContractError::LevelOpticalWorldNotDeclared)
+        );
+        assert_eq!(
+            require_level_optical_world(true, None),
+            Err(OccupancyProjectionContractError::CameraHeightNotConfigured)
+        );
+        assert_eq!(require_level_optical_world(true, Some(0.5)), Ok(0.5));
+    }
+
+    #[test]
+    fn occupancy_depth_projection_accepts_only_the_tracking_optical_frame_and_shape() {
+        let tracking_dimensions = FrameDimensions::try_new(640, 480).expect("dimensions");
+        let tracking_intrinsics =
+            PinholeIntrinsics::try_new(500.0, 500.0, 319.5, 239.5).expect("intrinsics");
+        let valid = occupancy_depth_camera(
+            tracking_intrinsics,
+            tracking_dimensions,
+            DepthProjectionContract::new(tracking_dimensions, DepthOpticalFrame::RectifiedLeft),
+            false,
+        )
+        .expect("rectified-left tracking projection");
+        assert_eq!(valid.dimensions(), tracking_dimensions);
+
+        assert!(matches!(
+            occupancy_depth_camera(
+                tracking_intrinsics,
+                tracking_dimensions,
+                DepthProjectionContract::new(
+                    tracking_dimensions,
+                    DepthOpticalFrame::RectifiedRight,
+                ),
+                false,
+            ),
+            Err(OccupancyProjectionContractError::UnsupportedOpticalFrame(
+                DepthOpticalFrame::RectifiedRight
+            ))
+        ));
+        assert!(matches!(
+            occupancy_depth_camera(
+                tracking_intrinsics,
+                tracking_dimensions,
+                DepthProjectionContract::new(
+                    FrameDimensions::try_new(320, 240).expect("different dimensions"),
+                    DepthOpticalFrame::RectifiedLeft,
+                ),
+                false,
+            ),
+            Err(OccupancyProjectionContractError::DepthCalibrationDimensionsMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn offline_deferred_snapshot_failure_preserves_its_typed_source() {
+        let source = OccupancyError::AllocationFailed {
+            context: "test offline snapshot",
+            requested: 42,
+        };
+        let mut deferred = Some(source);
+
+        assert!(matches!(
+            take_deferred_offline_snapshot_error(&mut deferred),
+            Err(OccupancyRuntimeError::Snapshot(error)) if error == source
+        ));
+        assert!(deferred.is_none());
+        assert!(take_deferred_offline_snapshot_error(&mut deferred).is_ok());
     }
 
     #[test]
@@ -3122,7 +5003,9 @@ mod tests {
 
     #[test]
     fn offline_depth_selector_uses_an_inclusive_association_window() {
-        let window = kiko_slam::dense::command_mapper::MAX_ASSOCIATION_WINDOW_NS;
+        let window =
+            i64::try_from(kiko_slam::dense::command_mapper::DEPTH_ASSOCIATION_WINDOW.as_nanos())
+                .expect("test association window fits in i64");
         let mut selector = OfflineDepthSelector::default();
         let mut entries = VecDeque::from([
             test_depth(0, window),
@@ -3156,7 +5039,7 @@ mod tests {
 
     #[test]
     fn offline_depth_selector_matches_nearest_timestamp_oracle_for_all_small_subsets() {
-        let window = kiko_slam::dense::command_mapper::MAX_ASSOCIATION_WINDOW_NS;
+        let window = kiko_slam::dense::command_mapper::DEPTH_ASSOCIATION_WINDOW.as_nanos();
         let candidates = [
             -30_000_000,
             -20_000_000,
@@ -3175,7 +5058,7 @@ mod tests {
             20_000_000,
             35_000_000,
         ];
-        let max_delta = u64::try_from(window).expect("nonnegative association window");
+        let max_delta = window;
 
         for mask in 0_u16..(1_u16 << candidates.len()) {
             let selected_timestamps: Vec<i64> = candidates
@@ -3255,8 +5138,12 @@ mod tests {
     fn live_error_preserves_dense_generation_source() {
         let mut generation =
             kiko_slam::dense::command_mapper::DenseCommandGeneration::from_current(u64::MAX);
-        let source = kiko_slam::dense::command_mapper::rebuild_from_snapshot_command(
-            Vec::new(),
+        let source = kiko_slam::dense::command_mapper::apply_pose_updates_command(
+            vec![kiko_slam::KeyframePoseUpdate::new(
+                kiko_slam::map::KeyframeId::default(),
+                kiko_slam::WorldToCamera::identity(),
+            )],
+            kiko_slam::Timestamp::from_nanos(0),
             &mut generation,
         )
         .expect_err("exhausted generation");

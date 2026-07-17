@@ -6,7 +6,9 @@ Kiko is a social robot combining custom SLAM and an expression engine. The SLAM 
 
 **Status:** Early development. The host pipeline includes stereo visual odometry, local bundle
 adjustment, map/covisibility maintenance, relocalization, and loop closure. Hardware-backed
-recording and TSDF/ESDF reconstruction still depend on external native components.
+recording and TSDF/ESDF reconstruction still depend on external native components. The host also
+provides deterministic geometric 2D occupancy mapping from calibrated depth; it is not a learned
+occupancy network.
 
 ## Structure
 
@@ -29,6 +31,12 @@ Record a dataset (requires OAK-D):
 cargo run -p kiko-slam --features record -- record recordings/<name>
 ```
 
+The `record` feature requires DepthAI headers and libraries. Set `DEPTHAI_INCLUDE` and
+`DEPTHAI_LIB` to OS path lists when they are not installed in the build script's standard
+locations. The macOS build also resolves OpenCV through `OPENCV_INCLUDE` and `OPENCV_LIB`; the
+Linux build does not consume those overrides. Explicit dependency paths are authoritative and fail
+rather than silently compiling against a different installation.
+
 Live match visualization (requires OAK-D + Rerun viewer):
 
 ```
@@ -47,10 +55,29 @@ Run visual odometry on a dataset (Rerun viewer):
 cargo run -p kiko-slam -- viz --odometry recordings/<name>
 ```
 
+Enable the 2D map only after declaring the physical floor assumption:
+
+```
+KIKO_DENSE=true \
+KIKO_OCCUPANCY_ASSUME_LEVEL_OPTICAL_WORLD=true \
+KIKO_OCCUPANCY_CAMERA_HEIGHT_M=0.42 \
+cargo run -p kiko-slam -- viz --odometry recordings/<name>
+```
+
+For live mapping, also set `KIKO_LIVE_DEPTH=true`. New recordings identify the depth optical
+frame. Legacy datasets without that metadata are rejected unless
+`KIKO_OCCUPANCY_ASSUME_RECTIFIED_LEFT=true` is explicitly set from known calibration evidence.
+
 Benchmark a dataset:
 
 ```
 cargo run -p kiko-slam -- bench recordings/<name>
+```
+
+Run the dependency-free occupancy microbenchmark with:
+
+```
+cargo bench -p kiko-slam --bench occupancy_mapping
 ```
 
 ## Config (flags or env)
@@ -74,6 +101,32 @@ cargo run -p kiko-slam -- bench recordings/<name>
 - `--rerun-decimation` / `KIKO_RERUN_DECIMATION` — image decimation for Rerun
 - `--rerun-finish-timeout-ms` / `KIKO_RERUN_FINISH_TIMEOUT_MS` — Rerun sink-flush timeout in milliseconds (default 5000); success confirms the calling thread's prior data reached the configured sink, not that a viewer consumed it
 - `--odometry` / `KIKO_VIZ_ODOMETRY` — enable visual odometry in viz mode
+
+**2D occupancy mapping:**
+
+- `KIKO_DENSE` — enable host occupancy mapping; offline mode requires `viz --odometry`, and live mode also requires `KIKO_LIVE_DEPTH=true`
+- `KIKO_OCCUPANCY_ASSUME_LEVEL_OPTICAL_WORLD` — required explicit assertion that the initial visual world is a level optical frame (`+x` right, `+y` down, `+z` forward); occupancy uses `[x, y, height] = [world_x, world_z, camera_height - world_y]`
+- `KIKO_OCCUPANCY_CAMERA_HEIGHT_M` — required camera height above the floor in metres
+- `KIKO_OCCUPANCY_ASSUME_RECTIFIED_LEFT` — compatibility assertion for legacy datasets whose depth optical frame was not recorded; not needed for newly recorded or live rectified-left depth
+- `KIKO_OCCUPANCY_RESOLUTION_M` — grid cell size in metres (default `0.05`)
+- `KIKO_OCCUPANCY_LOWER_X_M` / `KIKO_OCCUPANCY_LOWER_Y_M` — fixed grid lower bounds in metres (defaults `-10` / `-5`)
+- `KIKO_OCCUPANCY_WIDTH_CELLS` / `KIKO_OCCUPANCY_HEIGHT_CELLS` — fixed grid shape (defaults `400` / `400`)
+- `KIKO_OCCUPANCY_MAX_CELLS` — allocation safety bound (default `4000000`)
+- `KIKO_OCCUPANCY_MIN_HEIGHT_M` / `KIKO_OCCUPANCY_MAX_HEIGHT_M` — inclusive obstacle-height slab in metres (defaults `0.05` / `1.8`)
+- `KIKO_OCCUPANCY_MIN_DEPTH_M` / `KIKO_OCCUPANCY_MAX_DEPTH_M` — inclusive accepted depth range in metres (defaults `0.2` / `10`)
+- `KIKO_OCCUPANCY_SAMPLE_BLOCK_PX` — nearest-valid depth sampling block width in pixels (default `4`)
+- `KIKO_OCCUPANCY_MAX_KEYFRAMES` — maximum retained keyframe contributions (default `300`)
+- `KIKO_OCCUPANCY_RERUN_EVERY_KEYFRAMES` — successful integrations between regular map snapshots (default `5`)
+
+Rerun receives the map in Kiko's spatial graph under `world/map2d`: class `0` unknown, `1` free,
+and `2` occupied. Each snapshot logs the actual occupancy-to-world rigid transform at
+`world/map2d`, pixel-to-occupancy metric placement and the segmentation image at
+`world/map2d/grid`, and exact revision/map-identifier metadata at `world/map2d/metadata` on the
+same `capture_ns` timeline. A metric bounds outline lets Rerun's auto-spawn heuristics recommend a
+dedicated 2D map view rooted at `world/map2d`, so its axes are metres rather than pixels. The
+segmentation image is not a textured floor overlay in Rerun's 3D world view; the rigid transform
+registers the data truthfully without inventing a pinhole projection. The fixed world coordinate
+convention and class annotations are static.
 
 **Bundle adjustment:**
 
@@ -126,5 +179,6 @@ descriptors are required when loop closure is enabled.
 - ~~Covisibility graph~~
 - ~~Learned place recognition (EigenPlaces ONNX)~~
 - ~~Loop closure (geometric verification + SE(3) pose graph correction)~~
+- ~~Deterministic geometric 2D occupancy mapping + Rerun visualization~~
 - Global bundle adjustment
 - Dense mapping via nvblox (TSDF / ESDF on Jetson)
