@@ -4,6 +4,7 @@ mod cell_inflation;
 mod frames;
 mod global_planner;
 mod local_costmap;
+mod odometry;
 mod shadow_command;
 
 pub use frames::{
@@ -21,6 +22,16 @@ pub use local_costmap::{
     LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,
     LocalCostmapProvenance, LocalCostmapQuery, LocalCostmapUpdateOutcome, LocalCostmapView,
     LocalDepthObservation, TrackingCameraToBase,
+};
+pub use odometry::{
+    BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,
+    CalibrationVector, DurationParameter, ImuCalibrationProvenance, ImuUpdate, OdomPlanarTwist,
+    OdomSegmentId, OdomSegmentIdError, OdometryError, OdometryEstimate, OdometryQuality,
+    OdometryState, OdometryUnavailable, PlanarOdometry, PlanarOdometryConfig,
+    PlanarOdometryConfigDto, PlanarOdometryConfigError, PlanarityComponent, PoseHistoryQuery,
+    PredictionTranslationModel, RawImuCalibration, RawImuCalibrationDto, RawImuCalibrationError,
+    ReanchorReason, ScalarParameter, TimeAlignedOdomPose, TimeAlignment, TranslationIntegration,
+    VisualCaptureProvenance,
 };
 pub use shadow_command::{
     MAX_SHADOW_COMMAND_RECORDS, MotorPacketsSent, ShadowCommandConfig, ShadowCommandConfigDto,

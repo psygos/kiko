@@ -832,6 +832,17 @@ impl MapSnapshot {
     pub fn generation(self) -> MapGeneration {
         self.version.generation
     }
+
+    /// Whether two revisions belong to the same concrete mutation branch.
+    ///
+    /// Generation order alone cannot establish ancestry after a [`SlamMap`]
+    /// clone: the clone retains the exact source snapshot but reserves a
+    /// distinct lineage for its future mutations. This process-local predicate
+    /// lets internal consumers reject a newer revision from that sibling
+    /// branch without exposing the opaque lineage identifier as public data.
+    pub(crate) fn shares_mutation_lineage_with(self, other: Self) -> bool {
+        self.instance_id == other.instance_id && self.version.lineage == other.version.lineage
+    }
 }
 
 #[derive(Debug)]
@@ -2866,6 +2877,16 @@ mod tests {
 
         assert_eq!(first.snapshot(), source_snapshot);
         assert_eq!(second.snapshot(), source_snapshot);
+        assert!(
+            first
+                .snapshot()
+                .shares_mutation_lineage_with(source_snapshot)
+        );
+        assert!(
+            second
+                .snapshot()
+                .shares_mutation_lineage_with(source_snapshot)
+        );
 
         let first_pose = WorldToCamera::from_legacy_pose(crate::Pose::from_rt(
             [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -2888,6 +2909,25 @@ mod tests {
             second.snapshot().instance_id()
         );
         assert_ne!(first.snapshot(), second.snapshot());
+        assert!(
+            !first
+                .snapshot()
+                .shares_mutation_lineage_with(source_snapshot)
+        );
+        assert!(
+            !second
+                .snapshot()
+                .shares_mutation_lineage_with(source_snapshot)
+        );
+        assert!(
+            !first
+                .snapshot()
+                .shares_mutation_lineage_with(second.snapshot())
+        );
+
+        map.set_keyframe_pose(keyframe_id, first_pose)
+            .expect("mutate the source branch");
+        assert!(map.snapshot().shares_mutation_lineage_with(source_snapshot));
         assert_ne!(
             first
                 .keyframe(keyframe_id)
