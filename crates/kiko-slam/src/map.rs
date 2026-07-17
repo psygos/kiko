@@ -1,6 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+use std::collections::HashSet;
 
 use slotmap::{SlotMap, new_key_type};
 
@@ -15,6 +18,8 @@ const BLEND_SCALE: u16 = 256;
 const MIN_BLEND_ALPHA: f32 = 0.5 / BLEND_SCALE as f32;
 /// Rounding bias for fixed-point descriptor blending (half of BLEND_SCALE).
 const BLEND_ROUND: u32 = (BLEND_SCALE / 2) as u32;
+/// SlotMap reserves one `u32` key for its sentinel.
+const MAX_COVISIBILITY_COUNT: u32 = u32::MAX - 1;
 static NEXT_MAP_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_MAP_LINEAGE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -361,84 +366,274 @@ pub struct CovisibilityGraph {
 }
 
 impl CovisibilityGraph {
+    fn symmetric_pair_weight(&self, a: KeyframeId, b: KeyframeId) -> Option<NonZeroU32> {
+        assert_ne!(a, b, "covisibility graph contains a self edge");
+
+        let forward_neighbors = self.edges.get(&a);
+        if let Some(neighbors) = forward_neighbors {
+            assert!(
+                !neighbors.is_empty(),
+                "covisibility graph contains an empty adjacency bucket"
+            );
+        }
+        let reverse_neighbors = self.edges.get(&b);
+        if let Some(neighbors) = reverse_neighbors {
+            assert!(
+                !neighbors.is_empty(),
+                "covisibility graph contains an empty adjacency bucket"
+            );
+        }
+
+        let forward = forward_neighbors.and_then(|neighbors| neighbors.get(&b).copied());
+        let reverse = reverse_neighbors.and_then(|neighbors| neighbors.get(&a).copied());
+        match (forward, reverse) {
+            (None, None) => None,
+            (Some(weight), Some(reverse_weight)) => {
+                assert!(
+                    weight == reverse_weight,
+                    "covisibility graph contains asymmetric pair weights"
+                );
+                assert!(
+                    weight.get() <= MAX_COVISIBILITY_COUNT,
+                    "covisibility count exceeds the map point key space"
+                );
+                Some(weight)
+            }
+            _ => panic!("covisibility graph contains a missing reverse edge"),
+        }
+    }
+
+    fn preflight_increment_pair(&self, a: KeyframeId, b: KeyframeId) {
+        if let Some(weight) = self.symmetric_pair_weight(a, b) {
+            // SlotMap reserves one u32 key for its sentinel, and a map point
+            // contributes at most once to a keyframe pair. A valid count is
+            // therefore strictly below u32::MAX.
+            weight
+                .checked_add(1)
+                .filter(|next| next.get() <= MAX_COVISIBILITY_COUNT)
+                .expect("covisibility count exceeds the map point key space");
+        }
+    }
+
+    fn preflight_decrement_pair(&self, a: KeyframeId, b: KeyframeId) {
+        self.symmetric_pair_weight(a, b)
+            .expect("covisibility graph is missing an observed keyframe pair");
+    }
+
+    fn set_pair_weight(&mut self, a: KeyframeId, b: KeyframeId, weight: Option<NonZeroU32>) {
+        if let Some(weight) = weight {
+            self.edges.entry(a).or_default().insert(b, weight);
+            self.edges.entry(b).or_default().insert(a, weight);
+            return;
+        }
+
+        for (from, to) in [(a, b), (b, a)] {
+            let remove_bucket = {
+                let neighbors = self
+                    .edges
+                    .get_mut(&from)
+                    .expect("preflight proved the covisibility adjacency bucket exists");
+                neighbors
+                    .remove(&to)
+                    .expect("preflight proved the covisibility edge exists");
+                neighbors.is_empty()
+            };
+            if remove_bucket {
+                self.edges.remove(&from);
+            }
+        }
+    }
+
+    fn increment_pair_after_preflight(&mut self, a: KeyframeId, b: KeyframeId) {
+        let next = self
+            .edges
+            .get(&a)
+            .and_then(|neighbors| neighbors.get(&b).copied())
+            .map_or(NonZeroU32::MIN, |weight| {
+                weight
+                    .checked_add(1)
+                    .filter(|next| next.get() <= MAX_COVISIBILITY_COUNT)
+                    .expect("preflight proved the covisibility count has capacity")
+            });
+        self.set_pair_weight(a, b, Some(next));
+    }
+
+    fn decrement_pair_after_preflight(&mut self, a: KeyframeId, b: KeyframeId) {
+        let weight = self
+            .edges
+            .get(&a)
+            .and_then(|neighbors| neighbors.get(&b).copied())
+            .expect("preflight proved the covisibility edge exists");
+        self.set_pair_weight(a, b, NonZeroU32::new(weight.get() - 1));
+    }
+
+    #[cfg(test)]
     fn increment_pair(&mut self, a: KeyframeId, b: KeyframeId) {
         if a == b {
             return;
         }
-        self.increment_one(a, b);
-        self.increment_one(b, a);
+        self.preflight_increment_pair(a, b);
+        self.increment_pair_after_preflight(a, b);
     }
 
-    fn increment_one(&mut self, a: KeyframeId, b: KeyframeId) {
-        let entry = self.edges.entry(a).or_default();
-        if let Some(weight) = entry.get_mut(&b) {
-            *weight = weight.saturating_add(1);
-        } else {
-            entry.insert(b, NonZeroU32::MIN);
-        }
-    }
-
+    #[cfg(test)]
     fn decrement_pair(&mut self, a: KeyframeId, b: KeyframeId) {
         if a == b {
             return;
         }
-        self.decrement_one(a, b);
-        self.decrement_one(b, a);
+        self.preflight_decrement_pair(a, b);
+        self.decrement_pair_after_preflight(a, b);
     }
 
-    fn decrement_one(&mut self, a: KeyframeId, b: KeyframeId) {
-        let remove_edge = if let Some(neighbors) = self.edges.get_mut(&a) {
-            if let Some(weight) = neighbors.get(&b).copied() {
-                match NonZeroU32::new(weight.get().saturating_sub(1)) {
-                    Some(next) => {
-                        neighbors.insert(b, next);
-                    }
-                    None => {
-                        neighbors.remove(&b);
-                    }
-                }
-            }
-            neighbors.is_empty()
-        } else {
-            false
-        };
-
-        if remove_edge {
-            self.edges.remove(&a);
+    fn preflight_increment_observation_pairs(
+        &self,
+        keyframe_id: KeyframeId,
+        observations: &[KeyframeKeypoint],
+    ) {
+        for (index, observation) in observations.iter().enumerate() {
+            assert!(
+                observation.keyframe_id != keyframe_id
+                    && observations[..index]
+                        .iter()
+                        .all(|previous| previous.keyframe_id != observation.keyframe_id),
+                "map point contains duplicate keyframe observations"
+            );
+            self.preflight_increment_pair(keyframe_id, observation.keyframe_id);
         }
     }
 
-    fn remove_point_observations(&mut self, observations: &[KeyframeKeypoint]) {
+    fn increment_observation_pairs_after_preflight(
+        &mut self,
+        keyframe_id: KeyframeId,
+        observations: &[KeyframeKeypoint],
+    ) {
+        for observation in observations {
+            self.increment_pair_after_preflight(keyframe_id, observation.keyframe_id);
+        }
+    }
+
+    fn preflight_remove_point_observations(&self, observations: &[KeyframeKeypoint]) {
         for (i, obs_a) in observations.iter().enumerate() {
             for obs_b in &observations[i + 1..] {
-                self.decrement_pair(obs_a.keyframe_id, obs_b.keyframe_id);
+                self.preflight_decrement_pair(obs_a.keyframe_id, obs_b.keyframe_id);
             }
         }
     }
 
+    fn remove_point_observations_after_preflight(&mut self, observations: &[KeyframeKeypoint]) {
+        for (i, obs_a) in observations.iter().enumerate() {
+            for obs_b in &observations[i + 1..] {
+                self.decrement_pair_after_preflight(obs_a.keyframe_id, obs_b.keyframe_id);
+            }
+        }
+    }
+
+    /// Returns the non-empty neighbor set for a keyframe with incident edges.
     pub fn neighbors(&self, kf_id: KeyframeId) -> Option<&HashMap<KeyframeId, NonZeroU32>> {
-        self.edges.get(&kf_id)
+        self.edges.get(&kf_id).inspect(|neighbors| {
+            assert!(
+                !neighbors.is_empty(),
+                "covisibility graph contains an empty adjacency bucket"
+            );
+        })
     }
 
-    pub fn remove_keyframe(&mut self, kf_id: KeyframeId) {
-        if let Some(neighbors) = self.edges.remove(&kf_id) {
-            for neighbor_id in neighbors.keys() {
-                if let Some(their_edges) = self.edges.get_mut(neighbor_id) {
-                    their_edges.remove(&kf_id);
-                    if their_edges.is_empty() {
-                        self.edges.remove(neighbor_id);
-                    }
-                }
+    fn preflight_remove_keyframe(&self, kf_id: KeyframeId) {
+        let outgoing = self.edges.get(&kf_id);
+        if let Some(neighbors) = outgoing {
+            assert!(
+                !neighbors.is_empty(),
+                "covisibility graph contains an empty adjacency bucket"
+            );
+            for &neighbor_id in neighbors.keys() {
+                self.symmetric_pair_weight(kf_id, neighbor_id)
+                    .expect("outgoing covisibility edge disappeared during immutable preflight");
+            }
+        }
+
+        for (&neighbor_id, neighbors) in &self.edges {
+            if neighbor_id == kf_id {
+                continue;
+            }
+            if neighbors.contains_key(&kf_id) {
+                assert!(
+                    outgoing.is_some_and(|our_edges| our_edges.contains_key(&neighbor_id)),
+                    "covisibility graph contains an incoming-only edge"
+                );
             }
         }
     }
 
+    fn preflight_keyframe_counts(
+        &self,
+        kf_id: KeyframeId,
+        expected: &HashMap<KeyframeId, NonZeroU32>,
+    ) {
+        let actual = self.edges.get(&kf_id);
+        for (&neighbor_id, &weight) in expected {
+            assert!(
+                actual.and_then(|edges| edges.get(&neighbor_id)).copied() == Some(weight),
+                "covisibility graph is missing or miscounts an incident pair"
+            );
+        }
+        if let Some(actual) = actual {
+            assert!(
+                actual.len() == expected.len(),
+                "covisibility graph contains an unexpected incident pair"
+            );
+        }
+    }
+
+    fn remove_keyframe_after_preflight(&mut self, kf_id: KeyframeId) {
+        let Some(neighbors) = self.edges.remove(&kf_id) else {
+            return;
+        };
+        for (&neighbor_id, &weight) in &neighbors {
+            let remove_bucket = {
+                let their_edges = self
+                    .edges
+                    .get_mut(&neighbor_id)
+                    .expect("preflight proved the reverse adjacency bucket exists");
+                assert_eq!(
+                    their_edges.remove(&kf_id),
+                    Some(weight),
+                    "preflight proved the reverse covisibility edge matches"
+                );
+                their_edges.is_empty()
+            };
+            if remove_bucket {
+                self.edges.remove(&neighbor_id);
+            }
+        }
+    }
+
+    /// Removes every edge incident to `kf_id`.
+    ///
+    /// This is a no-op when the keyframe has no incident edges. It panics if
+    /// the graph's private symmetric-edge invariant has been violated.
+    pub fn remove_keyframe(&mut self, kf_id: KeyframeId) {
+        self.preflight_remove_keyframe(kf_id);
+        self.remove_keyframe_after_preflight(kf_id);
+    }
+
+    /// Returns the exact shared-point count, or zero for an absent or self pair.
+    ///
+    /// Panics if the graph's private symmetric-edge invariant has been violated.
     pub fn covisibility_count(&self, a: KeyframeId, b: KeyframeId) -> u32 {
-        self.edges
-            .get(&a)
-            .and_then(|m| m.get(&b))
-            .map(|v| v.get())
-            .unwrap_or(0)
+        if a == b {
+            if let Some(neighbors) = self.edges.get(&a) {
+                assert!(
+                    !neighbors.is_empty(),
+                    "covisibility graph contains an empty adjacency bucket"
+                );
+                assert!(
+                    !neighbors.contains_key(&a),
+                    "covisibility graph contains a self edge"
+                );
+            }
+            return 0;
+        }
+        self.symmetric_pair_weight(a, b).map_or(0, NonZeroU32::get)
     }
 }
 
@@ -880,13 +1075,10 @@ impl SlamMap {
         }
 
         let next_version = self.version.next(self.mutation_lineage);
-        for other in point
-            .observations
-            .iter()
-            .map(|existing| existing.keyframe_id)
-        {
-            self.covisibility.increment_pair(obs.keyframe_id, other);
-        }
+        self.covisibility
+            .preflight_increment_observation_pairs(obs.keyframe_id, &point.observations);
+        self.covisibility
+            .increment_observation_pairs_after_preflight(obs.keyframe_id, &point.observations);
 
         point.add_observation(obs);
         entry.set_point_ref(obs.index, point_id);
@@ -979,6 +1171,8 @@ impl SlamMap {
                 "map point observation backreference mismatch"
             );
         }
+        self.covisibility
+            .preflight_remove_point_observations(&point.observations);
 
         let point = self
             .points
@@ -1001,7 +1195,7 @@ impl SlamMap {
             );
         }
         self.covisibility
-            .remove_point_observations(&point.observations);
+            .remove_point_observations_after_preflight(&point.observations);
         self.version = next_version;
         Ok(())
     }
@@ -1023,6 +1217,7 @@ impl SlamMap {
             self.frame_to_keyframe.get(&entry.frame_id).copied() == Some(keyframe_id),
             "keyframe frame index is missing or mismatched"
         );
+        let mut expected_covisibility = HashMap::new();
         for (index, maybe_point_id) in entry.point_refs.iter().enumerate() {
             let Some(point_id) = *maybe_point_id else {
                 continue;
@@ -1034,23 +1229,61 @@ impl SlamMap {
                 .points
                 .get(raw_point_id)
                 .expect("keyframe map point is missing");
-            let mut observations = point
-                .observations
-                .iter()
-                .filter(|obs| obs.keyframe_id == keyframe_id);
-            let Some(observation) = observations.next() else {
+            let mut reciprocal_index = None;
+            for (observation_index, observation) in point.observations.iter().enumerate() {
+                if point.observations[..observation_index]
+                    .iter()
+                    .any(|previous| previous.keyframe_id == observation.keyframe_id)
+                {
+                    if observation.keyframe_id == keyframe_id {
+                        panic!("keyframe map point has duplicate reciprocal observations");
+                    }
+                    panic!("keyframe map point contains duplicate keyframe observations");
+                }
+                if observation.keyframe_id == keyframe_id {
+                    reciprocal_index = Some(observation.index.as_usize());
+                    continue;
+                }
+
+                let raw_observation_keyframe = observation
+                    .keyframe_id
+                    .raw_for(self.instance_id)
+                    .expect("keyframe map point observation belongs to another map");
+                let observation_keyframe = self
+                    .keyframes
+                    .get(raw_observation_keyframe)
+                    .expect("keyframe map point observation keyframe is missing");
+                assert!(
+                    observation_keyframe
+                        .point_refs
+                        .get(observation.index.as_usize())
+                        .copied()
+                        .flatten()
+                        == Some(point_id),
+                    "keyframe map point observation backreference mismatch"
+                );
+
+                expected_covisibility
+                    .entry(observation.keyframe_id)
+                    .and_modify(|count: &mut NonZeroU32| {
+                        *count = count
+                            .checked_add(1)
+                            .filter(|next| next.get() <= MAX_COVISIBILITY_COUNT)
+                            .expect("covisibility count exceeds the map point key space");
+                    })
+                    .or_insert(NonZeroU32::MIN);
+            }
+            let Some(reciprocal_index) = reciprocal_index else {
                 panic!("keyframe map point has no reciprocal observation");
             };
             assert_eq!(
-                observation.index.as_usize(),
-                index,
+                reciprocal_index, index,
                 "keyframe map point observation index mismatch"
             );
-            assert!(
-                observations.next().is_none(),
-                "keyframe map point has duplicate reciprocal observations"
-            );
         }
+        self.covisibility.preflight_remove_keyframe(keyframe_id);
+        self.covisibility
+            .preflight_keyframe_counts(keyframe_id, &expected_covisibility);
 
         let entry = self
             .keyframes
@@ -1061,7 +1294,8 @@ impl SlamMap {
             Some(keyframe_id),
             "keyframe frame index changed after validation"
         );
-        self.covisibility.remove_keyframe(keyframe_id);
+        self.covisibility
+            .remove_keyframe_after_preflight(keyframe_id);
 
         for point_id in entry.map_point_ids() {
             let raw_point_id = point_id
@@ -1276,16 +1510,20 @@ impl SlamMap {
             .collect();
 
         let mut edges = Vec::new();
-        let mut seen: HashSet<(KeyframeId, KeyframeId)> = HashSet::new();
         for (&a, neighbors) in &self.covisibility.edges {
+            assert!(
+                !neighbors.is_empty(),
+                "covisibility graph contains an empty adjacency bucket"
+            );
             for (&b, weight) in neighbors {
-                if a == b {
+                assert_eq!(
+                    self.covisibility.symmetric_pair_weight(a, b),
+                    Some(*weight),
+                    "covisibility snapshot pair changed during immutable traversal"
+                );
+                if a > b {
                     continue;
                 }
-                if seen.contains(&(b, a)) {
-                    continue;
-                }
-                seen.insert((a, b));
                 edges.push(CovisibilityEdge {
                     a,
                     b,
@@ -1395,6 +1633,9 @@ pub(crate) enum MapInvariantError {
         keyframe_id: KeyframeId,
         index: usize,
         found: Option<MapPointId>,
+    },
+    CovisibilityEmptyAdjacency {
+        keyframe_id: KeyframeId,
     },
     CovisibilitySelfEdge {
         keyframe_id: KeyframeId,
@@ -1511,6 +1752,10 @@ impl std::fmt::Display for MapInvariantError {
             } => write!(
                 f,
                 "map point backref mismatch: point={point_id:?}, keyframe={keyframe_id:?}, index={index}, found={found:?}"
+            ),
+            MapInvariantError::CovisibilityEmptyAdjacency { keyframe_id } => write!(
+                f,
+                "covisibility adjacency bucket is empty: keyframe={keyframe_id:?}"
             ),
             MapInvariantError::CovisibilitySelfEdge { keyframe_id } => {
                 write!(
@@ -1658,17 +1903,26 @@ pub(crate) fn assert_map_invariants(map: &SlamMap) -> Result<(), MapInvariantErr
 
         for (i, obs_a) in point.observations.iter().enumerate() {
             for obs_b in &point.observations[i + 1..] {
-                *expected_covisibility
+                let forward = expected_covisibility
                     .entry((obs_a.keyframe_id, obs_b.keyframe_id))
-                    .or_insert(0) += 1;
-                *expected_covisibility
+                    .or_insert(0);
+                *forward = forward
+                    .checked_add(1)
+                    .expect("covisibility count exceeds the map point key space");
+                let reverse = expected_covisibility
                     .entry((obs_b.keyframe_id, obs_a.keyframe_id))
-                    .or_insert(0) += 1;
+                    .or_insert(0);
+                *reverse = reverse
+                    .checked_add(1)
+                    .expect("covisibility count exceeds the map point key space");
             }
         }
     }
 
     for (&a, neighbors) in &map.covisibility.edges {
+        if neighbors.is_empty() {
+            return Err(MapInvariantError::CovisibilityEmptyAdjacency { keyframe_id: a });
+        }
         for (&b, &weight) in neighbors {
             if a == b {
                 return Err(MapInvariantError::CovisibilitySelfEdge { keyframe_id: a });
@@ -1732,6 +1986,60 @@ mod tests {
 
     fn make_descriptor() -> CompactDescriptor {
         CompactDescriptor([128; 256])
+    }
+
+    fn add_test_keyframe(map: &mut SlamMap, sequence: u64, keypoint_count: usize) -> KeyframeId {
+        map.add_keyframe(
+            FrameId::new(sequence),
+            Timestamp::from_nanos(i64::try_from(sequence).expect("test sequence fits i64")),
+            WorldToCamera::identity(),
+            ImageSize::try_new(640, 480).expect("valid image size"),
+            make_keypoints(keypoint_count),
+        )
+        .expect("test keyframe")
+    }
+
+    fn add_test_keyframes<const N: usize>(
+        map: &mut SlamMap,
+        first_sequence: u64,
+        keypoint_counts: [usize; N],
+    ) -> [KeyframeId; N] {
+        std::array::from_fn(|index| {
+            add_test_keyframe(
+                map,
+                first_sequence + u64::try_from(index).expect("test index fits u64"),
+                keypoint_counts[index],
+            )
+        })
+    }
+
+    fn test_observations<const N: usize>(
+        map: &SlamMap,
+        keyframes: [KeyframeId; N],
+        keypoint_index: usize,
+    ) -> [KeyframeKeypoint; N] {
+        keyframes.map(|keyframe_id| {
+            map.keyframe_keypoint(keyframe_id, keypoint_index)
+                .expect("test observation")
+        })
+    }
+
+    fn add_shared_test_point(
+        map: &mut SlamMap,
+        observations: &[KeyframeKeypoint],
+        x: f32,
+    ) -> MapPointId {
+        let (&first, remaining) = observations
+            .split_first()
+            .expect("shared test point needs an observation");
+        let point_id = map
+            .add_map_point(WorldPoint3::new(x, 0.0, 1.0), make_descriptor(), first)
+            .expect("shared test point");
+        for &observation in remaining {
+            map.add_observation(point_id, observation)
+                .expect("shared test observation");
+        }
+        point_id
     }
 
     fn assert_panics_with<T>(expected: &str, operation: impl FnOnce() -> T) {
@@ -2791,6 +3099,337 @@ mod tests {
         assert_eq!(map.covisibility().covisibility_count(kf1, kf2), 0);
         assert_eq!(map.covisibility_ratio(kf1, kf2).expect("zero ratio"), 0.0);
         assert_map_invariants(&map).expect("after point removal");
+    }
+
+    #[test]
+    fn covisibility_pair_updates_are_exact_and_symmetric() {
+        let first = KeyframeId::for_test(0);
+        let second = KeyframeId::for_test(1);
+        let mut graph = CovisibilityGraph::default();
+
+        graph.increment_pair(first, second);
+        assert_eq!(graph.covisibility_count(first, second), 1);
+        assert_eq!(graph.covisibility_count(second, first), 1);
+
+        graph.increment_pair(first, second);
+        assert_eq!(graph.covisibility_count(first, second), 2);
+        assert_eq!(graph.covisibility_count(second, first), 2);
+
+        graph.decrement_pair(first, second);
+        assert_eq!(graph.covisibility_count(first, second), 1);
+        assert_eq!(graph.covisibility_count(second, first), 1);
+        graph.decrement_pair(first, second);
+        assert_eq!(graph.covisibility_count(first, second), 0);
+        assert!(graph.edges.is_empty());
+
+        graph.set_pair_weight(first, second, NonZeroU32::new(MAX_COVISIBILITY_COUNT - 1));
+        graph.increment_pair(first, second);
+        assert_eq!(
+            graph.covisibility_count(first, second),
+            MAX_COVISIBILITY_COUNT
+        );
+        assert_eq!(
+            graph.covisibility_count(second, first),
+            MAX_COVISIBILITY_COUNT
+        );
+
+        let before = graph.edges.clone();
+        assert_panics_with("covisibility count exceeds the map point key space", || {
+            graph.increment_pair(first, second)
+        });
+        assert_eq!(graph.edges, before);
+
+        graph.set_pair_weight(first, second, NonZeroU32::new(u32::MAX));
+        let before = graph.edges.clone();
+        assert_panics_with("covisibility count exceeds the map point key space", || {
+            graph.increment_pair(first, second)
+        });
+        assert_eq!(graph.edges, before);
+    }
+
+    #[test]
+    fn covisibility_pair_updates_reject_corruption_without_mutation() {
+        let first = KeyframeId::for_test(0);
+        let second = KeyframeId::for_test(1);
+        let one = NonZeroU32::MIN;
+        let two = NonZeroU32::new(2).expect("nonzero weight");
+
+        let mut missing_reverse = CovisibilityGraph::default();
+        missing_reverse
+            .edges
+            .entry(first)
+            .or_default()
+            .insert(second, one);
+
+        let mut asymmetric = CovisibilityGraph::default();
+        asymmetric
+            .edges
+            .entry(first)
+            .or_default()
+            .insert(second, one);
+        asymmetric
+            .edges
+            .entry(second)
+            .or_default()
+            .insert(first, two);
+
+        let mut empty_adjacency = CovisibilityGraph::default();
+        empty_adjacency.edges.insert(first, HashMap::new());
+
+        for (expected, graph) in [
+            (
+                "covisibility graph contains a missing reverse edge",
+                missing_reverse,
+            ),
+            (
+                "covisibility graph contains asymmetric pair weights",
+                asymmetric,
+            ),
+            (
+                "covisibility graph contains an empty adjacency bucket",
+                empty_adjacency,
+            ),
+        ] {
+            let mut increment = graph.clone();
+            let before = increment.edges.clone();
+            assert_panics_with(expected, || increment.increment_pair(first, second));
+            assert_eq!(increment.edges, before);
+
+            let mut decrement = graph;
+            let before = decrement.edges.clone();
+            assert_panics_with(expected, || decrement.decrement_pair(first, second));
+            assert_eq!(decrement.edges, before);
+        }
+    }
+
+    #[test]
+    fn covisibility_batch_failures_precede_map_mutation() {
+        let mut insertion_map = SlamMap::new();
+        let insertion_keyframes = add_test_keyframes(&mut insertion_map, 1, [1; 3]);
+        let insertion_observations = test_observations(&insertion_map, insertion_keyframes, 0);
+        let insertion_point =
+            add_shared_test_point(&mut insertion_map, &insertion_observations[..2], 0.0);
+        let third_observation = insertion_observations[2];
+        insertion_map
+            .covisibility
+            .edges
+            .entry(insertion_keyframes[2])
+            .or_default()
+            .insert(insertion_keyframes[1], NonZeroU32::MIN);
+
+        let insertion_snapshot = insertion_map.snapshot();
+        let insertion_edges = insertion_map.covisibility.edges.clone();
+        assert_panics_with("covisibility graph contains a missing reverse edge", || {
+            insertion_map.add_observation(insertion_point, third_observation)
+        });
+        assert_eq!(insertion_map.snapshot(), insertion_snapshot);
+        assert_eq!(insertion_map.covisibility.edges, insertion_edges);
+        assert_eq!(
+            insertion_map
+                .point(insertion_point)
+                .expect("insertion point remains")
+                .observations,
+            insertion_observations[..2]
+        );
+        for observation in &insertion_observations[..2] {
+            assert_eq!(
+                insertion_map
+                    .map_point_for_keypoint(*observation)
+                    .expect("existing insertion backreference remains readable"),
+                Some(insertion_point)
+            );
+        }
+        assert_eq!(
+            insertion_map
+                .map_point_for_keypoint(third_observation)
+                .expect("third backreference remains readable"),
+            None
+        );
+
+        let mut removal_map = SlamMap::new();
+        let removal_keyframes = add_test_keyframes(&mut removal_map, 11, [1; 3]);
+        let removal_observations = test_observations(&removal_map, removal_keyframes, 0);
+        let removal_point = add_shared_test_point(&mut removal_map, &removal_observations, 0.0);
+        removal_map
+            .covisibility
+            .edges
+            .get_mut(&removal_keyframes[2])
+            .expect("third adjacency")
+            .remove(&removal_keyframes[1])
+            .expect("reverse edge to corrupt");
+
+        let removal_snapshot = removal_map.snapshot();
+        let removal_edges = removal_map.covisibility.edges.clone();
+        assert_panics_with("covisibility graph contains a missing reverse edge", || {
+            removal_map.remove_map_point(removal_point)
+        });
+        assert_eq!(removal_map.snapshot(), removal_snapshot);
+        assert_eq!(removal_map.covisibility.edges, removal_edges);
+        assert_eq!(
+            removal_map
+                .point(removal_point)
+                .expect("removal point remains")
+                .observations,
+            removal_observations
+        );
+        for observation in removal_observations {
+            assert_eq!(
+                removal_map
+                    .map_point_for_keypoint(observation)
+                    .expect("removal backreference remains readable"),
+                Some(removal_point)
+            );
+        }
+    }
+
+    #[test]
+    fn keyframe_removal_preflights_incident_covisibility() {
+        let mut map = SlamMap::new();
+        let keyframes = add_test_keyframes(&mut map, 21, [1, 2, 2, 1]);
+        let shared_observations = test_observations(&map, keyframes, 0);
+        let shared_point = add_shared_test_point(&mut map, &shared_observations[..3], 0.0);
+        let second_pair_observations = [
+            map.keyframe_keypoint(keyframes[1], 1)
+                .expect("second pair observation"),
+            map.keyframe_keypoint(keyframes[2], 1)
+                .expect("third pair observation"),
+        ];
+        let second_pair_point = add_shared_test_point(&mut map, &second_pair_observations, 1.0);
+        assert_eq!(
+            map.covisibility
+                .covisibility_count(keyframes[1], keyframes[2]),
+            2
+        );
+        assert_map_invariants(&map).expect("valid keyframe-removal fixture");
+
+        let mut incoming_only = map.clone();
+        incoming_only
+            .covisibility
+            .edges
+            .get_mut(&keyframes[0])
+            .expect("first adjacency")
+            .remove(&keyframes[2])
+            .expect("outgoing edge to corrupt");
+
+        let mut outgoing_only = map.clone();
+        outgoing_only
+            .covisibility
+            .edges
+            .get_mut(&keyframes[2])
+            .expect("third adjacency")
+            .remove(&keyframes[0])
+            .expect("reverse edge to corrupt");
+
+        let mut asymmetric = map.clone();
+        *asymmetric
+            .covisibility
+            .edges
+            .get_mut(&keyframes[2])
+            .expect("third adjacency")
+            .get_mut(&keyframes[0])
+            .expect("reverse edge") = NonZeroU32::new(2).expect("nonzero weight");
+
+        let mut missing_pair = map.clone();
+        for (from, to) in [(keyframes[0], keyframes[2]), (keyframes[2], keyframes[0])] {
+            missing_pair
+                .covisibility
+                .edges
+                .get_mut(&from)
+                .expect("pair adjacency")
+                .remove(&to)
+                .expect("pair edge to corrupt");
+        }
+
+        let mut wrong_count = map.clone();
+        for (from, to) in [(keyframes[0], keyframes[2]), (keyframes[2], keyframes[0])] {
+            *wrong_count
+                .covisibility
+                .edges
+                .get_mut(&from)
+                .expect("pair adjacency")
+                .get_mut(&to)
+                .expect("pair edge") = NonZeroU32::new(2).expect("nonzero weight");
+        }
+
+        let mut unexpected_pair = map.clone();
+        unexpected_pair.covisibility.set_pair_weight(
+            keyframes[0],
+            keyframes[3],
+            Some(NonZeroU32::MIN),
+        );
+
+        for (expected, mut corrupt) in [
+            (
+                "covisibility graph contains an incoming-only edge",
+                incoming_only,
+            ),
+            (
+                "covisibility graph contains a missing reverse edge",
+                outgoing_only,
+            ),
+            (
+                "covisibility graph contains asymmetric pair weights",
+                asymmetric,
+            ),
+            (
+                "covisibility graph is missing or miscounts an incident pair",
+                missing_pair,
+            ),
+            (
+                "covisibility graph is missing or miscounts an incident pair",
+                wrong_count,
+            ),
+            (
+                "covisibility graph contains an unexpected incident pair",
+                unexpected_pair,
+            ),
+        ] {
+            let corrupt_snapshot = corrupt.snapshot();
+            let corrupt_edges = corrupt.covisibility.edges.clone();
+            assert_panics_with(expected, || corrupt.remove_keyframe(keyframes[0]));
+            assert_eq!(corrupt.snapshot(), corrupt_snapshot);
+            assert_eq!(corrupt.covisibility.edges, corrupt_edges);
+            assert_eq!(corrupt.num_keyframes(), 4);
+            assert_eq!(corrupt.num_points(), 2);
+            assert_eq!(
+                corrupt.keyframe_by_frame(FrameId::new(21)),
+                Some(keyframes[0])
+            );
+            assert_eq!(
+                corrupt
+                    .point(shared_point)
+                    .expect("shared point remains")
+                    .observations,
+                shared_observations[..3]
+            );
+            for observation in &shared_observations[..3] {
+                assert_eq!(
+                    corrupt
+                        .map_point_for_keypoint(*observation)
+                        .expect("shared backreference remains readable"),
+                    Some(shared_point)
+                );
+            }
+        }
+
+        map.remove_keyframe(keyframes[0])
+            .expect("valid keyframe removal");
+        assert!(map.keyframe(keyframes[0]).is_none());
+        assert_eq!(map.keyframe_by_frame(FrameId::new(21)), None);
+        assert_eq!(
+            map.point(shared_point)
+                .expect("shared point remains observed")
+                .observation_count(),
+            2
+        );
+        assert!(map.point(second_pair_point).is_some());
+        assert_eq!(
+            map.covisibility
+                .covisibility_count(keyframes[1], keyframes[2]),
+            2
+        );
+        assert!(map.covisibility.neighbors(keyframes[0]).is_none());
+        assert_map_invariants(&map).expect("after valid keyframe removal");
     }
 
     #[test]
