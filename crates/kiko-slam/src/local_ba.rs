@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, TryReserveError};
 use std::num::NonZeroUsize;
 
 use crate::{
-    Keypoint, Observation, PinholeIntrinsics, Point3, Pose,
+    Keypoint, Observation, ObservationError, PinholeIntrinsics, Point3, Pose,
     map::{KeyframeId, KeyframeKeypoint, MapPointId, SlamMap},
     math,
 };
@@ -1055,8 +1055,8 @@ pub enum ObservationResolveError {
     MissingMapPoint {
         point_id: MapPointId,
     },
-    Pnp {
-        source: crate::PnpError,
+    Observation {
+        source: ObservationError,
     },
 }
 
@@ -1083,7 +1083,9 @@ impl std::fmt::Display for ObservationResolveError {
                     "BA observation references missing map point {point_id:?}"
                 )
             }
-            Self::Pnp { source } => write!(f, "BA observation geometry is invalid: {source}"),
+            Self::Observation { source } => {
+                write!(f, "BA observation coordinates are invalid: {source}")
+            }
         }
     }
 }
@@ -1093,7 +1095,7 @@ impl std::error::Error for ObservationResolveError {
         match self {
             Self::Allocation { source, .. } => Some(source),
             Self::Map { source } => Some(source),
-            Self::Pnp { source } => Some(source),
+            Self::Observation { source } => Some(source),
             Self::MissingAssociation { .. } | Self::MissingMapPoint { .. } => None,
         }
     }
@@ -1269,11 +1271,10 @@ impl ObservationSet {
     fn resolve(
         &self,
         map: &SlamMap,
-        intrinsics: PinholeIntrinsics,
         min_required: NonZeroUsize,
     ) -> Result<Option<ResolvedObservationSet>, ObservationResolveError> {
         let mut resolved = Vec::new();
-        if !self.resolve_observations_into(map, intrinsics, min_required, &mut resolved)? {
+        if !self.resolve_observations_into(map, min_required, &mut resolved)? {
             return Ok(None);
         }
         Ok(Some(ResolvedObservationSet {
@@ -1284,7 +1285,6 @@ impl ObservationSet {
     fn resolve_observations_into(
         &self,
         map: &SlamMap,
-        intrinsics: PinholeIntrinsics,
         min_required: NonZeroUsize,
         resolved: &mut Vec<Observation>,
     ) -> Result<bool, ObservationResolveError> {
@@ -1309,8 +1309,8 @@ impl ObservationSet {
                 .point(point_id)
                 .ok_or(ObservationResolveError::MissingMapPoint { point_id })?
                 .position();
-            let observation = Observation::try_new(world, obs.pixel(), intrinsics)
-                .map_err(|source| ObservationResolveError::Pnp { source })?;
+            let observation = Observation::try_new(world, obs.pixel())
+                .map_err(|source| ObservationResolveError::Observation { source })?;
             resolved.push(observation);
         }
         Ok(resolved.len() >= min_required.get())
@@ -3527,17 +3527,15 @@ impl LocalBundleAdjuster {
                 .min(self.config.window()),
         );
         for frame in self.frames.iter().skip(retained_start) {
-            let Some(frame_observations) =
-                frame
-                    .observations
-                    .resolve(map, self.intrinsics, self.config.min_observations)?
+            let Some(frame_observations) = frame
+                .observations
+                .resolve(map, self.config.min_observations)?
             else {
                 return Ok(PoseBaOutcome::InsufficientSupport);
             };
             resolved.push(frame_observations);
         }
-        let Some(frame_observations) =
-            observations.resolve(map, self.intrinsics, self.config.min_observations)?
+        let Some(frame_observations) = observations.resolve(map, self.config.min_observations)?
         else {
             return Ok(PoseBaOutcome::InsufficientSupport);
         };
@@ -4147,7 +4145,6 @@ fn optimize_vio_with_workspace(
         if let Some(observations) = window.observations(frame_index) {
             resolved.available = observations.resolve_observations_into(
                 map,
-                config.intrinsics,
                 NonZeroUsize::MIN,
                 &mut resolved.observations,
             )?;
@@ -5882,7 +5879,7 @@ mod tests {
 
     #[test]
     fn observation_resolution_reports_removed_association() {
-        let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let (mut map, _intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
         let keypoint = map
             .keyframe_keypoint(keyframe_id, 0)
             .expect("fixture keypoint");
@@ -5901,7 +5898,7 @@ mod tests {
             .expect("remove fixture point");
 
         let error = observations
-            .resolve(&map, intrinsics, NonZeroUsize::MIN)
+            .resolve(&map, NonZeroUsize::MIN)
             .expect_err("removed association must not look like insufficient support");
         assert!(matches!(
             error,
@@ -5912,7 +5909,7 @@ mod tests {
 
     #[test]
     fn observation_resolution_preserves_foreign_map_error_source() {
-        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let (map, _intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
         let keypoint = map
             .keyframe_keypoint(keyframe_id, 0)
             .expect("fixture keypoint");
@@ -5924,7 +5921,7 @@ mod tests {
         .expect("one observation");
 
         let error = observations
-            .resolve(&SlamMap::new(), intrinsics, NonZeroUsize::MIN)
+            .resolve(&SlamMap::new(), NonZeroUsize::MIN)
             .expect_err("foreign keypoint must be rejected");
         assert!(matches!(error, ObservationResolveError::Map { .. }));
         assert!(std::error::Error::source(&error).is_some());
@@ -5965,6 +5962,45 @@ mod tests {
                 source: ObservationResolveError::MissingAssociation { keypoint }
             }
                 if keypoint == removed_keypoint
+        ));
+        assert!(ba.frames.is_empty(), "failed push must be transactional");
+    }
+
+    #[test]
+    fn invalid_observation_coordinate_propagates_and_does_not_advance_ba_window() {
+        let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
+        let minimum = NonZeroUsize::new(4).expect("nonzero minimum");
+        let observations = (0..minimum.get())
+            .map(|index| {
+                let keypoint = map
+                    .keyframe_keypoint(keyframe_id, index)
+                    .expect("fixture keypoint");
+                let mut pixel = map.keypoint(keypoint).expect("fixture pixel");
+                if index == 0 {
+                    pixel.x = f32::NAN;
+                }
+                MapObservation::new(keypoint, pixel)
+            })
+            .collect();
+        let observations = ObservationSet::new(observations, minimum).expect("observation set");
+        let config =
+            LocalBaConfig::new(5, 5, minimum.get(), 2.0, lm(1e-3)).expect("valid BA config");
+        let mut ba = make_bundle_adjuster(intrinsics, config);
+
+        let error = ba
+            .push_frame(&map, Pose::identity(), observations)
+            .expect_err("nonfinite pixel must fail during observation parsing");
+
+        assert!(matches!(
+            error,
+            PoseBaError::Observation {
+                source: ObservationResolveError::Observation {
+                    source: ObservationError::NonFinitePixelCoordinate {
+                        axis: crate::ImagePlaneAxis::U,
+                        value,
+                    },
+                },
+            } if value.is_nan()
         ));
         assert!(ba.frames.is_empty(), "failed push must be transactional");
     }
@@ -6704,7 +6740,7 @@ mod tests {
         pixel.x += 1.7;
         pixel.y -= 0.9;
 
-        let obs = Observation::try_new(point, pixel, intrinsics).expect("observation");
+        let obs = Observation::try_new(point, pixel).expect("observation");
         let (_residual, jac) =
             reprojection_residual_and_jacobian(pose, &obs, intrinsics).expect("jacobian");
 
@@ -7876,7 +7912,6 @@ mod tests {
                 z: 2.0,
             },
             Keypoint { x: 320.0, y: 240.0 },
-            intrinsics,
         )
         .expect("front observation");
         let behind = Observation::try_new(
@@ -7886,7 +7921,6 @@ mod tests {
                 z: -2.0,
             },
             Keypoint { x: 320.0, y: 240.0 },
-            intrinsics,
         )
         .expect("behind observation");
         let resolved = vec![

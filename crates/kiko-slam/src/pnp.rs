@@ -142,12 +142,40 @@ impl PinholeIntrinsics {
     }
 }
 
+/// A finite correspondence between a world-frame point and an image pixel.
+///
+/// Observations are deliberately calibration-neutral. A PnP solve binds one
+/// authoritative [`PinholeIntrinsics`] value to both bearing construction and
+/// reprojection scoring, so mixed-calibration hypotheses are unrepresentable.
 #[derive(Clone, Copy, Debug)]
 pub struct Observation {
     world: Point3,
     pixel: Keypoint,
-    bearing: [f32; 3],
 }
+
+/// Failure to parse weakly typed coordinates into an [`Observation`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ObservationError {
+    NonFiniteWorldCoordinate { axis: CameraFrameAxis, value: f32 },
+    NonFinitePixelCoordinate { axis: ImagePlaneAxis, value: f32 },
+}
+
+impl std::fmt::Display for ObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFiniteWorldCoordinate { axis, value } => write!(
+                f,
+                "observation world-frame {axis} coordinate must be finite, got {value}"
+            ),
+            Self::NonFinitePixelCoordinate { axis, value } => write!(
+                f,
+                "observation image-plane {axis} coordinate must be finite, got {value}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObservationError {}
 
 impl Observation {
     pub fn world(&self) -> Point3 {
@@ -158,32 +186,22 @@ impl Observation {
         self.pixel
     }
 
-    pub fn bearing(&self) -> [f32; 3] {
-        self.bearing
-    }
-
-    pub fn try_new(
-        world: Point3,
-        pixel: Keypoint,
-        intrinsics: PinholeIntrinsics,
-    ) -> Result<Self, PnpError> {
-        for (field, value) in [
-            ("world.x", world.x),
-            ("world.y", world.y),
-            ("world.z", world.z),
-            ("pixel.x", pixel.x),
-            ("pixel.y", pixel.y),
+    pub fn try_new(world: Point3, pixel: Keypoint) -> Result<Self, ObservationError> {
+        for (axis, value) in [
+            (CameraFrameAxis::X, world.x),
+            (CameraFrameAxis::Y, world.y),
+            (CameraFrameAxis::Z, world.z),
         ] {
             if !value.is_finite() {
-                return Err(PnpError::NonFiniteObservation { field, value });
+                return Err(ObservationError::NonFiniteWorldCoordinate { axis, value });
             }
         }
-        let bearing = normalize_bearing(pixel, intrinsics)?;
-        Ok(Self {
-            world,
-            pixel,
-            bearing,
-        })
+        for (axis, value) in [(ImagePlaneAxis::U, pixel.x), (ImagePlaneAxis::V, pixel.y)] {
+            if !value.is_finite() {
+                return Err(ObservationError::NonFinitePixelCoordinate { axis, value });
+            }
+        }
+        Ok(Self { world, pixel })
     }
 }
 
@@ -1197,12 +1215,10 @@ impl std::error::Error for PnpRefinementFallback {
 #[derive(Debug)]
 pub enum PnpError {
     Rejected(PnpRejection),
-    NonFiniteObservation {
-        field: &'static str,
-        value: f32,
-    },
-    ObservationBearingForwardComponentOutsideF32Domain {
-        value: f64,
+    Observation(ObservationError),
+    BearingBufferAllocation {
+        observation_count: usize,
+        source: TryReserveError,
     },
     InlierBufferAllocation {
         buffer: PnpInlierBuffer,
@@ -1223,12 +1239,13 @@ impl std::fmt::Display for PnpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PnpError::Rejected(rejection) => write!(f, "pnp rejected: {rejection}"),
-            PnpError::NonFiniteObservation { field, value } => {
-                write!(f, "pnp observation {field} must be finite, got {value}")
-            }
-            PnpError::ObservationBearingForwardComponentOutsideF32Domain { value } => write!(
+            PnpError::Observation(source) => write!(f, "invalid pnp observation: {source}"),
+            PnpError::BearingBufferAllocation {
+                observation_count,
+                source,
+            } => write!(
                 f,
-                "pnp observation unit bearing has positive forward component {value}, which is not representable in f32"
+                "failed to allocate calibrated bearings for {observation_count} PnP observations: {source}"
             ),
             PnpError::InlierBufferAllocation {
                 buffer,
@@ -1257,11 +1274,12 @@ impl std::error::Error for PnpError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rejected(rejection) => Some(rejection),
+            Self::Observation(source) => Some(source),
+            Self::BearingBufferAllocation { source, .. } => Some(source),
             Self::InlierBufferAllocation { source, .. } => Some(source),
-            Self::NonFiniteObservation { .. }
-            | Self::ObservationBearingForwardComponentOutsideF32Domain { .. }
-            | Self::P3pBufferCapacityExceeded { .. }
-            | Self::RansacRejectionCountOverflow { .. } => None,
+            Self::P3pBufferCapacityExceeded { .. } | Self::RansacRejectionCountOverflow { .. } => {
+                None
+            }
         }
     }
 }
@@ -1337,12 +1355,18 @@ impl PnpError {
     pub fn rejection(&self) -> Option<PnpRejection> {
         match self {
             Self::Rejected(rejection) => Some(*rejection),
-            Self::NonFiniteObservation { .. }
-            | Self::ObservationBearingForwardComponentOutsideF32Domain { .. }
+            Self::Observation(_)
+            | Self::BearingBufferAllocation { .. }
             | Self::InlierBufferAllocation { .. }
             | Self::P3pBufferCapacityExceeded { .. }
             | Self::RansacRejectionCountOverflow { .. } => None,
         }
+    }
+}
+
+impl From<ObservationError> for PnpError {
+    fn from(source: ObservationError) -> Self {
+        Self::Observation(source)
     }
 }
 
@@ -1352,6 +1376,96 @@ impl From<PnpRejection> for PnpError {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct UnitBearing([f64; 3]);
+
+impl UnitBearing {
+    fn from_pixel(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Self {
+        let x = (f64::from(pixel.x) - f64::from(intrinsics.cx())) / f64::from(intrinsics.fx());
+        let y = (f64::from(pixel.y) - f64::from(intrinsics.cy())) / f64::from(intrinsics.fy());
+        let norm = x.hypot(y).hypot(1.0);
+
+        // Every input was parsed as finite f32 and the focal lengths are
+        // strictly positive. The largest possible quotient is below 2^279,
+        // so f64 normalization is finite and retains a positive forward ray.
+        debug_assert!(norm.is_finite() && norm >= 1.0);
+        let bearing = [x / norm, y / norm, 1.0 / norm];
+        debug_assert!(bearing.into_iter().all(f64::is_finite));
+        debug_assert!(bearing[2] > 0.0);
+        Self(bearing)
+    }
+
+    fn into_array(self) -> [f64; 3] {
+        self.0
+    }
+}
+
+/// One solve-owned calibration authority for both P3P rays and pixel scoring.
+struct CalibratedPnpProblem<'a> {
+    observations: &'a [Observation],
+    bearings: Vec<UnitBearing>,
+    intrinsics: PinholeIntrinsics,
+}
+
+impl<'a> CalibratedPnpProblem<'a> {
+    fn try_new(
+        observations: &'a [Observation],
+        intrinsics: PinholeIntrinsics,
+    ) -> Result<Self, PnpError> {
+        let mut bearings = Vec::new();
+        bearings
+            .try_reserve_exact(observations.len())
+            .map_err(|source| PnpError::BearingBufferAllocation {
+                observation_count: observations.len(),
+                source,
+            })?;
+        bearings.extend(
+            observations
+                .iter()
+                .map(|observation| UnitBearing::from_pixel(observation.pixel(), intrinsics)),
+        );
+        Ok(Self {
+            observations,
+            bearings,
+            intrinsics,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.observations.len()
+    }
+
+    fn sample(&self, indices: [usize; 3]) -> [CalibratedPnpObservation<'_>; 3] {
+        indices.map(|index| CalibratedPnpObservation {
+            observation: &self.observations[index],
+            bearing: self.bearings[index],
+        })
+    }
+
+    fn observation(&self, index: usize) -> Option<&Observation> {
+        self.observations.get(index)
+    }
+
+    fn evaluate_reprojection_residual(
+        &self,
+        pose: Pose,
+        index: usize,
+    ) -> Result<ReprojectionResidual, PinholeProjectionError> {
+        evaluate_reprojection_residual(pose, &self.observations[index], self.intrinsics)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CalibratedPnpObservation<'a> {
+    observation: &'a Observation,
+    bearing: UnitBearing,
+}
+
+/// Estimate a pose from finite, calibration-neutral observations.
+///
+/// `intrinsics` is the single camera model used to derive every P3P bearing,
+/// score every RANSAC candidate, and refine the winning pose. Returned inlier
+/// indices refer to the exact `observations` slice passed here.
 pub fn solve_pnp_ransac(
     observations: &[Observation],
     intrinsics: PinholeIntrinsics,
@@ -1372,6 +1486,8 @@ pub fn solve_pnp_ransac(
         .into());
     }
 
+    let problem = CalibratedPnpProblem::try_new(observations, intrinsics)?;
+
     let mut rng = XorShift64::new(config.seed);
     let mut best_pose = None;
     let mut best_inliers = try_inlier_buffer(PnpInlierBuffer::BestConsensus, observations.len())?;
@@ -1383,7 +1499,7 @@ pub fn solve_pnp_ransac(
     let mut saw_projection_complete_candidate = false;
 
     let mut ransac_iteration = NonZeroUsize::MIN;
-    let total = observations.len();
+    let total = problem.len();
     let mut target_iterations = config.max_iterations();
 
     let threshold_px = f64::from(config.reprojection_threshold_px());
@@ -1396,8 +1512,11 @@ pub fn solve_pnp_ransac(
             })
         })?;
 
-        let obs = [&observations[a], &observations[b], &observations[c]];
-        match p3p_solutions(obs, ransac_iteration, &mut p3p_candidates)? {
+        match p3p_solutions(
+            problem.sample([a, b, c]),
+            ransac_iteration,
+            &mut p3p_candidates,
+        )? {
             Some(reason) => {
                 PnpRansacRejections::try_record_minimal_sample(
                     &mut ransac_rejections,
@@ -1413,8 +1532,7 @@ pub fn solve_pnp_ransac(
                     if let Err(failure) = collect_inliers_into(
                         &mut candidate_inliers,
                         pose,
-                        observations,
-                        intrinsics,
+                        &problem,
                         threshold_sq_px2,
                     ) {
                         PnpRansacRejections::try_record_candidate_projection(
@@ -1465,52 +1583,50 @@ pub fn solve_pnp_ransac(
         return Err(no_consensus_error(ransac_rejections));
     }
 
-    let (pose, inliers, refinement) =
-        match refine_pose_on_inliers(pose, observations, intrinsics, &best_inliers) {
-            Ok((refined_pose, termination)) => match collect_inliers_into(
-                &mut candidate_inliers,
+    let (pose, inliers, refinement) = match refine_pose_on_inliers(pose, &problem, &best_inliers) {
+        Ok((refined_pose, termination)) => match collect_inliers_into(
+            &mut candidate_inliers,
+            refined_pose,
+            &problem,
+            threshold_sq_px2,
+        ) {
+            Ok(()) if candidate_inliers.len() >= config.min_inliers() => (
                 refined_pose,
-                observations,
-                intrinsics,
-                threshold_sq_px2,
-            ) {
-                Ok(()) if candidate_inliers.len() >= config.min_inliers() => (
-                    refined_pose,
-                    candidate_inliers,
-                    PnpRefinementStatus::Applied { termination },
-                ),
-                Ok(()) => {
-                    let refined_inliers = candidate_inliers.len();
-                    (
-                        pose,
-                        best_inliers,
-                        PnpRefinementStatus::RetainedRansacPose {
-                            reason: PnpRefinementFallback::LostConsensus {
-                                termination,
-                                candidate_inliers: refined_inliers,
-                                required_inliers: config.min_inliers(),
-                            },
-                        },
-                    )
-                }
-                Err(failure) => (
+                candidate_inliers,
+                PnpRefinementStatus::Applied { termination },
+            ),
+            Ok(()) => {
+                let refined_inliers = candidate_inliers.len();
+                (
                     pose,
                     best_inliers,
                     PnpRefinementStatus::RetainedRansacPose {
-                        reason: PnpRefinementFallback::PostRefinementConsensusProjection {
+                        reason: PnpRefinementFallback::LostConsensus {
                             termination,
-                            observation_index: failure.observation_index,
-                            source: failure.source,
+                            candidate_inliers: refined_inliers,
+                            required_inliers: config.min_inliers(),
                         },
                     },
-                ),
-            },
-            Err(reason) => (
+                )
+            }
+            Err(failure) => (
                 pose,
                 best_inliers,
-                PnpRefinementStatus::RetainedRansacPose { reason },
+                PnpRefinementStatus::RetainedRansacPose {
+                    reason: PnpRefinementFallback::PostRefinementConsensusProjection {
+                        termination,
+                        observation_index: failure.observation_index,
+                        source: failure.source,
+                    },
+                },
             ),
-        };
+        },
+        Err(reason) => (
+            pose,
+            best_inliers,
+            PnpRefinementStatus::RetainedRansacPose { reason },
+        ),
+    };
 
     Ok(PnpResult {
         pose,
@@ -1552,18 +1668,17 @@ struct IndexedProjectionFailure {
 fn collect_inliers_into(
     inliers: &mut Vec<usize>,
     pose: Pose,
-    observations: &[Observation],
-    intrinsics: PinholeIntrinsics,
+    problem: &CalibratedPnpProblem<'_>,
     threshold_sq_px2: f64,
 ) -> Result<(), IndexedProjectionFailure> {
     inliers.clear();
-    for (observation_index, observation) in observations.iter().enumerate() {
-        match evaluate_reprojection_residual(pose, observation, intrinsics).map_err(|source| {
-            IndexedProjectionFailure {
+    for observation_index in 0..problem.len() {
+        match problem
+            .evaluate_reprojection_residual(pose, observation_index)
+            .map_err(|source| IndexedProjectionFailure {
                 observation_index,
                 source,
-            }
-        })? {
+            })? {
             ReprojectionResidual::Projectable { residual_sq_px2 }
                 if residual_sq_px2 <= threshold_sq_px2 =>
             {
@@ -1598,8 +1713,7 @@ fn adaptive_ransac_iterations(inlier_count: usize, total: usize, confidence: f64
 
 fn refine_pose_on_inliers(
     initial_pose: Pose,
-    observations: &[Observation],
-    intrinsics: PinholeIntrinsics,
+    problem: &CalibratedPnpProblem<'_>,
     inlier_indices: &[usize],
 ) -> Result<(Pose, PnpRefinementTermination), PnpRefinementFallback> {
     if inlier_indices.is_empty() {
@@ -1618,15 +1732,16 @@ fn refine_pose_on_inliers(
         let mut current_cost = 0.0_f64;
 
         for &idx in inlier_indices {
-            let obs = observations
-                .get(idx)
-                .ok_or(PnpRefinementFallback::InvalidInlierIndex {
-                    iteration,
-                    index: idx,
-                    observation_count: observations.len(),
-                })?;
+            let obs =
+                problem
+                    .observation(idx)
+                    .ok_or(PnpRefinementFallback::InvalidInlierIndex {
+                        iteration,
+                        index: idx,
+                        observation_count: problem.len(),
+                    })?;
             let Some((residual, jacobian)) =
-                crate::local_ba::reprojection_residual_and_jacobian(pose, obs, intrinsics)
+                crate::local_ba::reprojection_residual_and_jacobian(pose, obs, problem.intrinsics)
             else {
                 nonprojectable = nonprojectable.saturating_add(1);
                 continue;
@@ -1667,21 +1782,20 @@ fn refine_pose_on_inliers(
         let mut candidate_nonprojectable = 0usize;
         let mut candidate_cost = 0.0_f64;
         for &idx in inlier_indices {
-            let observation =
-                observations
-                    .get(idx)
-                    .ok_or(PnpRefinementFallback::InvalidInlierIndex {
-                        iteration,
-                        index: idx,
-                        observation_count: observations.len(),
-                    })?;
-            match evaluate_reprojection_residual(candidate, observation, intrinsics).map_err(
-                |source| PnpRefinementFallback::CandidateProjection {
+            if problem.observation(idx).is_none() {
+                return Err(PnpRefinementFallback::InvalidInlierIndex {
+                    iteration,
+                    index: idx,
+                    observation_count: problem.len(),
+                });
+            }
+            match problem
+                .evaluate_reprojection_residual(candidate, idx)
+                .map_err(|source| PnpRefinementFallback::CandidateProjection {
                     iteration,
                     observation_index: idx,
                     source,
-                },
-            )? {
+                })? {
                 ReprojectionResidual::Projectable { residual_sq_px2 } => {
                     candidate_cost += residual_sq_px2;
                 }
@@ -1786,17 +1900,9 @@ fn decide_refinement_step(
     }
 }
 
-fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> Result<[f32; 3], PnpError> {
-    let x = (f64::from(pixel.x) - f64::from(intrinsics.cx())) / f64::from(intrinsics.fx());
-    let y = (f64::from(pixel.y) - f64::from(intrinsics.cy())) / f64::from(intrinsics.fy());
-    let norm = x.hypot(y).hypot(1.0);
-    let forward = 1.0 / norm;
-    if forward < f64::from(f32::from_bits(1)) {
-        return Err(
-            PnpError::ObservationBearingForwardComponentOutsideF32Domain { value: forward },
-        );
-    }
-    Ok([(x / norm) as f32, (y / norm) as f32, forward as f32])
+#[cfg(test)]
+fn normalize_bearing(pixel: Keypoint, intrinsics: PinholeIntrinsics) -> [f64; 3] {
+    UnitBearing::from_pixel(pixel, intrinsics).into_array()
 }
 
 const MAX_P3P_REAL_ROOTS: usize = 4;
@@ -1856,17 +1962,17 @@ fn p3p_capacity_error(
 }
 
 fn p3p_solutions(
-    obs: [&Observation; 3],
+    obs: [CalibratedPnpObservation<'_>; 3],
     ransac_iteration: NonZeroUsize,
     solutions: &mut FixedBuffer<Pose, MAX_P3P_POSE_CANDIDATES>,
 ) -> Result<Option<PnpMinimalSampleRejectionReason>, PnpError> {
     solutions.clear();
-    let p1 = vec3_from_point(obs[0].world);
-    let p2 = vec3_from_point(obs[1].world);
-    let p3 = vec3_from_point(obs[2].world);
-    let f1 = vec3_from_bearing(obs[0].bearing);
-    let f2 = vec3_from_bearing(obs[1].bearing);
-    let f3 = vec3_from_bearing(obs[2].bearing);
+    let p1 = vec3_from_point(obs[0].observation.world);
+    let p2 = vec3_from_point(obs[1].observation.world);
+    let p3 = vec3_from_point(obs[2].observation.world);
+    let f1 = obs[0].bearing.into_array();
+    let f2 = obs[1].bearing.into_array();
+    let f3 = obs[2].bearing.into_array();
 
     let a = norm(sub(p2, p3));
     let b = norm(sub(p1, p3));
@@ -2733,10 +2839,6 @@ fn vec3_from_point(p: Point3) -> [f64; 3] {
     [f64::from(p.x), f64::from(p.y), f64::from(p.z)]
 }
 
-fn vec3_from_bearing(bearing: [f32; 3]) -> [f64; 3] {
-    bearing.map(f64::from)
-}
-
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
@@ -2912,11 +3014,12 @@ mod tests {
 
     #[test]
     fn observation_rejects_non_finite_world_and_pixel_values() {
-        let intrinsics =
-            PinholeIntrinsics::try_new(400.0, 400.0, 320.0, 240.0).expect("intrinsics");
         let cases = [
             (
-                "world.x",
+                ObservationError::NonFiniteWorldCoordinate {
+                    axis: CameraFrameAxis::X,
+                    value: f32::NAN,
+                },
                 Point3 {
                     x: f32::NAN,
                     y: 0.0,
@@ -2925,7 +3028,10 @@ mod tests {
                 Keypoint { x: 1.0, y: 2.0 },
             ),
             (
-                "world.y",
+                ObservationError::NonFiniteWorldCoordinate {
+                    axis: CameraFrameAxis::Y,
+                    value: f32::INFINITY,
+                },
                 Point3 {
                     x: 0.0,
                     y: f32::INFINITY,
@@ -2934,7 +3040,10 @@ mod tests {
                 Keypoint { x: 1.0, y: 2.0 },
             ),
             (
-                "world.z",
+                ObservationError::NonFiniteWorldCoordinate {
+                    axis: CameraFrameAxis::Z,
+                    value: f32::NEG_INFINITY,
+                },
                 Point3 {
                     x: 0.0,
                     y: 0.0,
@@ -2943,7 +3052,10 @@ mod tests {
                 Keypoint { x: 1.0, y: 2.0 },
             ),
             (
-                "pixel.x",
+                ObservationError::NonFinitePixelCoordinate {
+                    axis: ImagePlaneAxis::U,
+                    value: f32::NAN,
+                },
                 Point3 {
                     x: 0.0,
                     y: 0.0,
@@ -2955,7 +3067,10 @@ mod tests {
                 },
             ),
             (
-                "pixel.y",
+                ObservationError::NonFinitePixelCoordinate {
+                    axis: ImagePlaneAxis::V,
+                    value: f32::INFINITY,
+                },
                 Point3 {
                     x: 0.0,
                     y: 0.0,
@@ -2968,11 +3083,34 @@ mod tests {
             ),
         ];
 
-        for (field, world, pixel) in cases {
-            assert!(matches!(
-                Observation::try_new(world, pixel, intrinsics),
-                Err(PnpError::NonFiniteObservation { field: actual, .. }) if actual == field
-            ));
+        for (expected, world, pixel) in cases {
+            let actual = Observation::try_new(world, pixel)
+                .expect_err("each weak coordinate must be parsed exactly once");
+            match (actual, expected) {
+                (
+                    ObservationError::NonFiniteWorldCoordinate {
+                        axis: actual_axis,
+                        value: actual_value,
+                    },
+                    ObservationError::NonFiniteWorldCoordinate {
+                        axis: expected_axis,
+                        value: expected_value,
+                    },
+                ) if actual_axis == expected_axis
+                    && actual_value.to_bits() == expected_value.to_bits() => {}
+                (
+                    ObservationError::NonFinitePixelCoordinate {
+                        axis: actual_axis,
+                        value: actual_value,
+                    },
+                    ObservationError::NonFinitePixelCoordinate {
+                        axis: expected_axis,
+                        value: expected_value,
+                    },
+                ) if actual_axis == expected_axis
+                    && actual_value.to_bits() == expected_value.to_bits() => {}
+                (actual, expected) => panic!("actual={actual:?}, expected={expected:?}"),
+            }
         }
     }
 
@@ -2988,7 +3126,7 @@ mod tests {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 400.0, 400.0, 320.0, 240.0).expect("intrinsics");
         let pixel = Keypoint { x: 369.0, y: 211.0 };
-        let b = normalize_bearing(pixel, intrinsics).expect("bearing");
+        let b = normalize_bearing(pixel, intrinsics);
         let n = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
         assert!((n - 1.0).abs() < 1e-6, "bearing norm must be 1, got {n}");
     }
@@ -3003,39 +3141,106 @@ mod tests {
                 y: 0.0,
             },
             intrinsics,
-        )
-        .expect("the finite normalized coordinate is representable");
+        );
 
-        assert!(bearing.into_iter().all(f32::is_finite));
+        assert!(bearing.into_iter().all(f64::is_finite));
         assert!(bearing[0] > 0.0);
         assert!(bearing[2] > 0.0);
         let norm = bearing
             .into_iter()
             .map(|value| value * value)
-            .sum::<f32>()
+            .sum::<f64>()
             .sqrt();
-        assert!((norm - 1.0).abs() <= f32::EPSILON);
+        assert!((norm - 1.0).abs() <= 4.0 * f64::EPSILON);
     }
 
     #[test]
-    fn normalize_bearing_rejects_forward_component_that_underflows_f32() {
+    fn normalize_bearing_retains_forward_component_below_f32_domain() {
         let intrinsics = PinholeIntrinsics::try_new(f32::from_bits(1), 1.0, -f32::MAX, 0.0)
             .expect("finite positive intrinsics");
-        let error = normalize_bearing(
+        let bearing = normalize_bearing(
             Keypoint {
                 x: f32::MAX,
                 y: 0.0,
             },
             intrinsics,
+        );
+
+        assert!(bearing.into_iter().all(f64::is_finite));
+        assert!(bearing[2] > 0.0);
+        assert!(bearing[2] < f64::from(f32::from_bits(1)));
+    }
+
+    #[test]
+    fn normalize_bearing_is_finite_unit_and_forward_over_f32_extremes() {
+        let focal_values = [f32::from_bits(1), f32::MIN_POSITIVE, 1.0, f32::MAX];
+        let coordinate_values = [-f32::MAX, -0.0, 0.0, f32::from_bits(1), f32::MAX];
+
+        for fx in focal_values {
+            for fy in focal_values {
+                for cx in coordinate_values {
+                    for cy in coordinate_values {
+                        let intrinsics = PinholeIntrinsics::try_new(fx, fy, cx, cy)
+                            .expect("finite positive intrinsics");
+                        for x in coordinate_values {
+                            for y in coordinate_values {
+                                let bearing = normalize_bearing(Keypoint { x, y }, intrinsics);
+                                assert!(bearing.into_iter().all(f64::is_finite));
+                                assert!(bearing[2] > 0.0);
+                                let norm = bearing[0].hypot(bearing[1]).hypot(bearing[2]);
+                                assert!(
+                                    (norm - 1.0).abs() <= 4.0 * f64::EPSILON,
+                                    "fx={fx} fy={fy} cx={cx} cy={cy} x={x} y={y} norm={norm}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn calibrated_problem_uses_one_intrinsics_authority_for_rays_and_scoring() {
+        let observation = Observation::try_new(
+            Point3 {
+                x: 1.0,
+                y: 0.0,
+                z: 2.0,
+            },
+            Keypoint { x: 420.0, y: 240.0 },
         )
-        .expect_err("the positive f64 forward component rounds to zero in f32");
+        .expect("finite calibration-neutral observation");
+        let observations = [observation];
+        let calibration_a =
+            PinholeIntrinsics::try_new(200.0, 200.0, 320.0, 240.0).expect("first calibration");
+        let calibration_b =
+            PinholeIntrinsics::try_new(400.0, 400.0, 320.0, 240.0).expect("second calibration");
+        let problem_a = CalibratedPnpProblem::try_new(&observations, calibration_a)
+            .expect("first calibrated problem");
+        let problem_b = CalibratedPnpProblem::try_new(&observations, calibration_b)
+            .expect("second calibrated problem");
+
+        let bearing_a = problem_a.bearings[0].into_array();
+        let bearing_b = problem_b.bearings[0].into_array();
+        assert!((bearing_a[0] - 0.5 / 1.25_f64.sqrt()).abs() <= 4.0 * f64::EPSILON);
+        assert!((bearing_b[0] - 0.25 / 1.0625_f64.sqrt()).abs() <= 4.0 * f64::EPSILON);
+        assert_ne!(bearing_a, bearing_b);
 
         assert!(matches!(
-            error,
-            PnpError::ObservationBearingForwardComponentOutsideF32Domain { value }
-                if value.is_finite() && value > 0.0 && value < f64::from(f32::from_bits(1))
+            problem_a
+                .evaluate_reprojection_residual(Pose::identity(), 0)
+                .expect("first calibrated score"),
+            ReprojectionResidual::Projectable { residual_sq_px2 }
+                if residual_sq_px2.to_bits() == 0.0_f64.to_bits()
         ));
-        assert!(error.rejection().is_none());
+        assert!(matches!(
+            problem_b
+                .evaluate_reprojection_residual(Pose::identity(), 0)
+                .expect("second calibrated score"),
+            ReprojectionResidual::Projectable { residual_sq_px2 }
+                if residual_sq_px2 == 10_000.0
+        ));
     }
 
     #[test]
@@ -3168,19 +3373,17 @@ mod tests {
                             x: u_px as f32,
                             y: v_px as f32,
                         },
-                        intrinsics,
                     )
                     .expect("finite observation")
                 })
                 .collect();
             assert_eq!(observations.len(), 3);
+            let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+                .expect("calibrated P3P sample");
             let mut solutions = FixedBuffer::new();
-            let rejection = p3p_solutions(
-                [&observations[0], &observations[1], &observations[2]],
-                NonZeroUsize::MIN,
-                &mut solutions,
-            )
-            .expect("fixed P3P capacity");
+            let rejection =
+                p3p_solutions(problem.sample([0, 1, 2]), NonZeroUsize::MIN, &mut solutions)
+                    .expect("fixed P3P capacity");
             assert!(rejection.is_none(), "sample rejection: {rejection:?}");
             let matched = solutions.iter().any(|solution| {
                 let actual_translation = solution.translation().map(f64::from);
@@ -3204,7 +3407,6 @@ mod tests {
         let observation = |world| Observation {
             world,
             pixel: Keypoint { x: 0.0, y: 0.0 },
-            bearing: [0.0, 0.0, 1.0],
         };
         let observations = [
             observation(Point3 {
@@ -3223,10 +3425,14 @@ mod tests {
                 z: 1.0,
             }),
         ];
+        let intrinsics =
+            PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("finite unit intrinsics");
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated P3P sample");
         let mut candidates = FixedBuffer::new();
 
         let rejection = p3p_solutions(
-            [&observations[0], &observations[1], &observations[2]],
+            problem.sample([0, 1, 2]),
             NonZeroUsize::MIN,
             &mut candidates,
         )
@@ -3343,7 +3549,13 @@ mod tests {
         let config = RansacConfig::new(700, 1.0, 20, 0xBAD5EED).expect("RANSAC config");
         let result = solve_pnp_ransac(&observations, intrinsics, config).expect("pnp");
         assert!(result.inliers().len() >= 20, "insufficient inliers");
-        assert!(result.refinement().applied());
+        assert!(matches!(
+            result.refinement(),
+            PnpRefinementStatus::Applied { .. }
+                | PnpRefinementStatus::RetainedRansacPose {
+                    reason: PnpRefinementFallback::Stationary { .. }
+                }
+        ));
         assert!(result.candidate_projection_rejections().is_none());
 
         let rot_err = rot_frob_norm(result.pose().rotation(), pose_gt.rotation());
@@ -3395,8 +3607,7 @@ mod tests {
                 pixel.x += 120.0;
                 pixel.y -= 85.0;
             }
-            with_outliers
-                .push(Observation::try_new(obs.world(), pixel, intrinsics).expect("observation"));
+            with_outliers.push(Observation::try_new(obs.world(), pixel).expect("observation"));
         }
 
         let config = RansacConfig::new(1000, 2.0, 14, 0x1337).expect("RANSAC config");
@@ -3448,19 +3659,15 @@ mod tests {
                 z: f32::MIN_POSITIVE,
             },
             pixel: Keypoint { x: 0.0, y: 0.0 },
-            bearing: [0.0, 0.0, 1.0],
         };
+        let observations = [observation];
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated finite-extreme problem");
         let mut inliers = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, 1)
             .expect("single-index scratch buffer");
 
-        collect_inliers_into(
-            &mut inliers,
-            Pose::identity(),
-            &[observation],
-            intrinsics,
-            1.0,
-        )
-        .expect("finite f32 inputs must remain numerically evaluable in f64");
+        collect_inliers_into(&mut inliers, Pose::identity(), &problem, 1.0)
+            .expect("finite f32 inputs must remain numerically evaluable in f64");
         assert!(inliers.is_empty());
     }
 
@@ -3475,16 +3682,17 @@ mod tests {
                 z: 1.0,
             },
             Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
         )
         .expect("finite observation");
+        let observations = [observation];
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated projection-failure problem");
         let mut inliers = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, 1)
             .expect("single-index scratch buffer");
         let failure = collect_inliers_into(
             &mut inliers,
             Pose::from_rt(Pose::identity().rotation(), [f32::NAN, 0.0, 0.0]),
-            &[observation],
-            intrinsics,
+            &problem,
             1.0,
         )
         .expect_err("nonfinite candidate geometry must reject the candidate");
@@ -3609,14 +3817,15 @@ mod tests {
         let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
         let observations =
             observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated refinement problem");
         let inlier_indices: Vec<usize> = (0..observations.len()).collect();
 
         let initial = axis_angle_pose([0.23, -0.08, 0.33], [0.10, -0.04, 0.02]);
         let initial_residuals_px = reprojection_residuals_px(&initial, &observations, intrinsics)
             .expect("initial reprojection residuals");
         let (refined, termination) =
-            refine_pose_on_inliers(initial, &observations, intrinsics, &inlier_indices)
-                .expect("refinement");
+            refine_pose_on_inliers(initial, &problem, &inlier_indices).expect("refinement");
         let refined_residuals_px = reprojection_residuals_px(&refined, &observations, intrinsics)
             .expect("refined reprojection residuals");
 
@@ -3716,6 +3925,8 @@ mod tests {
         let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
         let observations =
             observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated refinement problem");
         let inlier_indices: Vec<usize> = (0..observations.len()).collect();
 
         for initial in [
@@ -3736,9 +3947,7 @@ mod tests {
                     }
                 })
                 .sum();
-            if let Ok((refined, _)) =
-                refine_pose_on_inliers(initial, &observations, intrinsics, &inlier_indices)
-            {
+            if let Ok((refined, _)) = refine_pose_on_inliers(initial, &problem, &inlier_indices) {
                 let refined_cost: f64 = inlier_indices
                     .iter()
                     .map(|&index| {
@@ -3773,15 +3982,12 @@ mod tests {
         let observations =
             observations_from_projection(Pose::identity(), &synthetic_world_points(), intrinsics)
                 .expect("observations");
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated refinement problem");
         let invalid_index = observations.len();
 
-        let error = refine_pose_on_inliers(
-            Pose::identity(),
-            &observations,
-            intrinsics,
-            &[0, invalid_index],
-        )
-        .expect_err("invalid inlier index must not be skipped");
+        let error = refine_pose_on_inliers(Pose::identity(), &problem, &[0, invalid_index])
+            .expect_err("invalid inlier index must not be skipped");
 
         assert!(matches!(
             error,
@@ -3804,11 +4010,13 @@ mod tests {
                 z: -1.0,
             },
             Keypoint { x: 320.0, y: 240.0 },
-            intrinsics,
         )
         .expect("finite observation");
+        let observations = [observation];
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            .expect("calibrated nonprojectable problem");
 
-        let error = refine_pose_on_inliers(Pose::identity(), &[observation], intrinsics, &[0])
+        let error = refine_pose_on_inliers(Pose::identity(), &problem, &[0])
             .expect_err("behind-camera inlier must fail refinement");
 
         assert!(matches!(
@@ -3868,7 +4076,6 @@ mod tests {
                     z: 3.0,
                 },
                 Keypoint { x: 320.0, y: 240.0 },
-                intrinsics,
             )
             .expect("obs"),
             Observation::try_new(
@@ -3878,7 +4085,6 @@ mod tests {
                     z: 3.5,
                 },
                 Keypoint { x: 342.0, y: 252.0 },
-                intrinsics,
             )
             .expect("obs"),
             Observation::try_new(
@@ -3888,7 +4094,6 @@ mod tests {
                     z: 2.9,
                 },
                 Keypoint { x: 290.0, y: 266.0 },
-                intrinsics,
             )
             .expect("obs"),
         ];
@@ -3943,7 +4148,7 @@ mod tests {
             Keypoint { x: 340.0, y: 260.0 },
         ]
         .into_iter()
-        .map(|pixel| Observation::try_new(world, pixel, intrinsics).expect("finite observation"))
+        .map(|pixel| Observation::try_new(world, pixel).expect("finite observation"))
         .collect();
         let max_iterations = 7;
         let config = RansacConfig::new(max_iterations, 2.0, 4, 17).expect("RANSAC configuration");
@@ -3987,7 +4192,7 @@ mod tests {
             z: 4.2,
         };
         let pixel = project_pixel_from_pose(pose, point, intrinsics);
-        let obs = Observation::try_new(point, pixel, intrinsics).expect("obs");
+        let obs = Observation::try_new(point, pixel).expect("obs");
         let ReprojectionResidual::Projectable { residual_sq_px2 } =
             evaluate_reprojection_residual(pose, &obs, intrinsics)
                 .expect("finite projectable residual")
@@ -4029,7 +4234,6 @@ mod tests {
                 z: 2.0,
             },
             Keypoint { x: 320.0, y: 240.0 },
-            intrinsics,
         )
         .expect("observation");
         let behind_pose = Pose::from_rt(
@@ -4055,7 +4259,6 @@ mod tests {
                 x: -f32::MAX,
                 y: -f32::MAX,
             },
-            bearing: [0.0, 0.0, 1.0],
         };
 
         let ReprojectionResidual::Projectable {
@@ -4159,7 +4362,7 @@ mod tests {
             .map(|&point| {
                 let mut pixel = project_pixel_from_pose(pose, point, intrinsics);
                 pixel.x += 2.0;
-                Observation::try_new(point, pixel, intrinsics).expect("observation")
+                Observation::try_new(point, pixel).expect("observation")
             })
             .collect();
         let residuals_px = reprojection_residuals_px(&pose, &observations, intrinsics)
@@ -4187,7 +4390,6 @@ mod tests {
                     z: 2.5,
                 },
                 Keypoint { x: 300.0, y: 240.0 },
-                intrinsics,
             )
             .expect("observation"),
             Observation::try_new(
@@ -4197,7 +4399,6 @@ mod tests {
                     z: 3.0,
                 },
                 Keypoint { x: 340.0, y: 240.0 },
-                intrinsics,
             )
             .expect("observation"),
         ];

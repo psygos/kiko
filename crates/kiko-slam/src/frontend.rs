@@ -115,7 +115,7 @@ impl StereoFrontend {
         map: &SlamMap,
         matches: &Matches<Verified>,
     ) -> Result<TrackedMapObservations, MapObservationError> {
-        build_map_observations(map, matches, self.intrinsics)
+        build_map_observations(map, matches)
     }
 
     pub(crate) fn solve_tracking_pose(
@@ -141,7 +141,7 @@ pub enum MapObservationError {
         map_keypoints: usize,
     },
     Map(crate::map::MapError),
-    Pnp(crate::PnpError),
+    Observation(crate::ObservationError),
     NotEnoughPoints {
         required: usize,
         actual: usize,
@@ -174,8 +174,8 @@ impl std::fmt::Display for MapObservationError {
             MapObservationError::Map(source) => {
                 write!(f, "map observation lookup failed: {source}")
             }
-            MapObservationError::Pnp(source) => {
-                write!(f, "map observation bearing failed: {source}")
+            MapObservationError::Observation(source) => {
+                write!(f, "map observation coordinates are invalid: {source}")
             }
             MapObservationError::NotEnoughPoints { required, actual } => write!(
                 f,
@@ -189,7 +189,7 @@ impl std::error::Error for MapObservationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             MapObservationError::Map(source) => Some(source),
-            MapObservationError::Pnp(source) => Some(source),
+            MapObservationError::Observation(source) => Some(source),
             MapObservationError::MissingMatchProvenance
             | MapObservationError::MapInstanceMismatch { .. }
             | MapObservationError::KeyframeProvenanceMismatch { .. }
@@ -234,7 +234,6 @@ impl TrackedMapObservations {
 pub(crate) fn build_map_observations(
     map: &SlamMap,
     matches: &Matches<Verified>,
-    intrinsics: PinholeIntrinsics,
 ) -> Result<TrackedMapObservations, MapObservationError> {
     const MIN_PNP_CORRESPONDENCES: usize = 4;
     let verified_map_instance_id = matches
@@ -282,8 +281,8 @@ pub(crate) fn build_map_observations(
             crate::map::MapError::MapPointNotFound(point_id),
         ))?;
         let pixel = current.keypoints()[ci];
-        let obs = crate::Observation::try_new(point.position(), pixel, intrinsics)
-            .map_err(MapObservationError::Pnp)?;
+        let obs = crate::Observation::try_new(point.position(), pixel)
+            .map_err(MapObservationError::Observation)?;
         observations.push(obs);
         verified_match_indices.push(verified_match_idx);
     }

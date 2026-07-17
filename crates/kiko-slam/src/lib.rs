@@ -145,13 +145,14 @@ pub use pipeline::{
 };
 pub use place_recognition::{BootstrapDescriptorError, DescriptorInitError, DescriptorStats};
 pub use pnp::{
-    CameraFrameAxis, ImagePlaneAxis, IntrinsicsError, Observation, PinholeIntrinsics,
-    PinholeProjectionError, PnpCandidateProjectionRejection, PnpCandidateProjectionRejections,
-    PnpError, PnpInlierBuffer, PnpMinimalSampleRejection, PnpMinimalSampleRejectionReason,
-    PnpMinimalSampleRejections, PnpP3pBuffer, PnpRansacRejectionKind, PnpRansacRejections,
-    PnpRefinementCost, PnpRefinementFallback, PnpRefinementObjectiveStage, PnpRefinementStatus,
-    PnpRefinementTermination, PnpRejection, PnpResult, PnpWorldTriangleSide, Pose, RansacConfig,
-    RansacConfigError, ReprojectionEvaluationError, ReprojectionMetric, solve_pnp_ransac,
+    CameraFrameAxis, ImagePlaneAxis, IntrinsicsError, Observation, ObservationError,
+    PinholeIntrinsics, PinholeProjectionError, PnpCandidateProjectionRejection,
+    PnpCandidateProjectionRejections, PnpError, PnpInlierBuffer, PnpMinimalSampleRejection,
+    PnpMinimalSampleRejectionReason, PnpMinimalSampleRejections, PnpP3pBuffer,
+    PnpRansacRejectionKind, PnpRansacRejections, PnpRefinementCost, PnpRefinementFallback,
+    PnpRefinementObjectiveStage, PnpRefinementStatus, PnpRefinementTermination, PnpRejection,
+    PnpResult, PnpWorldTriangleSide, Pose, RansacConfig, RansacConfigError,
+    ReprojectionEvaluationError, ReprojectionMetric, solve_pnp_ransac,
 };
 pub use runtime_imu::{
     RuntimeImuCalibrationError, apply_runtime_imu_calibration_override,

@@ -6406,7 +6406,6 @@ mod tests {
                 z: 1.0,
             },
             crate::Keypoint { x: 0.0, y: 0.0 },
-            intrinsics,
         )
         .expect("finite observation");
         let pose = Pose::from_rt(Pose::identity().rotation(), [f32::NAN, 0.0, 0.0]);
@@ -6805,12 +6804,8 @@ mod tests {
         let verified = matches
             .with_landmarks(map.instance_id(), keyframe_id, &keyframe)
             .expect("verified matches");
-        let intrinsics =
-            crate::test_helpers::make_pinhole_intrinsics(320, 240, 300.0, 300.0, 160.0, 120.0)
-                .expect("intrinsics");
-
-        let tracked = crate::frontend::build_map_observations(&map, &verified, intrinsics)
-            .expect("tracked observations");
+        let tracked =
+            crate::frontend::build_map_observations(&map, &verified).expect("tracked observations");
 
         assert_eq!(tracked.observations().len(), 4);
         assert_eq!(tracked.verified_match_index(0), Some(0));
@@ -6876,7 +6871,7 @@ mod tests {
             .with_landmarks(map.instance_id(), wrong_keyframe_id, &keyframe)
             .expect("verified matches with wrong map id");
         assert!(matches!(
-            crate::frontend::build_map_observations(&map, &wrong_provenance, intrinsics),
+            crate::frontend::build_map_observations(&map, &wrong_provenance),
             Err(MapObservationError::KeyframeProvenanceMismatch { .. })
         ));
 
@@ -6885,7 +6880,7 @@ mod tests {
             .with_landmarks(foreign_map.instance_id(), keyframe_id, &keyframe)
             .expect("verified matches with foreign map id");
         assert!(matches!(
-            crate::frontend::build_map_observations(&map, &foreign_provenance, intrinsics),
+            crate::frontend::build_map_observations(&map, &foreign_provenance),
             Err(MapObservationError::MapInstanceMismatch { expected, actual })
                 if expected == map.instance_id() && actual == foreign_map.instance_id()
         ));
@@ -6893,8 +6888,6 @@ mod tests {
 
     #[test]
     fn derived_tracking_parallax_rejects_nonfinite_pixel_arithmetic() {
-        let intrinsics =
-            PinholeIntrinsics::try_new(300.0, 300.0, 160.0, 120.0).expect("intrinsics");
         let observation = Observation::try_new(
             Point3 {
                 x: 0.0,
@@ -6902,7 +6895,6 @@ mod tests {
                 z: 1.0,
             },
             Keypoint { x: 1.0, y: 1.0 },
-            intrinsics,
         )
         .expect("observation");
         let resolved = ResolvedTrackingInlier {

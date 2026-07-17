@@ -1397,7 +1397,8 @@ fn verify_pose_from_keyframe(
                 .ok_or(LoopVerificationError::Map(MapError::MapPointNotFound(
                     point_id,
                 )))?;
-        let obs = Observation::try_new(point.position(), pixel, intrinsics)
+        let obs = Observation::try_new(point.position(), pixel)
+            .map_err(crate::PnpError::from)
             .map_err(LoopVerificationError::PnpFailed)?;
         observations.push(obs);
     }
@@ -1940,10 +1941,10 @@ mod tests {
                 super::LoopVerificationError::QueryIndexOutOfBounds { index: 4, len: 4 },
             ),
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
-                crate::PnpError::NonFiniteObservation {
-                    field: "world.x",
+                crate::PnpError::Observation(crate::ObservationError::NonFiniteWorldCoordinate {
+                    axis: crate::CameraFrameAxis::X,
                     value: f32::NAN,
-                },
+                }),
             )),
             super::LoopDetectError::VerificationFailed(super::LoopVerificationError::PnpFailed(
                 crate::PnpError::RansacRejectionCountOverflow {
