@@ -48,7 +48,7 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_PROJECTED_MATCH_MIN_SIMILARITY  Deprecated misnamed alias for MIN_DOT_PRODUCT
 
   Triangulation:
-    KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX=2.0  Calibration/model-specific rectified-row gate
+    KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX=3.0  Calibration/model-specific rectified-row gate
 
   Loop Closure:
     KIKO_LOOP_CLOSURE=true                   Enable loop closure detection
