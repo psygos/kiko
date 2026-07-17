@@ -1,12 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use crate::inertial::{
+    AccelSample, DequeueSequence, DeviceSessionId, DeviceTimestamp, GyroSample,
+    HostMonotonicTimestamp, ImuReport, InertialAxis, InertialOrderTracker, InertialOrderingError,
+    InertialSensorKind, InertialValueError, OakImuAcceleration, OakImuAngularVelocity,
+    SensorAccuracy,
+};
 use crate::triangulation::{
     RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, StereoBaselineError,
     StereoBaselineMeters, StereoCalibration, StereoCameraSide,
@@ -21,6 +27,9 @@ pub mod format {
     pub const CALIBRATION_FILE: &str = "calibration.json";
     pub const MANIFEST_FILE: &str = "manifest.json";
     pub const FRAME_SUFFIX: &str = ".raw";
+    pub const IMU_STREAM_FILE: &str = "imu.v1.bin";
+
+    pub(super) const IMU_STREAM_TEMP_FILE: &str = ".imu.v1.bin.tmp";
 
     pub fn frame_name(timestamp_ns: i64, sensor: &str) -> String {
         format!("{timestamp_ns}_{sensor}{FRAME_SUFFIX}")
@@ -35,7 +44,10 @@ pub mod format {
 }
 
 mod reader;
-pub use reader::{DatasetDepthCursor, DatasetReadTimings, DatasetReader, DatasetStats, TimedPair};
+pub use reader::{
+    DatasetDepthCursor, DatasetImuCursor, DatasetReadTimings, DatasetReader, DatasetStats,
+    TimedPair,
+};
 
 // Meta Structs
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,7 +69,506 @@ pub struct MonoMeta {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImuMeta {
+    /// Requested nominal rate for both raw OAK inertial sensors.
+    /// Replay ordering and timing use each sample's device timestamp rather
+    /// than deriving time from this nominal configuration value.
     pub rate_hz: u32,
+}
+
+/// Provenance for the transform from the OAK's native IMU frame.
+///
+/// Neither state implies alignment with Kiko's robot-base frame. A calibrated
+/// value identifies only an independently supplied IMU-to-tracking-camera
+/// calibration artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImuExtrinsicProvenance(ImuExtrinsicProvenanceKind);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ImuExtrinsicProvenanceKind {
+    UncalibratedUnknown,
+    CalibratedToTrackingCamera { source: String },
+}
+
+impl ImuExtrinsicProvenance {
+    pub fn uncalibrated_unknown() -> Self {
+        Self(ImuExtrinsicProvenanceKind::UncalibratedUnknown)
+    }
+
+    pub fn try_calibrated_to_tracking_camera(
+        source: impl Into<String>,
+    ) -> Result<Self, ImuStreamMetadataError> {
+        let source = source.into();
+        if source.trim().is_empty() {
+            return Err(ImuStreamMetadataError::EmptyCalibrationSource);
+        }
+        Ok(Self(
+            ImuExtrinsicProvenanceKind::CalibratedToTrackingCamera { source },
+        ))
+    }
+}
+
+/// Complete metadata required before a new fixed-record OAK IMU stream can be written.
+///
+/// The remaining contract is intentionally fixed rather than caller-selectable:
+/// acceleration is `m_s2`, angular velocity is `rad_s`, samples remain in the
+/// DepthAI OAK native IMU axes, device timestamps belong to exactly one OAK
+/// connection session, accelerometer and gyroscope timestamps are independent,
+/// and host arrival uses one host process's monotonic nanosecond domain with an
+/// intentionally unspecified epoch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImuStreamMetadata {
+    device_session_id: DeviceSessionId,
+    extrinsic: ImuExtrinsicProvenance,
+}
+
+impl ImuStreamMetadata {
+    pub fn new(device_session_id: DeviceSessionId, extrinsic: ImuExtrinsicProvenance) -> Self {
+        Self {
+            device_session_id,
+            extrinsic,
+        }
+    }
+
+    pub fn try_from_raw_session_id(
+        device_session_id: u64,
+        extrinsic: ImuExtrinsicProvenance,
+    ) -> Result<Self, ImuStreamMetadataError> {
+        let device_session_id = DeviceSessionId::try_new(device_session_id)
+            .map_err(|_| ImuStreamMetadataError::ZeroDeviceSessionId)?;
+        Ok(Self::new(device_session_id, extrinsic))
+    }
+
+    pub fn device_session_id(&self) -> DeviceSessionId {
+        self.device_session_id
+    }
+
+    pub fn extrinsic(&self) -> &ImuExtrinsicProvenance {
+        &self.extrinsic
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImuStreamMetadataError {
+    ZeroDeviceSessionId,
+    EmptyCalibrationSource,
+}
+
+impl std::fmt::Display for ImuStreamMetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ZeroDeviceSessionId => f.write_str("IMU device session ID must be nonzero"),
+            Self::EmptyCalibrationSource => {
+                f.write_str("calibrated IMU extrinsic provenance must name its source")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ImuStreamMetadataError {}
+
+const IMU_STREAM_MAGIC: [u8; 8] = *b"KIKOIMU\0";
+const IMU_STREAM_FORMAT: &str = "fixed_le";
+const IMU_STREAM_VERSION: u16 = 1;
+const IMU_STREAM_HEADER_BYTES: u16 = 32;
+const IMU_STREAM_RECORD_BYTES: u16 = 80;
+const IMU_ACCELERATION_UNIT: &str = "m_s2";
+const IMU_ANGULAR_VELOCITY_UNIT: &str = "rad_s";
+const IMU_COORDINATE_FRAME: &str = "oak_imu";
+const IMU_AXES: &str = "depthai_native";
+const IMU_DEVICE_TIMEBASE: &str = "oak_device_clock_ns";
+const IMU_DEVICE_SESSION_SEMANTICS: &str = "single_oak_connection_session";
+const IMU_SAMPLE_TIMESTAMP_SEMANTICS: &str = "independent_accel_gyro";
+const IMU_HOST_ARRIVAL_TIMEBASE: &str = "host_process_monotonic_ns";
+
+#[derive(Clone, Debug)]
+struct ImuStreamContract {
+    nominal_rate_hz: NonZeroU32,
+    metadata: ImuStreamMetadata,
+}
+
+impl ImuStreamContract {
+    fn parse_for_write(
+        meta: &Meta,
+        metadata: Option<ImuStreamMetadata>,
+    ) -> Result<Option<Self>, DatasetError> {
+        match (meta.imu.as_ref(), metadata) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(DatasetError::ImuMetadataRequiredForWrite),
+            (None, Some(_)) => Err(DatasetError::ImuMetadataWithoutNominalStream),
+            (Some(imu), Some(metadata)) => {
+                let nominal_rate_hz = NonZeroU32::new(imu.rate_hz)
+                    .ok_or(DatasetError::InvalidImuNominalRate { value: imu.rate_hz })?;
+                Ok(Some(Self {
+                    nominal_rate_hz,
+                    metadata,
+                }))
+            }
+        }
+    }
+
+    fn require_report(&self, report: &ImuReport) -> Result<(), DatasetWriteError> {
+        let expected = self.metadata.device_session_id();
+        let actual = report.session_id();
+        if actual != expected {
+            return Err(DatasetWriteError::ImuDeviceSessionMismatch {
+                expected: expected.as_u64(),
+                actual: actual.as_u64(),
+            });
+        }
+        Ok(())
+    }
+
+    fn manifest(&self, written: RecordedImuStream) -> ManifestImuStream {
+        let extrinsic = match &self.metadata.extrinsic.0 {
+            ImuExtrinsicProvenanceKind::UncalibratedUnknown => {
+                ManifestImuExtrinsic::UncalibratedUnknown
+            }
+            ImuExtrinsicProvenanceKind::CalibratedToTrackingCamera { source } => {
+                ManifestImuExtrinsic::CalibratedToTrackingCamera {
+                    source: source.clone(),
+                }
+            }
+        };
+        ManifestImuStream {
+            path: format::IMU_STREAM_FILE.to_string(),
+            format: IMU_STREAM_FORMAT.to_string(),
+            version: IMU_STREAM_VERSION,
+            header_bytes: IMU_STREAM_HEADER_BYTES,
+            record_bytes: IMU_STREAM_RECORD_BYTES,
+            record_count: written.record_count,
+            byte_len: written.byte_len,
+            nominal_rate_hz: self.nominal_rate_hz.get(),
+            acceleration_unit: IMU_ACCELERATION_UNIT.to_string(),
+            angular_velocity_unit: IMU_ANGULAR_VELOCITY_UNIT.to_string(),
+            coordinate_frame: IMU_COORDINATE_FRAME.to_string(),
+            axes: IMU_AXES.to_string(),
+            extrinsic,
+            device_session_id: self.metadata.device_session_id().as_u64(),
+            device_timebase: IMU_DEVICE_TIMEBASE.to_string(),
+            device_session_semantics: IMU_DEVICE_SESSION_SEMANTICS.to_string(),
+            sample_timestamp_semantics: IMU_SAMPLE_TIMESTAMP_SEMANTICS.to_string(),
+            host_arrival_timebase: IMU_HOST_ARRIVAL_TIMEBASE.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImuWireRecord {
+    sequence: u32,
+    accel_accuracy: SensorAccuracy,
+    gyro_accuracy: SensorAccuracy,
+    host_arrival_ns: u64,
+    accel_timestamp_ns: u64,
+    gyro_timestamp_ns: u64,
+    accel_m_s2: [f64; 3],
+    gyro_rad_s: [f64; 3],
+}
+
+impl ImuWireRecord {
+    fn from_report(report: ImuReport) -> Self {
+        Self {
+            sequence: report.sequence().as_u32(),
+            accel_accuracy: report.accel().accuracy(),
+            gyro_accuracy: report.gyro().accuracy(),
+            host_arrival_ns: report.host_arrival().as_nanos(),
+            accel_timestamp_ns: report.accel().timestamp().as_nanos(),
+            gyro_timestamp_ns: report.gyro().timestamp().as_nanos(),
+            accel_m_s2: report.accel().acceleration().as_array(),
+            gyro_rad_s: report.gyro().angular_velocity().as_array(),
+        }
+    }
+
+    fn into_report(
+        self,
+        session_id: DeviceSessionId,
+        record_index: usize,
+    ) -> Result<ImuReport, ImuStreamError> {
+        let accel_timestamp =
+            parse_device_timestamp(record_index, "accelerometer", self.accel_timestamp_ns)?;
+        let gyro_timestamp =
+            parse_device_timestamp(record_index, "gyroscope", self.gyro_timestamp_ns)?;
+        let accel =
+            OakImuAcceleration::try_new(self.accel_m_s2[0], self.accel_m_s2[1], self.accel_m_s2[2])
+                .map_err(|source| {
+                    map_vector_error(record_index, ["accel_x", "accel_y", "accel_z"], source)
+                })?;
+        let gyro = OakImuAngularVelocity::try_new(
+            self.gyro_rad_s[0],
+            self.gyro_rad_s[1],
+            self.gyro_rad_s[2],
+        )
+        .map_err(|source| map_vector_error(record_index, ["gyro_x", "gyro_y", "gyro_z"], source))?;
+        Ok(ImuReport::new(
+            session_id,
+            DequeueSequence::new(self.sequence),
+            HostMonotonicTimestamp::from_nanos(self.host_arrival_ns),
+            AccelSample::new(accel_timestamp, accel, self.accel_accuracy),
+            GyroSample::new(gyro_timestamp, gyro, self.gyro_accuracy),
+        ))
+    }
+
+    fn encode(self) -> [u8; IMU_STREAM_RECORD_BYTES as usize] {
+        let mut bytes = [0_u8; IMU_STREAM_RECORD_BYTES as usize];
+        bytes[0..4].copy_from_slice(&self.sequence.to_le_bytes());
+        bytes[4] = encode_accuracy(self.accel_accuracy);
+        bytes[5] = encode_accuracy(self.gyro_accuracy);
+        // bytes 6..8 are reserved zeros.
+        write_u64(&mut bytes, 8, self.host_arrival_ns);
+        write_u64(&mut bytes, 16, self.accel_timestamp_ns);
+        write_u64(&mut bytes, 24, self.gyro_timestamp_ns);
+        for (index, value) in self.accel_m_s2.into_iter().enumerate() {
+            write_f64(&mut bytes, 32 + index * 8, value);
+        }
+        for (index, value) in self.gyro_rad_s.into_iter().enumerate() {
+            write_f64(&mut bytes, 56 + index * 8, value);
+        }
+        bytes
+    }
+
+    fn decode(
+        bytes: &[u8; IMU_STREAM_RECORD_BYTES as usize],
+        record_index: usize,
+    ) -> Result<Self, ImuStreamError> {
+        if bytes[6] != 0 || bytes[7] != 0 {
+            return Err(ImuStreamError::NonZeroReservedRecord { record_index });
+        }
+        let accel_accuracy = decode_accuracy(bytes[4]).ok_or(ImuStreamError::UnknownAccuracy {
+            record_index,
+            sensor: "accelerometer",
+            value: bytes[4],
+        })?;
+        let gyro_accuracy = decode_accuracy(bytes[5]).ok_or(ImuStreamError::UnknownAccuracy {
+            record_index,
+            sensor: "gyroscope",
+            value: bytes[5],
+        })?;
+        let mut accel_m_s2 = [0.0; 3];
+        let mut gyro_rad_s = [0.0; 3];
+        for (index, value) in accel_m_s2.iter_mut().enumerate() {
+            *value = read_f64(bytes, 32 + index * 8);
+        }
+        for (index, value) in gyro_rad_s.iter_mut().enumerate() {
+            *value = read_f64(bytes, 56 + index * 8);
+        }
+        Ok(Self {
+            sequence: read_u32(bytes, 0),
+            accel_accuracy,
+            gyro_accuracy,
+            host_arrival_ns: read_u64(bytes, 8),
+            accel_timestamp_ns: read_u64(bytes, 16),
+            gyro_timestamp_ns: read_u64(bytes, 24),
+            accel_m_s2,
+            gyro_rad_s,
+        })
+    }
+}
+
+fn map_vector_error(
+    record_index: usize,
+    axis_fields: [&'static str; 3],
+    source: InertialValueError,
+) -> ImuStreamError {
+    match source {
+        InertialValueError::NonFiniteComponent { axis, value, .. } => {
+            let field = axis_fields[match axis {
+                InertialAxis::X => 0,
+                InertialAxis::Y => 1,
+                InertialAxis::Z => 2,
+            }];
+            ImuStreamError::NonFiniteSample {
+                record_index,
+                field,
+                value,
+            }
+        }
+        _ => unreachable!("three-axis construction can only reject non-finite components"),
+    }
+}
+
+fn parse_device_timestamp(
+    record_index: usize,
+    sensor: &'static str,
+    value_ns: u64,
+) -> Result<DeviceTimestamp, ImuStreamError> {
+    let signed = i64::try_from(value_ns).map_err(|_| ImuStreamError::InvalidDeviceTimestamp {
+        record_index,
+        sensor,
+        value_ns,
+    })?;
+    DeviceTimestamp::try_from_nanos(signed).map_err(|_| ImuStreamError::InvalidDeviceTimestamp {
+        record_index,
+        sensor,
+        value_ns,
+    })
+}
+
+fn encode_accuracy(accuracy: SensorAccuracy) -> u8 {
+    match accuracy {
+        SensorAccuracy::Unreliable => 0,
+        SensorAccuracy::Low => 1,
+        SensorAccuracy::Medium => 2,
+        SensorAccuracy::High => 3,
+    }
+}
+
+fn decode_accuracy(value: u8) -> Option<SensorAccuracy> {
+    match value {
+        0 => Some(SensorAccuracy::Unreliable),
+        1 => Some(SensorAccuracy::Low),
+        2 => Some(SensorAccuracy::Medium),
+        3 => Some(SensorAccuracy::High),
+        _ => None,
+    }
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_f64(bytes: &mut [u8], offset: usize, value: f64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn read_f64(bytes: &[u8], offset: usize) -> f64 {
+    f64::from_bits(read_u64(bytes, offset))
+}
+
+fn encode_imu_header(record_count: u64) -> [u8; IMU_STREAM_HEADER_BYTES as usize] {
+    let mut bytes = [0_u8; IMU_STREAM_HEADER_BYTES as usize];
+    bytes[0..8].copy_from_slice(&IMU_STREAM_MAGIC);
+    bytes[8..10].copy_from_slice(&IMU_STREAM_VERSION.to_le_bytes());
+    bytes[10..12].copy_from_slice(&IMU_STREAM_HEADER_BYTES.to_le_bytes());
+    bytes[12..14].copy_from_slice(&IMU_STREAM_RECORD_BYTES.to_le_bytes());
+    // bytes 14..16 and 24..32 are reserved zeros.
+    write_u64(&mut bytes, 16, record_count);
+    bytes
+}
+
+fn decode_imu_header(
+    bytes: &[u8; IMU_STREAM_HEADER_BYTES as usize],
+) -> Result<u64, ImuStreamError> {
+    if bytes[0..8] != IMU_STREAM_MAGIC {
+        return Err(ImuStreamError::InvalidMagic);
+    }
+    let version = read_u16(bytes, 8);
+    if version != IMU_STREAM_VERSION {
+        return Err(ImuStreamError::UnsupportedVersion {
+            expected: IMU_STREAM_VERSION,
+            actual: version,
+        });
+    }
+    let header_bytes = read_u16(bytes, 10);
+    if header_bytes != IMU_STREAM_HEADER_BYTES {
+        return Err(ImuStreamError::HeaderLengthMismatch {
+            expected: IMU_STREAM_HEADER_BYTES,
+            actual: header_bytes,
+        });
+    }
+    let record_bytes = read_u16(bytes, 12);
+    if record_bytes != IMU_STREAM_RECORD_BYTES {
+        return Err(ImuStreamError::RecordLengthMismatch {
+            expected: IMU_STREAM_RECORD_BYTES,
+            actual: record_bytes,
+        });
+    }
+    if bytes[14..16].iter().any(|&value| value != 0)
+        || bytes[24..32].iter().any(|&value| value != 0)
+    {
+        return Err(ImuStreamError::NonZeroReservedHeader);
+    }
+    Ok(read_u64(bytes, 16))
+}
+
+fn imu_stream_byte_len(record_count: u64) -> Result<u64, ImuStreamError> {
+    record_count
+        .checked_mul(u64::from(IMU_STREAM_RECORD_BYTES))
+        .and_then(|records| records.checked_add(u64::from(IMU_STREAM_HEADER_BYTES)))
+        .ok_or(ImuStreamError::ByteLengthOverflow { record_count })
+}
+
+fn map_inertial_order_error(record_index: usize, error: InertialOrderingError) -> ImuStreamError {
+    match error {
+        InertialOrderingError::SessionMismatch { expected, actual } => {
+            ImuStreamError::DeviceSessionMismatch {
+                record_index,
+                expected: expected.as_u64(),
+                actual: actual.as_u64(),
+            }
+        }
+        InertialOrderingError::DuplicateSequence { sequence, .. } => {
+            ImuStreamError::SequenceNotNewer {
+                record_index,
+                previous: sequence.as_u32(),
+                current: sequence.as_u32(),
+            }
+        }
+        InertialOrderingError::SequenceRegression {
+            previous, current, ..
+        } => ImuStreamError::SequenceNotNewer {
+            record_index,
+            previous: previous.as_u32(),
+            current: current.as_u32(),
+        },
+        InertialOrderingError::HostArrivalRegression {
+            previous, current, ..
+        } => ImuStreamError::HostArrivalRegressed {
+            record_index,
+            previous_ns: previous.as_nanos(),
+            current_ns: current.as_nanos(),
+        },
+        InertialOrderingError::DuplicateDeviceTimestamp {
+            sensor, timestamp, ..
+        } => ImuStreamError::DeviceTimestampNotIncreasing {
+            record_index,
+            sensor: inertial_sensor_name(sensor),
+            previous_ns: timestamp.as_nanos(),
+            current_ns: timestamp.as_nanos(),
+        },
+        InertialOrderingError::DeviceTimestampRegression {
+            sensor,
+            previous,
+            current,
+            ..
+        } => ImuStreamError::DeviceTimestampNotIncreasing {
+            record_index,
+            sensor: inertial_sensor_name(sensor),
+            previous_ns: previous.as_nanos(),
+            current_ns: current.as_nanos(),
+        },
+    }
+}
+
+fn inertial_sensor_name(sensor: InertialSensorKind) -> &'static str {
+    match sensor {
+        InertialSensorKind::Accelerometer => "accelerometer",
+        InertialSensorKind::Gyroscope => "gyroscope",
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -426,10 +937,20 @@ struct WriterDatasetContract {
     device: String,
     mono: MonoImageContract,
     depth: Option<DepthImageContract>,
+    imu: Option<ImuStreamContract>,
 }
 
 impl WriterDatasetContract {
+    #[cfg(test)]
     fn parse(meta: &Meta, calibration: &Calibration) -> Result<Self, DatasetError> {
+        Self::parse_with_imu(meta, calibration, None)
+    }
+
+    fn parse_with_imu(
+        meta: &Meta,
+        calibration: &Calibration,
+        imu_metadata: Option<ImuStreamMetadata>,
+    ) -> Result<Self, DatasetError> {
         let mono = ParsedMonoContract::parse(meta, calibration)?.image;
         if meta
             .depth
@@ -447,6 +968,7 @@ impl WriterDatasetContract {
                 .as_ref()
                 .map(DepthImageContract::parse)
                 .transpose()?,
+            imu: ImuStreamContract::parse_for_write(meta, imu_metadata)?,
         })
     }
 }
@@ -486,10 +1008,15 @@ pub enum Backpressure {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DatasetWriterConfig {
-    /// Maximum accepted logical frames retained across the queue and in-flight batch.
+    /// Maximum accepted logical payload units retained across the queue and in-flight batch.
+    /// Mono, depth, and IMU reports count as one unit; a stereo pair counts as two.
+    /// The `frames` name is retained for source compatibility.
     pub max_spool_frames: usize,
     /// Maximum accepted payload bytes retained across the queue and in-flight batch.
     pub max_spool_bytes: usize,
+    /// Target logical payload units drained in one worker batch.
+    /// The worker stops after reaching or crossing this value and never splits
+    /// an atomic stereo pair. Units follow [`DatasetWriterConfig::max_spool_frames`].
     pub flush_batch_frames: usize,
     pub backpressure: Backpressure,
 }
@@ -524,10 +1051,17 @@ pub enum DatasetWriteError {
         expected: FrameDimensions,
         actual: FrameDimensions,
     },
+    ImuStreamNotConfigured,
+    ImuDeviceSessionMismatch {
+        expected: u64,
+        actual: u64,
+    },
     PairOutsideWriterWindow {
         delta_ns: u64,
         max_delta_ns: u64,
     },
+    /// One atomic item exceeds the logical-unit capacity. `frames` retains its
+    /// compatibility name and follows [`WriterStats`] accounting semantics.
     SpoolFrameCapacityExceeded {
         item: &'static str,
         frames: usize,
@@ -567,6 +1101,13 @@ impl std::fmt::Display for DatasetWriteError {
                 actual.width(),
                 actual.height()
             ),
+            Self::ImuStreamNotConfigured => {
+                f.write_str("dataset writer does not configure a replayable IMU stream")
+            }
+            Self::ImuDeviceSessionMismatch { expected, actual } => write!(
+                f,
+                "IMU report belongs to device session {actual}, but this dataset records session {expected}"
+            ),
             Self::PairOutsideWriterWindow {
                 delta_ns,
                 max_delta_ns,
@@ -580,7 +1121,7 @@ impl std::fmt::Display for DatasetWriteError {
                 max_frames,
             } => write!(
                 f,
-                "dataset {item} requires {frames} spool frame slots, but the configured maximum is {max_frames}"
+                "dataset {item} requires {frames} logical spool units, but the configured maximum is {max_frames}"
             ),
             Self::SpoolByteCapacityExceeded {
                 item,
@@ -596,6 +1137,190 @@ impl std::fmt::Display for DatasetWriteError {
 
 impl std::error::Error for DatasetWriteError {}
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImuStreamError {
+    InvalidMagic,
+    UnsupportedVersion {
+        expected: u16,
+        actual: u16,
+    },
+    HeaderLengthMismatch {
+        expected: u16,
+        actual: u16,
+    },
+    RecordLengthMismatch {
+        expected: u16,
+        actual: u16,
+    },
+    NonZeroReservedHeader,
+    NonZeroReservedRecord {
+        record_index: usize,
+    },
+    ByteLengthOverflow {
+        record_count: u64,
+    },
+    RecordIndexOutOfRange {
+        record_count: u64,
+    },
+    ByteLengthMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    ManifestMismatch {
+        field: &'static str,
+        declared: u64,
+        encoded: u64,
+    },
+    UnknownAccuracy {
+        record_index: usize,
+        sensor: &'static str,
+        value: u8,
+    },
+    NonFiniteSample {
+        record_index: usize,
+        field: &'static str,
+        value: f64,
+    },
+    DeviceSessionMismatch {
+        record_index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    SequenceNotNewer {
+        record_index: usize,
+        previous: u32,
+        current: u32,
+    },
+    HostArrivalRegressed {
+        record_index: usize,
+        previous_ns: u64,
+        current_ns: u64,
+    },
+    DeviceTimestampNotIncreasing {
+        record_index: usize,
+        sensor: &'static str,
+        previous_ns: u64,
+        current_ns: u64,
+    },
+    InvalidDeviceTimestamp {
+        record_index: usize,
+        sensor: &'static str,
+        value_ns: u64,
+    },
+}
+
+impl std::fmt::Display for ImuStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidMagic => f.write_str("IMU stream magic does not identify Kiko IMU v1"),
+            Self::UnsupportedVersion { expected, actual } => write!(
+                f,
+                "unsupported IMU stream version {actual}; expected {expected}"
+            ),
+            Self::HeaderLengthMismatch { expected, actual } => write!(
+                f,
+                "IMU stream header declares {actual} bytes; expected {expected}"
+            ),
+            Self::RecordLengthMismatch { expected, actual } => write!(
+                f,
+                "IMU stream record declares {actual} bytes; expected {expected}"
+            ),
+            Self::NonZeroReservedHeader => {
+                f.write_str("IMU stream header reserved fields must be zero")
+            }
+            Self::NonZeroReservedRecord { record_index } => write!(
+                f,
+                "IMU stream record {record_index} has nonzero reserved fields"
+            ),
+            Self::ByteLengthOverflow { record_count } => write!(
+                f,
+                "IMU stream byte length overflows for {record_count} records"
+            ),
+            Self::RecordIndexOutOfRange { record_count } => write!(
+                f,
+                "IMU stream record count {record_count} exceeds the host index representation"
+            ),
+            Self::ByteLengthMismatch { expected, actual } => write!(
+                f,
+                "IMU stream must contain exactly {expected} bytes, got {actual}"
+            ),
+            Self::ManifestMismatch {
+                field,
+                declared,
+                encoded,
+            } => write!(
+                f,
+                "IMU manifest {field}={declared} disagrees with encoded value {encoded}"
+            ),
+            Self::UnknownAccuracy {
+                record_index,
+                sensor,
+                value,
+            } => write!(
+                f,
+                "IMU stream record {record_index} has unknown {sensor} accuracy code {value}"
+            ),
+            Self::NonFiniteSample {
+                record_index,
+                field,
+                value,
+            } => write!(
+                f,
+                "IMU stream record {record_index} has non-finite {field} value {value}"
+            ),
+            Self::DeviceSessionMismatch {
+                record_index,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "IMU stream record {record_index} belongs to device session {actual}, expected {expected}"
+            ),
+            Self::SequenceNotNewer {
+                record_index,
+                previous,
+                current,
+            } => write!(
+                f,
+                "IMU stream record {record_index} dequeue sequence {current} is not newer than {previous}"
+            ),
+            Self::HostArrivalRegressed {
+                record_index,
+                previous_ns,
+                current_ns,
+            } => write!(
+                f,
+                "IMU stream record {record_index} host arrival regressed from {previous_ns}ns to {current_ns}ns"
+            ),
+            Self::DeviceTimestampNotIncreasing {
+                record_index,
+                sensor,
+                previous_ns,
+                current_ns,
+            } => write!(
+                f,
+                "IMU stream record {record_index} {sensor} timestamp {current_ns}ns is not later than {previous_ns}ns"
+            ),
+            Self::InvalidDeviceTimestamp {
+                record_index,
+                sensor,
+                value_ns,
+            } => write!(
+                f,
+                "IMU stream record {record_index} has invalid {sensor} device timestamp {value_ns}ns"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ImuStreamError {}
+
+/// Writer accounting in logical payload units.
+///
+/// Fields retaining `frames` in their names count one unit for each mono frame,
+/// depth image, or IMU report and two units for each stereo pair. The names are
+/// retained for source compatibility; they do not mean that IMU reports are
+/// camera frames.
 #[derive(Clone, Copy, Debug)]
 pub struct WriterStats {
     pub frames_enqueued: u64,
@@ -604,15 +1329,15 @@ pub struct WriterStats {
     pub bytes_enqueued: u64,
     pub bytes_written: u64,
     pub bytes_dropped: u64,
-    /// Logical frames belonging to accepted write transactions that failed.
+    /// Logical payload units belonging to accepted write transactions that failed.
     pub write_failed: u64,
     /// Bytes belonging to accepted write transactions that failed.
     pub bytes_write_failed: u64,
-    /// Accepted logical frames that were canceled after another write transaction failed.
+    /// Accepted logical payload units canceled after another write transaction failed.
     pub frames_canceled: u64,
     /// Accepted bytes that were canceled after another write transaction failed.
     pub bytes_canceled: u64,
-    /// Accepted logical frames still queued or being written.
+    /// Accepted logical payload units still queued or being written.
     pub spool_frames: u64,
     /// Accepted payload bytes still queued or being written.
     pub spool_bytes: u64,
@@ -622,6 +1347,7 @@ pub struct WriterStats {
 }
 
 impl WriterStats {
+    /// Accepted logical payload units not yet written, failed, or canceled.
     pub fn frames_pending(&self) -> u64 {
         self.frames_enqueued.saturating_sub(
             self.frames_written
@@ -708,6 +1434,25 @@ pub enum DatasetError {
         path: PathBuf,
         expected: u64,
         actual: u64,
+    },
+    ImuMetadataRequiredForWrite,
+    ImuMetadataWithoutNominalStream,
+    InvalidImuNominalRate {
+        value: u32,
+    },
+    ImuNominalRateMismatch {
+        metadata: u32,
+        manifest: u32,
+    },
+    ImuStreamNotConfigured,
+    LegacyImuManifestUnindexed,
+    ManifestImuStreamWithoutMetadata,
+    InvalidImuStream {
+        path: PathBuf,
+        source: ImuStreamError,
+    },
+    InvalidImuFileType {
+        path: PathBuf,
     },
     SidecarChanged {
         path: PathBuf,
@@ -803,6 +1548,11 @@ pub enum DatasetError {
     PublishManifest {
         temporary_path: PathBuf,
         manifest_path: PathBuf,
+        source: std::io::Error,
+    },
+    PublishImuStream {
+        temporary_path: PathBuf,
+        stream_path: PathBuf,
         source: std::io::Error,
     },
     ThreadSpawn {
@@ -926,6 +1676,39 @@ impl std::fmt::Display for DatasetError {
             } => write!(
                 f,
                 "dataset depth payload length changed after open at {}: expected {expected} bytes, got {actual}",
+                path.display()
+            ),
+            DatasetError::ImuMetadataRequiredForWrite => f.write_str(
+                "new datasets with IMU metadata require an explicit replayable IMU stream contract",
+            ),
+            DatasetError::ImuMetadataWithoutNominalStream => {
+                f.write_str("an IMU stream contract requires meta.imu nominal stream metadata")
+            }
+            DatasetError::InvalidImuNominalRate { value } => write!(
+                f,
+                "dataset nominal IMU rate must be nonzero, got {value} Hz"
+            ),
+            DatasetError::ImuNominalRateMismatch { metadata, manifest } => write!(
+                f,
+                "dataset nominal IMU rates disagree: meta.imu.rate_hz={metadata}Hz, manifest.imu_stream.nominal_rate_hz={manifest}Hz"
+            ),
+            DatasetError::ImuStreamNotConfigured => {
+                f.write_str("dataset metadata does not configure an IMU stream")
+            }
+            DatasetError::LegacyImuManifestUnindexed => f.write_str(
+                "legacy dataset IMU metadata does not identify a replayable fixed-record stream",
+            ),
+            DatasetError::ManifestImuStreamWithoutMetadata => {
+                f.write_str("dataset manifest declares an IMU stream without meta.imu metadata")
+            }
+            DatasetError::InvalidImuStream { path, source } => write!(
+                f,
+                "invalid dataset IMU stream at {}: {source}",
+                path.display()
+            ),
+            DatasetError::InvalidImuFileType { path } => write!(
+                f,
+                "dataset IMU stream path is not a regular file: {}",
                 path.display()
             ),
             DatasetError::SidecarChanged { path } => write!(
@@ -1067,6 +1850,16 @@ impl std::fmt::Display for DatasetError {
                 temporary_path.display(),
                 manifest_path.display()
             ),
+            DatasetError::PublishImuStream {
+                temporary_path,
+                stream_path,
+                source,
+            } => write!(
+                f,
+                "failed to publish dataset IMU stream from {} to {}: {source}",
+                temporary_path.display(),
+                stream_path.display()
+            ),
             DatasetError::ThreadSpawn { source } => {
                 write!(f, "failed to spawn writer thread: {source}")
             }
@@ -1098,12 +1891,14 @@ impl std::error::Error for DatasetError {
             | DatasetError::ReadFile { source, .. }
             | DatasetError::ThreadSpawn { source }
             | DatasetError::WriteFile { source, .. }
-            | DatasetError::PublishManifest { source, .. } => Some(source),
+            | DatasetError::PublishManifest { source, .. }
+            | DatasetError::PublishImuStream { source, .. } => Some(source),
             DatasetError::SerializeJson { source, .. }
             | DatasetError::DeserializeJson { source, .. } => Some(source),
             DatasetError::InvalidFrameDimensions { source, .. } => Some(source),
             DatasetError::InvalidFrameData { source, .. } => Some(source),
             DatasetError::InvalidDepthData { source, .. } => Some(source),
+            DatasetError::InvalidImuStream { source, .. } => Some(source),
             DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
             DatasetError::InvalidStereoBaseline { source } => Some(source),
             DatasetError::WriteContract { source } => Some(source),
@@ -1122,6 +1917,14 @@ impl std::error::Error for DatasetError {
             | DatasetError::DepthFrameIndexOutOfRange { .. }
             | DatasetError::DepthPayloadLengthOutOfRange { .. }
             | DatasetError::DepthPayloadLengthChanged { .. }
+            | DatasetError::ImuMetadataRequiredForWrite
+            | DatasetError::ImuMetadataWithoutNominalStream
+            | DatasetError::InvalidImuNominalRate { .. }
+            | DatasetError::ImuNominalRateMismatch { .. }
+            | DatasetError::ImuStreamNotConfigured
+            | DatasetError::LegacyImuManifestUnindexed
+            | DatasetError::ManifestImuStreamWithoutMetadata
+            | DatasetError::InvalidImuFileType { .. }
             | DatasetError::SidecarChanged { .. }
             | DatasetError::InvalidFrameFileType { .. }
             | DatasetError::InvalidFrameLength { .. }
@@ -1195,6 +1998,7 @@ impl DatasetWriter {
             calibration,
             DatasetWriterConfig::default(),
             ManifestMode::InferPairs,
+            None,
         )
     }
 
@@ -1204,7 +2008,32 @@ impl DatasetWriter {
         calibration: &Calibration,
         config: DatasetWriterConfig,
     ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
-        Self::create_internal(path, meta, calibration, config, ManifestMode::InferPairs)
+        Self::create_internal(
+            path,
+            meta,
+            calibration,
+            config,
+            ManifestMode::InferPairs,
+            None,
+        )
+    }
+
+    /// Create a writer with one explicit replayable OAK IMU session.
+    pub fn create_with_imu_config(
+        path: impl Into<PathBuf>,
+        meta: &Meta,
+        calibration: &Calibration,
+        imu_metadata: ImuStreamMetadata,
+        config: DatasetWriterConfig,
+    ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
+        Self::create_internal(
+            path,
+            meta,
+            calibration,
+            config,
+            ManifestMode::InferPairs,
+            Some(imu_metadata),
+        )
     }
 
     pub fn create_paired(
@@ -1240,6 +2069,38 @@ impl DatasetWriter {
             calibration,
             config,
             ManifestMode::PreservePairs { pairing_window },
+            None,
+        )?;
+        Ok((
+            PairedDatasetWriter {
+                inner,
+                pairing_window,
+            },
+            handle,
+        ))
+    }
+
+    /// Create a paired writer with one explicit replayable OAK IMU session.
+    pub fn create_paired_with_imu_config(
+        path: impl Into<PathBuf>,
+        meta: &Meta,
+        calibration: &Calibration,
+        pairing_window: PairingWindowNs,
+        imu_metadata: ImuStreamMetadata,
+        config: DatasetWriterConfig,
+    ) -> Result<(PairedDatasetWriter, DatasetWriterHandle), DatasetError> {
+        if config.max_spool_frames < 2 {
+            return Err(DatasetError::InvalidConfig {
+                msg: "paired writer max_spool_frames must be >= 2",
+            });
+        }
+        let (inner, handle) = Self::create_internal(
+            path,
+            meta,
+            calibration,
+            config,
+            ManifestMode::PreservePairs { pairing_window },
+            Some(imu_metadata),
         )?;
         Ok((
             PairedDatasetWriter {
@@ -1256,6 +2117,7 @@ impl DatasetWriter {
         calibration: &Calibration,
         config: DatasetWriterConfig,
         manifest_mode: ManifestMode,
+        imu_metadata: Option<ImuStreamMetadata>,
     ) -> Result<(Self, DatasetWriterHandle), DatasetError> {
         if config.max_spool_frames == 0 {
             return Err(DatasetError::InvalidConfig {
@@ -1273,7 +2135,8 @@ impl DatasetWriter {
             });
         }
 
-        let dataset_contract = WriterDatasetContract::parse(meta, calibration)?;
+        let dataset_contract =
+            WriterDatasetContract::parse_with_imu(meta, calibration, imu_metadata)?;
         let meta_json =
             serde_json::to_vec_pretty(meta).map_err(|source| DatasetError::SerializeJson {
                 document: "metadata",
@@ -1382,6 +2245,20 @@ impl DatasetWriter {
             return Err(self.reject_write(error));
         }
         self.write_item(SpoolItem::Depth(depth.clone()))
+    }
+
+    /// Enqueue one independently timestamped accelerometer/gyroscope report.
+    pub fn write_imu(&self, report: ImuReport) -> Result<WriteOutcome, DatasetWriteError> {
+        if !self.is_healthy() {
+            return Ok(WriteOutcome::WriterFailed);
+        }
+        let Some(contract) = self.state.dataset_contract.imu.as_ref() else {
+            return Err(self.reject_write(DatasetWriteError::ImuStreamNotConfigured));
+        };
+        if let Err(error) = contract.require_report(&report) {
+            return Err(self.reject_write(error));
+        }
+        self.write_item(SpoolItem::Imu(report))
     }
 
     fn write_item(&self, item: SpoolItem) -> Result<WriteOutcome, DatasetWriteError> {
@@ -1523,6 +2400,10 @@ impl PairedDatasetWriter {
         self.inner.write_depth(depth)
     }
 
+    pub fn write_imu(&self, report: ImuReport) -> Result<WriteOutcome, DatasetWriteError> {
+        self.inner.write_imu(report)
+    }
+
     pub fn stats(&self) -> WriterStats {
         self.inner.stats()
     }
@@ -1557,17 +2438,22 @@ impl DatasetWriterHandle {
     }
 }
 
+/// One atomic spool transaction.
+///
+/// Mono, depth, and IMU variants account for one logical payload unit; a pair
+/// accounts for two. Payload bytes exclude container/header overhead.
 #[derive(Debug)]
 enum SpoolItem {
     Mono(Frame),
     Pair(StereoPair),
     Depth(DepthImage),
+    Imu(ImuReport),
 }
 
 impl SpoolItem {
     fn frame_count(&self) -> usize {
         match self {
-            SpoolItem::Mono(_) | SpoolItem::Depth(_) => 1,
+            SpoolItem::Mono(_) | SpoolItem::Depth(_) | SpoolItem::Imu(_) => 1,
             SpoolItem::Pair(_) => 2,
         }
     }
@@ -1584,6 +2470,7 @@ impl SpoolItem {
                 .depth_m()
                 .len()
                 .saturating_mul(std::mem::size_of::<f32>()),
+            SpoolItem::Imu(_) => usize::from(IMU_STREAM_RECORD_BYTES),
         }
     }
 
@@ -1592,6 +2479,7 @@ impl SpoolItem {
             SpoolItem::Mono(_) => "mono frame",
             SpoolItem::Pair(_) => "stereo pair",
             SpoolItem::Depth(_) => "depth image",
+            SpoolItem::Imu(_) => "IMU report",
         }
     }
 }
@@ -1720,6 +2608,7 @@ struct WriterState {
     error: Mutex<Option<DatasetError>>,
     recorded_pairs: Mutex<Vec<RecordedPair>>,
     recorded_depth: Mutex<Vec<RecordedDepth>>,
+    recorded_imu: Mutex<Option<RecordedImuStream>>,
 }
 
 impl WriterState {
@@ -1757,6 +2646,7 @@ impl WriterState {
             error: Mutex::new(None),
             recorded_pairs: Mutex::new(Vec::new()),
             recorded_depth: Mutex::new(Vec::new()),
+            recorded_imu: Mutex::new(None),
         }
     }
 
@@ -1826,6 +2716,13 @@ impl WriterState {
             .push(depth);
     }
 
+    fn record_imu(&self, imu: RecordedImuStream) {
+        *self
+            .recorded_imu
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(imu);
+    }
+
     fn cancel_unwritten(&self, in_flight: impl IntoIterator<Item = SpoolItem>) {
         let mut canceled_frames = 0u64;
         let mut canceled_bytes = 0u64;
@@ -1866,8 +2763,159 @@ impl WriterState {
     }
 }
 
+struct ImuFileWriter {
+    file: std::fs::File,
+    temporary_path: PathBuf,
+    stream_path: PathBuf,
+    record_count: u64,
+    order: InertialOrderTracker,
+    published: bool,
+}
+
+impl ImuFileWriter {
+    fn create(dataset_dir: &Path, session_id: DeviceSessionId) -> Result<Self, DatasetError> {
+        let temporary_path = dataset_dir.join(format::IMU_STREAM_TEMP_FILE);
+        let stream_path = dataset_dir.join(format::IMU_STREAM_FILE);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|source| DatasetError::WriteFile {
+                path: temporary_path.clone(),
+                source,
+            })?;
+        if let Err(source) = file.write_all(&encode_imu_header(0)) {
+            drop(file);
+            let _ = std::fs::remove_file(&temporary_path);
+            return Err(DatasetError::WriteFile {
+                path: temporary_path,
+                source,
+            });
+        }
+        Ok(Self {
+            file,
+            temporary_path,
+            stream_path,
+            record_count: 0,
+            order: InertialOrderTracker::with_session(session_id),
+            published: false,
+        })
+    }
+
+    fn write_report(&mut self, report: ImuReport) -> Result<(), DatasetError> {
+        let record_index =
+            usize::try_from(self.record_count).map_err(|_| DatasetError::InvalidImuStream {
+                path: self.temporary_path.clone(),
+                source: ImuStreamError::RecordIndexOutOfRange {
+                    record_count: self.record_count,
+                },
+            })?;
+        let next_record_count =
+            self.record_count
+                .checked_add(1)
+                .ok_or_else(|| DatasetError::InvalidImuStream {
+                    path: self.temporary_path.clone(),
+                    source: ImuStreamError::ByteLengthOverflow {
+                        record_count: self.record_count,
+                    },
+                })?;
+        imu_stream_byte_len(next_record_count).map_err(|source| {
+            DatasetError::InvalidImuStream {
+                path: self.temporary_path.clone(),
+                source,
+            }
+        })?;
+        self.order
+            .observe(&report)
+            .map_err(|source| DatasetError::InvalidImuStream {
+                path: self.temporary_path.clone(),
+                source: map_inertial_order_error(record_index, source),
+            })?;
+        let bytes = ImuWireRecord::from_report(report).encode();
+        self.file
+            .write_all(&bytes)
+            .map_err(|source| DatasetError::WriteFile {
+                path: self.temporary_path.clone(),
+                source,
+            })?;
+        self.record_count = next_record_count;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<RecordedImuStream, DatasetError> {
+        let byte_len = imu_stream_byte_len(self.record_count).map_err(|source| {
+            DatasetError::InvalidImuStream {
+                path: self.temporary_path.clone(),
+                source,
+            }
+        })?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.file.write_all(&encode_imu_header(self.record_count)))
+            .and_then(|_| self.file.sync_all())
+            .map_err(|source| DatasetError::WriteFile {
+                path: self.temporary_path.clone(),
+                source,
+            })?;
+        std::fs::rename(&self.temporary_path, &self.stream_path).map_err(|source| {
+            DatasetError::PublishImuStream {
+                temporary_path: self.temporary_path.clone(),
+                stream_path: self.stream_path.clone(),
+                source,
+            }
+        })?;
+        self.published = true;
+        Ok(RecordedImuStream {
+            record_count: self.record_count,
+            byte_len,
+        })
+    }
+}
+
+impl Drop for ImuFileWriter {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.temporary_path);
+        }
+    }
+}
+
 fn writer_loop(frames_dir: PathBuf, state: Arc<WriterState>) {
-    writer_loop_with(state, |item| write_item_to_dir(&frames_dir, item));
+    let mut imu_writer = match state.dataset_contract.imu.as_ref() {
+        Some(contract) => {
+            match ImuFileWriter::create(&state.dataset_dir, contract.metadata.device_session_id) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    state.fail(error);
+                    state.cancel_unwritten(std::iter::empty());
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+    writer_loop_with(Arc::clone(&state), |item| match item {
+        SpoolItem::Imu(report) => {
+            let Some(writer) = imu_writer.as_mut() else {
+                return Err(DatasetError::InvalidConfig {
+                    msg: "IMU spool item reached an unconfigured stream writer",
+                });
+            };
+            writer.write_report(report)?;
+            Ok(WrittenManifestItem::None)
+        }
+        item => write_item_to_dir(&frames_dir, item),
+    });
+    if state.failed.load(Ordering::Acquire) {
+        return;
+    }
+    if let Some(writer) = imu_writer {
+        match writer.finish() {
+            Ok(recorded) => state.record_imu(recorded),
+            Err(error) => state.fail(error),
+        }
+    }
 }
 
 fn writer_loop_with(
@@ -1946,6 +2994,9 @@ fn write_item_to_dir(
         SpoolItem::Depth(depth) => {
             write_depth_to_dir(frames_dir, depth).map(WrittenManifestItem::Depth)
         }
+        SpoolItem::Imu(_) => Err(DatasetError::InvalidConfig {
+            msg: "IMU stream requires the transactional stream writer",
+        }),
     }
 }
 
@@ -2100,6 +3151,38 @@ struct Manifest {
     /// that completed without writing any depth payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     depth_entries: Option<Vec<ManifestFrameRef>>,
+    /// `None` preserves manifests written before fixed-record IMU replay existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    imu_stream: Option<ManifestImuStream>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestImuStream {
+    path: String,
+    format: String,
+    version: u16,
+    header_bytes: u16,
+    record_bytes: u16,
+    record_count: u64,
+    byte_len: u64,
+    nominal_rate_hz: u32,
+    acceleration_unit: String,
+    angular_velocity_unit: String,
+    coordinate_frame: String,
+    axes: String,
+    extrinsic: ManifestImuExtrinsic,
+    device_session_id: u64,
+    device_timebase: String,
+    device_session_semantics: String,
+    sample_timestamp_semantics: String,
+    host_arrival_timebase: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ManifestImuExtrinsic {
+    UncalibratedUnknown,
+    CalibratedToTrackingCamera { source: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2207,6 +3290,12 @@ struct RecordedDepth {
     timestamp_ns: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecordedImuStream {
+    record_count: u64,
+    byte_len: u64,
+}
+
 #[derive(Debug)]
 enum WrittenManifestItem {
     None,
@@ -2271,6 +3360,20 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         None => None,
     };
 
+    let imu_stream = match contract.imu.as_ref() {
+        Some(imu_contract) => {
+            let recorded = state
+                .recorded_imu
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .ok_or(DatasetError::InvalidManifest {
+                    reason: "configured IMU stream was not finalized",
+                })?;
+            Some(imu_contract.manifest(recorded))
+        }
+        None => None,
+    };
+
     let manifest = Manifest {
         header: ManifestHeader {
             dataset_id: dataset_id(&state.dataset_dir),
@@ -2301,6 +3404,7 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         },
         entries: topology.entries,
         depth_entries,
+        imu_stream,
     };
 
     let bytes =
@@ -2953,6 +4057,79 @@ mod tests {
             optical_frame: Some(DepthOpticalFrame::RectifiedLeft),
         });
         meta
+    }
+
+    fn meta_with_imu(rate_hz: u32) -> Meta {
+        let mut meta = meta();
+        meta.imu = Some(ImuMeta { rate_hz });
+        meta
+    }
+
+    fn imu_stream_metadata(session_id: u64) -> ImuStreamMetadata {
+        ImuStreamMetadata::new(
+            DeviceSessionId::try_new(session_id).expect("valid test session"),
+            ImuExtrinsicProvenance::uncalibrated_unknown(),
+        )
+    }
+
+    fn imu_report(
+        session_id: u64,
+        sequence: u32,
+        host_arrival_ns: u64,
+        accel_timestamp_ns: i64,
+        gyro_timestamp_ns: i64,
+        offset: f64,
+    ) -> ImuReport {
+        let session_id = DeviceSessionId::try_new(session_id).expect("test session");
+        ImuReport::new(
+            session_id,
+            DequeueSequence::new(sequence),
+            HostMonotonicTimestamp::from_nanos(host_arrival_ns),
+            AccelSample::new(
+                DeviceTimestamp::try_from_nanos(accel_timestamp_ns).expect("accel timestamp"),
+                OakImuAcceleration::try_new(1.0 + offset, 2.0 + offset, 3.0 + offset)
+                    .expect("finite acceleration"),
+                SensorAccuracy::High,
+            ),
+            GyroSample::new(
+                DeviceTimestamp::try_from_nanos(gyro_timestamp_ns).expect("gyro timestamp"),
+                OakImuAngularVelocity::try_new(4.0 + offset, 5.0 + offset, 6.0 + offset)
+                    .expect("finite angular velocity"),
+                SensorAccuracy::Medium,
+            ),
+        )
+    }
+
+    fn write_imu_fixture(test_name: &str, reports: &[ImuReport]) -> PathBuf {
+        let path = unique_dataset_path(test_name);
+        let (writer, handle) = DatasetWriter::create_with_imu_config(
+            &path,
+            &meta_with_imu(200),
+            &calibration(),
+            imu_stream_metadata(7),
+            DatasetWriterConfig::default(),
+        )
+        .expect("create IMU dataset");
+        for report in reports {
+            assert_eq!(
+                write_outcome(writer.write_imu(*report)),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish IMU dataset");
+        path
+    }
+
+    fn corrupt_imu_fixture(test_name: &str, mutate: impl FnOnce(&mut Vec<u8>)) -> DatasetError {
+        let path = write_imu_fixture(test_name, &[imu_report(7, 10, 100, 10, 40, 0.0)]);
+        let stream_path = path.join(format::IMU_STREAM_FILE);
+        let mut bytes = std::fs::read(&stream_path).expect("read IMU fixture");
+        mutate(&mut bytes);
+        std::fs::write(&stream_path, bytes).expect("write corrupted IMU fixture");
+        let error = DatasetReader::open(&path).expect_err("corrupt IMU stream must fail open");
+        std::fs::remove_dir_all(path).expect("remove corrupt IMU fixture");
+        error
     }
 
     fn depth_image(width: u32, height: u32, timestamp_ns: i64) -> DepthImage {
@@ -5573,5 +6750,580 @@ mod tests {
         DatasetReader::open(&path).expect("normalized in-root manifest path remains valid");
 
         std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn new_imu_writes_require_complete_metadata_before_filesystem_mutation() {
+        let root = unique_dataset_path("imu-metadata-required");
+        let path = root.join("missing-parent").join("dataset");
+        assert!(matches!(
+            DatasetWriter::create(&path, &meta_with_imu(200), &calibration())
+                .expect_err("implicit IMU metadata must be rejected"),
+            DatasetError::ImuMetadataRequiredForWrite
+        ));
+        assert!(!root.exists());
+
+        let root = unique_dataset_path("imu-metadata-without-stream");
+        let path = root.join("missing-parent").join("dataset");
+        assert!(matches!(
+            DatasetWriter::create_with_imu_config(
+                &path,
+                &meta(),
+                &calibration(),
+                imu_stream_metadata(7),
+                DatasetWriterConfig::default(),
+            )
+            .expect_err("explicit metadata without meta.imu must be rejected"),
+            DatasetError::ImuMetadataWithoutNominalStream
+        ));
+        assert!(!root.exists());
+
+        let root = unique_dataset_path("imu-zero-rate");
+        let path = root.join("missing-parent").join("dataset");
+        assert!(matches!(
+            DatasetWriter::create_with_imu_config(
+                &path,
+                &meta_with_imu(0),
+                &calibration(),
+                imu_stream_metadata(7),
+                DatasetWriterConfig::default(),
+            )
+            .expect_err("zero nominal rate must be rejected"),
+            DatasetError::InvalidImuNominalRate { value: 0 }
+        ));
+        assert!(!root.exists());
+
+        assert!(matches!(
+            ImuStreamMetadata::try_from_raw_session_id(
+                0,
+                ImuExtrinsicProvenance::uncalibrated_unknown()
+            ),
+            Err(ImuStreamMetadataError::ZeroDeviceSessionId)
+        ));
+        assert!(matches!(
+            ImuExtrinsicProvenance::try_calibrated_to_tracking_camera("  "),
+            Err(ImuStreamMetadataError::EmptyCalibrationSource)
+        ));
+    }
+
+    #[test]
+    fn imu_stream_round_trips_metadata_and_globally_merges_sensor_timestamps() {
+        let reports = [
+            imu_report(7, 10, 100, 10, 40, 0.0),
+            imu_report(7, 11, 110, 20, 50, 10.0),
+            imu_report(7, 12, 120, 40, 60, 20.0),
+        ];
+        let path = write_imu_fixture("imu-roundtrip", &reports);
+
+        let stream = std::fs::read(path.join(format::IMU_STREAM_FILE))
+            .expect("read fixed-record IMU stream");
+        assert_eq!(
+            stream.len(),
+            usize::from(IMU_STREAM_HEADER_BYTES)
+                + reports.len() * usize::from(IMU_STREAM_RECORD_BYTES)
+        );
+        assert_eq!(&stream[0..8], &IMU_STREAM_MAGIC);
+        assert_eq!(read_u16(&stream, 8), IMU_STREAM_VERSION);
+        assert_eq!(read_u16(&stream, 10), IMU_STREAM_HEADER_BYTES);
+        assert_eq!(read_u16(&stream, 12), IMU_STREAM_RECORD_BYTES);
+        assert_eq!(read_u64(&stream, 16), 3);
+        assert_eq!(read_u32(&stream, usize::from(IMU_STREAM_HEADER_BYTES)), 10);
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.join(format::MANIFEST_FILE)).expect("read manifest"),
+        )
+        .expect("parse manifest JSON");
+        let imu = &manifest["imu_stream"];
+        assert_eq!(imu["path"], format::IMU_STREAM_FILE);
+        assert_eq!(imu["format"], IMU_STREAM_FORMAT);
+        assert_eq!(imu["nominal_rate_hz"], 200);
+        assert_eq!(imu["acceleration_unit"], IMU_ACCELERATION_UNIT);
+        assert_eq!(imu["angular_velocity_unit"], IMU_ANGULAR_VELOCITY_UNIT);
+        assert_eq!(imu["coordinate_frame"], IMU_COORDINATE_FRAME);
+        assert_eq!(imu["axes"], IMU_AXES);
+        assert_eq!(imu["extrinsic"]["status"], "uncalibrated_unknown");
+        assert_eq!(imu["device_session_id"], 7);
+        assert_eq!(imu["device_timebase"], IMU_DEVICE_TIMEBASE);
+        assert_eq!(
+            imu["device_session_semantics"],
+            IMU_DEVICE_SESSION_SEMANTICS
+        );
+        assert_eq!(
+            imu["sample_timestamp_semantics"],
+            IMU_SAMPLE_TIMESTAMP_SEMANTICS
+        );
+        assert_eq!(imu["host_arrival_timebase"], IMU_HOST_ARRIVAL_TIMEBASE);
+
+        let reader = DatasetReader::open(&path).expect("open IMU dataset");
+        let mut cursor = reader.imu_cursor().expect("create IMU cursor");
+        assert_eq!(cursor.len(), 6);
+        assert_eq!(cursor.remaining(), 6);
+        let events: Vec<_> = cursor
+            .by_ref()
+            .collect::<Result<_, _>>()
+            .expect("replay validated IMU events");
+        let observed: Vec<_> = events
+            .iter()
+            .map(|event| {
+                (
+                    event.device_timestamp().as_nanos(),
+                    event.sensor(),
+                    event.sequence().as_u32(),
+                    event.host_arrival().as_nanos(),
+                    event.session_id().as_u64(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (10, InertialSensorKind::Accelerometer, 10, 100, 7),
+                (20, InertialSensorKind::Accelerometer, 11, 110, 7),
+                (40, InertialSensorKind::Accelerometer, 12, 120, 7),
+                (40, InertialSensorKind::Gyroscope, 10, 100, 7),
+                (50, InertialSensorKind::Gyroscope, 11, 110, 7),
+                (60, InertialSensorKind::Gyroscope, 12, 120, 7),
+            ]
+        );
+        assert_eq!(
+            events[0]
+                .as_accel()
+                .expect("first event is acceleration")
+                .acceleration()
+                .as_array(),
+            [1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            events[3]
+                .as_gyro()
+                .expect("fourth event is angular velocity")
+                .angular_velocity()
+                .as_array(),
+            [4.0, 5.0, 6.0]
+        );
+        assert_eq!(cursor.remaining(), 0);
+
+        std::fs::remove_dir_all(path).expect("remove round-trip fixture");
+    }
+
+    #[test]
+    fn configured_empty_imu_stream_is_distinct_from_legacy_and_unconfigured_streams() {
+        let path = write_imu_fixture("imu-empty", &[]);
+        assert_eq!(
+            std::fs::metadata(path.join(format::IMU_STREAM_FILE))
+                .expect("stat empty IMU stream")
+                .len(),
+            u64::from(IMU_STREAM_HEADER_BYTES)
+        );
+        let reader = DatasetReader::open(&path).expect("open configured empty stream");
+        let cursor = reader.imu_cursor().expect("configured stream has a cursor");
+        assert!(cursor.is_empty());
+        assert_eq!(cursor.remaining(), 0);
+        std::fs::remove_dir_all(path).expect("remove configured-empty fixture");
+
+        let path = unique_dataset_path("imu-legacy");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create legacy fixture");
+        drop(writer);
+        handle.finish().expect("finish legacy fixture");
+
+        let reader = DatasetReader::open(&path).expect("open unconfigured dataset");
+        assert!(matches!(
+            reader.imu_cursor(),
+            Err(DatasetError::ImuStreamNotConfigured)
+        ));
+
+        std::fs::write(
+            path.join(format::META_FILE),
+            serde_json::to_vec_pretty(&meta_with_imu(200)).expect("serialize legacy metadata"),
+        )
+        .expect("write legacy IMU metadata");
+        let reader = DatasetReader::open(&path).expect("legacy IMU metadata remains readable");
+        assert!(matches!(
+            reader.imu_cursor(),
+            Err(DatasetError::LegacyImuManifestUnindexed)
+        ));
+        std::fs::remove_dir_all(path).expect("remove legacy fixture");
+    }
+
+    #[test]
+    fn imu_reader_rejects_truncation_reserved_fields_unknown_accuracy_and_nonfinite_values() {
+        assert!(matches!(
+            corrupt_imu_fixture("imu-truncated", |bytes| {
+                bytes.pop();
+            }),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::ByteLengthMismatch { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            corrupt_imu_fixture("imu-version", |bytes| {
+                bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+            }),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::UnsupportedVersion {
+                    expected: IMU_STREAM_VERSION,
+                    actual: 2
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            corrupt_imu_fixture("imu-reserved-header", |bytes| bytes[14] = 1),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::NonZeroReservedHeader,
+                ..
+            }
+        ));
+        assert!(matches!(
+            corrupt_imu_fixture("imu-reserved-record", |bytes| {
+                bytes[usize::from(IMU_STREAM_HEADER_BYTES) + 6] = 1;
+            }),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::NonZeroReservedRecord { record_index: 0 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            corrupt_imu_fixture("imu-accuracy", |bytes| {
+                bytes[usize::from(IMU_STREAM_HEADER_BYTES) + 4] = 9;
+            }),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::UnknownAccuracy {
+                    record_index: 0,
+                    sensor: "accelerometer",
+                    value: 9
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            corrupt_imu_fixture("imu-nonfinite", |bytes| {
+                let offset = usize::from(IMU_STREAM_HEADER_BYTES) + 32;
+                bytes[offset..offset + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+            }),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::NonFiniteSample {
+                    record_index: 0,
+                    field: "accel_x",
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn imu_reader_rejects_corrupt_order_and_manifest_units() {
+        let reports = [
+            imu_report(7, 10, 100, 10, 40, 0.0),
+            imu_report(7, 11, 110, 20, 50, 1.0),
+        ];
+        let path = write_imu_fixture("imu-corrupt-order", &reports);
+        let stream_path = path.join(format::IMU_STREAM_FILE);
+        let mut bytes = std::fs::read(&stream_path).expect("read order fixture");
+        let second_record = usize::from(IMU_STREAM_HEADER_BYTES + IMU_STREAM_RECORD_BYTES);
+        bytes[second_record..second_record + 4].copy_from_slice(&10_u32.to_le_bytes());
+        std::fs::write(&stream_path, bytes).expect("write corrupt order fixture");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("duplicate sequence must fail open"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::SequenceNotNewer {
+                    record_index: 1,
+                    previous: 10,
+                    current: 10
+                },
+                ..
+            }
+        ));
+        std::fs::remove_dir_all(path).expect("remove order fixture");
+
+        let path = write_imu_fixture("imu-corrupt-units", &[imu_report(7, 10, 100, 10, 40, 0.0)]);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read manifest fixture"))
+                .expect("parse manifest fixture");
+        manifest["imu_stream"]["acceleration_unit"] = serde_json::json!("g");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize corrupt manifest"),
+        )
+        .expect("write corrupt manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("ambiguous acceleration unit must fail open"),
+            DatasetError::UnsupportedManifestValue {
+                field: "imu_stream.acceleration_unit",
+                value
+            } if value == "g"
+        ));
+        std::fs::remove_dir_all(path).expect("remove unit fixture");
+    }
+
+    #[test]
+    fn imu_cursor_reports_post_open_mutation_without_consuming_the_event() {
+        let reports = [
+            imu_report(7, 10, 100, 10, 40, 0.0),
+            imu_report(7, 11, 110, 20, 50, 1.0),
+        ];
+
+        let path = write_imu_fixture("imu-post-open-truncate", &reports);
+        let stream_path = path.join(format::IMU_STREAM_FILE);
+        let original = std::fs::read(&stream_path).expect("read truncation fixture");
+        let reader = DatasetReader::open(&path).expect("validate truncation fixture");
+        let mut cursor = reader.imu_cursor().expect("open truncation cursor");
+        let partial_first_record =
+            usize::from(IMU_STREAM_HEADER_BYTES) + usize::from(IMU_STREAM_RECORD_BYTES) / 2;
+        std::fs::write(&stream_path, &original[..partial_first_record])
+            .expect("truncate current record after open");
+        assert!(matches!(
+            cursor
+                .next_event()
+                .expect_err("post-open truncation must fail replay"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::ByteLengthMismatch { .. },
+                ..
+            }
+        ));
+        assert_eq!(cursor.remaining(), 4);
+        std::fs::write(&stream_path, &original).expect("restore truncated stream");
+        let event = cursor
+            .next_event()
+            .expect("retry restored stream")
+            .expect("first event remains available");
+        assert_eq!(event.device_timestamp().as_nanos(), 10);
+        assert_eq!(event.sensor(), InertialSensorKind::Accelerometer);
+        assert_eq!(cursor.remaining(), 3);
+        std::fs::remove_dir_all(path).expect("remove truncation fixture");
+
+        let path = write_imu_fixture("imu-post-open-domain", &reports);
+        let stream_path = path.join(format::IMU_STREAM_FILE);
+        let original = std::fs::read(&stream_path).expect("read mutation fixture");
+        let reader = DatasetReader::open(&path).expect("validate mutation fixture");
+        let mut cursor = reader.imu_cursor().expect("open mutation cursor");
+        let mut corrupted = original.clone();
+        let accel_x = usize::from(IMU_STREAM_HEADER_BYTES) + 32;
+        corrupted[accel_x..accel_x + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+        std::fs::write(&stream_path, corrupted).expect("mutate stream after open");
+        assert!(matches!(
+            cursor
+                .next_event()
+                .expect_err("post-open nonfinite sample must fail replay"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::NonFiniteSample {
+                    record_index: 0,
+                    field: "accel_x",
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(cursor.remaining(), 4);
+        std::fs::write(&stream_path, original).expect("restore mutated stream");
+        let event = cursor
+            .next_event()
+            .expect("retry restored stream")
+            .expect("first event remains available");
+        assert_eq!(event.device_timestamp().as_nanos(), 10);
+        assert_eq!(event.sensor(), InertialSensorKind::Accelerometer);
+        assert_eq!(cursor.remaining(), 3);
+        std::fs::remove_dir_all(path).expect("remove mutation fixture");
+    }
+
+    #[test]
+    fn imu_cursor_checks_for_appended_data_once_at_logical_eof() {
+        let path = write_imu_fixture(
+            "imu-post-open-append",
+            &[imu_report(7, 10, 100, 10, 40, 0.0)],
+        );
+        let stream_path = path.join(format::IMU_STREAM_FILE);
+        let original = std::fs::read(&stream_path).expect("read append fixture");
+        let reader = DatasetReader::open(&path).expect("validate append fixture");
+        let mut cursor = reader.imu_cursor().expect("open append cursor");
+        assert!(cursor.next_event().expect("read acceleration").is_some());
+        assert!(cursor.next_event().expect("read gyroscope").is_some());
+        assert_eq!(cursor.remaining(), 0);
+
+        let mut appended = original.clone();
+        appended.push(0);
+        std::fs::write(&stream_path, appended).expect("append after cursor open");
+        assert!(matches!(
+            cursor
+                .next_event()
+                .expect_err("appended tail must fail at logical EOF"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::ByteLengthMismatch { .. },
+                ..
+            }
+        ));
+        assert_eq!(cursor.remaining(), 0);
+        std::fs::write(&stream_path, original).expect("restore append fixture");
+        assert!(
+            cursor
+                .next_event()
+                .expect("retry restored logical EOF")
+                .is_none()
+        );
+        std::fs::remove_dir_all(path).expect("remove append fixture");
+    }
+
+    #[test]
+    fn imu_order_failure_does_not_publish_stream_or_completion_manifest() {
+        let path = unique_dataset_path("imu-transactional-order");
+        let (writer, handle) = DatasetWriter::create_with_imu_config(
+            &path,
+            &meta_with_imu(200),
+            &calibration(),
+            imu_stream_metadata(7),
+            DatasetWriterConfig::default(),
+        )
+        .expect("create transactional IMU fixture");
+        assert_eq!(
+            write_outcome(writer.write_imu(imu_report(7, 10, 100, 10, 40, 0.0))),
+            WriteOutcome::Enqueued
+        );
+        assert_eq!(
+            write_outcome(writer.write_imu(imu_report(7, 10, 110, 20, 50, 1.0))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("duplicate sequence must fail finalization"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::SequenceNotNewer {
+                    record_index: 1,
+                    previous: 10,
+                    current: 10
+                },
+                ..
+            }
+        ));
+        assert!(!path.join(format::IMU_STREAM_FILE).exists());
+        assert!(!path.join(format::IMU_STREAM_TEMP_FILE).exists());
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove failed transaction fixture");
+    }
+
+    #[test]
+    fn imu_write_contract_errors_reach_finalization_without_publication() {
+        let path = unique_dataset_path("imu-session-mismatch");
+        let (writer, handle) = DatasetWriter::create_with_imu_config(
+            &path,
+            &meta_with_imu(200),
+            &calibration(),
+            imu_stream_metadata(7),
+            DatasetWriterConfig::default(),
+        )
+        .expect("create session-bound IMU writer");
+        assert!(matches!(
+            writer.write_imu(imu_report(8, 1, 10, 1, 2, 0.0)),
+            Err(DatasetWriteError::ImuDeviceSessionMismatch {
+                expected: 7,
+                actual: 8
+            })
+        ));
+        assert!(!writer.is_healthy());
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("session mismatch must fail finalization"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::ImuDeviceSessionMismatch {
+                    expected: 7,
+                    actual: 8
+                }
+            }
+        ));
+        assert!(!path.join(format::IMU_STREAM_FILE).exists());
+        assert!(!path.join(format::IMU_STREAM_TEMP_FILE).exists());
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove session mismatch fixture");
+
+        let path = unique_dataset_path("imu-unconfigured-write");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create plain writer");
+        assert!(matches!(
+            writer.write_imu(imu_report(7, 1, 10, 1, 2, 0.0)),
+            Err(DatasetWriteError::ImuStreamNotConfigured)
+        ));
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("unconfigured IMU write must fail finalization"),
+            DatasetError::WriteContract {
+                source: DatasetWriteError::ImuStreamNotConfigured
+            }
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove unconfigured write fixture");
+    }
+
+    #[test]
+    fn imu_reports_share_the_bounded_writer_backpressure_accounting() {
+        let config = DatasetWriterConfig {
+            max_spool_frames: 1,
+            max_spool_bytes: usize::from(IMU_STREAM_RECORD_BYTES),
+            flush_batch_frames: 1,
+            backpressure: Backpressure::DropNewest,
+        };
+        let metadata = meta_with_imu(200);
+        let contract = WriterDatasetContract::parse_with_imu(
+            &metadata,
+            &calibration(),
+            Some(imu_stream_metadata(7)),
+        )
+        .expect("valid IMU writer contract");
+        let state = Arc::new(WriterState::new(
+            config,
+            PathBuf::new(),
+            PathBuf::new(),
+            ManifestMode::InferPairs,
+            contract,
+            WriterSidecars {
+                meta_json: serde_json::to_vec_pretty(&metadata).expect("serialize IMU metadata"),
+                calibration_json: serde_json::to_vec_pretty(&calibration())
+                    .expect("serialize calibration"),
+            },
+        ));
+        {
+            let mut spool = state.spool.lock().expect("lock IMU spool");
+            spool
+                .queue
+                .push_back(SpoolItem::Imu(imu_report(7, 1, 10, 1, 2, 0.0)));
+            spool.frames = 1;
+            spool.bytes = usize::from(IMU_STREAM_RECORD_BYTES);
+        }
+        state.enqueued.store(1, Ordering::Relaxed);
+        state
+            .bytes_enqueued
+            .store(u64::from(IMU_STREAM_RECORD_BYTES), Ordering::Relaxed);
+        state.spool_frames.store(1, Ordering::Relaxed);
+        state
+            .spool_bytes
+            .store(u64::from(IMU_STREAM_RECORD_BYTES), Ordering::Relaxed);
+        let writer = DatasetWriter {
+            config,
+            state: Arc::clone(&state),
+        };
+
+        assert_eq!(
+            write_outcome(writer.write_imu(imu_report(7, 2, 20, 3, 4, 1.0))),
+            WriteOutcome::Dropped
+        );
+        let stats = writer.stats();
+        assert_eq!(stats.frames_enqueued, 1);
+        assert_eq!(stats.bytes_enqueued, u64::from(IMU_STREAM_RECORD_BYTES));
+        assert_eq!(stats.frames_dropped, 1);
+        assert_eq!(stats.bytes_dropped, u64::from(IMU_STREAM_RECORD_BYTES));
+        assert_eq!(stats.spool_frames, 1);
+        assert_eq!(stats.spool_bytes, u64::from(IMU_STREAM_RECORD_BYTES));
+        let spool = state.spool.lock().expect("lock IMU spool");
+        assert_eq!(spool.queue.len(), 1);
+        assert_eq!(spool.frames, 1);
+        assert_eq!(spool.bytes, usize::from(IMU_STREAM_RECORD_BYTES));
     }
 }

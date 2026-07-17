@@ -44,24 +44,27 @@ use kiko_slam::{CameraPoint3, DepthImageError, Frame, FrameError, Raw, ReconStat
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
-    Calibration, CameraIntrinsics, DatasetWriteError, DatasetWriter, DepthMeta, ImuMeta, Meta,
-    MonoMeta, WriteOutcome,
+    Calibration, CameraIntrinsics, DatasetWriteError, DatasetWriter, DatasetWriterConfig,
+    DepthMeta, ImuExtrinsicProvenance, ImuMeta, ImuStreamMetadata, Meta, MonoMeta, WriteOutcome,
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
-    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSender, DiagnosticEvent,
-    DropPolicy, DropReceiver, FrameDiagnostics, PairingConfigError, PairingInputError,
+    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSender, DeviceSessionId,
+    DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, HostMonotonicTimestamp,
+    InertialOrderingError, InertialValueError, PairingConfigError, PairingInputError,
     PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer, SystemHealth,
-    TrackerInitError, VizConfigError, bounded_channel, dense_command_channel, oak_to_depth_image,
-    oak_to_frame,
+    TrackerInitError, VizConfigError, bounded_channel, dense_command_channel, depth_router,
+    imu_report_router, oak_to_depth_image, oak_to_frame, oak_to_imu_report,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
     CalibrationError as OakCalibrationError, CloseError as OakCloseError, DepthAlignment,
     DepthConfig, DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
-    ImageFrame as OakImageFrame, ImuConfig, Intrinsics as OakIntrinsics, MonoConfig, QueueConfig,
-    StreamId as OakStreamId,
+    ImageFrame as OakImageFrame, ImuConfig, ImuError, Intrinsics as OakIntrinsics, MonoConfig,
+    QueueConfig, StreamId as OakStreamId,
 };
+#[cfg(feature = "record")]
+use std::num::NonZeroU32;
 #[cfg(feature = "record")]
 use std::sync::Arc;
 #[cfg(feature = "record")]
@@ -566,6 +569,9 @@ struct CameraArgs {
     fps: u32,
     #[arg(long, default_value_t = true)]
     rectified: bool,
+    /// Enable raw accelerometer and gyroscope capture at this nominal rate.
+    #[arg(long, env = "KIKO_IMU_RATE_HZ")]
+    imu_rate_hz: Option<NonZeroU32>,
 }
 
 #[derive(Args, Clone, Debug)]
@@ -2441,6 +2447,7 @@ impl std::error::Error for OperationAndDeviceCloseError {
 #[derive(Clone, Copy, Debug)]
 enum RecordItem {
     DepthFrame,
+    ImuReport,
     StereoPair,
 }
 
@@ -2449,9 +2456,40 @@ impl std::fmt::Display for RecordItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DepthFrame => write!(f, "depth frame"),
+            Self::ImuReport => write!(f, "IMU report"),
             Self::StereoPair => write!(f, "stereo pair"),
         }
     }
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostMonotonicRangeError {
+    elapsed_ns: u128,
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for HostMonotonicRangeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "host monotonic elapsed time {} ns exceeds the u64 recording timebase",
+            self.elapsed_ns
+        )
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for HostMonotonicRangeError {}
+
+#[cfg(feature = "record")]
+fn host_monotonic_since(
+    origin: Instant,
+) -> Result<HostMonotonicTimestamp, HostMonotonicRangeError> {
+    let elapsed_ns = origin.elapsed().as_nanos();
+    let elapsed_ns =
+        u64::try_from(elapsed_ns).map_err(|_| HostMonotonicRangeError { elapsed_ns })?;
+    Ok(HostMonotonicTimestamp::from_nanos(elapsed_ns))
 }
 
 #[cfg(feature = "record")]
@@ -2474,6 +2512,15 @@ enum RecordCaptureError {
     },
     DepthFrame {
         source: RectifiedLeftDepthError,
+    },
+    Imu {
+        source: ImuError,
+    },
+    ImuSample {
+        source: InertialValueError,
+    },
+    HostTimestamp {
+        source: HostMonotonicRangeError,
     },
     PairingInput {
         source: PairingInputError,
@@ -2513,6 +2560,11 @@ impl std::fmt::Display for RecordCaptureError {
             Self::DepthFrame { source } => {
                 write!(f, "depth camera contract failed: {source}")
             }
+            Self::Imu { source } => write!(f, "IMU capture failed: {source}"),
+            Self::ImuSample { source } => write!(f, "IMU sample contract failed: {source}"),
+            Self::HostTimestamp { source } => {
+                write!(f, "IMU host-arrival timestamp failed: {source}")
+            }
             Self::PairingInput { source } => {
                 write!(f, "stereo pairing input failed: {source}")
             }
@@ -2539,6 +2591,9 @@ impl std::error::Error for RecordCaptureError {
             Self::LeftFrame { source } | Self::RightFrame { source } => Some(source),
             Self::Depth { source } => Some(source),
             Self::DepthFrame { source } => Some(source),
+            Self::Imu { source } => Some(source),
+            Self::ImuSample { source } => Some(source),
+            Self::HostTimestamp { source } => Some(source),
             Self::PairingInput { source } => Some(source),
             Self::DatasetWrite { source, .. } => Some(source),
             Self::DeviceClose { source } => Some(source),
@@ -2710,12 +2765,20 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         fps: mono_config.fps,
         alignment: DepthAlignment::RectifiedLeft,
     });
+    let imu_config = args.camera.imu_rate_hz.map(|rate_hz| ImuConfig {
+        rate_hz: rate_hz.get(),
+    });
+    // Device reconnect is not implemented. One invocation therefore contains
+    // exactly one dataset-local device-clock session.
+    let imu_session = imu_config
+        .map(|_| DeviceSessionId::try_new(1))
+        .transpose()?;
 
     let config = DeviceConfig {
         rgb: None,
         mono: Some(mono_config),
         depth: depth_config,
-        imu: None,
+        imu: imu_config,
         queue: QueueConfig {
             size: 8,
             blocking: false,
@@ -2733,16 +2796,29 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             rectified_left_intrinsics,
         } = bootstrap_stereo(&mut device, &mono_config, running.as_ref(), &mut pairer)?;
 
-        let meta = build_meta(&mono_config, depth_config.as_ref(), None);
+        let meta = build_meta(&mono_config, depth_config.as_ref(), imu_config.as_ref());
         eprintln!("creating dataset at {}", output_path.display());
-        let (writer, writer_handle) =
-            DatasetWriter::create_paired(output_path, &meta, &calibration, pairing_window)?;
+        let (writer, writer_handle) = if let Some(session_id) = imu_session {
+            let stream_metadata =
+                ImuStreamMetadata::new(session_id, ImuExtrinsicProvenance::uncalibrated_unknown());
+            DatasetWriter::create_paired_with_imu_config(
+                output_path,
+                &meta,
+                &calibration,
+                pairing_window,
+                stream_metadata,
+                DatasetWriterConfig::default(),
+            )?
+        } else {
+            DatasetWriter::create_paired(output_path, &meta, &calibration, pairing_window)?
+        };
 
         let start = Instant::now();
         let mut pair_count = 0u64;
         let mut left_count = 1u64;
         let mut right_count = 1u64;
         let mut depth_count = 0u64;
+        let mut imu_count = 0u64;
         let mut left_seq = 1u64;
         let mut right_seq = 1u64;
         let mut capture_error = None;
@@ -2831,6 +2907,43 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if let Some(session_id) = imu_session {
+                match device.imu() {
+                    Ok(samples) => {
+                        let host_arrival = match host_monotonic_since(start) {
+                            Ok(timestamp) => timestamp,
+                            Err(source) => {
+                                capture_error = Some(RecordCaptureError::HostTimestamp { source });
+                                break 'capture;
+                            }
+                        };
+                        for sample in samples {
+                            let report = match oak_to_imu_report(sample, session_id, host_arrival) {
+                                Ok(report) => report,
+                                Err(source) => {
+                                    capture_error = Some(RecordCaptureError::ImuSample { source });
+                                    break 'capture;
+                                }
+                            };
+                            if let Err(error) = require_record_write(
+                                writer.write_imu(report),
+                                RecordItem::ImuReport,
+                            ) {
+                                capture_error = Some(error);
+                                break 'capture;
+                            }
+                            imu_count = imu_count.saturating_add(1);
+                        }
+                        got_any = true;
+                    }
+                    Err(ImuError::Empty) => {}
+                    Err(source) => {
+                        capture_error = Some(RecordCaptureError::Imu { source });
+                        break 'capture;
+                    }
+                }
+            }
+
             while let Some(pair) = pairer.next_pair() {
                 if let Err(err) =
                     require_record_write(writer.write_pair(pair), RecordItem::StereoPair)
@@ -2858,7 +2971,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             let timed_left_count = left_count.saturating_sub(1);
             let timed_right_count = right_count.saturating_sub(1);
             eprintln!(
-                "finished timed capture in {:.1}s: pairs={}, left={} (1 bootstrap + {} timed, {:.1} timed fps), right={} (1 bootstrap + {} timed, {:.1} timed fps), depth={} ({:.1}fps), written={}, dropped={}",
+                "finished timed capture in {:.1}s: pairs={}, left={} (1 bootstrap + {} timed, {:.1} timed fps), right={} (1 bootstrap + {} timed, {:.1} timed fps), depth={} ({:.1}fps), imu_reports={} ({:.1}Hz), logical_payload_units_written={}, logical_payload_units_dropped={}",
                 elapsed,
                 pair_count,
                 left_count,
@@ -2869,6 +2982,8 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
                 finite_rate_per_second(timed_right_count, elapsed),
                 depth_count,
                 finite_rate_per_second(depth_count, elapsed),
+                imu_count,
+                finite_rate_per_second(imu_count, elapsed),
                 stats.frames_written,
                 stats.frames_dropped
             );
@@ -3253,6 +3368,11 @@ enum LiveCaptureError {
     PairingInput { source: PairingInputError },
     Depth { source: DepthError },
     DepthFrame { source: RectifiedLeftDepthError },
+    Imu { source: ImuError },
+    ImuSample { source: InertialValueError },
+    ImuOrdering { source: InertialOrderingError },
+    ImuRouteDisconnected,
+    HostTimestamp { source: HostMonotonicRangeError },
     DeviceClose { source: DeviceCloseFailure },
 }
 
@@ -3271,6 +3391,15 @@ impl std::fmt::Display for LiveCaptureError {
             Self::PairingInput { source } => write!(f, "stereo pairing input failed: {source}"),
             Self::Depth { source } => write!(f, "depth camera capture failed: {source}"),
             Self::DepthFrame { source } => write!(f, "depth camera contract failed: {source}"),
+            Self::Imu { source } => write!(f, "IMU capture failed: {source}"),
+            Self::ImuSample { source } => write!(f, "IMU sample contract failed: {source}"),
+            Self::ImuOrdering { source } => write!(f, "IMU ordering contract failed: {source}"),
+            Self::ImuRouteDisconnected => {
+                write!(f, "IMU estimator route disconnected during capture")
+            }
+            Self::HostTimestamp { source } => {
+                write!(f, "IMU host-arrival timestamp failed: {source}")
+            }
             Self::DeviceClose { source } => write!(f, "OAK device close failed: {source}"),
         }
     }
@@ -3285,6 +3414,11 @@ impl std::error::Error for LiveCaptureError {
             Self::PairingInput { source } => Some(source),
             Self::Depth { source } => Some(source),
             Self::DepthFrame { source } => Some(source),
+            Self::Imu { source } => Some(source),
+            Self::ImuSample { source } => Some(source),
+            Self::ImuOrdering { source } => Some(source),
+            Self::ImuRouteDisconnected => None,
+            Self::HostTimestamp { source } => Some(source),
             Self::DeviceClose { source } => Some(source),
         }
     }
@@ -3351,6 +3485,21 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     let depth_ring_capacity = depth_queue_capacity
         .map(DepthRingCapacity::from_queue_capacity)
         .unwrap_or_else(DepthRingCapacity::minimum);
+    let imu_config = args.camera.imu_rate_hz.map(|rate_hz| ImuConfig {
+        rate_hz: rate_hz.get(),
+    });
+    // This command does not reconnect. One invocation is therefore one
+    // explicitly delimited device-clock session.
+    let imu_session = imu_config
+        .map(|_| DeviceSessionId::try_new(1))
+        .transpose()?;
+    let imu_queue_capacity = if imu_config.is_some() {
+        Some(ChannelCapacity::try_from(
+            env_usize("KIKO_LIVE_IMU_QUEUE_DEPTH")?.unwrap_or(256),
+        )?)
+    } else {
+        None
+    };
 
     let config = DeviceConfig {
         rgb: None,
@@ -3361,7 +3510,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             fps: mono_config.fps,
             alignment: DepthAlignment::RectifiedLeft,
         }),
-        imu: None,
+        imu: imu_config,
         queue: QueueConfig {
             size: 8,
             blocking: false,
@@ -3387,14 +3536,27 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let viz_queue_depth = env_usize("KIKO_LIVE_VIZ_QUEUE_DEPTH")?.unwrap_or(12);
         let viz_capacity = ChannelCapacity::try_from(viz_queue_depth)?;
         let (viz_tx, viz_rx, viz_stats) = bounded_channel(viz_capacity, DropPolicy::DropNewest);
-        let (depth_tx, depth_rx, depth_stats_handle) =
+        let (depth_tx, depth_rx, _navigation_depth_rx, depth_stats_handle) =
             if let Some(depth_capacity) = depth_queue_capacity {
-                let (depth_tx, depth_rx, depth_stats) =
-                    bounded_channel::<DepthImage>(depth_capacity, DropPolicy::DropOldest);
-                (Some(depth_tx), Some(depth_rx), Some(depth_stats))
+                let (depth_tx, depth_routes, depth_stats) =
+                    depth_router(depth_capacity, DropPolicy::DropOldest);
+                (
+                    Some(depth_tx),
+                    Some(depth_routes.slam),
+                    Some(depth_routes.navigation),
+                    Some(depth_stats),
+                )
             } else {
-                (None, None, None)
+                (None, None, None, None)
             };
+        let (mut imu_tx, _imu_rx, imu_stats_handle) = match (imu_session, imu_queue_capacity) {
+            (Some(session_id), Some(capacity)) => {
+                let (tx, rx, stats) = imu_report_router(session_id, capacity);
+                (Some(tx), Some(rx), Some(stats))
+            }
+            (None, None) => (None, None, None),
+            _ => unreachable!("IMU session and queue capacity are derived together"),
+        };
 
         let inference = InferenceConfig::from_args(&args.inference)?;
         let InferenceConfig {
@@ -3417,11 +3579,14 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         )?;
 
         eprintln!(
-            "live: pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
+            "live: pair_queue_depth={} viz_queue_depth={} depth_enabled={} depth_queue_depth={} imu_enabled={} imu_rate_hz={} imu_queue_depth={} pairing_window_ns={} pairer_max_pending_per_side={}",
             pair_queue_depth,
             viz_queue_depth,
             depth_enabled,
             depth_queue_capacity.map_or(0, ChannelCapacity::get),
+            imu_config.is_some(),
+            imu_config.map_or(0, |config| config.rate_hz),
+            imu_queue_capacity.map_or(0, ChannelCapacity::get),
             pairer.window().as_ns(),
             pairer.max_pending_per_side()
         );
@@ -3830,6 +3995,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut left_seq = 1u64;
         let mut right_seq = 1u64;
         let mut capture_error = None;
+        let capture_clock_origin = Instant::now();
 
         eprintln!("streaming matches... press ctrl+c to stop");
 
@@ -3892,7 +4058,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 got_any = true;
                                 if let Some(depth_tx) = depth_tx.as_ref()
                                     && matches!(
-                                        depth_tx.try_send(depth_image),
+                                        depth_tx.route(depth_image).slam,
                                         SendOutcome::Disconnected
                                     )
                                 {
@@ -3913,6 +4079,46 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
+            if let (Some(session_id), Some(imu_tx)) = (imu_session, imu_tx.as_mut()) {
+                match device.imu() {
+                    Ok(samples) => {
+                        let host_arrival = match host_monotonic_since(capture_clock_origin) {
+                            Ok(timestamp) => timestamp,
+                            Err(source) => {
+                                capture_error = Some(LiveCaptureError::HostTimestamp { source });
+                                break 'capture;
+                            }
+                        };
+                        for sample in samples {
+                            let report = match oak_to_imu_report(sample, session_id, host_arrival) {
+                                Ok(report) => report,
+                                Err(source) => {
+                                    capture_error = Some(LiveCaptureError::ImuSample { source });
+                                    break 'capture;
+                                }
+                            };
+                            let outcome = match imu_tx.route(report) {
+                                Ok(outcome) => outcome,
+                                Err(source) => {
+                                    capture_error = Some(LiveCaptureError::ImuOrdering { source });
+                                    break 'capture;
+                                }
+                            };
+                            if matches!(outcome.delivery, SendOutcome::Disconnected) {
+                                capture_error = Some(LiveCaptureError::ImuRouteDisconnected);
+                                break 'capture;
+                            }
+                        }
+                        got_any = true;
+                    }
+                    Err(ImuError::Empty) => {}
+                    Err(source) => {
+                        capture_error = Some(LiveCaptureError::Imu { source });
+                        break 'capture;
+                    }
+                }
+            }
+
             while let Some(pair) = pairer.next_pair() {
                 if matches!(pair_tx.try_send(pair), SendOutcome::Disconnected) {
                     running.store(false, Ordering::SeqCst);
@@ -3927,6 +4133,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         drop(pair_tx);
         drop(depth_tx);
+        drop(imu_tx);
         let mut live_failures = capture_error
             .into_iter()
             .map(LiveWorkerFailure::Capture)
@@ -3979,11 +4186,31 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(depth_stats_handle) = depth_stats_handle {
             let depth_snapshot = depth_stats_handle.snapshot();
             eprintln!(
-                "depth queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
-                depth_snapshot.enqueued,
-                depth_snapshot.dropped_oldest,
-                depth_snapshot.dropped_newest,
-                depth_snapshot.disconnected
+                "depth SLAM queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+                depth_snapshot.slam.enqueued,
+                depth_snapshot.slam.dropped_oldest,
+                depth_snapshot.slam.dropped_newest,
+                depth_snapshot.slam.disconnected
+            );
+            eprintln!(
+                "depth navigation queue stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}",
+                depth_snapshot.navigation.enqueued,
+                depth_snapshot.navigation.dropped_oldest,
+                depth_snapshot.navigation.dropped_newest,
+                depth_snapshot.navigation.disconnected
+            );
+        }
+        if let Some(imu_stats_handle) = imu_stats_handle {
+            let imu_snapshot = imu_stats_handle.snapshot();
+            eprintln!(
+                "IMU route stats: enqueued={}, dropped_oldest={}, dropped_newest={}, disconnected={}, source_gap_events={}, source_missing_reports={}, ordering_rejected={}",
+                imu_snapshot.reports.enqueued,
+                imu_snapshot.reports.dropped_oldest,
+                imu_snapshot.reports.dropped_newest,
+                imu_snapshot.reports.disconnected,
+                imu_snapshot.source_gap_events,
+                imu_snapshot.source_missing_reports,
+                imu_snapshot.ordering_rejected
             );
         }
         if let Some(dense_command_stats_handle) = dense_command_stats_handle {

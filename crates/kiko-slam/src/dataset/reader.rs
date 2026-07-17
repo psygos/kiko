@@ -1,16 +1,23 @@
 use std::collections::HashSet;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    DepthImage, Frame, FrameId, PairingWindowNs, SensorId, StereoCalibration, StereoPair, Timestamp,
+    DepthImage, DeviceSessionId, Frame, FrameId, ImuEvent, ImuReport, InertialOrderTracker,
+    PairingWindowNs, SensorId, StereoCalibration, StereoPair, Timestamp,
 };
 
 use super::{
-    DatasetError, DatasetTimebase, DeltaStats, DepthImageContract, Manifest, ManifestFrameRef,
-    ManifestHeader, ManifestPairing, ManifestPairingPolicy, ManifestStats, MonoImageContract,
-    MonoPayloadFormat, PairReason, ParsedMonoContract, build_delta_stats, format,
+    DatasetError, DatasetTimebase, DeltaStats, DepthImageContract, IMU_ACCELERATION_UNIT,
+    IMU_ANGULAR_VELOCITY_UNIT, IMU_AXES, IMU_COORDINATE_FRAME, IMU_DEVICE_SESSION_SEMANTICS,
+    IMU_DEVICE_TIMEBASE, IMU_HOST_ARRIVAL_TIMEBASE, IMU_SAMPLE_TIMESTAMP_SEMANTICS,
+    IMU_STREAM_FORMAT, IMU_STREAM_HEADER_BYTES, IMU_STREAM_RECORD_BYTES, IMU_STREAM_VERSION,
+    ImuStreamError, ImuWireRecord, Manifest, ManifestFrameRef, ManifestHeader,
+    ManifestImuExtrinsic, ManifestImuStream, ManifestPairing, ManifestPairingPolicy, ManifestStats,
+    MonoImageContract, MonoPayloadFormat, PairReason, ParsedMonoContract, build_delta_stats,
+    decode_imu_header, format, imu_stream_byte_len, map_inertial_order_error,
     parse_image_dimensions, read_calibration, read_manifest, read_meta, sensor_to_str,
 };
 
@@ -58,9 +65,26 @@ enum ParsedDepthStream {
 }
 
 #[derive(Debug)]
+enum ParsedImuStream {
+    Unconfigured,
+    LegacyUnindexed,
+    Indexed(ImuStreamDescriptor),
+}
+
+#[derive(Clone, Debug)]
+struct ImuStreamDescriptor {
+    path: PathBuf,
+    session_id: DeviceSessionId,
+    record_count: u64,
+    event_count: usize,
+    byte_len: u64,
+}
+
+#[derive(Debug)]
 struct ParsedManifest {
     entries: Vec<DatasetEntry>,
     depth: ParsedDepthStream,
+    imu: ParsedImuStream,
     stats: DatasetStats,
 }
 
@@ -68,6 +92,7 @@ struct ParsedManifest {
 struct ParsedManifestContract {
     image: MonoImageContract,
     depth: Option<DepthImageContract>,
+    imu_nominal_rate_hz: Option<u32>,
     pairing_policy: ManifestPairingPolicy,
     pairing_window: PairingWindowNs,
 }
@@ -133,9 +158,11 @@ impl ParsedManifestContract {
             .as_ref()
             .map(DepthImageContract::parse)
             .transpose()?;
+        let imu_nominal_rate_hz = meta.imu.as_ref().map(|imu| imu.rate_hz);
         Ok(Self {
             image,
             depth,
+            imu_nominal_rate_hz,
             pairing_policy,
             pairing_window,
         })
@@ -148,6 +175,7 @@ pub struct DatasetReader {
     stereo_calibration: StereoCalibration,
     entries: Vec<DatasetEntry>,
     depth: ParsedDepthStream,
+    imu: ParsedImuStream,
     depth_projection: Option<super::DepthProjectionContract>,
     stats: DatasetStats,
     left_seq: u64,
@@ -190,6 +218,7 @@ impl DatasetReader {
             stereo_calibration: parsed_mono.stereo,
             entries: parsed.entries,
             depth: parsed.depth,
+            imu: parsed.imu,
             depth_projection,
             stats: parsed.stats,
             left_seq: 0,
@@ -229,6 +258,15 @@ impl DatasetReader {
                 entries: Arc::clone(entries),
                 next: 0,
             }),
+        }
+    }
+
+    /// Returns a deterministic device-timestamp-ordered IMU event cursor.
+    pub fn imu_cursor(&self) -> Result<DatasetImuCursor, DatasetError> {
+        match &self.imu {
+            ParsedImuStream::Unconfigured => Err(DatasetError::ImuStreamNotConfigured),
+            ParsedImuStream::LegacyUnindexed => Err(DatasetError::LegacyImuManifestUnindexed),
+            ParsedImuStream::Indexed(stream) => DatasetImuCursor::open(stream),
         }
     }
 
@@ -338,6 +376,268 @@ fn read_depth_image(
         path: path.clone(),
         source,
     })
+}
+
+/// Bounded-memory replay cursor that merges the individually monotonic
+/// accelerometer and gyroscope streams by device timestamp.
+///
+/// Dataset open validates the stream in one sequential pass. The cursor then
+/// owns two further sequential readers and retains at most one decoded report
+/// per sensor so it can merge independent timestamps without retaining the
+/// recording. Exact timestamp ties emit accelerometer before gyroscope;
+/// sequence order is retained within each sensor stream. Host arrival and
+/// dequeue sequence remain attached to both events from their originating
+/// bridge report.
+#[derive(Debug)]
+pub struct DatasetImuCursor {
+    accel: ImuReportFileCursor,
+    gyro: ImuReportFileCursor,
+    event_count: usize,
+    emitted: usize,
+}
+
+impl DatasetImuCursor {
+    fn open(stream: &ImuStreamDescriptor) -> Result<Self, DatasetError> {
+        Ok(Self {
+            accel: ImuReportFileCursor::open(stream)?,
+            gyro: ImuReportFileCursor::open(stream)?,
+            event_count: stream.event_count,
+            emitted: 0,
+        })
+    }
+
+    /// Total number of sensor events declared by the validated stream.
+    pub fn len(&self) -> usize {
+        self.event_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.event_count == 0
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.event_count - self.emitted
+    }
+
+    /// Decode and return the next globally ordered event.
+    ///
+    /// Any post-open I/O, length, sample-domain, or ordering failure leaves the
+    /// affected report unconsumed, so a caller can report the exact failure or
+    /// retry after restoring the payload.
+    pub fn next_event(&mut self) -> Result<Option<ImuEvent>, DatasetError> {
+        let accel = self.accel.peek()?;
+        let gyro = self.gyro.peek()?;
+        let event = match (accel, gyro) {
+            (None, None) => return Ok(None),
+            (Some(_), None) => accel_event(self.accel.consume()),
+            (None, Some(_)) => gyro_event(self.gyro.consume()),
+            (Some(accel_report), Some(gyro_report))
+                if accel_report.accel().timestamp() <= gyro_report.gyro().timestamp() =>
+            {
+                accel_event(self.accel.consume())
+            }
+            (Some(_), Some(_)) => gyro_event(self.gyro.consume()),
+        };
+        self.emitted += 1;
+        Ok(Some(event))
+    }
+}
+
+impl Iterator for DatasetImuCursor {
+    type Item = Result<ImuEvent, DatasetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_event() {
+            Ok(Some(event)) => Some(Ok(event)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ImuReportFileCursor {
+    path: PathBuf,
+    reader: BufReader<std::fs::File>,
+    session_id: DeviceSessionId,
+    record_count: u64,
+    expected_len: u64,
+    next_record_index: u64,
+    retry_requires_seek: bool,
+    eof_validated: bool,
+    order: InertialOrderTracker,
+    lookahead: Option<ImuReport>,
+}
+
+impl ImuReportFileCursor {
+    fn open(stream: &ImuStreamDescriptor) -> Result<Self, DatasetError> {
+        let mut file =
+            std::fs::File::open(&stream.path).map_err(|source| DatasetError::ReadFile {
+                path: stream.path.clone(),
+                source,
+            })?;
+        require_imu_file_len(&file, &stream.path, stream.byte_len)?;
+        let mut header = [0_u8; IMU_STREAM_HEADER_BYTES as usize];
+        file.read_exact(&mut header)
+            .map_err(|source| DatasetError::ReadFile {
+                path: stream.path.clone(),
+                source,
+            })?;
+        let encoded_count =
+            decode_imu_header(&header).map_err(|source| DatasetError::InvalidImuStream {
+                path: stream.path.clone(),
+                source,
+            })?;
+        if encoded_count != stream.record_count {
+            return Err(DatasetError::InvalidImuStream {
+                path: stream.path.clone(),
+                source: ImuStreamError::ManifestMismatch {
+                    field: "record_count",
+                    declared: stream.record_count,
+                    encoded: encoded_count,
+                },
+            });
+        }
+        Ok(Self {
+            path: stream.path.clone(),
+            reader: BufReader::with_capacity(usize::from(IMU_STREAM_RECORD_BYTES), file),
+            session_id: stream.session_id,
+            record_count: stream.record_count,
+            expected_len: stream.byte_len,
+            next_record_index: 0,
+            retry_requires_seek: false,
+            eof_validated: false,
+            order: InertialOrderTracker::with_session(stream.session_id),
+            lookahead: None,
+        })
+    }
+
+    fn peek(&mut self) -> Result<Option<ImuReport>, DatasetError> {
+        if let Some(report) = self.lookahead {
+            return Ok(Some(report));
+        }
+        if self.next_record_index == self.record_count {
+            if !self.eof_validated {
+                require_imu_file_len(self.reader.get_ref(), &self.path, self.expected_len)?;
+                self.eof_validated = true;
+            }
+            return Ok(None);
+        }
+
+        if self.retry_requires_seek {
+            let offset = imu_stream_byte_len(self.next_record_index).map_err(|source| {
+                DatasetError::InvalidImuStream {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+            self.reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|source| DatasetError::ReadFile {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.retry_requires_seek = false;
+        }
+
+        let mut bytes = [0_u8; IMU_STREAM_RECORD_BYTES as usize];
+        if let Err(source) = self.reader.read_exact(&mut bytes) {
+            self.retry_requires_seek = true;
+            if let Ok(metadata) = self.reader.get_ref().metadata() {
+                let actual = metadata.len();
+                if actual != self.expected_len {
+                    return Err(DatasetError::InvalidImuStream {
+                        path: self.path.clone(),
+                        source: ImuStreamError::ByteLengthMismatch {
+                            expected: self.expected_len,
+                            actual,
+                        },
+                    });
+                }
+            }
+            return Err(DatasetError::ReadFile {
+                path: self.path.clone(),
+                source,
+            });
+        }
+        let record_index = match usize::try_from(self.next_record_index) {
+            Ok(record_index) => record_index,
+            Err(_) => {
+                self.retry_requires_seek = true;
+                return Err(DatasetError::ManifestCountOutOfRange {
+                    field: "imu_stream record index",
+                    value: self.next_record_index,
+                });
+            }
+        };
+        let report = match ImuWireRecord::decode(&bytes, record_index)
+            .and_then(|record| record.into_report(self.session_id, record_index))
+        {
+            Ok(report) => report,
+            Err(source) => {
+                self.retry_requires_seek = true;
+                return Err(DatasetError::InvalidImuStream {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        if let Err(source) = self.order.observe(&report) {
+            self.retry_requires_seek = true;
+            return Err(DatasetError::InvalidImuStream {
+                path: self.path.clone(),
+                source: map_inertial_order_error(record_index, source),
+            });
+        }
+        self.next_record_index += 1;
+        self.lookahead = Some(report);
+        Ok(Some(report))
+    }
+
+    fn consume(&mut self) -> ImuReport {
+        self.lookahead
+            .take()
+            .expect("consume follows a successful nonempty peek")
+    }
+}
+
+fn require_imu_file_len(
+    file: &std::fs::File,
+    path: &Path,
+    expected: u64,
+) -> Result<(), DatasetError> {
+    let actual = file
+        .metadata()
+        .map_err(|source| DatasetError::ReadFile {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if actual != expected {
+        return Err(DatasetError::InvalidImuStream {
+            path: path.to_path_buf(),
+            source: ImuStreamError::ByteLengthMismatch { expected, actual },
+        });
+    }
+    Ok(())
+}
+
+fn accel_event(report: ImuReport) -> ImuEvent {
+    ImuEvent::Accel {
+        session_id: report.session_id(),
+        sequence: report.sequence(),
+        host_arrival: report.host_arrival(),
+        sample: report.accel(),
+    }
+}
+
+fn gyro_event(report: ImuReport) -> ImuEvent {
+    ImuEvent::Gyro {
+        session_id: report.session_id(),
+        sequence: report.sequence(),
+        host_arrival: report.host_arrival(),
+        sample: report.gyro(),
+    }
 }
 
 pub struct DatasetPairs<'a> {
@@ -462,6 +762,7 @@ fn parse_manifest(
         stats,
         entries,
         depth_entries,
+        imu_stream,
         ..
     } = manifest;
     if contract.pairing_policy == ManifestPairingPolicy::RecordedPairs
@@ -556,6 +857,7 @@ fn parse_manifest(
     }
 
     let depth = parse_depth_stream(root, contract.depth, depth_entries, &mut seen_paths)?;
+    let imu = parse_imu_stream(root, contract.imu_nominal_rate_hz, imu_stream)?;
 
     let derived_delta_stats = build_delta_stats(&paired_deltas);
     validate_manifest_delta_stats(stats.delta_stats.as_ref(), derived_delta_stats.as_ref())?;
@@ -568,6 +870,7 @@ fn parse_manifest(
     Ok(ParsedManifest {
         entries: parsed_entries,
         depth,
+        imu,
         stats,
     })
 }
@@ -624,6 +927,259 @@ fn parse_depth_stream(
         contract,
         entries: Arc::from(parsed.into_boxed_slice()),
     })
+}
+
+fn parse_imu_stream(
+    root: &Path,
+    nominal_rate_hz: Option<u32>,
+    manifest: Option<ManifestImuStream>,
+) -> Result<ParsedImuStream, DatasetError> {
+    let (nominal_rate_hz, manifest) = match (nominal_rate_hz, manifest) {
+        (None, None) => return Ok(ParsedImuStream::Unconfigured),
+        (Some(_), None) => return Ok(ParsedImuStream::LegacyUnindexed),
+        (None, Some(_)) => return Err(DatasetError::ManifestImuStreamWithoutMetadata),
+        (Some(rate), Some(manifest)) => (rate, manifest),
+    };
+    if nominal_rate_hz == 0 {
+        return Err(DatasetError::InvalidImuNominalRate {
+            value: nominal_rate_hz,
+        });
+    }
+    if manifest.nominal_rate_hz != nominal_rate_hz {
+        return Err(DatasetError::ImuNominalRateMismatch {
+            metadata: nominal_rate_hz,
+            manifest: manifest.nominal_rate_hz,
+        });
+    }
+
+    require_imu_manifest_value("imu_stream.format", &manifest.format, IMU_STREAM_FORMAT)?;
+    require_imu_manifest_value(
+        "imu_stream.acceleration_unit",
+        &manifest.acceleration_unit,
+        IMU_ACCELERATION_UNIT,
+    )?;
+    require_imu_manifest_value(
+        "imu_stream.angular_velocity_unit",
+        &manifest.angular_velocity_unit,
+        IMU_ANGULAR_VELOCITY_UNIT,
+    )?;
+    require_imu_manifest_value(
+        "imu_stream.coordinate_frame",
+        &manifest.coordinate_frame,
+        IMU_COORDINATE_FRAME,
+    )?;
+    require_imu_manifest_value("imu_stream.axes", &manifest.axes, IMU_AXES)?;
+    require_imu_manifest_value(
+        "imu_stream.device_timebase",
+        &manifest.device_timebase,
+        IMU_DEVICE_TIMEBASE,
+    )?;
+    require_imu_manifest_value(
+        "imu_stream.device_session_semantics",
+        &manifest.device_session_semantics,
+        IMU_DEVICE_SESSION_SEMANTICS,
+    )?;
+    require_imu_manifest_value(
+        "imu_stream.sample_timestamp_semantics",
+        &manifest.sample_timestamp_semantics,
+        IMU_SAMPLE_TIMESTAMP_SEMANTICS,
+    )?;
+    require_imu_manifest_value(
+        "imu_stream.host_arrival_timebase",
+        &manifest.host_arrival_timebase,
+        IMU_HOST_ARRIVAL_TIMEBASE,
+    )?;
+    if let ManifestImuExtrinsic::CalibratedToTrackingCamera { source } = &manifest.extrinsic
+        && source.trim().is_empty()
+    {
+        return Err(DatasetError::InvalidManifest {
+            reason: "calibrated IMU extrinsic provenance must name its source",
+        });
+    }
+
+    let path = parse_imu_stream_path(root, &manifest.path)?;
+    for (declared, expected, error) in [
+        (
+            manifest.version,
+            IMU_STREAM_VERSION,
+            ImuStreamError::UnsupportedVersion {
+                expected: IMU_STREAM_VERSION,
+                actual: manifest.version,
+            },
+        ),
+        (
+            manifest.header_bytes,
+            IMU_STREAM_HEADER_BYTES,
+            ImuStreamError::HeaderLengthMismatch {
+                expected: IMU_STREAM_HEADER_BYTES,
+                actual: manifest.header_bytes,
+            },
+        ),
+        (
+            manifest.record_bytes,
+            IMU_STREAM_RECORD_BYTES,
+            ImuStreamError::RecordLengthMismatch {
+                expected: IMU_STREAM_RECORD_BYTES,
+                actual: manifest.record_bytes,
+            },
+        ),
+    ] {
+        if declared != expected {
+            return Err(DatasetError::InvalidImuStream {
+                path: path.clone(),
+                source: error,
+            });
+        }
+    }
+
+    let session_id = DeviceSessionId::try_new(manifest.device_session_id).map_err(|_| {
+        DatasetError::InvalidManifest {
+            reason: "IMU device_session_id must be nonzero",
+        }
+    })?;
+    let expected_len = imu_stream_byte_len(manifest.record_count).map_err(|source| {
+        DatasetError::InvalidImuStream {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    if manifest.byte_len != expected_len {
+        return Err(DatasetError::InvalidImuStream {
+            path: path.clone(),
+            source: ImuStreamError::ManifestMismatch {
+                field: "byte_len",
+                declared: manifest.byte_len,
+                encoded: expected_len,
+            },
+        });
+    }
+    let metadata = std::fs::metadata(&path).map_err(|source| DatasetError::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(DatasetError::InvalidImuFileType { path });
+    }
+    if metadata.len() != expected_len {
+        return Err(DatasetError::InvalidImuStream {
+            path,
+            source: ImuStreamError::ByteLengthMismatch {
+                expected: expected_len,
+                actual: metadata.len(),
+            },
+        });
+    }
+
+    let file = std::fs::File::open(&path).map_err(|source| DatasetError::ReadFile {
+        path: path.clone(),
+        source,
+    })?;
+    require_imu_file_len(&file, &path, expected_len)?;
+    let mut reader = BufReader::with_capacity(usize::from(IMU_STREAM_RECORD_BYTES), file);
+    let mut header = [0_u8; IMU_STREAM_HEADER_BYTES as usize];
+    reader
+        .read_exact(&mut header)
+        .map_err(|source| DatasetError::ReadFile {
+            path: path.clone(),
+            source,
+        })?;
+    let encoded_count =
+        decode_imu_header(&header).map_err(|source| DatasetError::InvalidImuStream {
+            path: path.clone(),
+            source,
+        })?;
+    if encoded_count != manifest.record_count {
+        return Err(DatasetError::InvalidImuStream {
+            path: path.clone(),
+            source: ImuStreamError::ManifestMismatch {
+                field: "record_count",
+                declared: manifest.record_count,
+                encoded: encoded_count,
+            },
+        });
+    }
+    let record_count = usize::try_from(manifest.record_count).map_err(|_| {
+        DatasetError::ManifestCountOutOfRange {
+            field: "imu_stream.record_count",
+            value: manifest.record_count,
+        }
+    })?;
+    let event_count = record_count
+        .checked_mul(2)
+        .ok_or(DatasetError::InvalidManifest {
+            reason: "IMU event count exceeds the host address space",
+        })?;
+    let mut order = InertialOrderTracker::with_session(session_id);
+    let mut record_bytes = [0_u8; IMU_STREAM_RECORD_BYTES as usize];
+    for record_index in 0..record_count {
+        reader
+            .read_exact(&mut record_bytes)
+            .map_err(|source| DatasetError::ReadFile {
+                path: path.clone(),
+                source,
+            })?;
+        let record = ImuWireRecord::decode(&record_bytes, record_index).map_err(|source| {
+            DatasetError::InvalidImuStream {
+                path: path.clone(),
+                source,
+            }
+        })?;
+        let report = record
+            .into_report(session_id, record_index)
+            .map_err(|source| DatasetError::InvalidImuStream {
+                path: path.clone(),
+                source,
+            })?;
+        order
+            .observe(&report)
+            .map_err(|source| DatasetError::InvalidImuStream {
+                path: path.clone(),
+                source: map_inertial_order_error(record_index, source),
+            })?;
+    }
+    Ok(ParsedImuStream::Indexed(ImuStreamDescriptor {
+        path,
+        session_id,
+        record_count: manifest.record_count,
+        event_count,
+        byte_len: expected_len,
+    }))
+}
+
+fn require_imu_manifest_value(
+    field: &'static str,
+    actual: &str,
+    expected: &'static str,
+) -> Result<(), DatasetError> {
+    if actual != expected {
+        return Err(DatasetError::UnsupportedManifestValue {
+            field,
+            value: actual.to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn parse_imu_stream_path(root: &Path, declared: &str) -> Result<PathBuf, DatasetError> {
+    let relative = Path::new(declared);
+    if relative != Path::new(format::IMU_STREAM_FILE) {
+        return Err(DatasetError::InvalidFramePath {
+            path: declared.to_string(),
+            reason: "IMU stream path must be the canonical versioned root payload",
+        });
+    }
+    let candidate = root.join(relative);
+    let resolved = std::fs::canonicalize(&candidate).map_err(|source| DatasetError::ReadFile {
+        path: candidate,
+        source,
+    })?;
+    if !resolved.starts_with(root) {
+        return Err(DatasetError::InvalidFramePath {
+            path: declared.to_string(),
+            reason: "resolved IMU stream path escapes the dataset root",
+        });
+    }
+    Ok(resolved)
 }
 
 fn validate_manifest_delta_stats(

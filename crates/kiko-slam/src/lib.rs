@@ -13,6 +13,7 @@ mod depth;
 mod diagnostics;
 pub mod env;
 mod geometry;
+mod inertial;
 mod inference;
 mod local_ba;
 pub mod loop_closure;
@@ -26,6 +27,7 @@ mod pipeline;
 mod pnp;
 pub mod pose_graph;
 mod preprocess;
+mod sensor_router;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 mod tracker;
@@ -52,6 +54,13 @@ pub use env::{EnvError, env_bool, env_f32, env_f64, env_u32, env_u64, env_usize}
 pub use geometry::{
     CameraFrame, CameraPoint3, CoordinateFrame, Point3, Point3Error, WorldFrame, WorldPoint3,
 };
+pub use inertial::{
+    AccelSample, AccelerationMps2, AngularVelocityRadPerSec, DequeueSequence, DeviceSessionId,
+    DeviceTimestamp, GyroSample, HostMonotonicTimestamp, ImuEvent, ImuReport, InertialAxis,
+    InertialOrderOutcome, InertialOrderTracker, InertialOrderingError, InertialQuantity,
+    InertialSensorKind, InertialValueError, OakImuAcceleration, OakImuAngularVelocity, OakImuFrame,
+    SensorAccuracy,
+};
 pub use local_ba::{
     BaResult, DegenerateReason, LmConfig, LmConfigError, LocalBaConfig, LocalBaConfigError,
     LocalBaError, LocalBundleAdjuster, MapObservation, ObservationSet, ObservationSetError,
@@ -70,7 +79,7 @@ pub use map::{
 };
 pub use math::{Pose64, Pose64Error, PoseNarrowingError};
 #[cfg(feature = "record")]
-pub use oak::{oak_to_depth_image, oak_to_frame};
+pub use oak::{oak_to_depth_image, oak_to_frame, oak_to_imu_report};
 pub use pairing::{
     PairingConfigError, PairingInputError, PairingStats, PairingWindowNs, StereoPairer,
 };
@@ -82,6 +91,11 @@ pub use pnp::{
     CameraToWorld, IntrinsicsError, Observation, ObservationError, PinholeIntrinsics, PnpError,
     PnpResult, Pose, PoseError, RansacConfig, RansacConfigError, Transform, TransformError,
     WorldToCamera, build_observations, solve_pnp, solve_pnp_ransac,
+};
+pub use sensor_router::{
+    DepthRouteOutcome, DepthRouteStats, DepthRouteStatsHandle, DepthRouter, DepthRoutes,
+    ImuReportRoute, ImuReportRouteOutcome, ImuReportRouteStats, ImuReportRouteStatsHandle,
+    ImuReportRouter, depth_router, imu_report_router,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
