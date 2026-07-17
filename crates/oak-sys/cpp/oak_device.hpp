@@ -30,16 +30,17 @@ enum class StreamId : uint8_t;
 enum class FrameStatus : uint8_t;
 enum class ImuStatus : uint8_t;
 enum class ImuAccuracy : uint8_t;
+enum class DepthAlignment : uint8_t;
 
 class OakDevice {
 public:
     explicit OakDevice(const DeviceConfig& config, const std::string& selector);
-    ~OakDevice();
+    ~OakDevice() noexcept;
 
     OakDevice(const OakDevice&) = delete;
     OakDevice& operator=(const OakDevice&) = delete;
 
-    bool is_connected() const;
+    bool is_connected() const noexcept;
 
     ImageFrameResult try_get_rgb(uint32_t timeout_ms);
     ImageFrameResult try_get_mono_left(uint32_t timeout_ms);
@@ -47,14 +48,21 @@ public:
     DepthFrameResult try_get_depth(uint32_t timeout_ms);
     ImuBatchResult get_imu_batch();
 
-    Intrinsics get_rgb_intrinsics() const;
-    Intrinsics get_left_intrinsics() const;
-    Intrinsics get_right_intrinsics() const;
     float get_stereo_baseline_m() const;
 
     void close();
 
 private:
+    ImageFrameResult try_get_image(
+        StreamId stream,
+        bool enabled,
+        const std::shared_ptr<dai::MessageQueue>& queue,
+        std::atomic<uint64_t>& sequence,
+        dai::ImgFrame::Type expected_type,
+        uint32_t channels,
+        uint32_t timeout_ms
+    );
+
     bool rgb_enabled_;
     uint32_t rgb_width_;
     uint32_t rgb_height_;

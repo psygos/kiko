@@ -3,25 +3,115 @@
 #include "oak-sys/src/lib.rs.h"
 #include "oak_device.hpp"
 
+#include <chrono>
+#include <cstddef>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
 namespace kiko {
 namespace oak {
 
+namespace {
+
+bool checked_payload_size(
+    uint32_t width,
+    uint32_t height,
+    uint32_t bytes_per_pixel,
+    size_t& size
+) noexcept {
+    if (width == 0 || height == 0 || bytes_per_pixel == 0) return false;
+
+    const auto w = static_cast<size_t>(width);
+    const auto h = static_cast<size_t>(height);
+    const auto bpp = static_cast<size_t>(bytes_per_pixel);
+    const auto max = std::numeric_limits<size_t>::max();
+    if (w > max / h) return false;
+    const auto pixels = w * h;
+    if (pixels > max / bpp) return false;
+    size = pixels * bpp;
+    return true;
+}
+
+bool checked_row_size(uint32_t width, uint32_t channels, uint32_t& size) noexcept {
+    if (width == 0 || channels == 0) return false;
+    if (width > std::numeric_limits<uint32_t>::max() / channels) return false;
+    size = width * channels;
+    return true;
+}
+
+Intrinsics frame_intrinsics(const std::shared_ptr<dai::ImgFrame>& frame) {
+    const auto matrix = frame->getTransformation().getIntrinsicMatrix();
+    Intrinsics intrinsics{};
+    intrinsics.m00 = matrix[0][0];
+    intrinsics.m01 = matrix[0][1];
+    intrinsics.m02 = matrix[0][2];
+    intrinsics.m10 = matrix[1][0];
+    intrinsics.m11 = matrix[1][1];
+    intrinsics.m12 = matrix[1][2];
+    intrinsics.m20 = matrix[2][0];
+    intrinsics.m21 = matrix[2][1];
+    intrinsics.m22 = matrix[2][2];
+    intrinsics.width = frame->getWidth();
+    intrinsics.height = frame->getHeight();
+    return intrinsics;
+}
+
+std::optional<ImuAccuracy> imu_accuracy(dai::IMUReport::Accuracy accuracy) noexcept {
+    switch (accuracy) {
+        case dai::IMUReport::Accuracy::UNRELIABLE:
+            return ImuAccuracy::Unreliable;
+        case dai::IMUReport::Accuracy::LOW:
+            return ImuAccuracy::Low;
+        case dai::IMUReport::Accuracy::MEDIUM:
+            return ImuAccuracy::Medium;
+        case dai::IMUReport::Accuracy::HIGH:
+            return ImuAccuracy::High;
+        default:
+            return std::nullopt;
+    }
+}
+
+template <typename T>
+T next_sequence(std::atomic<T>& sequence) {
+    auto current = sequence.load(std::memory_order_relaxed);
+    while (true) {
+        if (current == std::numeric_limits<T>::max()) {
+            throw std::overflow_error("OAK host-delivery sequence exhausted");
+        }
+        if (sequence.compare_exchange_weak(
+                current,
+                static_cast<T>(current + 1),
+                std::memory_order_relaxed,
+                std::memory_order_relaxed
+            )) {
+            return current;
+        }
+    }
+}
+
+}  // namespace
+
 rust::Vec<DeviceInfo> list_devices() {
     rust::Vec<DeviceInfo> devices;
-    for (const auto& info : dai::Device::getAllAvailableDevices()) {
+    for (const auto& info : dai::Device::getAllConnectedDevices()) {
         DeviceInfo dev;
         dev.device_id = rust::String(info.deviceId);
         dev.name = rust::String(info.name);
         switch (info.state) {
             case X_LINK_UNBOOTED:
-            case X_LINK_BOOTED:
                 dev.state = DeviceState::Available;
+                break;
+            case X_LINK_BOOTED:
+                dev.state = DeviceState::InUse;
                 break;
             case X_LINK_BOOTLOADER:
                 dev.state = DeviceState::Bootloader;
                 break;
             default:
-                dev.state = DeviceState::Disconnected;
+                dev.state = DeviceState::Unknown;
                 break;
         }
         devices.push_back(std::move(dev));
@@ -44,7 +134,12 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
     , depth_enabled_(config.depth_enabled)
     , imu_enabled_(config.imu_enabled)
 {
-    pipeline_ = std::make_unique<dai::Pipeline>();
+    if (selector.empty()) {
+        pipeline_ = std::make_unique<dai::Pipeline>();
+    } else {
+        auto device = std::make_shared<dai::Device>(dai::DeviceInfo(selector));
+        pipeline_ = std::make_unique<dai::Pipeline>(std::move(device));
+    }
 
     if (rgb_enabled_) {
         auto cam = pipeline_->create<dai::node::Camera>();
@@ -81,8 +176,25 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
             leftOut->link(stereo->left);
             rightOut->link(stereo->right);
             stereo->setDefaultProfilePreset(dai::node::StereoDepth::PresetMode::DEFAULT);
+            stereo->initialConfig->setDepthUnit(dai::DepthUnit::MILLIMETER);
             stereo->enableDistortionCorrection(true);
             stereo->setRectifyEdgeFillColor(0);
+            // Depth pixels need an explicit optical-frame contract. Do not rely on
+            // DepthAI's default alignment because the selected calibration and pose
+            // must describe the same pixel grid.
+            switch (config.depth_alignment) {
+                case DepthAlignment::RectifiedLeft:
+                    stereo->setDepthAlign(dai::CameraBoardSocket::CAM_B);
+                    break;
+                case DepthAlignment::RectifiedRight:
+                    stereo->setDepthAlign(dai::CameraBoardSocket::CAM_C);
+                    break;
+                case DepthAlignment::Rgb:
+                    stereo->setDepthAlign(dai::CameraBoardSocket::CAM_A);
+                    break;
+                default:
+                    throw std::invalid_argument("unsupported depth alignment");
+            }
 
             if (mono_rectified_) {
                 mono_left_queue_ = stereo->rectifiedLeft.createOutputQueue(config.queue_size, config.queue_blocking);
@@ -105,131 +217,217 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
 
     pipeline_->start();
 
-    if (auto device = pipeline_->getDefaultDevice()) {
-        calibration_ = device->readCalibration();
-    }
+    const auto device = pipeline_->getDefaultDevice();
+    if (!device) throw std::runtime_error("DepthAI pipeline started without a default device");
+    calibration_ = device->readCalibration();
 
     connected_ = true;
 }
 
-OakDevice::~OakDevice() {
-    if (!closed_) close();
+OakDevice::~OakDevice() noexcept {
+    if (closed_) return;
+    try {
+        close();
+    } catch (...) {
+        // An explicit Rust `Device::close` reports this error. Destruction is
+        // necessarily best-effort and must not throw across the C++ ABI.
+    }
 }
 
-bool OakDevice::is_connected() const {
+bool OakDevice::is_connected() const noexcept {
     return connected_ && !closed_;
 }
 
 void OakDevice::close() {
-    closed_ = true;
+    if (closed_.exchange(true)) return;
     connected_ = false;
     if (pipeline_) pipeline_->stop();
 }
 
-ImageFrameResult OakDevice::try_get_rgb(uint32_t timeout_ms) {
+ImageFrameResult OakDevice::try_get_image(
+    StreamId stream,
+    bool enabled,
+    const std::shared_ptr<dai::MessageQueue>& queue,
+    std::atomic<uint64_t>& sequence,
+    dai::ImgFrame::Type expected_type,
+    uint32_t channels,
+    uint32_t timeout_ms
+) {
     ImageFrameResult result{};
-    result.frame.stream = StreamId::Rgb;
+    result.frame.stream = stream;
 
     if (!is_connected()) { result.status = FrameStatus::Disconnected; return result; }
-    if (!rgb_enabled_) { result.status = FrameStatus::StreamNotEnabled; return result; }
+    if (!enabled) { result.status = FrameStatus::StreamNotEnabled; return result; }
+    if (!queue) throw std::logic_error("enabled DepthAI image stream has no output queue");
 
     bool timedout = false;
-    auto msg = rgb_queue_->get<dai::ImgFrame>(std::chrono::milliseconds(timeout_ms), timedout);
-    if (timedout || !msg) { result.status = FrameStatus::Timeout; return result; }
+    std::shared_ptr<dai::ImgFrame> msg;
+    try {
+        msg = queue->get<dai::ImgFrame>(std::chrono::milliseconds(timeout_ms), timedout);
+    } catch (const dai::MessageQueue::QueueException&) {
+        connected_ = false;
+        result.status = FrameStatus::Disconnected;
+        return result;
+    }
+    if (timedout) {
+        result.status = timeout_ms == 0 ? FrameStatus::QueueEmpty : FrameStatus::Timeout;
+        return result;
+    }
+    if (!msg) { result.status = FrameStatus::Corrupt; return result; }
 
-    result.status = FrameStatus::Ok;
-    result.frame.stream = StreamId::Rgb;
-    result.frame.sequence = rgb_seq_.fetch_add(1);
+    if (msg->getType() != expected_type || !msg->validateTransformations()) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
     result.frame.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         msg->getTimestampDevice().time_since_epoch()).count();
     result.frame.width = msg->getWidth();
     result.frame.height = msg->getHeight();
-    result.frame.stride_bytes = msg->getWidth() * 3;
 
-    auto data = msg->getData();
-    result.frame.data.reserve(data.size());
-    for (auto b : data) result.frame.data.push_back(b);
+    size_t packed_size = 0;
+    if (!checked_payload_size(result.frame.width, result.frame.height, channels, packed_size)
+        || !checked_row_size(result.frame.width, channels, result.frame.stride_bytes)) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
+    const auto source_stride = msg->getStride();
+    size_t source_size = 0;
+    if (source_stride < result.frame.stride_bytes
+        || !checked_payload_size(source_stride, result.frame.height, 1, source_size)) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
+    const auto data = msg->getData();
+    if (data.size() != source_size) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
+    result.frame.intrinsics = frame_intrinsics(msg);
+    result.frame.data.reserve(packed_size);
+    if (source_stride == result.frame.stride_bytes) {
+        for (auto byte : data) result.frame.data.push_back(byte);
+    } else {
+        for (uint32_t row = 0; row < result.frame.height; ++row) {
+            const auto row_offset = static_cast<size_t>(row) * source_stride;
+            for (uint32_t column = 0; column < result.frame.stride_bytes; ++column) {
+                result.frame.data.push_back(data[row_offset + column]);
+            }
+        }
+    }
+    result.frame.sequence = next_sequence(sequence);
+    result.status = FrameStatus::Ok;
 
     return result;
+}
+
+ImageFrameResult OakDevice::try_get_rgb(uint32_t timeout_ms) {
+    return try_get_image(
+        StreamId::Rgb,
+        rgb_enabled_,
+        rgb_queue_,
+        rgb_seq_,
+        dai::ImgFrame::Type::BGR888i,
+        3,
+        timeout_ms
+    );
 }
 
 ImageFrameResult OakDevice::try_get_mono_left(uint32_t timeout_ms) {
-    ImageFrameResult result{};
-    result.frame.stream = StreamId::MonoLeft;
-
-    if (!is_connected()) { result.status = FrameStatus::Disconnected; return result; }
-    if (!mono_enabled_) { result.status = FrameStatus::StreamNotEnabled; return result; }
-
-    bool timedout = false;
-    auto msg = mono_left_queue_->get<dai::ImgFrame>(std::chrono::milliseconds(timeout_ms), timedout);
-    if (timedout || !msg) { result.status = FrameStatus::Timeout; return result; }
-
-    result.status = FrameStatus::Ok;
-    result.frame.sequence = mono_left_seq_.fetch_add(1);
-    result.frame.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        msg->getTimestampDevice().time_since_epoch()).count();
-    result.frame.width = msg->getWidth();
-    result.frame.height = msg->getHeight();
-    result.frame.stride_bytes = msg->getWidth();
-
-    auto data = msg->getData();
-    result.frame.data.reserve(data.size());
-    for (auto b : data) result.frame.data.push_back(b);
-
-    return result;
+    return try_get_image(
+        StreamId::MonoLeft,
+        mono_enabled_,
+        mono_left_queue_,
+        mono_left_seq_,
+        dai::ImgFrame::Type::GRAY8,
+        1,
+        timeout_ms
+    );
 }
 
 ImageFrameResult OakDevice::try_get_mono_right(uint32_t timeout_ms) {
-    ImageFrameResult result{};
-    result.frame.stream = StreamId::MonoRight;
-
-    if (!is_connected()) { result.status = FrameStatus::Disconnected; return result; }
-    if (!mono_enabled_) { result.status = FrameStatus::StreamNotEnabled; return result; }
-
-    bool timedout = false;
-    auto msg = mono_right_queue_->get<dai::ImgFrame>(std::chrono::milliseconds(timeout_ms), timedout);
-    if (timedout || !msg) { result.status = FrameStatus::Timeout; return result; }
-
-    result.status = FrameStatus::Ok;
-    result.frame.sequence = mono_right_seq_.fetch_add(1);
-    result.frame.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        msg->getTimestampDevice().time_since_epoch()).count();
-    result.frame.width = msg->getWidth();
-    result.frame.height = msg->getHeight();
-    result.frame.stride_bytes = msg->getWidth();
-
-    auto data = msg->getData();
-    result.frame.data.reserve(data.size());
-    for (auto b : data) result.frame.data.push_back(b);
-
-    return result;
+    return try_get_image(
+        StreamId::MonoRight,
+        mono_enabled_,
+        mono_right_queue_,
+        mono_right_seq_,
+        dai::ImgFrame::Type::GRAY8,
+        1,
+        timeout_ms
+    );
 }
 
 DepthFrameResult OakDevice::try_get_depth(uint32_t timeout_ms) {
     DepthFrameResult result{};
-    result.frame.depth_scale = 0.001f;
-    result.frame.min_depth_mm = 200;
-    result.frame.max_depth_mm = 10000;
 
     if (!is_connected()) { result.status = FrameStatus::Disconnected; return result; }
     if (!depth_enabled_) { result.status = FrameStatus::StreamNotEnabled; return result; }
+    if (!depth_queue_) throw std::logic_error("enabled DepthAI depth stream has no output queue");
 
     bool timedout = false;
-    auto msg = depth_queue_->get<dai::ImgFrame>(std::chrono::milliseconds(timeout_ms), timedout);
-    if (timedout || !msg) { result.status = FrameStatus::Timeout; return result; }
+    std::shared_ptr<dai::ImgFrame> msg;
+    try {
+        msg = depth_queue_->get<dai::ImgFrame>(std::chrono::milliseconds(timeout_ms), timedout);
+    } catch (const dai::MessageQueue::QueueException&) {
+        connected_ = false;
+        result.status = FrameStatus::Disconnected;
+        return result;
+    }
+    if (timedout) {
+        result.status = timeout_ms == 0 ? FrameStatus::QueueEmpty : FrameStatus::Timeout;
+        return result;
+    }
+    if (!msg) { result.status = FrameStatus::Corrupt; return result; }
 
-    result.status = FrameStatus::Ok;
-    result.frame.sequence = depth_seq_.fetch_add(1);
+    if (msg->getType() != dai::ImgFrame::Type::RAW16 || !msg->validateTransformations()) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
     result.frame.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         msg->getTimestampDevice().time_since_epoch()).count();
     result.frame.width = msg->getWidth();
     result.frame.height = msg->getHeight();
 
-    auto data = msg->getData();
-    result.frame.data.reserve(data.size() / 2);
-    for (size_t i = 0; i < data.size(); i += 2) {
-        result.frame.data.push_back(static_cast<uint16_t>(data[i]) | (static_cast<uint16_t>(data[i+1]) << 8));
+    size_t packed_size = 0;
+    uint32_t packed_stride = 0;
+    if (!checked_payload_size(result.frame.width, result.frame.height, 2, packed_size)
+        || !checked_row_size(result.frame.width, 2, packed_stride)) {
+        result.status = FrameStatus::Corrupt;
+        return result;
     }
+
+    const auto source_stride = msg->getStride();
+    size_t source_size = 0;
+    if (source_stride < packed_stride
+        || !checked_payload_size(source_stride, result.frame.height, 1, source_size)) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
+    const auto data = msg->getData();
+    if (data.size() != source_size) {
+        result.status = FrameStatus::Corrupt;
+        return result;
+    }
+
+    result.frame.intrinsics = frame_intrinsics(msg);
+    result.frame.data.reserve(packed_size / 2);
+    for (uint32_t row = 0; row < result.frame.height; ++row) {
+        const auto row_offset = static_cast<size_t>(row) * source_stride;
+        for (uint32_t column = 0; column < packed_stride; column += 2) {
+            const auto offset = row_offset + column;
+            result.frame.data.push_back(
+                static_cast<uint16_t>(data[offset])
+                | (static_cast<uint16_t>(data[offset + 1]) << 8)
+            );
+        }
+    }
+    result.frame.sequence = next_sequence(depth_seq_);
+    result.status = FrameStatus::Ok;
 
     return result;
 }
@@ -239,100 +437,66 @@ ImuBatchResult OakDevice::get_imu_batch() {
 
     if (!is_connected()) { result.status = ImuStatus::Disconnected; return result; }
     if (!imu_enabled_) { result.status = ImuStatus::Empty; return result; }
+    if (!imu_queue_) throw std::logic_error("enabled DepthAI IMU stream has no output queue");
 
-    auto packets = imu_queue_->tryGetAll<dai::IMUData>();
+    std::vector<std::shared_ptr<dai::IMUData>> packets;
+    try {
+        packets = imu_queue_->tryGetAll<dai::IMUData>();
+    } catch (const dai::MessageQueue::QueueException&) {
+        connected_ = false;
+        result.status = ImuStatus::Disconnected;
+        return result;
+    }
     if (packets.empty()) { result.status = ImuStatus::Empty; return result; }
 
-    result.status = ImuStatus::Ok;
+    // tryGetAll<T> returns nullptr only when a queued message fails its
+    // dynamic cast to T. With a batch threshold of one, a typed IMUData
+    // message with no reports is likewise outside this pipeline contract.
     for (const auto& imuData : packets) {
-        if (!imuData) continue;
+        if (!imuData || imuData->packets.empty()) {
+            result.status = ImuStatus::Corrupt;
+            return result;
+        }
+        for (const auto& packet : imuData->packets) {
+            if (!imu_accuracy(packet.acceleroMeter.accuracy).has_value()
+                || !imu_accuracy(packet.gyroscope.accuracy).has_value()) {
+                result.status = ImuStatus::Corrupt;
+                return result;
+            }
+        }
+    }
+
+    for (const auto& imuData : packets) {
         for (const auto& p : imuData->packets) {
-            ImuSample s;
-            s.sequence = imu_seq_.fetch_add(1);
-            s.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            ImuSample s{};
+            s.accel_timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 p.acceleroMeter.getTimestampDevice().time_since_epoch()).count();
+            s.gyro_timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                p.gyroscope.getTimestampDevice().time_since_epoch()).count();
             s.accel_x = p.acceleroMeter.x;
             s.accel_y = p.acceleroMeter.y;
             s.accel_z = p.acceleroMeter.z;
-            s.accel_accuracy = static_cast<ImuAccuracy>(static_cast<uint8_t>(p.acceleroMeter.accuracy));
+            s.accel_accuracy = imu_accuracy(p.acceleroMeter.accuracy).value();
             s.gyro_x = p.gyroscope.x;
             s.gyro_y = p.gyroscope.y;
             s.gyro_z = p.gyroscope.z;
-            s.gyro_accuracy = static_cast<ImuAccuracy>(static_cast<uint8_t>(p.gyroscope.accuracy));
+            s.gyro_accuracy = imu_accuracy(p.gyroscope.accuracy).value();
+            s.sequence = next_sequence(imu_seq_);
             result.batch.samples.push_back(s);
         }
     }
 
+    result.status = result.batch.samples.empty() ? ImuStatus::Empty : ImuStatus::Ok;
     return result;
 }
 
-Intrinsics OakDevice::get_rgb_intrinsics() const {
-    Intrinsics intr{};
-    intr.width = rgb_width_;
-    intr.height = rgb_height_;
-    try {
-        auto i = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, rgb_width_, rgb_height_);
-        intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
-    } catch (...) {
-        float scale = static_cast<float>(rgb_width_) / 640.0f;
-        intr.fx = 517.22f * scale; intr.fy = 517.18f * scale;
-        intr.cx = 316.91f * scale; intr.cy = 242.63f * scale;
-    }
-    return intr;
-}
-
-Intrinsics OakDevice::get_left_intrinsics() const {
-    Intrinsics intr{};
-    intr.width = mono_width_;
-    intr.height = mono_height_;
-    try {
-        auto i = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, mono_width_, mono_height_);
-        if (mono_rectified_) {
-            auto j = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, mono_width_, mono_height_);
-            intr.fx = 0.5f * (i[0][0] + j[0][0]);
-            intr.fy = 0.5f * (i[1][1] + j[1][1]);
-            intr.cx = 0.5f * (i[0][2] + j[0][2]);
-            intr.cy = 0.5f * (i[1][2] + j[1][2]);
-        } else {
-            intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
-        }
-    } catch (...) {
-        float scale = static_cast<float>(mono_width_) / 640.0f;
-        intr.fx = 398.17f * scale; intr.fy = 398.19f * scale;
-        intr.cx = 308.64f * scale; intr.cy = 239.88f * scale;
-    }
-    return intr;
-}
-
-Intrinsics OakDevice::get_right_intrinsics() const {
-    Intrinsics intr{};
-    intr.width = mono_width_;
-    intr.height = mono_height_;
-    try {
-        auto i = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_C, mono_width_, mono_height_);
-        if (mono_rectified_) {
-            auto j = calibration_.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, mono_width_, mono_height_);
-            intr.fx = 0.5f * (i[0][0] + j[0][0]);
-            intr.fy = 0.5f * (i[1][1] + j[1][1]);
-            intr.cx = 0.5f * (i[0][2] + j[0][2]);
-            intr.cy = 0.5f * (i[1][2] + j[1][2]);
-        } else {
-            intr.fx = i[0][0]; intr.fy = i[1][1]; intr.cx = i[0][2]; intr.cy = i[1][2];
-        }
-    } catch (...) {
-        float scale = static_cast<float>(mono_width_) / 640.0f;
-        intr.fx = 396.99f * scale; intr.fy = 397.00f * scale;
-        intr.cx = 326.85f * scale; intr.cy = 234.89f * scale;
-    }
-    return intr;
-}
-
 float OakDevice::get_stereo_baseline_m() const {
-    try {
-        return calibration_.getBaselineDistance(dai::CameraBoardSocket::CAM_B, dai::CameraBoardSocket::CAM_C) / 100.0f;
-    } catch (...) {
-        return 0.075f;
-    }
+    return calibration_.getBaselineDistance(
+        dai::CameraBoardSocket::CAM_B,
+        dai::CameraBoardSocket::CAM_C,
+        false,
+        dai::LengthUnit::METER
+    );
 }
 
 } // namespace oak

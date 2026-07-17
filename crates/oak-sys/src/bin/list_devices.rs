@@ -1,10 +1,10 @@
 use oak_sys::Device;
 
-fn main() {
-    let devices = Device::list();
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let devices = Device::list()?;
     if devices.is_empty() {
         println!("No OAK devices found.");
-        return;
+        return Ok(());
     }
 
     println!("Found {} device(s):", devices.len());
@@ -14,4 +14,5 @@ fn main() {
             dev.device_id, dev.name, dev.state
         );
     }
+    Ok(())
 }
