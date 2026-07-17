@@ -4368,6 +4368,100 @@ struct ResolvedVioVisualFactors<'a> {
 }
 
 #[cfg(feature = "vio")]
+#[derive(Clone, Copy, Debug)]
+struct VioReprojectionPosePair {
+    positive: Pose,
+    negative: Pose,
+}
+
+/// Per-frame cache for the camera poses used by central-difference visual Jacobians.
+///
+/// Pose perturbations depend on the navigation state and tangent axis, not on the observed
+/// landmark. Keeping one pair per axis preserves the exact checked pose arithmetic while avoiding
+/// the same SE(3) exponential, retraction, inversion, and composition for every observation.
+#[cfg(feature = "vio")]
+struct VioReprojectionPoseCache {
+    pairs: [Option<VioReprojectionPosePair>; VIO_REPROJECTION_POSE_FD_STEPS.len()],
+}
+
+#[cfg(feature = "vio")]
+impl VioReprojectionPoseCache {
+    fn new() -> Self {
+        Self {
+            pairs: [None; VIO_REPROJECTION_POSE_FD_STEPS.len()],
+        }
+    }
+
+    fn get_or_try_insert(
+        &mut self,
+        tangent_axis: usize,
+        compute: impl FnOnce() -> Result<VioReprojectionPosePair, VioSolveError>,
+    ) -> Result<&VioReprojectionPosePair, VioSolveError> {
+        let slot = &mut self.pairs[tangent_axis];
+        match slot {
+            Some(pair) => Ok(pair),
+            None => Ok(slot.insert(compute()?)),
+        }
+    }
+}
+
+#[cfg(feature = "vio")]
+#[allow(clippy::too_many_arguments)]
+fn vio_reprojection_pose_pair(
+    state: &crate::NavState,
+    camera_from_body: crate::Pose64,
+    map_from_odom: &crate::MapFromOdom,
+    evaluation: VioEvaluation,
+    frame_index: usize,
+    observation_index: usize,
+    tangent_axis: usize,
+    step: f64,
+) -> Result<VioReprojectionPosePair, VioSolveError> {
+    let VioEvaluation { stage, iteration } = evaluation;
+    let mut delta_positive = [0.0_f64; VIO_STATE_DIM];
+    let mut delta_negative = [0.0_f64; VIO_STATE_DIM];
+    delta_positive[tangent_axis] = step;
+    delta_negative[tangent_axis] = -step;
+    let positive_state = state.retract(&delta_positive).map_err(|source| {
+        VioSolveError::ReprojectionJacobianRetraction {
+            stage,
+            iteration,
+            frame_index,
+            observation_index,
+            tangent_axis,
+            side: crate::FiniteDifferenceSide::Positive,
+            source,
+        }
+    })?;
+    let negative_state = state.retract(&delta_negative).map_err(|source| {
+        VioSolveError::ReprojectionJacobianRetraction {
+            stage,
+            iteration,
+            frame_index,
+            observation_index,
+            tangent_axis,
+            side: crate::FiniteDifferenceSide::Negative,
+            source,
+        }
+    })?;
+    let positive = vio_cam_from_map_pose32(
+        &positive_state,
+        camera_from_body,
+        map_from_odom,
+        evaluation,
+        frame_index,
+    )?;
+    let negative = vio_cam_from_map_pose32(
+        &negative_state,
+        camera_from_body,
+        map_from_odom,
+        evaluation,
+        frame_index,
+    )?;
+    Ok(VioReprojectionPosePair { positive, negative })
+}
+
+#[cfg(feature = "vio")]
 impl VisualFactorSupport {
     fn try_new(frame_capacity: usize) -> Result<Self, VioOptimizerWorkspaceError> {
         let mut observation_indices_by_frame =
@@ -4490,6 +4584,7 @@ fn linearize_vio_states(
             evaluation,
             frame_idx,
         )?;
+        let mut reprojection_pose_cache = VioReprojectionPoseCache::new();
         if let Some(resolved) = resolved_observations[frame_idx].available() {
             for &observation_index in visual_support.indices_for_frame(frame_idx) {
                 let obs = &resolved[observation_index];
@@ -4519,48 +4614,20 @@ fn linearize_vio_states(
 
                 let mut j_15 = [[0.0_f64; STATE_DIM]; 2];
                 for (axis, step) in VIO_REPROJECTION_POSE_FD_STEPS.into_iter().enumerate() {
-                    let mut delta_plus = [0.0_f64; STATE_DIM];
-                    let mut delta_minus = [0.0_f64; STATE_DIM];
-                    delta_plus[axis] = step;
-                    delta_minus[axis] = -step;
-                    let s_plus = state.retract(&delta_plus).map_err(|source| {
-                        VioSolveError::ReprojectionJacobianRetraction {
-                            stage,
-                            iteration,
-                            frame_index: frame_idx,
+                    let poses = reprojection_pose_cache.get_or_try_insert(axis, || {
+                        vio_reprojection_pose_pair(
+                            state,
+                            config.camera_from_body,
+                            map_from_odom,
+                            evaluation,
+                            frame_idx,
                             observation_index,
-                            tangent_axis: axis,
-                            side: crate::FiniteDifferenceSide::Positive,
-                            source,
-                        }
+                            axis,
+                            step,
+                        )
                     })?;
-                    let s_minus = state.retract(&delta_minus).map_err(|source| {
-                        VioSolveError::ReprojectionJacobianRetraction {
-                            stage,
-                            iteration,
-                            frame_index: frame_idx,
-                            observation_index,
-                            tangent_axis: axis,
-                            side: crate::FiniteDifferenceSide::Negative,
-                            source,
-                        }
-                    })?;
-                    let p_plus = vio_cam_from_map_pose32(
-                        &s_plus,
-                        config.camera_from_body,
-                        map_from_odom,
-                        evaluation,
-                        frame_idx,
-                    )?;
-                    let p_minus = vio_cam_from_map_pose32(
-                        &s_minus,
-                        config.camera_from_body,
-                        map_from_odom,
-                        evaluation,
-                        frame_idx,
-                    )?;
                     let (r_plus, _, _) = reprojection_residual_and_jacobians(
-                        p_plus,
+                        poses.positive,
                         world,
                         pixel,
                         config.intrinsics,
@@ -4574,7 +4641,7 @@ fn linearize_vio_states(
                         side: crate::FiniteDifferenceSide::Positive,
                     })?;
                     let (r_minus, _, _) = reprojection_residual_and_jacobians(
-                        p_minus,
+                        poses.negative,
                         world,
                         pixel,
                         config.intrinsics,
@@ -5356,6 +5423,18 @@ mod tests {
             }
         }
         rot_sq.sqrt() <= tol && l2_3(a.translation(), b.translation()) <= tol
+    }
+
+    #[cfg(feature = "vio")]
+    fn assert_pose_bits_eq(actual: Pose, expected: Pose) {
+        assert_eq!(
+            actual.rotation().map(|row| row.map(f32::to_bits)),
+            expected.rotation().map(|row| row.map(f32::to_bits))
+        );
+        assert_eq!(
+            actual.translation().map(f32::to_bits),
+            expected.translation().map(f32::to_bits)
+        );
     }
 
     fn projection_residual(
@@ -7887,6 +7966,119 @@ mod tests {
             }
         ));
         assert!(error.is_rejected_candidate_nonprojectability());
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_reprojection_pose_cache_matches_uncached_checked_pose_math() {
+        let state = crate::NavState::try_new(
+            crate::math::se3_exp_f64([0.4, -0.2, 0.3, 0.08, -0.04, 0.06]),
+            [0.3, -0.1, 0.2],
+            crate::ImuBias::default(),
+        )
+        .expect("navigation state");
+        let camera_from_body = crate::math::se3_exp_f64([0.03, -0.02, 0.01, -0.04, 0.02, 0.03]);
+        let map_from_odom = crate::MapFromOdom::identity();
+        let evaluation = VioEvaluation {
+            stage: VioEvaluationStage::Candidate,
+            iteration: 4,
+        };
+        let mut cache = VioReprojectionPoseCache::new();
+
+        for (axis, step) in VIO_REPROJECTION_POSE_FD_STEPS.into_iter().enumerate() {
+            let cached = cache
+                .get_or_try_insert(axis, || {
+                    vio_reprojection_pose_pair(
+                        &state,
+                        camera_from_body,
+                        &map_from_odom,
+                        evaluation,
+                        2,
+                        7,
+                        axis,
+                        step,
+                    )
+                })
+                .expect("cached perturbation poses");
+
+            let mut positive_delta = [0.0_f64; VIO_STATE_DIM];
+            let mut negative_delta = [0.0_f64; VIO_STATE_DIM];
+            positive_delta[axis] = step;
+            negative_delta[axis] = -step;
+            let positive_state = state
+                .retract(&positive_delta)
+                .expect("uncached positive retraction");
+            let negative_state = state
+                .retract(&negative_delta)
+                .expect("uncached negative retraction");
+            let expected_positive = vio_cam_from_map_pose32(
+                &positive_state,
+                camera_from_body,
+                &map_from_odom,
+                evaluation,
+                2,
+            )
+            .expect("uncached positive camera pose");
+            let expected_negative = vio_cam_from_map_pose32(
+                &negative_state,
+                camera_from_body,
+                &map_from_odom,
+                evaluation,
+                2,
+            )
+            .expect("uncached negative camera pose");
+
+            assert_pose_bits_eq(cached.positive, expected_positive);
+            assert_pose_bits_eq(cached.negative, expected_negative);
+
+            let reused = cache
+                .get_or_try_insert(axis, || {
+                    Err(VioSolveError::WindowExceedsConfiguredCapacity {
+                        actual_frames: 6,
+                        capacity_frames: 5,
+                    })
+                })
+                .expect("an existing pair must be reused without recomputation");
+            assert_pose_bits_eq(reused.positive, expected_positive);
+            assert_pose_bits_eq(reused.negative, expected_negative);
+        }
+    }
+
+    #[cfg(feature = "vio")]
+    #[test]
+    fn vio_reprojection_pose_cache_does_not_cache_failed_computation() {
+        let mut cache = VioReprojectionPoseCache::new();
+        let mut computations = 0usize;
+        let error = cache
+            .get_or_try_insert(0, || {
+                computations += 1;
+                Err(VioSolveError::WindowExceedsConfiguredCapacity {
+                    actual_frames: 6,
+                    capacity_frames: 5,
+                })
+            })
+            .expect_err("failed checked pose arithmetic must propagate");
+        assert!(matches!(
+            error,
+            VioSolveError::WindowExceedsConfiguredCapacity {
+                actual_frames: 6,
+                capacity_frames: 5,
+            }
+        ));
+
+        let expected = VioReprojectionPosePair {
+            positive: Pose::identity(),
+            negative: Pose::identity(),
+        };
+        let recovered = cache
+            .get_or_try_insert(0, || {
+                computations += 1;
+                Ok(expected)
+            })
+            .expect("the failed cache slot must remain available");
+        assert_eq!(computations, 2);
+        assert_pose_bits_eq(recovered.positive, expected.positive);
+        assert_pose_bits_eq(recovered.negative, expected.negative);
     }
 
     #[cfg(feature = "vio")]
