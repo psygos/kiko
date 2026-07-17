@@ -94,9 +94,10 @@ pub use pnp::{
     WorldToCamera, build_observations, solve_pnp, solve_pnp_ransac,
 };
 pub use sensor_router::{
-    DepthRouteOutcome, DepthRouteStats, DepthRouteStatsHandle, DepthRouter, DepthRoutes,
-    ImuReportRoute, ImuReportRouteOutcome, ImuReportRouteStats, ImuReportRouteStatsHandle,
-    ImuReportRouter, depth_router, imu_report_router,
+    DepthObservation, DepthObservationError, DepthRouteOutcome, DepthRouteStats,
+    DepthRouteStatsHandle, DepthRouter, DepthRoutes, ImuReportRoute, ImuReportRouteOutcome,
+    ImuReportRouteStats, ImuReportRouteStatsHandle, ImuReportRouter, depth_router,
+    imu_report_router,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,

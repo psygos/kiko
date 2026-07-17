@@ -20,8 +20,8 @@ use crate::dense::occupancy::{
     DepthCameraModel, DepthRangeMeters, HeightRangeMeters, OccupancyGridGeometry,
 };
 use crate::{
-    DepthImage, DeviceSessionId, DeviceTimestamp, FrameDimensions, FrameId, HostMonotonicTimestamp,
-    InertialValueError, Pose,
+    DepthImage, DepthObservation, DeviceSessionId, DeviceTimestamp, FrameDimensions, FrameId,
+    HostMonotonicTimestamp, Pose,
 };
 
 use super::cell_inflation::{CellInflationError, CellSquareInflation};
@@ -261,26 +261,17 @@ impl LocalCostmapConfig {
 
 /// One depth frame plus the process-clock and planar-pose provenance used to
 /// build its local grid.
-#[derive(Clone, Copy, Debug)]
-pub struct LocalDepthObservation<'a> {
-    session_id: DeviceSessionId,
-    host_arrival: HostMonotonicTimestamp,
+#[derive(Clone, Debug)]
+pub struct LocalDepthObservation {
+    source: DepthObservation,
     local_costmap_to_odom: LocalCostmapToOdom,
-    depth: &'a DepthImage,
 }
 
-impl<'a> LocalDepthObservation<'a> {
-    pub fn new(
-        session_id: DeviceSessionId,
-        host_arrival: HostMonotonicTimestamp,
-        local_costmap_to_odom: LocalCostmapToOdom,
-        depth: &'a DepthImage,
-    ) -> Self {
+impl LocalDepthObservation {
+    pub fn new(source: DepthObservation, local_costmap_to_odom: LocalCostmapToOdom) -> Self {
         Self {
-            session_id,
-            host_arrival,
+            source,
             local_costmap_to_odom,
-            depth,
         }
     }
 }
@@ -347,9 +338,6 @@ pub enum LocalCostmapError {
         expected: DeviceSessionId,
         actual: DeviceSessionId,
     },
-    InvalidDeviceTimestamp {
-        source: InertialValueError,
-    },
     HostArrivalRegression {
         previous: HostMonotonicTimestamp,
         current: HostMonotonicTimestamp,
@@ -407,9 +395,6 @@ impl std::fmt::Display for LocalCostmapError {
                 expected.as_u64(),
                 actual.as_u64()
             ),
-            Self::InvalidDeviceTimestamp { source } => {
-                write!(f, "invalid local-costmap depth timestamp: {source}")
-            }
             Self::HostArrivalRegression { previous, current } => write!(
                 f,
                 "local-costmap host arrival regressed from {} ns to {} ns",
@@ -487,14 +472,7 @@ impl std::fmt::Display for LocalCostmapError {
     }
 }
 
-impl std::error::Error for LocalCostmapError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::InvalidDeviceTimestamp { source } => Some(source),
-            _ => None,
-        }
-    }
-}
+impl std::error::Error for LocalCostmapError {}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,33 +840,34 @@ impl LocalCostmap {
 
     pub fn update(
         &mut self,
-        observation: LocalDepthObservation<'_>,
+        observation: LocalDepthObservation,
     ) -> Result<LocalCostmapUpdateOutcome, LocalCostmapError> {
-        if observation.session_id != self.session_id {
+        let session_id = observation.source.session_id();
+        let host_arrival = observation.source.host_arrival();
+        let sensor_timestamp = observation.source.device_timestamp();
+        let depth = observation.source.depth();
+        if session_id != self.session_id {
             return Err(LocalCostmapError::SessionMismatch {
                 expected: self.session_id,
-                actual: observation.session_id,
+                actual: session_id,
             });
         }
         if let Some(previous) = self.last_observed_host_arrival
-            && observation.host_arrival < previous
+            && host_arrival < previous
         {
             return Err(LocalCostmapError::HostArrivalRegression {
                 previous,
-                current: observation.host_arrival,
+                current: host_arrival,
             });
         }
-        let sensor_timestamp =
-            DeviceTimestamp::try_from_nanos(observation.depth.timestamp().as_nanos())
-                .map_err(|source| LocalCostmapError::InvalidDeviceTimestamp { source })?;
         let frame = DepthFrameKey {
             sensor_timestamp,
-            frame_id: observation.depth.frame_id(),
+            frame_id: observation.source.frame_id(),
         };
 
         if let Some(previous) = self.provenance {
             if frame == previous.frame {
-                self.last_observed_host_arrival = Some(observation.host_arrival);
+                self.last_observed_host_arrival = Some(host_arrival);
                 return Ok(LocalCostmapUpdateOutcome::IgnoredDuplicate { frame });
             }
             if sensor_timestamp < previous.frame.sensor_timestamp {
@@ -920,13 +899,13 @@ impl LocalCostmap {
         }
 
         let expected = self.config.camera.dimensions();
-        let actual = observation.depth.dimensions();
+        let actual = depth.dimensions();
         if actual != expected {
             return Err(LocalCostmapError::DepthDimensionsMismatch { expected, actual });
         }
 
         self.staging.fill(CLASS_UNKNOWN);
-        let integration = self.integrate_depth(observation.depth);
+        let integration = self.integrate_depth(depth);
         let (sampled_pixels, usable_depth_samples, obstacle_endpoints) = match integration {
             Ok(value) => value,
             Err(error) => {
@@ -937,12 +916,12 @@ impl LocalCostmap {
         self.inflate_nonfree()?;
         std::mem::swap(&mut self.current, &mut self.staging);
         self.provenance = Some(LocalCostmapProvenance {
-            session_id: observation.session_id,
+            session_id,
             frame,
-            host_arrival: observation.host_arrival,
+            host_arrival,
             local_costmap_to_odom: observation.local_costmap_to_odom,
         });
-        self.last_observed_host_arrival = Some(observation.host_arrival);
+        self.last_observed_host_arrival = Some(host_arrival);
 
         Ok(LocalCostmapUpdateOutcome::Accepted {
             frame,
@@ -1463,12 +1442,23 @@ mod tests {
         .expect("test depth")
     }
 
-    fn observation<'a>(image: &'a DepthImage, host_ns: u64) -> LocalDepthObservation<'a> {
-        LocalDepthObservation::new(
-            session(1),
+    fn depth_source(
+        session_id: DeviceSessionId,
+        image: &DepthImage,
+        host_ns: u64,
+    ) -> DepthObservation {
+        DepthObservation::parse(
+            session_id,
             HostMonotonicTimestamp::from_nanos(host_ns),
+            image.clone(),
+        )
+        .expect("valid typed depth observation")
+    }
+
+    fn observation(image: &DepthImage, host_ns: u64) -> LocalDepthObservation {
+        LocalDepthObservation::new(
+            depth_source(session(1), image, host_ns),
             LocalCostmapToOdom::try_new(0.0, 0.0, 0.0).expect("identity capture pose"),
-            image,
         )
     }
 
@@ -1646,10 +1636,8 @@ mod tests {
             let image = depth(1, 10, 1, 1, vec![1.0]);
             let transform = LocalCostmapToOdom::try_new(10.0, -2.0, yaw).expect("capture pose");
             map.update(LocalDepthObservation::new(
-                session(1),
-                HostMonotonicTimestamp::from_nanos(20),
+                depth_source(session(1), &image, 20),
                 transform,
-                &image,
             ))
             .expect("update");
             let view = map
@@ -1743,12 +1731,6 @@ mod tests {
                 .iter()
                 .all(|class_id| *class_id == CLASS_UNKNOWN)
         );
-
-        let negative_time = depth(4, -1, 1, 1, vec![1.0]);
-        assert!(matches!(
-            map.update(observation(&negative_time, 23)),
-            Err(LocalCostmapError::InvalidDeviceTimestamp { .. })
-        ));
     }
 
     #[test]
@@ -1997,10 +1979,8 @@ mod tests {
         let image = depth(1, 10, 1, 1, vec![1.0]);
         assert!(matches!(
             map.update(LocalDepthObservation::new(
-                session(2),
-                HostMonotonicTimestamp::from_nanos(20),
+                depth_source(session(2), &image, 20),
                 LocalCostmapToOdom::try_new(0.0, 0.0, 0.0).expect("identity capture pose"),
-                &image,
             )),
             Err(LocalCostmapError::SessionMismatch { .. })
         ));

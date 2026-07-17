@@ -40,7 +40,7 @@ use kiko_slam::{ChannelCapacity, DenseCommandSendOutcome};
 use kiko_slam::env::{EnvError, env_u64};
 
 #[cfg(feature = "record")]
-use kiko_slam::{CameraPoint3, DepthImageError, Frame, FrameError, Raw, ReconState, WorldToCamera};
+use kiko_slam::{CameraPoint3, DepthImageError, Frame, FrameError, Raw, ReconState};
 
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
@@ -49,12 +49,13 @@ use kiko_slam::dataset::{
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
-    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSender, DeviceSessionId,
-    DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, HostMonotonicTimestamp,
+    DenseCommandQueueStatsHandle, DenseCommandReceiver, DenseCommandSender, DepthObservation,
+    DepthObservationError, DeviceSessionId, DropPolicy, DropReceiver, HostMonotonicTimestamp,
     InertialOrderingError, InertialValueError, PairingConfigError, PairingInputError,
-    PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer, SystemHealth,
-    TrackerInitError, TrackerOutput, VizConfigError, bounded_channel, dense_command_channel,
-    depth_router, imu_report_router, oak_to_depth_image, oak_to_frame, oak_to_imu_report,
+    PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer, TrackerInitError,
+    TrackerOutput, VizConfigError, bounded_channel,
+    dense_command_channel, depth_router, imu_report_router, oak_to_depth_image, oak_to_frame,
+    oak_to_imu_report,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -3365,6 +3366,7 @@ enum LiveCaptureError {
     PairingInput { source: PairingInputError },
     Depth { source: DepthError },
     DepthFrame { source: RectifiedLeftDepthError },
+    DepthObservation { source: DepthObservationError },
     Imu { source: ImuError },
     ImuSample { source: InertialValueError },
     ImuOrdering { source: InertialOrderingError },
@@ -3388,6 +3390,9 @@ impl std::fmt::Display for LiveCaptureError {
             Self::PairingInput { source } => write!(f, "stereo pairing input failed: {source}"),
             Self::Depth { source } => write!(f, "depth camera capture failed: {source}"),
             Self::DepthFrame { source } => write!(f, "depth camera contract failed: {source}"),
+            Self::DepthObservation { source } => {
+                write!(f, "navigation depth observation contract failed: {source}")
+            }
             Self::Imu { source } => write!(f, "IMU capture failed: {source}"),
             Self::ImuSample { source } => write!(f, "IMU sample contract failed: {source}"),
             Self::ImuOrdering { source } => write!(f, "IMU ordering contract failed: {source}"),
@@ -3395,7 +3400,7 @@ impl std::fmt::Display for LiveCaptureError {
                 write!(f, "IMU estimator route disconnected during capture")
             }
             Self::HostTimestamp { source } => {
-                write!(f, "IMU host-arrival timestamp failed: {source}")
+                write!(f, "capture host-arrival timestamp failed: {source}")
             }
             Self::DeviceClose { source } => write!(f, "OAK device close failed: {source}"),
         }
@@ -3411,6 +3416,7 @@ impl std::error::Error for LiveCaptureError {
             Self::PairingInput { source } => Some(source),
             Self::Depth { source } => Some(source),
             Self::DepthFrame { source } => Some(source),
+            Self::DepthObservation { source } => Some(source),
             Self::Imu { source } => Some(source),
             Self::ImuSample { source } => Some(source),
             Self::ImuOrdering { source } => Some(source),
@@ -3487,9 +3493,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
     });
     // This command does not reconnect. One invocation is therefore one
     // explicitly delimited device-clock session.
-    let imu_session = imu_config
-        .map(|_| DeviceSessionId::try_new(1))
-        .transpose()?;
+    let device_session = DeviceSessionId::try_new(1)?;
+    let imu_session = imu_config.map(|_| device_session);
     let imu_queue_capacity = if imu_config.is_some() {
         Some(ChannelCapacity::try_from(
             env_usize("KIKO_LIVE_IMU_QUEUE_DEPTH")?.unwrap_or(256),
@@ -4046,12 +4051,31 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             if depth_enabled {
                 match device.depth(0) {
                     Ok(depth_frame) => {
+                        let host_arrival = match host_monotonic_since(capture_clock_origin) {
+                            Ok(timestamp) => timestamp,
+                            Err(source) => {
+                                capture_error = Some(LiveCaptureError::HostTimestamp { source });
+                                break 'capture;
+                            }
+                        };
                         match parse_rectified_left_depth(depth_frame, rectified_left_intrinsics) {
                             Ok(depth_image) => {
+                                let observation = match DepthObservation::parse(
+                                    device_session,
+                                    host_arrival,
+                                    depth_image,
+                                ) {
+                                    Ok(observation) => observation,
+                                    Err(source) => {
+                                        capture_error =
+                                            Some(LiveCaptureError::DepthObservation { source });
+                                        break 'capture;
+                                    }
+                                };
                                 got_any = true;
                                 if let Some(depth_tx) = depth_tx.as_ref()
                                     && matches!(
-                                        depth_tx.route(depth_image).slam,
+                                        depth_tx.route(observation).slam,
                                         SendOutcome::Disconnected
                                     )
                                 {

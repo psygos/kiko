@@ -3,16 +3,96 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{
-    ChannelCapacity, ChannelStats, ChannelStatsHandle, DepthImage, DeviceSessionId, DropPolicy,
-    DropReceiver, DropSender, ImuReport, InertialOrderOutcome, InertialOrderTracker,
-    InertialOrderingError, SendOutcome, bounded_channel,
+    ChannelCapacity, ChannelStats, ChannelStatsHandle, DepthImage, DeviceSessionId,
+    DeviceTimestamp, DropPolicy, DropReceiver, DropSender, FrameId, HostMonotonicTimestamp,
+    ImuReport, InertialOrderOutcome, InertialOrderTracker, InertialOrderingError,
+    InertialValueError, SendOutcome, bounded_channel,
 };
+
+/// One navigation depth frame bound to its device-clock session and host
+/// dequeue time.
+///
+/// [`DepthImage`] deliberately remains the reusable metric pixel payload. This
+/// wrapper parses its weak signed timestamp once and adds the provenance needed
+/// for exact pose alignment, freshness checks, recording, and replay. Cloning
+/// an observation shares the depth pixel allocation.
+#[derive(Clone, Debug)]
+pub struct DepthObservation {
+    session_id: DeviceSessionId,
+    device_timestamp: DeviceTimestamp,
+    host_arrival: HostMonotonicTimestamp,
+    depth: DepthImage,
+}
+
+impl DepthObservation {
+    pub fn parse(
+        session_id: DeviceSessionId,
+        host_arrival: HostMonotonicTimestamp,
+        depth: DepthImage,
+    ) -> Result<Self, DepthObservationError> {
+        let device_timestamp = DeviceTimestamp::try_from_nanos(depth.timestamp().as_nanos())
+            .map_err(DepthObservationError::InvalidDeviceTimestamp)?;
+        Ok(Self {
+            session_id,
+            device_timestamp,
+            host_arrival,
+            depth,
+        })
+    }
+
+    pub fn session_id(&self) -> DeviceSessionId {
+        self.session_id
+    }
+
+    pub fn device_timestamp(&self) -> DeviceTimestamp {
+        self.device_timestamp
+    }
+
+    pub fn host_arrival(&self) -> HostMonotonicTimestamp {
+        self.host_arrival
+    }
+
+    pub fn frame_id(&self) -> FrameId {
+        self.depth.frame_id()
+    }
+
+    pub fn depth(&self) -> &DepthImage {
+        &self.depth
+    }
+
+    pub fn into_depth(self) -> DepthImage {
+        self.depth
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DepthObservationError {
+    InvalidDeviceTimestamp(InertialValueError),
+}
+
+impl std::fmt::Display for DepthObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDeviceTimestamp(source) => {
+                write!(f, "invalid navigation depth device timestamp: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DepthObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDeviceTimestamp(source) => Some(source),
+        }
+    }
+}
 
 /// The two independently backpressured destinations for one depth observation.
 #[derive(Debug)]
 pub struct DepthRoutes {
     pub slam: DropReceiver<DepthImage>,
-    pub navigation: DropReceiver<DepthImage>,
+    pub navigation: DropReceiver<DepthObservation>,
 }
 
 /// Per-destination result for one depth fanout attempt.
@@ -52,15 +132,15 @@ impl DepthRouteStatsHandle {
 #[derive(Debug)]
 pub struct DepthRouter {
     slam: DropSender<DepthImage>,
-    navigation: DropSender<DepthImage>,
+    navigation: DropSender<DepthObservation>,
 }
 
 impl DepthRouter {
     /// Attempt both destinations even if either has disconnected or rejects
     /// the observation.
-    pub fn route(&self, depth: DepthImage) -> DepthRouteOutcome {
-        let slam = self.slam.try_send(depth.clone());
-        let navigation = self.navigation.try_send(depth);
+    pub fn route(&self, observation: DepthObservation) -> DepthRouteOutcome {
+        let slam = self.slam.try_send(observation.depth.clone());
+        let navigation = self.navigation.try_send(observation);
         DepthRouteOutcome { slam, navigation }
     }
 }
@@ -257,6 +337,19 @@ mod tests {
         DeviceSessionId::try_new(1).expect("nonzero test session")
     }
 
+    fn depth_observation(
+        frame_id: u64,
+        timestamp_ns: i64,
+        host_arrival_ns: u64,
+    ) -> DepthObservation {
+        DepthObservation::parse(
+            session(),
+            HostMonotonicTimestamp::from_nanos(host_arrival_ns),
+            depth(frame_id, timestamp_ns),
+        )
+        .expect("valid navigation depth observation")
+    }
+
     fn imu_report(sequence: u32) -> ImuReport {
         let timestamp_ns = i64::from(sequence) + 1;
         ImuReport::new(
@@ -281,14 +374,14 @@ mod tests {
         let (router, routes, stats) = depth_router(capacity(2), DropPolicy::DropNewest);
 
         assert_eq!(
-            router.route(depth(1, 10)),
+            router.route(depth_observation(1, 10, 100)),
             DepthRouteOutcome {
                 slam: SendOutcome::Enqueued,
                 navigation: SendOutcome::Enqueued,
             }
         );
         assert_eq!(
-            router.route(depth(2, 20)),
+            router.route(depth_observation(2, 20, 200)),
             DepthRouteOutcome {
                 slam: SendOutcome::Enqueued,
                 navigation: SendOutcome::DroppedOldest,
@@ -300,7 +393,15 @@ mod tests {
             .try_recv()
             .expect("newest navigation depth");
         assert_eq!(latest.frame_id(), FrameId::new(2));
-        assert_eq!(latest.timestamp(), Timestamp::from_nanos(20));
+        assert_eq!(
+            latest.device_timestamp(),
+            DeviceTimestamp::try_from_nanos(20).expect("nonnegative fixture time")
+        );
+        assert_eq!(
+            latest.host_arrival(),
+            HostMonotonicTimestamp::from_nanos(200)
+        );
+        assert_eq!(latest.session_id(), session());
         assert!(routes.navigation.try_recv().is_err());
         assert_eq!(stats.snapshot().navigation.dropped_oldest, 1);
     }
@@ -310,9 +411,12 @@ mod tests {
         let (router, routes, _) = depth_router(capacity(1), DropPolicy::DropNewest);
         let original = depth(7, 70);
         let original_pixels = original.depth_m().as_ptr();
+        let observation =
+            DepthObservation::parse(session(), HostMonotonicTimestamp::from_nanos(700), original)
+                .expect("valid observation");
 
         assert_eq!(
-            router.route(original),
+            router.route(observation),
             DepthRouteOutcome {
                 slam: SendOutcome::Enqueued,
                 navigation: SendOutcome::Enqueued,
@@ -322,10 +426,13 @@ mod tests {
         let navigation = routes.navigation.try_recv().expect("navigation depth");
 
         assert_eq!(original_pixels, slam.depth_m().as_ptr());
-        assert_eq!(original_pixels, navigation.depth_m().as_ptr());
-        assert_eq!(slam.depth_m().as_ptr(), navigation.depth_m().as_ptr());
+        assert_eq!(original_pixels, navigation.depth().depth_m().as_ptr());
+        assert_eq!(
+            slam.depth_m().as_ptr(),
+            navigation.depth().depth_m().as_ptr()
+        );
         assert_eq!(slam.frame_id(), navigation.frame_id());
-        assert_eq!(slam.timestamp(), navigation.timestamp());
+        assert_eq!(slam.timestamp(), navigation.depth().timestamp());
     }
 
     #[test]
@@ -334,7 +441,7 @@ mod tests {
         drop(routes.navigation);
 
         assert_eq!(
-            router.route(depth(3, 30)),
+            router.route(depth_observation(3, 30, 300)),
             DepthRouteOutcome {
                 slam: SendOutcome::Enqueued,
                 navigation: SendOutcome::Disconnected,
@@ -353,7 +460,7 @@ mod tests {
         let (router, routes, _) = depth_router(capacity(1), DropPolicy::DropNewest);
         drop(routes.slam);
         assert_eq!(
-            router.route(depth(4, 40)),
+            router.route(depth_observation(4, 40, 400)),
             DepthRouteOutcome {
                 slam: SendOutcome::Disconnected,
                 navigation: SendOutcome::Enqueued,
@@ -367,6 +474,29 @@ mod tests {
                 .frame_id(),
             FrameId::new(4)
         );
+    }
+
+    #[test]
+    fn depth_observation_rejects_negative_device_time_before_routing() {
+        let error = DepthObservation::parse(
+            session(),
+            HostMonotonicTimestamp::from_nanos(1),
+            DepthImage::new(
+                FrameId::new(1),
+                Timestamp::from_nanos(-1),
+                2,
+                1,
+                vec![1.0, 1.0],
+            )
+            .expect("metric payload is valid independently of weak capture time"),
+        )
+        .expect_err("navigation cannot join negative depth time to a device session");
+        assert!(matches!(
+            error,
+            DepthObservationError::InvalidDeviceTimestamp(
+                InertialValueError::NegativeDeviceTimestamp { nanos: -1 }
+            )
+        ));
     }
 
     #[test]
