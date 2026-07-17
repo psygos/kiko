@@ -866,10 +866,12 @@ mod tests {
 
         assert!(matches!(
             map_from_odom.try_compose(odom_from_body),
-            Err(GeometryError::NonFiniteTransformTranslation {
+            Err(GeometryError::InvalidPose {
                 operation: "frame-typed transform composition",
-                axis: 0,
-                value,
+                source: Pose64Error::ComposeTranslationNonFinite {
+                    axis: 0,
+                    value,
+                },
             }) if value.is_infinite()
         ));
     }
@@ -910,10 +912,9 @@ mod tests {
 
         assert!(matches!(
             map_from_odom.try_inverse(),
-            Err(GeometryError::NonFiniteTransformTranslation {
+            Err(GeometryError::InvalidPose {
                 operation: "frame-typed transform inversion",
-                value,
-                ..
+                source: Pose64Error::InverseTranslationNonFinite { value, .. },
             }) if !value.is_finite()
         ));
     }
