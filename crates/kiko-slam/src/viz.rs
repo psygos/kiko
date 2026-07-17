@@ -3,12 +3,17 @@ use std::{num::NonZeroUsize, time::Duration};
 use crate::{
     CameraPoint3, CovisibilitySnapshot, DepthImage, Detections, Frame, Keypoint, Pose, Raw,
     Timestamp, VizPacket, WorldToCamera,
+    dense::occupancy::{OccupancyGridMetadata, OccupancyGridSnapshot, WorldToOccupancy},
     env::{EnvError, env_f32},
 };
 
 use std::collections::HashMap;
 
 const TIMELINE_CAPTURE_NS: &str = "capture_ns";
+const WORLD_PATH: &str = "world";
+const OCCUPANCY_ROOT_PATH: &str = "world/map2d";
+const OCCUPANCY_GRID_PATH: &str = "world/map2d/grid";
+const OCCUPANCY_METADATA_PATH: &str = "world/map2d/metadata";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VizDecimation(NonZeroUsize);
@@ -99,7 +104,18 @@ impl TryFrom<usize> for VizDecimation {
 #[derive(Debug)]
 pub enum VizLogError {
     Rerun(rerun::RecordingStreamError),
-    TimestampUnrepresentable { timestamp_ns: i64, encoded_ns: i64 },
+    TimestampUnrepresentable {
+        timestamp_ns: i64,
+        encoded_ns: i64,
+    },
+    OccupancyCoordinateUnrepresentable {
+        component: &'static str,
+        value_m: f64,
+    },
+    OccupancyRotationUnrepresentable {
+        component: &'static str,
+        value: f64,
+    },
     Pose(crate::PoseError),
     Point(crate::Point3Error),
 }
@@ -115,6 +131,14 @@ impl std::fmt::Display for VizLogError {
                 f,
                 "capture timestamp {timestamp_ns}ns is not exactly representable on the Rerun duration timeline (the SDK would encode {encoded_ns}ns)"
             ),
+            VizLogError::OccupancyCoordinateUnrepresentable { component, value_m } => write!(
+                f,
+                "occupancy {component} value {value_m}m is not representable by Rerun's finite f32 transform domain"
+            ),
+            VizLogError::OccupancyRotationUnrepresentable { component, value } => write!(
+                f,
+                "occupancy {component} dimensionless value {value} is not representable by Rerun's finite f32 transform domain"
+            ),
             VizLogError::Pose(err) => write!(f, "visualization pose error: {err}"),
             VizLogError::Point(err) => write!(f, "visualization point error: {err}"),
         }
@@ -125,7 +149,9 @@ impl std::error::Error for VizLogError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rerun(err) => Some(err),
-            Self::TimestampUnrepresentable { .. } => None,
+            Self::TimestampUnrepresentable { .. }
+            | Self::OccupancyCoordinateUnrepresentable { .. }
+            | Self::OccupancyRotationUnrepresentable { .. } => None,
             Self::Pose(err) => Some(err),
             Self::Point(err) => Some(err),
         }
@@ -215,6 +241,7 @@ pub struct RerunSink {
     tracks: TrackState,
     trajectory: Vec<[f32; 3]>,
     logged_world: bool,
+    logged_occupancy_context: bool,
 }
 
 /// Fully parsed visualization settings needed to construct a [`RerunSink`].
@@ -253,6 +280,7 @@ impl RerunSink {
             tracks: TrackState::new(config.track),
             trajectory: Vec::new(),
             logged_world: false,
+            logged_occupancy_context: false,
         }
     }
 
@@ -320,6 +348,57 @@ impl RerunSink {
         )
         .with_draw_order(0.0);
         self.rec.log("view/depth", &depth_image)?;
+        Ok(())
+    }
+
+    /// Logs a complete metric 2D occupancy snapshot without applying image decimation.
+    ///
+    /// The snapshot's canonical row-major storage is preserved: columns increase along the
+    /// occupancy `x` axis and rows increase along occupancy `y`. Temporal transforms register the
+    /// occupancy frame under Kiko's visual world and map pixels into metric occupancy coordinates,
+    /// including snapshots whose fixed grid origin changes.
+    pub fn log_occupancy(
+        &mut self,
+        timestamp: Timestamp,
+        snapshot: OccupancyGridSnapshot,
+    ) -> Result<(), VizLogError> {
+        let capture_time = RerunCaptureTime::try_from(timestamp)?;
+        let (metadata, class_ids) = snapshot.into_parts();
+        let world_placement = occupancy_to_world_placement(metadata.world_to_occupancy())?;
+        let grid_placement = occupancy_grid_placement(metadata)?;
+        let grid_outline = OccupancyGridOutline::from_placement(metadata, grid_placement);
+        let image = occupancy_segmentation_image(metadata, class_ids);
+
+        self.ensure_world_context()?;
+        if !self.logged_occupancy_context {
+            self.rec
+                .log_static(OCCUPANCY_ROOT_PATH, &occupancy_annotation_context())?;
+            self.logged_occupancy_context = true;
+        }
+
+        capture_time.set_on(&self.rec);
+        self.rec.log(
+            OCCUPANCY_ROOT_PATH,
+            &world_placement.as_rerun_parent_from_child(),
+        )?;
+        // The lightweight metric outline makes the occupancy root an indicated
+        // 2D entity. Rerun can therefore auto-root the dedicated map view here
+        // and apply the child image's pixel-to-metre transform.
+        self.rec
+            .log(OCCUPANCY_ROOT_PATH, &grid_outline.as_rerun())?;
+        self.rec.log(
+            OCCUPANCY_GRID_PATH,
+            &rerun::Transform3D::from_translation_scale(
+                grid_placement.translation,
+                grid_placement.scale,
+            )
+            .with_relation(rerun::components::TransformRelation::ParentFromChild),
+        )?;
+        self.rec.log(OCCUPANCY_GRID_PATH, &image)?;
+        self.rec.log(
+            OCCUPANCY_METADATA_PATH,
+            &rerun::TextLog::new(occupancy_metadata_text(metadata)),
+        )?;
         Ok(())
     }
 
@@ -391,12 +470,7 @@ impl RerunSink {
         pose: &WorldToCamera,
     ) -> Result<(), VizLogError> {
         self.set_time(timestamp)?;
-
-        if !self.logged_world {
-            let coords = rerun::archetypes::ViewCoordinates::RDF();
-            self.rec.log("world", &coords)?;
-            self.logged_world = true;
-        }
+        self.ensure_world_context()?;
 
         let camera_pose = pose.try_inverse()?;
         let position = camera_pose.translation();
@@ -462,6 +536,223 @@ impl RerunSink {
         RerunCaptureTime::try_from(timestamp)?.set_on(&self.rec);
         Ok(())
     }
+
+    fn ensure_world_context(&mut self) -> Result<(), VizLogError> {
+        if !self.logged_world {
+            let coords = rerun::archetypes::ViewCoordinates::RDF();
+            self.rec.log_static(WORLD_PATH, &coords)?;
+            self.logged_world = true;
+        }
+        Ok(())
+    }
+}
+
+/// Rerun's parent-from-child transform from metric occupancy coordinates into Kiko world.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OccupancyToWorldPlacement {
+    translation_m: [f32; 3],
+    /// Column-major: each entry is one occupancy basis vector expressed in world coordinates.
+    rotation_columns: [[f32; 3]; 3],
+}
+
+impl OccupancyToWorldPlacement {
+    fn as_rerun_parent_from_child(self) -> rerun::Transform3D {
+        rerun::Transform3D::from_translation_mat3x3(self.translation_m, self.rotation_columns)
+            .with_relation(rerun::components::TransformRelation::ParentFromChild)
+    }
+}
+
+fn occupancy_to_world_placement(
+    world_to_occupancy: WorldToOccupancy,
+) -> Result<OccupancyToWorldPlacement, VizLogError> {
+    const ROTATION_COMPONENTS: [[&str; 3]; 3] = [
+        [
+            "occupancy-to-world rotation column 0 row 0",
+            "occupancy-to-world rotation column 0 row 1",
+            "occupancy-to-world rotation column 0 row 2",
+        ],
+        [
+            "occupancy-to-world rotation column 1 row 0",
+            "occupancy-to-world rotation column 1 row 1",
+            "occupancy-to-world rotation column 1 row 2",
+        ],
+        [
+            "occupancy-to-world rotation column 2 row 0",
+            "occupancy-to-world rotation column 2 row 1",
+            "occupancy-to-world rotation column 2 row 2",
+        ],
+    ];
+    const TRANSLATION_COMPONENTS: [&str; 3] = [
+        "occupancy-to-world translation x",
+        "occupancy-to-world translation y",
+        "occupancy-to-world translation z",
+    ];
+
+    // If occupancy = R * world + t, then world = R^T * occupancy - R^T * t.
+    // Rerun's nested arrays are columns, so row `axis` of R is column `axis` of R^T.
+    let rotation = world_to_occupancy.rotation();
+    let translation = world_to_occupancy.translation_m();
+    let mut rotation_columns = [[0.0_f32; 3]; 3];
+    for occupancy_axis in 0..3 {
+        for world_axis in 0..3 {
+            rotation_columns[occupancy_axis][world_axis] = rerun_rotation_scalar(
+                ROTATION_COMPONENTS[occupancy_axis][world_axis],
+                rotation[occupancy_axis][world_axis],
+            )?;
+        }
+    }
+
+    let mut translation_m = [0.0_f32; 3];
+    for world_axis in 0..3 {
+        let inverse_translation = (0..3).fold(0.0, |sum, occupancy_axis| {
+            (-rotation[occupancy_axis][world_axis]).mul_add(translation[occupancy_axis], sum)
+        });
+        translation_m[world_axis] =
+            rerun_metric_scalar(TRANSLATION_COMPONENTS[world_axis], inverse_translation)?;
+    }
+
+    Ok(OccupancyToWorldPlacement {
+        translation_m,
+        rotation_columns,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OccupancyGridPlacement {
+    translation: [f32; 3],
+    scale: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OccupancyGridOutline {
+    points: [[f32; 2]; 5],
+}
+
+impl OccupancyGridOutline {
+    fn from_placement(metadata: OccupancyGridMetadata, placement: OccupancyGridPlacement) -> Self {
+        let lower = [placement.translation[0], placement.translation[1]];
+        let upper = [
+            lower[0] + placement.scale[0] * metadata.width() as f32,
+            lower[1] + placement.scale[1] * metadata.height() as f32,
+        ];
+        Self {
+            points: [
+                lower,
+                [upper[0], lower[1]],
+                upper,
+                [lower[0], upper[1]],
+                lower,
+            ],
+        }
+    }
+
+    fn as_rerun(self) -> rerun::LineStrips2D {
+        rerun::LineStrips2D::new([self.points])
+            .with_radii([rerun::Radius::new_ui_points(1.0)])
+            .with_colors([rerun::Color::from_rgb(48, 48, 48)])
+    }
+}
+
+fn occupancy_grid_placement(
+    metadata: OccupancyGridMetadata,
+) -> Result<OccupancyGridPlacement, VizLogError> {
+    let lower_bound_m = metadata.lower_bound_m();
+    let resolution_m = metadata.resolution_m();
+    let lower_u = rerun_metric_scalar("lower u bound", lower_bound_m[0])?;
+    let lower_v = rerun_metric_scalar("lower v bound", lower_bound_m[1])?;
+    let resolution = rerun_metric_scalar("resolution", resolution_m)?;
+
+    for (axis, lower, lower_m, cells) in [
+        ("u", lower_u, lower_bound_m[0], metadata.width()),
+        ("v", lower_v, lower_bound_m[1], metadata.height()),
+    ] {
+        let mut previous = lower;
+        for boundary_index in 1..=cells {
+            let boundary = lower + resolution * boundary_index as f32;
+            if !boundary.is_finite() || boundary <= previous {
+                return Err(VizLogError::OccupancyCoordinateUnrepresentable {
+                    component: match (axis, boundary_index) {
+                        ("u", 1) => "u first cell boundary",
+                        ("v", 1) => "v first cell boundary",
+                        ("u", index) if index == cells => "u upper bound",
+                        ("v", index) if index == cells => "v upper bound",
+                        ("u", _) => "u interior cell boundary",
+                        ("v", _) => "v interior cell boundary",
+                        _ => unreachable!("the occupancy axes are u and v"),
+                    },
+                    value_m: resolution_m.mul_add(f64::from(boundary_index), lower_m),
+                });
+            }
+            previous = boundary;
+        }
+    }
+
+    Ok(OccupancyGridPlacement {
+        translation: [lower_u, lower_v, 0.0],
+        scale: [resolution, resolution, 1.0],
+    })
+}
+
+fn rerun_metric_scalar(component: &'static str, value_m: f64) -> Result<f32, VizLogError> {
+    let narrowed = value_m as f32;
+    if !narrowed.is_finite() || (value_m != 0.0 && narrowed == 0.0) {
+        return Err(VizLogError::OccupancyCoordinateUnrepresentable { component, value_m });
+    }
+    Ok(narrowed)
+}
+
+fn rerun_rotation_scalar(component: &'static str, value: f64) -> Result<f32, VizLogError> {
+    let narrowed = value as f32;
+    if !narrowed.is_finite() || (value != 0.0 && narrowed == 0.0) {
+        return Err(VizLogError::OccupancyRotationUnrepresentable { component, value });
+    }
+    Ok(narrowed)
+}
+
+fn occupancy_segmentation_image(
+    metadata: OccupancyGridMetadata,
+    class_ids: Vec<u8>,
+) -> rerun::SegmentationImage {
+    rerun::SegmentationImage::new(
+        class_ids,
+        rerun::components::ImageFormat::segmentation(
+            [metadata.width(), metadata.height()],
+            rerun::ChannelDatatype::U8,
+        ),
+    )
+    .with_opacity(1.0)
+    .with_draw_order(0.0)
+}
+
+fn occupancy_annotation_context() -> rerun::AnnotationContext {
+    rerun::AnnotationContext::new([
+        (0_u16, "unknown", rerun::Rgba32::from_rgb(96, 96, 96)),
+        (1_u16, "free", rerun::Rgba32::from_rgb(238, 238, 238)),
+        (2_u16, "occupied", rerun::Rgba32::from_rgb(230, 57, 70)),
+    ])
+}
+
+fn occupancy_metadata_text(metadata: OccupancyGridMetadata) -> String {
+    let map_instance = metadata
+        .map_instance_id()
+        .map_or_else(|| "none".to_owned(), |id| id.as_u64().to_string());
+    let lower = metadata.lower_bound_m();
+    let height = metadata.height_range();
+    let world_to_occupancy = metadata.world_to_occupancy();
+    format!(
+        "revision={} map_instance_id={} grid={}x{} resolution_m={} lower_xy_m=[{},{}] height_range_m=[{},{}] row_order=increasing_occupancy_y classes=0:unknown,1:free,2:occupied world_to_occupancy_rotation={:?} world_to_occupancy_translation_m={:?}",
+        metadata.revision(),
+        map_instance,
+        metadata.width(),
+        metadata.height(),
+        metadata.resolution_m(),
+        lower[0],
+        lower[1],
+        height.minimum_m(),
+        height.maximum_m(),
+        world_to_occupancy.rotation(),
+        world_to_occupancy.translation_m(),
+    )
 }
 
 fn pose_position(pose: Pose) -> Result<[f32; 3], crate::PoseError> {
@@ -754,7 +1045,15 @@ fn stitch_luma(left: &Frame, right: &Frame) -> (Vec<u8>, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Descriptor, FrameId, SensorId};
+    use crate::{
+        Descriptor, FrameDimensions, FrameId, PinholeIntrinsics, SensorId,
+        dense::occupancy::{
+            DepthCameraModel, DepthRangeMeters, DepthToTrackingCamera, HeightRangeMeters,
+            OccupancyConfig, OccupancyEvidenceModel, OccupancyGridGeometry, OccupancyMapper,
+            WorldToOccupancy,
+        },
+    };
+    use rerun::Loggable as _;
 
     #[derive(Clone, Copy)]
     enum TestFlushResult {
@@ -809,7 +1108,39 @@ mod tests {
             ),
             trajectory: Vec::new(),
             logged_world: false,
+            logged_occupancy_context: false,
         }
+    }
+
+    fn test_occupancy_snapshot() -> OccupancyGridSnapshot {
+        let geometry = OccupancyGridGeometry::try_new(0.25, [-2.0, 1.5], 3, 2, 6)
+            .expect("test occupancy geometry");
+        test_occupancy_snapshot_with_geometry(geometry)
+    }
+
+    fn test_occupancy_snapshot_with_geometry(
+        geometry: OccupancyGridGeometry,
+    ) -> OccupancyGridSnapshot {
+        let camera = DepthCameraModel::new(
+            PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("test intrinsics"),
+            FrameDimensions::try_new(1, 1).expect("test frame dimensions"),
+            DepthToTrackingCamera::identity(),
+        );
+        let config = OccupancyConfig::try_new(
+            geometry,
+            WorldToOccupancy::level_optical_world(1.0).expect("test occupancy frame"),
+            camera,
+            HeightRangeMeters::try_new(-1.0, 2.0).expect("test height range"),
+            DepthRangeMeters::try_new(0.1, 10.0).expect("test depth range"),
+            1,
+            OccupancyEvidenceModel::try_new(-1, 1, -1, 1).expect("test evidence model"),
+            1,
+        )
+        .expect("test occupancy configuration");
+        OccupancyMapper::try_new(config)
+            .expect("test occupancy mapper")
+            .snapshot()
+            .expect("test occupancy snapshot")
     }
 
     #[test]
@@ -837,6 +1168,307 @@ mod tests {
             } if *timestamp_ns == i64::MIN && *encoded_ns == i64::MIN + 1
         ));
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn occupancy_grid_placement_maps_canonical_axes_without_flipping_rows() {
+        let metadata = test_occupancy_snapshot().metadata();
+        let placement = occupancy_grid_placement(metadata).expect("representable placement");
+
+        assert_eq!(placement.translation, [-2.0, 1.5, 0.0]);
+        assert_eq!(placement.scale, [0.25, 0.25, 1.0]);
+
+        let last_cell_center = [
+            placement.translation[0] + (metadata.width() as f32 - 0.5) * placement.scale[0],
+            placement.translation[1] + (metadata.height() as f32 - 0.5) * placement.scale[1],
+        ];
+        assert_eq!(last_cell_center, [-1.375, 1.875]);
+    }
+
+    #[test]
+    fn occupancy_outline_marks_the_metric_map_root_with_exact_bounds() {
+        let metadata = test_occupancy_snapshot().metadata();
+        let placement = occupancy_grid_placement(metadata).expect("representable placement");
+        let outline = OccupancyGridOutline::from_placement(metadata, placement);
+
+        assert_eq!(
+            outline.points,
+            [
+                [-2.0, 1.5],
+                [-1.25, 1.5],
+                [-1.25, 2.0],
+                [-2.0, 2.0],
+                [-2.0, 1.5],
+            ]
+        );
+        assert!(outline.as_rerun().strips.is_some());
+    }
+
+    #[test]
+    fn occupancy_paths_are_nested_under_the_existing_world_spatial_graph() {
+        assert_eq!(WORLD_PATH, "world");
+        assert_eq!(OCCUPANCY_ROOT_PATH, "world/map2d");
+        assert_eq!(OCCUPANCY_GRID_PATH, "world/map2d/grid");
+        assert_eq!(OCCUPANCY_METADATA_PATH, "world/map2d/metadata");
+        assert_eq!(OCCUPANCY_ROOT_PATH.strip_prefix(WORLD_PATH), Some("/map2d"));
+        assert_eq!(
+            OCCUPANCY_GRID_PATH.strip_prefix(OCCUPANCY_ROOT_PATH),
+            Some("/grid")
+        );
+    }
+
+    #[test]
+    fn occupancy_to_world_is_the_exact_inverse_frame_transform_before_f32_narrowing() {
+        let world_to_occupancy =
+            WorldToOccupancy::level_optical_world(1.25).expect("test occupancy frame");
+        let placement =
+            occupancy_to_world_placement(world_to_occupancy).expect("representable inverse");
+
+        assert_eq!(placement.translation_m, [0.0, 1.25, 0.0]);
+        assert_eq!(
+            placement.rotation_columns,
+            [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]
+        );
+
+        for world_m in [[0.0, 0.0, 0.0], [2.0, -0.25, 4.0], [-3.0, 1.5, 0.5]] {
+            let occupancy_m = world_to_occupancy
+                .try_transform_world_point(world_m)
+                .expect("finite world point");
+            let recovered_world_m = std::array::from_fn(|world_axis| {
+                (0..3).fold(
+                    f64::from(placement.translation_m[world_axis]),
+                    |sum, axis| {
+                        f64::from(placement.rotation_columns[axis][world_axis])
+                            .mul_add(occupancy_m[axis], sum)
+                    },
+                )
+            });
+            assert_eq!(recovered_world_m, world_m);
+        }
+    }
+
+    #[test]
+    fn occupancy_to_world_rerun_transform_explicitly_uses_parent_from_child() {
+        let placement = occupancy_to_world_placement(
+            WorldToOccupancy::level_optical_world(1.0).expect("test occupancy frame"),
+        )
+        .expect("representable inverse");
+        let transform = placement.as_rerun_parent_from_child();
+        let relations = rerun::components::TransformRelation::from_arrow(
+            transform
+                .relation
+                .as_ref()
+                .expect("explicit transform relation")
+                .array
+                .as_ref(),
+        )
+        .expect("decode transform relation");
+
+        assert_eq!(
+            relations,
+            [rerun::components::TransformRelation::ParentFromChild]
+        );
+    }
+
+    #[test]
+    fn occupancy_to_world_rejects_unrepresentable_rerun_translation() {
+        let world_to_occupancy = WorldToOccupancy::try_new(
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [f64::MAX, 0.0, 0.0],
+        )
+        .expect("the mapper accepts finite f64 metric translations");
+
+        let error = occupancy_to_world_placement(world_to_occupancy)
+            .expect_err("Rerun cannot represent the inverse translation as f32");
+        assert!(matches!(
+            error,
+            VizLogError::OccupancyCoordinateUnrepresentable {
+                component: "occupancy-to-world translation x",
+                value_m,
+            } if value_m == -f64::MAX
+        ));
+    }
+
+    #[test]
+    fn occupancy_to_world_reports_dimensionless_rotation_narrowing_separately() {
+        let tiny = f64::MIN_POSITIVE;
+        let world_to_occupancy = WorldToOccupancy::try_new(
+            [[1.0, -tiny, 0.0], [tiny, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            [0.0; 3],
+        )
+        .expect("the transform remains orthonormal within the mapper's f64 tolerance");
+
+        let error = occupancy_to_world_placement(world_to_occupancy)
+            .expect_err("a nonzero f64 rotation coefficient must not silently collapse to zero");
+        assert!(matches!(
+            error,
+            VizLogError::OccupancyRotationUnrepresentable {
+                component: "occupancy-to-world rotation column 0 row 1",
+                value,
+            } if value == -tiny
+        ));
+    }
+
+    #[test]
+    fn occupancy_grid_placement_rejects_cells_collapsed_by_rerun_f32_coordinates() {
+        let geometry = OccupancyGridGeometry::try_new(1.0, [1.0e9, 0.0], 400, 2, 800)
+            .expect("geometry remains distinct in the mapper's f64 domain");
+        let metadata = test_occupancy_snapshot_with_geometry(geometry).metadata();
+
+        let error = occupancy_grid_placement(metadata)
+            .expect_err("Rerun f32 placement must not collapse adjacent cells");
+        assert!(matches!(
+            error,
+            VizLogError::OccupancyCoordinateUnrepresentable {
+                component: "u first cell boundary",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn occupancy_grid_placement_rejects_an_interior_f32_boundary_collapse() {
+        let geometry = OccupancyGridGeometry::try_new(
+            5.937_181_302_151_373e-11,
+            [0.000_976_562_5, 0.0],
+            3,
+            2,
+            6,
+        )
+        .expect("geometry remains distinct in the mapper's f64 domain");
+        let metadata = test_occupancy_snapshot_with_geometry(geometry).metadata();
+
+        let error = occupancy_grid_placement(metadata)
+            .expect_err("every adjacent Rerun f32 cell boundary must remain distinct");
+        assert!(matches!(
+            error,
+            VizLogError::OccupancyCoordinateUnrepresentable {
+                component: "u interior cell boundary",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn occupancy_metadata_is_exact_and_self_describing() {
+        let metadata = test_occupancy_snapshot().metadata();
+        let text = occupancy_metadata_text(metadata);
+
+        assert!(text.contains("revision=0 map_instance_id=none"));
+        assert!(text.contains("grid=3x2 resolution_m=0.25 lower_xy_m=[-2,1.5]"));
+        assert!(text.contains("height_range_m=[-1,2]"));
+        assert!(text.contains("row_order=increasing_occupancy_y"));
+        assert!(text.contains("classes=0:unknown,1:free,2:occupied"));
+        assert!(text.contains("world_to_occupancy_rotation="));
+        assert!(text.contains("world_to_occupancy_translation_m="));
+    }
+
+    #[test]
+    fn occupancy_segmentation_preserves_owned_row_major_class_ids_and_u8_shape() {
+        let metadata = test_occupancy_snapshot().metadata();
+        let expected = vec![0_u8, 1, 2, 2, 1, 0];
+        let image = occupancy_segmentation_image(metadata, expected.clone());
+
+        let bytes = rerun::datatypes::Blob::serialized_blob_as_slice(
+            image.buffer.as_ref().expect("segmentation buffer"),
+        )
+        .expect("serialized segmentation bytes");
+        assert_eq!(bytes, expected);
+
+        let formats = rerun::components::ImageFormat::from_arrow(
+            image
+                .format
+                .as_ref()
+                .expect("segmentation format")
+                .array
+                .as_ref(),
+        )
+        .expect("decode segmentation format");
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0].0.width, 3);
+        assert_eq!(formats[0].0.height, 2);
+        assert_eq!(formats[0].datatype(), rerun::ChannelDatatype::U8);
+        assert!(formats[0].0.color_model.is_none());
+    }
+
+    #[test]
+    fn occupancy_annotation_context_names_every_class_including_unknown() {
+        let annotation = occupancy_annotation_context();
+        let contexts = rerun::components::AnnotationContext::from_arrow(
+            annotation
+                .context
+                .as_ref()
+                .expect("annotation context")
+                .array
+                .as_ref(),
+        )
+        .expect("decode annotation context");
+        let classes = &contexts.first().expect("one annotation context").0;
+        let ids_and_labels: Vec<_> = classes
+            .iter()
+            .map(|class| {
+                (
+                    class.class_id.0,
+                    class
+                        .class_description
+                        .info
+                        .label
+                        .as_ref()
+                        .expect("class label")
+                        .0
+                        .as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids_and_labels,
+            [(0, "unknown"), (1, "free"), (2, "occupied")]
+        );
+    }
+
+    #[test]
+    fn occupancy_logging_is_not_decimated_and_initializes_context_once() {
+        let rec = rerun::RecordingStream::disabled();
+        let config = RerunSinkConfig {
+            track: TrackConfig::try_new(24.0, 0.8).expect("test track configuration"),
+        };
+        let mut sink = RerunSink::from_config(
+            rec,
+            VizDecimation::every_n(NonZeroUsize::new(100).expect("nonzero")),
+            config,
+        );
+
+        sink.log_occupancy(Timestamp::from_nanos(1), test_occupancy_snapshot())
+            .expect("first occupancy snapshot");
+        assert!(sink.logged_world);
+        assert!(sink.logged_occupancy_context);
+        assert_eq!(sink.frame_index, 0);
+        assert_eq!(sink.depth_index, 0);
+
+        sink.log_occupancy(Timestamp::from_nanos(2), test_occupancy_snapshot())
+            .expect("second occupancy snapshot");
+        assert!(sink.logged_occupancy_context);
+        assert_eq!(sink.frame_index, 0);
+        assert_eq!(sink.depth_index, 0);
+    }
+
+    #[test]
+    fn occupancy_logging_parses_timestamp_before_static_side_effects() {
+        let rec = rerun::RecordingStream::disabled();
+        let config = RerunSinkConfig {
+            track: TrackConfig::try_new(24.0, 0.8).expect("test track configuration"),
+        };
+        let mut sink = RerunSink::from_config(rec, VizDecimation::default(), config);
+
+        let error = sink
+            .log_occupancy(Timestamp::from_nanos(i64::MIN), test_occupancy_snapshot())
+            .expect_err("reserved timestamp must fail before logging");
+        assert!(matches!(
+            error,
+            VizLogError::TimestampUnrepresentable { .. }
+        ));
+        assert!(!sink.logged_world);
+        assert!(!sink.logged_occupancy_context);
     }
 
     #[test]
