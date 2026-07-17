@@ -53,8 +53,8 @@ use kiko_slam::{
     DiagnosticEvent, DropPolicy, DropReceiver, FrameDiagnostics, HostMonotonicTimestamp,
     InertialOrderingError, InertialValueError, PairingConfigError, PairingInputError,
     PairingWindowNs, SendOutcome, SensorId, StereoPair, StereoPairer, SystemHealth,
-    TrackerInitError, VizConfigError, bounded_channel, dense_command_channel, depth_router,
-    imu_report_router, oak_to_depth_image, oak_to_frame, oak_to_imu_report,
+    TrackerInitError, TrackerOutput, VizConfigError, bounded_channel, dense_command_channel,
+    depth_router, imu_report_router, oak_to_depth_image, oak_to_frame, oak_to_imu_report,
 };
 #[cfg(feature = "record")]
 use oak_sys::{
@@ -3010,12 +3010,9 @@ struct LiveVizMsg {
     left: Frame,
     right: Frame,
     depth: Option<DepthImage>,
-    pose: Option<WorldToCamera>,
     packet: Option<VizPacket<Raw>>,
     points: Option<Vec<CameraPoint3>>,
-    health: SystemHealth,
-    diagnostics: FrameDiagnostics,
-    events: Vec<DiagnosticEvent>,
+    output: TrackerOutput,
     dense_stats: Option<DenseStats>,
 }
 
@@ -3029,12 +3026,12 @@ fn log_live_viz_message(sink: &mut RerunSink, msg: LiveVizMsg) -> Result<(), Viz
     if let Some(depth) = msg.depth.as_ref() {
         sink.log_depth(depth)?;
     }
-    if let Some(pose) = msg.pose.as_ref() {
+    if let Some(pose) = msg.output.pose().as_ref() {
         sink.log_pose(msg.left.timestamp(), pose)?;
     }
-    sink.log_system_health(msg.left.timestamp(), &msg.health)?;
-    sink.log_diagnostics(msg.left.timestamp(), &msg.diagnostics)?;
-    for event in &msg.events {
+    sink.log_system_health(msg.left.timestamp(), msg.output.health())?;
+    sink.log_diagnostics(msg.left.timestamp(), msg.output.diagnostics())?;
+    for event in msg.output.events() {
         sink.log_event(msg.left.timestamp(), event)?;
     }
     if let Some(ref dense_stats) = msg.dense_stats {
@@ -3784,17 +3781,13 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                                 )?,
                             );
                         }
-                        let (pose, health, diagnostics, events) = output.into_status_parts();
                         let msg = LiveVizMsg {
                             left,
                             right,
                             depth,
-                            pose,
                             packet,
                             points,
-                            health,
-                            diagnostics,
-                            events,
+                            output,
                             dense_stats,
                         };
                         if let Some(sender) = viz_tx.as_ref()

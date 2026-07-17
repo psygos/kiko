@@ -957,6 +957,27 @@ pub struct LocalBundleAdjuster {
     b_buf: Vec<f32>,
 }
 
+/// The newest two poses after one complete incremental optimization.
+///
+/// `previous_pose` is deliberately the pose re-optimized in the same call as
+/// `current_pose`, not a pose published by an earlier call. This is the only
+/// pair from which the tracker may derive a correction-safe visual increment.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IncrementalBaOutput {
+    current_pose: Pose,
+    previous_pose: Option<Pose>,
+}
+
+impl IncrementalBaOutput {
+    pub(crate) fn current_pose(self) -> Pose {
+        self.current_pose
+    }
+
+    pub(crate) fn previous_pose(self) -> Option<Pose> {
+        self.previous_pose
+    }
+}
+
 impl LocalBundleAdjuster {
     pub fn new(intrinsics: PinholeIntrinsics, config: LocalBaConfig) -> Self {
         let a_buf = vec![0.0_f32; config.normal_matrix_len()];
@@ -988,6 +1009,16 @@ impl LocalBundleAdjuster {
         pose: Pose,
         observations: ObservationSet,
     ) -> Result<Pose, LocalBaError> {
+        self.push_frame_with_context(map, pose, observations)
+            .map(IncrementalBaOutput::current_pose)
+    }
+
+    pub(crate) fn push_frame_with_context(
+        &mut self,
+        map: &SlamMap,
+        pose: Pose,
+        observations: ObservationSet,
+    ) -> Result<IncrementalBaOutput, LocalBaError> {
         self.frames.push(BaFrame { pose, observations });
         if self.frames.len() > self.config.window() {
             let excess = self.frames.len() - self.config.window();
@@ -998,10 +1029,21 @@ impl LocalBundleAdjuster {
             self.reset();
             return Err(err);
         }
-        self.frames
+        let current_pose = self
+            .frames
             .last()
             .map(|frame| frame.pose)
-            .ok_or(LocalBaError::EmptyOptimizedWindow)
+            .ok_or(LocalBaError::EmptyOptimizedWindow)?;
+        let previous_pose = self
+            .frames
+            .len()
+            .checked_sub(2)
+            .and_then(|index| self.frames.get(index))
+            .map(|frame| frame.pose);
+        Ok(IncrementalBaOutput {
+            current_pose,
+            previous_pose,
+        })
     }
 
     pub fn optimize_keyframe_window(
@@ -3187,16 +3229,22 @@ mod tests {
             fixture_observation_set(&map, kf_0, min_required),
         )
         .expect("first exact frame");
-        let refined = ba
-            .push_frame(
+        let optimized_pair = ba
+            .push_frame_with_context(
                 &map,
                 true_pose_1,
                 fixture_observation_set(&map, kf_1, min_required),
             )
             .expect("second exact frame");
+        let refined = optimized_pair.current_pose();
+        let predecessor = optimized_pair
+            .previous_pose()
+            .expect("two-frame optimization must return its optimized predecessor");
 
         assert_eq!(refined.translation(), true_pose_1.translation());
         assert_eq!(refined.rotation(), true_pose_1.rotation());
+        assert_eq!(predecessor.translation(), Pose::identity().translation());
+        assert_eq!(predecessor.rotation(), Pose::identity().rotation());
     }
 
     #[test]

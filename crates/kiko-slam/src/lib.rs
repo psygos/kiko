@@ -101,9 +101,11 @@ pub use sensor_router::{
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
-    KeyframePolicy, KeyframePolicyError, KeyframePoseUpdate, LoopSubsystemConfig, ParallaxPx,
-    PoseStatus, RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
-    TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
+    KeyframePolicy, KeyframePolicyError, KeyframePoseUpdate, LoopSubsystemConfig,
+    MapCorrectionApplied, MapCorrectionId, MapCorrectionIdExhausted, MapCorrectionKind,
+    MapLocalization, ParallaxPx, PoseStatus, RedundancyPolicy, RedundancyPolicyError, SlamTracker,
+    SystemHealth, TrackerConfig, TrackerError, TrackerInitError, TrackerOutput, TrackerStatusParts,
+    TrackingHealth, VisualFrameStamp, VisualIncrement, VisualIncrementBasis, VisualIncrementError,
 };
 pub use triangulation::{
     Keyframe, KeyframeError, KeyframeLandmarkError, RectifiedStereo,

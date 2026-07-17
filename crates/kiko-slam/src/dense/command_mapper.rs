@@ -361,6 +361,9 @@ mod tests {
             health: healthy(),
             diagnostics: FrameDiagnostics::empty(1, 1),
             events,
+            visual_increment: None,
+            map_corrections: Vec::new(),
+            current_map_localization: None,
         }
     }
 

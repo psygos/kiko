@@ -341,6 +341,110 @@ impl std::fmt::Display for BackendRequestIdExhausted {
 
 impl std::error::Error for BackendRequestIdExhausted {}
 
+/// Monotonic provenance for committed map-coordinate corrections in one
+/// tracker lifetime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MapCorrectionId(NonZeroU64);
+
+impl MapCorrectionId {
+    const FIRST: Self = Self(NonZeroU64::MIN);
+
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+
+    fn checked_successor(self) -> Option<Self> {
+        self.as_u64()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
+}
+
+#[derive(Debug)]
+struct MapCorrectionIds {
+    next: Option<MapCorrectionId>,
+}
+
+impl MapCorrectionIds {
+    fn new() -> Self {
+        Self {
+            next: Some(MapCorrectionId::FIRST),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_next(next: MapCorrectionId) -> Self {
+        Self { next: Some(next) }
+    }
+
+    fn take_next(&mut self) -> Result<MapCorrectionId, MapCorrectionIdExhausted> {
+        let current = self.next.ok_or(MapCorrectionIdExhausted)?;
+        self.next = current.checked_successor();
+        Ok(current)
+    }
+
+    fn ensure_available(&self) -> Result<(), MapCorrectionIdExhausted> {
+        self.next.map(|_| ()).ok_or(MapCorrectionIdExhausted)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapCorrectionIdExhausted;
+
+impl std::fmt::Display for MapCorrectionIdExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "map correction identifier domain is exhausted")
+    }
+}
+
+impl std::error::Error for MapCorrectionIdExhausted {}
+
+/// The subsystem that committed a change to stored map poses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapCorrectionKind {
+    AsynchronousBundleAdjustment,
+    SynchronousBundleAdjustment,
+    LoopClosure,
+}
+
+/// One committed map-pose correction with exact map-revision boundaries.
+///
+/// This is provenance, not a claim that the correction is one global rigid
+/// transform. Bundle adjustment and pose-graph optimization may deform the map
+/// non-uniformly, so odometry must consume [`VisualIncrement`] instead of
+/// subtracting map poses across this boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapCorrectionApplied {
+    id: MapCorrectionId,
+    kind: MapCorrectionKind,
+    before: MapSnapshot,
+    after: MapSnapshot,
+    corrected_keyframes: NonZeroUsize,
+}
+
+impl MapCorrectionApplied {
+    pub fn id(self) -> MapCorrectionId {
+        self.id
+    }
+
+    pub fn kind(self) -> MapCorrectionKind {
+        self.kind
+    }
+
+    pub fn before(self) -> MapSnapshot {
+        self.before
+    }
+
+    pub fn after(self) -> MapSnapshot {
+        self.after
+    }
+
+    pub fn corrected_keyframes(self) -> usize {
+        self.corrected_keyframes.get()
+    }
+}
+
 #[derive(Debug)]
 struct BackendWindow {
     keyframes: Vec<KeyframeId>,
@@ -1461,6 +1565,209 @@ impl RedundancyPolicy {
     }
 }
 
+/// Identity and left-camera capture time for one visual frame.
+///
+/// `timestamp` is the exact [`Timestamp`] carried by the stereo-left frame. It
+/// has device-capture-clock meaning only within the device session attached by
+/// the caller at the odometry boundary; the tracker itself has no reconnect or
+/// clock-session authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VisualFrameStamp {
+    frame_id: FrameId,
+    timestamp: Timestamp,
+}
+
+/// A current visual localization bound to the exact map revision in which its
+/// pose is expressed.
+#[derive(Clone, Copy, Debug)]
+pub struct MapLocalization {
+    visual_stamp: VisualFrameStamp,
+    map_snapshot: MapSnapshot,
+    world_to_camera: crate::WorldToCamera,
+}
+
+impl MapLocalization {
+    pub(crate) fn new(
+        visual_stamp: VisualFrameStamp,
+        map_snapshot: MapSnapshot,
+        world_to_camera: crate::WorldToCamera,
+    ) -> Self {
+        Self {
+            visual_stamp,
+            map_snapshot,
+            world_to_camera,
+        }
+    }
+
+    pub fn visual_stamp(self) -> VisualFrameStamp {
+        self.visual_stamp
+    }
+
+    pub fn map_snapshot(self) -> MapSnapshot {
+        self.map_snapshot
+    }
+
+    pub fn world_to_camera(self) -> crate::WorldToCamera {
+        self.world_to_camera
+    }
+}
+
+impl VisualFrameStamp {
+    pub fn new(frame_id: FrameId, timestamp: Timestamp) -> Self {
+        Self {
+            frame_id,
+            timestamp,
+        }
+    }
+
+    pub fn frame_id(self) -> FrameId {
+        self.frame_id
+    }
+
+    pub fn timestamp(self) -> Timestamp {
+        self.timestamp
+    }
+}
+
+/// The map authority from which a correction-safe visual increment was built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualIncrementBasis {
+    /// Both endpoint poses were produced by one incremental-BA optimization.
+    CoOptimized { map_snapshot: MapSnapshot },
+    /// The first endpoint was the active keyframe's authoritative stored pose.
+    ///
+    /// This basis is used only for the first accepted frame after the
+    /// incremental-BA window is reset at a keyframe boundary.
+    AuthoritativeKeyframeAnchor {
+        keyframe_id: KeyframeId,
+        map_snapshot: MapSnapshot,
+    },
+}
+
+impl VisualIncrementBasis {
+    pub fn map_snapshot(self) -> MapSnapshot {
+        match self {
+            Self::CoOptimized { map_snapshot }
+            | Self::AuthoritativeKeyframeAnchor { map_snapshot, .. } => map_snapshot,
+        }
+    }
+
+    pub fn anchor_keyframe_id(self) -> Option<KeyframeId> {
+        match self {
+            Self::CoOptimized { .. } => None,
+            Self::AuthoritativeKeyframeAnchor { keyframe_id, .. } => Some(keyframe_id),
+        }
+    }
+}
+
+/// A correction-safe visual motion measurement between two accepted frames.
+///
+/// `previous_camera_to_current_camera` is `T_C_current_C_previous`: it maps a
+/// point expressed in the previous tracking-camera coordinates into current
+/// tracking-camera coordinates. Its endpoints are either co-optimized or use
+/// the exact corrected active-keyframe anchor recorded by [`Self::basis`]. It
+/// never falls back to subtracting consecutive [`TrackerOutput::pose`] values.
+/// The relative transform remains usable across later map corrections even
+/// when its basis snapshot differs from the output's final map localization.
+#[derive(Clone, Copy, Debug)]
+pub struct VisualIncrement {
+    from: VisualFrameStamp,
+    to: VisualFrameStamp,
+    previous_camera_to_current_camera: crate::Pose64,
+    basis: VisualIncrementBasis,
+}
+
+impl VisualIncrement {
+    /// Construct an increment from poses with provenance established by the
+    /// tracker. Kept crate-private so external callers cannot forge that
+    /// provenance on a value received through [`TrackerOutput`].
+    pub(crate) fn try_from_world_to_camera_poses(
+        from: VisualFrameStamp,
+        to: VisualFrameStamp,
+        previous_world_to_camera: crate::WorldToCamera,
+        current_world_to_camera: crate::WorldToCamera,
+        basis: VisualIncrementBasis,
+    ) -> Result<Self, VisualIncrementError> {
+        if to.frame_id <= from.frame_id {
+            return Err(VisualIncrementError::NonIncreasingFrameId { from, to });
+        }
+        if to.timestamp <= from.timestamp {
+            return Err(VisualIncrementError::NonIncreasingTimestamp { from, to });
+        }
+        let previous = crate::Pose64::try_from_pose32(previous_world_to_camera.into_legacy_pose())
+            .map_err(VisualIncrementError::Pose)?;
+        let current = crate::Pose64::try_from_pose32(current_world_to_camera.into_legacy_pose())
+            .map_err(VisualIncrementError::Pose)?;
+        let previous_camera_to_current_camera = current
+            .try_compose(previous.try_inverse().map_err(VisualIncrementError::Pose)?)
+            .map_err(VisualIncrementError::Pose)?;
+        Ok(Self {
+            from,
+            to,
+            previous_camera_to_current_camera,
+            basis,
+        })
+    }
+
+    pub fn from(self) -> VisualFrameStamp {
+        self.from
+    }
+
+    pub fn to(self) -> VisualFrameStamp {
+        self.to
+    }
+
+    pub fn previous_camera_to_current_camera(self) -> crate::Pose64 {
+        self.previous_camera_to_current_camera
+    }
+
+    pub fn basis(self) -> VisualIncrementBasis {
+        self.basis
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VisualIncrementError {
+    NonIncreasingFrameId {
+        from: VisualFrameStamp,
+        to: VisualFrameStamp,
+    },
+    NonIncreasingTimestamp {
+        from: VisualFrameStamp,
+        to: VisualFrameStamp,
+    },
+    Pose(crate::Pose64Error),
+}
+
+impl std::fmt::Display for VisualIncrementError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonIncreasingFrameId { from, to } => write!(
+                f,
+                "visual increment frame IDs must increase (from={}, to={})",
+                from.frame_id.as_u64(),
+                to.frame_id.as_u64()
+            ),
+            Self::NonIncreasingTimestamp { from, to } => write!(
+                f,
+                "visual increment left-camera timestamps must increase (from={} ns, to={} ns)",
+                from.timestamp.as_nanos(),
+                to.timestamp.as_nanos()
+            ),
+            Self::Pose(err) => write!(f, "visual increment pose computation failed: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for VisualIncrementError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Pose(err) => Some(err),
+            Self::NonIncreasingFrameId { .. } | Self::NonIncreasingTimestamp { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TrackerError {
     Inference(InferenceError),
@@ -1476,6 +1783,8 @@ pub enum TrackerError {
     Transform(crate::TransformError),
     Pose64(crate::Pose64Error),
     PoseNarrowing(crate::PoseNarrowingError),
+    VisualIncrement(VisualIncrementError),
+    MapCorrectionIdExhausted(MapCorrectionIdExhausted),
     LoopMapSnapshotMismatch {
         verified: crate::map::MapSnapshot,
         current: crate::map::MapSnapshot,
@@ -1510,6 +1819,8 @@ impl std::fmt::Display for TrackerError {
             TrackerError::Transform(err) => write!(f, "coordinate transform error: {err}"),
             TrackerError::Pose64(err) => write!(f, "64-bit pose error: {err}"),
             TrackerError::PoseNarrowing(err) => write!(f, "pose narrowing error: {err}"),
+            TrackerError::VisualIncrement(err) => write!(f, "visual increment error: {err}"),
+            TrackerError::MapCorrectionIdExhausted(err) => write!(f, "{err}"),
             TrackerError::LoopMapSnapshotMismatch { verified, current } => write!(
                 f,
                 "verified loop map snapshot mismatch: verified={verified:?}, current={current:?}"
@@ -1544,6 +1855,8 @@ impl std::error::Error for TrackerError {
             Self::Transform(err) => Some(err),
             Self::Pose64(err) => Some(err),
             Self::PoseNarrowing(err) => Some(err),
+            Self::VisualIncrement(err) => Some(err),
+            Self::MapCorrectionIdExhausted(err) => Some(err),
             Self::LoopMapSnapshotMismatch { .. }
             | Self::RelocalizationMapSnapshotMismatch { .. }
             | Self::KeyframeRejected { .. }
@@ -1680,6 +1993,18 @@ impl From<crate::PoseNarrowingError> for TrackerError {
     }
 }
 
+impl From<VisualIncrementError> for TrackerError {
+    fn from(err: VisualIncrementError) -> Self {
+        Self::VisualIncrement(err)
+    }
+}
+
+impl From<MapCorrectionIdExhausted> for TrackerError {
+    fn from(err: MapCorrectionIdExhausted) -> Self {
+        Self::MapCorrectionIdExhausted(err)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrackingHealth {
     Good,
@@ -1813,6 +2138,22 @@ pub struct TrackerOutput {
     pub(crate) health: SystemHealth,
     pub(crate) diagnostics: FrameDiagnostics,
     pub(crate) events: Vec<DiagnosticEvent>,
+    pub(crate) visual_increment: Option<VisualIncrement>,
+    pub(crate) map_corrections: Vec<MapCorrectionApplied>,
+    pub(crate) current_map_localization: Option<MapLocalization>,
+}
+
+/// Lossless owned decomposition of a [`TrackerOutput`]'s status and motion
+/// provenance after image/match payloads have been handled.
+#[derive(Debug)]
+pub struct TrackerStatusParts {
+    pub pose: Option<crate::WorldToCamera>,
+    pub health: SystemHealth,
+    pub diagnostics: FrameDiagnostics,
+    pub events: Vec<DiagnosticEvent>,
+    pub visual_increment: Option<VisualIncrement>,
+    pub map_corrections: Vec<MapCorrectionApplied>,
+    pub current_map_localization: Option<MapLocalization>,
 }
 
 impl TrackerOutput {
@@ -1860,15 +2201,38 @@ impl TrackerOutput {
         &self.events
     }
 
-    pub fn into_status_parts(
-        self,
-    ) -> (
-        Option<crate::WorldToCamera>,
-        SystemHealth,
-        FrameDiagnostics,
-        Vec<DiagnosticEvent>,
-    ) {
-        (self.pose, self.health, self.diagnostics, self.events)
+    /// A frame-to-frame motion derived only from poses co-optimized in one
+    /// incremental-BA call.
+    ///
+    /// `None` is an explicit absence of correction-safe motion. Callers must
+    /// not replace it with a delta of consecutive map poses.
+    pub fn visual_increment(&self) -> Option<VisualIncrement> {
+        self.visual_increment
+    }
+
+    /// Committed map-pose corrections since the preceding successful output.
+    pub fn map_corrections(&self) -> &[MapCorrectionApplied] {
+        &self.map_corrections
+    }
+
+    /// Current pose with its exact visual timestamp and map revision.
+    ///
+    /// Stale and unavailable outputs deliberately return `None`; their legacy
+    /// pose, if any, must not be rebound to the tracker's later map snapshot.
+    pub fn current_map_localization(&self) -> Option<MapLocalization> {
+        self.current_map_localization
+    }
+
+    pub fn into_status_parts(self) -> TrackerStatusParts {
+        TrackerStatusParts {
+            pose: self.pose,
+            health: self.health,
+            diagnostics: self.diagnostics,
+            events: self.events,
+            visual_increment: self.visual_increment,
+            map_corrections: self.map_corrections,
+            current_map_localization: self.current_map_localization,
+        }
     }
 }
 
@@ -2042,10 +2406,14 @@ pub struct SlamTracker {
     pending_loop: Option<PendingLoopCandidate>,
     loop_streak: HashMap<KeyframeId, usize>,
     pending_events: Vec<DiagnosticEvent>,
+    pending_map_corrections: Vec<MapCorrectionApplied>,
+    map_correction_ids: MapCorrectionIds,
     pending_dense_pose_updates: PendingDensePoseUpdates,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
+    last_incremental_ba_stamp: Option<VisualFrameStamp>,
+    incremental_ba_anchor_keyframe: Option<KeyframeId>,
     cull_min_observations: NonZeroUsize,
     trace_transitions: bool,
 }
@@ -2111,10 +2479,14 @@ impl SlamTracker {
             pending_loop: None,
             loop_streak: HashMap::new(),
             pending_events: Vec::new(),
+            pending_map_corrections: Vec::new(),
+            map_correction_ids: MapCorrectionIds::new(),
             pending_dense_pose_updates: PendingDensePoseUpdates::default(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
+            last_incremental_ba_stamp: None,
+            incremental_ba_anchor_keyframe: None,
             cull_min_observations: environment.cull_min_observations,
             trace_transitions: environment.trace_transitions,
         })
@@ -2122,7 +2494,7 @@ impl SlamTracker {
 
     pub fn process(&mut self, pair: StereoPair) -> Result<TrackerOutput, TrackerError> {
         // Keep drained diagnostics queued until a TrackerOutput can carry them.
-        self.drain_backend_responses();
+        self.drain_backend_responses()?;
         self.drain_descriptor_responses()?;
         if let Err(err) = self.process_pending_loop_closure() {
             match err {
@@ -2217,6 +2589,12 @@ impl SlamTracker {
     }
 
     pub fn apply_loop_closure(&mut self, verified: VerifiedLoop) -> Result<(), TrackerError> {
+        // The optimizer reveals correction cardinality only after its
+        // transactional map commit. Fail closed by requiring provenance
+        // capacity before mutation: an empty correction still consumes no ID,
+        // but is refused when no ID would be available for a non-empty commit.
+        self.ensure_map_correction_id_available()?;
+        let before = self.map.snapshot();
         let corrected = apply_loop_closure_correction(
             &mut self.map,
             &mut self.essential_graph,
@@ -2227,6 +2605,14 @@ impl SlamTracker {
             .record_all(corrected.iter().map(|&(keyframe_id, pose)| {
                 KeyframePoseUpdate::new(keyframe_id, crate::WorldToCamera::from_legacy_pose(pose))
             }));
+        if !corrected.is_empty() {
+            self.record_map_correction(
+                MapCorrectionKind::LoopClosure,
+                before,
+                self.map.snapshot(),
+                corrected.len(),
+            )?;
+        }
         Ok(())
     }
 
@@ -2249,8 +2635,45 @@ impl SlamTracker {
         self.pending_events.push(event);
     }
 
+    fn ensure_map_correction_id_available(&self) -> Result<(), TrackerError> {
+        self.map_correction_ids
+            .ensure_available()
+            .map_err(Into::into)
+    }
+
+    fn record_map_correction(
+        &mut self,
+        kind: MapCorrectionKind,
+        before: MapSnapshot,
+        after: MapSnapshot,
+        corrected_keyframes: usize,
+    ) -> Result<(), TrackerError> {
+        let corrected_keyframes =
+            NonZeroUsize::new(corrected_keyframes).ok_or(TrackerError::InvariantViolation(
+                "map correction provenance requires at least one corrected keyframe",
+            ))?;
+        if before == after {
+            return Err(TrackerError::InvariantViolation(
+                "committed map correction must advance the map snapshot",
+            ));
+        }
+        let id = self.map_correction_ids.take_next()?;
+        self.pending_map_corrections.push(MapCorrectionApplied {
+            id,
+            kind,
+            before,
+            after,
+            corrected_keyframes,
+        });
+        Ok(())
+    }
+
     fn drain_events(&mut self) -> Vec<DiagnosticEvent> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    fn drain_map_corrections(&mut self) -> Vec<MapCorrectionApplied> {
+        std::mem::take(&mut self.pending_map_corrections)
     }
 
     fn empty_diagnostics(&self) -> FrameDiagnostics {
@@ -2278,8 +2701,31 @@ impl SlamTracker {
         frame_id: FrameId,
         tracking: TrackingHealth,
         diagnostics: FrameDiagnostics,
+        visual_increment: Option<VisualIncrement>,
+        current_map_localization: Option<MapLocalization>,
     ) -> TrackerOutput {
         debug_assert!(pose_status.is_consistent_with(pose));
+        debug_assert_eq!(
+            pose_status == PoseStatus::Current,
+            current_map_localization.is_some(),
+            "only a Current pose may carry current map-localization provenance"
+        );
+        if let (PoseStatus::Current, Some(pose), Some(localization)) =
+            (pose_status, pose, current_map_localization)
+        {
+            debug_assert_eq!(localization.visual_stamp().frame_id(), frame_id);
+            debug_assert_eq!(localization.map_snapshot(), self.map.snapshot());
+            debug_assert_eq!(
+                localization.world_to_camera().rotation(),
+                pose.rotation(),
+                "Current localization and legacy pose must describe the same rotation"
+            );
+            debug_assert_eq!(
+                localization.world_to_camera().translation(),
+                pose.translation(),
+                "Current localization and legacy pose must describe the same translation"
+            );
+        }
         if let Some(pose_world) = pose {
             self.last_pose_world = Some(pose_world);
         }
@@ -2293,6 +2739,9 @@ impl SlamTracker {
             health: self.emit_health(tracking),
             diagnostics,
             events: self.drain_events(),
+            visual_increment,
+            map_corrections: self.drain_map_corrections(),
+            current_map_localization,
         }
     }
 
@@ -2318,6 +2767,8 @@ impl SlamTracker {
             frame_id,
             health,
             diagnostics,
+            None,
+            None,
         )
     }
 
@@ -2590,11 +3041,36 @@ impl SlamTracker {
         Ok(())
     }
 
-    fn drain_backend_responses(&mut self) {
+    fn optimize_keyframe_window_synchronously(
+        &mut self,
+        window: &[KeyframeId],
+    ) -> Result<BaResult, TrackerError> {
+        self.ensure_map_correction_id_available()?;
+        let before = self.map.snapshot();
+        let result = self.ba.optimize_keyframe_window(&mut self.map, window)?;
+        let corrected_keyframes = record_committed_synchronous_ba_pose_updates(
+            &self.map,
+            &mut self.pending_dense_pose_updates,
+            window,
+            self.ba.window_size(),
+            &result,
+        );
+        if corrected_keyframes > 0 {
+            self.record_map_correction(
+                MapCorrectionKind::SynchronousBundleAdjustment,
+                before,
+                self.map.snapshot(),
+                corrected_keyframes,
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn drain_backend_responses(&mut self) -> Result<(), TrackerError> {
         loop {
             let response = {
                 let Some(supervisor) = self.backend.as_mut() else {
-                    return;
+                    return Ok(());
                 };
                 let response = supervisor.try_recv();
                 self.backend_stats.respawn_count = supervisor.respawn_count();
@@ -2612,6 +3088,11 @@ impl SlamTracker {
                     }
                     match &correction.correction.result {
                         BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
+                            let corrected_keyframes = correction.correction.corrected_poses.len();
+                            if corrected_keyframes > 0 {
+                                self.ensure_map_correction_id_available()?;
+                            }
+                            let before = self.map.snapshot();
                             match apply_backend_correction_and_record_dense_updates(
                                 &mut self.map,
                                 &mut self.pending_dense_pose_updates,
@@ -2620,6 +3101,14 @@ impl SlamTracker {
                                 Ok(()) => {
                                     self.backend_stats.applied =
                                         self.backend_stats.applied.saturating_add(1);
+                                    if corrected_keyframes > 0 {
+                                        self.record_map_correction(
+                                            MapCorrectionKind::AsynchronousBundleAdjustment,
+                                            before,
+                                            self.map.snapshot(),
+                                            corrected_keyframes,
+                                        )?;
+                                    }
                                 }
                                 Err(ApplyCorrectionError::StaleSnapshot { .. }) => {
                                     self.backend_stats.stale =
@@ -2681,6 +3170,7 @@ impl SlamTracker {
                 }
             }
         }
+        Ok(())
     }
 
     fn tracking_failure_health(&mut self) -> TrackingHealth {
@@ -2754,6 +3244,8 @@ impl SlamTracker {
             frame_id,
             health,
             diagnostics,
+            None,
+            None,
         )
     }
 
@@ -2928,6 +3420,8 @@ impl SlamTracker {
         self.emit_event(DiagnosticEvent::MappingSessionReset { transition });
         self.state = TrackerState::NeedKeyframe;
         self.ba.reset();
+        self.last_incremental_ba_stamp = None;
+        self.incremental_ba_anchor_keyframe = None;
         self.pending_loop = None;
         self.loop_streak.clear();
         self.pending_dense_pose_updates.clear();
@@ -3216,13 +3710,79 @@ impl SlamTracker {
 
         let pose_world = result.pose;
         let pose_world_legacy = pose_world.into_legacy_pose();
+        let current_visual_stamp = VisualFrameStamp::new(frame_id, left.timestamp());
         let observation_set = ObservationSet::new(map_observations, self.ba.min_observations())
             .map_err(LocalBaError::from)?;
-        let refined_world = self
-            .ba
-            .push_frame(&self.map, pose_world_legacy, observation_set)?;
+        let incremental_ba =
+            match self
+                .ba
+                .push_frame_with_context(&self.map, pose_world_legacy, observation_set)
+            {
+                Ok(output) => output,
+                Err(err) => {
+                    // `push_frame_with_context` resets its own window on failure.
+                    // Keep the matching stamp state transactional with that reset.
+                    self.last_incremental_ba_stamp = None;
+                    self.incremental_ba_anchor_keyframe = None;
+                    return Err(err.into());
+                }
+            };
+        let refined_world = incremental_ba.current_pose();
+        let visual_increment_result = match (
+            incremental_ba.previous_pose(),
+            self.last_incremental_ba_stamp,
+        ) {
+            (Some(previous_pose), Some(previous_stamp)) => {
+                VisualIncrement::try_from_world_to_camera_poses(
+                    previous_stamp,
+                    current_visual_stamp,
+                    crate::WorldToCamera::from_legacy_pose(previous_pose),
+                    crate::WorldToCamera::from_legacy_pose(refined_world),
+                    VisualIncrementBasis::CoOptimized {
+                        map_snapshot: self.map.snapshot(),
+                    },
+                )
+                .map(Some)
+            }
+            (Some(_), None) => {
+                self.ba.reset();
+                self.last_incremental_ba_stamp = None;
+                self.incremental_ba_anchor_keyframe = None;
+                return Err(TrackerError::InvariantViolation(
+                    "incremental BA predecessor has no matching visual frame stamp",
+                ));
+            }
+            (None, _) => match authoritative_keyframe_visual_anchor(
+                &self.map,
+                keyframe_id,
+                self.incremental_ba_anchor_keyframe,
+            ) {
+                Some(anchor) => VisualIncrement::try_from_world_to_camera_poses(
+                    anchor.visual_stamp,
+                    current_visual_stamp,
+                    anchor.world_to_camera,
+                    crate::WorldToCamera::from_legacy_pose(refined_world),
+                    VisualIncrementBasis::AuthoritativeKeyframeAnchor {
+                        keyframe_id: anchor.keyframe_id,
+                        map_snapshot: anchor.map_snapshot,
+                    },
+                )
+                .map(Some),
+                None => Ok(None),
+            },
+        };
+        let visual_increment = match visual_increment_result {
+            Ok(increment) => increment,
+            Err(err) => {
+                self.ba.reset();
+                self.last_incremental_ba_stamp = None;
+                self.incremental_ba_anchor_keyframe = None;
+                return Err(err.into());
+            }
+        };
 
         let pose_world = crate::WorldToCamera::from_legacy_pose(refined_world);
+        let mut output_pose_world = pose_world;
         // This is the last fallible acceptance check before recovery events or tracker/map/backend
         // mutations. If it rejects the refined frame, discard the already-mutated BA window just
         // as LocalBundleAdjuster::push_frame does when its own optimization fails.
@@ -3234,9 +3794,15 @@ impl SlamTracker {
             Ok(diagnostics) => diagnostics,
             Err(err) => {
                 self.ba.reset();
+                self.last_incremental_ba_stamp = None;
+                self.incremental_ba_anchor_keyframe = None;
                 return Err(err);
             }
         };
+        self.last_incremental_ba_stamp = Some(current_visual_stamp);
+        // The accepted current frame is now the incremental-BA predecessor;
+        // an authoritative keyframe anchor must never be reused afterward.
+        self.incremental_ba_anchor_keyframe = None;
         if self.consecutive_tracking_failures > 0 {
             self.emit_event(DiagnosticEvent::TrackingRecovered);
         }
@@ -3339,26 +3905,24 @@ impl SlamTracker {
                                         "backend submit failed for keyframe {keyframe_id:?}: {err}"
                                     );
                                     let result =
-                                        self.ba.optimize_keyframe_window(&mut self.map, &window)?;
-                                    record_committed_synchronous_ba_pose_updates(
-                                        &self.map,
-                                        &mut self.pending_dense_pose_updates,
-                                        &window,
-                                        self.ba.window_size(),
-                                        &result,
-                                    );
+                                        self.optimize_keyframe_window_synchronously(&window)?;
+                                    output_pose_world =
+                                        authoritative_keyframe_pose(&self.map, keyframe_id).ok_or(
+                                            TrackerError::InvariantViolation(
+                                                "synchronous BA removed the current keyframe",
+                                            ),
+                                        )?;
                                     ba_result = Some(result);
                                 }
                             } else {
                                 let result =
-                                    self.ba.optimize_keyframe_window(&mut self.map, &window)?;
-                                record_committed_synchronous_ba_pose_updates(
-                                    &self.map,
-                                    &mut self.pending_dense_pose_updates,
-                                    &window,
-                                    self.ba.window_size(),
-                                    &result,
-                                );
+                                    self.optimize_keyframe_window_synchronously(&window)?;
+                                output_pose_world =
+                                    authoritative_keyframe_pose(&self.map, keyframe_id).ok_or(
+                                        TrackerError::InvariantViolation(
+                                            "synchronous BA removed the current keyframe",
+                                        ),
+                                    )?;
                                 ba_result = Some(result);
                             }
                         }
@@ -3367,6 +3931,8 @@ impl SlamTracker {
                             keyframe_id,
                         };
                         self.ba.reset();
+                        self.last_incremental_ba_stamp = None;
+                        self.incremental_ba_anchor_keyframe = Some(keyframe_id);
                         output_keyframe = Some(keyframe);
                         output_matches = keyframe_output.stereo_matches;
                     }
@@ -3394,8 +3960,13 @@ impl SlamTracker {
         diagnostics.features_detected = Some(current.len());
         diagnostics.features_matched = Some(matches.len());
 
+        let current_map_localization = Some(MapLocalization::new(
+            current_visual_stamp,
+            self.map.snapshot(),
+            output_pose_world,
+        ));
         Ok(self.output_with_diagnostics(
-            Some(pose_world.into_legacy_pose()),
+            Some(output_pose_world.into_legacy_pose()),
             PoseStatus::Current,
             result.inliers.len(),
             output_keyframe,
@@ -3403,6 +3974,8 @@ impl SlamTracker {
             frame_id,
             TrackingHealth::Good,
             diagnostics,
+            visual_increment,
+            current_map_localization,
         ))
     }
 
@@ -3423,6 +3996,7 @@ impl SlamTracker {
     ) -> Result<TrackerOutput, TrackerError> {
         let (left, right) = pair.into_parts();
         let frame_id = left.frame_id();
+        let timestamp = left.timestamp();
         let is_relocalization = relocalization.is_some();
         let connection = relocalization.map_or(
             KeyframeConnection::Bootstrap,
@@ -3496,10 +4070,20 @@ impl SlamTracker {
             keyframe_id,
         };
         self.ba.reset();
+        self.last_incremental_ba_stamp = None;
+        self.incremental_ba_anchor_keyframe = Some(keyframe_id);
         self.consecutive_tracking_failures = 0;
         let diagnostics = output.diagnostics;
+        let authoritative_pose = authoritative_keyframe_pose(&self.map, keyframe_id).ok_or(
+            TrackerError::InvariantViolation("new current keyframe is missing from the map"),
+        )?;
+        let current_map_localization = Some(MapLocalization::new(
+            VisualFrameStamp::new(frame_id, timestamp),
+            self.map.snapshot(),
+            authoritative_pose,
+        ));
         Ok(self.output_with_diagnostics(
-            Some(pose_world),
+            Some(authoritative_pose.into_legacy_pose()),
             PoseStatus::Current,
             0,
             output.keyframe,
@@ -3507,6 +4091,8 @@ impl SlamTracker {
             frame_id,
             TrackingHealth::Good,
             diagnostics,
+            None,
+            current_map_localization,
         ))
     }
 
@@ -3620,6 +4206,9 @@ impl SlamTracker {
                 health: self.system_health(),
                 diagnostics,
                 events: Vec::new(),
+                visual_increment: None,
+                map_corrections: Vec::new(),
+                current_map_localization: None,
             },
             keyframe_id,
         ))
@@ -3911,18 +4500,48 @@ fn authoritative_keyframe_pose(
     map.keyframe(keyframe_id).map(|keyframe| keyframe.pose())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct AuthoritativeKeyframeVisualAnchor {
+    keyframe_id: KeyframeId,
+    visual_stamp: VisualFrameStamp,
+    map_snapshot: MapSnapshot,
+    world_to_camera: crate::WorldToCamera,
+}
+
+/// Resolve the one safe predecessor after an incremental-BA keyframe reset.
+///
+/// The armed keyframe must still be the exact active keyframe in this map
+/// instance. Its pose and capture stamp are read together from the
+/// authoritative map after all pending corrections have been applied.
+fn authoritative_keyframe_visual_anchor(
+    map: &SlamMap,
+    active_keyframe_id: KeyframeId,
+    armed_keyframe_id: Option<KeyframeId>,
+) -> Option<AuthoritativeKeyframeVisualAnchor> {
+    if armed_keyframe_id != Some(active_keyframe_id) {
+        return None;
+    }
+    let keyframe = map.keyframe(active_keyframe_id)?;
+    Some(AuthoritativeKeyframeVisualAnchor {
+        keyframe_id: active_keyframe_id,
+        visual_stamp: VisualFrameStamp::new(keyframe.frame_id(), keyframe.timestamp()),
+        map_snapshot: map.snapshot(),
+        world_to_camera: keyframe.pose(),
+    })
+}
+
 fn record_committed_synchronous_ba_pose_updates(
     map: &SlamMap,
     pending: &mut PendingDensePoseUpdates,
     requested_window: &[KeyframeId],
     max_window: NonZeroUsize,
     result: &BaResult,
-) {
+) -> usize {
     if !matches!(
         result,
         BaResult::Converged { .. } | BaResult::MaxIterations { .. }
     ) {
-        return;
+        return 0;
     }
 
     // Full BA commits exactly the prefix admitted by its configured window.
@@ -3934,6 +4553,7 @@ fn record_committed_synchronous_ba_pose_updates(
             .expect("committed BA keyframe must remain in the authoritative map");
         pending.record(KeyframePoseUpdate::new(keyframe_id, pose));
     }
+    optimized_count
 }
 
 fn apply_correction_event(
@@ -4609,13 +5229,14 @@ mod tests {
             },
         ] {
             let mut pending = PendingDensePoseUpdates::default();
-            record_committed_synchronous_ba_pose_updates(
+            let published = record_committed_synchronous_ba_pose_updates(
                 &map,
                 &mut pending,
                 &requested_window,
                 max_window,
                 &result,
             );
+            assert_eq!(published, max_window.get());
 
             let updates = pending.take_sorted();
             let mut expected_ids = requested_window[..max_window.get()].to_vec();
@@ -4638,7 +5259,7 @@ mod tests {
         }
 
         let mut pending = PendingDensePoseUpdates::default();
-        record_committed_synchronous_ba_pose_updates(
+        let published = record_committed_synchronous_ba_pose_updates(
             &map,
             &mut pending,
             &requested_window,
@@ -4647,6 +5268,7 @@ mod tests {
                 reason: crate::DegenerateReason::NoFactors,
             },
         );
+        assert_eq!(published, 0);
         assert!(pending.take_sorted().is_empty());
     }
 
@@ -4724,6 +5346,205 @@ mod tests {
 
         let (_other_map, other_keyframe, _) = make_map_with_single_point();
         assert!(authoritative_keyframe_pose(&map, other_keyframe).is_none());
+    }
+
+    #[test]
+    fn visual_increment_uses_previous_camera_to_current_camera_convention() {
+        let map = SlamMap::new();
+        let from = VisualFrameStamp::new(FrameId::new(7), Timestamp::from_nanos(10));
+        let to = VisualFrameStamp::new(FrameId::new(8), Timestamp::from_nanos(20));
+        let increment = VisualIncrement::try_from_world_to_camera_poses(
+            from,
+            to,
+            translated_world_to_camera(1.0),
+            translated_world_to_camera(3.5),
+            VisualIncrementBasis::CoOptimized {
+                map_snapshot: map.snapshot(),
+            },
+        )
+        .expect("ordered finite visual increment");
+
+        assert_eq!(increment.from(), from);
+        assert_eq!(increment.to(), to);
+        assert_eq!(
+            increment.previous_camera_to_current_camera().translation(),
+            [2.5, 0.0, 0.0]
+        );
+        assert_eq!(
+            increment.basis(),
+            VisualIncrementBasis::CoOptimized {
+                map_snapshot: map.snapshot()
+            }
+        );
+    }
+
+    #[test]
+    fn visual_increment_rejects_nonincreasing_frame_or_capture_time() {
+        let map_snapshot = SlamMap::new().snapshot();
+        let from = VisualFrameStamp::new(FrameId::new(7), Timestamp::from_nanos(10));
+        let basis = VisualIncrementBasis::CoOptimized { map_snapshot };
+
+        assert!(matches!(
+            VisualIncrement::try_from_world_to_camera_poses(
+                from,
+                VisualFrameStamp::new(FrameId::new(7), Timestamp::from_nanos(20)),
+                crate::WorldToCamera::identity(),
+                crate::WorldToCamera::identity(),
+                basis,
+            ),
+            Err(VisualIncrementError::NonIncreasingFrameId { .. })
+        ));
+        assert!(matches!(
+            VisualIncrement::try_from_world_to_camera_poses(
+                from,
+                VisualFrameStamp::new(FrameId::new(8), Timestamp::from_nanos(10)),
+                crate::WorldToCamera::identity(),
+                crate::WorldToCamera::identity(),
+                basis,
+            ),
+            Err(VisualIncrementError::NonIncreasingTimestamp { .. })
+        ));
+    }
+
+    #[test]
+    fn first_post_reset_increment_uses_corrected_authoritative_keyframe_anchor() {
+        let (mut map, keyframe_id, _) = make_map_with_single_point();
+        let stale_snapshot = map.snapshot();
+        map.set_keyframe_pose(keyframe_id, translated_world_to_camera(4.0))
+            .expect("simulate a committed correction before the next frame");
+        let corrected_snapshot = map.snapshot();
+        assert_ne!(corrected_snapshot, stale_snapshot);
+
+        let anchor = authoritative_keyframe_visual_anchor(&map, keyframe_id, Some(keyframe_id))
+            .expect("exact active keyframe is a valid post-reset anchor");
+        assert_eq!(anchor.keyframe_id, keyframe_id);
+        assert_eq!(anchor.visual_stamp.frame_id(), FrameId::new(1));
+        assert_eq!(anchor.visual_stamp.timestamp(), Timestamp::from_nanos(1));
+        assert_eq!(anchor.map_snapshot, corrected_snapshot);
+        assert_eq!(anchor.world_to_camera.translation(), [4.0, 0.0, 0.0]);
+
+        let increment = VisualIncrement::try_from_world_to_camera_poses(
+            anchor.visual_stamp,
+            VisualFrameStamp::new(FrameId::new(2), Timestamp::from_nanos(2)),
+            anchor.world_to_camera,
+            translated_world_to_camera(5.0),
+            VisualIncrementBasis::AuthoritativeKeyframeAnchor {
+                keyframe_id: anchor.keyframe_id,
+                map_snapshot: anchor.map_snapshot,
+            },
+        )
+        .expect("increment from corrected anchor");
+
+        assert_eq!(
+            increment.previous_camera_to_current_camera().translation(),
+            [1.0, 0.0, 0.0],
+            "using the stale pre-correction identity pose would have produced 5 m"
+        );
+        assert_eq!(
+            increment.basis(),
+            VisualIncrementBasis::AuthoritativeKeyframeAnchor {
+                keyframe_id,
+                map_snapshot: corrected_snapshot,
+            }
+        );
+    }
+
+    #[test]
+    fn keyframe_anchor_requires_exact_armed_active_map_identity() {
+        let (map, keyframe_id, _) = make_map_with_single_point();
+        let (_other_map, other_keyframe_id, _) = make_map_with_single_point();
+
+        assert!(authoritative_keyframe_visual_anchor(&map, keyframe_id, None).is_none());
+        assert!(
+            authoritative_keyframe_visual_anchor(&map, keyframe_id, Some(other_keyframe_id))
+                .is_none()
+        );
+        assert!(
+            authoritative_keyframe_visual_anchor(&map, other_keyframe_id, Some(other_keyframe_id))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tracker_status_parts_preserve_motion_and_map_provenance() {
+        let (mut map, keyframe_id, _) = make_map_with_single_point();
+        let before = map.snapshot();
+        let world_to_camera = translated_world_to_camera(2.0);
+        map.set_keyframe_pose(keyframe_id, world_to_camera)
+            .expect("correct keyframe pose");
+        let after = map.snapshot();
+        let from = VisualFrameStamp::new(FrameId::new(1), Timestamp::from_nanos(1));
+        let to = VisualFrameStamp::new(FrameId::new(2), Timestamp::from_nanos(2));
+        let visual_increment = VisualIncrement::try_from_world_to_camera_poses(
+            from,
+            to,
+            crate::WorldToCamera::identity(),
+            world_to_camera,
+            VisualIncrementBasis::AuthoritativeKeyframeAnchor {
+                keyframe_id,
+                map_snapshot: before,
+            },
+        )
+        .expect("visual increment fixture");
+        let correction = MapCorrectionApplied {
+            id: MapCorrectionId::FIRST,
+            kind: MapCorrectionKind::SynchronousBundleAdjustment,
+            before,
+            after,
+            corrected_keyframes: NonZeroUsize::MIN,
+        };
+        let localization = MapLocalization::new(to, after, world_to_camera);
+        let output = TrackerOutput {
+            pose: Some(world_to_camera),
+            pose_status: PoseStatus::Current,
+            inliers: 1,
+            keyframe: None,
+            stereo_matches: None,
+            frame_id: to.frame_id(),
+            health: SystemHealth::from_components(
+                TrackingHealth::Good,
+                false,
+                false,
+                false,
+                false,
+                BackendStats::default(),
+            ),
+            diagnostics: FrameDiagnostics::empty(1, 1),
+            events: Vec::new(),
+            visual_increment: Some(visual_increment),
+            map_corrections: vec![correction],
+            current_map_localization: Some(localization),
+        };
+
+        let parts = output.into_status_parts();
+        assert_eq!(parts.map_corrections, vec![correction]);
+        assert_eq!(
+            parts.visual_increment.expect("visual provenance").basis(),
+            visual_increment.basis()
+        );
+        let preserved_localization = parts
+            .current_map_localization
+            .expect("map-localization provenance");
+        assert_eq!(preserved_localization.visual_stamp(), to);
+        assert_eq!(preserved_localization.map_snapshot(), after);
+        assert_eq!(
+            preserved_localization.world_to_camera().translation(),
+            world_to_camera.translation()
+        );
+    }
+
+    #[test]
+    fn map_correction_ids_are_monotonic_and_fail_closed_at_exhaustion() {
+        let mut ids = MapCorrectionIds::new();
+        assert_eq!(ids.take_next().expect("first ID").as_u64(), 1);
+        assert_eq!(ids.take_next().expect("second ID").as_u64(), 2);
+
+        let maximum = MapCorrectionId(NonZeroU64::new(u64::MAX).expect("non-zero maximum"));
+        let mut final_id = MapCorrectionIds::from_next(maximum);
+        assert!(final_id.ensure_available().is_ok());
+        assert_eq!(final_id.take_next().expect("last ID"), maximum);
+        assert_eq!(final_id.ensure_available(), Err(MapCorrectionIdExhausted));
+        assert_eq!(final_id.take_next(), Err(MapCorrectionIdExhausted));
     }
 
     fn make_forced_panic_event(
