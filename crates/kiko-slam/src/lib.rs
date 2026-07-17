@@ -9,7 +9,7 @@ mod ort_compat;
 
 pub use inference::{
     EigenPlaces, End2EndPipeline, End2EndTimings, InferenceBackend, InferenceError, LightGlue,
-    PlaceDescriptorExtractor, SuperPoint,
+    PlaceDescriptorExtractor, SuperPoint, SuperPointSparseProfile,
 };
 mod calibration;
 mod capture;
@@ -687,6 +687,11 @@ impl Descriptor {
     pub const ZERO: Self = Self([0.0; DESCRIPTOR_DIM]);
 
     pub fn try_new(values: [f32; DESCRIPTOR_DIM]) -> Result<Self, DescriptorError> {
+        Self::validate_components(&values)?;
+        Ok(Self(values))
+    }
+
+    pub(crate) fn validate_components(values: &[f32]) -> Result<(), DescriptorError> {
         let mut norm_squared = 0.0_f64;
         for (index, &value) in values.iter().enumerate() {
             if !value.is_finite() {
@@ -698,7 +703,11 @@ impl Descriptor {
         if norm_squared > MAX_DESCRIPTOR_NORM_SQUARED {
             return Err(DescriptorError::NormExceedsRawDotProductDomain { norm_squared });
         }
-        Ok(Self(values))
+        Ok(())
+    }
+
+    pub(crate) fn from_validated_components(values: [f32; DESCRIPTOR_DIM]) -> Self {
+        Self(values)
     }
 
     pub fn as_slice(&self) -> &[f32] {
@@ -975,6 +984,30 @@ impl Detections {
             scores,
             descriptors,
         )
+    }
+
+    /// Builds detections from components whose complete domain contract was parsed upstream.
+    ///
+    /// The caller must prove equal lengths, finite values, and keypoint bounds in `dimensions`.
+    /// Public or weakly typed inputs must use [`Self::new`] or [`Self::from_dimensions`].
+    pub(crate) fn from_parsed_components(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        dimensions: FrameDimensions,
+        keypoints: Vec<Keypoint>,
+        scores: Vec<f32>,
+        descriptors: Vec<Descriptor>,
+    ) -> Self {
+        debug_assert_eq!(keypoints.len(), scores.len());
+        debug_assert_eq!(scores.len(), descriptors.len());
+        Self {
+            sensor_id,
+            frame_id,
+            dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        }
     }
 
     fn require_equal_lengths(

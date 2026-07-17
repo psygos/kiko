@@ -14,6 +14,43 @@ use std::path::Path;
 
 use crate::DESCRIPTOR_DIM;
 
+// The sparse adapter implements the declared profile exported by the tracked
+// sp_topk2048.onnx artifact. A matching session interface selects this adapter,
+// but cannot attest the model's internal semantics; callers declare the profile.
+const MODEL_STRIDE: u32 = 8;
+const EXCLUDED_BORDER: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SuperPointSparseProfile {
+    /// The tracked f16 sparse exports, including the active 2048-row Jetson model.
+    #[default]
+    CanonicalFp16,
+    /// The archived f32 `superpoint_512.onnx` export.
+    LegacyFp32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SparseOutputContract {
+    capacity: usize,
+    score_threshold: f32,
+}
+
+impl SuperPointSparseProfile {
+    const fn contract(self) -> SparseOutputContract {
+        match self {
+            Self::CanonicalFp16 => SparseOutputContract {
+                capacity: 2048,
+                // Exact f32 value of the graph's exported fp16 threshold (0x1019).
+                score_threshold: f32::from_bits(0x3a03_2000),
+            },
+            Self::LegacyFp32 => SparseOutputContract {
+                capacity: 512,
+                score_threshold: f32::from_bits(0x3a03_126f),
+            },
+        }
+    }
+}
+
 pub struct SuperPoint {
     session: Session,
     run_options: RunOptions,
@@ -28,16 +65,10 @@ pub struct SuperPoint {
     dense_candidate_cap: Option<NonZeroUsize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum SuperPointModelKind {
-    SparseOutputs(SparseKeypointKind),
+    SparseOutputs(SparseOutputContract),
     DenseHeads,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SparseKeypointKind {
-    Float32,
-    Int64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,20 +84,80 @@ struct DenseCandidate {
     score: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SuperPointInputDomain {
+    scale: u32,
+    effective_width: u32,
+    effective_height: u32,
+}
+
+impl SuperPointInputDomain {
+    fn try_new(
+        model_dimensions: FrameDimensions,
+        frame_dimensions: FrameDimensions,
+        downscale: Option<DownscaleFactor>,
+    ) -> Result<Self, InferenceError> {
+        let width = model_dimensions.width();
+        let height = model_dimensions.height();
+        if width < MODEL_STRIDE || height < MODEL_STRIDE {
+            return Err(InferenceError::InputDimensionsTooSmall {
+                model: "superpoint",
+                width,
+                height,
+                minimum: MODEL_STRIDE,
+            });
+        }
+
+        let scale = downscale.map_or(1, DownscaleFactor::as_u32);
+        if width.checked_mul(scale) != Some(frame_dimensions.width())
+            || height.checked_mul(scale) != Some(frame_dimensions.height())
+        {
+            return Err(InferenceError::InvariantViolation {
+                context: "SuperPoint model dimensions do not map to the frame dimensions",
+            });
+        }
+
+        Ok(Self {
+            scale,
+            effective_width: width / MODEL_STRIDE * MODEL_STRIDE,
+            effective_height: height / MODEL_STRIDE * MODEL_STRIDE,
+        })
+    }
+}
+
 impl SuperPoint {
     pub fn new(path: impl AsRef<Path>) -> Result<Self, InferenceError> {
-        Self::new_with_backend(path, InferenceBackend::auto())
+        Self::new_with_backend_and_sparse_profile(
+            path,
+            InferenceBackend::auto(),
+            SuperPointSparseProfile::default(),
+        )
+    }
+
+    pub fn new_with_sparse_profile(
+        path: impl AsRef<Path>,
+        sparse_profile: SuperPointSparseProfile,
+    ) -> Result<Self, InferenceError> {
+        Self::new_with_backend_and_sparse_profile(path, InferenceBackend::auto(), sparse_profile)
     }
 
     pub fn new_with_backend(
         path: impl AsRef<Path>,
         backend: InferenceBackend,
     ) -> Result<Self, InferenceError> {
+        Self::new_with_backend_and_sparse_profile(path, backend, SuperPointSparseProfile::default())
+    }
+
+    pub fn new_with_backend_and_sparse_profile(
+        path: impl AsRef<Path>,
+        backend: InferenceBackend,
+        sparse_profile: SuperPointSparseProfile,
+    ) -> Result<Self, InferenceError> {
         let path = path.as_ref();
         let (session, selected, diagnostics) = build_session(path, backend)?;
         let run_options = build_run_options(selected)?;
         let (kind, input_kind) =
-            parse_superpoint_model_interface(session.inputs(), session.outputs())?;
+            parse_superpoint_model_interface(session.inputs(), session.outputs(), sparse_profile)?;
         let dense_candidate_cap =
             inference_env(crate::env::try_env_usize("KIKO_SUPERPOINT_DENSE_CAP"))?
                 .map(|value| {
@@ -251,49 +342,40 @@ impl SuperPoint {
     }
 }
 
-const SUPERPOINT_INTERFACE_DESCRIPTION: &str = "an image tensor input [1, 1, height, width] (dynamic dimensions allowed) of f32 or u8 and either sparse outputs keypoints:(f32|i64), scores:f32, descriptors:f32 or dense outputs dense_scores:f32, dense_descriptors:f32";
+const SUPERPOINT_INTERFACE_DESCRIPTION: &str = "one image tensor input f32|u8 [1, 1, height, width] and either the canonical sparse outputs keypoints:i64 [1, N, 2], scores:f32 [1, N], descriptors:f32 rank-3, or the dense-head outputs dense_scores:f32 and dense_descriptors:f32";
 
 fn parse_superpoint_model_interface(
     inputs: &[Outlet],
     outputs: &[Outlet],
+    sparse_profile: SuperPointSparseProfile,
 ) -> Result<(SuperPointModelKind, SuperPointInputKind), InferenceError> {
-    let input_kind = match inputs
-        .iter()
-        .find(|outlet| outlet.name() == "image")
-        .map(Outlet::dtype)
-    {
-        Some(ValueType::Tensor {
+    if inputs.len() != 1 || inputs[0].name() != "image" {
+        return Err(unsupported_superpoint_interface(inputs, outputs));
+    }
+    let input_kind = match inputs[0].dtype() {
+        ValueType::Tensor {
             ty: TensorElementType::Float32,
             shape,
             ..
-        }) if superpoint_input_shape_supported(shape) => SuperPointInputKind::Float32,
-        Some(ValueType::Tensor {
+        } if superpoint_input_shape_supported(shape) => SuperPointInputKind::Float32,
+        ValueType::Tensor {
             ty: TensorElementType::Uint8,
             shape,
             ..
-        }) if superpoint_input_shape_supported(shape) => SuperPointInputKind::Uint8,
+        } if superpoint_input_shape_supported(shape) => SuperPointInputKind::Uint8,
         _ => return Err(unsupported_superpoint_interface(inputs, outputs)),
     };
 
-    let kind = if outlet_tensor_element_type(outputs, "dense_scores")
-        == Some(TensorElementType::Float32)
+    let kind = if outputs.len() == 2
+        && outlet_tensor_element_type(outputs, "dense_scores") == Some(TensorElementType::Float32)
         && outlet_tensor_element_type(outputs, "dense_descriptors")
             == Some(TensorElementType::Float32)
     {
         SuperPointModelKind::DenseHeads
+    } else if canonical_sparse_interface(outputs) {
+        SuperPointModelKind::SparseOutputs(sparse_profile.contract())
     } else {
-        let keypoint_kind = match outlet_tensor_element_type(outputs, "keypoints") {
-            Some(TensorElementType::Float32) => SparseKeypointKind::Float32,
-            Some(TensorElementType::Int64) => SparseKeypointKind::Int64,
-            _ => return Err(unsupported_superpoint_interface(inputs, outputs)),
-        };
-        if outlet_tensor_element_type(outputs, "scores") != Some(TensorElementType::Float32)
-            || outlet_tensor_element_type(outputs, "descriptors")
-                != Some(TensorElementType::Float32)
-        {
-            return Err(unsupported_superpoint_interface(inputs, outputs));
-        }
-        SuperPointModelKind::SparseOutputs(keypoint_kind)
+        return Err(unsupported_superpoint_interface(inputs, outputs));
     };
 
     Ok((kind, input_kind))
@@ -301,10 +383,44 @@ fn parse_superpoint_model_interface(
 
 fn superpoint_input_shape_supported(shape: &ort::value::Shape) -> bool {
     shape.len() == 4
-        && matches!(shape[0], -1 | 1)
-        && matches!(shape[1], -1 | 1)
+        && shape[0] == 1
+        && shape[1] == 1
         && (shape[2] == -1 || shape[2] > 0)
         && (shape[3] == -1 || shape[3] > 0)
+}
+
+fn canonical_sparse_interface(outputs: &[Outlet]) -> bool {
+    outputs.len() == 3
+        && outlet_tensor_shape(outputs, "keypoints", TensorElementType::Int64)
+            .is_some_and(|shape| {
+                shape.len() == 3
+                    && shape[0] == 1
+                    && (shape[1] == -1 || shape[1] >= 0)
+                    && shape[2] == 2
+            })
+        && outlet_tensor_shape(outputs, "scores", TensorElementType::Float32).is_some_and(
+            |shape| {
+                shape.len() == 2
+                    && shape[0] == 1
+                    && (shape[1] == -1 || shape[1] >= 0)
+            },
+        )
+        // The tracked exports have inaccurate symbolic descriptor dimensions;
+        // rank and type are construction-time facts, exact [1, N, 256] is a
+        // concrete runtime requirement.
+        && outlet_tensor_shape(outputs, "descriptors", TensorElementType::Float32)
+            .is_some_and(|shape| shape.len() == 3)
+}
+
+fn outlet_tensor_shape<'a>(
+    outlets: &'a [Outlet],
+    name: &str,
+    expected_type: TensorElementType,
+) -> Option<&'a ort::value::Shape> {
+    match outlets.iter().find(|outlet| outlet.name() == name)?.dtype() {
+        ValueType::Tensor { ty, shape, .. } if *ty == expected_type => Some(shape),
+        _ => None,
+    }
 }
 
 fn outlet_tensor_element_type(outlets: &[Outlet], name: &str) -> Option<TensorElementType> {
@@ -357,14 +473,15 @@ where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
     match kind {
-        SuperPointModelKind::SparseOutputs(keypoint_kind) => run_sparse_inference(
+        SuperPointModelKind::SparseOutputs(contract) => run_sparse_inference(
             session,
             run_options,
             frame,
             input_tensor,
-            keypoint_kind,
             input_dimensions,
             downscale,
+            max_keypoints,
+            contract,
             diagnostics,
         ),
         SuperPointModelKind::DenseHeads => run_dense_inference(
@@ -383,19 +500,23 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sparse_inference<T>(
     session: &mut Session,
     run_options: &RunOptions,
     frame: &Frame,
     input_tensor: TensorRef<'_, T>,
-    keypoint_kind: SparseKeypointKind,
     input_dimensions: FrameDimensions,
     downscale: Option<DownscaleFactor>,
+    max_keypoints: usize,
+    contract: SparseOutputContract,
     diagnostics: InferenceRunDiagnostics,
 ) -> Result<Detections, InferenceError>
 where
     T: PrimitiveTensorElementType + std::fmt::Debug,
 {
+    let input_domain =
+        SuperPointInputDomain::try_new(input_dimensions, frame.dimensions(), downscale)?;
     let outputs = super::run_with_slow_call_diagnostics(diagnostics, "superpoint", || {
         session
             .run_with_options(ort::inputs!["image" => input_tensor], run_options)
@@ -429,59 +550,245 @@ where
                 actual: "missing output".to_string(),
             })?;
 
-    // `ort` may return a null backing pointer for empty tensors; avoid raw extraction in that case.
-    let scores = match tensor_num_elements(scores_value, "scores")? {
-        0 => Vec::new(),
-        _ => super::extract_tensor::<f32>(scores_value, "scores")?
-            .1
-            .to_vec(),
-    };
-    let keypoints_pairs = match tensor_num_elements(keypoints_value, "keypoints")? {
-        0 => Vec::new(),
-        _ => match keypoint_kind {
-            SparseKeypointKind::Float32 => {
-                let (shape, data) = super::extract_tensor::<f32>(keypoints_value, "keypoints")?;
-                parse_keypoint_pairs(shape, data, "keypoints", |index, value| {
-                    finite_keypoint_coordinate("keypoints", index, value)
-                })?
-            }
-            SparseKeypointKind::Int64 => {
-                let (shape, data) = super::extract_tensor::<i64>(keypoints_value, "keypoints")?;
-                parse_keypoint_pairs(shape, data, "keypoints", |index, value| {
-                    super::exact_i64_output_f32("keypoints", index, value)
-                })?
-            }
-        },
-    };
-    let mut keypoints = to_keypoints(
-        &keypoints_pairs,
-        input_dimensions.width() as f32,
-        input_dimensions.height() as f32,
-    );
-    if let Some(scale) = downscale {
-        let factor = scale.get() as f32;
-        for kp in &mut keypoints {
-            kp.x *= factor;
-            kp.y *= factor;
-        }
-    }
-    let descriptors = match tensor_num_elements(descriptors_value, "descriptors")? {
-        0 => Vec::new(),
-        _ => {
-            let descriptors_raw = super::extract_tensor::<f32>(descriptors_value, "descriptors")?;
-            parse_descriptors(descriptors_raw.1, "descriptors")?
-        }
-    };
-
-    Detections::from_dimensions(
-        frame.sensor_id(),
-        frame.frame_id(),
-        frame.dimensions(),
+    let keypoints =
+        extract_tensor_allow_empty::<i64>(keypoints_value, "keypoints", TensorElementType::Int64)?;
+    let scores =
+        extract_tensor_allow_empty::<f32>(scores_value, "scores", TensorElementType::Float32)?;
+    let descriptors = extract_tensor_allow_empty::<f32>(
+        descriptors_value,
+        "descriptors",
+        TensorElementType::Float32,
+    )?;
+    let parsed = parse_sparse_outputs(
         keypoints,
         scores,
         descriptors,
-    )
-    .map_err(InferenceError::Detection)
+        input_domain,
+        max_keypoints,
+        contract,
+    )?;
+
+    Ok(Detections::from_parsed_components(
+        frame.sensor_id(),
+        frame.frame_id(),
+        frame.dimensions(),
+        parsed.keypoints,
+        parsed.scores,
+        parsed.descriptors,
+    ))
+}
+
+fn extract_tensor_allow_empty<'value, T: PrimitiveTensorElementType>(
+    value: &'value ort::value::DynValue,
+    name: &str,
+    expected_type: TensorElementType,
+) -> Result<(&'value ort::value::Shape, &'value [T]), InferenceError> {
+    if let ValueType::Tensor { ty, shape, .. } = value.dtype()
+        && *ty == expected_type
+        && shape.num_elements() == 0
+    {
+        // ONNX Runtime may represent an empty tensor with a null backing pointer.
+        // The concrete shape and construction-time type still define an empty slice.
+        return Ok((shape, &[]));
+    }
+    super::extract_tensor::<T>(value, name)
+}
+
+#[derive(Debug)]
+struct ParsedSuperPointOutput {
+    keypoints: Vec<Keypoint>,
+    scores: Vec<f32>,
+    descriptors: Vec<Descriptor>,
+}
+
+fn parse_sparse_outputs(
+    keypoints: (&ort::value::Shape, &[i64]),
+    scores: (&ort::value::Shape, &[f32]),
+    descriptors: (&ort::value::Shape, &[f32]),
+    input_domain: SuperPointInputDomain,
+    max_keypoints: usize,
+    contract: SparseOutputContract,
+) -> Result<ParsedSuperPointOutput, InferenceError> {
+    let (keypoint_shape, keypoint_data) = keypoints;
+    let count_i64 = match &keypoint_shape[..] {
+        [1, count, 2] if *count >= 0 => *count,
+        _ => {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "keypoints".to_string(),
+                expected: format!(
+                    "i64 tensor shape [1, N, 2] with 0 <= N <= {}",
+                    contract.capacity
+                ),
+                actual: format!("tensor shape {keypoint_shape}"),
+            });
+        }
+    };
+    let count = usize::try_from(count_i64).map_err(|_| InferenceError::UnexpectedOutput {
+        name: "keypoints".to_string(),
+        expected: "keypoint count representable by the host".to_string(),
+        actual: format!("keypoint count {count_i64}"),
+    })?;
+    if count > contract.capacity {
+        return Err(InferenceError::UnexpectedOutput {
+            name: "keypoints".to_string(),
+            expected: format!("at most {} keypoints", contract.capacity),
+            actual: format!("{count} keypoints"),
+        });
+    }
+
+    let keypoint_elements =
+        count
+            .checked_mul(2)
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "keypoints".to_string(),
+                expected: "keypoint tensor size representable by the host".to_string(),
+                actual: format!("keypoint count {count}"),
+            })?;
+    require_shape_and_length(
+        "keypoints",
+        keypoint_shape,
+        keypoint_data.len(),
+        &[1, count_i64, 2],
+        keypoint_elements,
+    )?;
+    require_shape_and_length("scores", scores.0, scores.1.len(), &[1, count_i64], count)?;
+    let descriptor_elements =
+        count
+            .checked_mul(DESCRIPTOR_DIM)
+            .ok_or_else(|| InferenceError::UnexpectedOutput {
+                name: "descriptors".to_string(),
+                expected: "descriptor tensor size representable by the host".to_string(),
+                actual: format!("descriptor count {count}"),
+            })?;
+    require_shape_and_length(
+        "descriptors",
+        descriptors.0,
+        descriptors.1.len(),
+        &[1, count_i64, DESCRIPTOR_DIM as i64],
+        descriptor_elements,
+    )?;
+
+    let mut previous_score = f32::INFINITY;
+    for (index, &score) in scores.1.iter().enumerate() {
+        if !score.is_finite() || score <= contract.score_threshold || score > 1.0 {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "scores".to_string(),
+                expected: format!(
+                    "finite confidence scores within ({}, 1] in non-increasing order",
+                    contract.score_threshold
+                ),
+                actual: format!("index {index} contains {score}"),
+            });
+        }
+        if score > previous_score {
+            return Err(InferenceError::UnexpectedOutput {
+                name: "scores".to_string(),
+                expected: "confidence scores in non-increasing TopK order".to_string(),
+                actual: format!(
+                    "index {index} contains {score} after {}",
+                    scores.1[index - 1]
+                ),
+            });
+        }
+        previous_score = score;
+    }
+
+    let selected_count = count.min(max_keypoints);
+    let mut parsed_keypoints = Vec::with_capacity(selected_count);
+    for (index, pair) in keypoint_data.chunks_exact(2).enumerate() {
+        let x = parse_canonical_coordinate(
+            pair[0],
+            input_domain.effective_width,
+            input_domain.scale,
+            index,
+            "x",
+        )?;
+        let y = parse_canonical_coordinate(
+            pair[1],
+            input_domain.effective_height,
+            input_domain.scale,
+            index,
+            "y",
+        )?;
+        if index < selected_count {
+            parsed_keypoints.push(Keypoint { x, y });
+        }
+    }
+
+    let mut parsed_descriptors = Vec::with_capacity(selected_count);
+    for (descriptor_index, chunk) in descriptors.1.chunks_exact(DESCRIPTOR_DIM).enumerate() {
+        Descriptor::validate_components(chunk).map_err(|source| {
+            InferenceError::DescriptorOutput {
+                name: "descriptors".to_string(),
+                descriptor_index,
+                source,
+            }
+        })?;
+        if descriptor_index < selected_count {
+            let mut descriptor = [0.0_f32; DESCRIPTOR_DIM];
+            descriptor.copy_from_slice(chunk);
+            parsed_descriptors.push(Descriptor::from_validated_components(descriptor));
+        }
+    }
+
+    Ok(ParsedSuperPointOutput {
+        keypoints: parsed_keypoints,
+        scores: scores.1[..selected_count].to_vec(),
+        descriptors: parsed_descriptors,
+    })
+}
+
+fn require_shape_and_length(
+    name: &str,
+    shape: &ort::value::Shape,
+    actual_length: usize,
+    expected_shape: &[i64],
+    expected_length: usize,
+) -> Result<(), InferenceError> {
+    if &shape[..] == expected_shape && actual_length == expected_length {
+        return Ok(());
+    }
+
+    Err(InferenceError::UnexpectedOutput {
+        name: name.to_string(),
+        expected: format!("shape {expected_shape:?} with {expected_length} elements"),
+        actual: format!("shape {shape} with {actual_length} elements"),
+    })
+}
+
+fn parse_canonical_coordinate(
+    value: i64,
+    effective_extent: u32,
+    scale: u32,
+    keypoint_index: usize,
+    axis: &'static str,
+) -> Result<f32, InferenceError> {
+    let upper_bound = effective_extent - EXCLUDED_BORDER;
+    let coordinate = u32::try_from(value)
+        .ok()
+        .filter(|&coordinate| coordinate >= EXCLUDED_BORDER && coordinate < upper_bound)
+        .ok_or_else(|| InferenceError::UnexpectedOutput {
+            name: "keypoints".to_string(),
+            expected: format!(
+                "absolute integer {axis} coordinates within [{EXCLUDED_BORDER}, {upper_bound})"
+            ),
+            actual: format!("keypoint {keypoint_index} contains {axis}={value}"),
+        })?;
+    let scaled = coordinate
+        .checked_mul(scale)
+        .ok_or(InferenceError::InvariantViolation {
+            context: "validated SuperPoint coordinate scaling overflowed",
+        })?;
+    let narrowed = scaled as f32;
+    if f64::from(narrowed) != f64::from(scaled) {
+        return Err(InferenceError::KeypointCoordinateUnrepresentable {
+            model: "superpoint",
+            index: keypoint_index,
+            axis,
+            coordinate: scaled,
+        });
+    }
+    Ok(narrowed)
 }
 
 // Dense decoding mutates two independent scratch buffers in addition to inference inputs.
@@ -829,212 +1136,13 @@ fn sample_dense_descriptor(
     Descriptor::try_new(out)
 }
 
-fn tensor_num_elements(
-    value: &ort::value::Value<ort::value::DynValueTypeMarker>,
-    output_name: &str,
-) -> Result<usize, InferenceError> {
-    match value.dtype() {
-        ValueType::Tensor { shape, .. } => Ok(shape.num_elements()),
-        dtype => Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: "tensor output".to_string(),
-            actual: format!("{dtype:?}"),
-        }),
-    }
-}
-
-fn parse_descriptors(data: &[f32], output_name: &str) -> Result<Vec<Descriptor>, InferenceError> {
-    if data.len() % DESCRIPTOR_DIM != 0 {
-        return Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: format!(
-                "tensor with element count divisible by {DESCRIPTOR_DIM} (descriptor dimension)"
-            ),
-            actual: format!("tensor with {} elements", data.len()),
-        });
-    }
-
-    let mut descriptors = Vec::with_capacity(data.len() / DESCRIPTOR_DIM);
-    for (descriptor_index, chunk) in data.chunks_exact(DESCRIPTOR_DIM).enumerate() {
-        let mut descriptor = [0.0_f32; DESCRIPTOR_DIM];
-        descriptor.copy_from_slice(chunk);
-        descriptors.push(Descriptor::try_new(descriptor).map_err(|source| {
-            InferenceError::DescriptorOutput {
-                name: output_name.to_string(),
-                descriptor_index,
-                source,
-            }
-        })?);
-    }
-    Ok(descriptors)
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Normalization {
-    None,
-    ZeroToOne,
-    NegOneToOne,
-}
-
-fn parse_keypoint_pairs<T: Copy>(
-    shape: &ort::value::Shape,
-    data: &[T],
-    output_name: &str,
-    mut parse_coordinate: impl FnMut(usize, T) -> Result<f32, InferenceError>,
-) -> Result<Vec<[f32; 2]>, InferenceError> {
-    let expected_len = shape.num_elements();
-    if expected_len != 0 && expected_len != data.len() {
-        return Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: format!("tensor with {expected_len} elements"),
-            actual: format!("tensor with {} elements", data.len()),
-        });
-    }
-
-    if data.len() % 2 != 0 {
-        return Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: "even-sized tensor".to_string(),
-            actual: format!("tensor with {} elements", data.len()),
-        });
-    }
-
-    let dims = &shape[..];
-    let count = data.len() / 2;
-    let mut pairs = Vec::with_capacity(count);
-
-    if dims.last().copied() == Some(2) {
-        for i in 0..count {
-            pairs.push([
-                parse_coordinate(2 * i, data[2 * i])?,
-                parse_coordinate(2 * i + 1, data[2 * i + 1])?,
-            ]);
-        }
-        return Ok(pairs);
-    }
-
-    if dims.first().copied() == Some(2) {
-        let (first, second) = data.split_at(count);
-        for i in 0..count {
-            pairs.push([
-                parse_coordinate(i, first[i])?,
-                parse_coordinate(count + i, second[i])?,
-            ]);
-        }
-        return Ok(pairs);
-    }
-
-    Err(InferenceError::UnexpectedOutput {
-        name: output_name.to_string(),
-        expected: "tensor with a leading or trailing dimension of size 2".to_string(),
-        actual: format!("{shape}"),
-    })
-}
-
-fn finite_keypoint_coordinate(
-    output_name: &str,
-    index: usize,
-    value: f32,
-) -> Result<f32, InferenceError> {
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(InferenceError::UnexpectedOutput {
-            name: output_name.to_string(),
-            expected: "finite keypoint coordinates".to_string(),
-            actual: format!("coordinate {index} is {value}"),
-        })
-    }
-}
-
-fn extract_xy(
-    pair: &[f32; 2],
-    width: f32,
-    height: f32,
-    norm: Normalization,
-    swap: bool,
-) -> (f32, f32) {
-    if swap {
-        (
-            scale_coordinate(pair[1], width, norm),
-            scale_coordinate(pair[0], height, norm),
-        )
-    } else {
-        (
-            scale_coordinate(pair[0], width, norm),
-            scale_coordinate(pair[1], height, norm),
-        )
-    }
-}
-
-fn to_keypoints(pairs: &[[f32; 2]], width: f32, height: f32) -> Vec<Keypoint> {
-    let norm = detect_normalization(pairs);
-    let score_xy = count_in_bounds(pairs, width, height, norm, false);
-    let score_yx = count_in_bounds(pairs, width, height, norm, true);
-    let swap = score_yx > score_xy;
-
-    pairs
-        .iter()
-        .map(|pair| {
-            let (x, y) = extract_xy(pair, width, height, norm, swap);
-            Keypoint { x, y }
-        })
-        .collect()
-}
-
-fn detect_normalization(pairs: &[[f32; 2]]) -> Normalization {
-    let mut min_value = f32::INFINITY;
-    let mut max_value = f32::NEG_INFINITY;
-
-    for [a, b] in pairs {
-        min_value = min_value.min(*a).min(*b);
-        max_value = max_value.max(*a).max(*b);
-    }
-
-    let epsilon = 1e-3_f32;
-    if min_value >= -epsilon && max_value <= 1.0 + epsilon {
-        return Normalization::ZeroToOne;
-    }
-    if min_value >= -1.0 - epsilon && max_value <= 1.0 + epsilon {
-        return Normalization::NegOneToOne;
-    }
-
-    Normalization::None
-}
-
-fn count_in_bounds(
-    pairs: &[[f32; 2]],
-    width: f32,
-    height: f32,
-    norm: Normalization,
-    swap: bool,
-) -> usize {
-    pairs
-        .iter()
-        .filter(|pair| {
-            let (x, y) = extract_xy(pair, width, height, norm, swap);
-            x >= 0.0 && x < width && y >= 0.0 && y < height
-        })
-        .count()
-}
-
-fn scale_coordinate(value: f32, dim: f32, norm: Normalization) -> f32 {
-    let extent = if dim > 1.0 { dim - 1.0 } else { 1.0 };
-    match norm {
-        Normalization::None => value,
-        Normalization::ZeroToOne => value * extent,
-        Normalization::NegOneToOne => (value + 1.0) * 0.5 * extent,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error as _;
 
-    fn tensor_outlet(name: &str, ty: TensorElementType) -> Outlet {
-        tensor_outlet_with_shape(name, ty, [-1_i64, -1, -1, -1])
-    }
+    const CANONICAL_CONTRACT: SparseOutputContract =
+        SuperPointSparseProfile::CanonicalFp16.contract();
+    const LEGACY_CONTRACT: SparseOutputContract = SuperPointSparseProfile::LegacyFp32.contract();
 
     fn tensor_outlet_with_shape<const N: usize>(
         name: &str,
@@ -1053,41 +1161,159 @@ mod tests {
         )
     }
 
+    fn image_outlet(ty: TensorElementType) -> Outlet {
+        tensor_outlet_with_shape("image", ty, [1_i64, 1, -1, -1])
+    }
+
+    fn canonical_sparse_outlets(keypoint_type: TensorElementType) -> [Outlet; 3] {
+        [
+            tensor_outlet_with_shape("keypoints", keypoint_type, [1_i64, -1, 2]),
+            tensor_outlet_with_shape("scores", TensorElementType::Float32, [1_i64, -1]),
+            // This deliberately mirrors the tracked artifact's inaccurate
+            // symbolic descriptor dimensions. Runtime parsing is exact.
+            tensor_outlet_with_shape("descriptors", TensorElementType::Float32, [-1_i64, -1, -1]),
+        ]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_fixture(
+        keypoint_shape: &[i64],
+        keypoint_data: &[i64],
+        score_shape: &[i64],
+        score_data: &[f32],
+        descriptor_shape: &[i64],
+        descriptor_data: &[f32],
+        model_dimensions: FrameDimensions,
+        frame_dimensions: FrameDimensions,
+        downscale: Option<DownscaleFactor>,
+        max_keypoints: usize,
+    ) -> Result<ParsedSuperPointOutput, InferenceError> {
+        parse_fixture_with_contract(
+            keypoint_shape,
+            keypoint_data,
+            score_shape,
+            score_data,
+            descriptor_shape,
+            descriptor_data,
+            model_dimensions,
+            frame_dimensions,
+            downscale,
+            max_keypoints,
+            CANONICAL_CONTRACT,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parse_fixture_with_contract(
+        keypoint_shape: &[i64],
+        keypoint_data: &[i64],
+        score_shape: &[i64],
+        score_data: &[f32],
+        descriptor_shape: &[i64],
+        descriptor_data: &[f32],
+        model_dimensions: FrameDimensions,
+        frame_dimensions: FrameDimensions,
+        downscale: Option<DownscaleFactor>,
+        max_keypoints: usize,
+        contract: SparseOutputContract,
+    ) -> Result<ParsedSuperPointOutput, InferenceError> {
+        let keypoint_shape = ort::value::Shape::new(keypoint_shape.iter().copied());
+        let score_shape = ort::value::Shape::new(score_shape.iter().copied());
+        let descriptor_shape = ort::value::Shape::new(descriptor_shape.iter().copied());
+        let input_domain =
+            SuperPointInputDomain::try_new(model_dimensions, frame_dimensions, downscale)?;
+        parse_sparse_outputs(
+            (&keypoint_shape, keypoint_data),
+            (&score_shape, score_data),
+            (&descriptor_shape, descriptor_data),
+            input_domain,
+            max_keypoints,
+            contract,
+        )
+    }
+
+    fn parse_original_scale(
+        keypoint_shape: &[i64],
+        keypoint_data: &[i64],
+        score_shape: &[i64],
+        score_data: &[f32],
+        descriptor_shape: &[i64],
+        descriptor_data: &[f32],
+    ) -> Result<ParsedSuperPointOutput, InferenceError> {
+        let dimensions = FrameDimensions::try_new(640, 480).expect("valid dimensions");
+        parse_fixture(
+            keypoint_shape,
+            keypoint_data,
+            score_shape,
+            score_data,
+            descriptor_shape,
+            descriptor_data,
+            dimensions,
+            dimensions,
+            None,
+            usize::MAX,
+        )
+    }
+
+    fn assert_output_error(
+        result: Result<ParsedSuperPointOutput, InferenceError>,
+        expected_name: &str,
+    ) {
+        assert!(matches!(
+            result.expect_err("malformed model output"),
+            InferenceError::UnexpectedOutput { name, .. } if name == expected_name
+        ));
+    }
+
     #[test]
     fn superpoint_interface_is_parsed_once_into_supported_kinds() {
-        let float_input = [tensor_outlet("image", TensorElementType::Float32)];
-        let uint8_input = [tensor_outlet("image", TensorElementType::Uint8)];
-        let sparse_i64 = [
-            tensor_outlet("keypoints", TensorElementType::Int64),
-            tensor_outlet("scores", TensorElementType::Float32),
-            tensor_outlet("descriptors", TensorElementType::Float32),
-        ];
-        let sparse_f32 = [
-            tensor_outlet("keypoints", TensorElementType::Float32),
-            tensor_outlet("scores", TensorElementType::Float32),
-            tensor_outlet("descriptors", TensorElementType::Float32),
-        ];
+        let float_input = [image_outlet(TensorElementType::Float32)];
+        let uint8_input = [image_outlet(TensorElementType::Uint8)];
+        let sparse_i64 = canonical_sparse_outlets(TensorElementType::Int64);
         let dense = [
-            tensor_outlet("dense_scores", TensorElementType::Float32),
-            tensor_outlet("dense_descriptors", TensorElementType::Float32),
+            tensor_outlet_with_shape(
+                "dense_scores",
+                TensorElementType::Float32,
+                [1_i64, 65, -1, -1],
+            ),
+            tensor_outlet_with_shape(
+                "dense_descriptors",
+                TensorElementType::Float32,
+                [1_i64, DESCRIPTOR_DIM as i64, -1, -1],
+            ),
         ];
 
         assert_eq!(
-            parse_superpoint_model_interface(&float_input, &sparse_i64).expect("sparse i64"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &sparse_i64,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect("sparse i64"),
             (
-                SuperPointModelKind::SparseOutputs(SparseKeypointKind::Int64),
+                SuperPointModelKind::SparseOutputs(CANONICAL_CONTRACT),
                 SuperPointInputKind::Float32
             )
         );
         assert_eq!(
-            parse_superpoint_model_interface(&uint8_input, &sparse_f32).expect("sparse f32"),
+            parse_superpoint_model_interface(
+                &uint8_input,
+                &sparse_i64,
+                SuperPointSparseProfile::LegacyFp32,
+            )
+            .expect("sparse u8"),
             (
-                SuperPointModelKind::SparseOutputs(SparseKeypointKind::Float32),
+                SuperPointModelKind::SparseOutputs(LEGACY_CONTRACT),
                 SuperPointInputKind::Uint8
             )
         );
         assert_eq!(
-            parse_superpoint_model_interface(&float_input, &dense).expect("dense"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &dense,
+                SuperPointSparseProfile::LegacyFp32,
+            )
+            .expect("dense"),
             (
                 SuperPointModelKind::DenseHeads,
                 SuperPointInputKind::Float32
@@ -1096,35 +1322,166 @@ mod tests {
     }
 
     #[test]
+    fn every_tracked_superpoint_artifact_selects_an_explicit_profile() {
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+        for name in [
+            "sp.onnx",
+            "sp_topk1024.onnx",
+            "sp_topk1536.onnx",
+            "sp_topk2048.onnx",
+        ] {
+            let model = SuperPoint::new_with_backend(model_dir.join(name), InferenceBackend::Cpu)
+                .unwrap_or_else(|error| panic!("{name} must select the sparse profile: {error}"));
+            assert_eq!(
+                model.kind,
+                SuperPointModelKind::SparseOutputs(CANONICAL_CONTRACT)
+            );
+            assert_eq!(model.input_kind, SuperPointInputKind::Float32);
+        }
+
+        let model = SuperPoint::new_with_backend_and_sparse_profile(
+            model_dir.join("superpoint_512.onnx"),
+            InferenceBackend::Cpu,
+            SuperPointSparseProfile::LegacyFp32,
+        )
+        .expect("tracked legacy f32 sparse profile");
+        assert_eq!(
+            model.kind,
+            SuperPointModelKind::SparseOutputs(LEGACY_CONTRACT)
+        );
+        assert_eq!(model.input_kind, SuperPointInputKind::Float32);
+
+        let model = SuperPoint::new_with_backend(
+            model_dir.join("sp_topk2048_u8.onnx"),
+            InferenceBackend::Cpu,
+        )
+        .expect("tracked u8 sparse profile");
+        assert_eq!(
+            model.kind,
+            SuperPointModelKind::SparseOutputs(CANONICAL_CONTRACT)
+        );
+        assert_eq!(model.input_kind, SuperPointInputKind::Uint8);
+
+        let model =
+            SuperPoint::new_with_backend(model_dir.join("sp_heads.onnx"), InferenceBackend::Cpu)
+                .expect("tracked dense-head profile");
+        assert_eq!(model.kind, SuperPointModelKind::DenseHeads);
+        assert_eq!(model.input_kind, SuperPointInputKind::Float32);
+    }
+
+    #[test]
+    fn active_and_legacy_artifacts_execute_through_their_declared_runtime_contracts() {
+        let model_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+        let data = (0..64 * 64)
+            .map(|index| ((index * 37 + index / 64 * 11) % 256) as u8)
+            .collect();
+        let frame = Frame::new(
+            crate::SensorId::StereoLeft,
+            crate::FrameId::new(1),
+            crate::Timestamp::from_nanos(1),
+            64,
+            64,
+            data,
+        )
+        .expect("synthetic frame");
+
+        let mut active =
+            SuperPoint::new_with_backend(model_dir.join("sp_topk2048.onnx"), InferenceBackend::Cpu)
+                .expect("active sparse model");
+        let detections = active
+            .detect_limited(&frame, 16)
+            .expect("active runtime tensors satisfy the declared contract");
+        assert!(detections.len() <= 16);
+
+        let mut legacy = SuperPoint::new_with_backend_and_sparse_profile(
+            model_dir.join("superpoint_512.onnx"),
+            InferenceBackend::Cpu,
+            SuperPointSparseProfile::LegacyFp32,
+        )
+        .expect("legacy sparse model");
+        let detections = legacy
+            .detect_limited(&frame, 16)
+            .expect("legacy runtime tensors satisfy the declared contract");
+        assert!(detections.len() <= 16);
+    }
+
+    #[test]
     fn superpoint_interface_rejects_missing_partial_and_wrong_typed_models() {
-        let float_input = [tensor_outlet("image", TensorElementType::Float32)];
-        let wrong_input = [tensor_outlet("image", TensorElementType::Int32)];
+        let float_input = [image_outlet(TensorElementType::Float32)];
+        let wrong_input = [image_outlet(TensorElementType::Int32)];
         let wrong_shape_input = [tensor_outlet_with_shape(
             "image",
             TensorElementType::Float32,
             [1_i64, 3, -1, -1],
         )];
-        let sparse = [
-            tensor_outlet("keypoints", TensorElementType::Int64),
-            tensor_outlet("scores", TensorElementType::Float32),
-            tensor_outlet("descriptors", TensorElementType::Float32),
+        let sparse = canonical_sparse_outlets(TensorElementType::Int64);
+        let partial_dense = [tensor_outlet_with_shape(
+            "dense_scores",
+            TensorElementType::Float32,
+            [1_i64, 65, -1, -1],
+        )];
+        let wrong_sparse = canonical_sparse_outlets(TensorElementType::Float32);
+        let wrong_score_type = [
+            tensor_outlet_with_shape("keypoints", TensorElementType::Int64, [1_i64, -1, 2]),
+            tensor_outlet_with_shape("scores", TensorElementType::Float64, [1_i64, -1]),
+            tensor_outlet_with_shape("descriptors", TensorElementType::Float32, [-1_i64, -1, -1]),
         ];
-        let partial_dense = [tensor_outlet("dense_scores", TensorElementType::Float32)];
-        let wrong_sparse = [
-            tensor_outlet("keypoints", TensorElementType::Int32),
-            tensor_outlet("scores", TensorElementType::Float32),
-            tensor_outlet("descriptors", TensorElementType::Float32),
+        let wrong_descriptor_type = [
+            tensor_outlet_with_shape("keypoints", TensorElementType::Int64, [1_i64, -1, 2]),
+            tensor_outlet_with_shape("scores", TensorElementType::Float32, [1_i64, -1]),
+            tensor_outlet_with_shape("descriptors", TensorElementType::Float64, [-1_i64, -1, -1]),
+        ];
+        let wrong_layout = [
+            tensor_outlet_with_shape("keypoints", TensorElementType::Int64, [1_i64, 2, -1]),
+            tensor_outlet_with_shape("scores", TensorElementType::Float32, [1_i64, -1]),
+            tensor_outlet_with_shape("descriptors", TensorElementType::Float32, [-1_i64, -1, -1]),
         ];
 
         for error in [
-            parse_superpoint_model_interface(&[], &sparse).expect_err("missing input"),
-            parse_superpoint_model_interface(&wrong_input, &sparse).expect_err("wrong input"),
-            parse_superpoint_model_interface(&wrong_shape_input, &sparse)
-                .expect_err("wrong input shape"),
-            parse_superpoint_model_interface(&float_input, &partial_dense)
-                .expect_err("partial dense outputs"),
-            parse_superpoint_model_interface(&float_input, &wrong_sparse)
-                .expect_err("wrong sparse keypoints"),
+            parse_superpoint_model_interface(&[], &sparse, SuperPointSparseProfile::CanonicalFp16)
+                .expect_err("missing input"),
+            parse_superpoint_model_interface(
+                &wrong_input,
+                &sparse,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("wrong input"),
+            parse_superpoint_model_interface(
+                &wrong_shape_input,
+                &sparse,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("wrong input shape"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &partial_dense,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("partial dense outputs"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &wrong_sparse,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("wrong sparse keypoints"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &wrong_score_type,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("wrong sparse score type"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &wrong_descriptor_type,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("wrong sparse descriptor type"),
+            parse_superpoint_model_interface(
+                &float_input,
+                &wrong_layout,
+                SuperPointSparseProfile::CanonicalFp16,
+            )
+            .expect_err("wrong sparse layout"),
         ] {
             assert!(matches!(
                 error,
@@ -1137,72 +1494,457 @@ mod tests {
     }
 
     #[test]
-    fn sparse_keypoint_parser_preserves_layout_and_rejects_nonfinite_coordinates() {
-        let interleaved_shape = ort::value::Shape::new([2_i64, 2]);
-        let interleaved = parse_keypoint_pairs(
-            &interleaved_shape,
-            &[1.0_f32, 2.0, 3.0, 4.0],
-            "keypoints",
-            |index, value| finite_keypoint_coordinate("keypoints", index, value),
-        )
-        .expect("interleaved pairs");
-        assert_eq!(interleaved, [[1.0, 2.0], [3.0, 4.0]]);
+    fn input_domain_preserves_typed_dimensions_and_model_minimum() {
+        for (width, height) in [(7, 8), (8, 7)] {
+            let dimensions = FrameDimensions::try_new(width, height).expect("nonzero dimensions");
+            assert!(matches!(
+                SuperPointInputDomain::try_new(dimensions, dimensions, None),
+                Err(InferenceError::InputDimensionsTooSmall {
+                    model: "superpoint",
+                    width: actual_width,
+                    height: actual_height,
+                    minimum: MODEL_STRIDE,
+                }) if actual_width == width && actual_height == height
+            ));
+        }
 
-        let planar_shape = ort::value::Shape::new([2_i64, 3]);
-        let planar = parse_keypoint_pairs(
-            &planar_shape,
-            &[1_i64, 2, 3, 4, 5, 6],
-            "keypoints",
-            |index, value| super::super::exact_i64_output_f32("keypoints", index, value),
-        )
-        .expect("planar pairs");
-        assert_eq!(planar, [[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]);
+        for (width, height) in [(8, 8), (15, 15), (27, 19)] {
+            let dimensions = FrameDimensions::try_new(width, height).expect("valid dimensions");
+            SuperPointInputDomain::try_new(dimensions, dimensions, None)
+                .expect("supported nonzero feature grid");
+        }
+    }
 
-        assert!(matches!(
-            parse_keypoint_pairs(
-                &interleaved_shape,
-                &[1.0_f32, f32::NAN, 3.0, 4.0],
-                "keypoints",
-                |index, value| finite_keypoint_coordinate("keypoints", index, value),
+    #[test]
+    fn canonical_outputs_preserve_integer_xy_and_row_alignment() {
+        let mut descriptor_data = vec![0.125; DESCRIPTOR_DIM];
+        descriptor_data.extend(std::iter::repeat_n(-0.5, DESCRIPTOR_DIM));
+        let parsed = parse_original_scale(
+            &[1, 2, 2],
+            &[4, 4, 17, 9],
+            &[1, 2],
+            &[1.0, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptor_data,
+        )
+        .expect("canonical sparse output");
+
+        assert_eq!((parsed.keypoints[0].x, parsed.keypoints[0].y), (4.0, 4.0));
+        assert_eq!((parsed.keypoints[1].x, parsed.keypoints[1].y), (17.0, 9.0));
+        assert_eq!(parsed.scores, [1.0, 0.5]);
+        assert_eq!(parsed.descriptors[0].as_slice(), &[0.125; DESCRIPTOR_DIM]);
+        assert_eq!(parsed.descriptors[1].as_slice(), &[-0.5; DESCRIPTOR_DIM]);
+    }
+
+    #[test]
+    fn canonical_empty_output_requires_exact_empty_shapes() {
+        let parsed = parse_original_scale(
+            &[1, 0, 2],
+            &[],
+            &[1, 0],
+            &[],
+            &[1, 0, DESCRIPTOR_DIM as i64],
+            &[],
+        )
+        .expect("canonical empty output");
+        assert!(parsed.keypoints.is_empty());
+        assert!(parsed.scores.is_empty());
+        assert!(parsed.descriptors.is_empty());
+
+        assert_output_error(
+            parse_original_scale(
+                &[0, 1, 2],
+                &[],
+                &[1, 0],
+                &[],
+                &[1, 0, DESCRIPTOR_DIM as i64],
+                &[],
             ),
-            Err(InferenceError::UnexpectedOutput { name, actual, .. })
-                if name == "keypoints" && actual.contains("coordinate 1")
-        ));
+            "keypoints",
+        );
     }
 
     #[test]
-    fn parse_descriptors_accepts_complete_chunks() {
-        let data: Vec<f32> = (0..(DESCRIPTOR_DIM * 2)).map(|v| v as f32).collect();
-        let descriptors = parse_descriptors(&data, "descriptors").expect("complete chunks");
+    fn output_parser_requires_exact_aligned_shapes_and_lengths() {
+        let descriptors = vec![0.0; DESCRIPTOR_DIM];
+        for shape in [&[1, 2][..], &[2, 1, 2], &[1, 1, 2, 1], &[1, 1, 3]] {
+            assert_output_error(
+                parse_original_scale(
+                    shape,
+                    &[4, 4],
+                    &[1, 1],
+                    &[0.5],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &descriptors,
+                ),
+                "keypoints",
+            );
+        }
+        assert_output_error(
+            parse_original_scale(
+                &[1, 1, 2],
+                &[4],
+                &[1, 1],
+                &[0.5],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &descriptors,
+            ),
+            "keypoints",
+        );
 
-        assert_eq!(descriptors.len(), 2);
-        assert_eq!(descriptors[0].as_slice()[0], 0.0);
-        assert_eq!(descriptors[1].as_slice()[0], DESCRIPTOR_DIM as f32);
+        for (shape, data) in [
+            (&[1, 1, 1][..], &[0.5][..]),
+            (&[1, 2][..], &[0.5, 0.25][..]),
+            (&[1, 1][..], &[][..]),
+        ] {
+            assert_output_error(
+                parse_original_scale(
+                    &[1, 1, 2],
+                    &[4, 4],
+                    shape,
+                    data,
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &descriptors,
+                ),
+                "scores",
+            );
+        }
+
+        for (shape, data) in [
+            (&[1, DESCRIPTOR_DIM as i64, 1][..], descriptors.as_slice()),
+            (
+                &[1, 1, (DESCRIPTOR_DIM - 1) as i64][..],
+                descriptors.as_slice(),
+            ),
+            (&[1, DESCRIPTOR_DIM as i64][..], descriptors.as_slice()),
+            (
+                &[1, 1, DESCRIPTOR_DIM as i64][..],
+                &descriptors[..DESCRIPTOR_DIM - 1],
+            ),
+        ] {
+            assert_output_error(
+                parse_original_scale(&[1, 1, 2], &[4, 4], &[1, 1], &[0.5], shape, data),
+                "descriptors",
+            );
+        }
     }
 
     #[test]
-    fn parse_descriptors_preserves_output_index_and_domain_source() {
-        let mut data = vec![0.0_f32; DESCRIPTOR_DIM * 2];
-        data[DESCRIPTOR_DIM + 7] = f32::NAN;
+    fn output_keypoint_count_accepts_2048_and_rejects_2049_before_copying() {
+        let count = CANONICAL_CONTRACT.capacity;
+        let keypoints: Vec<i64> = std::iter::repeat_n([4_i64, 4], count).flatten().collect();
+        let scores = vec![1.0; count];
+        let descriptors = vec![0.0; count * DESCRIPTOR_DIM];
+        let parsed = parse_original_scale(
+            &[1, count as i64, 2],
+            &keypoints,
+            &[1, count as i64],
+            &scores,
+            &[1, count as i64, DESCRIPTOR_DIM as i64],
+            &descriptors,
+        )
+        .expect("active 2048-row capacity");
+        assert_eq!(parsed.keypoints.len(), CANONICAL_CONTRACT.capacity);
 
-        let error = parse_descriptors(&data, "descriptors")
-            .expect_err("nonfinite model output must fail at the descriptor boundary");
+        let rejected = (CANONICAL_CONTRACT.capacity + 1) as i64;
+        assert_output_error(
+            parse_original_scale(
+                &[1, rejected, 2],
+                &[],
+                &[1, rejected],
+                &[],
+                &[1, rejected, DESCRIPTOR_DIM as i64],
+                &[],
+            ),
+            "keypoints",
+        );
+    }
+
+    #[test]
+    fn limited_parser_validates_all_rows_but_constructs_only_sorted_prefix() {
+        let dimensions = FrameDimensions::try_new(640, 480).expect("valid dimensions");
+        let descriptors = vec![0.0; 2 * DESCRIPTOR_DIM];
+        let parsed = parse_fixture(
+            &[1, 2, 2],
+            &[4, 4, 17, 9],
+            &[1, 2],
+            &[0.75, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptors,
+            dimensions,
+            dimensions,
+            None,
+            1,
+        )
+        .expect("validated TopK prefix");
+        assert_eq!(parsed.keypoints.len(), 1);
+        assert_eq!((parsed.keypoints[0].x, parsed.keypoints[0].y), (4.0, 4.0));
+        assert_eq!(parsed.scores, [0.75]);
+        assert_eq!(parsed.descriptors.len(), 1);
+
+        assert_output_error(
+            parse_fixture(
+                &[1, 2, 2],
+                &[4, 4, 3, 9],
+                &[1, 2],
+                &[0.75, 0.5],
+                &[1, 2, DESCRIPTOR_DIM as i64],
+                &descriptors,
+                dimensions,
+                dimensions,
+                None,
+                1,
+            ),
+            "keypoints",
+        );
+
+        let mut invalid_tail = descriptors;
+        invalid_tail[DESCRIPTOR_DIM + 7] = f32::NAN;
+        let error = parse_fixture(
+            &[1, 2, 2],
+            &[4, 4, 17, 9],
+            &[1, 2],
+            &[0.75, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &invalid_tail,
+            dimensions,
+            dimensions,
+            None,
+            1,
+        )
+        .expect_err("discarded descriptor rows are still validated");
         assert!(matches!(
-            &error,
+            error,
             InferenceError::DescriptorOutput {
-                name,
                 descriptor_index: 1,
                 source: crate::DescriptorError::NonFiniteComponent { index: 7, value },
-            } if name == "descriptors" && value.is_nan()
+                ..
+            } if value.is_nan()
         ));
-        assert!(error.to_string().contains("descriptor 1"));
-        assert!(error.to_string().contains("'descriptors'"));
-        assert!(
-            error
-                .source()
-                .expect("descriptor domain source")
-                .to_string()
-                .contains("component 7")
+    }
+
+    #[test]
+    fn coordinate_parser_enforces_effective_grid_border_and_top_left_scaling() {
+        let model_dimensions = FrameDimensions::try_new(27, 19).expect("valid dimensions");
+        let descriptors = vec![0.0; 2 * DESCRIPTOR_DIM];
+        let accepted = parse_fixture(
+            &[1, 2, 2],
+            &[4, 4, 19, 11],
+            &[1, 2],
+            &[1.0, 0.5],
+            &[1, 2, DESCRIPTOR_DIM as i64],
+            &descriptors,
+            model_dimensions,
+            model_dimensions,
+            None,
+            usize::MAX,
+        )
+        .expect("inclusive lower and exclusive upper graph bounds");
+        assert_eq!(
+            (accepted.keypoints[1].x, accepted.keypoints[1].y),
+            (19.0, 11.0)
+        );
+
+        for [x, y] in [
+            [-1, 4],
+            [i64::MAX, 4],
+            [3, 4],
+            [20, 4],
+            [26, 4],
+            [4, 3],
+            [4, 12],
+            [4, 18],
+        ] {
+            assert_output_error(
+                parse_fixture(
+                    &[1, 1, 2],
+                    &[x, y],
+                    &[1, 1],
+                    &[0.5],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &[0.0; DESCRIPTOR_DIM],
+                    model_dimensions,
+                    model_dimensions,
+                    None,
+                    usize::MAX,
+                ),
+                "keypoints",
+            );
+        }
+
+        let model_dimensions = FrameDimensions::try_new(320, 240).expect("valid dimensions");
+        let frame_dimensions = FrameDimensions::try_new(640, 480).expect("valid dimensions");
+        let factor = DownscaleFactor::try_from(2).expect("nonzero scale");
+        let scaled = parse_fixture(
+            &[1, 1, 2],
+            &[315, 235],
+            &[1, 1],
+            &[0.5],
+            &[1, 1, DESCRIPTOR_DIM as i64],
+            &[0.0; DESCRIPTOR_DIM],
+            model_dimensions,
+            frame_dimensions,
+            Some(factor),
+            usize::MAX,
+        )
+        .expect("integer top-left mapping");
+        assert_eq!(
+            (scaled.keypoints[0].x, scaled.keypoints[0].y),
+            (630.0, 470.0)
+        );
+    }
+
+    #[test]
+    fn coordinate_parser_rejects_unrepresentable_scaled_f32_pixel() {
+        const EXACT_MODEL_X: i64 = 5_592_406;
+        const INEXACT_MODEL_X: i64 = EXACT_MODEL_X + 1;
+        let model_dimensions =
+            FrameDimensions::try_new(5_592_424, 16).expect("valid model dimensions");
+        let frame_dimensions =
+            FrameDimensions::try_new(16_777_272, 48).expect("valid frame dimensions");
+        let factor = DownscaleFactor::try_from(3).expect("nonzero scale");
+        let descriptors = [0.0; DESCRIPTOR_DIM];
+
+        parse_fixture(
+            &[1, 1, 2],
+            &[EXACT_MODEL_X, 4],
+            &[1, 1],
+            &[0.5],
+            &[1, 1, DESCRIPTOR_DIM as i64],
+            &descriptors,
+            model_dimensions,
+            frame_dimensions,
+            Some(factor),
+            usize::MAX,
+        )
+        .expect("representable scaled pixel");
+
+        assert!(matches!(
+            parse_fixture(
+                &[1, 1, 2],
+                &[INEXACT_MODEL_X, 4],
+                &[1, 1],
+                &[0.5],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &descriptors,
+                model_dimensions,
+                frame_dimensions,
+                Some(factor),
+                usize::MAX,
+            ),
+            Err(InferenceError::KeypointCoordinateUnrepresentable {
+                model: "superpoint",
+                index: 0,
+                axis: "x",
+                coordinate: 16_777_221,
+            })
+        ));
+    }
+
+    #[test]
+    fn score_parser_enforces_exact_graph_threshold_range_and_topk_order() {
+        let threshold = CANONICAL_CONTRACT.score_threshold;
+        assert_eq!(threshold.to_bits(), 0x3a03_2000);
+        let descriptors = [0.0; DESCRIPTOR_DIM];
+        for score in [
+            f32::NAN,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -f32::from_bits(1),
+            threshold,
+            f32::from_bits(threshold.to_bits() - 1),
+            f32::from_bits(1.0_f32.to_bits() + 1),
+        ] {
+            assert_output_error(
+                parse_original_scale(
+                    &[1, 1, 2],
+                    &[4, 4],
+                    &[1, 1],
+                    &[score],
+                    &[1, 1, DESCRIPTOR_DIM as i64],
+                    &descriptors,
+                ),
+                "scores",
+            );
+        }
+        for score in [f32::from_bits(threshold.to_bits() + 1), 1.0] {
+            parse_original_scale(
+                &[1, 1, 2],
+                &[4, 4],
+                &[1, 1],
+                &[score],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &descriptors,
+            )
+            .expect("valid selected confidence");
+        }
+
+        assert_output_error(
+            parse_original_scale(
+                &[1, 2, 2],
+                &[4, 4, 5, 5],
+                &[1, 2],
+                &[0.5, 0.75],
+                &[1, 2, DESCRIPTOR_DIM as i64],
+                &[0.0; 2 * DESCRIPTOR_DIM],
+            ),
+            "scores",
+        );
+    }
+
+    #[test]
+    fn legacy_profile_retains_its_exact_threshold_and_512_row_capacity() {
+        assert_eq!(LEGACY_CONTRACT.score_threshold.to_bits(), 0x3a03_126f);
+        assert_eq!(LEGACY_CONTRACT.capacity, 512);
+        let dimensions = FrameDimensions::try_new(640, 480).expect("valid dimensions");
+        let legacy_only_score = f32::from_bits(LEGACY_CONTRACT.score_threshold.to_bits() + 1);
+
+        parse_fixture_with_contract(
+            &[1, 1, 2],
+            &[4, 4],
+            &[1, 1],
+            &[legacy_only_score],
+            &[1, 1, DESCRIPTOR_DIM as i64],
+            &[0.0; DESCRIPTOR_DIM],
+            dimensions,
+            dimensions,
+            None,
+            usize::MAX,
+            LEGACY_CONTRACT,
+        )
+        .expect("score selected by the legacy f32 graph");
+        assert_output_error(
+            parse_fixture(
+                &[1, 1, 2],
+                &[4, 4],
+                &[1, 1],
+                &[legacy_only_score],
+                &[1, 1, DESCRIPTOR_DIM as i64],
+                &[0.0; DESCRIPTOR_DIM],
+                dimensions,
+                dimensions,
+                None,
+                usize::MAX,
+            ),
+            "scores",
+        );
+
+        let rejected = (LEGACY_CONTRACT.capacity + 1) as i64;
+        assert_output_error(
+            parse_fixture_with_contract(
+                &[1, rejected, 2],
+                &[],
+                &[1, rejected],
+                &[],
+                &[1, rejected, DESCRIPTOR_DIM as i64],
+                &[],
+                dimensions,
+                dimensions,
+                None,
+                usize::MAX,
+                LEGACY_CONTRACT,
+            ),
+            "keypoints",
         );
     }
 
@@ -1237,25 +1979,6 @@ mod tests {
         assert!(descriptor.as_slice().iter().all(|value| value.is_finite()));
         for &value in descriptor.as_slice() {
             assert!((value - expected).abs() < 1e-6);
-        }
-    }
-
-    #[test]
-    fn parse_descriptors_rejects_partial_chunk() {
-        let data: Vec<f32> = (0..(DESCRIPTOR_DIM + 1)).map(|v| v as f32).collect();
-        let err = parse_descriptors(&data, "descriptors").expect_err("partial chunk");
-
-        match err {
-            InferenceError::UnexpectedOutput {
-                name,
-                expected,
-                actual,
-            } => {
-                assert_eq!(name, "descriptors");
-                assert!(expected.contains("divisible"));
-                assert!(actual.contains(&(DESCRIPTOR_DIM + 1).to_string()));
-            }
-            other => panic!("unexpected error: {other:?}"),
         }
     }
 }

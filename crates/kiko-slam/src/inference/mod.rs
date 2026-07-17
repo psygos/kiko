@@ -68,6 +68,18 @@ pub enum InferenceError {
         dimensions: crate::FrameDimensions,
         batch_size: usize,
     },
+    InputDimensionsTooSmall {
+        model: &'static str,
+        width: u32,
+        height: u32,
+        minimum: u32,
+    },
+    KeypointCoordinateUnrepresentable {
+        model: &'static str,
+        index: usize,
+        axis: &'static str,
+        coordinate: u32,
+    },
     UnexpectedOutput {
         name: String,
         expected: String,
@@ -128,6 +140,8 @@ impl std::error::Error for InferenceError {
             | InferenceError::UnsupportedModelInterface { .. }
             | InferenceError::StereoInputDimensionsMismatch { .. }
             | InferenceError::InputBatchSizeOverflow { .. }
+            | InferenceError::InputDimensionsTooSmall { .. }
+            | InferenceError::KeypointCoordinateUnrepresentable { .. }
             | InferenceError::BackendUnavailable { .. }
             | InferenceError::InvalidSetting { .. }
             | InferenceError::ThreadPanic { .. }
@@ -227,6 +241,24 @@ impl std::fmt::Display for InferenceError {
                 "inference batch of {batch_size} images at {}x{} exceeds addressable memory",
                 dimensions.width(),
                 dimensions.height()
+            ),
+            InferenceError::InputDimensionsTooSmall {
+                model,
+                width,
+                height,
+                minimum,
+            } => write!(
+                f,
+                "{model} input dimensions {width}x{height} are smaller than the {minimum}x{minimum} model minimum"
+            ),
+            InferenceError::KeypointCoordinateUnrepresentable {
+                model,
+                index,
+                axis,
+                coordinate,
+            } => write!(
+                f,
+                "{model} keypoint {index} scaled {axis} pixel {coordinate} cannot be represented exactly by the host f32 coordinate domain"
             ),
             InferenceError::UnexpectedOutput {
                 name,
@@ -346,7 +378,7 @@ pub(super) fn exact_i64_output_f32(
 }
 
 pub use lightglue::LightGlue;
-pub use superpoint::SuperPoint;
+pub use superpoint::{SuperPoint, SuperPointSparseProfile};
 
 pub(super) fn run_with_slow_call_diagnostics<T>(
     diagnostics: InferenceRunDiagnostics,
