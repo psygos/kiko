@@ -232,16 +232,16 @@ impl RectifiedStereo {
 pub struct TriangulationConfig {
     min_disparity_px: f32,
     max_depth_m: Option<f32>,
-    max_vertical_disparity_px: f32,
+    max_vertical_disparity_px: RectifiedRowMismatchPx,
 }
 
-const DEFAULT_MAX_VERTICAL_DISPARITY_PX: f32 = 1.0;
+const DEFAULT_MAX_VERTICAL_DISPARITY_PX: RectifiedRowMismatchPx = RectifiedRowMismatchPx(1.0);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TriangulationConfigError {
     InvalidMinDisparityPx { value: f32 },
     InvalidMaxDepthM { value: f32 },
-    InvalidMaxVerticalDisparityPx { value: f32 },
+    InvalidMaxVerticalDisparityPx { source: RectifiedRowMismatchError },
 }
 
 impl std::fmt::Display for TriangulationConfigError {
@@ -254,15 +254,21 @@ impl std::fmt::Display for TriangulationConfigError {
             TriangulationConfigError::InvalidMaxDepthM { value } => {
                 write!(f, "maximum depth must be positive and finite, got {value}")
             }
-            TriangulationConfigError::InvalidMaxVerticalDisparityPx { value } => write!(
-                f,
-                "maximum vertical disparity must be finite and nonnegative pixels, got {value}"
-            ),
+            TriangulationConfigError::InvalidMaxVerticalDisparityPx { source } => {
+                write!(f, "invalid maximum vertical disparity: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for TriangulationConfigError {}
+impl std::error::Error for TriangulationConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidMaxVerticalDisparityPx { source } => Some(source),
+            Self::InvalidMinDisparityPx { .. } | Self::InvalidMaxDepthM { .. } => None,
+        }
+    }
+}
 
 impl TriangulationConfig {
     pub fn new(
@@ -272,10 +278,15 @@ impl TriangulationConfig {
         Self::new_with_vertical_disparity(
             min_disparity_px,
             max_depth_m,
-            DEFAULT_MAX_VERTICAL_DISPARITY_PX,
+            DEFAULT_MAX_VERTICAL_DISPARITY_PX.value_px(),
         )
     }
 
+    /// Construct a triangulation policy with an explicit rectified-row gate.
+    ///
+    /// The acceptable mismatch depends on calibration residuals and feature
+    /// localization uncertainty. Deployments should supply a measured value
+    /// instead of treating the conservative fallback as a universal constant.
     pub fn new_with_vertical_disparity(
         min_disparity_px: f32,
         max_depth_m: Option<f32>,
@@ -291,11 +302,8 @@ impl TriangulationConfig {
                 return Err(TriangulationConfigError::InvalidMaxDepthM { value });
             }
         }
-        if !max_vertical_disparity_px.is_finite() || max_vertical_disparity_px < 0.0 {
-            return Err(TriangulationConfigError::InvalidMaxVerticalDisparityPx {
-                value: max_vertical_disparity_px,
-            });
-        }
+        let max_vertical_disparity_px = RectifiedRowMismatchPx::new(max_vertical_disparity_px)
+            .map_err(|source| TriangulationConfigError::InvalidMaxVerticalDisparityPx { source })?;
         Ok(Self {
             min_disparity_px,
             max_depth_m,
@@ -311,7 +319,7 @@ impl TriangulationConfig {
         self.max_depth_m
     }
 
-    pub fn max_vertical_disparity_px(self) -> f32 {
+    pub fn max_vertical_disparity_px(self) -> RectifiedRowMismatchPx {
         self.max_vertical_disparity_px
     }
 }
@@ -926,18 +934,20 @@ impl Triangulator {
                 return Err(StereoGeometryRejection::Depth);
             }
         }
-        let left_y = (f64::from(left_keypoint.y) - arithmetic.left.cy) / arithmetic.left.fy;
-        let right_y = (f64::from(right_keypoint.y) - arithmetic.right.cy) / arithmetic.right.fy;
+        let left_y_px = f64::from(left_keypoint.y) - arithmetic.left.cy;
+        let left_y = left_y_px / arithmetic.left.fy;
+        let right_y_in_left_pixels = (f64::from(right_keypoint.y) - arithmetic.right.cy)
+            * (arithmetic.left.fy / arithmetic.right.fy);
         let x_m = left_x * depth_m;
         let y_m = left_y * depth_m;
-        let row_mismatch_px = (left_y - right_y).abs() * arithmetic.left.fy;
-        if ![depth_m, x_m, y_m, row_mismatch_px]
+        let row_mismatch_px = (left_y_px - right_y_in_left_pixels).abs();
+        if ![depth_m, x_m, y_m, right_y_in_left_pixels, row_mismatch_px]
             .into_iter()
             .all(f64::is_finite)
         {
             return Err(StereoGeometryRejection::Numerical);
         }
-        if row_mismatch_px > f64::from(self.config.max_vertical_disparity_px()) {
+        if row_mismatch_px > f64::from(self.config.max_vertical_disparity_px().value_px()) {
             return Err(StereoGeometryRejection::Epipolar);
         }
 
@@ -1141,6 +1151,12 @@ mod tests {
 
     #[test]
     fn triangulation_config_rejects_invalid_thresholds() {
+        let default_policy =
+            TriangulationConfig::new(1.0, None).expect("default triangulation policy");
+        assert_eq!(default_policy.max_vertical_disparity_px().value_px(), 1.0);
+        let gated_policy = TriangulationConfig::new_with_vertical_disparity(1.0, None, 1.0)
+            .expect("explicit row-mismatch gate");
+        assert_eq!(gated_policy.max_vertical_disparity_px().value_px(), 1.0);
         assert!(matches!(
             TriangulationConfig::new(f32::NAN, None),
             Err(TriangulationConfigError::InvalidMinDisparityPx { .. })
@@ -1369,6 +1385,82 @@ mod tests {
         };
         assert_eq!(stats.dropped_epipolar, 1);
         assert_stats_accounting(stats);
+    }
+
+    #[test]
+    fn triangulation_keeps_geometry_at_the_explicit_row_mismatch_limit() {
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
+        let config = TriangulationConfig::new_with_vertical_disparity(1.0, None, 1.0)
+            .expect("explicit row-mismatch gate");
+        let triangulator = Triangulator::new(stereo, config);
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(14),
+            640,
+            480,
+            vec![Keypoint { x: 320.0, y: 100.0 }],
+        )
+        .expect("left detections");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(15),
+            640,
+            480,
+            vec![Keypoint { x: 310.0, y: 101.0 }],
+        )
+        .expect("right detections");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let result = triangulator
+            .triangulate(&matches)
+            .expect("the explicit maximum is inclusive");
+        assert_eq!(result.stats.kept, 1);
+        assert_eq!(result.stats.dropped_epipolar, 0);
+        assert_stats_accounting(result.stats);
+    }
+
+    #[test]
+    fn permissive_rectified_row_gate_preserves_measured_mismatch() {
+        let stereo =
+            make_rectified_stereo(640, 480, 400.0, 400.0, 320.0, 240.0, 0.075).expect("stereo");
+        let config = TriangulationConfig::new_with_vertical_disparity(1.0, None, 3.0)
+            .expect("measured row-mismatch gate");
+        let triangulator = Triangulator::new(stereo, config);
+        let left = make_detections(
+            SensorId::StereoLeft,
+            FrameId::new(14),
+            640,
+            480,
+            vec![Keypoint { x: 320.0, y: 100.0 }],
+        )
+        .expect("left detections");
+        let right = make_detections(
+            SensorId::StereoRight,
+            FrameId::new(15),
+            640,
+            480,
+            vec![Keypoint { x: 310.0, y: 102.0 }],
+        )
+        .expect("right detections");
+        let matches = Matches::new(left, right, vec![(0, 0)], vec![1.0]).expect("matches");
+
+        let result = triangulator
+            .triangulate(&matches)
+            .expect("geometry lies within the measured row-mismatch gate");
+        assert_eq!(result.stats.candidate_matches, 1);
+        assert_eq!(result.stats.kept, 1);
+        assert_eq!(result.stats.dropped_epipolar, 0);
+        assert_stats_accounting(result.stats);
+
+        let samples = triangulator
+            .extract_stereo_samples(&matches)
+            .expect("same geometry yields a sparse sample");
+        assert_eq!(samples.samples().len(), 1);
+        assert_eq!(
+            samples.samples()[0].rectified_row_mismatch_px().value_px(),
+            2.0
+        );
     }
 
     #[test]

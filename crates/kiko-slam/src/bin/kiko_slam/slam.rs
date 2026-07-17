@@ -47,6 +47,9 @@ ENVIRONMENT VARIABLES (expert tuning):
     KIKO_PROJECTED_MATCH_MIN_INLIERS=24  Fallback to LightGlue below this inlier count
     KIKO_PROJECTED_MATCH_MIN_SIMILARITY  Deprecated misnamed alias for MIN_DOT_PRODUCT
 
+  Triangulation:
+    KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX=1.0  Calibration/model-specific rectified-row gate
+
   Loop Closure:
     KIKO_LOOP_CLOSURE=true                   Enable loop closure detection
     KIKO_RELOCALIZATION=true                 Enable relocalization
@@ -193,6 +196,83 @@ impl OptionalCountTotals {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TriangulationTotals {
+    samples: usize,
+    candidate_matches: u128,
+    kept: u128,
+    dropped_disparity: u128,
+    dropped_epipolar: u128,
+    dropped_depth: u128,
+    dropped_numerical: u128,
+    dropped_unrepresentable: u128,
+    dropped_duplicate: u128,
+}
+
+impl TriangulationTotals {
+    fn add_count(
+        total: u128,
+        value: usize,
+        metric: &'static str,
+    ) -> Result<u128, DiagnosticAggregationError> {
+        total
+            .checked_add(value as u128)
+            .ok_or(DiagnosticAggregationError::Overflow { metric })
+    }
+
+    fn record(
+        &mut self,
+        stats: Option<kiko_slam::TriangulationStats>,
+    ) -> Result<(), DiagnosticAggregationError> {
+        let Some(stats) = stats else {
+            return Ok(());
+        };
+        self.samples = self
+            .samples
+            .checked_add(1)
+            .ok_or(DiagnosticAggregationError::Overflow {
+                metric: "triangulation samples",
+            })?;
+        self.candidate_matches = Self::add_count(
+            self.candidate_matches,
+            stats.candidate_matches,
+            "triangulation candidate matches",
+        )?;
+        self.kept = Self::add_count(self.kept, stats.kept, "triangulation kept matches")?;
+        self.dropped_disparity = Self::add_count(
+            self.dropped_disparity,
+            stats.dropped_disparity,
+            "triangulation disparity drops",
+        )?;
+        self.dropped_epipolar = Self::add_count(
+            self.dropped_epipolar,
+            stats.dropped_epipolar,
+            "triangulation epipolar drops",
+        )?;
+        self.dropped_depth = Self::add_count(
+            self.dropped_depth,
+            stats.dropped_depth,
+            "triangulation depth drops",
+        )?;
+        self.dropped_numerical = Self::add_count(
+            self.dropped_numerical,
+            stats.dropped_numerical,
+            "triangulation numerical drops",
+        )?;
+        self.dropped_unrepresentable = Self::add_count(
+            self.dropped_unrepresentable,
+            stats.dropped_unrepresentable,
+            "triangulation unrepresentable drops",
+        )?;
+        self.dropped_duplicate = Self::add_count(
+            self.dropped_duplicate,
+            stats.dropped_duplicate,
+            "triangulation duplicate drops",
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DiagnosticTotals {
     frames: usize,
     steady_frames: usize,
@@ -204,6 +284,7 @@ struct DiagnosticTotals {
     pnp_tracked_observations: OptionalCountTotals,
     pnp_projectable_tracked_observations: OptionalCountTotals,
     pnp_accepted_inliers: OptionalCountTotals,
+    triangulation: TriangulationTotals,
 }
 
 impl DiagnosticTotals {
@@ -257,6 +338,7 @@ impl DiagnosticTotals {
                 .map(|metric| metric.count()),
             steady,
         )?;
+        self.triangulation.record(diagnostics.triangulation)?;
         Ok(())
     }
 }
@@ -432,19 +514,6 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rectified = calibration.stereo().clone();
     let dense_cloud_enabled = kiko_slam::env::try_env_bool("KIKO_DENSE_CLOUD")?.unwrap_or(false);
     let dense_config = kiko_slam::DenseCloudConfig::try_from_env()?;
-    let dense_triangulator = if dense_cloud_enabled {
-        Some(kiko_slam::Triangulator::new(
-            rectified.clone(),
-            kiko_slam::TriangulationConfig::default(),
-        ))
-    } else {
-        None
-    };
-    if dense_cloud_enabled {
-        eprintln!(
-            "stable surface map: enabled (measured sparse stereo -> surface belief; TSDF integration unsupported)"
-        );
-    }
     #[cfg(feature = "vio")]
     if vio_enabled && calibration.inertial().is_none() {
         return Err(
@@ -474,6 +543,13 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         downscale,
         tracker_overrides(args, vio_enabled),
     )?;
+    let dense_triangulator = dense_cloud_enabled
+        .then(|| kiko_slam::Triangulator::new(rectified, tracker_config.triangulation));
+    if dense_cloud_enabled {
+        eprintln!(
+            "stable surface map: enabled (measured sparse stereo -> surface belief; TSDF integration unsupported)"
+        );
+    }
     let use_speculative_lg = tracker_config.tracking_matcher.uses_speculative_lightglue();
     let mut sink = if args.headless {
         eprintln!("rerun: disabled explicitly (--headless)");
@@ -1011,7 +1087,7 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         steady_pose_outcomes.unavailable
     );
     eprintln!(
-        "diagnostic totals: frames={} steady_frames={} final_map_keyframes={} final_map_points={} peak_map_points={} features_detected_samples={} features_detected_total={} steady_features_detected_samples={} steady_features_detected_total={} features_matched_samples={} features_matched_total={} steady_features_matched_samples={} steady_features_matched_total={} pnp_tracked_observations_samples={} pnp_tracked_observations_total={} steady_pnp_tracked_observations_samples={} steady_pnp_tracked_observations_total={} pnp_projectable_tracked_observations_samples={} pnp_projectable_tracked_observations_total={} steady_pnp_projectable_tracked_observations_samples={} steady_pnp_projectable_tracked_observations_total={} pnp_accepted_inliers_samples={} pnp_accepted_inliers_total={} steady_pnp_accepted_inliers_samples={} steady_pnp_accepted_inliers_total={}",
+        "diagnostic totals: frames={} steady_frames={} final_map_keyframes={} final_map_points={} peak_map_points={} features_detected_samples={} features_detected_total={} steady_features_detected_samples={} steady_features_detected_total={} features_matched_samples={} features_matched_total={} steady_features_matched_samples={} steady_features_matched_total={} pnp_tracked_observations_samples={} pnp_tracked_observations_total={} steady_pnp_tracked_observations_samples={} steady_pnp_tracked_observations_total={} pnp_projectable_tracked_observations_samples={} pnp_projectable_tracked_observations_total={} steady_pnp_projectable_tracked_observations_samples={} steady_pnp_projectable_tracked_observations_total={} pnp_accepted_inliers_samples={} pnp_accepted_inliers_total={} steady_pnp_accepted_inliers_samples={} steady_pnp_accepted_inliers_total={} triangulation_samples={} triangulation_candidate_matches_total={} triangulation_kept_total={} triangulation_dropped_disparity_total={} triangulation_dropped_epipolar_total={} triangulation_dropped_depth_total={} triangulation_dropped_numerical_total={} triangulation_dropped_unrepresentable_total={} triangulation_dropped_duplicate_total={}",
         diagnostic_totals.frames,
         diagnostic_totals.steady_frames,
         diagnostic_totals.final_map_keyframes,
@@ -1043,6 +1119,15 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         diagnostic_totals.pnp_accepted_inliers.total,
         diagnostic_totals.pnp_accepted_inliers.steady_samples,
         diagnostic_totals.pnp_accepted_inliers.steady_total,
+        diagnostic_totals.triangulation.samples,
+        diagnostic_totals.triangulation.candidate_matches,
+        diagnostic_totals.triangulation.kept,
+        diagnostic_totals.triangulation.dropped_disparity,
+        diagnostic_totals.triangulation.dropped_epipolar,
+        diagnostic_totals.triangulation.dropped_depth,
+        diagnostic_totals.triangulation.dropped_numerical,
+        diagnostic_totals.triangulation.dropped_unrepresentable,
+        diagnostic_totals.triangulation.dropped_duplicate,
     );
     if let Some(measured) = service_intervals.get(args.warmup_pairs..)
         && !measured.is_empty()
@@ -1137,6 +1222,13 @@ mod tests {
             kiko_slam::PnpProjectableTrackedObservationCountMetric::new(32),
         );
         warmup.pnp_accepted_inliers = Some(kiko_slam::PnpAcceptedInlierCountMetric::new(28));
+        warmup.triangulation = Some(kiko_slam::TriangulationStats {
+            candidate_matches: 50,
+            kept: 30,
+            dropped_epipolar: 10,
+            dropped_disparity: 10,
+            ..kiko_slam::TriangulationStats::default()
+        });
         let mut steady = kiko_slam::FrameDiagnostics::empty(3, 45);
         steady.features_detected = Some(120);
         steady.features_matched = Some(50);
@@ -1146,6 +1238,13 @@ mod tests {
             kiko_slam::PnpProjectableTrackedObservationCountMetric::new(41),
         );
         steady.pnp_accepted_inliers = Some(kiko_slam::PnpAcceptedInlierCountMetric::new(36));
+        steady.triangulation = Some(kiko_slam::TriangulationStats {
+            candidate_matches: 70,
+            kept: 50,
+            dropped_epipolar: 12,
+            dropped_disparity: 8,
+            ..kiko_slam::TriangulationStats::default()
+        });
 
         let mut totals = DiagnosticTotals::default();
         totals.record(&warmup, false).expect("warmup totals");
@@ -1163,6 +1262,36 @@ mod tests {
         assert_eq!(totals.pnp_projectable_tracked_observations.total, 73);
         assert_eq!(totals.pnp_accepted_inliers.total, 64);
         assert_eq!(totals.pnp_accepted_inliers.steady_total, 36);
+        assert_eq!(totals.triangulation.samples, 2);
+        assert_eq!(totals.triangulation.candidate_matches, 120);
+        assert_eq!(totals.triangulation.kept, 80);
+        assert_eq!(totals.triangulation.dropped_disparity, 18);
+        assert_eq!(totals.triangulation.dropped_epipolar, 22);
+        assert_eq!(totals.triangulation.dropped_depth, 0);
+        assert_eq!(totals.triangulation.dropped_numerical, 0);
+        assert_eq!(totals.triangulation.dropped_unrepresentable, 0);
+        assert_eq!(totals.triangulation.dropped_duplicate, 0);
+    }
+
+    #[test]
+    fn diagnostic_totals_preserve_zero_candidate_triangulation_attempts() {
+        let mut diagnostics = kiko_slam::FrameDiagnostics::empty(0, 0);
+        diagnostics.triangulation = Some(kiko_slam::TriangulationStats::default());
+
+        let mut totals = DiagnosticTotals::default();
+        totals
+            .record(&diagnostics, false)
+            .expect("zero-candidate triangulation totals");
+
+        assert_eq!(totals.triangulation.samples, 1);
+        assert_eq!(totals.triangulation.candidate_matches, 0);
+        assert_eq!(totals.triangulation.kept, 0);
+        assert_eq!(totals.triangulation.dropped_disparity, 0);
+        assert_eq!(totals.triangulation.dropped_epipolar, 0);
+        assert_eq!(totals.triangulation.dropped_depth, 0);
+        assert_eq!(totals.triangulation.dropped_numerical, 0);
+        assert_eq!(totals.triangulation.dropped_unrepresentable, 0);
+        assert_eq!(totals.triangulation.dropped_duplicate, 0);
     }
 
     #[test]
@@ -1202,5 +1331,11 @@ mod tests {
         assert!(SLAM_ENV_HELP.contains("KIKO_PROJECTED_MATCH_MIN_DOT_PRODUCT=0.45"));
         assert!(SLAM_ENV_HELP.contains("Raw descriptor dot-product gate"));
         assert!(SLAM_ENV_HELP.contains("Deprecated misnamed alias"));
+    }
+
+    #[test]
+    fn slam_env_help_names_rectified_row_gate() {
+        assert!(SLAM_ENV_HELP.contains("KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX"));
+        assert!(SLAM_ENV_HELP.contains("Calibration/model-specific rectified-row gate"));
     }
 }

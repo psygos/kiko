@@ -1749,9 +1749,6 @@ pub enum TrackerError {
         verified: MapSnapshot,
         current: MapSnapshot,
     },
-    KeyframeRejected {
-        landmarks: usize,
-    },
     InvariantViolation(&'static str),
 }
 
@@ -1821,9 +1818,6 @@ impl std::fmt::Display for TrackerError {
                 f,
                 "verified relocalization map snapshot mismatch: verified={verified}, current={current}"
             ),
-            TrackerError::KeyframeRejected { landmarks } => {
-                write!(f, "keyframe rejected: only {landmarks} landmarks")
-            }
             TrackerError::InvariantViolation(message) => {
                 write!(f, "tracker invariant violation: {message}")
             }
@@ -1868,7 +1862,6 @@ impl std::error::Error for TrackerError {
             #[cfg(feature = "vio")]
             TrackerError::VioSolve(source) => Some(source),
             TrackerError::RelocalizationMapSnapshotMismatch { .. }
-            | TrackerError::KeyframeRejected { .. }
             | TrackerError::InvariantViolation(_) => None,
         }
     }
@@ -2260,6 +2253,109 @@ struct CreatedKeyframe {
     keyframe: Arc<Keyframe>,
     stereo_matches: Matches<Raw>,
     diagnostics: FrameDiagnostics,
+}
+
+#[derive(Debug)]
+enum KeyframeCreationOutcome {
+    Created(CreatedKeyframe),
+    Rejected(KeyframeRejection),
+}
+
+#[derive(Debug)]
+enum KeyframeTriangulationOutcome {
+    Accepted(crate::TriangulationResult),
+    Rejected(KeyframeRejection),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KeyframeRejection {
+    NoStereoDetections {
+        left_detections: usize,
+        right_detections: usize,
+    },
+    InsufficientLandmarks {
+        left_detections: usize,
+        stats: crate::TriangulationStats,
+    },
+}
+
+impl KeyframeRejection {
+    fn triangulation_stats(self) -> Option<crate::TriangulationStats> {
+        match self {
+            Self::NoStereoDetections { .. } => None,
+            Self::InsufficientLandmarks { stats, .. } => Some(stats),
+        }
+    }
+
+    fn record_diagnostics(self, diagnostics: &mut FrameDiagnostics) {
+        match self {
+            Self::NoStereoDetections {
+                left_detections, ..
+            } => {
+                diagnostics.features_detected = Some(left_detections);
+                diagnostics.features_matched = Some(0);
+            }
+            Self::InsufficientLandmarks {
+                left_detections,
+                stats,
+            } => {
+                diagnostics.features_detected = Some(left_detections);
+                diagnostics.features_matched = Some(stats.candidate_matches);
+                diagnostics.triangulation = Some(stats);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for KeyframeRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoStereoDetections {
+                left_detections,
+                right_detections,
+            } => write!(
+                f,
+                "no stereo detections (left={left_detections}, right={right_detections})"
+            ),
+            Self::InsufficientLandmarks { stats, .. } => {
+                write!(f, "only {} triangulated landmarks", stats.kept)
+            }
+        }
+    }
+}
+
+fn classify_keyframe_triangulation(
+    result: Result<crate::TriangulationResult, TriangulationError>,
+    left_detections: usize,
+    min_landmarks: usize,
+) -> Result<KeyframeTriangulationOutcome, TrackerError> {
+    match result {
+        Ok(result) => {
+            let landmark_count = result.keyframe.landmarks().len();
+            if result.stats.kept != landmark_count {
+                return Err(TrackerError::InvariantViolation(
+                    "triangulation kept count does not match keyframe landmarks",
+                ));
+            }
+            if landmark_count < min_landmarks {
+                Ok(KeyframeTriangulationOutcome::Rejected(
+                    KeyframeRejection::InsufficientLandmarks {
+                        left_detections,
+                        stats: result.stats,
+                    },
+                ))
+            } else {
+                Ok(KeyframeTriangulationOutcome::Accepted(result))
+            }
+        }
+        Err(TriangulationError::NoLandmarks { stats }) => Ok(
+            KeyframeTriangulationOutcome::Rejected(KeyframeRejection::InsufficientLandmarks {
+                left_detections,
+                stats,
+            }),
+        ),
+        Err(source) => Err(TrackerError::Triangulation(source)),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -5254,8 +5350,8 @@ impl SlamTracker {
                 new_pose,
                 Some(current.clone()),
                 KeyframeConnection::Covisibility(shared),
-            ) {
-                Ok(created) => {
+            )? {
+                KeyframeCreationOutcome::Created(created) => {
                     let CreatedKeyframe {
                         keyframe_id,
                         keyframe,
@@ -5340,19 +5436,19 @@ impl SlamTracker {
                         output_matches = Some(stereo_matches);
                     }
                 }
-                Err(TrackerError::KeyframeRejected { landmarks }) => {
+                KeyframeCreationOutcome::Rejected(rejection) => {
                     keyframe_status = Some(KeyframeStatus::Rejected);
+                    triangulation_stats = rejection.triangulation_stats();
                     if self.trace_transitions {
                         eprintln!(
-                            "keyframe insertion rejected frame={} reason={} shared_pairs={} landmarks={}",
+                            "keyframe insertion rejected frame={} reason={} shared_pairs={} rejection={}",
                             frame_id.as_u64(),
                             reason.trace_label(),
                             shared_pairs,
-                            landmarks
+                            rejection,
                         );
                     }
                 }
-                Err(err) => return Err(err),
             }
         }
 
@@ -5562,8 +5658,8 @@ impl SlamTracker {
         let capture_time = left.timestamp();
         let created =
             match self.create_keyframe_internal(left, right, pose_world, left_det, connection) {
-                Ok(value) => value,
-                Err(TrackerError::KeyframeRejected { landmarks }) => {
+                Ok(KeyframeCreationOutcome::Created(value)) => value,
+                Ok(KeyframeCreationOutcome::Rejected(rejection)) => {
                     if is_relocalization {
                         #[cfg(feature = "vio")]
                         let reference_cam_from_odom = self.current_odom_pose()?;
@@ -5577,9 +5673,9 @@ impl SlamTracker {
                     }
                     if self.trace_transitions {
                         eprintln!(
-                            "keyframe creation rejected frame={} landmarks={} relocalization={} ",
+                            "keyframe creation rejected frame={} rejection={} relocalization={}",
                             frame_id.as_u64(),
-                            landmarks,
+                            rejection,
                             is_relocalization,
                         );
                     }
@@ -5587,6 +5683,7 @@ impl SlamTracker {
                     self.reset_inertial_runtime_continuity();
                     let mut diagnostics = self.empty_diagnostics();
                     diagnostics.keyframe_status = Some(KeyframeStatus::Rejected);
+                    rejection.record_diagnostics(&mut diagnostics);
                     return self.tracking_failure_output(
                         frame_id,
                         TrackingHealth::Degraded,
@@ -5630,7 +5727,7 @@ impl SlamTracker {
         pose_world: Pose,
         left_det: Option<Arc<Detections>>,
         connection: KeyframeConnection,
-    ) -> Result<CreatedKeyframe, TrackerError> {
+    ) -> Result<KeyframeCreationOutcome, TrackerError> {
         let frame_id = left.frame_id();
         let max_keypoints = self.config.max_keypoints();
 
@@ -5654,27 +5751,38 @@ impl SlamTracker {
         };
 
         let matches = if left_arc.is_empty() || right_arc.is_empty() {
-            return Err(TrackerError::KeyframeRejected { landmarks: 0 });
+            return Ok(KeyframeCreationOutcome::Rejected(
+                KeyframeRejection::NoStereoDetections {
+                    left_detections: left_arc.len(),
+                    right_detections: right_arc.len(),
+                },
+            ));
         } else {
             self.frontend
                 .match_stereo(left_arc.clone(), right_arc.clone())?
         };
 
-        let result = self.frontend.triangulate_matches(&matches)?;
+        let result = match classify_keyframe_triangulation(
+            self.frontend.triangulate_matches(&matches),
+            left_arc.len(),
+            self.config.min_keyframe_points,
+        )? {
+            KeyframeTriangulationOutcome::Accepted(result) => result,
+            KeyframeTriangulationOutcome::Rejected(rejection) => {
+                if self.trace_transitions {
+                    eprintln!(
+                        "keyframe rejected frame={} rejection={} min_required={}",
+                        frame_id.as_u64(),
+                        rejection,
+                        self.config.min_keyframe_points,
+                    );
+                }
+                return Ok(KeyframeCreationOutcome::Rejected(rejection));
+            }
+        };
         let triangulation_stats = result.stats;
         let landmarks = result.keyframe.landmarks().len();
         let depth_summary = summarize_depths(result.keyframe.landmarks());
-        if landmarks < self.config.min_keyframe_points {
-            if self.trace_transitions {
-                eprintln!(
-                    "keyframe rejected frame={} landmarks={} min_required={}",
-                    frame_id.as_u64(),
-                    landmarks,
-                    self.config.min_keyframe_points
-                );
-            }
-            return Err(TrackerError::KeyframeRejected { landmarks });
-        }
 
         let keyframe = Arc::new(result.keyframe);
         if self.trace_transitions {
@@ -5741,12 +5849,12 @@ impl SlamTracker {
         diagnostics.features_detected = Some(left_arc.len());
         diagnostics.features_matched = Some(matches.len());
 
-        Ok(CreatedKeyframe {
+        Ok(KeyframeCreationOutcome::Created(CreatedKeyframe {
             keyframe_id,
             keyframe,
             stereo_matches: matches,
             diagnostics,
-        })
+        }))
     }
 }
 
@@ -6093,6 +6201,83 @@ mod tests {
 
     fn make_descriptor() -> Descriptor {
         Descriptor::ZERO
+    }
+
+    #[test]
+    fn keyframe_rejections_record_truthful_optional_triangulation_diagnostics() {
+        let mut no_detections = FrameDiagnostics::empty(0, 0);
+        KeyframeRejection::NoStereoDetections {
+            left_detections: 5,
+            right_detections: 0,
+        }
+        .record_diagnostics(&mut no_detections);
+        assert_eq!(no_detections.features_detected, Some(5));
+        assert_eq!(no_detections.features_matched, Some(0));
+        assert!(no_detections.triangulation.is_none());
+
+        let stats = crate::TriangulationStats {
+            candidate_matches: 11,
+            kept: 3,
+            dropped_epipolar: 8,
+            ..crate::TriangulationStats::default()
+        };
+        let mut insufficient = FrameDiagnostics::empty(0, 0);
+        KeyframeRejection::InsufficientLandmarks {
+            left_detections: 17,
+            stats,
+        }
+        .record_diagnostics(&mut insufficient);
+        assert_eq!(insufficient.features_detected, Some(17));
+        assert_eq!(insufficient.features_matched, Some(11));
+        let recorded = insufficient
+            .triangulation
+            .expect("post-triangulation rejection preserves statistics");
+        assert_eq!(recorded.candidate_matches, stats.candidate_matches);
+        assert_eq!(recorded.kept, stats.kept);
+        assert_eq!(recorded.dropped_epipolar, stats.dropped_epipolar);
+    }
+
+    #[test]
+    fn no_landmarks_is_a_nonfatal_typed_keyframe_rejection() {
+        let outcome = classify_keyframe_triangulation(
+            Err(TriangulationError::NoLandmarks {
+                stats: crate::TriangulationStats::default(),
+            }),
+            9,
+            12,
+        )
+        .expect("empty triangulation is an expected keyframe outcome");
+
+        let KeyframeTriangulationOutcome::Rejected(KeyframeRejection::InsufficientLandmarks {
+            left_detections,
+            stats,
+        }) = outcome
+        else {
+            panic!("no-landmark triangulation must not be accepted");
+        };
+        assert_eq!(left_detections, 9);
+        assert_eq!(stats.candidate_matches, 0);
+        assert_eq!(stats.kept, 0);
+    }
+
+    #[test]
+    fn contradictory_triangulation_result_is_an_invariant_violation() {
+        let keyframe = Arc::try_unwrap(make_single_landmark_keyframe(34))
+            .expect("test owns the only keyframe reference");
+        let result = crate::TriangulationResult {
+            keyframe,
+            stats: crate::TriangulationStats::default(),
+        };
+
+        let error = classify_keyframe_triangulation(Ok(result), 9, 1)
+            .expect_err("forged triangulation statistics must fail closed");
+
+        assert!(matches!(
+            error,
+            TrackerError::InvariantViolation(
+                "triangulation kept count does not match keyframe landmarks"
+            )
+        ));
     }
 
     fn make_single_landmark_keyframe(frame_id: u64) -> Arc<Keyframe> {

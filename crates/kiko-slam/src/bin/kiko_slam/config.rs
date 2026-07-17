@@ -112,6 +112,7 @@ pub fn build_tracker_config_with_overrides(
         .unwrap_or(DEFAULT_KEYFRAME_REDUNDANT_COVISIBILITY);
     let min_inliers = try_env_usize("KIKO_TRACK_MIN_INLIERS")?.unwrap_or(defaults.min_inliers);
     let ransac = RansacConfig::default().try_with_min_inliers(min_inliers)?;
+    let triangulation = triangulation_config_from_env()?;
     let tracking_matcher = tracking_matcher_from_env(
         overrides
             .tracking_matcher
@@ -208,7 +209,7 @@ pub fn build_tracker_config_with_overrides(
         tracking_matcher,
         min_keyframe_points,
         ransac,
-        triangulation: TriangulationConfig::default(),
+        triangulation,
         keyframe_policy,
         ba: ba_config,
         redundancy,
@@ -221,6 +222,25 @@ pub fn build_tracker_config_with_overrides(
             None => try_env_bool("KIKO_VIO")?.unwrap_or(false),
         },
     })
+}
+
+fn triangulation_config_from_env() -> Result<TriangulationConfig, Box<dyn std::error::Error>> {
+    let defaults = TriangulationConfig::default();
+    let config = match try_env_f32("KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX")? {
+        Some(maximum) => TriangulationConfig::new_with_vertical_disparity(
+            defaults.min_disparity_px(),
+            defaults.max_depth_m(),
+            maximum,
+        )?,
+        None => defaults,
+    };
+    eprintln!(
+        "triangulation: min_disparity_px={} max_depth_m={:?} max_vertical_disparity_px={}",
+        config.min_disparity_px(),
+        config.max_depth_m(),
+        config.max_vertical_disparity_px().value_px(),
+    );
+    Ok(config)
 }
 
 fn tracking_matcher_from_env(

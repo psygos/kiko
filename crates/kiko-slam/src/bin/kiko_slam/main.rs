@@ -707,6 +707,46 @@ mod tests {
     }
 
     #[test]
+    fn build_tracker_config_reads_explicit_rectified_row_gate() {
+        let _guard = env_lock().lock().expect("env lock");
+        let key = "KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX";
+        let saved = std::env::var_os(key);
+        set_env(key, "1.5");
+
+        let config = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect("explicit rectified-row gate");
+
+        assert_eq!(
+            config.triangulation.max_vertical_disparity_px().value_px(),
+            1.5
+        );
+
+        set_env(key, "-1");
+        let error = build_tracker_config(
+            TrackerDefaults {
+                min_keyframe_points: 12,
+                refresh_inliers: 12,
+                min_inliers: 8,
+            },
+            KeypointLimit::try_from(1024).expect("keypoint limit"),
+            DownscaleFactor::try_from(1).expect("downscale"),
+        )
+        .expect_err("negative rectified-row gate must fail closed");
+        assert!(error.to_string().contains("rectified row mismatch"));
+        assert!(error.source().is_some());
+
+        restore_env(key, saved);
+    }
+
+    #[test]
     fn build_tracker_config_rejects_conflicting_projected_dot_product_aliases() {
         let _guard = env_lock().lock().expect("env lock");
         let keys = [
