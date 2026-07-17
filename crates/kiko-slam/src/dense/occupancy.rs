@@ -431,7 +431,12 @@ impl OccupancyGridGeometry {
             && point[1] < self.upper_bound_m[1]
     }
 
-    fn point_index(self, point: [f64; 2]) -> Option<usize> {
+    /// Returns the row-major cell containing `point` in the occupancy frame.
+    ///
+    /// Bounds are lower-inclusive and upper-exclusive. Generated internal
+    /// boundaries select their positive-side cell even when the fast quotient
+    /// estimate rounds to an adjacent integer.
+    pub fn point_index(self, point: [f64; 2]) -> Option<usize> {
         if !self.contains_xy(point) {
             return None;
         }
@@ -917,6 +922,7 @@ impl OccupancyGridMetadata {
 pub struct OccupancyGridSnapshot {
     class_ids: Vec<u8>,
     metadata: OccupancyGridMetadata,
+    geometry: OccupancyGridGeometry,
 }
 
 impl OccupancyGridSnapshot {
@@ -926,6 +932,11 @@ impl OccupancyGridSnapshot {
 
     pub fn metadata(&self) -> OccupancyGridMetadata {
         self.metadata
+    }
+
+    /// The parsed geometry that produced this snapshot.
+    pub fn geometry(&self) -> OccupancyGridGeometry {
+        self.geometry
     }
 
     pub fn into_parts(self) -> (OccupancyGridMetadata, Vec<u8>) {
@@ -977,6 +988,35 @@ impl OccupancyGridSnapshot {
             .get(index)
             .copied()
             .map(OccupancyCell::from_class_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_cells(
+        geometry: OccupancyGridGeometry,
+        cells: &[OccupancyCell],
+        map_instance_id: MapInstanceId,
+        revision: u64,
+    ) -> Self {
+        assert_eq!(cells.len(), geometry.cell_count());
+        Self {
+            class_ids: cells.iter().copied().map(OccupancyCell::class_id).collect(),
+            metadata: OccupancyGridMetadata {
+                width: geometry.width(),
+                height: geometry.height(),
+                resolution_m: geometry.resolution_m(),
+                lower_bound_m: geometry.lower_bound_m(),
+                world_to_occupancy: WorldToOccupancy::try_new(
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    [0.0; 3],
+                )
+                .expect("identity occupancy transform"),
+                height_range: HeightRangeMeters::try_new(-1.0, 1.0).expect("test height range"),
+                row_order: OccupancyRowOrder::IncreasingOccupancyY,
+                map_instance_id: Some(map_instance_id),
+                revision,
+            },
+            geometry,
+        }
     }
 }
 
@@ -1680,6 +1720,7 @@ impl OccupancyMapper {
                 map_instance_id: self.map_instance_id,
                 revision: self.revision,
             },
+            geometry,
         })
     }
 

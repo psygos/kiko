@@ -19,6 +19,7 @@ mod local_ba;
 pub mod loop_closure;
 pub mod map;
 mod math;
+pub mod navigation;
 #[cfg(feature = "record")]
 mod oak;
 mod observability;
