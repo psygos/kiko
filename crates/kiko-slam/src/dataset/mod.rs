@@ -45,8 +45,8 @@ pub mod format {
 
 mod reader;
 pub use reader::{
-    DatasetDepthCursor, DatasetImuCursor, DatasetReadTimings, DatasetReader, DatasetStats,
-    TimedPair,
+    DatasetDepthCursor, DatasetImuCursor, DatasetImuReportCursor, DatasetReadTimings,
+    DatasetReader, DatasetStats, TimedPair,
 };
 
 // Meta Structs
@@ -6855,6 +6855,27 @@ mod tests {
         assert_eq!(imu["host_arrival_timebase"], IMU_HOST_ARRIVAL_TIMEBASE);
 
         let reader = DatasetReader::open(&path).expect("open IMU dataset");
+        let mut report_cursor = reader
+            .imu_report_cursor()
+            .expect("create original-report cursor");
+        assert_eq!(report_cursor.len(), reports.len());
+        assert_eq!(report_cursor.remaining(), reports.len());
+        assert_eq!(
+            report_cursor.retained_state_for_test(),
+            (0, usize::from(IMU_STREAM_RECORD_BYTES)),
+            "the sequential cursor retains no bulk report collection"
+        );
+        let replayed_reports: Vec<_> = report_cursor
+            .by_ref()
+            .collect::<Result<_, _>>()
+            .expect("replay original IMU reports");
+        assert_eq!(replayed_reports, reports);
+        assert_eq!(report_cursor.remaining(), 0);
+        assert_eq!(
+            report_cursor.retained_state_for_test(),
+            (0, usize::from(IMU_STREAM_RECORD_BYTES))
+        );
+
         let mut cursor = reader.imu_cursor().expect("create IMU cursor");
         assert_eq!(cursor.len(), 6);
         assert_eq!(cursor.remaining(), 6);
@@ -6903,6 +6924,26 @@ mod tests {
         );
         assert_eq!(cursor.remaining(), 0);
 
+        let mut expanded_events: Vec<_> = replayed_reports
+            .iter()
+            .flat_map(|report| report.events())
+            .collect();
+        expanded_events.sort_by_key(|event| {
+            let sensor_order = match event.sensor() {
+                InertialSensorKind::Accelerometer => 0_u8,
+                InertialSensorKind::Gyroscope => 1_u8,
+            };
+            (
+                event.device_timestamp().as_nanos(),
+                sensor_order,
+                event.sequence().as_u32(),
+            )
+        });
+        assert_eq!(
+            expanded_events, events,
+            "expanding original reports reproduces the existing merged cursor exactly"
+        );
+
         std::fs::remove_dir_all(path).expect("remove round-trip fixture");
     }
 
@@ -6919,6 +6960,17 @@ mod tests {
         let cursor = reader.imu_cursor().expect("configured stream has a cursor");
         assert!(cursor.is_empty());
         assert_eq!(cursor.remaining(), 0);
+        let mut report_cursor = reader
+            .imu_report_cursor()
+            .expect("configured stream has an original-report cursor");
+        assert!(report_cursor.is_empty());
+        assert_eq!(report_cursor.remaining(), 0);
+        assert!(
+            report_cursor
+                .next_report()
+                .expect("configured empty report EOF is valid")
+                .is_none()
+        );
         std::fs::remove_dir_all(path).expect("remove configured-empty fixture");
 
         let path = unique_dataset_path("imu-legacy");
@@ -6932,6 +6984,10 @@ mod tests {
             reader.imu_cursor(),
             Err(DatasetError::ImuStreamNotConfigured)
         ));
+        assert!(matches!(
+            reader.imu_report_cursor(),
+            Err(DatasetError::ImuStreamNotConfigured)
+        ));
 
         std::fs::write(
             path.join(format::META_FILE),
@@ -6941,6 +6997,10 @@ mod tests {
         let reader = DatasetReader::open(&path).expect("legacy IMU metadata remains readable");
         assert!(matches!(
             reader.imu_cursor(),
+            Err(DatasetError::LegacyImuManifestUnindexed)
+        ));
+        assert!(matches!(
+            reader.imu_report_cursor(),
             Err(DatasetError::LegacyImuManifestUnindexed)
         ));
         std::fs::remove_dir_all(path).expect("remove legacy fixture");
@@ -7128,6 +7188,85 @@ mod tests {
         assert_eq!(event.sensor(), InertialSensorKind::Accelerometer);
         assert_eq!(cursor.remaining(), 3);
         std::fs::remove_dir_all(path).expect("remove mutation fixture");
+    }
+
+    #[test]
+    fn imu_report_cursor_retries_the_same_record_after_post_open_corruption_and_truncation() {
+        let reports = [
+            imu_report(7, 10, 100, 10, 40, 0.0),
+            imu_report(7, 11, 110, 20, 50, 1.0),
+        ];
+        let path = write_imu_fixture("imu-report-post-open-retry", &reports);
+        let stream_path = path.join(format::IMU_STREAM_FILE);
+        let original = std::fs::read(&stream_path).expect("read report-cursor fixture");
+        let reader = DatasetReader::open(&path).expect("validate report-cursor fixture");
+        let mut cursor = reader
+            .imu_report_cursor()
+            .expect("open original-report cursor");
+
+        let mut corrupted = original.clone();
+        let accel_x = usize::from(IMU_STREAM_HEADER_BYTES) + 32;
+        corrupted[accel_x..accel_x + 8].copy_from_slice(&f64::NAN.to_le_bytes());
+        std::fs::write(&stream_path, corrupted).expect("corrupt current report after open");
+        assert!(matches!(
+            cursor
+                .next_report()
+                .expect_err("post-open sample corruption must fail report replay"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::NonFiniteSample {
+                    record_index: 0,
+                    field: "accel_x",
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(cursor.remaining(), reports.len());
+        assert_eq!(cursor.retained_state_for_test().0, 0);
+
+        std::fs::write(&stream_path, &original).expect("restore corrupted report stream");
+        assert_eq!(
+            cursor
+                .next_report()
+                .expect("retry restored first report")
+                .expect("first report remains available"),
+            reports[0]
+        );
+        assert_eq!(cursor.remaining(), 1);
+
+        let partial_second_record = usize::from(IMU_STREAM_HEADER_BYTES)
+            + usize::from(IMU_STREAM_RECORD_BYTES)
+            + usize::from(IMU_STREAM_RECORD_BYTES) / 2;
+        std::fs::write(&stream_path, &original[..partial_second_record])
+            .expect("truncate current report after open");
+        assert!(matches!(
+            cursor
+                .next_report()
+                .expect_err("post-open truncation must fail report replay"),
+            DatasetError::InvalidImuStream {
+                source: ImuStreamError::ByteLengthMismatch { .. },
+                ..
+            }
+        ));
+        assert_eq!(cursor.remaining(), 1);
+
+        std::fs::write(&stream_path, &original).expect("restore truncated report stream");
+        assert_eq!(
+            cursor
+                .next_report()
+                .expect("retry restored second report")
+                .expect("second report remains available"),
+            reports[1]
+        );
+        assert_eq!(cursor.remaining(), 0);
+        assert!(
+            cursor
+                .next_report()
+                .expect("restored report stream reaches exact EOF")
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(path).expect("remove report-cursor retry fixture");
     }
 
     #[test]

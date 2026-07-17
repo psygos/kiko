@@ -76,6 +76,7 @@ struct ImuStreamDescriptor {
     path: PathBuf,
     session_id: DeviceSessionId,
     record_count: u64,
+    report_count: usize,
     event_count: usize,
     byte_len: u64,
 }
@@ -270,6 +271,20 @@ impl DatasetReader {
         }
     }
 
+    /// Returns the original IMU bridge reports in recorded dequeue order.
+    ///
+    /// Each item retains its shared dequeue sequence and host-arrival timestamp
+    /// together with the independently timestamped accelerometer and gyroscope
+    /// samples. This cursor does not reconstruct report pairing from the
+    /// device-time-merged event stream.
+    pub fn imu_report_cursor(&self) -> Result<DatasetImuReportCursor, DatasetError> {
+        match &self.imu {
+            ParsedImuStream::Unconfigured => Err(DatasetError::ImuStreamNotConfigured),
+            ParsedImuStream::LegacyUnindexed => Err(DatasetError::LegacyImuManifestUnindexed),
+            ParsedImuStream::Indexed(stream) => DatasetImuReportCursor::open(stream),
+        }
+    }
+
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
         DatasetPairs {
             reader: self,
@@ -449,6 +464,75 @@ impl Iterator for DatasetImuCursor {
     fn next(&mut self) -> Option<Self::Item> {
         match self.next_event() {
             Ok(Some(event)) => Some(Ok(event)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+}
+
+/// Bounded-memory replay cursor over the original stored IMU bridge reports.
+///
+/// Dataset open has already parsed and validated the stream descriptor and all
+/// records. A cursor reopens that exact payload and retains at most one decoded
+/// report while reading sequentially. Post-open I/O, length, sample-domain, or
+/// ordering failures do not consume the affected report, so restoring the
+/// payload permits a retry of the same record.
+#[derive(Debug)]
+pub struct DatasetImuReportCursor {
+    reports: ImuReportFileCursor,
+    report_count: usize,
+    emitted: usize,
+}
+
+impl DatasetImuReportCursor {
+    fn open(stream: &ImuStreamDescriptor) -> Result<Self, DatasetError> {
+        Ok(Self {
+            reports: ImuReportFileCursor::open(stream)?,
+            report_count: stream.report_count,
+            emitted: 0,
+        })
+    }
+
+    /// Total number of original bridge reports declared by the validated stream.
+    pub fn len(&self) -> usize {
+        self.report_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.report_count == 0
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.report_count - self.emitted
+    }
+
+    /// Decode the next original report without inventing cross-report pairing.
+    ///
+    /// Any failure leaves this cursor on the same logical record.
+    pub fn next_report(&mut self) -> Result<Option<ImuReport>, DatasetError> {
+        if self.reports.peek()?.is_none() {
+            return Ok(None);
+        }
+        let report = self.reports.consume();
+        self.emitted += 1;
+        Ok(Some(report))
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_state_for_test(&self) -> (usize, usize) {
+        (
+            usize::from(self.reports.lookahead.is_some()),
+            self.reports.reader.capacity(),
+        )
+    }
+}
+
+impl Iterator for DatasetImuReportCursor {
+    type Item = Result<ImuReport, DatasetError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.next_report() {
+            Ok(Some(report)) => Some(Ok(report)),
             Ok(None) => None,
             Err(error) => Some(Err(error)),
         }
@@ -1141,6 +1225,7 @@ fn parse_imu_stream(
         path,
         session_id,
         record_count: manifest.record_count,
+        report_count: record_count,
         event_count,
         byte_len: expected_len,
     }))
