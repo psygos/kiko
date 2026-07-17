@@ -235,7 +235,10 @@ pub struct TriangulationConfig {
     max_vertical_disparity_px: RectifiedRowMismatchPx,
 }
 
-const DEFAULT_MAX_VERTICAL_DISPARITY_PX: RectifiedRowMismatchPx = RectifiedRowMismatchPx(1.0);
+// Selected from Kiko's full-resolution lab sweep: 1.75 px remained on the
+// low-support branch, while 2.0 px restored baseline support and 3.0 px added
+// negligible tracking support at lower geometric selectivity.
+const DEFAULT_MAX_VERTICAL_DISPARITY_PX: RectifiedRowMismatchPx = RectifiedRowMismatchPx(2.0);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TriangulationConfigError {
@@ -1153,7 +1156,7 @@ mod tests {
     fn triangulation_config_rejects_invalid_thresholds() {
         let default_policy =
             TriangulationConfig::new(1.0, None).expect("default triangulation policy");
-        assert_eq!(default_policy.max_vertical_disparity_px().value_px(), 1.0);
+        assert_eq!(default_policy.max_vertical_disparity_px().value_px(), 2.0);
         let gated_policy = TriangulationConfig::new_with_vertical_disparity(1.0, None, 1.0)
             .expect("explicit row-mismatch gate");
         assert_eq!(gated_policy.max_vertical_disparity_px().value_px(), 1.0);
