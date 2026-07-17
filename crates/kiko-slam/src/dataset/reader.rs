@@ -1118,7 +1118,9 @@ mod tests {
             DatasetError::InvalidCalibration {
                 path,
                 source: crate::CalibrationBundleError::InvalidStereo {
-                    source: crate::RectifiedStereoError::InvalidBaseline { baseline_m: 0.0 },
+                    source: crate::StereoCalibrationError::InvalidBaseline {
+                        source: crate::StereoBaselineError::NonPositive { baseline_m: 0.0 },
+                    },
                 },
             } if path == &calibration_path
         ));
@@ -1156,6 +1158,58 @@ mod tests {
                 && calibration.height() == 2
         ));
         let _ = std::fs::remove_dir_all(&mismatch_dir);
+    }
+
+    #[test]
+    fn reader_retains_one_typed_asymmetric_stereo_authority() {
+        let dataset_dir = unique_temp_dir("reader-typed-asymmetric-calibration");
+        let mut serialized = calibration();
+        serialized.left.fx = 100.0;
+        serialized.left.fy = 101.0;
+        serialized.left.cx = 1.0;
+        serialized.left.cy = -0.0;
+        serialized.right.fx = 120.0;
+        serialized.right.fy = 111.0;
+        serialized.right.cx = -f32::from_bits(1);
+        serialized.right.cy = f32::from_bits(1);
+        serialized.baseline_m = f32::from_bits(1);
+        serialized.rectified = false;
+
+        let (writer, handle) = DatasetWriter::create(&dataset_dir, &meta_with_depth(), &serialized)
+            .expect("writer accepts structurally valid calibration");
+        drop(writer);
+        handle.finish().expect("finish dataset");
+
+        let reader = DatasetReader::open(&dataset_dir).expect("reader");
+        let structural = reader.calibration().stereo_calibration();
+        assert!(!structural.is_rectified());
+        assert_eq!(
+            structural.left().fx().to_bits(),
+            serialized.left.fx.to_bits()
+        );
+        assert_eq!(
+            structural.left().cy().to_bits(),
+            serialized.left.cy.to_bits()
+        );
+        assert_eq!(
+            structural.right().fx().to_bits(),
+            serialized.right.fx.to_bits()
+        );
+        assert_eq!(
+            structural.right().cx().to_bits(),
+            serialized.right.cx.to_bits()
+        );
+        assert_eq!(
+            structural.baseline_m().to_bits(),
+            serialized.baseline_m.to_bits()
+        );
+        assert_eq!(reader.calibration().intrinsics(), structural.left());
+        assert!(matches!(
+            reader.calibration().rectified_stereo(),
+            Err(crate::RectifiedStereoCompatibilityError::NotRectified)
+        ));
+
+        std::fs::remove_dir_all(dataset_dir).expect("remove typed calibration dataset");
     }
 
     #[test]

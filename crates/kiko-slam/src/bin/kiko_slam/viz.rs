@@ -30,6 +30,7 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
     let rerun_output = RerunOutput::try_from_args(&args.rerun)?;
     let sink_config = RerunSinkConfig::from_environment()?;
     let mut reader = DatasetReader::open(&args.dataset.path)?;
+    let rectified = reader.calibration().rectified_stereo()?;
     let stats = reader.stats();
 
     eprintln!("dataset: {}", args.dataset.path.display());
@@ -45,7 +46,6 @@ pub fn run_viz(args: &VizArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let inference = InferenceConfig::from_args(&args.inference, InferencePurpose::Visualization)?;
 
-    let rectified = reader.calibration().stereo().clone();
     let triangulator = Triangulator::new(rectified, TriangulationConfig::default());
 
     let rec = rerun_recording(rerun_output.destination(), "kiko-slam-dataset")?;

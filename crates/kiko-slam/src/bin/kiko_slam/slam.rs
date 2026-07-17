@@ -474,6 +474,8 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
     if vio_enabled && !reader.has_imu_data() {
         return Err("--vio requires IMU data in the dataset".into());
     }
+    let calibration = reader.calibration().clone();
+    let rectified = calibration.rectified_stereo()?;
     let stats = reader.stats();
 
     eprintln!("dataset: {}", args.dataset.path.display());
@@ -510,8 +512,6 @@ pub fn run_slam(args: &SlamArgs) -> Result<(), Box<dyn std::error::Error>> {
         inference_init.as_secs_f64() * 1000.0
     );
 
-    let calibration = reader.calibration().clone();
-    let rectified = calibration.stereo().clone();
     let dense_cloud_enabled = kiko_slam::env::try_env_bool("KIKO_DENSE_CLOUD")?.unwrap_or(false);
     let dense_config = kiko_slam::DenseCloudConfig::try_from_env()?;
     #[cfg(feature = "vio")]

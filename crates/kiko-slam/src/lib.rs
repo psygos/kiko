@@ -173,9 +173,11 @@ pub use tracker::{
 };
 pub use triangulation::{
     Keyframe, KeyframeError, KeyframeLandmarkError, Point3, RectifiedRowMismatchError,
-    RectifiedRowMismatchPx, RectifiedStereo, RectifiedStereoError, SparseStereoSample,
-    SparseStereoSamples, TriangulationConfig, TriangulationConfigError, TriangulationError,
-    TriangulationResult, TriangulationStats, Triangulator,
+    RectifiedRowMismatchPx, RectifiedStereo, RectifiedStereoCompatibilityError,
+    RectifiedStereoError, SparseStereoSample, SparseStereoSamples, StereoBaselineError,
+    StereoCalibration, StereoCalibrationError, StereoCameraSide, TriangulationConfig,
+    TriangulationConfigError, TriangulationError, TriangulationResult, TriangulationStats,
+    Triangulator,
 };
 #[cfg(feature = "vio")]
 pub use vio::{

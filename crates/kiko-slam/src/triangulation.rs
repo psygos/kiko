@@ -1,18 +1,201 @@
 use std::sync::Arc;
 
-use crate::dataset::{Calibration, CameraIntrinsics};
 use crate::{
-    DetectionError, Detections, FrameDimensions, FrameDimensionsError, FrameId, Keypoint, Matches,
-    Raw, SensorId,
+    DetectionError, Detections, FrameDimensions, FrameDimensionsError, FrameId, IntrinsicsError,
+    Keypoint, Matches, PinholeIntrinsics, Raw, SensorId,
 };
 
 #[derive(Clone, Debug)]
 pub struct RectifiedStereo {
-    left: CameraIntrinsics,
-    right: CameraIntrinsics,
-    dimensions: FrameDimensions,
-    baseline_m: f32,
+    calibration: StereoCalibration,
     arithmetic: RectifiedStereoArithmetic,
+}
+
+/// Camera side named by a structural stereo-calibration error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoCameraSide {
+    Left,
+    Right,
+}
+
+impl std::fmt::Display for StereoCameraSide {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Left => f.write_str("left"),
+            Self::Right => f.write_str("right"),
+        }
+    }
+}
+
+/// Positive finite stereo baseline, expressed in metres.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StereoBaselineMeters(f32);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StereoBaselineError {
+    NonFinite { baseline_m: f32 },
+    NonPositive { baseline_m: f32 },
+}
+
+impl StereoBaselineMeters {
+    pub(crate) fn try_new(baseline_m: f32) -> Result<Self, StereoBaselineError> {
+        if !baseline_m.is_finite() {
+            return Err(StereoBaselineError::NonFinite { baseline_m });
+        }
+        if baseline_m <= 0.0 {
+            return Err(StereoBaselineError::NonPositive { baseline_m });
+        }
+        Ok(Self(baseline_m))
+    }
+
+    fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for StereoBaselineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonFinite { baseline_m } => {
+                write!(f, "stereo baseline must be finite, got {baseline_m} m")
+            }
+            Self::NonPositive { baseline_m } => {
+                write!(f, "stereo baseline must be positive, got {baseline_m} m")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StereoBaselineError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StereoRectification {
+    Rectified,
+    Unrectified,
+}
+
+/// Policy-neutral stereo calibration whose structural facts are valid by construction.
+///
+/// Both cameras have finite projection coefficients with positive focal lengths,
+/// share one nonzero image size, and have a positive finite metric baseline. The
+/// serialized rectification declaration is retained without interpreting it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StereoCalibration {
+    left: PinholeIntrinsics,
+    right: PinholeIntrinsics,
+    dimensions: FrameDimensions,
+    baseline: StereoBaselineMeters,
+    rectification: StereoRectification,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StereoCalibrationError {
+    InvalidBaseline {
+        source: StereoBaselineError,
+    },
+    InvalidDimensions {
+        camera: StereoCameraSide,
+        source: FrameDimensionsError,
+    },
+    InvalidIntrinsics {
+        camera: StereoCameraSide,
+        source: IntrinsicsError,
+    },
+    DimensionMismatch {
+        left: FrameDimensions,
+        right: FrameDimensions,
+    },
+}
+
+impl std::fmt::Display for StereoCalibrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidBaseline { source } => write!(f, "invalid stereo baseline: {source}"),
+            Self::InvalidDimensions { camera, source } => {
+                write!(f, "invalid {camera} camera dimensions: {source}")
+            }
+            Self::InvalidIntrinsics { camera, source } => {
+                write!(f, "invalid {camera} camera intrinsics: {source}")
+            }
+            Self::DimensionMismatch { left, right } => write!(
+                f,
+                "stereo cameras must share dimensions: left={}x{}, right={}x{}",
+                left.width(),
+                left.height(),
+                right.width(),
+                right.height()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StereoCalibrationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidBaseline { source } => Some(source),
+            Self::InvalidDimensions { source, .. } => Some(source),
+            Self::InvalidIntrinsics { source, .. } => Some(source),
+            Self::DimensionMismatch { .. } => None,
+        }
+    }
+}
+
+impl StereoCalibration {
+    pub fn try_new(
+        left: PinholeIntrinsics,
+        right: PinholeIntrinsics,
+        dimensions: FrameDimensions,
+        baseline_m: f32,
+        rectified: bool,
+    ) -> Result<Self, StereoBaselineError> {
+        Ok(Self::new(
+            left,
+            right,
+            dimensions,
+            StereoBaselineMeters::try_new(baseline_m)?,
+            rectified,
+        ))
+    }
+
+    pub(crate) fn new(
+        left: PinholeIntrinsics,
+        right: PinholeIntrinsics,
+        dimensions: FrameDimensions,
+        baseline: StereoBaselineMeters,
+        rectified: bool,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            dimensions,
+            baseline,
+            rectification: if rectified {
+                StereoRectification::Rectified
+            } else {
+                StereoRectification::Unrectified
+            },
+        }
+    }
+
+    pub fn left(self) -> PinholeIntrinsics {
+        self.left
+    }
+
+    pub fn right(self) -> PinholeIntrinsics {
+        self.right
+    }
+
+    pub fn dimensions(self) -> FrameDimensions {
+        self.dimensions
+    }
+
+    pub fn baseline_m(self) -> f32 {
+        self.baseline.get()
+    }
+
+    pub fn is_rectified(self) -> bool {
+        self.rectification == StereoRectification::Rectified
+    }
 }
 
 /// Exact f32-to-f64 widening of the validated stereo calibration, parsed once.
@@ -32,85 +215,58 @@ struct CameraIntrinsics64 {
 }
 
 impl CameraIntrinsics64 {
-    fn from_finite(intrinsics: &CameraIntrinsics) -> Self {
+    fn from_finite(intrinsics: PinholeIntrinsics) -> Self {
         Self {
-            fx: f64::from(intrinsics.fx),
-            fy: f64::from(intrinsics.fy),
-            cx: f64::from(intrinsics.cx),
-            cy: f64::from(intrinsics.cy),
+            fx: f64::from(intrinsics.fx()),
+            fy: f64::from(intrinsics.fy()),
+            cx: f64::from(intrinsics.cx()),
+            cy: f64::from(intrinsics.cy()),
         }
     }
 }
 
 impl RectifiedStereoArithmetic {
-    fn new(left: &CameraIntrinsics, right: &CameraIntrinsics, baseline_m: f32) -> Self {
+    fn new(calibration: StereoCalibration) -> Self {
         Self {
-            left: CameraIntrinsics64::from_finite(left),
-            right: CameraIntrinsics64::from_finite(right),
-            baseline_m: f64::from(baseline_m),
+            left: CameraIntrinsics64::from_finite(calibration.left()),
+            right: CameraIntrinsics64::from_finite(calibration.right()),
+            baseline_m: f64::from(calibration.baseline_m()),
         }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum RectifiedStereoError {
-    InvalidLeftDimensions(FrameDimensionsError),
-    InvalidRightDimensions(FrameDimensionsError),
-    InvalidBaseline {
-        baseline_m: f32,
-    },
-    DimensionMismatch {
-        left: FrameDimensions,
-        right: FrameDimensions,
-    },
-    InvalidFocal {
-        camera: &'static str,
-        fx: f32,
-        fy: f32,
-    },
-    InvalidPrincipalPoint {
-        camera: &'static str,
-        cx: f32,
-        cy: f32,
-    },
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RectifiedStereoCompatibilityError {
     NotRectified,
+}
+
+impl std::fmt::Display for RectifiedStereoCompatibilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRectified => f.write_str("calibration is not marked rectified"),
+        }
+    }
+}
+
+impl std::error::Error for RectifiedStereoCompatibilityError {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RectifiedStereoError {
+    InvalidCalibration {
+        source: StereoCalibrationError,
+    },
+    Incompatible {
+        source: RectifiedStereoCompatibilityError,
+    },
 }
 
 impl std::fmt::Display for RectifiedStereoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RectifiedStereoError::InvalidLeftDimensions(source) => {
-                write!(f, "invalid left camera dimensions: {source}")
+            Self::InvalidCalibration { source } => {
+                write!(f, "invalid stereo calibration: {source}")
             }
-            RectifiedStereoError::InvalidRightDimensions(source) => {
-                write!(f, "invalid right camera dimensions: {source}")
-            }
-            RectifiedStereoError::InvalidBaseline { baseline_m } => {
-                write!(f, "baseline must be positive and finite, got {baseline_m}")
-            }
-            RectifiedStereoError::DimensionMismatch { left, right } => {
-                write!(
-                    f,
-                    "rectified stereo requires same dimensions: left={}x{}, right={}x{}",
-                    left.width(),
-                    left.height(),
-                    right.width(),
-                    right.height()
-                )
-            }
-            RectifiedStereoError::InvalidFocal { camera, fx, fy } => {
-                write!(
-                    f,
-                    "rectified stereo requires positive finite {camera} focal lengths: fx={fx}, fy={fy}"
-                )
-            }
-            RectifiedStereoError::InvalidPrincipalPoint { camera, cx, cy } => write!(
-                f,
-                "rectified stereo requires finite {camera} principal points: cx={cx}, cy={cy}"
-            ),
-            RectifiedStereoError::NotRectified => {
-                write!(f, "calibration is not marked rectified")
-            }
+            Self::Incompatible { source } => write!(f, "incompatible rectified stereo: {source}"),
         }
     }
 }
@@ -118,113 +274,71 @@ impl std::fmt::Display for RectifiedStereoError {
 impl std::error::Error for RectifiedStereoError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            RectifiedStereoError::InvalidLeftDimensions(source)
-            | RectifiedStereoError::InvalidRightDimensions(source) => Some(source),
-            RectifiedStereoError::InvalidBaseline { .. }
-            | RectifiedStereoError::DimensionMismatch { .. }
-            | RectifiedStereoError::InvalidFocal { .. }
-            | RectifiedStereoError::InvalidPrincipalPoint { .. }
-            | RectifiedStereoError::NotRectified => None,
+            Self::InvalidCalibration { source } => Some(source),
+            Self::Incompatible { source } => Some(source),
         }
     }
 }
 
 impl RectifiedStereo {
-    pub fn from_calibration(calibration: &Calibration) -> Result<Self, RectifiedStereoError> {
-        let left = calibration.left.clone();
-        let right = calibration.right.clone();
-        let left_dimensions = FrameDimensions::try_new(left.width, left.height)
-            .map_err(RectifiedStereoError::InvalidLeftDimensions)?;
-        let right_dimensions = FrameDimensions::try_new(right.width, right.height)
-            .map_err(RectifiedStereoError::InvalidRightDimensions)?;
-
-        if !calibration.baseline_m.is_finite() || calibration.baseline_m <= 0.0 {
-            return Err(RectifiedStereoError::InvalidBaseline {
-                baseline_m: calibration.baseline_m,
-            });
+    /// Apply Kiko's rectified-stereo compatibility policy to already parsed
+    /// calibration. The policy requires the explicit rectified declaration and
+    /// deliberately permits asymmetric calibrated camera coefficients.
+    pub fn from_stereo_calibration(
+        calibration: &StereoCalibration,
+    ) -> Result<Self, RectifiedStereoCompatibilityError> {
+        if !calibration.is_rectified() {
+            return Err(RectifiedStereoCompatibilityError::NotRectified);
         }
-
-        if left.width != right.width || left.height != right.height {
-            return Err(RectifiedStereoError::DimensionMismatch {
-                left: left_dimensions,
-                right: right_dimensions,
-            });
-        }
-
-        for (camera, intrinsics) in [("left", &left), ("right", &right)] {
-            if !intrinsics.fx.is_finite()
-                || !intrinsics.fy.is_finite()
-                || intrinsics.fx <= 0.0
-                || intrinsics.fy <= 0.0
-            {
-                return Err(RectifiedStereoError::InvalidFocal {
-                    camera,
-                    fx: intrinsics.fx,
-                    fy: intrinsics.fy,
-                });
-            }
-            if !intrinsics.cx.is_finite() || !intrinsics.cy.is_finite() {
-                return Err(RectifiedStereoError::InvalidPrincipalPoint {
-                    camera,
-                    cx: intrinsics.cx,
-                    cy: intrinsics.cy,
-                });
-            }
-        }
-
-        if !calibration.rectified {
-            return Err(RectifiedStereoError::NotRectified);
-        }
-
-        let arithmetic = RectifiedStereoArithmetic::new(&left, &right, calibration.baseline_m);
-
+        let calibration = *calibration;
         Ok(Self {
-            left,
-            right,
-            dimensions: left_dimensions,
-            baseline_m: calibration.baseline_m,
-            arithmetic,
+            calibration,
+            arithmetic: RectifiedStereoArithmetic::new(calibration),
         })
     }
 
-    pub fn left(&self) -> &CameraIntrinsics {
-        &self.left
+    pub fn stereo_calibration(&self) -> &StereoCalibration {
+        &self.calibration
     }
 
-    pub fn right(&self) -> &CameraIntrinsics {
-        &self.right
+    pub fn left(&self) -> PinholeIntrinsics {
+        self.calibration.left()
+    }
+
+    pub fn right(&self) -> PinholeIntrinsics {
+        self.calibration.right()
     }
 
     pub fn baseline_m(&self) -> f32 {
-        self.baseline_m
+        self.calibration.baseline_m()
     }
 
     pub fn width(&self) -> u32 {
-        self.dimensions.width()
+        self.calibration.dimensions().width()
     }
 
     pub fn height(&self) -> u32 {
-        self.dimensions.height()
+        self.calibration.dimensions().height()
     }
 
     pub fn dimensions(&self) -> FrameDimensions {
-        self.dimensions
+        self.calibration.dimensions()
     }
 
     pub fn fx(&self) -> f32 {
-        self.left.fx
+        self.left().fx()
     }
 
     pub fn fy(&self) -> f32 {
-        self.left.fy
+        self.left().fy()
     }
 
     pub fn cx(&self) -> f32 {
-        self.left.cx
+        self.left().cx()
     }
 
     pub fn cy(&self) -> f32 {
-        self.left.cy
+        self.left().cy()
     }
 }
 
@@ -1124,16 +1238,25 @@ mod tests {
         calibration.baseline_m = f32::NAN;
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
-            Err(RectifiedStereoError::InvalidBaseline { .. })
+            Err(RectifiedStereoError::InvalidCalibration {
+                source: StereoCalibrationError::InvalidBaseline {
+                    source: StereoBaselineError::NonFinite { .. },
+                },
+            })
         ));
 
         let mut calibration = valid_calibration();
         calibration.right.fx = 0.0;
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
-            Err(RectifiedStereoError::InvalidFocal {
-                camera: "right",
-                ..
+            Err(RectifiedStereoError::InvalidCalibration {
+                source: StereoCalibrationError::InvalidIntrinsics {
+                    camera: StereoCameraSide::Right,
+                    source: IntrinsicsError::NonPositive {
+                        field: "fx",
+                        value: 0.0,
+                    },
+                },
             })
         ));
 
@@ -1141,14 +1264,24 @@ mod tests {
         calibration.left.cx = f32::INFINITY;
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
-            Err(RectifiedStereoError::InvalidPrincipalPoint { camera: "left", .. })
+            Err(RectifiedStereoError::InvalidCalibration {
+                source: StereoCalibrationError::InvalidIntrinsics {
+                    camera: StereoCameraSide::Left,
+                    source: IntrinsicsError::NonFinite {
+                        field: "cx",
+                        value,
+                    },
+                },
+            }) if value.is_infinite()
         ));
 
         let mut calibration = valid_calibration();
         calibration.rectified = false;
         assert!(matches!(
             RectifiedStereo::from_calibration(&calibration),
-            Err(RectifiedStereoError::NotRectified)
+            Err(RectifiedStereoError::Incompatible {
+                source: RectifiedStereoCompatibilityError::NotRectified,
+            })
         ));
     }
 
@@ -1315,7 +1448,7 @@ mod tests {
             .expect("stereo samples");
         assert_eq!(samples.left_frame_id(), FrameId::new(12));
         assert_eq!(samples.right_frame_id(), FrameId::new(13));
-        assert_eq!(samples.stereo().right().fx, 420.0);
+        assert_eq!(samples.stereo().right().fx(), 420.0);
         assert_eq!(samples.stats().kept, 1);
         let sample = samples.samples()[0];
         assert_eq!(sample.left_pixel_px(), [left_kp.x, left_kp.y]);

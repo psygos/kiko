@@ -1,7 +1,6 @@
 use std::collections::TryReserveError;
 use std::num::{NonZeroU8, NonZeroU64, NonZeroUsize};
 
-use crate::dataset::CameraIntrinsics;
 use crate::{Keypoint, Point3, math};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -93,14 +92,6 @@ impl std::fmt::Display for PinholeProjectionError {
 
 impl std::error::Error for PinholeProjectionError {}
 
-impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
-    type Error = IntrinsicsError;
-
-    fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
-        Self::try_new(value.fx, value.fy, value.cx, value.cy)
-    }
-}
-
 impl PinholeIntrinsics {
     pub fn try_new(fx: f32, fy: f32, cx: f32, cy: f32) -> Result<Self, IntrinsicsError> {
         for (field, value) in [("fx", fx), ("fy", fy), ("cx", cx), ("cy", cy)] {
@@ -114,15 +105,6 @@ impl PinholeIntrinsics {
             }
         }
         Ok(Self { fx, fy, cx, cy })
-    }
-
-    pub(crate) fn from_rectified_stereo(stereo: &crate::RectifiedStereo) -> Self {
-        Self {
-            fx: stereo.fx(),
-            fy: stereo.fy(),
-            cx: stereo.cx(),
-            cy: stereo.cy(),
-        }
     }
 
     pub fn fx(&self) -> f32 {

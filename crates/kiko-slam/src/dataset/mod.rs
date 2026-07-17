@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
+use crate::triangulation::StereoBaselineMeters;
 use crate::{
     CalibrationBundleError, CaptureBundleError, CaptureIntervalError, DepthImage, Frame,
     FrameDimensions, FrameDimensionsError, FrameError, ImuBatch, ImuBatchError, ImuBatchSliceError,
-    ImuSampleError, ImuTimestampShiftError, PairError, PairingConfigError, SensorId, StereoPair,
-    Timestamp,
+    ImuSampleError, ImuTimestampShiftError, PairError, PairingConfigError, PinholeIntrinsics,
+    RectifiedStereo, RectifiedStereoError, SensorId, StereoCalibration, StereoCalibrationError,
+    StereoCameraSide, StereoPair, Timestamp,
 };
 
 pub mod format {
@@ -212,6 +214,77 @@ pub struct CameraIntrinsics {
     pub cy: f32,
     pub width: u32,
     pub height: u32,
+}
+
+/// Parse only the projection coefficients represented by a serialized camera.
+/// Image dimensions are parsed independently by the dataset contract.
+impl TryFrom<&CameraIntrinsics> for PinholeIntrinsics {
+    type Error = crate::IntrinsicsError;
+
+    fn try_from(value: &CameraIntrinsics) -> Result<Self, Self::Error> {
+        Self::try_new(value.fx, value.fy, value.cx, value.cy)
+    }
+}
+
+impl TryFrom<&Calibration> for StereoCalibration {
+    type Error = StereoCalibrationError;
+
+    /// Parse weak serialized stereo data in a stable order: baseline, left
+    /// camera, right camera, then their shared-dimensions invariant.
+    fn try_from(calibration: &Calibration) -> Result<Self, Self::Error> {
+        let baseline = StereoBaselineMeters::try_new(calibration.baseline_m)
+            .map_err(|source| StereoCalibrationError::InvalidBaseline { source })?;
+        let left_dimensions =
+            FrameDimensions::try_new(calibration.left.width, calibration.left.height).map_err(
+                |source| StereoCalibrationError::InvalidDimensions {
+                    camera: StereoCameraSide::Left,
+                    source,
+                },
+            )?;
+        let left = PinholeIntrinsics::try_from(&calibration.left).map_err(|source| {
+            StereoCalibrationError::InvalidIntrinsics {
+                camera: StereoCameraSide::Left,
+                source,
+            }
+        })?;
+        let right_dimensions =
+            FrameDimensions::try_new(calibration.right.width, calibration.right.height).map_err(
+                |source| StereoCalibrationError::InvalidDimensions {
+                    camera: StereoCameraSide::Right,
+                    source,
+                },
+            )?;
+        let right = PinholeIntrinsics::try_from(&calibration.right).map_err(|source| {
+            StereoCalibrationError::InvalidIntrinsics {
+                camera: StereoCameraSide::Right,
+                source,
+            }
+        })?;
+        if left_dimensions != right_dimensions {
+            return Err(StereoCalibrationError::DimensionMismatch {
+                left: left_dimensions,
+                right: right_dimensions,
+            });
+        }
+        Ok(StereoCalibration::new(
+            left,
+            right,
+            left_dimensions,
+            baseline,
+            calibration.rectified,
+        ))
+    }
+}
+
+impl RectifiedStereo {
+    /// Parse a weak dataset calibration once, then apply rectified-SLAM
+    /// compatibility without imposing camera-coefficient equality tolerances.
+    pub fn from_calibration(calibration: &Calibration) -> Result<Self, RectifiedStereoError> {
+        let calibration = StereoCalibration::try_from(calibration)
+            .map_err(|source| RectifiedStereoError::InvalidCalibration { source })?;
+        Self::from_stereo_calibration(&calibration)
+            .map_err(|source| RectifiedStereoError::Incompatible { source })
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2249,7 +2322,7 @@ fn require_calibration_dimensions<'a>(
             source,
         }
     })?;
-    let calibrated = calibration.stereo().dimensions();
+    let calibrated = calibration.stereo_calibration().dimensions();
     if metadata != calibrated {
         return Err(DatasetError::CalibrationDimensionsMismatch {
             metadata,
@@ -3189,7 +3262,9 @@ mod tests {
             DatasetError::InvalidCalibration {
                 path,
                 source: CalibrationBundleError::InvalidStereo {
-                    source: crate::RectifiedStereoError::InvalidBaseline { baseline_m: 0.0 },
+                    source: crate::StereoCalibrationError::InvalidBaseline {
+                        source: crate::StereoBaselineError::NonPositive { baseline_m: 0.0 },
+                    },
                 },
             } if path == &invalid_path.join(format::CALIBRATION_FILE)
         ));

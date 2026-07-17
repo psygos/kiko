@@ -1632,6 +1632,9 @@ impl RedundancyPolicy {
 
 #[derive(Debug)]
 pub enum TrackerInitError {
+    StereoCompatibility {
+        source: crate::RectifiedStereoCompatibilityError,
+    },
     BundleAdjuster {
         source: LocalBundleAdjusterWorkspaceError,
     },
@@ -1660,6 +1663,9 @@ pub enum TrackerInitError {
 impl std::fmt::Display for TrackerInitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            TrackerInitError::StereoCompatibility { source } => {
+                write!(f, "stereo calibration is incompatible with SLAM: {source}")
+            }
             TrackerInitError::BundleAdjuster { source } => {
                 write!(f, "failed to initialize local bundle adjuster: {source}")
             }
@@ -1695,6 +1701,7 @@ impl std::fmt::Display for TrackerInitError {
 impl std::error::Error for TrackerInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::StereoCompatibility { source } => Some(source),
             Self::BundleAdjuster { source } => Some(source),
             Self::BackendWorker { source } => Some(source),
             Self::Descriptor { source } => Some(source),
@@ -3158,7 +3165,9 @@ impl SlamTracker {
         calibration: CalibrationBundle,
         config: TrackerConfig,
     ) -> Result<Self, TrackerInitError> {
-        let stereo = calibration.stereo().clone();
+        let stereo = calibration
+            .rectified_stereo()
+            .map_err(|source| TrackerInitError::StereoCompatibility { source })?;
         let intrinsics = calibration.intrinsics();
         let triangulator = Triangulator::new(stereo, config.triangulation);
         let frontend = StereoFrontend::new(superpoint, lightglue, triangulator, intrinsics);
@@ -6441,6 +6450,19 @@ mod tests {
         let thread = descriptor.source().expect("thread spawn source");
         assert_eq!(thread.to_string(), "thread capacity exhausted");
         assert!(thread.source().is_none());
+    }
+
+    #[test]
+    fn tracker_init_error_preserves_rectification_policy_source() {
+        let error = TrackerInitError::StereoCompatibility {
+            source: crate::RectifiedStereoCompatibilityError::NotRectified,
+        };
+        assert!(matches!(
+            std::error::Error::source(&error).and_then(|source| {
+                source.downcast_ref::<crate::RectifiedStereoCompatibilityError>()
+            }),
+            Some(crate::RectifiedStereoCompatibilityError::NotRectified)
+        ));
     }
 
     #[test]
