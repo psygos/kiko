@@ -37,5 +37,9 @@ harness = false
 name = "descriptor_matching"
 harness = false
 
+[[bench]]
+name = "occupancy_mapping"
+harness = false
+
 [lints]
 workspace = true

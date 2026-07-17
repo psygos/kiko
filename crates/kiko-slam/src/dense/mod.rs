@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod command_mapper;
+pub mod occupancy;
+pub mod occupancy_runtime;
 pub mod ring_buffer;
 
 use std::collections::{HashMap, VecDeque};
@@ -9,9 +11,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::dense::backend::{TsdfBackend, TsdfBackendFactory, TsdfConfig};
+#[cfg(test)]
+use crate::Pose;
+use crate::dense::backend::{TsdfBackend, TsdfBackendFactory, TsdfConfig, TsdfError};
 use crate::map::{KeyframeId, MapInstanceId};
-use crate::{ChannelCapacity, DepthImage, MappingSessionTransition, PinholeIntrinsics, Pose};
+use crate::{
+    ChannelCapacity, DepthImage, KeyframePoseUpdate, MappingSessionTransition, PinholeIntrinsics,
+    Timestamp, WorldToCamera,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -27,11 +34,13 @@ use crate::{ChannelCapacity, DepthImage, MappingSessionTransition, PinholeIntrin
 pub enum DenseCommand {
     IntegrateKeyframe {
         keyframe_id: KeyframeId,
-        pose: Pose,
+        pose: WorldToCamera,
         depth: DepthImage,
+        timestamp: Timestamp,
     },
     RemoveKeyframe {
         keyframe_id: KeyframeId,
+        timestamp: Timestamp,
     },
     /// Establish a hard boundary between independent maps.
     ///
@@ -41,10 +50,15 @@ pub enum DenseCommand {
     ResetMappingSession {
         transition: MappingSessionTransition,
         generation: u64,
+        timestamp: Timestamp,
     },
-    RebuildFromSnapshot {
-        corrected_poses: Vec<(KeyframeId, Pose)>,
+    /// Apply committed authoritative tracker poses to retained reconstruction
+    /// sources. Updates may be a subset because integrations can be dropped or
+    /// keyframes can already have been evicted.
+    ApplyPoseUpdates {
+        updates: Vec<KeyframePoseUpdate>,
         generation: u64,
+        timestamp: Timestamp,
     },
 }
 
@@ -326,43 +340,21 @@ pub enum ReconState {
     AwaitingBackend,
     Nominal,
     Rebuilding { generation: u64 },
-    Degraded { generation: u64 },
     Down,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RebuildPolicy {
-    /// Rebuild only when every corrected keyframe still has a stored depth image.
-    #[default]
-    Strict,
-    /// Rebuild when enough corrected keyframes have depth coverage.
-    BestEffort { min_coverage_percent: u8 },
-}
-
 #[derive(Debug)]
-pub enum TsdfModeConfigError {
-    Tsdf(crate::dense::backend::TsdfConfigError),
-    InvalidCoveragePercent { value: u8 },
-}
+pub struct TsdfModeConfigError(crate::dense::backend::TsdfConfigError);
 
 impl std::fmt::Display for TsdfModeConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Tsdf(err) => write!(f, "invalid TSDF configuration: {err}"),
-            Self::InvalidCoveragePercent { value } => write!(
-                f,
-                "best-effort rebuild coverage must be in 1..=100 percent, got {value}"
-            ),
-        }
+        write!(f, "invalid TSDF configuration: {}", self.0)
     }
 }
 
 impl std::error::Error for TsdfModeConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Tsdf(err) => Some(err),
-            Self::InvalidCoveragePercent { .. } => None,
-        }
+        Some(&self.0)
     }
 }
 
@@ -370,30 +362,15 @@ impl std::error::Error for TsdfModeConfigError {
 pub struct TsdfModeConfig {
     config: TsdfConfig,
     intrinsics: PinholeIntrinsics,
-    rebuild_policy: RebuildPolicy,
 }
 
 impl TsdfModeConfig {
     pub fn try_new(
         config: TsdfConfig,
         intrinsics: PinholeIntrinsics,
-        rebuild_policy: RebuildPolicy,
     ) -> Result<Self, TsdfModeConfigError> {
-        config.validate().map_err(TsdfModeConfigError::Tsdf)?;
-        if let RebuildPolicy::BestEffort {
-            min_coverage_percent,
-        } = rebuild_policy
-            && !(1..=100).contains(&min_coverage_percent)
-        {
-            return Err(TsdfModeConfigError::InvalidCoveragePercent {
-                value: min_coverage_percent,
-            });
-        }
-        Ok(Self {
-            config,
-            intrinsics,
-            rebuild_policy,
-        })
+        config.validate().map_err(TsdfModeConfigError)?;
+        Ok(Self { config, intrinsics })
     }
 
     pub fn config(&self) -> &TsdfConfig {
@@ -402,10 +379,6 @@ impl TsdfModeConfig {
 
     pub fn intrinsics(&self) -> PinholeIntrinsics {
         self.intrinsics
-    }
-
-    pub fn rebuild_policy(&self) -> RebuildPolicy {
-        self.rebuild_policy
     }
 }
 
@@ -497,9 +470,21 @@ impl Default for DenseConfig {
 /// keyframe does not change its eviction position.
 #[derive(Debug)]
 pub(crate) struct DepthStore {
-    map: HashMap<KeyframeId, DepthImage>,
+    map: HashMap<KeyframeId, StoredDepth>,
     order: VecDeque<KeyframeId>,
     cap: NonZeroUsize,
+}
+
+#[derive(Debug)]
+struct StoredDepth {
+    pose: WorldToCamera,
+    depth: DepthImage,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DepthStoreInsertOutcome {
+    evicted: Option<KeyframeId>,
+    replaced_existing: bool,
 }
 
 impl DepthStore {
@@ -511,31 +496,53 @@ impl DepthStore {
         }
     }
 
+    #[cfg(test)]
     pub fn insert(&mut self, keyframe_id: KeyframeId, depth: DepthImage) {
+        let _ = self.insert_with_pose(keyframe_id, WorldToCamera::identity(), depth);
+    }
+
+    fn insert_with_pose(
+        &mut self,
+        keyframe_id: KeyframeId,
+        pose: WorldToCamera,
+        depth: DepthImage,
+    ) -> DepthStoreInsertOutcome {
         if let std::collections::hash_map::Entry::Occupied(mut entry) = self.map.entry(keyframe_id)
         {
             // Update in place, don't change order.
-            entry.insert(depth);
-            return;
+            entry.insert(StoredDepth { pose, depth });
+            return DepthStoreInsertOutcome {
+                evicted: None,
+                replaced_existing: true,
+            };
         }
 
         // Insertion-order eviction if at cap.
+        let mut evicted = None;
         while self.map.len() >= self.cap.get() {
             if let Some(oldest) = self.order.pop_front() {
                 self.map.remove(&oldest);
+                evicted = Some(oldest);
             } else {
                 break;
             }
         }
 
-        self.map.insert(keyframe_id, depth);
+        self.map.insert(keyframe_id, StoredDepth { pose, depth });
         self.order.push_back(keyframe_id);
+        DepthStoreInsertOutcome {
+            evicted,
+            replaced_existing: false,
+        }
     }
 
     /// Remove a keyframe. No-op if the ID is unknown.
-    pub fn remove(&mut self, keyframe_id: KeyframeId) {
+    pub fn remove(&mut self, keyframe_id: KeyframeId) -> bool {
         if self.map.remove(&keyframe_id).is_some() {
             self.order.retain(|id| *id != keyframe_id);
+            true
+        } else {
+            false
         }
     }
 
@@ -544,10 +551,30 @@ impl DepthStore {
         self.order.clear();
     }
 
+    #[cfg(test)]
     pub fn get(&self, keyframe_id: KeyframeId) -> Option<&DepthImage> {
-        self.map.get(&keyframe_id)
+        self.map.get(&keyframe_id).map(|stored| &stored.depth)
     }
 
+    fn update_pose(&mut self, update: KeyframePoseUpdate) -> bool {
+        let Some(stored) = self.map.get_mut(&update.keyframe_id()) else {
+            return false;
+        };
+        stored.pose = update.pose();
+        true
+    }
+
+    fn ordered_entries(&self) -> impl Iterator<Item = (WorldToCamera, &DepthImage)> {
+        self.order.iter().map(|keyframe_id| {
+            let stored = self
+                .map
+                .get(keyframe_id)
+                .expect("depth-store order must reference a stored keyframe");
+            (stored.pose, &stored.depth)
+        })
+    }
+
+    #[cfg(test)]
     pub fn contains(&self, keyframe_id: KeyframeId) -> bool {
         self.map.contains_key(&keyframe_id)
     }
@@ -631,17 +658,14 @@ impl DenseState {
         }
     }
 
-    fn accepts_rebuild(&mut self, corrected_poses: &[(KeyframeId, Pose)]) -> bool {
-        let Some((first, rest)) = corrected_poses.split_first() else {
-            // Empty rebuilds carry no map-scoped key. Their generation is the
-            // only ordering evidence, so the usual stale-generation check is
-            // authoritative for them.
-            return true;
+    fn accepts_pose_updates(&mut self, updates: &[KeyframePoseUpdate]) -> bool {
+        let Some((first, rest)) = updates.split_first() else {
+            return false;
         };
-        let command_map = first.0.map_instance_id();
+        let command_map = first.keyframe_id().map_instance_id();
         if rest
             .iter()
-            .any(|(keyframe_id, _)| keyframe_id.map_instance_id() != command_map)
+            .any(|update| update.keyframe_id().map_instance_id() != command_map)
         {
             return false;
         }
@@ -655,30 +679,125 @@ impl DenseState {
     }
 }
 
-fn rebuild_allowed(policy: RebuildPolicy, rebuildable: usize, total: usize) -> bool {
-    if total == 0 {
-        return true;
+fn rebuild_tsdf(
+    tsdf: &TsdfModeConfig,
+    backend: &mut dyn TsdfBackend,
+    store: &DepthStore,
+) -> Result<(), crate::dense::backend::TsdfError> {
+    backend.clear()?;
+    for (pose, depth) in store.ordered_entries() {
+        backend.integrate(pose.into_legacy_pose(), depth, tsdf.intrinsics)?;
     }
-    match policy {
-        RebuildPolicy::Strict => rebuildable == total,
-        RebuildPolicy::BestEffort {
-            min_coverage_percent,
-        } => {
-            let threshold = usize::from(min_coverage_percent);
-            rebuildable.saturating_mul(100) >= total.saturating_mul(threshold)
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseProcessingOperation {
+    IntegrateKeyframe,
+    RebuildAfterIntegration,
+    RebuildAfterRemoval,
+    ResetMappingSession,
+    RebuildAfterPoseUpdate,
+}
+
+impl std::fmt::Display for DenseProcessingOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operation = match self {
+            Self::IntegrateKeyframe => "integrating a keyframe",
+            Self::RebuildAfterIntegration => "rebuilding after integration replacement or eviction",
+            Self::RebuildAfterRemoval => "rebuilding after keyframe removal",
+            Self::ResetMappingSession => "clearing for a mapping-session reset",
+            Self::RebuildAfterPoseUpdate => "rebuilding after authoritative pose updates",
+        };
+        f.write_str(operation)
+    }
+}
+
+#[derive(Debug)]
+pub enum DenseProcessingError {
+    BackendUnavailable {
+        operation: DenseProcessingOperation,
+    },
+    Tsdf {
+        operation: DenseProcessingOperation,
+        source: TsdfError,
+    },
+    Panicked {
+        detail: String,
+    },
+}
+
+impl std::fmt::Display for DenseProcessingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendUnavailable { operation } => {
+                write!(f, "TSDF backend is unavailable while {operation}")
+            }
+            Self::Tsdf { operation, source } => {
+                write!(f, "TSDF failed while {operation}: {source}")
+            }
+            Self::Panicked { detail } => write!(f, "dense command processing panicked: {detail}"),
         }
     }
 }
 
-/// Process a single dense command. Returns updated stats.
+impl std::error::Error for DenseProcessingError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Tsdf { source, .. } => Some(source),
+            Self::BackendUnavailable { .. } | Self::Panicked { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum DenseWorkerError {
+    BackendFactory { source: TsdfError },
+    BackendFactoryPanicked { detail: String },
+    BackendFactoryRequired,
+    Processing { source: DenseProcessingError },
+}
+
+impl std::fmt::Display for DenseWorkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BackendFactory { source } => {
+                write!(f, "TSDF backend construction failed: {source}")
+            }
+            Self::BackendFactoryPanicked { detail } => {
+                write!(f, "TSDF backend factory panicked: {detail}")
+            }
+            Self::BackendFactoryRequired => {
+                write!(f, "TSDF mode requires a backend factory")
+            }
+            Self::Processing { source } => write!(f, "dense worker failed: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for DenseWorkerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BackendFactory { source } => Some(source),
+            Self::Processing { source } => Some(source),
+            Self::BackendFactoryPanicked { .. } | Self::BackendFactoryRequired => None,
+        }
+    }
+}
+
+/// Process one dense command and return updated stats.
 ///
-/// This is a pure function (no thread, no I/O) so that tests can exercise
-/// the full command processing logic without spawning threads.
-pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> DenseStats {
+/// TSDF failures leave the state fail-closed in [`ReconState::Down`] and
+/// preserve their typed source. The caller may inspect [`DenseState::stats`]
+/// after an error to publish the terminal state.
+pub fn process_dense_command(
+    state: &mut DenseState,
+    cmd: DenseCommand,
+) -> Result<DenseStats, DenseProcessingError> {
     if state.state == ReconState::Down && !matches!(&cmd, DenseCommand::ResetMappingSession { .. })
     {
         // Drain without processing.
-        return state.stats();
+        return Ok(state.stats());
     }
 
     match cmd {
@@ -686,60 +805,92 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
             keyframe_id,
             pose,
             depth,
+            timestamp: _,
         } => {
             if !state.accepts_keyframe(keyframe_id) {
                 eprintln!(
                     "dense: ignoring integration from inactive map {:?}",
                     keyframe_id.map_instance_id()
                 );
-                return state.stats();
+                return Ok(state.stats());
             }
-            state.store.insert(keyframe_id, depth.clone());
-            let backend_failed = match (&state.mode, state.backend.as_mut()) {
+            let insertion = state
+                .store
+                .insert_with_pose(keyframe_id, pose, depth.clone());
+            let operation = if insertion.evicted.is_some() || insertion.replaced_existing {
+                DenseProcessingOperation::RebuildAfterIntegration
+            } else {
+                DenseProcessingOperation::IntegrateKeyframe
+            };
+            let failure = match (&state.mode, state.backend.as_mut()) {
                 (DenseMode::DepthStoreOnly, _) => {
                     state.stats.integrated_count = state.stats.integrated_count.saturating_add(1);
-                    false
+                    None
                 }
                 (DenseMode::Tsdf(tsdf), Some(backend)) => {
-                    match backend.integrate(pose, &depth, tsdf.intrinsics) {
+                    let result = if insertion.evicted.is_some() || insertion.replaced_existing {
+                        rebuild_tsdf(tsdf, backend.as_mut(), &state.store)
+                    } else {
+                        backend.integrate(pose.into_legacy_pose(), &depth, tsdf.intrinsics)
+                    };
+                    match result {
                         Ok(()) => {
                             state.stats.integrated_count =
                                 state.stats.integrated_count.saturating_add(1);
-                            false
+                            None
                         }
-                        Err(e) => {
-                            eprintln!("dense: tsdf integration error: {e}");
-                            true
-                        }
+                        Err(source) => Some(DenseProcessingError::Tsdf { operation, source }),
                     }
                 }
                 (DenseMode::Tsdf(_), None) => {
-                    eprintln!("dense: tsdf integration requested without a backend");
-                    true
+                    Some(DenseProcessingError::BackendUnavailable { operation })
                 }
             };
-            if backend_failed {
+            if let Some(error) = failure {
                 state.backend = None;
                 state.state = ReconState::Down;
+                return Err(error);
             }
         }
-        DenseCommand::RemoveKeyframe { keyframe_id } => {
+        DenseCommand::RemoveKeyframe {
+            keyframe_id,
+            timestamp: _,
+        } => {
             if state.map_instance_id != Some(keyframe_id.map_instance_id()) {
                 eprintln!(
                     "dense: ignoring removal from inactive map {:?}",
                     keyframe_id.map_instance_id()
                 );
-                return state.stats();
+                return Ok(state.stats());
             }
-            state.store.remove(keyframe_id);
-            state.stats.removed_count = state.stats.removed_count.saturating_add(1);
+            if state.store.remove(keyframe_id) {
+                state.stats.removed_count = state.stats.removed_count.saturating_add(1);
+                let operation = DenseProcessingOperation::RebuildAfterRemoval;
+                let failure = match (&state.mode, state.backend.as_mut()) {
+                    (DenseMode::DepthStoreOnly, _) => None,
+                    (DenseMode::Tsdf(tsdf), Some(backend)) => {
+                        rebuild_tsdf(tsdf, backend.as_mut(), &state.store)
+                            .err()
+                            .map(|source| DenseProcessingError::Tsdf { operation, source })
+                    }
+                    (DenseMode::Tsdf(_), None) => {
+                        Some(DenseProcessingError::BackendUnavailable { operation })
+                    }
+                };
+                if let Some(error) = failure {
+                    state.backend = None;
+                    state.state = ReconState::Down;
+                    return Err(error);
+                }
+            }
         }
         DenseCommand::ResetMappingSession {
             transition,
             generation,
+            timestamp: _,
         } => {
             if generation <= state.generation {
-                return state.stats();
+                return Ok(state.stats());
             }
             let old_map = transition.old_map();
             let new_map = transition.new_map();
@@ -756,7 +907,7 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
                 eprintln!(
                     "dense: ignoring mapping-session reset for inactive map {old_map:?}; active map is {active_map:?}"
                 );
-                return state.stats();
+                return Ok(state.stats());
             }
             if state.map_instance_id == Some(new_map) {
                 eprintln!(
@@ -772,108 +923,87 @@ pub fn process_dense_command(state: &mut DenseState, cmd: DenseCommand) -> Dense
             state.map_instance_id = Some(new_map);
             state.generation = generation;
 
-            match (&state.mode, state.backend.as_mut()) {
+            let operation = DenseProcessingOperation::ResetMappingSession;
+            let failure = match (&state.mode, state.backend.as_mut()) {
                 (DenseMode::DepthStoreOnly, _) => {
                     state.state = ReconState::Nominal;
+                    None
                 }
-                (DenseMode::Tsdf(_), Some(backend)) => {
-                    if let Err(error) = backend.clear() {
-                        eprintln!("dense: tsdf session-reset clear error: {error}");
-                        state.backend = None;
-                        state.state = ReconState::Down;
-                    } else {
+                (DenseMode::Tsdf(_), Some(backend)) => match backend.clear() {
+                    Ok(()) => {
                         state.state = ReconState::Nominal;
+                        None
                     }
-                }
+                    Err(source) => Some(DenseProcessingError::Tsdf { operation, source }),
+                },
                 (DenseMode::Tsdf(_), None) => {
                     // There is no reachable backend state to contaminate the
                     // new session, but reconstruction cannot truthfully be
                     // reported as available until a backend is attached.
-                    state.state = ReconState::Down;
+                    Some(DenseProcessingError::BackendUnavailable { operation })
                 }
+            };
+            if let Some(error) = failure {
+                state.backend = None;
+                state.state = ReconState::Down;
+                return Err(error);
             }
         }
-        DenseCommand::RebuildFromSnapshot {
-            corrected_poses,
+        DenseCommand::ApplyPoseUpdates {
+            updates,
             generation,
+            timestamp: _,
         } => {
             if generation <= state.generation {
-                // Stale rebuild request — skip.
-                return state.stats();
+                // Stale pose-update request — skip.
+                return Ok(state.stats());
             }
-            if !state.accepts_rebuild(&corrected_poses) {
-                eprintln!("dense: ignoring rebuild whose keyframes are not all in the active map");
-                return state.stats();
+            if !state.accepts_pose_updates(&updates) {
+                eprintln!("dense: ignoring empty or mixed-session authoritative pose-update batch");
+                return Ok(state.stats());
             }
             state.state = ReconState::Rebuilding { generation };
-
-            // Count how many corrected keyframes still have depth snapshots.
-            let mut rebuildable = 0usize;
-            for (kf_id, _new_pose) in &corrected_poses {
-                if state.store.contains(*kf_id) {
-                    rebuildable = rebuildable.saturating_add(1);
-                }
+            let mut updated = 0usize;
+            for update in updates {
+                updated = updated.saturating_add(usize::from(state.store.update_pose(update)));
             }
-            if rebuildable < corrected_poses.len() {
+            if updated == 0 {
                 eprintln!(
-                    "dense rebuild missing depth snapshots for {} keyframes",
-                    corrected_poses.len().saturating_sub(rebuildable)
+                    "dense: authoritative pose update had no retained depth sources; accepting its generation without rebuilding"
                 );
             }
 
-            let mut backend_poisoned = false;
-            let rebuild_succeeded = match (&state.mode, state.backend.as_mut()) {
-                (DenseMode::DepthStoreOnly, _) => true,
+            let operation = DenseProcessingOperation::RebuildAfterPoseUpdate;
+            let failure = match (&state.mode, state.backend.as_mut()) {
+                (DenseMode::DepthStoreOnly, _) => None,
                 (DenseMode::Tsdf(tsdf), Some(backend)) => {
-                    let total = corrected_poses.len();
-                    if !rebuild_allowed(tsdf.rebuild_policy, rebuildable, total) {
-                        eprintln!(
-                            "dense: skipping tsdf rebuild due to policy {:?} (coverage={rebuildable}/{total})",
-                            tsdf.rebuild_policy
-                        );
-                        false
-                    } else if let Err(e) = backend.clear() {
-                        eprintln!("dense: tsdf clear error: {e}");
-                        backend_poisoned = true;
-                        false
+                    if updated == 0 {
+                        None
                     } else {
-                        let mut succeeded = true;
-                        for (kf_id, new_pose) in &corrected_poses {
-                            if let Some(depth) = state.store.get(*kf_id)
-                                && let Err(e) = backend.integrate(*new_pose, depth, tsdf.intrinsics)
-                            {
-                                eprintln!("dense: tsdf rebuild integration error: {e}");
-                                backend_poisoned = true;
-                                succeeded = false;
-                                break;
-                            }
-                        }
-                        succeeded
+                        rebuild_tsdf(tsdf, backend.as_mut(), &state.store)
+                            .err()
+                            .map(|source| DenseProcessingError::Tsdf { operation, source })
                     }
                 }
                 (DenseMode::Tsdf(_), None) => {
-                    eprintln!("dense: tsdf rebuild requested without a backend");
-                    backend_poisoned = true;
-                    false
+                    Some(DenseProcessingError::BackendUnavailable { operation })
                 }
             };
 
-            if backend_poisoned {
+            if let Some(error) = failure {
                 state.backend = None;
                 state.state = ReconState::Down;
-            } else if rebuild_succeeded {
-                state.generation = generation;
-                state.stats.rebuild_count = state.stats.rebuild_count.saturating_add(1);
-                state.state = ReconState::Nominal;
-            } else {
-                state.state = ReconState::Degraded {
-                    generation: state.generation,
-                };
+                return Err(error);
             }
+            state.generation = generation;
+            if updated > 0 {
+                state.stats.rebuild_count = state.stats.rebuild_count.saturating_add(1);
+            }
+            state.state = ReconState::Nominal;
         }
     }
 
-    state.stats()
+    Ok(state.stats())
 }
 
 // ---------------------------------------------------------------------------
@@ -884,26 +1014,26 @@ fn process_command_with_recovery(
     state: &mut DenseState,
     cmd: DenseCommand,
     stats_tx: Option<&crate::DropSender<DenseStats>>,
-) {
+) -> Result<DenseStats, DenseProcessingError> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         process_dense_command(state, cmd)
     }));
-    match result {
-        Ok(stats) => {
-            if let Some(tx) = stats_tx {
-                tx.try_send(stats);
-            }
-        }
-        Err(_) => {
+    let result = match result {
+        Ok(result) => result,
+        Err(payload) => {
             // The backend may have panicked after a partial mutation. Drop it
             // and stop processing instead of reusing uncertain state.
             state.backend = None;
             state.state = ReconState::Down;
-            if let Some(tx) = stats_tx {
-                tx.try_send(state.stats());
-            }
+            Err(DenseProcessingError::Panicked {
+                detail: crate::panic_payload_to_string(payload.as_ref()),
+            })
         }
+    };
+    if let Some(tx) = stats_tx {
+        tx.try_send(state.stats());
     }
+    result
 }
 
 /// Run the dense worker loop.
@@ -912,43 +1042,51 @@ fn process_command_with_recovery(
 /// and controls must never arrive through separate transports because reset,
 /// rebuild, integration, and removal semantics are causally dependent.
 /// `backend_factory` is required when `config.mode` is [`DenseMode::Tsdf`].
+/// The optional stats channel is diagnostic and best-effort; this result is
+/// the authoritative worker outcome.
 pub fn run_dense_worker(
     config: &DenseConfig,
     command_rx: &DenseCommandReceiver,
     backend_factory: Option<TsdfBackendFactory>,
     stats_tx: Option<&crate::DropSender<DenseStats>>,
-) {
+) -> Result<(), DenseWorkerError> {
     let mut state = DenseState::new(config);
-    match (&config.mode, backend_factory) {
-        (DenseMode::DepthStoreOnly, _) => {}
+    let initialization = match (&config.mode, backend_factory) {
+        (DenseMode::DepthStoreOnly, _) => Ok(()),
         (DenseMode::Tsdf(tsdf), Some(factory)) => {
             let created = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 factory(tsdf.config.clone())
             }));
             match created {
-                Ok(Ok(backend)) => state.set_backend(backend),
-                Ok(Err(err)) => {
-                    eprintln!("dense: failed to create TSDF backend: {err}");
-                    state.state = ReconState::Down;
+                Ok(Ok(backend)) => {
+                    state.set_backend(backend);
+                    Ok(())
                 }
-                Err(_) => {
-                    eprintln!("dense: TSDF backend factory panicked");
-                    state.state = ReconState::Down;
-                }
+                Ok(Err(source)) => Err(DenseWorkerError::BackendFactory { source }),
+                Err(payload) => Err(DenseWorkerError::BackendFactoryPanicked {
+                    detail: crate::panic_payload_to_string(payload.as_ref()),
+                }),
             }
         }
-        (DenseMode::Tsdf(_), None) => {
-            eprintln!("dense: TSDF mode requires a backend factory");
-            state.state = ReconState::Down;
+        (DenseMode::Tsdf(_), None) => Err(DenseWorkerError::BackendFactoryRequired),
+    };
+    if let Err(error) = initialization {
+        state.backend = None;
+        state.state = ReconState::Down;
+        if let Some(tx) = stats_tx {
+            tx.try_send(state.stats());
         }
+        return Err(error);
     }
     if let Some(tx) = stats_tx {
         tx.try_send(state.stats());
     }
 
     while let Ok(command) = command_rx.recv() {
-        process_command_with_recovery(&mut state, command, stats_tx);
+        process_command_with_recovery(&mut state, command, stats_tx)
+            .map_err(|source| DenseWorkerError::Processing { source })?;
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1189,10 @@ mod tests {
         KeyframeId::for_test(n as usize)
     }
 
+    fn pose_update(keyframe_id: KeyframeId) -> KeyframePoseUpdate {
+        KeyframePoseUpdate::new(keyframe_id, WorldToCamera::identity())
+    }
+
     fn map_keyframe(frame: u64) -> (MapInstanceId, KeyframeId) {
         let mut map = SlamMap::new();
         let keyframe_id = map
@@ -1073,7 +1215,7 @@ mod tests {
         DenseConfig::try_new(cap, DenseMode::DepthStoreOnly).expect("test dense config")
     }
 
-    fn make_tsdf_config(policy: RebuildPolicy) -> DenseConfig {
+    fn make_tsdf_config() -> DenseConfig {
         let intrinsics = PinholeIntrinsics::try_from(&CameraIntrinsics {
             fx: 100.0,
             fy: 100.0,
@@ -1083,21 +1225,9 @@ mod tests {
             height: 2,
         })
         .expect("test intrinsics");
-        let mode = TsdfModeConfig::try_new(TsdfConfig::default(), intrinsics, policy)
-            .expect("test TSDF config");
+        let mode =
+            TsdfModeConfig::try_new(TsdfConfig::default(), intrinsics).expect("test TSDF config");
         DenseConfig::try_new(10, DenseMode::Tsdf(mode)).expect("test dense config")
-    }
-
-    fn test_intrinsics() -> PinholeIntrinsics {
-        PinholeIntrinsics::try_from(&CameraIntrinsics {
-            fx: 100.0,
-            fy: 100.0,
-            cx: 1.0,
-            cy: 1.0,
-            width: 2,
-            height: 2,
-        })
-        .expect("test intrinsics")
     }
 
     fn dummy_depth() -> DepthImage {
@@ -1110,6 +1240,10 @@ mod tests {
 
     fn channel_capacity(capacity: usize) -> ChannelCapacity {
         ChannelCapacity::try_from(capacity).expect("nonzero test channel capacity")
+    }
+
+    fn process_dense_command(state: &mut DenseState, command: DenseCommand) -> DenseStats {
+        super::process_dense_command(state, command).expect("test dense command must succeed")
     }
 
     // -- DepthStore tests --
@@ -1207,8 +1341,9 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: kf(0),
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(stats.integrated_count, 1);
@@ -1217,22 +1352,32 @@ mod tests {
 
     #[test]
     fn failed_tsdf_integration_is_not_counted_as_success() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         state.set_backend(Box::new(FaultBackend {
             fail_integration_at: Some(1),
             ..FaultBackend::healthy()
         }));
 
-        let stats = process_dense_command(
+        let error = super::process_dense_command(
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: kf(0),
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
-        );
+        )
+        .expect_err("fault-injected integration must retain its typed error");
+        let stats = state.stats();
 
+        assert!(matches!(
+            error,
+            DenseProcessingError::Tsdf {
+                operation: DenseProcessingOperation::IntegrateKeyframe,
+                source: TsdfError::Integration(ref detail),
+            } if detail == "fault injected"
+        ));
         assert_eq!(stats.integrated_count, 0);
         assert_eq!(stats.stored_keyframes, 1);
         assert_eq!(stats.state, ReconState::Down);
@@ -1241,7 +1386,7 @@ mod tests {
 
     #[test]
     fn tsdf_state_is_not_nominal_until_backend_is_attached() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         assert_eq!(state.state(), ReconState::AwaitingBackend);
 
@@ -1250,26 +1395,34 @@ mod tests {
     }
 
     #[test]
-    fn tsdf_mode_rejects_invalid_best_effort_coverage() {
-        for value in [0, 101] {
-            let result = TsdfModeConfig::try_new(
-                TsdfConfig::default(),
-                test_intrinsics(),
-                RebuildPolicy::BestEffort {
-                    min_coverage_percent: value,
-                },
-            );
-            assert!(matches!(
-                result,
-                Err(TsdfModeConfigError::InvalidCoveragePercent { value: actual })
-                    if actual == value
-            ));
-        }
+    fn direct_tsdf_processing_without_backend_is_typed_and_fail_closed() {
+        let config = make_tsdf_config();
+        let mut state = DenseState::new(&config);
+
+        let error = super::process_dense_command(
+            &mut state,
+            DenseCommand::IntegrateKeyframe {
+                keyframe_id: kf(0),
+                pose: WorldToCamera::identity(),
+                depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
+            },
+        )
+        .expect_err("TSDF integration requires an attached backend");
+
+        assert!(matches!(
+            error,
+            DenseProcessingError::BackendUnavailable {
+                operation: DenseProcessingOperation::IntegrateKeyframe,
+            }
+        ));
+        assert_eq!(state.state(), ReconState::Down);
+        assert_eq!(state.stats().stored_keyframes, 1);
     }
 
     #[test]
     fn tsdf_worker_constructs_backend_on_worker_thread() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let (command_tx, command_rx, _) =
             dense_command_channel(channel_capacity(1), channel_capacity(1), Duration::ZERO)
                 .expect("command channel");
@@ -1280,8 +1433,9 @@ mod tests {
         assert_eq!(
             command_tx.route(DenseCommand::IntegrateKeyframe {
                 keyframe_id: kf(0),
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             }),
             DenseCommandSendOutcome::Enqueued
         );
@@ -1289,7 +1443,8 @@ mod tests {
 
         let worker = std::thread::spawn(move || {
             let factory: TsdfBackendFactory = Box::new(|_| Ok(Box::new(FaultBackend::healthy())));
-            run_dense_worker(&config, &command_rx, Some(factory), Some(&stats_tx));
+            run_dense_worker(&config, &command_rx, Some(factory), Some(&stats_tx))
+                .expect("healthy dense worker");
         });
         let initial = stats_rx
             .as_receiver()
@@ -1308,7 +1463,7 @@ mod tests {
 
     #[test]
     fn tsdf_worker_without_factory_reports_down() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let (command_tx, command_rx, _) =
             dense_command_channel(channel_capacity(1), channel_capacity(1), Duration::ZERO)
                 .expect("command channel");
@@ -1318,10 +1473,111 @@ mod tests {
         );
         drop(command_tx);
 
-        run_dense_worker(&config, &command_rx, None, Some(&stats_tx));
+        let error = run_dense_worker(&config, &command_rx, None, Some(&stats_tx))
+            .expect_err("missing factory must be authoritative worker failure");
 
         let stats = stats_rx.try_recv().expect("initial worker state");
         assert_eq!(stats.state, ReconState::Down);
+        assert!(matches!(error, DenseWorkerError::BackendFactoryRequired));
+    }
+
+    #[test]
+    fn tsdf_worker_factory_error_preserves_source_and_reports_down() {
+        let config = make_tsdf_config();
+        let (command_tx, command_rx, _) =
+            dense_command_channel(channel_capacity(1), channel_capacity(1), Duration::ZERO)
+                .expect("command channel");
+        let (stats_tx, stats_rx, _) =
+            crate::bounded_channel(channel_capacity(1), crate::DropPolicy::DropNewest);
+        drop(command_tx);
+        let factory: TsdfBackendFactory = Box::new(|_| {
+            Err(TsdfError::Internal(
+                "fault-injected factory failure".to_owned(),
+            ))
+        });
+
+        let error = run_dense_worker(&config, &command_rx, Some(factory), Some(&stats_tx))
+            .expect_err("factory failure must be returned");
+
+        assert!(matches!(
+            error,
+            DenseWorkerError::BackendFactory {
+                source: TsdfError::Internal(ref detail),
+            } if detail == "fault-injected factory failure"
+        ));
+        assert_eq!(
+            stats_rx.try_recv().expect("terminal worker state").state,
+            ReconState::Down
+        );
+    }
+
+    #[test]
+    fn tsdf_worker_factory_panic_is_typed_and_reports_down() {
+        let config = make_tsdf_config();
+        let (command_tx, command_rx, _) =
+            dense_command_channel(channel_capacity(1), channel_capacity(1), Duration::ZERO)
+                .expect("command channel");
+        let (stats_tx, stats_rx, _) =
+            crate::bounded_channel(channel_capacity(1), crate::DropPolicy::DropNewest);
+        drop(command_tx);
+        let factory: TsdfBackendFactory = Box::new(|_| panic!("fault-injected factory panic"));
+
+        let error = run_dense_worker(&config, &command_rx, Some(factory), Some(&stats_tx))
+            .expect_err("factory panic must be returned");
+
+        assert!(matches!(
+            error,
+            DenseWorkerError::BackendFactoryPanicked { ref detail }
+                if detail.contains("fault-injected factory panic")
+        ));
+        assert_eq!(
+            stats_rx.try_recv().expect("terminal worker state").state,
+            ReconState::Down
+        );
+    }
+
+    #[test]
+    fn tsdf_worker_processing_error_preserves_source_and_terminal_stats() {
+        let config = make_tsdf_config();
+        let (command_tx, command_rx, _) =
+            dense_command_channel(channel_capacity(1), channel_capacity(1), Duration::ZERO)
+                .expect("command channel");
+        let (stats_tx, stats_rx, _) =
+            crate::bounded_channel(channel_capacity(2), crate::DropPolicy::DropNewest);
+        assert_eq!(
+            command_tx.route(DenseCommand::IntegrateKeyframe {
+                keyframe_id: kf(0),
+                pose: WorldToCamera::identity(),
+                depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
+            }),
+            DenseCommandSendOutcome::Enqueued
+        );
+        drop(command_tx);
+        let factory: TsdfBackendFactory = Box::new(|_| {
+            Ok(Box::new(FaultBackend {
+                fail_integration_at: Some(1),
+                ..FaultBackend::healthy()
+            }))
+        });
+
+        let error = run_dense_worker(&config, &command_rx, Some(factory), Some(&stats_tx))
+            .expect_err("processing failure must be returned");
+
+        assert!(matches!(
+            error,
+            DenseWorkerError::Processing {
+                source: DenseProcessingError::Tsdf {
+                    operation: DenseProcessingOperation::IntegrateKeyframe,
+                    source: TsdfError::Integration(ref detail),
+                },
+            } if detail == "fault injected"
+        ));
+        let terminal = std::iter::from_fn(|| stats_rx.try_recv().ok())
+            .last()
+            .expect("initial and terminal stats");
+        assert_eq!(terminal.state, ReconState::Down);
+        assert_eq!(terminal.integrated_count, 0);
     }
 
     #[test]
@@ -1335,21 +1591,26 @@ mod tests {
         assert_eq!(
             sender.route(DenseCommand::IntegrateKeyframe {
                 keyframe_id: first,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             }),
             DenseCommandSendOutcome::Enqueued
         );
         assert_eq!(
             sender.route(DenseCommand::IntegrateKeyframe {
                 keyframe_id: second,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             }),
             DenseCommandSendOutcome::IntegrationDroppedNewest
         );
         assert_eq!(
-            sender.route(DenseCommand::RemoveKeyframe { keyframe_id: first }),
+            sender.route(DenseCommand::RemoveKeyframe {
+                keyframe_id: first,
+                timestamp: Timestamp::from_nanos(0)
+            }),
             DenseCommandSendOutcome::Enqueued,
             "the integration quota must leave the reserved control slot available"
         );
@@ -1361,15 +1622,16 @@ mod tests {
         assert_eq!(
             sender.route(DenseCommand::IntegrateKeyframe {
                 keyframe_id: second,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             }),
             DenseCommandSendOutcome::Enqueued,
             "dequeueing an integration must release its data slot"
         );
         assert!(matches!(
             receiver.try_recv(),
-            Ok(DenseCommand::RemoveKeyframe { keyframe_id }) if keyframe_id == first
+            Ok(DenseCommand::RemoveKeyframe { keyframe_id, .. }) if keyframe_id == first
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -1391,28 +1653,41 @@ mod tests {
             dense_command_channel(channel_capacity(1), channel_capacity(1), Duration::ZERO)
                 .expect("command channel");
         assert_eq!(
-            sender.route(DenseCommand::RemoveKeyframe { keyframe_id: kf(0) }),
+            sender.route(DenseCommand::RemoveKeyframe {
+                keyframe_id: kf(0),
+                timestamp: Timestamp::from_nanos(0)
+            }),
             DenseCommandSendOutcome::Enqueued
         );
         assert_eq!(
-            sender.route(DenseCommand::RemoveKeyframe { keyframe_id: kf(1) }),
+            sender.route(DenseCommand::RemoveKeyframe {
+                keyframe_id: kf(1),
+                timestamp: Timestamp::from_nanos(0)
+            }),
             DenseCommandSendOutcome::Enqueued,
             "controls may use idle data capacity while total backlog stays bounded"
         );
         assert_eq!(
-            sender.route(DenseCommand::RemoveKeyframe { keyframe_id: kf(2) }),
+            sender.route(DenseCommand::RemoveKeyframe {
+                keyframe_id: kf(2),
+                timestamp: Timestamp::from_nanos(0)
+            }),
             DenseCommandSendOutcome::ControlTimedOut
         );
         drop(receiver);
         assert_eq!(
-            sender.route(DenseCommand::RemoveKeyframe { keyframe_id: kf(3) }),
+            sender.route(DenseCommand::RemoveKeyframe {
+                keyframe_id: kf(3),
+                timestamp: Timestamp::from_nanos(0)
+            }),
             DenseCommandSendOutcome::Disconnected
         );
         assert_eq!(
             sender.route(DenseCommand::IntegrateKeyframe {
                 keyframe_id: kf(4),
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             }),
             DenseCommandSendOutcome::Disconnected
         );
@@ -1459,7 +1734,8 @@ mod tests {
         let (stats_tx, stats_rx, _) =
             crate::bounded_channel(channel_capacity(8), crate::DropPolicy::DropNewest);
 
-        run_dense_worker(&make_config(10), &receiver, None, Some(&stats_tx));
+        run_dense_worker(&make_config(10), &receiver, None, Some(&stats_tx))
+            .expect("depth-store worker");
 
         std::iter::from_fn(|| stats_rx.try_recv().ok())
             .last()
@@ -1475,11 +1751,13 @@ mod tests {
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: new_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         ]);
 
@@ -1496,14 +1774,17 @@ mod tests {
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: new_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
             DenseCommand::RemoveKeyframe {
                 keyframe_id: new_keyframe,
+                timestamp: Timestamp::from_nanos(0),
             },
         ]);
 
@@ -1513,8 +1794,8 @@ mod tests {
     }
 
     #[test]
-    fn rejected_rebuild_does_not_advance_generation_or_success_count() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+    fn pose_updates_ignore_unretained_sources_and_rebuild_retained_sources() {
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         state.set_backend(Box::new(FaultBackend::healthy()));
         let present = kf(0);
@@ -1522,15 +1803,16 @@ mod tests {
 
         let stats = process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![(present, Pose::identity()), (kf(1), Pose::identity())],
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(present), pose_update(kf(1))],
                 generation: 4,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
-        assert_eq!(state.generation, 0);
-        assert_eq!(stats.rebuild_count, 0);
-        assert_eq!(stats.state, ReconState::Degraded { generation: 0 });
+        assert_eq!(state.generation, 4);
+        assert_eq!(stats.rebuild_count, 1);
+        assert_eq!(stats.state, ReconState::Nominal);
     }
 
     #[test]
@@ -1545,7 +1827,7 @@ mod tests {
                 ..FaultBackend::healthy()
             },
         ] {
-            let config = make_tsdf_config(RebuildPolicy::Strict);
+            let config = make_tsdf_config();
             let mut state = DenseState::new(&config);
             state.set_backend(Box::new(backend));
             let first = kf(0);
@@ -1553,14 +1835,24 @@ mod tests {
             state.store.insert(first, dummy_depth());
             state.store.insert(second, dummy_depth());
 
-            let stats = process_dense_command(
+            let error = super::process_dense_command(
                 &mut state,
-                DenseCommand::RebuildFromSnapshot {
-                    corrected_poses: vec![(first, Pose::identity()), (second, Pose::identity())],
+                DenseCommand::ApplyPoseUpdates {
+                    updates: vec![pose_update(first), pose_update(second)],
                     generation: 1,
+                    timestamp: Timestamp::from_nanos(0),
                 },
-            );
+            )
+            .expect_err("fault-injected rebuild must retain its typed error");
+            let stats = state.stats();
 
+            assert!(matches!(
+                error,
+                DenseProcessingError::Tsdf {
+                    operation: DenseProcessingOperation::RebuildAfterPoseUpdate,
+                    ..
+                }
+            ));
             assert_eq!(state.generation, 0);
             assert_eq!(stats.rebuild_count, 0);
             assert_eq!(stats.state, ReconState::Down);
@@ -1570,23 +1862,30 @@ mod tests {
 
     #[test]
     fn backend_panic_never_reuses_half_mutated_state() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         state.set_backend(Box::new(FaultBackend {
             panic_integration_at: Some(1),
             ..FaultBackend::healthy()
         }));
 
-        process_command_with_recovery(
+        let error = process_command_with_recovery(
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: kf(0),
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
             None,
-        );
+        )
+        .expect_err("backend panic must be returned");
 
+        assert!(matches!(
+            error,
+            DenseProcessingError::Panicked { ref detail }
+                if detail.contains("fault-injected backend panic")
+        ));
         assert_eq!(state.state(), ReconState::Down);
         assert!(!state.has_backend());
     }
@@ -1600,12 +1899,18 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: id,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
-        let stats =
-            process_dense_command(&mut state, DenseCommand::RemoveKeyframe { keyframe_id: id });
+        let stats = process_dense_command(
+            &mut state,
+            DenseCommand::RemoveKeyframe {
+                keyframe_id: id,
+                timestamp: Timestamp::from_nanos(0),
+            },
+        );
         assert_eq!(stats.removed_count, 1);
         assert_eq!(stats.stored_keyframes, 0);
     }
@@ -1621,8 +1926,9 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: old_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         let reset_stats = process_dense_command(
@@ -1630,6 +1936,7 @@ mod tests {
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
@@ -1641,16 +1948,18 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: old_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         let new_stats = process_dense_command(
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: new_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
@@ -1671,8 +1980,9 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: active_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
@@ -1681,6 +1991,7 @@ mod tests {
             DenseCommand::ResetMappingSession {
                 transition: transition(inactive_map, proposed_map),
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
@@ -1692,7 +2003,7 @@ mod tests {
 
     #[test]
     fn failed_session_clear_drops_backend_but_commits_isolation_boundary() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         state.set_backend(Box::new(FaultBackend {
             fail_clear: true,
@@ -1704,19 +2015,30 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: old_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
-        let failed = process_dense_command(
+        let error = super::process_dense_command(
             &mut state,
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 7,
+                timestamp: Timestamp::from_nanos(0),
             },
-        );
+        )
+        .expect_err("session-clear failure must be returned");
+        let failed = state.stats();
 
+        assert!(matches!(
+            error,
+            DenseProcessingError::Tsdf {
+                operation: DenseProcessingOperation::ResetMappingSession,
+                source: TsdfError::Internal(ref detail),
+            } if detail == "fault-injected clear"
+        ));
         assert_eq!(failed.state, ReconState::Down);
         assert_eq!(failed.stored_keyframes, 0);
         assert_eq!(state.map_instance_id, Some(new_map));
@@ -1728,16 +2050,18 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: old_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         let recovered = process_dense_command(
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: new_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(recovered.state, ReconState::Nominal);
@@ -1748,7 +2072,7 @@ mod tests {
 
     #[test]
     fn reset_clears_new_session_data_that_raced_ahead_of_the_barrier() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         // Model one old-session volume entry that predates the host-side
         // session binding, then let one new-session integration race ahead.
@@ -1765,8 +2089,9 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: new_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(backend_entries.load(Ordering::SeqCst), 2);
@@ -1777,6 +2102,7 @@ mod tests {
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
@@ -1790,7 +2116,7 @@ mod tests {
 
     #[test]
     fn panicking_session_clear_keeps_the_committed_isolation_boundary() {
-        let config = make_tsdf_config(RebuildPolicy::Strict);
+        let config = make_tsdf_config();
         let mut state = DenseState::new(&config);
         state.set_backend(Box::new(FaultBackend {
             panic_clear: true,
@@ -1802,20 +2128,28 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: old_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
-        process_command_with_recovery(
+        let error = process_command_with_recovery(
             &mut state,
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 9,
+                timestamp: Timestamp::from_nanos(0),
             },
             None,
-        );
+        )
+        .expect_err("panicking clear must be returned");
 
+        assert!(matches!(
+            error,
+            DenseProcessingError::Panicked { ref detail }
+                if detail.contains("fault-injected clear panic")
+        ));
         assert_eq!(state.state(), ReconState::Down);
         assert_eq!(state.store.len(), 0);
         assert_eq!(state.map_instance_id, Some(new_map));
@@ -1824,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_generation_orders_empty_rebuilds_and_map_ids_order_nonempty_rebuilds() {
+    fn reset_generation_and_map_identity_order_pose_updates() {
         let config = make_config(10);
         let mut state = DenseState::new(&config);
         let (old_map, old_keyframe) = map_keyframe(1);
@@ -1833,8 +2167,9 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: old_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         process_dense_command(
@@ -1842,21 +2177,24 @@ mod tests {
             DenseCommand::ResetMappingSession {
                 transition: transition(old_map, new_map),
                 generation: 2,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
 
         process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: Vec::new(),
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(old_keyframe)],
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![(old_keyframe, Pose::identity())],
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(old_keyframe)],
                 generation: 3,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(state.generation, 2);
@@ -1866,15 +2204,17 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: new_keyframe,
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         let current = process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: Vec::new(),
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(new_keyframe)],
                 generation: 3,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(state.generation, 3);
@@ -1883,14 +2223,25 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_increments_count() {
+    fn retained_pose_update_increments_rebuild_count() {
         let config = make_config(10);
         let mut state = DenseState::new(&config);
+        let keyframe_id = kf(0);
+        process_dense_command(
+            &mut state,
+            DenseCommand::IntegrateKeyframe {
+                keyframe_id,
+                pose: WorldToCamera::identity(),
+                depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
+            },
+        );
         let stats = process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![],
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(keyframe_id)],
                 generation: 1,
+                timestamp: Timestamp::from_nanos(1),
             },
         );
         assert_eq!(stats.rebuild_count, 1);
@@ -1898,42 +2249,86 @@ mod tests {
     }
 
     #[test]
-    fn stale_rebuild_is_skipped() {
+    fn unretained_pose_update_advances_generation_without_reporting_a_rebuild() {
         let config = make_config(10);
         let mut state = DenseState::new(&config);
-        process_dense_command(
-            &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![],
-                generation: 5,
-            },
-        );
+
         let stats = process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![],
-                generation: 3, // stale
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(kf(0))],
+                generation: 1,
+                timestamp: Timestamp::from_nanos(1),
             },
         );
-        assert_eq!(stats.rebuild_count, 1, "stale rebuild should not increment");
+
+        assert_eq!(state.generation, 1);
+        assert_eq!(stats.rebuild_count, 0);
+        assert_eq!(stats.stored_keyframes, 0);
+        assert_eq!(stats.state, ReconState::Nominal);
     }
 
     #[test]
-    fn rebuild_aborts_on_higher_generation() {
+    fn stale_pose_update_is_skipped() {
         let config = make_config(10);
         let mut state = DenseState::new(&config);
+        let keyframe_id = kf(0);
         process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![],
-                generation: 1,
+            DenseCommand::IntegrateKeyframe {
+                keyframe_id,
+                pose: WorldToCamera::identity(),
+                depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
+            },
+        );
+        process_dense_command(
+            &mut state,
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(keyframe_id)],
+                generation: 5,
+                timestamp: Timestamp::from_nanos(1),
             },
         );
         let stats = process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![],
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(keyframe_id)],
+                generation: 3, // stale
+                timestamp: Timestamp::from_nanos(2),
+            },
+        );
+        assert_eq!(stats.rebuild_count, 1, "stale update should not increment");
+    }
+
+    #[test]
+    fn successive_authoritative_pose_generations_are_applied() {
+        let config = make_config(10);
+        let mut state = DenseState::new(&config);
+        let keyframe_id = kf(0);
+        process_dense_command(
+            &mut state,
+            DenseCommand::IntegrateKeyframe {
+                keyframe_id,
+                pose: WorldToCamera::identity(),
+                depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
+            },
+        );
+        process_dense_command(
+            &mut state,
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(keyframe_id)],
+                generation: 1,
+                timestamp: Timestamp::from_nanos(1),
+            },
+        );
+        let stats = process_dense_command(
+            &mut state,
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![pose_update(keyframe_id)],
                 generation: 2,
+                timestamp: Timestamp::from_nanos(2),
             },
         );
         assert_eq!(stats.rebuild_count, 2);
@@ -1948,8 +2343,9 @@ mod tests {
             &mut state,
             DenseCommand::IntegrateKeyframe {
                 keyframe_id: kf(0),
-                pose: Pose::identity(),
+                pose: WorldToCamera::identity(),
                 depth: dummy_depth(),
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(stats.integrated_count, 0, "Down state should not process");
@@ -1957,18 +2353,20 @@ mod tests {
     }
 
     #[test]
-    fn empty_rebuild_snapshot() {
+    fn empty_pose_update_batch_is_ignored_without_advancing_generation() {
         let config = make_config(10);
         let mut state = DenseState::new(&config);
         let stats = process_dense_command(
             &mut state,
-            DenseCommand::RebuildFromSnapshot {
-                corrected_poses: vec![],
+            DenseCommand::ApplyPoseUpdates {
+                updates: vec![],
                 generation: 1,
+                timestamp: Timestamp::from_nanos(0),
             },
         );
         assert_eq!(stats.state, ReconState::Nominal);
-        assert_eq!(stats.rebuild_count, 1);
+        assert_eq!(stats.rebuild_count, 0);
+        assert_eq!(state.generation, 0);
     }
 
     #[test]

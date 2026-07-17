@@ -382,7 +382,6 @@ impl RerunSink {
             ReconState::AwaitingBackend => 0.5,
             ReconState::Nominal => 0.0,
             ReconState::Rebuilding { .. } => 1.0,
-            ReconState::Degraded { .. } => 2.0,
             ReconState::Down => 3.0,
         };
         rec.log(PATH_DENSE_STATE, &rerun::Scalars::single(state_scalar))?;

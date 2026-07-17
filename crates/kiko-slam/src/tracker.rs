@@ -900,6 +900,83 @@ pub struct BackendStats {
     pub panics: u64,
 }
 
+/// One stored-keyframe pose value for downstream reconstruction.
+///
+/// The keyframe ID retains its originating [`crate::map::MapInstanceId`], and
+/// the pose is explicitly the world-to-camera transform stored by the tracker.
+/// Tracker-produced values are published only after the corresponding map
+/// mutation commits. The public constructor is a data constructor, not proof
+/// that an arbitrary caller obtained the pose from an authoritative tracker.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyframePoseUpdate {
+    keyframe_id: KeyframeId,
+    pose: crate::WorldToCamera,
+}
+
+impl KeyframePoseUpdate {
+    /// Construct pose-update data; this does not verify tracker-commit provenance.
+    pub fn new(keyframe_id: KeyframeId, pose: crate::WorldToCamera) -> Self {
+        Self { keyframe_id, pose }
+    }
+
+    pub fn keyframe_id(self) -> KeyframeId {
+        self.keyframe_id
+    }
+
+    pub fn pose(self) -> crate::WorldToCamera {
+        self.pose
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingDensePoseUpdates {
+    map_instance_id: Option<crate::map::MapInstanceId>,
+    by_keyframe: HashMap<KeyframeId, crate::WorldToCamera>,
+}
+
+impl PendingDensePoseUpdates {
+    fn record(&mut self, update: KeyframePoseUpdate) {
+        let update_map = update.keyframe_id().map_instance_id();
+        if self
+            .map_instance_id
+            .is_some_and(|pending_map| pending_map != update_map)
+        {
+            debug_assert!(
+                self.by_keyframe.is_empty(),
+                "mapping-session reset must clear pending dense pose updates"
+            );
+            // Preserve session isolation even in release builds if an internal
+            // caller ever violates the reset protocol.
+            self.by_keyframe.clear();
+        }
+        self.map_instance_id = Some(update_map);
+        // A later committed correction is authoritative for the same keyframe.
+        self.by_keyframe.insert(update.keyframe_id(), update.pose());
+    }
+
+    fn record_all(&mut self, updates: impl IntoIterator<Item = KeyframePoseUpdate>) {
+        for update in updates {
+            self.record(update);
+        }
+    }
+
+    fn take_sorted(&mut self) -> Vec<KeyframePoseUpdate> {
+        let mut updates: Vec<_> = self
+            .by_keyframe
+            .drain()
+            .map(|(keyframe_id, pose)| KeyframePoseUpdate::new(keyframe_id, pose))
+            .collect();
+        updates.sort_unstable_by_key(|update| update.keyframe_id());
+        self.map_instance_id = None;
+        updates
+    }
+
+    fn clear(&mut self) {
+        self.map_instance_id = None;
+        self.by_keyframe.clear();
+    }
+}
+
 #[derive(Debug)]
 enum SubmitEventError {
     InvalidWindow(BackendWindowError),
@@ -1965,7 +2042,7 @@ pub struct SlamTracker {
     pending_loop: Option<PendingLoopCandidate>,
     loop_streak: HashMap<KeyframeId, usize>,
     pending_events: Vec<DiagnosticEvent>,
-    pending_loop_correction: Option<Vec<(KeyframeId, Pose)>>,
+    pending_dense_pose_updates: PendingDensePoseUpdates,
     tracking_health: TrackingHealth,
     consecutive_tracking_failures: usize,
     last_pose_world: Option<Pose>,
@@ -2034,7 +2111,7 @@ impl SlamTracker {
             pending_loop: None,
             loop_streak: HashMap::new(),
             pending_events: Vec::new(),
-            pending_loop_correction: None,
+            pending_dense_pose_updates: PendingDensePoseUpdates::default(),
             tracking_health: TrackingHealth::Good,
             consecutive_tracking_failures: 0,
             last_pose_world: None,
@@ -2101,6 +2178,15 @@ impl SlamTracker {
         self.map.covisibility_snapshot()
     }
 
+    /// Return the authoritative stored pose for one map-scoped keyframe.
+    ///
+    /// Newly created dense integrations must use this accessor rather than the
+    /// frame pose in [`TrackerOutput`], which is not an authoritative lookup by
+    /// keyframe identity.
+    pub fn keyframe_pose(&self, keyframe_id: KeyframeId) -> Option<crate::WorldToCamera> {
+        authoritative_keyframe_pose(&self.map, keyframe_id)
+    }
+
     pub fn backend_stats(&self) -> BackendStats {
         self.backend_stats
     }
@@ -2137,21 +2223,21 @@ impl SlamTracker {
             &self.pose_graph_optimizer,
             &verified,
         )?;
-        self.pending_loop_correction = if corrected.is_empty() {
-            None
-        } else {
-            Some(corrected)
-        };
+        self.pending_dense_pose_updates
+            .record_all(corrected.iter().map(|&(keyframe_id, pose)| {
+                KeyframePoseUpdate::new(keyframe_id, crate::WorldToCamera::from_legacy_pose(pose))
+            }));
         Ok(())
     }
 
-    /// Take the pending loop closure correction, if any.
+    /// Take committed stored-keyframe pose changes for downstream reconstruction.
     ///
-    /// Returns the corrected poses produced by the most recent
-    /// `apply_loop_closure` call. The caller (pipeline) uses this to
-    /// send a `RebuildFromSnapshot` command to the dense worker.
-    pub fn take_pending_loop_correction(&mut self) -> Option<Vec<(KeyframeId, Pose)>> {
-        self.pending_loop_correction.take()
+    /// Multiple accepted corrections before a take are coalesced by map-scoped
+    /// keyframe ID, with the latest committed pose winning. The returned entries
+    /// are sorted by keyframe ID for deterministic processing. Mapping-session
+    /// reset clears the pending set before the new map can publish updates.
+    pub fn take_pending_dense_pose_updates(&mut self) -> Vec<KeyframePoseUpdate> {
+        self.pending_dense_pose_updates.take_sorted()
     }
 
     fn emit_health(&mut self, tracking: TrackingHealth) -> SystemHealth {
@@ -2526,7 +2612,11 @@ impl SlamTracker {
                     }
                     match &correction.correction.result {
                         BaResult::Converged { .. } | BaResult::MaxIterations { .. } => {
-                            match apply_correction_event(&mut self.map, &correction) {
+                            match apply_backend_correction_and_record_dense_updates(
+                                &mut self.map,
+                                &mut self.pending_dense_pose_updates,
+                                &correction,
+                            ) {
                                 Ok(()) => {
                                     self.backend_stats.applied =
                                         self.backend_stats.applied.saturating_add(1);
@@ -2840,7 +2930,7 @@ impl SlamTracker {
         self.ba.reset();
         self.pending_loop = None;
         self.loop_streak.clear();
-        self.pending_loop_correction = None;
+        self.pending_dense_pose_updates.clear();
         self.consecutive_tracking_failures = 0;
         self.last_pose_world = None;
     }
@@ -3250,11 +3340,25 @@ impl SlamTracker {
                                     );
                                     let result =
                                         self.ba.optimize_keyframe_window(&mut self.map, &window)?;
+                                    record_committed_synchronous_ba_pose_updates(
+                                        &self.map,
+                                        &mut self.pending_dense_pose_updates,
+                                        &window,
+                                        self.ba.window_size(),
+                                        &result,
+                                    );
                                     ba_result = Some(result);
                                 }
                             } else {
                                 let result =
                                     self.ba.optimize_keyframe_window(&mut self.map, &window)?;
+                                record_committed_synchronous_ba_pose_updates(
+                                    &self.map,
+                                    &mut self.pending_dense_pose_updates,
+                                    &window,
+                                    self.ba.window_size(),
+                                    &result,
+                                );
                                 ba_result = Some(result);
                             }
                         }
@@ -3800,6 +3904,38 @@ fn collect_window_points(
     Ok(points)
 }
 
+fn authoritative_keyframe_pose(
+    map: &SlamMap,
+    keyframe_id: KeyframeId,
+) -> Option<crate::WorldToCamera> {
+    map.keyframe(keyframe_id).map(|keyframe| keyframe.pose())
+}
+
+fn record_committed_synchronous_ba_pose_updates(
+    map: &SlamMap,
+    pending: &mut PendingDensePoseUpdates,
+    requested_window: &[KeyframeId],
+    max_window: NonZeroUsize,
+    result: &BaResult,
+) {
+    if !matches!(
+        result,
+        BaResult::Converged { .. } | BaResult::MaxIterations { .. }
+    ) {
+        return;
+    }
+
+    // Full BA commits exactly the prefix admitted by its configured window.
+    // Its transactional writeback has already succeeded, so these lookups
+    // cannot introduce a new fallible step after mutation.
+    let optimized_count = requested_window.len().min(max_window.get());
+    for &keyframe_id in &requested_window[..optimized_count] {
+        let pose = authoritative_keyframe_pose(map, keyframe_id)
+            .expect("committed BA keyframe must remain in the authoritative map");
+        pending.record(KeyframePoseUpdate::new(keyframe_id, pose));
+    }
+}
+
 fn apply_correction_event(
     map: &mut SlamMap,
     correction: &CorrectionEvent,
@@ -3835,6 +3971,22 @@ fn apply_correction_event(
         staged.set_map_point_position(*point_id, *corrected_position)?;
     }
     *map = staged;
+    Ok(())
+}
+
+fn apply_backend_correction_and_record_dense_updates(
+    map: &mut SlamMap,
+    pending: &mut PendingDensePoseUpdates,
+    correction: &CorrectionEvent,
+) -> Result<(), ApplyCorrectionError> {
+    apply_correction_event(map, correction)?;
+    pending.record_all(
+        correction
+            .correction
+            .corrected_poses
+            .iter()
+            .map(|&(keyframe_id, pose)| KeyframePoseUpdate::new(keyframe_id, pose)),
+    );
     Ok(())
 }
 
@@ -4408,6 +4560,172 @@ mod tests {
         (map, kf_a, kf_b)
     }
 
+    fn translated_world_to_camera(x: f32) -> crate::WorldToCamera {
+        let pose = Pose::try_from_rt(Pose::identity().rotation(), [x, 0.0, 0.0])
+            .expect("finite translated test pose");
+        crate::WorldToCamera::from_legacy_pose(pose)
+    }
+
+    #[test]
+    fn committed_synchronous_ba_publishes_exact_authoritative_optimized_prefix() {
+        let (mut map, first, second) = make_map_with_two_keyframes_one_shared_point();
+        let third_keyframe = make_single_landmark_keyframe(12);
+        let third = map
+            .add_keyframe_from_detections(
+                third_keyframe.detections(),
+                Timestamp::from_nanos(12),
+                crate::WorldToCamera::identity(),
+            )
+            .expect("third keyframe");
+        let fourth_keyframe = make_single_landmark_keyframe(13);
+        let fourth = map
+            .add_keyframe_from_detections(
+                fourth_keyframe.detections(),
+                Timestamp::from_nanos(13),
+                crate::WorldToCamera::identity(),
+            )
+            .expect("fourth keyframe");
+
+        for (keyframe_id, translation) in
+            [(first, 11.0), (second, 22.0), (third, 33.0), (fourth, 44.0)]
+        {
+            map.set_keyframe_pose(keyframe_id, translated_world_to_camera(translation))
+                .expect("store simulated optimized pose");
+        }
+
+        // Full BA consumes only the configured prefix, irrespective of the
+        // caller's window order. Publication must mirror that exact set while
+        // reading the post-commit values back from the authoritative map.
+        let requested_window = [third, first, fourth, second];
+        let max_window = NonZeroUsize::new(2).expect("non-zero BA window");
+        for result in [
+            BaResult::Converged {
+                iterations: 1,
+                final_cost: 0.0,
+            },
+            BaResult::MaxIterations {
+                iterations: 2,
+                final_cost: 1.0,
+            },
+        ] {
+            let mut pending = PendingDensePoseUpdates::default();
+            record_committed_synchronous_ba_pose_updates(
+                &map,
+                &mut pending,
+                &requested_window,
+                max_window,
+                &result,
+            );
+
+            let updates = pending.take_sorted();
+            let mut expected_ids = requested_window[..max_window.get()].to_vec();
+            expected_ids.sort_unstable();
+            assert_eq!(
+                updates
+                    .iter()
+                    .map(|update| update.keyframe_id())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            for update in updates {
+                assert_eq!(
+                    update.pose().translation(),
+                    authoritative_keyframe_pose(&map, update.keyframe_id())
+                        .expect("published keyframe remains authoritative")
+                        .translation()
+                );
+            }
+        }
+
+        let mut pending = PendingDensePoseUpdates::default();
+        record_committed_synchronous_ba_pose_updates(
+            &map,
+            &mut pending,
+            &requested_window,
+            max_window,
+            &BaResult::Degenerate {
+                reason: crate::DegenerateReason::NoFactors,
+            },
+        );
+        assert!(pending.take_sorted().is_empty());
+    }
+
+    #[test]
+    fn pending_dense_pose_updates_coalesce_latest_and_sort_by_keyframe() {
+        let (_map, first, second) = make_map_with_two_keyframes_one_shared_point();
+        let (lower, higher) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let mut pending = PendingDensePoseUpdates::default();
+
+        pending.record(KeyframePoseUpdate::new(
+            higher,
+            translated_world_to_camera(2.0),
+        ));
+        pending.record(KeyframePoseUpdate::new(
+            lower,
+            translated_world_to_camera(1.0),
+        ));
+        pending.record(KeyframePoseUpdate::new(
+            lower,
+            translated_world_to_camera(3.0),
+        ));
+
+        let updates = pending.take_sorted();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].keyframe_id(), lower);
+        assert_eq!(updates[0].pose().translation(), [3.0, 0.0, 0.0]);
+        assert_eq!(updates[1].keyframe_id(), higher);
+        assert_eq!(updates[1].pose().translation(), [2.0, 0.0, 0.0]);
+        assert!(pending.take_sorted().is_empty());
+    }
+
+    #[test]
+    fn pending_dense_pose_updates_clear_isolates_mapping_sessions() {
+        let (_old_map, old_keyframe, _) = make_map_with_single_point();
+        let (_new_map, new_keyframe, _) = make_map_with_single_point();
+        assert_ne!(
+            old_keyframe.map_instance_id(),
+            new_keyframe.map_instance_id()
+        );
+        let mut pending = PendingDensePoseUpdates::default();
+
+        pending.record(KeyframePoseUpdate::new(
+            old_keyframe,
+            translated_world_to_camera(1.0),
+        ));
+        pending.clear();
+        pending.record(KeyframePoseUpdate::new(
+            new_keyframe,
+            translated_world_to_camera(2.0),
+        ));
+
+        let updates = pending.take_sorted();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].keyframe_id(), new_keyframe);
+        assert_eq!(updates[0].pose().translation(), [2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn authoritative_keyframe_pose_is_current_and_map_scoped() {
+        let (mut map, keyframe_id, _) = make_map_with_single_point();
+        let corrected_pose = translated_world_to_camera(4.0);
+        map.set_keyframe_pose(keyframe_id, corrected_pose)
+            .expect("authoritative pose update");
+
+        assert_eq!(
+            authoritative_keyframe_pose(&map, keyframe_id)
+                .expect("stored keyframe pose")
+                .translation(),
+            [4.0, 0.0, 0.0]
+        );
+
+        let (_other_map, other_keyframe, _) = make_map_with_single_point();
+        assert!(authoritative_keyframe_pose(&map, other_keyframe).is_none());
+    }
+
     fn make_forced_panic_event(
         request_id: BackendRequestId,
         map: SlamMap,
@@ -4943,14 +5261,15 @@ mod tests {
     }
 
     #[test]
-    fn correction_apply_rejects_stale_snapshot() {
+    fn stale_backend_correction_does_not_publish_dense_pose_update() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
+        let corrected_pose = translated_world_to_camera(9.0);
         let correction = CorrectionEvent {
             request_id: BackendRequestId(NonZeroU64::new(1).expect("non-zero")),
             source_snapshot: map.snapshot(),
             trigger_keyframe: keyframe_id,
             correction: BackendCorrection {
-                corrected_poses: vec![(keyframe_id, crate::WorldToCamera::identity())],
+                corrected_poses: vec![(keyframe_id, corrected_pose)],
                 corrected_landmarks: vec![(point_id, crate::WorldPoint3::new(1.0, 2.0, 3.0))],
                 result: BaResult::Converged {
                     iterations: 1,
@@ -4958,13 +5277,29 @@ mod tests {
                 },
             },
         };
-        let position = map.point(point_id).expect("map point").position();
-        map.set_map_point_position(point_id, position)
+        let authoritative_pose = translated_world_to_camera(2.0);
+        map.set_keyframe_pose(keyframe_id, authoritative_pose)
             .expect("advance map generation");
+        let snapshot_before = map.snapshot();
+        let mut pending = PendingDensePoseUpdates::default();
+        pending.record(KeyframePoseUpdate::new(keyframe_id, authoritative_pose));
+
         assert!(matches!(
-            apply_correction_event(&mut map, &correction),
+            apply_backend_correction_and_record_dense_updates(&mut map, &mut pending, &correction,),
             Err(ApplyCorrectionError::StaleSnapshot { .. })
         ));
+        assert_eq!(map.snapshot(), snapshot_before);
+        assert_eq!(
+            map.keyframe(keyframe_id)
+                .expect("authoritative keyframe")
+                .pose()
+                .translation(),
+            [2.0, 0.0, 0.0]
+        );
+        let updates = pending.take_sorted();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].keyframe_id(), keyframe_id);
+        assert_eq!(updates[0].pose().translation(), [2.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -5078,7 +5413,7 @@ mod tests {
     }
 
     #[test]
-    fn correction_apply_updates_pose_and_landmark_atomically() {
+    fn backend_correction_commit_updates_map_and_publishes_pose_atomically() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
         let corrected_pose = crate::WorldToCamera::from_legacy_pose(
             crate::test_helpers::axis_angle_pose([0.2, -0.1, 0.05], [0.01, 0.0, 0.0]),
@@ -5102,7 +5437,9 @@ mod tests {
             },
         };
 
-        apply_correction_event(&mut map, &correction).expect("correction apply");
+        let mut pending = PendingDensePoseUpdates::default();
+        apply_backend_correction_and_record_dense_updates(&mut map, &mut pending, &correction)
+            .expect("correction apply and publication");
         assert_map_invariants(&map).expect("post-correction invariants");
 
         let stored_pose = map.keyframe(keyframe_id).expect("keyframe").pose();
@@ -5131,6 +5468,11 @@ mod tests {
         assert!((stored_point.x - corrected_point.x).abs() < 1e-6);
         assert!((stored_point.y - corrected_point.y).abs() < 1e-6);
         assert!((stored_point.z - corrected_point.z).abs() < 1e-6);
+
+        let updates = pending.take_sorted();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].keyframe_id(), keyframe_id);
+        assert_eq!(updates[0].pose().translation(), stored_pose.translation());
     }
 
     #[test]
@@ -5177,7 +5519,7 @@ mod tests {
     }
 
     #[test]
-    fn correction_apply_rejects_all_updates_when_a_landmark_is_missing() {
+    fn rejected_backend_correction_does_not_publish_dense_pose_update() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
         map.remove_map_point(point_id).expect("remove map point");
         let before_snapshot = map.snapshot();
@@ -5203,8 +5545,14 @@ mod tests {
             },
         };
 
+        let mut pending = PendingDensePoseUpdates::default();
+        pending.record(KeyframePoseUpdate::new(keyframe_id, before_pose));
         assert!(matches!(
-            apply_correction_event(&mut map, &correction),
+            apply_backend_correction_and_record_dense_updates(
+                &mut map,
+                &mut pending,
+                &correction,
+            ),
             Err(ApplyCorrectionError::MissingMapPoint { point_id: missing })
                 if missing == point_id
         ));
@@ -5224,6 +5572,11 @@ mod tests {
             before_pose.translation()
         );
         assert!(map.point(point_id).is_none());
+
+        let updates = pending.take_sorted();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].keyframe_id(), keyframe_id);
+        assert_eq!(updates[0].pose().translation(), before_pose.translation());
     }
 
     #[test]

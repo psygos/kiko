@@ -16,6 +16,11 @@ pub enum EnvError {
         value: String,
         source: ParseFloatError,
     },
+    InvalidF64 {
+        key: String,
+        value: String,
+        source: ParseFloatError,
+    },
     InvalidU32 {
         key: String,
         value: String,
@@ -45,6 +50,9 @@ impl std::fmt::Display for EnvError {
             Self::InvalidF32 { key, source, .. } => {
                 write!(f, "environment variable {key} is not a valid f32: {source}")
             }
+            Self::InvalidF64 { key, source, .. } => {
+                write!(f, "environment variable {key} is not a valid f64: {source}")
+            }
             Self::InvalidU32 { key, source, .. } => {
                 write!(f, "environment variable {key} is not a valid u32: {source}")
             }
@@ -64,7 +72,7 @@ impl std::fmt::Display for EnvError {
 impl std::error::Error for EnvError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidF32 { source, .. } => Some(source),
+            Self::InvalidF32 { source, .. } | Self::InvalidF64 { source, .. } => Some(source),
             Self::InvalidU32 { source, .. }
             | Self::InvalidU64 { source, .. }
             | Self::InvalidUsize { source, .. } => Some(source),
@@ -144,6 +152,14 @@ pub fn env_u32(key: &str) -> Result<Option<u32>, EnvError> {
 
 pub fn env_f32(key: &str) -> Result<Option<f32>, EnvError> {
     env_parse(key, |key, value, source| EnvError::InvalidF32 {
+        key,
+        value,
+        source,
+    })
+}
+
+pub fn env_f64(key: &str) -> Result<Option<f64>, EnvError> {
+    env_parse(key, |key, value, source| EnvError::InvalidF64 {
         key,
         value,
         source,
@@ -232,6 +248,10 @@ mod tests {
                 EnvError::InvalidF32 { key, value, source }
             })
             .unwrap_err(),
+            parse_value::<f64>("F64", "invalid".to_owned(), |key, value, source| {
+                EnvError::InvalidF64 { key, value, source }
+            })
+            .unwrap_err(),
             parse_value::<u32>("U32", "invalid".to_owned(), |key, value, source| {
                 EnvError::InvalidU32 { key, value, source }
             })
@@ -247,9 +267,10 @@ mod tests {
         ];
 
         assert!(matches!(&errors[0], EnvError::InvalidF32 { key, .. } if key == "F32"));
-        assert!(matches!(&errors[1], EnvError::InvalidU32 { key, .. } if key == "U32"));
-        assert!(matches!(&errors[2], EnvError::InvalidU64 { key, .. } if key == "U64"));
-        assert!(matches!(&errors[3], EnvError::InvalidUsize { key, .. } if key == "USIZE"));
+        assert!(matches!(&errors[1], EnvError::InvalidF64 { key, .. } if key == "F64"));
+        assert!(matches!(&errors[2], EnvError::InvalidU32 { key, .. } if key == "U32"));
+        assert!(matches!(&errors[3], EnvError::InvalidU64 { key, .. } if key == "U64"));
+        assert!(matches!(&errors[4], EnvError::InvalidUsize { key, .. } if key == "USIZE"));
         for error in &errors {
             assert!(std::error::Error::source(error).is_some());
         }

@@ -48,7 +48,7 @@ pub use diagnostics::{
     DiagnosticEvent, FrameDiagnostics, KeyframeRemovalReason, LoopClosureRejectReason,
     MappingSessionTransition, MappingSessionTransitionError,
 };
-pub use env::{EnvError, env_bool, env_f32, env_u32, env_u64, env_usize};
+pub use env::{EnvError, env_bool, env_f32, env_f64, env_u32, env_u64, env_usize};
 pub use geometry::{
     CameraFrame, CameraPoint3, CoordinateFrame, Point3, Point3Error, WorldFrame, WorldPoint3,
 };
@@ -86,8 +86,8 @@ pub use pnp::{
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
     DegradationLevel, DescriptorStats, GlobalDescriptorConfig, GlobalDescriptorConfigError,
-    KeyframePolicy, KeyframePolicyError, LoopSubsystemConfig, ParallaxPx, PoseStatus,
-    RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
+    KeyframePolicy, KeyframePolicyError, KeyframePoseUpdate, LoopSubsystemConfig, ParallaxPx,
+    PoseStatus, RedundancyPolicy, RedundancyPolicyError, SlamTracker, SystemHealth, TrackerConfig,
     TrackerError, TrackerInitError, TrackerOutput, TrackingHealth,
 };
 pub use triangulation::{
