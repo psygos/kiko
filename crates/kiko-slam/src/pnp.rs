@@ -1441,9 +1441,10 @@ impl<'a> CalibratedPnpProblem<'a> {
 
 /// Reusable scratch for calibration-derived PnP inputs.
 ///
-/// This deliberately retains only allocation capacity. Every solve rebuilds
-/// every bearing from that solve's observations and single intrinsics
-/// authority, so no calibration or observation state can leak across solves.
+/// Only allocation capacity is semantically reused. Initialized entries may
+/// remain between calls, but a solve that reaches calibration clears them and
+/// rebuilds exactly one bearing per current observation from that solve's
+/// single intrinsics authority; stale entries are never read.
 #[derive(Default)]
 pub(crate) struct PnpWorkspace {
     bearings: Vec<UnitBearing>,
