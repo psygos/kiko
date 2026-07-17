@@ -148,6 +148,7 @@ pub struct DatasetReader {
     stereo_calibration: StereoCalibration,
     entries: Vec<DatasetEntry>,
     depth: ParsedDepthStream,
+    depth_projection: Option<super::DepthProjectionContract>,
     stats: DatasetStats,
     left_seq: u64,
     right_seq: u64,
@@ -182,12 +183,14 @@ impl DatasetReader {
         let image = parsed_mono.image;
         let manifest = read_manifest(&root)?;
         let contract = ParsedManifestContract::parse(&manifest.header, image, &meta)?;
+        let depth_projection = contract.depth.map(DepthImageContract::projection);
         let parsed = parse_manifest(&root, manifest, contract)?;
         Ok(Self {
             meta,
             stereo_calibration: parsed_mono.stereo,
             entries: parsed.entries,
             depth: parsed.depth,
+            depth_projection,
             stats: parsed.stats,
             left_seq: 0,
             right_seq: 0,
@@ -202,6 +205,11 @@ impl DatasetReader {
     /// boundary. Rectification compatibility remains caller policy.
     pub fn stereo_calibration(&self) -> &StereoCalibration {
         &self.stereo_calibration
+    }
+
+    /// Return the depth projection contract parsed once from dataset metadata.
+    pub fn depth_projection_contract(&self) -> Option<super::DepthProjectionContract> {
+        self.depth_projection
     }
 
     pub fn stats(&self) -> DatasetStats {

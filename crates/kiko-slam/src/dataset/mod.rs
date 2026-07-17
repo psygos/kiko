@@ -66,6 +66,44 @@ pub struct DepthMeta {
     pub height: u32,
     pub fps: u32,
     pub encoding: String,
+    /// Optical frame whose pixel grid and intrinsics define each depth sample.
+    /// Legacy datasets omit this and cannot be used for geometric projection
+    /// without an explicit caller-supplied assumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optical_frame: Option<DepthOpticalFrame>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepthOpticalFrame {
+    RectifiedLeft,
+    RectifiedRight,
+    Rgb,
+}
+
+/// Parsed geometric contract for projecting recorded depth samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DepthProjectionContract {
+    dimensions: FrameDimensions,
+    optical_frame: Option<DepthOpticalFrame>,
+}
+
+impl DepthProjectionContract {
+    pub fn new(dimensions: FrameDimensions, optical_frame: DepthOpticalFrame) -> Self {
+        Self {
+            dimensions,
+            optical_frame: Some(optical_frame),
+        }
+    }
+
+    pub fn dimensions(self) -> FrameDimensions {
+        self.dimensions
+    }
+
+    /// `None` identifies legacy metadata that did not record the optical frame.
+    pub fn optical_frame(self) -> Option<DepthOpticalFrame> {
+        self.optical_frame
+    }
 }
 
 // Calibration structs
@@ -309,6 +347,7 @@ impl DepthPayloadFormat {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DepthImageContract {
     dimensions: FrameDimensions,
+    optical_frame: Option<DepthOpticalFrame>,
     _nominal_fps_hz: NonZeroU32,
     payload_format: DepthPayloadFormat,
     expected_payload_len: u64,
@@ -329,6 +368,7 @@ impl DepthImageContract {
             .ok_or(DatasetError::DepthPayloadSizeOverflow { dimensions })?;
         Ok(Self {
             dimensions,
+            optical_frame: meta.optical_frame,
             _nominal_fps_hz: nominal_fps_hz,
             payload_format,
             expected_payload_len,
@@ -352,6 +392,13 @@ impl DepthImageContract {
 
     fn dimensions(self) -> FrameDimensions {
         self.dimensions
+    }
+
+    fn projection(self) -> DepthProjectionContract {
+        DepthProjectionContract {
+            dimensions: self.dimensions,
+            optical_frame: self.optical_frame,
+        }
     }
 
     fn decode(self, bytes: &[u8]) -> Vec<f32> {
@@ -384,6 +431,13 @@ struct WriterDatasetContract {
 impl WriterDatasetContract {
     fn parse(meta: &Meta, calibration: &Calibration) -> Result<Self, DatasetError> {
         let mono = ParsedMonoContract::parse(meta, calibration)?.image;
+        if meta
+            .depth
+            .as_ref()
+            .is_some_and(|depth| depth.optical_frame.is_none())
+        {
+            return Err(DatasetError::DepthOpticalFrameRequiredForWrite);
+        }
         Ok(Self {
             created_at: meta.created.clone(),
             device: meta.device.clone(),
@@ -634,6 +688,7 @@ pub enum DatasetError {
     UnsupportedDepthEncoding {
         value: String,
     },
+    DepthOpticalFrameRequiredForWrite,
     DepthPayloadSizeOverflow {
         dimensions: FrameDimensions,
     },
@@ -833,6 +888,10 @@ impl std::fmt::Display for DatasetError {
             DatasetError::UnsupportedDepthEncoding { value } => write!(
                 f,
                 "unsupported dataset depth encoding {value:?}; expected \"f32_meters_le\""
+            ),
+            DatasetError::DepthOpticalFrameRequiredForWrite => write!(
+                f,
+                "new dataset depth metadata must declare its optical frame; omission is reserved for reading legacy datasets"
             ),
             DatasetError::DepthPayloadSizeOverflow { dimensions } => write!(
                 f,
@@ -1055,6 +1114,7 @@ impl std::error::Error for DatasetError {
             | DatasetError::InvalidNominalFps { .. }
             | DatasetError::ImageDimensionsMismatch { .. }
             | DatasetError::UnsupportedDepthEncoding { .. }
+            | DatasetError::DepthOpticalFrameRequiredForWrite
             | DatasetError::DepthPayloadSizeOverflow { .. }
             | DatasetError::DepthStreamNotConfigured
             | DatasetError::LegacyDepthManifestUnindexed
@@ -2890,6 +2950,7 @@ mod tests {
             height,
             fps: 30,
             encoding: "f32_meters_le".to_string(),
+            optical_frame: Some(DepthOpticalFrame::RectifiedLeft),
         });
         meta
     }
@@ -2915,6 +2976,25 @@ mod tests {
 
     fn writer_contract() -> WriterDatasetContract {
         WriterDatasetContract::parse(&meta(), &calibration()).expect("valid writer contract")
+    }
+
+    #[test]
+    fn new_depth_writer_rejects_legacy_unspecified_optical_frame() {
+        let mut metadata = meta_with_depth(2, 2);
+        metadata
+            .depth
+            .as_mut()
+            .expect("depth metadata")
+            .optical_frame = None;
+
+        assert!(matches!(
+            WriterDatasetContract::parse(&metadata, &calibration()),
+            Err(DatasetError::DepthOpticalFrameRequiredForWrite)
+        ));
+        assert!(
+            DepthImageContract::parse(metadata.depth.as_ref().expect("depth metadata")).is_ok(),
+            "reader parsing remains backward-compatible with legacy metadata"
+        );
     }
 
     fn writer_sidecars() -> WriterSidecars {
@@ -3011,6 +3091,33 @@ mod tests {
         }
         drop(writer);
         handle.finish().expect("finish dataset");
+    }
+
+    #[test]
+    fn depth_optical_frame_round_trips_and_legacy_metadata_remains_readable() {
+        let metadata = meta_with_depth(640, 480);
+        let encoded = serde_json::to_value(&metadata).expect("serialize depth metadata");
+        assert_eq!(
+            encoded["depth"]["optical_frame"],
+            serde_json::json!("rectified_left")
+        );
+        let decoded: Meta = serde_json::from_value(encoded.clone()).expect("parse metadata");
+        assert_eq!(
+            decoded.depth.and_then(|depth| depth.optical_frame),
+            Some(DepthOpticalFrame::RectifiedLeft)
+        );
+
+        let mut legacy = encoded;
+        legacy["depth"]
+            .as_object_mut()
+            .expect("depth object")
+            .remove("optical_frame");
+        let decoded: Meta = serde_json::from_value(legacy).expect("parse legacy metadata");
+        assert_eq!(
+            decoded.depth.and_then(|depth| depth.optical_frame),
+            None,
+            "absence is preserved so projection callers must make an explicit assumption"
+        );
     }
 
     #[test]
@@ -3420,7 +3527,15 @@ mod tests {
             .join(format::frame_name(3, "depth"));
         let payload = std::fs::read(depth_path).expect("read depth payload");
         assert_eq!(payload, 1.0_f32.to_le_bytes().repeat(4));
-        DatasetReader::open(&path).expect("reader accepts parsed depth contract");
+        let reader = DatasetReader::open(&path).expect("reader accepts parsed depth contract");
+        let projection = reader
+            .depth_projection_contract()
+            .expect("parsed depth projection contract");
+        assert_eq!(projection.dimensions(), FrameDimensions::new(2, 2));
+        assert_eq!(
+            projection.optical_frame(),
+            Some(DepthOpticalFrame::RectifiedLeft)
+        );
         let mut invalid_meta = dataset_meta;
         invalid_meta
             .depth
