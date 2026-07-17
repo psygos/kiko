@@ -5199,7 +5199,7 @@ mod tests {
         let intrinsics =
             crate::test_helpers::make_pinhole_intrinsics(320, 240, 200.0, 200.0, 160.0, 120.0)
                 .expect("intrinsics");
-        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+        let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
             .expect("ba config");
         let mut worker =
             BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
@@ -5253,7 +5253,7 @@ mod tests {
         let error = BackendSupervisor::spawn_initial_with(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             3,
             |_, _, _| -> Result<BackendWorker, std::io::Error> {
@@ -5278,7 +5278,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             3,
         );
@@ -5326,7 +5326,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             1,
         );
@@ -5397,7 +5397,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             3,
         );
@@ -5415,7 +5415,7 @@ mod tests {
         let mut supervisor = BackendSupervisor::with_max_respawns(
             BackendConfig::new(1).expect("backend config"),
             intrinsics,
-            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default(), 0.0)
+            LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
                 .expect("ba config"),
             2,
         );

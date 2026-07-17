@@ -49,8 +49,6 @@ pub struct LocalBaConfig {
     min_observations: NonZeroUsize,
     huber_delta_px: f32,
     lm: LmConfig,
-    motion_prior_weight: f32,
-    motion_prior_weight_squared: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -271,10 +269,6 @@ pub enum LocalBaConfigError {
     ZeroObservations,
     TooFewObservations { min: usize },
     NonPositiveHuber { value: f32 },
-    NegativeMotionWeight { value: f32 },
-    NonFiniteMotionWeight { value: f32 },
-    MotionWeightTooSmall { value: f32 },
-    MotionWeightTooLarge { value: f32 },
 }
 
 impl std::fmt::Display for LocalBaConfigError {
@@ -295,24 +289,6 @@ impl std::fmt::Display for LocalBaConfigError {
             LocalBaConfigError::NonPositiveHuber { value } => {
                 write!(f, "local BA huber delta must be > 0 (got {value})")
             }
-            LocalBaConfigError::NegativeMotionWeight { value } => {
-                write!(
-                    f,
-                    "incremental BA pose-parameter prior weight must be >= 0 (got {value})"
-                )
-            }
-            LocalBaConfigError::NonFiniteMotionWeight { value } => write!(
-                f,
-                "incremental BA pose-parameter prior weight must be finite (got {value})"
-            ),
-            LocalBaConfigError::MotionWeightTooSmall { value } => write!(
-                f,
-                "positive incremental BA pose-parameter prior weight must have a nonzero f32 square (got {value})"
-            ),
-            LocalBaConfigError::MotionWeightTooLarge { value } => write!(
-                f,
-                "incremental BA pose-parameter prior weight must have a finite f32 square (got {value})"
-            ),
         }
     }
 }
@@ -326,7 +302,6 @@ impl LocalBaConfig {
         min_observations: usize,
         huber_delta_px: f32,
         lm: LmConfig,
-        motion_prior_weight: f32,
     ) -> Result<Self, LocalBaConfigError> {
         let window = NonZeroUsize::new(window).ok_or(LocalBaConfigError::ZeroWindow)?;
         let pose_dimension =
@@ -355,28 +330,6 @@ impl LocalBaConfig {
                 value: huber_delta_px,
             });
         }
-        if !motion_prior_weight.is_finite() {
-            return Err(LocalBaConfigError::NonFiniteMotionWeight {
-                value: motion_prior_weight,
-            });
-        }
-        if motion_prior_weight < 0.0 {
-            return Err(LocalBaConfigError::NegativeMotionWeight {
-                value: motion_prior_weight,
-            });
-        }
-        let motion_prior_weight_squared =
-            (motion_prior_weight as f64) * (motion_prior_weight as f64);
-        if motion_prior_weight > 0.0 && (motion_prior_weight_squared as f32) == 0.0 {
-            return Err(LocalBaConfigError::MotionWeightTooSmall {
-                value: motion_prior_weight,
-            });
-        }
-        if motion_prior_weight_squared > f32::MAX as f64 {
-            return Err(LocalBaConfigError::MotionWeightTooLarge {
-                value: motion_prior_weight,
-            });
-        }
         Ok(Self {
             window,
             pose_dimension,
@@ -385,8 +338,6 @@ impl LocalBaConfig {
             min_observations,
             huber_delta_px,
             lm,
-            motion_prior_weight,
-            motion_prior_weight_squared,
         })
     }
 
@@ -416,19 +367,6 @@ impl LocalBaConfig {
 
     pub fn lm(&self) -> LmConfig {
         self.lm
-    }
-
-    /// Shared numerical weight for adjacent incremental pose-parameter differences.
-    ///
-    /// Translation components are world-to-camera metres and rotation components are
-    /// axis-angle radians. This is not a time-normalized physical motion model and does not
-    /// apply to covisible keyframe-window BA.
-    pub fn motion_prior_weight(&self) -> f32 {
-        self.motion_prior_weight
-    }
-
-    fn motion_prior_weight_squared(&self) -> f64 {
-        self.motion_prior_weight_squared
     }
 }
 
@@ -1123,7 +1061,6 @@ impl LocalBundleAdjuster {
         let max_iters = self.config.max_iterations();
         let huber = self.config.huber_delta_px();
         let damping = self.config.lm().initial_lambda().max(MIN_POSE_DAMPING);
-        let motion_weight_squared = self.config.motion_prior_weight_squared();
 
         for _ in 0..max_iters {
             let a = &mut self.a_buf[..dim * dim];
@@ -1173,25 +1110,6 @@ impl LocalBundleAdjuster {
                         required: self.config.min_observations(),
                         actual: usable_observations,
                     });
-                }
-            }
-
-            if motion_weight_squared > 0.0 && frame_count >= 2 {
-                for i in 1..frame_count {
-                    if !accumulate_motion_prior(
-                        a,
-                        b,
-                        dim,
-                        self.frames[i - 1].pose,
-                        self.frames[i].pose,
-                        (i - 1) * 6,
-                        i * 6,
-                        motion_weight_squared,
-                    ) {
-                        return Err(LocalBaError::NumericalFailure {
-                            operation: "accumulating the motion prior",
-                        });
-                    }
                 }
             }
 
@@ -2179,12 +2097,6 @@ pub(crate) fn se3_delta_between(from: Pose, to: Pose) -> Result<[f32; 6], crate:
     ])
 }
 
-fn pose_to_vec(pose: Pose) -> [f32; 6] {
-    let t = pose.translation();
-    let w = math::so3_log(pose.rotation());
-    [t[0], t[1], t[2], w[0], w[1], w[2]]
-}
-
 fn accumulate_pose_hessian(
     hessian: &mut [f32],
     pose_dim: usize,
@@ -2266,50 +2178,6 @@ fn extract_se3_delta(rhs: &[f32], base: usize) -> [f32; 6] {
 fn narrow_finite_f32(value: f64) -> Option<f32> {
     let narrowed = value as f32;
     narrowed.is_finite().then_some(narrowed)
-}
-
-fn add_finite_f32(target: &mut f32, delta: f64) -> bool {
-    let Some(sum) = narrow_finite_f32((*target as f64) + delta) else {
-        return false;
-    };
-    *target = sum;
-    true
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Accumulate a zero-difference parameter regularizer for consecutive incremental frames.
-///
-/// The first three residuals are world-to-camera translation in metres; the last three are
-/// absolute axis-angle rotation in radians. The shared weight is numerical, not a velocity or
-/// constant-motion model.
-fn accumulate_motion_prior(
-    hessian: &mut [f32],
-    rhs: &mut [f32],
-    dim: usize,
-    prev_pose: Pose,
-    curr_pose: Pose,
-    base_prev: usize,
-    base_curr: usize,
-    weight_squared: f64,
-) -> bool {
-    let r_prev = pose_to_vec(prev_pose);
-    let r_curr = pose_to_vec(curr_pose);
-    for k in 0..6 {
-        let residual = (r_curr[k] as f64) - (r_prev[k] as f64);
-        let weighted_residual = residual * weight_squared;
-        let prev = base_prev + k;
-        let curr = base_curr + k;
-        if !add_finite_f32(&mut rhs[prev], weighted_residual)
-            || !add_finite_f32(&mut rhs[curr], -weighted_residual)
-            || !add_finite_f32(&mut hessian[prev * dim + prev], weight_squared)
-            || !add_finite_f32(&mut hessian[curr * dim + curr], weight_squared)
-            || !add_finite_f32(&mut hessian[prev * dim + curr], -weight_squared)
-            || !add_finite_f32(&mut hessian[curr * dim + prev], -weight_squared)
-        {
-            return false;
-        }
-    }
-    true
 }
 
 fn mat63_mul_vec3(m: [[f32; 3]; 6], v: [f32; 3]) -> [f32; 6] {
@@ -2749,52 +2617,29 @@ mod tests {
     #[test]
     fn local_ba_config_rejects_invalid_values() {
         assert!(matches!(
-            LocalBaConfig::new(0, 10, 4, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(0, 10, 4, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::ZeroWindow)
         ));
         assert!(matches!(
-            LocalBaConfig::new(usize::MAX, 10, 4, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(usize::MAX, 10, 4, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::WindowTooLarge { value: usize::MAX })
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 0, 4, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 0, 4, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::ZeroIterations)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 0, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 10, 0, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::ZeroObservations)
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 3, 1.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 10, 3, 1.0, lm(1e-3)),
             Err(LocalBaConfigError::TooFewObservations { .. })
         ));
         assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 0.0, lm(1e-3), 0.0),
+            LocalBaConfig::new(5, 10, 4, 0.0, lm(1e-3)),
             Err(LocalBaConfigError::NonPositiveHuber { .. })
         ));
-        assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), -1.0),
-            Err(LocalBaConfigError::NegativeMotionWeight { .. })
-        ));
-        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(matches!(
-                LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), value),
-                Err(LocalBaConfigError::NonFiniteMotionWeight { .. })
-            ));
-        }
-        assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), f32::MIN_POSITIVE),
-            Err(LocalBaConfigError::MotionWeightTooSmall { .. })
-        ));
-        assert!(matches!(
-            LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), f32::MAX),
-            Err(LocalBaConfigError::MotionWeightTooLarge { .. })
-        ));
-
-        let extreme_finite_weight = f32::MAX.sqrt() / 2.0;
-        let config = LocalBaConfig::new(5, 10, 4, 1.0, lm(1e-3), extreme_finite_weight)
-            .expect("a motion weight with a representable square");
-        assert!(config.motion_prior_weight_squared().is_finite());
     }
 
     #[test]
@@ -2852,7 +2697,7 @@ mod tests {
     #[test]
     fn push_frame_rejects_unprojectable_observations_and_recovers() {
         let (mut map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let min_required = ba.min_observations();
         let observation_count = map.keyframe(keyframe_id).expect("keyframe").len();
@@ -2932,7 +2777,7 @@ mod tests {
     #[test]
     fn final_incremental_validation_rejects_a_staged_depth_threshold_crossing() {
         let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
-        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let observations = (0..map.keyframe(keyframe_id).expect("keyframe").len())
             .map(|index| {
@@ -2988,7 +2833,7 @@ mod tests {
                 )
             })
             .collect();
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let observation_set =
             ObservationSet::new(observations, ba.min_observations()).expect("observation set");
@@ -3006,7 +2851,7 @@ mod tests {
     #[test]
     fn push_frame_preserves_observation_error_and_resets_window() {
         let (map, intrinsics, keyframe_id, _, _, _) = build_full_ba_fixture([0.0; 6]);
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let observations = (0..ba.min_observations().get())
             .map(|index| {
@@ -3148,7 +2993,7 @@ mod tests {
     fn optimize_full_reports_degenerate_variants() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
 
         let mut no_poses = FullBaProblem {
@@ -3221,7 +3066,7 @@ mod tests {
     fn optimize_full_reports_numerical_failure_for_noninvertible_landmark_block() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, f32::MAX, 1.0, 0.0, 0.0).expect("finite intrinsics");
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("valid config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem {
             poses: vec![
@@ -3259,7 +3104,7 @@ mod tests {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
         let lm = LmConfig::new(1e-12, 10.0, 1e-12, 1e4, 0.25, 0.75).expect("valid LM");
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm, 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm).expect("valid config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let point = Point3::new(0.0, 0.0, 2.0);
         let pixel = project_pixel(Pose::identity(), point, intrinsics);
@@ -3295,11 +3140,11 @@ mod tests {
     }
 
     #[test]
-    fn full_keyframe_ba_ignores_incremental_motion_prior_at_exact_solution() {
+    fn full_keyframe_ba_converges_at_exact_moving_solution() {
         let (mut map, intrinsics, kf_0, kf_1, _, points_true) = build_full_ba_fixture([0.0; 6]);
         set_fixture_landmarks_exact(&mut map, kf_0, &points_true);
 
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 1.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("valid config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3309,8 +3154,8 @@ mod tests {
         )
         .expect("full BA problem");
         assert_ne!(
-            pose_to_vec(problem.poses[0].pose),
-            pose_to_vec(problem.poses[1].pose),
+            problem.poses[0].pose.translation(),
+            problem.poses[1].pose.translation(),
             "the exact fixture must contain camera motion"
         );
         assert_eq!(
@@ -3328,34 +3173,30 @@ mod tests {
     }
 
     #[test]
-    fn incremental_ba_retains_configured_pose_parameter_prior() {
+    fn incremental_ba_preserves_exact_moving_frame() {
         let (mut map, intrinsics, kf_0, kf_1, true_pose_1, points_true) =
             build_full_ba_fixture([0.0; 6]);
         set_fixture_landmarks_exact(&mut map, kf_0, &points_true);
 
-        let optimize = |motion_prior_weight| {
-            let config =
-                LocalBaConfig::new(2, 1, 4, 2.0, lm(1e-3), motion_prior_weight).expect("config");
-            let mut ba = LocalBundleAdjuster::new(intrinsics, config);
-            let min_required = ba.min_observations();
-            ba.push_frame(
-                &map,
-                Pose::identity(),
-                fixture_observation_set(&map, kf_0, min_required),
-            )
-            .expect("first exact frame");
-            ba.push_frame(
+        let config = LocalBaConfig::new(2, 1, 4, 2.0, lm(1e-3)).expect("config");
+        let mut ba = LocalBundleAdjuster::new(intrinsics, config);
+        let min_required = ba.min_observations();
+        ba.push_frame(
+            &map,
+            Pose::identity(),
+            fixture_observation_set(&map, kf_0, min_required),
+        )
+        .expect("first exact frame");
+        let refined = ba
+            .push_frame(
                 &map,
                 true_pose_1,
                 fixture_observation_set(&map, kf_1, min_required),
             )
-            .expect("second exact frame")
-        };
+            .expect("second exact frame");
 
-        let unregularized = optimize(0.0);
-        let regularized = optimize(1.0);
-        assert_eq!(pose_to_vec(unregularized), pose_to_vec(true_pose_1));
-        assert_ne!(pose_to_vec(regularized), pose_to_vec(unregularized));
+        assert_eq!(refined.translation(), true_pose_1.translation());
+        assert_eq!(refined.rotation(), true_pose_1.rotation());
     }
 
     #[test]
@@ -3376,7 +3217,7 @@ mod tests {
     fn optimize_full_returns_max_iterations_with_bad_init() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.8, -0.3, 0.4, 0.2, -0.1, 0.15]);
-        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3398,7 +3239,7 @@ mod tests {
     fn optimize_full_returns_converged_on_synthetic_scene() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3424,7 +3265,7 @@ mod tests {
     fn optimize_full_recovers_from_large_perturbation() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.45, -0.20, 0.28, 0.15, -0.08, 0.10]);
-        let config = LocalBaConfig::new(5, 30, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 30, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3452,7 +3293,7 @@ mod tests {
     fn optimize_full_final_cost_does_not_increase() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.12, -0.05, 0.07, 0.03, -0.02, 0.01]);
-        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 20, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3479,7 +3320,7 @@ mod tests {
     #[test]
     fn full_problem_cost_rejects_behind_camera_factor() {
         let (map, intrinsics, kf_0, kf_1, _, _) = build_full_ba_fixture([0.0; 6]);
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("valid config");
         let ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3503,7 +3344,7 @@ mod tests {
     #[test]
     fn optimize_full_rejects_and_restores_an_invalid_depth_trial() {
         let intrinsics = make_pinhole_intrinsics(640, 480, 1.0, 1.0, 0.0, 0.0).expect("intrinsics");
-        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 1, 4, 2.0, lm(1e-3)).expect("valid config");
         let initial_pose = Pose::identity();
         let initial_landmark = Point3::new(1.0, 0.0, 1.0);
         let mut problem = FullBaProblem {
@@ -3552,7 +3393,7 @@ mod tests {
     fn optimize_full_preserves_metric_gauge_anchor_distance() {
         let (map, intrinsics, kf_0, kf_1, _, _) =
             build_full_ba_fixture([0.08, -0.03, 0.04, 0.015, -0.01, 0.008]);
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let mut problem = FullBaProblem::try_from_map(
             &map,
@@ -3622,7 +3463,7 @@ mod tests {
                 .expect("external observation");
         }
 
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("valid config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("valid config");
         let ba = LocalBundleAdjuster::new(intrinsics, config);
         let problem = FullBaProblem::try_from_map(
             &map,
@@ -3638,69 +3479,6 @@ mod tests {
             .filter(|factor| matches!(factor.pose, FactorPose::Fixed(_)))
             .count();
         assert_eq!(fixed_factors, points_true.len());
-    }
-
-    #[test]
-    fn motion_prior_rhs_scales_with_weight_squared() {
-        let prev = Pose::identity();
-        let curr = Pose::from_rt(
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            [1.0, -2.0, 0.5],
-        );
-        let mut hessian_unit = vec![0.0; 12 * 12];
-        let mut rhs_unit = vec![0.0; 12];
-        assert!(accumulate_motion_prior(
-            &mut hessian_unit,
-            &mut rhs_unit,
-            12,
-            prev,
-            curr,
-            0,
-            6,
-            1.0,
-        ));
-        let mut hessian_half = vec![0.0; 12 * 12];
-        let mut rhs_half = vec![0.0; 12];
-        assert!(accumulate_motion_prior(
-            &mut hessian_half,
-            &mut rhs_half,
-            12,
-            prev,
-            curr,
-            0,
-            6,
-            0.25,
-        ));
-
-        for i in 0..12 {
-            assert!((rhs_half[i] - 0.25 * rhs_unit[i]).abs() < 1e-7);
-        }
-        for i in 0..12 * 12 {
-            assert!((hessian_half[i] - 0.25 * hessian_unit[i]).abs() < 1e-7);
-        }
-    }
-
-    #[test]
-    fn motion_prior_accumulation_stays_finite_for_extreme_supported_weight() {
-        let weight = f32::MAX.sqrt() / 2.0;
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), weight).expect("valid config");
-        let prev = Pose::identity();
-        let curr = Pose::from_rt(Pose::identity().rotation(), [1.0, -1.0, 0.5]);
-        let mut hessian = vec![0.0; 12 * 12];
-        let mut rhs = vec![0.0; 12];
-
-        assert!(accumulate_motion_prior(
-            &mut hessian,
-            &mut rhs,
-            12,
-            prev,
-            curr,
-            0,
-            6,
-            config.motion_prior_weight_squared(),
-        ));
-        assert!(hessian.iter().all(|value| value.is_finite()));
-        assert!(rhs.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -4762,7 +4540,7 @@ mod tests {
         );
         let before_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
 
-        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3), 0.0).expect("valid BA config");
+        let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
         let result = ba
             .optimize_keyframe_window(&mut map, &[kf_0, kf_1])
@@ -4804,7 +4582,7 @@ mod tests {
         map.set_keyframe_pose(kf_0, crate::WorldToCamera::from_legacy_pose(pose))
             .expect("set pose");
         let before = map.snapshot();
-        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3), 0.0).expect("config");
+        let config = LocalBaConfig::new(5, 5, 4, 2.0, lm(1e-3)).expect("config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
 
         assert!(matches!(

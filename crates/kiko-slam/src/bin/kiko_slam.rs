@@ -16,7 +16,7 @@ use kiko_slam::{
     VizDecimation, VizError, VizFlushError, VizLogError, VizPacket,
 };
 
-use kiko_slam::env::{env_bool, env_f32, env_usize};
+use kiko_slam::env::{env_bool, env_f32, env_string, env_usize};
 
 #[cfg(any(feature = "record", test))]
 use kiko_slam::ChannelCapacity;
@@ -64,7 +64,6 @@ const DEFAULT_BA_DAMPING: f32 = 1e-3;
 const DEFAULT_LM_FACTOR: f32 = 10.0;
 const DEFAULT_LM_MIN: f32 = 1e-8;
 const DEFAULT_LM_MAX: f32 = 1e4;
-const DEFAULT_BA_MOTION_WEIGHT: f32 = 0.0;
 
 // Keyframe policy defaults (overridable via KIKO_KEYFRAME_* env vars)
 const DEFAULT_KEYFRAME_PARALLAX_PX: f32 = 40.0;
@@ -2654,7 +2653,29 @@ struct BaConfigValues {
     lambda_factor: f32,
     min_lambda: f32,
     max_lambda: f32,
-    motion_prior_weight: f32,
+}
+
+#[derive(Debug)]
+struct RemovedBaMotionPriorSetting;
+
+impl std::fmt::Display for RemovedBaMotionPriorSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "KIKO_BA_MOTION_WEIGHT is no longer supported because its absolute pose-parameter penalty was not a frame-invariant SE(3) objective; remove the environment setting"
+        )
+    }
+}
+
+impl std::error::Error for RemovedBaMotionPriorSetting {}
+
+fn reject_removed_ba_motion_prior(
+    value: Option<String>,
+) -> Result<(), RemovedBaMotionPriorSetting> {
+    match value {
+        Some(_) => Err(RemovedBaMotionPriorSetting),
+        None => Ok(()),
+    }
 }
 
 fn build_ba_config_from_values(
@@ -2675,11 +2696,11 @@ fn build_ba_config_from_values(
         values.min_observations,
         values.huber_delta_px,
         lm,
-        values.motion_prior_weight,
     )?)
 }
 
 fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
+    reject_removed_ba_motion_prior(env_string("KIKO_BA_MOTION_WEIGHT")?)?;
     let config = build_ba_config_from_values(BaConfigValues {
         window: env_usize("KIKO_BA_WINDOW")?.unwrap_or(DEFAULT_BA_WINDOW),
         iterations: env_usize("KIKO_BA_ITERS")?.unwrap_or(DEFAULT_BA_ITERS),
@@ -2689,10 +2710,9 @@ fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
         lambda_factor: env_f32("KIKO_LM_FACTOR")?.unwrap_or(DEFAULT_LM_FACTOR),
         min_lambda: env_f32("KIKO_LM_MIN")?.unwrap_or(DEFAULT_LM_MIN),
         max_lambda: env_f32("KIKO_LM_MAX")?.unwrap_or(DEFAULT_LM_MAX),
-        motion_prior_weight: env_f32("KIKO_BA_MOTION_WEIGHT")?.unwrap_or(DEFAULT_BA_MOTION_WEIGHT),
     })?;
     eprintln!(
-        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={} motion_weight={} motion_prior_scope=incremental_pose_parameters",
+        "local BA: window={} iters={} min_obs={} huber_px={} lm_init={} lm_factor={} lm_min={} lm_max={}",
         config.window(),
         config.max_iterations(),
         config.min_observations(),
@@ -2700,8 +2720,7 @@ fn build_ba_config() -> Result<LocalBaConfig, Box<dyn std::error::Error>> {
         config.lm().initial_lambda(),
         config.lm().lambda_factor(),
         config.lm().min_lambda(),
-        config.lm().max_lambda(),
-        config.motion_prior_weight()
+        config.lm().max_lambda()
     );
     Ok(config)
 }
@@ -2778,6 +2797,7 @@ mod tests {
         BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, OdometryVizProcessingError,
         OfflineDepthSelector, RerunDestination, RerunDestinationError, RerunFinishTimeout,
         RerunSessionError, build_ba_config_from_values, combine_rerun_results,
+        reject_removed_ba_motion_prior,
     };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::DatasetError;
@@ -3210,7 +3230,6 @@ mod tests {
             lambda_factor: 12.0,
             min_lambda: 0.000_001,
             max_lambda: 5000.0,
-            motion_prior_weight: 0.25,
         })
         .expect("build config");
         assert_eq!(config.window(), 12);
@@ -3221,7 +3240,14 @@ mod tests {
         assert!((config.lm().lambda_factor() - 12.0).abs() < 1e-9);
         assert!((config.lm().min_lambda() - 1e-6).abs() < 1e-12);
         assert!((config.lm().max_lambda() - 5000.0).abs() < 1e-6);
-        assert!((config.motion_prior_weight() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn removed_ba_motion_prior_setting_is_never_silently_ignored() {
+        assert!(reject_removed_ba_motion_prior(None).is_ok());
+        for value in ["0", "1", "not-a-number"] {
+            assert!(reject_removed_ba_motion_prior(Some(value.to_owned())).is_err());
+        }
     }
 
     #[cfg(feature = "record")]
