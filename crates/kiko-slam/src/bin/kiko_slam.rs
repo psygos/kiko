@@ -7,9 +7,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use kiko_slam::dataset::{DatasetDepthCursor, DatasetError, DatasetReader};
 use kiko_slam::dense::{self, DenseConfig, command_mapper, ring_buffer::DepthRingBuffer};
 use kiko_slam::{
-    BackendConfig, DenseCommand, DepthImage, DownscaleFactor, FrameId, GlobalDescriptorConfig,
-    InferenceBackend, InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig,
-    LocalBaConfig, LoopClosureConfig, LoopSubsystemConfig, PipelineError, PipelineTimingError,
+    BackendConfig, DepthImage, DownscaleFactor, FrameId, GlobalDescriptorConfig, InferenceBackend,
+    InferencePipeline, KeyframePolicy, KeypointLimit, LightGlue, LmConfig, LocalBaConfig,
+    LoopClosureConfig, LoopSubsystemConfig, PipelineError, PipelineTimingError,
     PipelineWallBreakdown, RansacConfig, RectifiedStereo, RectifiedStereoConfig,
     RectifiedStereoConfigError, RedundancyPolicy, RelocalizationConfig, RerunSink, RerunSinkConfig,
     SlamTracker, SuperPoint, TrackerConfig, TriangulationConfig, TriangulationError, Triangulator,
@@ -308,6 +308,7 @@ fn run_rerun_session<T, P>(
 #[derive(Debug)]
 enum OdometryVizProcessingError {
     Dataset(DatasetError),
+    DenseCommandGeneration(command_mapper::DenseCommandGenerationError),
     Packet(VizError),
     Log(VizLogError),
 }
@@ -316,6 +317,9 @@ impl std::fmt::Display for OdometryVizProcessingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Dataset(source) => write!(f, "offline depth replay failed: {source}"),
+            Self::DenseCommandGeneration(source) => {
+                write!(f, "offline dense command sequencing failed: {source}")
+            }
             Self::Packet(source) => write!(f, "visualization packet creation failed: {source}"),
             Self::Log(source) => write!(f, "visualization logging failed: {source}"),
         }
@@ -326,6 +330,7 @@ impl std::error::Error for OdometryVizProcessingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Dataset(source) => Some(source),
+            Self::DenseCommandGeneration(source) => Some(source),
             Self::Packet(source) => Some(source),
             Self::Log(source) => Some(source),
         }
@@ -335,6 +340,12 @@ impl std::error::Error for OdometryVizProcessingError {
 impl From<DatasetError> for OdometryVizProcessingError {
     fn from(source: DatasetError) -> Self {
         Self::Dataset(source)
+    }
+}
+
+impl From<command_mapper::DenseCommandGenerationError> for OdometryVizProcessingError {
+    fn from(source: command_mapper::DenseCommandGenerationError) -> Self {
+        Self::DenseCommandGeneration(source)
     }
 }
 
@@ -1011,7 +1022,7 @@ struct OfflineDenseState {
     selector: OfflineDepthSelector,
     ring: DepthRingBuffer,
     state: dense::DenseState,
-    generation: u64,
+    generation: command_mapper::DenseCommandGeneration,
     last_buffered_depth: Option<FrameId>,
 }
 
@@ -1167,7 +1178,7 @@ fn run_viz_odometry(
             selector: OfflineDepthSelector::default(),
             ring: DepthRingBuffer::try_new(depth_ring_capacity.get())?,
             state: dense::DenseState::new(&DenseConfig::default()),
-            generation: 0,
+            generation: command_mapper::DenseCommandGeneration::default(),
             last_buffered_depth: None,
         }))
     } else {
@@ -1271,12 +1282,8 @@ fn run_viz_odometry(
                                     Some(ring.reorder_warnings());
                                 let correction = tracker.take_pending_loop_correction();
                                 let cmds = command_mapper::map_output_to_dense_commands(
-                                    &output,
-                                    correction.as_deref(),
-                                    ring,
-                                    timestamp,
-                                    generation,
-                                );
+                                    &output, correction, ring, timestamp, generation,
+                                )?;
                                 cmds.into_iter()
                                     .map(|cmd| dense::process_dense_command(state, cmd))
                                     .last()
@@ -1322,16 +1329,10 @@ fn run_viz_odometry(
                         {
                             let state = &mut dense.state;
                             let generation = &mut dense.generation;
-                            *generation = generation
-                                .checked_add(1)
-                                .expect("dense rebuild generation space exhausted");
-                            let stats = dense::process_dense_command(
-                                state,
-                                DenseCommand::RebuildFromSnapshot {
-                                    corrected_poses: correction,
-                                    generation: *generation,
-                                },
-                            );
+                            let command = command_mapper::rebuild_from_snapshot_command(
+                                correction, generation,
+                            )?;
+                            let stats = dense::process_dense_command(state, command);
                             sink.log_dense_stats(left.timestamp(), &stats)?;
                         }
                         eprintln!("tracker error: {err}");
@@ -1948,6 +1949,7 @@ enum LiveThreadError {
     RerunConnect { detail: String },
     VisualizationConfiguration { source: VizConfigError },
     VisualizationPacket { source: VizError },
+    DenseCommandGeneration(command_mapper::DenseCommandGenerationError),
     InferenceUnavailable { detail: String },
     TrackerInitialization { source: TrackerInitError },
     FrameProcessingPanic { detail: String },
@@ -1966,6 +1968,9 @@ impl std::fmt::Display for LiveThreadError {
             }
             LiveThreadError::VisualizationPacket { source } => {
                 write!(f, "invalid live visualization packet: {source}")
+            }
+            LiveThreadError::DenseCommandGeneration(source) => {
+                write!(f, "live dense command sequencing failed: {source}")
             }
             LiveThreadError::InferenceUnavailable { detail } => {
                 write!(f, "inference pipeline is unavailable: {detail}")
@@ -1986,12 +1991,20 @@ impl std::error::Error for LiveThreadError {
         match self {
             Self::VisualizationConfiguration { source } => Some(source),
             Self::VisualizationPacket { source } => Some(source),
+            Self::DenseCommandGeneration(source) => Some(source),
             Self::TrackerInitialization { source } => Some(source),
             Self::VizChannelDisconnected
             | Self::RerunConnect { .. }
             | Self::InferenceUnavailable { .. }
             | Self::FrameProcessingPanic { .. } => None,
         }
+    }
+}
+
+#[cfg(feature = "record")]
+impl From<command_mapper::DenseCommandGenerationError> for LiveThreadError {
+    fn from(source: command_mapper::DenseCommandGenerationError) -> Self {
+        Self::DenseCommandGeneration(source)
     }
 }
 
@@ -2172,7 +2185,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         report_tracker_runtime(&tracker_config, &tracker);
         let depth_rx = depth_rx;
         let depth_enabled_for_diagnostics = depth_rx.is_some();
-        let mut dense_generation: u64 = 0;
+        let mut dense_generation = command_mapper::DenseCommandGeneration::default();
         let mut dense_command_tx = dense_command_tx;
         let dense_stats_rx = dense_stats_rx;
         let mut dense_active = dense_enabled;
@@ -2204,11 +2217,11 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     let dense_stats = if dense_active {
                         let cmds = command_mapper::map_output_to_dense_commands(
                             &output,
-                            correction.as_deref(),
+                            correction,
                             &depth_ring,
                             timestamp,
                             &mut dense_generation,
-                        );
+                        )?;
                         for cmd in cmds {
                             if let Some(ref tx) = dense_command_tx {
                                 match tx.route(cmd) {
@@ -2292,13 +2305,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                     if dense_active && let Some(correction) = tracker.take_pending_loop_correction()
                     {
-                        dense_generation = dense_generation
-                            .checked_add(1)
-                            .expect("dense rebuild generation space exhausted");
-                        let rebuild_cmd = DenseCommand::RebuildFromSnapshot {
-                            corrected_poses: correction,
-                            generation: dense_generation,
-                        };
+                        let rebuild_cmd = command_mapper::rebuild_from_snapshot_command(
+                            correction,
+                            &mut dense_generation,
+                        )?;
                         if let Some(ref tx) = dense_command_tx {
                             match tx.route(rebuild_cmd) {
                                 DenseCommandSendOutcome::Enqueued => {}
@@ -2765,9 +2775,9 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, OfflineDepthSelector,
-        RerunDestination, RerunDestinationError, RerunFinishTimeout, RerunSessionError,
-        build_ba_config_from_values, combine_rerun_results,
+        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, OdometryVizProcessingError,
+        OfflineDepthSelector, RerunDestination, RerunDestinationError, RerunFinishTimeout,
+        RerunSessionError, build_ba_config_from_values, combine_rerun_results,
     };
     use clap::{Parser as _, error::ErrorKind};
     use kiko_slam::dataset::DatasetError;
@@ -2781,7 +2791,7 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(feature = "record")]
-    use super::LiveThreadExitGuard;
+    use super::{LiveThreadError, LiveThreadExitGuard};
     #[cfg(feature = "record")]
     use std::sync::{
         Arc,
@@ -2822,6 +2832,33 @@ mod tests {
             std::error::Error::source(&timing)
                 .and_then(|source| source.downcast_ref::<PipelineTimingError>())
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn odometry_error_preserves_dense_generation_source() {
+        let mut generation =
+            kiko_slam::dense::command_mapper::DenseCommandGeneration::from_current(u64::MAX);
+        let source = kiko_slam::dense::command_mapper::rebuild_from_snapshot_command(
+            Vec::new(),
+            &mut generation,
+        )
+        .expect_err("exhausted generation");
+        let error = OdometryVizProcessingError::from(source);
+
+        assert!(matches!(
+            &error,
+            OdometryVizProcessingError::DenseCommandGeneration(actual)
+                if actual.current() == u64::MAX
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| {
+                    source.downcast_ref::<
+                        kiko_slam::dense::command_mapper::DenseCommandGenerationError,
+                    >()
+                })
+                .is_some_and(|source| source.current() == u64::MAX)
         );
     }
 
@@ -3185,6 +3222,34 @@ mod tests {
         assert!((config.lm().min_lambda() - 1e-6).abs() < 1e-12);
         assert!((config.lm().max_lambda() - 5000.0).abs() < 1e-6);
         assert!((config.motion_prior_weight() - 0.25).abs() < 1e-6);
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn live_error_preserves_dense_generation_source() {
+        let mut generation =
+            kiko_slam::dense::command_mapper::DenseCommandGeneration::from_current(u64::MAX);
+        let source = kiko_slam::dense::command_mapper::rebuild_from_snapshot_command(
+            Vec::new(),
+            &mut generation,
+        )
+        .expect_err("exhausted generation");
+        let error = LiveThreadError::from(source);
+
+        assert!(matches!(
+            &error,
+            LiveThreadError::DenseCommandGeneration(source)
+                if source.current() == u64::MAX
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| {
+                    source.downcast_ref::<
+                        kiko_slam::dense::command_mapper::DenseCommandGenerationError,
+                    >()
+                })
+                .is_some_and(|source| source.current() == u64::MAX)
+        );
     }
 
     #[cfg(feature = "record")]

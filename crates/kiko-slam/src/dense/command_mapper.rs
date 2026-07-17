@@ -10,6 +10,85 @@ use crate::{DiagnosticEvent, Pose, PoseStatus, Timestamp, TrackerOutput, Trackin
 /// bound: δt < v / (2 · max(v_cam, ω · z_max)) ≈ 19 ms.
 pub const MAX_ASSOCIATION_WINDOW_NS: i64 = 20_000_000;
 
+/// Producer-side sequence for dense reset and rebuild control commands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DenseCommandGeneration(u64);
+
+impl DenseCommandGeneration {
+    pub const fn from_current(current: u64) -> Self {
+        Self(current)
+    }
+
+    pub const fn current(self) -> u64 {
+        self.0
+    }
+
+    fn checked_advance_for(
+        self,
+        reset_generations: usize,
+        rebuild_generation: bool,
+    ) -> Result<Self, DenseCommandGenerationError> {
+        let error = DenseCommandGenerationError {
+            current: self.0,
+            reset_generations,
+            rebuild_generation,
+        };
+        let required = u64::try_from(reset_generations)
+            .ok()
+            .and_then(|resets| resets.checked_add(u64::from(rebuild_generation)))
+            .ok_or(error)?;
+        self.0.checked_add(required).map(Self).ok_or(error)
+    }
+
+    fn checked_next(&mut self) -> Option<u64> {
+        let next = self.0.checked_add(1)?;
+        self.0 = next;
+        Some(next)
+    }
+}
+
+/// A dense control-command batch cannot fit in the remaining generation domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DenseCommandGenerationError {
+    current: u64,
+    reset_generations: usize,
+    rebuild_generation: bool,
+}
+
+impl DenseCommandGenerationError {
+    pub const fn current(self) -> u64 {
+        self.current
+    }
+
+    pub const fn reset_generations(self) -> usize {
+        self.reset_generations
+    }
+
+    pub const fn includes_rebuild(self) -> bool {
+        self.rebuild_generation
+    }
+
+    pub fn required(self) -> Option<u64> {
+        u64::try_from(self.reset_generations)
+            .ok()?
+            .checked_add(u64::from(self.rebuild_generation))
+    }
+}
+
+impl std::fmt::Display for DenseCommandGenerationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "dense control-command generation {} cannot reserve {} reset generation(s) and {} rebuild generation(s)",
+            self.current,
+            self.reset_generations,
+            u8::from(self.rebuild_generation)
+        )
+    }
+}
+
+impl std::error::Error for DenseCommandGenerationError {}
+
 /// Map a single `TrackerOutput` (plus any pending loop correction) into
 /// dense commands.
 ///
@@ -22,13 +101,29 @@ pub const MAX_ASSOCIATION_WINDOW_NS: i64 = 20_000_000;
 ///   output contains a mapping-session boundary.
 /// - `RebuildFromSnapshot` is emitted when `correction` is `Some`.
 /// - No `IntegrateKeyframe` commands are emitted when tracking is `Lost`.
+///
+/// If the control-command generation is exhausted, no commands are returned and
+/// `generation` remains unchanged.
 pub fn map_output_to_dense_commands(
     output: &TrackerOutput,
-    correction: Option<&[(KeyframeId, Pose)]>,
+    correction: Option<Vec<(KeyframeId, Pose)>>,
     depth_buffer: &DepthRingBuffer,
     timestamp: Timestamp,
-    generation: &mut u64,
-) -> Vec<DenseCommand> {
+    generation: &mut DenseCommandGeneration,
+) -> Result<Vec<DenseCommand>, DenseCommandGenerationError> {
+    let reset_count = output
+        .events
+        .iter()
+        .filter(|event| matches!(event, DiagnosticEvent::MappingSessionReset { .. }))
+        .count();
+    let rebuild_generation = correction.is_some();
+    let final_generation = generation.checked_advance_for(reset_count, rebuild_generation)?;
+    let batch_error = DenseCommandGenerationError {
+        current: generation.current(),
+        reset_generations: reset_count,
+        rebuild_generation,
+    };
+    let mut staged_generation = *generation;
     let mut commands = Vec::new();
 
     // A reset must be sent on the control path before any data command from
@@ -37,7 +132,7 @@ pub fn map_output_to_dense_commands(
     let mut output_map = None;
     for event in &output.events {
         if let DiagnosticEvent::MappingSessionReset { transition } = event {
-            let reset_generation = next_generation(generation);
+            let reset_generation = staged_generation.checked_next().ok_or(batch_error)?;
             commands.push(DenseCommand::ResetMappingSession {
                 transition: *transition,
                 generation: reset_generation,
@@ -100,22 +195,30 @@ pub fn map_output_to_dense_commands(
 
     // Emit rebuild if loop correction is available.
     if let Some(poses) = correction {
-        let rebuild_generation = next_generation(generation);
+        let rebuild_generation = staged_generation.checked_next().ok_or(batch_error)?;
         commands.push(DenseCommand::RebuildFromSnapshot {
-            corrected_poses: poses.to_vec(),
+            corrected_poses: poses,
             generation: rebuild_generation,
         });
     }
 
-    commands
+    debug_assert_eq!(staged_generation, final_generation);
+    *generation = final_generation;
+    Ok(commands)
 }
 
-fn next_generation(generation: &mut u64) -> u64 {
-    let next = generation
-        .checked_add(1)
-        .expect("dense rebuild generation space exhausted");
-    *generation = next;
-    next
+/// Build one owned rebuild command and commit its generation only on success.
+pub fn rebuild_from_snapshot_command(
+    corrected_poses: Vec<(KeyframeId, Pose)>,
+    generation: &mut DenseCommandGeneration,
+) -> Result<DenseCommand, DenseCommandGenerationError> {
+    let final_generation = generation.checked_advance_for(0, true)?;
+    let command = DenseCommand::RebuildFromSnapshot {
+        corrected_poses,
+        generation: final_generation.current(),
+    };
+    *generation = final_generation;
+    Ok(command)
 }
 
 #[cfg(test)]
@@ -181,6 +284,17 @@ mod tests {
         }
     }
 
+    fn map_commands(
+        output: &TrackerOutput,
+        correction: Option<Vec<(KeyframeId, Pose)>>,
+        depth_buffer: &DepthRingBuffer,
+        timestamp: Timestamp,
+        generation: &mut DenseCommandGeneration,
+    ) -> Vec<DenseCommand> {
+        map_output_to_dense_commands(output, correction, depth_buffer, timestamp, generation)
+            .expect("dense command mapping")
+    }
+
     #[test]
     fn keyframe_created_with_depth_emits_integrate() {
         let kf = kf_id();
@@ -192,8 +306,8 @@ mod tests {
             landmarks: 10,
         }]);
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, None, &buf, ts(100), &mut gen_);
         assert_eq!(cmds.len(), 1);
         assert!(
             matches!(cmds[0], DenseCommand::IntegrateKeyframe { keyframe_id, .. } if keyframe_id == kf)
@@ -210,8 +324,8 @@ mod tests {
             reason: KeyframeRemovalReason::Redundant,
         }]);
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, None, &buf, ts(100), &mut gen_);
         assert_eq!(cmds.len(), 1);
         assert!(
             matches!(cmds[0], DenseCommand::RemoveKeyframe { keyframe_id } if keyframe_id == kf)
@@ -224,15 +338,14 @@ mod tests {
         let output = base_output(vec![]);
 
         let correction = vec![(kf_id(), Pose::identity())];
-        let mut gen_ = 0;
-        let cmds =
-            map_output_to_dense_commands(&output, Some(&correction), &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, Some(correction), &buf, ts(100), &mut gen_);
         assert_eq!(cmds.len(), 1);
         assert!(matches!(
             cmds[0],
             DenseCommand::RebuildFromSnapshot { generation: 1, .. }
         ));
-        assert_eq!(gen_, 1);
+        assert_eq!(gen_.current(), 1);
     }
 
     #[test]
@@ -245,8 +358,8 @@ mod tests {
             landmarks: 5,
         }]);
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, None, &buf, ts(100), &mut gen_);
         assert!(cmds.is_empty(), "no depth available → no integrate command");
     }
 
@@ -262,8 +375,8 @@ mod tests {
         }]);
         output.health = lost_health();
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, None, &buf, ts(100), &mut gen_);
         assert!(
             cmds.is_empty(),
             "should not integrate when tracking is lost"
@@ -281,8 +394,8 @@ mod tests {
         }]);
         output.pose_status = PoseStatus::Stale;
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, None, &buf, ts(100), &mut gen_);
 
         assert!(cmds.is_empty(), "stale poses must not be integrated");
     }
@@ -304,8 +417,8 @@ mod tests {
             },
         ]);
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(&output, None, &buf, ts(100), &mut gen_);
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(&output, None, &buf, ts(100), &mut gen_);
         // Should only have RemoveKeyframe, not IntegrateKeyframe.
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], DenseCommand::RemoveKeyframe { .. }));
@@ -322,8 +435,8 @@ mod tests {
             landmarks: 5,
         }]);
 
-        let mut gen_ = 0;
-        let cmds = map_output_to_dense_commands(
+        let mut gen_ = DenseCommandGeneration::default();
+        let cmds = map_commands(
             &output,
             None,
             &buf,
@@ -338,13 +451,13 @@ mod tests {
         let buf = depth_buffer();
         let output = base_output(vec![]);
         let correction = vec![(kf_id(), Pose::identity())];
-        let mut gen_ = 0;
+        let mut gen_ = DenseCommandGeneration::default();
 
-        map_output_to_dense_commands(&output, Some(&correction), &buf, ts(100), &mut gen_);
-        assert_eq!(gen_, 1);
+        map_commands(&output, Some(correction.clone()), &buf, ts(100), &mut gen_);
+        assert_eq!(gen_.current(), 1);
 
-        map_output_to_dense_commands(&output, Some(&correction), &buf, ts(200), &mut gen_);
-        assert_eq!(gen_, 2);
+        map_commands(&output, Some(correction), &buf, ts(200), &mut gen_);
+        assert_eq!(gen_.current(), 2);
     }
 
     #[test]
@@ -355,11 +468,11 @@ mod tests {
             crate::MappingSessionTransition::try_new(old_map, new_map).expect("distinct test maps");
         let output = base_output(vec![DiagnosticEvent::MappingSessionReset { transition }]);
         let correction = vec![(kf_id(), Pose::identity())];
-        let mut generation = 0;
+        let mut generation = DenseCommandGeneration::default();
 
-        let commands = map_output_to_dense_commands(
+        let commands = map_commands(
             &output,
-            Some(&correction),
+            Some(correction),
             &depth_buffer(),
             ts(100),
             &mut generation,
@@ -377,22 +490,142 @@ mod tests {
             commands[1],
             DenseCommand::RebuildFromSnapshot { generation: 2, .. }
         ));
-        assert_eq!(generation, 2);
+        assert_eq!(generation.current(), 2);
     }
 
     #[test]
-    #[should_panic(expected = "dense rebuild generation space exhausted")]
-    fn generation_exhaustion_does_not_alias_a_stale_rebuild() {
+    fn generation_exhaustion_is_typed_and_does_not_mutate_the_counter() {
         let output = base_output(Vec::new());
         let correction = Vec::new();
-        let mut generation = u64::MAX;
+        let mut generation = DenseCommandGeneration::from_current(u64::MAX);
 
-        let _ = map_output_to_dense_commands(
+        let error = map_output_to_dense_commands(
             &output,
-            Some(&correction),
+            Some(correction),
+            &depth_buffer(),
+            ts(100),
+            &mut generation,
+        )
+        .expect_err("generation exhaustion");
+
+        assert_eq!(error.current(), u64::MAX);
+        assert_eq!(error.reset_generations(), 0);
+        assert!(error.includes_rebuild());
+        assert_eq!(error.required(), Some(1));
+        assert_eq!(generation.current(), u64::MAX);
+    }
+
+    #[test]
+    fn reset_and_rebuild_generation_exhaustion_is_transactional() {
+        let old_map = SlamMap::new().snapshot().instance_id();
+        let new_map = SlamMap::new().snapshot().instance_id();
+        let transition =
+            crate::MappingSessionTransition::try_new(old_map, new_map).expect("distinct test maps");
+        let output = base_output(vec![DiagnosticEvent::MappingSessionReset { transition }]);
+        let mut generation = DenseCommandGeneration::from_current(u64::MAX - 1);
+
+        for _ in 0..2 {
+            let error = map_output_to_dense_commands(
+                &output,
+                Some(Vec::new()),
+                &depth_buffer(),
+                ts(100),
+                &mut generation,
+            )
+            .expect_err("reset plus rebuild exceeds the generation domain");
+            assert_eq!(error.current(), u64::MAX - 1);
+            assert_eq!(error.reset_generations(), 1);
+            assert!(error.includes_rebuild());
+            assert_eq!(error.required(), Some(2));
+            assert_eq!(generation.current(), u64::MAX - 1);
+        }
+    }
+
+    #[test]
+    fn reset_and_empty_rebuild_exactly_fit_the_generation_domain() {
+        let old_map = SlamMap::new().snapshot().instance_id();
+        let new_map = SlamMap::new().snapshot().instance_id();
+        let transition =
+            crate::MappingSessionTransition::try_new(old_map, new_map).expect("distinct test maps");
+        let output = base_output(vec![DiagnosticEvent::MappingSessionReset { transition }]);
+        let correction = Vec::new();
+        let mut generation = DenseCommandGeneration::from_current(u64::MAX - 2);
+
+        let commands = map_commands(
+            &output,
+            Some(correction),
             &depth_buffer(),
             ts(100),
             &mut generation,
         );
+
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                DenseCommand::ResetMappingSession {
+                    generation: reset_generation,
+                    ..
+                },
+                DenseCommand::RebuildFromSnapshot {
+                    generation: rebuild_generation,
+                    corrected_poses,
+                }
+            ] if *reset_generation == u64::MAX - 1
+                && *rebuild_generation == u64::MAX
+                && corrected_poses.is_empty()
+        ));
+        assert_eq!(generation.current(), u64::MAX);
+    }
+
+    #[test]
+    fn non_generation_commands_succeed_at_generation_maximum() {
+        let empty_output = base_output(Vec::new());
+        let mut generation = DenseCommandGeneration::from_current(u64::MAX);
+        assert!(
+            map_commands(
+                &empty_output,
+                None,
+                &depth_buffer(),
+                ts(100),
+                &mut generation,
+            )
+            .is_empty()
+        );
+        assert_eq!(generation.current(), u64::MAX);
+
+        let keyframe_id = kf_id();
+        let output = base_output(vec![DiagnosticEvent::KeyframeRemoved {
+            keyframe_id,
+            reason: KeyframeRemovalReason::Redundant,
+        }]);
+
+        let commands = map_commands(&output, None, &depth_buffer(), ts(100), &mut generation);
+
+        assert!(matches!(
+            commands.as_slice(),
+            [DenseCommand::RemoveKeyframe { keyframe_id: actual }] if *actual == keyframe_id
+        ));
+        assert_eq!(generation.current(), u64::MAX);
+    }
+
+    #[test]
+    fn owned_rebuild_builder_commits_only_a_successful_generation() {
+        let mut generation = DenseCommandGeneration::from_current(u64::MAX - 1);
+        let command = rebuild_from_snapshot_command(Vec::new(), &mut generation)
+            .expect("last available generation");
+        assert!(matches!(
+            command,
+            DenseCommand::RebuildFromSnapshot {
+                generation: u64::MAX,
+                corrected_poses,
+            } if corrected_poses.is_empty()
+        ));
+        assert_eq!(generation.current(), u64::MAX);
+
+        let error = rebuild_from_snapshot_command(Vec::new(), &mut generation)
+            .expect_err("exhausted generation");
+        assert_eq!(error.current(), u64::MAX);
+        assert_eq!(error.required(), Some(1));
+        assert_eq!(generation.current(), u64::MAX);
     }
 }
