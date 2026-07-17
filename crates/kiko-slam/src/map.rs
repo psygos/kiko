@@ -453,6 +453,38 @@ impl CovisibilityGraph {
         }
     }
 
+    fn preflight_remove_point_observation_batches<'a>(
+        &self,
+        observation_batches: impl IntoIterator<Item = &'a [KeyframeKeypoint]>,
+    ) {
+        let mut required_decrements = HashMap::<(KeyframeId, KeyframeId), u32>::new();
+        for observations in observation_batches {
+            for (i, obs_a) in observations.iter().enumerate() {
+                for obs_b in &observations[i + 1..] {
+                    let pair = if obs_a.keyframe_id < obs_b.keyframe_id {
+                        (obs_a.keyframe_id, obs_b.keyframe_id)
+                    } else {
+                        (obs_b.keyframe_id, obs_a.keyframe_id)
+                    };
+                    let required = required_decrements.entry(pair).or_default();
+                    *required = required
+                        .checked_add(1)
+                        .expect("covisibility removal count exceeds the map point key space");
+                }
+            }
+        }
+
+        for ((a, b), required) in required_decrements {
+            let available = self
+                .symmetric_pair_weight(a, b)
+                .expect("covisibility graph is missing an observed keyframe pair");
+            assert!(
+                available.get() >= required,
+                "covisibility graph undercounts pending point removals"
+            );
+        }
+    }
+
     fn remove_point_observations_after_preflight(&mut self, observations: &[KeyframeKeypoint]) {
         for (i, obs_a) in observations.iter().enumerate() {
             for obs_b in &observations[i + 1..] {
@@ -1354,6 +1386,14 @@ impl SlamMap {
             self.validate_map_point_removal(id)
                 .expect("map point collected for culling must still exist");
         }
+        self.covisibility
+            .preflight_remove_point_observation_batches(to_remove.iter().map(|&id| {
+                self.points
+                    .get(id)
+                    .expect("map point validated for culling must still exist")
+                    .observations
+                    .as_slice()
+            }));
         for id in to_remove {
             self.remove_map_point_after_preflight_without_generation(id);
         }
@@ -3164,6 +3204,53 @@ mod tests {
                     .expect("removal backreference remains readable"),
                 Some(removal_point)
             );
+        }
+    }
+
+    #[test]
+    fn culling_preflights_aggregate_covisibility_decrements() {
+        let mut map = SlamMap::new();
+        let keyframes = add_test_keyframes(&mut map, 21, [2; 2]);
+        let first_observations = test_observations(&map, keyframes, 0);
+        let second_observations = test_observations(&map, keyframes, 1);
+        let first_point = add_shared_test_point(&mut map, &first_observations, 0.0);
+        let second_point = add_shared_test_point(&mut map, &second_observations, 1.0);
+        assert_eq!(
+            map.covisibility
+                .covisibility_count(keyframes[0], keyframes[1]),
+            2
+        );
+
+        map.covisibility
+            .set_pair_weight(keyframes[0], keyframes[1], Some(NonZeroU32::MIN));
+        let snapshot = map.snapshot();
+        let edges = map.covisibility.edges.clone();
+
+        assert_panics_with(
+            "covisibility graph undercounts pending point removals",
+            || map.cull_points(3),
+        );
+
+        assert_eq!(map.snapshot(), snapshot);
+        assert_eq!(map.num_points(), 2);
+        assert_eq!(map.covisibility.edges, edges);
+        for (point_id, observations) in [
+            (first_point, first_observations),
+            (second_point, second_observations),
+        ] {
+            assert_eq!(
+                map.point(point_id)
+                    .expect("culled point remains")
+                    .observations,
+                observations
+            );
+            for observation in observations {
+                assert_eq!(
+                    map.map_point_for_keypoint(observation)
+                        .expect("backreference remains readable"),
+                    Some(point_id)
+                );
+            }
         }
     }
 
