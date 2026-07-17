@@ -827,27 +827,13 @@ mod tests {
     fn imu_jacobians_finite_for_nontrivial_states() {
         let gravity = Gravity::try_new([0.0, 9.81, 0.0]).expect("gravity");
         let state_i = NavState::try_new(
-            Pose64::from_rt(
-                [
-                    [0.98, -0.17, 0.05],
-                    [0.18, 0.97, -0.15],
-                    [-0.02, 0.16, 0.99],
-                ],
-                [1.0, -0.5, 0.3],
-            ),
+            crate::math::se3_exp_f64([1.0, -0.5, 0.3, 0.16, 0.04, 0.18]),
             [0.5, -0.2, 0.1],
             ImuBias::try_new([0.1, -0.05, 0.02], [0.001, -0.002, 0.003]).expect("finite bias"),
         )
         .expect("state_i");
         let state_j = NavState::try_new(
-            Pose64::from_rt(
-                [
-                    [0.95, -0.30, 0.08],
-                    [0.31, 0.94, -0.12],
-                    [-0.04, 0.14, 0.99],
-                ],
-                [1.5, -0.3, 0.6],
-            ),
+            crate::math::se3_exp_f64([1.5, -0.3, 0.6, 0.14, 0.07, 0.31]),
             [0.8, -0.1, 0.3],
             ImuBias::try_new([0.12, -0.04, 0.03], [0.002, -0.001, 0.004]).expect("finite bias"),
         )
