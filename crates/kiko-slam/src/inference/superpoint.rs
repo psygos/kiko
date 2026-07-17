@@ -473,11 +473,10 @@ where
         }
     };
 
-    Detections::new(
+    Detections::from_dimensions(
         frame.sensor_id(),
         frame.frame_id(),
-        frame.width(),
-        frame.height(),
+        frame.dimensions(),
         keypoints,
         scores,
         descriptors,
@@ -585,11 +584,10 @@ where
         descriptors.push(descriptor);
     }
 
-    Detections::new(
+    Detections::from_dimensions(
         frame.sensor_id(),
         frame.frame_id(),
-        frame.width(),
-        frame.height(),
+        frame.dimensions(),
         keypoints,
         scores,
         descriptors,

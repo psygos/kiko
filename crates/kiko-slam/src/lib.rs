@@ -942,8 +942,44 @@ impl Detections {
         scores: Vec<f32>,
         descriptors: Vec<Descriptor>,
     ) -> Result<Self, DetectionError> {
+        Self::require_equal_lengths(&keypoints, &scores, &descriptors)?;
         let dimensions =
             FrameDimensions::try_new(width, height).map_err(DetectionError::InvalidDimensions)?;
+        Self::from_validated_shape(
+            sensor_id,
+            frame_id,
+            dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        )
+    }
+
+    /// Builds detections in an image coordinate domain that was already parsed.
+    pub fn from_dimensions(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        dimensions: FrameDimensions,
+        keypoints: Vec<Keypoint>,
+        scores: Vec<f32>,
+        descriptors: Vec<Descriptor>,
+    ) -> Result<Self, DetectionError> {
+        Self::require_equal_lengths(&keypoints, &scores, &descriptors)?;
+        Self::from_validated_shape(
+            sensor_id,
+            frame_id,
+            dimensions,
+            keypoints,
+            scores,
+            descriptors,
+        )
+    }
+
+    fn require_equal_lengths(
+        keypoints: &[Keypoint],
+        scores: &[f32],
+        descriptors: &[Descriptor],
+    ) -> Result<(), DetectionError> {
         if keypoints.len() != descriptors.len() || descriptors.len() != scores.len() {
             return Err(DetectionError::ShapeMismatch {
                 keypoints_len: keypoints.len(),
@@ -951,8 +987,19 @@ impl Detections {
                 descriptors_len: descriptors.len(),
             });
         }
-        let width_f64 = f64::from(width);
-        let height_f64 = f64::from(height);
+        Ok(())
+    }
+
+    fn from_validated_shape(
+        sensor_id: SensorId,
+        frame_id: FrameId,
+        dimensions: FrameDimensions,
+        keypoints: Vec<Keypoint>,
+        scores: Vec<f32>,
+        descriptors: Vec<Descriptor>,
+    ) -> Result<Self, DetectionError> {
+        let width_f64 = f64::from(dimensions.width());
+        let height_f64 = f64::from(dimensions.height());
 
         for (index, keypoint) in keypoints.iter().enumerate() {
             if !keypoint.x.is_finite() || !keypoint.y.is_finite() {
@@ -1442,6 +1489,12 @@ pub enum VizError {
         matches_left: SensorId,
         matches_right: SensorId,
     },
+    DimensionMismatch {
+        left: FrameDimensions,
+        right: FrameDimensions,
+        matches_left: FrameDimensions,
+        matches_right: FrameDimensions,
+    },
 }
 
 impl std::fmt::Display for VizError {
@@ -1468,6 +1521,23 @@ impl std::fmt::Display for VizError {
             } => write!(
                 f,
                 "viz packet sensor mismatch: left={left:?}, right={right:?}, matches_left={matches_left:?}, matches_right={matches_right:?}"
+            ),
+            VizError::DimensionMismatch {
+                left,
+                right,
+                matches_left,
+                matches_right,
+            } => write!(
+                f,
+                "viz packet dimension mismatch: left={}x{}, right={}x{}, matches_left={}x{}, matches_right={}x{}",
+                left.width(),
+                left.height(),
+                right.width(),
+                right.height(),
+                matches_left.width(),
+                matches_left.height(),
+                matches_right.width(),
+                matches_right.height(),
             ),
         }
     }
@@ -1504,6 +1574,18 @@ impl<State> VizPacket<State> {
                 matches_right: matches_right_sensor,
             });
         }
+        let matches_left_dimensions = matches.source_a().dimensions();
+        let matches_right_dimensions = matches.source_b().dimensions();
+        if left.dimensions() != matches_left_dimensions
+            || right.dimensions() != matches_right_dimensions
+        {
+            return Err(VizError::DimensionMismatch {
+                left: left.dimensions(),
+                right: right.dimensions(),
+                matches_left: matches_left_dimensions,
+                matches_right: matches_right_dimensions,
+            });
+        }
 
         Ok(Self {
             left,
@@ -1535,7 +1617,7 @@ mod tests {
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DescriptorError, DetectionError, Detections,
         DownscaleError, DownscaleFactor, Frame, FrameDimensions, FrameDimensionsError, FrameError,
         FrameId, Keyframe, KeyframeId, Keypoint, MapInstanceId, MatchError, Matches, Point3, Pose,
-        SensorId, Timestamp,
+        Raw, SensorId, Timestamp, VizError, VizPacket,
     };
 
     fn descriptor(values: [f32; DESCRIPTOR_DIM]) -> Descriptor {
@@ -1557,6 +1639,110 @@ mod tests {
         assert_eq!(frame.dimensions().width(), 2);
         assert_eq!(frame.dimensions().height(), 3);
         assert_eq!(frame.data().len(), frame.dimensions().area());
+    }
+
+    #[test]
+    fn detections_report_shape_before_invalid_raw_dimensions() {
+        let error = Detections::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            0,
+            0,
+            Vec::new(),
+            vec![1.0],
+            Vec::new(),
+        )
+        .expect_err("shape is the first malformed constructor argument");
+        assert!(matches!(
+            error,
+            DetectionError::ShapeMismatch {
+                keypoints_len: 0,
+                scores_len: 1,
+                descriptors_len: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn typed_detection_dimensions_survive_empty_top_k() {
+        let dimensions = FrameDimensions::try_new(5, 7).expect("typed dimensions");
+        let detections = Detections::from_dimensions(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            dimensions,
+            vec![Keypoint { x: 1.0, y: 2.0 }],
+            vec![1.0],
+            vec![Descriptor::ZERO],
+        )
+        .expect("typed detections")
+        .top_k(0);
+
+        assert!(detections.is_empty());
+        assert_eq!(detections.dimensions(), dimensions);
+    }
+
+    #[test]
+    fn viz_packet_rejects_detection_coordinates_from_another_image_size() {
+        let left_frame = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("left frame");
+        let right_frame = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(2),
+            Timestamp::from_nanos(1),
+            2,
+            2,
+            vec![0; 4],
+        )
+        .expect("right frame");
+        let left_detections = Arc::new(
+            Detections::new(
+                SensorId::StereoLeft,
+                FrameId::new(1),
+                3,
+                2,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("left detections"),
+        );
+        let right_detections = Arc::new(
+            Detections::new(
+                SensorId::StereoRight,
+                FrameId::new(2),
+                2,
+                2,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("right detections"),
+        );
+        let matches =
+            Matches::<Raw>::new(left_detections, right_detections, Vec::new(), Vec::new())
+                .expect("empty matches");
+        let two_by_two = FrameDimensions::try_new(2, 2).expect("frame dimensions");
+        let three_by_two = FrameDimensions::try_new(3, 2).expect("detection dimensions");
+
+        assert!(matches!(
+            VizPacket::try_new(left_frame, right_frame, matches),
+            Err(VizError::DimensionMismatch {
+                left,
+                right,
+                matches_left,
+                matches_right,
+            }) if left == two_by_two
+                && right == two_by_two
+                && matches_left == three_by_two
+                && matches_right == two_by_two
+        ));
     }
 
     #[test]

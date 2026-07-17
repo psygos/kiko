@@ -89,11 +89,10 @@ impl End2EndPipeline {
         // Build detections with empty descriptors — matching is done internally by the pipeline
         let left_scores = vec![1.0_f32; parsed.left_keypoints.len()];
         let left_descs = vec![Descriptor::ZERO; parsed.left_keypoints.len()];
-        let left_det = Detections::new(
+        let left_det = Detections::from_dimensions(
             left.sensor_id(),
             left.frame_id(),
-            left.width(),
-            left.height(),
+            left.dimensions(),
             parsed.left_keypoints,
             left_scores,
             left_descs,
@@ -102,11 +101,10 @@ impl End2EndPipeline {
 
         let right_scores = vec![1.0_f32; parsed.right_keypoints.len()];
         let right_descs = vec![Descriptor::ZERO; parsed.right_keypoints.len()];
-        let right_det = Detections::new(
+        let right_det = Detections::from_dimensions(
             right.sensor_id(),
             right.frame_id(),
-            right.width(),
-            right.height(),
+            right.dimensions(),
             parsed.right_keypoints,
             right_scores,
             right_descs,
