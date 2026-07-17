@@ -343,22 +343,23 @@ impl StereoPairer {
     }
 
     fn best_right(&self, left_ts: i64) -> Option<(usize, u64, i64)> {
-        if self.right.is_empty() {
-            return None;
-        }
-
+        let first = self.right.front()?;
         let mut best_idx = 0usize;
-        let mut best_delta = u64::MAX;
-        let mut best_ts = 0i64;
+        let mut best_ts = first.timestamp().as_nanos();
+        let mut best_delta = best_ts.abs_diff(left_ts);
 
-        for (idx, right) in self.right.iter().enumerate() {
+        // Accepted right timestamps are strictly increasing, so their absolute distance from one
+        // left timestamp is unimodal. Stop as soon as the distance no longer improves; equality
+        // deliberately preserves the earlier right timestamp.
+        for (idx, right) in self.right.iter().enumerate().skip(1) {
             let right_ts = right.timestamp().as_nanos();
             let delta = right_ts.abs_diff(left_ts);
-            if delta < best_delta {
-                best_delta = delta;
-                best_idx = idx;
-                best_ts = right_ts;
+            if delta >= best_delta {
+                break;
             }
+            best_delta = delta;
+            best_idx = idx;
+            best_ts = right_ts;
         }
 
         Some((best_idx, best_delta, best_ts))
@@ -524,6 +525,45 @@ mod tests {
             pairer.next_pair().is_some(),
             "left frame must remain pending"
         );
+    }
+
+    #[test]
+    fn nearest_right_tie_preserves_the_earlier_timestamp() {
+        let window = PairingWindowNs::new(5).expect("valid pairing window");
+        let mut pairer = StereoPairer::new(window);
+        pairer
+            .push_left(frame(SensorId::StereoLeft, 0, 1))
+            .expect("left frame");
+        pairer
+            .push_right(frame(SensorId::StereoRight, -5, 2))
+            .expect("earlier right frame");
+        pairer
+            .push_right(frame(SensorId::StereoRight, 5, 3))
+            .expect("later right frame");
+
+        let pair = pairer.next_pair().expect("in-window tie");
+        assert_eq!(pair.right().timestamp().as_nanos(), -5);
+        assert_eq!(pairer.stats().dropped_right, 0);
+    }
+
+    #[test]
+    fn nearest_right_search_handles_the_full_timestamp_domain() {
+        let window = PairingWindowNs::new(1).expect("narrow pairing window");
+        let mut pairer = StereoPairer::new(window);
+        pairer
+            .push_left(frame(SensorId::StereoLeft, i64::MAX, 1))
+            .expect("left frame");
+        pairer
+            .push_right(frame(SensorId::StereoRight, i64::MIN, 2))
+            .expect("minimum right timestamp");
+        pairer
+            .push_right(frame(SensorId::StereoRight, i64::MAX, 3))
+            .expect("maximum right timestamp");
+
+        let pair = pairer.next_pair().expect("exact maximum timestamp pair");
+        assert_eq!(pair.timestamp_delta_ns(), 0);
+        assert_eq!(pairer.stats().dropped_right, 1);
+        assert_eq!(pairer.stats().outside_window, 0);
     }
 
     #[test]
