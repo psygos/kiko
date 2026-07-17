@@ -13,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 from analyze_jetson_benchmark import (  # noqa: E402
     analyze_run,
     classify_kernel_lines,
+    diagnostic_total_failures,
     new_kernel_lines,
     parse_command_counts,
     parse_diagnostic_totals,
@@ -20,6 +21,7 @@ from analyze_jetson_benchmark import (  # noqa: E402
     parse_reported_metrics,
     parse_session_policies,
     parse_tegrastats,
+    parse_triangulation_policy,
     placement_evidence_failures,
 )
 
@@ -28,6 +30,24 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 
 class TegrastatsTests(unittest.TestCase):
+    def test_triangulation_policy_parser_requires_one_finite_policy(self) -> None:
+        line = (
+            "triangulation: min_disparity_px=1 max_depth_m=None "
+            "max_vertical_disparity_px=1.5\n"
+        )
+        self.assertEqual(
+            parse_triangulation_policy(line),
+            {"kind": "finite", "max_vertical_disparity_px": 1.5},
+        )
+        self.assertEqual(
+            parse_triangulation_policy(
+                "triangulation: max_vertical_disparity_px=unbounded\n"
+            ),
+            {"kind": "unbounded"},
+        )
+        self.assertIsNone(parse_triangulation_policy(""))
+        self.assertIsNone(parse_triangulation_policy(line + line))
+
     def test_diagnostic_totals_parser_requires_complete_unique_metrics(self) -> None:
         line = (
             "diagnostic totals: frames=2 steady_frames=1 final_map_keyframes=3 "
@@ -43,12 +63,63 @@ class TegrastatsTests(unittest.TestCase):
             "steady_pnp_projectable_tracked_observations_samples=1 "
             "steady_pnp_projectable_tracked_observations_total=41 "
             "pnp_accepted_inliers_samples=2 pnp_accepted_inliers_total=64 "
-            "steady_pnp_accepted_inliers_samples=1 steady_pnp_accepted_inliers_total=36\n"
+            "steady_pnp_accepted_inliers_samples=1 steady_pnp_accepted_inliers_total=36 "
+            "triangulation_samples=2 triangulation_candidate_matches_total=120 "
+            "triangulation_kept_total=80 triangulation_dropped_disparity_total=18 "
+            "triangulation_dropped_epipolar_total=22 "
+            "triangulation_dropped_depth_total=0 "
+            "triangulation_dropped_numerical_total=0 "
+            "triangulation_dropped_unrepresentable_total=0 "
+            "triangulation_dropped_duplicate_total=0\n"
         )
         totals = parse_diagnostic_totals(line)
         self.assertIsNotNone(totals)
         self.assertEqual(totals["final_map_points"], 45)
         self.assertEqual(totals["steady_pnp_accepted_inliers_total"], 36)
+        self.assertEqual(totals["triangulation_dropped_epipolar_total"], 22)
+        invalid = dict(totals)
+        invalid["triangulation_kept_total"] = 100
+        self.assertIn(
+            "triangulation_candidate_accounting_invalid",
+            diagnostic_total_failures(
+                invalid, {"processed": 2, "steady_processed": 1, "keyframes": 3}
+            ),
+        )
+        invalid["triangulation_kept_total"] = 70
+        self.assertIn(
+            "triangulation_candidate_accounting_invalid",
+            diagnostic_total_failures(
+                invalid, {"processed": 2, "steady_processed": 1, "keyframes": 3}
+            ),
+        )
+        zero_candidate = dict(totals)
+        zero_candidate.update(
+            {
+                "frames": 1,
+                "steady_frames": 0,
+                "final_map_keyframes": 0,
+                "features_detected_samples": 1,
+                "steady_features_detected_samples": 0,
+                "features_matched_samples": 1,
+                "steady_features_matched_samples": 0,
+                "triangulation_samples": 1,
+                "triangulation_candidate_matches_total": 0,
+                "triangulation_kept_total": 0,
+                "triangulation_dropped_disparity_total": 0,
+                "triangulation_dropped_epipolar_total": 0,
+                "triangulation_dropped_depth_total": 0,
+                "triangulation_dropped_numerical_total": 0,
+                "triangulation_dropped_unrepresentable_total": 0,
+                "triangulation_dropped_duplicate_total": 0,
+            }
+        )
+        self.assertNotIn(
+            "triangulation_candidate_accounting_invalid",
+            diagnostic_total_failures(
+                zero_candidate,
+                {"processed": 1, "steady_processed": 0, "keyframes": 0},
+            ),
+        )
         self.assertIsNone(parse_diagnostic_totals("diagnostic totals: frames=2\n"))
 
     def test_parser_reports_gpu_memory_temperature_and_power(self) -> None:
@@ -188,6 +259,7 @@ class AnalyzeRunTests(unittest.TestCase):
                 root,
                 "result.json",
                 {
+                    "schema_version": 2,
                     "state": "completed",
                     "returncode": 0,
                     "preflight": {
@@ -200,6 +272,7 @@ class AnalyzeRunTests(unittest.TestCase):
                 root,
                 "command.json",
                 {
+                    "schema_version": 2,
                     "provider": "cuda",
                     "expected_command_items": 2,
                     "selection": {"warmup_pairs": 1},
@@ -215,6 +288,10 @@ class AnalyzeRunTests(unittest.TestCase):
                         "max_temperature_c": 85.0,
                         "required_power_rails": ["VDD_IN"],
                         "min_steady_fps": 1.5,
+                        "expected_triangulation_policy": {
+                            "kind": "finite",
+                            "max_vertical_disparity_px": 1.5,
+                        },
                     },
                 },
             )
@@ -240,6 +317,8 @@ class AnalyzeRunTests(unittest.TestCase):
             self.write_json(root, "system-post.json", system)
             (root / "stdout.log").write_text("", encoding="utf-8")
             (root / "stderr.log").write_text(
+                "triangulation: min_disparity_px=1 max_depth_m=None "
+                "max_vertical_disparity_px=1.5\n"
                 "ort session policy: "
                 f"model={artifacts['superpoint_model']['path']} requested_backend=Cuda "
                 "configured_primary_backend=Cuda configured_providers=[CUDA] "
@@ -276,7 +355,14 @@ class AnalyzeRunTests(unittest.TestCase):
                 "steady_pnp_projectable_tracked_observations_total=38 "
                 "pnp_accepted_inliers_samples=1 pnp_accepted_inliers_total=32 "
                 "steady_pnp_accepted_inliers_samples=1 "
-                "steady_pnp_accepted_inliers_total=32\n",
+                "steady_pnp_accepted_inliers_total=32 "
+                "triangulation_samples=1 triangulation_candidate_matches_total=50 "
+                "triangulation_kept_total=30 triangulation_dropped_disparity_total=10 "
+                "triangulation_dropped_epipolar_total=10 "
+                "triangulation_dropped_depth_total=0 "
+                "triangulation_dropped_numerical_total=0 "
+                "triangulation_dropped_unrepresentable_total=0 "
+                "triangulation_dropped_duplicate_total=0\n",
                 encoding="utf-8",
             )
             expected_loaded = [
@@ -301,6 +387,23 @@ class AnalyzeRunTests(unittest.TestCase):
             self.assertEqual(len(clean["loaded_gpu_libraries"]), 3)
 
             command = json.loads((root / "command.json").read_text(encoding="utf-8"))
+            command["schema_version"] = 1
+            self.write_json(root, "command.json", command)
+            stale_command = analyze_run(root)
+            self.assertFalse(stale_command["pass"])
+            self.assertIn("command_schema_version_mismatch", stale_command["failures"])
+            command["schema_version"] = 2
+            self.write_json(root, "command.json", command)
+
+            result = json.loads((root / "result.json").read_text(encoding="utf-8"))
+            result["schema_version"] = 1
+            self.write_json(root, "result.json", result)
+            stale_result = analyze_run(root)
+            self.assertFalse(stale_result["pass"])
+            self.assertIn("result_schema_version_mismatch", stale_result["failures"])
+            result["schema_version"] = 2
+            self.write_json(root, "result.json", result)
+
             command["thresholds"]["min_steady_fps"] = 2.1
             self.write_json(root, "command.json", command)
             slow = analyze_run(root)
@@ -309,7 +412,28 @@ class AnalyzeRunTests(unittest.TestCase):
             command["thresholds"]["min_steady_fps"] = 1.5
             self.write_json(root, "command.json", command)
 
+            expected_policy = command["thresholds"].pop(
+                "expected_triangulation_policy"
+            )
+            self.write_json(root, "command.json", command)
+            missing_policy = analyze_run(root)
+            self.assertFalse(missing_policy["pass"])
+            self.assertIn(
+                "missing_expected_triangulation_policy", missing_policy["failures"]
+            )
+            command["thresholds"]["expected_triangulation_policy"] = expected_policy
+            self.write_json(root, "command.json", command)
+
             stderr = (root / "stderr.log").read_text(encoding="utf-8")
+            (root / "stderr.log").write_text(
+                stderr.replace("max_vertical_disparity_px=1.5", "max_vertical_disparity_px=2"),
+                encoding="utf-8",
+            )
+            policy_mismatch = analyze_run(root)
+            self.assertFalse(policy_mismatch["pass"])
+            self.assertIn("triangulation_policy_mismatch", policy_mismatch["failures"])
+            (root / "stderr.log").write_text(stderr, encoding="utf-8")
+
             legacy_counts = stderr.replace(
                 "entries_consumed=2, tracker_attempts=2, ", "attempted=2, "
             )

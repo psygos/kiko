@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -413,6 +413,26 @@ def parse_pose_outcomes(text: str) -> dict[str, int] | None:
     return dict(zip(keys, (int(value) for value in match.groups()), strict=True))
 
 
+TRIANGULATION_POLICY = re.compile(
+    r"^triangulation: .*\bmax_vertical_disparity_px="
+    r"(?P<maximum>unbounded|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)$",
+    re.MULTILINE,
+)
+
+
+def parse_triangulation_policy(text: str) -> dict[str, Any] | None:
+    matches = list(TRIANGULATION_POLICY.finditer(text))
+    if len(matches) != 1:
+        return None
+    raw_maximum = matches[0].group("maximum")
+    if raw_maximum == "unbounded":
+        return {"kind": "unbounded"}
+    maximum = float(raw_maximum)
+    if not math.isfinite(maximum) or maximum < 0.0:
+        return None
+    return {"kind": "finite", "max_vertical_disparity_px": maximum}
+
+
 DIAGNOSTIC_TOTAL_KEYS = frozenset(
     {
         "frames",
@@ -440,6 +460,15 @@ DIAGNOSTIC_TOTAL_KEYS = frozenset(
         "pnp_accepted_inliers_total",
         "steady_pnp_accepted_inliers_samples",
         "steady_pnp_accepted_inliers_total",
+        "triangulation_samples",
+        "triangulation_candidate_matches_total",
+        "triangulation_kept_total",
+        "triangulation_dropped_disparity_total",
+        "triangulation_dropped_epipolar_total",
+        "triangulation_dropped_depth_total",
+        "triangulation_dropped_numerical_total",
+        "triangulation_dropped_unrepresentable_total",
+        "triangulation_dropped_duplicate_total",
     }
 )
 
@@ -476,6 +505,24 @@ def diagnostic_total_failures(
             failures.append(f"{metric}_sample_count_mismatch")
         if totals[f"steady_{metric}_samples"] != totals["steady_frames"]:
             failures.append(f"steady_{metric}_sample_count_mismatch")
+    triangulation_samples = totals["triangulation_samples"]
+    triangulation_candidates = totals["triangulation_candidate_matches_total"]
+    if triangulation_samples == 0 or triangulation_samples > totals["frames"]:
+        failures.append("triangulation_sample_count_invalid")
+    triangulation_accounted = sum(
+        totals[key]
+        for key in (
+            "triangulation_kept_total",
+            "triangulation_dropped_disparity_total",
+            "triangulation_dropped_epipolar_total",
+            "triangulation_dropped_depth_total",
+            "triangulation_dropped_numerical_total",
+            "triangulation_dropped_unrepresentable_total",
+            "triangulation_dropped_duplicate_total",
+        )
+    )
+    if triangulation_accounted != triangulation_candidates:
+        failures.append("triangulation_candidate_accounting_invalid")
     return failures
 
 
@@ -692,6 +739,7 @@ def analyze_run(
     placements = parse_node_placements(combined_output)
     counts = parse_command_counts(combined_output)
     pose_outcomes = parse_pose_outcomes(combined_output)
+    triangulation_policy = parse_triangulation_policy(combined_output)
     diagnostic_totals = parse_diagnostic_totals(combined_output)
     reported_metrics = parse_reported_metrics(combined_output, counts)
     loaded_realpaths = parse_loaded_realpaths(
@@ -700,6 +748,10 @@ def analyze_run(
 
     expected_provider = str(manifest.get("provider", "")).lower()
     failures: list[str] = []
+    if manifest.get("schema_version") != SCHEMA_VERSION:
+        failures.append("command_schema_version_mismatch")
+    if result.get("schema_version") != SCHEMA_VERSION:
+        failures.append("result_schema_version_mismatch")
     if expected_provider not in {"cuda", "tensorrt"}:
         failures.append("invalid_expected_provider")
     if result.get("returncode") != 0:
@@ -839,6 +891,39 @@ def analyze_run(
             failures.append("missing_steady_fps")
         elif steady["fps"] < minimum_steady_fps:
             failures.append("steady_fps_below_gate")
+    expected_triangulation_policy = thresholds.get("expected_triangulation_policy")
+    if counts and counts.get("kind") == "slam":
+        expected_kind = (
+            expected_triangulation_policy.get("kind")
+            if isinstance(expected_triangulation_policy, dict)
+            else None
+        )
+        expected_policy_valid = expected_kind == "unbounded"
+        if expected_kind == "finite":
+            expected_maximum = expected_triangulation_policy.get(
+                "max_vertical_disparity_px"
+            )
+            expected_policy_valid = (
+                isinstance(expected_maximum, (int, float))
+                and not isinstance(expected_maximum, bool)
+                and math.isfinite(expected_maximum)
+                and expected_maximum >= 0.0
+            )
+        if expected_triangulation_policy is None:
+            failures.append("missing_expected_triangulation_policy")
+        elif not expected_policy_valid:
+            failures.append("invalid_expected_triangulation_policy")
+        elif triangulation_policy is None:
+            failures.append("missing_triangulation_policy")
+        elif expected_kind != triangulation_policy.get("kind"):
+            failures.append("triangulation_policy_mismatch")
+        elif expected_kind == "finite" and not math.isclose(
+            triangulation_policy["max_vertical_disparity_px"],
+            float(expected_triangulation_policy["max_vertical_disparity_px"]),
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            failures.append("triangulation_policy_mismatch")
 
     expected_library_paths = artifact_paths(
         artifacts,
@@ -888,6 +973,7 @@ def analyze_run(
         "loaded_gpu_libraries": loaded_gpu_libraries,
         "command_counts": counts,
         "pose_outcomes": pose_outcomes,
+        "triangulation_policy": triangulation_policy,
         "diagnostic_totals": diagnostic_totals,
         "reported_metrics": reported_metrics,
         "comparison_metrics_valid": comparison_metrics_valid,

@@ -169,6 +169,7 @@ class ArtifactAndEnvironmentTests(unittest.TestCase):
             digest = hashlib.sha256(b"model").hexdigest()
             manifest = root / "SHA256SUMS"
             manifest.write_text(f"{digest}  model.onnx\n", encoding="utf-8")
+            artifact = artifact.resolve(strict=True)
             self.assertEqual(load_hash_manifest(manifest)[artifact], digest)
             verified = verify_artifacts({"model": artifact}, manifest)
             self.assertEqual(verified["model"]["sha256"], digest)
@@ -273,7 +274,7 @@ class ArtifactAndEnvironmentTests(unittest.TestCase):
             resolved = parse_ldd_resolutions(
                 f"libcudart.so.12 => {link} (0x000000000000)\n"
             )
-            self.assertEqual(resolved, {"libcudart.so.12": str(library)})
+            self.assertEqual(resolved, {"libcudart.so.12": str(library.resolve())})
 
         selection = validate_command_selection(
             ["run", "--max-pairs", "300", "--warmup-pairs=4", "/data"],
@@ -297,6 +298,8 @@ class ArtifactAndEnvironmentTests(unittest.TestCase):
             dataset = root / "dataset"
             binary.write_text("", encoding="utf-8")
             dataset.mkdir()
+            binary = binary.resolve(strict=True)
+            dataset = dataset.resolve(strict=True)
             command = workload_command(binary, dataset, ["--", "bench", str(dataset)])
             self.assertEqual(command, [str(binary), "bench", str(dataset)])
             with self.assertRaises(GateError):

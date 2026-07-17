@@ -49,6 +49,20 @@ class GateError(RuntimeError):
     pass
 
 
+def nonnegative_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as source:
+        raise argparse.ArgumentTypeError(
+            f"expected a floating-point value, got {value!r}"
+        ) from source
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise argparse.ArgumentTypeError(
+            f"expected a finite nonnegative value, got {value!r}"
+        )
+    return parsed
+
+
 class RunInterrupted(RuntimeError):
     def __init__(self, signum: int):
         super().__init__(f"received signal {signal.Signals(signum).name}")
@@ -1182,6 +1196,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-cpu-node-fraction", type=float, default=0.0)
     result.add_argument("--max-temperature-c", type=float, default=85.0)
     result.add_argument("--min-steady-fps", type=float)
+    triangulation_policy = result.add_mutually_exclusive_group()
+    triangulation_policy.add_argument(
+        "--expected-triangulation-max-vertical-disparity-px",
+        type=nonnegative_finite_float,
+    )
+    triangulation_policy.add_argument(
+        "--expect-unbounded-triangulation-policy",
+        action="store_true",
+    )
     result.add_argument("--require-power-rail", action="append", default=[])
     result.add_argument(
         "--device-node",
@@ -1292,6 +1315,25 @@ def main() -> int:
 
         environment = build_environment(args, models)
         command = workload_command(binary, dataset, args.command_args)
+        is_slam_command = command[1] in {"run", "slam"}
+        has_expected_triangulation_policy = (
+            args.expected_triangulation_max_vertical_disparity_px is not None
+            or args.expect_unbounded_triangulation_policy
+        )
+        if is_slam_command and not has_expected_triangulation_policy:
+            raise GateError("SLAM workloads must attest the expected triangulation policy")
+        if not is_slam_command and has_expected_triangulation_policy:
+            raise GateError("triangulation policy attestation is only valid for SLAM workloads")
+        expected_triangulation_policy = None
+        if args.expect_unbounded_triangulation_policy:
+            expected_triangulation_policy = {"kind": "unbounded"}
+        elif args.expected_triangulation_max_vertical_disparity_px is not None:
+            expected_triangulation_policy = {
+                "kind": "finite",
+                "max_vertical_disparity_px": (
+                    args.expected_triangulation_max_vertical_disparity_px
+                ),
+            }
         selection = validate_command_selection(
             command[1:], args.expected_pairs, args.expected_command_items
         )
@@ -1319,6 +1361,7 @@ def main() -> int:
                 "max_cpu_node_fraction": args.max_cpu_node_fraction,
                 "max_temperature_c": args.max_temperature_c,
                 "min_steady_fps": args.min_steady_fps,
+                "expected_triangulation_policy": expected_triangulation_policy,
                 "required_power_rails": args.require_power_rail,
             },
         }
