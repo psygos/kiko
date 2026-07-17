@@ -106,14 +106,22 @@ python3 /home/makerspace/kiko/scripts/jetson_benchmark.py \
   --max-swap-used-mib 0 \
   --max-cpu-node-fraction 0.20 \
   --max-temperature-c 85 \
+  --expected-triangulation-max-vertical-disparity-px 3 \
   --require-power-rail VDD_IN \
   --min-steady-fps 17 \
   --kiko-env KIKO_DOWNSCALE=1 \
   --kiko-env KIKO_MAX_KEYPOINTS=2048 \
   --kiko-env KIKO_CUDA_CONV_SEARCH=heuristic \
+  --kiko-env KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX=3 \
   --ld-debug \
   -- run --profile jetson --visual-only --warmup-pairs 12 /home/makerspace/full_slam_lab
 ```
+
+Every SLAM benchmark must attest the exact triangulation policy. The current
+Jetson profile uses the explicit finite `3 px` gate above; a historical
+unbounded baseline must instead pass `--expect-unbounded-triangulation-policy`
+and must not set the finite `KIKO_TRIANGULATION_MAX_VERTICAL_DISPARITY_PX`
+override.
 
 Run each gate as a separate invocation and continue only after exit status `0`:
 
