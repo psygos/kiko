@@ -41,5 +41,9 @@ harness = false
 name = "occupancy_mapping"
 harness = false
 
+[[bench]]
+name = "navigation_planning"
+harness = false
+
 [lints]
 workspace = true
