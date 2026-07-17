@@ -1385,7 +1385,7 @@ impl UnitBearing {
 /// One solve-owned calibration authority for both P3P rays and pixel scoring.
 struct CalibratedPnpProblem<'a> {
     observations: &'a [Observation],
-    bearings: Vec<UnitBearing>,
+    bearings: &'a [UnitBearing],
     intrinsics: PinholeIntrinsics,
 }
 
@@ -1393,22 +1393,24 @@ impl<'a> CalibratedPnpProblem<'a> {
     fn try_new(
         observations: &'a [Observation],
         intrinsics: PinholeIntrinsics,
+        workspace: &'a mut PnpWorkspace,
     ) -> Result<Self, PnpError> {
-        let mut bearings = Vec::new();
-        bearings
+        workspace.bearings.clear();
+        workspace
+            .bearings
             .try_reserve_exact(observations.len())
             .map_err(|source| PnpError::BearingBufferAllocation {
                 observation_count: observations.len(),
                 source,
             })?;
-        bearings.extend(
+        workspace.bearings.extend(
             observations
                 .iter()
                 .map(|observation| UnitBearing::from_pixel(observation.pixel(), intrinsics)),
         );
         Ok(Self {
             observations,
-            bearings,
+            bearings: &workspace.bearings,
             intrinsics,
         })
     }
@@ -1437,6 +1439,16 @@ impl<'a> CalibratedPnpProblem<'a> {
     }
 }
 
+/// Reusable scratch for calibration-derived PnP inputs.
+///
+/// This deliberately retains only allocation capacity. Every solve rebuilds
+/// every bearing from that solve's observations and single intrinsics
+/// authority, so no calibration or observation state can leak across solves.
+#[derive(Default)]
+pub(crate) struct PnpWorkspace {
+    bearings: Vec<UnitBearing>,
+}
+
 #[derive(Clone, Copy)]
 struct CalibratedPnpObservation<'a> {
     observation: &'a Observation,
@@ -1453,6 +1465,20 @@ pub fn solve_pnp_ransac(
     intrinsics: PinholeIntrinsics,
     config: RansacConfig,
 ) -> Result<PnpResult, PnpError> {
+    solve_pnp_ransac_with_workspace(
+        observations,
+        intrinsics,
+        config,
+        &mut PnpWorkspace::default(),
+    )
+}
+
+pub(crate) fn solve_pnp_ransac_with_workspace(
+    observations: &[Observation],
+    intrinsics: PinholeIntrinsics,
+    config: RansacConfig,
+    workspace: &mut PnpWorkspace,
+) -> Result<PnpResult, PnpError> {
     if observations.len() < MIN_PNP_POINTS {
         return Err(PnpRejection::NotEnoughPoints {
             required: MIN_PNP_POINTS,
@@ -1468,7 +1494,7 @@ pub fn solve_pnp_ransac(
         .into());
     }
 
-    let problem = CalibratedPnpProblem::try_new(observations, intrinsics)?;
+    let problem = CalibratedPnpProblem::try_new(observations, intrinsics, workspace)?;
 
     let mut rng = XorShift64::new(config.seed);
     let mut best_pose = None;
@@ -2950,6 +2976,24 @@ mod tests {
         sum.sqrt()
     }
 
+    fn assert_pnp_results_bitwise_equal(lhs: &PnpResult, rhs: &PnpResult) {
+        assert_eq!(
+            lhs.pose().rotation().map(|row| row.map(f32::to_bits)),
+            rhs.pose().rotation().map(|row| row.map(f32::to_bits))
+        );
+        assert_eq!(
+            lhs.pose().translation().map(f32::to_bits),
+            rhs.pose().translation().map(f32::to_bits)
+        );
+        assert_eq!(lhs.inliers(), rhs.inliers());
+        assert_eq!(lhs.iterations(), rhs.iterations());
+        assert_eq!(lhs.ransac_rejections(), rhs.ransac_rejections());
+        assert_eq!(
+            format!("{:?}", lhs.refinement()),
+            format!("{:?}", rhs.refinement())
+        );
+    }
+
     #[test]
     fn ransac_config_rejects_invalid_solver_inputs() {
         assert!(matches!(
@@ -3198,10 +3242,14 @@ mod tests {
             PinholeIntrinsics::try_new(200.0, 200.0, 320.0, 240.0).expect("first calibration");
         let calibration_b =
             PinholeIntrinsics::try_new(400.0, 400.0, 320.0, 240.0).expect("second calibration");
-        let problem_a = CalibratedPnpProblem::try_new(&observations, calibration_a)
-            .expect("first calibrated problem");
-        let problem_b = CalibratedPnpProblem::try_new(&observations, calibration_b)
-            .expect("second calibrated problem");
+        let mut workspace_a = PnpWorkspace::default();
+        let mut workspace_b = PnpWorkspace::default();
+        let problem_a =
+            CalibratedPnpProblem::try_new(&observations, calibration_a, &mut workspace_a)
+                .expect("first calibrated problem");
+        let problem_b =
+            CalibratedPnpProblem::try_new(&observations, calibration_b, &mut workspace_b)
+                .expect("second calibrated problem");
 
         let bearing_a = problem_a.bearings[0].into_array();
         let bearing_b = problem_b.bearings[0].into_array();
@@ -3360,7 +3408,8 @@ mod tests {
                 })
                 .collect();
             assert_eq!(observations.len(), 3);
-            let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+            let mut workspace = PnpWorkspace::default();
+            let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
                 .expect("calibrated P3P sample");
             let mut solutions = FixedBuffer::new();
             let rejection =
@@ -3409,7 +3458,8 @@ mod tests {
         ];
         let intrinsics =
             PinholeIntrinsics::try_new(1.0, 1.0, 0.0, 0.0).expect("finite unit intrinsics");
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated P3P sample");
         let mut candidates = FixedBuffer::new();
 
@@ -3547,6 +3597,43 @@ mod tests {
     }
 
     #[test]
+    fn pnp_workspace_reuses_bearing_allocation_without_stale_solve_state() {
+        let calibration_a =
+            make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics A");
+        let calibration_b =
+            make_pinhole_intrinsics(640, 480, 510.0, 505.0, 311.0, 233.0).expect("intrinsics B");
+        let world = synthetic_world_points();
+        let pose = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
+        let observations_a =
+            observations_from_projection(pose, &world, calibration_a).expect("observations A");
+        let observations_b = observations_from_projection(pose, &world[..20], calibration_b)
+            .expect("observations B");
+        let config = RansacConfig::new(700, 1.0, 20, 0xBAD5EED).expect("RANSAC config");
+
+        let expected_a =
+            solve_pnp_ransac(&observations_a, calibration_a, config).expect("stateless solve A");
+        let expected_b =
+            solve_pnp_ransac(&observations_b, calibration_b, config).expect("stateless solve B");
+
+        let mut workspace = PnpWorkspace::default();
+        let actual_a =
+            solve_pnp_ransac_with_workspace(&observations_a, calibration_a, config, &mut workspace)
+                .expect("workspace solve A");
+        assert_pnp_results_bitwise_equal(&actual_a, &expected_a);
+        assert_eq!(workspace.bearings.len(), observations_a.len());
+        let allocation = workspace.bearings.as_ptr();
+        let capacity = workspace.bearings.capacity();
+
+        let actual_b =
+            solve_pnp_ransac_with_workspace(&observations_b, calibration_b, config, &mut workspace)
+                .expect("workspace solve B");
+        assert_pnp_results_bitwise_equal(&actual_b, &expected_b);
+        assert_eq!(workspace.bearings.len(), observations_b.len());
+        assert_eq!(workspace.bearings.capacity(), capacity);
+        assert_eq!(workspace.bearings.as_ptr(), allocation);
+    }
+
+    #[test]
     fn successful_pnp_retains_earlier_minimal_sample_rejection() {
         let intrinsics =
             make_pinhole_intrinsics(640, 480, 420.0, 418.0, 320.0, 240.0).expect("intrinsics");
@@ -3643,7 +3730,8 @@ mod tests {
             pixel: Keypoint { x: 0.0, y: 0.0 },
         };
         let observations = [observation];
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated finite-extreme problem");
         let mut inliers = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, 1)
             .expect("single-index scratch buffer");
@@ -3667,7 +3755,8 @@ mod tests {
         )
         .expect("finite observation");
         let observations = [observation];
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated projection-failure problem");
         let mut inliers = try_inlier_buffer(PnpInlierBuffer::CandidateScratch, 1)
             .expect("single-index scratch buffer");
@@ -3799,7 +3888,8 @@ mod tests {
         let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
         let observations =
             observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated refinement problem");
         let inlier_indices: Vec<usize> = (0..observations.len()).collect();
 
@@ -3907,7 +3997,8 @@ mod tests {
         let pose_gt = axis_angle_pose([0.2, -0.1, 0.35], [0.08, -0.06, 0.04]);
         let observations =
             observations_from_projection(pose_gt, &world, intrinsics).expect("observations");
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated refinement problem");
         let inlier_indices: Vec<usize> = (0..observations.len()).collect();
 
@@ -3964,7 +4055,8 @@ mod tests {
         let observations =
             observations_from_projection(Pose::identity(), &synthetic_world_points(), intrinsics)
                 .expect("observations");
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated refinement problem");
         let invalid_index = observations.len();
 
@@ -3995,7 +4087,8 @@ mod tests {
         )
         .expect("finite observation");
         let observations = [observation];
-        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics)
+        let mut workspace = PnpWorkspace::default();
+        let problem = CalibratedPnpProblem::try_new(&observations, intrinsics, &mut workspace)
             .expect("calibrated nonprojectable problem");
 
         let error = refine_pose_on_inliers(Pose::identity(), &problem, &[0])

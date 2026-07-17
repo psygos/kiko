@@ -2,10 +2,11 @@ use std::sync::Arc;
 
 use crate::inference::InferenceError;
 use crate::map::SlamMap;
+use crate::pnp::{PnpWorkspace, solve_pnp_ransac_with_workspace};
 use crate::{
     Detections, DownscaleFactor, Frame, LightGlue, Matches, Observation, PinholeIntrinsics,
     PnpError, PnpResult, RansacConfig, Raw, SuperPoint, TriangulationResult, Triangulator,
-    Verified, solve_pnp_ransac,
+    Verified,
 };
 
 pub(crate) struct StereoFrontend {
@@ -17,6 +18,7 @@ pub(crate) struct StereoFrontend {
     prefetch_lg: Option<LightGlue>,
     triangulator: Triangulator,
     intrinsics: PinholeIntrinsics,
+    pnp_workspace: PnpWorkspace,
 }
 
 impl StereoFrontend {
@@ -33,6 +35,7 @@ impl StereoFrontend {
             prefetch_lg: None,
             triangulator,
             intrinsics,
+            pnp_workspace: PnpWorkspace::default(),
         }
     }
 
@@ -119,11 +122,16 @@ impl StereoFrontend {
     }
 
     pub(crate) fn solve_tracking_pose(
-        &self,
+        &mut self,
         observations: &[Observation],
         ransac: RansacConfig,
     ) -> Result<PnpResult, PnpError> {
-        solve_pnp_ransac(observations, self.intrinsics, ransac)
+        solve_pnp_ransac_with_workspace(
+            observations,
+            self.intrinsics,
+            ransac,
+            &mut self.pnp_workspace,
+        )
     }
 }
 

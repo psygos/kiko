@@ -4680,7 +4680,7 @@ impl SlamTracker {
     }
 
     fn build_tracking_attempt(
-        &self,
+        &mut self,
         keyframe: &Keyframe,
         keyframe_id: KeyframeId,
         matches: Matches<Raw>,
@@ -4922,7 +4922,7 @@ impl SlamTracker {
     }
 
     fn projected_tracking_decision(
-        &self,
+        &mut self,
         current: Arc<Detections>,
         keyframe: &Keyframe,
         keyframe_id: KeyframeId,
