@@ -4,6 +4,7 @@ mod cell_inflation;
 mod frames;
 mod global_planner;
 mod local_costmap;
+mod shadow_command;
 
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,
@@ -20,4 +21,9 @@ pub use local_costmap::{
     LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,
     LocalCostmapProvenance, LocalCostmapQuery, LocalCostmapUpdateOutcome, LocalCostmapView,
     LocalDepthObservation, TrackingCameraToBase,
+};
+pub use shadow_command::{
+    MAX_SHADOW_COMMAND_RECORDS, MotorPacketsSent, ShadowCommandConfig, ShadowCommandConfigDto,
+    ShadowCommandConfigError, ShadowCommandDisposition, ShadowCommandError, ShadowCommandRecord,
+    ShadowCommandSession, ShadowDecisionId, ShadowPwmPair, ShadowPwmPairError,
 };

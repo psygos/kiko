@@ -3119,6 +3119,7 @@ dependencies = [
  "oak-sys",
  "ort",
  "rerun",
+ "robot-protocol",
  "serde",
  "serde_json",
  "slotmap",
