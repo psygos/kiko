@@ -288,15 +288,58 @@ pub struct RedundancyPolicy {
 struct BackendRequestId(NonZeroU64);
 
 impl BackendRequestId {
-    fn from_counter(counter: &mut u64) -> Self {
-        *counter = counter.saturating_add(1).max(1);
-        Self(NonZeroU64::new(*counter).unwrap_or(NonZeroU64::MIN))
-    }
+    const FIRST: Self = Self(NonZeroU64::MIN);
 
     fn as_u64(self) -> u64 {
         self.0.get()
     }
+
+    fn checked_successor(self) -> Option<Self> {
+        self.as_u64()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
 }
+
+/// Monotonic backend request identifiers for one supervisor lifetime.
+///
+/// Failed submissions may leave gaps. Identifiers are never reused across worker respawns, but
+/// they are not globally unique across tracker instances or processes.
+#[derive(Debug)]
+struct BackendRequestIds {
+    next: Option<BackendRequestId>,
+}
+
+impl BackendRequestIds {
+    fn new() -> Self {
+        Self {
+            next: Some(BackendRequestId::FIRST),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_next(next: BackendRequestId) -> Self {
+        Self { next: Some(next) }
+    }
+
+    fn take_next(&mut self) -> Result<BackendRequestId, BackendRequestIdExhausted> {
+        let current = self.next.ok_or(BackendRequestIdExhausted)?;
+        self.next = current.checked_successor();
+        Ok(current)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackendRequestIdExhausted;
+
+impl std::fmt::Display for BackendRequestIdExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend request identifier domain is exhausted")
+    }
+}
+
+impl std::error::Error for BackendRequestIdExhausted {}
 
 #[derive(Debug)]
 struct BackendWindow {
@@ -861,6 +904,7 @@ pub struct BackendStats {
 enum SubmitEventError {
     InvalidWindow(BackendWindowError),
     InvalidEvent(KeyframeEventError),
+    RequestIdExhausted(BackendRequestIdExhausted),
     QueueFull,
     Disconnected,
 }
@@ -870,6 +914,7 @@ impl std::fmt::Display for SubmitEventError {
         match self {
             SubmitEventError::InvalidWindow(err) => write!(f, "invalid backend window: {err}"),
             SubmitEventError::InvalidEvent(err) => write!(f, "invalid backend event: {err}"),
+            SubmitEventError::RequestIdExhausted(err) => write!(f, "{err}"),
             SubmitEventError::QueueFull => write!(f, "backend event queue is full"),
             SubmitEventError::Disconnected => write!(f, "backend worker is disconnected"),
         }
@@ -881,6 +926,7 @@ impl std::error::Error for SubmitEventError {
         match self {
             Self::InvalidWindow(err) => Some(err),
             Self::InvalidEvent(err) => Some(err),
+            Self::RequestIdExhausted(err) => Some(err),
             Self::QueueFull | Self::Disconnected => None,
         }
     }
@@ -943,7 +989,6 @@ impl From<crate::map::MapError> for ApplyCorrectionError {
 struct BackendWorker {
     tx: Sender<KeyframeEvent>,
     rx: Receiver<BackendResponse>,
-    next_request_id: u64,
 }
 
 impl BackendWorker {
@@ -1027,12 +1072,7 @@ impl BackendWorker {
         Ok(Self {
             tx: tx_req,
             rx: rx_resp,
-            next_request_id: 0,
         })
-    }
-
-    fn next_request_id(&mut self) -> BackendRequestId {
-        BackendRequestId::from_counter(&mut self.next_request_id)
     }
 
     fn try_submit(&self, event: KeyframeEvent) -> Result<(), SubmitEventError> {
@@ -1061,6 +1101,7 @@ struct BackendSupervisor {
     respawn_count: u32,
     max_respawns: u32,
     spawn_exhausted: bool,
+    request_ids: BackendRequestIds,
 }
 
 impl BackendSupervisor {
@@ -1117,6 +1158,7 @@ impl BackendSupervisor {
             respawn_count: 0,
             max_respawns,
             spawn_exhausted: false,
+            request_ids: BackendRequestIds::new(),
         })
     }
 
@@ -1202,11 +1244,16 @@ impl BackendSupervisor {
         }
     }
 
-    fn next_request_id(&mut self) -> Option<BackendRequestId> {
+    fn next_request_id(&mut self) -> Result<BackendRequestId, SubmitEventError> {
         if self.worker.is_none() {
             self.check_health();
         }
-        self.worker.as_mut().map(BackendWorker::next_request_id)
+        if self.worker.is_none() {
+            return Err(SubmitEventError::Disconnected);
+        }
+        self.request_ids
+            .take_next()
+            .map_err(SubmitEventError::RequestIdExhausted)
     }
 
     #[cfg(test)]
@@ -2448,9 +2495,7 @@ impl SlamTracker {
         };
 
         let window = BackendWindow::try_new(window_ids).map_err(SubmitEventError::InvalidWindow)?;
-        let request_id = supervisor
-            .next_request_id()
-            .ok_or(SubmitEventError::Disconnected)?;
+        let request_id = supervisor.next_request_id()?;
         let event = KeyframeEvent::try_new(request_id, trigger_keyframe, window, self.map.clone())
             .map_err(SubmitEventError::InvalidEvent)?;
         supervisor.submit(event)?;
@@ -3194,7 +3239,8 @@ impl SlamTracker {
                                             }
                                         }
                                         SubmitEventError::InvalidWindow(_)
-                                        | SubmitEventError::InvalidEvent(_) => {
+                                        | SubmitEventError::InvalidEvent(_)
+                                        | SubmitEventError::RequestIdExhausted(_) => {
                                             self.backend_stats.rejected =
                                                 self.backend_stats.rejected.saturating_add(1);
                                         }
@@ -4868,6 +4914,35 @@ mod tests {
     }
 
     #[test]
+    fn backend_request_ids_issue_maximum_once_then_exhaust_stickily() {
+        let penultimate = BackendRequestId(
+            NonZeroU64::new(u64::MAX - 1).expect("the penultimate u64 is nonzero"),
+        );
+        let mut request_ids = BackendRequestIds::from_next(penultimate);
+
+        assert_eq!(
+            request_ids.take_next().expect("penultimate id").as_u64(),
+            u64::MAX - 1
+        );
+        assert_eq!(
+            request_ids.take_next().expect("maximum id").as_u64(),
+            u64::MAX
+        );
+        assert_eq!(request_ids.take_next(), Err(BackendRequestIdExhausted));
+        let error = SubmitEventError::RequestIdExhausted(
+            request_ids
+                .take_next()
+                .expect_err("exhaustion must remain sticky"),
+        );
+        assert!(
+            std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<BackendRequestIdExhausted>())
+                .is_some(),
+            "submission errors must retain the typed exhaustion source"
+        );
+    }
+
+    #[test]
     fn correction_apply_rejects_stale_snapshot() {
         let (mut map, keyframe_id, point_id) = make_map_with_single_point();
         let correction = CorrectionEvent {
@@ -5201,13 +5276,13 @@ mod tests {
                 .expect("intrinsics");
         let ba_cfg = LocalBaConfig::new(5, 5, 4, 1.0, crate::local_ba::LmConfig::default())
             .expect("ba config");
-        let mut worker =
+        let worker =
             BackendWorker::spawn(backend_cfg, intrinsics, ba_cfg).expect("spawn backend worker");
 
         let window = BackendWindow::try_new(vec![kf_a, kf_b]).expect("window");
         let source_snapshot = map.snapshot();
         let event =
-            KeyframeEvent::try_new(worker.next_request_id(), kf_b, window, map).expect("event");
+            KeyframeEvent::try_new(BackendRequestId::FIRST, kf_b, window, map).expect("event");
         worker.try_submit(event).expect("submit");
 
         let mut response = None;
@@ -5284,13 +5359,9 @@ mod tests {
         );
 
         let (map, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
-        let mut req_counter = 0;
-        let event = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
-            map,
-            kf_a,
-            kf_b,
-        );
+        let request_id = supervisor.next_request_id().expect("first request id");
+        assert_eq!(request_id.as_u64(), 1);
+        let event = make_forced_panic_event(request_id, map, kf_a, kf_b);
         supervisor.submit(event).expect("submit");
 
         let mut saw_panic = false;
@@ -5316,6 +5387,14 @@ mod tests {
 
         assert_eq!(supervisor.respawn_count(), 1);
         assert!(supervisor.has_worker());
+        assert_eq!(
+            supervisor
+                .next_request_id()
+                .expect("request id after respawn")
+                .as_u64(),
+            2,
+            "a replacement worker must not reset the supervisor-owned sequence"
+        );
     }
 
     #[test]
@@ -5330,12 +5409,9 @@ mod tests {
                 .expect("ba config"),
             1,
         );
-
-        let mut req_counter = 0;
-
         let (map1, kf_a1, kf_b1) = make_map_with_two_keyframes_one_shared_point();
         let panic1 = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
+            supervisor.next_request_id().expect("first request id"),
             map1,
             kf_a1,
             kf_b1,
@@ -5362,7 +5438,7 @@ mod tests {
 
         let (map2, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
         let panic2 = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
+            supervisor.next_request_id().expect("second request id"),
             map2,
             kf_a2,
             kf_b2,
@@ -5419,15 +5495,11 @@ mod tests {
                 .expect("ba config"),
             2,
         );
-        let mut req_counter = 0;
 
         let (map_panic, kf_a, kf_b) = make_map_with_two_keyframes_one_shared_point();
-        let panic_event = make_forced_panic_event(
-            BackendRequestId::from_counter(&mut req_counter),
-            map_panic,
-            kf_a,
-            kf_b,
-        );
+        let first_request = supervisor.next_request_id().expect("first request id");
+        assert_eq!(first_request.as_u64(), 1);
+        let panic_event = make_forced_panic_event(first_request, map_panic, kf_a, kf_b);
         supervisor.submit(panic_event).expect("submit panic");
 
         let mut saw_panic = false;
@@ -5454,13 +5526,10 @@ mod tests {
 
         let (map_ok, kf_a2, kf_b2) = make_map_with_two_keyframes_one_shared_point();
         let window = BackendWindow::try_new(vec![kf_a2, kf_b2]).expect("window");
-        let ok_event = KeyframeEvent::try_new(
-            BackendRequestId::from_counter(&mut req_counter),
-            kf_b2,
-            window,
-            map_ok,
-        )
-        .expect("event");
+        let second_request = supervisor.next_request_id().expect("second request id");
+        assert_eq!(second_request.as_u64(), 2);
+        let ok_event =
+            KeyframeEvent::try_new(second_request, kf_b2, window, map_ok).expect("event");
         supervisor
             .submit(ok_event)
             .expect("submit event after respawn");
