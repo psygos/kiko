@@ -46,5 +46,9 @@ harness = false
 name = "navigation_planning"
 harness = false
 
+[[bench]]
+name = "navigation_shadow"
+harness = false
+
 [lints]
 workspace = true
