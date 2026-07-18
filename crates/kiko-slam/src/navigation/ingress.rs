@@ -23,12 +23,15 @@ use crate::{
 use super::{GlobalPlanError, MapPoint, PointGoal};
 
 pub const NAVIGATION_INGRESS_STREAM_FILE: &str = "navigation-ingress.v1.bin";
+pub const NAVIGATION_INGRESS_STREAM_FORMAT: &str = "fixed_le";
 pub const NAVIGATION_INGRESS_FORMAT_VERSION: u16 = 1;
+pub const NAVIGATION_INGRESS_HEADER_BYTES: u16 = 48;
+pub const NAVIGATION_INGRESS_RECORD_BYTES: u16 = 112;
 pub const MAX_NAVIGATION_INGRESS_RECORDS: usize = 1_048_576;
 
 const MAGIC: [u8; 8] = *b"KIKONAV\0";
-const HEADER_BYTES: usize = 48;
-const RECORD_BYTES: usize = 112;
+const HEADER_BYTES: usize = NAVIGATION_INGRESS_HEADER_BYTES as usize;
+const RECORD_BYTES: usize = NAVIGATION_INGRESS_RECORD_BYTES as usize;
 const RECORD_PAYLOAD_OFFSET: usize = 16;
 
 const KIND_VISUAL_ATTEMPT: u8 = 1;
@@ -70,6 +73,218 @@ impl std::fmt::Display for NavigationRecordingIdError {
 }
 
 impl std::error::Error for NavigationRecordingIdError {}
+
+/// Clock semantics encoded by every V1 ingress timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationIngressTimebase {
+    RecordingRelativeHostMonotonicNanoseconds,
+}
+
+impl NavigationIngressTimebase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordingRelativeHostMonotonicNanoseconds => {
+                "recording_relative_host_monotonic_ns"
+            }
+        }
+    }
+}
+
+/// Deliberately limited replay claim carried by a V1 ingress sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavigationIngressScope {
+    CoordinatorAdmissionOrderAndPayloadIdentity,
+}
+
+impl NavigationIngressScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CoordinatorAdmissionOrderAndPayloadIdentity => {
+                "coordinator_admission_order_and_payload_identity_only"
+            }
+        }
+    }
+}
+
+/// Finalized, self-consistent metadata for the canonical navigation ingress sidecar.
+///
+/// The fixed path and wire semantics are part of this type rather than caller-selected
+/// strings. The recording ID prevents accidental cross-dataset substitution. Neither it nor
+/// this descriptor provides integrity, authentication, or origin guarantees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NavigationIngressSidecarDescriptor {
+    recording_id: NavigationRecordingId,
+    record_count: u64,
+    byte_len: u64,
+}
+
+impl NavigationIngressSidecarDescriptor {
+    pub const fn recording_id(self) -> NavigationRecordingId {
+        self.recording_id
+    }
+
+    pub const fn relative_path(self) -> &'static str {
+        NAVIGATION_INGRESS_STREAM_FILE
+    }
+
+    pub const fn stream_format(self) -> &'static str {
+        NAVIGATION_INGRESS_STREAM_FORMAT
+    }
+
+    pub const fn format_version(self) -> u16 {
+        NAVIGATION_INGRESS_FORMAT_VERSION
+    }
+
+    pub const fn header_bytes(self) -> u16 {
+        NAVIGATION_INGRESS_HEADER_BYTES
+    }
+
+    pub const fn record_bytes(self) -> u16 {
+        NAVIGATION_INGRESS_RECORD_BYTES
+    }
+
+    pub const fn record_count(self) -> u64 {
+        self.record_count
+    }
+
+    pub const fn byte_len(self) -> u64 {
+        self.byte_len
+    }
+
+    pub const fn timebase(self) -> NavigationIngressTimebase {
+        NavigationIngressTimebase::RecordingRelativeHostMonotonicNanoseconds
+    }
+
+    pub const fn scope(self) -> NavigationIngressScope {
+        NavigationIngressScope::CoordinatorAdmissionOrderAndPayloadIdentity
+    }
+
+    fn from_finalized(
+        recording_id: NavigationRecordingId,
+        record_count: u64,
+        byte_len: u64,
+    ) -> Self {
+        Self {
+            recording_id,
+            record_count,
+            byte_len,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse_manifest_contract(
+        recording_id: NavigationRecordingId,
+        relative_path: &str,
+        stream_format: &str,
+        format_version: u16,
+        header_bytes: u16,
+        record_bytes: u16,
+        record_count: u64,
+        byte_len: u64,
+        timebase: &str,
+        scope: &str,
+    ) -> Result<Self, NavigationIngressSidecarDescriptorError> {
+        if relative_path != NAVIGATION_INGRESS_STREAM_FILE {
+            return Err(NavigationIngressSidecarDescriptorError::UnexpectedPath {
+                actual: relative_path.to_string(),
+            });
+        }
+        if stream_format != NAVIGATION_INGRESS_STREAM_FORMAT {
+            return Err(NavigationIngressSidecarDescriptorError::UnexpectedFormat {
+                actual: stream_format.to_string(),
+            });
+        }
+        if format_version != NAVIGATION_INGRESS_FORMAT_VERSION {
+            return Err(
+                NavigationIngressSidecarDescriptorError::UnsupportedVersion {
+                    expected: NAVIGATION_INGRESS_FORMAT_VERSION,
+                    actual: format_version,
+                },
+            );
+        }
+        if header_bytes != NAVIGATION_INGRESS_HEADER_BYTES {
+            return Err(
+                NavigationIngressSidecarDescriptorError::HeaderLengthMismatch {
+                    expected: NAVIGATION_INGRESS_HEADER_BYTES,
+                    actual: header_bytes,
+                },
+            );
+        }
+        if record_bytes != NAVIGATION_INGRESS_RECORD_BYTES {
+            return Err(
+                NavigationIngressSidecarDescriptorError::RecordLengthMismatch {
+                    expected: NAVIGATION_INGRESS_RECORD_BYTES,
+                    actual: record_bytes,
+                },
+            );
+        }
+        let maximum = u64::try_from(MAX_NAVIGATION_INGRESS_RECORDS)
+            .expect("navigation ingress record limit fits u64");
+        if record_count > maximum {
+            return Err(
+                NavigationIngressSidecarDescriptorError::RecordLimitExceeded {
+                    declared: record_count,
+                    maximum,
+                },
+            );
+        }
+        let expected_byte_len = navigation_ingress_byte_len(record_count)
+            .ok_or(NavigationIngressSidecarDescriptorError::ByteLengthOverflow { record_count })?;
+        if byte_len != expected_byte_len {
+            return Err(
+                NavigationIngressSidecarDescriptorError::ByteLengthMismatch {
+                    declared: byte_len,
+                    expected: expected_byte_len,
+                },
+            );
+        }
+        let expected_timebase =
+            NavigationIngressTimebase::RecordingRelativeHostMonotonicNanoseconds.as_str();
+        if timebase != expected_timebase {
+            return Err(
+                NavigationIngressSidecarDescriptorError::UnexpectedTimebase {
+                    actual: timebase.to_string(),
+                },
+            );
+        }
+        let expected_scope =
+            NavigationIngressScope::CoordinatorAdmissionOrderAndPayloadIdentity.as_str();
+        if scope != expected_scope {
+            return Err(NavigationIngressSidecarDescriptorError::UnexpectedScope {
+                actual: scope.to_string(),
+            });
+        }
+        Ok(Self::from_finalized(recording_id, record_count, byte_len))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NavigationIngressSidecarDescriptorError {
+    UnexpectedPath { actual: String },
+    UnexpectedFormat { actual: String },
+    UnsupportedVersion { expected: u16, actual: u16 },
+    HeaderLengthMismatch { expected: u16, actual: u16 },
+    RecordLengthMismatch { expected: u16, actual: u16 },
+    RecordLimitExceeded { declared: u64, maximum: u64 },
+    ByteLengthOverflow { record_count: u64 },
+    ByteLengthMismatch { declared: u64, expected: u64 },
+    UnexpectedTimebase { actual: String },
+    UnexpectedScope { actual: String },
+}
+
+impl std::fmt::Display for NavigationIngressSidecarDescriptorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid navigation ingress sidecar descriptor: {self:?}")
+    }
+}
+
+impl std::error::Error for NavigationIngressSidecarDescriptorError {}
+
+fn navigation_ingress_byte_len(record_count: u64) -> Option<u64> {
+    record_count
+        .checked_mul(u64::from(NAVIGATION_INGRESS_RECORD_BYTES))
+        .and_then(|records| records.checked_add(u64::from(NAVIGATION_INGRESS_HEADER_BYTES)))
+}
 
 /// Nanoseconds elapsed since one live navigation recording origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -1211,6 +1426,27 @@ pub struct NavigationIngressWriter<W> {
     poisoned: bool,
 }
 
+/// Successful stream finalization paired with the only descriptor that can bind it.
+#[derive(Debug)]
+pub struct FinalizedNavigationIngress<W> {
+    inner: W,
+    descriptor: NavigationIngressSidecarDescriptor,
+}
+
+impl<W> FinalizedNavigationIngress<W> {
+    pub fn descriptor(&self) -> NavigationIngressSidecarDescriptor {
+        self.descriptor
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
+    pub fn into_parts(self) -> (W, NavigationIngressSidecarDescriptor) {
+        (self.inner, self.descriptor)
+    }
+}
+
 impl<W: Write + Seek> NavigationIngressWriter<W> {
     pub fn new(
         mut inner: W,
@@ -1326,7 +1562,15 @@ impl<W: Write + Seek> NavigationIngressWriter<W> {
     }
 
     /// Publish the final record count and return the underlying stream.
-    pub fn finish(mut self) -> Result<W, NavigationIngressStreamWriteError> {
+    pub fn finish(self) -> Result<W, NavigationIngressStreamWriteError> {
+        self.finish_with_descriptor()
+            .map(FinalizedNavigationIngress::into_inner)
+    }
+
+    /// Publish the final record count and return its canonical dataset descriptor.
+    pub fn finish_with_descriptor(
+        mut self,
+    ) -> Result<FinalizedNavigationIngress<W>, NavigationIngressStreamWriteError> {
         if self.poisoned {
             return Err(NavigationIngressStreamWriteError::Poisoned);
         }
@@ -1408,7 +1652,15 @@ impl<W: Write + Seek> NavigationIngressWriter<W> {
             }
             (Ok(_), Ok(_)) => {}
         }
-        Ok(self.inner)
+        let descriptor = NavigationIngressSidecarDescriptor::from_finalized(
+            self.recording_id,
+            record_count,
+            expected_end,
+        );
+        Ok(FinalizedNavigationIngress {
+            inner: self.inner,
+            descriptor,
+        })
     }
 }
 
@@ -3304,7 +3556,28 @@ mod tests {
         }
         assert_eq!(writer.recording_id(), recording_id(1));
         assert_eq!(writer.record_count(), events.len());
-        let bytes = writer.finish().expect("finish").into_inner();
+        let finalized = writer.finish_with_descriptor().expect("finish");
+        let descriptor = finalized.descriptor();
+        assert_eq!(descriptor.recording_id(), recording_id(1));
+        assert_eq!(descriptor.relative_path(), NAVIGATION_INGRESS_STREAM_FILE);
+        assert_eq!(descriptor.stream_format(), NAVIGATION_INGRESS_STREAM_FORMAT);
+        assert_eq!(
+            descriptor.format_version(),
+            NAVIGATION_INGRESS_FORMAT_VERSION
+        );
+        assert_eq!(descriptor.header_bytes(), NAVIGATION_INGRESS_HEADER_BYTES);
+        assert_eq!(descriptor.record_bytes(), NAVIGATION_INGRESS_RECORD_BYTES);
+        assert_eq!(descriptor.record_count(), events.len() as u64);
+        assert_eq!(
+            descriptor.timebase(),
+            NavigationIngressTimebase::RecordingRelativeHostMonotonicNanoseconds
+        );
+        assert_eq!(
+            descriptor.scope(),
+            NavigationIngressScope::CoordinatorAdmissionOrderAndPayloadIdentity
+        );
+        let bytes = finalized.into_inner().into_inner();
+        assert_eq!(descriptor.byte_len(), bytes.len() as u64);
         assert_eq!(get_u64(&bytes, 16), events.len() as u64);
         assert_eq!(&bytes[24..40], &recording_id(1).into_bytes());
         assert_eq!(bytes.len(), HEADER_BYTES + events.len() * RECORD_BYTES);

@@ -13,6 +13,11 @@ use crate::inertial::{
     InertialSensorKind, InertialValueError, OakImuAcceleration, OakImuAngularVelocity,
     SensorAccuracy,
 };
+use crate::navigation::{
+    MAX_NAVIGATION_INGRESS_RECORDS, NavigationIngressCapacity, NavigationIngressReader,
+    NavigationIngressSidecarDescriptor, NavigationIngressSidecarDescriptorError,
+    NavigationIngressStreamReadError, NavigationRecordingId, NavigationRecordingIdError,
+};
 use crate::triangulation::{
     RectifiedStereo, RectifiedStereoConfig, RectifiedStereoError, StereoBaselineError,
     StereoBaselineMeters, StereoCalibration, StereoCameraSide,
@@ -1487,6 +1492,36 @@ pub enum DatasetError {
     InvalidImuFileType {
         path: PathBuf,
     },
+    NavigationIngressTimingUnavailable,
+    InvalidNavigationRecordingId {
+        source: NavigationRecordingIdError,
+    },
+    InvalidNavigationIngressDescriptor {
+        source: NavigationIngressSidecarDescriptorError,
+    },
+    InvalidNavigationIngressPath {
+        path: PathBuf,
+        reason: &'static str,
+    },
+    NavigationIngressSidecarSymlink {
+        path: PathBuf,
+    },
+    InvalidNavigationIngressFileType {
+        path: PathBuf,
+    },
+    NavigationIngressByteLengthMismatch {
+        path: PathBuf,
+        expected: u64,
+        actual: u64,
+    },
+    InvalidNavigationIngressStream {
+        path: PathBuf,
+        source: NavigationIngressStreamReadError,
+    },
+    NavigationIngressRecordCountMismatch {
+        descriptor: u64,
+        header: usize,
+    },
     SidecarChanged {
         path: PathBuf,
     },
@@ -1760,6 +1795,48 @@ impl std::fmt::Display for DatasetError {
                 "dataset IMU stream path is not a regular file: {}",
                 path.display()
             ),
+            DatasetError::NavigationIngressTimingUnavailable => f.write_str(
+                "dataset has no bound navigation ingress sidecar; coordinator timing is unavailable",
+            ),
+            DatasetError::InvalidNavigationRecordingId { source } => {
+                write!(f, "invalid dataset navigation recording ID: {source}")
+            }
+            DatasetError::InvalidNavigationIngressDescriptor { source } => {
+                write!(f, "invalid dataset navigation ingress descriptor: {source}")
+            }
+            DatasetError::InvalidNavigationIngressPath { path, reason } => write!(
+                f,
+                "invalid dataset navigation ingress path {}: {reason}",
+                path.display()
+            ),
+            DatasetError::NavigationIngressSidecarSymlink { path } => write!(
+                f,
+                "dataset navigation ingress sidecar must not be a symbolic link: {}",
+                path.display()
+            ),
+            DatasetError::InvalidNavigationIngressFileType { path } => write!(
+                f,
+                "dataset navigation ingress sidecar is not a regular file: {}",
+                path.display()
+            ),
+            DatasetError::NavigationIngressByteLengthMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "dataset navigation ingress sidecar length mismatch at {}: expected {expected} bytes, got {actual}",
+                path.display()
+            ),
+            DatasetError::InvalidNavigationIngressStream { path, source } => write!(
+                f,
+                "invalid dataset navigation ingress stream at {}: {source}",
+                path.display()
+            ),
+            DatasetError::NavigationIngressRecordCountMismatch { descriptor, header } => write!(
+                f,
+                "dataset navigation ingress record count mismatch: descriptor={descriptor}, header={header}"
+            ),
             DatasetError::SidecarChanged { path } => write!(
                 f,
                 "dataset sidecar changed after writer creation: {}",
@@ -1971,6 +2048,9 @@ impl std::error::Error for DatasetError {
             DatasetError::InvalidFrameData { source, .. } => Some(source),
             DatasetError::InvalidDepthData { source, .. } => Some(source),
             DatasetError::InvalidImuStream { source, .. } => Some(source),
+            DatasetError::InvalidNavigationRecordingId { source } => Some(source),
+            DatasetError::InvalidNavigationIngressDescriptor { source } => Some(source),
+            DatasetError::InvalidNavigationIngressStream { source, .. } => Some(source),
             DatasetError::InvalidCameraIntrinsics { source, .. } => Some(source),
             DatasetError::InvalidStereoBaseline { source } => Some(source),
             DatasetError::WriteContract { source } => Some(source),
@@ -1997,6 +2077,12 @@ impl std::error::Error for DatasetError {
             | DatasetError::LegacyImuManifestUnindexed
             | DatasetError::ManifestImuStreamWithoutMetadata
             | DatasetError::InvalidImuFileType { .. }
+            | DatasetError::NavigationIngressTimingUnavailable
+            | DatasetError::InvalidNavigationIngressPath { .. }
+            | DatasetError::NavigationIngressSidecarSymlink { .. }
+            | DatasetError::InvalidNavigationIngressFileType { .. }
+            | DatasetError::NavigationIngressByteLengthMismatch { .. }
+            | DatasetError::NavigationIngressRecordCountMismatch { .. }
             | DatasetError::SidecarChanged { .. }
             | DatasetError::InvalidFrameFileType { .. }
             | DatasetError::InvalidFrameLength { .. }
@@ -2491,7 +2577,26 @@ impl PairedDatasetWriter {
 
 impl DatasetWriterHandle {
     /// Blocks until the writer thread exits; all writer clones must be dropped first.
-    pub fn finish(mut self) -> Result<WriterStats, DatasetError> {
+    pub fn finish(self) -> Result<WriterStats, DatasetError> {
+        self.finish_internal(None)
+    }
+
+    /// Finalize the dataset and atomically bind one already-finalized navigation journal.
+    ///
+    /// The sidecar is fully revalidated before the completion manifest is published. Its
+    /// recording ID is an accidental-substitution guard, not an integrity or authentication
+    /// mechanism.
+    pub fn finish_with_navigation_ingress(
+        self,
+        descriptor: NavigationIngressSidecarDescriptor,
+    ) -> Result<WriterStats, DatasetError> {
+        self.finish_internal(Some(descriptor))
+    }
+
+    fn finish_internal(
+        mut self,
+        navigation_ingress: Option<NavigationIngressSidecarDescriptor>,
+    ) -> Result<WriterStats, DatasetError> {
         let Some(handle) = self.handle.take() else {
             return Err(DatasetError::InvalidConfig {
                 msg: "finish called twice",
@@ -2505,7 +2610,7 @@ impl DatasetWriterHandle {
             return Err(err);
         }
 
-        write_manifest(&self.state)?;
+        write_manifest(&self.state, navigation_ingress)?;
         Ok(self.state.stats())
     }
 
@@ -3168,6 +3273,103 @@ fn validate_payload_file(path: &Path, expected: u64) -> Result<(), DatasetError>
     Ok(())
 }
 
+fn open_validated_navigation_ingress_sidecar(
+    dataset_dir: &Path,
+    descriptor: NavigationIngressSidecarDescriptor,
+    capacity: NavigationIngressCapacity,
+) -> Result<
+    (
+        PathBuf,
+        NavigationIngressReader<std::io::BufReader<std::fs::File>>,
+    ),
+    DatasetError,
+> {
+    let root = std::fs::canonicalize(dataset_dir).map_err(|source| DatasetError::ReadFile {
+        path: dataset_dir.to_path_buf(),
+        source,
+    })?;
+    let candidate = root.join(descriptor.relative_path());
+    let link_metadata =
+        std::fs::symlink_metadata(&candidate).map_err(|source| DatasetError::ReadFile {
+            path: candidate.clone(),
+            source,
+        })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(DatasetError::NavigationIngressSidecarSymlink { path: candidate });
+    }
+    if !link_metadata.file_type().is_file() {
+        return Err(DatasetError::InvalidNavigationIngressFileType { path: candidate });
+    }
+
+    let resolved = std::fs::canonicalize(&candidate).map_err(|source| DatasetError::ReadFile {
+        path: candidate.clone(),
+        source,
+    })?;
+    if !resolved.starts_with(&root) {
+        return Err(DatasetError::InvalidNavigationIngressPath {
+            path: candidate,
+            reason: "resolved sidecar path escapes the dataset root",
+        });
+    }
+    if resolved != candidate {
+        return Err(DatasetError::InvalidNavigationIngressPath {
+            path: candidate,
+            reason: "sidecar path must be the canonical root-level payload",
+        });
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        // Linux and macOS reject a symlink substituted between the checks above and `open`.
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&resolved)
+        .map_err(|source| DatasetError::ReadFile {
+            path: resolved.clone(),
+            source,
+        })?;
+    let metadata = file.metadata().map_err(|source| DatasetError::ReadFile {
+        path: resolved.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(DatasetError::InvalidNavigationIngressFileType { path: resolved });
+    }
+    let actual = metadata.len();
+    let expected = descriptor.byte_len();
+    if actual != expected {
+        return Err(DatasetError::NavigationIngressByteLengthMismatch {
+            path: resolved,
+            expected,
+            actual,
+        });
+    }
+
+    let reader = NavigationIngressReader::new(
+        std::io::BufReader::new(file),
+        descriptor.recording_id(),
+        capacity,
+    )
+    .map_err(|source| DatasetError::InvalidNavigationIngressStream {
+        path: resolved.clone(),
+        source,
+    })?;
+    let header_count = u64::try_from(reader.declared_count())
+        .expect("bounded navigation ingress count always fits u64");
+    if header_count != descriptor.record_count() {
+        return Err(DatasetError::NavigationIngressRecordCountMismatch {
+            descriptor: descriptor.record_count(),
+            header: reader.declared_count(),
+        });
+    }
+    Ok((resolved, reader))
+}
+
 fn publish_manifest(dataset_dir: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
     const TEMP_FILE: &str = ".manifest.json.tmp";
 
@@ -3238,6 +3440,58 @@ struct Manifest {
     /// `None` preserves manifests written before fixed-record IMU replay existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     imu_stream: Option<ManifestImuStream>,
+    /// Absent only when coordinator timing was not recorded and is therefore unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    navigation_ingress: Option<ManifestNavigationIngress>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ManifestNavigationIngress {
+    recording_id: [u8; 16],
+    path: String,
+    format: String,
+    version: u16,
+    header_bytes: u16,
+    record_bytes: u16,
+    record_count: u64,
+    byte_len: u64,
+    timebase: String,
+    scope: String,
+}
+
+impl ManifestNavigationIngress {
+    fn from_descriptor(descriptor: NavigationIngressSidecarDescriptor) -> Self {
+        Self {
+            recording_id: descriptor.recording_id().into_bytes(),
+            path: descriptor.relative_path().to_string(),
+            format: descriptor.stream_format().to_string(),
+            version: descriptor.format_version(),
+            header_bytes: descriptor.header_bytes(),
+            record_bytes: descriptor.record_bytes(),
+            record_count: descriptor.record_count(),
+            byte_len: descriptor.byte_len(),
+            timebase: descriptor.timebase().as_str().to_string(),
+            scope: descriptor.scope().as_str().to_string(),
+        }
+    }
+
+    fn parse(self) -> Result<NavigationIngressSidecarDescriptor, DatasetError> {
+        let recording_id = NavigationRecordingId::try_new(self.recording_id)
+            .map_err(|source| DatasetError::InvalidNavigationRecordingId { source })?;
+        NavigationIngressSidecarDescriptor::parse_manifest_contract(
+            recording_id,
+            &self.path,
+            &self.format,
+            self.version,
+            self.header_bytes,
+            self.record_bytes,
+            self.record_count,
+            self.byte_len,
+            &self.timebase,
+            &self.scope,
+        )
+        .map_err(|source| DatasetError::InvalidNavigationIngressDescriptor { source })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3524,8 +3778,31 @@ struct FrameSet {
     size_mismatch: u64,
 }
 
-fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
+fn write_manifest(
+    state: &WriterState,
+    navigation_ingress: Option<NavigationIngressSidecarDescriptor>,
+) -> Result<(), DatasetError> {
     state.sidecars.require_unchanged(&state.dataset_dir)?;
+    let navigation_ingress = navigation_ingress
+        .map(|descriptor| {
+            let capacity = NavigationIngressCapacity::try_new(MAX_NAVIGATION_INGRESS_RECORDS)
+                .expect("navigation ingress maximum is a valid nonzero capacity");
+            let (path, mut reader) = open_validated_navigation_ingress_sidecar(
+                &state.dataset_dir,
+                descriptor,
+                capacity,
+            )?;
+            while reader
+                .next_record()
+                .map_err(|source| DatasetError::InvalidNavigationIngressStream {
+                    path: path.clone(),
+                    source,
+                })?
+                .is_some()
+            {}
+            Ok::<_, DatasetError>(ManifestNavigationIngress::from_descriptor(descriptor))
+        })
+        .transpose()?;
     let contract = &state.dataset_contract;
     let mono = contract.mono;
     let dimensions = mono.dimensions();
@@ -3618,6 +3895,7 @@ fn write_manifest(state: &WriterState) -> Result<(), DatasetError> {
         entries: topology.entries,
         depth_entries,
         imu_stream,
+        navigation_ingress,
     };
 
     let bytes =
@@ -4136,6 +4414,11 @@ fn dataset_id(dataset_dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::navigation::{
+        ControlTickIngress, NAVIGATION_INGRESS_STREAM_FILE, NavigationClockEpoch,
+        NavigationIngressEvent, NavigationIngressParseError, NavigationIngressStreamReadError,
+        NavigationIngressWriter,
+    };
     use crate::{
         FrameId, RectifiedStereo, RectifiedStereoCompatibilityError, RectifiedStereoConfig,
         Timestamp,
@@ -4242,6 +4525,77 @@ mod tests {
     fn unique_dataset_path(test_name: &str) -> PathBuf {
         let id = NEXT_PATH_ID.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("kiko-slam-{test_name}-{}-{id}", std::process::id()))
+    }
+
+    fn navigation_recording_id(seed: u8) -> NavigationRecordingId {
+        NavigationRecordingId::try_new([seed; 16]).expect("nonzero navigation recording ID")
+    }
+
+    fn navigation_capacity(value: usize) -> NavigationIngressCapacity {
+        NavigationIngressCapacity::try_new(value).expect("valid navigation ingress capacity")
+    }
+
+    fn write_navigation_ingress_sidecar(
+        dataset_path: &Path,
+        recording_id: NavigationRecordingId,
+    ) -> NavigationIngressSidecarDescriptor {
+        let path = dataset_path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create navigation ingress sidecar");
+        let mut writer = NavigationIngressWriter::new(file, recording_id, navigation_capacity(4))
+            .expect("start navigation ingress writer");
+        let clock = NavigationClockEpoch::new(HostMonotonicTimestamp::from_nanos(100));
+        let tick = ControlTickIngress::parse(clock, HostMonotonicTimestamp::from_nanos(125))
+            .expect("recording-relative control tick");
+        writer
+            .append(NavigationIngressEvent::ControlTick(tick))
+            .expect("append control tick");
+        let finalized = writer
+            .finish_with_descriptor()
+            .expect("finalize navigation ingress sidecar");
+        let (file, descriptor) = finalized.into_parts();
+        file.sync_all().expect("sync finalized navigation sidecar");
+        drop(file);
+        descriptor
+    }
+
+    fn navigation_dataset_fixture(
+        test_name: &str,
+        recording_seed: u8,
+    ) -> (
+        PathBuf,
+        DatasetWriter,
+        DatasetWriterHandle,
+        NavigationIngressSidecarDescriptor,
+    ) {
+        let path = unique_dataset_path(test_name);
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        let descriptor =
+            write_navigation_ingress_sidecar(&path, navigation_recording_id(recording_seed));
+        (path, writer, handle, descriptor)
+    }
+
+    fn finalized_navigation_dataset(
+        test_name: &str,
+        recording_seed: u8,
+    ) -> (PathBuf, NavigationIngressSidecarDescriptor) {
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture(test_name, recording_seed);
+        drop(writer);
+        handle
+            .finish_with_navigation_ingress(descriptor)
+            .expect("finalize dataset with navigation ingress sidecar");
+        (path, descriptor)
+    }
+
+    fn assert_no_completion_manifest(path: &Path) {
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        assert!(!path.join(".manifest.json.tmp").exists());
     }
 
     fn meta() -> Meta {
@@ -8055,5 +8409,344 @@ mod tests {
         assert_eq!(spool.queue.len(), 1);
         assert_eq!(spool.frames, 1);
         assert_eq!(spool.bytes, usize::from(IMU_STREAM_RECORD_BYTES));
+    }
+
+    #[test]
+    fn navigation_ingress_sidecar_round_trips_and_legacy_timing_is_explicit() {
+        let (path, descriptor) = finalized_navigation_dataset("navigation-roundtrip", 7);
+        let manifest_bytes =
+            std::fs::read(path.join(format::MANIFEST_FILE)).expect("read bound manifest");
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).expect("parse bound manifest");
+        let binding = manifest
+            .navigation_ingress
+            .expect("manifest binds navigation ingress");
+        assert_eq!(binding.recording_id, [7; 16]);
+        assert_eq!(binding.path, descriptor.relative_path());
+        assert_eq!(binding.format, descriptor.stream_format());
+        assert_eq!(binding.version, descriptor.format_version());
+        assert_eq!(binding.header_bytes, descriptor.header_bytes());
+        assert_eq!(binding.record_bytes, descriptor.record_bytes());
+        assert_eq!(binding.record_count, 1);
+        assert_eq!(binding.byte_len, descriptor.byte_len());
+        assert_eq!(binding.timebase, descriptor.timebase().as_str());
+        assert_eq!(binding.scope, descriptor.scope().as_str());
+        assert_eq!(binding.parse().expect("parse manifest binding"), descriptor);
+
+        let reader = DatasetReader::open(&path).expect("open bound dataset");
+        assert_eq!(
+            reader
+                .navigation_ingress_descriptor()
+                .expect("bound descriptor"),
+            descriptor
+        );
+        let mut ingress = reader
+            .navigation_ingress_reader(navigation_capacity(4))
+            .expect("open bounded navigation ingress reader");
+        assert_eq!(ingress.recording_id(), descriptor.recording_id());
+        assert_eq!(ingress.declared_count(), 1);
+        let record = ingress
+            .next_record()
+            .expect("read control tick")
+            .expect("one control tick");
+        match record.event() {
+            NavigationIngressEvent::ControlTick(tick) => {
+                assert_eq!(tick.offset().as_nanos(), 25);
+            }
+            event => panic!("expected control tick, got {event:?}"),
+        }
+        assert!(
+            ingress
+                .next_record()
+                .expect("verify exact navigation ingress EOF")
+                .is_none()
+        );
+        drop(ingress);
+
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let original_sidecar = std::fs::read(&sidecar_path).expect("read sidecar for reopen check");
+        let mut suffixed = original_sidecar.clone();
+        suffixed.push(0);
+        std::fs::write(&sidecar_path, suffixed).expect("append sidecar after dataset open");
+        assert!(matches!(
+            reader
+                .navigation_ingress_reader(navigation_capacity(4))
+                .expect_err("reopen must revalidate sidecar length"),
+            DatasetError::NavigationIngressByteLengthMismatch { .. }
+        ));
+        std::fs::write(&sidecar_path, original_sidecar).expect("restore valid sidecar");
+        reader
+            .navigation_ingress_reader(navigation_capacity(4))
+            .expect("restored sidecar reopens");
+        std::fs::remove_dir_all(path).expect("remove navigation roundtrip fixture");
+
+        let legacy_path = unique_dataset_path("navigation-legacy");
+        let (legacy_writer, legacy_handle) =
+            DatasetWriter::create(&legacy_path, &meta(), &calibration())
+                .expect("create legacy-style dataset");
+        drop(legacy_writer);
+        legacy_handle
+            .finish()
+            .expect("finalize dataset without navigation timing");
+        let legacy_manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(legacy_path.join(format::MANIFEST_FILE)).expect("read legacy manifest"),
+        )
+        .expect("parse legacy manifest");
+        assert!(legacy_manifest.get("navigation_ingress").is_none());
+        let legacy_reader = DatasetReader::open(&legacy_path).expect("open legacy dataset");
+        assert!(matches!(
+            legacy_reader.navigation_ingress_descriptor(),
+            Err(DatasetError::NavigationIngressTimingUnavailable)
+        ));
+        assert!(matches!(
+            legacy_reader.navigation_ingress_reader(navigation_capacity(1)),
+            Err(DatasetError::NavigationIngressTimingUnavailable)
+        ));
+        std::fs::remove_dir_all(legacy_path).expect("remove navigation legacy fixture");
+    }
+
+    #[test]
+    fn navigation_ingress_validation_failures_do_not_publish_completion_manifest() {
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-wrong-recording-id", 1);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let mut bytes = std::fs::read(&sidecar_path).expect("read navigation sidecar");
+        bytes[24..40].copy_from_slice(&navigation_recording_id(2).into_bytes());
+        std::fs::write(&sidecar_path, bytes).expect("substitute header recording ID");
+        drop(writer);
+        let error = handle
+            .finish_with_navigation_ingress(descriptor)
+            .expect_err("wrong header identity must fail finalization");
+        assert!(matches!(
+            error,
+            DatasetError::InvalidNavigationIngressStream {
+                source: NavigationIngressStreamReadError::Parse(
+                    NavigationIngressParseError::RecordingIdMismatch { expected, actual }
+                ),
+                ..
+            } if expected == navigation_recording_id(1) && actual == navigation_recording_id(2)
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove wrong-ID fixture");
+
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-wrong-version", 8);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let mut bytes = std::fs::read(&sidecar_path).expect("read navigation sidecar");
+        bytes[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        std::fs::write(&sidecar_path, bytes).expect("substitute header version");
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish_with_navigation_ingress(descriptor)
+                .expect_err("wrong header version must fail finalization"),
+            DatasetError::InvalidNavigationIngressStream {
+                source: NavigationIngressStreamReadError::Parse(
+                    NavigationIngressParseError::UnsupportedVersion {
+                        expected: 1,
+                        actual: 2
+                    }
+                ),
+                ..
+            }
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove wrong-version fixture");
+
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-wrong-record-count", 9);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let mut bytes = std::fs::read(&sidecar_path).expect("read navigation sidecar");
+        bytes[16..24].copy_from_slice(&0_u64.to_le_bytes());
+        std::fs::write(&sidecar_path, bytes).expect("substitute header record count");
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish_with_navigation_ingress(descriptor)
+                .expect_err("wrong header count must fail finalization"),
+            DatasetError::NavigationIngressRecordCountMismatch {
+                descriptor: 1,
+                header: 0
+            }
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove wrong-count fixture");
+
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-corrupt-record", 10);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let mut bytes = std::fs::read(&sidecar_path).expect("read navigation sidecar");
+        bytes[usize::from(descriptor.header_bytes()) + 9] = 1;
+        std::fs::write(&sidecar_path, bytes).expect("corrupt reserved record byte");
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish_with_navigation_ingress(descriptor)
+                .expect_err("corrupt record must fail finalization"),
+            DatasetError::InvalidNavigationIngressStream {
+                source: NavigationIngressStreamReadError::Parse(
+                    NavigationIngressParseError::NonZeroReservedRecord { record_index: 0 }
+                ),
+                ..
+            }
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove corrupt-record fixture");
+
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-truncated", 3);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar_path)
+            .expect("open sidecar for truncation")
+            .set_len(descriptor.byte_len() - 1)
+            .expect("truncate sidecar");
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish_with_navigation_ingress(descriptor)
+                .expect_err("truncated sidecar must fail finalization"),
+            DatasetError::NavigationIngressByteLengthMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == descriptor.byte_len() && actual == descriptor.byte_len() - 1
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove truncated fixture");
+
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-suffixed", 4);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&sidecar_path)
+            .expect("open sidecar for suffix")
+            .write_all(&[0])
+            .expect("suffix sidecar");
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish_with_navigation_ingress(descriptor)
+                .expect_err("suffixed sidecar must fail finalization"),
+            DatasetError::NavigationIngressByteLengthMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == descriptor.byte_len() && actual == descriptor.byte_len() + 1
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove suffixed fixture");
+    }
+
+    #[test]
+    fn navigation_ingress_manifest_and_header_mismatches_are_typed() {
+        let (path, descriptor) = finalized_navigation_dataset("navigation-mismatch", 5);
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original_manifest = std::fs::read(&manifest_path).expect("read valid manifest");
+
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&original_manifest).expect("parse valid manifest");
+        manifest["navigation_ingress"]["path"] =
+            serde_json::Value::String("../navigation-ingress.v1.bin".to_string());
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize traversal manifest"),
+        )
+        .expect("write traversal manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("traversal path must be rejected"),
+            DatasetError::InvalidNavigationIngressDescriptor {
+                source: NavigationIngressSidecarDescriptorError::UnexpectedPath { actual }
+            } if actual == "../navigation-ingress.v1.bin"
+        ));
+
+        std::fs::write(&manifest_path, &original_manifest).expect("restore valid manifest");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&original_manifest).expect("parse valid manifest");
+        manifest["navigation_ingress"]["recording_id"] =
+            serde_json::to_value([0_u8; 16]).expect("serialize zero recording ID");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize zero-ID manifest"),
+        )
+        .expect("write zero-ID manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("zero recording ID must be rejected"),
+            DatasetError::InvalidNavigationRecordingId { .. }
+        ));
+        std::fs::write(&manifest_path, &original_manifest).expect("restore valid manifest");
+
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let original_sidecar = std::fs::read(&sidecar_path).expect("read valid sidecar");
+        let mut wrong_version = original_sidecar.clone();
+        wrong_version[8..10].copy_from_slice(&2_u16.to_le_bytes());
+        std::fs::write(&sidecar_path, wrong_version).expect("write wrong header version");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("wrong header version must be rejected"),
+            DatasetError::InvalidNavigationIngressStream {
+                source: NavigationIngressStreamReadError::Parse(
+                    NavigationIngressParseError::UnsupportedVersion {
+                        expected: 1,
+                        actual: 2
+                    }
+                ),
+                ..
+            }
+        ));
+
+        let mut wrong_count = original_sidecar.clone();
+        wrong_count[16..24].copy_from_slice(&0_u64.to_le_bytes());
+        std::fs::write(&sidecar_path, wrong_count).expect("write wrong header count");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("wrong header count must be rejected"),
+            DatasetError::NavigationIngressRecordCountMismatch {
+                descriptor: 1,
+                header: 0
+            }
+        ));
+
+        std::fs::write(&sidecar_path, &original_sidecar).expect("restore valid sidecar");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar_path)
+            .expect("open sidecar for reader truncation")
+            .set_len(descriptor.byte_len() - 1)
+            .expect("truncate sidecar after publication");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("reader must reject truncated sidecar"),
+            DatasetError::NavigationIngressByteLengthMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == descriptor.byte_len() && actual == descriptor.byte_len() - 1
+        ));
+
+        std::fs::write(&sidecar_path, original_sidecar).expect("restore sidecar after truncation");
+        DatasetReader::open(&path).expect("fully restored dataset opens");
+        std::fs::remove_dir_all(path).expect("remove mismatch fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn navigation_ingress_symlink_is_rejected_before_manifest_publication() {
+        use std::os::unix::fs::symlink;
+
+        let (path, writer, handle, descriptor) =
+            navigation_dataset_fixture("navigation-symlink", 6);
+        let sidecar_path = path.join(NAVIGATION_INGRESS_STREAM_FILE);
+        let target_name = "navigation-ingress-target.bin";
+        std::fs::rename(&sidecar_path, path.join(target_name)).expect("rename sidecar to target");
+        symlink(target_name, &sidecar_path).expect("create sidecar symlink");
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish_with_navigation_ingress(descriptor)
+                .expect_err("symlink sidecar must fail finalization"),
+            DatasetError::NavigationIngressSidecarSymlink { .. }
+        ));
+        assert_no_completion_manifest(&path);
+        std::fs::remove_dir_all(path).expect("remove symlink fixture");
     }
 }

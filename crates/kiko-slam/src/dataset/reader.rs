@@ -4,6 +4,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::navigation::{
+    MAX_NAVIGATION_INGRESS_RECORDS, NavigationIngressCapacity, NavigationIngressReader,
+    NavigationIngressSidecarDescriptor,
+};
 use crate::{
     DepthImage, DeviceSessionId, Frame, FrameId, ImuEvent, ImuReport, InertialOrderTracker,
     PairingWindowNs, SensorId, StereoCalibration, StereoPair, Timestamp,
@@ -18,8 +22,9 @@ use super::{
     ManifestHeader, ManifestImuExtrinsic, ManifestImuStream, ManifestPairing,
     ManifestPairingPolicy, ManifestStats, MonoImageContract, MonoPayloadFormat, PairReason,
     ParsedMonoContract, build_delta_stats, decode_imu_header, format, imu_stream_byte_len,
-    map_inertial_order_error, parse_image_dimensions, read_calibration, read_manifest, read_meta,
-    sensor_to_str, validate_depth_manifest_frame_ids, validate_stereo_manifest_frame_ids,
+    map_inertial_order_error, open_validated_navigation_ingress_sidecar, parse_image_dimensions,
+    read_calibration, read_manifest, read_meta, sensor_to_str, validate_depth_manifest_frame_ids,
+    validate_stereo_manifest_frame_ids,
 };
 
 #[derive(Clone, Debug)]
@@ -83,11 +88,18 @@ struct ImuStreamDescriptor {
     byte_len: u64,
 }
 
+#[derive(Clone, Debug)]
+struct NavigationIngressStreamDescriptor {
+    path: PathBuf,
+    descriptor: NavigationIngressSidecarDescriptor,
+}
+
 #[derive(Debug)]
 struct ParsedManifest {
     entries: Vec<DatasetEntry>,
     depth: ParsedDepthStream,
     imu: ParsedImuStream,
+    navigation_ingress: Option<NavigationIngressStreamDescriptor>,
     stats: DatasetStats,
 }
 
@@ -179,6 +191,7 @@ pub struct DatasetReader {
     entries: Vec<DatasetEntry>,
     depth: ParsedDepthStream,
     imu: ParsedImuStream,
+    navigation_ingress: Option<NavigationIngressStreamDescriptor>,
     depth_projection: Option<super::DepthProjectionContract>,
     stats: DatasetStats,
     left_seq: u64,
@@ -222,6 +235,7 @@ impl DatasetReader {
             entries: parsed.entries,
             depth: parsed.depth,
             imu: parsed.imu,
+            navigation_ingress: parsed.navigation_ingress,
             depth_projection,
             stats: parsed.stats,
             left_seq: 0,
@@ -285,6 +299,46 @@ impl DatasetReader {
             ParsedImuStream::LegacyUnindexed => Err(DatasetError::LegacyImuManifestUnindexed),
             ParsedImuStream::Indexed(stream) => DatasetImuReportCursor::open(stream),
         }
+    }
+
+    /// Return the exact manifest-bound navigation timing descriptor.
+    ///
+    /// Legacy datasets return a typed unavailable error; timestamps are never synthesized.
+    pub fn navigation_ingress_descriptor(
+        &self,
+    ) -> Result<NavigationIngressSidecarDescriptor, DatasetError> {
+        self.navigation_ingress
+            .as_ref()
+            .map(|stream| stream.descriptor)
+            .ok_or(DatasetError::NavigationIngressTimingUnavailable)
+    }
+
+    /// Reopen and revalidate the manifest-bound journal with a caller-selected memory bound.
+    pub fn navigation_ingress_reader(
+        &self,
+        capacity: NavigationIngressCapacity,
+    ) -> Result<NavigationIngressReader<BufReader<std::fs::File>>, DatasetError> {
+        let stream = self
+            .navigation_ingress
+            .as_ref()
+            .ok_or(DatasetError::NavigationIngressTimingUnavailable)?;
+        let root =
+            stream
+                .path
+                .parent()
+                .ok_or_else(|| DatasetError::InvalidNavigationIngressPath {
+                    path: stream.path.clone(),
+                    reason: "canonical sidecar has no dataset parent",
+                })?;
+        let (path, reader) =
+            open_validated_navigation_ingress_sidecar(root, stream.descriptor, capacity)?;
+        if path != stream.path {
+            return Err(DatasetError::InvalidNavigationIngressPath {
+                path,
+                reason: "reopened sidecar no longer resolves to its parsed dataset path",
+            });
+        }
+        Ok(reader)
     }
 
     pub fn pairs(&mut self) -> DatasetPairs<'_> {
@@ -884,6 +938,7 @@ fn parse_manifest(
         entries,
         depth_entries,
         imu_stream,
+        navigation_ingress,
         ..
     } = manifest;
     validate_stereo_manifest_timestamp_order(&entries)?;
@@ -970,6 +1025,7 @@ fn parse_manifest(
 
     let depth = parse_depth_stream(root, contract.depth, depth_entries, &mut seen_paths)?;
     let imu = parse_imu_stream(root, contract.imu_nominal_rate_hz, imu_stream)?;
+    let navigation_ingress = parse_navigation_ingress_stream(root, navigation_ingress)?;
 
     let derived_delta_stats = build_delta_stats(&paired_deltas);
     validate_manifest_delta_stats(stats.delta_stats.as_ref(), derived_delta_stats.as_ref())?;
@@ -983,8 +1039,23 @@ fn parse_manifest(
         entries: parsed_entries,
         depth,
         imu,
+        navigation_ingress,
         stats,
     })
+}
+
+fn parse_navigation_ingress_stream(
+    root: &Path,
+    manifest: Option<super::ManifestNavigationIngress>,
+) -> Result<Option<NavigationIngressStreamDescriptor>, DatasetError> {
+    let Some(manifest) = manifest else {
+        return Ok(None);
+    };
+    let descriptor = manifest.parse()?;
+    let capacity = NavigationIngressCapacity::try_new(MAX_NAVIGATION_INGRESS_RECORDS)
+        .expect("navigation ingress maximum is a valid nonzero capacity");
+    let (path, _) = open_validated_navigation_ingress_sidecar(root, descriptor, capacity)?;
+    Ok(Some(NavigationIngressStreamDescriptor { path, descriptor }))
 }
 
 fn parse_depth_stream(
