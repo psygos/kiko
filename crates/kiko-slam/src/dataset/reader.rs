@@ -14,15 +14,17 @@ use super::{
     IMU_ANGULAR_VELOCITY_UNIT, IMU_AXES, IMU_COORDINATE_FRAME, IMU_DEVICE_SESSION_SEMANTICS,
     IMU_DEVICE_TIMEBASE, IMU_HOST_ARRIVAL_TIMEBASE, IMU_SAMPLE_TIMESTAMP_SEMANTICS,
     IMU_STREAM_FORMAT, IMU_STREAM_HEADER_BYTES, IMU_STREAM_RECORD_BYTES, IMU_STREAM_VERSION,
-    ImuStreamError, ImuWireRecord, Manifest, ManifestFrameRef, ManifestHeader,
-    ManifestImuExtrinsic, ManifestImuStream, ManifestPairing, ManifestPairingPolicy, ManifestStats,
-    MonoImageContract, MonoPayloadFormat, PairReason, ParsedMonoContract, build_delta_stats,
-    decode_imu_header, format, imu_stream_byte_len, map_inertial_order_error,
-    parse_image_dimensions, read_calibration, read_manifest, read_meta, sensor_to_str,
+    ImuStreamError, ImuWireRecord, Manifest, ManifestFrameIdentityMode, ManifestFrameRef,
+    ManifestHeader, ManifestImuExtrinsic, ManifestImuStream, ManifestPairing,
+    ManifestPairingPolicy, ManifestStats, MonoImageContract, MonoPayloadFormat, PairReason,
+    ParsedMonoContract, build_delta_stats, decode_imu_header, format, imu_stream_byte_len,
+    map_inertial_order_error, parse_image_dimensions, read_calibration, read_manifest, read_meta,
+    sensor_to_str, validate_depth_manifest_frame_ids, validate_stereo_manifest_frame_ids,
 };
 
 #[derive(Clone, Debug)]
 struct DatasetFrameRef {
+    frame_id: Option<FrameId>,
     timestamp: Timestamp,
     path: PathBuf,
 }
@@ -825,9 +827,12 @@ impl DatasetReader {
         let dimensions = self.stereo_calibration.dimensions();
         Frame::from_dimensions(
             sensor,
-            match sensor {
-                SensorId::StereoLeft => self.next_left_id(),
-                SensorId::StereoRight => self.next_right_id(),
+            match frame_ref.frame_id {
+                Some(frame_id) => frame_id,
+                None => match sensor {
+                    SensorId::StereoLeft => self.next_left_id(),
+                    SensorId::StereoRight => self.next_right_id(),
+                },
             },
             frame_ref.timestamp,
             dimensions,
@@ -835,6 +840,38 @@ impl DatasetReader {
         )
         .map_err(|source| DatasetError::InvalidFrameData { path, source })
     }
+}
+
+fn validate_stereo_manifest_timestamp_order(
+    entries: &[super::ManifestEntry],
+) -> Result<(), DatasetError> {
+    for pair in entries.windows(2) {
+        let previous = pair[0].left.timestamp_ns;
+        let current = pair[1].left.timestamp_ns;
+        if current <= previous {
+            return Err(DatasetError::NonMonotonicManifestEntries {
+                previous_left_timestamp_ns: previous,
+                current_left_timestamp_ns: current,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_depth_manifest_timestamp_order(
+    entries: &[ManifestFrameRef],
+) -> Result<(), DatasetError> {
+    for pair in entries.windows(2) {
+        let previous = pair[0].timestamp_ns;
+        let current = pair[1].timestamp_ns;
+        if current <= previous {
+            return Err(DatasetError::NonMonotonicManifestDepthEntries {
+                previous_depth_timestamp_ns: previous,
+                current_depth_timestamp_ns: current,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_manifest(
@@ -849,6 +886,8 @@ fn parse_manifest(
         imu_stream,
         ..
     } = manifest;
+    validate_stereo_manifest_timestamp_order(&entries)?;
+    validate_stereo_manifest_frame_ids(&entries)?;
     if contract.pairing_policy == ManifestPairingPolicy::RecordedPairs
         && (stats.left_orphans != 0 || stats.right_orphans != 0)
     {
@@ -871,20 +910,10 @@ fn parse_manifest(
             reason: "manifest frame reference count exceeds the host address space",
         })?;
     let mut seen_paths = HashSet::with_capacity(frame_ref_capacity);
-    let mut previous_left_timestamp_ns = None;
     let mut outside_window = 0u64;
 
     for entry in entries {
         let left_timestamp_ns = entry.left.timestamp_ns;
-        if let Some(previous) = previous_left_timestamp_ns
-            && left_timestamp_ns <= previous
-        {
-            return Err(DatasetError::NonMonotonicManifestEntries {
-                previous_left_timestamp_ns: previous,
-                current_left_timestamp_ns: left_timestamp_ns,
-            });
-        }
-
         let left = parse_manifest_frame_ref(
             root,
             entry.left,
@@ -937,7 +966,6 @@ fn parse_manifest(
             }
         };
         parsed_entries.push(DatasetEntry { left, right });
-        previous_left_timestamp_ns = Some(left_timestamp_ns);
     }
 
     let depth = parse_depth_stream(root, contract.depth, depth_entries, &mut seen_paths)?;
@@ -976,20 +1004,11 @@ fn parse_depth_stream(
         (Some(contract), Some(entries)) => (contract, entries),
     };
 
+    validate_depth_manifest_timestamp_order(&entries)?;
+    let identity_mode = validate_depth_manifest_frame_ids(&entries)?;
     let mut parsed = Vec::with_capacity(entries.len());
-    let mut previous_depth_timestamp_ns = None;
     let expected_payload_len = contract.expected_payload_len();
     for (index, frame_ref) in entries.into_iter().enumerate() {
-        let timestamp_ns = frame_ref.timestamp_ns;
-        if let Some(previous) = previous_depth_timestamp_ns
-            && timestamp_ns <= previous
-        {
-            return Err(DatasetError::NonMonotonicManifestDepthEntries {
-                previous_depth_timestamp_ns: previous,
-                current_depth_timestamp_ns: timestamp_ns,
-            });
-        }
-
         let frame_ref = parse_manifest_frame_ref(
             root,
             frame_ref,
@@ -997,14 +1016,18 @@ fn parse_depth_stream(
             expected_payload_len,
         )?;
         insert_unique_frame_ref(seen_paths, &frame_ref)?;
-        let frame_id = u64::try_from(index)
-            .map(FrameId::new)
-            .map_err(|_| DatasetError::DepthFrameIndexOutOfRange { index })?;
+        let frame_id = match identity_mode {
+            ManifestFrameIdentityMode::Exact => {
+                frame_ref.frame_id.expect("exact identity mode was parsed")
+            }
+            ManifestFrameIdentityMode::Legacy => u64::try_from(index)
+                .map(FrameId::new)
+                .map_err(|_| DatasetError::DepthFrameIndexOutOfRange { index })?,
+        };
         parsed.push(DatasetDepthRef {
             frame_id,
             frame_ref,
         });
-        previous_depth_timestamp_ns = Some(timestamp_ns);
     }
 
     Ok(ParsedDepthStream::Indexed {
@@ -1363,6 +1386,7 @@ fn parse_manifest_frame_ref(
     }
 
     Ok(DatasetFrameRef {
+        frame_id: frame_ref.frame_id.map(FrameId::new),
         timestamp: Timestamp::from_nanos(frame_ref.timestamp_ns),
         path: resolved,
     })

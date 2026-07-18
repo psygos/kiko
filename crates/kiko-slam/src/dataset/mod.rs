@@ -18,7 +18,8 @@ use crate::triangulation::{
     StereoBaselineMeters, StereoCalibration, StereoCameraSide,
 };
 use crate::{
-    DepthImage, Frame, FrameDimensions, PairingWindowNs, PinholeIntrinsics, SensorId, StereoPair,
+    DepthImage, Frame, FrameDimensions, FrameId, PairingWindowNs, PinholeIntrinsics, SensorId,
+    StereoPair,
 };
 
 pub mod format {
@@ -1040,6 +1041,38 @@ pub enum WriteOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestFrameIdentityDomain {
+    Stereo,
+    Depth,
+}
+
+impl std::fmt::Display for ManifestFrameIdentityDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Stereo => "stereo",
+            Self::Depth => "depth",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestFrameStream {
+    StereoLeft,
+    StereoRight,
+    Depth,
+}
+
+impl std::fmt::Display for ManifestFrameStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::StereoLeft => "stereo-left",
+            Self::StereoRight => "stereo-right",
+            Self::Depth => "depth",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatasetWriteError {
     FrameDimensionsMismatch {
         sensor: SensorId,
@@ -1521,6 +1554,22 @@ pub enum DatasetError {
     DuplicateManifestFrameRef {
         path: PathBuf,
     },
+    MixedManifestFrameIdentity {
+        domain: ManifestFrameIdentityDomain,
+    },
+    AmbiguousStereoManifestFrameIdentity {
+        left_frame_id: Option<u64>,
+        right_frame_id: Option<u64>,
+    },
+    DuplicateManifestFrameId {
+        stream: ManifestFrameStream,
+        frame_id: u64,
+    },
+    NonMonotonicManifestFrameId {
+        stream: ManifestFrameStream,
+        previous: u64,
+        current: u64,
+    },
     NonMonotonicManifestEntries {
         previous_left_timestamp_ns: i64,
         current_left_timestamp_ns: i64,
@@ -1804,6 +1853,29 @@ impl std::fmt::Display for DatasetError {
                 "dataset manifest references frame {} more than once",
                 path.display()
             ),
+            DatasetError::MixedManifestFrameIdentity { domain } => write!(
+                f,
+                "dataset manifest {domain} stream mixes exact frame IDs with legacy ID-less entries"
+            ),
+            DatasetError::AmbiguousStereoManifestFrameIdentity {
+                left_frame_id,
+                right_frame_id,
+            } => write!(
+                f,
+                "dataset manifest stereo pair has ambiguous cross-side identity: left frame ID {left_frame_id:?}, right frame ID {right_frame_id:?}"
+            ),
+            DatasetError::DuplicateManifestFrameId { stream, frame_id } => write!(
+                f,
+                "dataset manifest {stream} frame ID {frame_id} is duplicated"
+            ),
+            DatasetError::NonMonotonicManifestFrameId {
+                stream,
+                previous,
+                current,
+            } => write!(
+                f,
+                "dataset manifest {stream} frame ID regressed from {previous} to {current}"
+            ),
             DatasetError::NonMonotonicManifestEntries {
                 previous_left_timestamp_ns,
                 current_left_timestamp_ns,
@@ -1939,6 +2011,10 @@ impl std::error::Error for DatasetError {
             | DatasetError::ManifestDeltaStatsPresenceMismatch { .. }
             | DatasetError::ManifestFrameIdentityMismatch { .. }
             | DatasetError::DuplicateManifestFrameRef { .. }
+            | DatasetError::MixedManifestFrameIdentity { .. }
+            | DatasetError::AmbiguousStereoManifestFrameIdentity { .. }
+            | DatasetError::DuplicateManifestFrameId { .. }
+            | DatasetError::NonMonotonicManifestFrameId { .. }
             | DatasetError::NonMonotonicManifestEntries { .. }
             | DatasetError::NonMonotonicManifestDepthEntries { .. }
             | DatasetError::ManifestPairDeltaMismatch { .. }
@@ -3001,14 +3077,18 @@ fn write_item_to_dir(
 }
 
 fn write_pair_to_dir(frames_dir: &Path, pair: StereoPair) -> Result<RecordedPair, DatasetError> {
+    let left_frame_id = pair.left().frame_id();
     let left_timestamp_ns = pair.left().timestamp().as_nanos();
+    let right_frame_id = pair.right().frame_id();
     let right_timestamp_ns = pair.right().timestamp().as_nanos();
     let delta_ns = pair.timestamp_delta_ns();
     let (left_frame, right_frame) = pair.into_parts();
     write_frame_to_dir(frames_dir, left_frame)?;
     write_frame_to_dir(frames_dir, right_frame)?;
     Ok(RecordedPair {
+        left_frame_id,
         left_timestamp_ns,
+        right_frame_id,
         right_timestamp_ns,
         delta_ns,
     })
@@ -3031,6 +3111,7 @@ fn write_frame_to_dir(frames_dir: &Path, frame: Frame) -> Result<(), DatasetErro
 }
 
 fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<RecordedDepth, DatasetError> {
+    let frame_id = depth.frame_id();
     let timestamp_ns = depth.timestamp().as_nanos();
     let filename = format::frame_name(timestamp_ns, "depth");
     let path = frames_dir.join(&filename);
@@ -3044,7 +3125,10 @@ fn write_depth_to_dir(frames_dir: &Path, depth: DepthImage) -> Result<RecordedDe
         bytes.extend_from_slice(&value.to_le_bytes());
     }
     write_new_file(&path, &bytes)?;
-    Ok(RecordedDepth { timestamp_ns })
+    Ok(RecordedDepth {
+        frame_id,
+        timestamp_ns,
+    })
 }
 
 fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), DatasetError> {
@@ -3243,6 +3327,10 @@ struct ManifestEntry {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ManifestFrameRef {
+    /// Exact producer identity. Absent only in manifests written before frame
+    /// identity was part of the dataset contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frame_id: Option<u64>,
     timestamp_ns: i64,
     path: String,
 }
@@ -3258,6 +3346,128 @@ enum ManifestPairing {
         #[serde(default = "default_missing_right_reason")]
         reason: PairReason,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestFrameIdentityMode {
+    Legacy,
+    Exact,
+}
+
+fn validate_stereo_manifest_frame_ids(
+    entries: &[ManifestEntry],
+) -> Result<ManifestFrameIdentityMode, DatasetError> {
+    let mut has_exact_identity = None;
+    for entry in entries {
+        merge_manifest_identity_mode(
+            &mut has_exact_identity,
+            entry.left.frame_id,
+            ManifestFrameIdentityDomain::Stereo,
+        )?;
+        if let ManifestPairing::Paired { right, .. } = &entry.pairing {
+            if entry.left.frame_id.is_some() != right.frame_id.is_some() {
+                return Err(DatasetError::AmbiguousStereoManifestFrameIdentity {
+                    left_frame_id: entry.left.frame_id,
+                    right_frame_id: right.frame_id,
+                });
+            }
+            merge_manifest_identity_mode(
+                &mut has_exact_identity,
+                right.frame_id,
+                ManifestFrameIdentityDomain::Stereo,
+            )?;
+        }
+    }
+
+    if has_exact_identity != Some(true) {
+        return Ok(ManifestFrameIdentityMode::Legacy);
+    }
+
+    let mut previous_left = None;
+    let mut previous_right = None;
+    for entry in entries {
+        require_increasing_manifest_frame_id(
+            ManifestFrameStream::StereoLeft,
+            &mut previous_left,
+            entry.left.frame_id.expect("exact identity mode was parsed"),
+        )?;
+        if let ManifestPairing::Paired { right, .. } = &entry.pairing {
+            require_increasing_manifest_frame_id(
+                ManifestFrameStream::StereoRight,
+                &mut previous_right,
+                right.frame_id.expect("exact identity mode was parsed"),
+            )?;
+        }
+    }
+    Ok(ManifestFrameIdentityMode::Exact)
+}
+
+fn validate_depth_manifest_frame_ids(
+    entries: &[ManifestFrameRef],
+) -> Result<ManifestFrameIdentityMode, DatasetError> {
+    let mut has_exact_identity = None;
+    for entry in entries {
+        merge_manifest_identity_mode(
+            &mut has_exact_identity,
+            entry.frame_id,
+            ManifestFrameIdentityDomain::Depth,
+        )?;
+    }
+    if has_exact_identity != Some(true) {
+        return Ok(ManifestFrameIdentityMode::Legacy);
+    }
+
+    let mut previous = None;
+    for entry in entries {
+        require_increasing_manifest_frame_id(
+            ManifestFrameStream::Depth,
+            &mut previous,
+            entry.frame_id.expect("exact identity mode was parsed"),
+        )?;
+    }
+    Ok(ManifestFrameIdentityMode::Exact)
+}
+
+fn merge_manifest_identity_mode(
+    mode: &mut Option<bool>,
+    frame_id: Option<u64>,
+    domain: ManifestFrameIdentityDomain,
+) -> Result<(), DatasetError> {
+    let exact = frame_id.is_some();
+    match mode {
+        Some(previous) if *previous != exact => {
+            Err(DatasetError::MixedManifestFrameIdentity { domain })
+        }
+        Some(_) => Ok(()),
+        None => {
+            *mode = Some(exact);
+            Ok(())
+        }
+    }
+}
+
+fn require_increasing_manifest_frame_id(
+    stream: ManifestFrameStream,
+    previous: &mut Option<u64>,
+    current: u64,
+) -> Result<(), DatasetError> {
+    if let Some(previous) = *previous {
+        if current == previous {
+            return Err(DatasetError::DuplicateManifestFrameId {
+                stream,
+                frame_id: current,
+            });
+        }
+        if current < previous {
+            return Err(DatasetError::NonMonotonicManifestFrameId {
+                stream,
+                previous,
+                current,
+            });
+        }
+    }
+    *previous = Some(current);
+    Ok(())
 }
 
 fn default_missing_right_reason() -> PairReason {
@@ -3280,13 +3490,16 @@ struct FrameInfo {
 
 #[derive(Debug, Clone)]
 struct RecordedPair {
+    left_frame_id: FrameId,
     left_timestamp_ns: i64,
+    right_frame_id: FrameId,
     right_timestamp_ns: i64,
     delta_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct RecordedDepth {
+    frame_id: FrameId,
     timestamp_ns: i64,
 }
 
@@ -3425,7 +3638,7 @@ fn recorded_depth_entries(
 
     let mut entries = Vec::with_capacity(recorded_depth.len());
     for depth in recorded_depth {
-        let frame_ref = manifest_frame_ref(depth.timestamp_ns, "depth");
+        let frame_ref = exact_manifest_frame_ref(depth.frame_id, depth.timestamp_ns, "depth");
         let path = dataset_dir.join(&frame_ref.path);
         if entries.last().is_some_and(|previous: &ManifestFrameRef| {
             previous.timestamp_ns == frame_ref.timestamp_ns
@@ -3435,6 +3648,7 @@ fn recorded_depth_entries(
         validate_payload_file(&path, contract.expected_payload_len())?;
         entries.push(frame_ref);
     }
+    validate_depth_manifest_frame_ids(&entries)?;
     Ok(entries)
 }
 
@@ -3502,14 +3716,19 @@ fn recorded_manifest_topology(
     let mut entries: Vec<ManifestEntry> = recorded_pairs
         .iter()
         .map(|pair| ManifestEntry {
-            left: manifest_frame_ref(pair.left_timestamp_ns, "mono_left"),
+            left: exact_manifest_frame_ref(pair.left_frame_id, pair.left_timestamp_ns, "mono_left"),
             pairing: ManifestPairing::Paired {
-                right: manifest_frame_ref(pair.right_timestamp_ns, "mono_right"),
+                right: exact_manifest_frame_ref(
+                    pair.right_frame_id,
+                    pair.right_timestamp_ns,
+                    "mono_right",
+                ),
                 delta_ns: pair.delta_ns,
             },
         })
         .collect();
     entries.sort_by_key(|entry| entry.left.timestamp_ns);
+    validate_stereo_manifest_frame_ids(&entries)?;
 
     let deltas: Vec<u64> = recorded_pairs.iter().map(|pair| pair.delta_ns).collect();
     let pair_count = recorded_pairs.len() as u64;
@@ -3527,8 +3746,13 @@ fn recorded_manifest_topology(
     })
 }
 
-fn manifest_frame_ref(timestamp_ns: i64, sensor: &str) -> ManifestFrameRef {
+fn exact_manifest_frame_ref(
+    frame_id: FrameId,
+    timestamp_ns: i64,
+    sensor: &str,
+) -> ManifestFrameRef {
     ManifestFrameRef {
+        frame_id: Some(frame_id.as_u64()),
         timestamp_ns,
         path: frame_path(timestamp_ns, sensor),
     }
@@ -3811,6 +4035,7 @@ fn pair_entries(
                 outside_window += 1;
                 ManifestEntry {
                     left: ManifestFrameRef {
+                        frame_id: None,
                         timestamp_ns: left_frame.timestamp_ns,
                         path: left_frame.path.clone(),
                     },
@@ -3823,11 +4048,13 @@ fn pair_entries(
                 paired_count += 1;
                 ManifestEntry {
                     left: ManifestFrameRef {
+                        frame_id: None,
                         timestamp_ns: left_frame.timestamp_ns,
                         path: left_frame.path.clone(),
                     },
                     pairing: ManifestPairing::Paired {
                         right: ManifestFrameRef {
+                            frame_id: None,
                             timestamp_ns: right[idx].timestamp_ns,
                             path: right[idx].path.clone(),
                         },
@@ -3846,6 +4073,7 @@ fn pair_entries(
             };
             ManifestEntry {
                 left: ManifestFrameRef {
+                    frame_id: None,
                     timestamp_ns: left_frame.timestamp_ns,
                     path: left_frame.path.clone(),
                 },
@@ -4137,12 +4365,22 @@ mod tests {
     }
 
     fn depth_image_filled(width: u32, height: u32, timestamp_ns: i64, value: f32) -> DepthImage {
+        depth_image_filled_with_id(width, height, FrameId::new(0), timestamp_ns, value)
+    }
+
+    fn depth_image_filled_with_id(
+        width: u32,
+        height: u32,
+        frame_id: FrameId,
+        timestamp_ns: i64,
+        value: f32,
+    ) -> DepthImage {
         let len = usize::try_from(width)
             .expect("test width fits usize")
             .checked_mul(usize::try_from(height).expect("test height fits usize"))
             .expect("test depth area fits usize");
         DepthImage::new(
-            FrameId::new(0),
+            frame_id,
             Timestamp::from_nanos(timestamp_ns),
             width,
             height,
@@ -4235,9 +4473,41 @@ mod tests {
         right_timestamp_ns: i64,
         validation_window: PairingWindowNs,
     ) -> StereoPair {
+        stereo_pair_with_ids(
+            FrameId::new(0),
+            left_timestamp_ns,
+            FrameId::new(0),
+            right_timestamp_ns,
+            validation_window,
+        )
+    }
+
+    fn stereo_pair_with_ids(
+        left_frame_id: FrameId,
+        left_timestamp_ns: i64,
+        right_frame_id: FrameId,
+        right_timestamp_ns: i64,
+        validation_window: PairingWindowNs,
+    ) -> StereoPair {
         StereoPair::try_new(
-            frame(SensorId::StereoLeft, left_timestamp_ns, 1),
-            frame(SensorId::StereoRight, right_timestamp_ns, 2),
+            Frame::new(
+                SensorId::StereoLeft,
+                left_frame_id,
+                Timestamp::from_nanos(left_timestamp_ns),
+                2,
+                2,
+                vec![1; 4],
+            )
+            .expect("valid left frame"),
+            Frame::new(
+                SensorId::StereoRight,
+                right_frame_id,
+                Timestamp::from_nanos(right_timestamp_ns),
+                2,
+                2,
+                vec![2; 4],
+            )
+            .expect("valid right frame"),
             validation_window,
         )
         .expect("valid stereo pair")
@@ -4737,9 +5007,15 @@ mod tests {
         let dataset_meta = meta_with_depth(2, 2);
         let (writer, handle) = DatasetWriter::create(&path, &dataset_meta, &calibration())
             .expect("create depth dataset");
-        for timestamp_ns in [30, 10, 20] {
+        for (frame_id, timestamp_ns) in [(3, 30), (1, 10), (2, 20)] {
             assert_eq!(
-                write_outcome(writer.write_depth(&depth_image(2, 2, timestamp_ns))),
+                write_outcome(writer.write_depth(&depth_image_filled_with_id(
+                    2,
+                    2,
+                    FrameId::new(frame_id),
+                    timestamp_ns,
+                    1.0,
+                ))),
                 WriteOutcome::Enqueued
             );
         }
@@ -4757,16 +5033,22 @@ mod tests {
         let depth_entries = manifest
             .depth_entries
             .expect("configured depth stream must be represented");
-        let identities: Vec<(i64, String)> = depth_entries
+        let identities: Vec<(u64, i64, String)> = depth_entries
             .into_iter()
-            .map(|entry| (entry.timestamp_ns, entry.path))
+            .map(|entry| {
+                (
+                    entry.frame_id.expect("new depth manifest has exact IDs"),
+                    entry.timestamp_ns,
+                    entry.path,
+                )
+            })
             .collect();
         assert_eq!(
             identities,
             [
-                (10, frame_path(10, "depth")),
-                (20, frame_path(20, "depth")),
-                (30, frame_path(30, "depth")),
+                (1, 10, frame_path(10, "depth")),
+                (2, 20, frame_path(20, "depth")),
+                (3, 30, frame_path(30, "depth")),
             ]
         );
         assert!(unrecorded_path.exists());
@@ -4833,8 +5115,8 @@ mod tests {
             WriteOutcome::Enqueued
         );
         for depth in [
-            depth_image_filled(2, 2, i64::MAX, 2.0),
-            depth_image_filled(2, 2, i64::MIN, 1.0),
+            depth_image_filled_with_id(2, 2, FrameId::new(2), i64::MAX, 2.0),
+            depth_image_filled_with_id(2, 2, FrameId::new(1), i64::MIN, 1.0),
         ] {
             assert_eq!(
                 write_outcome(writer.write_depth(&depth)),
@@ -4873,7 +5155,7 @@ mod tests {
             .next_at_or_before(Timestamp::from_nanos(i64::MIN))
             .expect("decode earliest depth")
             .expect("inclusive cutoff returns earliest depth");
-        assert_eq!(earliest.frame_id(), FrameId::new(0));
+        assert_eq!(earliest.frame_id(), FrameId::new(1));
         assert_eq!(earliest.timestamp(), Timestamp::from_nanos(i64::MIN));
         assert_eq!(earliest.depth_m(), &[1.0; 4]);
         assert_eq!(first.remaining(), 1);
@@ -4889,7 +5171,7 @@ mod tests {
             .next_at_or_before(Timestamp::from_nanos(i64::MIN))
             .expect("decode earliest depth through second cursor")
             .expect("second cursor starts independently");
-        assert_eq!(independently_earliest.frame_id(), FrameId::new(0));
+        assert_eq!(independently_earliest.frame_id(), FrameId::new(1));
 
         let pair = reader
             .pairs()
@@ -4904,7 +5186,7 @@ mod tests {
             .next_at_or_before(Timestamp::from_nanos(i64::MAX))
             .expect("decode latest depth")
             .expect("inclusive upper cutoff returns latest depth");
-        assert_eq!(latest.frame_id(), FrameId::new(1));
+        assert_eq!(latest.frame_id(), FrameId::new(2));
         assert_eq!(latest.timestamp(), Timestamp::from_nanos(i64::MAX));
         assert_eq!(latest.depth_m(), &[2.0; 4]);
         assert_eq!(first.remaining(), 0);
@@ -4998,6 +5280,135 @@ mod tests {
     }
 
     #[test]
+    fn legacy_idless_depth_manifest_replays_synthesized_zero_based_ids() {
+        let path = unique_dataset_path("legacy-depth-frame-ids");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        for (frame_id, timestamp_ns) in [(70, 10), (90, 20)] {
+            assert_eq!(
+                write_outcome(writer.write_depth(&depth_image_filled_with_id(
+                    2,
+                    2,
+                    FrameId::new(frame_id),
+                    timestamp_ns,
+                    1.0,
+                ))),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read exact manifest"))
+                .expect("parse exact manifest");
+        for entry in manifest["depth_entries"]
+            .as_array_mut()
+            .expect("depth entries")
+        {
+            entry
+                .as_object_mut()
+                .expect("depth frame ref")
+                .remove("frame_id");
+        }
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).expect("serialize legacy manifest"),
+        )
+        .expect("write legacy manifest");
+
+        let reader = DatasetReader::open(&path).expect("open legacy depth manifest");
+        let mut cursor = reader.depth_cursor().expect("legacy ID cursor");
+        let first = cursor
+            .next_at_or_before(Timestamp::from_nanos(10))
+            .expect("read first depth")
+            .expect("first depth exists");
+        let second = cursor
+            .next_at_or_before(Timestamp::from_nanos(20))
+            .expect("read second depth")
+            .expect("second depth exists");
+        assert_eq!(first.frame_id(), FrameId::new(0));
+        assert_eq!(second.frame_id(), FrameId::new(1));
+        std::fs::remove_dir_all(path).expect("remove legacy depth dataset");
+    }
+
+    #[test]
+    fn reader_rejects_mixed_duplicate_and_regressing_depth_frame_ids() {
+        let path = unique_dataset_path("invalid-depth-frame-ids");
+        let (writer, handle) = DatasetWriter::create(&path, &meta_with_depth(2, 2), &calibration())
+            .expect("create depth dataset");
+        for (frame_id, timestamp_ns) in [(10, 10), (20, 20)] {
+            assert_eq!(
+                write_outcome(writer.write_depth(&depth_image_filled_with_id(
+                    2,
+                    2,
+                    FrameId::new(frame_id),
+                    timestamp_ns,
+                    1.0,
+                ))),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish depth dataset");
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read exact manifest"))
+                .expect("parse exact manifest");
+
+        let mut mixed = original.clone();
+        mixed["depth_entries"][1]
+            .as_object_mut()
+            .expect("depth frame ref")
+            .remove("frame_id");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&mixed).expect("serialize mixed manifest"),
+        )
+        .expect("write mixed manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("mixed depth IDs must fail"),
+            DatasetError::MixedManifestFrameIdentity {
+                domain: ManifestFrameIdentityDomain::Depth
+            }
+        ));
+
+        let mut duplicate = original.clone();
+        duplicate["depth_entries"][1]["frame_id"] = serde_json::json!(10);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&duplicate).expect("serialize duplicate manifest"),
+        )
+        .expect("write duplicate manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("duplicate depth ID must fail"),
+            DatasetError::DuplicateManifestFrameId {
+                stream: ManifestFrameStream::Depth,
+                frame_id: 10
+            }
+        ));
+
+        let mut regressing = original;
+        regressing["depth_entries"][1]["frame_id"] = serde_json::json!(9);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&regressing).expect("serialize regressing manifest"),
+        )
+        .expect("write regressing manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("regressing depth ID must fail"),
+            DatasetError::NonMonotonicManifestFrameId {
+                stream: ManifestFrameStream::Depth,
+                previous: 10,
+                current: 9
+            }
+        ));
+        std::fs::remove_dir_all(path).expect("remove invalid depth dataset");
+    }
+
+    #[test]
     fn reader_rejects_incoherent_or_nonmonotonic_depth_manifest_state() {
         let unconfigured_path = unique_dataset_path("depth-entries-without-meta");
         let (writer, handle) = DatasetWriter::create(&unconfigured_path, &meta(), &calibration())
@@ -5026,9 +5437,15 @@ mod tests {
         let (writer, handle) =
             DatasetWriter::create(&reordered_path, &meta_with_depth(2, 2), &calibration())
                 .expect("create depth dataset");
-        for timestamp_ns in [10, 20] {
+        for (frame_id, timestamp_ns) in [(1, 10), (2, 20)] {
             assert_eq!(
-                write_outcome(writer.write_depth(&depth_image(2, 2, timestamp_ns))),
+                write_outcome(writer.write_depth(&depth_image_filled_with_id(
+                    2,
+                    2,
+                    FrameId::new(frame_id),
+                    timestamp_ns,
+                    1.0,
+                ))),
                 WriteOutcome::Enqueued
             );
         }
@@ -5878,10 +6295,14 @@ mod tests {
         let (writer, handle) = DatasetWriter::create_paired(&path, &meta(), &calibration(), window)
             .expect("create paired dataset");
 
-        for (left_timestamp_ns, right_timestamp_ns) in [(0, 0), (7, 6), (8, 7)] {
+        for (left_frame_id, left_timestamp_ns, right_frame_id, right_timestamp_ns) in
+            [(41, 0, 101, 0), (43, 7, 102, 6), (50, 8, 110, 7)]
+        {
             assert_eq!(
-                write_outcome(writer.write_pair(stereo_pair(
+                write_outcome(writer.write_pair(stereo_pair_with_ids(
+                    FrameId::new(left_frame_id),
                     left_timestamp_ns,
+                    FrameId::new(right_frame_id),
                     right_timestamp_ns,
                     window,
                 ))),
@@ -5896,31 +6317,201 @@ mod tests {
         let manifest = read_manifest(&path).expect("read manifest");
         assert_eq!(manifest.header.pairing_policy, "recorded_pairs");
         assert_eq!(manifest.header.pairing_window_ns, 1);
-        let manifest_pairs: Vec<(i64, i64)> = manifest
+        let manifest_pairs: Vec<(u64, i64, u64, i64)> = manifest
             .entries
             .iter()
             .map(|entry| {
                 let ManifestPairing::Paired { right, .. } = &entry.pairing else {
                     panic!("recorded pair must remain paired");
                 };
-                (entry.left.timestamp_ns, right.timestamp_ns)
+                (
+                    entry.left.frame_id.expect("new paired manifest left ID"),
+                    entry.left.timestamp_ns,
+                    right.frame_id.expect("new paired manifest right ID"),
+                    right.timestamp_ns,
+                )
             })
             .collect();
-        assert_eq!(manifest_pairs, [(0, 0), (7, 6), (8, 7)]);
+        assert_eq!(
+            manifest_pairs,
+            [(41, 0, 101, 0), (43, 7, 102, 6), (50, 8, 110, 7)]
+        );
 
         let mut reader = DatasetReader::open(&path).expect("open paired dataset");
-        let replayed_pairs: Vec<(i64, i64)> = reader
+        let replayed_pairs: Vec<(u64, i64, u64, i64)> = reader
             .pairs()
             .map(|pair| {
                 let pair = pair.expect("read recorded pair");
                 (
+                    pair.left().frame_id().as_u64(),
                     pair.left().timestamp().as_nanos(),
+                    pair.right().frame_id().as_u64(),
                     pair.right().timestamp().as_nanos(),
                 )
             })
             .collect();
         assert_eq!(replayed_pairs, manifest_pairs);
         std::fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn legacy_idless_stereo_manifest_replays_synthesized_zero_based_ids() {
+        let path = unique_dataset_path("legacy-stereo-frame-ids");
+        write_exact_pairs(&path, &[10, 20]);
+
+        let manifest = read_manifest(&path).expect("read legacy-style manifest");
+        assert!(manifest.entries.iter().all(|entry| {
+            entry.left.frame_id.is_none()
+                && match &entry.pairing {
+                    ManifestPairing::Paired { right, .. } => right.frame_id.is_none(),
+                    ManifestPairing::MissingRight { .. } => true,
+                }
+        }));
+
+        let mut reader = DatasetReader::open(&path).expect("open legacy-style manifest");
+        let identities: Vec<(u64, u64)> = reader
+            .pairs()
+            .map(|pair| {
+                let pair = pair.expect("read legacy pair");
+                (
+                    pair.left().frame_id().as_u64(),
+                    pair.right().frame_id().as_u64(),
+                )
+            })
+            .collect();
+        assert_eq!(identities, [(0, 0), (1, 1)]);
+        std::fs::remove_dir_all(path).expect("remove legacy stereo dataset");
+    }
+
+    #[test]
+    fn reader_rejects_ambiguous_mixed_duplicate_and_regressing_stereo_frame_ids() {
+        let path = unique_dataset_path("invalid-stereo-frame-ids");
+        let window = PairingWindowNs::new(0).expect("exact pairing window");
+        let (writer, handle) = DatasetWriter::create_paired(&path, &meta(), &calibration(), window)
+            .expect("create paired dataset");
+        for (left_id, right_id, timestamp_ns) in [(10, 100, 10), (20, 200, 20)] {
+            assert_eq!(
+                write_outcome(writer.write_pair(stereo_pair_with_ids(
+                    FrameId::new(left_id),
+                    timestamp_ns,
+                    FrameId::new(right_id),
+                    timestamp_ns,
+                    window,
+                ))),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        handle.finish().expect("finish paired dataset");
+
+        let manifest_path = path.join(format::MANIFEST_FILE);
+        let original: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("read exact manifest"))
+                .expect("parse exact manifest");
+
+        let mut ambiguous = original.clone();
+        ambiguous["entries"][0]["right"]
+            .as_object_mut()
+            .expect("right frame ref")
+            .remove("frame_id");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&ambiguous).expect("serialize ambiguous manifest"),
+        )
+        .expect("write ambiguous manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("cross-side identity ambiguity must fail"),
+            DatasetError::AmbiguousStereoManifestFrameIdentity {
+                left_frame_id: Some(10),
+                right_frame_id: None
+            }
+        ));
+
+        let mut mixed = original.clone();
+        mixed["entries"][0]["left"]
+            .as_object_mut()
+            .expect("left frame ref")
+            .remove("frame_id");
+        mixed["entries"][0]["right"]
+            .as_object_mut()
+            .expect("right frame ref")
+            .remove("frame_id");
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&mixed).expect("serialize mixed manifest"),
+        )
+        .expect("write mixed manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("mixed stereo identity must fail"),
+            DatasetError::MixedManifestFrameIdentity {
+                domain: ManifestFrameIdentityDomain::Stereo
+            }
+        ));
+
+        let mut duplicate = original.clone();
+        duplicate["entries"][1]["left"]["frame_id"] = serde_json::json!(10);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&duplicate).expect("serialize duplicate manifest"),
+        )
+        .expect("write duplicate manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("duplicate left identity must fail"),
+            DatasetError::DuplicateManifestFrameId {
+                stream: ManifestFrameStream::StereoLeft,
+                frame_id: 10
+            }
+        ));
+
+        let mut regressing = original;
+        regressing["entries"][1]["right"]["frame_id"] = serde_json::json!(99);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&regressing).expect("serialize regressing manifest"),
+        )
+        .expect("write regressing manifest");
+        assert!(matches!(
+            DatasetReader::open(&path).expect_err("regressing right identity must fail"),
+            DatasetError::NonMonotonicManifestFrameId {
+                stream: ManifestFrameStream::StereoRight,
+                previous: 100,
+                current: 99
+            }
+        ));
+        std::fs::remove_dir_all(path).expect("remove invalid stereo dataset");
+    }
+
+    #[test]
+    fn paired_writer_does_not_publish_nonmonotonic_exact_frame_ids() {
+        let path = unique_dataset_path("writer-nonmonotonic-frame-ids");
+        let window = PairingWindowNs::new(0).expect("exact pairing window");
+        let (writer, handle) = DatasetWriter::create_paired(&path, &meta(), &calibration(), window)
+            .expect("create paired dataset");
+        for (left_id, right_id, timestamp_ns) in [(2, 20, 10), (1, 21, 20)] {
+            assert_eq!(
+                write_outcome(writer.write_pair(stereo_pair_with_ids(
+                    FrameId::new(left_id),
+                    timestamp_ns,
+                    FrameId::new(right_id),
+                    timestamp_ns,
+                    window,
+                ))),
+                WriteOutcome::Enqueued
+            );
+        }
+        drop(writer);
+        assert!(matches!(
+            handle
+                .finish()
+                .expect_err("regressing IDs must fail finish"),
+            DatasetError::NonMonotonicManifestFrameId {
+                stream: ManifestFrameStream::StereoLeft,
+                previous: 2,
+                current: 1
+            }
+        ));
+        assert!(!path.join(format::MANIFEST_FILE).exists());
+        std::fs::remove_dir_all(path).expect("remove invalid writer dataset");
     }
 
     #[test]
