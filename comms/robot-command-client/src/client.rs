@@ -163,13 +163,13 @@ where
         session: ControllerSession,
         requested_timer_pwm: TimerPwm,
         lease: V2CommandLeaseMs,
-        command_valid_through_exclusive: Option<MonotonicInstant>,
+        acknowledgement_deadline_exclusive: Option<MonotonicInstant>,
     ) -> Result<AppliedCommandReceipt, FailureCause<Transport::Error>> {
         let now = self.observe_now()?;
         let timeout_deadline = now
             .checked_add(self.config.applied_ack_timeout().as_duration())
             .ok_or(FailureCause::MonotonicArithmeticOverflow)?;
-        let effective_deadline = command_valid_through_exclusive
+        let effective_deadline = acknowledgement_deadline_exclusive
             .map_or(timeout_deadline, |valid_through| {
                 timeout_deadline.min(valid_through)
             });
@@ -209,10 +209,12 @@ where
         let reported_horizon = sent_at
             .checked_add(reported_remaining)
             .ok_or(FailureCause::MonotonicArithmeticOverflow)?;
-        let known_active_through_exclusive = command_valid_through_exclusive
-            .map_or(reported_horizon, |valid_through| {
-                reported_horizon.min(valid_through)
-            });
+        // The caller's acknowledgement deadline governs admission of this
+        // decision only. A successful exact ACK independently proves the
+        // conservative controller-reported lease horizon; carrying the old
+        // decision deadline into that receipt would falsely expire the next
+        // pre-solve applied-evidence gate.
+        let known_active_through_exclusive = reported_horizon;
         if acknowledged_at >= known_active_through_exclusive {
             return Err(FailureCause::LeaseNotKnownActiveAtAcknowledgement {
                 acknowledged_at,
@@ -472,7 +474,7 @@ where
             self.session,
             pending.requested_timer_pwm(),
             pending.lease(),
-            Some(pending.valid_through_exclusive()),
+            Some(pending.acknowledgement_deadline_exclusive()),
         ) {
             Ok(receipt) => receipt,
             Err(cause) => return Err(ApplyFailure::latch(core, cause)),
@@ -483,16 +485,34 @@ where
     }
 
     pub fn disarm(
+        self,
+    ) -> Result<
+        (DisarmedCommandClient<Transport, Clock>, DisarmReceipt),
+        DisarmFailure<Transport, Clock>,
+    > {
+        self.disarm_with_reason(ForceStopReason::Operator)
+    }
+
+    /// End this control session with an exact, caller-selected protocol reason.
+    /// This is used when a local safety boundary rejects a decision before it
+    /// can become a command. Success still requires a matching controller stop
+    /// receipt; a transport write alone is never reported as disarmed.
+    pub fn disarm_with_reason(
         mut self,
+        reason: ForceStopReason,
     ) -> Result<
         (DisarmedCommandClient<Transport, Clock>, DisarmReceipt),
         DisarmFailure<Transport, Clock>,
     > {
         let mut core = self.core.take().expect("armed client core is present");
         let timeout = core.config.stop_recovery().attempt_timeout().as_duration();
-        let receipt = match core.stop_once(ForceStopReason::Operator, timeout) {
+        let receipt = match core.stop_once(reason, timeout) {
             Ok(receipt) => receipt,
-            Err(cause) => return Err(DisarmFailure::latch_after_first_attempt(core, cause)),
+            Err(cause) => {
+                return Err(DisarmFailure::latch_after_first_attempt(
+                    core, cause, reason,
+                ));
+            }
         };
         core.reset_command_sequence();
         Ok((DisarmedCommandClient { core }, receipt))
@@ -1078,6 +1098,14 @@ where
         &self.cause
     }
 
+    pub const fn stop_knowledge(&self) -> LatchedStopKnowledge {
+        self.client.stop_knowledge()
+    }
+
+    pub const fn recovery(&self) -> &StopRecoveryReport<Transport::Error> {
+        self.client.recovery()
+    }
+
     pub fn into_latched(self) -> LatchedCommandClient<Transport, Clock> {
         *self.client
     }
@@ -1115,6 +1143,14 @@ where
         &self.cause
     }
 
+    pub const fn stop_knowledge(&self) -> LatchedStopKnowledge {
+        self.client.stop_knowledge()
+    }
+
+    pub const fn recovery(&self) -> &StopRecoveryReport<Transport::Error> {
+        self.client.recovery()
+    }
+
     pub fn into_latched(self) -> LatchedCommandClient<Transport, Clock> {
         *self.client
     }
@@ -1136,6 +1172,7 @@ where
     fn latch_after_first_attempt(
         mut core: ClientCore<Transport, Clock>,
         cause: FailureCause<Transport::Error>,
+        reason: ForceStopReason,
     ) -> Self {
         let remaining_attempts = core
             .config
@@ -1143,7 +1180,7 @@ where
             .attempts()
             .get()
             .saturating_sub(1);
-        let recovery = core.recover_stop(ForceStopReason::Operator, remaining_attempts);
+        let recovery = core.recover_stop(reason, remaining_attempts);
         Self {
             cause,
             client: Box::new(LatchedCommandClient {
@@ -1155,6 +1192,14 @@ where
 
     pub const fn cause(&self) -> &FailureCause<Transport::Error> {
         &self.cause
+    }
+
+    pub const fn stop_knowledge(&self) -> LatchedStopKnowledge {
+        self.client.stop_knowledge()
+    }
+
+    pub const fn recovery(&self) -> &StopRecoveryReport<Transport::Error> {
+        self.client.recovery()
     }
 
     pub fn into_latched(self) -> LatchedCommandClient<Transport, Clock> {

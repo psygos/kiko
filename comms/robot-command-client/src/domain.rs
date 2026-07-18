@@ -67,19 +67,19 @@ impl ControllerSession {
 pub struct PendingPhysicalCommand {
     requested_timer_pwm: TimerPwm,
     lease: V2CommandLeaseMs,
-    valid_through_exclusive: MonotonicInstant,
+    acknowledgement_deadline_exclusive: MonotonicInstant,
 }
 
 impl PendingPhysicalCommand {
     pub const fn new(
         requested_timer_pwm: TimerPwm,
         lease: V2CommandLeaseMs,
-        valid_through_exclusive: MonotonicInstant,
+        acknowledgement_deadline_exclusive: MonotonicInstant,
     ) -> Self {
         Self {
             requested_timer_pwm,
             lease,
-            valid_through_exclusive,
+            acknowledgement_deadline_exclusive,
         }
     }
 
@@ -91,8 +91,11 @@ impl PendingPhysicalCommand {
         self.lease
     }
 
-    pub const fn valid_through_exclusive(&self) -> MonotonicInstant {
-        self.valid_through_exclusive
+    /// Latest host time at which an exact application acknowledgement can
+    /// authorize this command. This admission deadline does not shorten the
+    /// controller lease proven by a successful receipt.
+    pub const fn acknowledgement_deadline_exclusive(&self) -> MonotonicInstant {
+        self.acknowledgement_deadline_exclusive
     }
 }
 

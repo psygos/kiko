@@ -36,6 +36,16 @@ impl TimeoutNs {
 pub struct UdpEndpoint(SocketAddr);
 
 impl UdpEndpoint {
+    pub fn try_new(address: SocketAddr) -> Result<Self, ConfigError> {
+        if address.port() == 0 {
+            return Err(ConfigError::EndpointPortZero);
+        }
+        if !is_literal_loopback(address.ip()) {
+            return Err(ConfigError::EndpointNotLoopback(address));
+        }
+        Ok(Self(address))
+    }
+
     pub const fn socket_addr(self) -> SocketAddr {
         self.0
     }
@@ -51,13 +61,7 @@ impl FromStr for UdpEndpoint {
         let address = text
             .parse::<SocketAddr>()
             .map_err(|_| ConfigError::EndpointSyntax)?;
-        if address.port() == 0 {
-            return Err(ConfigError::EndpointPortZero);
-        }
-        if !is_literal_loopback(address.ip()) {
-            return Err(ConfigError::EndpointNotLoopback(address));
-        }
-        Ok(Self(address))
+        Self::try_new(address)
     }
 }
 

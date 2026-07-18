@@ -539,6 +539,8 @@ impl ReadinessFlags {
     pub const DRIVER_FAULT_CLEAR: u16 = 1 << 3;
     pub const KNOWN_BITS: u16 = (1 << 4) - 1;
     pub const READY_BITS: u16 = Self::KNOWN_BITS;
+    pub const STOPPED_READY_BITS: u16 =
+        Self::SESSION_ESTABLISHED | Self::WATCHDOG_RUNNING | Self::DRIVER_FAULT_CLEAR;
 
     pub fn try_from_bits(bits: u16) -> Result<Self, DomainError> {
         if bits & !Self::KNOWN_BITS != 0 {
@@ -554,6 +556,13 @@ impl ReadinessFlags {
 
     pub const fn is_ready(self) -> bool {
         self.0 & Self::READY_BITS == Self::READY_BITS
+    }
+
+    /// A session is truthfully ready to accept its initial zero command while
+    /// no command deadline exists yet. The deadline bit must be absent; setting
+    /// it before sequence zero would claim a lease that does not exist.
+    pub const fn is_stopped_ready_for_acquisition(self) -> bool {
+        self.0 == Self::STOPPED_READY_BITS
     }
 }
 
@@ -2474,6 +2483,20 @@ mod tests {
         ReadinessFlags::try_from_bits(ReadinessFlags::READY_BITS).expect("known readiness bits")
     }
 
+    #[test]
+    fn stopped_readiness_is_distinct_from_an_armed_command_deadline() {
+        let stopped = ReadinessFlags::try_from_bits(ReadinessFlags::STOPPED_READY_BITS)
+            .expect("known stopped readiness bits");
+        assert!(stopped.is_stopped_ready_for_acquisition());
+        assert!(!stopped.is_ready());
+        assert!(!readiness().is_stopped_ready_for_acquisition());
+        let missing_driver_fault_evidence = ReadinessFlags::try_from_bits(
+            ReadinessFlags::STOPPED_READY_BITS & !ReadinessFlags::DRIVER_FAULT_CLEAR,
+        )
+        .expect("known subset");
+        assert!(!missing_driver_fault_evidence.is_stopped_ready_for_acquisition());
+    }
+
     fn moving_pwm() -> TimerPwm {
         TimerPwm::try_new(-25, 40).expect("valid timer PWM")
     }
@@ -2931,9 +2954,11 @@ mod tests {
         assert!(RemainingLeaseMs::try_new(MAX_V2_COMMAND_LEASE_MS + 1).is_err());
         let motion_disabled = MaxAbsPwmPercent::try_new(0).expect("zero is a truthful profile");
         assert!(!motion_disabled.grants_motion_authority());
-        assert!(MaxAbsPwmPercent::try_new(1)
-            .expect("one percent grants bounded motion authority")
-            .grants_motion_authority());
+        assert!(
+            MaxAbsPwmPercent::try_new(1)
+                .expect("one percent grants bounded motion authority")
+                .grants_motion_authority()
+        );
         assert!(MaxAbsPwmPercent::try_new(101).is_err());
         assert_eq!(V2CommandSequence::new(u32::MAX).checked_successor(), None);
         assert!(ControllerUid::try_new([0; 12]).is_err());

@@ -151,11 +151,11 @@ fn acquisition_steps() -> Vec<FakeStep> {
 }
 
 fn pending(clock: &FakeClock, pwm: TimerPwm) -> PendingPhysicalCommand {
-    let valid_through = clock
+    let acknowledgement_deadline = clock
         .now()
         .checked_add(Duration::from_millis(200))
         .expect("fixture deadline does not overflow");
-    PendingPhysicalCommand::new(pwm, lease(), valid_through)
+    PendingPhysicalCommand::new(pwm, lease(), acknowledgement_deadline)
 }
 
 #[test]
@@ -410,6 +410,47 @@ fn acknowledgement_at_exclusive_deadline_is_rejected() {
         failure.cause(),
         FailureCause::ResponseAtOrAfterDeadline { .. }
     ));
+}
+
+#[test]
+fn acknowledgement_deadline_does_not_truncate_applied_lease_evidence() {
+    let clock = FakeClock::default();
+    let motion = TimerPwm::try_new(15, 10).expect("valid fixture PWM");
+    let mut steps = acquisition_steps();
+    steps.push(FakeStep::respond(
+        MessageKind::HostCommand,
+        RESPONSE_DELAY,
+        command_result(1, motion, HostCommandResultCode::AppliedNew),
+    ));
+    steps.push(FakeStep::respond(
+        MessageKind::HostStop,
+        RESPONSE_DELAY,
+        stop_result(2),
+    ));
+    let (transport, _) = FakeTransport::scripted(clock.clone(), steps);
+    let client = DisarmedCommandClient::new(transport, clock.clone(), config());
+    let (armed, _) = client
+        .acquire_zero()
+        .ok()
+        .expect("zero acquisition succeeds");
+    let acknowledgement_deadline = clock
+        .now()
+        .checked_add(Duration::from_millis(10))
+        .expect("fixture deadline does not overflow");
+    let command = PendingPhysicalCommand::new(motion, lease(), acknowledgement_deadline);
+
+    let (armed, receipt) = armed.apply(command).ok().expect("motion applies in time");
+    assert!(receipt.acknowledged_at() < acknowledgement_deadline);
+    assert!(receipt.known_active_through_exclusive() > acknowledgement_deadline);
+    clock.set_nanos(
+        u64::try_from(acknowledgement_deadline.nanos_since_clock_start())
+            .expect("fixture timestamp fits u64"),
+    );
+    let armed = armed
+        .require_current_applied_evidence()
+        .ok()
+        .expect("old admission deadline cannot expire controller lease evidence");
+    let _ = armed.disarm().ok().expect("fixture disarms");
 }
 
 #[test]
