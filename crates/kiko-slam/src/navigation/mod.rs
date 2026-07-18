@@ -9,8 +9,8 @@ mod local_costmap;
 pub mod mpc;
 mod odometry;
 mod reference;
+mod safety;
 mod shadow_command;
-
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,
     OdomToBase, OdomToLocalCostmap, OdomToMap, PlanarAxis, PlanarFrame, PlanarPoint,
@@ -63,6 +63,13 @@ pub use reference::{
     MAX_SUPPORTED_PROJECTION_DISTANCE_M, NearestSegmentTiePolicyV1, PATH_REFERENCE_CONFIG_V1,
     PathReferenceBuildError, PathReferenceBuilderV1, PathReferenceConfigParseError,
     PathReferenceConfigV1, PathReferenceConfigV1Dto,
+};
+pub use safety::{
+    BoundPredictedTrajectory, FinalValidationMismatch, SafetyControllerDecision,
+    SafetyDecideError, SafetyDecision, SafetyDecisionOutcome, SafetyFatalError,
+    SafetyNotReadyReason, SafetyReadyTick, SafetySolverFailure, SafetySolverRequestContext,
+    SafetyStopCause, SafetyStoppedDecision, SafetySupervisorCreateError, SafetyTickInput,
+    ShadowSafetySupervisor, SolverBudgetError, SolverBudgetNs,
 };
 pub use shadow_command::{
     MAX_SHADOW_COMMAND_RECORDS, MotorPacketsSent, ShadowCommandConfig, ShadowCommandConfigDto,
