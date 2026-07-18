@@ -50,6 +50,8 @@ use kiko_slam::dataset::{
 };
 #[cfg(any(feature = "record", test))]
 use kiko_slam::navigation::NavigationGoalArg;
+#[cfg(all(feature = "record", feature = "actuation"))]
+use kiko_slam::navigation::actuation::{LiveActuationError, PhysicalActuationSession};
 #[cfg(feature = "record")]
 use kiko_slam::navigation::mpc::{HostMonotonicClock, MpcConfigV1};
 #[cfg(feature = "record")]
@@ -63,6 +65,10 @@ use kiko_slam::navigation::{
     PlanarOdometry, SafetyDecisionOutcome, ShadowNavigationConfigV1, ShadowNavigationCoordinator,
     ShadowSafetySupervisor, SolverBudgetNs, VisualAdmission, VisualAdmissionError,
     VisualAttemptOutcome,
+};
+#[cfg(all(feature = "record", feature = "actuation"))]
+use kiko_slam::navigation::{
+    MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, NavigationActuationConfigV1,
 };
 #[cfg(feature = "record")]
 use kiko_slam::{
@@ -81,11 +87,13 @@ use oak_sys::{
     ImageFrame as OakImageFrame, ImuConfig, ImuError, Intrinsics as OakIntrinsics, MonoConfig,
     QueueConfig, StreamId as OakStreamId,
 };
+#[cfg(all(feature = "record", feature = "actuation"))]
+use robot_command_client::AppliedCommandReceipt;
 #[cfg(feature = "record")]
 use std::num::{NonZeroU32, NonZeroU64};
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 use std::sync::Arc;
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "record")]
 use std::thread;
@@ -631,6 +639,14 @@ struct LiveArgs {
     /// Dataset directory that atomically binds captured payloads to navigation ingress.
     #[arg(long, value_name = "DATASET_PATH")]
     navigation_record: Option<PathBuf>,
+    /// Separate physical-authority manifest. Requires --navigation-arm-robot.
+    #[cfg(feature = "actuation")]
+    #[arg(long, value_name = "ACTUATION_JSON")]
+    navigation_actuation_config: Option<PathBuf>,
+    /// Exact robot ID named by the physical-authority manifest. No environment alias exists.
+    #[cfg(feature = "actuation")]
+    #[arg(long, value_name = "EXACT_ROBOT_ID")]
+    navigation_arm_robot: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -3100,6 +3116,17 @@ enum LiveNavigationRequest {
         config_path: PathBuf,
         goal: NavigationGoalArg,
         dataset_path: PathBuf,
+        actuation: LiveActuationRequest,
+    },
+}
+
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LiveActuationRequest {
+    ShadowOnly,
+    Physical {
+        config_path: PathBuf,
+        exact_robot_id: String,
     },
 }
 
@@ -3109,19 +3136,45 @@ impl LiveNavigationRequest {
         config_path: Option<PathBuf>,
         goal: Option<NavigationGoalArg>,
         dataset_path: Option<PathBuf>,
+        actuation_config_path: Option<PathBuf>,
+        exact_robot_id: Option<String>,
     ) -> Result<Self, LiveNavigationBoundaryError> {
         match (config_path, goal, dataset_path) {
-            (None, None, None) => Ok(Self::Disabled),
-            (Some(config_path), Some(goal), Some(dataset_path)) => Ok(Self::Enabled {
-                config_path,
-                goal,
-                dataset_path,
-            }),
-            (config_path, goal, dataset_path) => Err(LiveNavigationBoundaryError {
-                missing_config: config_path.is_none(),
-                missing_goal: goal.is_none(),
-                missing_dataset: dataset_path.is_none(),
-            }),
+            (None, None, None) => {
+                if actuation_config_path.is_some() || exact_robot_id.is_some() {
+                    Err(LiveNavigationBoundaryError::ActuationRequiresNavigation)
+                } else {
+                    Ok(Self::Disabled)
+                }
+            }
+            (Some(config_path), Some(goal), Some(dataset_path)) => {
+                let actuation = match (actuation_config_path, exact_robot_id) {
+                    (None, None) => LiveActuationRequest::ShadowOnly,
+                    (Some(config_path), Some(exact_robot_id)) => LiveActuationRequest::Physical {
+                        config_path,
+                        exact_robot_id,
+                    },
+                    (config_path, exact_robot_id) => {
+                        return Err(LiveNavigationBoundaryError::IncompleteActuation {
+                            missing_config: config_path.is_none(),
+                            missing_robot_id: exact_robot_id.is_none(),
+                        });
+                    }
+                };
+                Ok(Self::Enabled {
+                    config_path,
+                    goal,
+                    dataset_path,
+                    actuation,
+                })
+            }
+            (config_path, goal, dataset_path) => {
+                Err(LiveNavigationBoundaryError::IncompleteNavigation {
+                    missing_config: config_path.is_none(),
+                    missing_goal: goal.is_none(),
+                    missing_dataset: dataset_path.is_none(),
+                })
+            }
         }
     }
 
@@ -3132,29 +3185,60 @@ impl LiveNavigationRequest {
 
 #[cfg(any(feature = "record", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LiveNavigationBoundaryError {
-    missing_config: bool,
-    missing_goal: bool,
-    missing_dataset: bool,
+enum LiveNavigationBoundaryError {
+    IncompleteNavigation {
+        missing_config: bool,
+        missing_goal: bool,
+        missing_dataset: bool,
+    },
+    IncompleteActuation {
+        missing_config: bool,
+        missing_robot_id: bool,
+    },
+    ActuationRequiresNavigation,
 }
 
 #[cfg(any(feature = "record", test))]
 impl std::fmt::Display for LiveNavigationBoundaryError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "live navigation requires --navigation-config, --navigation-goal, and --navigation-record together",
-        )?;
-        formatter.write_str("; missing")?;
-        if self.missing_config {
-            formatter.write_str(" --navigation-config")?;
+        match *self {
+            Self::IncompleteNavigation {
+                missing_config,
+                missing_goal,
+                missing_dataset,
+            } => {
+                formatter.write_str(
+                    "live navigation requires --navigation-config, --navigation-goal, and --navigation-record together; missing",
+                )?;
+                if missing_config {
+                    formatter.write_str(" --navigation-config")?;
+                }
+                if missing_goal {
+                    formatter.write_str(" --navigation-goal")?;
+                }
+                if missing_dataset {
+                    formatter.write_str(" --navigation-record")?;
+                }
+                Ok(())
+            }
+            Self::IncompleteActuation {
+                missing_config,
+                missing_robot_id,
+            } => {
+                formatter.write_str(
+                    "physical navigation actuation requires --navigation-actuation-config and --navigation-arm-robot together; missing",
+                )?;
+                if missing_config {
+                    formatter.write_str(" --navigation-actuation-config")?;
+                }
+                if missing_robot_id {
+                    formatter.write_str(" --navigation-arm-robot")?;
+                }
+                Ok(())
+            }
+            Self::ActuationRequiresNavigation => formatter
+                .write_str("physical actuation options require a complete live navigation request"),
         }
-        if self.missing_goal {
-            formatter.write_str(" --navigation-goal")?;
-        }
-        if self.missing_dataset {
-            formatter.write_str(" --navigation-record")?;
-        }
-        Ok(())
     }
 }
 
@@ -3201,17 +3285,60 @@ impl std::fmt::Display for LiveNavigationPrerequisiteError {
 impl std::error::Error for LiveNavigationPrerequisiteError {}
 
 #[cfg(feature = "record")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveNavigationPreparationError {
+    MissingNavigationConfigBytes,
+    UnexpectedNavigationConfigBytes,
+    #[cfg(feature = "actuation")]
+    MissingActuationConfigBytes,
+    UnexpectedActuationConfigBytes,
+    #[cfg(not(feature = "actuation"))]
+    PhysicalActuationFeatureDisabled,
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveNavigationPreparationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingNavigationConfigBytes => {
+                "enabled live navigation has no bounded navigation-config input"
+            }
+            Self::UnexpectedNavigationConfigBytes => {
+                "disabled live navigation received unexpected navigation-config input"
+            }
+            #[cfg(feature = "actuation")]
+            Self::MissingActuationConfigBytes => {
+                "physical live navigation has no bounded actuation-config input"
+            }
+            Self::UnexpectedActuationConfigBytes => {
+                "shadow-only live navigation received unexpected actuation-config input"
+            }
+            #[cfg(not(feature = "actuation"))]
+            Self::PhysicalActuationFeatureDisabled => {
+                "physical live navigation was requested without the actuation build feature"
+            }
+        })
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveNavigationPreparationError {}
+
+#[cfg(feature = "record")]
 #[derive(Debug)]
 enum LiveNavigationConfigReadError {
     Open {
+        kind: &'static str,
         path: PathBuf,
         source: std::io::Error,
     },
     Read {
+        kind: &'static str,
         path: PathBuf,
         source: std::io::Error,
     },
     InputTooLarge {
+        kind: &'static str,
         path: PathBuf,
         actual_bytes_at_least: usize,
         maximum_bytes: usize,
@@ -3222,23 +3349,24 @@ enum LiveNavigationConfigReadError {
 impl std::fmt::Display for LiveNavigationConfigReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Open { path, source } => write!(
+            Self::Open { kind, path, source } => write!(
                 formatter,
-                "cannot open navigation config {}: {source}",
+                "cannot open {kind} config {}: {source}",
                 path.display()
             ),
-            Self::Read { path, source } => write!(
+            Self::Read { kind, path, source } => write!(
                 formatter,
-                "cannot read navigation config {}: {source}",
+                "cannot read {kind} config {}: {source}",
                 path.display()
             ),
             Self::InputTooLarge {
+                kind,
                 path,
                 actual_bytes_at_least,
                 maximum_bytes,
             } => write!(
                 formatter,
-                "navigation config {} is at least {actual_bytes_at_least} bytes; maximum is {maximum_bytes} bytes",
+                "{kind} config {} is at least {actual_bytes_at_least} bytes; maximum is {maximum_bytes} bytes",
                 path.display()
             ),
         }
@@ -3257,25 +3385,44 @@ impl std::error::Error for LiveNavigationConfigReadError {
 
 #[cfg(feature = "record")]
 fn read_navigation_config_bounded(path: &Path) -> Result<Vec<u8>, LiveNavigationConfigReadError> {
+    read_live_config_bounded(path, "navigation", MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES)
+}
+
+#[cfg(all(feature = "record", feature = "actuation"))]
+fn read_actuation_config_bounded(path: &Path) -> Result<Vec<u8>, LiveNavigationConfigReadError> {
+    read_live_config_bounded(
+        path,
+        "navigation actuation",
+        MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES,
+    )
+}
+
+#[cfg(feature = "record")]
+fn read_live_config_bounded(
+    path: &Path,
+    kind: &'static str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, LiveNavigationConfigReadError> {
     let file = File::open(path).map_err(|source| LiveNavigationConfigReadError::Open {
+        kind,
         path: path.to_path_buf(),
         source,
     })?;
-    let read_bound = u64::try_from(MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES)
-        .expect("navigation config byte bound fits u64")
-        + 1;
-    let mut bytes = Vec::with_capacity(MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES.min(16 * 1024));
+    let read_bound = u64::try_from(maximum_bytes).expect("live config byte bound fits u64") + 1;
+    let mut bytes = Vec::with_capacity(maximum_bytes.min(16 * 1024));
     file.take(read_bound)
         .read_to_end(&mut bytes)
         .map_err(|source| LiveNavigationConfigReadError::Read {
+            kind,
             path: path.to_path_buf(),
             source,
         })?;
-    if bytes.len() > MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES {
+    if bytes.len() > maximum_bytes {
         return Err(LiveNavigationConfigReadError::InputTooLarge {
+            kind,
             path: path.to_path_buf(),
             actual_bytes_at_least: bytes.len(),
-            maximum_bytes: MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES,
+            maximum_bytes,
         });
     }
     Ok(bytes)
@@ -3510,6 +3657,55 @@ struct LiveLocalCostmapViz {
 
 #[cfg(feature = "record")]
 #[derive(Debug)]
+struct LiveAppliedActuationViz {
+    controller_boot_id: u64,
+    control_epoch: u32,
+    sequence: u32,
+    applied_pwm: [i8; 2],
+    remaining_lease_at_server_emission_ms: u16,
+    acknowledged_at_ns_decimal: String,
+    known_active_through_ns_decimal: String,
+}
+
+#[cfg(all(feature = "record", feature = "actuation"))]
+fn live_applied_actuation_viz(receipt: &AppliedCommandReceipt) -> LiveAppliedActuationViz {
+    let pwm = receipt.applied_timer_pwm();
+    LiveAppliedActuationViz {
+        controller_boot_id: receipt.controller_session().boot_id().get(),
+        control_epoch: receipt.controller_session().control_epoch().get(),
+        sequence: receipt.sequence().get(),
+        applied_pwm: [pwm.left().get(), pwm.right().get()],
+        remaining_lease_at_server_emission_ms: receipt.remaining_lease_at_server_emission().get(),
+        acknowledged_at_ns_decimal: receipt
+            .acknowledged_at()
+            .nanos_since_clock_start()
+            .to_string(),
+        known_active_through_ns_decimal: receipt
+            .known_active_through_exclusive()
+            .nanos_since_clock_start()
+            .to_string(),
+    }
+}
+
+#[cfg(any(feature = "record", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDecisionVizKind {
+    Controller,
+    Stopped,
+}
+
+#[cfg(any(feature = "record", test))]
+const fn live_decision_viz_status(kind: LiveDecisionVizKind, applied: bool) -> &'static str {
+    match (kind, applied) {
+        (LiveDecisionVizKind::Controller, false) => "controller_request",
+        (LiveDecisionVizKind::Controller, true) => "controller_applied",
+        (LiveDecisionVizKind::Stopped, false) => "fail_closed_stop",
+        (LiveDecisionVizKind::Stopped, true) => "fail_closed_stop_applied",
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Debug)]
 struct LiveNavigationVizMsg {
     tick_sequence: i64,
     host_timestamp_ns: u64,
@@ -3527,7 +3723,8 @@ struct LiveNavigationVizMsg {
     reason: String,
     requested_pwm: [i8; 2],
     objective_cost: Option<f64>,
-    motor_packets_sent: u64,
+    shadow_record_motor_packets_sent: u64,
+    applied_actuation: Option<LiveAppliedActuationViz>,
     diagnostic_warning: Option<String>,
 }
 
@@ -3545,6 +3742,7 @@ fn build_live_navigation_viz_message(
     tick_sequence: i64,
     goal: NavigationGoalArg,
     outcome: &CoordinatorTickOutcome<NavigationIngressStreamWriteError>,
+    applied_actuation: Option<LiveAppliedActuationViz>,
 ) -> LiveNavigationVizMsg {
     let mut warnings = Vec::new();
     let goal = rerun_point2(goal.point().as_array()).or_else(|| {
@@ -3630,16 +3828,31 @@ fn build_live_navigation_viz_message(
     });
 
     let decision = outcome.decision();
-    let (status, reason, objective_cost) = match decision.outcome() {
+    let applied = applied_actuation.is_some();
+    let (kind, reason, objective_cost) = match decision.outcome() {
         SafetyDecisionOutcome::Controller(controller) => (
-            "controller_request",
-            "safety-approved shadow MPC request; no transport exists".to_owned(),
+            LiveDecisionVizKind::Controller,
+            if applied {
+                "exact V2 controller application receipt matched; physical wheel motion remains unobserved".to_owned()
+            } else {
+                "safety-approved shadow MPC request; no transport exists".to_owned()
+            },
             Some(controller.objective_cost()),
         ),
-        SafetyDecisionOutcome::Stopped(stopped) => {
-            ("fail_closed_stop", stopped.cause().to_string(), None)
-        }
+        SafetyDecisionOutcome::Stopped(stopped) => (
+            LiveDecisionVizKind::Stopped,
+            if applied {
+                format!(
+                    "{}; exact V2 zero application receipt matched; physical wheel motion remains unobserved",
+                    stopped.cause()
+                )
+            } else {
+                stopped.cause().to_string()
+            },
+            None,
+        ),
     };
+    let status = live_decision_viz_status(kind, applied);
     let predicted_odom = coordinator
         .safety()
         .last_success_trajectory()
@@ -3674,7 +3887,8 @@ fn build_live_navigation_viz_message(
         reason,
         requested_pwm: [pwm.left().get(), pwm.right().get()],
         objective_cost,
-        motor_packets_sent: decision.motor_packets_sent().get(),
+        shadow_record_motor_packets_sent: decision.motor_packets_sent().get(),
+        applied_actuation,
         diagnostic_warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
     }
 }
@@ -3790,14 +4004,45 @@ fn log_live_navigation_viz_message(
     ] {
         recording.log(path, &rerun::Scalars::single(value))?;
     }
-    if let Ok(motor_packets_sent) = u32::try_from(message.motor_packets_sent) {
+    if let Some(applied) = message.applied_actuation.as_ref() {
+        for (path, value) in [
+            (
+                "navigation/actuation/applied_left_pwm_percent",
+                f64::from(applied.applied_pwm[0]),
+            ),
+            (
+                "navigation/actuation/applied_right_pwm_percent",
+                f64::from(applied.applied_pwm[1]),
+            ),
+            (
+                "navigation/actuation/remaining_lease_at_server_emission_ms",
+                f64::from(applied.remaining_lease_at_server_emission_ms),
+            ),
+        ] {
+            recording.log(path, &rerun::Scalars::single(value))?;
+        }
         recording.log(
-            "navigation/decision/motor_packets_sent",
+            "navigation/actuation/applied_receipt",
+            &rerun::TextLog::new(format!(
+                "boot_id={} control_epoch={} sequence={} acknowledged_at_host_ns={} known_active_through_host_ns={}",
+                applied.controller_boot_id,
+                applied.control_epoch,
+                applied.sequence,
+                applied.acknowledged_at_ns_decimal,
+                applied.known_active_through_ns_decimal,
+            )),
+        )?;
+    } else {
+        recording.log("navigation/actuation", &rerun::Clear::recursive())?;
+    }
+    if let Ok(motor_packets_sent) = u32::try_from(message.shadow_record_motor_packets_sent) {
+        recording.log(
+            "navigation/decision/shadow_record_motor_packets_sent",
             &rerun::Scalars::single(f64::from(motor_packets_sent)),
         )?;
     } else {
         recording.log(
-            "navigation/decision/motor_packets_sent",
+            "navigation/decision/shadow_record_motor_packets_sent",
             &rerun::Clear::flat(),
         )?;
     }
@@ -3861,7 +4106,7 @@ fn log_live_navigation_viz_message(
         )?;
     }
     let mut status = format!(
-        "host_timestamp_ns={} decision_id={} request_id={} status={} goal_state={} motor_packets_sent={} reason={}",
+        "host_timestamp_ns={} decision_id={} request_id={} status={} goal_state={} shadow_record_motor_packets_sent={} reason={}",
         message.host_timestamp_ns,
         message.decision_id,
         message
@@ -3869,7 +4114,7 @@ fn log_live_navigation_viz_message(
             .map_or_else(|| "none".to_owned(), |id| id.to_string()),
         message.status,
         message.goal_state,
-        message.motor_packets_sent,
+        message.shadow_record_motor_packets_sent,
         message.reason
     );
     if let Some(local_costmap_evidence) = local_costmap_evidence {
@@ -4016,6 +4261,16 @@ enum LiveNavigationWorkerError {
     },
     ClockDuringSolver(HostMonotonicRangeError),
     TickSequenceExhausted,
+    #[cfg(feature = "actuation")]
+    Actuation {
+        phase: &'static str,
+        source: LiveActuationError,
+    },
+    #[cfg(feature = "actuation")]
+    OperationAndDisarm {
+        operation: Box<Self>,
+        disarm: LiveActuationError,
+    },
     JournalFinalization {
         source: NavigationIngressStreamWriteError,
     },
@@ -4054,6 +4309,18 @@ impl std::fmt::Display for LiveNavigationWorkerError {
             Self::TickSequenceExhausted => {
                 formatter.write_str("navigation diagnostic tick sequence exhausted i64")
             }
+            #[cfg(feature = "actuation")]
+            Self::Actuation { phase, source } => {
+                write!(
+                    formatter,
+                    "physical actuation failed during {phase}: {source}"
+                )
+            }
+            #[cfg(feature = "actuation")]
+            Self::OperationAndDisarm { operation, disarm } => write!(
+                formatter,
+                "navigation failed ({operation}); shutdown also could not prove controller stop ({disarm})"
+            ),
             Self::JournalFinalization { source } => {
                 write!(
                     formatter,
@@ -4079,6 +4346,10 @@ impl std::error::Error for LiveNavigationWorkerError {
             Self::Tick { source } => Some(source),
             Self::JournalFinalization { source } => Some(source),
             Self::JournalSync { source } => Some(source),
+            #[cfg(feature = "actuation")]
+            Self::Actuation { source, .. } => Some(source),
+            #[cfg(feature = "actuation")]
+            Self::OperationAndDisarm { operation, .. } => Some(operation.as_ref()),
             Self::TickSequenceExhausted => None,
         }
     }
@@ -4096,6 +4367,7 @@ fn run_live_navigation_worker(
     goal: NavigationGoalArg,
     control_period: ControlPeriodNs,
     clock_origin: Instant,
+    #[cfg(feature = "actuation")] actuation_config: Option<NavigationActuationConfigV1>,
     running: Arc<AtomicBool>,
     visual_rx: crossbeam_channel::Receiver<VisualAdmission>,
     depth_rx: DropReceiver<DepthObservation>,
@@ -4105,138 +4377,224 @@ fn run_live_navigation_worker(
     mut navigation_viz_tx: Option<DropSender<LiveNavigationVizMsg>>,
 ) -> Result<LiveNavigationWorkerSuccess, LiveNavigationWorkerError> {
     let _exit_guard = LiveThreadExitGuard(Arc::clone(&running));
-    let mut clock = InstantHostClock::new(clock_origin);
-    let tick_rx = crossbeam_channel::tick(control_period.as_duration());
-    let never_visual = crossbeam_channel::never::<VisualAdmission>();
-    let never_depth = crossbeam_channel::never::<DepthObservation>();
-    let never_imu = crossbeam_channel::never::<ImuReport>();
-    let never_map = crossbeam_channel::never::<TimedOccupancySnapshot>();
-    let never_tick = crossbeam_channel::never::<Instant>();
-    let mut visual_open = true;
-    let mut depth_open = true;
-    let mut imu_open = true;
-    let mut map_open = true;
-    let mut tick_sequence = 0_i64;
+    #[cfg(feature = "actuation")]
+    let mut physical_actuation = match actuation_config.as_ref() {
+        Some(config) => {
+            let (session, initial_zero) = PhysicalActuationSession::acquire(config, clock_origin)
+                .map_err(|source| {
+                LiveNavigationWorkerError::Actuation {
+                    phase: "zero acquisition",
+                    source,
+                }
+            })?;
+            eprintln!(
+                "physical actuation acquired: robot_id={} boot_id={} epoch={} sequence={} applied_pwm=[{},{}] known_active_through_host_ns={}",
+                config.robot_id(),
+                initial_zero.controller_session().boot_id().get(),
+                initial_zero.controller_session().control_epoch().get(),
+                initial_zero.sequence().get(),
+                initial_zero.applied_timer_pwm().left().get(),
+                initial_zero.applied_timer_pwm().right().get(),
+                initial_zero
+                    .known_active_through_exclusive()
+                    .nanos_since_clock_start(),
+            );
+            Some(session)
+        }
+        None => None,
+    };
+    let operation_result = (|| -> Result<(), LiveNavigationWorkerError> {
+        let mut clock = InstantHostClock::new(clock_origin);
+        let tick_rx = crossbeam_channel::tick(control_period.as_duration());
+        let never_visual = crossbeam_channel::never::<VisualAdmission>();
+        let never_depth = crossbeam_channel::never::<DepthObservation>();
+        let never_imu = crossbeam_channel::never::<ImuReport>();
+        let never_map = crossbeam_channel::never::<TimedOccupancySnapshot>();
+        let mut visual_open = true;
+        let mut depth_open = true;
+        let mut imu_open = true;
+        let mut map_open = true;
+        let mut tick_sequence = 0_i64;
 
-    while visual_open || depth_open || imu_open || map_open {
-        let visual_receiver = if visual_open {
-            &visual_rx
-        } else {
-            &never_visual
-        };
-        let depth_receiver = if depth_open {
-            depth_rx.as_receiver()
-        } else {
-            &never_depth
-        };
-        let imu_receiver = if imu_open {
-            imu_rx.as_receiver()
-        } else {
-            &never_imu
-        };
-        let map_receiver = if map_open {
-            map_rx.as_receiver()
-        } else {
-            &never_map
-        };
-        let tick_receiver = if running.load(Ordering::SeqCst) {
-            &tick_rx
-        } else {
-            &never_tick
-        };
-        crossbeam_channel::select! {
-            recv(visual_receiver) -> message => match message {
-                Ok(admission) => {
-                    let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                    coordinator.accept_visual(admission, now).map_err(|source| {
-                        LiveNavigationWorkerError::VisualAdmission { source }
-                    })?;
-                }
-                Err(_) => visual_open = false,
-            },
-            recv(depth_receiver) -> message => match message {
-                Ok(observation) => {
-                    let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                    coordinator.accept_depth(observation, now).map_err(|source| {
-                        LiveNavigationWorkerError::DepthAdmission { source }
-                    })?;
-                }
-                Err(_) => depth_open = false,
-            },
-            recv(imu_receiver) -> message => match message {
-                Ok(report) => {
-                    let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                    coordinator.accept_imu(report, now).map_err(|source| {
-                        LiveNavigationWorkerError::ImuAdmission { source }
-                    })?;
-                }
-                Err(_) => imu_open = false,
-            },
-            recv(map_receiver) -> message => match message {
-                Ok(snapshot) => {
-                    // The inference producer routes each visual outcome before it can
-                    // issue that attempt's dense-map command. Because visual and map
-                    // traffic use distinct bounded queues, `select!` may nevertheless
-                    // observe the derived map first. Admit every visual outcome already
-                    // ready on its queue before admitting this map; the journal remains
-                    // the authority for the actual cross-channel admission order.
-                    loop {
-                        match visual_rx.try_recv() {
-                            Ok(admission) => {
-                                let now = clock
-                                    .checked_now()
-                                    .map_err(LiveNavigationWorkerError::HostClock)?;
-                                coordinator.accept_visual(admission, now).map_err(|source| {
-                                    LiveNavigationWorkerError::VisualAdmission { source }
-                                })?;
-                            }
-                            Err(crossbeam_channel::TryRecvError::Empty) => break,
-                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                                visual_open = false;
-                                break;
+        while visual_open || depth_open || imu_open || map_open {
+            if !running.load(Ordering::SeqCst) {
+                break;
+            }
+            let visual_receiver = if visual_open {
+                &visual_rx
+            } else {
+                &never_visual
+            };
+            let depth_receiver = if depth_open {
+                depth_rx.as_receiver()
+            } else {
+                &never_depth
+            };
+            let imu_receiver = if imu_open {
+                imu_rx.as_receiver()
+            } else {
+                &never_imu
+            };
+            let map_receiver = if map_open {
+                map_rx.as_receiver()
+            } else {
+                &never_map
+            };
+            crossbeam_channel::select! {
+                recv(visual_receiver) -> message => match message {
+                    Ok(admission) => {
+                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
+                        coordinator.accept_visual(admission, now).map_err(|source| {
+                            LiveNavigationWorkerError::VisualAdmission { source }
+                        })?;
+                    }
+                    Err(_) => visual_open = false,
+                },
+                recv(depth_receiver) -> message => match message {
+                    Ok(observation) => {
+                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
+                        coordinator.accept_depth(observation, now).map_err(|source| {
+                            LiveNavigationWorkerError::DepthAdmission { source }
+                        })?;
+                    }
+                    Err(_) => depth_open = false,
+                },
+                recv(imu_receiver) -> message => match message {
+                    Ok(report) => {
+                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
+                        coordinator.accept_imu(report, now).map_err(|source| {
+                            LiveNavigationWorkerError::ImuAdmission { source }
+                        })?;
+                    }
+                    Err(_) => imu_open = false,
+                },
+                recv(map_receiver) -> message => match message {
+                    Ok(snapshot) => {
+                        // The inference producer routes each visual outcome before it can
+                        // issue that attempt's dense-map command. Because visual and map
+                        // traffic use distinct bounded queues, `select!` may nevertheless
+                        // observe the derived map first. Admit every visual outcome already
+                        // ready on its queue before admitting this map; the journal remains
+                        // the authority for the actual cross-channel admission order.
+                        loop {
+                            match visual_rx.try_recv() {
+                                Ok(admission) => {
+                                    let now = clock
+                                        .checked_now()
+                                        .map_err(LiveNavigationWorkerError::HostClock)?;
+                                    coordinator.accept_visual(admission, now).map_err(|source| {
+                                        LiveNavigationWorkerError::VisualAdmission { source }
+                                    })?;
+                                }
+                                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                    visual_open = false;
+                                    break;
+                                }
                             }
                         }
+                        let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
+                        coordinator
+                            .accept_global_map(now, snapshot.timestamp(), snapshot.snapshot())
+                            .map_err(|source| LiveNavigationWorkerError::MapAdmission { source })?;
+                        if let Some(sender) = map_viz_tx.as_ref()
+                            && matches!(sender.try_send(snapshot), SendOutcome::Disconnected)
+                        {
+                            map_viz_tx = None;
+                        }
                     }
-                    let now = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                    coordinator
-                        .accept_global_map(now, snapshot.timestamp(), snapshot.snapshot())
-                        .map_err(|source| LiveNavigationWorkerError::MapAdmission { source })?;
-                    if let Some(sender) = map_viz_tx.as_ref()
-                        && matches!(sender.try_send(snapshot), SendOutcome::Disconnected)
-                    {
-                        map_viz_tx = None;
+                    Err(_) => map_open = false,
+                },
+                recv(&tick_rx) -> _ => {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
                     }
-                }
-                Err(_) => map_open = false,
-            },
-            recv(tick_receiver) -> _ => {
-                let tick = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
-                let outcome = coordinator
-                    .tick(tick, &mut clock)
-                    .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
-                if let Some(source) = clock.take_overflow() {
-                    return Err(LiveNavigationWorkerError::ClockDuringSolver(source));
-                }
-                tick_sequence = tick_sequence
-                    .checked_add(1)
-                    .ok_or(LiveNavigationWorkerError::TickSequenceExhausted)?;
-                // Diagnostic copies happen only after the authoritative decision and never
-                // feed back into planning, MPC, journal admission, or shadow evidence.
-                if let Some(sender) = navigation_viz_tx.as_ref() {
-                    let message = build_live_navigation_viz_message(
-                        &coordinator,
-                        tick,
-                        tick_sequence,
-                        goal,
-                        &outcome,
-                    );
-                    if matches!(sender.try_send(message), SendOutcome::Disconnected) {
-                        navigation_viz_tx = None;
+                    #[cfg(feature = "actuation")]
+                    if let Some(session) = physical_actuation.as_mut() {
+                        session.require_current_before_solve().map_err(|source| {
+                            LiveNavigationWorkerError::Actuation {
+                                phase: "pre-solve applied-evidence gate",
+                                source,
+                            }
+                        })?;
                     }
-                }
-            },
+                    let tick = clock.checked_now().map_err(LiveNavigationWorkerError::HostClock)?;
+                    let outcome = coordinator
+                        .tick(tick, &mut clock)
+                        .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
+                    if let Some(source) = clock.take_overflow() {
+                        return Err(LiveNavigationWorkerError::ClockDuringSolver(source));
+                    }
+                    tick_sequence = tick_sequence
+                        .checked_add(1)
+                        .ok_or(LiveNavigationWorkerError::TickSequenceExhausted)?;
+                    #[cfg(feature = "actuation")]
+                    let applied_actuation = if let Some(session) = physical_actuation.as_mut() {
+                        let receipt = session.apply(outcome.decision()).map_err(|source| {
+                            LiveNavigationWorkerError::Actuation {
+                                phase: "synchronous command application",
+                                source,
+                            }
+                        })?;
+                        Some(live_applied_actuation_viz(&receipt))
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "actuation"))]
+                    let applied_actuation = None;
+                    // Diagnostic copies happen only after the authoritative decision and never
+                    // feed back into planning, MPC, journal admission, applied evidence, or shadow evidence.
+                    if let Some(sender) = navigation_viz_tx.as_ref() {
+                        let message = build_live_navigation_viz_message(
+                            &coordinator,
+                            tick,
+                            tick_sequence,
+                            goal,
+                            &outcome,
+                            applied_actuation,
+                        );
+                        if matches!(sender.try_send(message), SendOutcome::Disconnected) {
+                            navigation_viz_tx = None;
+                        }
+                    }
+                },
+            }
+        }
+
+        Ok(())
+    })();
+
+    #[cfg(feature = "actuation")]
+    let disarm_result = match physical_actuation.as_mut() {
+        Some(session) if !session.is_consumed() => session.disarm().map(|receipt| {
+            eprintln!(
+                "physical actuation disarmed: boot_id={} request_id={} acknowledged_at_host_ns={}",
+                receipt.observed_boot_id().get(),
+                receipt.request_id().get(),
+                receipt.acknowledged_at().nanos_since_clock_start(),
+            );
+        }),
+        Some(_) | None => Ok(()),
+    };
+    #[cfg(feature = "actuation")]
+    match (operation_result, disarm_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(operation), Ok(())) => return Err(operation),
+        (Ok(()), Err(source)) => {
+            return Err(LiveNavigationWorkerError::Actuation {
+                phase: "shutdown disarm",
+                source,
+            });
+        }
+        (Err(operation), Err(disarm)) => {
+            return Err(LiveNavigationWorkerError::OperationAndDisarm {
+                operation: Box::new(operation),
+                disarm,
+            });
         }
     }
+    #[cfg(not(feature = "actuation"))]
+    operation_result?;
 
     let finalized = coordinator
         .into_journal()
@@ -4533,10 +4891,10 @@ impl std::error::Error for LiveRunError {
     }
 }
 
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 struct LiveThreadExitGuard(Arc<AtomicBool>);
 
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 impl Drop for LiveThreadExitGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
@@ -4673,6 +5031,8 @@ struct PreparedLiveNavigationRuntime {
     mpc_config: MpcConfigV1,
     solver_budget: SolverBudgetNs,
     safety: ShadowSafetySupervisor,
+    #[cfg(feature = "actuation")]
+    actuation: Option<NavigationActuationConfigV1>,
 }
 
 #[cfg(feature = "record")]
@@ -4682,6 +5042,8 @@ struct ActiveLiveNavigation {
     control_period: ControlPeriodNs,
     dataset_writer: PairedDatasetWriter,
     dataset_handle: DatasetWriterHandle,
+    #[cfg(feature = "actuation")]
+    actuation: Option<NavigationActuationConfigV1>,
 }
 
 #[cfg(feature = "record")]
@@ -4730,20 +5092,77 @@ fn fail_navigation_setup_after_dataset<T>(
 fn prepare_live_navigation_runtime(
     request: &LiveNavigationRequest,
     config_bytes: Option<&[u8]>,
+    actuation_config_bytes: Option<&[u8]>,
     runtime_depth_camera: DepthCameraModel,
     device_session: DeviceSessionId,
 ) -> Result<Option<PreparedLiveNavigationRuntime>, Box<dyn std::error::Error>> {
     let LiveNavigationRequest::Enabled {
-        goal, dataset_path, ..
+        goal,
+        dataset_path,
+        actuation,
+        ..
     } = request
     else {
-        debug_assert!(config_bytes.is_none());
+        if config_bytes.is_some() {
+            return Err(Box::new(
+                LiveNavigationPreparationError::UnexpectedNavigationConfigBytes,
+            ));
+        }
+        if actuation_config_bytes.is_some() {
+            return Err(Box::new(
+                LiveNavigationPreparationError::UnexpectedActuationConfigBytes,
+            ));
+        }
         return Ok(None);
     };
-    let bytes = config_bytes.expect("enabled request has bounded config bytes");
+    let Some(bytes) = config_bytes else {
+        return Err(Box::new(
+            LiveNavigationPreparationError::MissingNavigationConfigBytes,
+        ));
+    };
     let parsed = ShadowNavigationConfigV1::parse_json(bytes, runtime_depth_camera)?;
     let occupancy_config = build_navigation_occupancy_runtime_config(&parsed)?;
     let parts = parsed.into_runtime_parts();
+    #[cfg(feature = "actuation")]
+    let actuation = match actuation {
+        LiveActuationRequest::ShadowOnly => {
+            if actuation_config_bytes.is_some() {
+                return Err(Box::new(
+                    LiveNavigationPreparationError::UnexpectedActuationConfigBytes,
+                ));
+            }
+            None
+        }
+        LiveActuationRequest::Physical { exact_robot_id, .. } => {
+            let Some(actuation_bytes) = actuation_config_bytes else {
+                return Err(Box::new(
+                    LiveNavigationPreparationError::MissingActuationConfigBytes,
+                ));
+            };
+            Some(NavigationActuationConfigV1::parse_and_authorize(
+                actuation_bytes,
+                exact_robot_id,
+                bytes,
+                parts.mpc_solver.model(),
+                parts.solver_budget,
+                parts.control_period,
+            )?)
+        }
+    };
+    #[cfg(not(feature = "actuation"))]
+    match actuation {
+        LiveActuationRequest::ShadowOnly if actuation_config_bytes.is_none() => {}
+        LiveActuationRequest::ShadowOnly => {
+            return Err(Box::new(
+                LiveNavigationPreparationError::UnexpectedActuationConfigBytes,
+            ));
+        }
+        LiveActuationRequest::Physical { .. } => {
+            return Err(Box::new(
+                LiveNavigationPreparationError::PhysicalActuationFeatureDisabled,
+            ));
+        }
+    }
     let mpc_config = parts.mpc_solver.config();
     let odometry = PlanarOdometry::new(parts.odometry);
     let local_costmap = LocalCostmap::try_new(parts.local_costmap, device_session)?;
@@ -4762,6 +5181,8 @@ fn prepare_live_navigation_runtime(
         mpc_config,
         solver_budget: parts.solver_budget,
         safety,
+        #[cfg(feature = "actuation")]
+        actuation,
     }))
 }
 
@@ -4837,15 +5258,26 @@ fn activate_live_navigation(
         control_period: runtime.control_period,
         dataset_writer,
         dataset_handle,
+        #[cfg(feature = "actuation")]
+        actuation: runtime.actuation,
     })
 }
 
 #[cfg(feature = "record")]
 fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "actuation")]
+    let (navigation_actuation_config, navigation_arm_robot) = (
+        args.navigation_actuation_config.clone(),
+        args.navigation_arm_robot.clone(),
+    );
+    #[cfg(not(feature = "actuation"))]
+    let (navigation_actuation_config, navigation_arm_robot) = (None, None);
     let navigation_request = LiveNavigationRequest::parse(
         args.navigation_config.clone(),
         args.navigation_goal,
         args.navigation_record.clone(),
+        navigation_actuation_config,
+        navigation_arm_robot,
     )?;
     let navigation_config_bytes = match &navigation_request {
         LiveNavigationRequest::Disabled => None,
@@ -4853,6 +5285,20 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             Some(read_navigation_config_bounded(config_path)?)
         }
     };
+    #[cfg(feature = "actuation")]
+    let navigation_actuation_config_bytes = match &navigation_request {
+        LiveNavigationRequest::Enabled {
+            actuation: LiveActuationRequest::Physical { config_path, .. },
+            ..
+        } => Some(read_actuation_config_bounded(config_path)?),
+        LiveNavigationRequest::Disabled
+        | LiveNavigationRequest::Enabled {
+            actuation: LiveActuationRequest::ShadowOnly,
+            ..
+        } => None,
+    };
+    #[cfg(not(feature = "actuation"))]
+    let navigation_actuation_config_bytes: Option<Vec<u8>> = None;
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
@@ -4950,6 +5396,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut prepared_navigation_runtime = prepare_live_navigation_runtime(
             &navigation_request,
             navigation_config_bytes.as_deref(),
+            navigation_actuation_config_bytes.as_deref(),
             runtime_depth_camera,
             device_session,
         )?;
@@ -5122,6 +5569,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 )
             })
             .transpose()?;
+        #[cfg(feature = "actuation")]
+        let navigation_actuation_config = active_navigation
+            .as_ref()
+            .and_then(|active| active.actuation.clone());
         let (
             navigation_coordinator,
             navigation_goal,
@@ -5183,6 +5634,8 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                         goal,
                         control_period,
                         capture_clock_origin,
+                        #[cfg(feature = "actuation")]
+                        navigation_actuation_config,
                         navigation_running,
                         visual_rx,
                         depth_rx,
@@ -5645,6 +6098,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         eprintln!("streaming matches... press ctrl+c to stop");
 
+        let capture_exit_guard = LiveThreadExitGuard(Arc::clone(&running));
         'capture: while running.load(Ordering::Relaxed) {
             let mut got_any = false;
 
@@ -5838,6 +6292,10 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Dropping the capture exit guard propagates every normal/error exit
+        // before the remaining bounded queues are joined and drained. It also
+        // covers unwinding through this scope.
+        drop(capture_exit_guard);
         drop(pair_tx);
         drop(depth_tx);
         drop(imu_tx);
@@ -6229,15 +6687,16 @@ fn max_rss_bytes(raw: libc::c_long) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveDenseCommandClass,
-        LiveDenseRouteContext, LiveDenseRouteDisposition, LiveDenseRouteError,
-        LiveLosslessRouteError, LiveNavigationBoundaryError, LiveNavigationRequest,
-        LiveVisualShape, OccupancyProjectionContractError, OdometryVizProcessingError,
-        OfflineDepthSelector, OfflineFatalDenseError, OfflineFatalTrackerError, RerunDestination,
-        RerunDestinationError, RerunFinishTimeout, RerunSessionError, build_ba_config_from_values,
+        BaConfigValues, BenchError, Cli, Command, DepthRingCapacity, LiveActuationRequest,
+        LiveDecisionVizKind, LiveDenseCommandClass, LiveDenseRouteContext,
+        LiveDenseRouteDisposition, LiveDenseRouteError, LiveLosslessRouteError,
+        LiveNavigationBoundaryError, LiveNavigationRequest, LiveThreadExitGuard, LiveVisualShape,
+        OccupancyProjectionContractError, OdometryVizProcessingError, OfflineDepthSelector,
+        OfflineFatalDenseError, OfflineFatalTrackerError, RerunDestination, RerunDestinationError,
+        RerunFinishTimeout, RerunSessionError, build_ba_config_from_values,
         classify_live_dense_route, classify_live_visual_shape, classify_lossless_send,
-        combine_rerun_results, navigation_dataset_may_publish, occupancy_depth_camera,
-        reject_removed_ba_motion_prior, require_level_optical_world,
+        combine_rerun_results, live_decision_viz_status, navigation_dataset_may_publish,
+        occupancy_depth_camera, reject_removed_ba_motion_prior, require_level_optical_world,
         take_deferred_offline_snapshot_error,
     };
     use clap::{Parser as _, error::ErrorKind};
@@ -6251,22 +6710,20 @@ mod tests {
     use std::collections::VecDeque;
     use std::num::NonZeroU16;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
-
-    #[cfg(feature = "record")]
-    use super::{
-        DeviceCloseFailure, LiveThreadError, LiveThreadExitGuard, RecordCaptureError, RecordError,
-        RecordItem, RectifiedLeftDepthError, build_calibration, compose_record_errors,
-        finite_rate_per_second, record_device_close_error, require_rectified_left_depth_projection,
-    };
-    #[cfg(feature = "record")]
-    use oak_sys::Intrinsics as OakIntrinsics;
-    #[cfg(feature = "record")]
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::Duration;
 
+    #[cfg(feature = "record")]
+    use super::{
+        DeviceCloseFailure, LiveThreadError, RecordCaptureError, RecordError, RecordItem,
+        RectifiedLeftDepthError, build_calibration, compose_record_errors, finite_rate_per_second,
+        record_device_close_error, require_rectified_left_depth_projection,
+    };
+    #[cfg(feature = "record")]
+    use oak_sys::Intrinsics as OakIntrinsics;
     #[cfg(feature = "record")]
     fn oak_intrinsics(fx: f32, width: u32, height: u32) -> OakIntrinsics {
         OakIntrinsics::try_from_projection_matrix(
@@ -6283,7 +6740,8 @@ mod tests {
 
     #[test]
     fn live_navigation_boundary_disables_only_when_all_options_are_absent() {
-        let request = LiveNavigationRequest::parse(None, None, None).expect("all options absent");
+        let request =
+            LiveNavigationRequest::parse(None, None, None, None, None).expect("all options absent");
         assert_eq!(request, LiveNavigationRequest::Disabled);
         assert!(!request.is_enabled());
     }
@@ -6300,6 +6758,8 @@ mod tests {
             Some(config_path.clone()),
             Some(goal),
             Some(dataset_path.clone()),
+            None,
+            None,
         )
         .expect("complete navigation request");
         assert!(request.is_enabled());
@@ -6309,7 +6769,78 @@ mod tests {
                 config_path,
                 goal,
                 dataset_path,
+                actuation: LiveActuationRequest::ShadowOnly,
             }
+        );
+    }
+
+    #[test]
+    fn live_actuation_requires_an_explicit_paired_manifest_and_robot_id() {
+        let goal = "1.25,-2.5"
+            .parse::<kiko_slam::navigation::NavigationGoalArg>()
+            .expect("finite map-frame goal");
+        let request = LiveNavigationRequest::parse(
+            Some(PathBuf::from("navigation.json")),
+            Some(goal),
+            Some(PathBuf::from("capture")),
+            Some(PathBuf::from("actuation.json")),
+            Some("kiko-01".to_string()),
+        )
+        .expect("complete physical request");
+        assert_eq!(
+            request,
+            LiveNavigationRequest::Enabled {
+                config_path: PathBuf::from("navigation.json"),
+                goal,
+                dataset_path: PathBuf::from("capture"),
+                actuation: LiveActuationRequest::Physical {
+                    config_path: PathBuf::from("actuation.json"),
+                    exact_robot_id: "kiko-01".to_string(),
+                },
+            }
+        );
+
+        for (config, robot, expected) in [
+            (
+                Some(PathBuf::from("actuation.json")),
+                None,
+                LiveNavigationBoundaryError::IncompleteActuation {
+                    missing_config: false,
+                    missing_robot_id: true,
+                },
+            ),
+            (
+                None,
+                Some("kiko-01".to_string()),
+                LiveNavigationBoundaryError::IncompleteActuation {
+                    missing_config: true,
+                    missing_robot_id: false,
+                },
+            ),
+        ] {
+            assert_eq!(
+                LiveNavigationRequest::parse(
+                    Some(PathBuf::from("navigation.json")),
+                    Some(goal),
+                    Some(PathBuf::from("capture")),
+                    config,
+                    robot,
+                )
+                .expect_err("partial actuation authority must reject"),
+                expected
+            );
+        }
+
+        assert_eq!(
+            LiveNavigationRequest::parse(
+                None,
+                None,
+                None,
+                Some(PathBuf::from("actuation.json")),
+                Some("kiko-01".to_string()),
+            )
+            .expect_err("actuation without navigation must reject"),
+            LiveNavigationBoundaryError::ActuationRequiresNavigation
         );
     }
 
@@ -6321,7 +6852,7 @@ mod tests {
         let cases = [
             (
                 0b001,
-                LiveNavigationBoundaryError {
+                LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: false,
                     missing_goal: true,
                     missing_dataset: true,
@@ -6330,7 +6861,7 @@ mod tests {
             ),
             (
                 0b010,
-                LiveNavigationBoundaryError {
+                LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: true,
                     missing_goal: false,
                     missing_dataset: true,
@@ -6339,7 +6870,7 @@ mod tests {
             ),
             (
                 0b100,
-                LiveNavigationBoundaryError {
+                LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: true,
                     missing_goal: true,
                     missing_dataset: false,
@@ -6348,7 +6879,7 @@ mod tests {
             ),
             (
                 0b011,
-                LiveNavigationBoundaryError {
+                LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: false,
                     missing_goal: false,
                     missing_dataset: true,
@@ -6357,7 +6888,7 @@ mod tests {
             ),
             (
                 0b101,
-                LiveNavigationBoundaryError {
+                LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: false,
                     missing_goal: true,
                     missing_dataset: false,
@@ -6366,7 +6897,7 @@ mod tests {
             ),
             (
                 0b110,
-                LiveNavigationBoundaryError {
+                LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: true,
                     missing_goal: false,
                     missing_dataset: false,
@@ -6380,6 +6911,8 @@ mod tests {
                 (present & 0b001 != 0).then(|| PathBuf::from("navigation.json")),
                 (present & 0b010 != 0).then_some(goal),
                 (present & 0b100 != 0).then(|| PathBuf::from("capture")),
+                None,
+                None,
             )
             .expect_err("every nonempty partial request must fail");
             assert_eq!(actual, expected, "present mask {present:#05b}");
@@ -7316,7 +7849,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "record")]
     #[test]
     fn live_thread_exit_guard_stops_capture() {
         let running = Arc::new(AtomicBool::new(true));
@@ -7325,5 +7857,25 @@ mod tests {
             assert!(running.load(Ordering::SeqCst));
         }
         assert!(!running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn live_decision_viz_keeps_stop_outcome_separate_from_applied_evidence() {
+        assert_eq!(
+            live_decision_viz_status(LiveDecisionVizKind::Controller, false),
+            "controller_request"
+        );
+        assert_eq!(
+            live_decision_viz_status(LiveDecisionVizKind::Controller, true),
+            "controller_applied"
+        );
+        assert_eq!(
+            live_decision_viz_status(LiveDecisionVizKind::Stopped, false),
+            "fail_closed_stop"
+        );
+        assert_eq!(
+            live_decision_viz_status(LiveDecisionVizKind::Stopped, true),
+            "fail_closed_stop_applied"
+        );
     }
 }

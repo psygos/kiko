@@ -66,6 +66,10 @@ pub const MAX_COMMAND_LEASE_CONTROL_PERIODS: u64 = 2;
 pub struct ControlPeriodNs(NonZeroU64);
 
 impl ControlPeriodNs {
+    pub const fn from_nonzero(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
     pub const fn get(self) -> u64 {
         self.0.get()
     }

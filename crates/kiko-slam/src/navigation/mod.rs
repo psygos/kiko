@@ -1,5 +1,9 @@
 //! Hardware-independent navigation contracts and algorithms.
 
+#[cfg(feature = "actuation")]
+pub mod actuation;
+#[cfg(feature = "actuation")]
+mod actuation_config;
 mod cell_inflation;
 mod coordinator;
 mod frames;
@@ -14,6 +18,12 @@ mod safety;
 mod shadow_command;
 mod shadow_config;
 
+#[cfg(feature = "actuation")]
+pub use actuation_config::{
+    ActuationConfigParseError, ActuatorConfigFingerprint, ControllerUid,
+    MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, NAVIGATION_ACTUATION_CONFIG_V1,
+    NavigationActuationConfigV1, NavigationConfigSha256, OperatorClaimedPhysicalApprovalV1,
+};
 pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
     CoordinatorTickOutcome, DepthAdmissionOutcome, GlobalMapAdmissionOutcome,
