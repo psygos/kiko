@@ -12,6 +12,7 @@ mod odometry;
 mod reference;
 mod safety;
 mod shadow_command;
+mod shadow_config;
 
 pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
@@ -84,4 +85,9 @@ pub use shadow_command::{
     MAX_SHADOW_COMMAND_RECORDS, MotorPacketsSent, ShadowCommandConfig, ShadowCommandConfigDto,
     ShadowCommandConfigError, ShadowCommandDisposition, ShadowCommandError, ShadowCommandRecord,
     ShadowCommandSession, ShadowDecisionId, ShadowPwmPair, ShadowPwmPairError,
+};
+pub use shadow_config::{
+    ControlPeriodNs, FreshnessParameter, MAX_COMMAND_LEASE_CONTROL_PERIODS,
+    MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES, SHADOW_NAVIGATION_CONFIG_V1,
+    ShadowNavigationConfigParseError, ShadowNavigationConfigV1, ShadowNavigationRuntimePartsV1,
 };
