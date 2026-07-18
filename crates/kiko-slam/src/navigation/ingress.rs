@@ -465,6 +465,48 @@ impl VisualAttemptOutcome {
 /// Stable stereo identity plus its recording-relative admission offset.
 /// Image bytes remain in the dataset identified by these frame/timestamp pairs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingVisualAttemptIngress {
+    session_id: DeviceSessionId,
+    arrival_offset: NavigationClockOffset,
+    left_frame_id: FrameId,
+    left_timestamp: DeviceTimestamp,
+    right_frame_id: FrameId,
+    right_timestamp: DeviceTimestamp,
+}
+
+impl PendingVisualAttemptIngress {
+    /// Parse the weak observation boundary before its image payload is consumed.
+    pub fn from_observation(
+        clock_epoch: NavigationClockEpoch,
+        observation: &StereoObservation,
+    ) -> Result<Self, NavigationIngressBoundaryError> {
+        let pair = observation.pair();
+        Ok(Self {
+            session_id: observation.session_id(),
+            arrival_offset: clock_epoch.offset_at(observation.host_arrival())?,
+            left_frame_id: pair.left().frame_id(),
+            left_timestamp: observation.left_device_timestamp(),
+            right_frame_id: pair.right().frame_id(),
+            right_timestamp: observation.right_device_timestamp(),
+        })
+    }
+
+    /// Attach the authoritative result after tracking consumes the image payload.
+    pub fn complete(self, outcome: VisualAttemptOutcome) -> VisualAttemptIngress {
+        VisualAttemptIngress {
+            session_id: self.session_id,
+            arrival_offset: self.arrival_offset,
+            left_frame_id: self.left_frame_id,
+            left_timestamp: self.left_timestamp,
+            right_frame_id: self.right_frame_id,
+            right_timestamp: self.right_timestamp,
+            outcome,
+        }
+    }
+}
+
+/// A completed visual attempt ready for ordered journaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VisualAttemptIngress {
     session_id: DeviceSessionId,
     arrival_offset: NavigationClockOffset,
@@ -481,16 +523,8 @@ impl VisualAttemptIngress {
         observation: &StereoObservation,
         outcome: VisualAttemptOutcome,
     ) -> Result<Self, NavigationIngressBoundaryError> {
-        let pair = observation.pair();
-        Ok(Self {
-            session_id: observation.session_id(),
-            arrival_offset: clock_epoch.offset_at(observation.host_arrival())?,
-            left_frame_id: pair.left().frame_id(),
-            left_timestamp: observation.left_device_timestamp(),
-            right_frame_id: pair.right().frame_id(),
-            right_timestamp: observation.right_device_timestamp(),
-            outcome,
-        })
+        Ok(PendingVisualAttemptIngress::from_observation(clock_epoch, observation)?
+            .complete(outcome))
     }
 
     pub fn session_id(self) -> DeviceSessionId {
@@ -867,7 +901,7 @@ impl AcceptedGlobalMapIngress {
         )
     }
 
-    fn parse_snapshot(
+    pub(crate) fn parse_snapshot(
         clock_epoch: NavigationClockEpoch,
         host_arrival: HostMonotonicTimestamp,
         binding: CurrentMapEpochBinding,
@@ -3014,31 +3048,25 @@ mod tests {
     }
 
     #[test]
-    fn visual_ingress_uses_the_already_parsed_stereo_boundary() {
+    fn pending_visual_ingress_survives_consuming_the_stereo_payload() {
         let observation = stereo_observation();
-        let ingress = VisualAttemptIngress::from_observation(
-            clock(),
-            &observation,
-            VisualAttemptOutcome::LocalizationOnly,
-        )
-        .expect("ingress");
-        assert_eq!(ingress.session_id(), observation.session_id());
-        assert_eq!(
-            ingress.left_timestamp(),
-            observation.left_device_timestamp()
-        );
-        assert_eq!(
-            ingress.right_timestamp(),
-            observation.right_device_timestamp()
-        );
-        assert_eq!(
-            ingress.left_frame_id(),
-            observation.pair().left().frame_id()
-        );
-        assert_eq!(
-            ingress.right_frame_id(),
-            observation.pair().right().frame_id()
-        );
+        let expected_session = observation.session_id();
+        let expected_left_timestamp = observation.left_device_timestamp();
+        let expected_right_timestamp = observation.right_device_timestamp();
+        let expected_left_frame = observation.pair().left().frame_id();
+        let expected_right_frame = observation.pair().right().frame_id();
+        let pending = PendingVisualAttemptIngress::from_observation(clock(), &observation)
+            .expect("pending ingress");
+
+        let _consumed_pair = observation.into_pair();
+        let ingress = pending.complete(VisualAttemptOutcome::LocalizationOnly);
+
+        assert_eq!(ingress.session_id(), expected_session);
+        assert_eq!(ingress.left_timestamp(), expected_left_timestamp);
+        assert_eq!(ingress.right_timestamp(), expected_right_timestamp);
+        assert_eq!(ingress.left_frame_id(), expected_left_frame);
+        assert_eq!(ingress.right_frame_id(), expected_right_frame);
+        assert_eq!(ingress.outcome(), VisualAttemptOutcome::LocalizationOnly);
     }
 
     #[test]

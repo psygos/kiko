@@ -36,8 +36,9 @@ pub use ingress::{
     NavigationIngressStreamReadError, NavigationIngressStreamWriteError, NavigationIngressTimebase,
     NavigationIngressWriteError, NavigationIngressWriteStage, NavigationIngressWriter,
     NavigationMapEpochCoordinator, NavigationRecordingId, NavigationRecordingIdError,
-    NavigationReplayClock, NavigationReplayClockError, RecordedImuReport, RecordedMapEpochId,
-    RecordedMapEpochIdError, ReplayMapEpochBinding, VisualAttemptIngress, VisualAttemptOutcome,
+    NavigationReplayClock, NavigationReplayClockError, PendingVisualAttemptIngress,
+    RecordedImuReport, RecordedMapEpochId, RecordedMapEpochIdError, ReplayMapEpochBinding,
+    VisualAttemptIngress, VisualAttemptOutcome,
 };
 pub use local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapCell, LocalCostmapClockRegression, LocalCostmapConfig,
