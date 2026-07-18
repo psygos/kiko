@@ -462,6 +462,53 @@ fn expired_previous_applied_evidence_prevents_next_motion_send() {
 }
 
 #[test]
+fn expired_previous_applied_evidence_prevents_pre_solve_admission() {
+    let clock = FakeClock::default();
+    let mut steps = acquisition_steps();
+    steps.push(FakeStep::respond(
+        MessageKind::HostStop,
+        RESPONSE_DELAY,
+        stop_result(2),
+    ));
+    let (transport, probe) = FakeTransport::scripted(clock.clone(), steps);
+    let client = DisarmedCommandClient::new(transport, clock.clone(), config());
+    let (armed, initial) = client
+        .acquire_zero()
+        .ok()
+        .expect("zero acquisition succeeds");
+    clock.set_nanos(
+        u64::try_from(
+            initial
+                .known_active_through_exclusive()
+                .nanos_since_clock_start(),
+        )
+        .expect("fixture timestamp fits u64"),
+    );
+
+    let failure = match armed.require_current_applied_evidence() {
+        Ok(_) => panic!("expired evidence must prevent the next solve"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        failure.cause(),
+        FailureCause::PreviousAppliedEvidenceExpired { .. }
+    ));
+    assert_eq!(
+        probe
+            .exchanges()
+            .iter()
+            .filter(|exchange| matches!(exchange.request(), Message::HostCommand(_)))
+            .count(),
+        1,
+        "only the acquisition zero may have crossed the command boundary"
+    );
+    assert!(probe.exchanges().iter().any(|exchange| matches!(
+        exchange.request(),
+        Message::HostStop(stop) if stop.reason == ForceStopReason::LeaseExpired
+    )));
+}
+
+#[test]
 fn regressed_clock_still_sends_bounded_stops_but_claims_no_receipt() {
     let clock = FakeClock::default();
     let motion = TimerPwm::try_new(10, 10).expect("valid fixture PWM");

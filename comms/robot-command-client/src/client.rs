@@ -424,6 +424,32 @@ where
     Transport: V2CommandTransport,
     Clock: MonotonicClock,
 {
+    /// Consumes the armed state and returns it only when the previous applied
+    /// receipt still proves an active controller lease. Call this immediately
+    /// before starting work that may produce the next motion decision; a stale
+    /// receipt latches the session and performs bounded stop recovery without
+    /// allowing another command to be constructed.
+    pub fn require_current_applied_evidence(
+        mut self,
+    ) -> Result<Self, ApplyFailure<Transport, Clock>> {
+        let mut core = self.core.take().expect("armed client core is present");
+        let now = match core.observe_now() {
+            Ok(now) => now,
+            Err(cause) => return Err(ApplyFailure::latch(core, cause)),
+        };
+        if now >= self.confirmed.known_active_through_exclusive {
+            return Err(ApplyFailure::latch(
+                core,
+                FailureCause::PreviousAppliedEvidenceExpired {
+                    now,
+                    known_active_through_exclusive: self.confirmed.known_active_through_exclusive,
+                },
+            ));
+        }
+        self.core = Some(core);
+        Ok(self)
+    }
+
     pub fn apply(
         mut self,
         pending: PendingPhysicalCommand,
