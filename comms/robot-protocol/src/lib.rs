@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod v2;
+
 use core::num::{NonZeroU16, NonZeroU32};
 
 pub const MAX_ABS_PWM_PERCENT: i8 = 100;
