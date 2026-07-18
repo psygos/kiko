@@ -1,32 +1,41 @@
 use anyhow::{Context, Result as AnyResult};
 use bytes::{Buf, Bytes, BytesMut};
 use futures::StreamExt;
+#[cfg(test)]
 use robot_protocol::{
-    parse_controller_report, AppliedPwm, CommandSequenceRelation, ControllerError, ControllerEvent,
-    ControllerReport, LeasedPwmCommandError, RobotCommand, RobotCommandAcknowledgement,
-    RobotCommandAcknowledgementPacket, RobotCommandPacket, RobotOdometry,
-    RobotOdometryWithServerReceiveAge, RobotPacketLengthError,
+    parse_controller_report, CommandSequenceRelation, ControllerError, ControllerEvent,
+    ControllerReport, LeasedPwmCommandError, RobotCommandAcknowledgement,
+    RobotCommandAcknowledgementPacket, RobotPacketLengthError,
+};
+use robot_protocol::{
+    AppliedPwm, RobotCommand, RobotCommandPacket, RobotOdometry, RobotOdometryWithServerReceiveAge,
 };
 #[cfg(test)]
 use robot_protocol::{
     ControllerUptimeMsWrapping, EstimatedWrappingEncoderTicks, ModuloEncoderDeltaTicks,
 };
 use std::convert::Infallible;
+#[cfg(test)]
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(test)]
 use tokio::net::UdpSocket;
 use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
+#[cfg(test)]
 use tokio_serial::SerialPortBuilderExt;
 use tokio_stream::wrappers::BroadcastStream;
 use warp::hyper::Body;
 use warp::Filter;
 
+#[cfg(test)]
 const SERIAL_FORWARD_PERIOD: Duration = Duration::from_millis(20);
+#[cfg(test)]
 const SERIAL_ACTIVE_LEASE_MS: u16 = 50;
+#[cfg(test)]
 const SERIAL_STOP_LEASE_MS: u16 = 1;
 const CAMERA_READ_BUFFER_BYTES: usize = 64 * 1_024;
 const MAX_JPEG_FRAME_BYTES: usize = 4 * 1_024 * 1_024;
@@ -105,28 +114,6 @@ fn odometry_age_fields(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ControllerDiagnostic {
-    Error(ControllerError),
-    Event(ControllerEvent),
-}
-
-impl ControllerDiagnostic {
-    const fn kind(self) -> &'static str {
-        match self {
-            Self::Error(_) => "error",
-            Self::Event(_) => "event",
-        }
-    }
-
-    const fn code(self) -> &'static str {
-        match self {
-            Self::Error(error) => error.code(),
-            Self::Event(event) => event.code(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 enum VideoStreamStatus {
     #[default]
@@ -169,6 +156,7 @@ impl VideoStreamStatus {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommandAcceptanceError {
     LeaseDeadlineOverflow,
@@ -185,6 +173,7 @@ enum CommandAcceptanceError {
     },
 }
 
+#[cfg(test)]
 impl std::fmt::Display for CommandAcceptanceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -212,13 +201,16 @@ impl std::fmt::Display for CommandAcceptanceError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for CommandAcceptanceError {}
 
+#[cfg(test)]
 #[derive(Debug)]
 struct SerialPortDiscoveryError {
     attempts: Vec<(&'static str, tokio_serial::Error)>,
 }
 
+#[cfg(test)]
 impl std::fmt::Display for SerialPortDiscoveryError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("no supported robot-controller serial port could be opened")?;
@@ -229,6 +221,7 @@ impl std::fmt::Display for SerialPortDiscoveryError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for SerialPortDiscoveryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.attempts
@@ -242,12 +235,12 @@ pub struct RobotState {
     accepted_command: Option<AcceptedRobotCommand>,
     last_unsequenced_applied_pwm: Option<AppliedPwm>,
     last_odometry: Option<ReceivedRobotOdometry>,
-    last_controller_diagnostic: Option<ControllerDiagnostic>,
     video_tx: Option<broadcast::Sender<Bytes>>,
     video_stream_status: VideoStreamStatus,
 }
 
 impl RobotState {
+    #[cfg(test)]
     fn accept_command(
         &mut self,
         command: RobotCommand,
@@ -305,12 +298,14 @@ impl RobotState {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum CommandDatagramError {
     Decode(RobotPacketLengthError),
     Validation(LeasedPwmCommandError),
 }
 
+#[cfg(test)]
 impl std::fmt::Display for CommandDatagramError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -327,6 +322,7 @@ impl std::fmt::Display for CommandDatagramError {
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for CommandDatagramError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -336,6 +332,7 @@ impl std::error::Error for CommandDatagramError {
     }
 }
 
+#[cfg(test)]
 fn decode_command_datagram(
     bytes: &[u8],
 ) -> std::result::Result<RobotCommand, CommandDatagramError> {
@@ -344,6 +341,9 @@ fn decode_command_datagram(
     RobotCommand::try_from(packet).map_err(CommandDatagramError::Validation)
 }
 
+/// Compiled only for legacy compatibility tests. Production has no V1 command
+/// socket; `actuation_v2` is the sole actuation boundary.
+#[cfg(test)]
 pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
     let socket = UdpSocket::bind("0.0.0.0:8080")
         .await
@@ -396,6 +396,9 @@ pub async fn udp_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
     }
 }
 
+/// Compiled only for legacy parser/lease regression tests. Production never
+/// discovers serial devices and never emits the legacy ASCII motor protocol.
+#[cfg(test)]
 pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
     let port_names = [
         "/dev/ttyACM0",
@@ -521,8 +524,6 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
                                 }
                                 Ok(ControllerReport::Error(error)) => {
                                     log::error!("Robot controller reported error: {}", error.code());
-                                    state.write().await.last_controller_diagnostic =
-                                        Some(ControllerDiagnostic::Error(error));
                                 }
                                 Ok(ControllerReport::Event(event)) => {
                                     match event {
@@ -535,8 +536,6 @@ pub async fn serial_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
                                             event.code()
                                         ),
                                     }
-                                    state.write().await.last_controller_diagnostic =
-                                        Some(ControllerDiagnostic::Event(event));
                                 }
                                 Err(error) => {
                                     log::warn!("Rejected robot-controller serial report: {error}");
@@ -750,8 +749,7 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
     let status = warp::path("status")
         .and(warp::path::end())
         .and(state_filter.clone())
-        .and_then(
-        |state: Arc<RwLock<RobotState>>| async move {
+        .and_then(|state: Arc<RwLock<RobotState>>| async move {
             let state = state.read().await;
             let now = Instant::now();
             let active_command = state.active_command_at(now);
@@ -770,13 +768,9 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
                     "device": state.video_stream_status.device(),
                     "detail": state.video_stream_status.detail(),
                 },
-                "last_controller_diagnostic": state.last_controller_diagnostic.map(|diagnostic| serde_json::json!({
-                    "kind": diagnostic.kind(),
-                    "code": diagnostic.code(),
-                })),
+                "last_controller_diagnostic": serde_json::Value::Null,
             })))
-        },
-    );
+        });
 
     let video = warp::path("video.mjpeg")
         .and(warp::path::end())
@@ -861,10 +855,7 @@ pub async fn http_service(state: Arc<RwLock<RobotState>>) -> AnyResult<()> {
                     "server_receive_age_ms_decimal": odometry_age_ms_decimal,
                     "age_error": odometry_age_error,
                 })),
-                "last_controller_diagnostic": s.last_controller_diagnostic.map(|diagnostic| serde_json::json!({
-                    "kind": diagnostic.kind(),
-                    "code": diagnostic.code(),
-                })),
+                "last_controller_diagnostic": serde_json::Value::Null,
             })))
         },
     );
@@ -932,6 +923,16 @@ fn find_jpeg_end(data: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use bincode::Options;
+
+    #[test]
+    fn legacy_services_exist_only_in_test_builds() {
+        let _udp_service_symbol = udp_service;
+        let _serial_service_symbol = serial_service;
+        let discovery = SerialPortDiscoveryError {
+            attempts: Vec::new(),
+        };
+        assert!(discovery.to_string().contains("no supported"));
+    }
 
     fn source(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
