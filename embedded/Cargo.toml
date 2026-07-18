@@ -6,21 +6,24 @@ edition = "2024"
 [features]
 default = []
 firmware = []
+# Motion-capable hardware profiles must enable this and provide the link-time
+# `kiko_external_boot_id` symbol from a reviewed per-boot identity source.
+external-boot-identity = []
 
 [[bin]]
 name = "embedded"
-path = "src/main.rs"
+path = "src/firmware_v2.rs"
 required-features = ["firmware"]
 
 [dependencies]
+robot-protocol = { path = "../comms/robot-protocol" }
+
+[target.'cfg(target_arch = "arm")'.dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
-panic-halt = "0.2"
 nb = "1.0"
 heapless = "0.7"
-embedded-hal = "0.2"
 stm32f4xx-hal = { version = "0.20", features = ["stm32f446"] }
-robot-protocol = { path = "../comms/robot-protocol" }
 
 [lints]
 workspace = true

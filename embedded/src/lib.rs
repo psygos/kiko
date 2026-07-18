@@ -1,5 +1,9 @@
 #![no_std]
 
+pub mod controller;
+pub mod motor;
+pub mod watchdog_gate;
+
 use robot_protocol::PwmPercent;
 
 /// Applies one pending timer update using the timer's currently reported direction.
