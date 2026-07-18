@@ -8,6 +8,7 @@ mod ingress;
 mod local_costmap;
 pub mod mpc;
 mod odometry;
+mod reference;
 mod shadow_command;
 
 pub use frames::{
@@ -55,6 +56,13 @@ pub use odometry::{
     PredictionTranslationModel, RawImuCalibration, RawImuCalibrationDto, RawImuCalibrationError,
     ReanchorReason, ScalarParameter, TimeAlignedOdomPose, TimeAlignment, TranslationIntegration,
     VisualCaptureProvenance,
+};
+pub use reference::{
+    EpochPathMismatchV1, FORWARD_MOST_NEAREST_SEGMENT_V1, MAX_PATH_REFERENCE_POINTS,
+    MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S, MAX_SUPPORTED_PATH_LENGTH_M,
+    MAX_SUPPORTED_PROJECTION_DISTANCE_M, NearestSegmentTiePolicyV1, PATH_REFERENCE_CONFIG_V1,
+    PathReferenceBuildError, PathReferenceBuilderV1, PathReferenceConfigParseError,
+    PathReferenceConfigV1, PathReferenceConfigV1Dto,
 };
 pub use shadow_command::{
     MAX_SHADOW_COMMAND_RECORDS, MotorPacketsSent, ShadowCommandConfig, ShadowCommandConfigDto,
