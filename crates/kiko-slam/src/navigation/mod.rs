@@ -5,6 +5,7 @@ mod frames;
 mod global_planner;
 mod ingress;
 mod local_costmap;
+pub mod mpc;
 mod odometry;
 mod shadow_command;
 
@@ -37,7 +38,7 @@ pub use local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapCell, LocalCostmapClockRegression, LocalCostmapConfig,
     LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,
     LocalCostmapProvenance, LocalCostmapQuery, LocalCostmapUpdateOutcome, LocalCostmapView,
-    LocalDepthObservation, TrackingCameraToBase,
+    LocalDepthObservation, LocalDepthObservationError, TrackingCameraToBase,
 };
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,
