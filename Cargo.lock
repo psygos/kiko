@@ -5453,6 +5453,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "robot-command-client"
+version = "0.1.0"
+dependencies = [
+ "robot-protocol",
+]
+
+[[package]]
 name = "robot-control-client"
 version = "0.0.0"
 dependencies = [

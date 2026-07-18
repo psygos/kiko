@@ -4,6 +4,7 @@ members = [
   "crates/kiko-slam",
   "crates/oak-sys",
   "comms/robot-protocol",
+  "comms/robot-command-client",
   "comms/robot-server",
   "comms/desktop-client/src-tauri",
   "embedded",
