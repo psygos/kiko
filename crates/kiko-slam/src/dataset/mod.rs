@@ -2581,6 +2581,18 @@ impl DatasetWriterHandle {
         self.finish_internal(None)
     }
 
+    /// Drain and join the writer without publishing a completion manifest.
+    ///
+    /// All writer clones must be dropped first, exactly as for [`Self::finish`].
+    /// This is the failure-path finalizer for a multi-sidecar recording: payloads
+    /// already written may remain for diagnosis, but readers cannot mistake the
+    /// directory for a complete dataset. A worker panic or latent write error is
+    /// still returned truthfully.
+    pub fn abort_without_manifest(mut self) -> Result<WriterStats, DatasetError> {
+        self.join_writer()?;
+        Ok(self.state.stats())
+    }
+
     /// Finalize the dataset and atomically bind one already-finalized navigation journal.
     ///
     /// The sidecar is fully revalidated before the completion manifest is published. Its
@@ -2597,9 +2609,16 @@ impl DatasetWriterHandle {
         mut self,
         navigation_ingress: Option<NavigationIngressSidecarDescriptor>,
     ) -> Result<WriterStats, DatasetError> {
+        self.join_writer()?;
+
+        write_manifest(&self.state, navigation_ingress)?;
+        Ok(self.state.stats())
+    }
+
+    fn join_writer(&mut self) -> Result<(), DatasetError> {
         let Some(handle) = self.handle.take() else {
             return Err(DatasetError::InvalidConfig {
-                msg: "finish called twice",
+                msg: "dataset writer handle finalized twice",
             });
         };
         handle.join().map_err(|err| DatasetError::WorkerJoin {
@@ -2609,9 +2628,7 @@ impl DatasetWriterHandle {
         if let Some(err) = self.state.take_error() {
             return Err(err);
         }
-
-        write_manifest(&self.state, navigation_ingress)?;
-        Ok(self.state.stats())
+        Ok(())
     }
 
     pub fn stats(&self) -> WriterStats {
@@ -4596,6 +4613,27 @@ mod tests {
     fn assert_no_completion_manifest(path: &Path) {
         assert!(!path.join(format::MANIFEST_FILE).exists());
         assert!(!path.join(".manifest.json.tmp").exists());
+    }
+
+    #[test]
+    fn abort_without_manifest_drains_and_joins_without_publishing_completion() {
+        let path = unique_dataset_path("abort-without-manifest");
+        let (writer, handle) =
+            DatasetWriter::create(&path, &meta(), &calibration()).expect("create dataset");
+        assert_eq!(
+            write_outcome(writer.write_frame(&frame(SensorId::StereoLeft, 1, 1))),
+            WriteOutcome::Enqueued
+        );
+        drop(writer);
+
+        let stats = handle
+            .abort_without_manifest()
+            .expect("drain and join incomplete dataset");
+
+        assert_eq!(stats.frames_written, 1);
+        assert_no_completion_manifest(&path);
+        assert!(path.join(format::FRAMES_DIR).read_dir().is_ok());
+        std::fs::remove_dir_all(path).expect("remove test directory");
     }
 
     fn meta() -> Meta {
