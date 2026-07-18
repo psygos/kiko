@@ -2,6 +2,7 @@
 
 mod cell_inflation;
 mod frames;
+mod goal_input;
 mod global_planner;
 mod ingress;
 mod local_costmap;
@@ -15,6 +16,7 @@ pub use frames::{
     PlanarPointError, PlanarTransform, PlanarTransformComponent, PlanarTransformError,
     PlanarTransformOperation,
 };
+pub use goal_input::{NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis};
 pub use global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig,
     GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint, PlanStart,
