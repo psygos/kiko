@@ -866,7 +866,8 @@ impl Detections {
     }
 }
 
-#[derive(Debug)]
+/// A validated stereo pair. Cloning shares both immutable frame payloads.
+#[derive(Clone, Debug)]
 pub struct StereoPair {
     left: Frame,
     right: Frame,
@@ -1279,8 +1280,9 @@ mod tests {
     use super::{
         CompactDescriptor, DESCRIPTOR_DIM, Descriptor, DetectionError, Detections, Frame,
         FrameDimensions, FrameDimensionsError, FrameError, FrameId, Keypoint, Matches, Raw,
-        SensorId, Timestamp, VizError, VizPacket,
+        SensorId, StereoPair, Timestamp, VizError, VizPacket,
     };
+    use crate::PairingWindowNs;
     use std::sync::Arc;
 
     #[test]
@@ -1298,6 +1300,39 @@ mod tests {
         assert_eq!(frame.dimensions().width(), 2);
         assert_eq!(frame.dimensions().height(), 3);
         assert_eq!(frame.data().len(), frame.dimensions().area());
+    }
+
+    #[test]
+    fn stereo_pair_clone_shares_immutable_frame_payloads() {
+        let left = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(1),
+            Timestamp::from_nanos(2),
+            2,
+            1,
+            vec![3, 4],
+        )
+        .expect("left frame");
+        let right = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(2),
+            Timestamp::from_nanos(2),
+            2,
+            1,
+            vec![5, 6],
+        )
+        .expect("right frame");
+        let pair = StereoPair::try_new(
+            left,
+            right,
+            PairingWindowNs::new(0).expect("exact pairing window"),
+        )
+        .expect("stereo pair");
+
+        let cloned = pair.clone();
+
+        assert!(std::ptr::eq(pair.left().data(), cloned.left().data()));
+        assert!(std::ptr::eq(pair.right().data(), cloned.right().data()));
     }
 
     #[test]
