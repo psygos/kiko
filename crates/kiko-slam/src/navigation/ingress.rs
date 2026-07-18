@@ -13,10 +13,11 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use crate::dense::occupancy::OccupancyGridSnapshot;
+use crate::dense::occupancy_runtime::TimedOccupancySnapshot;
 use crate::{
     AccelSample, DepthObservation, DequeueSequence, DeviceSessionId, DeviceTimestamp, FrameId,
     GyroSample, HostMonotonicTimestamp, ImuReport, InertialValueError, MapInstanceId,
-    OakImuAcceleration, OakImuAngularVelocity, SensorAccuracy, StereoObservation,
+    OakImuAcceleration, OakImuAngularVelocity, SensorAccuracy, StereoObservation, Timestamp,
 };
 
 use super::{GlobalPlanError, MapPoint, PointGoal};
@@ -36,6 +37,7 @@ const KIND_ACCEPTED_DEPTH: u8 = 3;
 const KIND_POINT_GOAL: u8 = 4;
 const KIND_MAP_EPOCH_STARTED: u8 = 5;
 const KIND_CONTROL_TICK: u8 = 6;
+const KIND_ACCEPTED_GLOBAL_MAP: u8 = 7;
 
 /// Opaque identity shared with the dataset manifest that owns this sidecar.
 ///
@@ -327,6 +329,12 @@ pub enum NavigationIngressBoundaryError {
         bound_map_instance_id: MapInstanceId,
         goal_map_instance_id: MapInstanceId,
     },
+    GlobalMapHasNoInstance,
+    GlobalMapInstanceMismatch {
+        map_epoch_id: RecordedMapEpochId,
+        bound_map_instance_id: MapInstanceId,
+        snapshot_map_instance_id: MapInstanceId,
+    },
 }
 
 impl std::fmt::Display for NavigationIngressBoundaryError {
@@ -341,7 +349,9 @@ impl std::error::Error for NavigationIngressBoundaryError {
             Self::HostTimeBeforeClockEpoch { .. }
             | Self::MapEpochAlreadyCurrent { .. }
             | Self::MapEpochIdExhausted
-            | Self::GoalMapMismatch { .. } => None,
+            | Self::GoalMapMismatch { .. }
+            | Self::GlobalMapHasNoInstance
+            | Self::GlobalMapInstanceMismatch { .. } => None,
         }
     }
 }
@@ -610,6 +620,87 @@ impl MapEpochStartedIngress {
     }
 }
 
+/// One occupancy snapshot accepted by the navigation coordinator.
+///
+/// The grid payload remains owned by the live snapshot transport. This event
+/// records only its wire-stable map epoch, exact mapper revision, exact
+/// source capture timestamp, and recording-relative coordinator admission
+/// time. The process-local map instance is checked against the current live
+/// binding and deliberately does not enter the wire format. Revision zero is
+/// retained because it is valid in the occupancy snapshot domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AcceptedGlobalMapIngress {
+    arrival_offset: NavigationClockOffset,
+    map_epoch_id: RecordedMapEpochId,
+    revision: u64,
+    source_capture_timestamp: Timestamp,
+}
+
+impl AcceptedGlobalMapIngress {
+    pub fn parse(
+        clock_epoch: NavigationClockEpoch,
+        host_arrival: HostMonotonicTimestamp,
+        binding: CurrentMapEpochBinding,
+        timed_snapshot: &TimedOccupancySnapshot,
+    ) -> Result<Self, NavigationIngressBoundaryError> {
+        Self::parse_snapshot(
+            clock_epoch,
+            host_arrival,
+            binding,
+            timed_snapshot.timestamp(),
+            timed_snapshot.snapshot(),
+        )
+    }
+
+    fn parse_snapshot(
+        clock_epoch: NavigationClockEpoch,
+        host_arrival: HostMonotonicTimestamp,
+        binding: CurrentMapEpochBinding,
+        source_capture_timestamp: Timestamp,
+        snapshot: &OccupancyGridSnapshot,
+    ) -> Result<Self, NavigationIngressBoundaryError> {
+        let snapshot_map_instance_id = snapshot
+            .map_instance_id()
+            .ok_or(NavigationIngressBoundaryError::GlobalMapHasNoInstance)?;
+        if snapshot_map_instance_id != binding.map_instance_id {
+            return Err(NavigationIngressBoundaryError::GlobalMapInstanceMismatch {
+                map_epoch_id: binding.map_epoch_id,
+                bound_map_instance_id: binding.map_instance_id,
+                snapshot_map_instance_id,
+            });
+        }
+        Ok(Self {
+            arrival_offset: clock_epoch.offset_at(host_arrival)?,
+            map_epoch_id: binding.map_epoch_id,
+            revision: snapshot.revision(),
+            source_capture_timestamp,
+        })
+    }
+
+    pub fn arrival_offset(self) -> NavigationClockOffset {
+        self.arrival_offset
+    }
+
+    pub fn replay_host_arrival(
+        self,
+        clock: NavigationReplayClock,
+    ) -> Result<HostMonotonicTimestamp, NavigationReplayClockError> {
+        clock.resolve(self.arrival_offset)
+    }
+
+    pub fn map_epoch_id(self) -> RecordedMapEpochId {
+        self.map_epoch_id
+    }
+
+    pub fn revision(self) -> u64 {
+        self.revision
+    }
+
+    pub fn source_capture_timestamp(self) -> Timestamp {
+        self.source_capture_timestamp
+    }
+}
+
 /// Replay-process map bound to one parsed recorded epoch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplayMapEpochBinding {
@@ -785,6 +876,7 @@ pub enum NavigationIngressEvent {
     ImuReport(RecordedImuReport),
     AcceptedDepth(AcceptedDepthIngress),
     MapEpochStarted(MapEpochStartedIngress),
+    AcceptedGlobalMap(AcceptedGlobalMapIngress),
     PointGoal(MapPointGoalIngress),
     ControlTick(ControlTickIngress),
 }
@@ -808,6 +900,14 @@ impl NavigationIngressRecord {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct NavigationIngressOrderState {
     current_map_epoch_id: Option<RecordedMapEpochId>,
+    last_global_map: Option<AcceptedGlobalMapOrderCursor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcceptedGlobalMapOrderCursor {
+    revision: u64,
+    arrival_offset: NavigationClockOffset,
+    source_capture_timestamp: Timestamp,
 }
 
 impl NavigationIngressOrderState {
@@ -840,6 +940,37 @@ impl NavigationIngressOrderState {
                 }
                 Some(_) => {}
             },
+            NavigationIngressEvent::AcceptedGlobalMap(map) => {
+                let current = self
+                    .current_map_epoch_id
+                    .ok_or(IngressOrderViolation::GlobalMapBeforeMapEpoch)?;
+                if current != map.map_epoch_id {
+                    return Err(IngressOrderViolation::GlobalMapEpochMismatch {
+                        current: current.as_u64(),
+                        map: map.map_epoch_id.as_u64(),
+                    });
+                }
+                if let Some(previous) = self.last_global_map {
+                    if map.revision <= previous.revision {
+                        return Err(IngressOrderViolation::GlobalMapRevisionNotIncreasing {
+                            previous: previous.revision,
+                            actual: map.revision,
+                        });
+                    }
+                    if map.arrival_offset < previous.arrival_offset {
+                        return Err(IngressOrderViolation::GlobalMapArrivalOffsetRegression {
+                            previous_ns: previous.arrival_offset.as_nanos(),
+                            actual_ns: map.arrival_offset.as_nanos(),
+                        });
+                    }
+                    if map.source_capture_timestamp < previous.source_capture_timestamp {
+                        return Err(IngressOrderViolation::GlobalMapSourceTimestampRegression {
+                            previous_ns: previous.source_capture_timestamp.as_nanos(),
+                            actual_ns: map.source_capture_timestamp.as_nanos(),
+                        });
+                    }
+                }
+            }
             NavigationIngressEvent::VisualAttempt(_)
             | NavigationIngressEvent::ImuReport(_)
             | NavigationIngressEvent::AcceptedDepth(_)
@@ -849,8 +980,23 @@ impl NavigationIngressOrderState {
     }
 
     fn commit(&mut self, event: NavigationIngressEvent) {
-        if let NavigationIngressEvent::MapEpochStarted(started) = event {
-            self.current_map_epoch_id = Some(started.map_epoch_id);
+        match event {
+            NavigationIngressEvent::MapEpochStarted(started) => {
+                self.current_map_epoch_id = Some(started.map_epoch_id);
+                self.last_global_map = None;
+            }
+            NavigationIngressEvent::AcceptedGlobalMap(map) => {
+                self.last_global_map = Some(AcceptedGlobalMapOrderCursor {
+                    revision: map.revision,
+                    arrival_offset: map.arrival_offset,
+                    source_capture_timestamp: map.source_capture_timestamp,
+                });
+            }
+            NavigationIngressEvent::VisualAttempt(_)
+            | NavigationIngressEvent::ImuReport(_)
+            | NavigationIngressEvent::AcceptedDepth(_)
+            | NavigationIngressEvent::PointGoal(_)
+            | NavigationIngressEvent::ControlTick(_) => {}
         }
     }
 }
@@ -861,6 +1007,11 @@ enum IngressOrderViolation {
     MapEpochSequenceExhausted { current: u64 },
     GoalBeforeMapEpoch,
     GoalMapEpochMismatch { current: u64, goal: u64 },
+    GlobalMapBeforeMapEpoch,
+    GlobalMapEpochMismatch { current: u64, map: u64 },
+    GlobalMapRevisionNotIncreasing { previous: u64, actual: u64 },
+    GlobalMapArrivalOffsetRegression { previous_ns: u64, actual_ns: u64 },
+    GlobalMapSourceTimestampRegression { previous_ns: i64, actual_ns: i64 },
 }
 
 /// Ordered, bounded navigation ingress journal.
@@ -1676,6 +1827,11 @@ pub enum NavigationIngressWriteError {
     MapEpochSequenceExhausted { current: u64 },
     GoalBeforeMapEpoch,
     GoalMapEpochMismatch { current: u64, goal: u64 },
+    GlobalMapBeforeMapEpoch,
+    GlobalMapEpochMismatch { current: u64, map: u64 },
+    GlobalMapRevisionNotIncreasing { previous: u64, actual: u64 },
+    GlobalMapArrivalOffsetRegression { previous_ns: u64, actual_ns: u64 },
+    GlobalMapSourceTimestampRegression { previous_ns: i64, actual_ns: i64 },
 }
 
 impl NavigationIngressWriteError {
@@ -1691,6 +1847,27 @@ impl NavigationIngressWriteError {
             IngressOrderViolation::GoalMapEpochMismatch { current, goal } => {
                 Self::GoalMapEpochMismatch { current, goal }
             }
+            IngressOrderViolation::GlobalMapBeforeMapEpoch => Self::GlobalMapBeforeMapEpoch,
+            IngressOrderViolation::GlobalMapEpochMismatch { current, map } => {
+                Self::GlobalMapEpochMismatch { current, map }
+            }
+            IngressOrderViolation::GlobalMapRevisionNotIncreasing { previous, actual } => {
+                Self::GlobalMapRevisionNotIncreasing { previous, actual }
+            }
+            IngressOrderViolation::GlobalMapArrivalOffsetRegression {
+                previous_ns,
+                actual_ns,
+            } => Self::GlobalMapArrivalOffsetRegression {
+                previous_ns,
+                actual_ns,
+            },
+            IngressOrderViolation::GlobalMapSourceTimestampRegression {
+                previous_ns,
+                actual_ns,
+            } => Self::GlobalMapSourceTimestampRegression {
+                previous_ns,
+                actual_ns,
+            },
         }
     }
 }
@@ -1800,6 +1977,29 @@ pub enum NavigationIngressParseError {
         current: u64,
         goal: u64,
     },
+    GlobalMapBeforeMapEpoch {
+        record_index: usize,
+    },
+    GlobalMapEpochMismatch {
+        record_index: usize,
+        current: u64,
+        map: u64,
+    },
+    GlobalMapRevisionNotIncreasing {
+        record_index: usize,
+        previous: u64,
+        actual: u64,
+    },
+    GlobalMapArrivalOffsetRegression {
+        record_index: usize,
+        previous_ns: u64,
+        actual_ns: u64,
+    },
+    GlobalMapSourceTimestampRegression {
+        record_index: usize,
+        previous_ns: i64,
+        actual_ns: i64,
+    },
     InvalidGoalPoint {
         record_index: usize,
         source: super::PlanarPointError,
@@ -1830,6 +2030,39 @@ impl NavigationIngressParseError {
                     goal,
                 }
             }
+            IngressOrderViolation::GlobalMapBeforeMapEpoch => {
+                Self::GlobalMapBeforeMapEpoch { record_index }
+            }
+            IngressOrderViolation::GlobalMapEpochMismatch { current, map } => {
+                Self::GlobalMapEpochMismatch {
+                    record_index,
+                    current,
+                    map,
+                }
+            }
+            IngressOrderViolation::GlobalMapRevisionNotIncreasing { previous, actual } => {
+                Self::GlobalMapRevisionNotIncreasing {
+                    record_index,
+                    previous,
+                    actual,
+                }
+            }
+            IngressOrderViolation::GlobalMapArrivalOffsetRegression {
+                previous_ns,
+                actual_ns,
+            } => Self::GlobalMapArrivalOffsetRegression {
+                record_index,
+                previous_ns,
+                actual_ns,
+            },
+            IngressOrderViolation::GlobalMapSourceTimestampRegression {
+                previous_ns,
+                actual_ns,
+            } => Self::GlobalMapSourceTimestampRegression {
+                record_index,
+                previous_ns,
+                actual_ns,
+            },
         }
     }
 }
@@ -1971,6 +2204,13 @@ fn encode_record(bytes: &mut [u8], record: NavigationIngressRecord) {
             put_u64(payload, 0, event.offset.as_nanos());
             put_u64(payload, 8, event.map_epoch_id.as_u64());
         }
+        NavigationIngressEvent::AcceptedGlobalMap(event) => {
+            record_header[8] = KIND_ACCEPTED_GLOBAL_MAP;
+            put_u64(payload, 0, event.arrival_offset.as_nanos());
+            put_u64(payload, 8, event.map_epoch_id.as_u64());
+            put_u64(payload, 16, event.revision);
+            put_i64(payload, 24, event.source_capture_timestamp.as_nanos());
+        }
         NavigationIngressEvent::ControlTick(event) => {
             record_header[8] = KIND_CONTROL_TICK;
             put_u64(payload, 0, event.offset.as_nanos());
@@ -2011,6 +2251,7 @@ fn parse_record(
         KIND_POINT_GOAL => parse_goal(record_index, payload)?,
         KIND_MAP_EPOCH_STARTED => parse_map_epoch_started(record_index, payload)?,
         KIND_CONTROL_TICK => parse_control_tick(record_index, payload)?,
+        KIND_ACCEPTED_GLOBAL_MAP => parse_accepted_global_map(record_index, payload)?,
         value => {
             return Err(NavigationIngressParseError::UnknownEventKind {
                 record_index,
@@ -2144,6 +2385,23 @@ fn parse_map_epoch_started(
     ))
 }
 
+fn parse_accepted_global_map(
+    record_index: usize,
+    payload: &[u8],
+) -> Result<NavigationIngressEvent, NavigationIngressParseError> {
+    require_zero(record_index, &payload[32..])?;
+    let map_epoch_id = RecordedMapEpochId::try_new(get_u64(payload, 8))
+        .map_err(|_| NavigationIngressParseError::ZeroMapEpochId { record_index })?;
+    Ok(NavigationIngressEvent::AcceptedGlobalMap(
+        AcceptedGlobalMapIngress {
+            arrival_offset: NavigationClockOffset(get_u64(payload, 0)),
+            map_epoch_id,
+            revision: get_u64(payload, 16),
+            source_capture_timestamp: Timestamp::from_nanos(get_i64(payload, 24)),
+        },
+    ))
+}
+
 fn parse_control_tick(
     record_index: usize,
     payload: &[u8],
@@ -2230,6 +2488,10 @@ fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+fn put_i64(bytes: &mut [u8], offset: usize, value: i64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn put_f64(bytes: &mut [u8], offset: usize, value: f64) {
     put_u64(bytes, offset, value.to_bits());
 }
@@ -2244,6 +2506,10 @@ fn get_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn get_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed record"))
+}
+
+fn get_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed record"))
 }
 
 fn get_f64(bytes: &[u8], offset: usize) -> f64 {
@@ -2439,7 +2705,23 @@ mod tests {
             .expect("map epoch")
     }
 
-    fn mixed_events() -> [NavigationIngressEvent; 7] {
+    fn accepted_global_map(
+        snapshot: &OccupancyGridSnapshot,
+        binding: CurrentMapEpochBinding,
+        arrival_ns: u64,
+        source_capture_ns: i64,
+    ) -> AcceptedGlobalMapIngress {
+        AcceptedGlobalMapIngress::parse_snapshot(
+            clock(),
+            host_time(arrival_ns),
+            binding,
+            Timestamp::from_nanos(source_capture_ns),
+            snapshot,
+        )
+        .expect("accepted global map")
+    }
+
+    fn mixed_events() -> [NavigationIngressEvent; 8] {
         let snapshot = snapshot(4);
         let mut coordinator = NavigationMapEpochCoordinator::new();
         let transition = transition(&mut coordinator, &snapshot, 970);
@@ -2457,6 +2739,12 @@ mod tests {
                 AcceptedDepthIngress::parse(clock(), &depth()).expect("depth ingress"),
             ),
             NavigationIngressEvent::MapEpochStarted(transition.event()),
+            NavigationIngressEvent::AcceptedGlobalMap(accepted_global_map(
+                &snapshot,
+                transition.binding(),
+                980,
+                400,
+            )),
             NavigationIngressEvent::PointGoal(
                 MapPointGoalIngress::parse(
                     clock(),
@@ -2549,13 +2837,14 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix_is_rejected_as_truncated() {
-        let mut log = NavigationIngressLog::new(recording_id(1), capacity(2));
-        log.push(NavigationIngressEvent::ImuReport(recorded_imu()))
-            .expect("record");
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(8));
+        for event in mixed_events() {
+            log.push(event).expect("record");
+        }
         let bytes = log.encode().expect("encode");
         for length in 0..bytes.len() {
             assert!(matches!(
-                NavigationIngressLog::parse(Some(&bytes[..length]), recording_id(1), capacity(2),),
+                NavigationIngressLog::parse(Some(&bytes[..length]), recording_id(1), capacity(8),),
                 Err(NavigationIngressParseError::Truncated { .. })
             ));
         }
@@ -2720,6 +3009,207 @@ mod tests {
                 record_index: 1,
                 expected: 2,
                 actual: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn accepted_global_map_retains_zero_revision_and_exact_capture_provenance() {
+        let live_snapshot = snapshot(0);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let transition = transition(&mut coordinator, &live_snapshot, 800);
+        let accepted = accepted_global_map(&live_snapshot, transition.binding(), 900, -17);
+        assert_eq!(accepted.arrival_offset().as_nanos(), 200);
+        assert_eq!(accepted.map_epoch_id(), transition.binding().map_epoch_id());
+        assert_eq!(accepted.revision(), 0);
+        assert_eq!(
+            accepted.source_capture_timestamp(),
+            Timestamp::from_nanos(-17)
+        );
+        assert_eq!(
+            accepted
+                .replay_host_arrival(NavigationReplayClock::new(host_time(5_000)))
+                .expect("replay arrival"),
+            host_time(5_200)
+        );
+
+        let other_map = snapshot(0);
+        assert!(matches!(
+            AcceptedGlobalMapIngress::parse_snapshot(
+                clock(),
+                host_time(901),
+                transition.binding(),
+                Timestamp::from_nanos(18),
+                &other_map,
+            ),
+            Err(NavigationIngressBoundaryError::GlobalMapInstanceMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn accepted_global_map_requires_the_current_recorded_epoch() {
+        let first = snapshot(1);
+        let second = snapshot(1);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let first_transition = transition(&mut coordinator, &first, 800);
+        let second_transition = transition(&mut coordinator, &second, 900);
+        let first_map = accepted_global_map(&first, first_transition.binding(), 810, 10);
+        let second_map = accepted_global_map(&second, second_transition.binding(), 910, 20);
+
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(3));
+        assert_eq!(
+            log.push(NavigationIngressEvent::AcceptedGlobalMap(first_map)),
+            Err(NavigationIngressWriteError::GlobalMapBeforeMapEpoch)
+        );
+        log.push(NavigationIngressEvent::MapEpochStarted(
+            first_transition.event(),
+        ))
+        .expect("first epoch");
+        assert_eq!(
+            log.push(NavigationIngressEvent::AcceptedGlobalMap(second_map)),
+            Err(NavigationIngressWriteError::GlobalMapEpochMismatch { current: 1, map: 2 })
+        );
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(first_map))
+            .expect("current epoch map");
+    }
+
+    #[test]
+    fn accepted_global_map_revision_must_strictly_increase_within_one_epoch() {
+        let map_id = SlamMap::new().snapshot().instance_id();
+        let revision_four = snapshot_for(map_id, 4);
+        let revision_five = snapshot_for(map_id, 5);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let transition = transition(&mut coordinator, &revision_four, 800);
+        let first = accepted_global_map(&revision_four, transition.binding(), 810, 10);
+        let duplicate = accepted_global_map(&revision_four, transition.binding(), 820, 20);
+        let next = accepted_global_map(&revision_five, transition.binding(), 830, 30);
+
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(3));
+        log.push(NavigationIngressEvent::MapEpochStarted(transition.event()))
+            .expect("epoch");
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(first))
+            .expect("first map");
+        let before = log.records().to_vec();
+        assert_eq!(
+            log.push(NavigationIngressEvent::AcceptedGlobalMap(duplicate)),
+            Err(
+                NavigationIngressWriteError::GlobalMapRevisionNotIncreasing {
+                    previous: 4,
+                    actual: 4,
+                }
+            )
+        );
+        assert_eq!(log.records(), before);
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(next))
+            .expect("next map after rejected duplicate");
+
+        let mut bytes = log.encode().expect("encode");
+        let second_map_payload = HEADER_BYTES + 2 * RECORD_BYTES + RECORD_PAYLOAD_OFFSET;
+        put_u64(&mut bytes[second_map_payload..], 16, 3);
+        assert_eq!(
+            NavigationIngressLog::parse(Some(&bytes), recording_id(1), capacity(3)),
+            Err(
+                NavigationIngressParseError::GlobalMapRevisionNotIncreasing {
+                    record_index: 2,
+                    previous: 4,
+                    actual: 3,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn accepted_global_map_time_provenance_cannot_regress() {
+        let map_id = SlamMap::new().snapshot().instance_id();
+        let revision_one = snapshot_for(map_id, 1);
+        let revision_two = snapshot_for(map_id, 2);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let transition = transition(&mut coordinator, &revision_one, 800);
+        let first = accepted_global_map(&revision_one, transition.binding(), 900, 100);
+        let earlier_arrival = accepted_global_map(&revision_two, transition.binding(), 899, 101);
+        let earlier_capture = accepted_global_map(&revision_two, transition.binding(), 901, 99);
+
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(3));
+        log.push(NavigationIngressEvent::MapEpochStarted(transition.event()))
+            .expect("epoch");
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(first))
+            .expect("first map");
+        assert_eq!(
+            log.push(NavigationIngressEvent::AcceptedGlobalMap(earlier_arrival)),
+            Err(
+                NavigationIngressWriteError::GlobalMapArrivalOffsetRegression {
+                    previous_ns: 200,
+                    actual_ns: 199,
+                }
+            )
+        );
+        assert_eq!(
+            log.push(NavigationIngressEvent::AcceptedGlobalMap(earlier_capture)),
+            Err(
+                NavigationIngressWriteError::GlobalMapSourceTimestampRegression {
+                    previous_ns: 100,
+                    actual_ns: 99,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_new_map_epoch_resets_revision_and_capture_monotonicity() {
+        let first = snapshot(9);
+        let second = snapshot(0);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let first_transition = transition(&mut coordinator, &first, 800);
+        let second_transition = transition(&mut coordinator, &second, 900);
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(4));
+        log.push(NavigationIngressEvent::MapEpochStarted(
+            first_transition.event(),
+        ))
+        .expect("first epoch");
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(
+            accepted_global_map(&first, first_transition.binding(), 850, 100),
+        ))
+        .expect("first map");
+        log.push(NavigationIngressEvent::MapEpochStarted(
+            second_transition.event(),
+        ))
+        .expect("second epoch");
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(
+            accepted_global_map(&second, second_transition.binding(), 950, 1),
+        ))
+        .expect("new epoch starts its own revision history");
+    }
+
+    #[test]
+    fn accepted_global_map_decoder_rejects_reserved_bytes_and_epoch_mismatch() {
+        let snapshot = snapshot(2);
+        let mut coordinator = NavigationMapEpochCoordinator::new();
+        let transition = transition(&mut coordinator, &snapshot, 800);
+        let mut log = NavigationIngressLog::new(recording_id(1), capacity(2));
+        log.push(NavigationIngressEvent::MapEpochStarted(transition.event()))
+            .expect("epoch");
+        log.push(NavigationIngressEvent::AcceptedGlobalMap(
+            accepted_global_map(&snapshot, transition.binding(), 900, 100),
+        ))
+        .expect("map");
+
+        let encoded = log.encode().expect("encode");
+        let map_payload = HEADER_BYTES + RECORD_BYTES + RECORD_PAYLOAD_OFFSET;
+        let mut reserved = encoded.clone();
+        reserved[map_payload + 32] = 1;
+        assert_eq!(
+            NavigationIngressLog::parse(Some(&reserved), recording_id(1), capacity(2)),
+            Err(NavigationIngressParseError::NonZeroReservedRecord { record_index: 1 })
+        );
+
+        let mut wrong_epoch = encoded;
+        put_u64(&mut wrong_epoch[map_payload..], 8, 2);
+        assert_eq!(
+            NavigationIngressLog::parse(Some(&wrong_epoch), recording_id(1), capacity(2)),
+            Err(NavigationIngressParseError::GlobalMapEpochMismatch {
+                record_index: 1,
+                current: 1,
+                map: 2,
             })
         );
     }
