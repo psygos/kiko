@@ -13,6 +13,99 @@ The new 2D map is deterministic geometric occupancy derived from calibrated dept
 learned occupancy network. It keeps the existing SLAM architecture and consumes authoritative
 keyframe poses and corrections from that architecture.
 
+## Replay-bound navigation shadow closure
+
+The host closure is transport-free shadow execution, not robot actuation. The live boundary takes
+`--navigation-config`, `--navigation-goal X_M,Y_M`, and `--navigation-record` as an all-or-none
+set. It parses the JSON and goal once, requires depth, IMU, rectified stereo, and dense occupancy,
+and records the coordinator's actual admission order in a dataset-bound ingress sidecar. Thread
+scheduling itself is not claimed deterministic. The journal, rather than a reconstructed schedule
+or Rerun output, is the replay authority.
+
+Every admitted control tick reaches the fail-closed safety supervisor and produces one bounded
+shadow command record. The shadow session exposes `motor_packets_sent = 0` and has no command
+transport. STOP is recorded for stale or missing observations, identity/provenance mismatch,
+blocked trajectories, infeasible solutions, deadline failures, or command-session failure. A
+global map admitted before the first visual localization anchor is deliberately not rebound after
+the fact; planning waits for a later map revision.
+
+The local costmap clears the raw cells conservatively occupied by the robot's current footprint,
+then inflates observed obstacles. It does not mark the clearance ring or unseen exterior free.
+Consequently, a forward-only depth observation can leave rear/side clearance blocked and stop the
+first rollout even though the body's current cell is free. This is the intended unknown-is-blocked
+contract, not evidence that the synthetic fixture can drive the physical robot.
+
+Focused host checks at the navigation library state through `a4213ff`:
+
+```text
+cargo test --locked -p kiko-slam --lib navigation::shadow_config::tests
+18 passed; 0 failed
+
+cargo test --locked -p kiko-slam --lib navigation::ingress::tests
+30 passed; 0 failed
+
+cargo test --locked -p kiko-slam --lib navigation::coordinator::tests
+12 passed; 0 failed
+
+cargo test --locked -p kiko-slam --lib navigation::safety::tests
+11 passed; 0 failed
+
+cargo test --locked -p kiko-slam --lib navigation::local_costmap::tests
+15 passed; 0 failed
+```
+
+`configs/navigation-shadow-v1.example.json` is valid JSON and was passed through the public
+`ShadowNavigationConfigV1::parse_json` boundary with an explicit 640x400 runtime depth-camera
+model. The parser accepted all 4,695 bytes. Its calibration IDs and plant evidence identify it as
+a synthetic, non-actuating, non-physically-validated schema example; its values are not Kiko plant
+identification or sensor calibration.
+
+Rerun remains output-only. The live adapter emits the CLI goal, poses/transforms, map and local
+grid, path, predicted trajectory, solver/safety outcome, requested PWM, and zero-motor-packet
+counter for inspection. It does not implement or claim a viewer map-click callback, and Rerun
+failure cannot authorize motion.
+
+## Reproducible navigation shadow benchmark
+
+Command:
+
+```text
+cargo bench --locked -p kiko-slam --bench navigation_shadow
+```
+
+Representative host workload and absolute result:
+
+```text
+git_commit=44d3689bad3dac5de290e88835b8eb5580d53fff
+git_worktree=dirty
+rustc="rustc 1.97.0 (2d8144b78 2026-07-07)"
+os=macos
+arch=aarch64
+cpu_model="Apple M4 Max"
+short=false
+samples=9
+warmup_rounds=3
+iterations_per_sample=10000
+total_timed_iterations=90000
+horizon_steps=8
+shadow_retained_records=64
+median_ns_per_iteration=591.0
+iterations_per_second=1692190.5
+behavior_digest=0xa36205e266434cac
+stable_timed_digest=0x428bf62449d07aa5
+motor_packets_sent=0
+allocations=not_instrumented
+successful_mpc_timing=false
+```
+
+The timed scope is path-reference construction plus the public-API
+ready-but-unproven-depth fail-closed safety admission. Public APIs intentionally prevent an
+external benchmark from forging time-aligned odometry or local-costmap provenance, so this run
+does not time a successful collision-checked MPC solve or final revalidation. It also makes no
+allocation or before/after performance claim. The worktree was dirty because the live binary and
+closure documentation were under review; the benchmark and navigation library source were the
+tracked `44d3689` state.
+
 ## Reproducible occupancy benchmark
 
 Command:
@@ -63,7 +156,7 @@ touched cell. At the configured four-million-cell safety limit on this 64-bit ho
 vector payload is 36,000,000 bytes, excluding allocator bookkeeping. This is a structural bound,
 not an RSS measurement or timing claim.
 
-## Verification
+## Earlier occupancy-lane verification
 
 - `cargo test --locked -p kiko-slam`: 639 library tests and 25 default binary tests passed; the
   compile-fail doctest passed and one backend example remained intentionally ignored.
@@ -82,7 +175,7 @@ not an RSS measurement or timing claim.
 - The occupancy traversal suite includes a 200,000-case randomized DDA/reference regression with
   no mismatch.
 
-## Rerun contract
+## Occupancy Rerun contract
 
 Occupancy is logged under `world/map2d` with an explicit occupancy-to-world `ParentFromChild`
 transform, pixel-to-metre grid placement, class annotations, exact map identifier and revision,
@@ -97,6 +190,14 @@ was not exercised, so actual viewer auto-spawn and rendering remain unverified.
 
 - Native DepthAI/OpenCV compilation and physical OAK behavior were not verified because the local
   SDK headers, libraries, and device were unavailable.
+- A published navigation dataset proves completed payload writers and a synchronized, revalidated
+  ingress sidecar. OAK close is post-publication cleanup: its failure is returned separately and
+  does not invalidate the complete artifact.
+- Post-activation workers retain the existing `std::thread::spawn` panic boundary. OS
+  resource-exhaustion spawn failure and a combined multi-worker fault-injection matrix were not
+  converted into or verified as typed abort paths in this closure.
+- The recording binds payloads to admitted ingress but does not embed the navigation JSON or code
+  revision; replay requires the same external configuration and software revision.
 - Linux aarch64 cross-checking was attempted but the host lacks a Linux cross-C toolchain/sysroot:
   the third-party `ring` build first lacked `aarch64-linux-gnu-gcc`, and the Clang attempt then
   lacked the target `assert.h`. Linux aarch64 compilation therefore remains unverified.

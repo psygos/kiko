@@ -43,6 +43,26 @@ Live match visualization (requires OAK-D + Rerun viewer):
 cargo run -p kiko-slam --features record -- live
 ```
 
+Run the encoderless host navigator in transport-free shadow mode while recording its exact sensor
+payloads and coordinator admissions:
+
+```
+KIKO_LIVE_DEPTH=true \
+KIKO_DENSE=true \
+cargo run --locked -p kiko-slam --features record -- live \
+  --imu-rate-hz 200 \
+  --navigation-config configs/navigation-shadow-v1.example.json \
+  --navigation-goal 2.0,1.0 \
+  --navigation-record recordings/shadow-example
+```
+
+The checked-in configuration is a synthetic schema example, not physical calibration or an
+identified Kiko plant. This mode computes and displays requested PWM but owns no motor transport
+and sends zero motor packets. The goal is a typed map-frame point; the pinned Rerun SDK is
+output-only and does not provide a map-click callback. See
+[the shadow-navigation architecture](docs/navigation-shadow-architecture.md) for frames, dynamic
+obstacle behavior, replay evidence, and the exact closure boundary.
+
 Visualize stereo matches on a dataset:
 
 ```
@@ -180,5 +200,6 @@ descriptors are required when loop closure is enabled.
 - ~~Learned place recognition (EigenPlaces ONNX)~~
 - ~~Loop closure (geometric verification + SE(3) pose graph correction)~~
 - ~~Deterministic geometric 2D occupancy mapping + Rerun visualization~~
+- ~~Replay-bound encoderless host navigation in transport-free shadow mode~~
 - Global bundle adjustment
 - Dense mapping via nvblox (TSDF / ESDF on Jetson)
