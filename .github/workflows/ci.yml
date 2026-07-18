@@ -4,61 +4,145 @@ on:
   push:
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  kiko-lints:
-    name: Kiko Lints
+  host-quality:
+    name: Host Formatting and Clippy (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy, rustfmt
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Format check
-        run: cargo fmt --package kiko-slam -- --check
+      - name: Check workspace formatting
+        run: cargo fmt --all -- --check
 
-      - name: Clippy
-        # `record` links DepthAI and is checked on the Jetson native toolchain.
-        run: cargo clippy -p kiko-slam --all-targets -- -D warnings
+      - name: Clippy robot protocol
+        run: >-
+          cargo clippy --locked -p robot-protocol --all-features --all-targets
+          -- -D warnings
+
+      - name: Clippy command client
+        run: >-
+          cargo clippy --locked -p robot-command-client --all-features
+          --all-targets
+          -- -D warnings
+
+      - name: Clippy robot server
+        run: cargo clippy --locked -p robot-server --all-targets -- -D warnings
+
+      - name: Clippy desktop client
+        run: >-
+          cargo clippy --locked -p robot-control-client --all-targets
+          -- -D warnings
+
+      - name: Clippy embedded pure logic
+        run: cargo clippy --locked -p embedded --lib --tests -- -D warnings
+
+      - name: Clippy Kiko SLAM host code
+        # `record` requires a native DepthAI SDK and remains outside portable
+        # host CI.
+        run: >-
+          cargo clippy --locked -p kiko-slam --features actuation --all-targets
+          -- -D warnings
 
   host-tests:
-    name: Host Workspace Tests
+    name: Host Tests (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.97.0
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run host crate tests
-        run: cargo test -p kiko-slam
+      - name: Test robot protocol
+        run: cargo test --locked -p robot-protocol --all-features
 
-      - name: Build robot-server tests
-        run: cargo test -p robot-server --no-run
+      - name: Test command client
+        run: cargo test --locked -p robot-command-client --all-features
 
-      - name: Build desktop client tests
-        run: cargo test -p robot-control-client --no-run
+      - name: Test robot server
+        run: cargo test --locked -p robot-server
 
-  embedded-check:
-    name: Embedded Target Check
+      - name: Test desktop client
+        run: cargo test --locked -p robot-control-client
+
+      - name: Test embedded pure logic
+        run: cargo test --locked -p embedded --lib
+
+      - name: Test Kiko SLAM host code
+        # Exercise the opt-in host actuation boundary without enabling
+        # DepthAI-backed recording.
+        run: cargo test --locked -p kiko-slam --features actuation
+
+  linux-aarch64-check:
+    name: Portable Host Compile (Linux aarch64)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain + embedded target
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain and Linux aarch64 target
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-unknown-linux-gnu
+
+      - name: Compile portable host crates for Linux aarch64
+        # `cargo check` proves target compilation only; it does not execute
+        # aarch64 code.
+        run: >-
+          cargo check --locked --target aarch64-unknown-linux-gnu
+          --all-features --all-targets
+          -p robot-protocol
+          -p robot-command-client
+          -p robot-server
+
+  embedded-firmware:
+    name: STM32 Firmware Build (thumbv7em-none-eabihf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain and embedded target
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: clippy
           targets: thumbv7em-none-eabihf
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          key: thumbv7em-none-eabihf
 
-      - name: Check embedded crate for MCU target
-        run: cargo check -p embedded --target thumbv7em-none-eabihf
+      - name: Clippy firmware
+        run: >-
+          cargo clippy --locked -p embedded --features firmware
+          --bin embedded
+          --target thumbv7em-none-eabihf -- -D warnings
+
+      - name: Check firmware
+        run: >-
+          cargo check --locked -p embedded --features firmware
+          --bin embedded
+          --target thumbv7em-none-eabihf
+
+      - name: Build release firmware
+        run: >-
+          cargo build --locked --release -p embedded --features firmware
+          --bin embedded
+          --target thumbv7em-none-eabihf
