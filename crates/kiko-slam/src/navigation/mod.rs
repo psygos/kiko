@@ -3,8 +3,8 @@
 mod cell_inflation;
 mod coordinator;
 mod frames;
-mod goal_input;
 mod global_planner;
+mod goal_input;
 mod ingress;
 mod local_costmap;
 pub mod mpc;
@@ -27,12 +27,12 @@ pub use frames::{
     PlanarPointError, PlanarTransform, PlanarTransformComponent, PlanarTransformError,
     PlanarTransformOperation,
 };
-pub use goal_input::{NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis};
 pub use global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig,
     GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint, PlanStart,
     PointGoal, UnknownSpacePolicy,
 };
+pub use goal_input::{NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis};
 pub use ingress::{
     AcceptedDepthIngress, ControlTickIngress, CurrentMapEpochBinding, FinalizedNavigationIngress,
     MAX_NAVIGATION_INGRESS_RECORDS, MapEpochStartedIngress, MapEpochTransition,
@@ -75,11 +75,11 @@ pub use reference::{
     PathReferenceConfigV1, PathReferenceConfigV1Dto,
 };
 pub use safety::{
-    BoundPredictedTrajectory, FinalValidationMismatch, SafetyControllerDecision,
-    SafetyDecideError, SafetyDecision, SafetyDecisionOutcome, SafetyFatalError,
-    SafetyNotReadyReason, SafetyReadyTick, SafetySolverFailure, SafetySolverRequestContext,
-    SafetyStopCause, SafetyStoppedDecision, SafetySupervisorCreateError, SafetyTickInput,
-    ShadowSafetySupervisor, SolverBudgetError, SolverBudgetNs,
+    BoundPredictedTrajectory, FinalValidationMismatch, SafetyControllerDecision, SafetyDecideError,
+    SafetyDecision, SafetyDecisionOutcome, SafetyFatalError, SafetyNotReadyReason, SafetyReadyTick,
+    SafetySolverFailure, SafetySolverRequestContext, SafetyStopCause, SafetyStoppedDecision,
+    SafetySupervisorCreateError, SafetyTickInput, ShadowSafetySupervisor, SolverBudgetError,
+    SolverBudgetNs,
 };
 pub use shadow_command::{
     MAX_SHADOW_COMMAND_RECORDS, MotorPacketsSent, ShadowCommandConfig, ShadowCommandConfigDto,

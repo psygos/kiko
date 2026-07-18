@@ -1470,6 +1470,36 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_shadow_example_stays_strict_and_synthetic() {
+        let bytes = include_bytes!("../../../../configs/navigation-shadow-v1.example.json");
+        let parsed = ShadowNavigationConfigV1::parse_json(bytes, camera())
+            .expect("checked-in shadow configuration must satisfy the public parser");
+
+        assert_eq!(
+            parsed.global_planner().unknown_space(),
+            UnknownSpacePolicy::Blocked
+        );
+        match parsed.mpc_solver().model().evidence() {
+            PlantEvidenceV1::SyntheticFixture {
+                fixture_id,
+                generator_id,
+            } => {
+                assert_eq!(
+                    fixture_id.as_str(),
+                    "host-shadow-example-not-physically-validated"
+                );
+                assert_eq!(
+                    generator_id.as_str(),
+                    "hand-authored-from-shadow-config-v1-test-fixture"
+                );
+            }
+            PlantEvidenceV1::ClaimedPhysicalIdentification { .. } => {
+                panic!("the checked-in schema example must never imply physical evidence")
+            }
+        }
+    }
+
+    #[test]
     fn preserves_unverified_physical_evidence_as_a_claim() {
         let mut value = fixture();
         value["plant_model"]["evidence"] = json!({

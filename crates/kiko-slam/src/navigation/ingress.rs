@@ -523,8 +523,10 @@ impl VisualAttemptIngress {
         observation: &StereoObservation,
         outcome: VisualAttemptOutcome,
     ) -> Result<Self, NavigationIngressBoundaryError> {
-        Ok(PendingVisualAttemptIngress::from_observation(clock_epoch, observation)?
-            .complete(outcome))
+        Ok(
+            PendingVisualAttemptIngress::from_observation(clock_epoch, observation)?
+                .complete(outcome),
+        )
     }
 
     pub fn session_id(self) -> DeviceSessionId {

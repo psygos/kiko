@@ -1,4 +1,4 @@
-//! A transport-free command session for deterministic navigation shadow mode.
+//! A transport-free command session for replay-bound navigation shadow mode.
 //!
 //! The session deliberately reuses the canonical STM32 command-domain types,
 //! including signed left/right PWM, modular command sequence, and bounded
