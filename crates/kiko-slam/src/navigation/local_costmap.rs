@@ -25,6 +25,7 @@ use crate::{
 };
 
 use super::cell_inflation::{CellInflationError, CellSquareInflation};
+use super::odometry::{OdomSegmentId, TimeAlignedOdomPose};
 use super::{
     LocalCostmapFrame, LocalCostmapToOdom, OdomFrame, PlanarPoint, PlanarPointError,
     PlanarTransformError,
@@ -264,14 +265,85 @@ impl LocalCostmapConfig {
 #[derive(Clone, Debug)]
 pub struct LocalDepthObservation {
     source: DepthObservation,
+    odom_segment_id: OdomSegmentId,
     local_costmap_to_odom: LocalCostmapToOdom,
 }
 
 impl LocalDepthObservation {
-    pub fn new(source: DepthObservation, local_costmap_to_odom: LocalCostmapToOdom) -> Self {
+    /// Bind a depth payload to the estimator result for that exact device
+    /// session and capture timestamp.
+    ///
+    /// The caller cannot supply a free-standing transform: it is derived from
+    /// the checked time-aligned pose, which also retains the odom-segment
+    /// identity needed by downstream collision provenance.
+    pub fn try_from_time_aligned(
+        source: DepthObservation,
+        pose: TimeAlignedOdomPose,
+    ) -> Result<Self, LocalDepthObservationError> {
+        if source.session_id() != pose.session_id() {
+            return Err(LocalDepthObservationError::SessionMismatch {
+                depth: source.session_id(),
+                pose: pose.session_id(),
+            });
+        }
+        if source.device_timestamp() != pose.timestamp() {
+            return Err(LocalDepthObservationError::DeviceTimestampMismatch {
+                depth: source.device_timestamp(),
+                pose: pose.timestamp(),
+            });
+        }
+        let base_to_odom = pose.base_to_odom();
+        let local_costmap_to_odom = LocalCostmapToOdom::try_new(
+            base_to_odom.source_origin_x_in_destination_m(),
+            base_to_odom.source_origin_y_in_destination_m(),
+            base_to_odom.source_yaw_in_destination_rad(),
+        )
+        .map_err(LocalDepthObservationError::Transform)?;
+        Ok(Self {
+            source,
+            odom_segment_id: pose.segment_id(),
+            local_costmap_to_odom,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_validated_parts_for_test(
+        source: DepthObservation,
+        odom_segment_id: OdomSegmentId,
+        local_costmap_to_odom: LocalCostmapToOdom,
+    ) -> Self {
         Self {
             source,
+            odom_segment_id,
             local_costmap_to_odom,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum LocalDepthObservationError {
+    SessionMismatch {
+        depth: DeviceSessionId,
+        pose: DeviceSessionId,
+    },
+    DeviceTimestampMismatch {
+        depth: DeviceTimestamp,
+        pose: DeviceTimestamp,
+    },
+    Transform(PlanarTransformError),
+}
+
+impl std::fmt::Display for LocalDepthObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid time-aligned local depth observation: {self:?}")
+    }
+}
+
+impl std::error::Error for LocalDepthObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transform(source) => Some(source),
+            Self::SessionMismatch { .. } | Self::DeviceTimestampMismatch { .. } => None,
         }
     }
 }
@@ -296,6 +368,7 @@ impl DepthFrameKey {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LocalCostmapProvenance {
     session_id: DeviceSessionId,
+    odom_segment_id: OdomSegmentId,
     frame: DepthFrameKey,
     host_arrival: HostMonotonicTimestamp,
     local_costmap_to_odom: LocalCostmapToOdom,
@@ -304,6 +377,10 @@ pub struct LocalCostmapProvenance {
 impl LocalCostmapProvenance {
     pub fn session_id(self) -> DeviceSessionId {
         self.session_id
+    }
+
+    pub fn odom_segment_id(self) -> OdomSegmentId {
+        self.odom_segment_id
     }
 
     pub fn frame(self) -> DepthFrameKey {
@@ -554,6 +631,7 @@ pub struct LocalCostmapView<'a> {
     class_ids: &'a [u8],
     geometry: OccupancyGridGeometry,
     freshness: LocalCostmapFreshness,
+    max_observation_age_ns: u64,
     provenance: Option<LocalCostmapProvenance>,
 }
 
@@ -584,6 +662,16 @@ impl<'a> LocalCostmapView<'a> {
 
     pub fn freshness(&self) -> LocalCostmapFreshness {
         self.freshness
+    }
+
+    /// Maximum age used to classify this exact view.
+    ///
+    /// Collision adapters use this retained policy value to prove that a
+    /// controller deadline cannot outlive the immutable depth snapshot being
+    /// queried. Callers do not need to repeat or reconstruct the costmap
+    /// configuration at that later boundary.
+    pub fn max_observation_age_ns(&self) -> u64 {
+        self.max_observation_age_ns
     }
 
     pub fn provenance(&self) -> Option<LocalCostmapProvenance> {
@@ -917,6 +1005,7 @@ impl LocalCostmap {
         std::mem::swap(&mut self.current, &mut self.staging);
         self.provenance = Some(LocalCostmapProvenance {
             session_id,
+            odom_segment_id: observation.odom_segment_id,
             frame,
             host_arrival,
             local_costmap_to_odom: observation.local_costmap_to_odom,
@@ -932,7 +1021,7 @@ impl LocalCostmap {
     }
 
     /// Return a fail-closed view at a timestamp from the same host monotonic
-    /// clock as [`LocalDepthObservation::new`]. Expired grids expose an
+    /// clock as [`LocalDepthObservation::try_from_time_aligned`]. Expired grids expose an
     /// all-unknown buffer while retaining source provenance for diagnostics.
     pub fn view_at(
         &self,
@@ -943,6 +1032,7 @@ impl LocalCostmap {
                 class_ids: &self.all_unknown,
                 geometry: self.config.geometry,
                 freshness: LocalCostmapFreshness::NoObservation,
+                max_observation_age_ns: self.config.max_observation_age_ns,
                 provenance: None,
             });
         };
@@ -971,6 +1061,7 @@ impl LocalCostmap {
             class_ids,
             geometry: self.config.geometry,
             freshness,
+            max_observation_age_ns: self.config.max_observation_age_ns,
             provenance: Some(provenance),
         })
     }
@@ -1367,6 +1458,7 @@ fn next_down(value: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{BaseToOdom, TimeAlignment};
     use super::*;
     use crate::dense::occupancy::{DepthToTrackingCamera, OccupancyGridGeometryError};
     use crate::{PinholeIntrinsics, Timestamp};
@@ -1456,10 +1548,76 @@ mod tests {
     }
 
     fn observation(image: &DepthImage, host_ns: u64) -> LocalDepthObservation {
-        LocalDepthObservation::new(
+        LocalDepthObservation::from_validated_parts_for_test(
             depth_source(session(1), image, host_ns),
+            OdomSegmentId::try_new(1).expect("nonzero test odom segment"),
             LocalCostmapToOdom::try_new(0.0, 0.0, 0.0).expect("identity capture pose"),
         )
+    }
+
+    fn aligned_pose(
+        session_id: DeviceSessionId,
+        timestamp: DeviceTimestamp,
+        base_to_odom: BaseToOdom,
+    ) -> TimeAlignedOdomPose {
+        TimeAlignedOdomPose::from_validated_parts_for_test(
+            OdomSegmentId::try_new(7).expect("nonzero test odom segment"),
+            session_id,
+            timestamp,
+            base_to_odom,
+            TimeAlignment::InterpolatedVisual {
+                before: DeviceTimestamp::try_from_nanos(9).expect("test timestamp"),
+                after: DeviceTimestamp::try_from_nanos(11).expect("test timestamp"),
+            },
+        )
+    }
+
+    #[test]
+    fn depth_capture_pose_binding_requires_exact_session_and_timestamp() {
+        let image = depth(5, 10, 1, 1, vec![1.0]);
+        let source = depth_source(session(1), &image, 20);
+        let transform = BaseToOdom::try_new(1.25, -0.75, 0.4).expect("finite test pose");
+        let exact_pose = aligned_pose(session(1), source.device_timestamp(), transform);
+        let observation =
+            LocalDepthObservation::try_from_time_aligned(source.clone(), exact_pose.clone())
+                .expect("exact capture binding");
+        assert_eq!(observation.odom_segment_id, exact_pose.segment_id());
+        assert_eq!(
+            observation
+                .local_costmap_to_odom
+                .source_origin_in_destination_m(),
+            transform.source_origin_in_destination_m()
+        );
+        assert_eq!(
+            observation
+                .local_costmap_to_odom
+                .source_yaw_in_destination_rad(),
+            transform.source_yaw_in_destination_rad()
+        );
+
+        let session_error = LocalDepthObservation::try_from_time_aligned(
+            source.clone(),
+            aligned_pose(session(2), source.device_timestamp(), transform),
+        )
+        .expect_err("cross-session capture pose must fail");
+        assert!(matches!(
+            session_error,
+            LocalDepthObservationError::SessionMismatch { .. }
+        ));
+
+        let timestamp_error = LocalDepthObservation::try_from_time_aligned(
+            source,
+            aligned_pose(
+                session(1),
+                DeviceTimestamp::try_from_nanos(11).expect("test timestamp"),
+                transform,
+            ),
+        )
+        .expect_err("cross-timestamp capture pose must fail");
+        assert!(matches!(
+            timestamp_error,
+            LocalDepthObservationError::DeviceTimestampMismatch { .. }
+        ));
     }
 
     fn point(x_m: f64, y_m: f64) -> PlanarPoint<LocalCostmapFrame> {
@@ -1635,8 +1793,9 @@ mod tests {
             let mut map = LocalCostmap::try_new(config.clone(), session(1)).expect("costmap");
             let image = depth(1, 10, 1, 1, vec![1.0]);
             let transform = LocalCostmapToOdom::try_new(10.0, -2.0, yaw).expect("capture pose");
-            map.update(LocalDepthObservation::new(
+            map.update(LocalDepthObservation::from_validated_parts_for_test(
                 depth_source(session(1), &image, 20),
+                OdomSegmentId::try_new(1).expect("nonzero test odom segment"),
                 transform,
             ))
             .expect("update");
@@ -1848,6 +2007,7 @@ mod tests {
             boundary.freshness(),
             LocalCostmapFreshness::Current { age_ns: 10 }
         );
+        assert_eq!(boundary.max_observation_age_ns(), 10);
         assert!(boundary.class_ids().contains(&CLASS_OCCUPIED));
 
         let expired = map
@@ -1867,6 +2027,7 @@ mod tests {
                 .all(|class_id| *class_id == CLASS_UNKNOWN)
         );
         assert!(expired.provenance().is_some());
+        assert_eq!(expired.max_observation_age_ns(), 10);
     }
 
     #[test]
@@ -1978,8 +2139,9 @@ mod tests {
         let mut map = LocalCostmap::try_new(config, session(1)).expect("costmap");
         let image = depth(1, 10, 1, 1, vec![1.0]);
         assert!(matches!(
-            map.update(LocalDepthObservation::new(
+            map.update(LocalDepthObservation::from_validated_parts_for_test(
                 depth_source(session(2), &image, 20),
+                OdomSegmentId::try_new(1).expect("nonzero test odom segment"),
                 LocalCostmapToOdom::try_new(0.0, 0.0, 0.0).expect("identity capture pose"),
             )),
             Err(LocalCostmapError::SessionMismatch { .. })
@@ -1992,6 +2154,7 @@ mod tests {
             .view_at(HostMonotonicTimestamp::from_nanos(0))
             .expect("reset view");
         assert_eq!(view.freshness(), LocalCostmapFreshness::NoObservation);
+        assert_eq!(view.max_observation_age_ns(), 100);
         assert!(
             view.class_ids()
                 .iter()

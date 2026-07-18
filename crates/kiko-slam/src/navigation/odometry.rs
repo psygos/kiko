@@ -1016,6 +1016,23 @@ pub struct TimeAlignedOdomPose {
 }
 
 impl TimeAlignedOdomPose {
+    #[cfg(test)]
+    pub(super) fn from_validated_parts_for_test(
+        segment_id: OdomSegmentId,
+        session_id: DeviceSessionId,
+        timestamp: DeviceTimestamp,
+        base_to_odom: BaseToOdom,
+        alignment: TimeAlignment,
+    ) -> Self {
+        Self {
+            segment_id,
+            session_id,
+            timestamp,
+            base_to_odom,
+            alignment,
+        }
+    }
+
     pub fn segment_id(&self) -> OdomSegmentId {
         self.segment_id
     }
