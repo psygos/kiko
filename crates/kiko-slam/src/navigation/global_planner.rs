@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::dense::occupancy::{OccupancyCell, OccupancyGridGeometry, OccupancyGridSnapshot};
 use crate::map::MapInstanceId;
@@ -9,6 +11,7 @@ use super::frames::{MapFrame, PlanarPoint};
 
 const CARDINAL_COST: u64 = 10;
 const DIAGONAL_COST: u64 = 14;
+static NEXT_GLOBAL_PLANNER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A finite metric point in the displayed occupancy-map frame.
 pub type MapPoint = PlanarPoint<MapFrame>;
@@ -40,7 +43,11 @@ impl GlobalPlannerConfig {
             return Err(GlobalPlanError::InvalidClearanceRadius { clearance_radius_m });
         }
         Ok(Self {
-            clearance_radius_m,
+            clearance_radius_m: if clearance_radius_m == 0.0 {
+                0.0
+            } else {
+                clearance_radius_m
+            },
             unknown_space,
         })
     }
@@ -91,6 +98,9 @@ pub enum GlobalPlanError {
     NoPath,
     SearchCostOverflow,
     SearchInvariant,
+    ZeroPlannerInstanceId,
+    PlannerInstanceIdExhausted,
+    PlannerInvocationIdExhausted,
 }
 
 impl std::fmt::Display for GlobalPlanError {
@@ -166,18 +176,133 @@ impl std::fmt::Display for GlobalPlanError {
             Self::SearchInvariant => {
                 write!(f, "global planner violated its bounded search invariant")
             }
+            Self::ZeroPlannerInstanceId => {
+                write!(f, "global planner instance ID must be nonzero")
+            }
+            Self::PlannerInstanceIdExhausted => {
+                write!(f, "global planner instance ID space is exhausted")
+            }
+            Self::PlannerInvocationIdExhausted => {
+                write!(f, "global planner invocation ID space is exhausted")
+            }
         }
     }
 }
 
 impl std::error::Error for GlobalPlanError {}
 
-/// A global path valid only for one exact occupancy-map instance and revision.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GlobalPath {
+/// Process-local identity of one constructed planner and its immutable map/config contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GlobalPlannerInstanceId(NonZeroU64);
+
+impl GlobalPlannerInstanceId {
+    /// Parse a recorded planner-instance ID for deterministic replay.
+    pub fn try_new(raw: u64) -> Result<Self, GlobalPlanError> {
+        NonZeroU64::new(raw)
+            .map(Self)
+            .ok_or(GlobalPlanError::ZeroPlannerInstanceId)
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+
+    fn allocate() -> Result<Self, GlobalPlanError> {
+        let raw = NEXT_GLOBAL_PLANNER_INSTANCE_ID
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| GlobalPlanError::PlannerInstanceIdExhausted)?;
+        let value = NonZeroU64::new(raw)
+            .expect("global planner instance allocation starts at one and never wraps");
+        Ok(Self(value))
+    }
+}
+
+/// Monotonic identity of one planning attempt within a planner instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GlobalPlannerInvocationId(NonZeroU64);
+
+impl GlobalPlannerInvocationId {
+    pub fn as_u64(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Exact deterministic algorithm contract used to produce a global path.
+///
+/// Increment this revision whenever neighbor ordering, costs, tie-breaking,
+/// inflation semantics, or path reconstruction changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u32)]
+pub enum GlobalPlannerRevision {
+    OctileAStarV1 = 1,
+}
+
+impl GlobalPlannerRevision {
+    pub fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Collision-free, content-bearing identity of one produced live plan.
+///
+/// This is deliberately not a hash. It retains the exact parsed boundary
+/// values and the unique process-local invocation that produced the path. An
+/// exact replay intentionally reconstructs an equal identity from its recorded
+/// planner-instance ID and the same ordered planning attempts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlobalPlanIdentity {
+    planner_instance_id: GlobalPlannerInstanceId,
+    planner_revision: GlobalPlannerRevision,
+    invocation_id: GlobalPlannerInvocationId,
     map_instance_id: MapInstanceId,
     map_revision: u64,
+    start: PlanStart,
+    goal: PointGoal,
     safety_profile: GlobalPlannerConfig,
+}
+
+impl GlobalPlanIdentity {
+    pub fn planner_instance_id(self) -> GlobalPlannerInstanceId {
+        self.planner_instance_id
+    }
+
+    pub fn planner_revision(self) -> GlobalPlannerRevision {
+        self.planner_revision
+    }
+
+    pub fn invocation_id(self) -> GlobalPlannerInvocationId {
+        self.invocation_id
+    }
+
+    pub fn map_instance_id(self) -> MapInstanceId {
+        self.map_instance_id
+    }
+
+    pub fn map_revision(self) -> u64 {
+        self.map_revision
+    }
+
+    pub fn start(self) -> PlanStart {
+        self.start
+    }
+
+    pub fn goal(self) -> PointGoal {
+        self.goal
+    }
+
+    pub fn safety_profile(self) -> GlobalPlannerConfig {
+        self.safety_profile
+    }
+}
+
+/// A global path valid only for the exact contract in its identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalPath {
+    identity: GlobalPlanIdentity,
     points: Vec<MapPoint>,
 }
 
@@ -273,17 +398,21 @@ impl PlanStart {
 }
 
 impl GlobalPath {
+    pub fn identity(&self) -> GlobalPlanIdentity {
+        self.identity
+    }
+
     pub fn map_instance_id(&self) -> MapInstanceId {
-        self.map_instance_id
+        self.identity.map_instance_id
     }
 
     pub fn map_revision(&self) -> u64 {
-        self.map_revision
+        self.identity.map_revision
     }
 
     /// Safety assumptions under which this path was computed.
     pub fn safety_profile(&self) -> GlobalPlannerConfig {
-        self.safety_profile
+        self.identity.safety_profile
     }
 
     pub fn points(&self) -> &[MapPoint] {
@@ -291,13 +420,15 @@ impl GlobalPath {
     }
 
     pub fn is_current_for(&self, snapshot: &OccupancyGridSnapshot) -> bool {
-        snapshot.map_instance_id() == Some(self.map_instance_id)
-            && snapshot.revision() == self.map_revision
+        snapshot.map_instance_id() == Some(self.identity.map_instance_id)
+            && snapshot.revision() == self.identity.map_revision
     }
 }
 
 /// Cached inflated traversability for one exact occupancy-map revision.
 pub struct GlobalPlanner {
+    instance_id: GlobalPlannerInstanceId,
+    next_invocation_id: Option<NonZeroU64>,
     map_instance_id: MapInstanceId,
     map_revision: u64,
     safety_profile: GlobalPlannerConfig,
@@ -311,6 +442,19 @@ impl GlobalPlanner {
     pub fn try_new(
         snapshot: &OccupancyGridSnapshot,
         config: GlobalPlannerConfig,
+    ) -> Result<Self, GlobalPlanError> {
+        Self::try_new_with_instance_id(snapshot, config, GlobalPlannerInstanceId::allocate()?)
+    }
+
+    /// Reconstruct a planner under an exact recorded identity for replay.
+    ///
+    /// Reusing an ID is authority to reproduce that recorded planner. Ordinary
+    /// live construction must use [`Self::try_new`] so unrelated planners
+    /// receive distinct instance IDs.
+    pub fn try_new_with_instance_id(
+        snapshot: &OccupancyGridSnapshot,
+        config: GlobalPlannerConfig,
+        instance_id: GlobalPlannerInstanceId,
     ) -> Result<Self, GlobalPlanError> {
         let map_instance_id = snapshot
             .map_instance_id()
@@ -343,6 +487,8 @@ impl GlobalPlanner {
         )?;
 
         Ok(Self {
+            instance_id,
+            next_invocation_id: Some(NonZeroU64::MIN),
             map_instance_id,
             map_revision: snapshot.revision(),
             safety_profile: config,
@@ -355,6 +501,14 @@ impl GlobalPlanner {
 
     pub fn map_instance_id(&self) -> MapInstanceId {
         self.map_instance_id
+    }
+
+    pub fn instance_id(&self) -> GlobalPlannerInstanceId {
+        self.instance_id
+    }
+
+    pub fn revision(&self) -> GlobalPlannerRevision {
+        GlobalPlannerRevision::OctileAStarV1
     }
 
     pub fn map_revision(&self) -> u64 {
@@ -370,7 +524,12 @@ impl GlobalPlanner {
             && snapshot.revision() == self.map_revision
     }
 
-    pub fn plan(&self, start: PlanStart, goal: PointGoal) -> Result<GlobalPath, GlobalPlanError> {
+    pub fn plan(
+        &mut self,
+        start: PlanStart,
+        goal: PointGoal,
+    ) -> Result<GlobalPath, GlobalPlanError> {
+        let invocation_id = self.next_invocation_id()?;
         if start.map_instance_id != self.map_instance_id || start.map_revision != self.map_revision
         {
             return Err(GlobalPlanError::StartMapMismatch {
@@ -388,6 +547,7 @@ impl GlobalPlanner {
                 goal_selected_revision: goal.selected_revision,
             });
         }
+        let identity = self.plan_identity(invocation_id, start, goal);
         let start = start.point;
         let goal = goal.point;
         let start_index = self
@@ -416,12 +576,7 @@ impl GlobalPlanner {
                 points.push(start);
             }
             points.push(goal);
-            return Ok(GlobalPath {
-                map_instance_id: self.map_instance_id,
-                map_revision: self.map_revision,
-                safety_profile: self.safety_profile,
-                points,
-            });
+            return Ok(GlobalPath { identity, points });
         }
 
         let indices = search_grid(
@@ -449,12 +604,37 @@ impl GlobalPlanner {
         }
         points.push(goal);
 
-        Ok(GlobalPath {
+        Ok(GlobalPath { identity, points })
+    }
+
+    fn next_invocation_id(&mut self) -> Result<GlobalPlannerInvocationId, GlobalPlanError> {
+        let current = self
+            .next_invocation_id
+            .take()
+            .ok_or(GlobalPlanError::PlannerInvocationIdExhausted)?;
+        self.next_invocation_id = current.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok(GlobalPlannerInvocationId(current))
+    }
+
+    fn plan_identity(
+        &self,
+        invocation_id: GlobalPlannerInvocationId,
+        start: PlanStart,
+        goal: PointGoal,
+    ) -> GlobalPlanIdentity {
+        debug_assert_eq!(start.map_instance_id, self.map_instance_id);
+        debug_assert_eq!(start.map_revision, self.map_revision);
+        debug_assert_eq!(goal.map_instance_id, self.map_instance_id);
+        GlobalPlanIdentity {
+            planner_instance_id: self.instance_id,
+            planner_revision: self.revision(),
+            invocation_id,
             map_instance_id: self.map_instance_id,
             map_revision: self.map_revision,
+            start,
+            goal,
             safety_profile: self.safety_profile,
-            points,
-        })
+        }
     }
 
     fn point_index(&self, point: MapPoint) -> Option<usize> {
@@ -918,6 +1098,12 @@ mod tests {
                 Err(GlobalPlanError::InvalidClearanceRadius { .. })
             ));
         }
+        let negative_zero = GlobalPlannerConfig::try_new(-0.0, UnknownSpacePolicy::Blocked)
+            .expect("negative zero has canonical zero-radius semantics");
+        assert_eq!(
+            negative_zero.clearance_radius_m().to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -944,7 +1130,7 @@ mod tests {
         cells[boundary_index as usize] = OccupancyCell::Occupied;
         let map_instance_id = new_map_instance_id();
         let snapshot = snapshot(geometry, &cells, map_instance_id, 7);
-        let planner = GlobalPlanner::try_new(
+        let mut planner = GlobalPlanner::try_new(
             &snapshot,
             GlobalPlannerConfig::try_new(0.0, UnknownSpacePolicy::Traversable)
                 .expect("planner config"),
@@ -995,7 +1181,7 @@ mod tests {
         let snapshot = snapshot(geometry, &cells, new_map_instance_id(), 1);
         let config = GlobalPlannerConfig::try_new(0.1, UnknownSpacePolicy::Traversable)
             .expect("planner config");
-        let planner = GlobalPlanner::try_new(&snapshot, config).expect("planner");
+        let mut planner = GlobalPlanner::try_new(&snapshot, config).expect("planner");
         let unsafe_start_point = point(3.01, 2.5);
         let start = PlanStart::for_snapshot(unsafe_start_point, &snapshot).expect("bound start");
         let goal = PointGoal::for_snapshot(point(3.2, 2.5), &snapshot).expect("bound goal");
@@ -1047,7 +1233,7 @@ mod tests {
         let edge_start = PlanStart::for_snapshot(edge_point, &snapshot).expect("bound start");
         let edge_goal = PointGoal::for_snapshot(edge_point, &snapshot).expect("bound goal");
 
-        let point_planner = GlobalPlanner::try_new(
+        let mut point_planner = GlobalPlanner::try_new(
             &snapshot,
             GlobalPlannerConfig::try_new(0.0, UnknownSpacePolicy::Traversable)
                 .expect("point planner config"),
@@ -1055,7 +1241,7 @@ mod tests {
         .expect("point planner");
         assert!(point_planner.plan(edge_start, edge_goal).is_ok());
 
-        let footprint_planner = GlobalPlanner::try_new(
+        let mut footprint_planner = GlobalPlanner::try_new(
             &snapshot,
             GlobalPlannerConfig::try_new(0.01, UnknownSpacePolicy::Traversable)
                 .expect("footprint planner config"),
@@ -1115,7 +1301,7 @@ mod tests {
         let current_snapshot = snapshot(geometry, &cells, map_instance_id, 5);
         let config = GlobalPlannerConfig::try_new(0.1, UnknownSpacePolicy::Traversable)
             .expect("planner config");
-        let planner = GlobalPlanner::try_new(&current_snapshot, config).expect("planner");
+        let mut planner = GlobalPlanner::try_new(&current_snapshot, config).expect("planner");
         let stale_start =
             PlanStart::for_snapshot(point(2.5, 2.5), &stale_snapshot).expect("stale bound start");
         let selected_goal =
@@ -1151,6 +1337,95 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn exact_plan_identity_binds_contract_and_distinguishes_every_produced_plan() {
+        let geometry =
+            OccupancyGridGeometry::try_new(1.0, [0.0, 0.0], 5, 5, 25).expect("test geometry");
+        let cells = vec![OccupancyCell::Free; geometry.cell_count()];
+        let snapshot = snapshot(geometry, &cells, new_map_instance_id(), 9);
+        let config = GlobalPlannerConfig::try_new(0.25, UnknownSpacePolicy::Traversable)
+            .expect("planner config");
+        let start = PlanStart::for_snapshot(point(1.5, 1.5), &snapshot).expect("bound start");
+        let goal = PointGoal::for_snapshot(point(3.5, 3.5), &snapshot).expect("bound goal");
+
+        let mut first_planner = GlobalPlanner::try_new(&snapshot, config).expect("first planner");
+        let first = first_planner.plan(start, goal).expect("first plan");
+        let repeated = first_planner.plan(start, goal).expect("repeated plan");
+        assert_eq!(first.points(), repeated.points());
+
+        let first_identity = first.identity();
+        assert_eq!(
+            first_identity.planner_instance_id(),
+            first_planner.instance_id()
+        );
+        assert_eq!(
+            first_identity.planner_revision(),
+            GlobalPlannerRevision::OctileAStarV1
+        );
+        assert_eq!(first_identity.planner_revision().as_u32(), 1);
+        assert_eq!(first_identity.invocation_id().as_u64(), 1);
+        assert_eq!(repeated.identity().invocation_id().as_u64(), 2);
+        assert_ne!(first.identity(), repeated.identity());
+        assert_eq!(
+            first_identity.map_instance_id(),
+            snapshot
+                .map_instance_id()
+                .expect("test snapshot has an instance")
+        );
+        assert_eq!(first_identity.map_revision(), snapshot.revision());
+        assert_eq!(first_identity.start(), start);
+        assert_eq!(first_identity.goal(), goal);
+        assert_eq!(first_identity.safety_profile(), config);
+
+        let mut second_planner = GlobalPlanner::try_new(&snapshot, config).expect("second planner");
+        let equivalent = second_planner
+            .plan(start, goal)
+            .expect("equivalent plan from a distinct planner");
+        assert_eq!(first.points(), equivalent.points());
+        assert_ne!(
+            first.identity().planner_instance_id(),
+            equivalent.identity().planner_instance_id()
+        );
+        assert_ne!(first.identity(), equivalent.identity());
+    }
+
+    #[test]
+    fn recorded_planner_instance_makes_replay_identity_allocator_independent() {
+        assert_eq!(
+            GlobalPlannerInstanceId::try_new(0),
+            Err(GlobalPlanError::ZeroPlannerInstanceId)
+        );
+        let recorded_instance =
+            GlobalPlannerInstanceId::try_new(42_424).expect("nonzero recorded planner instance");
+        let geometry =
+            OccupancyGridGeometry::try_new(1.0, [0.0, 0.0], 3, 3, 9).expect("test geometry");
+        let cells = vec![OccupancyCell::Free; geometry.cell_count()];
+        let snapshot = snapshot(geometry, &cells, new_map_instance_id(), 3);
+        let config = GlobalPlannerConfig::try_new(0.0, UnknownSpacePolicy::Traversable)
+            .expect("planner config");
+        let start = PlanStart::for_snapshot(point(0.5, 0.5), &snapshot).expect("bound start");
+        let goal = PointGoal::for_snapshot(point(2.5, 2.5), &snapshot).expect("bound goal");
+
+        let mut first =
+            GlobalPlanner::try_new_with_instance_id(&snapshot, config, recorded_instance)
+                .expect("first replay planner");
+        let expected = first
+            .plan(start, goal)
+            .expect("first replay plan")
+            .identity();
+
+        let _unrelated = GlobalPlanner::try_new(&snapshot, config).expect("unrelated live planner");
+
+        let mut replayed =
+            GlobalPlanner::try_new_with_instance_id(&snapshot, config, recorded_instance)
+                .expect("reconstructed replay planner");
+        let actual = replayed
+            .plan(start, goal)
+            .expect("reconstructed replay plan")
+            .identity();
+        assert_eq!(actual, expected);
     }
 
     #[test]

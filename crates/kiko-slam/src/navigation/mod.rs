@@ -14,7 +14,8 @@ pub use frames::{
     PlanarTransformOperation,
 };
 pub use global_planner::{
-    GlobalPath, GlobalPlanError, GlobalPlanner, GlobalPlannerConfig, MapPoint, PlanStart,
+    GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig,
+    GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint, PlanStart,
     PointGoal, UnknownSpacePolicy,
 };
 pub use local_costmap::{

@@ -179,7 +179,7 @@ fn path_digest(points: &[MapPoint]) -> u64 {
 
 fn probe_behavior(
     scenario: &Scenario<'_>,
-    planner: &GlobalPlanner,
+    planner: &mut GlobalPlanner,
     start: PlanStart,
     goal: PointGoal,
     start_point: MapPoint,
@@ -194,7 +194,7 @@ fn probe_behavior(
             let second = planner
                 .plan(start, goal)
                 .expect("deterministic benchmark path probe");
-            assert_eq!(first, second);
+            assert_eq!(first.points(), second.points());
             assert_eq!(first.points().first(), Some(&start_point));
             assert_eq!(first.points().last(), Some(&goal_point));
             assert!(first.points().len() >= 2);
@@ -229,9 +229,9 @@ fn probe_behavior(
 fn probe_sparse_obstacle_changes_route(fixtures: &Fixtures) {
     let config = GlobalPlannerConfig::try_new(0.10, UnknownSpacePolicy::Traversable)
         .expect("sparse-route comparison config");
-    let unknown_planner =
+    let mut unknown_planner =
         GlobalPlanner::try_new(&fixtures.unknown, config).expect("open comparison planner");
-    let sparse_planner =
+    let mut sparse_planner =
         GlobalPlanner::try_new(&fixtures.sparse, config).expect("sparse comparison planner");
     let unknown_path = unknown_planner
         .plan(
@@ -274,7 +274,7 @@ fn run_constructions(
 }
 
 fn run_plans(
-    planner: &GlobalPlanner,
+    planner: &mut GlobalPlanner,
     start: PlanStart,
     goal: PointGoal,
     probe: BehaviorProbe,
@@ -515,7 +515,7 @@ fn main() {
     );
 
     for scenario in &scenarios {
-        let planner = GlobalPlanner::try_new(scenario.snapshot, scenario.config)
+        let mut planner = GlobalPlanner::try_new(scenario.snapshot, scenario.config)
             .expect("benchmark behavior-probe planner");
         let start = PlanStart::for_snapshot(fixtures.start, scenario.snapshot)
             .expect("benchmark bound start");
@@ -523,7 +523,7 @@ fn main() {
             .expect("benchmark bound goal");
         let probe = probe_behavior(
             scenario,
-            &planner,
+            &mut planner,
             start,
             goal,
             fixtures.start,
@@ -537,7 +537,7 @@ fn main() {
                 construction_iterations,
             ));
             black_box(run_plans(
-                &planner,
+                &mut planner,
                 start,
                 goal,
                 probe,
@@ -554,7 +554,7 @@ fn main() {
             samples,
             || {
                 run_plans(
-                    &planner,
+                    &mut planner,
                     start,
                     goal,
                     probe,
