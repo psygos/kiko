@@ -5,16 +5,18 @@
 This lane closes at **replay-bound live host shadow mode**. Kiko accepts an exact map-frame point at
 the typed command-line boundary, maintains a continuous local pose, plans a revision-bound route,
 incorporates the newest admitted depth frame as local collision evidence, and computes the
-direct-PWM command that a bounded controller would request. Every admitted control tick produces
-one fail-closed shadow decision. The process has no motor-command transport and emits zero STM32
-motor packets.
+direct-PWM command that a bounded controller would request. Every admitted control tick either
+produces one fail-closed shadow decision or ends the session on a fatal evidence-recording error.
+The process has no motor-command transport and emits zero STM32 motor packets.
 
 Live sensor, visual-attempt, map, goal, and tick admissions are appended in the order actually
 observed by the coordinator and bound to the captured dataset. Operating-system thread scheduling
-is neither controlled nor claimed deterministic. The journal is the replay authority for that
-observed order; a replay consumes those typed admissions rather than reconstructing a schedule.
-Given the same admitted events and configuration, the algorithms are deterministic, but no
-bit-for-bit cross-platform floating-point claim is made for platform `libm` operations.
+is neither controlled nor claimed deterministic. The journal is authoritative evidence of that
+observed order; it does not capture tracker-derived increments/localizations or the controller's
+live deadline clock and therefore does not promise deterministic end-to-end SLAM or MPC replay.
+Typed parsing and state transitions are deterministic when all perception outputs, clock values,
+and configuration inputs are supplied, but no bit-for-bit cross-platform floating-point claim is
+made for platform `libm` operations.
 The recording binds payloads to the journal; it does not embed the JSON configuration or software
 revision. Reproduction therefore also requires the same external configuration and code revision.
 
@@ -45,12 +47,16 @@ versioned plant model + limits ------> deadline-bounded MPC
 The existing SLAM map remains authoritative for global localization and loop correction. `odom`
 is the locally continuous control frame; global corrections update `map <- odom` instead of
 jumping the controller state. `base` is the planar robot frame. OAK optical and IMU measurements
-remain in their native frames until an explicit calibrated extrinsic converts them.
+remain in their native frames until an explicitly declared extrinsic converts them.
 
-IMU data alone cannot determine drift-free planar translation. With no wheel encoders, continuous
-motion therefore comes from visual odometry constrained by calibrated inertial measurements. If
-camera-to-base, IMU-to-camera, gravity/ground-plane, or clock-session authority is missing, the
-estimator and controller must stay unavailable rather than assume alignment.
+IMU data alone cannot determine drift-free planar translation. With no wheel encoders, visual
+increments are the only source of translational motion; calibrated raw gyroscope samples extend
+yaw for a short, bounded prediction window, while acceleration is deliberately not integrated into
+translation. The configuration explicitly supplies tracking-camera-to-base and native-IMU-to-base
+transforms, and the live runtime constructs a typed device/host clock session. Parsing checks
+structure and geometric consistency; it cannot authenticate physical calibration. Synthetic,
+unvalidated values may exercise only the transport-free shadow path and do not establish physical
+alignment or authorize actuation.
 
 ## Boundary contracts
 
@@ -87,7 +93,7 @@ this can correctly stop a rollout even when the body's current cell is known fre
 
 Robot footprint and clearance are applied before trajectory acceptance. The safety supervisor
 also rejects missing localization, stale inputs, map/path identity mismatch, infeasible controller
-results, deadline misses, and command-session loss.
+results, and deadline misses; failure to append shadow decision evidence is fatal.
 
 ## Controller and plant-model contract
 
@@ -107,12 +113,15 @@ shadow command session.
 
 ## Rerun evidence
 
-Shadow mode emits the map and local grids, exact frame transforms, pose quality, goal and path
-provenance, predicted trajectory, solver status, safety reason, and requested PWM on one coherent
-Rerun timeline. It also exposes an explicit `motor_packets_sent = 0` counter. Rerun is diagnostic,
+Shadow mode submits best-effort diagnostic entries to one Rerun recording on explicit capture and
+navigation timelines. The entries include the map and local grids, exact frame transforms, pose
+quality, goal and path provenance, predicted trajectory, solver status, safety reason, requested
+PWM, and an explicit `motor_packets_sent = 0` counter. The bounded diagnostic queue may drop a
+newest entry under backpressure, so Rerun is not a complete decision ledger. It is diagnostic,
 output-only evidence; it is not part of the safety decision, and its failure cannot enable motion.
-The durable dataset binds the sensor payloads to the exact coordinator-admission journal; Rerun is
-not the replay authority.
+The durable dataset structurally binds sensor payloads to the coordinator-admission journal by
+recording identity, path, count, and length; this is not cryptographic integrity, authentication,
+or origin proof. Rerun is not the replay authority.
 
 The global goal and path use the registered map frame. The predicted trajectory and local grid are
 kept under explicitly named odom and capture-time local frames, with exact transform scalars and

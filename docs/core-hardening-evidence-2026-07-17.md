@@ -19,15 +19,17 @@ The host closure is transport-free shadow execution, not robot actuation. The li
 `--navigation-config`, `--navigation-goal X_M,Y_M`, and `--navigation-record` as an all-or-none
 set. It parses the JSON and goal once, requires depth, IMU, rectified stereo, and dense occupancy,
 and records the coordinator's actual admission order in a dataset-bound ingress sidecar. Thread
-scheduling itself is not claimed deterministic. The journal, rather than a reconstructed schedule
-or Rerun output, is the replay authority.
+scheduling itself is not claimed deterministic. The journal is authoritative for admitted order
+and identity rather than a reconstructed schedule or Rerun output; because it omits tracker-derived
+outputs and the live deadline clock, it is not a deterministic end-to-end SLAM or MPC replay log.
 
-Every admitted control tick reaches the fail-closed safety supervisor and produces one bounded
-shadow command record. The shadow session exposes `motor_packets_sent = 0` and has no command
-transport. STOP is recorded for stale or missing observations, identity/provenance mismatch,
-blocked trajectories, infeasible solutions, deadline failures, or command-session failure. A
-global map admitted before the first visual localization anchor is deliberately not rebound after
-the fact; planning waits for a later map revision.
+Every admitted control tick reaches the fail-closed safety supervisor and either produces one
+bounded shadow command record or ends the session on a fatal evidence-recording error. The shadow
+session exposes `motor_packets_sent = 0` and has no command transport. STOP is recorded for stale
+or missing observations, identity/provenance mismatch, blocked trajectories, infeasible solutions,
+or deadline failures. Failure to append the shadow decision is fatal and does not fabricate a STOP
+record. A global map admitted before the first visual localization anchor is deliberately not
+rebound after the fact; planning waits for a later map revision.
 
 The local costmap clears the raw cells conservatively occupied by the robot's current footprint,
 then inflates observed obstacles. It does not mark the clearance ring or unseen exterior free.
@@ -60,10 +62,36 @@ model. The parser accepted all 4,695 bytes. Its calibration IDs and plant eviden
 a synthetic, non-actuating, non-physically-validated schema example; its values are not Kiko plant
 identification or sensor calibration.
 
-Rerun remains output-only. The live adapter emits the CLI goal, poses/transforms, map and local
-grid, path, predicted trajectory, solver/safety outcome, requested PWM, and zero-motor-packet
-counter for inspection. It does not implement or claim a viewer map-click callback, and Rerun
-failure cannot authorize motion.
+Rerun remains output-only. The live adapter submits best-effort entries on explicit capture and
+navigation timelines for the CLI goal, poses/transforms, map and local grid, path, predicted
+trajectory, solver/safety outcome, requested PWM, and zero-motor-packet counter. Its bounded
+diagnostic queue can omit a newest entry under backpressure. It does not implement or claim a
+viewer map-click callback, and Rerun failure cannot authorize motion.
+
+Final macOS aarch64 host verification for implementation commit `ebae23f`:
+
+```text
+cargo test --locked -p kiko-slam --quiet
+875 library tests passed; 31 default binary tests passed; compile-fail doctest passed;
+1 backend example doctest remained intentionally ignored
+
+cargo check --locked -p kiko-slam --all-targets
+passed
+
+cargo clippy --locked -p kiko-slam --all-targets -- -D warnings
+passed
+
+cargo fmt --all -- --check
+passed
+
+git diff --check
+passed
+```
+
+The final `record`-feature source also passed strict Clippy for the `kiko-slam` binary and tests in
+an isolated archive with a temporary build-script early return that bypassed unavailable native
+OAK discovery, C++ compilation, and linking. This proves the Rust feature path type-checks with
+warnings denied; it is not a native DepthAI/OpenCV link or device-runtime result.
 
 ## Reproducible navigation shadow benchmark
 
@@ -196,8 +224,10 @@ was not exercised, so actual viewer auto-spawn and rendering remain unverified.
 - Post-activation workers retain the existing `std::thread::spawn` panic boundary. OS
   resource-exhaustion spawn failure and a combined multi-worker fault-injection matrix were not
   converted into or verified as typed abort paths in this closure.
-- The recording binds payloads to admitted ingress but does not embed the navigation JSON or code
-  revision; replay requires the same external configuration and software revision.
+- The recording structurally binds payloads to admitted ingress by identity, path, count, and
+  length; it is not cryptographic integrity, authentication, or origin proof. It also does not
+  embed the navigation JSON or code revision, so reproduction requires the same external
+  configuration and software revision.
 - Linux aarch64 cross-checking was attempted but the host lacks a Linux cross-C toolchain/sysroot:
   the third-party `ring` build first lacked `aarch64-linux-gnu-gcc`, and the Clang attempt then
   lacked the target `assert.h`. Linux aarch64 compilation therefore remains unverified.
