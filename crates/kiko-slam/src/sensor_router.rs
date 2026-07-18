@@ -6,8 +6,110 @@ use crate::{
     ChannelCapacity, ChannelStats, ChannelStatsHandle, DepthImage, DeviceSessionId,
     DeviceTimestamp, DropPolicy, DropReceiver, DropSender, FrameId, HostMonotonicTimestamp,
     ImuReport, InertialOrderOutcome, InertialOrderTracker, InertialOrderingError,
-    InertialValueError, SendOutcome, bounded_channel,
+    InertialValueError, SendOutcome, StereoPair, bounded_channel,
 };
+
+/// One valid stereo pair bound to its device-clock session and exact
+/// coordinator-entry time.
+///
+/// [`StereoPair`] deliberately retains the image payloads. This boundary
+/// parses both weak signed frame timestamps once into [`DeviceTimestamp`] and
+/// requires callers, including dataset replay, to supply the real host time;
+/// it never substitutes a device timestamp or nominal frame period.
+#[derive(Debug)]
+pub struct StereoObservation {
+    session_id: DeviceSessionId,
+    host_arrival: HostMonotonicTimestamp,
+    left_device_timestamp: DeviceTimestamp,
+    right_device_timestamp: DeviceTimestamp,
+    pair: StereoPair,
+}
+
+impl StereoObservation {
+    pub fn parse(
+        session_id: DeviceSessionId,
+        host_arrival: HostMonotonicTimestamp,
+        pair: StereoPair,
+    ) -> Result<Self, StereoObservationError> {
+        let left_device_timestamp = DeviceTimestamp::try_from_nanos(
+            pair.left().timestamp().as_nanos(),
+        )
+        .map_err(|source| StereoObservationError::InvalidDeviceTimestamp {
+            side: StereoObservationSide::Left,
+            source,
+        })?;
+        let right_device_timestamp = DeviceTimestamp::try_from_nanos(
+            pair.right().timestamp().as_nanos(),
+        )
+        .map_err(|source| StereoObservationError::InvalidDeviceTimestamp {
+            side: StereoObservationSide::Right,
+            source,
+        })?;
+        Ok(Self {
+            session_id,
+            host_arrival,
+            left_device_timestamp,
+            right_device_timestamp,
+            pair,
+        })
+    }
+
+    pub fn session_id(&self) -> DeviceSessionId {
+        self.session_id
+    }
+
+    pub fn host_arrival(&self) -> HostMonotonicTimestamp {
+        self.host_arrival
+    }
+
+    pub fn left_device_timestamp(&self) -> DeviceTimestamp {
+        self.left_device_timestamp
+    }
+
+    pub fn right_device_timestamp(&self) -> DeviceTimestamp {
+        self.right_device_timestamp
+    }
+
+    pub fn pair(&self) -> &StereoPair {
+        &self.pair
+    }
+
+    pub fn into_pair(self) -> StereoPair {
+        self.pair
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StereoObservationSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StereoObservationError {
+    InvalidDeviceTimestamp {
+        side: StereoObservationSide,
+        source: InertialValueError,
+    },
+}
+
+impl std::fmt::Display for StereoObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDeviceTimestamp { side, source } => {
+                write!(f, "invalid {side:?} stereo device timestamp: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StereoObservationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidDeviceTimestamp { source, .. } => Some(source),
+        }
+    }
+}
 
 /// One navigation depth frame bound to its device-clock session and host
 /// dequeue time.
@@ -313,9 +415,9 @@ pub fn imu_report_router(
 mod tests {
     use super::*;
     use crate::{
-        AccelSample, DequeueSequence, DeviceSessionId, DeviceTimestamp, FrameId, GyroSample,
-        HostMonotonicTimestamp, OakImuAcceleration, OakImuAngularVelocity, SensorAccuracy,
-        Timestamp,
+        AccelSample, DequeueSequence, DeviceSessionId, DeviceTimestamp, Frame, FrameId, GyroSample,
+        HostMonotonicTimestamp, OakImuAcceleration, OakImuAngularVelocity, PairingWindowNs,
+        SensorAccuracy, SensorId, Timestamp,
     };
 
     fn capacity(value: usize) -> ChannelCapacity {
@@ -335,6 +437,34 @@ mod tests {
 
     fn session() -> DeviceSessionId {
         DeviceSessionId::try_new(1).expect("nonzero test session")
+    }
+
+    fn stereo_pair(left_timestamp_ns: i64, right_timestamp_ns: i64) -> StereoPair {
+        let left = Frame::new(
+            SensorId::StereoLeft,
+            FrameId::new(41),
+            Timestamp::from_nanos(left_timestamp_ns),
+            2,
+            1,
+            vec![1, 2],
+        )
+        .expect("valid left frame");
+        let right = Frame::new(
+            SensorId::StereoRight,
+            FrameId::new(42),
+            Timestamp::from_nanos(right_timestamp_ns),
+            2,
+            1,
+            vec![3, 4],
+        )
+        .expect("valid right frame");
+        StereoPair::try_new(
+            left,
+            right,
+            PairingWindowNs::try_from_u64(left_timestamp_ns.abs_diff(right_timestamp_ns))
+                .expect("fixture delta fits the pairing domain"),
+        )
+        .expect("valid stereo pair")
     }
 
     fn depth_observation(
@@ -367,6 +497,83 @@ mod tests {
                 SensorAccuracy::High,
             ),
         )
+    }
+
+    #[test]
+    fn stereo_observation_preserves_exact_session_host_and_device_times() {
+        let session_id = DeviceSessionId::try_new(99).expect("nonzero session");
+        let host_arrival = HostMonotonicTimestamp::from_nanos(u64::MAX);
+        let observation = StereoObservation::parse(session_id, host_arrival, stereo_pair(123, 124))
+            .expect("nonnegative pair timestamps");
+
+        assert_eq!(observation.session_id(), session_id);
+        assert_eq!(observation.host_arrival(), host_arrival);
+        assert_eq!(
+            observation.left_device_timestamp(),
+            DeviceTimestamp::try_from_nanos(123).expect("nonnegative left timestamp")
+        );
+        assert_eq!(
+            observation.right_device_timestamp(),
+            DeviceTimestamp::try_from_nanos(124).expect("nonnegative right timestamp")
+        );
+        assert_eq!(observation.pair().left().frame_id(), FrameId::new(41));
+        assert_eq!(observation.pair().right().frame_id(), FrameId::new(42));
+        assert_eq!(
+            observation.pair().left().timestamp(),
+            Timestamp::from_nanos(123)
+        );
+        assert_eq!(
+            observation.pair().right().timestamp(),
+            Timestamp::from_nanos(124)
+        );
+    }
+
+    #[test]
+    fn stereo_observation_rejects_each_negative_timestamp_with_its_side_and_source() {
+        for (left_timestamp_ns, right_timestamp_ns, expected_side, expected_nanos) in [
+            (
+                i64::MIN,
+                i64::MIN + 1,
+                StereoObservationSide::Left,
+                i64::MIN,
+            ),
+            (0, -1, StereoObservationSide::Right, -1),
+        ] {
+            let error = StereoObservation::parse(
+                session(),
+                HostMonotonicTimestamp::from_nanos(10),
+                stereo_pair(left_timestamp_ns, right_timestamp_ns),
+            )
+            .expect_err("device timestamps cannot be negative");
+            assert_eq!(
+                error,
+                StereoObservationError::InvalidDeviceTimestamp {
+                    side: expected_side,
+                    source: InertialValueError::NegativeDeviceTimestamp {
+                        nanos: expected_nanos,
+                    },
+                }
+            );
+            assert!(std::error::Error::source(&error).is_some());
+        }
+    }
+
+    #[test]
+    fn stereo_observation_owns_and_returns_the_source_pair_without_copying_frames() {
+        let pair = stereo_pair(200, 201);
+        let left_pixels = pair.left().data().as_ptr();
+        let right_pixels = pair.right().data().as_ptr();
+        let observation =
+            StereoObservation::parse(session(), HostMonotonicTimestamp::from_nanos(300), pair)
+                .expect("valid observation");
+
+        assert_eq!(observation.pair().left().data().as_ptr(), left_pixels);
+        assert_eq!(observation.pair().right().data().as_ptr(), right_pixels);
+        let pair = observation.into_pair();
+        assert_eq!(pair.left().data().as_ptr(), left_pixels);
+        assert_eq!(pair.right().data().as_ptr(), right_pixels);
+        assert_eq!(pair.left().data(), [1, 2]);
+        assert_eq!(pair.right().data(), [3, 4]);
     }
 
     #[test]

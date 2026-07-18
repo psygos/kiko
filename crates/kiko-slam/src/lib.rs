@@ -96,8 +96,8 @@ pub use pnp::{
 pub use sensor_router::{
     DepthObservation, DepthObservationError, DepthRouteOutcome, DepthRouteStats,
     DepthRouteStatsHandle, DepthRouter, DepthRoutes, ImuReportRoute, ImuReportRouteOutcome,
-    ImuReportRouteStats, ImuReportRouteStatsHandle, ImuReportRouter, depth_router,
-    imu_report_router,
+    ImuReportRouteStats, ImuReportRouteStatsHandle, ImuReportRouter, StereoObservation,
+    StereoObservationError, StereoObservationSide, depth_router, imu_report_router,
 };
 pub use tracker::{
     BackendConfig, BackendConfigError, BackendStats, ComponentHealth, CovisibilityRatio,
