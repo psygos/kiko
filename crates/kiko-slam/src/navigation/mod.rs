@@ -3,6 +3,7 @@
 mod cell_inflation;
 mod frames;
 mod global_planner;
+mod ingress;
 mod local_costmap;
 mod odometry;
 mod shadow_command;
@@ -17,6 +18,20 @@ pub use global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig,
     GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint, PlanStart,
     PointGoal, UnknownSpacePolicy,
+};
+pub use ingress::{
+    AcceptedDepthIngress, ControlTickIngress, CurrentMapEpochBinding,
+    MAX_NAVIGATION_INGRESS_RECORDS, MapEpochStartedIngress, MapEpochTransition,
+    MapPointGoalIngress, NAVIGATION_INGRESS_FORMAT_VERSION, NAVIGATION_INGRESS_STREAM_FILE,
+    NavigationClockEpoch, NavigationClockOffset, NavigationGoalReplayError,
+    NavigationIngressBoundaryError, NavigationIngressCapacity, NavigationIngressCapacityError,
+    NavigationIngressEvent, NavigationIngressLog, NavigationIngressParseError,
+    NavigationIngressReadStage, NavigationIngressReader, NavigationIngressRecord,
+    NavigationIngressSequence, NavigationIngressStreamReadError, NavigationIngressStreamWriteError,
+    NavigationIngressWriteError, NavigationIngressWriteStage, NavigationIngressWriter,
+    NavigationMapEpochCoordinator, NavigationRecordingId, NavigationRecordingIdError,
+    NavigationReplayClock, NavigationReplayClockError, RecordedImuReport, RecordedMapEpochId,
+    RecordedMapEpochIdError, ReplayMapEpochBinding, VisualAttemptIngress, VisualAttemptOutcome,
 };
 pub use local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapCell, LocalCostmapClockRegression, LocalCostmapConfig,
