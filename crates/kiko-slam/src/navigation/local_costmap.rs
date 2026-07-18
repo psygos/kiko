@@ -12,6 +12,12 @@
 //! visible through the configured obstacle-height slab carry free evidence;
 //! unseen cells become unknown. Unknown, expired, inflated, and out-of-bounds
 //! locations are all non-traversable.
+//!
+//! The robot's exact configured physical footprint at the capture pose is
+//! embodied space, not unobserved environment. Its conservative cell-square
+//! mask is therefore cleared before configuration-space inflation. This does
+//! not clear the additional requested clearance shell: unseen clearance
+//! remains unknown and fail-closed, including behind a forward-only camera.
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -837,6 +843,7 @@ pub struct LocalCostmap {
     current: Vec<u8>,
     staging: Vec<u8>,
     all_unknown: Vec<u8>,
+    embodied_footprint: Vec<bool>,
     inflation_sources: Vec<bool>,
     inflation_result: Vec<bool>,
     inflation: CellSquareInflation,
@@ -872,13 +879,29 @@ impl LocalCostmap {
         let current = unknown_buffer(cell_count, "current cells")?;
         let staging = unknown_buffer(cell_count, "staging cells")?;
         let all_unknown = unknown_buffer(cell_count, "expired cells")?;
-        let inflation_sources = bool_buffer(cell_count, "inflation sources")?;
+        let mut inflation_sources = bool_buffer(cell_count, "inflation sources")?;
+        let mut embodied_footprint = bool_buffer(cell_count, "embodied footprint")?;
         let inflation_result = bool_buffer(cell_count, "inflation result")?;
-        let inflation = CellSquareInflation::try_new(
+        let mut inflation = CellSquareInflation::try_new(
             config.geometry.width() as usize,
             config.geometry.height() as usize,
         )
         .map_err(map_inflation_construction_error)?;
+        let base_cell = config
+            .geometry
+            .point_index([0.0, 0.0])
+            .expect("validated local-costmap bounds contain the base origin");
+        inflation_sources[base_cell] = true;
+        inflation
+            .inflate(
+                &inflation_sources,
+                &mut embodied_footprint,
+                config.geometry.resolution_m(),
+                config.footprint_radius_m,
+                false,
+            )
+            .map_err(|_| LocalCostmapError::InflationInvariant)?;
+        inflation_sources.fill(false);
 
         let depth_to_tracking =
             RigidTransform64::from_pose(config.camera.depth_to_tracking().pose());
@@ -894,6 +917,7 @@ impl LocalCostmap {
             current,
             staging,
             all_unknown,
+            embodied_footprint,
             inflation_sources,
             inflation_result,
             inflation,
@@ -1001,6 +1025,7 @@ impl LocalCostmap {
                 return Err(error);
             }
         };
+        self.clear_embodied_footprint();
         self.inflate_nonfree()?;
         std::mem::swap(&mut self.current, &mut self.staging);
         self.provenance = Some(LocalCostmapProvenance {
@@ -1253,6 +1278,14 @@ impl LocalCostmap {
             }
         }
         Ok(())
+    }
+
+    fn clear_embodied_footprint(&mut self) {
+        for (class_id, &embodied) in self.staging.iter_mut().zip(&self.embodied_footprint) {
+            if embodied {
+                *class_id = CLASS_FREE;
+            }
+        }
     }
 }
 
@@ -1885,10 +1918,18 @@ mod tests {
         let view = map
             .view_at(HostMonotonicTimestamp::from_nanos(22))
             .expect("view");
-        assert!(
-            view.class_ids()
-                .iter()
-                .all(|class_id| *class_id == CLASS_UNKNOWN)
+        for (&class_id, &embodied) in view.class_ids().iter().zip(&map.embodied_footprint) {
+            if class_id == CLASS_FREE {
+                assert!(
+                    embodied,
+                    "missing depth may expose no free cell outside the embodied footprint"
+                );
+            }
+            assert_ne!(class_id, CLASS_OCCUPIED);
+        }
+        assert_eq!(
+            view.cell_at_local(PlanarPoint::<LocalCostmapFrame>::origin()),
+            LocalCostmapQuery::InBounds(LocalCostmapCell::Free)
         );
     }
 
@@ -1961,10 +2002,18 @@ mod tests {
         let view = map
             .view_at(HostMonotonicTimestamp::from_nanos(20))
             .expect("view");
-        assert!(
-            view.class_ids()
-                .iter()
-                .all(|class_id| *class_id == CLASS_UNKNOWN)
+        for (&class_id, &embodied) in view.class_ids().iter().zip(&map.embodied_footprint) {
+            if class_id == CLASS_FREE {
+                assert!(
+                    embodied,
+                    "out-of-slab depth may expose no free cell outside the embodied footprint"
+                );
+            }
+            assert_ne!(class_id, CLASS_OCCUPIED);
+        }
+        assert_eq!(
+            view.cell_at_local(PlanarPoint::<LocalCostmapFrame>::origin()),
+            LocalCostmapQuery::InBounds(LocalCostmapCell::Free)
         );
     }
 
