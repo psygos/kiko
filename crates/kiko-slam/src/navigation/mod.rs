@@ -1,6 +1,7 @@
 //! Hardware-independent navigation contracts and algorithms.
 
 mod cell_inflation;
+mod coordinator;
 mod frames;
 mod goal_input;
 mod global_planner;
@@ -11,6 +12,14 @@ mod odometry;
 mod reference;
 mod safety;
 mod shadow_command;
+
+pub use coordinator::{
+    CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
+    CoordinatorTickOutcome, DepthAdmissionOutcome, GlobalMapAdmissionOutcome,
+    GlobalPlanningOutcome, ImuAdmissionOutcome, NavigationGoalState, NavigationIngressSink,
+    ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission, VisualAdmissionError,
+    VisualAdmissionOutcome,
+};
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,
     OdomToBase, OdomToLocalCostmap, OdomToMap, PlanarAxis, PlanarFrame, PlanarPoint,
