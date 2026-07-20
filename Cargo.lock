@@ -3117,6 +3117,10 @@ dependencies = [
  "kiko-eye-protocol",
  "kiko-head-protocol",
  "robot-protocol",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

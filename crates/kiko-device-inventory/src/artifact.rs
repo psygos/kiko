@@ -1,10 +1,12 @@
 use crate::{ArtifactId, InventoryParseError, Sha256Id, TextField};
+use serde::Deserialize;
 
 pub const MAX_CALIBRATION_ARTIFACTS: usize = 8;
 pub const MAX_PLANT_ARTIFACTS: usize = 4;
 pub const MAX_ARTIFACTS: usize = MAX_CALIBRATION_ARTIFACTS + MAX_PLANT_ARTIFACTS;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactDigestDto {
     pub artifact_id: String,
     pub sha256: [u8; 32],

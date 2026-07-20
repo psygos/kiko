@@ -5,6 +5,7 @@ use kiko_head_protocol::{HeadJoint, ServoId};
 use robot_protocol::v2::{
     ActuatorConfigFingerprint, ControllerCapabilities, ControllerUid, VERSION as ROBOT_PROTOCOL_V2,
 };
+use serde::Deserialize;
 
 use crate::{
     ArtifactDigestDto, ArtifactSet, BuildProvenance, ControlEndpointIdentity, DeviceRole,
@@ -15,7 +16,8 @@ use crate::{
 pub const DEVICE_INVENTORY_MANIFEST_V1: u32 = 1;
 pub const REQUIRED_EYE_CAPABILITY_BITS: u32 = EyeCapabilities::KNOWN_BITS;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OakManifestV1Dto {
     pub mxid: String,
     pub runtime_provenance: String,
@@ -23,7 +25,8 @@ pub struct OakManifestV1Dto {
     pub adapter_build_provenance: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Stm32ManifestV1Dto {
     pub serial_by_id_path: String,
     pub control_endpoint_identity: String,
@@ -34,7 +37,8 @@ pub struct Stm32ManifestV1Dto {
     pub capabilities_bits: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HeadManifestV1Dto {
     pub adapter_serial_by_id_path: String,
     pub bow_servo_id: u8,
@@ -46,7 +50,8 @@ pub struct HeadManifestV1Dto {
     pub rts_asserted: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EyeManifestV1Dto {
     pub serial_by_id_path: String,
     pub kep_protocol_version: u8,
@@ -60,7 +65,8 @@ pub struct EyeManifestV1Dto {
 /// OAK, STM32, calibration artifacts, and plant artifacts are mandatory for
 /// the mobile SLAM base. Head and eye are the only optional expected devices,
 /// because a base can be physically built without either expressive accessory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceInventoryManifestV1Dto {
     pub schema_version: u32,
     pub robot_id: String,

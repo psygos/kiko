@@ -1,17 +1,22 @@
 #![forbid(unsafe_code)]
 
-//! Transport-independent expected/observed device inventory for one Kiko robot.
+//! Typed inventory domains plus a bounded Unix host boundary for one Kiko robot.
 //!
-//! This crate performs no filesystem, udev, USB, serial, socket, or hardware
-//! access. It parses caller-provided claims and compares them exactly; neither
-//! parsing nor equality proves that a physical device or artifact is genuine.
+//! Manifest loading and artifact hashing establish structural validity and
+//! content identity only. Neither result proves provenance or authenticity.
 
 mod artifact;
+#[cfg(unix)]
+mod artifact_io;
 mod bounded;
 mod compare;
 mod manifest;
+#[cfg(unix)]
+mod manifest_io;
 mod model;
 mod observed;
+#[cfg(unix)]
+mod secure_fs;
 
 use core::fmt;
 
@@ -20,6 +25,13 @@ use kiko_head_protocol::{HeadJoint, ServoId};
 pub use artifact::{
     ArtifactDigest, ArtifactDigestDto, ArtifactKind, ArtifactSet, MAX_ARTIFACTS,
     MAX_CALIBRATION_ARTIFACTS, MAX_PLANT_ARTIFACTS,
+};
+#[cfg(unix)]
+pub use artifact_io::{
+    ArtifactContentIdentity, ArtifactFileBindingInput, ArtifactHashError, ArtifactRelativePath,
+    ArtifactRelativePathError, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_PATH_COMPONENTS,
+    MAX_ARTIFACT_RELATIVE_PATH_BYTES, MAX_ARTIFACT_ROOT_PATH_BYTES, ManifestArtifactHashes,
+    hash_manifest_artifacts,
 };
 pub use bounded::{
     ArtifactId, BoundedTextError, BuildProvenance, ControlEndpointIdentity, MAX_ARTIFACT_ID_BYTES,
@@ -33,6 +45,12 @@ pub use manifest::{
     EyeManifestV1Dto, HeadManifestV1Dto, OakManifestV1Dto, REQUIRED_EYE_CAPABILITY_BITS,
     Stm32ManifestV1Dto,
 };
+#[cfg(unix)]
+pub use manifest_io::{
+    FileKind, LoadedExpectedManifestV1, MAX_MANIFEST_JSON_BYTES, MAX_MANIFEST_PATH_BYTES,
+    ManifestJsonError, ManifestLoadError, load_expected_manifest_v1_file,
+    load_expected_manifest_v1_from_slice,
+};
 pub use model::{
     DeviceRole, EyeStaticIdentity, HeadExpectedIdentity, MAX_OBSERVED_HEAD_SERVOS, OakIdentity,
     ObservedEye, ObservedHead, ObservedServoIds, ObservedStm32, Stm32StaticIdentity,
@@ -41,6 +59,8 @@ pub use observed::{
     OBSERVED_DEVICE_INVENTORY_V1, ObservedDeviceInventoryV1, ObservedDeviceInventoryV1Dto,
     ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedStm32V1Dto,
 };
+#[cfg(unix)]
+pub use secure_fs::SecureOpenError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextField {

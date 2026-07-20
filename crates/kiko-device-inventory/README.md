@@ -1,9 +1,13 @@
 # Kiko device inventory
 
-`kiko-device-inventory` is the transport-independent boundary between a weak
-inventory document, an external probe report, and Kiko's startup policy. It
-parses each report once into bounded domain types and then performs an exact,
-allocation-free comparison of those parsed values.
+`kiko-device-inventory` owns the typed boundary between a weak inventory
+document, an external probe report, and Kiko's startup policy. Its domain model
+is transport-independent. On Unix hosts it also provides bounded file loading
+and artifact hashing for Linux and macOS.
+
+Weak values are parsed into bounded domain types once and compared exactly.
+Already-parsed inventory comparison is allocation-free and borrows both
+snapshots.
 
 ## Contract
 
@@ -37,17 +41,59 @@ capability set, path, or digest as a substitute. STM32 and eye boot IDs are
 retained in observed identities but are not compared: they are intentionally
 per-boot values and have no stable counterpart in the manifest.
 
+## Unix host boundary
+
+`load_expected_manifest_v1_from_slice` accepts at most 64 KiB of JSON. It
+deserializes directly into `DeviceInventoryManifestV1Dto`, rejects duplicate
+fields, unknown fields at every DTO level, malformed values, and trailing JSON,
+then calls `DeviceInventoryManifestV1::parse`. That existing parser remains the
+only admission path into the manifest domain.
+
+`load_expected_manifest_v1_file` applies the same parser after opening one
+absolute, canonical path without following a symlink in any component. It
+accepts only a regular file, checks the metadata length before allocation,
+streams no more than 64 KiB, and reports a length change observed during the
+read. Relative paths, dot components, repeated or trailing separators, paths
+over 1,024 bytes, non-regular files, allocation failures, and I/O failures are
+distinct typed errors. No alternate manifest path is tried.
+
+`hash_manifest_artifacts` binds an exact set of caller-declared relative paths
+to the artifact kind and ID already present in a parsed manifest. The binding
+count must equal the manifest artifact count and therefore cannot exceed 12.
+IDs and paths are parsed before filesystem access; missing, unexpected, or
+duplicate bindings and duplicate paths are rejected. The artifact root must be
+an absolute canonical path of at most 1,024 bytes. Each relative path is at most
+512 bytes and 64 components, uses `/`, and contains no empty, dot, parent, NUL,
+or backslash component.
+
+The root and every artifact path component are opened relative to anchored
+directory descriptors with no-follow semantics. Only regular files of at most
+128 MiB are hashed. SHA-256 is computed in a bounded 64 KiB streaming buffer;
+the result retains the manifest digest, observed digest, exact relative path,
+and bytes read. A digest difference is successful identity evidence with
+`content_matches_manifest() == false`, not a hashing failure.
+
 ## Evidence boundary
 
-This crate does **not** access the filesystem, udev, USB, serial ports, sockets,
-OAK hardware, STM32 hardware, head servos, eye firmware, or artifact contents.
-Both DTOs contain caller-supplied claims. Successful parsing proves only that a
-claim is structurally valid; an exact comparison proves only that two claims
-agree. Neither result proves physical identity, connectivity, firmware
-authenticity, artifact authenticity, readiness, calibration quality, or safe
-motion. A host integration must obtain observed values from authoritative
-protocol handshakes and hash the actual artifacts before constructing the
-observed DTO.
+The Unix functions access only the explicitly supplied manifest or artifact
+paths. This crate does **not** access udev, USB, serial ports, sockets, OAK
+hardware, STM32 hardware, head servos, or eye firmware. Observed device DTOs
+remain caller-supplied claims.
+
+Successful parsing proves structural validity. Exact inventory comparison
+proves only agreement between two parsed snapshots. A SHA-256 match means the
+bytes read produced the digest declared by the manifest; an untrusted manifest
+can truthfully describe malicious content, so the result does not prove origin,
+signature, authorization, provenance, or authenticity. It also does not
+establish physical identity, connectivity, readiness, calibration quality, or
+safe motion.
+
+Hashing is not an atomic filesystem snapshot. The code detects a file-length
+change between metadata and end of read, but a concurrent writer can replace
+bytes without changing the length and can make a streamed digest represent
+more than one write epoch. Production artifact trees must therefore be made
+immutable before startup admission. The returned digest is content identity
+for the bytes the reader observed, with no stronger claim.
 
 ## Verification
 
