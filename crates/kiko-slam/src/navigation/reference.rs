@@ -13,8 +13,9 @@ use super::frames::{MapToOdom, OdomFrame, PlanarPoint, PlanarTransformError};
 use super::global_planner::{GlobalPath, GlobalPlanIdentity, MapPoint};
 use super::mpc::{
     MAX_SUPPORTED_ABS_ODOM_COORDINATE_M, MIN_STEP_PERIOD_S, MPC_REFERENCE_V1, MpcConfigV1,
-    MpcReferenceParseError, MpcReferenceV1, MpcReferenceV1Dto, NavigationEpochV1, OdomAxisV1,
-    OdomPoseV1, OdomReferencePointV1Dto, ReferenceBuilderRevisionV1,
+    MpcReferenceParseError, MpcReferenceV1, MpcReferenceV1Dto, NavigationEpochV1,
+    NavigationReferenceIdentityV1, OdomAxisV1, OdomPoseV1, OdomReferencePointV1Dto,
+    ReferenceBuilderRevisionV1,
 };
 
 pub const PATH_REFERENCE_CONFIG_V1: u32 = 1;
@@ -327,7 +328,9 @@ impl PathReferenceBuilderV1 {
         mpc_config: MpcConfigV1,
         created_at: HostMonotonicTimestamp,
     ) -> Result<MpcReferenceV1<'path>, PathReferenceBuildError> {
-        let expected = epoch.global_plan_identity();
+        let expected = epoch.try_global_plan_identity().ok_or_else(|| {
+            PathReferenceBuildError::EpochNotGlobalPlan(Box::new(epoch.reference_identity()))
+        })?;
         let actual = global_path.identity();
         if expected != actual {
             return Err(PathReferenceBuildError::EpochPathMismatch(Box::new(
@@ -739,6 +742,7 @@ impl EpochPathMismatchV1 {
 #[derive(Debug, PartialEq)]
 pub enum PathReferenceBuildError {
     EpochPathMismatch(Box<EpochPathMismatchV1>),
+    EpochNotGlobalPlan(Box<NavigationReferenceIdentityV1>),
     EmptyPath,
     PathPointLimitExceeded {
         actual: usize,
@@ -837,7 +841,7 @@ mod tests {
     use super::super::global_planner::{
         GlobalPlanner, GlobalPlannerConfig, PlanStart, PointGoal, UnknownSpacePolicy,
     };
-    use super::super::mpc::{MPC_CONFIG_V1, MpcConfigV1Dto};
+    use super::super::mpc::{MPC_CONFIG_V1, ManualReferenceIdentityV1, MpcConfigV1Dto};
     use super::super::odometry::OdomSegmentId;
 
     fn config_dto() -> PathReferenceConfigV1Dto {
@@ -1025,7 +1029,11 @@ mod tests {
             reference.builder_revision(),
             ReferenceBuilderRevisionV1::TimeParameterizedGlobalPathV1
         );
-        assert!(std::ptr::eq(reference.source_path(), &path));
+        assert!(
+            reference
+                .global_path()
+                .is_some_and(|source| std::ptr::eq(source, &path))
+        );
         for (index, point) in reference.points().iter().copied().enumerate() {
             let expected_x = 0.6 + index as f64 * 0.1;
             assert!((point.pose().position().x_m() - expected_x).abs() < 1.0e-12);
@@ -1309,6 +1317,34 @@ mod tests {
         };
         assert_eq!(mismatch.expected(), first.identity());
         assert_eq!(mismatch.actual(), second.identity());
+        assert!(builder.transformed_points.is_empty());
+
+        let direct_identity = ManualReferenceIdentityV1::try_new(
+            1,
+            1,
+            HostMonotonicTimestamp::from_nanos(10),
+            0.1,
+            0.0,
+        )
+        .unwrap();
+        let direct_epoch = NavigationEpochV1::for_manual_body_twist(
+            DeviceSessionId::try_new(1).unwrap(),
+            OdomSegmentId::try_new(1).unwrap(),
+            map_snapshot,
+            direct_identity,
+        );
+        assert!(matches!(
+            builder.build(
+                direct_epoch,
+                &first,
+                identity_map_to_odom(),
+                odom_pose(0.5, 0.5, 0.0),
+                mpc_config(0.1, 2),
+                HostMonotonicTimestamp::from_nanos(1),
+            ),
+            Err(PathReferenceBuildError::EpochNotGlobalPlan(actual))
+                if *actual == NavigationReferenceIdentityV1::ManualBodyTwist(direct_identity)
+        ));
         assert!(builder.transformed_points.is_empty());
     }
 

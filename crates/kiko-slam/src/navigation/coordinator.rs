@@ -34,9 +34,13 @@ use super::local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapClockRegression, LocalCostmapError,
     LocalCostmapUpdateOutcome, LocalDepthObservation, LocalDepthObservationError,
 };
+use super::manual_reference::{
+    FrontierYawReferenceBuildError, FrontierYawReferenceBuilderV1, FrontierYawScanCommandV1,
+    ManualMpcCommandV1, ManualReferenceBuildError, ManualReferenceBuilderV1,
+};
 use super::mpc::{
     HostMonotonicClock, MotionValueError, MpcConfigV1, NavigationEpochError, NavigationEpochV1,
-    ODOM_MOTION_STATE_V1, OdomMotionStateV1, OdomMotionStateV1Dto,
+    ODOM_MOTION_STATE_V1, OdomMotionStateV1, OdomMotionStateV1Dto, OdomPoseV1,
 };
 use super::odometry::{
     ImuUpdate, OdomSegmentId, OdometryError, OdometryEstimate, OdometryState, OdometryUnavailable,
@@ -261,10 +265,55 @@ enum GoalBinding {
     },
 }
 
+/// Mutually exclusive reference mode owned by this coordinator.
+///
+/// Entering a direct-control mode is only possible from `MappingOnly`, after
+/// the caller has removed any point goal and fulfilled the supervisor's
+/// separate fresh-zero handover obligation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorMotionModeV1 {
+    MappingOnly,
+    PointGoal,
+    Manual { authority_lease_id: NonZeroU64 },
+    FrontierInPlaceYaw { authority_lease_id: NonZeroU64 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatorMotionModeError {
+    NotMappingOnly {
+        actual: CoordinatorMotionModeV1,
+    },
+    NotDirectControl {
+        actual: CoordinatorMotionModeV1,
+    },
+    AuthorityLeaseMismatch {
+        bound: NonZeroU64,
+        supplied: NonZeroU64,
+    },
+}
+
+impl fmt::Display for CoordinatorMotionModeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid coordinator motion-mode transition: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for CoordinatorMotionModeError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CurrentOccupancyMap {
     binding: CurrentMapEpochBinding,
     revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectLocalizationBinding {
+    device_session_id: DeviceSessionId,
+    odom_segment_id: OdomSegmentId,
+    map_instance_id: MapInstanceId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -438,6 +487,9 @@ pub enum CoordinatorAdmissionError<E> {
         displayed: u64,
         snapshot: u64,
     },
+    PointGoalModeConflict {
+        actual: CoordinatorMotionModeV1,
+    },
 }
 
 impl<E: fmt::Debug> fmt::Display for CoordinatorAdmissionError<E> {
@@ -460,7 +512,8 @@ impl<E: std::error::Error + 'static> std::error::Error for CoordinatorAdmissionE
             | Self::GoalMapEpochMismatch { .. }
             | Self::GoalDisplayedRevisionMismatch { .. }
             | Self::GoalSnapshotMapMismatch { .. }
-            | Self::GoalSnapshotRevisionMismatch { .. } => None,
+            | Self::GoalSnapshotRevisionMismatch { .. }
+            | Self::PointGoalModeConflict { .. } => None,
         }
     }
 }
@@ -487,6 +540,37 @@ pub enum CoordinatorTickBlocker {
     MotionState(MotionValueError),
     MapToOdom(PlanarTransformError),
     Reference(PathReferenceBuildError),
+    MotionModeMismatch {
+        expected: CoordinatorMotionModeV1,
+        actual: CoordinatorMotionModeV1,
+    },
+    DirectAuthorityLeaseMismatch {
+        bound: NonZeroU64,
+        command: NonZeroU64,
+    },
+    ManualCommandSequenceRegression {
+        previous: u64,
+        command: u64,
+    },
+    ManualCommandIdentityConflict {
+        sequence: u64,
+    },
+    FrontierCommandSequenceRegression {
+        previous: u64,
+        command: u64,
+    },
+    FrontierCommandIdentityConflict {
+        sequence: u64,
+    },
+    DirectLocalizationEpochTransition,
+    ManualReference(ManualReferenceBuildError),
+    FrontierYawReference(FrontierYawReferenceBuildError),
+    FrontierMapRevisionMismatch {
+        expected_map_instance_id: MapInstanceId,
+        expected_revision: u64,
+        actual_map_instance_id: MapInstanceId,
+        actual_revision: u64,
+    },
 }
 
 impl CoordinatorTickBlocker {
@@ -511,7 +595,19 @@ impl CoordinatorTickBlocker {
             Self::MotionState(_) | Self::MapToOdom(_) => {
                 SafetyNotReadyReason::MotionStateUnavailable
             }
-            Self::Reference(_) => SafetyNotReadyReason::ReferenceUnavailable,
+            Self::Reference(_) | Self::ManualReference(_) | Self::FrontierYawReference(_) => {
+                SafetyNotReadyReason::ReferenceUnavailable
+            }
+            Self::MotionModeMismatch { .. }
+            | Self::DirectAuthorityLeaseMismatch { .. }
+            | Self::ManualCommandSequenceRegression { .. }
+            | Self::ManualCommandIdentityConflict { .. }
+            | Self::FrontierCommandSequenceRegression { .. }
+            | Self::FrontierCommandIdentityConflict { .. }
+            | Self::DirectLocalizationEpochTransition
+            | Self::FrontierMapRevisionMismatch { .. } => {
+                SafetyNotReadyReason::NavigationEpochTransition
+            }
         }
     }
 }
@@ -583,6 +679,12 @@ pub struct ShadowNavigationCoordinator<J: NavigationIngressSink> {
     path: Option<GlobalPath>,
     plan_fault: Option<StoredPlanFault>,
     reference_builder: PathReferenceBuilderV1,
+    manual_reference_builder: ManualReferenceBuilderV1,
+    frontier_yaw_reference_builder: FrontierYawReferenceBuilderV1,
+    motion_mode: CoordinatorMotionModeV1,
+    direct_localization_binding: Option<DirectLocalizationBinding>,
+    last_manual_command: Option<ManualMpcCommandV1>,
+    last_frontier_yaw_command: Option<FrontierYawScanCommandV1>,
     mpc_config: MpcConfigV1,
     solver_budget: SolverBudgetNs,
     safety: ShadowSafetySupervisor,
@@ -658,6 +760,11 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         solver_budget: SolverBudgetNs,
         safety: ShadowSafetySupervisor,
     ) -> Self {
+        let motion_mode = if pending_goal.is_some() {
+            CoordinatorMotionModeV1::PointGoal
+        } else {
+            CoordinatorMotionModeV1::MappingOnly
+        };
         Self {
             clock_epoch,
             journal,
@@ -674,6 +781,12 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
             path: None,
             plan_fault: None,
             reference_builder,
+            manual_reference_builder: ManualReferenceBuilderV1,
+            frontier_yaw_reference_builder: FrontierYawReferenceBuilderV1,
+            motion_mode,
+            direct_localization_binding: None,
+            last_manual_command: None,
+            last_frontier_yaw_command: None,
             mpc_config,
             solver_budget,
             safety,
@@ -752,15 +865,107 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         }
     }
 
-    /// Remove every actionable goal and path from this coordinator.
+    pub fn motion_mode(&self) -> CoordinatorMotionModeV1 {
+        self.motion_mode
+    }
+
+    /// Enter manual reference mode after a separately evidenced zero handover.
+    #[allow(
+        dead_code,
+        reason = "crate-private until the reviewed supervised live owner is wired"
+    )]
+    pub(crate) fn enter_manual_mode(
+        &mut self,
+        authority_lease_id: NonZeroU64,
+    ) -> Result<(), CoordinatorMotionModeError> {
+        if self.motion_mode != CoordinatorMotionModeV1::MappingOnly {
+            return Err(CoordinatorMotionModeError::NotMappingOnly {
+                actual: self.motion_mode,
+            });
+        }
+        self.motion_mode = CoordinatorMotionModeV1::Manual { authority_lease_id };
+        self.direct_localization_binding = None;
+        self.last_manual_command = None;
+        self.last_frontier_yaw_command = None;
+        Ok(())
+    }
+
+    /// Enter frontier-yaw reference mode after a separately evidenced zero
+    /// handover. This is not a point goal and never creates a `GlobalPath`.
+    #[allow(
+        dead_code,
+        reason = "crate-private until the reviewed supervised live owner is wired"
+    )]
+    pub(crate) fn enter_frontier_yaw_mode(
+        &mut self,
+        authority_lease_id: NonZeroU64,
+    ) -> Result<(), CoordinatorMotionModeError> {
+        if self.motion_mode != CoordinatorMotionModeV1::MappingOnly {
+            return Err(CoordinatorMotionModeError::NotMappingOnly {
+                actual: self.motion_mode,
+            });
+        }
+        self.motion_mode = CoordinatorMotionModeV1::FrontierInPlaceYaw { authority_lease_id };
+        self.direct_localization_binding = None;
+        self.last_manual_command = None;
+        self.last_frontier_yaw_command = None;
+        Ok(())
+    }
+
+    /// Leave a direct-control mode after checking the exact authority lease.
     ///
-    /// This mutates planning state only; it does not itself claim that a
-    /// controller received zero. The owner must immediately call [`Self::tick`]
-    /// and, in physical mode, retain the resulting exact applied-zero receipt.
+    /// This only changes reference ownership. It does not claim that zero was
+    /// applied; the owner must make and retain an immediate stopped tick and
+    /// satisfy the supervisor's independent fresh-zero obligation.
+    #[allow(
+        dead_code,
+        reason = "crate-private until the reviewed supervised live owner is wired"
+    )]
+    pub(crate) fn leave_direct_mode(
+        &mut self,
+        authority_lease_id: NonZeroU64,
+    ) -> Result<(), CoordinatorMotionModeError> {
+        let bound = match self.motion_mode {
+            CoordinatorMotionModeV1::Manual { authority_lease_id }
+            | CoordinatorMotionModeV1::FrontierInPlaceYaw { authority_lease_id } => {
+                authority_lease_id
+            }
+            actual => return Err(CoordinatorMotionModeError::NotDirectControl { actual }),
+        };
+        if bound != authority_lease_id {
+            return Err(CoordinatorMotionModeError::AuthorityLeaseMismatch {
+                bound,
+                supplied: authority_lease_id,
+            });
+        }
+        self.motion_mode = CoordinatorMotionModeV1::MappingOnly;
+        self.direct_localization_binding = None;
+        self.last_manual_command = None;
+        self.last_frontier_yaw_command = None;
+        Ok(())
+    }
+
+    /// Remove every actionable point goal and path.
+    ///
+    /// A direct-control mode and its localization binding are deliberately
+    /// preserved: this public goal operation cannot bypass the exact-lease
+    /// check in `leave_direct_mode` or pretend a fresh hardware zero
+    /// was applied. Proof-bearing in-crate supervisor actions own that
+    /// handover. Mapping and point-goal modes return to mapping-only.
     pub fn clear_goal(&mut self) {
         self.goal = GoalBinding::Unavailable;
         self.path = None;
         self.plan_fault = None;
+        if !matches!(
+            self.motion_mode,
+            CoordinatorMotionModeV1::Manual { .. }
+                | CoordinatorMotionModeV1::FrontierInPlaceYaw { .. }
+        ) {
+            self.motion_mode = CoordinatorMotionModeV1::MappingOnly;
+            self.direct_localization_binding = None;
+            self.last_manual_command = None;
+            self.last_frontier_yaw_command = None;
+        }
     }
 
     pub fn current_map_binding(&self) -> Option<CurrentMapEpochBinding> {
@@ -1076,6 +1281,14 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         displayed_snapshot: &OccupancyGridSnapshot,
     ) -> Result<GoalSelectionOutcome, CoordinatorAdmissionError<J::Error>> {
         self.ensure_open()?;
+        if !matches!(
+            self.motion_mode,
+            CoordinatorMotionModeV1::MappingOnly | CoordinatorMotionModeV1::PointGoal
+        ) {
+            return Err(CoordinatorAdmissionError::PointGoalModeConflict {
+                actual: self.motion_mode,
+            });
+        }
         let current = self
             .current_map
             .ok_or(CoordinatorAdmissionError::NoCurrentMapForGoal)?;
@@ -1112,6 +1325,8 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         self.append(NavigationIngressEvent::PointGoal(ingress))?;
 
         self.goal = GoalBinding::Bound(goal);
+        self.motion_mode = CoordinatorMotionModeV1::PointGoal;
+        self.direct_localization_binding = None;
         self.path = None;
         self.plan_fault = None;
         let planning = self.plan_snapshot(displayed_snapshot);
@@ -1126,29 +1341,8 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         tick: HostMonotonicTimestamp,
         clock: &mut C,
     ) -> Result<CoordinatorTickOutcome<J::Error>, CoordinatorTickError> {
-        let mut control_tick_journaled = false;
-        let mut journal_error = None;
-        let journal_blocker = if self.latch.is_some() {
-            Some(CoordinatorTickBlocker::JournalLatched)
-        } else {
-            match ControlTickIngress::parse(self.clock_epoch, tick) {
-                Ok(event) => match self.append(NavigationIngressEvent::ControlTick(event)) {
-                    Ok(_) => {
-                        control_tick_journaled = true;
-                        None
-                    }
-                    Err(CoordinatorAdmissionError::Journal(source)) => {
-                        journal_error = Some(source);
-                        Some(CoordinatorTickBlocker::JournalLatched)
-                    }
-                    Err(_) => Some(CoordinatorTickBlocker::JournalLatched),
-                },
-                Err(source) => {
-                    self.latch = Some(CoordinatorLatch::ClockBoundary);
-                    Some(CoordinatorTickBlocker::ControlTickBoundary(source))
-                }
-            }
-        };
+        let (control_tick_journaled, journal_error, journal_blocker) =
+            self.journal_control_tick(tick);
         if let Some(blocker) = journal_blocker {
             return self.stop_tick(tick, blocker, control_tick_journaled, journal_error, clock);
         }
@@ -1157,6 +1351,416 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         }
 
         self.ready_tick(tick, control_tick_journaled, clock)
+    }
+
+    fn journal_control_tick(
+        &mut self,
+        tick: HostMonotonicTimestamp,
+    ) -> (bool, Option<J::Error>, Option<CoordinatorTickBlocker>) {
+        if self.latch.is_some() {
+            return (false, None, Some(CoordinatorTickBlocker::JournalLatched));
+        }
+        match ControlTickIngress::parse(self.clock_epoch, tick) {
+            Ok(event) => match self.append(NavigationIngressEvent::ControlTick(event)) {
+                Ok(_) => (true, None, None),
+                Err(CoordinatorAdmissionError::Journal(source)) => (
+                    false,
+                    Some(source),
+                    Some(CoordinatorTickBlocker::JournalLatched),
+                ),
+                Err(_) => (false, None, Some(CoordinatorTickBlocker::JournalLatched)),
+            },
+            Err(source) => {
+                self.latch = Some(CoordinatorLatch::ClockBoundary);
+                (
+                    false,
+                    None,
+                    Some(CoordinatorTickBlocker::ControlTickBoundary(source)),
+                )
+            }
+        }
+    }
+
+    /// Run one manual command through the same MPC, immutable collision view,
+    /// solver deadline, final revalidation, and shadow evidence path as a
+    /// point goal. No manual value is ever converted directly to PWM.
+    pub fn tick_manual<C: HostMonotonicClock>(
+        &mut self,
+        tick: HostMonotonicTimestamp,
+        command: ManualMpcCommandV1,
+        clock: &mut C,
+    ) -> Result<CoordinatorTickOutcome<J::Error>, CoordinatorTickError> {
+        let (control_tick_journaled, journal_error, journal_blocker) =
+            self.journal_control_tick(tick);
+        if let Some(blocker) = journal_blocker {
+            return self.stop_tick(tick, blocker, control_tick_journaled, journal_error, clock);
+        }
+        let bound_lease = match self.motion_mode {
+            CoordinatorMotionModeV1::Manual { authority_lease_id } => authority_lease_id,
+            actual => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionModeMismatch {
+                        expected: CoordinatorMotionModeV1::Manual {
+                            authority_lease_id: command.authority_lease_id(),
+                        },
+                        actual,
+                    },
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        if bound_lease != command.authority_lease_id() {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::DirectAuthorityLeaseMismatch {
+                    bound: bound_lease,
+                    command: command.authority_lease_id(),
+                },
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        if let Some(blocker) = self.admit_manual_command_order(command) {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        if let Some(blocker) = self.direct_preflight_blocker() {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        let state = match self.estimate_state_at(tick) {
+            Ok(state) => state,
+            Err(blocker) => {
+                return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+            }
+        };
+        if !self.admit_direct_localization_binding(&state) {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::DirectLocalizationEpochTransition,
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        let epoch = NavigationEpochV1::for_manual_body_twist(
+            state.session_id(),
+            state.segment_id(),
+            state.map_snapshot(),
+            command.identity(),
+        );
+        let motion_state = match motion_state_from_odometry(&state, epoch, tick) {
+            Ok(state) => state,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionState(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let reference = match self.manual_reference_builder.build(
+            epoch,
+            command,
+            motion_state.pose(),
+            self.mpc_config,
+            tick,
+        ) {
+            Ok(reference) => reference,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::ManualReference(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let expected_depth = match self.depth_readiness {
+            DepthReadiness::Current(frame) => frame,
+            DepthReadiness::NoObservation => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::DepthUnavailable,
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+            DepthReadiness::Unaligned { .. } | DepthReadiness::Rejected { .. } => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::DepthUnaligned,
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let local_view = match self.local_costmap.view_at(tick) {
+            Ok(view) => view,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::LocalCostmapClock(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let freshness_blocker = if !local_view.freshness().is_current() {
+            Some(CoordinatorTickBlocker::LocalCostmapExpired)
+        } else if !local_view
+            .provenance()
+            .is_some_and(|provenance| provenance.frame() == expected_depth)
+        {
+            Some(CoordinatorTickBlocker::DepthUnaligned)
+        } else {
+            None
+        };
+        if let Some(blocker) = freshness_blocker {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        let ready = SafetyReadyTick::new(
+            epoch,
+            motion_state,
+            &reference,
+            local_view,
+            self.solver_budget,
+        );
+        let decision = self
+            .safety
+            .decide(tick, SafetyTickInput::Ready(ready), clock)
+            .map_err(CoordinatorTickError::Safety)?;
+        Ok(CoordinatorTickOutcome {
+            decision,
+            blocker: None,
+            control_tick_journaled,
+            journal_error: None,
+        })
+    }
+
+    /// Run a map-revision-bound frontier yaw target without fabricating a
+    /// global point goal or path.
+    pub fn tick_frontier_yaw<C: HostMonotonicClock>(
+        &mut self,
+        tick: HostMonotonicTimestamp,
+        command: FrontierYawScanCommandV1,
+        clock: &mut C,
+    ) -> Result<CoordinatorTickOutcome<J::Error>, CoordinatorTickError> {
+        let (control_tick_journaled, journal_error, journal_blocker) =
+            self.journal_control_tick(tick);
+        if let Some(blocker) = journal_blocker {
+            return self.stop_tick(tick, blocker, control_tick_journaled, journal_error, clock);
+        }
+        let bound_lease = match self.motion_mode {
+            CoordinatorMotionModeV1::FrontierInPlaceYaw { authority_lease_id } => {
+                authority_lease_id
+            }
+            actual => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionModeMismatch {
+                        expected: CoordinatorMotionModeV1::FrontierInPlaceYaw {
+                            authority_lease_id: command.authority_lease_id(),
+                        },
+                        actual,
+                    },
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        if bound_lease != command.authority_lease_id() {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::DirectAuthorityLeaseMismatch {
+                    bound: bound_lease,
+                    command: command.authority_lease_id(),
+                },
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        if let Some(blocker) = self.admit_frontier_command_order(command) {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        let Some(current_map) = self.current_map else {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::GoalUnavailable,
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        };
+        if current_map.binding.map_instance_id() != command.scan().map_instance_id()
+            || current_map.revision != command.scan().map_revision()
+        {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::FrontierMapRevisionMismatch {
+                    expected_map_instance_id: current_map.binding.map_instance_id(),
+                    expected_revision: current_map.revision,
+                    actual_map_instance_id: command.scan().map_instance_id(),
+                    actual_revision: command.scan().map_revision(),
+                },
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        if let Some(blocker) = self.direct_preflight_blocker() {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        let state = match self.estimate_state_at(tick) {
+            Ok(state) => state,
+            Err(blocker) => {
+                return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+            }
+        };
+        if !self.admit_direct_localization_binding(&state) {
+            return self.stop_tick(
+                tick,
+                CoordinatorTickBlocker::DirectLocalizationEpochTransition,
+                control_tick_journaled,
+                None,
+                clock,
+            );
+        }
+        let base_to_odom = state.base_to_odom();
+        let current_pose = match OdomPoseV1::try_new(
+            base_to_odom.source_origin_x_in_destination_m(),
+            base_to_odom.source_origin_y_in_destination_m(),
+            base_to_odom.source_yaw_in_destination_rad(),
+        ) {
+            Ok(pose) => pose,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionState(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let map_to_odom = match state.map_to_odom() {
+            Ok(transform) => transform,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MapToOdom(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let (epoch, reference) = match self.frontier_yaw_reference_builder.build(
+            command,
+            state.session_id(),
+            state.segment_id(),
+            state.map_snapshot(),
+            map_to_odom,
+            current_pose,
+            self.mpc_config,
+            tick,
+        ) {
+            Ok(reference) => reference,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::FrontierYawReference(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let motion_state = match motion_state_from_odometry(&state, epoch, tick) {
+            Ok(state) => state,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::MotionState(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let expected_depth = match self.depth_readiness {
+            DepthReadiness::Current(frame) => frame,
+            DepthReadiness::NoObservation => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::DepthUnavailable,
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+            DepthReadiness::Unaligned { .. } | DepthReadiness::Rejected { .. } => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::DepthUnaligned,
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let local_view = match self.local_costmap.view_at(tick) {
+            Ok(view) => view,
+            Err(source) => {
+                return self.stop_tick(
+                    tick,
+                    CoordinatorTickBlocker::LocalCostmapClock(source),
+                    control_tick_journaled,
+                    None,
+                    clock,
+                );
+            }
+        };
+        let freshness_blocker = if !local_view.freshness().is_current() {
+            Some(CoordinatorTickBlocker::LocalCostmapExpired)
+        } else if !local_view
+            .provenance()
+            .is_some_and(|provenance| provenance.frame() == expected_depth)
+        {
+            Some(CoordinatorTickBlocker::DepthUnaligned)
+        } else {
+            None
+        };
+        if let Some(blocker) = freshness_blocker {
+            return self.stop_tick(tick, blocker, control_tick_journaled, None, clock);
+        }
+        let ready = SafetyReadyTick::new(
+            epoch,
+            motion_state,
+            &reference,
+            local_view,
+            self.solver_budget,
+        );
+        let decision = self
+            .safety
+            .decide(tick, SafetyTickInput::Ready(ready), clock)
+            .map_err(CoordinatorTickError::Safety)?;
+        Ok(CoordinatorTickOutcome {
+            decision,
+            blocker: None,
+            control_tick_journaled,
+            journal_error: None,
+        })
     }
 
     fn ready_tick<C: HostMonotonicClock>(
@@ -1326,6 +1930,16 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
     }
 
     fn preflight_blocker(&self, tick: HostMonotonicTimestamp) -> Option<CoordinatorTickBlocker> {
+        if matches!(
+            self.motion_mode,
+            CoordinatorMotionModeV1::Manual { .. }
+                | CoordinatorMotionModeV1::FrontierInPlaceYaw { .. }
+        ) {
+            return Some(CoordinatorTickBlocker::MotionModeMismatch {
+                expected: CoordinatorMotionModeV1::PointGoal,
+                actual: self.motion_mode,
+            });
+        }
         match self.visual_readiness {
             VisualReadiness::AwaitingAnchor => {
                 return Some(CoordinatorTickBlocker::VisualOdometryUnavailable);
@@ -1374,6 +1988,117 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
             Ok(_) => Some(CoordinatorTickBlocker::LocalCostmapExpired),
             Err(source) => Some(CoordinatorTickBlocker::LocalCostmapClock(source)),
         }
+    }
+
+    fn direct_preflight_blocker(&self) -> Option<CoordinatorTickBlocker> {
+        match self.visual_readiness {
+            VisualReadiness::AwaitingAnchor => {
+                return Some(CoordinatorTickBlocker::VisualOdometryUnavailable);
+            }
+            VisualReadiness::BrokenAttempt | VisualReadiness::RejectedUpdate => {
+                return Some(CoordinatorTickBlocker::VisualOdometryRejected);
+            }
+            VisualReadiness::Continuous => {}
+        }
+        match self.depth_readiness {
+            DepthReadiness::NoObservation => {
+                return Some(CoordinatorTickBlocker::DepthUnavailable);
+            }
+            DepthReadiness::Unaligned { .. } | DepthReadiness::Rejected { .. } => {
+                return Some(CoordinatorTickBlocker::DepthUnaligned);
+            }
+            DepthReadiness::Current(_) => {}
+        }
+        self.latest_device_time
+            .is_none()
+            .then_some(CoordinatorTickBlocker::VisualOdometryUnavailable)
+    }
+
+    fn estimate_state_at(
+        &self,
+        tick: HostMonotonicTimestamp,
+    ) -> Result<OdometryState, CoordinatorTickBlocker> {
+        let (session_id, device_timestamp) = self
+            .latest_device_time
+            .ok_or(CoordinatorTickBlocker::VisualOdometryUnavailable)?;
+        match self.odometry.estimate(session_id, device_timestamp, tick) {
+            Ok(OdometryEstimate::Available(state)) => Ok(state),
+            Ok(OdometryEstimate::Unavailable(reason)) => {
+                Err(CoordinatorTickBlocker::OdometryUnavailable(reason))
+            }
+            Err(source) => Err(CoordinatorTickBlocker::Odometry(source)),
+        }
+    }
+
+    fn admit_direct_localization_binding(&mut self, state: &OdometryState) -> bool {
+        let actual = DirectLocalizationBinding {
+            device_session_id: state.session_id(),
+            odom_segment_id: state.segment_id(),
+            map_instance_id: state.map_snapshot().instance_id(),
+        };
+        match self.direct_localization_binding {
+            None => {
+                self.direct_localization_binding = Some(actual);
+                true
+            }
+            Some(bound) => bound == actual,
+        }
+    }
+
+    fn admit_manual_command_order(
+        &mut self,
+        command: ManualMpcCommandV1,
+    ) -> Option<CoordinatorTickBlocker> {
+        let Some(previous) = self.last_manual_command else {
+            self.last_manual_command = Some(command);
+            return None;
+        };
+        if command == previous {
+            return None;
+        }
+        let previous_sequence = previous.sequence().get();
+        let command_sequence = command.sequence().get();
+        if command_sequence < previous_sequence {
+            return Some(CoordinatorTickBlocker::ManualCommandSequenceRegression {
+                previous: previous_sequence,
+                command: command_sequence,
+            });
+        }
+        if command_sequence == previous_sequence {
+            return Some(CoordinatorTickBlocker::ManualCommandIdentityConflict {
+                sequence: command_sequence,
+            });
+        }
+        self.last_manual_command = Some(command);
+        None
+    }
+
+    fn admit_frontier_command_order(
+        &mut self,
+        command: FrontierYawScanCommandV1,
+    ) -> Option<CoordinatorTickBlocker> {
+        let Some(previous) = self.last_frontier_yaw_command else {
+            self.last_frontier_yaw_command = Some(command);
+            return None;
+        };
+        if command == previous {
+            return None;
+        }
+        let previous_sequence = previous.scan_sequence();
+        let command_sequence = command.scan_sequence();
+        if command_sequence < previous_sequence {
+            return Some(CoordinatorTickBlocker::FrontierCommandSequenceRegression {
+                previous: previous_sequence,
+                command: command_sequence,
+            });
+        }
+        if command_sequence == previous_sequence {
+            return Some(CoordinatorTickBlocker::FrontierCommandIdentityConflict {
+                sequence: command_sequence,
+            });
+        }
+        self.last_frontier_yaw_command = Some(command);
+        None
     }
 
     fn plan_snapshot(&mut self, snapshot: &OccupancyGridSnapshot) -> GlobalPlanningOutcome {
@@ -1585,6 +2310,9 @@ mod tests {
     };
 
     use super::super::frames::LocalCostmapFrame;
+    use super::super::frontier::{
+        FrontierExplorer, FrontierExplorerConfig, FrontierSearchOutcome, FrontierUnknownDirection,
+    };
     use super::super::goal_input::MapPointGoalSelectionDto;
     use super::super::ingress::{
         NavigationIngressCapacity, NavigationRecordingId, PendingVisualAttemptIngress,
@@ -1592,10 +2320,19 @@ mod tests {
     use super::super::local_costmap::{
         LocalCostmapCell, LocalCostmapConfig, LocalCostmapQuery, TrackingCameraToBase,
     };
+    use super::super::manual_drive::{
+        MANUAL_DRIVE_COMMAND_V1, ManualAuthoritySnapshot, ManualDriveCommandDto,
+        ManualDriveCommandKindDto, ManualDriveConfigV1, ManualDriveConfigV1Dto, ManualDriveCore,
+        ManualDriveOutput,
+    };
+    use super::super::manual_reference::{
+        FrontierYawScanBudgetV1, FrontierYawScanCommandV1, FrontierYawTurnDirectionV1,
+    };
     use super::super::mpc::{
-        HostMonotonicClockFailure, HostMonotonicClockReadError, MPC_CONFIG_V1, MpcConfigV1Dto,
-        MpcFailureKind, MpcSolveProgressV1, MpcSolver, PLANT_MODEL_V1, PlantEvidenceV1Dto,
-        PlantModelV1, PlantModelV1Dto, PlantValidityEnvelopeV1Dto, WheelPlantV1Dto,
+        ClockFault, HostMonotonicClockFailure, HostMonotonicClockReadError, MPC_CONFIG_V1,
+        MpcConfigV1Dto, MpcFailureKind, MpcSolveProgressV1, MpcSolver, PLANT_MODEL_V1,
+        PlantEvidenceV1Dto, PlantModelV1, PlantModelV1Dto, PlantValidityEnvelopeV1Dto,
+        WheelPlantV1Dto,
     };
     use super::super::odometry::{
         PlanarOdometryConfig, PlanarOdometryConfigDto, RawImuCalibrationDto,
@@ -2026,6 +2763,439 @@ mod tests {
         ));
         accept_aligned_depth(&mut coordinator);
         coordinator
+    }
+
+    fn manual_command(
+        lease: NonZeroU64,
+        sequence: u64,
+        forward_velocity_mps: f64,
+        yaw_rate_rad_s: f64,
+        received_at_ns: u64,
+        deadman_timeout_ns: u64,
+    ) -> ManualMpcCommandV1 {
+        let config = ManualDriveConfigV1::parse(ManualDriveConfigV1Dto {
+            schema_version: 1,
+            maximum_abs_forward_velocity_mps: 1.0,
+            maximum_abs_yaw_rate_rad_s: 2.0,
+            maximum_command_age_ns: deadman_timeout_ns,
+            deadman_timeout_ns,
+        })
+        .expect("manual fixture limits");
+        let mut core = ManualDriveCore::new(config, lease, host(received_at_ns));
+        let output = core.ingest(
+            ManualDriveCommandDto {
+                schema_version: MANUAL_DRIVE_COMMAND_V1,
+                authority_lease_id: lease,
+                sequence,
+                command: ManualDriveCommandKindDto::Velocity {
+                    forward_velocity_mps,
+                    yaw_rate_rad_s,
+                },
+            },
+            host(received_at_ns),
+            host(received_at_ns),
+            ManualAuthoritySnapshot::active_manual(lease, host(10_000)),
+        );
+        let ManualDriveOutput::Accepted(accepted) = output else {
+            panic!("manual fixture must be admitted")
+        };
+        ManualMpcCommandV1::try_from_accepted(accepted).expect("typed manual MPC command")
+    }
+
+    #[test]
+    fn manual_mode_is_exclusive_and_uses_the_full_safety_pipeline() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        let lease = NonZeroU64::new(21).unwrap();
+        assert!(matches!(
+            coordinator.enter_manual_mode(lease),
+            Err(CoordinatorMotionModeError::NotMappingOnly {
+                actual: CoordinatorMotionModeV1::PointGoal
+            })
+        ));
+
+        coordinator.clear_goal();
+        coordinator.enter_manual_mode(lease).unwrap();
+        assert!(coordinator.global_path().is_none());
+        let command = manual_command(lease, 4, 0.2, 0.1, 1_110, 500);
+        let tick = host(1_120);
+        let outcome = coordinator
+            .tick_manual(tick, command, &mut FixedClock(tick))
+            .expect("manual attempt retains exactly one safety decision");
+        assert!(outcome.control_tick_journaled());
+        assert!(outcome.blocker().is_none(), "manual request reached safety");
+        assert_eq!(outcome.decision().motor_packets_sent().get(), 0);
+
+        let ordinary_tick = host(1_130);
+        let ordinary = coordinator
+            .tick(ordinary_tick, &mut FixedClock(ordinary_tick))
+            .expect("point-path entry point fail-closes in manual mode");
+        assert!(matches!(
+            ordinary.blocker(),
+            Some(CoordinatorTickBlocker::MotionModeMismatch {
+                expected: CoordinatorMotionModeV1::PointGoal,
+                actual: CoordinatorMotionModeV1::Manual { authority_lease_id }
+            }) if *authority_lease_id == lease
+        ));
+        assert!(ordinary.decision().record().pwm().is_stop());
+    }
+
+    #[test]
+    fn manual_tick_rejects_wrong_lease_expiry_and_stale_depth() {
+        let lease = NonZeroU64::new(31).unwrap();
+        let other = NonZeroU64::new(32).unwrap();
+
+        let mut wrong_lease = ready_fixture(1_000, 10, 2.0);
+        wrong_lease.clear_goal();
+        wrong_lease.enter_manual_mode(lease).unwrap();
+        let command = manual_command(other, 1, 0.2, 0.0, 1_110, 500);
+        let tick = host(1_120);
+        let outcome = wrong_lease
+            .tick_manual(tick, command, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::DirectAuthorityLeaseMismatch { bound, command })
+                if *bound == lease && *command == other
+        ));
+
+        let mut expired = ready_fixture(1_000, 10, 2.0);
+        expired.clear_goal();
+        expired.enter_manual_mode(lease).unwrap();
+        let command = manual_command(lease, 2, 0.2, 0.0, 1_110, 10);
+        let tick = command.valid_through_exclusive();
+        let outcome = expired
+            .tick_manual(tick, command, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::ManualReference(
+                ManualReferenceBuildError::CommandExpired { .. }
+            ))
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
+
+        let mut stale = ready_fixture(20, 10, 2.0);
+        stale.clear_goal();
+        stale.enter_manual_mode(lease).unwrap();
+        let command = manual_command(lease, 3, -0.2, 0.0, 1_110, 500);
+        let tick = host(DEPTH_HOST_NS + 21);
+        let outcome = stale
+            .tick_manual(tick, command, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::LocalCostmapExpired)
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
+    }
+
+    #[test]
+    fn manual_command_order_is_monotonic_and_public_goal_clear_cannot_release_authority() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        coordinator.clear_goal();
+        let lease = NonZeroU64::new(33).unwrap();
+        coordinator.enter_manual_mode(lease).unwrap();
+        let accepted = manual_command(lease, 5, 0.2, 0.0, 1_110, 1_000);
+
+        for tick_ns in [1_120, 1_130] {
+            let tick = host(tick_ns);
+            let outcome = coordinator
+                .tick_manual(tick, accepted, &mut FixedClock(tick))
+                .unwrap();
+            assert!(
+                outcome.blocker().is_none(),
+                "an exact periodic repeat is admissible"
+            );
+        }
+
+        let regressed = manual_command(lease, 4, 0.2, 0.0, 1_110, 1_000);
+        let tick = host(1_140);
+        let outcome = coordinator
+            .tick_manual(tick, regressed, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::ManualCommandSequenceRegression {
+                previous: 5,
+                command: 4,
+            })
+        ));
+
+        let conflicting = manual_command(lease, 5, 0.3, 0.0, 1_110, 1_000);
+        let tick = host(1_150);
+        let outcome = coordinator
+            .tick_manual(tick, conflicting, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::ManualCommandIdentityConflict { sequence: 5 })
+        ));
+
+        let advanced = manual_command(lease, 6, 0.3, 0.0, 1_110, 1_000);
+        let tick = host(1_160);
+        assert!(
+            coordinator
+                .tick_manual(tick, advanced, &mut FixedClock(tick))
+                .unwrap()
+                .blocker()
+                .is_none()
+        );
+
+        coordinator.clear_goal();
+        assert_eq!(
+            coordinator.motion_mode(),
+            CoordinatorMotionModeV1::Manual {
+                authority_lease_id: lease,
+            }
+        );
+        assert!(matches!(
+            coordinator.leave_direct_mode(NonZeroU64::new(34).unwrap()),
+            Err(CoordinatorMotionModeError::AuthorityLeaseMismatch { bound, supplied })
+                if bound == lease && supplied.get() == 34
+        ));
+        coordinator.leave_direct_mode(lease).unwrap();
+        assert_eq!(
+            coordinator.motion_mode(),
+            CoordinatorMotionModeV1::MappingOnly
+        );
+    }
+
+    #[test]
+    fn manual_solver_deadline_cannot_outlive_exclusive_command_validity() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        coordinator.clear_goal();
+        let lease = NonZeroU64::new(35).unwrap();
+        coordinator.enter_manual_mode(lease).unwrap();
+        let command = manual_command(lease, 1, 0.2, 0.0, 1_110, 15);
+        let tick = host(1_120);
+        let deadline = command.valid_through_exclusive();
+        assert_eq!(deadline, host(1_125));
+
+        let outcome = coordinator
+            .tick_manual(tick, command, &mut FixedClock(deadline))
+            .expect("authority deadline must produce one stopped decision");
+        let SafetyDecisionOutcome::Stopped(stopped) = outcome.decision().outcome() else {
+            panic!("a solve observed at command expiry cannot issue a controller decision")
+        };
+        let SafetyStopCause::Solver(source) = stopped.cause() else {
+            panic!("the exact solver deadline failure must be retained")
+        };
+        assert!(matches!(
+            source.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Fault(
+                ClockFault::DeadlineReached {
+                    deadline: actual_deadline,
+                    observed_at,
+                }
+            )) if *actual_deadline == deadline && *observed_at == deadline
+        ));
+        assert_eq!(source.request().deadline(), deadline);
+        assert!(outcome.decision().record().pwm().is_stop());
+    }
+
+    #[test]
+    fn manual_tick_stops_immediately_when_visual_localization_is_lost() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        coordinator.clear_goal();
+        let lease = NonZeroU64::new(41).unwrap();
+        coordinator.enter_manual_mode(lease).unwrap();
+        let broken = VisualAdmission::no_localization(visual_ingress(
+            2,
+            200,
+            1_115,
+            VisualAttemptOutcome::NoLocalization,
+        ))
+        .unwrap();
+        coordinator.accept_visual(broken, host(1_115)).unwrap();
+
+        let command = manual_command(lease, 1, 0.2, 0.0, 1_110, 500);
+        let tick = host(1_120);
+        let outcome = coordinator
+            .tick_manual(tick, command, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::VisualOdometryRejected)
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
+    }
+
+    #[test]
+    fn frontier_in_place_scan_uses_yaw_mpc_and_rejects_a_newer_map_revision() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let geometry = OccupancyGridGeometry::try_new(0.25, [-2.0, -2.0], 20, 16, 320)
+            .expect("bounded frontier map");
+        let mut cells = vec![OccupancyCell::Unknown; geometry.cell_count()];
+        cells[8 * 20 + 8] = OccupancyCell::Free;
+        let snapshot =
+            OccupancyGridSnapshot::from_test_cells(geometry, &cells, map.instance_id(), 1);
+        coordinator
+            .accept_global_map(
+                host(1_050),
+                Timestamp::from_nanos(VISUAL_TIMESTAMP_NS),
+                &snapshot,
+            )
+            .unwrap();
+        accept_aligned_depth(&mut coordinator);
+        let start = coordinator.plan_start_for_snapshot(&snapshot).unwrap();
+        let mut explorer = FrontierExplorer::try_new(
+            &snapshot,
+            FrontierExplorerConfig::try_new(0.0, 320, 320, 2_560).unwrap(),
+        )
+        .unwrap();
+        let FrontierSearchOutcome::InPlaceScanRequired(scan) = explorer.select(start).unwrap()
+        else {
+            panic!("single observed start cell must require a deliberate scan")
+        };
+
+        let lease = NonZeroU64::new(51).unwrap();
+        coordinator.enter_frontier_yaw_mode(lease).unwrap();
+        let budget =
+            FrontierYawScanBudgetV1::try_new(1.0, std::f64::consts::PI, 0.0, 5_000_000_000)
+                .unwrap();
+        let command = FrontierYawScanCommandV1::try_new(
+            lease,
+            1,
+            scan,
+            FrontierUnknownDirection::PositiveMapY,
+            FrontierYawTurnDirectionV1::CounterClockwise,
+            host(1_110),
+            host(10_000_000_000),
+            budget,
+        )
+        .unwrap();
+        let tick = host(1_120);
+        let outcome = coordinator
+            .tick_frontier_yaw(tick, command, &mut FixedClock(tick))
+            .unwrap();
+        assert!(outcome.blocker().is_none(), "yaw reference reached safety");
+        assert_eq!(outcome.decision().motor_packets_sent().get(), 0);
+
+        let newer = OccupancyGridSnapshot::from_test_cells(geometry, &cells, map.instance_id(), 2);
+        coordinator
+            .accept_global_map(
+                host(1_130),
+                Timestamp::from_nanos(VISUAL_TIMESTAMP_NS),
+                &newer,
+            )
+            .unwrap();
+        let tick = host(1_140);
+        let outcome = coordinator
+            .tick_frontier_yaw(tick, command, &mut FixedClock(tick))
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::FrontierMapRevisionMismatch {
+                expected_revision: 2,
+                actual_revision: 1,
+                ..
+            })
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
+    }
+
+    #[test]
+    fn frontier_command_order_allows_exact_repeats_but_rejects_replay_and_conflict() {
+        let mut coordinator = coordinator_without_goal();
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let geometry = OccupancyGridGeometry::try_new(0.25, [-2.0, -2.0], 20, 16, 320)
+            .expect("bounded frontier map");
+        let mut cells = vec![OccupancyCell::Unknown; geometry.cell_count()];
+        cells[8 * 20 + 8] = OccupancyCell::Free;
+        let snapshot =
+            OccupancyGridSnapshot::from_test_cells(geometry, &cells, map.instance_id(), 1);
+        coordinator
+            .accept_global_map(
+                host(1_050),
+                Timestamp::from_nanos(VISUAL_TIMESTAMP_NS),
+                &snapshot,
+            )
+            .unwrap();
+        accept_aligned_depth(&mut coordinator);
+        let start = coordinator.plan_start_for_snapshot(&snapshot).unwrap();
+        let mut explorer = FrontierExplorer::try_new(
+            &snapshot,
+            FrontierExplorerConfig::try_new(0.0, 320, 320, 2_560).unwrap(),
+        )
+        .unwrap();
+        let FrontierSearchOutcome::InPlaceScanRequired(scan) = explorer.select(start).unwrap()
+        else {
+            panic!("single observed start cell must require a deliberate scan")
+        };
+        let lease = NonZeroU64::new(52).unwrap();
+        coordinator.enter_frontier_yaw_mode(lease).unwrap();
+        let budget =
+            FrontierYawScanBudgetV1::try_new(1.0, std::f64::consts::PI, 0.0, 5_000_000_000)
+                .unwrap();
+        let command = |sequence, turn_direction| {
+            FrontierYawScanCommandV1::try_new(
+                lease,
+                sequence,
+                scan,
+                FrontierUnknownDirection::PositiveMapY,
+                turn_direction,
+                host(1_110),
+                host(10_000_000_000),
+                budget,
+            )
+            .unwrap()
+        };
+        let accepted = command(5, FrontierYawTurnDirectionV1::CounterClockwise);
+        for tick_ns in [1_120, 1_130] {
+            let tick = host(tick_ns);
+            assert!(
+                coordinator
+                    .tick_frontier_yaw(tick, accepted, &mut FixedClock(tick))
+                    .unwrap()
+                    .blocker()
+                    .is_none()
+            );
+        }
+
+        let tick = host(1_140);
+        let outcome = coordinator
+            .tick_frontier_yaw(
+                tick,
+                command(4, FrontierYawTurnDirectionV1::CounterClockwise),
+                &mut FixedClock(tick),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::FrontierCommandSequenceRegression {
+                previous: 5,
+                command: 4,
+            })
+        ));
+
+        let tick = host(1_150);
+        let outcome = coordinator
+            .tick_frontier_yaw(
+                tick,
+                command(5, FrontierYawTurnDirectionV1::Clockwise),
+                &mut FixedClock(tick),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::FrontierCommandIdentityConflict { sequence: 5 })
+        ));
+
+        let tick = host(1_160);
+        assert!(
+            coordinator
+                .tick_frontier_yaw(
+                    tick,
+                    command(6, FrontierYawTurnDirectionV1::CounterClockwise),
+                    &mut FixedClock(tick),
+                )
+                .unwrap()
+                .blocker()
+                .is_none()
+        );
     }
 
     #[test]

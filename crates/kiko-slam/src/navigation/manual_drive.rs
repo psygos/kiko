@@ -15,6 +15,8 @@ use std::num::NonZeroU64;
 
 use crate::HostMonotonicTimestamp;
 
+use super::reference::MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S;
+
 pub const MANUAL_DRIVE_CONFIG_V1: u32 = 1;
 pub const MANUAL_DRIVE_COMMAND_V1: u32 = 1;
 pub const BODY_VELOCITY_TARGET_V1: u32 = 1;
@@ -42,6 +44,11 @@ pub enum ManualDriveConfigParseError {
         field: &'static str,
         value: f64,
     },
+    AboveSupportedLimit {
+        field: &'static str,
+        value: f64,
+        maximum: f64,
+    },
     ZeroMaximumCommandAge,
     ZeroDeadmanTimeout,
     CommandAgeExceedsDeadman {
@@ -66,6 +73,14 @@ impl fmt::Display for ManualDriveConfigParseError {
             Self::NonPositiveLimit { field, value } => write!(
                 formatter,
                 "manual-drive {field} must be strictly positive, got {value}"
+            ),
+            Self::AboveSupportedLimit {
+                field,
+                value,
+                maximum,
+            } => write!(
+                formatter,
+                "manual-drive {field} {value} exceeds the supported maximum {maximum}"
             ),
             Self::ZeroMaximumCommandAge => {
                 formatter.write_str("manual-drive maximum command age must be nonzero")
@@ -108,6 +123,13 @@ impl ManualDriveConfigV1 {
             dto.maximum_abs_forward_velocity_mps,
         )?;
         parse_positive_limit("maximum_abs_yaw_rate_rad_s", dto.maximum_abs_yaw_rate_rad_s)?;
+        if dto.maximum_abs_yaw_rate_rad_s > MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S {
+            return Err(ManualDriveConfigParseError::AboveSupportedLimit {
+                field: "maximum_abs_yaw_rate_rad_s",
+                value: dto.maximum_abs_yaw_rate_rad_s,
+                maximum: MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S,
+            });
+        }
         let maximum_command_age_ns = NonZeroU64::new(dto.maximum_command_age_ns)
             .ok_or(ManualDriveConfigParseError::ZeroMaximumCommandAge)?;
         let deadman_timeout_ns = NonZeroU64::new(dto.deadman_timeout_ns)
@@ -828,6 +850,20 @@ mod tests {
                 Err(ManualDriveConfigParseError::NonPositiveLimit { .. })
             ));
         }
+        let mut dto = config_dto();
+        dto.maximum_abs_yaw_rate_rad_s = MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S;
+        assert!(ManualDriveConfigV1::parse(dto).is_ok());
+        dto.maximum_abs_yaw_rate_rad_s =
+            f64::from_bits(MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S.to_bits() + 1);
+        assert!(matches!(
+            ManualDriveConfigV1::parse(dto),
+            Err(ManualDriveConfigParseError::AboveSupportedLimit {
+                field: "maximum_abs_yaw_rate_rad_s",
+                value,
+                maximum,
+            }) if value == dto.maximum_abs_yaw_rate_rad_s
+                && maximum == MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S
+        ));
         let mut dto = config_dto();
         dto.maximum_command_age_ns = 0;
         assert_eq!(

@@ -22,6 +22,7 @@ mod goal_input;
 mod ingress;
 mod local_costmap;
 mod manual_drive;
+mod manual_reference;
 pub mod mpc;
 mod odometry;
 mod reference;
@@ -62,17 +63,18 @@ pub use control_socket::{
     MAX_AGENT_CONTROL_RUNTIME_QUEUE_CAPACITY, MAX_AGENT_CONTROL_SOCKET_PATH_BYTES,
     agent_control_runtime_queue,
 };
+pub use coordinator::{
+    CoordinatorAdmissionError, CoordinatorLatch, CoordinatorMotionModeError,
+    CoordinatorMotionModeV1, CoordinatorTickBlocker, CoordinatorTickError, CoordinatorTickOutcome,
+    DepthAdmissionOutcome, GlobalMapAdmissionOutcome, GlobalPlanningOutcome, GoalSelectionOutcome,
+    ImuAdmissionOutcome, NavigationGoalState, NavigationIngressSink, PlanStartBuildError,
+    ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission, VisualAdmissionError,
+    VisualAdmissionOutcome,
+};
 #[cfg(all(feature = "agent-runtime", feature = "record", unix))]
 pub use expression_bridge::{
     RGB_EXPRESSION_HEAD_POLICY, RgbExpressionBridge, RgbExpressionBridgeError,
     RgbExpressionBridgeOutcome,
-};
-pub use coordinator::{
-    CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
-    CoordinatorTickOutcome, DepthAdmissionOutcome, GlobalMapAdmissionOutcome,
-    GlobalPlanningOutcome, GoalSelectionOutcome, ImuAdmissionOutcome, NavigationGoalState,
-    NavigationIngressSink, PlanStartBuildError, ShadowNavigationCoordinator, StoredPlanFault,
-    VisualAdmission, VisualAdmissionError, VisualAdmissionOutcome,
 };
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,
@@ -124,6 +126,11 @@ pub use manual_drive::{
     ManualDriveCommandDto, ManualDriveCommandKindDto, ManualDriveConfigParseError,
     ManualDriveConfigV1, ManualDriveConfigV1Dto, ManualDriveCore, ManualDriveOutput,
     ManualDriveSequence, ManualDriveStopCause, ManualDriveStopped,
+};
+pub use manual_reference::{
+    FrontierYawReferenceBuildError, FrontierYawScanBudgetError, FrontierYawScanBudgetV1,
+    FrontierYawScanCommandError, FrontierYawScanCommandV1, FrontierYawTurnDirectionV1,
+    ManualMpcCommandError, ManualMpcCommandV1, ManualReferenceBuildError, NumericAuthorityLeaseId,
 };
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,

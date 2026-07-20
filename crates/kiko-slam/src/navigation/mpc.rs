@@ -863,7 +863,252 @@ pub struct NavigationEpochV1 {
     device_session_id: DeviceSessionId,
     odom_segment_id: OdomSegmentId,
     map_snapshot: MapSnapshot,
-    global_plan_identity: GlobalPlanIdentity,
+    reference_identity: NavigationReferenceIdentityV1,
+}
+
+/// Exact source identity for the reference consumed by one MPC request.
+///
+/// A path, a manual body-twist command, and a frontier yaw scan are distinct
+/// control authorities. Keeping that distinction in the epoch prevents either
+/// direct-control mode from masquerading as a fabricated global plan.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NavigationReferenceIdentityV1 {
+    GlobalPlan(GlobalPlanIdentity),
+    ManualBodyTwist(ManualReferenceIdentityV1),
+    FrontierInPlaceYaw(FrontierYawReferenceIdentityV1),
+}
+
+/// Process-local identity of one accepted manual command.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ManualReferenceIdentityV1 {
+    authority_lease_id: NonZeroU64,
+    command_sequence: u64,
+    valid_through_exclusive: HostMonotonicTimestamp,
+    forward_velocity_mps: f64,
+    yaw_rate_rad_s: f64,
+}
+
+impl ManualReferenceIdentityV1 {
+    pub fn try_new(
+        authority_lease_id: u64,
+        command_sequence: u64,
+        valid_through_exclusive: HostMonotonicTimestamp,
+        forward_velocity_mps: f64,
+        yaw_rate_rad_s: f64,
+    ) -> Result<Self, ReferenceIdentityError> {
+        let authority_lease_id = NonZeroU64::new(authority_lease_id)
+            .ok_or(ReferenceIdentityError::ZeroAuthorityLeaseId)?;
+        require_reference_identity_finite("manual.forward_velocity_mps", forward_velocity_mps)?;
+        require_reference_identity_finite("manual.yaw_rate_rad_s", yaw_rate_rad_s)?;
+        if yaw_rate_rad_s.abs() > super::reference::MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S {
+            return Err(ReferenceIdentityError::YawRateOutsideBounds {
+                value_rad_s: yaw_rate_rad_s,
+                maximum_abs_rad_s: super::reference::MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S,
+            });
+        }
+        Ok(Self {
+            authority_lease_id,
+            command_sequence,
+            valid_through_exclusive,
+            forward_velocity_mps: canonical_reference_zero(forward_velocity_mps),
+            yaw_rate_rad_s: canonical_reference_zero(yaw_rate_rad_s),
+        })
+    }
+
+    pub fn authority_lease_id(self) -> NonZeroU64 {
+        self.authority_lease_id
+    }
+    pub fn command_sequence(self) -> u64 {
+        self.command_sequence
+    }
+    pub fn valid_through_exclusive(self) -> HostMonotonicTimestamp {
+        self.valid_through_exclusive
+    }
+    pub fn forward_velocity_mps(self) -> f64 {
+        self.forward_velocity_mps
+    }
+    pub fn yaw_rate_rad_s(self) -> f64 {
+        self.yaw_rate_rad_s
+    }
+}
+
+/// Process-local identity of one bounded frontier scan attempt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrontierYawReferenceIdentityV1 {
+    authority_lease_id: NonZeroU64,
+    scan_sequence: u64,
+    occupancy_map_instance_id: crate::map::MapInstanceId,
+    occupancy_map_revision: u64,
+    frontier_column: u32,
+    frontier_row: u32,
+    scan_origin_map_x_m: f64,
+    scan_origin_map_y_m: f64,
+    maximum_scan_origin_displacement_m: f64,
+    target_map_yaw_rad: f64,
+    signed_yaw_rate_rad_s: f64,
+    yaw_travel_limit_exclusive_rad: f64,
+    valid_through_exclusive: HostMonotonicTimestamp,
+}
+
+impl FrontierYawReferenceIdentityV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        authority_lease_id: u64,
+        scan_sequence: u64,
+        occupancy_map_instance_id: crate::map::MapInstanceId,
+        occupancy_map_revision: u64,
+        frontier_column: u32,
+        frontier_row: u32,
+        scan_origin_map_x_m: f64,
+        scan_origin_map_y_m: f64,
+        maximum_scan_origin_displacement_m: f64,
+        target_map_yaw_rad: f64,
+        signed_yaw_rate_rad_s: f64,
+        yaw_travel_limit_exclusive_rad: f64,
+        valid_through_exclusive: HostMonotonicTimestamp,
+    ) -> Result<Self, ReferenceIdentityError> {
+        let authority_lease_id = NonZeroU64::new(authority_lease_id)
+            .ok_or(ReferenceIdentityError::ZeroAuthorityLeaseId)?;
+        require_reference_identity_finite("frontier.scan_origin_map_x_m", scan_origin_map_x_m)?;
+        require_reference_identity_finite("frontier.scan_origin_map_y_m", scan_origin_map_y_m)?;
+        require_reference_identity_finite(
+            "frontier.maximum_scan_origin_displacement_m",
+            maximum_scan_origin_displacement_m,
+        )?;
+        if maximum_scan_origin_displacement_m < 0.0 {
+            return Err(ReferenceIdentityError::Negative {
+                field: "frontier.maximum_scan_origin_displacement_m",
+                value: maximum_scan_origin_displacement_m,
+            });
+        }
+        require_reference_identity_finite("frontier.target_map_yaw_rad", target_map_yaw_rad)?;
+        require_reference_identity_finite("frontier.signed_yaw_rate_rad_s", signed_yaw_rate_rad_s)?;
+        require_reference_identity_finite(
+            "frontier.yaw_travel_limit_exclusive_rad",
+            yaw_travel_limit_exclusive_rad,
+        )?;
+        if signed_yaw_rate_rad_s == 0.0 {
+            return Err(ReferenceIdentityError::ZeroYawRate);
+        }
+        if signed_yaw_rate_rad_s.abs()
+            > super::reference::MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S
+        {
+            return Err(ReferenceIdentityError::YawRateOutsideBounds {
+                value_rad_s: signed_yaw_rate_rad_s,
+                maximum_abs_rad_s: super::reference::MAX_SUPPORTED_ABS_REFERENCE_YAW_RATE_RAD_S,
+            });
+        }
+        if yaw_travel_limit_exclusive_rad <= 0.0
+            || yaw_travel_limit_exclusive_rad > std::f64::consts::TAU
+        {
+            return Err(ReferenceIdentityError::YawTravelLimitOutsideBounds {
+                value_rad: yaw_travel_limit_exclusive_rad,
+                maximum_rad: std::f64::consts::TAU,
+            });
+        }
+        Ok(Self {
+            authority_lease_id,
+            scan_sequence,
+            occupancy_map_instance_id,
+            occupancy_map_revision,
+            frontier_column,
+            frontier_row,
+            scan_origin_map_x_m: canonical_reference_zero(scan_origin_map_x_m),
+            scan_origin_map_y_m: canonical_reference_zero(scan_origin_map_y_m),
+            maximum_scan_origin_displacement_m: canonical_reference_zero(
+                maximum_scan_origin_displacement_m,
+            ),
+            target_map_yaw_rad: normalize_angle(target_map_yaw_rad),
+            signed_yaw_rate_rad_s,
+            yaw_travel_limit_exclusive_rad,
+            valid_through_exclusive,
+        })
+    }
+
+    pub fn authority_lease_id(self) -> NonZeroU64 {
+        self.authority_lease_id
+    }
+    pub fn scan_sequence(self) -> u64 {
+        self.scan_sequence
+    }
+    pub fn occupancy_map_instance_id(self) -> crate::map::MapInstanceId {
+        self.occupancy_map_instance_id
+    }
+    pub fn occupancy_map_revision(self) -> u64 {
+        self.occupancy_map_revision
+    }
+    pub fn frontier_column(self) -> u32 {
+        self.frontier_column
+    }
+    pub fn frontier_row(self) -> u32 {
+        self.frontier_row
+    }
+    pub fn scan_origin_map_x_m(self) -> f64 {
+        self.scan_origin_map_x_m
+    }
+    pub fn scan_origin_map_y_m(self) -> f64 {
+        self.scan_origin_map_y_m
+    }
+    pub fn maximum_scan_origin_displacement_m(self) -> f64 {
+        self.maximum_scan_origin_displacement_m
+    }
+    pub fn target_map_yaw_rad(self) -> f64 {
+        self.target_map_yaw_rad
+    }
+    pub fn signed_yaw_rate_rad_s(self) -> f64 {
+        self.signed_yaw_rate_rad_s
+    }
+    pub fn yaw_travel_limit_exclusive_rad(self) -> f64 {
+        self.yaw_travel_limit_exclusive_rad
+    }
+    pub fn valid_through_exclusive(self) -> HostMonotonicTimestamp {
+        self.valid_through_exclusive
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ReferenceIdentityError {
+    ZeroAuthorityLeaseId,
+    NonFinite {
+        field: &'static str,
+        value: f64,
+    },
+    Negative {
+        field: &'static str,
+        value: f64,
+    },
+    ZeroYawRate,
+    YawRateOutsideBounds {
+        value_rad_s: f64,
+        maximum_abs_rad_s: f64,
+    },
+    YawTravelLimitOutsideBounds {
+        value_rad: f64,
+        maximum_rad: f64,
+    },
+}
+
+impl fmt::Display for ReferenceIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid MPC reference identity: {self:?}")
+    }
+}
+
+impl std::error::Error for ReferenceIdentityError {}
+
+fn require_reference_identity_finite(
+    field: &'static str,
+    value: f64,
+) -> Result<(), ReferenceIdentityError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(ReferenceIdentityError::NonFinite { field, value })
+    }
+}
+
+fn canonical_reference_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
 }
 
 impl NavigationEpochV1 {
@@ -885,7 +1130,44 @@ impl NavigationEpochV1 {
             device_session_id,
             odom_segment_id,
             map_snapshot,
-            global_plan_identity,
+            reference_identity: NavigationReferenceIdentityV1::GlobalPlan(global_plan_identity),
+        })
+    }
+
+    pub fn for_manual_body_twist(
+        device_session_id: DeviceSessionId,
+        odom_segment_id: OdomSegmentId,
+        map_snapshot: MapSnapshot,
+        identity: ManualReferenceIdentityV1,
+    ) -> Self {
+        Self {
+            schema_version: NAVIGATION_EPOCH_V1,
+            device_session_id,
+            odom_segment_id,
+            map_snapshot,
+            reference_identity: NavigationReferenceIdentityV1::ManualBodyTwist(identity),
+        }
+    }
+
+    pub fn for_frontier_in_place_yaw(
+        device_session_id: DeviceSessionId,
+        odom_segment_id: OdomSegmentId,
+        map_snapshot: MapSnapshot,
+        identity: FrontierYawReferenceIdentityV1,
+    ) -> Result<Self, NavigationEpochError> {
+        if map_snapshot.instance_id() != identity.occupancy_map_instance_id {
+            return Err(NavigationEpochError::FrontierMapMismatch {
+                map_snapshot,
+                occupancy_map_instance_id: identity.occupancy_map_instance_id,
+                occupancy_map_revision: identity.occupancy_map_revision,
+            });
+        }
+        Ok(Self {
+            schema_version: NAVIGATION_EPOCH_V1,
+            device_session_id,
+            odom_segment_id,
+            map_snapshot,
+            reference_identity: NavigationReferenceIdentityV1::FrontierInPlaceYaw(identity),
         })
     }
 
@@ -898,8 +1180,16 @@ impl NavigationEpochV1 {
     pub fn map_snapshot(self) -> MapSnapshot {
         self.map_snapshot
     }
-    pub fn global_plan_identity(self) -> GlobalPlanIdentity {
-        self.global_plan_identity
+    pub fn reference_identity(self) -> NavigationReferenceIdentityV1 {
+        self.reference_identity
+    }
+
+    pub fn try_global_plan_identity(self) -> Option<GlobalPlanIdentity> {
+        match self.reference_identity {
+            NavigationReferenceIdentityV1::GlobalPlan(identity) => Some(identity),
+            NavigationReferenceIdentityV1::ManualBodyTwist(_)
+            | NavigationReferenceIdentityV1::FrontierInPlaceYaw(_) => None,
+        }
     }
 }
 
@@ -908,6 +1198,11 @@ pub enum NavigationEpochError {
     GlobalPathMapMismatch {
         map_snapshot: MapSnapshot,
         global_plan_identity: Box<GlobalPlanIdentity>,
+    },
+    FrontierMapMismatch {
+        map_snapshot: MapSnapshot,
+        occupancy_map_instance_id: crate::map::MapInstanceId,
+        occupancy_map_revision: u64,
     },
 }
 
@@ -1110,6 +1405,48 @@ pub struct MpcReferenceV1Dto {
 #[repr(u32)]
 pub enum ReferenceBuilderRevisionV1 {
     TimeParameterizedGlobalPathV1 = 1,
+    ValidityBoundedBodyTwistV1 = 2,
+    BoundedFrontierYawV1 = 3,
+}
+
+/// Exact non-forged source retained by an MPC reference.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MpcReferenceSourceV1<'source> {
+    GlobalPath(&'source GlobalPath),
+    ManualBodyTwist(ManualReferenceIdentityV1),
+    FrontierInPlaceYaw(FrontierYawReferenceIdentityV1),
+}
+
+impl MpcReferenceSourceV1<'_> {
+    pub fn identity(self) -> NavigationReferenceIdentityV1 {
+        match self {
+            Self::GlobalPath(path) => NavigationReferenceIdentityV1::GlobalPlan(path.identity()),
+            Self::ManualBodyTwist(identity) => {
+                NavigationReferenceIdentityV1::ManualBodyTwist(identity)
+            }
+            Self::FrontierInPlaceYaw(identity) => {
+                NavigationReferenceIdentityV1::FrontierInPlaceYaw(identity)
+            }
+        }
+    }
+
+    fn expected_builder_revision(self) -> ReferenceBuilderRevisionV1 {
+        match self {
+            Self::GlobalPath(_) => ReferenceBuilderRevisionV1::TimeParameterizedGlobalPathV1,
+            Self::ManualBodyTwist(_) => ReferenceBuilderRevisionV1::ValidityBoundedBodyTwistV1,
+            Self::FrontierInPlaceYaw(_) => ReferenceBuilderRevisionV1::BoundedFrontierYawV1,
+        }
+    }
+
+    /// Exclusive authority deadline carried by direct-control references.
+    /// Global plans have no authority deadline at this geometry boundary.
+    pub fn valid_through_exclusive(self) -> Option<HostMonotonicTimestamp> {
+        match self {
+            Self::GlobalPath(_) => None,
+            Self::ManualBodyTwist(identity) => Some(identity.valid_through_exclusive()),
+            Self::FrontierInPlaceYaw(identity) => Some(identity.valid_through_exclusive()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1120,6 +1457,20 @@ pub struct OdomReferencePointV1 {
 }
 
 impl OdomReferencePointV1 {
+    pub(crate) fn try_new(
+        pose: OdomPoseV1,
+        forward_velocity_mps: f64,
+        yaw_rate_rad_s: f64,
+    ) -> Result<Self, MotionValueError> {
+        require_motion_finite("reference.forward_velocity_mps", forward_velocity_mps)?;
+        require_motion_finite("reference.yaw_rate_rad_s", yaw_rate_rad_s)?;
+        Ok(Self {
+            pose,
+            forward_velocity_mps: canonical_reference_zero(forward_velocity_mps),
+            yaw_rate_rad_s: canonical_reference_zero(yaw_rate_rad_s),
+        })
+    }
+
     pub fn pose(self) -> OdomPoseV1 {
         self.pose
     }
@@ -1132,23 +1483,36 @@ impl OdomReferencePointV1 {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct MpcReferenceV1<'path> {
+pub struct MpcReferenceV1<'source> {
     schema_version: u32,
     builder_revision: ReferenceBuilderRevisionV1,
     epoch: NavigationEpochV1,
-    global_plan_identity: GlobalPlanIdentity,
-    source_path: &'path GlobalPath,
+    source: MpcReferenceSourceV1<'source>,
     created_at: HostMonotonicTimestamp,
     step_period_s: f64,
     points: Vec<OdomReferencePointV1>,
 }
 
-impl<'path> MpcReferenceV1<'path> {
+impl<'source> MpcReferenceV1<'source> {
     pub fn parse(
         dto: MpcReferenceV1Dto,
         config: MpcConfigV1,
         epoch: NavigationEpochV1,
-        global_path: &'path GlobalPath,
+        global_path: &'source GlobalPath,
+    ) -> Result<Self, MpcReferenceParseError> {
+        Self::parse_for_source(
+            dto,
+            config,
+            epoch,
+            MpcReferenceSourceV1::GlobalPath(global_path),
+        )
+    }
+
+    pub(crate) fn parse_for_source(
+        dto: MpcReferenceV1Dto,
+        config: MpcConfigV1,
+        epoch: NavigationEpochV1,
+        source: MpcReferenceSourceV1<'source>,
     ) -> Result<Self, MpcReferenceParseError> {
         if dto.schema_version != MPC_REFERENCE_V1 {
             return Err(MpcReferenceParseError::UnsupportedSchemaVersion(
@@ -1157,27 +1521,18 @@ impl<'path> MpcReferenceV1<'path> {
         }
         let builder_revision = match dto.builder_revision {
             1 => ReferenceBuilderRevisionV1::TimeParameterizedGlobalPathV1,
+            2 => ReferenceBuilderRevisionV1::ValidityBoundedBodyTwistV1,
+            3 => ReferenceBuilderRevisionV1::BoundedFrontierYawV1,
             value => return Err(MpcReferenceParseError::UnsupportedBuilderRevision(value)),
         };
-        let global_plan_identity = global_path.identity();
-        if global_plan_identity != epoch.global_plan_identity {
-            return Err(MpcReferenceParseError::GlobalPathMismatch {
-                expected: Box::new(epoch.global_plan_identity),
-                actual: Box::new(global_plan_identity),
-            });
-        }
-        if dto.step_period_s.to_bits() != config.dt_s.to_bits() {
-            return Err(MpcReferenceParseError::StepPeriodMismatch {
-                reference_s: dto.step_period_s,
-                config_s: config.dt_s,
-            });
-        }
-        if dto.points.len() != config.horizon {
-            return Err(MpcReferenceParseError::PointCount {
-                expected: config.horizon,
-                actual: dto.points.len(),
-            });
-        }
+        Self::validate_metadata(
+            builder_revision,
+            dto.step_period_s,
+            dto.points.len(),
+            config,
+            epoch,
+            source,
+        )?;
         let mut points = Vec::new();
         points.try_reserve_exact(dto.points.len()).map_err(|_| {
             MpcReferenceParseError::Allocation {
@@ -1187,26 +1542,114 @@ impl<'path> MpcReferenceV1<'path> {
         for (index, point) in dto.points.into_iter().enumerate() {
             let pose = OdomPoseV1::try_new(point.x_m, point.y_m, point.yaw_rad)
                 .map_err(|source| MpcReferenceParseError::InvalidPoint { index, source })?;
-            require_motion_finite("reference.forward_velocity_mps", point.forward_velocity_mps)
-                .map_err(|source| MpcReferenceParseError::InvalidPoint { index, source })?;
-            require_motion_finite("reference.yaw_rate_rad_s", point.yaw_rate_rad_s)
-                .map_err(|source| MpcReferenceParseError::InvalidPoint { index, source })?;
-            points.push(OdomReferencePointV1 {
-                pose,
-                forward_velocity_mps: point.forward_velocity_mps,
-                yaw_rate_rad_s: point.yaw_rate_rad_s,
+            points.push(
+                OdomReferencePointV1::try_new(
+                    pose,
+                    point.forward_velocity_mps,
+                    point.yaw_rate_rad_s,
+                )
+                .map_err(|source| MpcReferenceParseError::InvalidPoint { index, source })?,
+            );
+        }
+        Ok(Self::from_validated_parts(
+            builder_revision,
+            epoch,
+            source,
+            HostMonotonicTimestamp::from_nanos(dto.created_at_host_ns),
+            dto.step_period_s,
+            points,
+        ))
+    }
+
+    pub(crate) fn from_typed_points(
+        builder_revision: ReferenceBuilderRevisionV1,
+        created_at: HostMonotonicTimestamp,
+        step_period_s: f64,
+        points: Vec<OdomReferencePointV1>,
+        config: MpcConfigV1,
+        epoch: NavigationEpochV1,
+        source: MpcReferenceSourceV1<'source>,
+    ) -> Result<Self, MpcReferenceParseError> {
+        Self::validate_metadata(
+            builder_revision,
+            step_period_s,
+            points.len(),
+            config,
+            epoch,
+            source,
+        )?;
+        Ok(Self::from_validated_parts(
+            builder_revision,
+            epoch,
+            source,
+            created_at,
+            step_period_s,
+            points,
+        ))
+    }
+
+    fn validate_metadata(
+        builder_revision: ReferenceBuilderRevisionV1,
+        step_period_s: f64,
+        point_count: usize,
+        config: MpcConfigV1,
+        epoch: NavigationEpochV1,
+        source: MpcReferenceSourceV1<'source>,
+    ) -> Result<(), MpcReferenceParseError> {
+        if builder_revision != source.expected_builder_revision() {
+            return Err(MpcReferenceParseError::BuilderSourceMismatch {
+                builder_revision,
+                source_identity: Box::new(source.identity()),
             });
         }
-        Ok(Self {
+        let source_identity = source.identity();
+        if source_identity != epoch.reference_identity {
+            return match (epoch.reference_identity, source_identity) {
+                (
+                    NavigationReferenceIdentityV1::GlobalPlan(expected),
+                    NavigationReferenceIdentityV1::GlobalPlan(actual),
+                ) => Err(MpcReferenceParseError::GlobalPathMismatch {
+                    expected: Box::new(expected),
+                    actual: Box::new(actual),
+                }),
+                (expected, actual) => Err(MpcReferenceParseError::ReferenceIdentityMismatch {
+                    expected: Box::new(expected),
+                    actual: Box::new(actual),
+                }),
+            };
+        }
+        if step_period_s.to_bits() != config.dt_s.to_bits() {
+            return Err(MpcReferenceParseError::StepPeriodMismatch {
+                reference_s: step_period_s,
+                config_s: config.dt_s,
+            });
+        }
+        if point_count != config.horizon {
+            return Err(MpcReferenceParseError::PointCount {
+                expected: config.horizon,
+                actual: point_count,
+            });
+        }
+        Ok(())
+    }
+
+    fn from_validated_parts(
+        builder_revision: ReferenceBuilderRevisionV1,
+        epoch: NavigationEpochV1,
+        source: MpcReferenceSourceV1<'source>,
+        created_at: HostMonotonicTimestamp,
+        step_period_s: f64,
+        points: Vec<OdomReferencePointV1>,
+    ) -> Self {
+        Self {
             schema_version: MPC_REFERENCE_V1,
             builder_revision,
             epoch,
-            global_plan_identity,
-            source_path: global_path,
-            created_at: HostMonotonicTimestamp::from_nanos(dto.created_at_host_ns),
-            step_period_s: dto.step_period_s,
+            source,
+            created_at,
+            step_period_s,
             points,
-        })
+        }
     }
 
     pub fn builder_revision(&self) -> ReferenceBuilderRevisionV1 {
@@ -1215,11 +1658,25 @@ impl<'path> MpcReferenceV1<'path> {
     pub fn epoch(&self) -> NavigationEpochV1 {
         self.epoch
     }
-    pub fn global_plan_identity(&self) -> GlobalPlanIdentity {
-        self.global_plan_identity
+    pub fn source(&self) -> MpcReferenceSourceV1<'source> {
+        self.source
     }
-    pub fn source_path(&self) -> &'path GlobalPath {
-        self.source_path
+    pub fn try_global_plan_identity(&self) -> Option<GlobalPlanIdentity> {
+        match self.source {
+            MpcReferenceSourceV1::GlobalPath(path) => Some(path.identity()),
+            MpcReferenceSourceV1::ManualBodyTwist(_)
+            | MpcReferenceSourceV1::FrontierInPlaceYaw(_) => None,
+        }
+    }
+    pub fn global_path(&self) -> Option<&'source GlobalPath> {
+        match self.source {
+            MpcReferenceSourceV1::GlobalPath(path) => Some(path),
+            MpcReferenceSourceV1::ManualBodyTwist(_)
+            | MpcReferenceSourceV1::FrontierInPlaceYaw(_) => None,
+        }
+    }
+    pub fn valid_through_exclusive(&self) -> Option<HostMonotonicTimestamp> {
+        self.source.valid_through_exclusive()
     }
     pub fn created_at(&self) -> HostMonotonicTimestamp {
         self.created_at
@@ -1236,6 +1693,14 @@ pub enum MpcReferenceParseError {
     GlobalPathMismatch {
         expected: Box<GlobalPlanIdentity>,
         actual: Box<GlobalPlanIdentity>,
+    },
+    ReferenceIdentityMismatch {
+        expected: Box<NavigationReferenceIdentityV1>,
+        actual: Box<NavigationReferenceIdentityV1>,
+    },
+    BuilderSourceMismatch {
+        builder_revision: ReferenceBuilderRevisionV1,
+        source_identity: Box<NavigationReferenceIdentityV1>,
     },
     StepPeriodMismatch {
         reference_s: f64,
@@ -1432,6 +1897,14 @@ impl<'reference> MpcRequestV1<'reference> {
                 submitted_at,
             });
         }
+        if let Some(valid_through_exclusive) = reference.valid_through_exclusive()
+            && submitted_at >= valid_through_exclusive
+        {
+            return Err(MpcRequestParseError::ReferenceExpiredAtSubmission {
+                submitted_at,
+                valid_through_exclusive,
+            });
+        }
         if deadline <= submitted_at {
             return Err(MpcRequestParseError::NonFutureDeadline {
                 submitted_at,
@@ -1442,6 +1915,14 @@ impl<'reference> MpcRequestV1<'reference> {
             return Err(MpcRequestParseError::DeadlineExceedsCollisionValidity {
                 deadline,
                 collision_valid_through: collision_snapshot.valid_through,
+            });
+        }
+        if let Some(valid_through_exclusive) = reference.valid_through_exclusive()
+            && deadline > valid_through_exclusive
+        {
+            return Err(MpcRequestParseError::DeadlineExceedsReferenceValidity {
+                deadline,
+                valid_through_exclusive,
             });
         }
         Ok(Self {
@@ -1503,6 +1984,10 @@ pub enum MpcRequestParseError {
         snapshot: HostMonotonicTimestamp,
         submitted_at: HostMonotonicTimestamp,
     },
+    ReferenceExpiredAtSubmission {
+        submitted_at: HostMonotonicTimestamp,
+        valid_through_exclusive: HostMonotonicTimestamp,
+    },
     NonFutureDeadline {
         submitted_at: HostMonotonicTimestamp,
         deadline: HostMonotonicTimestamp,
@@ -1510,6 +1995,10 @@ pub enum MpcRequestParseError {
     DeadlineExceedsCollisionValidity {
         deadline: HostMonotonicTimestamp,
         collision_valid_through: HostMonotonicTimestamp,
+    },
+    DeadlineExceedsReferenceValidity {
+        deadline: HostMonotonicTimestamp,
+        valid_through_exclusive: HostMonotonicTimestamp,
     },
 }
 
@@ -4622,7 +5111,10 @@ mod tests {
         assert_eq!(solution.model(), fixture.model);
         assert_eq!(solution.config(), fixture.config);
         assert_eq!(solution.request(), request);
-        assert_eq!(solution.request().reference().source_path(), &fixture.path);
+        assert_eq!(
+            solution.request().reference().global_path(),
+            Some(&fixture.path)
+        );
         assert_eq!(
             solution.final_validation().collision_snapshot(),
             fixture.collision

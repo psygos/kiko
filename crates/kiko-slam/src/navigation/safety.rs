@@ -678,7 +678,13 @@ impl ShadowSafetySupervisor {
                 },
             );
         };
-        let deadline_ns = budget_deadline_ns.min(collision_snapshot.valid_through().as_nanos());
+        let reference_deadline_ns = ready
+            .reference
+            .valid_through_exclusive()
+            .map_or(u64::MAX, HostMonotonicTimestamp::as_nanos);
+        let deadline_ns = budget_deadline_ns
+            .min(collision_snapshot.valid_through().as_nanos())
+            .min(reference_deadline_ns);
         let previous_pwm = self
             .shadow_session
             .latest()
