@@ -194,6 +194,7 @@ impl ReadbackEvidence {
 pub struct VerifiedNaturalHoldEvidence {
     started_at: MonotonicTime,
     completed_at: MonotonicTime,
+    pre_observation_torque_disable: TorqueDisableReport,
     observed_pose: HeadPose,
     configured_pose: HeadPoseWithinConfiguredBounds,
     observations: [PositionObservationEvidence; 4],
@@ -210,6 +211,12 @@ impl VerifiedNaturalHoldEvidence {
 
     pub const fn completed_at(&self) -> MonotonicTime {
         self.completed_at
+    }
+
+    /// All four host writes which established a torque-disabled baseline
+    /// before the actor attempted its first position observation.
+    pub const fn pre_observation_torque_disable(&self) -> &TorqueDisableReport {
+        &self.pre_observation_torque_disable
     }
 
     pub const fn observed_pose(&self) -> HeadPose {
@@ -299,6 +306,9 @@ pub enum CancellationCause {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeadRuntimeError {
+    PreObservationTorqueDisable {
+        report: Box<TorqueDisableReport>,
+    },
     Cancelled {
         cause: CancellationCause,
         stage: RuntimeStage,
@@ -377,6 +387,9 @@ impl fmt::Display for HeadRuntimeError {
 impl std::error::Error for HeadRuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::PreObservationTorqueDisable { report } => report
+                .first_failure()
+                .map(|source| source as &(dyn std::error::Error + 'static)),
             Self::PositionObservation { source, .. } | Self::VerificationRead { source, .. } => {
                 Some(source)
             }
@@ -435,6 +448,12 @@ impl TorqueDisableReport {
 
     pub fn all_writes_completed(&self) -> bool {
         self.outcomes.iter().all(|outcome| outcome.result.is_ok())
+    }
+
+    pub fn first_failure(&self) -> Option<&FrameWriteError> {
+        self.outcomes
+            .iter()
+            .find_map(|outcome| outcome.result.as_ref().err())
     }
 }
 
@@ -750,6 +769,14 @@ where
         control: &mut ControlState,
     ) -> Result<VerifiedNaturalHoldEvidence, HeadRuntimeError> {
         let started_at = self.clock.now();
+        // Establish a known host-commanded torque-disabled baseline before any
+        // read request. All joints are attempted even when one write fails.
+        let pre_observation_torque_disable = self.disable_all().await;
+        if !pre_observation_torque_disable.all_writes_completed() {
+            return Err(HeadRuntimeError::PreObservationTorqueDisable {
+                report: Box::new(pre_observation_torque_disable),
+            });
+        }
         let bow = self
             .observe_joint(HeadJoint::Bow, commands, control)
             .await?;
@@ -860,6 +887,7 @@ where
         Ok(VerifiedNaturalHoldEvidence {
             started_at,
             completed_at: self.clock.now(),
+            pre_observation_torque_disable,
             observed_pose,
             configured_pose,
             observations,
@@ -1411,6 +1439,7 @@ mod tests {
     struct FakeShared {
         writes: Vec<Vec<u8>>,
         write_failures: BTreeMap<usize, TransportFailure>,
+        read_calls: usize,
     }
 
     struct FakeTransport {
@@ -1457,6 +1486,7 @@ mod tests {
             _timeout: Duration,
         ) -> Result<usize, TransportFailure> {
             self.clock.advance_one_millisecond();
+            self.shared.lock().expect("fake transport mutex").read_calls += 1;
             loop {
                 if !self.pending.is_empty() {
                     let read = bytes.len().min(self.pending.len());
@@ -1573,8 +1603,28 @@ mod tests {
         HeadActorTask,
         Arc<Mutex<FakeShared>>,
     ) {
+        spawn_fake_with_bounds_and_write_failures(
+            reads,
+            config,
+            configured_pose_bounds,
+            BTreeMap::new(),
+        )
+    }
+
+    fn spawn_fake_with_bounds_and_write_failures(
+        reads: Vec<ReadAction>,
+        config: HeadRuntimeConfig,
+        configured_pose_bounds: ConfiguredHeadPoseBounds,
+        write_failures: BTreeMap<usize, TransportFailure>,
+    ) -> (
+        HeadActorHandle,
+        StartupReceipt,
+        HeadActorTask,
+        Arc<Mutex<FakeShared>>,
+    ) {
         let clock = TestClock::default();
         let (transport, shared) = FakeTransport::new(clock.clone(), reads);
+        shared.lock().expect("fake state").write_failures = write_failures;
         let (handle, startup, task) = spawn_head_actor(
             transport,
             clock,
@@ -1626,6 +1676,11 @@ mod tests {
                 && readback.second_target_difference_ticks() == 0
                 && readback.stable_difference_ticks() == 0
         }));
+        assert!(
+            evidence
+                .pre_observation_torque_disable()
+                .all_writes_completed()
+        );
 
         let disable = handle.shutdown().await.expect("shutdown report");
         assert!(disable.all_writes_completed());
@@ -1634,12 +1689,31 @@ mod tests {
         assert_eq!(exit.torque_disable(), &disable);
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 32);
-        for write in &shared.writes[..8] {
+        assert_eq!(shared.writes.len(), 36);
+        assert!(
+            shared.writes[..4]
+                .iter()
+                .all(|write| write[5..=6] == [40, 0])
+        );
+        assert_eq!(
+            shared.writes[..4]
+                .iter()
+                .map(|write| write[2])
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        for write in &shared.writes[4..12] {
             assert_eq!(&write[4..=6], &[2, 56, 2]);
         }
-        assert!(shared.writes[8..12].iter().all(|write| write[5] == 48));
-        for write in &shared.writes[12..16] {
+        assert_eq!(
+            shared.writes[4..12]
+                .iter()
+                .map(|write| write[2])
+                .collect::<Vec<_>>(),
+            vec![1, 1, 2, 2, 3, 3, 4, 4]
+        );
+        assert!(shared.writes[12..16].iter().all(|write| write[5] == 48));
+        for write in &shared.writes[16..20] {
             assert_eq!(write[5], 42);
             let id = usize::from(write[2] - 1);
             let target = u16::from_le_bytes([write[6], write[7]]);
@@ -1647,20 +1721,77 @@ mod tests {
             assert_ne!(u16::from_le_bytes([write[10], write[11]]), 0);
         }
         assert!(
-            shared.writes[16..20]
+            shared.writes[20..24]
                 .iter()
                 .all(|write| write[5..=6] == [40, 1])
         );
         assert!(
-            shared.writes[20..28]
+            shared.writes[24..32]
                 .iter()
                 .all(|write| write[4..=6] == [2, 56, 15])
         );
         assert!(
-            shared.writes[28..]
+            shared.writes[32..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
+    }
+
+    #[tokio::test]
+    async fn every_pre_observation_disable_failure_blocks_all_reads_and_arming_writes() {
+        for failing_joint_index in 0..HeadJoint::ALL.len() {
+            let mut write_failures = BTreeMap::new();
+            let source = io::Error::from(io::ErrorKind::BrokenPipe);
+            write_failures.insert(
+                failing_joint_index,
+                TransportFailure::from_io(TransportOperation::Write, &source, 0),
+            );
+            let (handle, receipt, task, shared) = spawn_fake_with_bounds_and_write_failures(
+                successful_reads(),
+                valid_config(1),
+                valid_pose_bounds(),
+                write_failures,
+            );
+            let error = receipt
+                .wait()
+                .await
+                .expect("startup channel")
+                .expect_err("every pre-observation disable failure must refuse startup");
+            let HeadRuntimeError::PreObservationTorqueDisable { report } = &error else {
+                panic!("unexpected startup error: {error:?}");
+            };
+            assert_eq!(report.outcomes().len(), HeadJoint::ALL.len());
+            for (index, outcome) in report.outcomes().iter().enumerate() {
+                assert_eq!(outcome.joint(), HeadJoint::ALL[index]);
+                assert_eq!(outcome.result().is_err(), index == failing_joint_index);
+            }
+            assert!(report.first_failure().is_some());
+
+            drop(handle);
+            let exit = task.join().await.expect("actor task");
+            assert_eq!(exit.startup(), &Err(error.clone()));
+            assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+            assert!(exit.torque_disable().all_writes_completed());
+            assert!(
+                exit.torque_disable().started_at() >= report.completed_at(),
+                "cleanup disable must follow the refused startup transaction"
+            );
+
+            let shared = shared.lock().expect("fake state");
+            assert_eq!(shared.read_calls, 0);
+            assert_eq!(shared.writes.len(), 8);
+            assert!(
+                shared.writes.iter().all(|write| write[5..=6] == [40, 0]),
+                "only four pre-disable and four cleanup-disable frames are permitted"
+            );
+            assert_eq!(
+                shared.writes[..4]
+                    .iter()
+                    .map(|write| write[2])
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3, 4]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1694,14 +1825,19 @@ mod tests {
         assert!(exit.torque_disable().all_writes_completed());
 
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 12);
+        assert_eq!(shared.writes.len(), 16);
         assert!(
-            shared.writes[..8]
+            shared.writes[..4]
+                .iter()
+                .all(|write| write[5..=6] == [40, 0])
+        );
+        assert!(
+            shared.writes[4..12]
                 .iter()
                 .all(|write| write[4..=6] == [2, 56, 2])
         );
         assert!(
-            shared.writes[8..]
+            shared.writes[12..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
@@ -1868,7 +2004,7 @@ mod tests {
             } if source.kind() == TransportFailureKind::TimedOut
         ));
         assert!(exit.torque_disable().all_writes_completed());
-        assert_eq!(shared.lock().expect("fake state").writes.len(), 5);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 9);
     }
 
     #[tokio::test]
@@ -1878,7 +2014,7 @@ mod tests {
             .lock()
             .expect("fake state")
             .write_failures
-            .insert(0, TransportFailure::timed_out(TransportOperation::Write, 3));
+            .insert(4, TransportFailure::timed_out(TransportOperation::Write, 3));
         let error = receipt
             .wait()
             .await
@@ -1898,7 +2034,7 @@ mod tests {
         drop(handle);
         let exit = task.join().await.expect("actor task");
         assert!(exit.torque_disable().all_writes_completed());
-        assert_eq!(shared.lock().expect("fake state").writes.len(), 5);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 9);
     }
 
     #[tokio::test]
@@ -1908,7 +2044,7 @@ mod tests {
             .lock()
             .expect("fake state")
             .write_failures
-            .insert(0, TransportFailure::timed_out(TransportOperation::Write, 0));
+            .insert(4, TransportFailure::timed_out(TransportOperation::Write, 0));
         let evidence = receipt
             .wait()
             .await
@@ -1956,10 +2092,15 @@ mod tests {
         ));
         assert_eq!(exit.termination(), &ActorTermination::StartupFault);
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 12);
-        assert!(shared.writes[..8].iter().all(|write| write[4] == 2));
+        assert_eq!(shared.writes.len(), 16);
         assert!(
-            shared.writes[8..]
+            shared.writes[..4]
+                .iter()
+                .all(|write| write[5..=6] == [40, 0])
+        );
+        assert!(shared.writes[4..12].iter().all(|write| write[4] == 2));
+        assert!(
+            shared.writes[12..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
@@ -1981,9 +2122,9 @@ mod tests {
         ));
         assert_eq!(exit.termination(), &ActorTermination::StartupFault);
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 20);
+        assert_eq!(shared.writes.len(), 24);
         assert!(
-            shared.writes[16..]
+            shared.writes[20..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
@@ -2038,7 +2179,7 @@ mod tests {
         assert_eq!(exit.termination(), &ActorTermination::HandleDropped);
         assert!(exit.torque_disable().all_writes_completed());
         let shared = shared.lock().expect("fake state");
-        assert_eq!(shared.writes.len(), 4);
+        assert_eq!(shared.writes.len(), 8);
         assert!(shared.writes.iter().all(|write| write[5..=6] == [40, 0]));
     }
 
@@ -2054,11 +2195,11 @@ mod tests {
             let mut state = shared.lock().expect("fake state");
             let error = io::Error::from(io::ErrorKind::BrokenPipe);
             state.write_failures.insert(
-                28,
+                32,
                 TransportFailure::from_io(TransportOperation::Write, &error, 0),
             );
             state.write_failures.insert(
-                29,
+                33,
                 TransportFailure::from_io(TransportOperation::Write, &error, 0),
             );
         }
@@ -2071,7 +2212,7 @@ mod tests {
         assert!(report.outcomes()[3].result().is_ok());
         let exit = task.join().await.expect("actor task");
         assert_eq!(exit.torque_disable().outcomes().len(), 4);
-        assert_eq!(shared.lock().expect("fake state").writes.len(), 32);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 36);
     }
 
     #[tokio::test]
