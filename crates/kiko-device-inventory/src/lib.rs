@@ -29,9 +29,9 @@ pub use artifact::{
 #[cfg(unix)]
 pub use artifact_io::{
     ArtifactContentIdentity, ArtifactFileBindingInput, ArtifactHashError, ArtifactRelativePath,
-    ArtifactRelativePathError, MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_PATH_COMPONENTS,
-    MAX_ARTIFACT_RELATIVE_PATH_BYTES, MAX_ARTIFACT_ROOT_PATH_BYTES, ManifestArtifactHashes,
-    hash_manifest_artifacts,
+    ArtifactRelativePathError, CalibrationBundleHashError, ExactCalibrationBundleSha256,
+    MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_PATH_COMPONENTS, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
+    MAX_ARTIFACT_ROOT_PATH_BYTES, ManifestArtifactHashes, hash_manifest_artifacts,
 };
 pub use bounded::{
     ArtifactId, BoundedTextError, BuildProvenance, ControlEndpointIdentity, MAX_ARTIFACT_ID_BYTES,
@@ -48,7 +48,7 @@ pub use manifest::{
 #[cfg(unix)]
 pub use manifest_io::{
     FileKind, LoadedExpectedManifestV1, MAX_MANIFEST_JSON_BYTES, MAX_MANIFEST_PATH_BYTES,
-    ManifestJsonError, ManifestLoadError, load_expected_manifest_v1_file,
+    ManifestContentSha256, ManifestJsonError, ManifestLoadError, load_expected_manifest_v1_file,
     load_expected_manifest_v1_from_slice,
 };
 pub use model::{

@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kiko_device_inventory::{
-    ArtifactFileBindingInput, ArtifactHashError, ArtifactKind, InventoryParseError,
-    MAX_ARTIFACT_FILE_BYTES, MAX_MANIFEST_JSON_BYTES, ManifestJsonError, ManifestLoadError,
-    hash_manifest_artifacts, load_expected_manifest_v1_file, load_expected_manifest_v1_from_slice,
+    ArtifactFileBindingInput, ArtifactHashError, ArtifactKind, CalibrationBundleHashError,
+    InventoryParseError, MAX_ARTIFACT_FILE_BYTES, MAX_MANIFEST_JSON_BYTES, ManifestJsonError,
+    ManifestLoadError, hash_manifest_artifacts, load_expected_manifest_v1_file,
+    load_expected_manifest_v1_from_slice,
 };
 use robot_protocol::v2::{ControllerCapabilities, VERSION as ROBOT_PROTOCOL_VERSION};
 use serde_json::json;
@@ -107,6 +108,7 @@ fn slice_and_file_load_once_through_the_existing_domain_dto() {
     let json = manifest_json(calibration, plant);
     let loaded = load_expected_manifest_v1_from_slice(&json).expect("bounded slice manifest");
     assert_eq!(loaded.json_bytes(), json.len());
+    assert_eq!(loaded.content_sha256().as_bytes(), &sha256(&json));
     assert_eq!(loaded.manifest().robot_id().as_str(), "kiko-production-01");
     assert_eq!(loaded.manifest().artifacts().len(), 2);
 
@@ -116,6 +118,14 @@ fn slice_and_file_load_once_through_the_existing_domain_dto() {
     let from_file = load_expected_manifest_v1_file(&path).expect("exact manifest file");
     assert_eq!(from_file.json_bytes(), json.len());
     assert_eq!(from_file.manifest(), loaded.manifest());
+    assert_eq!(from_file.content_sha256(), loaded.content_sha256());
+
+    let value: serde_json::Value = serde_json::from_slice(&json).expect("fixture JSON");
+    let pretty = serde_json::to_vec_pretty(&value).expect("pretty fixture JSON");
+    let reformatted =
+        load_expected_manifest_v1_from_slice(&pretty).expect("reformatted valid manifest");
+    assert_eq!(reformatted.manifest(), loaded.manifest());
+    assert_ne!(reformatted.content_sha256(), loaded.content_sha256());
 }
 
 #[test]
@@ -234,12 +244,27 @@ fn hashes_exact_manifest_bindings_and_exposes_changed_content() {
     assert_eq!(exact.len(), 2);
     assert!(exact.all_content_matches_manifest());
     assert!(exact.iter().all(|entry| entry.bytes_hashed() != 0));
+    assert_eq!(
+        exact
+            .exact_calibration_bundle_sha256()
+            .expect("exact calibration bundle")
+            .as_bytes(),
+        &[
+            0x7f, 0x85, 0xe8, 0x11, 0x0d, 0x10, 0xb3, 0x65, 0xe5, 0xbe, 0xac, 0x20, 0x96, 0xa7,
+            0xc4, 0xdd, 0x37, 0x94, 0x93, 0x89, 0x4c, 0xce, 0x20, 0x20, 0x8c, 0x2f, 0x3e, 0xb7,
+            0x08, 0xec, 0x2c, 0x89,
+        ]
+    );
 
     fs::write(temp.path().join("plant/main.bin"), b"drive plant X4")
         .expect("changed same-length artifact");
     let changed =
         hash_manifest_artifacts(&manifest, temp.path(), bindings()).expect("changed hash");
     assert!(!changed.all_content_matches_manifest());
+    assert!(matches!(
+        changed.exact_calibration_bundle_sha256(),
+        Err(CalibrationBundleHashError::ContentMismatch { .. })
+    ));
     let plant_identity = changed
         .iter()
         .find(|entry| entry.kind() == ArtifactKind::Plant)

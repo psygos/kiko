@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::secure_fs::{
     OpenedPathKind, SecureOpenError, is_canonical_absolute_path, open_absolute_nofollow,
@@ -19,6 +20,22 @@ pub const MAX_MANIFEST_PATH_BYTES: usize = 1_024;
 pub struct LoadedExpectedManifestV1 {
     manifest: DeviceInventoryManifestV1,
     json_bytes: usize,
+    content_sha256: ManifestContentSha256,
+}
+
+/// SHA-256 identity of the exact admitted JSON bytes.
+///
+/// This is available only after the bytes have passed the bounded JSON and
+/// manifest-domain parsers. It deliberately includes whitespace and key order;
+/// it identifies one loaded file representation rather than a canonicalized
+/// semantic manifest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ManifestContentSha256([u8; 32]);
+
+impl ManifestContentSha256 {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl LoadedExpectedManifestV1 {
@@ -28,6 +45,10 @@ impl LoadedExpectedManifestV1 {
 
     pub const fn json_bytes(&self) -> usize {
         self.json_bytes
+    }
+
+    pub const fn content_sha256(&self) -> ManifestContentSha256 {
+        self.content_sha256
     }
 
     pub fn into_manifest(self) -> DeviceInventoryManifestV1 {
@@ -55,6 +76,7 @@ pub fn load_expected_manifest_v1_from_slice(
     Ok(LoadedExpectedManifestV1 {
         manifest,
         json_bytes: json.len(),
+        content_sha256: ManifestContentSha256(Sha256::digest(json).into()),
     })
 }
 

@@ -57,6 +57,12 @@ read. Relative paths, dot components, repeated or trailing separators, paths
 over 1,024 bytes, non-regular files, allocation failures, and I/O failures are
 distinct typed errors. No alternate manifest path is tried.
 
+The loaded value also retains SHA-256 of the exact admitted JSON byte slice.
+That identity is computed during the one bounded read; callers do not reopen
+the path. Whitespace and key order intentionally affect it, so it identifies
+the reviewed file representation rather than claiming semantic JSON
+canonicalization.
+
 `hash_manifest_artifacts` binds an exact set of caller-declared relative paths
 to the artifact kind and ID already present in a parsed manifest. The binding
 count must equal the manifest artifact count and therefore cannot exceed 12.
@@ -72,6 +78,13 @@ directory descriptors with no-follow semantics. Only regular files of at most
 the result retains the manifest digest, observed digest, exact relative path,
 and bytes read. A digest difference is successful identity evidence with
 `content_matches_manifest() == false`, not a hashing failure.
+
+After all artifact contents match, `exact_calibration_bundle_sha256` derives a
+domain-separated V1 digest from the sorted calibration artifact IDs and their
+observed SHA-256 values. It allocates no intermediate serialization and refuses
+to produce readiness evidence for any content mismatch. Plant artifacts stay
+covered by exact inventory comparison and the enclosing manifest-content
+identity; they are not mislabeled as calibration inputs.
 
 ## Evidence boundary
 

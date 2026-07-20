@@ -18,6 +18,7 @@ pub const MAX_ARTIFACT_FILE_BYTES: u64 = 128 * 1_024 * 1_024;
 pub const MAX_ARTIFACT_RELATIVE_PATH_BYTES: usize = 512;
 pub const MAX_ARTIFACT_PATH_COMPONENTS: usize = 64;
 pub const MAX_ARTIFACT_ROOT_PATH_BYTES: usize = 1_024;
+const CALIBRATION_BUNDLE_DOMAIN_V1: &[u8] = b"KIKO_CALIBRATION_BUNDLE_V1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactFileBindingInput {
@@ -162,6 +163,40 @@ pub struct ManifestArtifactHashes {
     len: u8,
 }
 
+/// Deterministic identity of the exact calibration files admitted at startup.
+///
+/// Construction is possible only when every manifest-bound artifact content
+/// hash matches. The bundle covers calibration artifact IDs and observed
+/// digests in the manifest domain's sorted order; plant artifacts remain bound
+/// through the containing manifest identity and exact inventory comparison.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExactCalibrationBundleSha256([u8; 32]);
+
+impl ExactCalibrationBundleSha256 {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalibrationBundleHashError<'evidence> {
+    ContentMismatch {
+        artifact: &'evidence ArtifactContentIdentity,
+    },
+    MissingCalibrationArtifact,
+}
+
+impl fmt::Display for CalibrationBundleHashError<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot identify an exact calibration bundle: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for CalibrationBundleHashError<'_> {}
+
 impl ManifestArtifactHashes {
     pub fn len(&self) -> usize {
         usize::from(self.len)
@@ -182,6 +217,45 @@ impl ManifestArtifactHashes {
     pub fn all_content_matches_manifest(&self) -> bool {
         self.iter()
             .all(ArtifactContentIdentity::content_matches_manifest)
+    }
+
+    /// Bind the complete exact calibration set without allocating or
+    /// serializing an intermediate representation.
+    pub fn exact_calibration_bundle_sha256(
+        &self,
+    ) -> Result<ExactCalibrationBundleSha256, CalibrationBundleHashError<'_>> {
+        if let Some(mismatch) = self.iter().find(|entry| !entry.content_matches_manifest()) {
+            return Err(CalibrationBundleHashError::ContentMismatch { artifact: mismatch });
+        }
+
+        let calibration_count = self
+            .iter()
+            .filter(|entry| entry.kind == ArtifactKind::Calibration)
+            .count();
+        if calibration_count == 0 {
+            return Err(CalibrationBundleHashError::MissingCalibrationArtifact);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(CALIBRATION_BUNDLE_DOMAIN_V1);
+        hasher.update(
+            u16::try_from(calibration_count)
+                .expect("manifest calibration limit fits u16")
+                .to_be_bytes(),
+        );
+        for entry in self
+            .iter()
+            .filter(|entry| entry.kind == ArtifactKind::Calibration)
+        {
+            let id = entry.artifact_id.as_str().as_bytes();
+            hasher.update(
+                u16::try_from(id.len())
+                    .expect("bounded artifact ID length fits u16")
+                    .to_be_bytes(),
+            );
+            hasher.update(id);
+            hasher.update(entry.observed_sha256);
+        }
+        Ok(ExactCalibrationBundleSha256(hasher.finalize().into()))
     }
 }
 
