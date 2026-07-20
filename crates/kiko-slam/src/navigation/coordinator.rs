@@ -231,6 +231,7 @@ impl std::error::Error for VisualAdmissionError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavigationGoalState {
+    Unavailable,
     PendingFirstMap,
     Bound {
         map_instance_id: MapInstanceId,
@@ -251,6 +252,7 @@ pub enum CoordinatorLatch {
 
 #[derive(Debug)]
 enum GoalBinding {
+    Unavailable,
     Pending(MapPoint),
     Bound(PointGoal),
     Invalidated {
@@ -295,6 +297,36 @@ pub enum StoredPlanFault {
     StartTransform,
     PlannerConstruction,
     Planning,
+}
+
+#[derive(Debug)]
+pub enum PlanStartBuildError {
+    OdometryUnavailable,
+    OdomMapMismatch {
+        odometry_map_instance_id: MapInstanceId,
+        snapshot_map_instance_id: Option<MapInstanceId>,
+    },
+    Transform(PlanarTransformError),
+    Plan(GlobalPlanError),
+}
+
+impl fmt::Display for PlanStartBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "cannot bind the current robot pose to a map snapshot: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for PlanStartBuildError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transform(source) => Some(source),
+            Self::Plan(source) => Some(source),
+            Self::OdometryUnavailable | Self::OdomMapMismatch { .. } => None,
+        }
+    }
 }
 
 /// Result of accepting one tracker attempt after its journal record committed.
@@ -571,12 +603,67 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         solver_budget: SolverBudgetNs,
         safety: ShadowSafetySupervisor,
     ) -> Self {
+        Self::new_with_optional_goal(
+            clock_epoch,
+            journal,
+            Some(pending_goal),
+            odometry,
+            local_costmap,
+            planner_config,
+            reference_builder,
+            mpc_config,
+            solver_budget,
+            safety,
+        )
+    }
+
+    /// Construct a mapping-only coordinator. Every control tick remains a
+    /// typed stop until an exact map-revision-bound point is selected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_without_goal(
+        clock_epoch: NavigationClockEpoch,
+        journal: J,
+        odometry: PlanarOdometry,
+        local_costmap: LocalCostmap,
+        planner_config: GlobalPlannerConfig,
+        reference_builder: PathReferenceBuilderV1,
+        mpc_config: MpcConfigV1,
+        solver_budget: SolverBudgetNs,
+        safety: ShadowSafetySupervisor,
+    ) -> Self {
+        Self::new_with_optional_goal(
+            clock_epoch,
+            journal,
+            None,
+            odometry,
+            local_costmap,
+            planner_config,
+            reference_builder,
+            mpc_config,
+            solver_budget,
+            safety,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_optional_goal(
+        clock_epoch: NavigationClockEpoch,
+        journal: J,
+        pending_goal: Option<MapPoint>,
+        odometry: PlanarOdometry,
+        local_costmap: LocalCostmap,
+        planner_config: GlobalPlannerConfig,
+        reference_builder: PathReferenceBuilderV1,
+        mpc_config: MpcConfigV1,
+        solver_budget: SolverBudgetNs,
+        safety: ShadowSafetySupervisor,
+    ) -> Self {
         Self {
             clock_epoch,
             journal,
             map_epochs: NavigationMapEpochCoordinator::new(),
             current_map: None,
-            goal: GoalBinding::Pending(pending_goal),
+            goal: pending_goal.map_or(GoalBinding::Unavailable, GoalBinding::Pending),
             odometry,
             next_segment_id: NonZeroU64::new(1),
             latest_device_time: None,
@@ -636,6 +723,7 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
 
     pub fn goal_state(&self) -> NavigationGoalState {
         match self.goal {
+            GoalBinding::Unavailable => NavigationGoalState::Unavailable,
             GoalBinding::Pending(_) => NavigationGoalState::PendingFirstMap,
             GoalBinding::Bound(goal) => NavigationGoalState::Bound {
                 map_instance_id: goal.map_instance_id(),
@@ -653,6 +741,32 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
 
     pub fn current_map_binding(&self) -> Option<CurrentMapEpochBinding> {
         self.current_map.map(|current| current.binding)
+    }
+
+    /// Bind the freshest admitted robot pose to this exact immutable global
+    /// map. Frontier selection uses this instead of reconstructing transforms
+    /// or borrowing a stale path start.
+    pub fn plan_start_for_snapshot(
+        &self,
+        snapshot: &OccupancyGridSnapshot,
+    ) -> Result<PlanStart, PlanStartBuildError> {
+        let state = self
+            .odometry
+            .current()
+            .ok_or(PlanStartBuildError::OdometryUnavailable)?;
+        let odometry_map_instance_id = state.map_snapshot().instance_id();
+        if snapshot.map_instance_id() != Some(odometry_map_instance_id) {
+            return Err(PlanStartBuildError::OdomMapMismatch {
+                odometry_map_instance_id,
+                snapshot_map_instance_id: snapshot.map_instance_id(),
+            });
+        }
+        let base_in_map = state
+            .odom_to_map()
+            .compose(state.base_to_odom())
+            .and_then(|base_to_map| base_to_map.transform_point(PlanarPoint::<BaseFrame>::origin()))
+            .map_err(PlanStartBuildError::Transform)?;
+        PlanStart::for_snapshot(base_in_map, snapshot).map_err(PlanStartBuildError::Plan)
     }
 
     pub fn accept_visual(
@@ -1198,7 +1312,9 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
             VisualReadiness::Continuous => {}
         }
         match self.goal {
-            GoalBinding::Pending(_) => return Some(CoordinatorTickBlocker::GoalUnavailable),
+            GoalBinding::Unavailable | GoalBinding::Pending(_) => {
+                return Some(CoordinatorTickBlocker::GoalUnavailable);
+            }
             GoalBinding::Invalidated { .. } => {
                 return Some(CoordinatorTickBlocker::GoalInvalidated);
             }
@@ -1239,37 +1355,29 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
     fn plan_snapshot(&mut self, snapshot: &OccupancyGridSnapshot) -> GlobalPlanningOutcome {
         let Some(goal) = (match self.goal {
             GoalBinding::Bound(goal) => Some(goal),
-            GoalBinding::Pending(_) | GoalBinding::Invalidated { .. } => None,
+            GoalBinding::Unavailable
+            | GoalBinding::Pending(_)
+            | GoalBinding::Invalidated { .. } => None,
         }) else {
             self.plan_fault = Some(StoredPlanFault::Planning);
             return GlobalPlanningOutcome::Deferred(StoredPlanFault::Planning);
         };
-        let Some(state) = self.odometry.current() else {
-            self.plan_fault = Some(StoredPlanFault::OdometryUnavailable(
-                OdometryUnavailable::NotAnchored,
-            ));
-            return GlobalPlanningOutcome::Deferred(StoredPlanFault::OdometryUnavailable(
-                OdometryUnavailable::NotAnchored,
-            ));
-        };
-        if state.map_snapshot().instance_id() != snapshot.map_instance_id().expect("parsed map") {
-            self.plan_fault = Some(StoredPlanFault::OdomMapMismatch);
-            return GlobalPlanningOutcome::Deferred(StoredPlanFault::OdomMapMismatch);
-        }
-        let base_in_map = match state
-            .odom_to_map()
-            .compose(state.base_to_odom())
-            .and_then(|base_to_map| base_to_map.transform_point(PlanarPoint::<BaseFrame>::origin()))
-        {
-            Ok(point) => point,
-            Err(_) => {
+        let start = match self.plan_start_for_snapshot(snapshot) {
+            Ok(start) => start,
+            Err(PlanStartBuildError::OdometryUnavailable) => {
+                let fault = StoredPlanFault::OdometryUnavailable(OdometryUnavailable::NotAnchored);
+                self.plan_fault = Some(fault);
+                return GlobalPlanningOutcome::Deferred(fault);
+            }
+            Err(PlanStartBuildError::OdomMapMismatch { .. }) => {
+                self.plan_fault = Some(StoredPlanFault::OdomMapMismatch);
+                return GlobalPlanningOutcome::Deferred(StoredPlanFault::OdomMapMismatch);
+            }
+            Err(PlanStartBuildError::Transform(_)) => {
                 self.plan_fault = Some(StoredPlanFault::StartTransform);
                 return GlobalPlanningOutcome::Deferred(StoredPlanFault::StartTransform);
             }
-        };
-        let start = match PlanStart::for_snapshot(base_in_map, snapshot) {
-            Ok(start) => start,
-            Err(source) => {
+            Err(PlanStartBuildError::Plan(source)) => {
                 self.plan_fault = Some(StoredPlanFault::Planning);
                 return GlobalPlanningOutcome::Failed(source);
             }
@@ -1699,6 +1807,22 @@ mod tests {
         )
     }
 
+    fn coordinator_without_goal() -> ShadowNavigationCoordinator<NavigationIngressLog> {
+        let config = mpc_config();
+        ShadowNavigationCoordinator::new_without_goal(
+            clock_epoch(),
+            journal(),
+            odometry(),
+            local_costmap(1_000, 0.0),
+            GlobalPlannerConfig::try_new(0.05, super::super::UnknownSpacePolicy::Blocked)
+                .expect("planner clearance"),
+            reference_builder(2.0),
+            config,
+            SolverBudgetNs::try_new(10).expect("nonzero solver budget"),
+            safety(config),
+        )
+    }
+
     fn visual_ingress(
         frame_id: u64,
         timestamp_ns: i64,
@@ -2092,6 +2216,54 @@ mod tests {
         assert_eq!(goals[1].map_epoch_id(), binding.map_epoch_id());
         assert_eq!(goals[1].selected_revision(), 1);
         assert_eq!(goals[1].point().as_array(), [1.5, 0.5]);
+    }
+
+    #[test]
+    fn mapping_without_a_goal_stays_stopped_until_an_exact_current_map_click() {
+        let mut coordinator = coordinator_without_goal();
+        assert_eq!(coordinator.goal_state(), NavigationGoalState::Unavailable);
+
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        let admitted = coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("mapping-only snapshot");
+        assert_eq!(admitted.goal_state(), NavigationGoalState::Unavailable);
+        assert!(matches!(
+            admitted.planning(),
+            GlobalPlanningOutcome::Deferred(StoredPlanFault::Planning)
+        ));
+
+        let start = coordinator
+            .plan_start_for_snapshot(&snapshot)
+            .expect("fresh current plan start");
+        assert_eq!(start.map_instance_id(), map.instance_id());
+        assert_eq!(start.map_revision(), 1);
+
+        accept_aligned_depth(&mut coordinator);
+        let tick = host(1_120);
+        let stopped = coordinator
+            .tick(tick, &mut FixedClock(tick))
+            .expect("goal-free tick is a recorded stop");
+        assert!(matches!(
+            stopped.blocker(),
+            Some(CoordinatorTickBlocker::GoalUnavailable)
+        ));
+        assert!(stopped.decision().record().pwm().is_stop());
+
+        let binding = coordinator.current_map_binding().expect("map binding");
+        let selected = coordinator
+            .select_map_point_goal(
+                host(1_121),
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("exact click activates a goal");
+        assert!(matches!(
+            selected.planning(),
+            GlobalPlanningOutcome::Planned(_)
+        ));
     }
 
     #[test]

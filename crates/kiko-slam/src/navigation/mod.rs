@@ -30,8 +30,8 @@ pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
     CoordinatorTickOutcome, DepthAdmissionOutcome, GlobalMapAdmissionOutcome,
     GlobalPlanningOutcome, GoalSelectionOutcome, ImuAdmissionOutcome, NavigationGoalState,
-    NavigationIngressSink, ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission,
-    VisualAdmissionError, VisualAdmissionOutcome,
+    NavigationIngressSink, PlanStartBuildError, ShadowNavigationCoordinator, StoredPlanFault,
+    VisualAdmission, VisualAdmissionError, VisualAdmissionOutcome,
 };
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,
