@@ -1374,6 +1374,12 @@ mod target {
 
     #[allow(unsafe_code)]
     fn set_watchdog_period(watchdog: &mut IndependentWatchdog, requested_ms: u32) -> bool {
+        if requested_ms == super::BOTH_FORWARD_WATCHDOG_CONFIG_MS
+            && requested_ms.saturating_mul(super::LSI_NOMINAL_KHZ) / super::LSI_MAX_KHZ
+                < super::BOTH_FORWARD_DURATION_MS + super::WATCHDOG_BACKSTOP_MARGIN_MS
+        {
+            return false;
+        }
         watchdog.start(requested_ms.millis());
         let update_deadline_ms = uptime_ms().wrapping_add(WATCHDOG_REGISTER_UPDATE_TIMEOUT_MS);
         loop {
