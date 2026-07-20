@@ -10,9 +10,9 @@ use std::fmt;
 use std::time::Instant;
 
 use robot_command_client::{
-    AcquireFailure, AppliedCommandReceipt, ApplyFailure, ArmedCommandClient, DisarmFailure,
-    DisarmReceipt, DisarmedCommandClient, MonotonicClock, MonotonicInstant, PendingPhysicalCommand,
-    RobotProtocolV2WireAdapter, UdpTransportBuildError, UdpV2Transport,
+    AcquireFailure, AppliedCommandReceipt, ApplyFailure, ArmedCommandClient, ClientConfig,
+    DisarmFailure, DisarmReceipt, DisarmedCommandClient, MonotonicClock, MonotonicInstant,
+    PendingPhysicalCommand, RobotProtocolV2WireAdapter, UdpTransportBuildError, UdpV2Transport,
 };
 use robot_protocol::v2::{DomainError, ForceStopReason, TimerPwm, V2CommandLeaseMs};
 
@@ -62,6 +62,13 @@ impl ActuationTiming {
         Self {
             apply_ack_budget_ns: config.apply_ack_budget().get(),
             lease: config.controller_motion_lease(),
+        }
+    }
+
+    fn from_zero_client(config: &ClientConfig) -> Self {
+        Self {
+            apply_ack_budget_ns: config.applied_ack_timeout().get(),
+            lease: config.zero_acquisition_lease(),
         }
     }
 }
@@ -159,21 +166,66 @@ pub struct PhysicalActuationSession {
     timing: ActuationTiming,
 }
 
+/// A zero-only live controller session for non-motion diagnostics.
+///
+/// The type exposes no PWM-bearing input and can therefore only refresh an
+/// already acquired zero or request a terminal stop.
+#[must_use = "a zero-only session must be explicitly disarmed and its receipt checked"]
+pub struct PhysicalZeroHoldSession {
+    inner: PhysicalActuationSession,
+}
+
+impl PhysicalZeroHoldSession {
+    pub fn acquire_zero_only(
+        config: ClientConfig,
+        clock_origin: Instant,
+    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
+        let timing = ActuationTiming::from_zero_client(&config);
+        let (inner, receipt) =
+            PhysicalActuationSession::acquire_from_client_config(config, clock_origin, timing)?;
+        Ok((Self { inner }, receipt))
+    }
+
+    pub fn refresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
+        self.inner.apply_fresh_zero()
+    }
+
+    pub fn disarm(mut self) -> Result<DisarmReceipt, LiveActuationError> {
+        self.inner.disarm()
+    }
+
+    pub const fn is_consumed(&self) -> bool {
+        self.inner.is_consumed()
+    }
+}
+
 impl PhysicalActuationSession {
     pub fn acquire(
         config: &NavigationActuationConfigV1,
         clock_origin: Instant,
     ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
-        let transport = UdpV2Transport::connect_canonical(config.command_endpoint())
+        Self::acquire_from_client_config(
+            config.client_config(),
+            clock_origin,
+            ActuationTiming::from_authority(config),
+        )
+    }
+
+    fn acquire_from_client_config(
+        config: ClientConfig,
+        clock_origin: Instant,
+        timing: ActuationTiming,
+    ) -> Result<(Self, AppliedCommandReceipt), LiveActuationError> {
+        let transport = UdpV2Transport::connect_canonical(config.endpoint())
             .map_err(LiveActuationError::TransportBuild)?;
         let clock = ActuationMonotonicClock::new(clock_origin);
-        let client = DisarmedCommandClient::new(transport, clock, config.client_config());
+        let client = DisarmedCommandClient::new(transport, clock, config);
         let (armed, receipt) = client.acquire_zero().map_err(LiveActuationError::Acquire)?;
         Ok((
             Self {
                 armed: Some(armed),
                 clock,
-                timing: ActuationTiming::from_authority(config),
+                timing,
             },
             receipt,
         ))
