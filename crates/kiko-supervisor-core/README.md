@@ -10,8 +10,9 @@ Important invariants:
 - inventory readiness and an explicit arm request are separate facts;
 - commissioning, manual driving, point navigation, and exploration are
   mutually exclusive;
-- a fresh, exact STM32-applied zero is required before initial authority,
-  handover, lease-expiry recovery, or disarm completion;
+- a fresh, exact STM32-applied zero from the inventory-bound control epoch and
+  observed strictly after the corresponding stop request is required before
+  initial authority, handover, lease-expiry recovery, or disarm completion;
 - equality at a lease deadline is expired;
 - controller identity changes, clock regression, and faults latch the
   supervisor and require inventory again; and

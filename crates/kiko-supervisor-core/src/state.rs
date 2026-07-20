@@ -100,6 +100,7 @@ pub enum SupervisorState {
     AwaitingZero {
         readiness: ReadinessBinding,
         reason: StopReason,
+        zero_required_after: MonotonicInstant,
     },
     ReadyStopped {
         readiness: ReadinessBinding,
@@ -254,7 +255,7 @@ impl RobotSupervisor {
             return Err(self.invalid_transition("arm"));
         };
         self.commit_time(now);
-        Ok(self.await_zero(readiness, StopReason::Arming, AfterZero::Ready))
+        Ok(self.await_zero(readiness, StopReason::Arming, AfterZero::Ready, now))
     }
 
     pub fn request_authority(
@@ -276,6 +277,7 @@ impl RobotSupervisor {
                 readiness,
                 StopReason::ZeroEvidenceStale,
                 AfterZero::Activate(lease),
+                now,
             ));
         }
         self.state = SupervisorState::Active { readiness, lease };
@@ -299,6 +301,7 @@ impl RobotSupervisor {
             readiness,
             StopReason::AuthorityHandover,
             AfterZero::Activate(lease),
+            now,
         ))
     }
 
@@ -324,6 +327,7 @@ impl RobotSupervisor {
                 readiness,
                 StopReason::AuthorityLeaseExpired,
                 AfterZero::Ready,
+                now,
             ));
         }
         let renewed = self.build_lease(id, lease.mode, readiness.epoch(), duration, now)?;
@@ -351,7 +355,12 @@ impl RobotSupervisor {
             });
         }
         self.commit_time(now);
-        Ok(self.await_zero(readiness, StopReason::AuthorityReleased, AfterZero::Ready))
+        Ok(self.await_zero(
+            readiness,
+            StopReason::AuthorityReleased,
+            AfterZero::Ready,
+            now,
+        ))
     }
 
     pub fn disarm(&mut self, now: MonotonicInstant) -> Result<SupervisorAction, SupervisorError> {
@@ -364,7 +373,12 @@ impl RobotSupervisor {
             SupervisorState::ReadyStopped { readiness, .. }
             | SupervisorState::Active { readiness, .. } => {
                 self.commit_time(now);
-                Ok(self.await_zero(readiness, StopReason::ExplicitDisarm, AfterZero::Disarmed))
+                Ok(self.await_zero(
+                    readiness,
+                    StopReason::ExplicitDisarm,
+                    AfterZero::Disarmed,
+                    now,
+                ))
             }
             _ => Err(self.invalid_transition("disarm")),
         }
@@ -376,9 +390,20 @@ impl RobotSupervisor {
         now: MonotonicInstant,
     ) -> Result<SupervisorAction, SupervisorError> {
         self.require_time(now)?;
-        let SupervisorState::AwaitingZero { readiness, .. } = self.state else {
+        let SupervisorState::AwaitingZero {
+            readiness,
+            zero_required_after,
+            ..
+        } = self.state
+        else {
             return Err(self.invalid_transition("admit confirmed zero"));
         };
+        if zero.observed_at() <= zero_required_after {
+            return Err(SupervisorError::ZeroEvidencePredatesStopRequest {
+                observed_at_ns: zero.observed_at().as_nanos(),
+                required_after_ns: zero_required_after.as_nanos(),
+            });
+        }
         if !self.zero_is_fresh_and_bound(zero, readiness, now)? {
             return Err(SupervisorError::ZeroEvidenceStale);
         }
@@ -415,6 +440,7 @@ impl RobotSupervisor {
                     readiness,
                     StopReason::AuthorityLeaseExpired,
                     AfterZero::Ready,
+                    now,
                 ),
             _ => SupervisorAction::None,
         };
@@ -488,6 +514,12 @@ impl RobotSupervisor {
         {
             return Err(SupervisorError::ZeroControllerIdentityMismatch);
         }
+        if zero.control_epoch() != readiness.control_epoch() {
+            return Err(SupervisorError::ZeroControlEpochMismatch {
+                expected: readiness.control_epoch(),
+                actual: zero.control_epoch(),
+            });
+        }
         let Some(age_ns) = now.checked_elapsed_since(zero.observed_at()) else {
             return Err(SupervisorError::ZeroObservedInFuture {
                 observed_at_ns: zero.observed_at().as_nanos(),
@@ -502,9 +534,14 @@ impl RobotSupervisor {
         readiness: ReadinessBinding,
         reason: StopReason,
         after_zero: AfterZero,
+        zero_required_after: MonotonicInstant,
     ) -> SupervisorAction {
         self.after_zero = Some(after_zero);
-        self.state = SupervisorState::AwaitingZero { readiness, reason };
+        self.state = SupervisorState::AwaitingZero {
+            readiness,
+            reason,
+            zero_required_after,
+        };
         SupervisorAction::BaseZeroRequired { reason }
     }
 
@@ -560,6 +597,14 @@ pub enum SupervisorError {
         actual: AuthorityLeaseId,
     },
     ZeroControllerIdentityMismatch,
+    ZeroControlEpochMismatch {
+        expected: robot_protocol::v2::ControlEpoch,
+        actual: robot_protocol::v2::ControlEpoch,
+    },
+    ZeroEvidencePredatesStopRequest {
+        observed_at_ns: u64,
+        required_after_ns: u64,
+    },
     ZeroObservedInFuture {
         observed_at_ns: u64,
         now_ns: u64,
@@ -611,17 +656,22 @@ mod tests {
             ReadinessEpoch::try_new(epoch).unwrap(),
             uid(),
             boot(),
+            ControlEpoch::try_new(9).unwrap(),
             Sha256Digest::try_new([2; 32]).unwrap(),
             Sha256Digest::try_new([3; 32]).unwrap(),
         )
     }
 
     fn zero(observed_at: u64) -> ConfirmedBaseZero {
+        zero_in_epoch(observed_at, 9)
+    }
+
+    fn zero_in_epoch(observed_at: u64, control_epoch: u32) -> ConfirmedBaseZero {
         ConfirmedBaseZero::try_from_applied_result(
             AppliedResult {
                 controller_uid: uid(),
                 boot_id: boot(),
-                control_epoch: ControlEpoch::try_new(9).unwrap(),
+                control_epoch: ControlEpoch::try_new(control_epoch).unwrap(),
                 sequence: V2CommandSequence::FIRST,
                 result: AppliedResultCode::AppliedNew,
                 timer_pwm: TimerPwm::ZERO,
@@ -789,6 +839,33 @@ mod tests {
             future.admit_confirmed_zero(wrong, at(5)),
             Err(SupervisorError::ZeroControllerIdentityMismatch)
         );
+    }
+
+    #[test]
+    fn zero_must_follow_the_stop_request_and_match_the_inventory_control_epoch() {
+        let mut supervisor = supervisor();
+        supervisor.begin_inventory(at(1)).unwrap();
+        supervisor.admit_readiness(readiness(1), at(2)).unwrap();
+        supervisor.arm(at(3)).unwrap();
+
+        assert_eq!(
+            supervisor.admit_confirmed_zero(zero(3), at(4)),
+            Err(SupervisorError::ZeroEvidencePredatesStopRequest {
+                observed_at_ns: 3,
+                required_after_ns: 3,
+            })
+        );
+        assert_eq!(
+            supervisor.admit_confirmed_zero(zero_in_epoch(4, 10), at(4)),
+            Err(SupervisorError::ZeroControlEpochMismatch {
+                expected: ControlEpoch::try_new(9).unwrap(),
+                actual: ControlEpoch::try_new(10).unwrap(),
+            })
+        );
+        assert!(matches!(
+            supervisor.state(),
+            SupervisorState::AwaitingZero { .. }
+        ));
     }
 
     #[test]

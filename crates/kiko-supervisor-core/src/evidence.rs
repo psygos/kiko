@@ -50,6 +50,7 @@ pub struct ReadinessBinding {
     epoch: ReadinessEpoch,
     controller_uid: ControllerUid,
     controller_boot_id: ControllerBootId,
+    control_epoch: ControlEpoch,
     hardware_manifest: Sha256Digest,
     calibration_bundle: Sha256Digest,
 }
@@ -59,6 +60,7 @@ impl ReadinessBinding {
         epoch: ReadinessEpoch,
         controller_uid: ControllerUid,
         controller_boot_id: ControllerBootId,
+        control_epoch: ControlEpoch,
         hardware_manifest: Sha256Digest,
         calibration_bundle: Sha256Digest,
     ) -> Self {
@@ -66,6 +68,7 @@ impl ReadinessBinding {
             epoch,
             controller_uid,
             controller_boot_id,
+            control_epoch,
             hardware_manifest,
             calibration_bundle,
         }
@@ -81,6 +84,10 @@ impl ReadinessBinding {
 
     pub const fn controller_boot_id(self) -> ControllerBootId {
         self.controller_boot_id
+    }
+
+    pub const fn control_epoch(self) -> ControlEpoch {
+        self.control_epoch
     }
 
     pub const fn hardware_manifest(self) -> Sha256Digest {
