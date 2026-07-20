@@ -3108,6 +3108,10 @@ name = "kiko-expression-core"
 version = "0.1.0"
 
 [[package]]
+name = "kiko-eye-protocol"
+version = "0.1.0"
+
+[[package]]
 name = "kiko-slam"
 version = "0.1.0"
 dependencies = [

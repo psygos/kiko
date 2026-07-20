@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/kiko-expression-core",
+  "crates/kiko-eye-protocol",
   "crates/kiko-slam",
   "crates/oak-sys",
   "comms/robot-protocol",
