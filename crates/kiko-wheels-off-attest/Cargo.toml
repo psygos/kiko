@@ -1,0 +1,7 @@
+[package]
+name = "kiko-wheels-off-attest"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
