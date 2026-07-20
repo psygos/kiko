@@ -2,8 +2,8 @@ use std::fmt;
 use std::time::Duration;
 
 use kiko_head_protocol::{
-    FrameBuildError, GoalSpeedTicksPerSecond, HeadJoint, HeadTorqueLimits, PositionAgreementError,
-    PositionAgreementTicks, TorqueLimitPermille,
+    FrameBuildError, GoalSpeedTicksPerSecond, HeadJoint, HeadPose, HeadTorqueLimits,
+    PositionAgreementError, PositionAgreementTicks, PositionTicks, TorqueLimitPermille,
 };
 
 const MAX_DEVICE_PATH_BYTES: usize = 512;
@@ -12,6 +12,11 @@ const MAX_OPERATION_TIMEOUT_MS: u64 = 5_000;
 const MAX_ARMING_FRESHNESS_MS: u64 = 5_000;
 const MAX_WRITE_ATTEMPTS: u8 = 8;
 const MAX_NOISE_BUDGET_BYTES: u16 = 1_024;
+/// Maximum admitted width of one raw-encoder startup pose window.
+///
+/// This is a structural anti-bypass bound, not a physical joint envelope. The
+/// assembly-specific minimum and maximum still require independent review.
+pub const MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS: u16 = 256;
 
 /// Weak configuration accepted at the process boundary.
 ///
@@ -169,6 +174,170 @@ impl ArmingFreshness {
 
     pub const fn get(self) -> Duration {
         self.0
+    }
+}
+
+/// Exact caller-reviewed raw-encoder windows in bow/curl/yaw/roll order.
+///
+/// Construction rejects descending, out-of-domain, and overly broad windows;
+/// in particular, the full encoder range is unrepresentable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfiguredHeadPoseBounds {
+    minimum: [PositionTicks; 4],
+    maximum: [PositionTicks; 4],
+}
+
+impl ConfiguredHeadPoseBounds {
+    pub fn try_new(
+        minimum_ticks: [u16; 4],
+        maximum_ticks: [u16; 4],
+    ) -> Result<Self, ConfiguredHeadPoseBoundsError> {
+        let mut minimum = [PositionTicks::MIN; 4];
+        let mut maximum = [PositionTicks::MIN; 4];
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            minimum[index] = PositionTicks::try_new(minimum_ticks[index]).map_err(|source| {
+                ConfiguredHeadPoseBoundsError::Position {
+                    joint,
+                    bound: ConfiguredHeadPoseBound::Minimum,
+                    source,
+                }
+            })?;
+            maximum[index] = PositionTicks::try_new(maximum_ticks[index]).map_err(|source| {
+                ConfiguredHeadPoseBoundsError::Position {
+                    joint,
+                    bound: ConfiguredHeadPoseBound::Maximum,
+                    source,
+                }
+            })?;
+            if minimum[index] > maximum[index] {
+                return Err(ConfiguredHeadPoseBoundsError::Descending {
+                    joint,
+                    minimum: minimum[index],
+                    maximum: maximum[index],
+                });
+            }
+            let span_ticks = maximum[index].get() - minimum[index].get();
+            if span_ticks > MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS {
+                return Err(ConfiguredHeadPoseBoundsError::SpanAboveMaximum {
+                    joint,
+                    minimum: minimum[index],
+                    maximum: maximum[index],
+                    span_ticks,
+                    maximum_span_ticks: MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS,
+                });
+            }
+        }
+        Ok(Self { minimum, maximum })
+    }
+
+    pub const fn minimum(self, joint: HeadJoint) -> PositionTicks {
+        self.minimum[joint as usize]
+    }
+
+    pub const fn maximum(self, joint: HeadJoint) -> PositionTicks {
+        self.maximum[joint as usize]
+    }
+
+    pub fn admit(
+        self,
+        observed_pose: HeadPose,
+    ) -> Result<HeadPoseWithinConfiguredBounds, HeadPoseBoundsAdmissionError> {
+        for joint in HeadJoint::ALL {
+            let observed = observed_pose.position(joint);
+            if observed < self.minimum(joint) || observed > self.maximum(joint) {
+                return Err(HeadPoseBoundsAdmissionError::OutsideConfiguredWindow {
+                    joint,
+                    observed,
+                    minimum: self.minimum(joint),
+                    maximum: self.maximum(joint),
+                });
+            }
+        }
+        Ok(HeadPoseWithinConfiguredBounds {
+            observed_pose,
+            configured_bounds: self,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfiguredHeadPoseBound {
+    Minimum,
+    Maximum,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfiguredHeadPoseBoundsError {
+    Position {
+        joint: HeadJoint,
+        bound: ConfiguredHeadPoseBound,
+        source: FrameBuildError,
+    },
+    Descending {
+        joint: HeadJoint,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+    },
+    SpanAboveMaximum {
+        joint: HeadJoint,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+        span_ticks: u16,
+        maximum_span_ticks: u16,
+    },
+}
+
+impl fmt::Display for ConfiguredHeadPoseBoundsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid configured Kiko head pose bounds: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for ConfiguredHeadPoseBoundsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Position { source, .. } => Some(source),
+            Self::Descending { .. } | Self::SpanAboveMaximum { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadPoseBoundsAdmissionError {
+    OutsideConfiguredWindow {
+        joint: HeadJoint,
+        observed: PositionTicks,
+        minimum: PositionTicks,
+        maximum: PositionTicks,
+    },
+}
+
+impl fmt::Display for HeadPoseBoundsAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "observed head pose was not admitted: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadPoseBoundsAdmissionError {}
+
+/// Evidence constructed only when the complete observed pose is inside all
+/// four caller-reviewed windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadPoseWithinConfiguredBounds {
+    observed_pose: HeadPose,
+    configured_bounds: ConfiguredHeadPoseBounds,
+}
+
+impl HeadPoseWithinConfiguredBounds {
+    pub const fn observed_pose(self) -> HeadPose {
+        self.observed_pose
+    }
+
+    pub const fn configured_bounds(self) -> ConfiguredHeadPoseBounds {
+        self.configured_bounds
     }
 }
 
@@ -399,6 +568,43 @@ mod tests {
             goal_speed_ticks_per_second: 100,
             torque_limit_permille: [600, 400, 400, 400],
         }
+    }
+
+    #[test]
+    fn configured_pose_windows_are_bounded_and_cannot_admit_the_full_encoder_domain() {
+        ConfiguredHeadPoseBounds::try_new(
+            [1_900; 4],
+            [1_900 + MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS; 4],
+        )
+        .expect("maximum bounded pose-window span");
+
+        assert!(matches!(
+            ConfiguredHeadPoseBounds::try_new(
+                [1_900; 4],
+                [1_901 + MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS; 4],
+            ),
+            Err(ConfiguredHeadPoseBoundsError::SpanAboveMaximum {
+                joint: HeadJoint::Bow,
+                span_ticks,
+                maximum_span_ticks: MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS,
+                ..
+            }) if span_ticks == MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS + 1
+        ));
+        assert!(matches!(
+            ConfiguredHeadPoseBounds::try_new([0; 4], [4_095; 4]),
+            Err(ConfiguredHeadPoseBoundsError::SpanAboveMaximum {
+                joint: HeadJoint::Bow,
+                span_ticks: 4_095,
+                ..
+            })
+        ));
+        assert!(matches!(
+            ConfiguredHeadPoseBounds::try_new([2_000; 4], [1_999; 4]),
+            Err(ConfiguredHeadPoseBoundsError::Descending {
+                joint: HeadJoint::Bow,
+                ..
+            })
+        ));
     }
 
     #[test]

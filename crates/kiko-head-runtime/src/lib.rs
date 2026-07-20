@@ -16,8 +16,11 @@ pub use actor::{
     start_serial_head_actor,
 };
 pub use config::{
-    ArmingFreshness, ConfigParseError, DeviceIdentity, DeviceIdentityKind, HeadRuntimeConfig,
-    HeadRuntimeConfigInput, OperationTimeout, WriteAttemptLimit,
+    ArmingFreshness, ConfigParseError, ConfiguredHeadPoseBound, ConfiguredHeadPoseBounds,
+    ConfiguredHeadPoseBoundsError, DeviceIdentity, DeviceIdentityKind,
+    HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds, HeadRuntimeConfig,
+    HeadRuntimeConfigInput, MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS, OperationTimeout,
+    WriteAttemptLimit,
 };
 pub use framing::{FrameReadError, MAX_RESPONSE_BYTES};
 pub use transport::{

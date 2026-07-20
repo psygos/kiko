@@ -11,7 +11,10 @@ use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinError, JoinHandle};
 
-use crate::config::HeadRuntimeConfig;
+use crate::config::{
+    ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds,
+    HeadRuntimeConfig,
+};
 use crate::framing::{FrameReadError, read_response_frame};
 use crate::transport::{
     AsyncByteTransport, MonotonicClock, MonotonicTime, SerialConfigurationEvidence,
@@ -192,6 +195,7 @@ pub struct VerifiedNaturalHoldEvidence {
     started_at: MonotonicTime,
     completed_at: MonotonicTime,
     observed_pose: HeadPose,
+    configured_pose: HeadPoseWithinConfiguredBounds,
     observations: [PositionObservationEvidence; 4],
     observed_goal_writes: [WriteEvidence; 4],
     torque_limit_writes: [WriteEvidence; 4],
@@ -210,6 +214,12 @@ impl VerifiedNaturalHoldEvidence {
 
     pub const fn observed_pose(&self) -> HeadPose {
         self.observed_pose
+    }
+
+    /// Typed evidence that the observed pose passed inside the actor before
+    /// any goal, torque-limit, or torque-enable write was attempted.
+    pub const fn configured_pose(&self) -> HeadPoseWithinConfiguredBounds {
+        self.configured_pose
     }
 
     pub const fn observations(&self) -> &[PositionObservationEvidence; 4] {
@@ -306,6 +316,9 @@ pub enum HeadRuntimeError {
     PoseAdmission {
         source: HeadPoseError,
     },
+    ConfiguredPoseAdmission {
+        source: HeadPoseBoundsAdmissionError,
+    },
     Write {
         stage: RuntimeStage,
         source: FrameWriteError,
@@ -369,6 +382,7 @@ impl std::error::Error for HeadRuntimeError {
             }
             Self::PositionAgreement { source, .. } => Some(source),
             Self::PoseAdmission { source } => Some(source),
+            Self::ConfiguredPoseAdmission { source } => Some(source),
             Self::Write { source, .. } => Some(source),
             Self::Cancelled { .. }
             | Self::ReadbackMismatch { .. }
@@ -574,6 +588,7 @@ pub fn spawn_head_actor<T, C>(
     transport: T,
     clock: C,
     config: HeadRuntimeConfig,
+    configured_pose_bounds: ConfiguredHeadPoseBounds,
     consent: PhysicalTorqueEnableConsent,
 ) -> Result<(HeadActorHandle, StartupReceipt, HeadActorTask), HeadActorSpawnError>
 where
@@ -583,7 +598,12 @@ where
     let runtime =
         Handle::try_current().map_err(|source| HeadActorSpawnError::NoTokioRuntime { source })?;
     Ok(spawn_head_actor_on(
-        &runtime, transport, clock, config, consent,
+        &runtime,
+        transport,
+        clock,
+        config,
+        configured_pose_bounds,
+        consent,
     ))
 }
 
@@ -592,6 +612,7 @@ fn spawn_head_actor_on<T, C>(
     transport: T,
     clock: C,
     config: HeadRuntimeConfig,
+    configured_pose_bounds: ConfiguredHeadPoseBounds,
     _consent: PhysicalTorqueEnableConsent,
 ) -> (HeadActorHandle, StartupReceipt, HeadActorTask)
 where
@@ -604,6 +625,7 @@ where
         transport,
         clock,
         config,
+        configured_pose_bounds,
     };
     let task = runtime.spawn(actor.run(receiver, startup_sender));
     (
@@ -619,6 +641,7 @@ where
 /// actor. No protocol traffic occurs until every serial setting succeeds.
 pub fn start_serial_head_actor(
     config: HeadRuntimeConfig,
+    configured_pose_bounds: ConfiguredHeadPoseBounds,
     consent: PhysicalTorqueEnableConsent,
 ) -> Result<
     (
@@ -635,8 +658,14 @@ pub fn start_serial_head_actor(
     let transport = SerialTransport::open(config.device())
         .map_err(|source| HeadActorStartError::Serial { source })?;
     let serial_evidence = transport.evidence().clone();
-    let (handle, startup, task) =
-        spawn_head_actor_on(&runtime, transport, TokioClock::new(), config, consent);
+    let (handle, startup, task) = spawn_head_actor_on(
+        &runtime,
+        transport,
+        TokioClock::new(),
+        config,
+        configured_pose_bounds,
+        consent,
+    );
     Ok((serial_evidence, handle, startup, task))
 }
 
@@ -644,6 +673,7 @@ struct HeadActor<T, C> {
     transport: T,
     clock: C,
     config: HeadRuntimeConfig,
+    configured_pose_bounds: ConfiguredHeadPoseBounds,
 }
 
 struct ControlState {
@@ -733,6 +763,21 @@ where
             .observe_joint(HeadJoint::Roll, commands, control)
             .await?;
         let observations = [bow, curl, yaw, roll];
+        let observed_pose = HeadPose::try_from_validated([
+            observations[0].validated(),
+            observations[1].validated(),
+            observations[2].validated(),
+            observations[3].validated(),
+        ])
+        .map_err(|source| HeadRuntimeError::PoseAdmission { source })?;
+        // This admission is deliberately inside the serial-owning actor and
+        // before every configuration or torque-enable write. Callers receive
+        // only the resulting evidence and cannot validate weak tick arrays a
+        // second time after the head has already been energised.
+        let configured_pose = self
+            .configured_pose_bounds
+            .admit(observed_pose)
+            .map_err(|source| HeadRuntimeError::ConfiguredPoseAdmission { source })?;
         let oldest_observation_at = observations
             .iter()
             .map(|observation| observation.second().received_at())
@@ -743,13 +788,6 @@ where
             HeadJoint::Bow,
             ArmingFreshnessCheck::BeforeConfigurationWrites,
         )?;
-        let observed_pose = HeadPose::try_from_validated([
-            observations[0].validated(),
-            observations[1].validated(),
-            observations[2].validated(),
-            observations[3].validated(),
-        ])
-        .map_err(|source| HeadRuntimeError::PoseAdmission { source })?;
         let frames = build_natural_hold_frames(
             observed_pose,
             self.config.torque_limits(),
@@ -823,6 +861,7 @@ where
             started_at,
             completed_at: self.clock.now(),
             observed_pose,
+            configured_pose,
             observations,
             observed_goal_writes,
             torque_limit_writes,
@@ -1464,6 +1503,14 @@ mod tests {
         .expect("test configuration")
     }
 
+    fn valid_pose_bounds() -> ConfiguredHeadPoseBounds {
+        ConfiguredHeadPoseBounds::try_new(
+            [2_000, 2_450, 2_800, 2_800],
+            [2_250, 2_700, 3_050, 3_050],
+        )
+        .expect("bounded test pose windows")
+    }
+
     fn status(id: ServoId, parameters: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0xff, 0xff, id.get(), 0, 0];
         bytes[3] = u8::try_from(parameters.len() + 2).expect("test response length");
@@ -1513,12 +1560,26 @@ mod tests {
         HeadActorTask,
         Arc<Mutex<FakeShared>>,
     ) {
+        spawn_fake_with_bounds(reads, config, valid_pose_bounds())
+    }
+
+    fn spawn_fake_with_bounds(
+        reads: Vec<ReadAction>,
+        config: HeadRuntimeConfig,
+        configured_pose_bounds: ConfiguredHeadPoseBounds,
+    ) -> (
+        HeadActorHandle,
+        StartupReceipt,
+        HeadActorTask,
+        Arc<Mutex<FakeShared>>,
+    ) {
         let clock = TestClock::default();
         let (transport, shared) = FakeTransport::new(clock.clone(), reads);
         let (handle, startup, task) = spawn_head_actor(
             transport,
             clock,
             config,
+            configured_pose_bounds,
             PhysicalTorqueEnableConsent::explicitly_granted(),
         )
         .expect("test runtime is active");
@@ -1550,6 +1611,14 @@ mod tests {
             .expect("verified natural hold");
         assert_eq!(
             evidence.observed_pose().positions().map(PositionTicks::get),
+            [2_127, 2_558, 2_925, 2_930]
+        );
+        assert_eq!(
+            evidence
+                .configured_pose()
+                .observed_pose()
+                .positions()
+                .map(PositionTicks::get),
             [2_127, 2_558, 2_925, 2_930]
         );
         assert!(evidence.readbacks().iter().all(|readback| {
@@ -1592,6 +1661,55 @@ mod tests {
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
         );
+    }
+
+    #[tokio::test]
+    async fn out_of_window_pose_prevents_every_goal_limit_and_enable_write() {
+        let bounds = ConfiguredHeadPoseBounds::try_new(
+            [1_900, 2_450, 2_800, 2_800],
+            [2_000, 2_700, 3_050, 3_050],
+        )
+        .expect("bounded rejecting pose windows");
+        let (handle, receipt, task, shared) =
+            spawn_fake_with_bounds(successful_reads(), valid_config(1), bounds);
+        let error = receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect_err("bow pose must be rejected before arming");
+        assert!(matches!(
+            error,
+            HeadRuntimeError::ConfiguredPoseAdmission {
+                source: HeadPoseBoundsAdmissionError::OutsideConfiguredWindow {
+                    joint: HeadJoint::Bow,
+                    observed,
+                    minimum,
+                    maximum,
+                }
+            } if observed.get() == 2_127 && minimum.get() == 1_900 && maximum.get() == 2_000
+        ));
+        drop(handle);
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::StartupFault);
+        assert!(exit.torque_disable().all_writes_completed());
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.writes.len(), 12);
+        assert!(
+            shared.writes[..8]
+                .iter()
+                .all(|write| write[4..=6] == [2, 56, 2])
+        );
+        assert!(
+            shared.writes[8..]
+                .iter()
+                .all(|write| write[5..=6] == [40, 0])
+        );
+        assert!(shared.writes.iter().all(|write| {
+            write.get(5) != Some(&48)
+                && write.get(5) != Some(&42)
+                && write.get(5..=6) != Some(&[40, 1])
+        }));
     }
 
     #[tokio::test]
@@ -2027,6 +2145,7 @@ mod tests {
             transport,
             clock,
             valid_config(1),
+            valid_pose_bounds(),
             PhysicalTorqueEnableConsent::explicitly_granted(),
         );
         assert!(matches!(
@@ -2036,6 +2155,7 @@ mod tests {
 
         let start = start_serial_head_actor(
             valid_config(1),
+            valid_pose_bounds(),
             PhysicalTorqueEnableConsent::explicitly_granted(),
         );
         assert!(matches!(
