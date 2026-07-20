@@ -20,6 +20,19 @@ mod ffi {
         Unknown,
     }
 
+    /// Raw DepthAI USB-speed readback. `Unknown` and `Unrecognized` are
+    /// boundary values and are never admitted into the public domain.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum UsbSpeed {
+        Unknown,
+        Low,
+        Full,
+        High,
+        Super,
+        SuperPlus,
+        Unrecognized,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum StreamId {
         Rgb,
@@ -64,6 +77,8 @@ mod ffi {
 
     #[derive(Debug, Clone)]
     pub struct DeviceConfig {
+        pub maximum_usb_speed: UsbSpeed,
+
         pub rgb_enabled: bool,
         pub rgb_width: u32,
         pub rgb_height: u32,
@@ -216,6 +231,7 @@ mod ffi {
         fn list_devices() -> Result<Vec<DeviceInfo>>;
         fn create_device(selector: &str, config: &DeviceConfig) -> Result<UniquePtr<OakDevice>>;
         fn is_connected(self: &OakDevice) -> bool;
+        fn get_usb_speed(self: &OakDevice) -> Result<UsbSpeed>;
         fn get_connected_device_identity(self: &OakDevice) -> Result<ConnectedDeviceIdentity>;
         fn try_get_rgb(self: Pin<&mut OakDevice>, timeout_ms: u32) -> Result<ImageFrameResult>;
         fn try_get_mono_left(
@@ -384,6 +400,205 @@ impl Vec3 {
 // CONFIGURATION - Parsed once at the Device::connect boundary
 // ============================================================================
 
+/// A known USB link speed in increasing transport-rate order.
+///
+/// The names deliberately match DepthAI's v3 `dai::UsbSpeed` values. The
+/// native `UNKNOWN` readback is excluded: admitting it would turn missing
+/// evidence into a transport claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UsbTransportSpeed {
+    Low,
+    Full,
+    High,
+    Super,
+    SuperPlus,
+}
+
+impl UsbTransportSpeed {
+    pub const fn as_depthai_name(self) -> &'static str {
+        match self {
+            Self::Low => "LOW",
+            Self::Full => "FULL",
+            Self::High => "HIGH",
+            Self::Super => "SUPER",
+            Self::SuperPlus => "SUPER_PLUS",
+        }
+    }
+
+    /// Parse one exact DepthAI v3 USB-speed name.
+    pub fn parse(value: &str) -> Result<Self, UsbTransportSpeedParseError> {
+        match value {
+            "LOW" => Ok(Self::Low),
+            "FULL" => Ok(Self::Full),
+            "HIGH" => Ok(Self::High),
+            "SUPER" => Ok(Self::Super),
+            "SUPER_PLUS" => Ok(Self::SuperPlus),
+            _ => Err(UsbTransportSpeedParseError),
+        }
+    }
+
+    #[cfg(not(oak_sys_check_only))]
+    fn to_ffi(self) -> ffi::UsbSpeed {
+        match self {
+            Self::Low => ffi::UsbSpeed::Low,
+            Self::Full => ffi::UsbSpeed::Full,
+            Self::High => ffi::UsbSpeed::High,
+            Self::Super => ffi::UsbSpeed::Super,
+            Self::SuperPlus => ffi::UsbSpeed::SuperPlus,
+        }
+    }
+}
+
+impl std::fmt::Display for UsbTransportSpeed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_depthai_name())
+    }
+}
+
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error("OAK USB transport speed must be exactly one of LOW, FULL, HIGH, SUPER, SUPER_PLUS")]
+pub struct UsbTransportSpeedParseError;
+
+/// Requested maximum and admitted minimum USB link speed for one connection.
+///
+/// Construction makes `minimum <= maximum` unrepresentable. A HIGH/HIGH
+/// policy is available for deliberately bandwidth-limited diagnostics; camera
+/// production constructors use SUPER/SUPER.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbTransportPolicy {
+    maximum: UsbTransportSpeed,
+    minimum: UsbTransportSpeed,
+}
+
+impl UsbTransportPolicy {
+    pub fn try_new(
+        maximum: UsbTransportSpeed,
+        minimum: UsbTransportSpeed,
+    ) -> Result<Self, UsbTransportPolicyError> {
+        if minimum > maximum {
+            return Err(UsbTransportPolicyError::MinimumAboveMaximum { minimum, maximum });
+        }
+        Ok(Self { maximum, minimum })
+    }
+
+    /// Production camera policy: request and require USB 3 SuperSpeed.
+    pub const fn super_speed_required() -> Self {
+        Self {
+            maximum: UsbTransportSpeed::Super,
+            minimum: UsbTransportSpeed::Super,
+        }
+    }
+
+    /// Explicit USB 2 HIGH diagnostic policy; never selected implicitly.
+    pub const fn high_speed_diagnostic() -> Self {
+        Self {
+            maximum: UsbTransportSpeed::High,
+            minimum: UsbTransportSpeed::High,
+        }
+    }
+
+    pub const fn maximum(self) -> UsbTransportSpeed {
+        self.maximum
+    }
+
+    pub const fn minimum(self) -> UsbTransportSpeed {
+        self.minimum
+    }
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbTransportPolicyError {
+    #[error("OAK USB minimum transport speed {minimum} exceeds requested maximum {maximum}")]
+    MinimumAboveMaximum {
+        minimum: UsbTransportSpeed,
+        maximum: UsbTransportSpeed,
+    },
+}
+
+/// Transport evidence captured from the already-selected device after its
+/// pipeline started and admitted against the parsed policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsbTransportAdmissionEvidence {
+    requested_maximum: UsbTransportSpeed,
+    required_minimum: UsbTransportSpeed,
+    observed: UsbTransportSpeed,
+}
+
+impl UsbTransportAdmissionEvidence {
+    pub const fn requested_maximum(self) -> UsbTransportSpeed {
+        self.requested_maximum
+    }
+
+    pub const fn required_minimum(self) -> UsbTransportSpeed {
+        self.required_minimum
+    }
+
+    pub const fn observed(self) -> UsbTransportSpeed {
+        self.observed
+    }
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbTransportAdmissionError {
+    #[error("DepthAI returned UNKNOWN for the connected OAK USB speed")]
+    UnknownReadback,
+
+    #[error("DepthAI returned an unrecognized OAK USB-speed value")]
+    UnrecognizedReadback,
+
+    #[error(
+        "connected OAK USB speed {observed} is below required minimum {required_minimum} (requested maximum {requested_maximum})"
+    )]
+    BelowMinimum {
+        observed: UsbTransportSpeed,
+        required_minimum: UsbTransportSpeed,
+        requested_maximum: UsbTransportSpeed,
+    },
+
+    #[error("connected OAK USB speed {observed} exceeds requested maximum {requested_maximum}")]
+    AboveMaximum {
+        observed: UsbTransportSpeed,
+        requested_maximum: UsbTransportSpeed,
+    },
+}
+
+#[cfg(any(test, not(oak_sys_check_only)))]
+fn admit_usb_transport(
+    policy: UsbTransportPolicy,
+    raw: ffi::UsbSpeed,
+) -> Result<UsbTransportAdmissionEvidence, UsbTransportAdmissionError> {
+    let observed = match raw {
+        ffi::UsbSpeed::Unknown => return Err(UsbTransportAdmissionError::UnknownReadback),
+        ffi::UsbSpeed::Low => UsbTransportSpeed::Low,
+        ffi::UsbSpeed::Full => UsbTransportSpeed::Full,
+        ffi::UsbSpeed::High => UsbTransportSpeed::High,
+        ffi::UsbSpeed::Super => UsbTransportSpeed::Super,
+        ffi::UsbSpeed::SuperPlus => UsbTransportSpeed::SuperPlus,
+        ffi::UsbSpeed::Unrecognized => {
+            return Err(UsbTransportAdmissionError::UnrecognizedReadback);
+        }
+        _ => return Err(UsbTransportAdmissionError::UnrecognizedReadback),
+    };
+    if observed < policy.minimum() {
+        return Err(UsbTransportAdmissionError::BelowMinimum {
+            observed,
+            required_minimum: policy.minimum(),
+            requested_maximum: policy.maximum(),
+        });
+    }
+    if observed > policy.maximum() {
+        return Err(UsbTransportAdmissionError::AboveMaximum {
+            observed,
+            requested_maximum: policy.maximum(),
+        });
+    }
+    Ok(UsbTransportAdmissionEvidence {
+        requested_maximum: policy.maximum(),
+        required_minimum: policy.minimum(),
+        observed,
+    })
+}
+
 /// RGB camera stream configuration
 #[derive(Debug, Clone, Copy)]
 pub struct RgbConfig {
@@ -454,6 +669,7 @@ impl Default for QueueConfig {
 /// Disabled streams have no associated configuration.
 #[derive(Debug, Clone)]
 pub struct DeviceConfig {
+    pub usb_transport: UsbTransportPolicy,
     pub rgb: Option<RgbConfig>,
     pub mono: Option<MonoConfig>,
     pub depth: Option<DepthConfig>,
@@ -491,6 +707,7 @@ impl DeviceConfig {
     /// All streams enabled at 640x480@30fps
     pub fn all_streams() -> Self {
         Self {
+            usb_transport: UsbTransportPolicy::super_speed_required(),
             rgb: Some(RgbConfig {
                 width: 640,
                 height: 480,
@@ -516,6 +733,7 @@ impl DeviceConfig {
     /// Only RGB stream
     pub fn rgb_only(width: u32, height: u32, fps: u32) -> Self {
         Self {
+            usb_transport: UsbTransportPolicy::super_speed_required(),
             rgb: Some(RgbConfig { width, height, fps }),
             mono: None,
             depth: None,
@@ -577,6 +795,7 @@ impl DeviceConfig {
     #[cfg(not(oak_sys_check_only))]
     fn to_ffi(&self) -> ffi::DeviceConfig {
         ffi::DeviceConfig {
+            maximum_usb_speed: self.usb_transport.maximum().to_ffi(),
             rgb_enabled: self.rgb.is_some(),
             rgb_width: self.rgb.map(|c| c.width).unwrap_or(0),
             rgb_height: self.rgb.map(|c| c.height).unwrap_or(0),
@@ -750,6 +969,12 @@ pub enum ConnectedDeviceIdentityError {
     },
 }
 
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsbTransportEvidenceError {
+    #[error("OAK native runtime is disabled by OAK_SYS_CHECK_ONLY=1")]
+    CompileOnlyNativeDisabled,
+}
+
 /// Errors when connecting to a device
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionError {
@@ -770,6 +995,12 @@ pub enum ConnectionError {
 
     #[error("OAK pipeline for selector '{selector}' did not reach the connected state")]
     NotConnected { selector: String },
+
+    #[error("DepthAI USB-speed readback failed for OAK selector '{selector}': {message}")]
+    UsbTransportReadbackNative { selector: String, message: String },
+
+    #[error("connected OAK USB transport was not admitted: {0}")]
+    UsbTransportAdmission(#[from] UsbTransportAdmissionError),
 
     #[error("connected OAK identity is invalid: {0}")]
     InvalidConnectedIdentity(#[from] ConnectedDeviceIdentityError),
@@ -1175,6 +1406,7 @@ pub struct Device {
     inner: cxx::UniquePtr<ffi::OakDevice>,
     config: DeviceConfig,
     connected_identity: ConnectedDeviceIdentity,
+    usb_transport: UsbTransportAdmissionEvidence,
 }
 
 #[cfg(not(oak_sys_check_only))]
@@ -1215,6 +1447,17 @@ impl Device {
             });
         }
 
+        // This queries the exact device already owned by the started pipeline;
+        // it does not enumerate or reopen a default device.
+        let raw_usb_speed =
+            inner
+                .get_usb_speed()
+                .map_err(|error| ConnectionError::UsbTransportReadbackNative {
+                    selector: selector.to_owned(),
+                    message: error.what().to_owned(),
+                })?;
+        let usb_transport = admit_usb_transport(config.usb_transport, raw_usb_speed)?;
+
         let raw_identity = inner.get_connected_device_identity().map_err(|error| {
             ConnectedDeviceIdentityError::Native {
                 message: error.what().to_owned(),
@@ -1226,6 +1469,7 @@ impl Device {
             inner,
             config,
             connected_identity,
+            usb_transport,
         })
     }
 
@@ -1233,6 +1477,12 @@ impl Device {
         &self,
     ) -> Result<&ConnectedDeviceIdentity, ConnectedDeviceIdentityError> {
         Ok(&self.connected_identity)
+    }
+
+    pub fn usb_transport_evidence(
+        &self,
+    ) -> Result<&UsbTransportAdmissionEvidence, UsbTransportEvidenceError> {
+        Ok(&self.usb_transport)
     }
 
     /// Get RGB frame. Returns error if RGB not enabled in config.
@@ -1369,6 +1619,12 @@ impl Device {
         &self,
     ) -> Result<&ConnectedDeviceIdentity, ConnectedDeviceIdentityError> {
         Err(ConnectedDeviceIdentityError::CompileOnlyNativeDisabled)
+    }
+
+    pub fn usb_transport_evidence(
+        &self,
+    ) -> Result<&UsbTransportAdmissionEvidence, UsbTransportEvidenceError> {
+        Err(UsbTransportEvidenceError::CompileOnlyNativeDisabled)
     }
 
     pub fn rgb(&mut self, _timeout_ms: u32) -> Result<ImageFrame, ImageError> {
@@ -1684,6 +1940,7 @@ mod tests {
 
     fn base_config() -> DeviceConfig {
         DeviceConfig {
+            usb_transport: UsbTransportPolicy::super_speed_required(),
             rgb: None,
             mono: Some(mono_config()),
             depth: None,
@@ -1824,6 +2081,101 @@ mod tests {
         );
     }
 
+    #[test]
+    fn usb_transport_speed_parser_is_exact_and_policy_orders_minimum_below_maximum() {
+        for (name, expected) in [
+            ("LOW", UsbTransportSpeed::Low),
+            ("FULL", UsbTransportSpeed::Full),
+            ("HIGH", UsbTransportSpeed::High),
+            ("SUPER", UsbTransportSpeed::Super),
+            ("SUPER_PLUS", UsbTransportSpeed::SuperPlus),
+        ] {
+            let parsed = UsbTransportSpeed::parse(name).expect("known exact DepthAI name");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_depthai_name(), name);
+        }
+        for invalid in ["", "high", "SUPER+", "UNKNOWN"] {
+            assert!(UsbTransportSpeed::parse(invalid).is_err());
+        }
+        assert!(UsbTransportSpeed::Low < UsbTransportSpeed::Full);
+        assert!(UsbTransportSpeed::Full < UsbTransportSpeed::High);
+        assert!(UsbTransportSpeed::High < UsbTransportSpeed::Super);
+        assert!(UsbTransportSpeed::Super < UsbTransportSpeed::SuperPlus);
+
+        assert_eq!(
+            UsbTransportPolicy::try_new(UsbTransportSpeed::High, UsbTransportSpeed::Super),
+            Err(UsbTransportPolicyError::MinimumAboveMaximum {
+                minimum: UsbTransportSpeed::Super,
+                maximum: UsbTransportSpeed::High,
+            })
+        );
+        assert_eq!(
+            UsbTransportPolicy::high_speed_diagnostic(),
+            UsbTransportPolicy::try_new(UsbTransportSpeed::High, UsbTransportSpeed::High)
+                .expect("HIGH diagnostic policy")
+        );
+    }
+
+    #[test]
+    fn usb_transport_admission_rejects_unknown_and_below_minimum_readbacks() {
+        let policy =
+            UsbTransportPolicy::try_new(UsbTransportSpeed::SuperPlus, UsbTransportSpeed::Super)
+                .expect("ordered transport policy");
+
+        assert_eq!(
+            admit_usb_transport(policy, ffi::UsbSpeed::Unknown),
+            Err(UsbTransportAdmissionError::UnknownReadback)
+        );
+        assert_eq!(
+            admit_usb_transport(policy, ffi::UsbSpeed::Unrecognized),
+            Err(UsbTransportAdmissionError::UnrecognizedReadback)
+        );
+        assert_eq!(
+            admit_usb_transport(policy, ffi::UsbSpeed::High),
+            Err(UsbTransportAdmissionError::BelowMinimum {
+                observed: UsbTransportSpeed::High,
+                required_minimum: UsbTransportSpeed::Super,
+                requested_maximum: UsbTransportSpeed::SuperPlus,
+            })
+        );
+
+        let capped = UsbTransportPolicy::super_speed_required();
+        assert_eq!(
+            admit_usb_transport(capped, ffi::UsbSpeed::SuperPlus),
+            Err(UsbTransportAdmissionError::AboveMaximum {
+                observed: UsbTransportSpeed::SuperPlus,
+                requested_maximum: UsbTransportSpeed::Super,
+            })
+        );
+
+        let evidence = admit_usb_transport(policy, ffi::UsbSpeed::Super)
+            .expect("minimum transport speed is admissible");
+        assert_eq!(
+            (
+                evidence.requested_maximum(),
+                evidence.required_minimum(),
+                evidence.observed(),
+            ),
+            (
+                UsbTransportSpeed::SuperPlus,
+                UsbTransportSpeed::Super,
+                UsbTransportSpeed::Super,
+            )
+        );
+    }
+
+    #[test]
+    fn production_camera_constructors_require_super_speed() {
+        assert_eq!(
+            DeviceConfig::all_streams().usb_transport,
+            UsbTransportPolicy::super_speed_required()
+        );
+        assert_eq!(
+            DeviceConfig::rgb_only(640, 480, 30).usb_transport,
+            UsbTransportPolicy::super_speed_required()
+        );
+    }
+
     #[cfg(oak_sys_check_only)]
     #[test]
     fn compile_only_mode_never_claims_native_build_provenance() {
@@ -1831,6 +2183,10 @@ mod tests {
             depthai_build_metadata(),
             Err(DepthAiBuildMetadataError::CompileOnlyNativeDisabled)
         );
+        assert!(matches!(
+            Device::connect("mxid-123", base_config()),
+            Err(ConnectionError::CompileOnlyNativeDisabled)
+        ));
     }
 
     #[test]
@@ -1845,6 +2201,7 @@ mod tests {
     fn device_config_rejects_no_streams_and_zero_queue() {
         assert_eq!(
             DeviceConfig {
+                usb_transport: UsbTransportPolicy::super_speed_required(),
                 rgb: None,
                 mono: None,
                 depth: None,
@@ -1917,6 +2274,7 @@ mod tests {
             ("fps", 640, 480, 0),
         ] {
             let config = DeviceConfig {
+                usb_transport: UsbTransportPolicy::super_speed_required(),
                 rgb: None,
                 mono: None,
                 depth: Some(DepthConfig {
@@ -1938,6 +2296,7 @@ mod tests {
         }
 
         let config = DeviceConfig {
+            usb_transport: UsbTransportPolicy::super_speed_required(),
             rgb: None,
             mono: None,
             depth: None,
@@ -2347,12 +2706,14 @@ mod tests {
             13.0
         );
         let component = f32::MAX / 4.0;
-        assert!(Vec3 {
-            x: component,
-            y: component,
-            z: component,
-        }
-        .magnitude()
-        .is_finite());
+        assert!(
+            Vec3 {
+                x: component,
+                y: component,
+                z: component,
+            }
+            .magnitude()
+            .is_finite()
+        );
     }
 }

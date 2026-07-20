@@ -90,7 +90,8 @@ use oak_sys::{
     ConnectedDeviceIdentityError, DepthAiBuildMetadataError, DepthAlignment, DepthConfig,
     DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
     ImageFrame as OakImageFrame, ImuConfig, ImuError, Intrinsics as OakIntrinsics, MonoConfig,
-    QueueConfig, StreamId as OakStreamId,
+    QueueConfig, StreamId as OakStreamId, UsbTransportEvidenceError, UsbTransportPolicy,
+    UsbTransportSpeed,
 };
 #[cfg(all(feature = "record", feature = "actuation"))]
 use robot_command_client::AppliedCommandReceipt;
@@ -2343,6 +2344,9 @@ enum OakRuntimeProvenanceError {
     ConnectedIdentity {
         source: ConnectedDeviceIdentityError,
     },
+    UsbTransport {
+        source: UsbTransportEvidenceError,
+    },
     LinkedDepthAiBuildMetadata {
         source: DepthAiBuildMetadataError,
     },
@@ -2354,6 +2358,9 @@ impl std::fmt::Display for OakRuntimeProvenanceError {
         match self {
             Self::ConnectedIdentity { source } => {
                 write!(f, "could not read actual connected OAK identity: {source}")
+            }
+            Self::UsbTransport { source } => {
+                write!(f, "could not read admitted OAK USB transport: {source}")
             }
             Self::LinkedDepthAiBuildMetadata { source } => {
                 write!(f, "could not read linked DepthAI build metadata: {source}")
@@ -2367,6 +2374,7 @@ impl std::error::Error for OakRuntimeProvenanceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ConnectedIdentity { source } => Some(source),
+            Self::UsbTransport { source } => Some(source),
             Self::LinkedDepthAiBuildMetadata { source } => Some(source),
         }
     }
@@ -2376,6 +2384,9 @@ impl std::error::Error for OakRuntimeProvenanceError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OakRuntimeProvenance {
     connected_mxid: String,
+    usb_requested_maximum: UsbTransportSpeed,
+    usb_required_minimum: UsbTransportSpeed,
+    usb_observed: UsbTransportSpeed,
     depthai_sdk_version: String,
     depthai_sdk_commit: String,
     embedded_device_artifact_version: String,
@@ -2386,8 +2397,11 @@ struct OakRuntimeProvenance {
 impl OakRuntimeProvenance {
     fn dataset_device_label(&self) -> String {
         format!(
-            "OAK-D mxid={} depthai_sdk={} depthai_commit={} embedded_device={} embedded_bootloader={} timestamp=device_exposure_midpoint",
+            "OAK-D mxid={} usb_requested_maximum={} usb_required_minimum={} usb_observed={} depthai_sdk={} depthai_commit={} embedded_device={} embedded_bootloader={} timestamp=device_exposure_midpoint",
             self.connected_mxid,
+            self.usb_requested_maximum,
+            self.usb_required_minimum,
+            self.usb_observed,
             self.depthai_sdk_version,
             self.depthai_sdk_commit,
             self.embedded_device_artifact_version,
@@ -2404,6 +2418,9 @@ fn inspect_oak_runtime(
     let connected = device
         .connected_identity()
         .map_err(|source| OakRuntimeProvenanceError::ConnectedIdentity { source })?;
+    let usb = device
+        .usb_transport_evidence()
+        .map_err(|source| OakRuntimeProvenanceError::UsbTransport { source })?;
     let build = oak_sys::depthai_build_metadata()
         .map_err(|source| OakRuntimeProvenanceError::LinkedDepthAiBuildMetadata { source })?;
 
@@ -2415,6 +2432,12 @@ fn inspect_oak_runtime(
         connected.product_name(),
     );
     eprintln!(
+        "{context} OAK USB transport: requested_maximum={} required_minimum={} observed={}",
+        usb.requested_maximum(),
+        usb.required_minimum(),
+        usb.observed(),
+    );
+    eprintln!(
         "{context} DepthAI build provenance: sdk_version={:?} sdk_commit={:?} embedded_device_artifact={:?} embedded_bootloader_artifact={:?} camera_timestamp=device_exposure_midpoint",
         build.sdk_version(),
         build.sdk_commit(),
@@ -2424,6 +2447,9 @@ fn inspect_oak_runtime(
 
     Ok(OakRuntimeProvenance {
         connected_mxid: connected.mxid().to_owned(),
+        usb_requested_maximum: usb.requested_maximum(),
+        usb_required_minimum: usb.required_minimum(),
+        usb_observed: usb.observed(),
         depthai_sdk_version: build.sdk_version().to_owned(),
         depthai_sdk_commit: build.sdk_commit().to_owned(),
         embedded_device_artifact_version: build.embedded_device_artifact_version().to_owned(),
@@ -3072,6 +3098,7 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
 
     let config = DeviceConfig {
+        usb_transport: UsbTransportPolicy::super_speed_required(),
         rgb: None,
         mono: Some(mono_config),
         depth: depth_config,
@@ -5540,6 +5567,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         alignment: DepthAlignment::RectifiedLeft,
     });
     let config = DeviceConfig {
+        usb_transport: UsbTransportPolicy::super_speed_required(),
         rgb: None,
         mono: Some(mono_config),
         depth: depth_config,
@@ -7203,6 +7231,9 @@ mod tests {
     fn dataset_device_label_retains_runtime_identity_and_build_provenance() {
         let provenance = OakRuntimeProvenance {
             connected_mxid: "mxid-123".to_owned(),
+            usb_requested_maximum: oak_sys::UsbTransportSpeed::Super,
+            usb_required_minimum: oak_sys::UsbTransportSpeed::Super,
+            usb_observed: oak_sys::UsbTransportSpeed::Super,
             depthai_sdk_version: "3.6.1".to_owned(),
             depthai_sdk_commit: "commit-abc".to_owned(),
             embedded_device_artifact_version: "device-1".to_owned(),
@@ -7210,7 +7241,7 @@ mod tests {
         };
         assert_eq!(
             provenance.dataset_device_label(),
-            "OAK-D mxid=mxid-123 depthai_sdk=3.6.1 depthai_commit=commit-abc embedded_device=device-1 embedded_bootloader=bootloader-1 timestamp=device_exposure_midpoint"
+            "OAK-D mxid=mxid-123 usb_requested_maximum=SUPER usb_required_minimum=SUPER usb_observed=SUPER depthai_sdk=3.6.1 depthai_commit=commit-abc embedded_device=device-1 embedded_bootloader=bootloader-1 timestamp=device_exposure_midpoint"
         );
     }
 

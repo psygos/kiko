@@ -28,6 +28,7 @@ struct DepthFrameResult;
 struct ImuBatchResult;
 
 enum class DeviceState : uint8_t;
+enum class UsbSpeed : uint8_t;
 enum class StreamId : uint8_t;
 enum class FrameStatus : uint8_t;
 enum class ImuStatus : uint8_t;
@@ -43,6 +44,7 @@ public:
     OakDevice& operator=(const OakDevice&) = delete;
 
     bool is_connected() const noexcept;
+    UsbSpeed get_usb_speed() const;
 
     ImageFrameResult try_get_rgb(uint32_t timeout_ms);
     ImageFrameResult try_get_mono_left(uint32_t timeout_ms);

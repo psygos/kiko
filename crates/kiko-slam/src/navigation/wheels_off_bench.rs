@@ -37,6 +37,7 @@ use kiko_supervisor_core::{
 use oak_sys::{
     ConnectedDeviceIdentityError, ConnectionError, DepthAlignment, DepthError, DepthFrame, Device,
     DeviceConfig, DeviceConfigError, ImageError, ImageFrame, ImuError, ImuSample, StreamId,
+    UsbTransportEvidenceError, UsbTransportSpeed,
 };
 
 use crate::HostMonotonicTimestamp;
@@ -178,6 +179,12 @@ impl WheelsOffBenchOakConfig {
         if device.imu.is_none() {
             return Err(WheelsOffBenchOakConfigError::RequiredStreamDisabled { stream: "IMU" });
         }
+        if device.usb_transport.minimum() < UsbTransportSpeed::Super {
+            return Err(WheelsOffBenchOakConfigError::UsbMinimumBelowProduction {
+                actual: device.usb_transport.minimum(),
+                required: UsbTransportSpeed::Super,
+            });
+        }
         Ok(Self {
             expected_mxid: expected_mxid.into_boxed_str(),
             device,
@@ -213,6 +220,10 @@ pub enum WheelsOffBenchOakConfigError {
     DepthAlignment {
         actual: DepthAlignment,
         required: DepthAlignment,
+    },
+    UsbMinimumBelowProduction {
+        actual: UsbTransportSpeed,
+        required: UsbTransportSpeed,
     },
 }
 
@@ -853,6 +864,9 @@ pub struct BenchOakConnectionEvidence {
     discovery_transport_name: Option<Box<str>>,
     eeprom_device_name: Option<Box<str>>,
     product_name: Option<Box<str>>,
+    usb_requested_maximum: UsbTransportSpeed,
+    usb_required_minimum: UsbTransportSpeed,
+    usb_observed: UsbTransportSpeed,
 }
 
 impl BenchOakConnectionEvidence {
@@ -874,6 +888,18 @@ impl BenchOakConnectionEvidence {
 
     pub fn product_name(&self) -> Option<&str> {
         self.product_name.as_deref()
+    }
+
+    pub const fn usb_requested_maximum(&self) -> UsbTransportSpeed {
+        self.usb_requested_maximum
+    }
+
+    pub const fn usb_required_minimum(&self) -> UsbTransportSpeed {
+        self.usb_required_minimum
+    }
+
+    pub const fn usb_observed(&self) -> UsbTransportSpeed {
+        self.usb_observed
     }
 }
 
@@ -2016,6 +2042,7 @@ pub enum NativeWheelsOffOakError {
     NotConnected,
     Connect(ConnectionError),
     ConnectedIdentity(ConnectedDeviceIdentityError),
+    UsbTransportEvidence(UsbTransportEvidenceError),
     Rgb(ImageError),
     Depth(DepthError),
     Imu(ImuError),
@@ -2037,6 +2064,7 @@ impl std::error::Error for NativeWheelsOffOakError {
         match self {
             Self::Connect(source) => Some(source),
             Self::ConnectedIdentity(source) => Some(source),
+            Self::UsbTransportEvidence(source) => Some(source),
             Self::Rgb(source) => Some(source),
             Self::Depth(source) => Some(source),
             Self::Imu(source) => Some(source),
@@ -2065,12 +2093,18 @@ impl WheelsOffOakPort for NativeWheelsOffOakPort {
         let identity = device
             .connected_identity()
             .map_err(NativeWheelsOffOakError::ConnectedIdentity)?;
+        let usb = device
+            .usb_transport_evidence()
+            .map_err(NativeWheelsOffOakError::UsbTransportEvidence)?;
         let evidence = BenchOakConnectionEvidence {
             requested_mxid: requested_mxid.into(),
             opened_mxid: identity.mxid().into(),
             discovery_transport_name: identity.discovery_transport_name().map(Into::into),
             eeprom_device_name: identity.eeprom_device_name().map(Into::into),
             product_name: identity.product_name().map(Into::into),
+            usb_requested_maximum: usb.requested_maximum(),
+            usb_required_minimum: usb.required_minimum(),
+            usb_observed: usb.observed(),
         };
         self.device = Some(device);
         Ok(evidence)
@@ -2238,6 +2272,17 @@ impl WheelsOffTelemetryPort<NativeWheelsOffOakPort> for RerunWheelsOffTelemetry 
             .log_static(
                 "bench/camera/opened_mxid",
                 &rerun::TextLog::new(connection.opened_mxid()),
+            )
+            .map_err(RerunWheelsOffError::Recording)?;
+        self.recording
+            .log_static(
+                "bench/camera/usb_transport",
+                &rerun::TextLog::new(format!(
+                    "requested_maximum={} required_minimum={} observed={}",
+                    connection.usb_requested_maximum(),
+                    connection.usb_required_minimum(),
+                    connection.usb_observed(),
+                )),
             )
             .map_err(RerunWheelsOffError::Recording)?;
         self.recording
@@ -2447,7 +2492,7 @@ mod tests {
         AuthorityDuration, ReadinessEpoch, Sha256Digest, StopReason, SupervisorAction,
         SupervisorConfig,
     };
-    use oak_sys::{DepthConfig, ImuConfig, MonoConfig, QueueConfig, RgbConfig};
+    use oak_sys::{DepthConfig, ImuConfig, MonoConfig, QueueConfig, RgbConfig, UsbTransportPolicy};
     use robot_protocol::ControllerUptimeMsWrapping;
     use robot_protocol::v2::{
         ControlEpoch, ControllerBootId, ControllerDeadlineMsWrapping, ControllerFaults,
@@ -2585,6 +2630,7 @@ mod tests {
 
     fn navigation_oak_device_config() -> DeviceConfig {
         DeviceConfig {
+            usb_transport: UsbTransportPolicy::super_speed_required(),
             rgb: Some(RgbConfig {
                 width: 640,
                 height: 480,
@@ -2697,7 +2743,12 @@ mod tests {
                 "frame_freshness_ms":80,
                 "brightness_basis_points":7000,
                 "color_rgb":[32,128,255],
-                "blink":false
+                "blink":false,
+                "gaze_geometry": {
+                    "schema_version":1,
+                    "head_origin_in_camera_m":[0.0,-0.25,-0.20],
+                    "neutral_head_from_camera_quaternion_xyzw":[0.0,0.0,0.0,1.0]
+                }
             },
             "supervisor": {
                 "maximum_authority_lease_ms":1000,
@@ -2888,6 +2939,9 @@ mod tests {
                 discovery_transport_name: None,
                 eeprom_device_name: None,
                 product_name: None,
+                usb_requested_maximum: config.device().usb_transport.maximum(),
+                usb_required_minimum: config.device().usb_transport.minimum(),
+                usb_observed: UsbTransportSpeed::Super,
             })
         }
 
@@ -3159,6 +3213,16 @@ mod tests {
 
     #[test]
     fn oak_contract_rejects_a_different_pipeline_than_navigation() {
+        let mut usb2_diagnostic = navigation_oak_device_config();
+        usb2_diagnostic.usb_transport = UsbTransportPolicy::high_speed_diagnostic();
+        assert!(matches!(
+            WheelsOffBenchOakConfig::try_new("ABCDEF1234567890".into(), usb2_diagnostic),
+            Err(WheelsOffBenchOakConfigError::UsbMinimumBelowProduction {
+                actual: UsbTransportSpeed::High,
+                required: UsbTransportSpeed::Super,
+            })
+        ));
+
         let mut rgb_aligned = navigation_oak_device_config();
         rgb_aligned.depth.as_mut().expect("depth enabled").alignment = DepthAlignment::Rgb;
         assert!(matches!(

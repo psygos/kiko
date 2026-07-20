@@ -4,7 +4,7 @@ Requires=kiko-robot-server.service
 After=kiko-robot-server.service
 ConditionPathIsExecutable=/opt/kiko/bin/kiko-nano-wheels-off-bench
 ConditionPathIsExecutable=/opt/kiko/bin/kiko-wheels-off-attest
-ConditionPathIsRegular=/opt/kiko/deployment/nano-wheels-off-bench-v1.json
+ConditionPathIsRegular=/opt/kiko/deployment/nano-wheels-off-bench-v2.json
 
 [Service]
 Type=exec
@@ -14,7 +14,7 @@ WorkingDirectory=/opt/kiko
 Environment=RUST_LOG=info
 # Atomically claim, verify, and always consume the exact root-owned set.
 ExecStartPre=+/opt/kiko/bin/kiko-wheels-off-attest
-ExecStart=/opt/kiko/bin/kiko-nano-wheels-off-bench --deployment-root /opt/kiko/deployment --config nano-wheels-off-bench-v1.json --wheels-removed --head-path-clear --power-cut-reachable
+ExecStart=/opt/kiko/bin/kiko-nano-wheels-off-bench --deployment-root /opt/kiko/deployment --config nano-wheels-off-bench-v2.json --wheels-removed --head-path-clear --power-cut-reachable
 Restart=no
 # Outer ceiling includes bounded startup, the 900-second running phase, and
 # normal cleanup slack. TimeoutStopSec begins only after systemd sends SIGTERM.

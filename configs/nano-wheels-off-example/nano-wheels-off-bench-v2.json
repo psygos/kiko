@@ -1,10 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "agent_policy_asset": "agent-policy-v1.json",
   "zero_only_policy_asset": "nano-zero-only-v1.json",
   "controller_server_asset": "controller-server-v1.json",
   "command_bind": "127.0.0.1:8080",
   "oak": {
+    "maximum_usb_speed": "SUPER",
+    "minimum_usb_speed": "SUPER",
     "rgb_width_px": 640,
     "rgb_height_px": 480,
     "rgb_fps": 30,

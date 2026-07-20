@@ -5,13 +5,14 @@ It is deliberately a non-driving gate. The wheels must be physically removed
 and the robot supported before either service is started.
 
 Passing this gate means the exact configured STM32 repeatedly admitted zero,
-the exact OAK produced two ordered startup samples from RGB, depth, and IMU and
+the exact OAK negotiated and reported at least the configured USB transport
+minimum, produced two ordered startup samples from RGB, depth, and IMU, and
 continued producing RGB within a bounded liveness budget, the head startup
 transaction admitted an already-safe observed pose inside reviewed tick
 windows, and the eye firmware admitted RGB-derived expressions. It does not
-validate SLAM, wheel
-calibration, MPC, navigation, camera optics, depth accuracy, IMU calibration,
-visible eye photons, thermal behavior, or any nonzero motor command.
+validate SLAM, wheel calibration, MPC, navigation, camera optics, depth
+accuracy, IMU calibration, visible eye photons, thermal behavior, or any
+nonzero motor command.
 
 ## What “ready normal position” means
 
@@ -76,7 +77,7 @@ process as root as a shortcut.
 `configs/nano-wheels-off-example/` mirrors `/opt/kiko/deployment`:
 
 ```text
-nano-wheels-off-bench-v1.json
+nano-wheels-off-bench-v2.json
 agent-policy-v1.json
 nano-zero-only-v1.json
 controller-server-v1.json
@@ -90,6 +91,20 @@ root. The agent policy uses exact absolute paths for the inventory and artifact
 root. The server unit and bench document both select the same
 `controller-server-v1.json`; the server bind, inventory endpoint, zero-only
 endpoint, and bench bind must all equal `127.0.0.1:8080`.
+
+The OAK section names `maximum_usb_speed` and `minimum_usb_speed` with exact
+DepthAI v3 values (`LOW`, `FULL`, `HIGH`, `SUPER`, or `SUPER_PLUS`). The pair is
+parsed once and rejects a minimum above the requested maximum. This all-stream
+production bench requires a minimum of `SUPER`; the template therefore requests
+and requires `SUPER`. The core transport type can represent an explicit
+`HIGH`/`HIGH` USB 2 diagnostic, but the production wheels-off admission rejects
+it. DepthAI constructs the already-selected MXID with the requested maximum,
+starts that device's pipeline, reads `getUsbSpeed()` back from the same device,
+and fails startup before camera readiness when the readback is unknown,
+unrecognized, below the minimum, or contradicts the requested maximum. Device
+presence or a requested speed alone is not transport evidence.
+These required fields make the launch document schema version 2; the v1 file
+name and schema are not silently reinterpreted.
 
 The template is structurally shaped like a deployment but is intentionally not
 launchable. Values containing `REPLACE`, the `DEAD...` OAK MXID, `DE`/`AD`
@@ -126,7 +141,7 @@ sudo install -o root -g root -m 0755 target/release/kiko-nano-wheels-off-bench /
 sudo install -o root -g root -m 0755 target/release/kiko-wheels-off-attest /opt/kiko/bin/kiko-wheels-off-attest
 sudo install -d -o root -g root -m 0755 /opt/kiko/deployment/artifacts/calibration
 sudo install -d -o root -g root -m 0755 /opt/kiko/deployment/artifacts/plant
-sudo install -o root -g root -m 0444 configs/nano-wheels-off-example/nano-wheels-off-bench-v1.json /opt/kiko/deployment/nano-wheels-off-bench-v1.json
+sudo install -o root -g root -m 0444 configs/nano-wheels-off-example/nano-wheels-off-bench-v2.json /opt/kiko/deployment/nano-wheels-off-bench-v2.json
 sudo install -o root -g root -m 0444 configs/nano-wheels-off-example/agent-policy-v1.json /opt/kiko/deployment/agent-policy-v1.json
 sudo install -o root -g root -m 0444 configs/nano-wheels-off-example/nano-zero-only-v1.json /opt/kiko/deployment/nano-zero-only-v1.json
 sudo install -o root -g root -m 0444 configs/nano-wheels-off-example/controller-server-v1.json /opt/kiko/deployment/controller-server-v1.json
@@ -197,11 +212,11 @@ is unavailable, stop and report it as unknown.
 With both wheels still removed and power-cut access in reach:
 
 ```bash
-jq empty /opt/kiko/deployment/nano-wheels-off-bench-v1.json /opt/kiko/deployment/agent-policy-v1.json /opt/kiko/deployment/nano-zero-only-v1.json /opt/kiko/deployment/controller-server-v1.json /opt/kiko/deployment/device-inventory-v1.json
+jq empty /opt/kiko/deployment/nano-wheels-off-bench-v2.json /opt/kiko/deployment/agent-policy-v1.json /opt/kiko/deployment/nano-zero-only-v1.json /opt/kiko/deployment/controller-server-v1.json /opt/kiko/deployment/device-inventory-v1.json
 grep -R -n -E 'REPLACE|DEADDEAD|placeholder|template_only|replacement_required' /opt/kiko/deployment
 find /opt/kiko/deployment -type l -print
-jq -e '.ready_pose.minimum_ticks as $lo | .ready_pose.maximum_ticks as $hi | [range(0;4) as $i | ($lo[$i] <= $hi[$i] and ($hi[$i] - $lo[$i]) <= 256)] | all' /opt/kiko/deployment/nano-wheels-off-bench-v1.json
-sudo -u makerspace test -r /opt/kiko/deployment/nano-wheels-off-bench-v1.json
+jq -e '.ready_pose.minimum_ticks as $lo | .ready_pose.maximum_ticks as $hi | [range(0;4) as $i | ($lo[$i] <= $hi[$i] and ($hi[$i] - $lo[$i]) <= 256)] | all' /opt/kiko/deployment/nano-wheels-off-bench-v2.json
+sudo -u makerspace test -r /opt/kiko/deployment/nano-wheels-off-bench-v2.json
 sudo -u makerspace test -r /opt/kiko/deployment/controller-server-v1.json
 ```
 

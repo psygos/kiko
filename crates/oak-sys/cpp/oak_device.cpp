@@ -89,6 +89,44 @@ std::optional<ImuAccuracy> imu_accuracy(dai::IMUReport::Accuracy accuracy) noexc
     }
 }
 
+dai::UsbSpeed to_depthai_usb_speed(UsbSpeed speed) {
+    switch (speed) {
+        case UsbSpeed::Low:
+            return dai::UsbSpeed::LOW;
+        case UsbSpeed::Full:
+            return dai::UsbSpeed::FULL;
+        case UsbSpeed::High:
+            return dai::UsbSpeed::HIGH;
+        case UsbSpeed::Super:
+            return dai::UsbSpeed::SUPER;
+        case UsbSpeed::SuperPlus:
+            return dai::UsbSpeed::SUPER_PLUS;
+        case UsbSpeed::Unknown:
+        case UsbSpeed::Unrecognized:
+        default:
+            throw std::invalid_argument("UNKNOWN is not a valid requested OAK USB speed");
+    }
+}
+
+UsbSpeed from_depthai_usb_speed(dai::UsbSpeed speed) {
+    switch (speed) {
+        case dai::UsbSpeed::UNKNOWN:
+            return UsbSpeed::Unknown;
+        case dai::UsbSpeed::LOW:
+            return UsbSpeed::Low;
+        case dai::UsbSpeed::FULL:
+            return UsbSpeed::Full;
+        case dai::UsbSpeed::HIGH:
+            return UsbSpeed::High;
+        case dai::UsbSpeed::SUPER:
+            return UsbSpeed::Super;
+        case dai::UsbSpeed::SUPER_PLUS:
+            return UsbSpeed::SuperPlus;
+        default:
+            return UsbSpeed::Unrecognized;
+    }
+}
+
 template <typename T>
 T next_sequence(std::atomic<T>& sequence) {
     auto current = sequence.load(std::memory_order_relaxed);
@@ -175,7 +213,13 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
             + "' for requested id '" + selector + "'"
         );
     }
-    auto selected_device = std::make_shared<dai::Device>(device_info);
+    // DepthAI v3's `(DeviceInfo, UsbSpeed)` constructor binds the requested
+    // maximum speed to this exact MXID. Passing the selected Device into the
+    // Pipeline prevents an implicit first/default-device reopen.
+    auto selected_device = std::make_shared<dai::Device>(
+        device_info,
+        to_depthai_usb_speed(config.maximum_usb_speed)
+    );
     pipeline_ = std::make_unique<dai::Pipeline>(std::move(selected_device));
 
     if (rgb_enabled_) {
@@ -284,6 +328,17 @@ OakDevice::~OakDevice() noexcept {
 
 bool OakDevice::is_connected() const noexcept {
     return connected_ && !closed_;
+}
+
+UsbSpeed OakDevice::get_usb_speed() const {
+    if (!is_connected()) {
+        throw std::runtime_error("cannot read USB speed from a disconnected OAK pipeline");
+    }
+    const auto device = pipeline_->getDefaultDevice();
+    if (!device) {
+        throw std::runtime_error("DepthAI pipeline has no selected device for USB-speed readback");
+    }
+    return from_depthai_usb_speed(device->getUsbSpeed());
 }
 
 void OakDevice::close() {

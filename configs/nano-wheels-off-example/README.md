@@ -13,5 +13,14 @@ drive-plant artifacts.
 After read-only discovery, replace every sentinel and every hardware claim,
 install qualified artifacts, recompute their SHA-256 byte arrays in
 `device-inventory-v1.json`, and set reviewed bow/curl/yaw/roll pose windows.
+The all-stream OAK launch explicitly requests and requires DepthAI `SUPER` USB
+speed; startup reads the negotiated speed from the same exact-MXID device and
+fails closed below that minimum. Those required transport fields are why the
+bench launch document is `nano-wheels-off-bench-v2.json`; v1 is not redefined.
+The RGB gaze geometry records the current assembly claim that the neutral head
+origin is `[0,-0.25,-0.20]` metres in the OAK camera frame with parallel axes;
+its `0.32 m` magnitude is inside the parser's conservative `1 m` assembly
+limit. It enables geometry only and is not physical extrinsic or servo
+calibration evidence.
 Follow `docs/nano-wheels-off-bench.md`; never make the template launchable by
 broadening all pose windows to the full encoder range.

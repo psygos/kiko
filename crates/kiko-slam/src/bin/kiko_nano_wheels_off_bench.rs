@@ -52,13 +52,15 @@ mod enabled {
     };
     use oak_sys::{
         DepthAlignment, DepthConfig, DeviceConfig, ImuConfig, MonoConfig, QueueConfig, RgbConfig,
+        UsbTransportPolicy, UsbTransportPolicyError, UsbTransportSpeed,
+        UsbTransportSpeedParseError,
     };
     use robot_command_client::DisarmReceipt;
     use robot_server::config::{ControllerServerConfigV1, MAX_CONTROLLER_SERVER_CONFIG_JSON_BYTES};
     use serde::Deserialize;
     use tokio::task::JoinError;
 
-    const BENCH_CONFIG_V1: u32 = 1;
+    const BENCH_CONFIG_V2: u32 = 2;
     const MAX_BENCH_CONFIG_JSON_BYTES: u64 = 16 * 1_024;
     const MAX_AGENT_POLICY_JSON_BYTES: u64 = 64 * 1_024;
     const MAX_ZERO_ONLY_JSON_BYTES: u64 = 4 * 1_024;
@@ -111,6 +113,8 @@ mod enabled {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct OakConfigDto {
+        maximum_usb_speed: Option<String>,
+        minimum_usb_speed: Option<String>,
         rgb_width_px: u32,
         rgb_height_px: u32,
         rgb_fps: u32,
@@ -175,6 +179,9 @@ mod enabled {
             actual: u32,
             supported: u32,
         },
+        MissingField {
+            field: &'static str,
+        },
         AssetPath {
             field: &'static str,
             source: kiko_device_inventory::ArtifactRelativePathError,
@@ -188,6 +195,11 @@ mod enabled {
         OakPixelCountOverflow {
             stream: &'static str,
         },
+        OakUsbSpeed {
+            field: &'static str,
+            source: UsbTransportSpeedParseError,
+        },
+        OakUsbPolicy(UsbTransportPolicyError),
         OakConfig(oak_sys::DeviceConfigError),
         Capture(kiko_slam::navigation::BenchCapturePlanError),
         ReadyPose(kiko_slam::navigation::WheelsOffConfiguredPoseBoundsError),
@@ -219,6 +231,7 @@ mod enabled {
                     formatter,
                     "schema version {actual} is unsupported; expected {supported}"
                 ),
+                Self::MissingField { field } => write!(formatter, "missing required {field}"),
                 Self::AssetPath { field, source } => {
                     write!(
                         formatter,
@@ -239,6 +252,12 @@ mod enabled {
                         formatter,
                         "{stream} dimensions overflow their byte-count bound"
                     )
+                }
+                Self::OakUsbSpeed { field, source } => {
+                    write!(formatter, "{field} is invalid: {source}")
+                }
+                Self::OakUsbPolicy(source) => {
+                    write!(formatter, "OAK USB transport policy is invalid: {source}")
                 }
                 Self::OakConfig(source) => write!(formatter, "OAK pipeline is invalid: {source}"),
                 Self::Capture(source) => write!(formatter, "capture plan is invalid: {source}"),
@@ -276,11 +295,14 @@ mod enabled {
             match self {
                 Self::JsonDecode(source) | Self::JsonTrailingData(source) => Some(source),
                 Self::AssetPath { source, .. } => Some(source),
+                Self::OakUsbSpeed { source, .. } => Some(source),
+                Self::OakUsbPolicy(source) => Some(source),
                 Self::OakConfig(source) => Some(source),
                 Self::Capture(source) => Some(source),
                 Self::ReadyPose(source) => Some(source),
                 Self::Rerun(source) => Some(source),
                 Self::UnsupportedSchemaVersion { .. }
+                | Self::MissingField { .. }
                 | Self::OakFieldOutOfRange { .. }
                 | Self::OakPixelCountOverflow { .. }
                 | Self::RerunPortZero
@@ -299,10 +321,10 @@ mod enabled {
             deserializer
                 .end()
                 .map_err(BenchConfigError::JsonTrailingData)?;
-            if dto.schema_version != BENCH_CONFIG_V1 {
+            if dto.schema_version != BENCH_CONFIG_V2 {
                 return Err(BenchConfigError::UnsupportedSchemaVersion {
                     actual: dto.schema_version,
-                    supported: BENCH_CONFIG_V1,
+                    supported: BENCH_CONFIG_V2,
                 });
             }
             let agent_policy_asset =
@@ -407,6 +429,30 @@ mod enabled {
     }
 
     fn parse_oak_config(dto: OakConfigDto) -> Result<DeviceConfig, BenchConfigError> {
+        let maximum_usb_speed = dto
+            .maximum_usb_speed
+            .ok_or(BenchConfigError::MissingField {
+                field: "oak.maximum_usb_speed",
+            })?;
+        let minimum_usb_speed = dto
+            .minimum_usb_speed
+            .ok_or(BenchConfigError::MissingField {
+                field: "oak.minimum_usb_speed",
+            })?;
+        let maximum_usb_speed = UsbTransportSpeed::parse(&maximum_usb_speed).map_err(|source| {
+            BenchConfigError::OakUsbSpeed {
+                field: "oak.maximum_usb_speed",
+                source,
+            }
+        })?;
+        let minimum_usb_speed = UsbTransportSpeed::parse(&minimum_usb_speed).map_err(|source| {
+            BenchConfigError::OakUsbSpeed {
+                field: "oak.minimum_usb_speed",
+                source,
+            }
+        })?;
+        let usb_transport = UsbTransportPolicy::try_new(maximum_usb_speed, minimum_usb_speed)
+            .map_err(BenchConfigError::OakUsbPolicy)?;
         let rgb_width =
             bounded_oak_field("oak.rgb_width_px", dto.rgb_width_px, MAX_OAK_DIMENSION_PX)?;
         let rgb_height =
@@ -438,6 +484,7 @@ mod enabled {
         // mono, rectified-left depth, and equal stereo shape/timing. RGB-aligned
         // depth would silently change the projection frame used by SLAM.
         let config = DeviceConfig {
+            usb_transport,
             rgb: Some(RgbConfig {
                 width: rgb_width,
                 height: rgb_height,
@@ -484,12 +531,14 @@ mod enabled {
 
         fn bench_document(memory_limit_bytes: u64) -> Vec<u8> {
             serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "agent_policy_asset": "agent-policy-v1.json",
                 "zero_only_policy_asset": "nano-zero-only-v1.json",
                 "controller_server_asset": "controller-server-v1.json",
                 "command_bind": "127.0.0.1:8080",
                 "oak": {
+                    "maximum_usb_speed": "SUPER",
+                    "minimum_usb_speed": "SUPER",
                     "rgb_width_px": 640,
                     "rgb_height_px": 480,
                     "rgb_fps": 30,
@@ -535,6 +584,71 @@ mod enabled {
                     }) if actual == actual_bytes
                 ));
             }
+        }
+
+        #[test]
+        fn oak_usb_policy_parses_exact_names_once_and_keeps_high_diagnostic_representable() {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&bench_document(MIN_RERUN_SERVER_MEMORY_BYTES))
+                    .expect("decode bench fixture");
+            document["oak"]["maximum_usb_speed"] = serde_json::json!("HIGH");
+            document["oak"]["minimum_usb_speed"] = serde_json::json!("HIGH");
+            let bytes = serde_json::to_vec(&document).expect("serialize HIGH diagnostic fixture");
+            let parsed = BenchConfig::parse(&bytes).expect("HIGH diagnostic transport policy");
+            assert_eq!(
+                parsed.oak.usb_transport,
+                UsbTransportPolicy::high_speed_diagnostic()
+            );
+
+            document["oak"]["minimum_usb_speed"] = serde_json::json!("high");
+            let bytes = serde_json::to_vec(&document).expect("serialize invalid speed fixture");
+            assert!(matches!(
+                BenchConfig::parse(&bytes),
+                Err(BenchConfigError::OakUsbSpeed {
+                    field: "oak.minimum_usb_speed",
+                    ..
+                })
+            ));
+
+            document["oak"]["minimum_usb_speed"] = serde_json::json!("SUPER");
+            let bytes = serde_json::to_vec(&document).expect("serialize reversed policy fixture");
+            assert!(matches!(
+                BenchConfig::parse(&bytes),
+                Err(BenchConfigError::OakUsbPolicy(
+                    UsbTransportPolicyError::MinimumAboveMaximum {
+                        minimum: UsbTransportSpeed::Super,
+                        maximum: UsbTransportSpeed::High,
+                    }
+                ))
+            ));
+        }
+
+        #[test]
+        fn transport_fields_are_not_silently_added_to_the_v1_schema() {
+            let mut document: serde_json::Value =
+                serde_json::from_slice(&bench_document(MIN_RERUN_SERVER_MEMORY_BYTES))
+                    .expect("decode bench fixture");
+            document["schema_version"] = serde_json::json!(1);
+            let oak = document["oak"].as_object_mut().expect("fixture OAK object");
+            oak.remove("maximum_usb_speed");
+            oak.remove("minimum_usb_speed");
+            let bytes = serde_json::to_vec(&document).expect("serialize v1 fixture");
+            assert!(matches!(
+                BenchConfig::parse(&bytes),
+                Err(BenchConfigError::UnsupportedSchemaVersion {
+                    actual: 1,
+                    supported: 2,
+                })
+            ));
+
+            document["schema_version"] = serde_json::json!(2);
+            let bytes = serde_json::to_vec(&document).expect("serialize incomplete v2 fixture");
+            assert!(matches!(
+                BenchConfig::parse(&bytes),
+                Err(BenchConfigError::MissingField {
+                    field: "oak.maximum_usb_speed",
+                })
+            ));
         }
 
         #[test]
@@ -1702,8 +1816,11 @@ mod enabled {
             .positions()
             .map(PositionTicks::get);
         eprintln!(
-            "bench_started=true opened_mxid={} head_observed_ticks={observed_ticks:?} base_zero_sequences={}/{}/{} expression_rgb_sequence={}",
+            "bench_started=true opened_mxid={} usb_requested_maximum={} usb_required_minimum={} usb_observed={} head_observed_ticks={observed_ticks:?} base_zero_sequences={}/{}/{} expression_rgb_sequence={}",
             startup.connection.opened_mxid(),
+            startup.connection.usb_requested_maximum(),
+            startup.connection.usb_required_minimum(),
+            startup.connection.usb_observed(),
             startup.before_oak.confirmed().sequence().get(),
             startup.before_head.confirmed().sequence().get(),
             startup.before_eye.confirmed().sequence().get(),
