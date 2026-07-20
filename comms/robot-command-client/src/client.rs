@@ -224,10 +224,8 @@ where
 
         Ok(AppliedCommandReceipt::new(
             session,
-            sequence,
-            requested_timer_pwm,
             lease,
-            result.remaining_lease,
+            result,
             ReceiptTiming {
                 sent_at,
                 acknowledged_at,

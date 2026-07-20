@@ -1,7 +1,9 @@
 use robot_protocol::v2::{
-    ControlEpoch, ControllerBootId, ControllerFaults, ControllerUid, OutputState, RemainingLeaseMs,
-    RequestId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
+    ControlEpoch, ControllerBootId, ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid,
+    HostCommandResult, HostCommandResultCode, OutputState, RemainingLeaseMs, RequestId, TimerPwm,
+    V2CommandLeaseMs, V2CommandSequence,
 };
+use robot_protocol::ControllerUptimeMsWrapping;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -102,10 +104,8 @@ impl PendingPhysicalCommand {
 #[derive(Debug, PartialEq, Eq)]
 pub struct AppliedCommandReceipt {
     controller_session: ControllerSession,
-    sequence: V2CommandSequence,
-    applied_timer_pwm: TimerPwm,
+    verified_host_result: HostCommandResult,
     requested_lease: V2CommandLeaseMs,
-    remaining_lease_at_server_emission: RemainingLeaseMs,
     sent_at: MonotonicInstant,
     acknowledged_at: MonotonicInstant,
     known_active_through_exclusive: MonotonicInstant,
@@ -120,18 +120,14 @@ pub(crate) struct ReceiptTiming {
 impl AppliedCommandReceipt {
     pub(crate) const fn new(
         controller_session: ControllerSession,
-        sequence: V2CommandSequence,
-        applied_timer_pwm: TimerPwm,
         requested_lease: V2CommandLeaseMs,
-        remaining_lease_at_server_emission: RemainingLeaseMs,
+        result: HostCommandResult,
         timing: ReceiptTiming,
     ) -> Self {
         Self {
             controller_session,
-            sequence,
-            applied_timer_pwm,
+            verified_host_result: result,
             requested_lease,
-            remaining_lease_at_server_emission,
             sent_at: timing.sent_at,
             acknowledged_at: timing.acknowledged_at,
             known_active_through_exclusive: timing.known_active_through_exclusive,
@@ -143,11 +139,27 @@ impl AppliedCommandReceipt {
     }
 
     pub const fn sequence(&self) -> V2CommandSequence {
-        self.sequence
+        self.verified_host_result.sequence
+    }
+
+    pub const fn result(&self) -> HostCommandResultCode {
+        self.verified_host_result.result
     }
 
     pub const fn applied_timer_pwm(&self) -> TimerPwm {
-        self.applied_timer_pwm
+        self.verified_host_result.controller_timer_pwm
+    }
+
+    pub const fn output_state(&self) -> OutputState {
+        self.verified_host_result.output_state
+    }
+
+    pub const fn controller_applied_at(&self) -> ControllerUptimeMsWrapping {
+        self.verified_host_result.controller_applied_at
+    }
+
+    pub const fn controller_expires_at(&self) -> ControllerDeadlineMsWrapping {
+        self.verified_host_result.controller_expires_at
     }
 
     pub const fn requested_lease(&self) -> V2CommandLeaseMs {
@@ -155,7 +167,17 @@ impl AppliedCommandReceipt {
     }
 
     pub const fn remaining_lease_at_server_emission(&self) -> RemainingLeaseMs {
-        self.remaining_lease_at_server_emission
+        self.verified_host_result.remaining_lease
+    }
+
+    pub const fn controller_faults(&self) -> ControllerFaults {
+        self.verified_host_result.faults
+    }
+
+    /// Exact server result retained after all identity, sequence, PWM, output,
+    /// fault, and controller-deadline checks succeeded.
+    pub const fn verified_host_result(&self) -> HostCommandResult {
+        self.verified_host_result
     }
 
     pub const fn sent_at(&self) -> MonotonicInstant {
@@ -171,7 +193,13 @@ impl AppliedCommandReceipt {
     }
 
     pub const fn is_confirmed_zero(&self) -> bool {
-        self.applied_timer_pwm.is_zero()
+        self.verified_host_result.controller_timer_pwm.is_zero()
+            && self.verified_host_result.output_state.is_safe()
+            && self.verified_host_result.faults.is_clear()
+            && self
+                .verified_host_result
+                .result
+                .proves_controller_application()
     }
 }
 

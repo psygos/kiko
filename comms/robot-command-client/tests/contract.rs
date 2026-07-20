@@ -4,14 +4,15 @@ use robot_command_client::{
     LatchedStopKnowledge, MonotonicClock, PendingPhysicalCommand, RobotProtocolV2WireAdapter,
     UdpV2Transport, V2CommandTransport, V2WireAdapter,
 };
-use robot_protocol::ControllerUptimeMsWrapping;
 use robot_protocol::v2::{
     AcquireResult, AcquireResultCode, ActuatorConfigFingerprint, ControlEpoch, ControllerBootId,
     ControllerCapabilities, ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid,
-    ForceStopReason, HostCommandResult, HostCommandResultCode, HostStopResult, MAX_RAW_FRAME_BYTES,
-    Message, MessageKind, OutputState, RawFrame, RemainingLeaseMs, RequestId, StatusCode,
-    StatusReport, StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
+    ForceStopReason, HostCommandResult, HostCommandResultCode, HostStopResult, Message,
+    MessageKind, OutputState, RawFrame, RemainingLeaseMs, RequestId, StatusCode, StatusReport,
+    StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
+    MAX_RAW_FRAME_BYTES,
 };
+use robot_protocol::ControllerUptimeMsWrapping;
 use std::net::UdpSocket;
 use std::time::Duration;
 
@@ -205,12 +206,28 @@ fn exact_status_acquire_zero_motion_and_disarm_path() {
         .expect("zero acquisition succeeds");
     assert!(initial_receipt.is_confirmed_zero());
     assert_eq!(initial_receipt.sequence(), V2CommandSequence::FIRST);
+    assert_eq!(initial_receipt.result(), HostCommandResultCode::AppliedNew);
+    assert_eq!(initial_receipt.output_state(), OutputState::ZeroPwm);
+    assert_eq!(
+        initial_receipt.controller_applied_at(),
+        ControllerUptimeMsWrapping::new(2_000)
+    );
+    assert_eq!(
+        initial_receipt.controller_expires_at(),
+        ControllerDeadlineMsWrapping::new(2_100)
+    );
+    assert!(initial_receipt.controller_faults().is_clear());
+    let retained_zero = initial_receipt.verified_host_result();
+    assert_eq!(retained_zero.requested_timer_pwm, TimerPwm::ZERO);
+    assert_eq!(retained_zero.controller_timer_pwm, TimerPwm::ZERO);
     let (armed, motion_receipt) = armed
         .apply(pending(&clock, motion))
         .ok()
         .expect("motion applies once");
     assert_eq!(motion_receipt.sequence(), V2CommandSequence::new(1));
     assert_eq!(motion_receipt.applied_timer_pwm(), motion);
+    assert_eq!(motion_receipt.output_state(), OutputState::NonzeroPwm);
+    assert!(!motion_receipt.is_confirmed_zero());
     let (_disarmed, stop_receipt) = armed.disarm().ok().expect("explicit stop is confirmed");
     assert_eq!(stop_receipt.controller_uid(), uid());
 
