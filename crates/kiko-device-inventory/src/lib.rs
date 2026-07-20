@@ -8,6 +8,8 @@
 mod artifact;
 #[cfg(unix)]
 mod artifact_io;
+#[cfg(unix)]
+mod asset_io;
 mod bounded;
 mod compare;
 mod manifest;
@@ -33,6 +35,12 @@ pub use artifact_io::{
     ArtifactRelativePathError, CalibrationBundleHashError, ExactCalibrationBundleSha256,
     MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_PATH_COMPONENTS, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
     MAX_ARTIFACT_ROOT_PATH_BYTES, ManifestArtifactHashes, hash_manifest_artifacts,
+};
+#[cfg(unix)]
+pub use asset_io::{
+    DeploymentAssetByteLimit, DeploymentAssetByteLimitError, DeploymentAssetContentSha256,
+    DeploymentAssetLoadError, LoadedDeploymentAsset, MAX_DEPLOYMENT_ASSET_BYTES,
+    load_deployment_asset,
 };
 pub use bounded::{
     ArtifactId, BoundedTextError, BuildProvenance, ControlEndpointIdentity, MAX_ARTIFACT_ID_BYTES,

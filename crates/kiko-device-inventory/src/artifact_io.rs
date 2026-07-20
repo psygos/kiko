@@ -32,7 +32,12 @@ pub struct ArtifactFileBindingInput {
 pub struct ArtifactRelativePath(String);
 
 impl ArtifactRelativePath {
-    fn parse(value: String) -> Result<Self, ArtifactRelativePathError> {
+    /// Parse a canonical, platform-unambiguous relative deployment path.
+    ///
+    /// Although this type originated at the inventory-artifact boundary, the
+    /// same grammar is suitable for any file opened beneath an already
+    /// admitted deployment root.
+    pub fn parse(value: String) -> Result<Self, ArtifactRelativePathError> {
         if value.is_empty() {
             return Err(ArtifactRelativePathError::Empty);
         }
@@ -95,10 +100,7 @@ pub enum ArtifactRelativePathError {
 
 impl fmt::Display for ArtifactRelativePathError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "invalid manifest artifact relative path: {self:?}"
-        )
+        write!(formatter, "invalid deployment-relative path: {self:?}")
     }
 }
 
