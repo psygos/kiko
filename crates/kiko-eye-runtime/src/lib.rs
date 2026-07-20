@@ -1,9 +1,12 @@
 //! Exclusive, bounded host-side serial ownership for Kiko's KEP2 eyes.
 //!
-//! Weak configuration is parsed once into [`EyeRuntimeConfig`]. A single
-//! non-cloneable [`EyeActorHandle`] then drives an exact identity challenge,
-//! control acquisition, one-in-flight intent admission, and explicit release
-//! over one exclusively owned serial transport. Every fault enters the
+//! Weak deployment configuration is parsed once into
+//! [`StaticEyeRuntimeConfig`]. A per-start [`EyeSessionMaterialGenerator`] must
+//! then produce one-shot session material before the non-cloneable
+//! [`EyeRuntimeConfig`] can be constructed. A single non-cloneable
+//! [`EyeActorHandle`] drives the resulting exact identity challenge, control
+//! acquisition, one-in-flight intent admission, and explicit release over one
+//! exclusively owned serial transport. Every fault enters the
 //! transport-independent session's fallback state and records whether its
 //! best-effort release was unavailable, written, or failed.
 //! The injected [`MonotonicClock`] must be the same clock epoch used to stamp
@@ -31,7 +34,10 @@ pub use actor::{
 
 pub use config::{
     BaudRate, ConfigParseError, DeviceIdentity, DeviceIdentityKind, EyeRuntimeConfig,
-    EyeRuntimeConfigInput, OperationTimeout, WriteAttemptLimit,
+    EyeSessionMaterial, EyeSessionMaterialError, EyeSessionMaterialGenerator,
+    EyeSessionMaterialInput, OperationTimeout, OsEyeSessionMaterialError,
+    OsEyeSessionMaterialGenerator, StaticEyeRuntimeConfig, StaticEyeRuntimeConfigInput,
+    WriteAttemptLimit,
 };
 pub use framing::{FrameReadError, MAX_READ_CHUNK_BYTES};
 pub use transport::{

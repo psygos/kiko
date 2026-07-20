@@ -3143,6 +3143,7 @@ version = "0.1.0"
 name = "kiko-eye-runtime"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "kiko-expression-core",
  "kiko-expression-runtime",
  "kiko-eye-protocol",
@@ -3187,10 +3188,12 @@ dependencies = [
  "rerun",
  "robot-command-client",
  "robot-protocol",
+ "robot-server",
  "serde",
  "serde_json",
  "sha2",
  "slotmap",
+ "tokio",
 ]
 
 [[package]]

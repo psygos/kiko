@@ -6,6 +6,7 @@ description = "Exclusive, bounded host serial actor for Kiko's KEP2 eye controll
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+getrandom = { version = "0.3", features = ["std"] }
 kiko-expression-core = { path = "../kiko-expression-core" }
 kiko-expression-runtime = { path = "../kiko-expression-runtime" }
 kiko-eye-protocol = { path = "../kiko-eye-protocol" }

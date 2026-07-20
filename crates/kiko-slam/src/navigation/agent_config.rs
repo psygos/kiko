@@ -31,7 +31,7 @@ use kiko_expression_runtime::{
 };
 use kiko_eye_protocol::PROTOCOL_VERSION as EYE_PROTOCOL_VERSION;
 use kiko_eye_runtime::{
-    ConfigParseError as EyeConfigParseError, EyeRuntimeConfig, EyeRuntimeConfigInput,
+    ConfigParseError as EyeConfigParseError, StaticEyeRuntimeConfig, StaticEyeRuntimeConfigInput,
 };
 use kiko_head_protocol::{
     ADAPTER_DTR_ASSERTED, ADAPTER_RTS_ASSERTED, BUS_BAUD_RATE_BPS, HeadJoint,
@@ -385,7 +385,7 @@ pub enum NanoMapWarmStart {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParsedNanoEyePolicy {
     Disabled,
-    Kep2(EyeRuntimeConfig),
+    Kep2(StaticEyeRuntimeConfig),
 }
 
 /// Manifest-bound KEP2 eye selection. Disabled means no eye transport is
@@ -393,11 +393,13 @@ enum ParsedNanoEyePolicy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NanoManifestBoundEyePolicy {
     Disabled,
-    Kep2(EyeRuntimeConfig),
+    Kep2(StaticEyeRuntimeConfig),
 }
 
 impl NanoManifestBoundEyePolicy {
-    pub const fn runtime(&self) -> Option<&EyeRuntimeConfig> {
+    /// Return only restart-safe static policy. The caller must generate fresh
+    /// one-shot KEP2 session material before an actor-ready config exists.
+    pub const fn static_runtime(&self) -> Option<&StaticEyeRuntimeConfig> {
         match self {
             Self::Disabled => None,
             Self::Kep2(runtime) => Some(runtime),
@@ -549,7 +551,7 @@ fn bind_eye_to_manifest(
                 );
             }
 
-            let runtime_identity = runtime.session_plan().expected_identity();
+            let runtime_identity = runtime.expected_identity();
             let runtime_uid = *runtime_identity.device_uid().as_bytes();
             let manifest_uid = *expected.device_uid().as_bytes();
             if runtime_uid != manifest_uid {
@@ -1128,11 +1130,8 @@ fn parse_eye(
             expected_device_uid,
             expected_firmware_build_id,
             expected_capabilities_bits,
-            identity_nonce,
-            acquire_nonce,
-            control_epoch,
             intent_lease_ms,
-        } => EyeRuntimeConfig::parse(EyeRuntimeConfigInput {
+        } => StaticEyeRuntimeConfig::parse(StaticEyeRuntimeConfigInput {
             device_path,
             baud_rate_bps,
             response_timeout_ms,
@@ -1142,9 +1141,6 @@ fn parse_eye(
             expected_device_uid,
             expected_firmware_build_id,
             expected_capabilities_bits,
-            identity_nonce,
-            acquire_nonce,
-            control_epoch,
             intent_lease_ms,
         })
         .map(ParsedNanoEyePolicy::Kep2)
@@ -1588,9 +1584,6 @@ enum NanoEyePolicyDto {
         expected_device_uid: [u8; 16],
         expected_firmware_build_id: [u8; 32],
         expected_capabilities_bits: u32,
-        identity_nonce: u64,
-        acquire_nonce: u64,
-        control_epoch: u32,
         intent_lease_ms: u16,
     },
 }
@@ -1732,9 +1725,6 @@ mod tests {
                 "expected_device_uid": vec![1_u8; 16],
                 "expected_firmware_build_id": vec![2_u8; 32],
                 "expected_capabilities_bits": REQUIRED_EYE_CAPABILITIES,
-                "identity_nonce": 11,
-                "acquire_nonce": 12,
-                "control_epoch": 13,
                 "intent_lease_ms": 100
             },
             "head": {
@@ -1893,7 +1883,10 @@ mod tests {
         let bound = parsed
             .bind_accessories_to_manifest(&manifest(&manifest_value()))
             .expect("exact accessory binding");
-        let eye = bound.eye().runtime().expect("bound eye runtime");
+        let eye = bound
+            .eye()
+            .static_runtime()
+            .expect("bound static eye runtime");
         assert_eq!(
             eye.device().path(),
             "/dev/serial/by-id/usb-kiko_kiko-eyes_1-if00"
@@ -2079,6 +2072,28 @@ mod tests {
             NanoAgentPolicyConfigV1::parse_json(&trailing),
             Err(NanoAgentPolicyConfigParseError::JsonTrailingData(_))
         ));
+    }
+
+    #[test]
+    fn static_eye_policy_rejects_persisted_session_material() {
+        for (field, value) in [
+            ("identity_nonce", json!(11)),
+            ("acquire_nonce", json!(12)),
+            ("control_epoch", json!(13)),
+        ] {
+            let mut document = valid_value();
+            document["eye"]
+                .as_object_mut()
+                .expect("eye policy object")
+                .insert(field.to_owned(), value);
+            assert!(
+                matches!(
+                    parse(&document),
+                    Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+                ),
+                "accepted persisted per-start field {field}"
+            );
+        }
     }
 
     #[test]

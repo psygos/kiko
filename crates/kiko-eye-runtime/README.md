@@ -6,12 +6,13 @@ or duplicate the protocol state machine.
 
 ## Boundary and ownership
 
-Callers first parse `EyeRuntimeConfigInput` into `EyeRuntimeConfig`. Parsing
-rejects generic Linux tty names, discovery paths, zero identities, zero or
-reused nonces, zero control epochs, unknown or incomplete capabilities,
-unbounded timeouts/retries/noise, and a host round-trip budget that cannot fit
-strictly inside the configured firmware lease. The only supported port forms
-are:
+Callers first parse `StaticEyeRuntimeConfigInput` into
+`StaticEyeRuntimeConfig`. This restart-safe deployment policy deliberately has
+no identity nonce, acquisition nonce, or control epoch. Static parsing rejects
+generic Linux tty names, discovery paths, zero identities, unknown or
+incomplete capabilities, unbounded timeouts/retries/noise, and a host
+round-trip budget that cannot fit strictly inside the configured firmware
+lease. The only supported port forms are:
 
 - Linux: `/dev/serial/by-id/<one component>`
 - macOS: `/dev/cu.<one component>`
@@ -23,10 +24,19 @@ not scan ports or fall back to another device. The KEP2 UID, firmware build,
 capabilities, boot ID, nonces, epoch, and non-wrapping host intent sequence are
 then checked by `EyeSession`.
 
-The caller must allocate identity/acquire nonces and the control epoch for this
-startup and must not reuse persisted values. Parsing proves that they are
-non-zero and that the two nonces differ; it cannot infer cross-process
-freshness from integers alone.
+Immediately before each actor start, the caller must pass an
+`EyeSessionMaterialGenerator` to `StaticEyeRuntimeConfig::new_session`. The
+production `OsEyeSessionMaterialGenerator` draws all 160 bits from the
+operating system CSPRNG and rejects zero identifiers or equal phase nonces. It
+returns one non-cloneable `EyeRuntimeConfig`, which the actor start consumes.
+The static policy cannot start an actor directly, and constructing a second
+actor configuration requires another generator call.
+
+Fresh random material makes accidental reuse cryptographically improbable; it
+does not provide a deterministic proof of uniqueness across process starts.
+Such a proof would require a durable monotonic allocator with its own crash and
+storage-failure semantics. Custom generators therefore remain responsible for
+not reusing material across calls or starts.
 
 Both spawn paths first require an active Tokio runtime. Production proves this
 before opening the serial path, so a missing executor is a typed error and

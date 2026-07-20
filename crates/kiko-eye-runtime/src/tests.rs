@@ -22,8 +22,10 @@ use kiko_eye_protocol::{
 
 use crate::{
     ActorTermination, AsyncByteTransport, CancellationCause, CleanupOutcome, EyeRuntimeConfig,
-    EyeRuntimeConfigInput, FrameReadError, FrameWriteFailure, HandleRequestError, MonotonicClock,
-    ProtocolExchange, ReleaseReport, RuntimeFaultCause, TransportFailure, TransportOperation,
+    EyeSessionMaterial, EyeSessionMaterialError, EyeSessionMaterialGenerator,
+    EyeSessionMaterialInput, FrameReadError, FrameWriteFailure, HandleRequestError, MonotonicClock,
+    ProtocolExchange, ReleaseReport, RuntimeFaultCause, StaticEyeRuntimeConfig,
+    StaticEyeRuntimeConfigInput, TransportFailure, TransportOperation,
     spawn_eye_actor as try_spawn_eye_actor,
 };
 
@@ -260,7 +262,7 @@ fn encode_messages(messages: impl IntoIterator<Item = Message>) -> Vec<u8> {
 }
 
 fn config() -> EyeRuntimeConfig {
-    EyeRuntimeConfig::parse(EyeRuntimeConfigInput {
+    let policy = StaticEyeRuntimeConfig::parse(StaticEyeRuntimeConfigInput {
         device_path: "/dev/serial/by-id/kiko-eye-001".to_owned(),
         baud_rate_bps: 115_200,
         response_timeout_ms: 20,
@@ -270,12 +272,26 @@ fn config() -> EyeRuntimeConfig {
         expected_device_uid: [1; 16],
         expected_firmware_build_id: [2; 32],
         expected_capabilities_bits: REQUIRED_EYE_CAPABILITIES,
-        identity_nonce: 11,
-        acquire_nonce: 12,
-        control_epoch: 13,
         intent_lease_ms: 100,
     })
-    .expect("test config")
+    .expect("test policy");
+    policy
+        .new_session(&mut FixedSessionMaterial)
+        .expect("test session material")
+}
+
+struct FixedSessionMaterial;
+
+impl EyeSessionMaterialGenerator for FixedSessionMaterial {
+    type Error = EyeSessionMaterialError;
+
+    fn generate(&mut self) -> Result<EyeSessionMaterial, Self::Error> {
+        EyeSessionMaterial::parse(EyeSessionMaterialInput {
+            identity_nonce: 11,
+            acquire_nonce: 12,
+            control_epoch: 13,
+        })
+    }
 }
 
 fn prepared(at_ns: u64) -> PreparedEyeIntent {
