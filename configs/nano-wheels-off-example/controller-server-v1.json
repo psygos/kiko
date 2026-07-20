@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "serial_device": "/dev/serial/by-id/REPLACE_STM32_SERIAL_BY_ID",
+  "controller_uid_hex": "dededededededededededede",
+  "firmware_abi": 2,
+  "firmware_build_id": 3735928559,
+  "actuator_config_fingerprint_hex": "adadadadadadadadadadadadadadadad",
+  "hardware_profile_claim_id": "REPLACE_WITH_QUALIFIED_STM32_PROFILE",
+  "heartbeat_period_ms": 20,
+  "maximum_heartbeat_age_ms": 60,
+  "serial_applied_ack_timeout_ms": 30,
+  "controller_clock_abs_error_ppm_bound": 50000,
+  "deadline_quantization_margin_ms": 2,
+  "expected_max_abs_pwm_percent": 50,
+  "expected_pwm_frequency_hz": 20000,
+  "expected_watchdog_nominal_timeout_ms": 250,
+  "expected_neutral_output": "both_low",
+  "expected_physical_stop_semantics": "coast_verified"
+}

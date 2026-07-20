@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "control": {
+    "socket_path": "/run/kiko/agent-control.sock",
+    "read_timeout_ms": 100,
+    "write_timeout_ms": 100,
+    "runtime_response_timeout_ms": 500,
+    "runtime_queue_capacity": 8
+  },
+  "inventory": {
+    "manifest_path": "/opt/kiko/deployment/device-inventory-v1.json",
+    "artifact_root_path": "/opt/kiko/deployment/artifacts",
+    "artifact_bindings": [
+      {
+        "kind": "calibration",
+        "artifact_id": "REPLACE-camera-calibration",
+        "relative_path": "calibration/camera-placeholder.json"
+      },
+      {
+        "kind": "plant",
+        "artifact_id": "REPLACE-drive-plant",
+        "relative_path": "plant/drive-placeholder.json"
+      }
+    ]
+  },
+  "map_persistence": {
+    "save_snapshot_path": "/var/lib/kiko/maps/current.kmap",
+    "warm_start": {
+      "kind": "none"
+    }
+  },
+  "eye": {
+    "mode": "kep2",
+    "device_path": "/dev/serial/by-id/REPLACE_EYE_SERIAL_BY_ID",
+    "baud_rate_bps": 115200,
+    "response_timeout_ms": 20,
+    "write_timeout_ms": 5,
+    "write_attempts": 2,
+    "empty_delimiter_budget": 2,
+    "expected_device_uid": [238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238],
+    "expected_firmware_build_id": [238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238],
+    "expected_capabilities_bits": 255,
+    "intent_lease_ms": 100
+  },
+  "head": {
+    "mode": "natural_hold",
+    "device_path": "/dev/serial/by-id/REPLACE_HEAD_SERIAL_BY_ID",
+    "response_timeout_ms": 100,
+    "write_timeout_ms": 100,
+    "arming_freshness_ms": 250,
+    "write_attempts": 2,
+    "noise_budget_bytes": 32,
+    "redundant_read_tolerance_ticks": 10,
+    "readback_tolerance_ticks": 20,
+    "goal_speed_ticks_per_second": 50,
+    "torque_limit_permille": [100, 100, 100, 100],
+    "physical_torque_consent": "natural_hold_at_observed_pose"
+  },
+  "rgb_expression": {
+    "mode": "scene_motion",
+    "sampling_columns": 16,
+    "sampling_rows": 12,
+    "minimum_residual_luma": 24,
+    "minimum_active_fraction_basis_points": 500,
+    "frame_freshness_ms": 80,
+    "brightness_basis_points": 7000,
+    "color_rgb": [32, 128, 255],
+    "blink": false
+  },
+  "supervisor": {
+    "maximum_authority_lease_ms": 1000,
+    "maximum_zero_age_ms": 250
+  },
+  "live_mode_policy": {
+    "startup": "disarmed_map_only",
+    "manual": {
+      "permission": "disabled"
+    },
+    "point_goal": {
+      "permission": "disabled"
+    },
+    "frontier_explore": {
+      "permission": "disabled"
+    }
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "robot_id": "REPLACE-kiko-robot",
+  "oak": {
+    "mxid": "DEADDEADDEADDEAD",
+    "runtime_provenance": "REPLACE-depthai-runtime",
+    "sdk_build_provenance": "REPLACE-depthai-core",
+    "adapter_build_provenance": "REPLACE-kiko-oak-adapter"
+  },
+  "stm32": {
+    "serial_by_id_path": "/dev/serial/by-id/REPLACE_STM32_SERIAL_BY_ID",
+    "control_endpoint_identity": "udp://127.0.0.1:8080",
+    "controller_uid": [222, 222, 222, 222, 222, 222, 222, 222, 222, 222, 222, 222],
+    "firmware_abi": 2,
+    "firmware_build_id": 3735928559,
+    "hardware_profile_fingerprint": [173, 173, 173, 173, 173, 173, 173, 173, 173, 173, 173, 173, 173, 173, 173, 173],
+    "capabilities_bits": 255
+  },
+  "head": {
+    "adapter_serial_by_id_path": "/dev/serial/by-id/REPLACE_HEAD_SERIAL_BY_ID",
+    "bow_servo_id": 1,
+    "curl_servo_id": 2,
+    "yaw_servo_id": 3,
+    "roll_servo_id": 4,
+    "baud_rate_bps": 1000000,
+    "dtr_asserted": false,
+    "rts_asserted": true
+  },
+  "eye": {
+    "serial_by_id_path": "/dev/serial/by-id/REPLACE_EYE_SERIAL_BY_ID",
+    "kep_protocol_version": 2,
+    "device_uid": [238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238],
+    "firmware_build_id": [238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238, 238],
+    "capabilities_bits": 255
+  },
+  "calibration_artifacts": [
+    {
+      "artifact_id": "REPLACE-camera-calibration",
+      "sha256": [102, 165, 231, 17, 201, 199, 191, 89, 58, 114, 57, 217, 56, 31, 183, 144, 197, 68, 194, 140, 107, 43, 49, 216, 226, 91, 9, 79, 214, 2, 55, 219]
+    }
+  ],
+  "plant_artifacts": [
+    {
+      "artifact_id": "REPLACE-drive-plant",
+      "sha256": [201, 216, 252, 145, 30, 235, 238, 7, 198, 182, 179, 102, 14, 187, 162, 3, 224, 229, 190, 134, 120, 158, 241, 28, 215, 53, 135, 150, 16, 230, 168, 254]
+    }
+  ]
+}

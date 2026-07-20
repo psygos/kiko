@@ -1,0 +1,47 @@
+[Unit]
+Description=Kiko manual wheels-off camera/head/eye acceptance bench
+Requires=kiko-robot-server.service
+After=kiko-robot-server.service
+ConditionPathIsExecutable=/opt/kiko/bin/kiko-nano-wheels-off-bench
+ConditionPathIsExecutable=/opt/kiko/bin/kiko-wheels-off-attest
+ConditionPathIsRegular=/opt/kiko/deployment/nano-wheels-off-bench-v1.json
+
+[Service]
+Type=exec
+User=makerspace
+SupplementaryGroups=dialout video render plugdev
+WorkingDirectory=/opt/kiko
+Environment=RUST_LOG=info
+# Atomically claim, verify, and always consume the exact root-owned set.
+ExecStartPre=+/opt/kiko/bin/kiko-wheels-off-attest
+ExecStart=/opt/kiko/bin/kiko-nano-wheels-off-bench --deployment-root /opt/kiko/deployment --config nano-wheels-off-bench-v1.json --wheels-removed --head-path-clear --power-cut-reachable
+Restart=no
+# Outer ceiling includes bounded startup, the 900-second running phase, and
+# normal cleanup slack. TimeoutStopSec begins only after systemd sends SIGTERM.
+RuntimeMaxSec=1200
+TimeoutStopSec=120
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectClock=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+StateDirectory=kiko
+StateDirectoryMode=0750
+CacheDirectory=kiko
+CacheDirectoryMode=0750
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+# Deliberately no [Install] section: this physical bench is manual-only.

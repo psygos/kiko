@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "command_endpoint": "127.0.0.1:8080",
+  "status_timeout_ns": 40000000,
+  "acquire_timeout_ns": 40000000,
+  "applied_ack_timeout_ns": 40000000,
+  "stop_attempt_timeout_ns": 40000000,
+  "maximum_stop_recovery_attempts": 3,
+  "zero_acquisition_lease_ms": 250,
+  "server_dispatch_margin_ns": 5000000
+}
