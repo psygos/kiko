@@ -65,7 +65,12 @@
     "frame_freshness_ms": 80,
     "brightness_basis_points": 7000,
     "color_rgb": [32, 128, 255],
-    "blink": false
+    "blink": false,
+    "gaze_geometry": {
+      "schema_version": 1,
+      "head_origin_in_camera_m": [0.0, -0.25, -0.20],
+      "neutral_head_from_camera_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
+    }
   },
   "supervisor": {
     "maximum_authority_lease_ms": 1000,

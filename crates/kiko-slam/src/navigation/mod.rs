@@ -80,7 +80,7 @@ pub use coordinator::{
 #[cfg(all(feature = "agent-runtime", feature = "record", unix))]
 pub use expression_bridge::{
     RGB_EXPRESSION_HEAD_POLICY, RgbExpressionBridge, RgbExpressionBridgeError,
-    RgbExpressionBridgeOutcome,
+    RgbExpressionBridgeOutcome, RgbHeadGazeProjectionError,
 };
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,

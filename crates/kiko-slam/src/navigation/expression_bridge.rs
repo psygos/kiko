@@ -21,7 +21,9 @@ use kiko_expression_core::{
     RgbFrameView, RgbObservation, StreamEpochId, TimeError,
 };
 use kiko_expression_runtime::{
-    AdaptError, EyeRenderStyle, PreparedEyeIntent, SceneAnalysis, SceneMotionConfig,
+    AdaptError, CameraForwardDepthMeters, CameraToHeadGazeExtrinsics, EyeRenderStyle,
+    HeadGazeProjectionError, HeadRelativeGaze, OakCameraTargetPoint, OakCameraTargetRay,
+    PreparedEyeIntent, RayHeadGazeProjectionError, SceneAnalysis, SceneMotionConfig,
     SceneMotionError, SceneMotionExtractor, adapt_reaction_output,
 };
 use kiko_eye_runtime::{ClockError, MonotonicClock};
@@ -31,6 +33,36 @@ use super::NanoRgbExpressionConfig;
 
 /// The RGB expression path can never request expressive head displacement.
 pub const RGB_EXPRESSION_HEAD_POLICY: HeadMotionPolicy = HeadMotionPolicy::NaturalHold;
+
+/// Why the RGB domain seam cannot produce typed head-relative gaze geometry.
+///
+/// This output is geometry only. It is not a [`HeadMotionPolicy`], head actor
+/// command, servo pose, or permission to move the physical head.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RgbHeadGazeProjectionError {
+    GeometryUnavailable,
+    Point(HeadGazeProjectionError),
+    Ray(RayHeadGazeProjectionError),
+}
+
+impl fmt::Display for RgbHeadGazeProjectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "RGB expression head-gaze projection failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for RgbHeadGazeProjectionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::GeometryUnavailable => None,
+            Self::Point(source) => Some(source),
+            Self::Ray(source) => Some(source),
+        }
+    }
+}
 
 /// A successful expression decision and its continuity semantics.
 ///
@@ -156,6 +188,7 @@ pub struct RgbExpressionBridge<C> {
     stream_epoch: StreamEpochId,
     freshness: NonZeroDuration,
     style: EyeRenderStyle,
+    gaze_geometry: Option<CameraToHeadGazeExtrinsics>,
     extractor: SceneMotionExtractor,
     mixer: ReactionMixer,
     last_accepted: Option<AcceptedFrame>,
@@ -174,6 +207,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             config.scene_motion(),
             config.frame_freshness(),
             config.render_style(),
+            config.gaze_geometry(),
             clock,
         )
     }
@@ -183,6 +217,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         scene_motion: SceneMotionConfig,
         freshness: NonZeroDuration,
         style: EyeRenderStyle,
+        gaze_geometry: Option<CameraToHeadGazeExtrinsics>,
         clock: C,
     ) -> Self {
         Self {
@@ -190,6 +225,7 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
             stream_epoch,
             freshness,
             style,
+            gaze_geometry,
             extractor: SceneMotionExtractor::new(scene_motion),
             mixer: ReactionMixer::new(RGB_EXPRESSION_HEAD_POLICY),
             last_accepted: None,
@@ -205,6 +241,33 @@ impl<C: MonotonicClock> RgbExpressionBridge<C> {
         C: Clone,
     {
         self.clock.clone()
+    }
+
+    /// Project one already-parsed positive-depth OAK point into neutral-head
+    /// yaw-right/pitch-down radians. No head intention or actuator command is
+    /// constructed by this seam.
+    pub fn project_head_gaze_to_point(
+        &self,
+        target: OakCameraTargetPoint,
+    ) -> Result<HeadRelativeGaze, RgbHeadGazeProjectionError> {
+        self.gaze_geometry
+            .ok_or(RgbHeadGazeProjectionError::GeometryUnavailable)?
+            .project_point(target)
+            .map_err(RgbHeadGazeProjectionError::Point)
+    }
+
+    /// Project a parsed OAK ray at an explicit positive camera-forward depth.
+    /// Range is mandatory because the configured camera/head origin offset
+    /// makes a direction alone geometrically insufficient.
+    pub fn project_head_gaze_along_ray(
+        &self,
+        ray: OakCameraTargetRay,
+        depth: CameraForwardDepthMeters,
+    ) -> Result<HeadRelativeGaze, RgbHeadGazeProjectionError> {
+        self.gaze_geometry
+            .ok_or(RgbHeadGazeProjectionError::GeometryUnavailable)?
+            .project_ray_at_forward_depth(ray, depth)
+            .map_err(RgbHeadGazeProjectionError::Ray)
     }
 
     /// Borrow one checked OAK RGB frame and prepare one bounded eye intent.
@@ -457,6 +520,7 @@ mod tests {
             scene_config(),
             NonZeroDuration::try_from_nanos(100).expect("test freshness"),
             render_style(),
+            None,
             clock,
         )
     }
@@ -712,5 +776,42 @@ mod tests {
             .expect("NaturalHold is accepted by the headless eye adapter")
             .into_prepared();
         assert_eq!(prepared.intent().expression(), Expression::Curious);
+    }
+
+    #[test]
+    fn optional_gaze_geometry_projects_points_and_rays_without_head_authority() {
+        assert_eq!(RGB_EXPRESSION_HEAD_POLICY, HeadMotionPolicy::NaturalHold);
+        let clock = TestClock::new(10);
+        let unavailable = bridge(clock.clone());
+        let point = OakCameraTargetPoint::parse([0.0, 0.0, 1.0]).unwrap();
+        assert_eq!(
+            unavailable.project_head_gaze_to_point(point),
+            Err(RgbHeadGazeProjectionError::GeometryUnavailable)
+        );
+
+        let geometry = CameraToHeadGazeExtrinsics::parse(
+            kiko_expression_runtime::CameraToHeadGazeExtrinsicsInput {
+                head_origin_in_camera_m: [0.0, -0.25, -0.20],
+                neutral_head_from_camera_quaternion_xyzw: [0.0, 0.0, 0.0, 1.0],
+            },
+        )
+        .unwrap();
+        let configured = RgbExpressionBridge::from_parts(
+            stream_epoch(),
+            scene_config(),
+            NonZeroDuration::try_from_nanos(100).expect("test freshness"),
+            render_style(),
+            Some(geometry),
+            clock,
+        );
+        let point_gaze = configured.project_head_gaze_to_point(point).unwrap();
+        assert_eq!(point_gaze.yaw_right_rad(), 0.0);
+        assert!(point_gaze.pitch_down_rad() > 0.0);
+
+        let ray = OakCameraTargetRay::parse([0.0, 0.0, 1.0]).unwrap();
+        let ray_gaze = configured
+            .project_head_gaze_along_ray(ray, CameraForwardDepthMeters::parse(1.0).unwrap())
+            .unwrap();
+        assert_eq!(ray_gaze, point_gaze);
     }
 }

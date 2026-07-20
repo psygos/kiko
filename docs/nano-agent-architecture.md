@@ -109,8 +109,12 @@ freshness, mixes semantic reactions, and sends bounded KEP2 eye intentions.
 Stale RGB or a failed eye session returns the eyes to firmware fallback.
 
 The default head intention is always `NaturalHold`. RGB does not directly map
-to servo ticks. Expressive head offsets remain disabled until physical yaw
-ratio/sign, joint envelopes, backlash, stop behavior, voltage/temperature
+to servo ticks. An optional, explicitly configured camera-to-neutral-head
+extrinsic can produce typed yaw-right/pitch-down radians for observation and
+future qualification; absence makes that projection unavailable, and its
+presence grants no head-motion authority. Expressive head offsets remain
+disabled until physical yaw ratio/sign, joint envelopes, backlash, stop
+behavior, voltage/temperature
 limits, process-kill behavior, and safe natural-pose approach have been
 qualified on this assembly.
 

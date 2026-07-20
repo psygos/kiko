@@ -26,8 +26,9 @@ use kiko_device_inventory::{
 };
 use kiko_expression_core::{NonZeroDuration, PositiveUnitAmount, TimeError, UnitAmount};
 use kiko_expression_runtime::{
-    EyeRenderStyle, MotionThresholds, SamplingGeometry, SamplingGeometryError, SceneMotionConfig,
-    SceneMotionConfigError,
+    CameraToHeadGazeExtrinsics, CameraToHeadGazeExtrinsicsInput, EyeRenderStyle,
+    GazeExtrinsicsParseError, MotionThresholds, SamplingGeometry, SamplingGeometryError,
+    SceneMotionConfig, SceneMotionConfigError,
 };
 use kiko_eye_protocol::PROTOCOL_VERSION as EYE_PROTOCOL_VERSION;
 use kiko_eye_runtime::{
@@ -53,6 +54,10 @@ use super::{
 
 /// The only supported Nano-agent policy-component schema.
 pub const NANO_AGENT_POLICY_CONFIG_V1: u32 = 1;
+
+/// Nested camera-to-head gaze-geometry schema retained independently of the
+/// surrounding Nano policy schema.
+pub const NANO_RGB_GAZE_GEOMETRY_V1: u32 = 1;
 
 /// Hard input bound checked before JSON can allocate caller-sized values.
 pub const MAX_NANO_AGENT_POLICY_CONFIG_JSON_BYTES: usize = 64 * 1_024;
@@ -649,6 +654,7 @@ pub struct NanoRgbExpressionConfig {
     scene_motion: SceneMotionConfig,
     frame_freshness: NonZeroDuration,
     render_style: EyeRenderStyle,
+    gaze_geometry: Option<CameraToHeadGazeExtrinsics>,
 }
 
 impl NanoRgbExpressionConfig {
@@ -662,6 +668,12 @@ impl NanoRgbExpressionConfig {
 
     pub const fn render_style(self) -> EyeRenderStyle {
         self.render_style
+    }
+
+    /// Parsed camera-to-neutral-head geometry, or `None` when this schema-v1
+    /// policy deliberately leaves RGB head-gaze projection unavailable.
+    pub const fn gaze_geometry(self) -> Option<CameraToHeadGazeExtrinsics> {
+        self.gaze_geometry
     }
 }
 
@@ -829,6 +841,11 @@ pub enum NanoAgentPolicyConfigParseError {
     RgbActiveFraction(kiko_expression_core::AmountError),
     RgbMotionThreshold(SceneMotionConfigError),
     RgbBrightness(kiko_expression_core::AmountError),
+    UnsupportedRgbGazeGeometrySchemaVersion {
+        actual: u32,
+        supported: u32,
+    },
+    RgbGazeGeometry(GazeExtrinsicsParseError),
     RgbFrameFreshness {
         source: NanoBoundedMillisecondsError,
     },
@@ -903,6 +920,7 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             Self::RgbSamplingGeometry(source) => Some(source),
             Self::RgbActiveFraction(source) | Self::RgbBrightness(source) => Some(source),
             Self::RgbMotionThreshold(source) => Some(source),
+            Self::RgbGazeGeometry(source) => Some(source),
             Self::RgbFrameFreshness { source }
             | Self::SupervisorDuration { source, .. }
             | Self::ModeAuthorityLease { source, .. }
@@ -917,6 +935,7 @@ impl std::error::Error for NanoAgentPolicyConfigParseError {
             | Self::WarmStartPathRoleCollision
             | Self::DuplicateAccessorySerialPath
             | Self::RgbExpressionRequiresEye
+            | Self::UnsupportedRgbGazeGeometrySchemaVersion { .. }
             | Self::RgbEyeRoundTripBudgetOverflow { .. }
             | Self::RgbFreshnessDoesNotCoverEyeRoundTrip { .. }
             | Self::ModeAuthorityLeaseExceedsSupervisor { .. }
@@ -1200,6 +1219,7 @@ fn parse_rgb_expression(
         brightness_basis_points,
         color_rgb,
         blink,
+        gaze_geometry,
     } = dto
     else {
         return Ok(NanoRgbExpressionPolicy::Disabled);
@@ -1217,6 +1237,27 @@ fn parse_rgb_expression(
         .map_err(NanoAgentPolicyConfigParseError::RgbMotionThreshold)?;
     let brightness = UnitAmount::try_from_basis_points(brightness_basis_points)
         .map_err(NanoAgentPolicyConfigParseError::RgbBrightness)?;
+    let gaze_geometry = match gaze_geometry {
+        Some(raw) => {
+            if raw.schema_version != NANO_RGB_GAZE_GEOMETRY_V1 {
+                return Err(
+                    NanoAgentPolicyConfigParseError::UnsupportedRgbGazeGeometrySchemaVersion {
+                        actual: raw.schema_version,
+                        supported: NANO_RGB_GAZE_GEOMETRY_V1,
+                    },
+                );
+            }
+            Some(
+                CameraToHeadGazeExtrinsics::parse(CameraToHeadGazeExtrinsicsInput {
+                    head_origin_in_camera_m: raw.head_origin_in_camera_m,
+                    neutral_head_from_camera_quaternion_xyzw: raw
+                        .neutral_head_from_camera_quaternion_xyzw,
+                })
+                .map_err(NanoAgentPolicyConfigParseError::RgbGazeGeometry)?,
+            )
+        }
+        None => None,
+    };
     let frame_freshness_ns =
         parse_bounded_milliseconds(frame_freshness_ms, MAX_NANO_AGENT_RGB_FRAME_FRESHNESS_MS)
             .map_err(|source| NanoAgentPolicyConfigParseError::RgbFrameFreshness { source })?;
@@ -1251,6 +1292,7 @@ fn parse_rgb_expression(
             scene_motion: SceneMotionConfig::new(geometry, thresholds),
             frame_freshness,
             render_style: EyeRenderStyle::new(brightness, color_rgb, blink),
+            gaze_geometry,
         },
     ))
 }
@@ -1626,7 +1668,28 @@ enum NanoRgbExpressionPolicyDto {
         brightness_basis_points: u16,
         color_rgb: [u8; 3],
         blink: bool,
+        #[serde(default, deserialize_with = "deserialize_present_rgb_gaze_geometry")]
+        gaze_geometry: Option<NanoRgbGazeGeometryDto>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NanoRgbGazeGeometryDto {
+    schema_version: u32,
+    head_origin_in_camera_m: [f64; 3],
+    neutral_head_from_camera_quaternion_xyzw: [f64; 4],
+}
+
+/// Missing preserves schema-v1 compatibility; an explicitly present value must
+/// be the versioned object, so JSON `null` cannot masquerade as absence.
+fn deserialize_present_rgb_gaze_geometry<'de, D>(
+    deserializer: D,
+) -> Result<Option<NanoRgbGazeGeometryDto>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    NanoRgbGazeGeometryDto::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -1750,7 +1813,12 @@ mod tests {
                 "frame_freshness_ms": 80,
                 "brightness_basis_points": 7000,
                 "color_rgb": [32, 128, 255],
-                "blink": false
+                "blink": false,
+                "gaze_geometry": {
+                    "schema_version": 1,
+                    "head_origin_in_camera_m": [0.0, -0.25, -0.20],
+                    "neutral_head_from_camera_quaternion_xyzw": [0.0, 0.0, 0.0, 1.0]
+                }
             },
             "supervisor": {
                 "maximum_authority_lease_ms": 1000,
@@ -1868,6 +1936,13 @@ mod tests {
         assert_eq!(expression.scene_motion().geometry().sample_count(), 192);
         assert_eq!(expression.frame_freshness().as_nanos(), 80_000_000);
         assert_eq!(
+            expression
+                .gaze_geometry()
+                .expect("explicit gaze geometry")
+                .head_origin_in_camera_m(),
+            [0.0, -0.25, -0.20]
+        );
+        assert_eq!(
             parsed.supervisor().maximum_authority_lease().as_nanos(),
             1_000_000_000
         );
@@ -1875,6 +1950,68 @@ mod tests {
             parsed.live_mode_policy().startup(),
             NanoAgentStartupMode::DisarmedMapOnly
         );
+    }
+
+    #[test]
+    fn schema_v1_absence_disables_gaze_projection_without_assuming_extrinsics() {
+        let mut value = valid_value();
+        value["rgb_expression"]
+            .as_object_mut()
+            .expect("RGB expression object")
+            .remove("gaze_geometry");
+
+        let parsed = parse(&value).expect("legacy schema-v1 RGB policy remains compatible");
+        let expression = parsed
+            .rgb_expression()
+            .scene_motion()
+            .expect("scene motion remains enabled");
+        assert_eq!(expression.gaze_geometry(), None);
+
+        let mut value = valid_value();
+        value["rgb_expression"]["gaze_geometry"] = Value::Null;
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentPolicyConfigParseError::JsonDecode(_))
+        ));
+    }
+
+    #[test]
+    fn configured_gaze_geometry_is_parsed_once_and_rejects_invalid_physical_domain() {
+        let mut value = valid_value();
+        value["rgb_expression"]["gaze_geometry"]["neutral_head_from_camera_quaternion_xyzw"] =
+            json!([0.0, 0.0, 0.0, 0.0]);
+
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentPolicyConfigParseError::RgbGazeGeometry(
+                GazeExtrinsicsParseError::DegenerateRotationQuaternion
+            ))
+        ));
+
+        let mut value = valid_value();
+        value["rgb_expression"]["gaze_geometry"]["head_origin_in_camera_m"] =
+            json!([0.0, -25.0, -20.0]);
+        assert!(matches!(
+            parse(&value),
+            Err(NanoAgentPolicyConfigParseError::RgbGazeGeometry(
+                GazeExtrinsicsParseError::HeadOriginDistanceOutOfRange {
+                    distance_m,
+                    maximum_m,
+                }
+            )) if distance_m > maximum_m
+        ));
+
+        let mut value = valid_value();
+        value["rgb_expression"]["gaze_geometry"]["schema_version"] = json!(2);
+        assert!(matches!(
+            parse(&value),
+            Err(
+                NanoAgentPolicyConfigParseError::UnsupportedRgbGazeGeometrySchemaVersion {
+                    actual: 2,
+                    supported: NANO_RGB_GAZE_GEOMETRY_V1,
+                }
+            )
+        ));
     }
 
     #[test]
