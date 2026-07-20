@@ -1360,9 +1360,9 @@ mod tests {
         LocalCostmapCell, LocalCostmapConfig, LocalCostmapQuery, TrackingCameraToBase,
     };
     use super::super::mpc::{
-        MPC_CONFIG_V1, MpcConfigV1Dto, MpcFailureKind, MpcSolver, PLANT_MODEL_V1,
-        PlantEvidenceV1Dto, PlantModelV1, PlantModelV1Dto, PlantValidityEnvelopeV1Dto,
-        WheelPlantV1Dto,
+        HostMonotonicClockFailure, HostMonotonicClockReadError, MPC_CONFIG_V1, MpcConfigV1Dto,
+        MpcFailureKind, MpcSolveProgressV1, MpcSolver, PLANT_MODEL_V1, PlantEvidenceV1Dto,
+        PlantModelV1, PlantModelV1Dto, PlantValidityEnvelopeV1Dto, WheelPlantV1Dto,
     };
     use super::super::odometry::{
         PlanarOdometryConfig, PlanarOdometryConfigDto, RawImuCalibrationDto,
@@ -1734,8 +1734,16 @@ mod tests {
     struct FixedClock(HostMonotonicTimestamp);
 
     impl HostMonotonicClock for FixedClock {
-        fn now(&mut self) -> HostMonotonicTimestamp {
-            self.0
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            Ok(self.0)
+        }
+    }
+
+    struct ReadFailingClock(HostMonotonicClockReadError);
+
+    impl HostMonotonicClock for ReadFailingClock {
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            Err(self.0)
         }
     }
 
@@ -1754,6 +1762,38 @@ mod tests {
         ));
         accept_aligned_depth(&mut coordinator);
         coordinator
+    }
+
+    #[test]
+    fn ready_tick_clock_read_failure_is_a_journaled_transport_free_stop() {
+        let mut coordinator = ready_fixture(1_000, 10, 2.0);
+        let injected = HostMonotonicClockReadError::ElapsedNanosecondsOutOfRange {
+            elapsed_nanoseconds: 18_446_744_073_709_551_616,
+        };
+        let outcome = coordinator
+            .tick(host(1_120), &mut ReadFailingClock(injected))
+            .expect("clock read failure must remain an admitted STOP decision");
+
+        let SafetyDecisionOutcome::Stopped(stopped) = outcome.decision().outcome() else {
+            panic!("clock read failure cannot produce a controller decision")
+        };
+        let SafetyStopCause::Solver(source) = stopped.cause() else {
+            panic!("coordinator must retain the exact solver clock failure")
+        };
+        assert_eq!(source.progress(), MpcSolveProgressV1::NotStarted);
+        assert!(matches!(
+            source.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(actual))
+                if *actual == injected
+        ));
+        assert_eq!(
+            outcome.decision().record().disposition(),
+            ShadowCommandDisposition::FailClosedStop
+        );
+        assert!(outcome.decision().record().pwm().is_stop());
+        assert!(outcome.control_tick_journaled());
+        assert!(coordinator.safety().last_success_trajectory().is_none());
+        assert_eq!(outcome.decision().motor_packets_sent().get(), 0);
     }
 
     #[test]

@@ -1773,8 +1773,35 @@ impl CollisionQuery for LocalCostmapCapsuleQueryV1<'_> {
     }
 }
 
+/// Failure to read a timestamp in the host navigation clock's `u64`
+/// nanosecond domain.
+///
+/// The production clock is process-relative and based on [`std::time::Instant`].
+/// `Duration::as_nanos` is `u128`, so the boundary conversion remains fallible
+/// instead of fabricating a maximum timestamp when its target domain is
+/// exhausted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostMonotonicClockReadError {
+    ElapsedNanosecondsOutOfRange { elapsed_nanoseconds: u128 },
+}
+
+impl fmt::Display for HostMonotonicClockReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ElapsedNanosecondsOutOfRange {
+                elapsed_nanoseconds,
+            } => write!(
+                formatter,
+                "host monotonic elapsed time {elapsed_nanoseconds} ns exceeds the u64 navigation timebase"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HostMonotonicClockReadError {}
+
 pub trait HostMonotonicClock {
-    fn now(&mut self) -> HostMonotonicTimestamp;
+    fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1802,15 +1829,39 @@ impl SolveStatusV1 {
     pub fn completed_iterations(self) -> u8 {
         self.completed_iterations
     }
+    /// Admitted rollout attempts charged against the configured solve budget.
+    ///
+    /// The count advances before the rollout body starts, so an in-progress
+    /// failure can retain an attempt which did not produce a rollout outcome.
     pub fn rollout_evaluations(self) -> u64 {
         self.rollout_evaluations
     }
+    /// Pre-final collision-query attempts whose query method was invoked.
+    ///
+    /// This counts invocations, not traversable results. A query error or the
+    /// immediately following clock-read failure retains the invoked attempt.
     pub fn pre_final_collision_queries(self) -> u64 {
         self.pre_final_collision_queries
     }
+    /// Final-revalidation collision-query attempts whose method was invoked.
+    ///
+    /// A successful solution proves these returned traversable; a failed
+    /// solve can retain an invoked attempt without claiming that result.
     pub fn final_validation_queries(self) -> u64 {
         self.final_validation_queries
     }
+}
+
+/// Truthful progress retained by a failed solve.
+///
+/// `NotStarted` means the solver never obtained its first clock observation,
+/// so no timestamp or work counter exists. `InProgress` begins after that
+/// first successful observation and retains only the last successfully read
+/// timestamp plus counters with the support documented by [`SolveStatusV1`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MpcSolveProgressV1 {
+    NotStarted,
+    InProgress(SolveStatusV1),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1943,11 +1994,40 @@ impl fmt::Display for ClockFault {
 }
 impl std::error::Error for ClockFault {}
 
+/// A clock source read failure is distinct from a successfully read value
+/// which violates the parsed request's monotonic/deadline contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostMonotonicClockFailure {
+    Read(HostMonotonicClockReadError),
+    Fault(ClockFault),
+}
+
+impl fmt::Display for HostMonotonicClockFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(source) => source.fmt(formatter),
+            Self::Fault(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for HostMonotonicClockFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(source) => Some(source),
+            Self::Fault(source) => Some(source),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CollisionObservationFailure<E> {
     Query(E),
-    Clock(ClockFault),
-    QueryAndClock { query: E, clock: ClockFault },
+    Clock(HostMonotonicClockFailure),
+    QueryAndClock {
+        query: E,
+        clock: HostMonotonicClockFailure,
+    },
 }
 
 impl<E: fmt::Debug> fmt::Display for CollisionObservationFailure<E> {
@@ -2012,7 +2092,7 @@ pub enum NumericalStageV1 {
 
 #[derive(Debug)]
 pub enum MpcFailureKind<E> {
-    Clock(ClockFault),
+    Clock(HostMonotonicClockFailure),
     CollisionSnapshotMismatch {
         requested: Box<CollisionSnapshotProvenanceV1>,
         actual: Box<CollisionSnapshotProvenanceV1>,
@@ -2055,6 +2135,7 @@ pub enum MpcFailureKind<E> {
         integration_substep: Option<usize>,
     },
     EvaluationLimit {
+        /// Configured maximum admitted, budget-charged rollout attempts.
         configured: u64,
     },
 }
@@ -2064,7 +2145,7 @@ pub struct MpcFailure<'reference, E> {
     model: PlantModelV1,
     config: MpcConfigV1,
     request: MpcRequestV1<'reference>,
-    status: SolveStatusV1,
+    progress: MpcSolveProgressV1,
     kind: MpcFailureKind<E>,
 }
 
@@ -2082,8 +2163,8 @@ impl<'reference, E> MpcFailure<'reference, E> {
     pub fn request(&self) -> MpcRequestV1<'reference> {
         self.request
     }
-    pub fn status(&self) -> SolveStatusV1 {
-        self.status
+    pub fn progress(&self) -> MpcSolveProgressV1 {
+        self.progress
     }
     pub fn kind(&self) -> &MpcFailureKind<E> {
         &self.kind
@@ -2889,7 +2970,15 @@ impl MpcSolver {
         Q: CollisionQuery,
         C: HostMonotonicClock,
     {
-        let started_at = clock.now();
+        let started_at = match clock.try_now() {
+            Ok(started_at) => started_at,
+            Err(source) => {
+                return Err(self.failure_before_start(
+                    request,
+                    MpcFailureKind::Clock(HostMonotonicClockFailure::Read(source)),
+                ));
+            }
+        };
         let mut status = SolveStatusV1 {
             started_at,
             observed_at: started_at,
@@ -2901,7 +2990,11 @@ impl MpcSolver {
             final_validation_queries: 0,
         };
         if let Some(fault) = clock_fault(request, started_at, started_at) {
-            return Err(self.failure(request, status, MpcFailureKind::Clock(fault)));
+            return Err(self.failure(
+                request,
+                status,
+                MpcFailureKind::Clock(HostMonotonicClockFailure::Fault(fault)),
+            ));
         }
         if request.reference.points.len() != self.config.horizon
             || request.reference.step_period_s.to_bits() != self.config.dt_s.to_bits()
@@ -3046,6 +3139,9 @@ impl MpcSolver {
             }
         }
         self.begin_rollout(request, status)?;
+        // Admission charges one bounded attempt before the body starts. A
+        // body failure must retain that consumed budget rather than pretending
+        // the attempt was never admitted.
         status.rollout_evaluations += 1;
         let objective_cost =
             match self.evaluate_rollout_body(initial, request, collision, clock, &mut status)? {
@@ -3160,6 +3256,8 @@ impl MpcSolver {
         C: HostMonotonicClock,
     {
         self.begin_rollout(request, *status)?;
+        // This is an admitted, budget-charged attempt, not a completion
+        // counter. Increment before entering the fallible rollout body.
         status.rollout_evaluations += 1;
         self.evaluate_rollout_body(initial, request, collision, clock, status)
     }
@@ -3363,10 +3461,23 @@ impl MpcSolver {
         C: HostMonotonicClock,
     {
         let previous = status.observed_at;
-        let observed = clock.now();
+        let observed = match clock.try_now() {
+            Ok(observed) => observed,
+            Err(source) => {
+                return Err(self.failure(
+                    request,
+                    *status,
+                    MpcFailureKind::Clock(HostMonotonicClockFailure::Read(source)),
+                ));
+            }
+        };
         status.observed_at = observed;
         match clock_fault(request, previous, observed) {
-            Some(fault) => Err(self.failure(request, *status, MpcFailureKind::Clock(fault))),
+            Some(fault) => Err(self.failure(
+                request,
+                *status,
+                MpcFailureKind::Clock(HostMonotonicClockFailure::Fault(fault)),
+            )),
             None => Ok(()),
         }
     }
@@ -3384,6 +3495,9 @@ impl MpcSolver {
         Q: CollisionQuery,
         C: HostMonotonicClock,
     {
+        // Count the invocation before calling the fallible query so a query
+        // error or the immediately following clock-read failure retains that
+        // the query method actually ran.
         if final_revalidation {
             status.final_validation_queries += 1;
         } else {
@@ -3391,9 +3505,13 @@ impl MpcSolver {
         }
         let query_result = collision.is_capsule_traversable(capsule);
         let previous = status.observed_at;
-        let observed = clock.now();
-        status.observed_at = observed;
-        let clock_result = clock_fault(request, previous, observed);
+        let clock_result = match clock.try_now() {
+            Ok(observed) => {
+                status.observed_at = observed;
+                clock_fault(request, previous, observed).map(HostMonotonicClockFailure::Fault)
+            }
+            Err(source) => Some(HostMonotonicClockFailure::Read(source)),
+        };
         match (query_result, clock_result) {
             (Ok(value), None) => Ok(value),
             (Ok(_), Some(clock)) => Err(self.failure(
@@ -3445,7 +3563,21 @@ impl MpcSolver {
             model: self.model,
             config: self.config,
             request,
-            status,
+            progress: MpcSolveProgressV1::InProgress(status),
+            kind,
+        })
+    }
+
+    fn failure_before_start<'reference, E>(
+        &self,
+        request: MpcRequestV1<'reference>,
+        kind: MpcFailureKind<E>,
+    ) -> MpcSolveError<'reference, E> {
+        Box::new(MpcFailure {
+            model: self.model,
+            config: self.config,
+            request,
+            progress: MpcSolveProgressV1::NotStarted,
             kind,
         })
     }
@@ -3879,8 +4011,8 @@ mod tests {
 
     struct ConstantClock(HostMonotonicTimestamp);
     impl HostMonotonicClock for ConstantClock {
-        fn now(&mut self) -> HostMonotonicTimestamp {
-            self.0
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            Ok(self.0)
         }
     }
 
@@ -3902,8 +4034,47 @@ mod tests {
         }
     }
     impl HostMonotonicClock for ScriptedClock {
-        fn now(&mut self) -> HostMonotonicTimestamp {
-            self.times.pop_front().unwrap_or(self.last)
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            Ok(self.times.pop_front().unwrap_or(self.last))
+        }
+    }
+
+    const INJECTED_CLOCK_READ_ERROR: HostMonotonicClockReadError =
+        HostMonotonicClockReadError::ElapsedNanosecondsOutOfRange {
+            elapsed_nanoseconds: 18_446_744_073_709_551_616,
+        };
+
+    struct ReadFailingClock {
+        now: HostMonotonicTimestamp,
+        fail_at_call: usize,
+        calls: usize,
+    }
+
+    impl ReadFailingClock {
+        fn new(now: HostMonotonicTimestamp, fail_at_call: usize) -> Self {
+            Self {
+                now,
+                fail_at_call,
+                calls: 0,
+            }
+        }
+    }
+
+    impl HostMonotonicClock for ReadFailingClock {
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            self.calls += 1;
+            if self.calls == self.fail_at_call {
+                Err(INJECTED_CLOCK_READ_ERROR)
+            } else {
+                Ok(self.now)
+            }
+        }
+    }
+
+    fn in_progress<E>(failure: &MpcFailure<'_, E>) -> SolveStatusV1 {
+        match failure.progress() {
+            MpcSolveProgressV1::NotStarted => panic!("solve unexpectedly never started"),
+            MpcSolveProgressV1::InProgress(status) => status,
         }
     }
 
@@ -3944,6 +4115,170 @@ mod tests {
                 Ok(self.block_on != Some(self.calls))
             }
         }
+    }
+
+    #[test]
+    fn initial_clock_read_failure_has_no_fabricated_progress_or_work() {
+        let fixture = runtime_fixture(1, 1);
+        let reference = reference(&fixture, 0.0);
+        let request = request(&fixture, &reference);
+        let mut solver = MpcSolver::new(fixture.model, fixture.config).expect("solver");
+        let mut query = ScriptedQuery::clear(fixture.collision);
+        let mut clock = ReadFailingClock::new(HostMonotonicTimestamp::from_nanos(30), 1);
+
+        let failure = solver
+            .solve(request, &mut query, &mut clock)
+            .expect_err("initial read failure");
+
+        assert_eq!(clock.calls, 1);
+        assert_eq!(query.calls, 0);
+        assert_eq!(failure.progress(), MpcSolveProgressV1::NotStarted);
+        assert!(matches!(
+            failure.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(source))
+                if *source == INJECTED_CLOCK_READ_ERROR
+        ));
+    }
+
+    #[test]
+    fn second_clock_read_failure_retains_first_observation_and_zero_work() {
+        let fixture = runtime_fixture(1, 1);
+        let reference = reference(&fixture, 0.0);
+        let request = request(&fixture, &reference);
+        let mut solver = MpcSolver::new(fixture.model, fixture.config).expect("solver");
+        let mut query = ScriptedQuery::clear(fixture.collision);
+        let observed = HostMonotonicTimestamp::from_nanos(30);
+        let mut clock = ReadFailingClock::new(observed, 2);
+
+        let failure = solver
+            .solve(request, &mut query, &mut clock)
+            .expect_err("second read failure");
+        let status = in_progress(&failure);
+
+        assert_eq!(clock.calls, 2);
+        assert_eq!(query.calls, 0);
+        assert_eq!(status.started_at(), observed);
+        assert_eq!(status.observed_at(), observed);
+        assert_eq!(status.completed_iterations(), 0);
+        assert_eq!(status.rollout_evaluations(), 0);
+        assert_eq!(status.pre_final_collision_queries(), 0);
+        assert_eq!(status.final_validation_queries(), 0);
+        assert!(matches!(
+            failure.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(source))
+                if *source == INJECTED_CLOCK_READ_ERROR
+        ));
+    }
+
+    #[test]
+    fn query_and_following_clock_read_failure_retain_both_sources() {
+        let fixture = runtime_fixture(1, 1);
+        let reference = reference(&fixture, 0.0);
+        let request = request(&fixture, &reference);
+        let mut solver = MpcSolver::new(fixture.model, fixture.config).expect("solver");
+        let mut query = ScriptedQuery {
+            snapshot: fixture.collision,
+            calls: 0,
+            error_on: Some(1),
+            block_on: None,
+        };
+        let observed = HostMonotonicTimestamp::from_nanos(30);
+        let mut clock = ReadFailingClock::new(observed, 3);
+
+        let failure = solver
+            .solve(request, &mut query, &mut clock)
+            .expect_err("combined query and read failure");
+        let status = in_progress(&failure);
+
+        assert_eq!(clock.calls, 3);
+        assert_eq!(query.calls, 1);
+        assert_eq!(status.observed_at(), observed);
+        assert_eq!(status.rollout_evaluations(), 0);
+        assert_eq!(status.pre_final_collision_queries(), 1);
+        assert_eq!(status.final_validation_queries(), 0);
+        assert!(matches!(
+            failure.kind(),
+            MpcFailureKind::CollisionObservation {
+                horizon_step: None,
+                integration_substep: None,
+                final_revalidation: false,
+                source: CollisionObservationFailure::QueryAndClock {
+                    query: QueryError::Injected,
+                    clock: HostMonotonicClockFailure::Read(source),
+                },
+            } if *source == INJECTED_CLOCK_READ_ERROR
+        ));
+    }
+
+    #[test]
+    fn admitted_rollout_is_charged_before_body_clock_read_failure() {
+        let fixture = runtime_fixture(1, 1);
+        let reference = reference(&fixture, 0.0);
+        let request = request(&fixture, &reference);
+        let mut solver = MpcSolver::new(fixture.model, fixture.config).expect("solver");
+        let mut query = ScriptedQuery::clear(fixture.collision);
+        let observed = HostMonotonicTimestamp::from_nanos(30);
+        let mut clock = ReadFailingClock::new(observed, 5);
+
+        let failure = solver
+            .solve(request, &mut query, &mut clock)
+            .expect_err("rollout body read failure");
+        let status = in_progress(&failure);
+
+        assert_eq!(clock.calls, 5);
+        assert_eq!(query.calls, 1);
+        assert_eq!(status.completed_iterations(), 0);
+        assert_eq!(status.rollout_evaluations(), 1);
+        assert!(status.rollout_evaluations() <= failure.config().max_rollout_evaluations());
+        assert_eq!(status.pre_final_collision_queries(), 1);
+        assert_eq!(status.final_validation_queries(), 0);
+        assert!(matches!(
+            failure.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(source))
+                if *source == INJECTED_CLOCK_READ_ERROR
+        ));
+    }
+
+    #[test]
+    fn final_clock_read_failure_retains_bounded_attempt_counters() {
+        let fixture = runtime_fixture(1, 1);
+        let reference = reference(&fixture, 0.0);
+        let request = request(&fixture, &reference);
+        let observed = HostMonotonicTimestamp::from_nanos(30);
+
+        let mut successful_solver =
+            MpcSolver::new(fixture.model, fixture.config).expect("successful solver");
+        let mut successful_query = ScriptedQuery::clear(fixture.collision);
+        let mut successful_clock = ReadFailingClock::new(observed, usize::MAX);
+        let expected_status = successful_solver
+            .solve(request, &mut successful_query, &mut successful_clock)
+            .expect("deterministic successful solve")
+            .status();
+        let final_read_call = successful_clock.calls;
+
+        let mut failing_solver =
+            MpcSolver::new(fixture.model, fixture.config).expect("failing solver");
+        let mut failing_query = ScriptedQuery::clear(fixture.collision);
+        let mut failing_clock = ReadFailingClock::new(observed, final_read_call);
+        let failure = failing_solver
+            .solve(request, &mut failing_query, &mut failing_clock)
+            .expect_err("last clock read must remain fallible");
+
+        assert_eq!(failing_clock.calls, final_read_call);
+        assert_eq!(
+            failure.progress(),
+            MpcSolveProgressV1::InProgress(expected_status)
+        );
+        let status = in_progress(&failure);
+        assert!(status.rollout_evaluations() > 0);
+        assert!(status.rollout_evaluations() <= failure.config().max_rollout_evaluations());
+        assert!(status.pre_final_collision_queries() > 0);
+        assert_eq!(status.final_validation_queries(), 1);
+        assert!(matches!(
+            failure.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(source))
+                if *source == INJECTED_CLOCK_READ_ERROR
+        ));
     }
 
     #[test]
@@ -4341,7 +4676,7 @@ mod tests {
                 final_revalidation: false,
                 source: CollisionObservationFailure::QueryAndClock {
                     query: QueryError::Injected,
-                    clock: ClockFault::DeadlineReached { .. },
+                    clock: HostMonotonicClockFailure::Fault(ClockFault::DeadlineReached { .. }),
                 },
                 ..
             }
@@ -4372,8 +4707,8 @@ mod tests {
                 integration_substep: 0
             }
         ));
-        assert_eq!(failure.status().pre_final_collision_queries(), 11);
-        assert_eq!(failure.status().final_validation_queries(), 1);
+        assert_eq!(in_progress(&failure).pre_final_collision_queries(), 11);
+        assert_eq!(in_progress(&failure).final_validation_queries(), 1);
     }
 
     #[test]
@@ -4513,7 +4848,7 @@ mod tests {
             failure.kind(),
             MpcFailureKind::EvaluationLimit { configured: 1 }
         ));
-        assert_eq!(failure.status().rollout_evaluations(), 1);
+        assert_eq!(in_progress(&failure).rollout_evaluations(), 1);
     }
 
     #[test]

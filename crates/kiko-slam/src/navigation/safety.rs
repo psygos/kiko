@@ -20,8 +20,8 @@ use super::mpc::{
     CollisionSnapshotProvenanceV1, FinalTrajectoryValidationV1, HostMonotonicClock,
     LocalCostmapCapsuleAdapterError, LocalCostmapCapsuleQueryError, LocalCostmapCapsuleQueryV1,
     MPC_REQUEST_V1, MpcConfigV1, MpcFailureKind, MpcReferenceV1, MpcRequestParseError,
-    MpcRequestV1, MpcRequestV1Dto, MpcSolveError, MpcSolver, NavigationEpochV1, OdomMotionStateV1,
-    PlantModelV1, PredictedOdomPointV1, SolveStatusV1,
+    MpcRequestV1, MpcRequestV1Dto, MpcSolveError, MpcSolveProgressV1, MpcSolver, NavigationEpochV1,
+    OdomMotionStateV1, PlantModelV1, PredictedOdomPointV1, SolveStatusV1,
 };
 use super::shadow_command::{
     MotorPacketsSent, ShadowCommandConfig, ShadowCommandError, ShadowCommandRecord,
@@ -272,7 +272,7 @@ pub struct SafetySolverFailure {
     model: PlantModelV1,
     config: MpcConfigV1,
     request: SafetySolverRequestContext,
-    status: SolveStatusV1,
+    progress: MpcSolveProgressV1,
     kind: MpcFailureKind<LocalCostmapCapsuleQueryError>,
 }
 
@@ -292,7 +292,7 @@ impl SafetySolverFailure {
                 previous_pwm: request.previous_pwm(),
                 collision_snapshot: request.collision_snapshot(),
             },
-            status: source.status(),
+            progress: source.progress(),
             kind: own_mpc_failure_kind(source.kind()),
         }
     }
@@ -309,8 +309,8 @@ impl SafetySolverFailure {
         self.request
     }
 
-    pub fn status(&self) -> SolveStatusV1 {
-        self.status
+    pub fn progress(&self) -> MpcSolveProgressV1 {
+        self.progress
     }
 
     pub fn kind(&self) -> &MpcFailureKind<LocalCostmapCapsuleQueryError> {
@@ -324,7 +324,15 @@ impl fmt::Display for SafetySolverFailure {
     }
 }
 
-impl std::error::Error for SafetySolverFailure {}
+impl std::error::Error for SafetySolverFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            MpcFailureKind::Clock(source) => Some(source),
+            MpcFailureKind::CollisionObservation { source, .. } => source.source(),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum SafetyStopCause {
@@ -730,7 +738,10 @@ impl ShadowSafetySupervisor {
         let solution = match self.solver.solve(request, collision, clock) {
             Ok(solution) => solution,
             Err(source) => {
-                let recorded_at = tick.max(source.status().observed_at());
+                let recorded_at = match source.progress() {
+                    MpcSolveProgressV1::NotStarted => tick,
+                    MpcSolveProgressV1::InProgress(status) => tick.max(status.observed_at()),
+                };
                 let source = SafetySolverFailure::from_mpc(source);
                 return self.record_stop(
                     recorded_at,
@@ -1012,9 +1023,10 @@ mod tests {
     };
 
     use super::super::mpc::{
-        ClockFault, ConservativeCapsuleSegmentV1, MpcConfigV1Dto, ODOM_MOTION_STATE_V1,
-        OdomMotionStateV1Dto, OdomReferencePointV1Dto, PLANT_MODEL_V1, PlantEvidenceV1Dto,
-        PlantModelV1Dto, PlantValidityEnvelopeV1Dto, ReferenceBuilderRevisionV1, WheelPlantV1Dto,
+        ClockFault, ConservativeCapsuleSegmentV1, HostMonotonicClockFailure,
+        HostMonotonicClockReadError, MpcConfigV1Dto, ODOM_MOTION_STATE_V1, OdomMotionStateV1Dto,
+        OdomReferencePointV1Dto, PLANT_MODEL_V1, PlantEvidenceV1Dto, PlantModelV1Dto,
+        PlantValidityEnvelopeV1Dto, ReferenceBuilderRevisionV1, WheelPlantV1Dto,
     };
     use super::super::{
         BaseToOdom, GlobalPath, GlobalPlanner, GlobalPlannerConfig, LocalCostmap,
@@ -1340,8 +1352,8 @@ mod tests {
     struct ConstantClock(HostMonotonicTimestamp);
 
     impl HostMonotonicClock for ConstantClock {
-        fn now(&mut self) -> HostMonotonicTimestamp {
-            self.0
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            Ok(self.0)
         }
     }
 
@@ -1366,8 +1378,40 @@ mod tests {
     }
 
     impl HostMonotonicClock for ScriptedClock {
-        fn now(&mut self) -> HostMonotonicTimestamp {
-            self.times.pop_front().unwrap_or(self.last)
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            Ok(self.times.pop_front().unwrap_or(self.last))
+        }
+    }
+
+    const INJECTED_CLOCK_READ_ERROR: HostMonotonicClockReadError =
+        HostMonotonicClockReadError::ElapsedNanosecondsOutOfRange {
+            elapsed_nanoseconds: 18_446_744_073_709_551_616,
+        };
+
+    struct ReadFailingClock {
+        now: HostMonotonicTimestamp,
+        fail_at_call: usize,
+        calls: usize,
+    }
+
+    impl ReadFailingClock {
+        fn new(now: HostMonotonicTimestamp, fail_at_call: usize) -> Self {
+            Self {
+                now,
+                fail_at_call,
+                calls: 0,
+            }
+        }
+    }
+
+    impl HostMonotonicClock for ReadFailingClock {
+        fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+            self.calls += 1;
+            if self.calls == self.fail_at_call {
+                Err(INJECTED_CLOCK_READ_ERROR)
+            } else {
+                Ok(self.now)
+            }
         }
     }
 
@@ -1443,10 +1487,99 @@ mod tests {
     }
 
     #[test]
+    fn initial_clock_read_failure_records_stop_without_fabricated_progress() {
+        let fixture = runtime_fixture();
+        let reference = reference_at(&fixture, 12);
+        let tick = HostMonotonicTimestamp::from_nanos(20);
+        let mut supervisor = supervisor(&fixture);
+        let mut clock = ReadFailingClock::new(HostMonotonicTimestamp::from_nanos(30), 1);
+
+        let decision = supervisor
+            .decide(
+                tick,
+                SafetyTickInput::Ready(ready(
+                    &fixture,
+                    &reference,
+                    state_at(fixture.epoch, 11),
+                    tick.as_nanos(),
+                    1_000,
+                )),
+                &mut clock,
+            )
+            .expect("clock read failure must remain an admitted STOP decision");
+
+        assert_eq!(clock.calls, 1);
+        assert_stop_record(&supervisor, &decision);
+        assert_eq!(decision.record().recorded_at(), tick);
+        assert!(supervisor.last_success_trajectory().is_none());
+        let SafetyStopCause::Solver(source) = stopped(&decision).cause() else {
+            panic!("initial clock failure must retain its solver cause")
+        };
+        assert_eq!(source.progress(), MpcSolveProgressV1::NotStarted);
+        assert!(matches!(
+            source.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(actual))
+                if *actual == INJECTED_CLOCK_READ_ERROR
+        ));
+        let clock_failure = std::error::Error::source(source.as_ref())
+            .expect("safety failure must expose its typed clock cause");
+        assert_eq!(
+            clock_failure.downcast_ref::<HostMonotonicClockFailure>(),
+            Some(&HostMonotonicClockFailure::Read(INJECTED_CLOCK_READ_ERROR))
+        );
+    }
+
+    #[test]
+    fn second_clock_read_failure_stops_at_last_truthful_observation_with_zero_work() {
+        let fixture = runtime_fixture();
+        let reference = reference_at(&fixture, 12);
+        let tick = HostMonotonicTimestamp::from_nanos(20);
+        let first_observation = HostMonotonicTimestamp::from_nanos(30);
+        let mut supervisor = supervisor(&fixture);
+        let mut clock = ReadFailingClock::new(first_observation, 2);
+
+        let decision = supervisor
+            .decide(
+                tick,
+                SafetyTickInput::Ready(ready(
+                    &fixture,
+                    &reference,
+                    state_at(fixture.epoch, 11),
+                    tick.as_nanos(),
+                    1_000,
+                )),
+                &mut clock,
+            )
+            .expect("second clock read failure must journal STOP");
+
+        assert_eq!(clock.calls, 2);
+        assert_stop_record(&supervisor, &decision);
+        assert_eq!(decision.record().recorded_at(), first_observation);
+        assert!(supervisor.last_success_trajectory().is_none());
+        let SafetyStopCause::Solver(source) = stopped(&decision).cause() else {
+            panic!("clock failure must retain its solver cause")
+        };
+        let MpcSolveProgressV1::InProgress(status) = source.progress() else {
+            panic!("the successful first read established solver progress")
+        };
+        assert_eq!(status.started_at(), first_observation);
+        assert_eq!(status.observed_at(), first_observation);
+        assert_eq!(status.completed_iterations(), 0);
+        assert_eq!(status.rollout_evaluations(), 0);
+        assert_eq!(status.pre_final_collision_queries(), 0);
+        assert_eq!(status.final_validation_queries(), 0);
+        assert!(matches!(
+            source.kind(),
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Read(actual))
+                if *actual == INJECTED_CLOCK_READ_ERROR
+        ));
+    }
+
+    #[test]
     fn every_not_ready_reason_records_exactly_one_bounded_stop_without_a_request_id() {
         struct PanicClock;
         impl HostMonotonicClock for PanicClock {
-            fn now(&mut self) -> HostMonotonicTimestamp {
+            fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
                 panic!("not-ready ticks must not query the solver clock")
             }
         }
@@ -1571,7 +1704,9 @@ mod tests {
         assert!(source.request().previous_pwm().is_stop());
         assert!(matches!(
             source.kind(),
-            MpcFailureKind::Clock(ClockFault::DeadlineReached { .. })
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Fault(
+                ClockFault::DeadlineReached { .. }
+            ))
         ));
         assert_eq!(supervisor.shadow_session().retained_len(), 3);
     }
@@ -1920,32 +2055,40 @@ mod tests {
             let SafetyStopCause::Solver(source) = stopped(&decision).cause() else {
                 panic!("expected solver stop")
             };
-            (own_mpc_failure_kind(source.kind()), source.status())
+            (own_mpc_failure_kind(source.kind()), source.progress())
         };
 
-        let (regression, regression_status) = run(
+        let (regression, regression_progress) = run(
             &mut ScriptedClock::new(&[30, 29]),
             ScriptedQuery::clear(fixture.collision),
         );
         assert!(matches!(
             regression,
-            MpcFailureKind::Clock(ClockFault::Regression { .. })
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Fault(
+                ClockFault::Regression { .. }
+            ))
         ));
+        let MpcSolveProgressV1::InProgress(regression_status) = regression_progress else {
+            panic!("the first clock read succeeded")
+        };
         assert_eq!(regression_status.observed_at().as_nanos(), 29);
 
         let mut query = ScriptedQuery::clear(fixture.collision);
         query.error_on = Some(1);
-        let (combined, combined_status) = run(&mut ScriptedClock::new(&[30, 30, 100]), query);
+        let (combined, combined_progress) = run(&mut ScriptedClock::new(&[30, 30, 100]), query);
         assert!(matches!(
             combined,
             MpcFailureKind::CollisionObservation {
                 source: CollisionObservationFailure::QueryAndClock {
                     query: LocalCostmapCapsuleQueryError::NumericalBounds,
-                    clock: ClockFault::DeadlineReached { .. },
+                    clock: HostMonotonicClockFailure::Fault(ClockFault::DeadlineReached { .. }),
                 },
                 ..
             }
         ));
+        let MpcSolveProgressV1::InProgress(combined_status) = combined_progress else {
+            panic!("the first clock read succeeded")
+        };
         assert_eq!(combined_status.observed_at().as_nanos(), 100);
 
         let (deadline, _) = run(
@@ -1954,7 +2097,9 @@ mod tests {
         );
         assert!(matches!(
             deadline,
-            MpcFailureKind::Clock(ClockFault::DeadlineReached { .. })
+            MpcFailureKind::Clock(HostMonotonicClockFailure::Fault(
+                ClockFault::DeadlineReached { .. }
+            ))
         ));
     }
 

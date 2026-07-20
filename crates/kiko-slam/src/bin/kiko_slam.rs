@@ -42,6 +42,8 @@ use kiko_slam::env::{EnvError, env_u64};
 #[cfg(feature = "record")]
 use kiko_slam::{CameraPoint3, DepthImageError, Frame, FrameError, Raw, ReconState};
 
+#[cfg(all(test, not(feature = "record")))]
+use kiko_slam::HostMonotonicTimestamp;
 #[cfg(feature = "record")]
 use kiko_slam::dataset::{
     Backpressure, Calibration, CameraIntrinsics, DatasetWriteError, DatasetWriter,
@@ -52,6 +54,8 @@ use kiko_slam::dataset::{
 use kiko_slam::navigation::NavigationGoalArg;
 #[cfg(all(feature = "record", feature = "actuation"))]
 use kiko_slam::navigation::actuation::{LiveActuationError, PhysicalActuationSession};
+#[cfg(any(feature = "record", test))]
+use kiko_slam::navigation::mpc::HostMonotonicClockReadError;
 #[cfg(feature = "record")]
 use kiko_slam::navigation::mpc::{HostMonotonicClock, MpcConfigV1};
 #[cfg(feature = "record")]
@@ -2565,13 +2569,13 @@ impl std::fmt::Display for RecordItem {
     }
 }
 
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct HostMonotonicRangeError {
     elapsed_ns: u128,
 }
 
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 impl std::fmt::Display for HostMonotonicRangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -2582,17 +2586,30 @@ impl std::fmt::Display for HostMonotonicRangeError {
     }
 }
 
-#[cfg(feature = "record")]
+#[cfg(any(feature = "record", test))]
 impl std::error::Error for HostMonotonicRangeError {}
 
 #[cfg(feature = "record")]
 fn host_monotonic_since(
     origin: Instant,
 ) -> Result<HostMonotonicTimestamp, HostMonotonicRangeError> {
-    let elapsed_ns = origin.elapsed().as_nanos();
+    host_monotonic_from_elapsed_nanos(origin.elapsed().as_nanos())
+}
+
+#[cfg(any(feature = "record", test))]
+fn host_monotonic_from_elapsed_nanos(
+    elapsed_ns: u128,
+) -> Result<HostMonotonicTimestamp, HostMonotonicRangeError> {
     let elapsed_ns =
         u64::try_from(elapsed_ns).map_err(|_| HostMonotonicRangeError { elapsed_ns })?;
     Ok(HostMonotonicTimestamp::from_nanos(elapsed_ns))
+}
+
+#[cfg(any(feature = "record", test))]
+fn navigation_clock_read_error(source: HostMonotonicRangeError) -> HostMonotonicClockReadError {
+    HostMonotonicClockReadError::ElapsedNanosecondsOutOfRange {
+        elapsed_nanoseconds: source.elapsed_ns,
+    }
 }
 
 #[cfg(feature = "record")]
@@ -3482,37 +3499,23 @@ fn generate_navigation_recording_id() -> Result<NavigationRecordingId, Navigatio
 #[derive(Clone, Copy, Debug)]
 struct InstantHostClock {
     origin: Instant,
-    overflow: Option<HostMonotonicRangeError>,
 }
 
 #[cfg(feature = "record")]
 impl InstantHostClock {
     fn new(origin: Instant) -> Self {
-        Self {
-            origin,
-            overflow: None,
-        }
+        Self { origin }
     }
 
     fn checked_now(&self) -> Result<HostMonotonicTimestamp, HostMonotonicRangeError> {
         host_monotonic_since(self.origin)
     }
-
-    fn take_overflow(&mut self) -> Option<HostMonotonicRangeError> {
-        self.overflow.take()
-    }
 }
 
 #[cfg(feature = "record")]
 impl HostMonotonicClock for InstantHostClock {
-    fn now(&mut self) -> HostMonotonicTimestamp {
-        match self.checked_now() {
-            Ok(now) => now,
-            Err(source) => {
-                self.overflow.get_or_insert(source);
-                HostMonotonicTimestamp::from_nanos(u64::MAX)
-            }
-        }
+    fn try_now(&mut self) -> Result<HostMonotonicTimestamp, HostMonotonicClockReadError> {
+        self.checked_now().map_err(navigation_clock_read_error)
     }
 }
 
@@ -4259,7 +4262,6 @@ enum LiveNavigationWorkerError {
     Tick {
         source: CoordinatorTickError,
     },
-    ClockDuringSolver(HostMonotonicRangeError),
     TickSequenceExhausted,
     #[cfg(feature = "actuation")]
     Actuation {
@@ -4302,10 +4304,6 @@ impl std::fmt::Display for LiveNavigationWorkerError {
                 )
             }
             Self::Tick { source } => write!(formatter, "navigation tick failed: {source}"),
-            Self::ClockDuringSolver(source) => write!(
-                formatter,
-                "navigation solver observed an unrepresentable host time: {source}"
-            ),
             Self::TickSequenceExhausted => {
                 formatter.write_str("navigation diagnostic tick sequence exhausted i64")
             }
@@ -4338,7 +4336,7 @@ impl std::fmt::Display for LiveNavigationWorkerError {
 impl std::error::Error for LiveNavigationWorkerError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::HostClock(source) | Self::ClockDuringSolver(source) => Some(source),
+            Self::HostClock(source) => Some(source),
             Self::VisualAdmission { source }
             | Self::ImuAdmission { source }
             | Self::DepthAdmission { source }
@@ -4522,9 +4520,6 @@ fn run_live_navigation_worker(
                     let outcome = coordinator
                         .tick(tick, &mut clock)
                         .map_err(|source| LiveNavigationWorkerError::Tick { source })?;
-                    if let Some(source) = clock.take_overflow() {
-                        return Err(LiveNavigationWorkerError::ClockDuringSolver(source));
-                    }
                     tick_sequence = tick_sequence
                         .checked_add(1)
                         .ok_or(LiveNavigationWorkerError::TickSequenceExhausted)?;
@@ -6715,6 +6710,21 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+
+    #[test]
+    fn live_navigation_clock_rejects_elapsed_time_outside_u64_without_timestamp_fallback() {
+        let elapsed_nanoseconds = 18_446_744_073_709_551_616_u128;
+        let source = super::host_monotonic_from_elapsed_nanos(elapsed_nanoseconds)
+            .expect_err("u64 navigation timebase must reject the next value");
+        let error = super::navigation_clock_read_error(source);
+
+        assert!(matches!(
+            error,
+            kiko_slam::navigation::mpc::HostMonotonicClockReadError::ElapsedNanosecondsOutOfRange {
+                elapsed_nanoseconds: actual,
+            } if actual == elapsed_nanoseconds
+        ));
+    }
 
     #[cfg(feature = "record")]
     use super::{

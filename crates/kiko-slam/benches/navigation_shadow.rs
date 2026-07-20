@@ -98,7 +98,10 @@ struct RunState {
 struct PanicClock;
 
 impl HostMonotonicClock for PanicClock {
-    fn now(&mut self) -> HostMonotonicTimestamp {
+    fn try_now(
+        &mut self,
+    ) -> Result<HostMonotonicTimestamp, kiko_slam::navigation::mpc::HostMonotonicClockReadError>
+    {
         panic!("missing collision provenance must stop before the MPC clock is queried")
     }
 }
