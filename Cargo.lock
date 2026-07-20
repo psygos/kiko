@@ -3160,6 +3160,8 @@ name = "kiko-head-runtime"
 version = "0.1.0"
 dependencies = [
  "kiko-head-protocol",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-serial",
 ]

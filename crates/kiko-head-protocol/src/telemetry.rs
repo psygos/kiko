@@ -5,6 +5,60 @@ use crate::packet::{
     parse_status_response,
 };
 
+/// Exact observed value of the STS torque-switch register.
+///
+/// Unknown values remain representable because a read must report what the
+/// installed firmware returned rather than silently treating it as disabled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ObservedTorqueSwitch {
+    Disabled,
+    Enabled,
+    Calibration,
+    Unrecognized(u8),
+}
+
+impl ObservedTorqueSwitch {
+    pub const fn raw(self) -> u8 {
+        match self {
+            Self::Disabled => 0,
+            Self::Enabled => 1,
+            Self::Calibration => 128,
+            Self::Unrecognized(value) => value,
+        }
+    }
+}
+
+/// One checksum-valid torque-switch observation for one exact servo ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TorqueSwitchObservation {
+    id: ServoId,
+    state: ObservedTorqueSwitch,
+}
+
+impl TorqueSwitchObservation {
+    pub fn parse(bytes: &[u8], expected_id: ServoId) -> Result<Self, ResponseParseError> {
+        let parameters = parse_status_response(bytes, expected_id, 1)?;
+        let state = match parameters[0] {
+            0 => ObservedTorqueSwitch::Disabled,
+            1 => ObservedTorqueSwitch::Enabled,
+            128 => ObservedTorqueSwitch::Calibration,
+            value => ObservedTorqueSwitch::Unrecognized(value),
+        };
+        Ok(Self {
+            id: expected_id,
+            state,
+        })
+    }
+
+    pub const fn id(self) -> ServoId {
+        self.id
+    }
+
+    pub const fn state(self) -> ObservedTorqueSwitch {
+        self.state
+    }
+}
+
 /// Exact present-position response after envelope and domain parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PresentPosition {
@@ -309,6 +363,36 @@ mod tests {
 
     fn position(id: ServoId, value: u16) -> PresentPosition {
         PresentPosition::parse(&status(id, &value.to_le_bytes()), id).expect("position response")
+    }
+
+    #[test]
+    fn torque_switch_observation_preserves_known_and_unknown_values() {
+        let servo = id(2);
+        for (raw, expected) in [
+            (0, ObservedTorqueSwitch::Disabled),
+            (1, ObservedTorqueSwitch::Enabled),
+            (128, ObservedTorqueSwitch::Calibration),
+            (17, ObservedTorqueSwitch::Unrecognized(17)),
+        ] {
+            let observation = TorqueSwitchObservation::parse(&status(servo, &[raw]), servo)
+                .expect("checksum-valid torque-switch response");
+            assert_eq!(observation.id(), servo);
+            assert_eq!(observation.state(), expected);
+            assert_eq!(observation.state().raw(), raw);
+        }
+    }
+
+    #[test]
+    fn torque_switch_observation_rejects_corrupt_checksum() {
+        let servo = id(1);
+        let mut response = status(servo, &[1]);
+        let last = response.len() - 1;
+        response[last] ^= 1;
+
+        assert!(matches!(
+            TorqueSwitchObservation::parse(&response, servo),
+            Err(ResponseParseError::ChecksumMismatch { .. })
+        ));
     }
 
     #[test]

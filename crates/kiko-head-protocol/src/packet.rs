@@ -154,6 +154,11 @@ pub fn build_full_telemetry_read(id: ServoId) -> CommandFrame {
     )
 }
 
+/// Read the one-byte torque-switch register without changing servo state.
+pub fn build_torque_switch_read(id: ServoId) -> CommandFrame {
+    build_command(id, INSTRUCTION_READ, &[TORQUE_SWITCH_REGISTER, 1])
+}
+
 /// Build the only supported position write: goal, zero time, and a mandatory
 /// nonzero speed clamp are sent atomically in one register span.
 pub fn build_goal_with_speed_write(
@@ -318,6 +323,14 @@ fn checksum(payload: &[u8]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn torque_switch_read_is_an_exact_checksum_valid_read() {
+        let id = ServoId::try_new(4).expect("exact test ID");
+        let frame = build_torque_switch_read(id);
+
+        assert_eq!(frame.as_bytes(), &[0xff, 0xff, 4, 4, 2, 40, 1, 204]);
+    }
 
     fn id(value: u8) -> ServoId {
         ServoId::try_new(value).expect("test ID")

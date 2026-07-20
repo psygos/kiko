@@ -1,10 +1,62 @@
 # Kiko head runtime
 
 `kiko-head-runtime` is the sole host-side serial owner for Kiko's four Feetech
-STS head servos. It intentionally implements one energising operation only:
-capture the physical pose twice, command that same observed pose with explicit
-nonzero speed and torque limits, enable torque, and read back all four
-positions. It exposes no calibrated motion command.
+STS head servos. Its `kiko-head-commission` binary is read-only by default: it
+reads the torque-switch register and qualified telemetry window for the four
+fixed servo IDs and reports exactly what it observed. The runtime implements
+one separately gated energising operation: capture the physical pose twice,
+command that same observed pose with explicit nonzero speed and torque limits,
+enable torque, and read back all four positions. It exposes no calibrated
+motion command.
+
+## Commissioning command
+
+The safe default sends eight fixed STS READ requests and no register write:
+
+```text
+cargo run -p kiko-head-runtime --bin kiko-head-commission -- \
+  --config /absolute/path/to/head-commission.json
+```
+
+Configuration is strict JSON: unknown and duplicate fields fail, the file is
+bounded to 16 KiB, and the path must be absolute without `.` or `..`
+components. A read-only file needs only:
+
+```json
+{
+  "schema_version": 1,
+  "probe": {
+    "device_path": "/dev/serial/by-id/REPLACE_WITH_REVIEWED_IDENTITY",
+    "response_timeout_ms": 100,
+    "request_timeout_ms": 100,
+    "noise_budget_bytes": 32
+  },
+  "hold_observed": null
+}
+```
+
+The optional `hold_observed` object additionally requires `write_timeout_ms`,
+`arming_freshness_ms`, `write_attempts`, both position tolerances,
+`goal_speed_ticks_per_second`, four `torque_limit_permille` values, exact
+`minimum_ticks` and `maximum_ticks` arrays in bow/curl/yaw/roll order, and a
+positive `maximum_hold_ms` no greater than 900,000. Every joint window is at
+most 256 ticks wide. These assembly-specific values must come from reviewed
+physical evidence; the software does not guess them.
+
+Even with a valid hold configuration, torque writes remain unavailable unless
+both flags are present:
+
+```text
+--hold-observed --physical-torque-consent
+```
+
+That mode first completes the read-only probe, then uses the existing typed
+actor to torque-disable, observe twice, admit the pose inside all four reviewed
+windows, apply the bounded observed-position hold, and verify stopped
+telemetry. It does not move to a stored or inferred “normal” pose. SIGINT,
+SIGTERM, or the configured duration initiates a four-joint torque-disable; the
+per-joint cleanup result is printed. SIGKILL, power loss, or process failure
+cannot provide that cleanup guarantee.
 
 ## Boundary contract
 
@@ -40,14 +92,15 @@ changing the physical serial port.
 
 Startup is ordered and fail-closed:
 
-1. Read every joint twice and admit only same-ID positions within tolerance.
-2. Write all four nonzero torque limits before any goal write.
-3. Write each freshly observed position together with mandatory nonzero speed.
-4. Enable torque on all four joints.
-5. Before each enable write, require that the oldest admitted observation is
+1. Attempt torque-disable on every joint and stop if any write does not complete.
+2. Read every joint twice and admit only same-ID positions within tolerance.
+3. Write all four nonzero torque limits before any goal write.
+4. Write each freshly observed position together with mandatory nonzero speed.
+5. Enable torque on all four joints.
+6. Before each enable write, require that the oldest admitted observation is
    still inside the typed arming-freshness bound and that the remaining window
    covers every configured bounded write attempt; otherwise fail and disable.
-6. Read exact full telemetry twice for each expected ID. Both samples must be
+7. Read exact full telemetry twice for each expected ID. Both samples must be
    stopped, each must agree with its observed target, and the pair must agree
    with each other inside the configured tick bound.
 

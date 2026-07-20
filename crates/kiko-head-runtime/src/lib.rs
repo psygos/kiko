@@ -4,6 +4,7 @@
 mod actor;
 mod config;
 mod framing;
+mod probe;
 mod transport;
 
 pub use actor::{
@@ -18,11 +19,16 @@ pub use actor::{
 pub use config::{
     ArmingFreshness, ConfigParseError, ConfiguredHeadPoseBound, ConfiguredHeadPoseBounds,
     ConfiguredHeadPoseBoundsError, DeviceIdentity, DeviceIdentityKind,
-    HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds, HeadRuntimeConfig,
-    HeadRuntimeConfigInput, MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS, OperationTimeout,
-    WriteAttemptLimit,
+    HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds, HeadProbeConfig,
+    HeadProbeConfigInput, HeadRuntimeConfig, HeadRuntimeConfigInput,
+    MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS, ObservedHoldConfig, ObservedHoldConfigInput,
+    ObservedHoldConfigParseError, OperationTimeout, WriteAttemptLimit,
 };
 pub use framing::{FrameReadError, MAX_RESPONSE_BYTES};
+pub use probe::{
+    HeadProbeError, HeadProbeReport, ProbeRequest, ProbeResponseEvidence, SerialHeadProbeError,
+    ServoProbeReport, probe_serial_head,
+};
 pub use transport::{
     AsyncByteTransport, MonotonicClock, MonotonicTime, SerialConfigurationEvidence,
     SerialOpenError, SerialSetting, TokioClock, TransportFailure, TransportFailureKind,

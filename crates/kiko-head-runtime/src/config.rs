@@ -12,6 +12,7 @@ const MAX_OPERATION_TIMEOUT_MS: u64 = 5_000;
 const MAX_ARMING_FRESHNESS_MS: u64 = 5_000;
 const MAX_WRITE_ATTEMPTS: u8 = 8;
 const MAX_NOISE_BUDGET_BYTES: u16 = 1_024;
+const MAX_HOLD_DURATION_MS: u64 = 900_000;
 /// Maximum admitted width of one raw-encoder startup pose window.
 ///
 /// This is a structural anti-bypass bound, not a physical joint envelope. The
@@ -35,6 +36,15 @@ pub struct HeadRuntimeConfigInput {
     pub goal_speed_ticks_per_second: u16,
     /// Bow, curl, yaw, and roll, in that exact order.
     pub torque_limit_permille: [u16; 4],
+}
+
+/// Weak configuration for the read-only commissioning probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadProbeConfigInput {
+    pub device_path: String,
+    pub response_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub noise_budget_bytes: u16,
 }
 
 /// Supported stable device-name schemes.
@@ -133,6 +143,48 @@ impl OperationTimeout {
     }
 }
 
+/// Fully parsed configuration for fixed, read-only head probing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadProbeConfig {
+    device: DeviceIdentity,
+    response_timeout: OperationTimeout,
+    request_timeout: OperationTimeout,
+    noise_budget_bytes: u16,
+}
+
+impl HeadProbeConfig {
+    pub fn parse(input: HeadProbeConfigInput) -> Result<Self, ConfigParseError> {
+        Ok(Self {
+            device: DeviceIdentity::parse(input.device_path)?,
+            response_timeout: OperationTimeout::parse(
+                "response_timeout_ms",
+                input.response_timeout_ms,
+            )?,
+            request_timeout: OperationTimeout::parse(
+                "request_timeout_ms",
+                input.request_timeout_ms,
+            )?,
+            noise_budget_bytes: parse_noise_budget(input.noise_budget_bytes)?,
+        })
+    }
+
+    pub const fn device(&self) -> &DeviceIdentity {
+        &self.device
+    }
+
+    pub const fn response_timeout(&self) -> OperationTimeout {
+        self.response_timeout
+    }
+
+    pub const fn request_timeout(&self) -> OperationTimeout {
+        self.request_timeout
+    }
+
+    pub const fn noise_budget_bytes(&self) -> u16 {
+        self.noise_budget_bytes
+    }
+}
+
 /// Number of permitted write attempts. Only a retryable zero-progress failure
 /// can consume an attempt after the first one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -185,6 +237,111 @@ impl ArmingFreshness {
 pub struct ConfiguredHeadPoseBounds {
     minimum: [PositionTicks; 4],
     maximum: [PositionTicks; 4],
+}
+
+/// Weak fields required only by the explicitly armed observed-position hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedHoldConfigInput {
+    pub write_timeout_ms: u64,
+    pub arming_freshness_ms: u64,
+    pub write_attempts: u8,
+    pub redundant_read_tolerance_ticks: u16,
+    pub readback_tolerance_ticks: u16,
+    pub goal_speed_ticks_per_second: u16,
+    pub torque_limit_permille: [u16; 4],
+    pub minimum_ticks: [u16; 4],
+    pub maximum_ticks: [u16; 4],
+    pub maximum_hold_ms: u64,
+}
+
+/// Typed, bounded observed-position hold configuration derived from an
+/// already parsed probe boundary. Device identity and read settings are never
+/// parsed or validated a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedHoldConfig {
+    runtime: HeadRuntimeConfig,
+    pose_bounds: ConfiguredHeadPoseBounds,
+    maximum_duration: Duration,
+}
+
+impl ObservedHoldConfig {
+    pub fn parse(
+        probe: &HeadProbeConfig,
+        input: ObservedHoldConfigInput,
+    ) -> Result<Self, ObservedHoldConfigParseError> {
+        let pose_bounds =
+            ConfiguredHeadPoseBounds::try_new(input.minimum_ticks, input.maximum_ticks)
+                .map_err(ObservedHoldConfigParseError::PoseBounds)?;
+        if !(1..=MAX_HOLD_DURATION_MS).contains(&input.maximum_hold_ms) {
+            return Err(ObservedHoldConfigParseError::DurationOutOfRange {
+                milliseconds: input.maximum_hold_ms,
+                minimum_ms: 1,
+                maximum_ms: MAX_HOLD_DURATION_MS,
+            });
+        }
+        let runtime = HeadRuntimeConfig::parse_tuning(
+            probe.device.clone(),
+            probe.response_timeout,
+            probe.noise_budget_bytes,
+            RuntimeTuningInput {
+                write_timeout_ms: input.write_timeout_ms,
+                arming_freshness_ms: input.arming_freshness_ms,
+                write_attempts: input.write_attempts,
+                redundant_read_tolerance_ticks: input.redundant_read_tolerance_ticks,
+                readback_tolerance_ticks: input.readback_tolerance_ticks,
+                goal_speed_ticks_per_second: input.goal_speed_ticks_per_second,
+                torque_limit_permille: input.torque_limit_permille,
+            },
+        )
+        .map_err(ObservedHoldConfigParseError::Runtime)?;
+        Ok(Self {
+            runtime,
+            pose_bounds,
+            maximum_duration: Duration::from_millis(input.maximum_hold_ms),
+        })
+    }
+
+    pub const fn runtime(&self) -> &HeadRuntimeConfig {
+        &self.runtime
+    }
+
+    pub const fn pose_bounds(&self) -> ConfiguredHeadPoseBounds {
+        self.pose_bounds
+    }
+
+    pub const fn maximum_duration(&self) -> Duration {
+        self.maximum_duration
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservedHoldConfigParseError {
+    Runtime(ConfigParseError),
+    PoseBounds(ConfiguredHeadPoseBoundsError),
+    DurationOutOfRange {
+        milliseconds: u64,
+        minimum_ms: u64,
+        maximum_ms: u64,
+    },
+}
+
+impl fmt::Display for ObservedHoldConfigParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid observed-position hold configuration: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for ObservedHoldConfigParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(source) => Some(source),
+            Self::PoseBounds(source) => Some(source),
+            Self::DurationOutOfRange { .. } => None,
+        }
+    }
 }
 
 impl ConfiguredHeadPoseBounds {
@@ -361,6 +518,29 @@ impl HeadRuntimeConfig {
         let device = DeviceIdentity::parse(input.device_path)?;
         let response_timeout =
             OperationTimeout::parse("response_timeout_ms", input.response_timeout_ms)?;
+        let noise_budget_bytes = parse_noise_budget(input.noise_budget_bytes)?;
+        Self::parse_tuning(
+            device,
+            response_timeout,
+            noise_budget_bytes,
+            RuntimeTuningInput {
+                write_timeout_ms: input.write_timeout_ms,
+                arming_freshness_ms: input.arming_freshness_ms,
+                write_attempts: input.write_attempts,
+                redundant_read_tolerance_ticks: input.redundant_read_tolerance_ticks,
+                readback_tolerance_ticks: input.readback_tolerance_ticks,
+                goal_speed_ticks_per_second: input.goal_speed_ticks_per_second,
+                torque_limit_permille: input.torque_limit_permille,
+            },
+        )
+    }
+
+    fn parse_tuning(
+        device: DeviceIdentity,
+        response_timeout: OperationTimeout,
+        noise_budget_bytes: u16,
+        input: RuntimeTuningInput,
+    ) -> Result<Self, ConfigParseError> {
         let write_timeout = OperationTimeout::parse("write_timeout_ms", input.write_timeout_ms)?;
         let write_attempts = WriteAttemptLimit::parse(input.write_attempts)?;
         let arming_freshness = ArmingFreshness::parse(input.arming_freshness_ms)?;
@@ -372,12 +552,6 @@ impl HeadRuntimeConfig {
             return Err(ConfigParseError::ArmingFreshnessShorterThanWriteBudget {
                 arming_freshness: arming_freshness.get(),
                 maximum_write_budget,
-            });
-        }
-        if input.noise_budget_bytes > MAX_NOISE_BUDGET_BYTES {
-            return Err(ConfigParseError::NoiseBudgetOutOfRange {
-                value: input.noise_budget_bytes,
-                maximum: MAX_NOISE_BUDGET_BYTES,
             });
         }
         let redundant_read_tolerance = PositionAgreementTicks::try_new(
@@ -408,7 +582,7 @@ impl HeadRuntimeConfig {
             write_timeout,
             write_attempts,
             arming_freshness,
-            noise_budget_bytes: input.noise_budget_bytes,
+            noise_budget_bytes,
             redundant_read_tolerance,
             readback_tolerance,
             goal_speed,
@@ -455,6 +629,27 @@ impl HeadRuntimeConfig {
     pub const fn torque_limits(&self) -> HeadTorqueLimits {
         self.torque_limits
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeTuningInput {
+    write_timeout_ms: u64,
+    arming_freshness_ms: u64,
+    write_attempts: u8,
+    redundant_read_tolerance_ticks: u16,
+    readback_tolerance_ticks: u16,
+    goal_speed_ticks_per_second: u16,
+    torque_limit_permille: [u16; 4],
+}
+
+fn parse_noise_budget(value: u16) -> Result<u16, ConfigParseError> {
+    if value > MAX_NOISE_BUDGET_BYTES {
+        return Err(ConfigParseError::NoiseBudgetOutOfRange {
+            value,
+            maximum: MAX_NOISE_BUDGET_BYTES,
+        });
+    }
+    Ok(value)
 }
 
 fn parse_torque_limit(
@@ -568,6 +763,93 @@ mod tests {
             goal_speed_ticks_per_second: 100,
             torque_limit_permille: [600, 400, 400, 400],
         }
+    }
+
+    fn valid_probe() -> HeadProbeConfig {
+        HeadProbeConfig::parse(HeadProbeConfigInput {
+            device_path: "/dev/serial/by-id/usb-Kiko_STS_adapter_0001".to_owned(),
+            response_timeout_ms: 100,
+            request_timeout_ms: 100,
+            noise_budget_bytes: 32,
+        })
+        .expect("valid probe configuration")
+    }
+
+    fn valid_hold_input() -> ObservedHoldConfigInput {
+        ObservedHoldConfigInput {
+            write_timeout_ms: 100,
+            arming_freshness_ms: 250,
+            write_attempts: 2,
+            redundant_read_tolerance_ticks: 10,
+            readback_tolerance_ticks: 20,
+            goal_speed_ticks_per_second: 100,
+            torque_limit_permille: [600, 400, 400, 400],
+            minimum_ticks: [1_900; 4],
+            maximum_ticks: [2_100; 4],
+            maximum_hold_ms: 60_000,
+        }
+    }
+
+    #[test]
+    fn probe_and_hold_boundaries_parse_common_identity_once() {
+        let probe = valid_probe();
+        let hold = ObservedHoldConfig::parse(&probe, valid_hold_input())
+            .expect("valid observed-position hold");
+
+        assert_eq!(hold.runtime().device(), probe.device());
+        assert_eq!(hold.runtime().response_timeout(), probe.response_timeout());
+        assert_eq!(
+            hold.runtime().noise_budget_bytes(),
+            probe.noise_budget_bytes()
+        );
+        assert_eq!(hold.maximum_duration(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn observed_hold_duration_and_pose_windows_are_structurally_bounded() {
+        let probe = valid_probe();
+        let mut input = valid_hold_input();
+        input.maximum_hold_ms = 0;
+        assert!(matches!(
+            ObservedHoldConfig::parse(&probe, input),
+            Err(ObservedHoldConfigParseError::DurationOutOfRange { .. })
+        ));
+
+        let mut input = valid_hold_input();
+        input.maximum_hold_ms = MAX_HOLD_DURATION_MS + 1;
+        assert!(matches!(
+            ObservedHoldConfig::parse(&probe, input),
+            Err(ObservedHoldConfigParseError::DurationOutOfRange { .. })
+        ));
+
+        let mut input = valid_hold_input();
+        input.maximum_ticks[1] = input.minimum_ticks[1] + MAX_CONFIGURED_POSE_WINDOW_SPAN_TICKS + 1;
+        assert!(matches!(
+            ObservedHoldConfig::parse(&probe, input),
+            Err(ObservedHoldConfigParseError::PoseBounds(
+                ConfiguredHeadPoseBoundsError::SpanAboveMaximum {
+                    joint: HeadJoint::Curl,
+                    ..
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn probe_rejects_unbounded_request_settings() {
+        let input = HeadProbeConfigInput {
+            device_path: "/dev/serial/by-id/usb-Kiko_STS_adapter_0001".to_owned(),
+            response_timeout_ms: 100,
+            request_timeout_ms: 0,
+            noise_budget_bytes: 32,
+        };
+        assert!(matches!(
+            HeadProbeConfig::parse(input),
+            Err(ConfigParseError::OperationTimeoutOutOfRange {
+                field: "request_timeout_ms",
+                ..
+            })
+        ));
     }
 
     #[test]
