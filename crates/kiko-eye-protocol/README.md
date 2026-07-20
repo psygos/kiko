@@ -10,14 +10,19 @@ Version 2 replaces the experimental ASCII commands with:
 - a fixed header and exact message lengths;
 - CRC-32C over the header and payload;
 - nonzero device, build, boot, and control-session identities;
-- nonce-bound identity discovery and explicit control acquisition;
+- distinct nonzero-nonce-bound identity discovery and explicit control
+  acquisition;
 - monotonically sequenced intents with bounded device-relative leases;
 - explicit release and applied-result messages; and
 - strict rejection of reserved fields, unknown values, trailing bytes, and
   oversized records.
 
 The lease begins when the firmware admits the command on its monotonic clock.
-The applied report returns that device-clock instant and its checked expiry.
+Device-clock instants and renderer-frame sequences have distinct wire-domain
+types, so they cannot be mixed with host time or intent sequences. The applied
+report returns its device-clock instant and checked expiry. Its result fields
+are private and checked as one value: admitted outcomes carry a bounded lease,
+while rejected, released, and fallback outcomes have a zero interval.
 It proves only that the firmware accepted the requested eye state; it does not
 claim that a particular LED was optically observed.
 

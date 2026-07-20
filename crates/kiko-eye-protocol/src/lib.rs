@@ -10,13 +10,46 @@ pub const PROTOCOL_VERSION: u8 = 2;
 pub const MAX_INTENT_LEASE_MS: u16 = 2_000;
 pub const MIN_INTENT_LEASE_MS: u16 = 20;
 pub const NORMALIZED_SCALE: i16 = 1_000;
+const NORMALIZED_SCALE_U16: u16 = 1_000;
 pub const HEADER_BYTES: usize = 8;
 pub const CHECKSUM_BYTES: usize = 4;
 pub const MAX_PAYLOAD_BYTES: usize = 80;
 pub const MAX_RAW_FRAME_BYTES: usize = HEADER_BYTES + MAX_PAYLOAD_BYTES + CHECKSUM_BYTES;
-pub const MAX_ENCODED_FRAME_BYTES: usize = MAX_RAW_FRAME_BYTES + 2;
+pub const MAX_ENCODED_FRAME_BYTES: usize = MAX_RAW_FRAME_BYTES + MAX_RAW_FRAME_BYTES / 254 + 2;
 
 const MAGIC: [u8; 2] = *b"KE";
+
+/// Non-zero challenge bound to exactly one identity or acquisition exchange.
+///
+/// Zero is excluded so a cleared or never-initialized challenge cannot become
+/// an encodable KEP2 message.
+///
+/// ```compile_fail
+/// use core::num::NonZeroU64;
+/// use kiko_eye_protocol::HandshakeNonce;
+///
+/// let value = NonZeroU64::new(1).unwrap();
+/// let _ = HandshakeNonce(value);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HandshakeNonce(NonZeroU64);
+
+impl HandshakeNonce {
+    pub const fn try_new(value: u64) -> Result<Self, DomainError> {
+        match NonZeroU64::new(value) {
+            Some(value) => Ok(Self::from_nonzero(value)),
+            None => Err(DomainError::ZeroHandshakeNonce),
+        }
+    }
+
+    pub const fn from_nonzero(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceUid([u8; 16]);
@@ -67,6 +100,29 @@ impl DeviceBootId {
     }
 }
 
+/// Milliseconds on the reporting device's monotonic clock since this boot.
+///
+/// This is deliberately distinct from host timestamps and durations. Zero is
+/// valid at the start of a boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DeviceTimestampMs(u64);
+
+impl DeviceTimestampMs {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn from_millis_since_boot(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn millis_since_boot(self) -> u64 {
+        self.0
+    }
+
+    pub const fn checked_millis_since(self, earlier: Self) -> Option<u64> {
+        self.0.checked_sub(earlier.0)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ControlEpoch(NonZeroU32);
 
@@ -101,6 +157,23 @@ impl IntentSequence {
             Some(value) => Some(Self(value)),
             None => None,
         }
+    }
+}
+
+/// Wrapping sequence of frames admitted by the eye renderer.
+///
+/// This counter has RFC-1982-style serial-number semantics at the host session
+/// layer and is not interchangeable with [`IntentSequence`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RenderedFrameSequence(u32);
+
+impl RenderedFrameSequence {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
     }
 }
 
@@ -157,10 +230,10 @@ pub struct UnitAmount(u16);
 
 impl UnitAmount {
     pub const ZERO: Self = Self(0);
-    pub const FULL: Self = Self(NORMALIZED_SCALE as u16);
+    pub const FULL: Self = Self(NORMALIZED_SCALE_U16);
 
     pub fn try_new(value: u16) -> Result<Self, DomainError> {
-        if value <= NORMALIZED_SCALE as u16 {
+        if value <= NORMALIZED_SCALE_U16 {
             Ok(Self(value))
         } else {
             Err(DomainError::UnitAmountOutOfRange { value })
@@ -325,7 +398,7 @@ pub struct ApplyIntent {
 pub struct AcquireControl {
     pub expected_boot_id: DeviceBootId,
     pub requested_epoch: ControlEpoch,
-    pub nonce: u64,
+    pub nonce: HandshakeNonce,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,9 +429,9 @@ impl AcquireResultCode {
 pub struct AcquireResult {
     pub boot_id: DeviceBootId,
     pub control_epoch: ControlEpoch,
-    pub nonce: u64,
+    pub nonce: HandshakeNonce,
     pub result: AcquireResultCode,
-    pub device_uptime_ms: u64,
+    pub device_uptime: DeviceTimestampMs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,23 +507,45 @@ impl IntentResultCode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IdentityReport {
-    pub nonce: u64,
+    pub nonce: HandshakeNonce,
     pub device_uid: DeviceUid,
     pub firmware_build_id: FirmwareBuildId,
     pub boot_id: DeviceBootId,
-    pub device_uptime_ms: u64,
+    pub device_uptime: DeviceTimestampMs,
     pub capabilities: Capabilities,
 }
 
+/// Firmware result bound to one exact boot, epoch, and intent sequence.
+///
+/// The fields are private because the result code and device-clock interval
+/// form one invariant: admitted results carry a bounded KEP2 lease, while all
+/// other results are instantaneous. Use [`IntentResult::try_new`] to construct
+/// a value; decoded frames pass through the same parser exactly once.
+///
+/// ```compile_fail
+/// use kiko_eye_protocol::IntentResult;
+///
+/// let _ = IntentResult {
+///     boot_id: todo!(),
+///     control_epoch: todo!(),
+///     sequence: todo!(),
+///     result: todo!(),
+///     applied_at: todo!(),
+///     expires_at: todo!(),
+///     admitted_lease: todo!(),
+///     rendered_frame_sequence: todo!(),
+/// };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntentResult {
-    pub boot_id: DeviceBootId,
-    pub control_epoch: ControlEpoch,
-    pub sequence: IntentSequence,
-    pub result: IntentResultCode,
-    pub applied_at_ms: u64,
-    pub expires_at_ms: u64,
-    pub rendered_frame_sequence: u32,
+    boot_id: DeviceBootId,
+    control_epoch: ControlEpoch,
+    sequence: IntentSequence,
+    result: IntentResultCode,
+    applied_at: DeviceTimestampMs,
+    expires_at: DeviceTimestampMs,
+    admitted_lease: Option<IntentLeaseMs>,
+    rendered_frame_sequence: RenderedFrameSequence,
 }
 
 impl IntentResult {
@@ -459,46 +554,96 @@ impl IntentResult {
         control_epoch: ControlEpoch,
         sequence: IntentSequence,
         result: IntentResultCode,
-        applied_at_ms: u64,
-        expires_at_ms: u64,
-        rendered_frame_sequence: u32,
+        applied_at: DeviceTimestampMs,
+        expires_at: DeviceTimestampMs,
+        rendered_frame_sequence: RenderedFrameSequence,
     ) -> Result<Self, DomainError> {
-        let lease_ms = expires_at_ms.checked_sub(applied_at_ms);
-        let timing_is_valid = match result {
-            IntentResultCode::AppliedNew | IntentResultCode::DuplicateCached => lease_ms
-                .is_some_and(|lease_ms| {
-                    (u64::from(MIN_INTENT_LEASE_MS)..=u64::from(MAX_INTENT_LEASE_MS))
-                        .contains(&lease_ms)
-                }),
+        let interval_ms = expires_at.checked_millis_since(applied_at);
+        let invalid_timing = || DomainError::InvalidIntentResultTiming {
+            result,
+            applied_at_ms: applied_at.millis_since_boot(),
+            expires_at_ms: expires_at.millis_since_boot(),
+        };
+        let admitted_lease = match result {
+            IntentResultCode::AppliedNew | IntentResultCode::DuplicateCached => {
+                let interval_ms = interval_ms.ok_or_else(invalid_timing)?;
+                let interval_ms = u16::try_from(interval_ms).map_err(|_| invalid_timing())?;
+                // Preserve the richer result/timestamp context instead of
+                // surfacing the derived lease value as if it came from wire.
+                let lease = IntentLeaseMs::try_new(interval_ms).map_err(|_| invalid_timing())?;
+                Some(lease)
+            }
             IntentResultCode::Released
             | IntentResultCode::RejectedExpired
             | IntentResultCode::RejectedSession
             | IntentResultCode::RejectedSequence
             | IntentResultCode::RejectedDomain
-            | IntentResultCode::FaultedFallback => lease_ms == Some(0),
+            | IntentResultCode::FaultedFallback => {
+                if interval_ms != Some(0) {
+                    return Err(invalid_timing());
+                }
+                None
+            }
         };
-        if !timing_is_valid {
-            return Err(DomainError::InvalidIntentResultTiming {
-                result,
-                applied_at_ms,
-                expires_at_ms,
-            });
-        }
         Ok(Self {
             boot_id,
             control_epoch,
             sequence,
             result,
-            applied_at_ms,
-            expires_at_ms,
+            applied_at,
+            expires_at,
+            admitted_lease,
             rendered_frame_sequence,
         })
+    }
+
+    pub const fn boot_id(self) -> DeviceBootId {
+        self.boot_id
+    }
+
+    pub const fn control_epoch(self) -> ControlEpoch {
+        self.control_epoch
+    }
+
+    pub const fn sequence(self) -> IntentSequence {
+        self.sequence
+    }
+
+    pub const fn result(self) -> IntentResultCode {
+        self.result
+    }
+
+    pub const fn applied_at(self) -> DeviceTimestampMs {
+        self.applied_at
+    }
+
+    pub const fn expires_at(self) -> DeviceTimestampMs {
+        self.expires_at
+    }
+
+    /// The checked device-relative lease for admitted results.
+    ///
+    /// This is `Some` exactly for `AppliedNew` and `DuplicateCached` and `None`
+    /// for every instantaneous result.
+    pub const fn admitted_lease(self) -> Option<IntentLeaseMs> {
+        self.admitted_lease
+    }
+
+    pub const fn device_interval_ms(self) -> u16 {
+        match self.admitted_lease {
+            Some(lease) => lease.get(),
+            None => 0,
+        }
+    }
+
+    pub const fn rendered_frame_sequence(self) -> RenderedFrameSequence {
+        self.rendered_frame_sequence
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Message {
-    IdentityQuery { nonce: u64 },
+    IdentityQuery { nonce: HandshakeNonce },
     IdentityReport(IdentityReport),
     AcquireControl(AcquireControl),
     AcquireResult(AcquireResult),
@@ -536,6 +681,7 @@ impl MessageKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DomainError {
+    ZeroHandshakeNonce,
     ZeroDeviceUid,
     ZeroFirmwareBuildId,
     ZeroDeviceBootId,
@@ -575,9 +721,23 @@ impl core::error::Error for DomainError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PayloadError {
     Domain(DomainError),
-    LengthMismatch { expected: usize, actual: usize },
-    UnknownEnum { field: &'static str, value: u8 },
-    ReservedNonzero { offset: usize, value: u8 },
+    LengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    FieldOutOfBounds {
+        offset: usize,
+        width: usize,
+        payload_length: usize,
+    },
+    UnknownEnum {
+        field: &'static str,
+        value: u8,
+    },
+    ReservedNonzero {
+        offset: usize,
+        value: u8,
+    },
 }
 
 impl From<DomainError> for PayloadError {
@@ -651,10 +811,11 @@ pub fn encode(message: Message, output: &mut [u8]) -> Result<usize, EncodeError>
     raw[..2].copy_from_slice(&MAGIC);
     raw[2] = PROTOCOL_VERSION;
     let (kind, payload_len) = encode_payload(message, &mut raw[HEADER_BYTES..]);
+    let payload_len_bytes = usize::from(payload_len);
     raw[3] = kind as u8;
-    raw[4..6].copy_from_slice(&(payload_len as u16).to_le_bytes());
+    raw[4..6].copy_from_slice(&payload_len.to_le_bytes());
     raw[6..8].fill(0);
-    let checksum_offset = HEADER_BYTES + payload_len;
+    let checksum_offset = HEADER_BYTES + payload_len_bytes;
     let checksum = crc32c(&raw[..checksum_offset]);
     raw[checksum_offset..checksum_offset + CHECKSUM_BYTES].copy_from_slice(&checksum.to_le_bytes());
     cobs_encode(&raw[..checksum_offset + CHECKSUM_BYTES], output)
@@ -707,11 +868,16 @@ pub fn decode(encoded_record: &[u8]) -> Result<Message, FrameError> {
         });
     }
     let checksum_offset = HEADER_BYTES + payload_len;
-    let actual = u32::from_le_bytes(
-        raw[checksum_offset..raw_len]
-            .try_into()
-            .expect("fixed checksum slice"),
-    );
+    let Some(checksum_bytes) = raw
+        .get(checksum_offset..raw_len)
+        .and_then(|bytes| <[u8; CHECKSUM_BYTES]>::try_from(bytes).ok())
+    else {
+        return Err(FrameError::LengthMismatch {
+            declared_payload: payload_len,
+            actual_frame: raw_len,
+        });
+    };
+    let actual = u32::from_le_bytes(checksum_bytes);
     let expected = crc32c(&raw[..checksum_offset]);
     if actual != expected {
         return Err(FrameError::ChecksumMismatch { expected, actual });
@@ -719,34 +885,34 @@ pub fn decode(encoded_record: &[u8]) -> Result<Message, FrameError> {
     decode_payload(kind, &raw[HEADER_BYTES..checksum_offset]).map_err(FrameError::Payload)
 }
 
-fn encode_payload(message: Message, output: &mut [u8]) -> (MessageKind, usize) {
+fn encode_payload(message: Message, output: &mut [u8]) -> (MessageKind, u16) {
     match message {
         Message::IdentityQuery { nonce } => {
-            put_u64(output, 0, nonce);
+            put_u64(output, 0, nonce.get());
             (MessageKind::IdentityQuery, 8)
         }
         Message::IdentityReport(report) => {
-            put_u64(output, 0, report.nonce);
+            put_u64(output, 0, report.nonce.get());
             output[8..24].copy_from_slice(report.device_uid.as_bytes());
             output[24..56].copy_from_slice(report.firmware_build_id.as_bytes());
             put_u64(output, 56, report.boot_id.get());
-            put_u64(output, 64, report.device_uptime_ms);
+            put_u64(output, 64, report.device_uptime.millis_since_boot());
             put_u32(output, 72, report.capabilities.bits());
             (MessageKind::IdentityReport, 76)
         }
         Message::AcquireControl(acquire) => {
             put_u64(output, 0, acquire.expected_boot_id.get());
             put_u32(output, 8, acquire.requested_epoch.get());
-            put_u64(output, 12, acquire.nonce);
+            put_u64(output, 12, acquire.nonce.get());
             (MessageKind::AcquireControl, 20)
         }
         Message::AcquireResult(result) => {
             put_u64(output, 0, result.boot_id.get());
             put_u32(output, 8, result.control_epoch.get());
-            put_u64(output, 12, result.nonce);
+            put_u64(output, 12, result.nonce.get());
             output[20] = result.result as u8;
             output[21..24].fill(0);
-            put_u64(output, 24, result.device_uptime_ms);
+            put_u64(output, 24, result.device_uptime.millis_since_boot());
             (MessageKind::AcquireResult, 32)
         }
         Message::ApplyIntent(command) => {
@@ -774,14 +940,14 @@ fn encode_payload(message: Message, output: &mut [u8]) -> (MessageKind, usize) {
             (MessageKind::ReleaseControl, 20)
         }
         Message::IntentResult(result) => {
-            put_u64(output, 0, result.boot_id.get());
-            put_u32(output, 8, result.control_epoch.get());
-            put_u32(output, 12, result.sequence.get());
-            output[16] = result.result as u8;
+            put_u64(output, 0, result.boot_id().get());
+            put_u32(output, 8, result.control_epoch().get());
+            put_u32(output, 12, result.sequence().get());
+            output[16] = result.result() as u8;
             output[17..20].fill(0);
-            put_u64(output, 20, result.applied_at_ms);
-            put_u64(output, 28, result.expires_at_ms);
-            put_u32(output, 36, result.rendered_frame_sequence);
+            put_u64(output, 20, result.applied_at().millis_since_boot());
+            put_u64(output, 28, result.expires_at().millis_since_boot());
+            put_u32(output, 36, result.rendered_frame_sequence().get());
             (MessageKind::IntentResult, 40)
         }
     }
@@ -792,60 +958,59 @@ fn decode_payload(kind: MessageKind, payload: &[u8]) -> Result<Message, PayloadE
         MessageKind::IdentityQuery => {
             require_len(payload, 8)?;
             Ok(Message::IdentityQuery {
-                nonce: get_u64(payload, 0),
+                nonce: HandshakeNonce::try_new(read_u64(payload, 0)?)?,
             })
         }
         MessageKind::IdentityReport => {
             require_len(payload, 76)?;
-            let device_uid = DeviceUid::try_new(payload[8..24].try_into().expect("fixed uid"))?;
-            let firmware_build_id =
-                FirmwareBuildId::try_new(payload[24..56].try_into().expect("fixed build id"))?;
+            let device_uid = DeviceUid::try_new(read_array(payload, 8)?)?;
+            let firmware_build_id = FirmwareBuildId::try_new(read_array(payload, 24)?)?;
             Ok(Message::IdentityReport(IdentityReport {
-                nonce: get_u64(payload, 0),
+                nonce: HandshakeNonce::try_new(read_u64(payload, 0)?)?,
                 device_uid,
                 firmware_build_id,
-                boot_id: DeviceBootId::try_new(get_u64(payload, 56))?,
-                device_uptime_ms: get_u64(payload, 64),
-                capabilities: Capabilities::try_from_bits(get_u32(payload, 72))?,
+                boot_id: DeviceBootId::try_new(read_u64(payload, 56)?)?,
+                device_uptime: DeviceTimestampMs::from_millis_since_boot(read_u64(payload, 64)?),
+                capabilities: Capabilities::try_from_bits(read_u32(payload, 72)?)?,
             }))
         }
         MessageKind::AcquireControl => {
             require_len(payload, 20)?;
             Ok(Message::AcquireControl(AcquireControl {
-                expected_boot_id: DeviceBootId::try_new(get_u64(payload, 0))?,
-                requested_epoch: ControlEpoch::try_new(get_u32(payload, 8))?,
-                nonce: get_u64(payload, 12),
+                expected_boot_id: DeviceBootId::try_new(read_u64(payload, 0)?)?,
+                requested_epoch: ControlEpoch::try_new(read_u32(payload, 8)?)?,
+                nonce: HandshakeNonce::try_new(read_u64(payload, 12)?)?,
             }))
         }
         MessageKind::AcquireResult => {
             require_len(payload, 32)?;
             require_reserved_zero(payload, 21..24)?;
             Ok(Message::AcquireResult(AcquireResult {
-                boot_id: DeviceBootId::try_new(get_u64(payload, 0))?,
-                control_epoch: ControlEpoch::try_new(get_u32(payload, 8))?,
-                nonce: get_u64(payload, 12),
-                result: AcquireResultCode::parse(payload[20])?,
-                device_uptime_ms: get_u64(payload, 24),
+                boot_id: DeviceBootId::try_new(read_u64(payload, 0)?)?,
+                control_epoch: ControlEpoch::try_new(read_u32(payload, 8)?)?,
+                nonce: HandshakeNonce::try_new(read_u64(payload, 12)?)?,
+                result: AcquireResultCode::parse(read_u8(payload, 20)?)?,
+                device_uptime: DeviceTimestampMs::from_millis_since_boot(read_u64(payload, 24)?),
             }))
         }
         MessageKind::ApplyIntent => {
             require_len(payload, 34)?;
             require_zero(payload, 33)?;
             let intent = EyeIntent::new(
-                SignedUnit::try_new(get_i16(payload, 18))?,
-                SignedUnit::try_new(get_i16(payload, 20))?,
-                UnitAmount::try_new(get_u16(payload, 22))?,
-                UnitAmount::try_new(get_u16(payload, 24))?,
-                UnitAmount::try_new(get_u16(payload, 26))?,
-                Expression::parse(payload[28])?,
-                EyeFlags::try_from_bits(payload[29])?,
-                payload[30..33].try_into().expect("fixed rgb"),
+                SignedUnit::try_new(read_i16(payload, 18)?)?,
+                SignedUnit::try_new(read_i16(payload, 20)?)?,
+                UnitAmount::try_new(read_u16(payload, 22)?)?,
+                UnitAmount::try_new(read_u16(payload, 24)?)?,
+                UnitAmount::try_new(read_u16(payload, 26)?)?,
+                Expression::parse(read_u8(payload, 28)?)?,
+                EyeFlags::try_from_bits(read_u8(payload, 29)?)?,
+                read_array(payload, 30)?,
             );
             Ok(Message::ApplyIntent(ApplyIntent {
-                boot_id: DeviceBootId::try_new(get_u64(payload, 0))?,
-                control_epoch: ControlEpoch::try_new(get_u32(payload, 8))?,
-                sequence: IntentSequence::new(get_u32(payload, 12)),
-                lease: IntentLeaseMs::try_new(get_u16(payload, 16))?,
+                boot_id: DeviceBootId::try_new(read_u64(payload, 0)?)?,
+                control_epoch: ControlEpoch::try_new(read_u32(payload, 8)?)?,
+                sequence: IntentSequence::new(read_u32(payload, 12)?),
+                lease: IntentLeaseMs::try_new(read_u16(payload, 16)?)?,
                 intent,
             }))
         }
@@ -853,23 +1018,23 @@ fn decode_payload(kind: MessageKind, payload: &[u8]) -> Result<Message, PayloadE
             require_len(payload, 20)?;
             require_reserved_zero(payload, 17..20)?;
             Ok(Message::ReleaseControl(ReleaseControl {
-                boot_id: DeviceBootId::try_new(get_u64(payload, 0))?,
-                control_epoch: ControlEpoch::try_new(get_u32(payload, 8))?,
-                sequence: IntentSequence::new(get_u32(payload, 12)),
-                reason: ReleaseReason::parse(payload[16])?,
+                boot_id: DeviceBootId::try_new(read_u64(payload, 0)?)?,
+                control_epoch: ControlEpoch::try_new(read_u32(payload, 8)?)?,
+                sequence: IntentSequence::new(read_u32(payload, 12)?),
+                reason: ReleaseReason::parse(read_u8(payload, 16)?)?,
             }))
         }
         MessageKind::IntentResult => {
             require_len(payload, 40)?;
             require_reserved_zero(payload, 17..20)?;
             Ok(Message::IntentResult(IntentResult::try_new(
-                DeviceBootId::try_new(get_u64(payload, 0))?,
-                ControlEpoch::try_new(get_u32(payload, 8))?,
-                IntentSequence::new(get_u32(payload, 12)),
-                IntentResultCode::parse(payload[16])?,
-                get_u64(payload, 20),
-                get_u64(payload, 28),
-                get_u32(payload, 36),
+                DeviceBootId::try_new(read_u64(payload, 0)?)?,
+                ControlEpoch::try_new(read_u32(payload, 8)?)?,
+                IntentSequence::new(read_u32(payload, 12)?),
+                IntentResultCode::parse(read_u8(payload, 16)?)?,
+                DeviceTimestampMs::from_millis_since_boot(read_u64(payload, 20)?),
+                DeviceTimestampMs::from_millis_since_boot(read_u64(payload, 28)?),
+                RenderedFrameSequence::new(read_u32(payload, 36)?),
             )?))
         }
     }
@@ -887,13 +1052,11 @@ fn require_len(payload: &[u8], expected: usize) -> Result<(), PayloadError> {
 }
 
 fn require_zero(payload: &[u8], offset: usize) -> Result<(), PayloadError> {
-    if payload[offset] == 0 {
+    let value = read_u8(payload, offset)?;
+    if value == 0 {
         Ok(())
     } else {
-        Err(PayloadError::ReservedNonzero {
-            offset,
-            value: payload[offset],
-        })
+        Err(PayloadError::ReservedNonzero { offset, value })
     }
 }
 
@@ -1068,17 +1231,52 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
 fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
-fn get_u16(bytes: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("fixed u16"))
+fn read_array<const WIDTH: usize>(
+    payload: &[u8],
+    offset: usize,
+) -> Result<[u8; WIDTH], PayloadError> {
+    let Some(end) = offset.checked_add(WIDTH) else {
+        return Err(PayloadError::FieldOutOfBounds {
+            offset,
+            width: WIDTH,
+            payload_length: payload.len(),
+        });
+    };
+    payload
+        .get(offset..end)
+        .and_then(|bytes| <[u8; WIDTH]>::try_from(bytes).ok())
+        .ok_or(PayloadError::FieldOutOfBounds {
+            offset,
+            width: WIDTH,
+            payload_length: payload.len(),
+        })
 }
-fn get_i16(bytes: &[u8], offset: usize) -> i16 {
-    i16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("fixed i16"))
+
+fn read_u8(payload: &[u8], offset: usize) -> Result<u8, PayloadError> {
+    payload
+        .get(offset)
+        .copied()
+        .ok_or(PayloadError::FieldOutOfBounds {
+            offset,
+            width: 1,
+            payload_length: payload.len(),
+        })
 }
-fn get_u32(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("fixed u32"))
+
+fn read_u16(payload: &[u8], offset: usize) -> Result<u16, PayloadError> {
+    Ok(u16::from_le_bytes(read_array(payload, offset)?))
 }
-fn get_u64(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().expect("fixed u64"))
+
+fn read_i16(payload: &[u8], offset: usize) -> Result<i16, PayloadError> {
+    Ok(i16::from_le_bytes(read_array(payload, offset)?))
+}
+
+fn read_u32(payload: &[u8], offset: usize) -> Result<u32, PayloadError> {
+    Ok(u32::from_le_bytes(read_array(payload, offset)?))
+}
+
+fn read_u64(payload: &[u8], offset: usize) -> Result<u64, PayloadError> {
+    Ok(u64::from_le_bytes(read_array(payload, offset)?))
 }
 
 #[cfg(test)]
@@ -1092,6 +1290,43 @@ mod tests {
     }
     fn epoch() -> ControlEpoch {
         ControlEpoch::try_new(11).expect("nonzero epoch")
+    }
+    fn nonce(value: u64) -> HandshakeNonce {
+        HandshakeNonce::try_new(value).expect("nonzero nonce")
+    }
+    const fn device_time(value: u64) -> DeviceTimestampMs {
+        DeviceTimestampMs::from_millis_since_boot(value)
+    }
+    const fn rendered_sequence(value: u32) -> RenderedFrameSequence {
+        RenderedFrameSequence::new(value)
+    }
+
+    fn decode_after_raw_mutation(
+        message: Message,
+        mutate: impl FnOnce(&mut [u8], usize),
+    ) -> Result<Message, FrameError> {
+        let mut encoded = [0_u8; MAX_ENCODED_FRAME_BYTES];
+        let encoded_len = encode(message, &mut encoded).expect("encode source frame");
+        let mut raw = [0_u8; MAX_RAW_FRAME_BYTES];
+        let raw_len = cobs_decode(&encoded[..encoded_len - 1], &mut raw).expect("decode COBS");
+        let payload_len = usize::from(u16::from_le_bytes([raw[4], raw[5]]));
+        mutate(&mut raw[..raw_len], payload_len);
+        let checksum_offset = HEADER_BYTES + payload_len;
+        let checksum = crc32c(&raw[..checksum_offset]);
+        raw[checksum_offset..checksum_offset + CHECKSUM_BYTES]
+            .copy_from_slice(&checksum.to_le_bytes());
+        let rewritten_len =
+            cobs_encode(&raw[..raw_len], &mut encoded).expect("re-encode mutated frame");
+        decode(&encoded[..rewritten_len - 1])
+    }
+
+    fn decode_after_payload_mutation(
+        message: Message,
+        mutate: impl FnOnce(&mut [u8]),
+    ) -> Result<Message, FrameError> {
+        decode_after_raw_mutation(message, |raw, payload_len| {
+            mutate(&mut raw[HEADER_BYTES..HEADER_BYTES + payload_len]);
+        })
     }
     fn intent() -> EyeIntent {
         EyeIntent::new(
@@ -1108,26 +1343,26 @@ mod tests {
 
     fn messages() -> [Message; 7] {
         [
-            Message::IdentityQuery { nonce: 123 },
+            Message::IdentityQuery { nonce: nonce(123) },
             Message::IdentityReport(IdentityReport {
-                nonce: 123,
+                nonce: nonce(123),
                 device_uid: DeviceUid::try_new([1; 16]).expect("uid"),
                 firmware_build_id: FirmwareBuildId::try_new([2; 32]).expect("build"),
                 boot_id: boot(),
-                device_uptime_ms: 456,
+                device_uptime: device_time(456),
                 capabilities: Capabilities::try_from_bits(Capabilities::KNOWN_BITS).expect("caps"),
             }),
             Message::AcquireControl(AcquireControl {
                 expected_boot_id: boot(),
                 requested_epoch: epoch(),
-                nonce: 456,
+                nonce: nonce(456),
             }),
             Message::AcquireResult(AcquireResult {
                 boot_id: boot(),
                 control_epoch: epoch(),
-                nonce: 456,
+                nonce: nonce(456),
                 result: AcquireResultCode::Granted,
-                device_uptime_ms: 789,
+                device_uptime: device_time(789),
             }),
             Message::ApplyIntent(ApplyIntent {
                 boot_id: boot(),
@@ -1148,9 +1383,9 @@ mod tests {
                     epoch(),
                     IntentSequence::new(3),
                     IntentResultCode::AppliedNew,
-                    1_000,
-                    1_500,
-                    88,
+                    device_time(1_000),
+                    device_time(1_500),
+                    rendered_sequence(88),
                 )
                 .expect("result"),
             ),
@@ -1165,6 +1400,57 @@ mod tests {
             assert_eq!(encoded[length - 1], 0);
             assert_eq!(decode(&encoded[..length - 1]), Ok(message));
         }
+    }
+
+    #[test]
+    fn every_result_code_and_lease_boundary_round_trips() {
+        let cases = [
+            (IntentResultCode::AppliedNew, MIN_INTENT_LEASE_MS),
+            (IntentResultCode::AppliedNew, MAX_INTENT_LEASE_MS),
+            (IntentResultCode::DuplicateCached, MIN_INTENT_LEASE_MS),
+            (IntentResultCode::DuplicateCached, MAX_INTENT_LEASE_MS),
+            (IntentResultCode::Released, 0),
+            (IntentResultCode::RejectedExpired, 0),
+            (IntentResultCode::RejectedSession, 0),
+            (IntentResultCode::RejectedSequence, 0),
+            (IntentResultCode::RejectedDomain, 0),
+            (IntentResultCode::FaultedFallback, 0),
+        ];
+        for (index, (result, interval_ms)) in cases.into_iter().enumerate() {
+            let applied_at_ms = u64::try_from(index).expect("small index") * 10_000;
+            let expires_at_ms = applied_at_ms + u64::from(interval_ms);
+            let message = Message::IntentResult(
+                IntentResult::try_new(
+                    boot(),
+                    epoch(),
+                    IntentSequence::new(u32::try_from(index).expect("small index")),
+                    result,
+                    device_time(applied_at_ms),
+                    device_time(expires_at_ms),
+                    rendered_sequence(u32::try_from(index).expect("small index")),
+                )
+                .expect("valid result case"),
+            );
+            let mut encoded = [0_u8; MAX_ENCODED_FRAME_BYTES];
+            let encoded_len = encode(message, &mut encoded).expect("encode");
+            assert_eq!(decode(&encoded[..encoded_len - 1]), Ok(message));
+        }
+    }
+
+    #[test]
+    fn identity_query_wire_bytes_remain_stable() {
+        let message = Message::IdentityQuery {
+            nonce: nonce(0x0102_0304_0506_0708),
+        };
+        let mut encoded = [0_u8; MAX_ENCODED_FRAME_BYTES];
+        let length = encode(message, &mut encoded).expect("encode");
+        assert_eq!(
+            &encoded[..length],
+            &[
+                0x06, 0x4b, 0x45, 0x02, 0x01, 0x08, 0x01, 0x01, 0x0d, 0x08, 0x07, 0x06, 0x05, 0x04,
+                0x03, 0x02, 0x01, 0x11, 0x13, 0x34, 0x57, 0x00,
+            ]
+        );
     }
 
     #[test]
@@ -1194,7 +1480,7 @@ mod tests {
             StreamEvent::Dropped(FrameError::EncodedRecordTooLong { .. })
         ));
 
-        let message = Message::IdentityQuery { nonce: 9 };
+        let message = Message::IdentityQuery { nonce: nonce(9) };
         let mut encoded = [0; MAX_ENCODED_FRAME_BYTES];
         let length = encode(message, &mut encoded).expect("encode");
         let mut result = StreamEvent::Pending;
@@ -1221,6 +1507,10 @@ mod tests {
 
     #[test]
     fn constructors_reject_invalid_domains() {
+        assert_eq!(
+            HandshakeNonce::try_new(0),
+            Err(DomainError::ZeroHandshakeNonce)
+        );
         assert_eq!(DeviceUid::try_new([0; 16]), Err(DomainError::ZeroDeviceUid));
         assert_eq!(
             FirmwareBuildId::try_new([0; 32]),
@@ -1230,9 +1520,118 @@ mod tests {
         assert!(IntentLeaseMs::try_new(MAX_INTENT_LEASE_MS + 1).is_err());
         assert!(SignedUnit::try_new(-NORMALIZED_SCALE - 1).is_err());
         assert!(SignedUnit::try_new(NORMALIZED_SCALE + 1).is_err());
-        assert!(UnitAmount::try_new(NORMALIZED_SCALE as u16 + 1).is_err());
+        assert!(UnitAmount::try_new(NORMALIZED_SCALE_U16 + 1).is_err());
         assert!(EyeFlags::try_from_bits(0x80).is_err());
         assert!(Capabilities::try_from_bits(1 << 31).is_err());
+    }
+
+    #[test]
+    fn zero_nonce_is_rejected_at_every_inbound_handshake_boundary() {
+        let cases = [
+            (Message::IdentityQuery { nonce: nonce(1) }, 0),
+            (messages()[1], 0),
+            (messages()[2], 12),
+            (messages()[3], 12),
+        ];
+        for (message, nonce_offset) in cases {
+            assert_eq!(
+                decode_after_payload_mutation(message, |payload| {
+                    payload[nonce_offset..nonce_offset + 8].fill(0);
+                }),
+                Err(FrameError::Payload(PayloadError::Domain(
+                    DomainError::ZeroHandshakeNonce
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn checksum_valid_invalid_primitives_are_rejected_at_decode() {
+        assert_eq!(
+            decode_after_payload_mutation(messages()[1], |payload| payload[8..24].fill(0)),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::ZeroDeviceUid
+            )))
+        );
+        assert_eq!(
+            decode_after_payload_mutation(messages()[1], |payload| payload[24..56].fill(0)),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::ZeroFirmwareBuildId
+            )))
+        );
+        assert_eq!(
+            decode_after_payload_mutation(messages()[1], |payload| payload[56..64].fill(0)),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::ZeroDeviceBootId
+            )))
+        );
+        assert_eq!(
+            decode_after_payload_mutation(messages()[1], |payload| {
+                payload[72..76].copy_from_slice(&(1_u32 << 31).to_le_bytes());
+            }),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::UnknownCapabilityBits { bits: 1_u32 << 31 }
+            )))
+        );
+        assert_eq!(
+            decode_after_payload_mutation(messages()[2], |payload| payload[8..12].fill(0)),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::ZeroControlEpoch
+            )))
+        );
+        assert!(matches!(
+            decode_after_payload_mutation(messages()[4], |payload| {
+                payload[16..18].copy_from_slice(&(MIN_INTENT_LEASE_MS - 1).to_le_bytes());
+            }),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::IntentLeaseOutOfRange { .. }
+            )))
+        ));
+        assert_eq!(
+            decode_after_payload_mutation(messages()[4], |payload| {
+                payload[18..20].copy_from_slice(&(NORMALIZED_SCALE + 1).to_le_bytes());
+            }),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::SignedUnitOutOfRange {
+                    value: NORMALIZED_SCALE + 1
+                }
+            )))
+        );
+        assert_eq!(
+            decode_after_payload_mutation(messages()[4], |payload| {
+                payload[22..24].copy_from_slice(&(NORMALIZED_SCALE_U16 + 1).to_le_bytes());
+            }),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::UnitAmountOutOfRange {
+                    value: NORMALIZED_SCALE_U16 + 1
+                }
+            )))
+        );
+        assert_eq!(
+            decode_after_payload_mutation(messages()[4], |payload| payload[29] = 0x80),
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::UnknownEyeFlagBits { bits: 0x80 }
+            )))
+        );
+    }
+
+    #[test]
+    fn checksum_valid_unknown_enums_are_rejected_at_decode() {
+        let cases = [
+            (messages()[3], 20, "acquire result"),
+            (messages()[4], 28, "expression"),
+            (messages()[5], 16, "release reason"),
+            (messages()[6], 16, "intent result"),
+        ];
+        for (message, offset, field) in cases {
+            assert_eq!(
+                decode_after_payload_mutation(message, |payload| payload[offset] = u8::MAX),
+                Err(FrameError::Payload(PayloadError::UnknownEnum {
+                    field,
+                    value: u8::MAX,
+                }))
+            );
+        }
     }
 
     #[test]
@@ -1243,9 +1642,9 @@ mod tests {
                 epoch(),
                 IntentSequence::FIRST,
                 IntentResultCode::AppliedNew,
-                10,
-                9,
-                0
+                device_time(10),
+                device_time(9),
+                rendered_sequence(0)
             ),
             Err(DomainError::InvalidIntentResultTiming { .. })
         ));
@@ -1255,9 +1654,9 @@ mod tests {
                 epoch(),
                 IntentSequence::FIRST,
                 IntentResultCode::AppliedNew,
-                10,
-                10 + u64::from(MAX_INTENT_LEASE_MS) + 1,
-                0
+                device_time(10),
+                device_time(10 + u64::from(MAX_INTENT_LEASE_MS) + 1),
+                rendered_sequence(0)
             )
             .is_err()
         );
@@ -1267,12 +1666,117 @@ mod tests {
                 epoch(),
                 IntentSequence::FIRST,
                 IntentResultCode::RejectedExpired,
-                10,
-                10,
-                0
+                device_time(10),
+                device_time(10),
+                rendered_sequence(0)
             )
             .is_ok()
         );
+
+        let admitted = IntentResult::try_new(
+            boot(),
+            epoch(),
+            IntentSequence::FIRST,
+            IntentResultCode::AppliedNew,
+            device_time(u64::MAX - u64::from(MIN_INTENT_LEASE_MS)),
+            device_time(u64::MAX),
+            rendered_sequence(u32::MAX),
+        )
+        .expect("upper-bound timestamp");
+        assert_eq!(
+            admitted.admitted_lease(),
+            Some(IntentLeaseMs::try_new(MIN_INTENT_LEASE_MS).expect("lease"))
+        );
+        assert_eq!(admitted.device_interval_ms(), MIN_INTENT_LEASE_MS);
+        assert_eq!(admitted.applied_at().millis_since_boot(), u64::MAX - 20);
+        assert_eq!(admitted.expires_at().millis_since_boot(), u64::MAX);
+        assert_eq!(admitted.rendered_frame_sequence().get(), u32::MAX);
+    }
+
+    #[test]
+    fn checksum_valid_invalid_result_timing_is_rejected_during_decode() {
+        let admitted = messages()[6];
+        let reversed = decode_after_payload_mutation(admitted, |payload| {
+            payload[28..36].copy_from_slice(&999_u64.to_le_bytes());
+        });
+        assert!(matches!(
+            reversed,
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::InvalidIntentResultTiming {
+                    result: IntentResultCode::AppliedNew,
+                    applied_at_ms: 1_000,
+                    expires_at_ms: 999,
+                }
+            )))
+        ));
+
+        let released = Message::IntentResult(
+            IntentResult::try_new(
+                boot(),
+                epoch(),
+                IntentSequence::new(4),
+                IntentResultCode::Released,
+                device_time(1_600),
+                device_time(1_600),
+                rendered_sequence(89),
+            )
+            .expect("released"),
+        );
+        let nonzero = decode_after_payload_mutation(released, |payload| {
+            payload[28..36].copy_from_slice(&1_601_u64.to_le_bytes());
+        });
+        assert!(matches!(
+            nonzero,
+            Err(FrameError::Payload(PayloadError::Domain(
+                DomainError::InvalidIntentResultTiming {
+                    result: IntentResultCode::Released,
+                    applied_at_ms: 1_600,
+                    expires_at_ms: 1_601,
+                }
+            )))
+        ));
+    }
+
+    #[test]
+    fn checksum_valid_reserved_fields_are_still_rejected() {
+        let cases = [
+            (messages()[3], 21),
+            (messages()[4], 33),
+            (messages()[5], 17),
+            (messages()[6], 17),
+        ];
+        for (message, reserved_offset) in cases {
+            assert_eq!(
+                decode_after_payload_mutation(message, |payload| {
+                    payload[reserved_offset] = 1;
+                }),
+                Err(FrameError::Payload(PayloadError::ReservedNonzero {
+                    offset: reserved_offset,
+                    value: 1,
+                }))
+            );
+        }
+        assert_eq!(
+            decode_after_raw_mutation(messages()[0], |raw, _| raw[6] = 1),
+            Err(FrameError::HeaderReservedNonzero { bytes: [1, 0] })
+        );
+    }
+
+    #[test]
+    fn arbitrary_bounded_records_never_panic_the_decoder() {
+        let mut state = 0x4b45_5032_5eed_u64;
+        let mut record = [0_u8; MAX_ENCODED_FRAME_BYTES + 4];
+        for length in 0..=record.len() {
+            for _ in 0..32 {
+                for byte in &mut record[..length] {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    *byte = state as u8;
+                }
+                let _ = decode(&record[..length]);
+            }
+        }
     }
 
     #[test]
