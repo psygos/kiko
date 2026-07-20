@@ -17,6 +17,7 @@ agent-runtime = [
     "dep:kiko-head-runtime",
     "dep:kiko-supervisor-core",
 ]
+nano-bench = ["agent-runtime", "actuation", "record", "dep:robot-server", "dep:tokio"]
 ort-coreml = ["ort/coreml"]
 ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]
@@ -31,6 +32,7 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 rerun = { version = "=0.27.2", default-features = false, features = ["sdk", "server"] }
 robot-protocol = { path = "../../comms/robot-protocol" }
 robot-command-client = { path = "../../comms/robot-command-client", optional = true }
+robot-server = { path = "../../comms/robot-server", optional = true }
 kiko-device-inventory = { path = "../kiko-device-inventory", optional = true }
 kiko-expression-core = { path = "../kiko-expression-core", optional = true }
 kiko-expression-runtime = { path = "../kiko-expression-runtime", optional = true }
@@ -46,10 +48,16 @@ slotmap = "1.0"
 oak-sys = { path = "../oak-sys", optional = true }
 ctrlc = { version = "3.4", optional = true }
 chrono = { version = "0.4", optional = true }
+tokio = { version = "1.35", optional = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 
 [[bin]]
 name = "kiko-slam"
 path = "src/bin/kiko_slam.rs"
+
+[[bin]]
+name = "kiko-nano-wheels-off-bench"
+path = "src/bin/kiko_nano_wheels_off_bench.rs"
+required-features = ["nano-bench"]
 
 [[bench]]
 name = "pose_graph_jacobians"

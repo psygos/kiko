@@ -29,6 +29,12 @@ mod reference;
 mod safety;
 mod shadow_command;
 mod shadow_config;
+#[cfg(all(feature = "nano-bench", unix))]
+mod wheels_off_bench;
+#[cfg(all(feature = "nano-bench", unix))]
+mod zero_hold_keeper;
+#[cfg(all(feature = "nano-bench", unix))]
+mod zero_only_config;
 
 #[cfg(feature = "actuation")]
 pub use actuation_config::{
@@ -165,4 +171,18 @@ pub use shadow_config::{
     ControlPeriodNs, FreshnessParameter, MAX_COMMAND_LEASE_CONTROL_PERIODS,
     MAX_SHADOW_NAVIGATION_CONFIG_JSON_BYTES, SHADOW_NAVIGATION_CONFIG_V1,
     ShadowNavigationConfigParseError, ShadowNavigationConfigV1, ShadowNavigationRuntimePartsV1,
+};
+#[cfg(all(feature = "nano-bench", unix))]
+pub use wheels_off_bench::*;
+#[cfg(all(feature = "nano-bench", unix))]
+pub use zero_hold_keeper::{
+    FreshZeroEvidence, ZeroHoldKeeper, ZeroHoldKeeperStartError, ZeroHoldLatchedError,
+    ZeroHoldRequestError, ZeroHoldStatus, ZeroHoldTerminalError, ZeroHoldTerminalReport,
+    ZeroHoldTimingError,
+};
+#[cfg(all(feature = "nano-bench", unix))]
+pub use zero_only_config::{
+    BoundZeroOnlyActuationConfigV1, MAX_ZERO_ONLY_ACTUATION_POLICY_JSON_BYTES,
+    ZERO_ONLY_ACTUATION_POLICY_V1, ZeroOnlyActuationBindingError, ZeroOnlyActuationPolicyError,
+    ZeroOnlyActuationPolicyV1,
 };
