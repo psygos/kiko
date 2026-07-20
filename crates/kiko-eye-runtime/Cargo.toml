@@ -1,0 +1,19 @@
+[package]
+name = "kiko-eye-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Exclusive, bounded host serial actor for Kiko's KEP2 eye controller"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+kiko-expression-core = { path = "../kiko-expression-core" }
+kiko-expression-runtime = { path = "../kiko-expression-runtime" }
+kiko-eye-protocol = { path = "../kiko-eye-protocol" }
+tokio = { version = "1.35", features = ["io-util", "rt", "sync", "time"] }
+tokio-serial = "5.4"
+
+[dev-dependencies]
+tokio = { version = "1.35", features = ["macros", "rt", "sync", "time"] }
+
+[lints]
+workspace = true

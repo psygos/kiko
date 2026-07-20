@@ -3136,6 +3136,17 @@ name = "kiko-eye-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "kiko-eye-runtime"
+version = "0.1.0"
+dependencies = [
+ "kiko-expression-core",
+ "kiko-expression-runtime",
+ "kiko-eye-protocol",
+ "tokio",
+ "tokio-serial",
+]
+
+[[package]]
 name = "kiko-head-protocol"
 version = "0.1.0"
 

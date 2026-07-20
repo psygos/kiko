@@ -6,6 +6,7 @@ members = [
   "crates/kiko-expression-core",
   "crates/kiko-expression-runtime",
   "crates/kiko-eye-protocol",
+  "crates/kiko-eye-runtime",
   "crates/kiko-head-protocol",
   "crates/kiko-head-runtime",
   "crates/kiko-supervisor-core",
