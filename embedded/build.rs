@@ -11,8 +11,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     fs::copy("memory.x", output_directory.join("memory.x"))?;
 
-    println!("cargo:rustc-link-search={}", output_directory.display());
-    println!("cargo:rustc-link-arg-bin=embedded=-Tlink.x");
+    let target = env::var("TARGET")?;
+    if target == "thumbv7em-none-eabihf" {
+        println!("cargo:rustc-link-search={}", output_directory.display());
+        println!("cargo:rustc-link-arg-bin=embedded=-Tlink.x");
+        println!("cargo:rustc-link-arg-bin=kiko-motor-commission=-Tlink.x");
+    }
     println!("cargo:rerun-if-changed=memory.x");
     Ok(())
 }

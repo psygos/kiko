@@ -6,6 +6,10 @@ edition = "2024"
 [features]
 default = []
 firmware = []
+# Builds the separately identified, wheels-off-only, one-shot motor
+# commissioning image. This does not alter or grant motion authority to the
+# canonical `firmware` binary.
+wheels-off-motor-commissioning = []
 # Motion-capable hardware profiles must enable this and provide the link-time
 # `kiko_external_boot_id` symbol from a reviewed per-boot identity source.
 external-boot-identity = []
@@ -14,6 +18,11 @@ external-boot-identity = []
 name = "embedded"
 path = "src/firmware_v2.rs"
 required-features = ["firmware"]
+
+[[bin]]
+name = "kiko-motor-commission"
+path = "src/motor_commission.rs"
+required-features = ["wheels-off-motor-commissioning"]
 
 [dependencies]
 robot-protocol = { path = "../comms/robot-protocol" }
@@ -24,6 +33,13 @@ cortex-m-rt = "0.7"
 nb = "1.0"
 heapless = "0.7"
 stm32f4xx-hal = { version = "0.20", features = ["stm32f446"] }
+
+[target.'cfg(not(target_arch = "arm"))'.dependencies]
+clap = { version = "4.5.28", features = ["derive"] }
+getrandom = { version = "0.3", features = ["std"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["io-util", "macros", "rt", "time"] }
+tokio-serial = "5.4"
 
 [lints]
 workspace = true
