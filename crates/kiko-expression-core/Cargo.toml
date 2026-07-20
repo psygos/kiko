@@ -1,0 +1,11 @@
+[package]
+name = "kiko-expression-core"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic, no-I/O expression-domain core for Kiko"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+
+[lints]
+workspace = true
