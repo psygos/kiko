@@ -146,6 +146,10 @@ injection, that:
    process cancellation, and clock faults all require or confirm zero.
 
 Physical acceptance additionally requires the assembled devices to be visible
-on the Nano and an independent emergency stop. The current checked Nano state
-on 2026-07-20 exposed no Kiko serial/video/DepthAI device, so no cold-boot
-camera, STM32, eye, head, or drive result is claimed by this document.
+on the Nano and an independent emergency stop. The read-only inventory on
+2026-07-20 found the OAK, STM32 ST-Link serial function, eye controller, and
+head adapter on an NVIDIA Jetson Orin Nano. That establishes USB presence only:
+no camera stream, STM32 control identity, KEP2 eye session, head hold, emergency
+stop, motor motion, or drive result is claimed by this document. See
+`nano-validation-evidence-2026-07-20.md` for the exact observations and native
+aarch64 host-test evidence.
