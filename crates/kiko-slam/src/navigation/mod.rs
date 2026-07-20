@@ -8,6 +8,8 @@ mod actuation_config;
 mod authority;
 mod cell_inflation;
 mod control_api;
+#[cfg(unix)]
+mod control_socket;
 mod coordinator;
 mod frames;
 mod frontier;
@@ -39,6 +41,20 @@ pub use control_api::{
     AgentControlStatusV1, AgentLocalizationStateV1, AgentManualStopV1, AgentManualVelocityV1,
     AgentMapStateV1, AgentOperatingModeV1, AgentRuntimeStateV1,
     MAX_AGENT_CONTROL_REQUEST_JSON_BYTES, ManualVelocityComponentV1,
+};
+#[cfg(unix)]
+pub use control_socket::{
+    AgentControlAcceptedRequest, AgentControlClaimedRequest, AgentControlClockError,
+    AgentControlConnectionIssue, AgentControlDispatch, AgentControlDispatchResponseError,
+    AgentControlMonotonicOrigin, AgentControlObservedSocketPath, AgentControlRuntimeQueueCapacity,
+    AgentControlRuntimeQueueCapacityError, AgentControlRuntimeReceiveError,
+    AgentControlRuntimeReceiver, AgentControlRuntimeSender, AgentControlServeError,
+    AgentControlServeOutcome, AgentControlSocketBindError, AgentControlSocketCleanupOutcome,
+    AgentControlSocketConfig, AgentControlSocketPath, AgentControlSocketPathError,
+    AgentControlSocketServer, AgentControlSocketTimeoutError, AgentControlSocketTimeouts,
+    AgentControlTimeoutKind, MAX_AGENT_CONTROL_RESPONSE_JSON_BYTES,
+    MAX_AGENT_CONTROL_RUNTIME_QUEUE_CAPACITY, MAX_AGENT_CONTROL_SOCKET_PATH_BYTES,
+    agent_control_runtime_queue,
 };
 pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
