@@ -102,9 +102,11 @@ After copying the exact UID, build ID, and capability bits from the identity
 probe into the deployment manifest, `kep2_eye_commission` exercises the normal
 typed actor rather than reimplementing KEP2. It opens only the exact eye serial
 path, verifies that complete pinned identity, acquires renderer control with
-fresh OS-generated session material, and runs one fixed nominal 3.2-second recipe:
-neutral, curious-left, greet-right, blink-center, and neutral. The command has
-no base, head, or camera interface.
+fresh OS-generated session material, and runs one fixed, deliberately obvious
+6.55-second optical recipe: bright white center, two full-left red holds, two
+full-right blue holds, three separately triggered white blinks, and neutral.
+The repeated holds distinguish a genuine panel update from the firmware's
+subtle autonomous gaze. The command has no base, head, or camera interface.
 
 ```bash
 cargo run --locked --release -p kiko-eye-runtime --bin kep2_eye_commission -- \
@@ -116,8 +118,8 @@ cargo run --locked --release -p kiko-eye-runtime --bin kep2_eye_commission -- \
 ```
 
 Every apply has a 1.8-second firmware lease. The configured maximum response
-wait, complete write-attempt budget, and longest requested hold total 1.5
-seconds, leaving 300 milliseconds of protocol-budget margin before that lease;
+wait, complete write-attempt budget, and longest requested hold total 1.6
+seconds, leaving 200 milliseconds of protocol-budget margin before that lease;
 scheduler stalls remain bounded by firmware fallback. Normal completion, and Ctrl-C when
 observed during a visual hold, request a graceful release and require the
 actor's final admission count, last admission, release report, and termination

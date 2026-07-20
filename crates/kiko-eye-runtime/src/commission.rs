@@ -21,13 +21,13 @@ use kiko_expression_runtime::{
 pub const COMMISSIONING_INTENT_LEASE_MS: u16 = 1_800;
 
 /// Number of fixed, finite visual steps in one commissioning run.
-pub const COMMISSIONING_STEP_COUNT: usize = 5;
+pub const COMMISSIONING_STEP_COUNT: usize = 9;
 
 /// Longest requested host-side hold in the fixed recipe.
-pub const COMMISSIONING_MAX_HOLD_MS: u64 = 800;
+pub const COMMISSIONING_MAX_HOLD_MS: u64 = 900;
 
 const PREPARED_INTENT_FRESHNESS_MS: u64 = 2_000;
-const BRIGHTNESS_BASIS_POINTS: u16 = 7_000;
+const BRIGHTNESS_BASIS_POINTS: u16 = 10_000;
 
 /// One immutable visual request in the bounded commissioning recipe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,34 +111,66 @@ pub fn eye_commissioning_steps()
 
 const STEPS: [EyeCommissioningStep; COMMISSIONING_STEP_COUNT] = [
     EyeCommissioningStep {
-        name: "neutral_open",
+        name: "white_center",
         semantic_expression: ExpressionKind::Neutral,
         gaze_basis_points: None,
-        color_rgb: [64, 160, 255],
+        color_rgb: [255, 255, 255],
         blink: false,
+        hold_duration_ms: 800,
+    },
+    EyeCommissioningStep {
+        name: "red_full_left_1",
+        semantic_expression: ExpressionKind::Curious,
+        gaze_basis_points: Some([0, 5_000]),
+        color_rgb: [255, 0, 0],
+        blink: false,
+        hold_duration_ms: 900,
+    },
+    EyeCommissioningStep {
+        name: "red_full_left_2",
+        semantic_expression: ExpressionKind::Curious,
+        gaze_basis_points: Some([0, 5_000]),
+        color_rgb: [255, 0, 0],
+        blink: false,
+        hold_duration_ms: 900,
+    },
+    EyeCommissioningStep {
+        name: "blue_full_right_1",
+        semantic_expression: ExpressionKind::Friendly,
+        gaze_basis_points: Some([10_000, 5_000]),
+        color_rgb: [0, 0, 255],
+        blink: false,
+        hold_duration_ms: 900,
+    },
+    EyeCommissioningStep {
+        name: "blue_full_right_2",
+        semantic_expression: ExpressionKind::Friendly,
+        gaze_basis_points: Some([10_000, 5_000]),
+        color_rgb: [0, 0, 255],
+        blink: false,
+        hold_duration_ms: 900,
+    },
+    EyeCommissioningStep {
+        name: "white_blink_1",
+        semantic_expression: ExpressionKind::Friendly,
+        gaze_basis_points: Some([5_000, 5_000]),
+        color_rgb: [255, 255, 255],
+        blink: true,
         hold_duration_ms: 450,
     },
     EyeCommissioningStep {
-        name: "curious_left",
-        semantic_expression: ExpressionKind::Curious,
-        gaze_basis_points: Some([2_500, 4_200]),
-        color_rgb: [96, 220, 255],
-        blink: false,
-        hold_duration_ms: 800,
-    },
-    EyeCommissioningStep {
-        name: "greet_right",
-        semantic_expression: ExpressionKind::Friendly,
-        gaze_basis_points: Some([7_500, 4_200]),
-        color_rgb: [120, 255, 180],
-        blink: false,
-        hold_duration_ms: 800,
-    },
-    EyeCommissioningStep {
-        name: "blink_center",
+        name: "white_blink_2",
         semantic_expression: ExpressionKind::Friendly,
         gaze_basis_points: Some([5_000, 5_000]),
-        color_rgb: [120, 255, 180],
+        color_rgb: [255, 255, 255],
+        blink: true,
+        hold_duration_ms: 450,
+    },
+    EyeCommissioningStep {
+        name: "white_blink_3",
+        semantic_expression: ExpressionKind::Friendly,
+        gaze_basis_points: Some([5_000, 5_000]),
+        color_rgb: [255, 255, 255],
         blink: true,
         hold_duration_ms: 450,
     },
@@ -148,7 +180,7 @@ const STEPS: [EyeCommissioningStep; COMMISSIONING_STEP_COUNT] = [
         gaze_basis_points: None,
         color_rgb: [64, 160, 255],
         blink: false,
-        hold_duration_ms: 700,
+        hold_duration_ms: 800,
     },
 ];
 
@@ -197,7 +229,7 @@ mod tests {
     fn recipe_is_finite_distinct_centered_at_both_ends_and_lease_bounded() {
         let steps: Vec<_> = eye_commissioning_steps().collect();
         assert_eq!(steps.len(), COMMISSIONING_STEP_COUNT);
-        assert_eq!(steps.first().map(|step| step.name()), Some("neutral_open"));
+        assert_eq!(steps.first().map(|step| step.name()), Some("white_center"));
         assert_eq!(steps.last().map(|step| step.name()), Some("neutral_finish"));
         assert!(steps.iter().all(|step| {
             step.hold_duration() < Duration::from_millis(COMMISSIONING_INTENT_LEASE_MS.into())
@@ -214,12 +246,21 @@ mod tests {
         assert_eq!(prepared[0].expression(), Expression::Neutral);
         assert_eq!(prepared[0].gaze_x().get(), 0);
         assert_eq!(prepared[1].expression(), Expression::Curious);
-        assert!(prepared[1].gaze_x().get() < 0);
-        assert_eq!(prepared[2].expression(), Expression::Greet);
-        assert!(prepared[2].gaze_x().get() > 0);
-        assert_eq!(prepared[3].flags().bits(), EyeFlags::BLINK);
-        assert_eq!(prepared[4].expression(), Expression::Neutral);
-        assert_eq!(prepared[4].gaze_x().get(), 0);
+        assert_eq!(prepared[1].gaze_x().get(), -1_000);
+        assert_eq!(prepared[1].color_rgb(), [255, 0, 0]);
+        assert_eq!(prepared[2].gaze_x().get(), -1_000);
+        assert_eq!(prepared[3].expression(), Expression::Greet);
+        assert_eq!(prepared[3].gaze_x().get(), 1_000);
+        assert_eq!(prepared[3].color_rgb(), [0, 0, 255]);
+        assert_eq!(prepared[4].gaze_x().get(), 1_000);
+        assert!(prepared[5..8]
+            .iter()
+            .all(|intent| intent.flags().bits() == EyeFlags::BLINK));
+        assert_eq!(prepared[8].expression(), Expression::Neutral);
+        assert_eq!(prepared[8].gaze_x().get(), 0);
+        assert!(prepared
+            .iter()
+            .all(|intent| intent.brightness().get() == 1_000));
     }
 
     #[test]
