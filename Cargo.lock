@@ -3115,6 +3115,14 @@ name = "kiko-expression-core"
 version = "0.1.0"
 
 [[package]]
+name = "kiko-expression-runtime"
+version = "0.1.0"
+dependencies = [
+ "kiko-expression-core",
+ "kiko-eye-protocol",
+]
+
+[[package]]
 name = "kiko-eye-protocol"
 version = "0.1.0"
 

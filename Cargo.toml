@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "crates/kiko-base-commissioning",
   "crates/kiko-expression-core",
+  "crates/kiko-expression-runtime",
   "crates/kiko-eye-protocol",
   "crates/kiko-supervisor-core",
   "crates/kiko-slam",

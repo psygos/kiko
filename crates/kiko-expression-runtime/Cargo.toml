@@ -1,0 +1,13 @@
+[package]
+name = "kiko-expression-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-independent host boundary for Kiko RGB reactions and KEP2 eyes"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+kiko-expression-core = { path = "../kiko-expression-core" }
+kiko-eye-protocol = { path = "../kiko-eye-protocol" }
+
+[lints]
+workspace = true
