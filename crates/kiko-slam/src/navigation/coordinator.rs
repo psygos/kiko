@@ -21,13 +21,14 @@ use super::global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig, MapPoint,
     PlanStart, PointGoal,
 };
+use super::goal_input::MapPointGoalSelection;
 use super::ingress::{
     AcceptedDepthIngress, AcceptedGlobalMapIngress, ControlTickIngress, CurrentMapEpochBinding,
     MapPointGoalIngress, NavigationClockEpoch, NavigationIngressBoundaryError,
     NavigationIngressEvent, NavigationIngressLog, NavigationIngressRecord,
     NavigationIngressStreamWriteError, NavigationIngressWriteError, NavigationIngressWriter,
     NavigationMapEpochCoordinator, NavigationReplayClock, NavigationReplayClockError,
-    RecordedImuReport, VisualAttemptIngress, VisualAttemptOutcome,
+    RecordedImuReport, RecordedMapEpochId, VisualAttemptIngress, VisualAttemptOutcome,
 };
 use super::local_costmap::{
     DepthFrameKey, LocalCostmap, LocalCostmapClockRegression, LocalCostmapError,
@@ -338,6 +339,22 @@ pub struct GlobalMapAdmissionOutcome {
     planning: GlobalPlanningOutcome,
 }
 
+#[derive(Debug)]
+pub struct GoalSelectionOutcome {
+    goal_state: NavigationGoalState,
+    planning: GlobalPlanningOutcome,
+}
+
+impl GoalSelectionOutcome {
+    pub fn goal_state(&self) -> NavigationGoalState {
+        self.goal_state
+    }
+
+    pub fn planning(&self) -> &GlobalPlanningOutcome {
+        &self.planning
+    }
+}
+
 impl GlobalMapAdmissionOutcome {
     pub fn map_instance_id(&self) -> MapInstanceId {
         self.map_instance_id
@@ -368,7 +385,27 @@ pub enum CoordinatorAdmissionError<E> {
     ReplayClock(NavigationReplayClockError),
     SegmentIdExhausted,
     Plan(GlobalPlanError),
-    MapRevisionNotIncreasing { previous: u64, actual: u64 },
+    MapRevisionNotIncreasing {
+        previous: u64,
+        actual: u64,
+    },
+    NoCurrentMapForGoal,
+    GoalMapEpochMismatch {
+        displayed: RecordedMapEpochId,
+        current: RecordedMapEpochId,
+    },
+    GoalDisplayedRevisionMismatch {
+        displayed: u64,
+        current: u64,
+    },
+    GoalSnapshotMapMismatch {
+        expected: MapInstanceId,
+        actual: Option<MapInstanceId>,
+    },
+    GoalSnapshotRevisionMismatch {
+        displayed: u64,
+        snapshot: u64,
+    },
 }
 
 impl<E: fmt::Debug> fmt::Display for CoordinatorAdmissionError<E> {
@@ -384,9 +421,14 @@ impl<E: std::error::Error + 'static> std::error::Error for CoordinatorAdmissionE
             Self::Journal(source) => Some(source),
             Self::ReplayClock(source) => Some(source),
             Self::Plan(source) => Some(source),
-            Self::Latched(_) | Self::SegmentIdExhausted | Self::MapRevisionNotIncreasing { .. } => {
-                None
-            }
+            Self::Latched(_)
+            | Self::SegmentIdExhausted
+            | Self::MapRevisionNotIncreasing { .. }
+            | Self::NoCurrentMapForGoal
+            | Self::GoalMapEpochMismatch { .. }
+            | Self::GoalDisplayedRevisionMismatch { .. }
+            | Self::GoalSnapshotMapMismatch { .. }
+            | Self::GoalSnapshotRevisionMismatch { .. } => None,
         }
     }
 }
@@ -883,6 +925,64 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         })
     }
 
+    /// Replace the active point goal using the exact immutable map snapshot
+    /// displayed by the control surface.
+    ///
+    /// The epoch, accepted revision, snapshot map instance, and snapshot
+    /// revision must all agree before the goal is journaled. This prevents a
+    /// delayed Rerun/UI click from silently steering in a reset or newer map.
+    pub fn select_map_point_goal(
+        &mut self,
+        host_arrival: HostMonotonicTimestamp,
+        selection: MapPointGoalSelection,
+        displayed_snapshot: &OccupancyGridSnapshot,
+    ) -> Result<GoalSelectionOutcome, CoordinatorAdmissionError<J::Error>> {
+        self.ensure_open()?;
+        let current = self
+            .current_map
+            .ok_or(CoordinatorAdmissionError::NoCurrentMapForGoal)?;
+        if selection.map_epoch_id() != current.binding.map_epoch_id() {
+            return Err(CoordinatorAdmissionError::GoalMapEpochMismatch {
+                displayed: selection.map_epoch_id(),
+                current: current.binding.map_epoch_id(),
+            });
+        }
+        if selection.displayed_revision() != current.revision {
+            return Err(CoordinatorAdmissionError::GoalDisplayedRevisionMismatch {
+                displayed: selection.displayed_revision(),
+                current: current.revision,
+            });
+        }
+        if displayed_snapshot.map_instance_id() != Some(current.binding.map_instance_id()) {
+            return Err(CoordinatorAdmissionError::GoalSnapshotMapMismatch {
+                expected: current.binding.map_instance_id(),
+                actual: displayed_snapshot.map_instance_id(),
+            });
+        }
+        if displayed_snapshot.revision() != selection.displayed_revision() {
+            return Err(CoordinatorAdmissionError::GoalSnapshotRevisionMismatch {
+                displayed: selection.displayed_revision(),
+                snapshot: displayed_snapshot.revision(),
+            });
+        }
+
+        let goal = PointGoal::for_snapshot(selection.point(), displayed_snapshot)
+            .map_err(CoordinatorAdmissionError::Plan)?;
+        let ingress =
+            MapPointGoalIngress::parse(self.clock_epoch, host_arrival, current.binding, goal)
+                .map_err(CoordinatorAdmissionError::Boundary)?;
+        self.append(NavigationIngressEvent::PointGoal(ingress))?;
+
+        self.goal = GoalBinding::Bound(goal);
+        self.path = None;
+        self.plan_fault = None;
+        let planning = self.plan_snapshot(displayed_snapshot);
+        Ok(GoalSelectionOutcome {
+            goal_state: self.goal_state(),
+            planning,
+        })
+    }
+
     pub fn tick<C: HostMonotonicClock>(
         &mut self,
         tick: HostMonotonicTimestamp,
@@ -1353,6 +1453,7 @@ mod tests {
     };
 
     use super::super::frames::LocalCostmapFrame;
+    use super::super::goal_input::MapPointGoalSelectionDto;
     use super::super::ingress::{
         NavigationIngressCapacity, NavigationRecordingId, PendingVisualAttemptIngress,
     };
@@ -1703,6 +1804,21 @@ mod tests {
             .expect("accepted exact occupancy revision")
     }
 
+    fn goal_selection(
+        map_epoch_id: RecordedMapEpochId,
+        revision: u64,
+        x_m: f64,
+        y_m: f64,
+    ) -> MapPointGoalSelection {
+        MapPointGoalSelection::parse(MapPointGoalSelectionDto {
+            map_epoch_id: map_epoch_id.as_u64(),
+            displayed_revision: revision,
+            x_m,
+            y_m,
+        })
+        .expect("typed goal selection fixture")
+    }
+
     fn depth_observation(timestamp_ns: i64, host_ns: u64) -> DepthObservation {
         let image = DepthImage::new(
             FrameId::new(5_000 + u64::try_from(timestamp_ns).unwrap_or(0)),
@@ -1930,6 +2046,132 @@ mod tests {
             goal_records, 1,
             "the old click must not bind to the reset map"
         );
+    }
+
+    #[test]
+    fn exact_current_map_click_replaces_goal_and_is_journaled_before_planning() {
+        let mut coordinator = coordinator(1_000, 10, 2.0);
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("initial map");
+        let binding = coordinator
+            .current_map_binding()
+            .expect("current map binding");
+
+        let outcome = coordinator
+            .select_map_point_goal(
+                host(1_060),
+                goal_selection(binding.map_epoch_id(), 1, 1.5, 0.5),
+                &snapshot,
+            )
+            .expect("exact displayed-map click");
+        assert_eq!(
+            outcome.goal_state(),
+            NavigationGoalState::Bound {
+                map_instance_id: map.instance_id(),
+                selected_revision: 1,
+            }
+        );
+        assert!(matches!(
+            outcome.planning(),
+            GlobalPlanningOutcome::Planned(_)
+        ));
+        let goals: Vec<_> = coordinator
+            .journal()
+            .records()
+            .iter()
+            .filter_map(|record| match record.event() {
+                NavigationIngressEvent::PointGoal(goal) => Some(goal),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(goals.len(), 2);
+        assert_eq!(goals[1].map_epoch_id(), binding.map_epoch_id());
+        assert_eq!(goals[1].selected_revision(), 1);
+        assert_eq!(goals[1].point().as_array(), [1.5, 0.5]);
+    }
+
+    #[test]
+    fn stale_revision_or_epoch_click_cannot_change_goal_or_journal() {
+        let mut coordinator = coordinator(1_000, 10, 2.0);
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let first_snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &first_snapshot)
+            .expect("first map");
+        let binding = coordinator.current_map_binding().expect("binding");
+        let second_snapshot = occupancy(map, 2);
+        coordinator
+            .accept_global_map(host(1_060), Timestamp::from_nanos(101), &second_snapshot)
+            .expect("newer map");
+        let before_state = coordinator.goal_state();
+        let before_records = coordinator.journal().len();
+
+        assert!(matches!(
+            coordinator.select_map_point_goal(
+                host(1_070),
+                goal_selection(binding.map_epoch_id(), 1, 0.0, 0.0),
+                &first_snapshot,
+            ),
+            Err(CoordinatorAdmissionError::GoalDisplayedRevisionMismatch {
+                displayed: 1,
+                current: 2,
+            })
+        ));
+        let future_epoch = RecordedMapEpochId::try_new(binding.map_epoch_id().as_u64() + 1)
+            .expect("next epoch fixture");
+        assert!(matches!(
+            coordinator.select_map_point_goal(
+                host(1_071),
+                goal_selection(future_epoch, 2, 0.0, 0.0),
+                &second_snapshot,
+            ),
+            Err(CoordinatorAdmissionError::GoalMapEpochMismatch { .. })
+        ));
+        assert_eq!(coordinator.goal_state(), before_state);
+        assert_eq!(coordinator.journal().len(), before_records);
+    }
+
+    #[test]
+    fn mismatched_snapshot_identity_or_revision_cannot_back_a_click() {
+        let mut coordinator = coordinator(1_000, 10, 2.0);
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let current_snapshot = occupancy(map, 4);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &current_snapshot)
+            .expect("current map");
+        let binding = coordinator.current_map_binding().expect("binding");
+        let selection = goal_selection(binding.map_epoch_id(), 4, 0.0, 0.0);
+        let foreign = occupancy(SlamMap::new().snapshot(), 4);
+        assert!(matches!(
+            coordinator.select_map_point_goal(host(1_060), selection, &foreign),
+            Err(CoordinatorAdmissionError::GoalSnapshotMapMismatch { .. })
+        ));
+        let wrong_revision = occupancy(map, 5);
+        assert!(matches!(
+            coordinator.select_map_point_goal(host(1_061), selection, &wrong_revision),
+            Err(CoordinatorAdmissionError::GoalSnapshotRevisionMismatch {
+                displayed: 4,
+                snapshot: 5,
+            })
+        ));
+    }
+
+    #[test]
+    fn click_before_any_accepted_map_is_rejected_without_a_fallback_binding() {
+        let mut coordinator = coordinator(1_000, 10, 2.0);
+        let snapshot = occupancy(SlamMap::new().snapshot(), 1);
+        let selection = goal_selection(RecordedMapEpochId::try_new(1).expect("epoch"), 1, 0.0, 0.0);
+        assert!(matches!(
+            coordinator.select_map_point_goal(host(1_000), selection, &snapshot),
+            Err(CoordinatorAdmissionError::NoCurrentMapForGoal)
+        ));
+        assert!(coordinator.journal().is_empty());
     }
 
     #[test]

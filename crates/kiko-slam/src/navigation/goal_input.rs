@@ -6,7 +6,7 @@
 use std::num::ParseFloatError;
 use std::str::FromStr;
 
-use super::{MapPoint, PlanarPointError};
+use super::{MapPoint, PlanarPointError, RecordedMapEpochId, RecordedMapEpochIdError};
 
 /// A finite map-frame goal parsed from the exact text form `X_M,Y_M`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -15,6 +15,73 @@ pub struct NavigationGoalArg(MapPoint);
 impl NavigationGoalArg {
     pub fn point(self) -> MapPoint {
         self.0
+    }
+}
+
+/// Weak boundary object for a viewer or control API map click.
+///
+/// Both map fields are mandatory: a coordinate alone is ambiguous after a map
+/// reset or while a newer occupancy revision is displayed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapPointGoalSelectionDto {
+    pub map_epoch_id: u64,
+    pub displayed_revision: u64,
+    pub x_m: f64,
+    pub y_m: f64,
+}
+
+/// One finite map point bound to the exact map view from which it was chosen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapPointGoalSelection {
+    map_epoch_id: RecordedMapEpochId,
+    displayed_revision: u64,
+    point: MapPoint,
+}
+
+impl MapPointGoalSelection {
+    pub fn parse(dto: MapPointGoalSelectionDto) -> Result<Self, MapPointGoalSelectionParseError> {
+        let map_epoch_id = RecordedMapEpochId::try_new(dto.map_epoch_id)
+            .map_err(MapPointGoalSelectionParseError::MapEpochId)?;
+        let point =
+            MapPoint::try_new(dto.x_m, dto.y_m).map_err(MapPointGoalSelectionParseError::Point)?;
+        Ok(Self {
+            map_epoch_id,
+            displayed_revision: dto.displayed_revision,
+            point,
+        })
+    }
+
+    pub fn map_epoch_id(self) -> RecordedMapEpochId {
+        self.map_epoch_id
+    }
+
+    pub fn displayed_revision(self) -> u64 {
+        self.displayed_revision
+    }
+
+    pub fn point(self) -> MapPoint {
+        self.point
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MapPointGoalSelectionParseError {
+    MapEpochId(RecordedMapEpochIdError),
+    Point(PlanarPointError),
+}
+
+impl std::fmt::Display for MapPointGoalSelectionParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid map-point goal selection: {self:?}")
+    }
+}
+
+impl std::error::Error for MapPointGoalSelectionParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MapEpochId(source) => Some(source),
+            Self::Point(source) => Some(source),
+        }
     }
 }
 
@@ -156,6 +223,46 @@ mod tests {
                 .expect("finite coordinate sample");
             assert_eq!(parsed.point().x_m().to_bits(), x_m.to_bits());
             assert_eq!(parsed.point().y_m().to_bits(), y_m.to_bits());
+        }
+    }
+
+    #[test]
+    fn viewer_selection_parses_epoch_revision_and_si_point_once() {
+        let selection = MapPointGoalSelection::parse(MapPointGoalSelectionDto {
+            map_epoch_id: 7,
+            displayed_revision: 42,
+            x_m: -1.25,
+            y_m: 2.5,
+        })
+        .expect("typed viewer selection");
+        assert_eq!(selection.map_epoch_id().as_u64(), 7);
+        assert_eq!(selection.displayed_revision(), 42);
+        assert_eq!(selection.point().as_array(), [-1.25, 2.5]);
+    }
+
+    #[test]
+    fn viewer_selection_rejects_zero_epoch_and_nonfinite_coordinates() {
+        for dto in [
+            MapPointGoalSelectionDto {
+                map_epoch_id: 0,
+                displayed_revision: 1,
+                x_m: 0.0,
+                y_m: 0.0,
+            },
+            MapPointGoalSelectionDto {
+                map_epoch_id: 1,
+                displayed_revision: 1,
+                x_m: f64::NAN,
+                y_m: 0.0,
+            },
+            MapPointGoalSelectionDto {
+                map_epoch_id: 1,
+                displayed_revision: 1,
+                x_m: 0.0,
+                y_m: f64::INFINITY,
+            },
+        ] {
+            assert!(MapPointGoalSelection::parse(dto).is_err());
         }
     }
 }

@@ -7,10 +7,12 @@ mod actuation_config;
 mod cell_inflation;
 mod coordinator;
 mod frames;
+mod frontier;
 mod global_planner;
 mod goal_input;
 mod ingress;
 mod local_costmap;
+mod manual_drive;
 pub mod mpc;
 mod odometry;
 mod reference;
@@ -27,9 +29,9 @@ pub use actuation_config::{
 pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
     CoordinatorTickOutcome, DepthAdmissionOutcome, GlobalMapAdmissionOutcome,
-    GlobalPlanningOutcome, ImuAdmissionOutcome, NavigationGoalState, NavigationIngressSink,
-    ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission, VisualAdmissionError,
-    VisualAdmissionOutcome,
+    GlobalPlanningOutcome, GoalSelectionOutcome, ImuAdmissionOutcome, NavigationGoalState,
+    NavigationIngressSink, ShadowNavigationCoordinator, StoredPlanFault, VisualAdmission,
+    VisualAdmissionError, VisualAdmissionOutcome,
 };
 pub use frames::{
     BaseFrame, BaseToOdom, LocalCostmapFrame, LocalCostmapToOdom, MapFrame, MapToOdom, OdomFrame,
@@ -37,12 +39,20 @@ pub use frames::{
     PlanarPointError, PlanarTransform, PlanarTransformComponent, PlanarTransformError,
     PlanarTransformOperation,
 };
+pub use frontier::{
+    FrontierBuildError, FrontierExplorer, FrontierExplorerConfig, FrontierExplorerConfigError,
+    FrontierGoal, FrontierInPlaceScan, FrontierScore, FrontierSearchError, FrontierSearchOutcome,
+    FrontierUnknownDirection, FrontierUnknownDirections,
+};
 pub use global_planner::{
     GlobalPath, GlobalPlanError, GlobalPlanIdentity, GlobalPlanner, GlobalPlannerConfig,
     GlobalPlannerInstanceId, GlobalPlannerInvocationId, GlobalPlannerRevision, MapPoint, PlanStart,
     PointGoal, UnknownSpacePolicy,
 };
-pub use goal_input::{NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis};
+pub use goal_input::{
+    MapPointGoalSelection, MapPointGoalSelectionDto, MapPointGoalSelectionParseError,
+    NavigationGoalArg, NavigationGoalArgError, NavigationGoalAxis,
+};
 pub use ingress::{
     AcceptedDepthIngress, ControlTickIngress, CurrentMapEpochBinding, FinalizedNavigationIngress,
     MAX_NAVIGATION_INGRESS_RECORDS, MapEpochStartedIngress, MapEpochTransition,
@@ -66,6 +76,13 @@ pub use local_costmap::{
     LocalCostmapConfigError, LocalCostmapCoordinateError, LocalCostmapError, LocalCostmapFreshness,
     LocalCostmapProvenance, LocalCostmapQuery, LocalCostmapUpdateOutcome, LocalCostmapView,
     LocalDepthObservation, LocalDepthObservationError, TrackingCameraToBase,
+};
+pub use manual_drive::{
+    BODY_VELOCITY_TARGET_V1, BodyVelocityTargetV1, MANUAL_DRIVE_COMMAND_V1, MANUAL_DRIVE_CONFIG_V1,
+    ManualAuthoritySnapshot, ManualDriveAcceptedIntent, ManualDriveAcceptedTarget,
+    ManualDriveCommandDto, ManualDriveCommandKindDto, ManualDriveConfigParseError,
+    ManualDriveConfigV1, ManualDriveConfigV1Dto, ManualDriveCore, ManualDriveOutput,
+    ManualDriveSequence, ManualDriveStopCause, ManualDriveStopped,
 };
 pub use odometry::{
     BaseAcceleration, BaseAngularVelocity, CalibratedQuantity, CalibrationMatrix,
