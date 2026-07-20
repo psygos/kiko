@@ -12,17 +12,24 @@
 //! - `LeftThenRight250Ms`: zero 500 ms, left-forward 8% for 250 ms,
 //!   zero 500 ms, right-forward 8% for 250 ms, then lock safe; or
 //! - `BothForward10S`: zero 500 ms, both forward outputs at 8% for exactly
-//!   10,000 nominal TIM5 milliseconds, then lock safe.
+//!   10,000 nominal TIM5 milliseconds, then lock safe; or
+//! - `LeftBreakaway30Pct500Ms` / `RightBreakaway30Pct500Ms`: zero 500 ms,
+//!   exactly one selected forward output at 30% for 500 nominal TIM5
+//!   milliseconds, then lock safe. The inactive wheel and both reverse
+//!   directions remain disabled and zero. A fresh reset and fresh typed trigger
+//!   are required to test the other wheel; there is no automatic sweep.
 //!
 //! A priority-0 TIM5 compare ISR is the nominal cutoff, with a post-enable
 //! deadline re-sample and exception-path emergency MMIO. The 250 ms recipe
 //! retains its nominal 500 ms independent-watchdog reset backstop. Immediately
 //! before the 10,000 ms recipe starts, the watchdog is configured to 15,500 ms
-//! under the HAL's nominal 32 kHz LSI model, and is never fed while outputs are
-//! active. That conservative configuration keeps the reset later than 10,500
-//! ms even at the STM32F446 datasheet's 47 kHz maximum LSI frequency; its real
-//! interval can be much longer at lower LSI frequencies. The 500 ms watchdog
-//! configuration is restored immediately after outputs are disabled.
+//! under the HAL's nominal 32 kHz LSI model. The 500 ms breakaway discriminator
+//! similarly uses a 1,500 ms watchdog configuration. Neither is fed while an
+//! output is active. At the STM32F446 datasheet's 47 kHz maximum LSI frequency,
+//! each configuration still leaves at least 500 ms after its nominal TIM5
+//! cutoff. The real interval can be much longer at lower LSI frequencies. The
+//! 500 ms watchdog configuration is restored immediately after outputs are
+//! disabled.
 //! These layers do **not** prove an unconditional physical cutoff under
 //! arbitrary CPU, clock, timer, watchdog, driver, or wiring fault. A watchdog
 //! reset returns to disabled boot state and requires a new typed trigger.
@@ -30,11 +37,11 @@
 //! Trigger frame (little endian, 16 bytes):
 //!
 //! ```text
-//! 0..4   "KMC2"
-//! 4      protocol version (2)
-//! 5      command (0xa5 = left/right 250 ms; 0xb6 = both forward 10 s)
-//! 6      recipe id (1 = left/right 250 ms; 2 = both forward 10 s)
-//! 7      expected compiled maximum PWM percent (8)
+//! 0..4   "KMC3"
+//! 4      protocol version (3)
+//! 5      exact recipe command (0xa5, 0xb6, 0xc7, or 0xd8)
+//! 6      recipe id (1 = left/right 8%; 2 = both 8%; 3 = left 30%; 4 = right 30%)
+//! 7      exact expected PWM percent for the selected recipe (8 or 30)
 //! 8..12  non-zero host nonce, u32 LE
 //! 12..16 CRC-32/ISO-HDLC of bytes 0..12, u32 LE
 //! ```
@@ -42,17 +49,17 @@
 //! Evidence frame (little endian, 32 bytes):
 //!
 //! ```text
-//! 0..4   "KMR2"
-//! 4      protocol version (2)
+//! 0..4   "KMR3"
+//! 4      protocol version (3)
 //! 5      event code
 //! 6      recipe id, or zero before admission/rejection
 //! 7      zero-based segment index, or 0xff
 //! 8..12  echoed host nonce, or zero before admission
 //! 12..16 TIM5 uptime in milliseconds, u32 LE
-//! 16..20 commissioning build id (0x4b4d_4302), u32 LE
+//! 16..20 commissioning build id (0x4b4d_4303), u32 LE
 //! 20..24 exact commanded active duration in ms, u32 LE
 //! 24     commanded output mask (bit 0 left-forward, bit 1 right-forward)
-//! 25     commanded PWM percent
+//! 25     compiled maximum PWM for Ready; selected PWM for Accepted/Pulse; zero otherwise
 //! 26     event detail (segment count or rejection code)
 //! 27     reserved zero
 //! 28..32 CRC-32/ISO-HDLC of bytes 0..28, u32 LE
@@ -60,24 +67,30 @@
 
 use core::num::NonZeroU32;
 
-const REQUEST_MAGIC: [u8; 4] = *b"KMC2";
-const RESPONSE_MAGIC: [u8; 4] = *b"KMR2";
-const PROTOCOL_VERSION: u8 = 2;
+const REQUEST_MAGIC: [u8; 4] = *b"KMC3";
+const RESPONSE_MAGIC: [u8; 4] = *b"KMR3";
+const PROTOCOL_VERSION: u8 = 3;
 const LEFT_RIGHT_COMMAND: u8 = 0xa5;
 const BOTH_FORWARD_10S_COMMAND: u8 = 0xb6;
+const LEFT_BREAKAWAY_COMMAND: u8 = 0xc7;
+const RIGHT_BREAKAWAY_COMMAND: u8 = 0xd8;
 const REQUEST_BYTES: usize = 16;
 const RESPONSE_BYTES: usize = 32;
-const COMMISSIONING_BUILD_ID: u32 = 0x4b4d_4302;
+const COMMISSIONING_BUILD_ID: u32 = 0x4b4d_4303;
 
 const PWM_FREQUENCY_HZ: u16 = 20_000;
-const PULSE_PWM_PERCENT: u8 = 8;
+const LEGACY_PULSE_PWM_PERCENT: u8 = 8;
+const BREAKAWAY_PWM_PERCENT: u8 = 30;
+const MAX_COMMISSIONING_PWM_PERCENT: u8 = BREAKAWAY_PWM_PERCENT;
 const PULSE_DURATION_MS: u32 = 250;
 const BOTH_FORWARD_DURATION_MS: u32 = 10_000;
+const BREAKAWAY_DURATION_MS: u32 = 500;
 const INITIAL_ZERO_DWELL_MS: u32 = 500;
 const INTER_PULSE_ZERO_DWELL_MS: u32 = 500;
 const SAFE_WATCHDOG_PERIOD_MS: u32 = 500;
 const WATCHDOG_BACKSTOP_MARGIN_MS: u32 = 500;
 const BOTH_FORWARD_WATCHDOG_CONFIG_MS: u32 = 15_500;
+const BREAKAWAY_WATCHDOG_CONFIG_MS: u32 = 1_500;
 const LSI_NOMINAL_KHZ: u32 = 32;
 const LSI_MAX_KHZ: u32 = 47;
 const MAIN_LOOP_DELAY_MS: u32 = 1;
@@ -85,17 +98,26 @@ const SERIAL_RESPONSE_TIMEOUT_MS: u32 = 50;
 const READY_PERIOD_MS: u32 = 1_000;
 const WATCHDOG_REGISTER_UPDATE_TIMEOUT_MS: u32 = 10;
 
-const _: () = assert!(PULSE_PWM_PERCENT > 0 && PULSE_PWM_PERCENT <= 8);
+const _: () = assert!(LEGACY_PULSE_PWM_PERCENT > 0 && LEGACY_PULSE_PWM_PERCENT <= 8);
+const _: () = assert!(BREAKAWAY_PWM_PERCENT == 30);
+const _: () = assert!(MAX_COMMISSIONING_PWM_PERCENT == BREAKAWAY_PWM_PERCENT);
 const _: () = assert!(PULSE_DURATION_MS > 0 && PULSE_DURATION_MS <= 300);
 const _: () = assert!(BOTH_FORWARD_DURATION_MS == 10_000);
+const _: () = assert!(BREAKAWAY_DURATION_MS == 500);
 const _: () = assert!(BOTH_FORWARD_WATCHDOG_CONFIG_MS < (1 << 15));
+const _: () = assert!(BREAKAWAY_WATCHDOG_CONFIG_MS < (1 << 15));
 const _: () = assert!(
     BOTH_FORWARD_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ
         >= BOTH_FORWARD_DURATION_MS + WATCHDOG_BACKSTOP_MARGIN_MS
 );
+const _: () = assert!(
+    BREAKAWAY_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ
+        >= BREAKAWAY_DURATION_MS + WATCHDOG_BACKSTOP_MARGIN_MS
+);
 const _: () = assert!(INITIAL_ZERO_DWELL_MS > 0);
 const _: () = assert!(INTER_PULSE_ZERO_DWELL_MS > 0);
 const _: () = assert!(INITIAL_ZERO_DWELL_MS >= PULSE_DURATION_MS);
+const _: () = assert!(INITIAL_ZERO_DWELL_MS >= BREAKAWAY_DURATION_MS);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Trigger {
@@ -108,6 +130,8 @@ struct Trigger {
 enum Recipe {
     LeftThenRight250Ms = 1,
     BothForward10S = 2,
+    LeftBreakaway30Pct500Ms = 3,
+    RightBreakaway30Pct500Ms = 4,
 }
 
 impl Recipe {
@@ -115,6 +139,8 @@ impl Recipe {
         match self {
             Self::LeftThenRight250Ms => LEFT_RIGHT_COMMAND,
             Self::BothForward10S => BOTH_FORWARD_10S_COMMAND,
+            Self::LeftBreakaway30Pct500Ms => LEFT_BREAKAWAY_COMMAND,
+            Self::RightBreakaway30Pct500Ms => RIGHT_BREAKAWAY_COMMAND,
         }
     }
 
@@ -125,7 +151,9 @@ impl Recipe {
     const fn segment_count(self) -> u8 {
         match self {
             Self::LeftThenRight250Ms => 2,
-            Self::BothForward10S => 1,
+            Self::BothForward10S
+            | Self::LeftBreakaway30Pct500Ms
+            | Self::RightBreakaway30Pct500Ms => 1,
         }
     }
 
@@ -133,15 +161,28 @@ impl Recipe {
         match (self, index) {
             (Self::LeftThenRight250Ms, 0) => Some(Segment {
                 outputs: ForwardOutputs::Left,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: PULSE_DURATION_MS,
             }),
             (Self::LeftThenRight250Ms, 1) => Some(Segment {
                 outputs: ForwardOutputs::Right,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: PULSE_DURATION_MS,
             }),
             (Self::BothForward10S, 0) => Some(Segment {
                 outputs: ForwardOutputs::Both,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: BOTH_FORWARD_DURATION_MS,
+            }),
+            (Self::LeftBreakaway30Pct500Ms, 0) => Some(Segment {
+                outputs: ForwardOutputs::Left,
+                pwm_percent: BREAKAWAY_PWM_PERCENT,
+                duration_ms: BREAKAWAY_DURATION_MS,
+            }),
+            (Self::RightBreakaway30Pct500Ms, 0) => Some(Segment {
+                outputs: ForwardOutputs::Right,
+                pwm_percent: BREAKAWAY_PWM_PERCENT,
+                duration_ms: BREAKAWAY_DURATION_MS,
             }),
             _ => None,
         }
@@ -151,17 +192,32 @@ impl Recipe {
         match self {
             Self::LeftThenRight250Ms => 2 * PULSE_DURATION_MS,
             Self::BothForward10S => BOTH_FORWARD_DURATION_MS,
+            Self::LeftBreakaway30Pct500Ms | Self::RightBreakaway30Pct500Ms => BREAKAWAY_DURATION_MS,
         }
     }
 
     const fn output_union(self) -> ForwardOutputs {
-        ForwardOutputs::Both
+        match self {
+            Self::LeftThenRight250Ms | Self::BothForward10S => ForwardOutputs::Both,
+            Self::LeftBreakaway30Pct500Ms => ForwardOutputs::Left,
+            Self::RightBreakaway30Pct500Ms => ForwardOutputs::Right,
+        }
+    }
+
+    const fn pwm_percent(self) -> u8 {
+        match self {
+            Self::LeftThenRight250Ms | Self::BothForward10S => LEGACY_PULSE_PWM_PERCENT,
+            Self::LeftBreakaway30Pct500Ms | Self::RightBreakaway30Pct500Ms => BREAKAWAY_PWM_PERCENT,
+        }
     }
 
     const fn watchdog_period_ms(self) -> u32 {
         match self {
             Self::LeftThenRight250Ms => SAFE_WATCHDOG_PERIOD_MS,
             Self::BothForward10S => BOTH_FORWARD_WATCHDOG_CONFIG_MS,
+            Self::LeftBreakaway30Pct500Ms | Self::RightBreakaway30Pct500Ms => {
+                BREAKAWAY_WATCHDOG_CONFIG_MS
+            }
         }
     }
 
@@ -169,6 +225,8 @@ impl Recipe {
         match value {
             1 => Some(Self::LeftThenRight250Ms),
             2 => Some(Self::BothForward10S),
+            3 => Some(Self::LeftBreakaway30Pct500Ms),
+            4 => Some(Self::RightBreakaway30Pct500Ms),
             _ => None,
         }
     }
@@ -177,6 +235,7 @@ impl Recipe {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Segment {
     outputs: ForwardOutputs,
+    pwm_percent: u8,
     duration_ms: u32,
 }
 
@@ -255,7 +314,7 @@ fn parse_trigger(frame: &[u8; REQUEST_BYTES]) -> Result<Trigger, TriggerError> {
     if frame[5] != recipe.command() {
         return Err(TriggerError::Command);
     }
-    if frame[7] != PULSE_PWM_PERCENT {
+    if frame[7] != recipe.pwm_percent() {
         return Err(TriggerError::ExpectedPwm);
     }
     let expected_checksum = u32::from_le_bytes([frame[12], frame[13], frame[14], frame[15]]);
@@ -274,7 +333,7 @@ fn encode_trigger(trigger: Trigger) -> [u8; REQUEST_BYTES] {
     frame[4] = PROTOCOL_VERSION;
     frame[5] = trigger.recipe.command();
     frame[6] = trigger.recipe.wire();
-    frame[7] = PULSE_PWM_PERCENT;
+    frame[7] = trigger.recipe.pwm_percent();
     frame[8..12].copy_from_slice(&trigger.nonce.get().to_le_bytes());
     let checksum = crc32(&frame[..12]);
     frame[12..16].copy_from_slice(&checksum.to_le_bytes());
@@ -370,6 +429,7 @@ enum MachineAction {
         recipe: Recipe,
         index: u8,
         outputs: ForwardOutputs,
+        pwm_percent: u8,
         duration_ms: u32,
     },
     StartPulse {
@@ -377,6 +437,7 @@ enum MachineAction {
         recipe: Recipe,
         index: u8,
         outputs: ForwardOutputs,
+        pwm_percent: u8,
         duration_ms: u32,
         deadline_ms: u32,
     },
@@ -385,6 +446,7 @@ enum MachineAction {
         recipe: Recipe,
         index: u8,
         outputs: ForwardOutputs,
+        pwm_percent: u8,
         duration_ms: u32,
         complete: bool,
     },
@@ -450,6 +512,7 @@ impl CommissionMachine {
             recipe,
             index,
             outputs: segment.outputs,
+            pwm_percent: segment.pwm_percent,
             duration_ms: segment.duration_ms,
         }
     }
@@ -480,6 +543,7 @@ impl CommissionMachine {
             recipe,
             index,
             outputs: segment.outputs,
+            pwm_percent: segment.pwm_percent,
             duration_ms: segment.duration_ms,
             deadline_ms,
         }
@@ -524,6 +588,7 @@ impl CommissionMachine {
             recipe,
             index,
             outputs: segment.outputs,
+            pwm_percent: segment.pwm_percent,
             duration_ms: segment.duration_ms,
             complete,
         }
@@ -635,7 +700,7 @@ fn parse_response(frame: &[u8; RESPONSE_BYTES]) -> Result<CommissionResponse, Re
                 || nonce != 0
                 || commanded_duration_ms != 0
                 || outputs_wire != 0
-                || pwm_percent != PULSE_PWM_PERCENT
+                || pwm_percent != MAX_COMMISSIONING_PWM_PERCENT
                 || detail != 0
             {
                 return Err(ResponseParseError::Fields);
@@ -647,7 +712,7 @@ fn parse_response(frame: &[u8; RESPONSE_BYTES]) -> Result<CommissionResponse, Re
             if segment_index != u8::MAX
                 || commanded_duration_ms != recipe.total_active_duration_ms()
                 || outputs_wire != recipe.output_union().wire()
-                || pwm_percent != PULSE_PWM_PERCENT
+                || pwm_percent != recipe.pwm_percent()
                 || detail != recipe.segment_count()
             {
                 return Err(ResponseParseError::Fields);
@@ -668,7 +733,7 @@ fn parse_response(frame: &[u8; RESPONSE_BYTES]) -> Result<CommissionResponse, Re
                 ForwardOutputs::from_wire(outputs_wire).ok_or(ResponseParseError::Fields)?;
             if commanded_duration_ms != segment.duration_ms
                 || outputs != segment.outputs
-                || pwm_percent != PULSE_PWM_PERCENT
+                || pwm_percent != segment.pwm_percent
                 || detail != 0
             {
                 return Err(ResponseParseError::Fields);
@@ -763,6 +828,8 @@ enum CompletedPulse {
     SequentialLeft,
     SequentialRight,
     Both10S,
+    LeftBreakaway30Pct,
+    RightBreakaway30Pct,
 }
 
 impl CompletedPulse {
@@ -771,6 +838,8 @@ impl CompletedPulse {
             (Recipe::LeftThenRight250Ms, 0) => Some(Self::SequentialLeft),
             (Recipe::LeftThenRight250Ms, 1) => Some(Self::SequentialRight),
             (Recipe::BothForward10S, 0) => Some(Self::Both10S),
+            (Recipe::LeftBreakaway30Pct500Ms, 0) => Some(Self::LeftBreakaway30Pct),
+            (Recipe::RightBreakaway30Pct500Ms, 0) => Some(Self::RightBreakaway30Pct),
             _ => None,
         }
     }
@@ -779,12 +848,17 @@ impl CompletedPulse {
         match self {
             Self::SequentialLeft | Self::SequentialRight => Recipe::LeftThenRight250Ms,
             Self::Both10S => Recipe::BothForward10S,
+            Self::LeftBreakaway30Pct => Recipe::LeftBreakaway30Pct500Ms,
+            Self::RightBreakaway30Pct => Recipe::RightBreakaway30Pct500Ms,
         }
     }
 
     const fn index(self) -> u8 {
         match self {
-            Self::SequentialLeft | Self::Both10S => 0,
+            Self::SequentialLeft
+            | Self::Both10S
+            | Self::LeftBreakaway30Pct
+            | Self::RightBreakaway30Pct => 0,
             Self::SequentialRight => 1,
         }
     }
@@ -793,15 +867,28 @@ impl CompletedPulse {
         match self {
             Self::SequentialLeft => Segment {
                 outputs: ForwardOutputs::Left,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: PULSE_DURATION_MS,
             },
             Self::SequentialRight => Segment {
                 outputs: ForwardOutputs::Right,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: PULSE_DURATION_MS,
             },
             Self::Both10S => Segment {
                 outputs: ForwardOutputs::Both,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: BOTH_FORWARD_DURATION_MS,
+            },
+            Self::LeftBreakaway30Pct => Segment {
+                outputs: ForwardOutputs::Left,
+                pwm_percent: BREAKAWAY_PWM_PERCENT,
+                duration_ms: BREAKAWAY_DURATION_MS,
+            },
+            Self::RightBreakaway30Pct => Segment {
+                outputs: ForwardOutputs::Right,
+                pwm_percent: BREAKAWAY_PWM_PERCENT,
+                duration_ms: BREAKAWAY_DURATION_MS,
             },
         }
     }
@@ -849,7 +936,7 @@ fn encode_response(response: OutboundResponse) -> [u8; RESPONSE_BYTES] {
             None,
             0,
             None,
-            PULSE_PWM_PERCENT,
+            MAX_COMMISSIONING_PWM_PERCENT,
             0,
             0,
             uptime_ms,
@@ -860,7 +947,7 @@ fn encode_response(response: OutboundResponse) -> [u8; RESPONSE_BYTES] {
             None,
             trigger.recipe.total_active_duration_ms(),
             Some(trigger.recipe.output_union()),
-            PULSE_PWM_PERCENT,
+            trigger.recipe.pwm_percent(),
             trigger.recipe.segment_count(),
             trigger.nonce.get(),
             uptime_ms,
@@ -877,7 +964,7 @@ fn encode_response(response: OutboundResponse) -> [u8; RESPONSE_BYTES] {
                 Some(pulse.index()),
                 segment.duration_ms,
                 Some(segment.outputs),
-                PULSE_PWM_PERCENT,
+                segment.pwm_percent,
                 0,
                 nonce.get(),
                 uptime_ms,
@@ -959,9 +1046,9 @@ mod target {
 
     use super::{
         CommissionMachine, CompletedPulse, DecodeEvent, ForwardOutputs, MAIN_LOOP_DELAY_MS,
-        MachineAction, OutboundResponse, PULSE_PWM_PERCENT, PWM_FREQUENCY_HZ, READY_PERIOD_MS,
-        RESPONSE_BYTES, SAFE_WATCHDOG_PERIOD_MS, SERIAL_RESPONSE_TIMEOUT_MS, Trigger,
-        TriggerDecoder, WATCHDOG_REGISTER_UPDATE_TIMEOUT_MS, deadline_reached, encode_response,
+        MachineAction, OutboundResponse, PWM_FREQUENCY_HZ, READY_PERIOD_MS, RESPONSE_BYTES, Recipe,
+        SAFE_WATCHDOG_PERIOD_MS, SERIAL_RESPONSE_TIMEOUT_MS, Trigger, TriggerDecoder,
+        WATCHDOG_REGISTER_UPDATE_TIMEOUT_MS, deadline_reached, encode_response,
     };
 
     static PULSE_ARMED: AtomicBool = AtomicBool::new(false);
@@ -1018,10 +1105,18 @@ mod target {
             Some(motor)
         }
 
-        fn start_pulse(&mut self, outputs: ForwardOutputs, deadline_ms: u32) -> bool {
+        fn start_pulse(
+            &mut self,
+            outputs: ForwardOutputs,
+            pwm_percent: u8,
+            deadline_ms: u32,
+        ) -> bool {
             self.disable_and_zero();
-            let left_duty = scale_duty(PULSE_PWM_PERCENT, self.left_max_duty);
-            let right_duty = scale_duty(PULSE_PWM_PERCENT, self.right_max_duty);
+            if pwm_percent == 0 || pwm_percent > super::MAX_COMMISSIONING_PWM_PERCENT {
+                return false;
+            }
+            let left_duty = scale_duty(pwm_percent, self.left_max_duty);
+            let right_duty = scale_duty(pwm_percent, self.right_max_duty);
             if (outputs.drives_left() && left_duty == 0)
                 || (outputs.drives_right() && right_duty == 0)
             {
@@ -1200,6 +1295,7 @@ mod target {
                         recipe,
                         index,
                         outputs,
+                        pwm_percent,
                         duration_ms,
                         complete,
                     } => {
@@ -1209,6 +1305,7 @@ mod target {
                         };
                         let expected_segment = pulse.segment();
                         if expected_segment.outputs != outputs
+                            || expected_segment.pwm_percent != pwm_percent
                             || expected_segment.duration_ms != duration_ms
                         {
                             enter_fault(&mut machine, &mut motor, &mut watchdog);
@@ -1306,11 +1403,12 @@ mod target {
                 MachineAction::PreparePulse {
                     recipe,
                     outputs,
+                    pwm_percent,
                     duration_ms,
                     index,
                     ..
                 } => {
-                    if !set_watchdog_period(&mut watchdog, recipe.watchdog_period_ms()) {
+                    if !set_recipe_watchdog_period(&mut watchdog, recipe) {
                         enter_fault(&mut machine, &mut motor, &mut watchdog);
                     } else {
                         // The active deadline is derived only after the new
@@ -1323,15 +1421,17 @@ mod target {
                                 recipe: started_recipe,
                                 index: started_index,
                                 outputs: started_outputs,
+                                pwm_percent: started_pwm_percent,
                                 duration_ms: started_duration_ms,
                                 deadline_ms,
                                 ..
                             } if started_recipe == recipe
                                 && started_index == index
                                 && started_outputs == outputs
+                                && started_pwm_percent == pwm_percent
                                 && started_duration_ms == duration_ms =>
                             {
-                                if !motor.start_pulse(outputs, deadline_ms) {
+                                if !motor.start_pulse(outputs, pwm_percent, deadline_ms) {
                                     enter_fault(&mut machine, &mut motor, &mut watchdog);
                                 }
                             }
@@ -1348,10 +1448,11 @@ mod target {
                 && !PULSE_EXPIRED.load(Ordering::Acquire);
             // Never feed IWDG while outputs are active. Each recipe configured
             // its own pre-enable interval: nominal 500 ms for a 250 ms pulse,
-            // or a conservative nominal-32-kHz 15,500 ms configuration for a
-            // 10,000 ms pulse. At the datasheet maximum 47 kHz LSI this still
-            // leaves at least 500 ms after nominal cutoff; at lower frequency
-            // it can be much longer. This is not an arbitrary-fault proof.
+            // a conservative nominal-32-kHz 1,500 ms configuration for a 500
+            // ms breakaway pulse, or 15,500 ms for the 10,000 ms pulse. At the
+            // datasheet maximum 47 kHz LSI, both extended profiles leave at
+            // least 500 ms after nominal cutoff; at lower frequency the reset
+            // can be much later. This is not an arbitrary-fault proof.
             if outputs_safely_zero {
                 watchdog.feed();
             }
@@ -1372,14 +1473,24 @@ mod target {
         }
     }
 
+    fn set_recipe_watchdog_period(watchdog: &mut IndependentWatchdog, recipe: Recipe) -> bool {
+        let requested_ms = recipe.watchdog_period_ms();
+        let margin_is_proven = match recipe {
+            Recipe::LeftThenRight250Ms => true,
+            Recipe::BothForward10S => {
+                requested_ms.saturating_mul(super::LSI_NOMINAL_KHZ) / super::LSI_MAX_KHZ
+                    >= super::BOTH_FORWARD_DURATION_MS + super::WATCHDOG_BACKSTOP_MARGIN_MS
+            }
+            Recipe::LeftBreakaway30Pct500Ms | Recipe::RightBreakaway30Pct500Ms => {
+                requested_ms.saturating_mul(super::LSI_NOMINAL_KHZ) / super::LSI_MAX_KHZ
+                    >= super::BREAKAWAY_DURATION_MS + super::WATCHDOG_BACKSTOP_MARGIN_MS
+            }
+        };
+        margin_is_proven && set_watchdog_period(watchdog, requested_ms)
+    }
+
     #[allow(unsafe_code)]
     fn set_watchdog_period(watchdog: &mut IndependentWatchdog, requested_ms: u32) -> bool {
-        if requested_ms == super::BOTH_FORWARD_WATCHDOG_CONFIG_MS
-            && requested_ms.saturating_mul(super::LSI_NOMINAL_KHZ) / super::LSI_MAX_KHZ
-                < super::BOTH_FORWARD_DURATION_MS + super::WATCHDOG_BACKSTOP_MARGIN_MS
-        {
-            return false;
-        }
         watchdog.start(requested_ms.millis());
         let update_deadline_ms = uptime_ms().wrapping_add(WATCHDOG_REGISTER_UPDATE_TIMEOUT_MS);
         loop {
@@ -1661,16 +1772,18 @@ mod target {
 mod host {
     use std::{fmt, str::FromStr, time::Duration};
 
-    use clap::{ArgAction, Parser};
+    use clap::{ArgAction, ArgGroup, Parser};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_serial::{DataBits, FlowControl, Parity, SerialPort, SerialPortBuilderExt, StopBits};
 
     use super::{
-        BOTH_FORWARD_DURATION_MS, BOTH_FORWARD_WATCHDOG_CONFIG_MS, COMMISSIONING_BUILD_ID,
-        CommissionResponse, INITIAL_ZERO_DWELL_MS, INTER_PULSE_ZERO_DWELL_MS, LSI_MAX_KHZ,
-        LSI_NOMINAL_KHZ, PULSE_DURATION_MS, PULSE_PWM_PERCENT, READY_PERIOD_MS, Recipe,
-        ResponseDecoder, ResponseParseError, Trigger, WATCHDOG_BACKSTOP_MARGIN_MS, encode_trigger,
+        BOTH_FORWARD_DURATION_MS, BOTH_FORWARD_WATCHDOG_CONFIG_MS, BREAKAWAY_DURATION_MS,
+        BREAKAWAY_PWM_PERCENT, BREAKAWAY_WATCHDOG_CONFIG_MS, COMMISSIONING_BUILD_ID,
+        CommissionResponse, INITIAL_ZERO_DWELL_MS, INTER_PULSE_ZERO_DWELL_MS,
+        LEGACY_PULSE_PWM_PERCENT, LSI_MAX_KHZ, LSI_NOMINAL_KHZ, PULSE_DURATION_MS, READY_PERIOD_MS,
+        Recipe, ResponseDecoder, ResponseParseError, Trigger, WATCHDOG_BACKSTOP_MARGIN_MS,
+        encode_trigger,
     };
 
     const SERIAL_BAUD_BPS: u32 = 115_200;
@@ -1688,7 +1801,9 @@ mod host {
     const fn required_post_ready_ms(recipe: Recipe) -> u32 {
         let inter_segment_ms = match recipe {
             Recipe::LeftThenRight250Ms => INTER_PULSE_ZERO_DWELL_MS,
-            Recipe::BothForward10S => 0,
+            Recipe::BothForward10S
+            | Recipe::LeftBreakaway30Pct500Ms
+            | Recipe::RightBreakaway30Pct500Ms => 0,
         };
         INITIAL_ZERO_DWELL_MS
             + recipe.total_active_duration_ms()
@@ -1705,7 +1820,18 @@ mod host {
     #[derive(Parser, Debug)]
     #[command(
         name = "kiko-motor-commission",
-        about = "Execute the one-shot, wheels-off-only Kiko STM32 motor pulse sequence"
+        about = "Execute one selected, one-shot, wheels-off-only Kiko STM32 motor recipe",
+        group(
+            ArgGroup::new("recipe")
+                .required(true)
+                .multiple(false)
+                .args([
+                    "execute_wheels_off_sequence",
+                    "execute_both_forward_10s",
+                    "execute_left_breakaway_30_percent",
+                    "execute_right_breakaway_30_percent",
+                ])
+        )
     )]
     struct Cli {
         /// Exact Linux persistent ST-Link virtual UART path; no tty fallback.
@@ -1713,22 +1839,20 @@ mod host {
         serial_device: PersistentSerialPath,
 
         /// Required physical-action acknowledgement. Wheels must be removed.
-        #[arg(
-            long,
-            action = ArgAction::SetTrue,
-            required_unless_present = "execute_both_forward_10s",
-            conflicts_with = "execute_both_forward_10s"
-        )]
+        #[arg(long, action = ArgAction::SetTrue)]
         execute_wheels_off_sequence: bool,
 
         /// Execute both forward outputs at 8% for 10,000 ms; wheels must be removed.
-        #[arg(
-            long,
-            action = ArgAction::SetTrue,
-            required_unless_present = "execute_wheels_off_sequence",
-            conflicts_with = "execute_wheels_off_sequence"
-        )]
+        #[arg(long, action = ArgAction::SetTrue)]
         execute_both_forward_10s: bool,
+
+        /// Execute only left forward at 30% for 500 ms; wheels must be removed.
+        #[arg(long, action = ArgAction::SetTrue)]
+        execute_left_breakaway_30_percent: bool,
+
+        /// Execute only right forward at 30% for 500 ms; wheels must be removed.
+        #[arg(long, action = ArgAction::SetTrue)]
+        execute_right_breakaway_30_percent: bool,
 
         /// One exclusive end-to-end deadline, including Ready observation.
         #[arg(long, default_value_t = 15_000, value_parser = parse_timeout_ms)]
@@ -1847,6 +1971,7 @@ mod host {
         LeftPulseComplete,
         RightPulseComplete,
         BothPulseComplete,
+        BreakawayPulseComplete,
         Complete,
     }
 
@@ -1920,7 +2045,7 @@ mod host {
             formatter.write_str("wheels-off motor commissioning failed: ")?;
             match self {
                 Self::InvalidExecutionFlagSelection => formatter.write_str(
-                    "exactly one of --execute-wheels-off-sequence or --execute-both-forward-10s is required before any trigger is sent",
+                    "exactly one compiled recipe flag is required before any trigger is sent",
                 ),
                 Self::Open(source) => {
                     write!(formatter, "could not open exact serial device: {source}")
@@ -2046,6 +2171,35 @@ mod host {
         flow_control_none: bool,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BreakawayWheel {
+        Left,
+        Right,
+    }
+
+    impl BreakawayWheel {
+        const fn recipe(self) -> Recipe {
+            match self {
+                Self::Left => Recipe::LeftBreakaway30Pct500Ms,
+                Self::Right => Recipe::RightBreakaway30Pct500Ms,
+            }
+        }
+
+        const fn evidence_name(self) -> &'static str {
+            match self {
+                Self::Left => "left_breakaway_30_percent_500ms",
+                Self::Right => "right_breakaway_30_percent_500ms",
+            }
+        }
+
+        const fn output_name(self) -> &'static str {
+            match self {
+                Self::Left => "left_forward",
+                Self::Right => "right_forward",
+            }
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum SequenceEvidence {
         LeftThenRight {
@@ -2064,15 +2218,32 @@ mod host {
             accepted_to_both_ms: u32,
             both_to_complete_ms: u32,
         },
+        SingleWheelBreakaway {
+            wheel: BreakawayWheel,
+            accepted_uptime_ms: u32,
+            pulse_uptime_ms: u32,
+            complete_uptime_ms: u32,
+            accepted_to_pulse_ms: u32,
+            pulse_to_complete_ms: u32,
+        },
     }
 
     const fn select_recipe(
         left_then_right: bool,
         both_forward_10s: bool,
+        left_breakaway_30_percent: bool,
+        right_breakaway_30_percent: bool,
     ) -> Result<Recipe, HostError> {
-        match (left_then_right, both_forward_10s) {
-            (true, false) => Ok(Recipe::LeftThenRight250Ms),
-            (false, true) => Ok(Recipe::BothForward10S),
+        match (
+            left_then_right,
+            both_forward_10s,
+            left_breakaway_30_percent,
+            right_breakaway_30_percent,
+        ) {
+            (true, false, false, false) => Ok(Recipe::LeftThenRight250Ms),
+            (false, true, false, false) => Ok(Recipe::BothForward10S),
+            (false, false, true, false) => Ok(Recipe::LeftBreakaway30Pct500Ms),
+            (false, false, false, true) => Ok(Recipe::RightBreakaway30Pct500Ms),
             _ => Err(HostError::InvalidExecutionFlagSelection),
         }
     }
@@ -2082,6 +2253,8 @@ mod host {
         let recipe = select_recipe(
             cli.execute_wheels_off_sequence,
             cli.execute_both_forward_10s,
+            cli.execute_left_breakaway_30_percent,
+            cli.execute_right_breakaway_30_percent,
         )?;
         let (mut port, serial_evidence) = open_exact_serial(&cli.serial_device)?;
         let host_started_at = tokio::time::Instant::now();
@@ -2160,8 +2333,8 @@ mod host {
                     "id": Recipe::LeftThenRight250Ms.wire(),
                     "name": "left_then_right_250ms",
                     "segments": [
-                        {"index": 0, "outputs": ["left_forward"], "pwm_percent": PULSE_PWM_PERCENT, "duration_ms": PULSE_DURATION_MS},
-                        {"index": 1, "outputs": ["right_forward"], "pwm_percent": PULSE_PWM_PERCENT, "duration_ms": PULSE_DURATION_MS}
+                        {"index": 0, "outputs": ["left_forward"], "pwm_percent": LEGACY_PULSE_PWM_PERCENT, "duration_ms": PULSE_DURATION_MS},
+                        {"index": 1, "outputs": ["right_forward"], "pwm_percent": LEGACY_PULSE_PWM_PERCENT, "duration_ms": PULSE_DURATION_MS}
                     ],
                     "initial_zero_dwell_ms": INITIAL_ZERO_DWELL_MS,
                     "inter_segment_zero_dwell_ms": INTER_PULSE_ZERO_DWELL_MS,
@@ -2191,7 +2364,7 @@ mod host {
                     "id": Recipe::BothForward10S.wire(),
                     "name": "both_forward_10s",
                     "segments": [
-                        {"index": 0, "outputs": ["left_forward", "right_forward"], "pwm_percent": PULSE_PWM_PERCENT, "duration_ms": BOTH_FORWARD_DURATION_MS}
+                        {"index": 0, "outputs": ["left_forward", "right_forward"], "pwm_percent": LEGACY_PULSE_PWM_PERCENT, "duration_ms": BOTH_FORWARD_DURATION_MS}
                     ],
                     "initial_zero_dwell_ms": INITIAL_ZERO_DWELL_MS,
                     "inter_segment_zero_dwell_ms": 0,
@@ -2211,10 +2384,48 @@ mod host {
                     "both_complete_to_sequence_complete": both_to_complete_ms,
                 }),
             ),
+            SequenceEvidence::SingleWheelBreakaway {
+                wheel,
+                accepted_uptime_ms,
+                pulse_uptime_ms,
+                complete_uptime_ms,
+                accepted_to_pulse_ms,
+                pulse_to_complete_ms,
+            } => {
+                let recipe = wheel.recipe();
+                (
+                    json!({
+                        "id": recipe.wire(),
+                        "name": wheel.evidence_name(),
+                        "segments": [
+                            {"index": 0, "outputs": [wheel.output_name()], "pwm_percent": BREAKAWAY_PWM_PERCENT, "duration_ms": BREAKAWAY_DURATION_MS}
+                        ],
+                        "initial_zero_dwell_ms": INITIAL_ZERO_DWELL_MS,
+                        "inter_segment_zero_dwell_ms": 0,
+                        "watchdog_hal_config_ms_at_nominal_32khz_lsi": BREAKAWAY_WATCHDOG_CONFIG_MS,
+                        "watchdog_lsi_model_nominal_khz": LSI_NOMINAL_KHZ,
+                        "watchdog_lsi_datasheet_max_khz": LSI_MAX_KHZ,
+                        "watchdog_designed_minimum_margin_at_max_lsi_ms": WATCHDOG_BACKSTOP_MARGIN_MS,
+                        "other_wheel_and_both_reverse_directions_commanded_zero": true,
+                        "requires_fresh_reset_and_trigger_for_other_wheel": true,
+                        "automatic_sweep": false,
+                    }),
+                    json!({
+                        "ready": ready_uptime_ms,
+                        "accepted": accepted_uptime_ms,
+                        "selected_wheel_pulse_complete": pulse_uptime_ms,
+                        "sequence_complete": complete_uptime_ms,
+                    }),
+                    json!({
+                        "accepted_to_selected_wheel_complete": accepted_to_pulse_ms,
+                        "selected_wheel_complete_to_sequence_complete": pulse_to_complete_ms,
+                    }),
+                )
+            }
         };
 
         let evidence = json!({
-            "schema_version": 2,
+            "schema_version": 3,
             "observation_kind": "wheels_off_stm32_motor_commissioning",
             "serial_by_id_path": cli.serial_device.as_str(),
             "exclusive_lock_requested_and_set": true,
@@ -2235,7 +2446,7 @@ mod host {
             "host_elapsed_ms": host_elapsed_ms,
             "observed_serial_bytes": responses.observed_bytes,
             "sequence_complete": true,
-            "evidence_boundary": "software admission and STM32 nominal timer evidence only; wheels-off state and physical shaft motion require separate operator observation. The 10,000 ms TIM5 cutoff plus a watchdog configuration designed to leave at least 500 ms at the datasheet maximum LSI frequency is not an arbitrary-fault physical bound; the real watchdog interval may be much longer at lower LSI frequency. This is not velocity calibration, KRP2 motion authority, closed-loop control, or MPC validation",
+            "evidence_boundary": "software admission and STM32 nominal timer evidence only; wheels-off state and physical shaft motion require separate operator observation. A 30% breakaway recipe is a one-wheel electrical/motion discriminator motivated by surviving BTS7960 demos whose lowest command is 30%; it is not a safe-drive limit or a PWM-to-velocity calibration. The 500 ms breakaway and 10,000 ms both-forward recipes use watchdog configurations designed to leave at least 500 ms after their nominal TIM5 cutoffs at the datasheet maximum LSI frequency; the legacy 250 ms recipe retains its nominal 500 ms watchdog and does not claim that worst-case margin. None is an arbitrary-fault physical bound, and the real watchdog interval may be much longer at lower LSI frequency. This is not KRP2 motion authority, closed-loop control, or MPC validation",
         });
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
@@ -2344,7 +2555,67 @@ mod host {
                     )?,
                 })
             }
+            Recipe::LeftBreakaway30Pct500Ms => {
+                observe_breakaway_sequence(
+                    port,
+                    responses,
+                    nonce,
+                    accepted_uptime_ms,
+                    BreakawayWheel::Left,
+                )
+                .await
+            }
+            Recipe::RightBreakaway30Pct500Ms => {
+                observe_breakaway_sequence(
+                    port,
+                    responses,
+                    nonce,
+                    accepted_uptime_ms,
+                    BreakawayWheel::Right,
+                )
+                .await
+            }
         }
+    }
+
+    async fn observe_breakaway_sequence(
+        port: &mut tokio_serial::SerialStream,
+        responses: &mut ResponseStream,
+        nonce: core::num::NonZeroU32,
+        accepted_uptime_ms: u32,
+        wheel: BreakawayWheel,
+    ) -> Result<SequenceEvidence, HostError> {
+        let recipe = wheel.recipe();
+        let pulse_uptime_ms = responses
+            .expect_pulse(
+                port,
+                nonce,
+                recipe,
+                0,
+                SequenceStage::BreakawayPulseComplete,
+            )
+            .await?;
+        let complete_uptime_ms = responses.expect_complete(port, nonce, recipe).await?;
+        Ok(SequenceEvidence::SingleWheelBreakaway {
+            wheel,
+            accepted_uptime_ms,
+            pulse_uptime_ms,
+            complete_uptime_ms,
+            accepted_to_pulse_ms: bounded_controller_delta(
+                "accepted_to_breakaway_complete",
+                accepted_uptime_ms,
+                pulse_uptime_ms,
+                INITIAL_ZERO_DWELL_MS + BREAKAWAY_DURATION_MS,
+                INITIAL_ZERO_DWELL_MS + BREAKAWAY_DURATION_MS + MAX_TIMER_EVENT_LATENCY_MS,
+            )?,
+            pulse_to_complete_ms: bounded_controller_delta(
+                "breakaway_complete_to_sequence_complete",
+                pulse_uptime_ms,
+                complete_uptime_ms,
+                0,
+                MAX_FINAL_EVIDENCE_DELAY_MS,
+            )?,
+        })
     }
 
     fn post_trigger(source: HostError) -> HostError {
@@ -2608,15 +2879,71 @@ mod host {
         #[test]
         fn execution_flags_select_exactly_one_recipe() {
             assert!(matches!(
-                select_recipe(true, false),
+                select_recipe(true, false, false, false),
                 Ok(Recipe::LeftThenRight250Ms)
             ));
             assert!(matches!(
-                select_recipe(false, true),
+                select_recipe(false, true, false, false),
                 Ok(Recipe::BothForward10S)
             ));
-            assert!(select_recipe(false, false).is_err());
-            assert!(select_recipe(true, true).is_err());
+            assert!(matches!(
+                select_recipe(false, false, true, false),
+                Ok(Recipe::LeftBreakaway30Pct500Ms)
+            ));
+            assert!(matches!(
+                select_recipe(false, false, false, true),
+                Ok(Recipe::RightBreakaway30Pct500Ms)
+            ));
+            assert!(select_recipe(false, false, false, false).is_err());
+            assert!(select_recipe(true, true, false, false).is_err());
+            assert!(select_recipe(false, false, true, true).is_err());
+        }
+
+        #[test]
+        fn clap_requires_one_and_only_one_physical_recipe_flag() {
+            let base = ["kiko-motor-commission", "--serial-device", KNOWN_STLINK];
+            assert!(Cli::try_parse_from(base).is_err());
+
+            for (flag, expected) in [
+                ("--execute-wheels-off-sequence", Recipe::LeftThenRight250Ms),
+                ("--execute-both-forward-10s", Recipe::BothForward10S),
+                (
+                    "--execute-left-breakaway-30-percent",
+                    Recipe::LeftBreakaway30Pct500Ms,
+                ),
+                (
+                    "--execute-right-breakaway-30-percent",
+                    Recipe::RightBreakaway30Pct500Ms,
+                ),
+            ] {
+                let cli = Cli::try_parse_from(base.into_iter().chain([flag]))
+                    .expect("one exact breakaway flag is admitted");
+                assert_eq!(
+                    select_recipe(
+                        cli.execute_wheels_off_sequence,
+                        cli.execute_both_forward_10s,
+                        cli.execute_left_breakaway_30_percent,
+                        cli.execute_right_breakaway_30_percent,
+                    )
+                    .expect("parsed CLI has exactly one recipe"),
+                    expected
+                );
+            }
+
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain([
+                    "--execute-wheels-off-sequence",
+                    "--execute-left-breakaway-30-percent",
+                ]))
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from(base.into_iter().chain([
+                    "--execute-left-breakaway-30-percent",
+                    "--execute-right-breakaway-30-percent",
+                ]))
+                .is_err()
+            );
         }
 
         #[test]
@@ -2665,7 +2992,7 @@ mod tests {
         frame[4] = PROTOCOL_VERSION;
         frame[5] = recipe.command();
         frame[6] = recipe.wire();
-        frame[7] = PULSE_PWM_PERCENT;
+        frame[7] = recipe.pwm_percent();
         frame[8..12].copy_from_slice(&nonce.to_le_bytes());
         let checksum = crc32(&frame[..12]);
         frame[12..16].copy_from_slice(&checksum.to_le_bytes());
@@ -2688,8 +3015,13 @@ mod tests {
     }
 
     #[test]
-    fn both_crc_bound_recipes_parse_once_into_typed_triggers() {
-        for recipe in [Recipe::LeftThenRight250Ms, Recipe::BothForward10S] {
+    fn every_crc_bound_recipe_parses_once_into_a_typed_trigger() {
+        for recipe in [
+            Recipe::LeftThenRight250Ms,
+            Recipe::BothForward10S,
+            Recipe::LeftBreakaway30Pct500Ms,
+            Recipe::RightBreakaway30Pct500Ms,
+        ] {
             let nonce = NonZeroU32::new(0x1234_5678).expect("nonzero");
             let encoded = encode_trigger(Trigger { nonce, recipe });
             assert_eq!(encoded, request(recipe, nonce.get()));
@@ -2699,16 +3031,24 @@ mod tests {
 
     #[test]
     fn command_recipe_pairs_cannot_be_mixed() {
-        for recipe in [Recipe::LeftThenRight250Ms, Recipe::BothForward10S] {
-            let other = match recipe {
-                Recipe::LeftThenRight250Ms => Recipe::BothForward10S,
-                Recipe::BothForward10S => Recipe::LeftThenRight250Ms,
-            };
-            let mut frame = request(recipe, 1);
-            frame[5] = other.command();
-            let checksum = crc32(&frame[..12]);
-            frame[12..16].copy_from_slice(&checksum.to_le_bytes());
-            assert_eq!(parse_trigger(&frame), Err(TriggerError::Command));
+        let recipes = [
+            Recipe::LeftThenRight250Ms,
+            Recipe::BothForward10S,
+            Recipe::LeftBreakaway30Pct500Ms,
+            Recipe::RightBreakaway30Pct500Ms,
+        ];
+        for recipe in recipes {
+            for wrong_command in recipes
+                .into_iter()
+                .filter(|candidate| *candidate != recipe)
+                .map(Recipe::command)
+            {
+                let mut frame = request(recipe, 1);
+                frame[5] = wrong_command;
+                let checksum = crc32(&frame[..12]);
+                frame[12..16].copy_from_slice(&checksum.to_le_bytes());
+                assert_eq!(parse_trigger(&frame), Err(TriggerError::Command));
+            }
 
             let mut unknown = request(recipe, 1);
             unknown[6] = 0xff;
@@ -2720,7 +3060,12 @@ mod tests {
 
     #[test]
     fn every_single_bit_request_corruption_is_rejected_for_each_recipe() {
-        for recipe in [Recipe::LeftThenRight250Ms, Recipe::BothForward10S] {
+        for recipe in [
+            Recipe::LeftThenRight250Ms,
+            Recipe::BothForward10S,
+            Recipe::LeftBreakaway30Pct500Ms,
+            Recipe::RightBreakaway30Pct500Ms,
+        ] {
             let valid = request(recipe, 0x1234_5678);
             for bit in 0..(REQUEST_BYTES * 8) {
                 let mut corrupt = valid;
@@ -2736,7 +3081,7 @@ mod tests {
     #[test]
     fn stream_decoder_ignores_noise_and_decodes_the_both_recipe_once() {
         let mut decoder = TriggerDecoder::new();
-        for byte in [0, b'K', 0, b'K', b'M', b'K', b'M', b'C', b'2'] {
+        for byte in [0, b'K', 0, b'K', b'M', b'K', b'M', b'C', b'3'] {
             assert_eq!(decoder.push(byte), None);
         }
         let frame = request(Recipe::BothForward10S, 7);
@@ -2776,6 +3121,7 @@ mod tests {
                 recipe: Recipe::LeftThenRight250Ms,
                 index: 0,
                 outputs: ForwardOutputs::Left,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: 250,
             }
         );
@@ -2794,6 +3140,7 @@ mod tests {
                 recipe: Recipe::LeftThenRight250Ms,
                 index: 0,
                 outputs: ForwardOutputs::Left,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: 250,
                 complete: false,
             }
@@ -2844,6 +3191,7 @@ mod tests {
                 recipe: Recipe::BothForward10S,
                 index: 0,
                 outputs: ForwardOutputs::Both,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: 10_000,
             }
         );
@@ -2855,6 +3203,7 @@ mod tests {
                 recipe: Recipe::BothForward10S,
                 index: 0,
                 outputs: ForwardOutputs::Both,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: 10_000,
                 deadline_ms: 11_507,
             }
@@ -2866,11 +3215,98 @@ mod tests {
                 recipe: Recipe::BothForward10S,
                 index: 0,
                 outputs: ForwardOutputs::Both,
+                pwm_percent: LEGACY_PULSE_PWM_PERCENT,
                 duration_ms: 10_000,
                 complete: true,
             }
         );
         assert!(machine.outputs_must_be_safe());
+    }
+
+    #[test]
+    fn breakaway_recipes_command_exactly_one_wheel_at_thirty_percent_for_500ms() {
+        for (recipe, expected_outputs) in [
+            (Recipe::LeftBreakaway30Pct500Ms, ForwardOutputs::Left),
+            (Recipe::RightBreakaway30Pct500Ms, ForwardOutputs::Right),
+        ] {
+            let nonce = NonZeroU32::new(u32::from(recipe.wire())).expect("nonzero recipe id");
+            let mut machine = CommissionMachine::new();
+            assert!(matches!(
+                machine.accept(Trigger { nonce, recipe }, 10),
+                MachineAction::Accepted { .. }
+            ));
+            assert_eq!(machine.poll_zero_phase(509), MachineAction::None);
+            assert_eq!(
+                machine.poll_zero_phase(510),
+                MachineAction::PreparePulse {
+                    nonce,
+                    recipe,
+                    index: 0,
+                    outputs: expected_outputs,
+                    pwm_percent: BREAKAWAY_PWM_PERCENT,
+                    duration_ms: BREAKAWAY_DURATION_MS,
+                }
+            );
+            assert!(machine.outputs_must_be_safe());
+            assert_eq!(
+                machine.begin_prepared_pulse(515),
+                MachineAction::StartPulse {
+                    nonce,
+                    recipe,
+                    index: 0,
+                    outputs: expected_outputs,
+                    pwm_percent: BREAKAWAY_PWM_PERCENT,
+                    duration_ms: BREAKAWAY_DURATION_MS,
+                    deadline_ms: 1_015,
+                }
+            );
+            assert_eq!(
+                machine.pulse_expired(1_015),
+                MachineAction::PulseStopped {
+                    nonce,
+                    recipe,
+                    index: 0,
+                    outputs: expected_outputs,
+                    pwm_percent: BREAKAWAY_PWM_PERCENT,
+                    duration_ms: BREAKAWAY_DURATION_MS,
+                    complete: true,
+                }
+            );
+            assert!(machine.outputs_must_be_safe());
+            assert!(matches!(
+                machine.phase,
+                Phase::LockedComplete {
+                    nonce: observed_nonce,
+                    recipe: observed_recipe,
+                } if observed_nonce == nonce && observed_recipe == recipe
+            ));
+            assert_eq!(
+                machine.accept(Trigger { nonce, recipe }, 1_016),
+                MachineAction::None,
+                "a completed one-shot cannot admit a second wheel or level without reset"
+            );
+            assert!(matches!(machine.phase, Phase::LockedFault));
+        }
+    }
+
+    #[test]
+    fn trigger_binds_the_exact_recipe_specific_pwm() {
+        for recipe in [
+            Recipe::LeftThenRight250Ms,
+            Recipe::BothForward10S,
+            Recipe::LeftBreakaway30Pct500Ms,
+            Recipe::RightBreakaway30Pct500Ms,
+        ] {
+            let mut frame = request(recipe, 1);
+            frame[7] = if recipe.pwm_percent() == LEGACY_PULSE_PWM_PERCENT {
+                BREAKAWAY_PWM_PERCENT
+            } else {
+                LEGACY_PULSE_PWM_PERCENT
+            };
+            let checksum = crc32(&frame[..12]);
+            frame[12..16].copy_from_slice(&checksum.to_le_bytes());
+            assert_eq!(parse_trigger(&frame), Err(TriggerError::ExpectedPwm));
+        }
     }
 
     #[test]
@@ -2934,20 +3370,35 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_profiles_preserve_short_recipe_and_bound_long_recipe_at_max_lsi() {
+    fn watchdog_profiles_preserve_short_recipe_and_bound_long_recipes_at_max_lsi() {
         assert_eq!(Recipe::LeftThenRight250Ms.watchdog_period_ms(), 500);
         assert_eq!(Recipe::BothForward10S.watchdog_period_ms(), 15_500);
+        assert_eq!(Recipe::LeftBreakaway30Pct500Ms.watchdog_period_ms(), 1_500);
+        assert_eq!(Recipe::RightBreakaway30Pct500Ms.watchdog_period_ms(), 1_500);
         assert!(
             BOTH_FORWARD_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ
                 >= BOTH_FORWARD_DURATION_MS + WATCHDOG_BACKSTOP_MARGIN_MS
+        );
+        assert!(
+            BREAKAWAY_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ
+                >= BREAKAWAY_DURATION_MS + WATCHDOG_BACKSTOP_MARGIN_MS
+        );
+        assert_eq!(
+            BREAKAWAY_WATCHDOG_CONFIG_MS * LSI_NOMINAL_KHZ / LSI_MAX_KHZ - BREAKAWAY_DURATION_MS,
+            521
         );
     }
 
     #[test]
     fn response_is_recipe_timing_output_and_crc_self_identifying() {
-        for recipe in [Recipe::LeftThenRight250Ms, Recipe::BothForward10S] {
+        for recipe in [
+            Recipe::LeftThenRight250Ms,
+            Recipe::BothForward10S,
+            Recipe::LeftBreakaway30Pct500Ms,
+            Recipe::RightBreakaway30Pct500Ms,
+        ] {
             let frame = complete_response(recipe, 17, 42);
-            assert_eq!(&frame[..4], b"KMR2");
+            assert_eq!(&frame[..4], b"KMR3");
             assert_eq!(frame[4], PROTOCOL_VERSION);
             assert_eq!(frame[6], recipe.wire());
             assert_eq!(
@@ -2984,8 +3435,66 @@ mod tests {
     }
 
     #[test]
+    fn breakaway_evidence_binds_wheel_pwm_duration_and_build_identity() {
+        for (pulse, recipe, outputs) in [
+            (
+                CompletedPulse::LeftBreakaway30Pct,
+                Recipe::LeftBreakaway30Pct500Ms,
+                ForwardOutputs::Left,
+            ),
+            (
+                CompletedPulse::RightBreakaway30Pct,
+                Recipe::RightBreakaway30Pct500Ms,
+                ForwardOutputs::Right,
+            ),
+        ] {
+            let frame = encode_response(OutboundResponse::PulseCompleted {
+                nonce: NonZeroU32::new(31).expect("nonzero"),
+                pulse,
+                uptime_ms: 1_000,
+            });
+            assert_eq!(frame[6], recipe.wire());
+            assert_eq!(frame[7], 0);
+            assert_eq!(frame[24], outputs.wire());
+            assert_eq!(frame[25], BREAKAWAY_PWM_PERCENT);
+            assert_eq!(
+                u32::from_le_bytes(frame[20..24].try_into().expect("duration bytes")),
+                BREAKAWAY_DURATION_MS
+            );
+            assert_eq!(
+                u32::from_le_bytes(frame[16..20].try_into().expect("build bytes")),
+                0x4b4d_4303
+            );
+            assert!(parse_response(&frame).is_ok());
+
+            for (field, replacement) in [
+                (
+                    24,
+                    if outputs == ForwardOutputs::Left {
+                        2
+                    } else {
+                        1
+                    },
+                ),
+                (25, LEGACY_PULSE_PWM_PERCENT),
+            ] {
+                let mut corrupt = frame;
+                corrupt[field] = replacement;
+                let checksum = crc32(&corrupt[..28]);
+                corrupt[28..32].copy_from_slice(&checksum.to_le_bytes());
+                assert_eq!(parse_response(&corrupt), Err(ResponseParseError::Fields));
+            }
+        }
+    }
+
+    #[test]
     fn every_single_bit_evidence_corruption_is_rejected_for_each_recipe() {
-        for recipe in [Recipe::LeftThenRight250Ms, Recipe::BothForward10S] {
+        for recipe in [
+            Recipe::LeftThenRight250Ms,
+            Recipe::BothForward10S,
+            Recipe::LeftBreakaway30Pct500Ms,
+            Recipe::RightBreakaway30Pct500Ms,
+        ] {
             let valid = complete_response(recipe, 17, 42);
             for bit in 0..(RESPONSE_BYTES * 8) {
                 let mut corrupt = valid;
