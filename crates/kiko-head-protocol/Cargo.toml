@@ -1,0 +1,9 @@
+[package]
+name = "kiko-head-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Allocation-free typed Feetech STS head protocol and pose contract for Kiko"
+license = "MIT OR Apache-2.0"
+
+[lints]
+workspace = true
