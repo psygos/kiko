@@ -3104,6 +3104,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiko-base-commissioning"
+version = "0.1.0"
+dependencies = [
+ "robot-protocol",
+]
+
+[[package]]
 name = "kiko-expression-core"
 version = "0.1.0"
 

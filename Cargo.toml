@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/kiko-base-commissioning",
   "crates/kiko-expression-core",
   "crates/kiko-eye-protocol",
   "crates/kiko-supervisor-core",

@@ -1,0 +1,12 @@
+[package]
+name = "kiko-base-commissioning"
+version = "0.1.0"
+edition = "2024"
+description = "Deterministic encoderless base commissioning and identification core for Kiko"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+robot-protocol = { path = "../../comms/robot-protocol" }
+
+[lints]
+workspace = true
