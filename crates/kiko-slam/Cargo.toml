@@ -7,7 +7,16 @@ edition = "2024"
 default = []
 record = ["oak-sys", "ctrlc", "chrono"]
 actuation = ["dep:robot-command-client", "dep:sha2"]
-agent-runtime = ["dep:kiko-supervisor-core"]
+agent-runtime = [
+    "dep:kiko-device-inventory",
+    "dep:kiko-expression-core",
+    "dep:kiko-expression-runtime",
+    "dep:kiko-eye-protocol",
+    "dep:kiko-eye-runtime",
+    "dep:kiko-head-protocol",
+    "dep:kiko-head-runtime",
+    "dep:kiko-supervisor-core",
+]
 ort-coreml = ["ort/coreml"]
 ort-cuda = ["ort/cuda"]
 ort-tensorrt = ["ort/tensorrt"]
@@ -22,6 +31,13 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 rerun = { version = "=0.27.2", default-features = false, features = ["sdk", "server"] }
 robot-protocol = { path = "../../comms/robot-protocol" }
 robot-command-client = { path = "../../comms/robot-command-client", optional = true }
+kiko-device-inventory = { path = "../kiko-device-inventory", optional = true }
+kiko-expression-core = { path = "../kiko-expression-core", optional = true }
+kiko-expression-runtime = { path = "../kiko-expression-runtime", optional = true }
+kiko-eye-protocol = { path = "../kiko-eye-protocol", optional = true }
+kiko-eye-runtime = { path = "../kiko-eye-runtime", optional = true }
+kiko-head-protocol = { path = "../kiko-head-protocol", optional = true }
+kiko-head-runtime = { path = "../kiko-head-runtime", optional = true }
 kiko-supervisor-core = { path = "../kiko-supervisor-core", optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
