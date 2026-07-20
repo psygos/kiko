@@ -246,7 +246,12 @@ fn build_fixtures() -> Fixtures {
     let segment = OdomSegmentId::try_new(ODOM_SEGMENT_ID).expect("synthetic odom segment");
     let epoch = NavigationEpochV1::from_runtime(session, segment, map_snapshot, &path)
         .expect("synthetic navigation epoch");
-    assert_eq!(epoch.global_plan_identity(), path.identity());
+    assert_eq!(
+        epoch
+            .try_global_plan_identity()
+            .expect("synthetic epoch is global-path driven"),
+        path.identity()
+    );
 
     let local_config = LocalCostmapConfig::try_new(
         OccupancyGridGeometry::try_new(0.1, [-2.0, -1.5], 40, 30, 1_200)
@@ -371,7 +376,12 @@ fn execute_iteration(fixtures: &Fixtures, state: &mut RunState) -> u64 {
         )
         .expect("time-parameterized synthetic reference");
     assert_eq!(reference.epoch(), fixtures.epoch);
-    assert_eq!(reference.global_plan_identity(), fixtures.path.identity());
+    assert_eq!(
+        reference
+            .try_global_plan_identity()
+            .expect("synthetic reference is global-path driven"),
+        fixtures.path.identity()
+    );
     assert_eq!(reference.created_at(), tick);
 
     let local_view = fixtures
@@ -439,7 +449,10 @@ fn behavior_probe(fixtures: &Fixtures) -> BehaviorProbe {
     );
     assert_eq!(fixtures.epoch.odom_segment_id().as_u64(), ODOM_SEGMENT_ID);
     assert_eq!(
-        fixtures.epoch.global_plan_identity(),
+        fixtures
+            .epoch
+            .try_global_plan_identity()
+            .expect("synthetic epoch is global-path driven"),
         fixtures.path.identity()
     );
     assert_eq!(
@@ -448,7 +461,11 @@ fn behavior_probe(fixtures: &Fixtures) -> BehaviorProbe {
     );
     assert_eq!(
         fixtures.path.map_revision(),
-        fixtures.epoch.global_plan_identity().map_revision()
+        fixtures
+            .epoch
+            .try_global_plan_identity()
+            .expect("synthetic epoch is global-path driven")
+            .map_revision()
     );
     assert_eq!(
         fixtures.parsed_depth.session_id().as_u64(),

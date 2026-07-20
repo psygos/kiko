@@ -3474,11 +3474,11 @@ impl std::error::Error for LiveNavigationPrerequisiteError {}
 #[cfg(feature = "record")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LiveNavigationPreparationError {
-    MissingNavigationConfigBytes,
-    UnexpectedNavigationConfigBytes,
+    MissingNavigationPolicy,
+    NavigationPolicyWhileDisabled,
     #[cfg(feature = "actuation")]
-    MissingActuationConfigBytes,
-    UnexpectedActuationConfigBytes,
+    MissingPhysicalAuthority,
+    PhysicalAuthorityInShadowMode,
     #[cfg(not(feature = "actuation"))]
     PhysicalActuationFeatureDisabled,
 }
@@ -3487,17 +3487,17 @@ enum LiveNavigationPreparationError {
 impl std::fmt::Display for LiveNavigationPreparationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::MissingNavigationConfigBytes => {
+            Self::MissingNavigationPolicy => {
                 "enabled live navigation has no bounded navigation-config input"
             }
-            Self::UnexpectedNavigationConfigBytes => {
+            Self::NavigationPolicyWhileDisabled => {
                 "disabled live navigation received unexpected navigation-config input"
             }
             #[cfg(feature = "actuation")]
-            Self::MissingActuationConfigBytes => {
+            Self::MissingPhysicalAuthority => {
                 "physical live navigation has no bounded actuation-config input"
             }
-            Self::UnexpectedActuationConfigBytes => {
+            Self::PhysicalAuthorityInShadowMode => {
                 "shadow-only live navigation received unexpected actuation-config input"
             }
             #[cfg(not(feature = "actuation"))]
@@ -5268,19 +5268,19 @@ fn prepare_live_navigation_runtime(
     else {
         if config_bytes.is_some() {
             return Err(Box::new(
-                LiveNavigationPreparationError::UnexpectedNavigationConfigBytes,
+                LiveNavigationPreparationError::NavigationPolicyWhileDisabled,
             ));
         }
         if actuation_config_bytes.is_some() {
             return Err(Box::new(
-                LiveNavigationPreparationError::UnexpectedActuationConfigBytes,
+                LiveNavigationPreparationError::PhysicalAuthorityInShadowMode,
             ));
         }
         return Ok(None);
     };
     let Some(bytes) = config_bytes else {
         return Err(Box::new(
-            LiveNavigationPreparationError::MissingNavigationConfigBytes,
+            LiveNavigationPreparationError::MissingNavigationPolicy,
         ));
     };
     let parsed = ShadowNavigationConfigV1::parse_json(bytes, runtime_depth_camera)?;
@@ -5291,7 +5291,7 @@ fn prepare_live_navigation_runtime(
         LiveActuationRequest::ShadowOnly => {
             if actuation_config_bytes.is_some() {
                 return Err(Box::new(
-                    LiveNavigationPreparationError::UnexpectedActuationConfigBytes,
+                    LiveNavigationPreparationError::PhysicalAuthorityInShadowMode,
                 ));
             }
             None
@@ -5299,7 +5299,7 @@ fn prepare_live_navigation_runtime(
         LiveActuationRequest::Physical { exact_robot_id, .. } => {
             let Some(actuation_bytes) = actuation_config_bytes else {
                 return Err(Box::new(
-                    LiveNavigationPreparationError::MissingActuationConfigBytes,
+                    LiveNavigationPreparationError::MissingPhysicalAuthority,
                 ));
             };
             Some(NavigationActuationConfigV1::parse_and_authorize(
@@ -5317,7 +5317,7 @@ fn prepare_live_navigation_runtime(
         LiveActuationRequest::ShadowOnly if actuation_config_bytes.is_none() => {}
         LiveActuationRequest::ShadowOnly => {
             return Err(Box::new(
-                LiveNavigationPreparationError::UnexpectedActuationConfigBytes,
+                LiveNavigationPreparationError::PhysicalAuthorityInShadowMode,
             ));
         }
         LiveActuationRequest::Physical { .. } => {
