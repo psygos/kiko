@@ -13,6 +13,8 @@ mod control_api;
 #[cfg(unix)]
 mod control_socket;
 mod coordinator;
+#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+mod expression_bridge;
 mod frames;
 mod frontier;
 mod global_planner;
@@ -59,6 +61,11 @@ pub use control_socket::{
     AgentControlTimeoutKind, MAX_AGENT_CONTROL_RESPONSE_JSON_BYTES,
     MAX_AGENT_CONTROL_RUNTIME_QUEUE_CAPACITY, MAX_AGENT_CONTROL_SOCKET_PATH_BYTES,
     agent_control_runtime_queue,
+};
+#[cfg(all(feature = "agent-runtime", feature = "record", unix))]
+pub use expression_bridge::{
+    RGB_EXPRESSION_HEAD_POLICY, RgbExpressionBridge, RgbExpressionBridgeError,
+    RgbExpressionBridgeOutcome,
 };
 pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
