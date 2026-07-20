@@ -2024,8 +2024,16 @@ mod host {
 
 #[cfg(not(target_arch = "arm"))]
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), host::HostError> {
-    host::run().await
+async fn main() -> std::process::ExitCode {
+    match host::run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            let stderr = std::io::stderr();
+            let mut stderr = stderr.lock();
+            let _reported = std::io::Write::write_fmt(&mut stderr, format_args!("{error}\n"));
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
