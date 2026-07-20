@@ -437,13 +437,15 @@ async fn fixed_commissioning_recipe_acquires_applies_and_releases_consistently()
             sequence + 1,
         )));
     }
+    let release_at_ms = 130
+        + u64::try_from(crate::COMMISSIONING_STEP_COUNT).expect("bounded steps") * 10;
     inbound.push(Message::IntentResult(intent_result(
         boot(7),
         epoch(13),
         u32::try_from(crate::COMMISSIONING_STEP_COUNT).expect("bounded steps"),
         IntentResultCode::Released,
-        180,
-        180,
+        release_at_ms,
+        release_at_ms,
         u32::try_from(crate::COMMISSIONING_STEP_COUNT + 1).expect("bounded steps"),
     )));
 
