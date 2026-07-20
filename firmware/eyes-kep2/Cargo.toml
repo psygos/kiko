@@ -1,0 +1,64 @@
+[package]
+name = "kiko-eyes-kep2-firmware"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Canonical allocation-free KEP2 firmware core and RP2350 eye-controller image"
+
+# This firmware is intentionally its own workspace. It consumes the canonical
+# protocol crate by path without becoming a member of the host workspace.
+[workspace]
+resolver = "2"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "kiko-eyes-kep2-rp2350"
+path = "src/bin/rp2350.rs"
+test = false
+bench = false
+required-features = ["rp2350"]
+
+[features]
+default = []
+rp2350 = [
+  "dep:cortex-m-rt",
+  "dep:embassy-executor",
+  "dep:embassy-futures",
+  "dep:embassy-rp",
+  "dep:embassy-sync",
+  "dep:embassy-time",
+  "dep:embassy-usb",
+  "dep:panic-halt",
+]
+
+[dependencies]
+kiko-eye-protocol = { path = "../../crates/kiko-eye-protocol" }
+smart-leds = "0.4"
+
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
+cortex-m-rt = { version = "0.7", optional = true }
+embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread"], optional = true }
+embassy-futures = { version = "0.1", optional = true }
+embassy-rp = { version = "0.10", features = ["time-driver", "critical-section-impl", "rp235xa"], optional = true }
+embassy-sync = { version = "0.8", optional = true }
+embassy-time = { version = "0.5", optional = true }
+embassy-usb = { version = "0.6", optional = true }
+panic-halt = { version = "1", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
+overflow-checks = true
+
+[profile.dev]
+opt-level = 1
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
