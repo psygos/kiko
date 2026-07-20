@@ -18,6 +18,7 @@ Important invariants:
   supervisor and require inventory again; and
 - clearing a fault never resumes a previous authority.
 
-`ConfirmedBaseZero` means that a typed V2 applied result reported zero PWM,
-safe output state, and clear controller faults. It is evidence of controller
-state, not independently observed wheel motion.
+`ConfirmedBaseZero` means that a typed V2 result reported a newly applied zero
+command or an explicit stop, safe output state, and clear controller faults. A
+cached duplicate is deliberately insufficient for the fresh post-stop gate. It
+is evidence of controller state, not independently observed wheel motion.

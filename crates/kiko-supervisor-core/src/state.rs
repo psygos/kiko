@@ -919,5 +919,14 @@ mod tests {
             ConfirmedBaseZero::try_from_applied_result(rejected, at(1)),
             Err(ZeroEvidenceError::ResultDoesNotProveApplication { .. })
         ));
+
+        let mut cached = rejected;
+        cached.result = AppliedResultCode::DuplicateCached;
+        assert!(matches!(
+            ConfirmedBaseZero::try_from_applied_result(cached, at(1)),
+            Err(ZeroEvidenceError::ResultDoesNotProveApplication {
+                result: AppliedResultCode::DuplicateCached
+            })
+        ));
     }
 }

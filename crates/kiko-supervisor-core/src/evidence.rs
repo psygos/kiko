@@ -115,7 +115,14 @@ impl ConfirmedBaseZero {
         result: AppliedResult,
         observed_at: MonotonicInstant,
     ) -> Result<Self, ZeroEvidenceError> {
-        if !result.result.proves_applied() {
+        // A cached duplicate proves that some earlier command was applied, but
+        // it cannot prove the post-stop application required for an authority
+        // handoff. Admit only a newly applied command or the controller's
+        // explicit stopped result as fresh zero evidence.
+        if !matches!(
+            result.result,
+            AppliedResultCode::AppliedNew | AppliedResultCode::Stopped
+        ) {
             return Err(ZeroEvidenceError::ResultDoesNotProveApplication {
                 result: result.result,
             });
