@@ -13,6 +13,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 const PENDING_DIRECTORY: &str = "/run/kiko-wheels-off.pending";
 const CONSUMING_DIRECTORY: &str = "/run/kiko-wheels-off.consuming";
@@ -21,6 +22,7 @@ const ROOT_UID: u32 = 0;
 const ROOT_GID: u32 = 0;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o400;
+const MAX_ATTESTATION_AGE: Duration = Duration::from_secs(60);
 
 fn main() {
     if let Err(error) = consume_attestations(
@@ -60,7 +62,8 @@ fn consume_attestations(
         ));
     }
 
-    let verification = verify_claimed_directory(consuming, required_uid, required_gid);
+    let observed_at = SystemTime::now();
+    let verification = verify_claimed_directory(consuming, required_uid, required_gid, observed_at);
     let cleanup = remove_path_if_present(consuming);
     match (verification, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
@@ -80,6 +83,7 @@ fn verify_claimed_directory(
     directory: &Path,
     required_uid: u32,
     required_gid: u32,
+    observed_at: SystemTime,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(directory)
         .map_err(|source| format!("cannot inspect {}: {source}", directory.display()))?;
@@ -96,6 +100,7 @@ fn verify_claimed_directory(
         required_gid,
         DIRECTORY_MODE,
     )?;
+    require_fresh_timestamp(directory, &metadata, observed_at)?;
 
     let mut actual_names = BTreeSet::new();
     let entries = fs::read_dir(directory)
@@ -128,7 +133,7 @@ fn verify_claimed_directory(
 
     for name in REQUIRED_FILES {
         let path = directory.join(name);
-        verify_attestation_file(&path, required_uid, required_gid)?;
+        verify_attestation_file(&path, required_uid, required_gid, observed_at)?;
     }
     Ok(())
 }
@@ -137,6 +142,7 @@ fn verify_attestation_file(
     path: &Path,
     required_uid: u32,
     required_gid: u32,
+    observed_at: SystemTime,
 ) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|source| format!("cannot inspect {}: {source}", path.display()))?;
@@ -147,6 +153,7 @@ fn verify_attestation_file(
         ));
     }
     require_owner_mode(path, &metadata, required_uid, required_gid, FILE_MODE)?;
+    require_fresh_timestamp(path, &metadata, observed_at)?;
     if metadata.nlink() != 1 {
         return Err(format!(
             "attestation {} has {} hard links; exactly one is required",
@@ -159,6 +166,29 @@ fn verify_attestation_file(
             "attestation {} contains {} bytes; an empty file is required",
             path.display(),
             metadata.len()
+        ));
+    }
+    Ok(())
+}
+
+fn require_fresh_timestamp(
+    path: &Path,
+    metadata: &fs::Metadata,
+    observed_at: SystemTime,
+) -> Result<(), String> {
+    let modified = metadata
+        .modified()
+        .map_err(|source| format!("cannot read {} modification time: {source}", path.display()))?;
+    let age = observed_at.duration_since(modified).map_err(|source| {
+        format!(
+            "attestation {} has a future modification time: {source}",
+            path.display()
+        )
+    })?;
+    if age > MAX_ATTESTATION_AGE {
+        return Err(format!(
+            "attestation {} is {age:?} old; maximum age is {MAX_ATTESTATION_AGE:?}",
+            path.display()
         ));
     }
     Ok(())
@@ -201,6 +231,7 @@ fn remove_path_if_present(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{File, FileTimes};
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -307,5 +338,48 @@ mod tests {
         assert!(consume_attestations(&root.pending(), &root.consuming(), uid, gid).is_err());
         assert!(!root.pending().exists());
         assert!(!root.consuming().exists());
+    }
+
+    #[test]
+    fn stale_file_rejects_and_consumes_the_whole_transaction() {
+        let root = TestRoot::new("stale");
+        let (uid, gid) = create_valid_pending(&root);
+        let stale = SystemTime::now()
+            .checked_sub(MAX_ATTESTATION_AGE + Duration::from_secs(1))
+            .expect("test clock supports a stale instant");
+        File::open(root.pending().join("wheels-removed"))
+            .expect("open stale fixture")
+            .set_times(FileTimes::new().set_modified(stale))
+            .expect("set stale modification time");
+
+        assert!(consume_attestations(&root.pending(), &root.consuming(), uid, gid).is_err());
+        assert!(!root.pending().exists());
+        assert!(!root.consuming().exists());
+    }
+
+    #[test]
+    fn freshness_boundary_is_exact_and_future_times_fail_closed() {
+        let root = TestRoot::new("freshness-boundary");
+        let (uid, gid) = create_valid_pending(&root);
+        let path = root.pending().join("wheels-removed");
+        let modified = fs::metadata(&path)
+            .expect("fresh fixture metadata")
+            .modified()
+            .expect("fresh fixture modification time");
+
+        verify_attestation_file(&path, uid, gid, modified + MAX_ATTESTATION_AGE)
+            .expect("exact maximum age is accepted");
+        assert!(
+            verify_attestation_file(
+                &path,
+                uid,
+                gid,
+                modified + MAX_ATTESTATION_AGE + Duration::from_nanos(1),
+            )
+            .is_err()
+        );
+        assert!(
+            verify_attestation_file(&path, uid, gid, modified - Duration::from_nanos(1),).is_err()
+        );
     }
 }
