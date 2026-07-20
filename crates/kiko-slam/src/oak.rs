@@ -5,11 +5,8 @@ use crate::{
 };
 use oak_sys::{DepthFrame, ImageFrame, ImuAccuracy, ImuSample};
 
-pub fn oak_to_frame(
-    oak_frame: ImageFrame,
-    sensor: SensorId,
-    frame_id: FrameId,
-) -> Result<Frame, FrameError> {
+pub fn oak_to_frame(oak_frame: ImageFrame, sensor: SensorId) -> Result<Frame, FrameError> {
+    let frame_id = FrameId::new(oak_frame.device_capture_sequence.as_u64());
     Frame::new(
         sensor,
         frame_id,
@@ -21,7 +18,7 @@ pub fn oak_to_frame(
 }
 
 pub fn oak_to_depth_image(oak_frame: DepthFrame) -> Result<DepthImage, DepthImageError> {
-    let frame_id = FrameId::new(oak_frame.sequence);
+    let frame_id = FrameId::new(oak_frame.device_capture_sequence.as_u64());
     let timestamp = Timestamp::from_nanos(oak_frame.timestamp.as_nanos());
     let width = oak_frame.width;
     let height = oak_frame.height;
@@ -89,8 +86,8 @@ mod tests {
 
     fn raw_sample() -> ImuSample {
         ImuSample {
-            accel_timestamp: OakTimestamp::from_nanos(10),
-            gyro_timestamp: OakTimestamp::from_nanos(12),
+            accel_timestamp: OakTimestamp::try_from_nanos(10).expect("valid timestamp"),
+            gyro_timestamp: OakTimestamp::try_from_nanos(12).expect("valid timestamp"),
             sequence: 4,
             accel: Vec3 {
                 x: 1.0,
@@ -128,14 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn oak_adapter_rejects_negative_timestamps_and_nonfinite_components() {
-        let mut negative = raw_sample();
-        negative.accel_timestamp = OakTimestamp::from_nanos(-1);
-        assert_eq!(
-            oak_to_imu_report(negative, session(), HostMonotonicTimestamp::from_nanos(1)),
-            Err(InertialValueError::NegativeDeviceTimestamp { nanos: -1 })
-        );
-
+    fn oak_adapter_rejects_nonfinite_components() {
         let mut nonfinite = raw_sample();
         nonfinite.gyro.z = f32::NAN;
         assert!(matches!(

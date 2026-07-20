@@ -15,6 +15,8 @@ namespace oak {
 // Forward declarations from cxx-generated code
 struct DeviceConfig;
 struct DeviceInfo;
+struct DepthAiBuildMetadata;
+struct ConnectedDeviceIdentity;
 struct Timestamp;
 struct ImageFrame;
 struct DepthFrame;
@@ -50,6 +52,8 @@ public:
 
     float get_stereo_baseline_m() const;
 
+    ConnectedDeviceIdentity get_connected_device_identity() const;
+
     void close();
 
 private:
@@ -57,7 +61,7 @@ private:
         StreamId stream,
         bool enabled,
         const std::shared_ptr<dai::MessageQueue>& queue,
-        std::atomic<uint64_t>& sequence,
+        std::atomic<uint64_t>& host_delivery_sequence,
         dai::ImgFrame::Type expected_type,
         uint32_t channels,
         uint32_t timeout_ms
@@ -85,6 +89,10 @@ private:
     std::atomic<uint32_t> imu_seq_{0};
 
     std::unique_ptr<dai::Pipeline> pipeline_;
+    std::string connected_mxid_;
+    std::string discovery_transport_name_;
+    std::string eeprom_device_name_;
+    std::string product_name_;
     std::shared_ptr<dai::MessageQueue> rgb_queue_;
     std::shared_ptr<dai::MessageQueue> mono_left_queue_;
     std::shared_ptr<dai::MessageQueue> mono_right_queue_;
@@ -93,6 +101,7 @@ private:
     dai::CalibrationHandler calibration_;
 };
 
+DepthAiBuildMetadata depthai_build_metadata();
 rust::Vec<DeviceInfo> list_devices();
 std::unique_ptr<OakDevice> create_device(rust::Str selector, const DeviceConfig& config);
 

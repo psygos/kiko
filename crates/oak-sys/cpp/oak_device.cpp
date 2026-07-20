@@ -3,11 +3,14 @@
 #include "oak-sys/src/lib.rs.h"
 #include "oak_device.hpp"
 
+#include <depthai/build/version.hpp>
+
 #include <chrono>
 #include <cstddef>
 #include <limits>
 #include <optional>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -59,6 +62,18 @@ Intrinsics frame_intrinsics(const std::shared_ptr<dai::ImgFrame>& frame) {
     return intrinsics;
 }
 
+template <typename BridgeFrame>
+void set_camera_capture_metadata(
+    BridgeFrame& output,
+    const std::shared_ptr<dai::ImgFrame>& input
+) {
+    output.device_capture_sequence = input->getSequenceNum();
+    output.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        input->getTimestampDevice(dai::CameraExposureOffset::MIDDLE).time_since_epoch()
+    ).count();
+    output.exposure_time_us = input->getExposureTime().count();
+}
+
 std::optional<ImuAccuracy> imu_accuracy(dai::IMUReport::Accuracy accuracy) noexcept {
     switch (accuracy) {
         case dai::IMUReport::Accuracy::UNRELIABLE:
@@ -93,6 +108,17 @@ T next_sequence(std::atomic<T>& sequence) {
 }
 
 }  // namespace
+
+DepthAiBuildMetadata depthai_build_metadata() {
+    DepthAiBuildMetadata metadata{};
+    metadata.sdk_version = rust::String(dai::build::VERSION);
+    metadata.sdk_commit = rust::String(dai::build::COMMIT);
+    metadata.embedded_device_artifact_version = rust::String(dai::build::DEVICE_VERSION);
+    metadata.embedded_bootloader_artifact_version = rust::String(
+        dai::build::BOOTLOADER_VERSION
+    );
+    return metadata;
+}
 
 rust::Vec<DeviceInfo> list_devices() {
     rust::Vec<DeviceInfo> devices;
@@ -135,11 +161,22 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
     , imu_enabled_(config.imu_enabled)
 {
     if (selector.empty()) {
-        pipeline_ = std::make_unique<dai::Pipeline>();
-    } else {
-        auto device = std::make_shared<dai::Device>(dai::DeviceInfo(selector));
-        pipeline_ = std::make_unique<dai::Pipeline>(std::move(device));
+        throw std::invalid_argument("OAK device selector must be a nonempty exact MXID");
     }
+
+    const auto lookup = dai::Device::getDeviceById(selector);
+    if (!std::get<0>(lookup)) {
+        throw std::invalid_argument("no DepthAI device has exact id '" + selector + "'");
+    }
+    const auto& device_info = std::get<1>(lookup);
+    if (device_info.deviceId != selector) {
+        throw std::runtime_error(
+            "DepthAI exact-id lookup returned '" + device_info.deviceId
+            + "' for requested id '" + selector + "'"
+        );
+    }
+    auto selected_device = std::make_shared<dai::Device>(device_info);
+    pipeline_ = std::make_unique<dai::Pipeline>(std::move(selected_device));
 
     if (rgb_enabled_) {
         auto cam = pipeline_->create<dai::node::Camera>();
@@ -219,6 +256,17 @@ OakDevice::OakDevice(const DeviceConfig& config, const std::string& selector)
 
     const auto device = pipeline_->getDefaultDevice();
     if (!device) throw std::runtime_error("DepthAI pipeline started without a default device");
+    const auto actual_device_id = device->getDeviceId();
+    if (actual_device_id != selector) {
+        throw std::runtime_error(
+            "DepthAI pipeline opened device '" + actual_device_id
+            + "' instead of requested exact id '" + selector + "'"
+        );
+    }
+    connected_mxid_ = actual_device_id;
+    discovery_transport_name_ = device_info.name;
+    eeprom_device_name_ = device->getDeviceName();
+    product_name_ = device->getProductName();
     calibration_ = device->readCalibration();
 
     connected_ = true;
@@ -248,7 +296,7 @@ ImageFrameResult OakDevice::try_get_image(
     StreamId stream,
     bool enabled,
     const std::shared_ptr<dai::MessageQueue>& queue,
-    std::atomic<uint64_t>& sequence,
+    std::atomic<uint64_t>& host_delivery_sequence,
     dai::ImgFrame::Type expected_type,
     uint32_t channels,
     uint32_t timeout_ms
@@ -280,8 +328,7 @@ ImageFrameResult OakDevice::try_get_image(
         return result;
     }
 
-    result.frame.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        msg->getTimestampDevice().time_since_epoch()).count();
+    set_camera_capture_metadata(result.frame, msg);
     result.frame.width = msg->getWidth();
     result.frame.height = msg->getHeight();
 
@@ -318,7 +365,7 @@ ImageFrameResult OakDevice::try_get_image(
             }
         }
     }
-    result.frame.sequence = next_sequence(sequence);
+    result.frame.host_delivery_sequence = next_sequence(host_delivery_sequence);
     result.status = FrameStatus::Ok;
 
     return result;
@@ -387,8 +434,7 @@ DepthFrameResult OakDevice::try_get_depth(uint32_t timeout_ms) {
         return result;
     }
 
-    result.frame.timestamp.device_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        msg->getTimestampDevice().time_since_epoch()).count();
+    set_camera_capture_metadata(result.frame, msg);
     result.frame.width = msg->getWidth();
     result.frame.height = msg->getHeight();
 
@@ -426,7 +472,7 @@ DepthFrameResult OakDevice::try_get_depth(uint32_t timeout_ms) {
             );
         }
     }
-    result.frame.sequence = next_sequence(depth_seq_);
+    result.frame.host_delivery_sequence = next_sequence(depth_seq_);
     result.status = FrameStatus::Ok;
 
     return result;
@@ -497,6 +543,15 @@ float OakDevice::get_stereo_baseline_m() const {
         false,
         dai::LengthUnit::METER
     );
+}
+
+ConnectedDeviceIdentity OakDevice::get_connected_device_identity() const {
+    ConnectedDeviceIdentity identity{};
+    identity.mxid = rust::String(connected_mxid_);
+    identity.discovery_transport_name = rust::String(discovery_transport_name_);
+    identity.eeprom_device_name = rust::String(eeprom_device_name_);
+    identity.product_name = rust::String(product_name_);
+    return identity;
 }
 
 } // namespace oak

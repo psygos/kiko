@@ -12,6 +12,7 @@ const INPUT_ENV_VARS: &[&str] = &[
     "HOMEBREW_PREFIX",
     "OPENCV_INCLUDE",
     "OPENCV_LIB",
+    "OAK_SYS_CHECK_ONLY",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -353,6 +354,7 @@ fn discover(inputs: &BuildInputs) -> Result<NativePaths, DiscoveryError> {
 }
 
 fn emit_rerun_directives() {
+    println!("cargo:rustc-check-cfg=cfg(oak_sys_check_only)");
     for path in ["src/lib.rs", "cpp/oak_device.hpp", "cpp/oak_device.cpp"] {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -378,6 +380,20 @@ fn link_directives(target_os: TargetOs) -> &'static [&'static str] {
 #[cfg(not(test))]
 fn main() {
     emit_rerun_directives();
+    match env::var("OAK_SYS_CHECK_ONLY") {
+        Ok(value) if value == "1" => {
+            println!("cargo:rustc-cfg=oak_sys_check_only");
+            println!(
+                "cargo:warning=oak-sys native bridge skipped for compile-only host validation"
+            );
+            return;
+        }
+        Ok(value) => panic!("OAK_SYS_CHECK_ONLY must be exactly `1` when set, got {value:?}"),
+        Err(env::VarError::NotPresent) => {}
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("OAK_SYS_CHECK_ONLY must contain valid UTF-8")
+        }
+    }
     let inputs = BuildInputs::from_process()
         .unwrap_or_else(|error| panic!("oak-sys native dependency discovery failed: {error}"));
     let paths = discover(&inputs)

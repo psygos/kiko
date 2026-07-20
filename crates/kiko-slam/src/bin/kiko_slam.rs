@@ -86,8 +86,9 @@ use kiko_slam::{
 };
 #[cfg(feature = "record")]
 use oak_sys::{
-    CalibrationError as OakCalibrationError, CloseError as OakCloseError, DepthAlignment,
-    DepthConfig, DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
+    CalibrationError as OakCalibrationError, CloseError as OakCloseError,
+    ConnectedDeviceIdentityError, DepthAiBuildMetadataError, DepthAlignment, DepthConfig,
+    DepthError, DepthFrame as OakDepthFrame, Device, DeviceConfig, ImageError,
     ImageFrame as OakImageFrame, ImuConfig, ImuError, Intrinsics as OakIntrinsics, MonoConfig,
     QueueConfig, StreamId as OakStreamId,
 };
@@ -596,6 +597,9 @@ impl From<PipelineTimingError> for BenchError {
 #[derive(Args, Clone, Debug)]
 #[cfg(feature = "record")]
 struct CameraArgs {
+    /// Exact DepthAI MXID. No first-device fallback is permitted.
+    #[arg(long, env = "KIKO_OAK_DEVICE_ID", value_name = "EXACT_MXID")]
+    oak_device_id: OakMxidArg,
     #[arg(long, default_value_t = 640)]
     width: u32,
     #[arg(long, default_value_t = 480)]
@@ -607,6 +611,43 @@ struct CameraArgs {
     /// Enable raw accelerometer and gyroscope capture at this nominal rate.
     #[arg(long, env = "KIKO_IMU_RATE_HZ")]
     imu_rate_hz: Option<NonZeroU32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(feature = "record")]
+struct OakMxidArg(String);
+
+#[cfg(feature = "record")]
+impl OakMxidArg {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "record")]
+struct OakMxidArgError;
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for OakMxidArgError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OAK MXID must be nonempty")
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for OakMxidArgError {}
+
+#[cfg(feature = "record")]
+impl std::str::FromStr for OakMxidArg {
+    type Err = OakMxidArgError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.trim().is_empty() {
+            return Err(OakMxidArgError);
+        }
+        Ok(Self(value.to_owned()))
+    }
 }
 
 #[derive(Args, Clone, Debug)]
@@ -2297,6 +2338,102 @@ impl std::error::Error for StereoBootstrapError {
 }
 
 #[cfg(feature = "record")]
+#[derive(Debug)]
+enum OakRuntimeProvenanceError {
+    ConnectedIdentity {
+        source: ConnectedDeviceIdentityError,
+    },
+    LinkedDepthAiBuildMetadata {
+        source: DepthAiBuildMetadataError,
+    },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for OakRuntimeProvenanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectedIdentity { source } => {
+                write!(f, "could not read actual connected OAK identity: {source}")
+            }
+            Self::LinkedDepthAiBuildMetadata { source } => {
+                write!(f, "could not read linked DepthAI build metadata: {source}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for OakRuntimeProvenanceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConnectedIdentity { source } => Some(source),
+            Self::LinkedDepthAiBuildMetadata { source } => Some(source),
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OakRuntimeProvenance {
+    connected_mxid: String,
+    depthai_sdk_version: String,
+    depthai_sdk_commit: String,
+    embedded_device_artifact_version: String,
+    embedded_bootloader_artifact_version: String,
+}
+
+#[cfg(feature = "record")]
+impl OakRuntimeProvenance {
+    fn dataset_device_label(&self) -> String {
+        format!(
+            "OAK-D mxid={} depthai_sdk={} depthai_commit={} embedded_device={} embedded_bootloader={} timestamp=device_exposure_midpoint",
+            self.connected_mxid,
+            self.depthai_sdk_version,
+            self.depthai_sdk_commit,
+            self.embedded_device_artifact_version,
+            self.embedded_bootloader_artifact_version,
+        )
+    }
+}
+
+#[cfg(feature = "record")]
+fn inspect_oak_runtime(
+    device: &Device,
+    context: &str,
+) -> Result<OakRuntimeProvenance, OakRuntimeProvenanceError> {
+    let connected = device
+        .connected_identity()
+        .map_err(|source| OakRuntimeProvenanceError::ConnectedIdentity { source })?;
+    let build = oak_sys::depthai_build_metadata()
+        .map_err(|source| OakRuntimeProvenanceError::LinkedDepthAiBuildMetadata { source })?;
+
+    eprintln!(
+        "{context} OAK connected identity: mxid={:?} xlink_name={:?} eeprom_name={:?} product_name={:?}",
+        connected.mxid(),
+        connected.discovery_transport_name(),
+        connected.eeprom_device_name(),
+        connected.product_name(),
+    );
+    eprintln!(
+        "{context} DepthAI build provenance: sdk_version={:?} sdk_commit={:?} embedded_device_artifact={:?} embedded_bootloader_artifact={:?} camera_timestamp=device_exposure_midpoint",
+        build.sdk_version(),
+        build.sdk_commit(),
+        build.embedded_device_artifact_version(),
+        build.embedded_bootloader_artifact_version(),
+    );
+
+    Ok(OakRuntimeProvenance {
+        connected_mxid: connected.mxid().to_owned(),
+        depthai_sdk_version: build.sdk_version().to_owned(),
+        depthai_sdk_commit: build.sdk_commit().to_owned(),
+        embedded_device_artifact_version: build.embedded_device_artifact_version().to_owned(),
+        embedded_bootloader_artifact_version: build
+            .embedded_bootloader_artifact_version()
+            .to_owned(),
+    })
+}
+
+#[cfg(feature = "record")]
 struct StereoBootstrap {
     calibration: Calibration,
     rectified_left_intrinsics: OakIntrinsics,
@@ -2330,8 +2467,9 @@ fn require_bootstrap_frame_contract(
 
 /// Establish the runtime stereo contract from the first delivered projections.
 ///
-/// Both boundary frames are converted and inserted into the caller's pairer as
-/// frame ID zero, so calibration discovery does not silently consume data.
+/// Both boundary frames retain their native DepthAI capture identities and are
+/// inserted into the caller's pairer, so calibration discovery does not
+/// silently consume data or replace device provenance with host counters.
 #[cfg(feature = "record")]
 fn bootstrap_stereo(
     device: &mut Device,
@@ -2392,9 +2530,9 @@ fn bootstrap_stereo(
         config.rectified,
     );
 
-    let left = oak_to_frame(left, SensorId::StereoLeft, FrameId::new(0))
+    let left = oak_to_frame(left, SensorId::StereoLeft)
         .map_err(|source| StereoBootstrapError::LeftFrame { source })?;
-    let right = oak_to_frame(right, SensorId::StereoRight, FrameId::new(0))
+    let right = oak_to_frame(right, SensorId::StereoRight)
         .map_err(|source| StereoBootstrapError::RightFrame { source })?;
     pairer
         .push_left(left)
@@ -2428,6 +2566,10 @@ enum RectifiedLeftDepthError {
         expected: [[f32; 3]; 3],
         actual: [[f32; 3]; 3],
     },
+    MissingConnectedAlignment,
+    UnexpectedConnectedAlignment {
+        actual: DepthAlignment,
+    },
     Conversion {
         source: DepthImageError,
     },
@@ -2450,6 +2592,13 @@ impl std::fmt::Display for RectifiedLeftDepthError {
                 f,
                 "depth projection intrinsics {actual:?} do not match calibrated rectified-left intrinsics {expected:?}"
             ),
+            Self::MissingConnectedAlignment => {
+                f.write_str("depth frame lacks a connected-device alignment stamp")
+            }
+            Self::UnexpectedConnectedAlignment { actual } => write!(
+                f,
+                "depth frame is aligned to {actual:?}, not the required RectifiedLeft optical frame"
+            ),
             Self::Conversion { source } => write!(f, "invalid delivered depth frame: {source}"),
         }
     }
@@ -2460,7 +2609,10 @@ impl std::error::Error for RectifiedLeftDepthError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Conversion { source } => Some(source),
-            Self::DimensionMismatch { .. } | Self::ProjectionMismatch { .. } => None,
+            Self::DimensionMismatch { .. }
+            | Self::ProjectionMismatch { .. }
+            | Self::MissingConnectedAlignment
+            | Self::UnexpectedConnectedAlignment { .. } => None,
         }
     }
 }
@@ -2488,11 +2640,36 @@ fn require_rectified_left_depth_projection(
 }
 
 #[cfg(feature = "record")]
+fn require_rectified_left_depth_alignment(
+    actual: Option<DepthAlignment>,
+) -> Result<(), RectifiedLeftDepthError> {
+    match actual {
+        Some(DepthAlignment::RectifiedLeft) => Ok(()),
+        Some(actual) => Err(RectifiedLeftDepthError::UnexpectedConnectedAlignment { actual }),
+        None => Err(RectifiedLeftDepthError::MissingConnectedAlignment),
+    }
+}
+
+#[cfg(feature = "record")]
+fn require_rectified_left_depth_contract(
+    expected: OakIntrinsics,
+    actual: OakIntrinsics,
+    alignment: Option<DepthAlignment>,
+) -> Result<(), RectifiedLeftDepthError> {
+    require_rectified_left_depth_projection(expected, actual)?;
+    require_rectified_left_depth_alignment(alignment)
+}
+
+#[cfg(feature = "record")]
 fn parse_rectified_left_depth(
     frame: OakDepthFrame,
     expected: OakIntrinsics,
 ) -> Result<DepthImage, RectifiedLeftDepthError> {
-    require_rectified_left_depth_projection(expected, frame.intrinsics())?;
+    require_rectified_left_depth_contract(
+        expected,
+        frame.intrinsics(),
+        frame.connected_alignment(),
+    )?;
     oak_to_depth_image(frame).map_err(|source| RectifiedLeftDepthError::Conversion { source })
 }
 
@@ -2905,8 +3082,12 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    eprintln!("connecting to oak-d...");
-    let mut device = Device::connect("", config)?;
+    eprintln!(
+        "connecting to OAK MXID {:?}...",
+        args.camera.oak_device_id.as_str()
+    );
+    let mut device = Device::connect(args.camera.oak_device_id.as_str(), config)?;
+    let oak_provenance = inspect_oak_runtime(&device, "record")?;
     let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
         let pairing_window = load_pairing_window()?;
         let pairer_max_pending = load_pairer_max_pending_per_side()?;
@@ -2916,7 +3097,12 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             rectified_left_intrinsics,
         } = bootstrap_stereo(&mut device, &mono_config, running.as_ref(), &mut pairer)?;
 
-        let meta = build_meta(&mono_config, depth_config.as_ref(), imu_config.as_ref());
+        let meta = build_meta(
+            &mono_config,
+            depth_config.as_ref(),
+            imu_config.as_ref(),
+            &oak_provenance,
+        );
         eprintln!("creating dataset at {}", output_path.display());
         let (writer, writer_handle) = if let Some(session_id) = imu_session {
             let stream_metadata =
@@ -2939,8 +3125,6 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
         let mut right_count = 1u64;
         let mut depth_count = 0u64;
         let mut imu_count = 0u64;
-        let mut left_seq = 1u64;
-        let mut right_seq = 1u64;
         let mut capture_error = None;
 
         eprintln!("recording... press ctrl+c to stop");
@@ -2949,23 +3133,20 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             let mut got_any = false;
 
             match device.mono_left(0) {
-                Ok(frame) => {
-                    match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
-                        Ok(frame) => {
-                            if let Err(source) = pairer.push_left(frame) {
-                                capture_error = Some(RecordCaptureError::PairingInput { source });
-                                break 'capture;
-                            }
-                            left_count += 1;
-                            left_seq += 1;
-                            got_any = true;
-                        }
-                        Err(source) => {
-                            capture_error = Some(RecordCaptureError::LeftFrame { source });
+                Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft) {
+                    Ok(frame) => {
+                        if let Err(source) = pairer.push_left(frame) {
+                            capture_error = Some(RecordCaptureError::PairingInput { source });
                             break 'capture;
                         }
+                        left_count += 1;
+                        got_any = true;
                     }
-                }
+                    Err(source) => {
+                        capture_error = Some(RecordCaptureError::LeftFrame { source });
+                        break 'capture;
+                    }
+                },
                 Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
                 Err(source) => {
                     capture_error = Some(RecordCaptureError::LeftImage { source });
@@ -2974,23 +3155,20 @@ fn run_record(args: RecordArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             match device.mono_right(0) {
-                Ok(frame) => {
-                    match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
-                        Ok(frame) => {
-                            if let Err(source) = pairer.push_right(frame) {
-                                capture_error = Some(RecordCaptureError::PairingInput { source });
-                                break 'capture;
-                            }
-                            right_count += 1;
-                            right_seq += 1;
-                            got_any = true;
-                        }
-                        Err(source) => {
-                            capture_error = Some(RecordCaptureError::RightFrame { source });
+                Ok(frame) => match oak_to_frame(frame, SensorId::StereoRight) {
+                    Ok(frame) => {
+                        if let Err(source) = pairer.push_right(frame) {
+                            capture_error = Some(RecordCaptureError::PairingInput { source });
                             break 'capture;
                         }
+                        right_count += 1;
+                        got_any = true;
                     }
-                }
+                    Err(source) => {
+                        capture_error = Some(RecordCaptureError::RightFrame { source });
+                        break 'capture;
+                    }
+                },
                 Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
                 Err(source) => {
                     capture_error = Some(RecordCaptureError::RightImage { source });
@@ -5192,8 +5370,9 @@ fn activate_live_navigation(
     pairing_window: PairingWindowNs,
     device_session: DeviceSessionId,
     clock_epoch: NavigationClockEpoch,
+    oak_provenance: &OakRuntimeProvenance,
 ) -> Result<ActiveLiveNavigation, Box<dyn std::error::Error>> {
-    let meta = build_meta(mono_config, depth_config, imu_config);
+    let meta = build_meta(mono_config, depth_config, imu_config, oak_provenance);
     let imu_metadata = ImuStreamMetadata::new(
         device_session,
         ImuExtrinsicProvenance::uncalibrated_unknown(),
@@ -5369,8 +5548,12 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    eprintln!("connecting to oak-d...");
-    let mut device = Device::connect("", config)?;
+    eprintln!(
+        "connecting to OAK MXID {:?}...",
+        args.camera.oak_device_id.as_str()
+    );
+    let mut device = Device::connect(args.camera.oak_device_id.as_str(), config)?;
+    let oak_provenance = inspect_oak_runtime(&device, "live")?;
     let operation = (|| -> Result<(), Box<dyn std::error::Error>> {
         let pairing_window = load_pairing_window()?;
         let pairer_max_pending = load_pairer_max_pending_per_side()?;
@@ -5561,6 +5744,7 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                     pairing_window,
                     device_session,
                     navigation_clock_epoch,
+                    &oak_provenance,
                 )
             })
             .transpose()?;
@@ -6087,8 +6271,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        let mut left_seq = 1u64;
-        let mut right_seq = 1u64;
         let mut capture_error = None;
 
         eprintln!("streaming matches... press ctrl+c to stop");
@@ -6098,22 +6280,19 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             let mut got_any = false;
 
             match device.mono_left(0) {
-                Ok(frame) => {
-                    match oak_to_frame(frame, SensorId::StereoLeft, FrameId::new(left_seq)) {
-                        Ok(frame) => {
-                            if let Err(source) = pairer.push_left(frame) {
-                                capture_error = Some(LiveCaptureError::PairingInput { source });
-                                break 'capture;
-                            }
-                            left_seq += 1;
-                            got_any = true;
-                        }
-                        Err(source) => {
-                            capture_error = Some(LiveCaptureError::LeftFrame { source });
+                Ok(frame) => match oak_to_frame(frame, SensorId::StereoLeft) {
+                    Ok(frame) => {
+                        if let Err(source) = pairer.push_left(frame) {
+                            capture_error = Some(LiveCaptureError::PairingInput { source });
                             break 'capture;
                         }
+                        got_any = true;
                     }
-                }
+                    Err(source) => {
+                        capture_error = Some(LiveCaptureError::LeftFrame { source });
+                        break 'capture;
+                    }
+                },
                 Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
                 Err(source) => {
                     capture_error = Some(LiveCaptureError::LeftImage { source });
@@ -6122,22 +6301,19 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             match device.mono_right(0) {
-                Ok(frame) => {
-                    match oak_to_frame(frame, SensorId::StereoRight, FrameId::new(right_seq)) {
-                        Ok(frame) => {
-                            if let Err(source) = pairer.push_right(frame) {
-                                capture_error = Some(LiveCaptureError::PairingInput { source });
-                                break 'capture;
-                            }
-                            right_seq += 1;
-                            got_any = true;
-                        }
-                        Err(source) => {
-                            capture_error = Some(LiveCaptureError::RightFrame { source });
+                Ok(frame) => match oak_to_frame(frame, SensorId::StereoRight) {
+                    Ok(frame) => {
+                        if let Err(source) = pairer.push_right(frame) {
+                            capture_error = Some(LiveCaptureError::PairingInput { source });
                             break 'capture;
                         }
+                        got_any = true;
                     }
-                }
+                    Err(source) => {
+                        capture_error = Some(LiveCaptureError::RightFrame { source });
+                        break 'capture;
+                    }
+                },
                 Err(ImageError::Timeout { .. } | ImageError::QueueEmpty) => {}
                 Err(source) => {
                     capture_error = Some(LiveCaptureError::RightImage { source });
@@ -6478,10 +6654,11 @@ fn build_meta(
     config: &MonoConfig,
     depth_config: Option<&DepthConfig>,
     imu_config: Option<&ImuConfig>,
+    oak_provenance: &OakRuntimeProvenance,
 ) -> Meta {
     Meta {
         created: chrono::Utc::now().to_rfc3339(),
-        device: "OAK-D".to_string(),
+        device: oak_provenance.dataset_device_label(),
         mono: Some(MonoMeta {
             width: config.width,
             height: config.height,
@@ -6728,12 +6905,13 @@ mod tests {
 
     #[cfg(feature = "record")]
     use super::{
-        DeviceCloseFailure, LiveThreadError, RecordCaptureError, RecordError, RecordItem,
-        RectifiedLeftDepthError, build_calibration, compose_record_errors, finite_rate_per_second,
-        record_device_close_error, require_rectified_left_depth_projection,
+        DeviceCloseFailure, LiveThreadError, OakMxidArg, OakRuntimeProvenance, RecordCaptureError,
+        RecordError, RecordItem, RectifiedLeftDepthError, build_calibration, compose_record_errors,
+        finite_rate_per_second, record_device_close_error, require_rectified_left_depth_contract,
+        require_rectified_left_depth_projection,
     };
     #[cfg(feature = "record")]
-    use oak_sys::Intrinsics as OakIntrinsics;
+    use oak_sys::{DepthAlignment, Intrinsics as OakIntrinsics};
     #[cfg(feature = "record")]
     fn oak_intrinsics(fx: f32, width: u32, height: u32) -> OakIntrinsics {
         OakIntrinsics::try_from_projection_matrix(
@@ -7000,6 +7178,82 @@ mod tests {
         let wrong_projection = oak_intrinsics(401.0, 640, 480);
         assert!(matches!(
             require_rectified_left_depth_projection(expected, wrong_projection),
+            Err(RectifiedLeftDepthError::ProjectionMismatch { .. })
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn oak_mxid_boundary_rejects_empty_without_normalizing_exact_values() {
+        assert!("".parse::<OakMxidArg>().is_err());
+        assert!("   ".parse::<OakMxidArg>().is_err());
+        let exact = "18443010C1A34AF500"
+            .parse::<OakMxidArg>()
+            .expect("nonempty exact MXID");
+        assert_eq!(exact.as_str(), "18443010C1A34AF500");
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn dataset_device_label_retains_runtime_identity_and_build_provenance() {
+        let provenance = OakRuntimeProvenance {
+            connected_mxid: "mxid-123".to_owned(),
+            depthai_sdk_version: "3.6.1".to_owned(),
+            depthai_sdk_commit: "commit-abc".to_owned(),
+            embedded_device_artifact_version: "device-1".to_owned(),
+            embedded_bootloader_artifact_version: "bootloader-1".to_owned(),
+        };
+        assert_eq!(
+            provenance.dataset_device_label(),
+            "OAK-D mxid=mxid-123 depthai_sdk=3.6.1 depthai_commit=commit-abc embedded_device=device-1 embedded_bootloader=bootloader-1 timestamp=device_exposure_midpoint"
+        );
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn matching_intrinsics_cannot_relabel_non_left_or_missing_depth() {
+        let expected = oak_intrinsics(400.0, 640, 480);
+        assert!(matches!(
+            require_rectified_left_depth_contract(
+                expected,
+                expected,
+                Some(DepthAlignment::RectifiedRight),
+            ),
+            Err(RectifiedLeftDepthError::UnexpectedConnectedAlignment {
+                actual: DepthAlignment::RectifiedRight
+            })
+        ));
+        assert!(matches!(
+            require_rectified_left_depth_contract(expected, expected, Some(DepthAlignment::Rgb),),
+            Err(RectifiedLeftDepthError::UnexpectedConnectedAlignment {
+                actual: DepthAlignment::Rgb
+            })
+        ));
+        assert!(matches!(
+            require_rectified_left_depth_contract(expected, expected, None),
+            Err(RectifiedLeftDepthError::MissingConnectedAlignment)
+        ));
+        assert!(matches!(
+            require_rectified_left_depth_contract(
+                expected,
+                expected,
+                Some(DepthAlignment::RectifiedLeft),
+            ),
+            Ok(())
+        ));
+    }
+
+    #[cfg(feature = "record")]
+    #[test]
+    fn projection_failure_precedes_alignment_failure() {
+        let expected = oak_intrinsics(400.0, 640, 480);
+        let wrong_projection = oak_intrinsics(401.0, 640, 480);
+        assert!(matches!(
+            require_rectified_left_depth_contract(
+                expected,
+                wrong_projection,
+                Some(DepthAlignment::Rgb),
+            ),
             Err(RectifiedLeftDepthError::ProjectionMismatch { .. })
         ));
     }

@@ -10,6 +10,7 @@ use thiserror::Error;
 // ============================================================================
 
 #[cxx::bridge(namespace = "kiko::oak")]
+#[cfg_attr(oak_sys_check_only, allow(dead_code))]
 mod ffi {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum DeviceState {
@@ -111,9 +112,14 @@ mod ffi {
     #[derive(Debug, Clone)]
     pub struct ImageFrame {
         pub stream: StreamId,
-        /// Strictly increasing host bridge dequeue sequence, not a device sequence.
-        pub sequence: u64,
+        /// Native DepthAI capture sequence. Negative values are rejected in Rust.
+        pub device_capture_sequence: i64,
+        /// Synthetic host bridge dequeue sequence, independent of capture identity.
+        pub host_delivery_sequence: u64,
+        /// Device-clock timestamp requested at exposure midpoint.
         pub timestamp: Timestamp,
+        /// DepthAI-reported exposure duration in microseconds. Zero means unavailable.
+        pub exposure_time_us: i64,
         pub width: u32,
         pub height: u32,
         pub stride_bytes: u32,
@@ -123,9 +129,14 @@ mod ffi {
 
     #[derive(Debug, Clone)]
     pub struct DepthFrame {
-        /// Strictly increasing host bridge dequeue sequence, not a device sequence.
-        pub sequence: u64,
+        /// Native DepthAI capture sequence. Negative values are rejected in Rust.
+        pub device_capture_sequence: i64,
+        /// Synthetic host bridge dequeue sequence, independent of capture identity.
+        pub host_delivery_sequence: u64,
+        /// Device-clock timestamp requested at exposure midpoint.
         pub timestamp: Timestamp,
+        /// DepthAI-reported exposure duration in microseconds. Zero means unavailable.
+        pub exposure_time_us: i64,
         pub width: u32,
         pub height: u32,
         /// Unsigned millimetres. Zero is the sole invalid-depth sentinel.
@@ -179,14 +190,33 @@ mod ffi {
         pub state: DeviceState,
     }
 
+    #[derive(Debug, Clone)]
+    pub struct DepthAiBuildMetadata {
+        pub sdk_version: String,
+        pub sdk_commit: String,
+        pub embedded_device_artifact_version: String,
+        pub embedded_bootloader_artifact_version: String,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ConnectedDeviceIdentity {
+        pub mxid: String,
+        pub discovery_transport_name: String,
+        pub eeprom_device_name: String,
+        pub product_name: String,
+    }
+
+    #[cfg(not(oak_sys_check_only))]
     unsafe extern "C++" {
         include!("oak_device.hpp");
 
         type OakDevice;
 
+        fn depthai_build_metadata() -> Result<DepthAiBuildMetadata>;
         fn list_devices() -> Result<Vec<DeviceInfo>>;
         fn create_device(selector: &str, config: &DeviceConfig) -> Result<UniquePtr<OakDevice>>;
         fn is_connected(self: &OakDevice) -> bool;
+        fn get_connected_device_identity(self: &OakDevice) -> Result<ConnectedDeviceIdentity>;
         fn try_get_rgb(self: Pin<&mut OakDevice>, timeout_ms: u32) -> Result<ImageFrameResult>;
         fn try_get_mono_left(
             self: Pin<&mut OakDevice>,
@@ -218,8 +248,11 @@ pub use ffi::{DeviceState, ImuAccuracy, StreamId};
 pub struct Timestamp(i64);
 
 impl Timestamp {
-    pub fn from_nanos(ns: i64) -> Self {
-        Self(ns)
+    pub fn try_from_nanos(ns: i64) -> Result<Self, TimestampError> {
+        if ns < 0 {
+            return Err(TimestampError::Negative { value_ns: ns });
+        }
+        Ok(Self(ns))
     }
 
     pub fn as_nanos(self) -> i64 {
@@ -235,10 +268,98 @@ impl Timestamp {
     }
 }
 
-impl From<ffi::Timestamp> for Timestamp {
-    fn from(ts: ffi::Timestamp) -> Self {
-        Self(ts.device_ns)
+impl TryFrom<ffi::Timestamp> for Timestamp {
+    type Error = TimestampError;
+
+    fn try_from(ts: ffi::Timestamp) -> Result<Self, Self::Error> {
+        Self::try_from_nanos(ts.device_ns)
     }
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampError {
+    #[error("device timestamp must be nonnegative, got {value_ns}ns")]
+    Negative { value_ns: i64 },
+}
+
+/// Native DepthAI image/depth capture identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeviceFrameSequence(i64);
+
+impl DeviceFrameSequence {
+    pub fn try_from_i64(value: i64) -> Result<Self, FrameSequenceError> {
+        if value < 0 {
+            return Err(FrameSequenceError::Negative { value });
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0 as u64
+    }
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSequenceError {
+    #[error("native DepthAI frame sequence must be nonnegative, got {value}")]
+    Negative { value: i64 },
+}
+
+/// Synthetic host-bridge delivery identity, distinct from device capture identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FrameDeliverySequence(u64);
+
+impl FrameDeliverySequence {
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraTimestampReference {
+    ExposureMidpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExposureDuration {
+    micros: u64,
+}
+
+impl ExposureDuration {
+    pub fn as_micros(self) -> u64 {
+        self.micros
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposureTime {
+    Unavailable,
+    Known(ExposureDuration),
+}
+
+#[cfg(any(test, not(oak_sys_check_only)))]
+fn parse_exposure_time(value_us: i64) -> Result<ExposureTime, ExposureTimeError> {
+    match value_us {
+        value if value < 0 => Err(ExposureTimeError::Negative { value_us: value }),
+        0 => Ok(ExposureTime::Unavailable),
+        value => Ok(ExposureTime::Known(ExposureDuration {
+            micros: value as u64,
+        })),
+    }
+}
+
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExposureTimeError {
+    #[error("DepthAI exposure duration must be nonnegative, got {value_us}us")]
+    Negative { value_us: i64 },
 }
 
 /// 3D vector for accelerometer/gyroscope readings
@@ -453,6 +574,7 @@ impl DeviceConfig {
         Ok(())
     }
 
+    #[cfg(not(oak_sys_check_only))]
     fn to_ffi(&self) -> ffi::DeviceConfig {
         ffi::DeviceConfig {
             rgb_enabled: self.rgb.is_some(),
@@ -509,6 +631,15 @@ pub enum ImageError {
     #[error("invalid frame projection intrinsics: {0}")]
     InvalidIntrinsics(#[from] IntrinsicsError),
 
+    #[error("invalid image device timestamp: {0}")]
+    InvalidTimestamp(#[from] TimestampError),
+
+    #[error("invalid native image capture sequence: {0}")]
+    InvalidDeviceSequence(#[from] FrameSequenceError),
+
+    #[error("invalid image exposure metadata: {0}")]
+    InvalidExposureTime(#[from] ExposureTimeError),
+
     #[error("DepthAI frame acquisition failed: {message}")]
     Native { message: String },
 }
@@ -533,6 +664,15 @@ pub enum DepthError {
 
     #[error("invalid depth projection intrinsics: {0}")]
     InvalidIntrinsics(#[from] IntrinsicsError),
+
+    #[error("invalid depth device timestamp: {0}")]
+    InvalidTimestamp(#[from] TimestampError),
+
+    #[error("invalid native depth capture sequence: {0}")]
+    InvalidDeviceSequence(#[from] FrameSequenceError),
+
+    #[error("invalid depth exposure metadata: {0}")]
+    InvalidExposureTime(#[from] ExposureTimeError),
 
     #[error("DepthAI depth acquisition failed: {message}")]
     Native { message: String },
@@ -559,6 +699,14 @@ pub enum ImuError {
         field: &'static str,
     },
 
+    #[error("IMU sample {sample_index} has an invalid {sensor} device timestamp: {source}")]
+    InvalidTimestamp {
+        sample_index: usize,
+        sensor: &'static str,
+        #[source]
+        source: TimestampError,
+    },
+
     #[error("DepthAI IMU acquisition failed: {message}")]
     Native { message: String },
 }
@@ -570,11 +718,49 @@ pub struct DeviceDiscoveryError {
     message: String,
 }
 
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum DepthAiBuildMetadataError {
+    #[error("OAK native runtime is disabled by OAK_SYS_CHECK_ONLY=1")]
+    CompileOnlyNativeDisabled,
+
+    #[error("DepthAI SDK build-metadata query failed: {message}")]
+    Native { message: String },
+
+    #[error("required DepthAI SDK build-metadata field '{field}' is empty")]
+    EmptyRequiredField { field: &'static str },
+}
+
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ConnectedDeviceIdentityError {
+    #[error("OAK native runtime is disabled by OAK_SYS_CHECK_ONLY=1")]
+    CompileOnlyNativeDisabled,
+
+    #[error("DepthAI connected-device identity query failed: {message}")]
+    Native { message: String },
+
+    #[error("the connected DepthAI device returned an empty MXID")]
+    EmptyMxid,
+
+    #[error(
+        "DepthAI opened MXID '{actual_mxid}' instead of requested exact MXID '{requested_mxid}'"
+    )]
+    SelectorMismatch {
+        requested_mxid: String,
+        actual_mxid: String,
+    },
+}
+
 /// Errors when connecting to a device
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionError {
     #[error("invalid OAK device configuration: {0}")]
     InvalidConfig(#[from] DeviceConfigError),
+
+    #[error("OAK device selector must be a nonempty exact MXID")]
+    EmptySelector,
+
+    #[error("OAK native runtime is disabled by OAK_SYS_CHECK_ONLY=1")]
+    CompileOnlyNativeDisabled,
 
     #[error("DepthAI failed to connect to OAK selector '{selector}': {message}")]
     Native { selector: String, message: String },
@@ -584,6 +770,9 @@ pub enum ConnectionError {
 
     #[error("OAK pipeline for selector '{selector}' did not reach the connected state")]
     NotConnected { selector: String },
+
+    #[error("connected OAK identity is invalid: {0}")]
+    InvalidConnectedIdentity(#[from] ConnectedDeviceIdentityError),
 }
 
 /// Errors when reading fixed stereo calibration.
@@ -641,10 +830,14 @@ pub enum IntrinsicsError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImageFrame {
     pub stream: StreamId,
-    /// Strictly increasing host-bridge dequeue sequence. This is not a device
-    /// sequence, and gaps are not evidence that the device dropped frames.
-    pub sequence: u64,
+    /// Native sequence returned by `ImgFrame::getSequenceNum()`.
+    pub device_capture_sequence: DeviceFrameSequence,
+    /// Strictly increasing bridge dequeue sequence, independent of capture identity.
+    pub host_delivery_sequence: FrameDeliverySequence,
+    /// Device clock at exposure midpoint.
     pub timestamp: Timestamp,
+    pub timestamp_reference: CameraTimestampReference,
+    pub exposure_time: ExposureTime,
     pub width: u32,
     pub height: u32,
     pub stride_bytes: u32,
@@ -673,14 +866,19 @@ impl ImageFrame {
 /// A valid depth frame
 #[derive(Debug, Clone, PartialEq)]
 pub struct DepthFrame {
-    /// Strictly increasing host-bridge dequeue sequence. This is not a device
-    /// sequence, and gaps are not evidence that the device dropped frames.
-    pub sequence: u64,
+    /// Native sequence returned by `ImgFrame::getSequenceNum()`.
+    pub device_capture_sequence: DeviceFrameSequence,
+    /// Strictly increasing bridge dequeue sequence, independent of capture identity.
+    pub host_delivery_sequence: FrameDeliverySequence,
+    /// Device clock at exposure midpoint.
     pub timestamp: Timestamp,
+    pub timestamp_reference: CameraTimestampReference,
+    pub exposure_time: ExposureTime,
     pub width: u32,
     pub height: u32,
     data: Vec<u16>, // Private - use depth_mm() or depth_m() accessors
     intrinsics: Intrinsics,
+    connected_alignment: Option<DepthAlignment>,
 }
 
 impl DepthFrame {
@@ -692,6 +890,16 @@ impl DepthFrame {
     /// Projection intrinsics for this exact delivered depth grid.
     pub fn intrinsics(&self) -> Intrinsics {
         self.intrinsics
+    }
+
+    /// Alignment sealed by the connected device's validated configuration.
+    pub fn connected_alignment(&self) -> Option<DepthAlignment> {
+        self.connected_alignment
+    }
+
+    #[cfg(any(test, not(oak_sys_check_only)))]
+    fn attach_connected_alignment(&mut self, alignment: DepthAlignment) {
+        self.connected_alignment = Some(alignment);
     }
 
     /// Depth at pixel (x, y) in metres. Zero millimetres is invalid.
@@ -832,6 +1040,129 @@ impl From<ffi::DeviceInfo> for DeviceInfo {
     }
 }
 
+/// Provenance compiled into the native bridge from DepthAI's build header.
+///
+/// Embedded artifact versions describe inputs bundled with that SDK build;
+/// they are not proof of firmware currently executing on a physical device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthAiBuildMetadata {
+    sdk_version: String,
+    sdk_commit: String,
+    embedded_device_artifact_version: String,
+    embedded_bootloader_artifact_version: String,
+}
+
+impl DepthAiBuildMetadata {
+    pub fn sdk_version(&self) -> &str {
+        &self.sdk_version
+    }
+
+    pub fn sdk_commit(&self) -> &str {
+        &self.sdk_commit
+    }
+
+    pub fn embedded_device_artifact_version(&self) -> &str {
+        &self.embedded_device_artifact_version
+    }
+
+    pub fn embedded_bootloader_artifact_version(&self) -> &str {
+        &self.embedded_bootloader_artifact_version
+    }
+}
+
+/// Exact, non-conflated identity fields observed for the opened OAK device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedDeviceIdentity {
+    mxid: String,
+    discovery_transport_name: Option<String>,
+    eeprom_device_name: Option<String>,
+    product_name: Option<String>,
+}
+
+impl ConnectedDeviceIdentity {
+    pub fn mxid(&self) -> &str {
+        &self.mxid
+    }
+
+    pub fn discovery_transport_name(&self) -> Option<&str> {
+        self.discovery_transport_name.as_deref()
+    }
+
+    pub fn eeprom_device_name(&self) -> Option<&str> {
+        self.eeprom_device_name.as_deref()
+    }
+
+    pub fn product_name(&self) -> Option<&str> {
+        self.product_name.as_deref()
+    }
+}
+
+#[cfg(any(test, not(oak_sys_check_only)))]
+fn parse_depthai_build_metadata(
+    raw: ffi::DepthAiBuildMetadata,
+) -> Result<DepthAiBuildMetadata, DepthAiBuildMetadataError> {
+    for (field, value) in [
+        ("sdk_version", raw.sdk_version.as_str()),
+        ("sdk_commit", raw.sdk_commit.as_str()),
+        (
+            "embedded_device_artifact_version",
+            raw.embedded_device_artifact_version.as_str(),
+        ),
+        (
+            "embedded_bootloader_artifact_version",
+            raw.embedded_bootloader_artifact_version.as_str(),
+        ),
+    ] {
+        if value.is_empty() {
+            return Err(DepthAiBuildMetadataError::EmptyRequiredField { field });
+        }
+    }
+
+    Ok(DepthAiBuildMetadata {
+        sdk_version: raw.sdk_version,
+        sdk_commit: raw.sdk_commit,
+        embedded_device_artifact_version: raw.embedded_device_artifact_version,
+        embedded_bootloader_artifact_version: raw.embedded_bootloader_artifact_version,
+    })
+}
+
+#[cfg(any(test, not(oak_sys_check_only)))]
+fn parse_connected_device_identity(
+    raw: ffi::ConnectedDeviceIdentity,
+    requested_mxid: &str,
+) -> Result<ConnectedDeviceIdentity, ConnectedDeviceIdentityError> {
+    if raw.mxid.is_empty() {
+        return Err(ConnectedDeviceIdentityError::EmptyMxid);
+    }
+    if raw.mxid != requested_mxid {
+        return Err(ConnectedDeviceIdentityError::SelectorMismatch {
+            requested_mxid: requested_mxid.to_owned(),
+            actual_mxid: raw.mxid,
+        });
+    }
+
+    let optional = |value: String| (!value.is_empty()).then_some(value);
+    Ok(ConnectedDeviceIdentity {
+        mxid: raw.mxid,
+        discovery_transport_name: optional(raw.discovery_transport_name),
+        eeprom_device_name: optional(raw.eeprom_device_name),
+        product_name: optional(raw.product_name),
+    })
+}
+
+#[cfg(not(oak_sys_check_only))]
+pub fn depthai_build_metadata() -> Result<DepthAiBuildMetadata, DepthAiBuildMetadataError> {
+    let raw = ffi::depthai_build_metadata().map_err(|error| DepthAiBuildMetadataError::Native {
+        message: error.what().to_owned(),
+    })?;
+    parse_depthai_build_metadata(raw)
+}
+
+#[cfg(oak_sys_check_only)]
+pub fn depthai_build_metadata() -> Result<DepthAiBuildMetadata, DepthAiBuildMetadataError> {
+    Err(DepthAiBuildMetadataError::CompileOnlyNativeDisabled)
+}
+
 // ============================================================================
 // DEVICE - Safe wrapper that enforces valid usage
 // ============================================================================
@@ -839,11 +1170,14 @@ impl From<ffi::DeviceInfo> for DeviceInfo {
 /// An OAK-D pipeline that connected successfully when constructed.
 ///
 /// A later physical disconnect is reported by acquisition methods.
+#[cfg(not(oak_sys_check_only))]
 pub struct Device {
     inner: cxx::UniquePtr<ffi::OakDevice>,
     config: DeviceConfig,
+    connected_identity: ConnectedDeviceIdentity,
 }
 
+#[cfg(not(oak_sys_check_only))]
 impl Device {
     /// List all visible OAK devices, including devices already in use.
     pub fn list() -> Result<Vec<DeviceInfo>, DeviceDiscoveryError> {
@@ -856,8 +1190,11 @@ impl Device {
             .collect())
     }
 
-    /// Connect to a device. Empty selector uses first available.
+    /// Connect to one exact, nonempty DepthAI MXID and verify what was opened.
     pub fn connect(selector: &str, config: DeviceConfig) -> Result<Self, ConnectionError> {
+        if selector.is_empty() {
+            return Err(ConnectionError::EmptySelector);
+        }
         config.validate()?;
         let ffi_config = config.to_ffi();
         let inner =
@@ -878,7 +1215,24 @@ impl Device {
             });
         }
 
-        Ok(Self { inner, config })
+        let raw_identity = inner.get_connected_device_identity().map_err(|error| {
+            ConnectedDeviceIdentityError::Native {
+                message: error.what().to_owned(),
+            }
+        })?;
+        let connected_identity = parse_connected_device_identity(raw_identity, selector)?;
+
+        Ok(Self {
+            inner,
+            config,
+            connected_identity,
+        })
+    }
+
+    pub fn connected_identity(
+        &self,
+    ) -> Result<&ConnectedDeviceIdentity, ConnectedDeviceIdentityError> {
+        Ok(&self.connected_identity)
     }
 
     /// Get RGB frame. Returns error if RGB not enabled in config.
@@ -944,7 +1298,14 @@ impl Device {
             .map_err(|error| DepthError::Native {
                 message: error.what().to_owned(),
             })?;
-        parse_depth_result(result, timeout_ms)
+        let mut frame = parse_depth_result(result, timeout_ms)?;
+        let alignment = self
+            .config
+            .depth
+            .expect("depth stream was checked as enabled")
+            .alignment;
+        frame.attach_connected_alignment(alignment);
+        Ok(frame)
     }
 
     /// Get IMU samples. Returns error if IMU not enabled in config.
@@ -981,10 +1342,83 @@ impl Device {
     }
 }
 
+/// Compile-only stand-in. It type-checks downstream contracts without
+/// pretending that native discovery, capture, or shutdown occurred.
+#[cfg(oak_sys_check_only)]
+pub struct Device {
+    _private: (),
+}
+
+#[cfg(oak_sys_check_only)]
+impl Device {
+    pub fn list() -> Result<Vec<DeviceInfo>, DeviceDiscoveryError> {
+        Err(DeviceDiscoveryError {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn connect(selector: &str, config: DeviceConfig) -> Result<Self, ConnectionError> {
+        if selector.is_empty() {
+            return Err(ConnectionError::EmptySelector);
+        }
+        config.validate()?;
+        Err(ConnectionError::CompileOnlyNativeDisabled)
+    }
+
+    pub fn connected_identity(
+        &self,
+    ) -> Result<&ConnectedDeviceIdentity, ConnectedDeviceIdentityError> {
+        Err(ConnectedDeviceIdentityError::CompileOnlyNativeDisabled)
+    }
+
+    pub fn rgb(&mut self, _timeout_ms: u32) -> Result<ImageFrame, ImageError> {
+        Err(ImageError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn mono_left(&mut self, _timeout_ms: u32) -> Result<ImageFrame, ImageError> {
+        Err(ImageError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn mono_right(&mut self, _timeout_ms: u32) -> Result<ImageFrame, ImageError> {
+        Err(ImageError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn depth(&mut self, _timeout_ms: u32) -> Result<DepthFrame, DepthError> {
+        Err(DepthError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn imu(&mut self) -> Result<Vec<ImuSample>, ImuError> {
+        Err(ImuError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn stereo_baseline_m(&self) -> Result<f32, CalibrationError> {
+        Err(CalibrationError::Native {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+
+    pub fn close(self) -> Result<(), CloseError> {
+        Err(CloseError {
+            message: "native runtime disabled by OAK_SYS_CHECK_ONLY=1".to_owned(),
+        })
+    }
+}
+
 // ============================================================================
 // PARSING FUNCTIONS - Convert FFI results to proper Result types
 // ============================================================================
 
+#[cfg(any(test, not(oak_sys_check_only)))]
 fn parse_stereo_baseline_m(value: f32) -> Result<f32, CalibrationError> {
     if !value.is_finite() || value <= 0.0 {
         return Err(CalibrationError::InvalidBaseline { value });
@@ -992,6 +1426,7 @@ fn parse_stereo_baseline_m(value: f32) -> Result<f32, CalibrationError> {
     Ok(value)
 }
 
+#[cfg(any(test, not(oak_sys_check_only)))]
 fn parse_intrinsics(
     raw: ffi::Intrinsics,
     frame_width: u32,
@@ -1017,6 +1452,7 @@ fn parse_intrinsics(
     Ok(intrinsics)
 }
 
+#[cfg(any(test, not(oak_sys_check_only)))]
 fn parse_image_result(
     result: ffi::ImageFrameResult,
     timeout_ms: u32,
@@ -1054,10 +1490,18 @@ fn parse_image_result(
                 result.frame.width,
                 result.frame.height,
             )?;
+            let device_capture_sequence =
+                DeviceFrameSequence::try_from_i64(result.frame.device_capture_sequence)?;
+            let exposure_time = parse_exposure_time(result.frame.exposure_time_us)?;
             Ok(ImageFrame {
                 stream: result.frame.stream,
-                sequence: result.frame.sequence,
-                timestamp: result.frame.timestamp.into(),
+                device_capture_sequence,
+                host_delivery_sequence: FrameDeliverySequence::new(
+                    result.frame.host_delivery_sequence,
+                ),
+                timestamp: Timestamp::try_from(result.frame.timestamp)?,
+                timestamp_reference: CameraTimestampReference::ExposureMidpoint,
+                exposure_time,
                 width: result.frame.width,
                 height: result.frame.height,
                 stride_bytes: result.frame.stride_bytes,
@@ -1076,6 +1520,7 @@ fn parse_image_result(
     }
 }
 
+#[cfg(any(test, not(oak_sys_check_only)))]
 fn parse_depth_result(
     result: ffi::DepthFrameResult,
     timeout_ms: u32,
@@ -1101,13 +1546,22 @@ fn parse_depth_result(
                 result.frame.width,
                 result.frame.height,
             )?;
+            let device_capture_sequence =
+                DeviceFrameSequence::try_from_i64(result.frame.device_capture_sequence)?;
+            let exposure_time = parse_exposure_time(result.frame.exposure_time_us)?;
             Ok(DepthFrame {
-                sequence: result.frame.sequence,
-                timestamp: result.frame.timestamp.into(),
+                device_capture_sequence,
+                host_delivery_sequence: FrameDeliverySequence::new(
+                    result.frame.host_delivery_sequence,
+                ),
+                timestamp: Timestamp::try_from(result.frame.timestamp)?,
+                timestamp_reference: CameraTimestampReference::ExposureMidpoint,
+                exposure_time,
                 width: result.frame.width,
                 height: result.frame.height,
                 data: result.frame.data,
                 intrinsics,
+                connected_alignment: None,
             })
         }
         ffi::FrameStatus::Timeout => Err(DepthError::Timeout { timeout_ms }),
@@ -1119,6 +1573,7 @@ fn parse_depth_result(
     }
 }
 
+#[cfg(any(test, not(oak_sys_check_only)))]
 fn parse_imu_accuracy(value: ffi::ImuAccuracy) -> Result<ImuAccuracy, ImuError> {
     match value {
         ffi::ImuAccuracy::Unreliable
@@ -1129,6 +1584,7 @@ fn parse_imu_accuracy(value: ffi::ImuAccuracy) -> Result<ImuAccuracy, ImuError> 
     }
 }
 
+#[cfg(any(test, not(oak_sys_check_only)))]
 fn parse_imu_result(result: ffi::ImuBatchResult) -> Result<Vec<ImuSample>, ImuError> {
     match result.status {
         ffi::ImuStatus::Ok => {
@@ -1158,9 +1614,25 @@ fn parse_imu_result(result: ffi::ImuBatchResult) -> Result<Vec<ImuSample>, ImuEr
                     }
                     let accel_accuracy = parse_imu_accuracy(s.accel_accuracy)?;
                     let gyro_accuracy = parse_imu_accuracy(s.gyro_accuracy)?;
+                    let accel_timestamp =
+                        Timestamp::try_from(s.accel_timestamp).map_err(|source| {
+                            ImuError::InvalidTimestamp {
+                                sample_index,
+                                sensor: "accelerometer",
+                                source,
+                            }
+                        })?;
+                    let gyro_timestamp =
+                        Timestamp::try_from(s.gyro_timestamp).map_err(|source| {
+                            ImuError::InvalidTimestamp {
+                                sample_index,
+                                sensor: "gyroscope",
+                                source,
+                            }
+                        })?;
                     Ok(ImuSample {
-                        accel_timestamp: s.accel_timestamp.into(),
-                        gyro_timestamp: s.gyro_timestamp.into(),
+                        accel_timestamp,
+                        gyro_timestamp,
                         sequence: s.sequence,
                         accel: Vec3 {
                             x: s.accel_x,
@@ -1186,6 +1658,7 @@ fn parse_imu_result(result: ffi::ImuBatchResult) -> Result<Vec<ImuSample>, ImuEr
     }
 }
 
+#[cfg(not(oak_sys_check_only))]
 impl Drop for Device {
     fn drop(&mut self) {
         // Destructors cannot report errors. Call `Device::close` explicitly if
@@ -1246,8 +1719,10 @@ mod tests {
             status: ffi::FrameStatus::Ok,
             frame: ffi::ImageFrame {
                 stream,
-                sequence: 1,
+                device_capture_sequence: 41,
+                host_delivery_sequence: 1,
                 timestamp: ffi::Timestamp { device_ns: 2 },
+                exposure_time_us: 3,
                 width,
                 height,
                 stride_bytes,
@@ -1261,14 +1736,109 @@ mod tests {
         ffi::DepthFrameResult {
             status: ffi::FrameStatus::Ok,
             frame: ffi::DepthFrame {
-                sequence: 1,
+                device_capture_sequence: 41,
+                host_delivery_sequence: 1,
                 timestamp: ffi::Timestamp { device_ns: 2 },
+                exposure_time_us: 3,
                 width,
                 height,
                 data,
                 intrinsics: raw_intrinsics(width, height),
             },
         }
+    }
+
+    fn raw_build_metadata() -> ffi::DepthAiBuildMetadata {
+        ffi::DepthAiBuildMetadata {
+            sdk_version: "3.6.1".to_owned(),
+            sdk_commit: "commit-abc".to_owned(),
+            embedded_device_artifact_version: "device-1".to_owned(),
+            embedded_bootloader_artifact_version: "bootloader-1".to_owned(),
+        }
+    }
+
+    fn raw_connected_identity() -> ffi::ConnectedDeviceIdentity {
+        ffi::ConnectedDeviceIdentity {
+            mxid: "mxid-123".to_owned(),
+            discovery_transport_name: "usb".to_owned(),
+            eeprom_device_name: "kiko-oak".to_owned(),
+            product_name: "OAK-D".to_owned(),
+        }
+    }
+
+    #[test]
+    fn build_metadata_parser_preserves_exact_fields_and_rejects_empty_required_values() {
+        let parsed = parse_depthai_build_metadata(raw_build_metadata()).expect("valid metadata");
+        assert_eq!(parsed.sdk_version(), "3.6.1");
+        assert_eq!(parsed.sdk_commit(), "commit-abc");
+        assert_eq!(parsed.embedded_device_artifact_version(), "device-1");
+        assert_eq!(
+            parsed.embedded_bootloader_artifact_version(),
+            "bootloader-1"
+        );
+
+        for field in [
+            "sdk_version",
+            "sdk_commit",
+            "embedded_device_artifact_version",
+            "embedded_bootloader_artifact_version",
+        ] {
+            let mut raw = raw_build_metadata();
+            match field {
+                "sdk_version" => raw.sdk_version.clear(),
+                "sdk_commit" => raw.sdk_commit.clear(),
+                "embedded_device_artifact_version" => raw.embedded_device_artifact_version.clear(),
+                "embedded_bootloader_artifact_version" => {
+                    raw.embedded_bootloader_artifact_version.clear()
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                parse_depthai_build_metadata(raw),
+                Err(DepthAiBuildMetadataError::EmptyRequiredField { field })
+            );
+        }
+    }
+
+    #[test]
+    fn connected_identity_requires_and_verifies_the_exact_mxid() {
+        let parsed = parse_connected_device_identity(raw_connected_identity(), "mxid-123")
+            .expect("matching identity");
+        assert_eq!(parsed.mxid(), "mxid-123");
+        assert_eq!(parsed.discovery_transport_name(), Some("usb"));
+        assert_eq!(parsed.eeprom_device_name(), Some("kiko-oak"));
+        assert_eq!(parsed.product_name(), Some("OAK-D"));
+
+        let mut empty = raw_connected_identity();
+        empty.mxid.clear();
+        assert_eq!(
+            parse_connected_device_identity(empty, "mxid-123"),
+            Err(ConnectedDeviceIdentityError::EmptyMxid)
+        );
+        assert_eq!(
+            parse_connected_device_identity(raw_connected_identity(), "other"),
+            Err(ConnectedDeviceIdentityError::SelectorMismatch {
+                requested_mxid: "other".to_owned(),
+                actual_mxid: "mxid-123".to_owned(),
+            })
+        );
+    }
+
+    #[cfg(oak_sys_check_only)]
+    #[test]
+    fn compile_only_mode_never_claims_native_build_provenance() {
+        assert_eq!(
+            depthai_build_metadata(),
+            Err(DepthAiBuildMetadataError::CompileOnlyNativeDisabled)
+        );
+    }
+
+    #[test]
+    fn device_connect_rejects_empty_selector_before_native_work() {
+        assert!(matches!(
+            Device::connect("", base_config()),
+            Err(ConnectionError::EmptySelector)
+        ));
     }
 
     #[test]
@@ -1517,6 +2087,72 @@ mod tests {
         assert_eq!(parsed.depth_m_at(0, 2), None);
         let max_metres = parsed.depth_m_at(1, 1).expect("u16::MAX is valid");
         assert!((max_metres - f32::from(u16::MAX) * 0.001).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn camera_parser_preserves_native_and_host_capture_provenance_separately() {
+        let mut image = raw_image(StreamId::MonoLeft, 1, 1, 1, vec![7]);
+        image.frame.device_capture_sequence = 9001;
+        image.frame.host_delivery_sequence = 17;
+        image.frame.timestamp.device_ns = 123;
+        image.frame.exposure_time_us = 456;
+        let image = parse_image_result(image, 0).expect("valid image provenance");
+        assert_eq!(image.device_capture_sequence.as_i64(), 9001);
+        assert_eq!(image.host_delivery_sequence.as_u64(), 17);
+        assert_eq!(image.timestamp.as_nanos(), 123);
+        assert_eq!(
+            image.timestamp_reference,
+            CameraTimestampReference::ExposureMidpoint
+        );
+        assert_eq!(
+            image.exposure_time,
+            ExposureTime::Known(ExposureDuration { micros: 456 })
+        );
+
+        let mut depth = raw_depth(1, 1, vec![9]);
+        depth.frame.device_capture_sequence = 9002;
+        depth.frame.host_delivery_sequence = 18;
+        depth.frame.exposure_time_us = 0;
+        let mut depth = parse_depth_result(depth, 0).expect("valid depth provenance");
+        assert_eq!(depth.device_capture_sequence.as_u64(), 9002);
+        assert_eq!(depth.host_delivery_sequence.as_u64(), 18);
+        assert_eq!(depth.exposure_time, ExposureTime::Unavailable);
+        assert_eq!(depth.connected_alignment(), None);
+        depth.attach_connected_alignment(DepthAlignment::RectifiedLeft);
+        assert_eq!(
+            depth.connected_alignment(),
+            Some(DepthAlignment::RectifiedLeft)
+        );
+    }
+
+    #[test]
+    fn invalid_camera_capture_metadata_fails_closed() {
+        let mut image = raw_image(StreamId::MonoLeft, 1, 1, 1, vec![7]);
+        image.frame.device_capture_sequence = -1;
+        assert_eq!(
+            parse_image_result(image, 0),
+            Err(ImageError::InvalidDeviceSequence(
+                FrameSequenceError::Negative { value: -1 }
+            ))
+        );
+
+        let mut depth = raw_depth(1, 1, vec![9]);
+        depth.frame.timestamp.device_ns = -1;
+        assert_eq!(
+            parse_depth_result(depth, 0),
+            Err(DepthError::InvalidTimestamp(TimestampError::Negative {
+                value_ns: -1
+            }))
+        );
+
+        let mut depth = raw_depth(1, 1, vec![9]);
+        depth.frame.exposure_time_us = -1;
+        assert_eq!(
+            parse_depth_result(depth, 0),
+            Err(DepthError::InvalidExposureTime(
+                ExposureTimeError::Negative { value_us: -1 }
+            ))
+        );
     }
 
     #[test]
