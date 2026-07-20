@@ -990,6 +990,38 @@ impl OccupancyGridSnapshot {
             .map(OccupancyCell::from_class_id)
     }
 
+    /// Builds a snapshot from persistence fields that have already passed the
+    /// occupancy format's structural and domain validation.
+    ///
+    /// A map instance ID intentionally cannot be supplied here: it identifies
+    /// one live mapping process and is never meaningful after a persisted map
+    /// is loaded in another process.
+    pub(super) fn from_validated_persistent_parts(
+        geometry: OccupancyGridGeometry,
+        world_to_occupancy: WorldToOccupancy,
+        height_range: HeightRangeMeters,
+        revision: u64,
+        class_ids: Vec<u8>,
+    ) -> Self {
+        debug_assert_eq!(class_ids.len(), geometry.cell_count());
+        debug_assert!(class_ids.iter().all(|class_id| *class_id <= 2));
+        Self {
+            class_ids,
+            metadata: OccupancyGridMetadata {
+                width: geometry.width(),
+                height: geometry.height(),
+                resolution_m: geometry.resolution_m(),
+                lower_bound_m: geometry.lower_bound_m(),
+                world_to_occupancy,
+                height_range,
+                row_order: OccupancyRowOrder::IncreasingOccupancyY,
+                map_instance_id: None,
+                revision,
+            },
+            geometry,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn from_test_cells(
         geometry: OccupancyGridGeometry,

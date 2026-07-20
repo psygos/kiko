@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod command_mapper;
 pub mod occupancy;
+pub mod occupancy_persistence;
 pub mod occupancy_runtime;
 pub mod ring_buffer;
 
