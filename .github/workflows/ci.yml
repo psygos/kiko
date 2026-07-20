@@ -54,6 +54,9 @@ jobs:
           cargo clippy --locked -p kiko-slam --features actuation --all-targets
           -- -D warnings
 
+      - name: Clippy KEP2 eye runtime and commissioning probe
+        run: cargo clippy --locked -p kiko-eye-runtime --all-targets -- -D warnings
+
   host-tests:
     name: Host Tests (macOS)
     runs-on: macos-latest
@@ -86,6 +89,9 @@ jobs:
         # DepthAI-backed recording.
         run: cargo test --locked -p kiko-slam --features actuation
 
+      - name: Test KEP2 eye runtime and commissioning probe
+        run: cargo test --locked -p kiko-eye-runtime --all-targets
+
   linux-aarch64-check:
     name: Portable Host Compile (Linux aarch64)
     runs-on: ubuntu-latest
@@ -111,6 +117,7 @@ jobs:
           -p robot-protocol
           -p robot-command-client
           -p robot-server
+          -p kiko-eye-runtime
 
   embedded-firmware:
     name: STM32 Firmware Build (thumbv7em-none-eabihf)

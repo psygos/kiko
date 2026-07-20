@@ -199,7 +199,7 @@ pub struct DeviceIdentity {
 }
 
 impl DeviceIdentity {
-    fn parse(path: String) -> Result<Self, ConfigParseError> {
+    pub(crate) fn parse(path: String) -> Result<Self, ConfigParseError> {
         if path.is_empty() {
             return Err(ConfigParseError::EmptyDevicePath);
         }
@@ -261,7 +261,7 @@ impl DeviceIdentity {
 pub struct BaudRate(u32);
 
 impl BaudRate {
-    fn parse(value: u32) -> Result<Self, ConfigParseError> {
+    pub(crate) fn parse(value: u32) -> Result<Self, ConfigParseError> {
         if !(MIN_BAUD_RATE_BPS..=MAX_BAUD_RATE_BPS).contains(&value) {
             return Err(ConfigParseError::BaudRateOutOfRange {
                 value,
@@ -281,7 +281,7 @@ impl BaudRate {
 pub struct OperationTimeout(Duration);
 
 impl OperationTimeout {
-    fn parse(field: &'static str, milliseconds: u64) -> Result<Self, ConfigParseError> {
+    pub(crate) fn parse(field: &'static str, milliseconds: u64) -> Result<Self, ConfigParseError> {
         if !(1..=MAX_OPERATION_TIMEOUT_MS).contains(&milliseconds) {
             return Err(ConfigParseError::OperationTimeoutOutOfRange {
                 field,

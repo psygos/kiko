@@ -73,6 +73,29 @@ Prepared expression freshness is checked when an intent is submitted and
 again when its firmware result is handled. Device lease time and host monotonic
 time remain separate domains.
 
+## Identity-only commissioning probe
+
+`kep2_identity_probe` bootstraps the expected eye UID after a firmware flash
+without acquiring renderer control. It opens one exact stable path exclusively,
+reads back the canonical 115200/8-N-1/no-flow-control configuration, sends one
+OS-random nonzero `IdentityQuery`, and accepts exactly one canonical
+`IdentityReport` that echoes that challenge. It never sends `AcquireControl`,
+`ApplyIntent`, or `ReleaseControl`.
+
+On Linux:
+
+```bash
+cargo run --locked -p kiko-eye-runtime --bin kep2_identity_probe -- \
+  --serial-device /dev/serial/by-id/<exact-eye-identity> \
+  --timeout-ms 5000
+```
+
+On macOS, pass the exact `/dev/cu.<identity>` callout instead. The JSON result
+contains the manifest-ready UID/build byte arrays and hex strings, current boot
+ID, device uptime, capability bits, challenge, and serial-setting readback. It
+is a nonce-bound firmware claim only; it does not prove optical output, panel
+wiring, or fallback visibility. Stop every eye owner before running it.
+
 ## Failure and evidence semantics
 
 Timeout, stale/future expression input, malformed or unexpected messages,

@@ -40,13 +40,22 @@ static ENDPOINT: Mutex<CriticalSectionRawMutex, RefCell<Option<Kep2Endpoint>>> =
 
 type EyeBank = [EyeFrame; 2];
 
+const USB_SERIAL_HEX_BYTES: usize = 32;
+const USB_SERIAL_DESCRIPTOR_BYTES: usize = 2 + USB_SERIAL_HEX_BYTES * 2;
+const USB_CONTROL_BUFFER_BYTES: usize = 128;
+
+// embassy-usb 0.6 requires one byte of slack beyond the complete UTF-16LE
+// string descriptor. Without this proof, the 32-character OTP serial panics
+// the device while the host enumerates it and CDC never becomes available.
+const _: () = assert!(USB_CONTROL_BUFFER_BYTES > USB_SERIAL_DESCRIPTOR_BYTES);
+
 fn device_now() -> DeviceTimestampMs {
     DeviceTimestampMs::from_millis_since_boot(Instant::now().as_millis())
 }
 
-fn uid_hex(uid: [u8; 16]) -> [u8; 32] {
+fn uid_hex(uid: [u8; 16]) -> [u8; USB_SERIAL_HEX_BYTES] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = [0_u8; 32];
+    let mut output = [0_u8; USB_SERIAL_HEX_BYTES];
     let mut index = 0;
     while index < uid.len() {
         output[index * 2] = HEX[usize::from(uid[index] >> 4)];
@@ -101,7 +110,7 @@ fn render_bank(left: &mut EyeRenderer, right: &mut EyeRenderer, bank: &mut EyeBa
 }
 
 #[embassy_executor::task]
-async fn usb_task(driver: UsbDriver<'static, USB>, serial_ascii: [u8; 32]) {
+async fn usb_task(driver: UsbDriver<'static, USB>, serial_ascii: [u8; USB_SERIAL_HEX_BYTES]) {
     let mut config = UsbConfig::new(0xc0de, 0xcafe);
     config.manufacturer = Some("kiko");
     config.product = Some("kiko-eyes-kep2");
@@ -111,7 +120,7 @@ async fn usb_task(driver: UsbDriver<'static, USB>, serial_ascii: [u8; 32]) {
     let mut config_descriptor = [0_u8; 256];
     let mut bos_descriptor = [0_u8; 256];
     let mut msos_descriptor = [0_u8; 256];
-    let mut control_buffer = [0_u8; 64];
+    let mut control_buffer = [0_u8; USB_CONTROL_BUFFER_BYTES];
     let mut cdc_state = CdcState::new();
     let mut builder = Builder::new(
         driver,

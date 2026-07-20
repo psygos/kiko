@@ -21,6 +21,7 @@
 mod actor;
 mod config;
 mod framing;
+mod identity_probe;
 mod transport;
 
 pub use actor::{
@@ -40,6 +41,11 @@ pub use config::{
     WriteAttemptLimit,
 };
 pub use framing::{FrameReadError, MAX_READ_CHUNK_BYTES};
+pub use identity_probe::{
+    EyeIdentityObservation, IdentityProbeConfig, IdentityProbeConfigError,
+    IdentityProbeConfigInput, IdentityProbeError, IdentityQueryWriteError,
+    probe_serial_eye_identity,
+};
 pub use transport::{
     AsyncByteTransport, ClockError, MonotonicClock, SerialConfigurationEvidence, SerialOpenError,
     SerialSetting, TokioClock, TransportFailure, TransportFailureKind, TransportOperation,

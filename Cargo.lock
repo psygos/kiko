@@ -3147,6 +3147,7 @@ dependencies = [
  "kiko-expression-core",
  "kiko-expression-runtime",
  "kiko-eye-protocol",
+ "serde_json",
  "tokio",
  "tokio-serial",
 ]
