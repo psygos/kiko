@@ -554,6 +554,8 @@ impl AgentControlCommandV1Dto {
 pub enum AgentRuntimeStateV1 {
     Booting,
     Inventory,
+    Disarmed,
+    AwaitingZero,
     ReadyStopped,
     Active { mode: AgentOperatingModeV1 },
     Faulted,
@@ -565,6 +567,7 @@ pub enum AgentRuntimeStateV1 {
 #[serde(rename_all = "snake_case")]
 pub enum AgentOperatingModeV1 {
     MapOnly,
+    Commissioning,
     Manual,
     FrontierExplore,
     PointGoal,
@@ -1183,5 +1186,35 @@ mod tests {
         assert_eq!(rejected["request_id"], Value::Null);
         assert_eq!(rejected["response"]["code"], "malformed_request");
         assert_eq!(rejected["response"]["retryable"], Value::Bool(false));
+    }
+
+    #[test]
+    fn every_lifecycle_and_authority_mode_has_an_exact_wire_name() {
+        let lifecycle = [
+            (AgentRuntimeStateV1::Booting, "booting"),
+            (AgentRuntimeStateV1::Inventory, "inventory"),
+            (AgentRuntimeStateV1::Disarmed, "disarmed"),
+            (AgentRuntimeStateV1::AwaitingZero, "awaiting_zero"),
+            (AgentRuntimeStateV1::ReadyStopped, "ready_stopped"),
+            (AgentRuntimeStateV1::Faulted, "faulted"),
+            (AgentRuntimeStateV1::ShuttingDown, "shutting_down"),
+        ];
+        for (state, expected) in lifecycle {
+            let encoded = serde_json::to_value(state).expect("serialize lifecycle state");
+            assert_eq!(encoded, json!({"kind": expected}));
+        }
+
+        let modes = [
+            (AgentOperatingModeV1::MapOnly, "map_only"),
+            (AgentOperatingModeV1::Commissioning, "commissioning"),
+            (AgentOperatingModeV1::Manual, "manual"),
+            (AgentOperatingModeV1::FrontierExplore, "frontier_explore"),
+            (AgentOperatingModeV1::PointGoal, "point_goal"),
+        ];
+        for (mode, expected) in modes {
+            let encoded = serde_json::to_value(AgentRuntimeStateV1::Active { mode })
+                .expect("serialize active mode");
+            assert_eq!(encoded, json!({"kind": "active", "mode": expected}));
+        }
     }
 }

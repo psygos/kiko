@@ -4,6 +4,8 @@
 pub mod actuation;
 #[cfg(feature = "actuation")]
 mod actuation_config;
+#[cfg(feature = "agent-runtime")]
+mod authority;
 mod cell_inflation;
 mod control_api;
 mod coordinator;
@@ -27,6 +29,8 @@ pub use actuation_config::{
     MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, NAVIGATION_ACTUATION_CONFIG_V1,
     NavigationActuationConfigV1, NavigationConfigSha256, OperatorClaimedPhysicalApprovalV1,
 };
+#[cfg(feature = "agent-runtime")]
+pub use authority::{AgentAuthorityError, AgentAuthoritySupervisor};
 pub use control_api::{
     AGENT_CONTROL_SCHEMA_V1, AgentBaseCommandStateV1, AgentControlCommandKindV1,
     AgentControlCommandV1, AgentControlCompletionV1, AgentControlRejectionCodeV1,
