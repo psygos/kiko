@@ -1,0 +1,18 @@
+[package]
+name = "kiko-device-inventory"
+version = "0.1.0"
+edition = "2024"
+description = "Typed, transport-independent expected/observed device inventory for Kiko"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+kiko-eye-protocol = { path = "../kiko-eye-protocol" }
+kiko-head-protocol = { path = "../kiko-head-protocol" }
+robot-protocol = { path = "../../comms/robot-protocol" }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "inventory"
+harness = false

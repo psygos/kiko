@@ -3111,6 +3111,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiko-device-inventory"
+version = "0.1.0"
+dependencies = [
+ "kiko-eye-protocol",
+ "kiko-head-protocol",
+ "robot-protocol",
+]
+
+[[package]]
 name = "kiko-expression-core"
 version = "0.1.0"
 
