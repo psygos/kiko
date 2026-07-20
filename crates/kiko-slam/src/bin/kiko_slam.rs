@@ -3309,7 +3309,7 @@ enum LiveNavigationRequest {
     Disabled,
     Enabled {
         config_path: PathBuf,
-        goal: NavigationGoalArg,
+        goal: Option<NavigationGoalArg>,
         dataset_path: PathBuf,
         actuation: LiveActuationRequest,
     },
@@ -3334,15 +3334,15 @@ impl LiveNavigationRequest {
         actuation_config_path: Option<PathBuf>,
         exact_robot_id: Option<String>,
     ) -> Result<Self, LiveNavigationBoundaryError> {
-        match (config_path, goal, dataset_path) {
-            (None, None, None) => {
+        match (config_path, dataset_path) {
+            (None, None) if goal.is_none() => {
                 if actuation_config_path.is_some() || exact_robot_id.is_some() {
                     Err(LiveNavigationBoundaryError::ActuationRequiresNavigation)
                 } else {
                     Ok(Self::Disabled)
                 }
             }
-            (Some(config_path), Some(goal), Some(dataset_path)) => {
+            (Some(config_path), Some(dataset_path)) => {
                 let actuation = match (actuation_config_path, exact_robot_id) {
                     (None, None) => LiveActuationRequest::ShadowOnly,
                     (Some(config_path), Some(exact_robot_id)) => LiveActuationRequest::Physical {
@@ -3363,13 +3363,10 @@ impl LiveNavigationRequest {
                     actuation,
                 })
             }
-            (config_path, goal, dataset_path) => {
-                Err(LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: config_path.is_none(),
-                    missing_goal: goal.is_none(),
-                    missing_dataset: dataset_path.is_none(),
-                })
-            }
+            (config_path, dataset_path) => Err(LiveNavigationBoundaryError::IncompleteNavigation {
+                missing_config: config_path.is_none(),
+                missing_dataset: dataset_path.is_none(),
+            }),
         }
     }
 
@@ -3383,7 +3380,6 @@ impl LiveNavigationRequest {
 enum LiveNavigationBoundaryError {
     IncompleteNavigation {
         missing_config: bool,
-        missing_goal: bool,
         missing_dataset: bool,
     },
     IncompleteActuation {
@@ -3399,17 +3395,13 @@ impl std::fmt::Display for LiveNavigationBoundaryError {
         match *self {
             Self::IncompleteNavigation {
                 missing_config,
-                missing_goal,
                 missing_dataset,
             } => {
                 formatter.write_str(
-                    "live navigation requires --navigation-config, --navigation-goal, and --navigation-record together; missing",
+                    "live navigation requires --navigation-config and --navigation-record together; --navigation-goal is optional; missing",
                 )?;
                 if missing_config {
                     formatter.write_str(" --navigation-config")?;
-                }
-                if missing_goal {
-                    formatter.write_str(" --navigation-goal")?;
                 }
                 if missing_dataset {
                     formatter.write_str(" --navigation-record")?;
@@ -3921,14 +3913,15 @@ fn build_live_navigation_viz_message(
     coordinator: &ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
     tick: HostMonotonicTimestamp,
     tick_sequence: i64,
-    goal: NavigationGoalArg,
     outcome: &CoordinatorTickOutcome<NavigationIngressStreamWriteError>,
     applied_actuation: Option<LiveAppliedActuationViz>,
 ) -> LiveNavigationVizMsg {
     let mut warnings = Vec::new();
-    let goal = rerun_point2(goal.point().as_array()).or_else(|| {
-        warnings.push("goal is outside Rerun's finite f32 coordinate domain".to_owned());
-        None
+    let goal = coordinator.current_goal().and_then(|goal| {
+        rerun_point2(goal.point().as_array()).or_else(|| {
+            warnings.push("goal is outside Rerun's finite f32 coordinate domain".to_owned());
+            None
+        })
     });
     let path = coordinator.global_path().and_then(|path| {
         let points = path
@@ -4540,7 +4533,6 @@ struct LiveNavigationWorkerSuccess {
 #[allow(clippy::too_many_arguments)]
 fn run_live_navigation_worker(
     mut coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
-    goal: NavigationGoalArg,
     control_period: ControlPeriodNs,
     clock_origin: Instant,
     #[cfg(feature = "actuation")] actuation_config: Option<NavigationActuationConfigV1>,
@@ -4722,7 +4714,6 @@ fn run_live_navigation_worker(
                             &coordinator,
                             tick,
                             tick_sequence,
-                            goal,
                             &outcome,
                             applied_actuation,
                         );
@@ -5192,7 +5183,7 @@ fn drain_depth_batch(rx: &DropReceiver<DepthImage>) -> Vec<DepthImage> {
 
 #[cfg(feature = "record")]
 struct PreparedLiveNavigationRuntime {
-    goal: NavigationGoalArg,
+    goal: Option<NavigationGoalArg>,
     dataset_path: PathBuf,
     control_period: ControlPeriodNs,
     occupancy_config: Option<OccupancyRuntimeConfig>,
@@ -5211,7 +5202,6 @@ struct PreparedLiveNavigationRuntime {
 #[cfg(feature = "record")]
 struct ActiveLiveNavigation {
     coordinator: ShadowNavigationCoordinator<NavigationIngressWriter<File>>,
-    goal: NavigationGoalArg,
     control_period: ControlPeriodNs,
     dataset_writer: PairedDatasetWriter,
     dataset_handle: DatasetWriterHandle,
@@ -5414,21 +5404,33 @@ fn activate_live_navigation(
                 return fail_navigation_setup_after_dataset(dataset_writer, dataset_handle, source);
             }
         };
-    let coordinator = ShadowNavigationCoordinator::new(
-        clock_epoch,
-        journal,
-        runtime.goal.point(),
-        runtime.odometry,
-        runtime.local_costmap,
-        runtime.global_planner,
-        runtime.reference_builder,
-        runtime.mpc_config,
-        runtime.solver_budget,
-        runtime.safety,
-    );
+    let coordinator = match runtime.goal {
+        Some(goal) => ShadowNavigationCoordinator::new(
+            clock_epoch,
+            journal,
+            goal.point(),
+            runtime.odometry,
+            runtime.local_costmap,
+            runtime.global_planner,
+            runtime.reference_builder,
+            runtime.mpc_config,
+            runtime.solver_budget,
+            runtime.safety,
+        ),
+        None => ShadowNavigationCoordinator::new_without_goal(
+            clock_epoch,
+            journal,
+            runtime.odometry,
+            runtime.local_costmap,
+            runtime.global_planner,
+            runtime.reference_builder,
+            runtime.mpc_config,
+            runtime.solver_budget,
+            runtime.safety,
+        ),
+    };
     Ok(ActiveLiveNavigation {
         coordinator,
-        goal: runtime.goal,
         control_period: runtime.control_period,
         dataset_writer,
         dataset_handle,
@@ -5754,19 +5756,17 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|active| active.actuation.clone());
         let (
             navigation_coordinator,
-            navigation_goal,
             navigation_control_period,
             navigation_dataset_writer,
             navigation_dataset_handle,
         ) = match active_navigation {
             Some(active) => (
                 Some(active.coordinator),
-                Some(active.goal),
                 Some(active.control_period),
                 Some(active.dataset_writer),
                 Some(active.dataset_handle),
             ),
-            None => (None, None, None, None, None),
+            None => (None, None, None, None),
         };
 
         let dense_handle = if let (Some(config), Some(command_rx), stats_tx, snapshot_tx) = (
@@ -5791,7 +5791,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let navigation_handle = match navigation_coordinator {
             Some(coordinator) => {
-                let goal = navigation_goal.expect("enabled navigation has a typed goal");
                 let control_period = navigation_control_period
                     .expect("enabled navigation has a parsed control period");
                 let visual_rx = navigation_visual_rx
@@ -5810,7 +5809,6 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
                 Some(thread::spawn(move || {
                     run_live_navigation_worker(
                         coordinator,
-                        goal,
                         control_period,
                         capture_clock_origin,
                         #[cfg(feature = "actuation")]
@@ -6955,8 +6953,29 @@ mod tests {
             request,
             LiveNavigationRequest::Enabled {
                 config_path,
-                goal,
+                goal: Some(goal),
                 dataset_path,
+                actuation: LiveActuationRequest::ShadowOnly,
+            }
+        );
+    }
+
+    #[test]
+    fn live_navigation_boundary_accepts_safe_mapping_without_an_initial_goal() {
+        let request = LiveNavigationRequest::parse(
+            Some(PathBuf::from("navigation.json")),
+            None,
+            Some(PathBuf::from("capture")),
+            None,
+            None,
+        )
+        .expect("mapping-only navigation request");
+        assert_eq!(
+            request,
+            LiveNavigationRequest::Enabled {
+                config_path: PathBuf::from("navigation.json"),
+                goal: None,
+                dataset_path: PathBuf::from("capture"),
                 actuation: LiveActuationRequest::ShadowOnly,
             }
         );
@@ -6979,7 +6998,7 @@ mod tests {
             request,
             LiveNavigationRequest::Enabled {
                 config_path: PathBuf::from("navigation.json"),
-                goal,
+                goal: Some(goal),
                 dataset_path: PathBuf::from("capture"),
                 actuation: LiveActuationRequest::Physical {
                     config_path: PathBuf::from("actuation.json"),
@@ -7042,16 +7061,14 @@ mod tests {
                 0b001,
                 LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: false,
-                    missing_goal: true,
                     missing_dataset: true,
                 },
-                " --navigation-goal --navigation-record",
+                " --navigation-record",
             ),
             (
                 0b010,
                 LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: true,
-                    missing_goal: false,
                     missing_dataset: true,
                 },
                 " --navigation-config --navigation-record",
@@ -7060,34 +7077,22 @@ mod tests {
                 0b100,
                 LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: true,
-                    missing_goal: true,
                     missing_dataset: false,
                 },
-                " --navigation-config --navigation-goal",
+                " --navigation-config",
             ),
             (
                 0b011,
                 LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: false,
-                    missing_goal: false,
                     missing_dataset: true,
                 },
                 " --navigation-record",
             ),
             (
-                0b101,
-                LiveNavigationBoundaryError::IncompleteNavigation {
-                    missing_config: false,
-                    missing_goal: true,
-                    missing_dataset: false,
-                },
-                " --navigation-goal",
-            ),
-            (
                 0b110,
                 LiveNavigationBoundaryError::IncompleteNavigation {
                     missing_config: true,
-                    missing_goal: false,
                     missing_dataset: false,
                 },
                 " --navigation-config",
@@ -7107,7 +7112,7 @@ mod tests {
             assert_eq!(
                 actual.to_string(),
                 format!(
-                    "live navigation requires --navigation-config, --navigation-goal, and --navigation-record together; missing{missing_flags}"
+                    "live navigation requires --navigation-config and --navigation-record together; --navigation-goal is optional; missing{missing_flags}"
                 ),
                 "present mask {present:#05b}"
             );

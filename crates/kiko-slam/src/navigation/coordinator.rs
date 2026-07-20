@@ -739,6 +739,30 @@ impl<J: NavigationIngressSink> ShadowNavigationCoordinator<J> {
         }
     }
 
+    /// The exact currently bound point goal, if one exists.
+    ///
+    /// Pending CLI input and goals invalidated by a map reset are deliberately
+    /// not exposed as actionable map goals.
+    pub fn current_goal(&self) -> Option<PointGoal> {
+        match self.goal {
+            GoalBinding::Bound(goal) => Some(goal),
+            GoalBinding::Unavailable
+            | GoalBinding::Pending(_)
+            | GoalBinding::Invalidated { .. } => None,
+        }
+    }
+
+    /// Remove every actionable goal and path from this coordinator.
+    ///
+    /// This mutates planning state only; it does not itself claim that a
+    /// controller received zero. The owner must immediately call [`Self::tick`]
+    /// and, in physical mode, retain the resulting exact applied-zero receipt.
+    pub fn clear_goal(&mut self) {
+        self.goal = GoalBinding::Unavailable;
+        self.path = None;
+        self.plan_fault = None;
+    }
+
     pub fn current_map_binding(&self) -> Option<CurrentMapEpochBinding> {
         self.current_map.map(|current| current.binding)
     }
@@ -2264,6 +2288,35 @@ mod tests {
             selected.planning(),
             GlobalPlanningOutcome::Planned(_)
         ));
+    }
+
+    #[test]
+    fn clearing_a_bound_goal_removes_the_path_and_next_tick_records_stop() {
+        let mut coordinator = coordinator(1_000, 10, 2.0);
+        let map = SlamMap::new().snapshot();
+        anchor(&mut coordinator, map);
+        let snapshot = occupancy(map, 1);
+        coordinator
+            .accept_global_map(host(1_050), Timestamp::from_nanos(100), &snapshot)
+            .expect("global map");
+        accept_aligned_depth(&mut coordinator);
+        assert!(coordinator.current_goal().is_some());
+        assert!(coordinator.global_path().is_some());
+
+        coordinator.clear_goal();
+        assert_eq!(coordinator.goal_state(), NavigationGoalState::Unavailable);
+        assert!(coordinator.current_goal().is_none());
+        assert!(coordinator.global_path().is_none());
+
+        let tick = host(1_120);
+        let outcome = coordinator
+            .tick(tick, &mut FixedClock(tick))
+            .expect("goal-free tick records a stop");
+        assert!(matches!(
+            outcome.blocker(),
+            Some(CoordinatorTickBlocker::GoalUnavailable)
+        ));
+        assert!(outcome.decision().record().pwm().is_stop());
     }
 
     #[test]
