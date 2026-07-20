@@ -38,6 +38,36 @@ alive at processing time. Gaps, duplicates, reordering, clock faults, stale or
 future frames, epoch changes, and layout changes are errors which do not
 advance extractor state. A stream restart requires an explicit `reset()`.
 
+## Camera-to-head gaze geometry
+
+`CameraToHeadGazeExtrinsics` parses one finite camera/head origin and one
+non-degenerate camera-to-neutral-head quaternion, normalizes the rotation once,
+and retains its matrix for allocation-free projection. The head-origin vector
+is limited to `1 m`: this is deliberately more than three times the current
+roughly `0.32 m` assembly offset while rejecting centimetre-as-metre and
+millimetre-as-metre mistakes. The OAK camera convention is `+x` image-right,
+`+y` image-down, `+z` forward. Output is explicitly `yaw_right_rad` and
+`pitch_down_rad` in SI radians. Projection subtracts the camera-frame head
+origin before applying the camera-to-neutral-head rotation. Fused dot products
+and stable `atan2`/`hypot` angle geometry are used near the forward plane; a
+plane classification or strict forward-hemisphere angle that cannot be
+represented is a typed error, never a rounded valid gaze.
+
+Target points are finite metres with each `x`/`y` coordinate in `[-10, 10] m`
+and camera-forward depth in `[0.1, 10] m`. These are conservative local
+head-gaze input-policy limits, not claims about OAK ranging accuracy. A camera
+ray is normalized on parsing but cannot be projected by itself: the head and
+camera do not share an origin, so a bounded positive camera-forward depth is
+required to resolve the target point. This prevents an unknown range from being
+silently treated as infinite range and rejects common unit typos without
+clamping.
+
+The Nano schema-v1 RGB policy stores this boundary as an optional, independently
+versioned nested `gaze_geometry`. Absence means projection is unavailable; it
+never assumes identity rotation or zero translation. Geometry output is not a
+head intention, servo pose, calibration certificate, or permission to move
+hardware.
+
 ## Expression to KEP2 mapping
 
 The adapter maps core basis points (`10,000 = 1`) to KEP2 normalized units
