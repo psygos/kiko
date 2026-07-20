@@ -5,6 +5,7 @@ pub mod actuation;
 #[cfg(feature = "actuation")]
 mod actuation_config;
 mod cell_inflation;
+mod control_api;
 mod coordinator;
 mod frames;
 mod frontier;
@@ -25,6 +26,15 @@ pub use actuation_config::{
     ActuationConfigParseError, ActuatorConfigFingerprint, ControllerUid,
     MAX_NAVIGATION_ACTUATION_CONFIG_JSON_BYTES, NAVIGATION_ACTUATION_CONFIG_V1,
     NavigationActuationConfigV1, NavigationConfigSha256, OperatorClaimedPhysicalApprovalV1,
+};
+pub use control_api::{
+    AGENT_CONTROL_SCHEMA_V1, AgentBaseCommandStateV1, AgentControlCommandKindV1,
+    AgentControlCommandV1, AgentControlCompletionV1, AgentControlRejectionCodeV1,
+    AgentControlRequestId, AgentControlRequestParseError, AgentControlRequestParser,
+    AgentControlRequestV1, AgentControlResponseKindV1, AgentControlResponseV1,
+    AgentControlStatusV1, AgentLocalizationStateV1, AgentManualStopV1, AgentManualVelocityV1,
+    AgentMapStateV1, AgentOperatingModeV1, AgentRuntimeStateV1,
+    MAX_AGENT_CONTROL_REQUEST_JSON_BYTES, ManualVelocityComponentV1,
 };
 pub use coordinator::{
     CoordinatorAdmissionError, CoordinatorLatch, CoordinatorTickBlocker, CoordinatorTickError,
