@@ -3140,6 +3140,15 @@ name = "kiko-head-protocol"
 version = "0.1.0"
 
 [[package]]
+name = "kiko-head-runtime"
+version = "0.1.0"
+dependencies = [
+ "kiko-head-protocol",
+ "tokio",
+ "tokio-serial",
+]
+
+[[package]]
 name = "kiko-slam"
 version = "0.1.0"
 dependencies = [
