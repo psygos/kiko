@@ -43,10 +43,10 @@ pub use asset_io::{
     load_deployment_asset,
 };
 pub use bounded::{
-    ArtifactId, BoundedTextError, BuildProvenance, ControlEndpointIdentity, MAX_ARTIFACT_ID_BYTES,
-    MAX_BUILD_PROVENANCE_BYTES, MAX_CONTROL_ENDPOINT_ID_BYTES, MAX_OAK_MXID_BYTES,
-    MAX_ROBOT_ID_BYTES, MAX_SERIAL_BY_ID_PATH_BYTES, OakMxid, PersistentSerialPath, RobotId,
-    Sha256Id,
+    ArtifactId, BoundedTextError, BuildProvenance, ControlEndpointIdentity,
+    ControlEndpointTransport, MAX_ARTIFACT_ID_BYTES, MAX_BUILD_PROVENANCE_BYTES,
+    MAX_CONTROL_ENDPOINT_ID_BYTES, MAX_OAK_MXID_BYTES, MAX_ROBOT_ID_BYTES,
+    MAX_SERIAL_BY_ID_PATH_BYTES, OakMxid, PersistentSerialPath, RobotId, Sha256Id,
 };
 pub use compare::{InventoryComparison, InventoryMismatch, MAX_INVENTORY_MISMATCHES};
 pub use manifest::{

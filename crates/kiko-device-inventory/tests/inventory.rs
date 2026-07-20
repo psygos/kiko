@@ -300,6 +300,11 @@ fn serial_paths_and_control_endpoints_must_be_persistent_and_local() {
         "tcp://0.0.0.0:5000",
         "tcp://192.168.50.2:5000",
         "tcp://127.0.0.1:0",
+        "tcp://127.0.0.1:05000",
+        "udp://0.0.0.0:5000",
+        "udp://192.168.50.2:5000",
+        "udp://127.0.0.1:0",
+        "udp://127.0.0.1:05000",
     ] {
         let mut dto = manifest_dto();
         dto.stm32.control_endpoint_identity = invalid.into();
@@ -311,6 +316,19 @@ fn serial_paths_and_control_endpoints_must_be_persistent_and_local() {
             })
         ));
     }
+
+    let mut dto = manifest_dto();
+    dto.stm32.control_endpoint_identity = "udp://127.0.0.1:8080".into();
+    let parsed = DeviceInventoryManifestV1::parse(dto).expect("local UDP endpoint");
+    let endpoint = *parsed.stm32().control_endpoint();
+    assert_eq!(
+        endpoint.transport(),
+        kiko_device_inventory::ControlEndpointTransport::Udp
+    );
+    assert_eq!(
+        endpoint.socket_addr(),
+        Some("127.0.0.1:8080".parse().expect("socket"))
+    );
 }
 
 #[test]

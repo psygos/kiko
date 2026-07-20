@@ -1,4 +1,5 @@
 use core::fmt;
+use std::net::SocketAddr;
 
 pub const MAX_ROBOT_ID_BYTES: usize = 64;
 pub const MAX_OAK_MXID_BYTES: usize = 64;
@@ -202,26 +203,50 @@ impl fmt::Debug for PersistentSerialPath {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ControlEndpointIdentity(BoundedAscii<MAX_CONTROL_ENDPOINT_ID_BYTES>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ControlEndpointTransport {
+    Unix,
+    Tcp,
+    Udp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ControlEndpointIdentity {
+    text: BoundedAscii<MAX_CONTROL_ENDPOINT_ID_BYTES>,
+    transport: ControlEndpointTransport,
+    socket_addr: Option<SocketAddr>,
+}
 
 impl ControlEndpointIdentity {
     pub(crate) fn parse(value: String) -> Result<Self, BoundedTextError> {
         let parsed = BoundedAscii::parse(value, endpoint_byte)?;
         let text = parsed.as_str();
-        let valid = text.strip_prefix("unix:").is_some_and(valid_unix_path)
-            || text
-                .strip_prefix("tcp://127.0.0.1:")
-                .is_some_and(valid_port)
-            || text.strip_prefix("tcp://[::1]:").is_some_and(valid_port);
-        if !valid {
+        let (transport, socket_addr) = if text.strip_prefix("unix:").is_some_and(valid_unix_path) {
+            (ControlEndpointTransport::Unix, None)
+        } else if let Some(socket) = parse_loopback_socket(text, "tcp://") {
+            (ControlEndpointTransport::Tcp, Some(socket))
+        } else if let Some(socket) = parse_loopback_socket(text, "udp://") {
+            (ControlEndpointTransport::Udp, Some(socket))
+        } else {
             return Err(BoundedTextError::InvalidControlEndpoint);
-        }
-        Ok(Self(parsed))
+        };
+        Ok(Self {
+            text: parsed,
+            transport,
+            socket_addr,
+        })
     }
 
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.text.as_str()
+    }
+
+    pub const fn transport(self) -> ControlEndpointTransport {
+        self.transport
+    }
+
+    pub const fn socket_addr(self) -> Option<SocketAddr> {
+        self.socket_addr
     }
 }
 
@@ -234,11 +259,10 @@ impl fmt::Debug for ControlEndpointIdentity {
     }
 }
 
-fn valid_port(value: &str) -> bool {
-    !value.is_empty()
-        && (value.len() == 1 || !value.starts_with('0'))
-        && value.bytes().all(|byte| byte.is_ascii_digit())
-        && value.parse::<u16>().is_ok_and(|port| port != 0)
+fn parse_loopback_socket(text: &str, scheme: &str) -> Option<SocketAddr> {
+    let socket = text.strip_prefix(scheme)?.parse::<SocketAddr>().ok()?;
+    (socket.ip().is_loopback() && socket.port() != 0 && format!("{scheme}{socket}") == text)
+        .then_some(socket)
 }
 
 fn valid_unix_path(value: &str) -> bool {
@@ -291,6 +315,8 @@ mod tests {
             "unix:/run/kiko/robot.sock",
             "tcp://127.0.0.1:5000",
             "tcp://[::1]:5000",
+            "udp://127.0.0.1:5000",
+            "udp://[::1]:5000",
         ] {
             assert!(
                 ControlEndpointIdentity::parse(valid.into()).is_ok(),
@@ -303,6 +329,8 @@ mod tests {
             "tcp://127.0.0.1:0",
             "tcp://127.0.0.1:05000",
             "tcp://127.0.0.1:70000",
+            "udp://0.0.0.0:5000",
+            "udp://127.0.0.1:05000",
             "unix:/run/../tmp/robot.sock",
             "unix:/run//kiko.sock",
         ] {
