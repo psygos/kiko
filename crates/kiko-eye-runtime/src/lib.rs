@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod actor;
+mod commission;
 mod config;
 mod framing;
 mod identity_probe;
@@ -31,6 +32,10 @@ pub use actor::{
     HandleRequestError, PriorReleaseAttempt, ProtocolExchange, ReleaseEvidence, ReleaseReport,
     RuntimeFaultCause, StartupEvidence, StartupReceipt, StartupReceiptError, spawn_eye_actor,
     start_serial_eye_actor,
+};
+pub use commission::{
+    COMMISSIONING_INTENT_LEASE_MS, COMMISSIONING_MAX_HOLD_MS, COMMISSIONING_STEP_COUNT,
+    CommissioningPrepareError, EyeCommissioningStep, eye_commissioning_steps,
 };
 
 pub use config::{

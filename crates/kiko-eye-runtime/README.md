@@ -96,6 +96,38 @@ ID, device uptime, capability bits, challenge, and serial-setting readback. It
 is a nonce-bound firmware claim only; it does not prove optical output, panel
 wiring, or fallback visibility. Stop every eye owner before running it.
 
+## Eye-only expression commissioning
+
+After copying the exact UID, build ID, and capability bits from the identity
+probe into the deployment manifest, `kep2_eye_commission` exercises the normal
+typed actor rather than reimplementing KEP2. It opens only the exact eye serial
+path, verifies that complete pinned identity, acquires renderer control with
+fresh OS-generated session material, and runs one fixed nominal 3.2-second recipe:
+neutral, curious-left, greet-right, blink-center, and neutral. The command has
+no base, head, or camera interface.
+
+```bash
+cargo run --locked --release -p kiko-eye-runtime --bin kep2_eye_commission -- \
+  --serial-device /dev/serial/by-id/<exact-eye-identity> \
+  --expected-device-uid-hex <32-hex-digits> \
+  --expected-firmware-build-id-hex <64-hex-digits> \
+  --expected-capabilities-bits <u32-decimal> \
+  --execute-eye-sequence
+```
+
+Every apply has a 1.8-second firmware lease. The configured maximum response
+wait, complete write-attempt budget, and longest requested hold total 1.5
+seconds, leaving 300 milliseconds of protocol-budget margin before that lease;
+scheduler stalls remain bounded by firmware fallback. Normal completion, and Ctrl-C when
+observed during a visual hold, request a graceful release and require the
+actor's final admission count, last admission, release report, and termination
+reason to agree. Transport operations are bounded; after any ungraceful host
+loss the final lease bounds the time until firmware autonomous fallback. The
+resulting JSON records serial readback, identity/acquisition binding, every
+exact requested intent and firmware admission, and confirmed release. Those
+are protocol facts, not proof that either physical panel emitted the intended
+pixels; the operator must still confirm the visible sequence.
+
 ## Failure and evidence semantics
 
 Timeout, stale/future expression input, malformed or unexpected messages,

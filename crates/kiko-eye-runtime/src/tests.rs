@@ -21,12 +21,12 @@ use kiko_eye_protocol::{
 };
 
 use crate::{
-    ActorTermination, AsyncByteTransport, CancellationCause, CleanupOutcome, EyeRuntimeConfig,
-    EyeSessionMaterial, EyeSessionMaterialError, EyeSessionMaterialGenerator,
-    EyeSessionMaterialInput, FrameReadError, FrameWriteFailure, HandleRequestError, MonotonicClock,
-    ProtocolExchange, ReleaseReport, RuntimeFaultCause, StaticEyeRuntimeConfig,
-    StaticEyeRuntimeConfigInput, TransportFailure, TransportOperation,
-    spawn_eye_actor as try_spawn_eye_actor,
+    ActorTermination, AsyncByteTransport, COMMISSIONING_INTENT_LEASE_MS, CancellationCause,
+    CleanupOutcome, EyeRuntimeConfig, EyeSessionMaterial, EyeSessionMaterialError,
+    EyeSessionMaterialGenerator, EyeSessionMaterialInput, FrameReadError, FrameWriteFailure,
+    HandleRequestError, MonotonicClock, ProtocolExchange, ReleaseReport, RuntimeFaultCause,
+    StaticEyeRuntimeConfig, StaticEyeRuntimeConfigInput, TransportFailure, TransportOperation,
+    eye_commissioning_steps, spawn_eye_actor as try_spawn_eye_actor,
 };
 
 fn spawn_eye_actor<T, C>(
@@ -262,6 +262,10 @@ fn encode_messages(messages: impl IntoIterator<Item = Message>) -> Vec<u8> {
 }
 
 fn config() -> EyeRuntimeConfig {
+    config_with_lease(100)
+}
+
+fn config_with_lease(intent_lease_ms: u16) -> EyeRuntimeConfig {
     let policy = StaticEyeRuntimeConfig::parse(StaticEyeRuntimeConfigInput {
         device_path: "/dev/serial/by-id/kiko-eye-001".to_owned(),
         baud_rate_bps: 115_200,
@@ -272,7 +276,7 @@ fn config() -> EyeRuntimeConfig {
         expected_device_uid: [1; 16],
         expected_firmware_build_id: [2; 32],
         expected_capabilities_bits: REQUIRED_EYE_CAPABILITIES,
-        intent_lease_ms: 100,
+        intent_lease_ms,
     })
     .expect("test policy");
     policy
@@ -416,6 +420,84 @@ async fn partial_io_nominal_handshake_apply_and_release_are_exact() {
     assert!(matches!(written[1], Message::AcquireControl(_)));
     assert!(matches!(written[2], Message::ApplyIntent(_)));
     assert!(matches!(written[3], Message::ReleaseControl(_)));
+}
+
+#[tokio::test]
+async fn fixed_commissioning_recipe_acquires_applies_and_releases_consistently() {
+    let mut inbound = Vec::from(handshake_messages());
+    for sequence in 0..u32::try_from(crate::COMMISSIONING_STEP_COUNT).expect("bounded steps") {
+        let applied_at_ms = 120 + u64::from(sequence) * 10;
+        inbound.push(Message::IntentResult(intent_result(
+            boot(7),
+            epoch(13),
+            sequence,
+            IntentResultCode::AppliedNew,
+            applied_at_ms,
+            applied_at_ms + u64::from(COMMISSIONING_INTENT_LEASE_MS),
+            sequence + 1,
+        )));
+    }
+    inbound.push(Message::IntentResult(intent_result(
+        boot(7),
+        epoch(13),
+        u32::try_from(crate::COMMISSIONING_STEP_COUNT).expect("bounded steps"),
+        IntentResultCode::Released,
+        180,
+        180,
+        u32::try_from(crate::COMMISSIONING_STEP_COUNT + 1).expect("bounded steps"),
+    )));
+
+    let clock = FakeClock::default();
+    let (transport, probe) = FakeTransport::new(encode_messages(inbound), clock.clone());
+    let (mut handle, startup, task) = spawn_eye_actor(
+        transport,
+        clock.clone(),
+        config_with_lease(COMMISSIONING_INTENT_LEASE_MS),
+    );
+    startup.wait().await.expect("receipt").expect("startup");
+
+    let mut expected_intents = Vec::new();
+    for step in eye_commissioning_steps() {
+        let prepared = step.prepare(clock.now().expect("clock")).expect("recipe");
+        expected_intents.push(prepared.intent());
+        handle.apply_intent(prepared).await.expect("admission");
+    }
+    let release = handle.shutdown().await.expect("release report");
+    assert!(matches!(release, ReleaseReport::Released(_)));
+    let exit = task.join().await.expect("actor join");
+    assert_eq!(exit.termination(), &ActorTermination::RequestedShutdown);
+    assert_eq!(
+        exit.admitted_intent_count(),
+        u64::try_from(crate::COMMISSIONING_STEP_COUNT).expect("bounded steps")
+    );
+    assert_eq!(
+        exit.last_admission()
+            .expect("last admission")
+            .admission()
+            .sequence(),
+        IntentSequence::new(
+            u32::try_from(crate::COMMISSIONING_STEP_COUNT - 1).expect("bounded steps")
+        )
+    );
+
+    let written = probe.written_messages();
+    assert_eq!(written.len(), crate::COMMISSIONING_STEP_COUNT + 3);
+    for (index, expected) in expected_intents.into_iter().enumerate() {
+        let Message::ApplyIntent(actual) = written[index + 2] else {
+            panic!("commissioning write {index} was not an ApplyIntent")
+        };
+        assert_eq!(
+            actual.sequence,
+            IntentSequence::new(u32::try_from(index).expect("bounded steps"))
+        );
+        assert_eq!(actual.lease.get(), COMMISSIONING_INTENT_LEASE_MS);
+        assert_eq!(actual.intent, expected);
+    }
+    assert!(matches!(
+        written.last(),
+        Some(Message::ReleaseControl(release))
+            if release.reason == ReleaseReason::HostShutdown
+    ));
 }
 
 #[tokio::test]
