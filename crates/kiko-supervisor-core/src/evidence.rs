@@ -2,7 +2,8 @@ use core::fmt;
 use core::num::NonZeroU64;
 
 use robot_protocol::v2::{
-    AppliedResult, AppliedResultCode, ControlEpoch, ControllerBootId, ControllerUid, OutputState,
+    AppliedResult, AppliedResultCode, ControlEpoch, ControllerBootId, ControllerFaults,
+    ControllerUid, HostCommandResult, HostCommandResultCode, OutputState, TimerPwm,
     V2CommandSequence,
 };
 
@@ -127,30 +128,89 @@ impl ConfirmedBaseZero {
                 result: result.result,
             });
         }
-        if !result.timer_pwm.is_zero() {
+        Self::try_from_parts(
+            result.controller_uid,
+            result.boot_id,
+            result.control_epoch,
+            result.sequence,
+            result.result,
+            result.timer_pwm,
+            result.output_state,
+            result.faults,
+            observed_at,
+        )
+    }
+
+    /// Admit the exact host-server result retained by a verified command
+    /// receipt without reconstructing a controller wire message.
+    ///
+    /// The host request itself must have requested zero. A nonzero command
+    /// that happened to stop cannot satisfy the supervisor's deliberate
+    /// post-stop zero-command gate.
+    pub fn try_from_host_command_result(
+        result: HostCommandResult,
+        observed_at: MonotonicInstant,
+    ) -> Result<Self, ZeroEvidenceError> {
+        if !result.requested_timer_pwm.is_zero() {
+            return Err(ZeroEvidenceError::RequestedNonzeroPwm {
+                left: result.requested_timer_pwm.left().get(),
+                right: result.requested_timer_pwm.right().get(),
+            });
+        }
+        let controller_result = match result.result {
+            HostCommandResultCode::AppliedNew => AppliedResultCode::AppliedNew,
+            HostCommandResultCode::Stopped => AppliedResultCode::Stopped,
+            result => {
+                return Err(ZeroEvidenceError::HostResultDoesNotProveFreshApplication { result });
+            }
+        };
+        Self::try_from_parts(
+            result.controller_uid,
+            result.boot_id,
+            result.control_epoch,
+            result.sequence,
+            controller_result,
+            result.controller_timer_pwm,
+            result.output_state,
+            result.faults,
+            observed_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_from_parts(
+        controller_uid: ControllerUid,
+        controller_boot_id: ControllerBootId,
+        control_epoch: ControlEpoch,
+        sequence: V2CommandSequence,
+        result: AppliedResultCode,
+        timer_pwm: TimerPwm,
+        output_state: OutputState,
+        faults: ControllerFaults,
+        observed_at: MonotonicInstant,
+    ) -> Result<Self, ZeroEvidenceError> {
+        if !timer_pwm.is_zero() {
             return Err(ZeroEvidenceError::NonzeroPwm {
-                left: result.timer_pwm.left().get(),
-                right: result.timer_pwm.right().get(),
+                left: timer_pwm.left().get(),
+                right: timer_pwm.right().get(),
             });
         }
-        if !result.output_state.is_safe() {
-            return Err(ZeroEvidenceError::UnsafeOutputState {
-                output_state: result.output_state,
-            });
+        if !output_state.is_safe() {
+            return Err(ZeroEvidenceError::UnsafeOutputState { output_state });
         }
-        if !result.faults.is_clear() {
+        if !faults.is_clear() {
             return Err(ZeroEvidenceError::ControllerFaults {
-                bits: result.faults.bits(),
+                bits: faults.bits(),
             });
         }
         Ok(Self {
-            controller_uid: result.controller_uid,
-            controller_boot_id: result.boot_id,
-            control_epoch: result.control_epoch,
-            sequence: result.sequence,
+            controller_uid,
+            controller_boot_id,
+            control_epoch,
+            sequence,
             observed_at,
-            result: result.result,
-            output_state: result.output_state,
+            result,
+            output_state,
         })
     }
 
@@ -200,6 +260,8 @@ impl core::error::Error for EvidenceValueError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZeroEvidenceError {
     ResultDoesNotProveApplication { result: AppliedResultCode },
+    HostResultDoesNotProveFreshApplication { result: HostCommandResultCode },
+    RequestedNonzeroPwm { left: i8, right: i8 },
     NonzeroPwm { left: i8, right: i8 },
     UnsafeOutputState { output_state: OutputState },
     ControllerFaults { bits: u32 },

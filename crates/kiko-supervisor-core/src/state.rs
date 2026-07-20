@@ -628,8 +628,8 @@ mod tests {
     use robot_protocol::ControllerUptimeMsWrapping;
     use robot_protocol::v2::{
         AppliedResult, AppliedResultCode, ControlEpoch, ControllerBootId,
-        ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid, OutputState, TimerPwm,
-        V2CommandSequence,
+        ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid, HostCommandResult,
+        HostCommandResultCode, OutputState, RemainingLeaseMs, TimerPwm, V2CommandSequence,
     };
 
     use super::*;
@@ -927,6 +927,38 @@ mod tests {
             Err(ZeroEvidenceError::ResultDoesNotProveApplication {
                 result: AppliedResultCode::DuplicateCached
             })
+        ));
+
+        let host = HostCommandResult {
+            controller_uid: uid(),
+            boot_id: boot(),
+            control_epoch: ControlEpoch::try_new(9).unwrap(),
+            sequence: V2CommandSequence::FIRST,
+            result: HostCommandResultCode::AppliedNew,
+            requested_timer_pwm: TimerPwm::ZERO,
+            controller_timer_pwm: TimerPwm::ZERO,
+            output_state: OutputState::ZeroPwm,
+            controller_applied_at: ControllerUptimeMsWrapping::new(1),
+            controller_expires_at: ControllerDeadlineMsWrapping::new(2),
+            remaining_lease: RemainingLeaseMs::ZERO,
+            faults: ControllerFaults::NONE,
+        };
+        assert!(ConfirmedBaseZero::try_from_host_command_result(host, at(1)).is_ok());
+
+        let mut cached_host = host;
+        cached_host.result = HostCommandResultCode::DuplicateCached;
+        assert!(matches!(
+            ConfirmedBaseZero::try_from_host_command_result(cached_host, at(1)),
+            Err(ZeroEvidenceError::HostResultDoesNotProveFreshApplication {
+                result: HostCommandResultCode::DuplicateCached
+            })
+        ));
+
+        let mut nonzero_request = host;
+        nonzero_request.requested_timer_pwm = TimerPwm::try_new(1, -1).unwrap();
+        assert!(matches!(
+            ConfirmedBaseZero::try_from_host_command_result(nonzero_request, at(1)),
+            Err(ZeroEvidenceError::RequestedNonzeroPwm { left: 1, right: -1 })
         ));
     }
 }
