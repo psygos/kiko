@@ -93,6 +93,23 @@ pub struct ControllerServerConfigV1 {
 }
 
 impl ControllerServerConfigV1 {
+    /// Parse one already bounded controller JSON document into the exact
+    /// server-side domain contract.
+    ///
+    /// This does not open the serial device or prove that the configured
+    /// identity is present. A caller that loaded the bytes from an immutable
+    /// deployment asset can cross-bind the returned values to device
+    /// inventory before either process is allowed to use them.
+    pub fn parse_json(bytes: &[u8]) -> Result<Self, ServerConfigError> {
+        if bytes.len() > MAX_CONTROLLER_SERVER_CONFIG_JSON_BYTES {
+            return Err(ServerConfigError::InputBytesTooLarge {
+                actual_bytes: bytes.len(),
+                maximum_bytes: MAX_CONTROLLER_SERVER_CONFIG_JSON_BYTES,
+            });
+        }
+        parse_controller_config(bytes)
+    }
+
     pub fn serial_device(&self) -> &Path {
         &self.serial_device
     }
@@ -175,6 +192,10 @@ pub enum ServerConfigError {
         actual_at_least_bytes: usize,
         maximum_bytes: usize,
     },
+    InputBytesTooLarge {
+        actual_bytes: usize,
+        maximum_bytes: usize,
+    },
     Json(serde_json::Error),
     UnsupportedSchemaVersion(u32),
     SerialDeviceIsNotAbsolute,
@@ -229,6 +250,13 @@ impl fmt::Display for ServerConfigError {
                 formatter,
                 "controller config {} is at least {actual_at_least_bytes} bytes; maximum is {maximum_bytes}",
                 path.display()
+            ),
+            Self::InputBytesTooLarge {
+                actual_bytes,
+                maximum_bytes,
+            } => write!(
+                formatter,
+                "controller config input is {actual_bytes} bytes; maximum is {maximum_bytes}"
             ),
             Self::Json(source) => write!(formatter, "invalid controller config JSON: {source}"),
             Self::UnsupportedSchemaVersion(version) => {
@@ -589,7 +617,9 @@ mod tests {
     }
 
     fn parse(value: &Value) -> Result<ControllerServerConfigV1, ServerConfigError> {
-        parse_controller_config(&serde_json::to_vec(value).expect("serialize fixture"))
+        ControllerServerConfigV1::parse_json(
+            &serde_json::to_vec(value).expect("serialize fixture"),
+        )
     }
 
     #[test]
@@ -650,6 +680,18 @@ mod tests {
         assert!(matches!(
             args.into_runtime(),
             Err(ServerConfigError::CommandBindIsNotLoopback(_))
+        ));
+    }
+
+    #[test]
+    fn shared_slice_boundary_rejects_oversized_input_before_json_decode() {
+        let bytes = vec![b' '; MAX_CONTROLLER_SERVER_CONFIG_JSON_BYTES + 1];
+        assert!(matches!(
+            ControllerServerConfigV1::parse_json(&bytes),
+            Err(ServerConfigError::InputBytesTooLarge {
+                actual_bytes,
+                maximum_bytes: MAX_CONTROLLER_SERVER_CONFIG_JSON_BYTES,
+            }) if actual_bytes == bytes.len()
         ));
     }
 }

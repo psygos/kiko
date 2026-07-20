@@ -3,10 +3,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 mod actuation_v2;
-mod config;
 mod deadline;
 mod protocol;
 use protocol::*;
+use robot_server::config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
