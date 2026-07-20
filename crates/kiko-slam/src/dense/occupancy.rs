@@ -943,6 +943,29 @@ impl OccupancyGridSnapshot {
         (self.metadata, self.class_ids)
     }
 
+    /// Makes an independently owned copy for a second bounded consumer.
+    ///
+    /// Snapshot ownership is normally moved so the grid buffer is never
+    /// copied. Live navigation is the exceptional fan-out: it must retain the
+    /// exact map revision used for delayed control requests while Rerun owns
+    /// the same revision's segmentation buffer. Keeping this operation
+    /// explicit prevents an accidental full-grid copy through `Clone`, and
+    /// reports allocation failure instead of aborting the process.
+    pub fn try_duplicate(&self) -> Result<Self, OccupancyError> {
+        let mut class_ids = Vec::new();
+        try_reserve(
+            &mut class_ids,
+            self.class_ids.len(),
+            "duplicated occupancy snapshot cells",
+        )?;
+        class_ids.extend_from_slice(&self.class_ids);
+        Ok(Self {
+            class_ids,
+            metadata: self.metadata,
+            geometry: self.geometry,
+        })
+    }
+
     pub fn width(&self) -> u32 {
         self.metadata.width()
     }
@@ -3078,6 +3101,29 @@ mod tests {
         assert_eq!(metadata.width(), 6);
         assert_eq!(metadata.height(), 6);
         assert_eq!(owned, expected);
+    }
+
+    #[test]
+    fn explicit_snapshot_duplication_preserves_exact_identity_and_storage_independence() {
+        let mut mapper = test_mapper(1, 1);
+        mapper
+            .integrate(
+                keyframe(0),
+                WorldToCamera::identity(),
+                &depth(1, 1, vec![2.0]),
+            )
+            .expect("integration");
+        let snapshot = mapper.snapshot().expect("snapshot");
+        let duplicate = snapshot.try_duplicate().expect("bounded duplicate");
+
+        assert_eq!(duplicate.metadata(), snapshot.metadata());
+        assert_eq!(duplicate.geometry(), snapshot.geometry());
+        assert_eq!(duplicate.class_ids(), snapshot.class_ids());
+        assert_ne!(
+            duplicate.class_ids().as_ptr(),
+            snapshot.class_ids().as_ptr(),
+            "the second consumer must own independent storage"
+        );
     }
 
     #[test]

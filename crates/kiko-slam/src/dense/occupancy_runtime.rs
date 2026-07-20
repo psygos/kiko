@@ -82,6 +82,17 @@ impl TimedOccupancySnapshot {
     pub fn into_parts(self) -> (Timestamp, OccupancyGridSnapshot) {
         (self.timestamp, self.snapshot)
     }
+
+    /// Duplicates this exact timestamped revision for a second owner.
+    ///
+    /// See [`OccupancyGridSnapshot::try_duplicate`]. The allocation remains
+    /// explicit because a complete occupancy grid can be large.
+    pub fn try_duplicate(&self) -> Result<Self, OccupancyError> {
+        Ok(Self {
+            timestamp: self.timestamp,
+            snapshot: self.snapshot.try_duplicate()?,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -520,6 +531,32 @@ mod tests {
         assert_eq!(final_snapshot.timestamp(), Timestamp::from_nanos(30));
         assert_eq!(final_snapshot.snapshot().metadata().revision(), 3);
         assert!(runtime.finish(true).expect("second finish").is_none());
+    }
+
+    #[test]
+    fn timed_snapshot_duplicate_preserves_timestamp_and_revision() {
+        let ids = mapped_keyframes(1);
+        let mut runtime = OccupancyRuntime::try_new(runtime_config(1)).expect("runtime");
+        let original = runtime
+            .process(integrate(ids[0], 10), true)
+            .expect("integration")
+            .snapshot
+            .expect("cadence snapshot");
+        let duplicate = original.try_duplicate().expect("bounded duplicate");
+
+        assert_eq!(duplicate.timestamp(), original.timestamp());
+        assert_eq!(
+            duplicate.snapshot().metadata(),
+            original.snapshot().metadata()
+        );
+        assert_eq!(
+            duplicate.snapshot().class_ids(),
+            original.snapshot().class_ids()
+        );
+        assert_ne!(
+            duplicate.snapshot().class_ids().as_ptr(),
+            original.snapshot().class_ids().as_ptr()
+        );
     }
 
     #[test]
