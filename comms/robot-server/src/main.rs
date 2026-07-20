@@ -14,8 +14,25 @@ async fn main() -> Result<()> {
     log::info!("Starting Kiko Robot Server...");
 
     let runtime_config = config::ServerArgs::parse_runtime()?;
+    if runtime_config.legacy_http_camera_enabled() {
+        log::warn!(
+            "legacy HTTP/camera service explicitly enabled; its state is not V2 controller evidence"
+        );
+        let state = Arc::new(RwLock::new(RobotState::default()));
+        tokio::try_join!(run_v2(runtime_config), async {
+            protocol::http_service(state)
+                .await
+                .context("legacy HTTP/camera service stopped")
+        },)?;
+    } else {
+        log::info!("legacy HTTP/camera service disabled; running the typed V2 owner only");
+        run_v2(runtime_config).await?;
+    }
 
-    let state = Arc::new(RwLock::new(RobotState::default()));
+    Ok(())
+}
+
+async fn run_v2(runtime_config: config::ServerRuntimeConfig) -> Result<()> {
     let command_bind = runtime_config.command_bind();
     if let Some(controller) = runtime_config.controller() {
         log::info!(
@@ -35,48 +52,22 @@ async fn main() -> Result<()> {
                             .await
                             .context("V2 command service stopped")
                     },
-                    async {
-                        protocol::http_service(state)
-                            .await
-                            .context("HTTP telemetry service stopped")
-                    },
                     supervise_actuation_actor(actor),
                 )?;
             }
             Err(source) => {
-                log::error!(
-                    "configured V2 controller is unavailable ({source}); serving typed disconnected status"
+                return Err(source).context(
+                    "configured V2 controller could not start; refusing a degraded server",
                 );
-                tokio::try_join!(
-                    async {
-                        actuation_v2::unavailable_udp_service(command_bind)
-                            .await
-                            .context("unavailable V2 status service stopped")
-                    },
-                    async {
-                        protocol::http_service(state)
-                            .await
-                            .context("HTTP telemetry service stopped")
-                    },
-                )?;
             }
         }
     } else {
         log::warn!(
             "no controller authority supplied; V2 actuation is unavailable and status reports disconnected"
         );
-        tokio::try_join!(
-            async {
-                actuation_v2::unavailable_udp_service(command_bind)
-                    .await
-                    .context("unavailable V2 status service stopped")
-            },
-            async {
-                protocol::http_service(state)
-                    .await
-                    .context("HTTP telemetry service stopped")
-            },
-        )?;
+        actuation_v2::unavailable_udp_service(command_bind)
+            .await
+            .context("unavailable V2 status service stopped")?;
     }
 
     Ok(())
@@ -86,9 +77,8 @@ async fn supervise_actuation_actor(
     actor: tokio::task::JoinHandle<std::result::Result<(), actuation_v2::ActuationActorError>>,
 ) -> Result<()> {
     match actor.await {
-        Ok(Ok(())) => log::error!("V2 controller actor ended unexpectedly without an error"),
-        Ok(Err(source)) => log::error!("V2 controller actor failed: {source}"),
-        Err(source) => log::error!("V2 controller actor task failed: {source}"),
+        Ok(Ok(())) => anyhow::bail!("V2 controller actor ended unexpectedly without an error"),
+        Ok(Err(source)) => Err(source).context("V2 controller actor failed"),
+        Err(source) => Err(source).context("V2 controller actor task failed"),
     }
-    Ok(())
 }

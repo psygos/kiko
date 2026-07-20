@@ -161,6 +161,7 @@ The authoritative runtime status is the typed V2 `StatusQuery`/`StatusReport`
 path. Rerun records the host's exact applied receipts and the reported
 remaining lease at server emission for diagnosis, but it does not observe wheel
 motion and is not physical evidence.
-The existing HTTP telemetry surface is deliberately connected to a no-op V2
-telemetry adapter in this milestone; its legacy controller-diagnostic field is
-`null` and must not be used to infer V2 actuation state.
+`robot-server` now runs only the typed V2 controller owner by default. The
+obsolete HTTP/camera service requires the explicit `--legacy-http-camera`
+opt-in; it remains disconnected from V2 telemetry and must never be used to
+infer controller state. The Nano controller-owner unit does not enable it.

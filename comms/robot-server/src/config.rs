@@ -28,6 +28,11 @@ pub struct ServerArgs {
     /// Strict external controller authority JSON. Absence keeps actuation unavailable.
     #[arg(long, value_name = "CONFIG_JSON")]
     controller_config: Option<PathBuf>,
+    /// Opt in to the obsolete public HTTP/camera service. Disabled by default
+    /// so the typed controller owner neither scans cameras nor publishes
+    /// telemetry from the unrelated legacy state store.
+    #[arg(long, default_value_t = false)]
+    legacy_http_camera: bool,
 }
 
 impl ServerArgs {
@@ -52,6 +57,7 @@ impl ServerArgs {
         Ok(ServerRuntimeConfig {
             command_bind: self.command_bind,
             controller,
+            legacy_http_camera: self.legacy_http_camera,
         })
     }
 }
@@ -60,6 +66,7 @@ impl ServerArgs {
 pub struct ServerRuntimeConfig {
     command_bind: SocketAddr,
     controller: Option<ControllerServerConfigV1>,
+    legacy_http_camera: bool,
 }
 
 impl ServerRuntimeConfig {
@@ -69,6 +76,10 @@ impl ServerRuntimeConfig {
 
     pub const fn controller(&self) -> Option<&ControllerServerConfigV1> {
         self.controller.as_ref()
+    }
+
+    pub const fn legacy_http_camera_enabled(&self) -> bool {
+        self.legacy_http_camera
     }
 }
 
@@ -260,7 +271,10 @@ impl fmt::Display for ServerConfigError {
             ),
             Self::Json(source) => write!(formatter, "invalid controller config JSON: {source}"),
             Self::UnsupportedSchemaVersion(version) => {
-                write!(formatter, "unsupported controller server config schema {version}")
+                write!(
+                    formatter,
+                    "unsupported controller server config schema {version}"
+                )
             }
             Self::SerialDeviceIsNotAbsolute => {
                 formatter.write_str("serial_device must be an absolute path")
@@ -274,7 +288,10 @@ impl fmt::Display for ServerConfigError {
                 "{field} must contain exactly {expected_digits} hex digits, got {actual_digits}"
             ),
             Self::InvalidHexDigit { field, digit_index } => {
-                write!(formatter, "{field} has a non-hex digit at index {digit_index}")
+                write!(
+                    formatter,
+                    "{field} has a non-hex digit at index {digit_index}"
+                )
             }
             Self::ZeroControllerUid => {
                 formatter.write_str("the all-zero controller UID is reserved")
@@ -288,9 +305,9 @@ impl fmt::Display for ServerConfigError {
                 value,
                 maximum,
             } => write!(formatter, "{field} value {value} exceeds maximum {maximum}"),
-            Self::InvalidHardwareProfileClaimId => formatter.write_str(
-                "hardware_profile_claim_id must be bounded canonical ASCII",
-            ),
+            Self::InvalidHardwareProfileClaimId => {
+                formatter.write_str("hardware_profile_claim_id must be bounded canonical ASCII")
+            }
             Self::UnverifiedPhysicalStopSemantics => formatter.write_str(
                 "expected_physical_stop_semantics must be coast_verified or brake_verified",
             ),
@@ -592,7 +609,7 @@ const fn hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn valid() -> Value {
         json!({
@@ -617,9 +634,7 @@ mod tests {
     }
 
     fn parse(value: &Value) -> Result<ControllerServerConfigV1, ServerConfigError> {
-        ControllerServerConfigV1::parse_json(
-            &serde_json::to_vec(value).expect("serialize fixture"),
-        )
+        ControllerServerConfigV1::parse_json(&serde_json::to_vec(value).expect("serialize fixture"))
     }
 
     #[test]
@@ -676,11 +691,33 @@ mod tests {
         let args = ServerArgs {
             command_bind: "192.168.50.2:8080".parse().expect("fixture address"),
             controller_config: None,
+            legacy_http_camera: false,
         };
         assert!(matches!(
             args.into_runtime(),
             Err(ServerConfigError::CommandBindIsNotLoopback(_))
         ));
+    }
+
+    #[test]
+    fn legacy_http_camera_requires_an_explicit_opt_in() {
+        let default = ServerArgs {
+            command_bind: "127.0.0.1:8080".parse().expect("fixture address"),
+            controller_config: None,
+            legacy_http_camera: false,
+        }
+        .into_runtime()
+        .expect("default runtime");
+        assert!(!default.legacy_http_camera_enabled());
+
+        let opted_in = ServerArgs {
+            command_bind: "127.0.0.1:8080".parse().expect("fixture address"),
+            controller_config: None,
+            legacy_http_camera: true,
+        }
+        .into_runtime()
+        .expect("opted-in runtime");
+        assert!(opted_in.legacy_http_camera_enabled());
     }
 
     #[test]
