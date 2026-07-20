@@ -209,6 +209,42 @@ impl PhysicalActuationSession {
             let stop_reason = source.force_stop_reason();
             self.reject_local_decision(source, stop_reason)
         })?;
+        self.apply_pending(pending)
+    }
+
+    /// Submit a newly sequenced zero command and retain its exact applied receipt.
+    ///
+    /// This is the physical half of a supervisor `BaseZeroRequired` obligation.
+    /// It does not grant or change supervisor authority by itself. In particular,
+    /// callers must pass `receipt.verified_host_result()` through
+    /// `ConfirmedBaseZero::try_from_host_command_result` and then admit that
+    /// evidence to the same supervisor instance which requested the stop.
+    ///
+    /// Unlike [`Self::disarm`], success retains the armed command session so a
+    /// subsequent supervisor-authorized mode can use the same controller epoch.
+    pub fn apply_fresh_zero(&mut self) -> Result<AppliedCommandReceipt, LiveActuationError> {
+        let now = self.clock.host_now().map_err(|source| {
+            let stop_reason = source.force_stop_reason();
+            self.reject_local_decision(source, stop_reason)
+        })?;
+        let pending = pending_command(
+            self.timing,
+            PhysicalDecisionInput::Stopped {
+                recorded_pwm: ShadowPwmPair::STOP,
+            },
+            now,
+        )
+        .map_err(|source| {
+            let stop_reason = source.force_stop_reason();
+            self.reject_local_decision(source, stop_reason)
+        })?;
+        self.apply_pending(pending)
+    }
+
+    fn apply_pending(
+        &mut self,
+        pending: PendingPhysicalCommand,
+    ) -> Result<AppliedCommandReceipt, LiveActuationError> {
         let armed = self.take_armed()?;
         match armed.apply(pending) {
             Ok((armed, receipt)) => {
