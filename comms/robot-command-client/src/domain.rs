@@ -1,9 +1,9 @@
+use robot_protocol::ControllerUptimeMsWrapping;
 use robot_protocol::v2::{
     ControlEpoch, ControllerBootId, ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid,
     HostCommandResult, HostCommandResultCode, OutputState, RemainingLeaseMs, RequestId, TimerPwm,
     V2CommandLeaseMs, V2CommandSequence,
 };
-use robot_protocol::ControllerUptimeMsWrapping;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

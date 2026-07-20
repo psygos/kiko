@@ -4,15 +4,14 @@ use robot_command_client::{
     LatchedStopKnowledge, MonotonicClock, PendingPhysicalCommand, RobotProtocolV2WireAdapter,
     UdpV2Transport, V2CommandTransport, V2WireAdapter,
 };
+use robot_protocol::ControllerUptimeMsWrapping;
 use robot_protocol::v2::{
     AcquireResult, AcquireResultCode, ActuatorConfigFingerprint, ControlEpoch, ControllerBootId,
     ControllerCapabilities, ControllerDeadlineMsWrapping, ControllerFaults, ControllerUid,
-    ForceStopReason, HostCommandResult, HostCommandResultCode, HostStopResult, Message,
-    MessageKind, OutputState, RawFrame, RemainingLeaseMs, RequestId, StatusCode, StatusReport,
-    StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
-    MAX_RAW_FRAME_BYTES,
+    ForceStopReason, HostCommandResult, HostCommandResultCode, HostStopResult, MAX_RAW_FRAME_BYTES,
+    Message, MessageKind, OutputState, RawFrame, RemainingLeaseMs, RequestId, StatusCode,
+    StatusReport, StopResultCode, TargetBootId, TimerPwm, V2CommandLeaseMs, V2CommandSequence,
 };
-use robot_protocol::ControllerUptimeMsWrapping;
 use std::net::UdpSocket;
 use std::time::Duration;
 
