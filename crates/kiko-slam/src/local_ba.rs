@@ -1071,7 +1071,7 @@ impl LocalBundleAdjuster {
             result,
             BaResult::Converged { .. } | BaResult::MaxIterations { .. }
         ) {
-            let mut staged_map = map.clone();
+            let mut staged_map = map.clone_for_transaction();
             problem.write_back(&mut staged_map)?;
             *map = staged_map;
         }
@@ -4587,6 +4587,7 @@ mod tests {
             true_pose_1,
         );
         let before_landmark_err = mean_landmark_error(&map, kf_0, &points_true);
+        let source_snapshot = map.snapshot();
 
         let config = LocalBaConfig::new(5, 15, 4, 2.0, lm(1e-3)).expect("valid BA config");
         let mut ba = LocalBundleAdjuster::new(intrinsics, config);
@@ -4601,6 +4602,7 @@ mod tests {
             "full local BA should succeed, got {result:?}"
         );
         assert_map_invariants(&map).expect("map invariants after BA");
+        assert!(source_snapshot.shares_mutation_lineage_with(map.snapshot()));
 
         let after_pose_err = pose_distance(
             map.keyframe(kf_1).expect("kf1").pose().into_legacy_pose(),

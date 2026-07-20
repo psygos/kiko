@@ -4357,7 +4357,7 @@ fn stage_keyframe_in_map(
     shared: Option<&SharedMatches>,
     cull_min_observations: NonZeroUsize,
 ) -> Result<(SlamMap, KeyframeId), TrackerError> {
-    let mut staged = map.clone();
+    let mut staged = map.clone_for_transaction();
     let keyframe_id = staged.add_keyframe_from_detections(
         keyframe.detections().as_ref(),
         timestamp,
@@ -4410,7 +4410,7 @@ fn remove_keyframe_from_graph_and_db(
     loop_db: Option<&mut KeyframeDatabase>,
     keyframe_id: KeyframeId,
 ) -> Result<(), TrackerError> {
-    let mut staged_map = map.clone();
+    let mut staged_map = map.clone_for_transaction();
     let mut staged_graph = essential_graph.clone();
     let staged_db = match loop_db.as_deref() {
         Some(database) => {
@@ -4583,7 +4583,7 @@ fn apply_correction_event(
         }
     }
 
-    let mut staged = map.clone();
+    let mut staged = map.clone_for_transaction();
     for (keyframe_id, corrected_pose) in &correction.correction.corrected_poses {
         staged.set_keyframe_pose(*keyframe_id, *corrected_pose)?;
     }
@@ -4701,7 +4701,7 @@ fn apply_loop_closure_correction(
         .map(|(keyframe_id, pose)| pose.try_to_pose32().map(|pose| (keyframe_id, pose)))
         .collect::<Result<_, _>>()?;
 
-    let mut staged_map = map.clone();
+    let mut staged_map = map.clone_for_transaction();
     for (keyframe_id, corrected_pose) in &corrected_poses {
         staged_map.set_keyframe_pose(
             *keyframe_id,
@@ -5742,6 +5742,10 @@ mod tests {
         )
         .expect("map and graph staging succeeds");
         assert_eq!(staged_map.num_keyframes(), 1);
+        assert!(
+            map_before.shares_mutation_lineage_with(staged_map.snapshot()),
+            "a staged keyframe that may replace the source must remain on its lineage"
+        );
         assert_eq!(staged_graph.parent_of(keyframe_id), Some(keyframe_id));
         let mut loop_db = KeyframeDatabase::new(0);
 
@@ -6308,6 +6312,7 @@ mod tests {
         );
         map.set_keyframe_pose(keyframe_id, large_source_pose)
             .expect("store source pose");
+        let source_snapshot = map.snapshot();
         let corrected_pose = crate::WorldToCamera::from_legacy_pose(
             Pose::try_from_rt(
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
@@ -6330,6 +6335,7 @@ mod tests {
         };
 
         apply_correction_event(&mut map, &correction).expect("apply exact corrected pose");
+        assert!(source_snapshot.shares_mutation_lineage_with(map.snapshot()));
         assert_eq!(
             map.keyframe(keyframe_id)
                 .expect("keyframe")
@@ -7187,6 +7193,7 @@ mod tests {
         let (mut map, mut essential_graph, verified, query_kf, _) =
             make_loop_closure_apply_fixture();
         let optimizer = PoseGraphOptimizer::new(PoseGraphConfig::default());
+        let source_snapshot = map.snapshot();
 
         let before = map
             .keyframe(query_kf)
@@ -7198,6 +7205,7 @@ mod tests {
 
         apply_loop_closure_correction(&mut map, &mut essential_graph, &optimizer, &verified)
             .expect("apply loop closure");
+        assert!(source_snapshot.shares_mutation_lineage_with(map.snapshot()));
 
         let after = map
             .keyframe(query_kf)
@@ -7414,6 +7422,7 @@ mod tests {
                 )
                 .expect("unique keyframe");
         }
+        let source_snapshot = map.snapshot();
 
         remove_keyframe_from_graph_and_db(
             &mut map,
@@ -7423,6 +7432,7 @@ mod tests {
         )
         .expect("remove keyframe");
 
+        assert!(source_snapshot.shares_mutation_lineage_with(map.snapshot()));
         assert!(map.keyframe(removed_kf).is_none());
         assert!(essential_graph.parent_of(removed_kf).is_none());
         assert!(loop_db.descriptor_source(removed_kf).is_none());

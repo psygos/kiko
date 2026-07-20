@@ -520,6 +520,39 @@ impl CovisibilityGraph {
         }
     }
 
+    fn preflight_remove_point_observation_batches<'a>(
+        &self,
+        observation_batches: impl IntoIterator<Item = &'a [KeyframeKeypoint]>,
+    ) {
+        let mut required_decrements = HashMap::<(KeyframeId, KeyframeId), u32>::new();
+        for observations in observation_batches {
+            for (i, obs_a) in observations.iter().enumerate() {
+                for obs_b in &observations[i + 1..] {
+                    let pair = if obs_a.keyframe_id < obs_b.keyframe_id {
+                        (obs_a.keyframe_id, obs_b.keyframe_id)
+                    } else {
+                        (obs_b.keyframe_id, obs_a.keyframe_id)
+                    };
+                    let required = required_decrements.entry(pair).or_default();
+                    *required = required
+                        .checked_add(1)
+                        .filter(|&count| count <= MAX_COVISIBILITY_COUNT)
+                        .expect("covisibility removal count exceeds the map point key space");
+                }
+            }
+        }
+
+        for ((a, b), required) in required_decrements {
+            let available = self
+                .symmetric_pair_weight(a, b)
+                .expect("covisibility graph is missing an observed keyframe pair");
+            assert!(
+                available.get() >= required,
+                "covisibility graph undercounts pending point removals"
+            );
+        }
+    }
+
     fn remove_point_observations_after_preflight(&mut self, observations: &[KeyframeKeypoint]) {
         for (i, obs_a) in observations.iter().enumerate() {
             for obs_b in &observations[i + 1..] {
@@ -858,7 +891,22 @@ pub struct SlamMap {
 
 impl Clone for SlamMap {
     fn clone(&self) -> Self {
-        let mutation_lineage = MapLineageId::next();
+        self.clone_with_mutation_lineage(MapLineageId::next())
+    }
+}
+
+impl SlamMap {
+    /// Clones this revision for an all-or-nothing update that may replace it.
+    ///
+    /// The source revision must remain immutable while the candidate is staged,
+    /// and at most one candidate may be promoted. A successful candidate then
+    /// remains on the canonical mutation lineage. Ordinary [`Clone`] continues
+    /// to reserve a distinct lineage for a true snapshot or fork.
+    pub(crate) fn clone_for_transaction(&self) -> Self {
+        self.clone_with_mutation_lineage(self.mutation_lineage)
+    }
+
+    fn clone_with_mutation_lineage(&self, mutation_lineage: MapLineageId) -> Self {
         Self {
             instance_id: self.instance_id,
             points: self.points.clone(),
@@ -866,9 +914,8 @@ impl Clone for SlamMap {
             covisibility: self.covisibility.clone(),
             frame_to_keyframe: self.frame_to_keyframe.clone(),
             version: self.version,
-            // The clone still represents exactly the source state. Reserve a
-            // distinct lineage only for its future successful mutations so
-            // asynchronous snapshots of an unmodified clone remain equal.
+            // The unmodified clone still represents exactly the source state;
+            // this reserved lineage only becomes visible after a mutation.
             mutation_lineage,
         }
     }
@@ -1156,12 +1203,33 @@ impl SlamMap {
     }
 
     pub fn remove_map_point(&mut self, point_id: MapPointId) -> Result<(), MapError> {
+        let raw_point_id = self.validate_map_point_removal(point_id)?;
+        let next_version = self.version.next(self.mutation_lineage);
+        self.remove_map_point_after_preflight_without_version(point_id, raw_point_id);
+        self.version = next_version;
+        Ok(())
+    }
+
+    fn validate_map_point_removal(&self, point_id: MapPointId) -> Result<RawMapPointId, MapError> {
+        let raw_point_id = self.validate_map_point_removal_structure(point_id)?;
+        let point = self
+            .points
+            .get(raw_point_id)
+            .expect("map point existence validated before covisibility preflight");
+        self.covisibility
+            .preflight_remove_point_observations(&point.observations);
+        Ok(raw_point_id)
+    }
+
+    fn validate_map_point_removal_structure(
+        &self,
+        point_id: MapPointId,
+    ) -> Result<RawMapPointId, MapError> {
         let raw_point_id = self.raw_point_id(point_id)?;
         let point = self
             .points
             .get(raw_point_id)
             .ok_or(MapError::MapPointNotFound(point_id))?;
-        let next_version = self.version.next(self.mutation_lineage);
 
         for (observation_index, obs) in point.observations.iter().enumerate() {
             assert!(
@@ -1188,9 +1256,14 @@ impl SlamMap {
                 "map point observation backreference mismatch"
             );
         }
-        self.covisibility
-            .preflight_remove_point_observations(&point.observations);
+        Ok(raw_point_id)
+    }
 
+    fn remove_map_point_after_preflight_without_version(
+        &mut self,
+        point_id: MapPointId,
+        raw_point_id: RawMapPointId,
+    ) {
         let point = self
             .points
             .remove(raw_point_id)
@@ -1213,8 +1286,6 @@ impl SlamMap {
         }
         self.covisibility
             .remove_point_observations_after_preflight(&point.observations);
-        self.version = next_version;
-        Ok(())
     }
 
     pub fn remove_keyframe(&mut self, keyframe_id: KeyframeId) -> Result<(), MapError> {
@@ -1340,26 +1411,49 @@ impl SlamMap {
     }
 
     pub fn cull_points(&mut self, min_observations: usize) -> usize {
-        let to_remove: Vec<MapPointId> = self
+        let to_remove: Vec<(MapPointId, RawMapPointId)> = self
             .points
             .iter()
             .filter(|(_, p)| p.observation_count() < min_observations)
-            .map(|(id, _)| MapPointId::new(self.instance_id, id))
+            .map(|(raw_id, _)| (MapPointId::new(self.instance_id, raw_id), raw_id))
             .collect();
         let count = to_remove.len();
+        if count == 0 {
+            return 0;
+        }
         // Each removal advances the generation once. Prove that the complete
         // batch fits before the first mutation so exhaustion cannot expose a
         // partially culled map to a caller that catches the panic.
-        let expected_generation = self
+        let final_generation = self
             .version
             .generation
             .checked_advance_by(count)
             .expect("map generation space exhausted");
-        for id in to_remove {
-            self.remove_map_point(id)
+
+        for &(point_id, expected_raw_id) in &to_remove {
+            let raw_point_id = self
+                .validate_map_point_removal_structure(point_id)
                 .expect("map point collected for culling must still exist");
+            debug_assert_eq!(raw_point_id, expected_raw_id);
         }
-        debug_assert_eq!(self.generation(), expected_generation);
+        self.covisibility
+            .preflight_remove_point_observation_batches(to_remove.iter().map(
+                |&(_, raw_point_id)| {
+                    self.points
+                        .get(raw_point_id)
+                        .expect("map point validated for culling must still exist")
+                        .observations
+                        .as_slice()
+                },
+            ));
+
+        for (point_id, raw_point_id) in to_remove {
+            self.remove_map_point_after_preflight_without_version(point_id, raw_point_id);
+        }
+        self.version = MapVersion {
+            generation: final_generation,
+            lineage: self.mutation_lineage,
+        };
         count
     }
 
@@ -2836,6 +2930,139 @@ mod tests {
     }
 
     #[test]
+    fn culling_preflights_aggregate_covisibility_decrements() {
+        let mut map = SlamMap::new();
+        let keyframes = add_test_keyframes(&mut map, 21, [2; 2]);
+        let first_observations = test_observations(&map, keyframes, 0);
+        let second_observations = test_observations(&map, keyframes, 1);
+        let first_point = add_shared_test_point(&mut map, &first_observations, 0.0);
+        let second_point = add_shared_test_point(&mut map, &second_observations, 1.0);
+        assert_eq!(
+            map.covisibility
+                .covisibility_count(keyframes[0], keyframes[1]),
+            2
+        );
+
+        map.covisibility
+            .set_pair_weight(keyframes[0], keyframes[1], Some(NonZeroU32::MIN));
+        let snapshot = map.snapshot();
+        let edges = map.covisibility.edges.clone();
+
+        assert_panics_with(
+            "covisibility graph undercounts pending point removals",
+            || map.cull_points(3),
+        );
+
+        assert_eq!(map.snapshot(), snapshot);
+        assert_eq!(map.num_points(), 2);
+        assert_eq!(map.covisibility.edges, edges);
+        for (point_id, observations) in [
+            (first_point, first_observations),
+            (second_point, second_observations),
+        ] {
+            assert_eq!(
+                map.point(point_id)
+                    .expect("culled point remains")
+                    .observations,
+                observations
+            );
+            for observation in observations {
+                assert_eq!(
+                    map.map_point_for_keypoint(observation)
+                        .expect("backreference remains readable"),
+                    Some(point_id)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn culling_preflights_every_point_before_batch_mutation() {
+        let mut map = SlamMap::new();
+        let keyframe_id = add_test_keyframe(&mut map, 30, 2);
+        for keypoint_index in 0..2 {
+            let observation = map
+                .keyframe_keypoint(keyframe_id, keypoint_index)
+                .expect("test observation");
+            map.add_map_point(
+                WorldPoint3::new(keypoint_index as f32, 0.0, 1.0),
+                make_descriptor(),
+                observation,
+            )
+            .expect("test point");
+        }
+        let removal_order: Vec<_> = map.points().map(|(point_id, _)| point_id).collect();
+        let [first_point, corrupt_point] = removal_order.as_slice() else {
+            panic!("fixture must contain exactly two points");
+        };
+        let corrupt_observation = map
+            .point(*corrupt_point)
+            .expect("corrupt point")
+            .observations[0];
+        let raw_keyframe_id = keyframe_id
+            .raw_for(map.instance_id)
+            .expect("fixture keyframe belongs to map");
+        assert_eq!(
+            map.keyframes
+                .get_mut(raw_keyframe_id)
+                .expect("fixture keyframe")
+                .clear_point_ref(corrupt_observation.index),
+            Some(*corrupt_point)
+        );
+        let first_observation = map.point(*first_point).expect("first point").observations[0];
+        let snapshot = map.snapshot();
+
+        assert_panics_with("map point observation backreference mismatch", || {
+            map.cull_points(2)
+        });
+
+        assert_eq!(map.snapshot(), snapshot);
+        assert!(map.point(*first_point).is_some());
+        assert!(map.point(*corrupt_point).is_some());
+        assert_eq!(
+            map.map_point_for_keypoint(first_observation)
+                .expect("first backreference remains readable"),
+            Some(*first_point)
+        );
+        assert_eq!(
+            map.map_point_for_keypoint(corrupt_observation)
+                .expect("corrupt backreference remains readable"),
+            None
+        );
+    }
+
+    #[test]
+    fn culling_shared_point_batches_preserves_graph_invariants() {
+        for point_count in 1..=8 {
+            let mut map = SlamMap::new();
+            let keyframes = add_test_keyframes(&mut map, 31, [point_count; 2]);
+            for keypoint_index in 0..point_count {
+                let observations = test_observations(&map, keyframes, keypoint_index);
+                add_shared_test_point(&mut map, &observations, keypoint_index as f32);
+            }
+            let final_generation = map
+                .generation()
+                .checked_advance_by(point_count)
+                .expect("small property fixture fits generation space");
+
+            assert_eq!(
+                map.covisibility()
+                    .covisibility_count(keyframes[0], keyframes[1]),
+                u32::try_from(point_count).expect("small property fixture fits u32")
+            );
+            assert_eq!(map.cull_points(3), point_count);
+            assert_eq!(map.generation(), final_generation);
+            assert_eq!(map.num_points(), 0);
+            assert_eq!(
+                map.covisibility()
+                    .covisibility_count(keyframes[0], keyframes[1]),
+                0
+            );
+            assert_map_invariants(&map).expect("culled property fixture preserves invariants");
+        }
+    }
+
+    #[test]
     fn map_clone_preserves_generation() {
         let mut map = SlamMap::new();
         let size = ImageSize::try_new(640, 480).expect("valid size");
@@ -2940,6 +3167,38 @@ mod tests {
                 .pose()
                 .translation()
         );
+    }
+
+    #[test]
+    fn transactional_clones_continue_the_source_lineage() {
+        let mut map = SlamMap::new();
+        let keyframe_id = add_test_keyframe(&mut map, 1, 1);
+        let source_snapshot = map.snapshot();
+        let translated_x = |x| {
+            WorldToCamera::from_legacy_pose(crate::Pose::from_rt(
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                [x, 0.0, 0.0],
+            ))
+        };
+
+        let mut transaction = map.clone_for_transaction();
+        transaction
+            .set_keyframe_pose(keyframe_id, translated_x(1.0))
+            .expect("mutate first transaction");
+        let first_commit = transaction.snapshot();
+        assert!(source_snapshot.shares_mutation_lineage_with(first_commit));
+        assert!(first_commit.generation() > source_snapshot.generation());
+
+        let mut follow_up = transaction.clone_for_transaction();
+        follow_up
+            .set_keyframe_pose(keyframe_id, translated_x(2.0))
+            .expect("mutate follow-up transaction");
+        assert!(first_commit.shares_mutation_lineage_with(follow_up.snapshot()));
+
+        let mut fork = transaction.clone();
+        fork.set_keyframe_pose(keyframe_id, translated_x(-1.0))
+            .expect("mutate true fork");
+        assert!(!first_commit.shares_mutation_lineage_with(fork.snapshot()));
     }
 
     #[test]
