@@ -12,6 +12,7 @@ use crate::secure_fs::{
 };
 use crate::{
     ArtifactDigestDto, ArtifactId, ArtifactKind, DeviceInventoryManifestV1, MAX_ARTIFACTS,
+    MAX_CALIBRATION_ARTIFACTS, MAX_PLANT_ARTIFACTS,
 };
 
 pub const MAX_ARTIFACT_FILE_BYTES: u64 = 128 * 1_024 * 1_024;
@@ -103,11 +104,175 @@ impl fmt::Display for ArtifactRelativePathError {
 
 impl std::error::Error for ArtifactRelativePathError {}
 
-#[derive(Debug, PartialEq, Eq)]
-struct ParsedArtifactBinding {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactFileBinding {
     kind: ArtifactKind,
     artifact_id: ArtifactId,
     relative_path: ArtifactRelativePath,
+}
+
+impl ArtifactFileBinding {
+    pub const fn kind(&self) -> ArtifactKind {
+        self.kind
+    }
+
+    pub const fn artifact_id(&self) -> &ArtifactId {
+        &self.artifact_id
+    }
+
+    pub const fn relative_path(&self) -> &ArtifactRelativePath {
+        &self.relative_path
+    }
+}
+
+/// Exact, bounded deployment bindings parsed once from weak configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactFileBindingSet {
+    entries: [Option<ArtifactFileBinding>; MAX_ARTIFACTS],
+    len: u8,
+}
+
+impl ArtifactFileBindingSet {
+    pub fn parse(
+        inputs: Vec<ArtifactFileBindingInput>,
+    ) -> Result<Self, ArtifactFileBindingParseError> {
+        let calibration_count = inputs
+            .iter()
+            .filter(|input| input.kind == ArtifactKind::Calibration)
+            .count();
+        let plant_count = inputs
+            .iter()
+            .filter(|input| input.kind == ArtifactKind::Plant)
+            .count();
+        require_binding_count(
+            ArtifactKind::Calibration,
+            calibration_count,
+            MAX_CALIBRATION_ARTIFACTS,
+        )?;
+        require_binding_count(ArtifactKind::Plant, plant_count, MAX_PLANT_ARTIFACTS)?;
+
+        let mut output = Self {
+            entries: core::array::from_fn(|_| None),
+            len: 0,
+        };
+        for (index, input) in inputs.into_iter().enumerate() {
+            let artifact_id = ArtifactId::parse(input.artifact_id).map_err(|source| {
+                ArtifactFileBindingParseError::InvalidArtifactId {
+                    index,
+                    kind: input.kind,
+                    source,
+                }
+            })?;
+            let relative_path =
+                ArtifactRelativePath::parse(input.relative_path).map_err(|source| {
+                    ArtifactFileBindingParseError::InvalidRelativePath {
+                        index,
+                        artifact_id,
+                        source,
+                    }
+                })?;
+            if output
+                .iter()
+                .any(|existing| existing.artifact_id == artifact_id)
+            {
+                return Err(ArtifactFileBindingParseError::DuplicateArtifactId { artifact_id });
+            }
+            if output
+                .iter()
+                .any(|existing| existing.relative_path == relative_path)
+            {
+                return Err(ArtifactFileBindingParseError::DuplicateRelativePath { relative_path });
+            }
+            output.entries[usize::from(output.len)] = Some(ArtifactFileBinding {
+                kind: input.kind,
+                artifact_id,
+                relative_path,
+            });
+            output.len += 1;
+        }
+        Ok(output)
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ArtifactFileBinding> + '_ {
+        self.entries[..self.len()].iter().map(|entry| {
+            entry
+                .as_ref()
+                .expect("parsed artifact-binding prefix is initialized")
+        })
+    }
+}
+
+fn require_binding_count(
+    kind: ArtifactKind,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), ArtifactFileBindingParseError> {
+    if actual == 0 {
+        Err(ArtifactFileBindingParseError::MissingRequiredKind { kind })
+    } else if actual > maximum {
+        Err(ArtifactFileBindingParseError::TooManyBindings {
+            kind,
+            actual,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArtifactFileBindingParseError {
+    MissingRequiredKind {
+        kind: ArtifactKind,
+    },
+    TooManyBindings {
+        kind: ArtifactKind,
+        actual: usize,
+        maximum: usize,
+    },
+    InvalidArtifactId {
+        index: usize,
+        kind: ArtifactKind,
+        source: crate::BoundedTextError,
+    },
+    InvalidRelativePath {
+        index: usize,
+        artifact_id: ArtifactId,
+        source: ArtifactRelativePathError,
+    },
+    DuplicateArtifactId {
+        artifact_id: ArtifactId,
+    },
+    DuplicateRelativePath {
+        relative_path: ArtifactRelativePath,
+    },
+}
+
+impl fmt::Display for ArtifactFileBindingParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid artifact file-binding set: {self:?}")
+    }
+}
+
+impl std::error::Error for ArtifactFileBindingParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidArtifactId { source, .. } => Some(source),
+            Self::InvalidRelativePath { source, .. } => Some(source),
+            Self::MissingRequiredKind { .. }
+            | Self::TooManyBindings { .. }
+            | Self::DuplicateArtifactId { .. }
+            | Self::DuplicateRelativePath { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -262,7 +427,7 @@ impl ManifestArtifactHashes {
 pub fn hash_manifest_artifacts(
     manifest: &DeviceInventoryManifestV1,
     artifact_root: &Path,
-    bindings: Vec<ArtifactFileBindingInput>,
+    mut bindings: ArtifactFileBindingSet,
 ) -> Result<ManifestArtifactHashes, ArtifactHashError> {
     if bindings.len() != manifest.artifacts().len() {
         return Err(ArtifactHashError::BindingCountMismatch {
@@ -272,56 +437,17 @@ pub fn hash_manifest_artifacts(
         });
     }
 
-    let mut parsed: [Option<ParsedArtifactBinding>; MAX_ARTIFACTS] = core::array::from_fn(|_| None);
-    let mut parsed_len = 0_usize;
-    for (index, input) in bindings.into_iter().enumerate() {
-        let artifact_id = ArtifactId::parse(input.artifact_id).map_err(|source| {
-            ArtifactHashError::InvalidArtifactId {
-                index,
-                kind: input.kind,
-                source,
-            }
-        })?;
-        let relative_path = ArtifactRelativePath::parse(input.relative_path).map_err(|source| {
-            ArtifactHashError::InvalidRelativePath {
-                index,
-                artifact_id,
-                source,
-            }
-        })?;
-        if parsed[..parsed_len]
-            .iter()
-            .flatten()
-            .any(|existing| existing.kind == input.kind && existing.artifact_id == artifact_id)
-        {
-            return Err(ArtifactHashError::DuplicateBinding {
-                kind: input.kind,
-                artifact_id,
-            });
-        }
-        if parsed[..parsed_len]
-            .iter()
-            .flatten()
-            .any(|existing| existing.relative_path == relative_path)
-        {
-            return Err(ArtifactHashError::DuplicateRelativePath { relative_path });
-        }
+    for binding in bindings.iter() {
         if manifest
             .artifacts()
-            .find(input.kind, &artifact_id)
+            .find(binding.kind, &binding.artifact_id)
             .is_none()
         {
             return Err(ArtifactHashError::UnexpectedBinding {
-                kind: input.kind,
-                artifact_id,
+                kind: binding.kind,
+                artifact_id: binding.artifact_id,
             });
         }
-        parsed[parsed_len] = Some(ParsedArtifactBinding {
-            kind: input.kind,
-            artifact_id,
-            relative_path,
-        });
-        parsed_len += 1;
     }
     validate_root_path(artifact_root)?;
     let root =
@@ -336,7 +462,7 @@ pub fn hash_manifest_artifacts(
         len: 0,
     };
     for expected in manifest.artifacts().iter() {
-        let binding_index = parsed[..parsed_len]
+        let binding_index = bindings.entries[..bindings.len()]
             .iter()
             .position(|binding| {
                 binding.as_ref().is_some_and(|binding| {
@@ -345,7 +471,7 @@ pub fn hash_manifest_artifacts(
                 })
             })
             .expect("exact manifest binding set was established before filesystem access");
-        let binding = parsed[binding_index]
+        let binding = bindings.entries[binding_index]
             .as_ref()
             .expect("matching manifest binding is initialized");
         let descriptor =
@@ -383,7 +509,7 @@ pub fn hash_manifest_artifacts(
             });
         }
         let (observed_sha256, bytes_hashed) = hash_file(&mut file, binding, metadata.len())?;
-        let binding = parsed[binding_index]
+        let binding = bindings.entries[binding_index]
             .take()
             .expect("matching manifest binding is consumed once");
         let output_index = usize::from(output.len);
@@ -402,7 +528,7 @@ pub fn hash_manifest_artifacts(
 
 fn hash_file(
     file: &mut File,
-    binding: &ParsedArtifactBinding,
+    binding: &ArtifactFileBinding,
     metadata_bytes: u64,
 ) -> Result<([u8; 32], u64), ArtifactHashError> {
     let mut hasher = Sha256::new();
@@ -475,23 +601,6 @@ pub enum ArtifactHashError {
         expected: usize,
         maximum: usize,
     },
-    InvalidArtifactId {
-        index: usize,
-        kind: ArtifactKind,
-        source: crate::BoundedTextError,
-    },
-    InvalidRelativePath {
-        index: usize,
-        artifact_id: ArtifactId,
-        source: ArtifactRelativePathError,
-    },
-    DuplicateBinding {
-        kind: ArtifactKind,
-        artifact_id: ArtifactId,
-    },
-    DuplicateRelativePath {
-        relative_path: ArtifactRelativePath,
-    },
     UnexpectedBinding {
         kind: ArtifactKind,
         artifact_id: ArtifactId,
@@ -562,13 +671,9 @@ impl fmt::Display for ArtifactHashError {
 impl std::error::Error for ArtifactHashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidArtifactId { source, .. } => Some(source),
-            Self::InvalidRelativePath { source, .. } => Some(source),
             Self::OpenRoot { source, .. } | Self::OpenArtifact { source, .. } => Some(source),
             Self::Metadata { source, .. } | Self::Read { source, .. } => Some(source),
             Self::BindingCountMismatch { .. }
-            | Self::DuplicateBinding { .. }
-            | Self::DuplicateRelativePath { .. }
             | Self::UnexpectedBinding { .. }
             | Self::RootNotAbsolute { .. }
             | Self::RootPathTooLong { .. }

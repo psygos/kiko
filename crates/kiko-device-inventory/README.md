@@ -63,14 +63,16 @@ the path. Whitespace and key order intentionally affect it, so it identifies
 the reviewed file representation rather than claiming semantic JSON
 canonicalization.
 
-`hash_manifest_artifacts` binds an exact set of caller-declared relative paths
-to the artifact kind and ID already present in a parsed manifest. The binding
-count must equal the manifest artifact count and therefore cannot exceed 12.
-IDs and paths are parsed before filesystem access; missing, unexpected, or
-duplicate bindings and duplicate paths are rejected. The artifact root must be
-an absolute canonical path of at most 1,024 bytes. Each relative path is at most
-512 bytes and 64 components, uses `/`, and contains no empty, dot, parent, NUL,
-or backslash component.
+`ArtifactFileBindingSet::parse` consumes weak caller-declared paths once. It
+requires calibration and plant entries, enforces the per-kind limits and a
+globally unique artifact-ID/path set, and returns only bounded parsed bindings.
+Each relative path is at most 512 bytes and 64 components, uses `/`, and
+contains no empty, dot, parent, NUL, or backslash component.
+
+`hash_manifest_artifacts` consumes that parsed set and only then binds it to
+the artifact kind and ID already present in a parsed manifest. The count and
+membership must match exactly; it does not reparse IDs or paths. The artifact
+root must be an absolute canonical path of at most 1,024 bytes.
 
 The root and every artifact path component are opened relative to anchored
 directory descriptors with no-follow semantics. Only regular files of at most

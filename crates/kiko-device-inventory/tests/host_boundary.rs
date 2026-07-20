@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kiko_device_inventory::{
-    ArtifactFileBindingInput, ArtifactHashError, ArtifactKind, CalibrationBundleHashError,
-    InventoryParseError, MAX_ARTIFACT_FILE_BYTES, MAX_MANIFEST_JSON_BYTES, ManifestJsonError,
-    ManifestLoadError, hash_manifest_artifacts, load_expected_manifest_v1_file,
-    load_expected_manifest_v1_from_slice,
+    ArtifactFileBindingInput, ArtifactFileBindingParseError, ArtifactFileBindingSet,
+    ArtifactHashError, ArtifactKind, CalibrationBundleHashError, InventoryParseError,
+    MAX_ARTIFACT_FILE_BYTES, MAX_MANIFEST_JSON_BYTES, ManifestJsonError, ManifestLoadError,
+    hash_manifest_artifacts, load_expected_manifest_v1_file, load_expected_manifest_v1_from_slice,
 };
 use robot_protocol::v2::{ControllerCapabilities, VERSION as ROBOT_PROTOCOL_VERSION};
 use serde_json::json;
@@ -92,6 +92,10 @@ fn bindings() -> Vec<ArtifactFileBindingInput> {
             relative_path: "plant/main.bin".to_owned(),
         },
     ]
+}
+
+fn parsed_bindings() -> ArtifactFileBindingSet {
+    ArtifactFileBindingSet::parse(bindings()).expect("valid artifact binding fixture")
 }
 
 fn write_artifacts(root: &Path, calibration: &[u8], plant: &[u8]) {
@@ -240,7 +244,7 @@ fn hashes_exact_manifest_bindings_and_exposes_changed_content() {
     let temp = TempDirectory::new();
     write_artifacts(temp.path(), calibration, plant);
 
-    let exact = hash_manifest_artifacts(&manifest, temp.path(), bindings()).expect("hashes");
+    let exact = hash_manifest_artifacts(&manifest, temp.path(), parsed_bindings()).expect("hashes");
     assert_eq!(exact.len(), 2);
     assert!(exact.all_content_matches_manifest());
     assert!(exact.iter().all(|entry| entry.bytes_hashed() != 0));
@@ -259,7 +263,7 @@ fn hashes_exact_manifest_bindings_and_exposes_changed_content() {
     fs::write(temp.path().join("plant/main.bin"), b"drive plant X4")
         .expect("changed same-length artifact");
     let changed =
-        hash_manifest_artifacts(&manifest, temp.path(), bindings()).expect("changed hash");
+        hash_manifest_artifacts(&manifest, temp.path(), parsed_bindings()).expect("changed hash");
     assert!(!changed.all_content_matches_manifest());
     assert!(matches!(
         changed.exact_calibration_bundle_sha256(),
@@ -288,25 +292,80 @@ fn binding_set_and_paths_are_exact_without_fallback() {
     let temp = TempDirectory::new();
     write_artifacts(temp.path(), b"calibration", b"plant");
 
-    let mut missing = bindings();
-    missing.pop();
+    let mut extra = bindings();
+    extra.push(ArtifactFileBindingInput {
+        kind: ArtifactKind::Calibration,
+        artifact_id: "calibration-extra".to_owned(),
+        relative_path: "calibration/extra.bin".to_owned(),
+    });
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, temp.path(), missing),
+        hash_manifest_artifacts(
+            &manifest,
+            temp.path(),
+            ArtifactFileBindingSet::parse(extra).expect("bounded extra binding")
+        ),
         Err(ArtifactHashError::BindingCountMismatch { .. })
     ));
 
     let mut traversal = bindings();
     traversal[0].relative_path = "../calibration/main.bin".to_owned();
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, temp.path(), traversal),
-        Err(ArtifactHashError::InvalidRelativePath { .. })
+        ArtifactFileBindingSet::parse(traversal),
+        Err(ArtifactFileBindingParseError::InvalidRelativePath { .. })
     ));
 
     let mut wrong_id = bindings();
     wrong_id[0].artifact_id = "calibration-fallback".to_owned();
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, temp.path(), wrong_id),
+        hash_manifest_artifacts(
+            &manifest,
+            temp.path(),
+            ArtifactFileBindingSet::parse(wrong_id).expect("valid unexpected binding")
+        ),
         Err(ArtifactHashError::UnexpectedBinding { .. })
+    ));
+}
+
+#[test]
+fn binding_parser_owns_collection_and_lexical_invariants_once() {
+    let mut missing_plant = bindings();
+    missing_plant.pop();
+    assert!(matches!(
+        ArtifactFileBindingSet::parse(missing_plant),
+        Err(ArtifactFileBindingParseError::MissingRequiredKind {
+            kind: ArtifactKind::Plant
+        })
+    ));
+
+    let mut duplicate_id = bindings();
+    duplicate_id[1].artifact_id = duplicate_id[0].artifact_id.clone();
+    assert!(matches!(
+        ArtifactFileBindingSet::parse(duplicate_id),
+        Err(ArtifactFileBindingParseError::DuplicateArtifactId { .. })
+    ));
+
+    let mut duplicate_path = bindings();
+    duplicate_path[1].relative_path = duplicate_path[0].relative_path.clone();
+    assert!(matches!(
+        ArtifactFileBindingSet::parse(duplicate_path),
+        Err(ArtifactFileBindingParseError::DuplicateRelativePath { .. })
+    ));
+
+    let mut too_many_calibrations = bindings();
+    for index in 1..=8 {
+        too_many_calibrations.push(ArtifactFileBindingInput {
+            kind: ArtifactKind::Calibration,
+            artifact_id: format!("calibration-{index}"),
+            relative_path: format!("calibration/{index}.bin"),
+        });
+    }
+    assert!(matches!(
+        ArtifactFileBindingSet::parse(too_many_calibrations),
+        Err(ArtifactFileBindingParseError::TooManyBindings {
+            kind: ArtifactKind::Calibration,
+            actual: 9,
+            maximum: 8,
+        })
     ));
 }
 
@@ -334,7 +393,7 @@ fn absolute_paths_reject_aliases_before_filesystem_access() {
     }
 
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, Path::new("artifacts"), bindings()),
+        hash_manifest_artifacts(&manifest, Path::new("artifacts"), parsed_bindings()),
         Err(ArtifactHashError::RootNotAbsolute { .. })
     ));
     for aliased in [
@@ -343,7 +402,7 @@ fn absolute_paths_reject_aliases_before_filesystem_access() {
         format!("{}/../artifacts", temp.path().display()),
     ] {
         assert!(matches!(
-            hash_manifest_artifacts(&manifest, Path::new(&aliased), bindings()),
+            hash_manifest_artifacts(&manifest, Path::new(&aliased), parsed_bindings()),
             Err(ArtifactHashError::NonCanonicalRootPath { .. })
         ));
     }
@@ -364,7 +423,7 @@ fn artifact_size_non_regular_and_symlink_paths_fail_closed() {
         .set_len(MAX_ARTIFACT_FILE_BYTES + 1)
         .expect("sparse artifact");
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, oversized_root.path(), bindings()),
+        hash_manifest_artifacts(&manifest, oversized_root.path(), parsed_bindings()),
         Err(ArtifactHashError::ArtifactTooLarge { .. })
     ));
 
@@ -373,7 +432,7 @@ fn artifact_size_non_regular_and_symlink_paths_fail_closed() {
     fs::remove_file(directory_root.path().join("calibration/main.bin")).expect("remove file");
     fs::create_dir(directory_root.path().join("calibration/main.bin")).expect("directory artifact");
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, directory_root.path(), bindings()),
+        hash_manifest_artifacts(&manifest, directory_root.path(), parsed_bindings()),
         Err(ArtifactHashError::NotRegularFile { .. })
     ));
 
@@ -384,7 +443,7 @@ fn artifact_size_non_regular_and_symlink_paths_fail_closed() {
     fs::remove_file(symlink_root.path().join("calibration/main.bin")).expect("remove file");
     symlink(&target, symlink_root.path().join("calibration/main.bin")).expect("artifact symlink");
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, symlink_root.path(), bindings()),
+        hash_manifest_artifacts(&manifest, symlink_root.path(), parsed_bindings()),
         Err(ArtifactHashError::OpenArtifact { .. })
     ));
 
@@ -394,7 +453,7 @@ fn artifact_size_non_regular_and_symlink_paths_fail_closed() {
     let linked_root = parent.path().join("linked-root");
     symlink(real_root.path(), &linked_root).expect("root symlink");
     assert!(matches!(
-        hash_manifest_artifacts(&manifest, &linked_root, bindings()),
+        hash_manifest_artifacts(&manifest, &linked_root, parsed_bindings()),
         Err(ArtifactHashError::OpenRoot { .. })
     ));
 }

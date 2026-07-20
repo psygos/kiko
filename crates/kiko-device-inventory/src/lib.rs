@@ -28,7 +28,8 @@ pub use artifact::{
 };
 #[cfg(unix)]
 pub use artifact_io::{
-    ArtifactContentIdentity, ArtifactFileBindingInput, ArtifactHashError, ArtifactRelativePath,
+    ArtifactContentIdentity, ArtifactFileBinding, ArtifactFileBindingInput,
+    ArtifactFileBindingParseError, ArtifactFileBindingSet, ArtifactHashError, ArtifactRelativePath,
     ArtifactRelativePathError, CalibrationBundleHashError, ExactCalibrationBundleSha256,
     MAX_ARTIFACT_FILE_BYTES, MAX_ARTIFACT_PATH_COMPONENTS, MAX_ARTIFACT_RELATIVE_PATH_BYTES,
     MAX_ARTIFACT_ROOT_PATH_BYTES, ManifestArtifactHashes, hash_manifest_artifacts,
