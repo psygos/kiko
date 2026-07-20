@@ -1,0 +1,10 @@
+[package]
+name = "kiko-supervisor-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+robot-protocol = { path = "../../comms/robot-protocol" }
+
+[lints]
+workspace = true

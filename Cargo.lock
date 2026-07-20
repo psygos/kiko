@@ -3134,6 +3134,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kiko-supervisor-core"
+version = "0.1.0"
+dependencies = [
+ "robot-protocol",
+]
+
+[[package]]
 name = "kuchikiki"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
