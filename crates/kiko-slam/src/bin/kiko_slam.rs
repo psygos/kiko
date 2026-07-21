@@ -3463,7 +3463,6 @@ impl std::error::Error for LiveNavigationBoundaryError {}
 fn navigation_dataset_may_publish(
     authoritative_failure: bool,
     journal_descriptor_finalized: bool,
-    _visualization_failure: bool,
 ) -> bool {
     !authoritative_failure && journal_descriptor_finalized
 }
@@ -4999,8 +4998,6 @@ enum LiveWorkerFailure {
     NavigationPanic { detail: String },
     DatasetFinalization(DatasetError),
     DatasetAbort(DatasetError),
-    Visualization(LiveThreadError),
-    VisualizationPanic { detail: String },
 }
 
 #[cfg(feature = "record")]
@@ -5029,12 +5026,6 @@ impl std::fmt::Display for LiveWorkerFailure {
                     "unpublished live navigation dataset abort failed: {source}"
                 )
             }
-            Self::Visualization(source) => {
-                write!(f, "live visualization worker failed: {source}")
-            }
-            Self::VisualizationPanic { detail } => {
-                write!(f, "live visualization worker panicked: {detail}")
-            }
         }
     }
 }
@@ -5044,14 +5035,45 @@ impl std::error::Error for LiveWorkerFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Capture(source) => Some(source),
-            Self::Inference(source) | Self::Visualization(source) => Some(source),
+            Self::Inference(source) => Some(source),
             Self::Occupancy(source) => Some(source),
             Self::Navigation(source) => Some(source),
             Self::DatasetFinalization(source) | Self::DatasetAbort(source) => Some(source),
             Self::InferencePanic { .. }
             | Self::OccupancyPanic { .. }
-            | Self::NavigationPanic { .. }
-            | Self::VisualizationPanic { .. } => None,
+            | Self::NavigationPanic { .. } => None,
+        }
+    }
+}
+
+/// A terminal Rerun worker problem is diagnostic evidence, never an
+/// authoritative robot-owner failure. Keeping it outside [`LiveWorkerFailure`]
+/// makes it impossible to append one to the service-failure ledger by mistake.
+#[cfg(feature = "record")]
+#[derive(Debug)]
+enum LiveVisualizationFailure {
+    Worker(LiveThreadError),
+    Panic { detail: String },
+}
+
+#[cfg(feature = "record")]
+impl std::fmt::Display for LiveVisualizationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Worker(source) => write!(formatter, "live visualization worker failed: {source}"),
+            Self::Panic { detail } => {
+                write!(formatter, "live visualization worker panicked: {detail}")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "record")]
+impl std::error::Error for LiveVisualizationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Worker(source) => Some(source),
+            Self::Panic { .. } => None,
         }
     }
 }
@@ -6537,24 +6559,15 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
         // whether an otherwise complete payload+journal recording is publishable.
         let authoritative_failure = !live_failures.is_empty();
 
-        let visualization_failure = match viz_handle.join() {
-            Ok(Ok(())) => false,
-            Ok(Err(error)) => {
-                live_failures.push(LiveWorkerFailure::Visualization(error));
-                true
-            }
-            Err(payload) => {
-                live_failures.push(LiveWorkerFailure::VisualizationPanic {
-                    detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
-                });
-                true
-            }
+        let visualization_diagnostic = match viz_handle.join() {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(LiveVisualizationFailure::Worker(error)),
+            Err(payload) => Some(LiveVisualizationFailure::Panic {
+                detail: kiko_slam::panic_payload_to_string(payload.as_ref()),
+            }),
         };
-        let navigation_dataset_publishable = navigation_dataset_may_publish(
-            authoritative_failure,
-            navigation_descriptor.is_some(),
-            visualization_failure,
-        );
+        let navigation_dataset_publishable =
+            navigation_dataset_may_publish(authoritative_failure, navigation_descriptor.is_some());
 
         if let Some(handle) = navigation_dataset_handle {
             if navigation_dataset_publishable {
@@ -6566,6 +6579,12 @@ fn run_live(args: LiveArgs) -> Result<(), Box<dyn std::error::Error>> {
             } else if let Err(source) = handle.abort_without_manifest() {
                 live_failures.push(LiveWorkerFailure::DatasetAbort(source));
             }
+        }
+        if let Some(diagnostic) = visualization_diagnostic {
+            // Rerun receives diagnostic copies only. Reporting its terminal
+            // failure must not turn an otherwise healthy robot owner into a
+            // failed service that an external manager could restart.
+            eprintln!("non-authoritative live visualization failure: {diagnostic}");
         }
 
         let pair_snapshot = pair_stats.snapshot();
@@ -7182,13 +7201,10 @@ mod tests {
     }
 
     #[test]
-    fn navigation_dataset_publication_ignores_only_visualization_failure() {
-        assert!(navigation_dataset_may_publish(false, true, false));
-        assert!(navigation_dataset_may_publish(false, true, true));
-        assert!(!navigation_dataset_may_publish(true, true, false));
-        assert!(!navigation_dataset_may_publish(true, true, true));
-        assert!(!navigation_dataset_may_publish(false, false, false));
-        assert!(!navigation_dataset_may_publish(false, false, true));
+    fn navigation_dataset_publication_uses_only_authoritative_inputs() {
+        assert!(navigation_dataset_may_publish(false, true));
+        assert!(!navigation_dataset_may_publish(true, true));
+        assert!(!navigation_dataset_may_publish(false, false));
     }
 
     #[cfg(feature = "record")]
