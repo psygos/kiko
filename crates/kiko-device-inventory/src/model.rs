@@ -23,23 +23,26 @@ pub enum DeviceRole {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OakIdentity {
     mxid: OakMxid,
-    runtime_provenance: BuildProvenance,
-    sdk_build_provenance: BuildProvenance,
-    adapter_build_provenance: BuildProvenance,
+    compiled_depthai_header_sdk_version: BuildProvenance,
+    compiled_depthai_header_sdk_commit: BuildProvenance,
+    compiled_depthai_header_embedded_device_artifact_version: BuildProvenance,
+    compiled_depthai_header_embedded_bootloader_artifact_version: BuildProvenance,
 }
 
 impl OakIdentity {
     pub(crate) const fn new(
         mxid: OakMxid,
-        runtime_provenance: BuildProvenance,
-        sdk_build_provenance: BuildProvenance,
-        adapter_build_provenance: BuildProvenance,
+        compiled_depthai_header_sdk_version: BuildProvenance,
+        compiled_depthai_header_sdk_commit: BuildProvenance,
+        compiled_depthai_header_embedded_device_artifact_version: BuildProvenance,
+        compiled_depthai_header_embedded_bootloader_artifact_version: BuildProvenance,
     ) -> Self {
         Self {
             mxid,
-            runtime_provenance,
-            sdk_build_provenance,
-            adapter_build_provenance,
+            compiled_depthai_header_sdk_version,
+            compiled_depthai_header_sdk_commit,
+            compiled_depthai_header_embedded_device_artifact_version,
+            compiled_depthai_header_embedded_bootloader_artifact_version,
         }
     }
 
@@ -47,16 +50,28 @@ impl OakIdentity {
         &self.mxid
     }
 
-    pub fn runtime_provenance(&self) -> &BuildProvenance {
-        &self.runtime_provenance
+    pub fn compiled_depthai_header_sdk_version(&self) -> &BuildProvenance {
+        &self.compiled_depthai_header_sdk_version
     }
 
-    pub fn sdk_build_provenance(&self) -> &BuildProvenance {
-        &self.sdk_build_provenance
+    pub fn compiled_depthai_header_sdk_commit(&self) -> &BuildProvenance {
+        &self.compiled_depthai_header_sdk_commit
     }
 
-    pub fn adapter_build_provenance(&self) -> &BuildProvenance {
-        &self.adapter_build_provenance
+    /// Device-artifact version reported by the compiled DepthAI header.
+    ///
+    /// This proves neither the identity of a linked/runtime DepthAI library nor
+    /// firmware currently executing on the connected OAK device.
+    pub fn compiled_depthai_header_embedded_device_artifact_version(&self) -> &BuildProvenance {
+        &self.compiled_depthai_header_embedded_device_artifact_version
+    }
+
+    /// Bootloader-artifact version reported by the compiled DepthAI header.
+    ///
+    /// This proves neither the identity of a linked/runtime DepthAI library nor
+    /// the bootloader installed on the connected OAK device.
+    pub fn compiled_depthai_header_embedded_bootloader_artifact_version(&self) -> &BuildProvenance {
+        &self.compiled_depthai_header_embedded_bootloader_artifact_version
     }
 }
 

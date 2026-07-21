@@ -3,7 +3,9 @@
 //! Typed inventory domains plus a bounded Unix host boundary for one Kiko robot.
 //!
 //! Manifest loading and artifact hashing establish structural validity and
-//! content identity only. Neither result proves provenance or authenticity.
+//! content identity only. Exact comparison is the sole constructor for owned
+//! inventory-admission evidence. None of these results proves provenance,
+//! authenticity, or continuing device liveness.
 
 mod artifact;
 #[cfg(unix)]
@@ -48,7 +50,10 @@ pub use bounded::{
     MAX_CONTROL_ENDPOINT_ID_BYTES, MAX_OAK_MXID_BYTES, MAX_ROBOT_ID_BYTES,
     MAX_SERIAL_BY_ID_PATH_BYTES, OakMxid, PersistentSerialPath, RobotId, Sha256Id,
 };
-pub use compare::{InventoryComparison, InventoryMismatch, MAX_INVENTORY_MISMATCHES};
+pub use compare::{
+    ExactInventoryAdmission, InventoryComparison, InventoryMismatch, InventoryMismatchReport,
+    MAX_INVENTORY_MISMATCHES, admit_exact_inventory,
+};
 pub use manifest::{
     DEVICE_INVENTORY_MANIFEST_V1, DeviceInventoryManifestV1, DeviceInventoryManifestV1Dto,
     EyeManifestV1Dto, HeadManifestV1Dto, OakManifestV1Dto, REQUIRED_EYE_CAPABILITY_BITS,
@@ -66,7 +71,7 @@ pub use model::{
 };
 pub use observed::{
     OBSERVED_DEVICE_INVENTORY_V1, ObservedDeviceInventoryV1, ObservedDeviceInventoryV1Dto,
-    ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedStm32V1Dto,
+    ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedOakV1Dto, ObservedStm32V1Dto,
 };
 #[cfg(unix)]
 pub use secure_fs::SecureOpenError;
@@ -75,9 +80,10 @@ pub use secure_fs::SecureOpenError;
 pub enum TextField {
     RobotId,
     OakMxid,
-    OakRuntimeProvenance,
-    OakSdkBuildProvenance,
-    OakAdapterBuildProvenance,
+    OakCompiledDepthAiHeaderSdkVersion,
+    OakCompiledDepthAiHeaderSdkCommit,
+    OakCompiledDepthAiHeaderEmbeddedDeviceArtifactVersion,
+    OakCompiledDepthAiHeaderEmbeddedBootloaderArtifactVersion,
     SerialPath(DeviceRole),
     Stm32ControlEndpoint,
     ArtifactId { kind: ArtifactKind, index: usize },

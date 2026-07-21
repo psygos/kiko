@@ -1,3 +1,5 @@
+use core::fmt;
+
 use kiko_eye_protocol::{
     Capabilities as EyeCapabilities, DeviceUid as EyeDeviceUid,
     FirmwareBuildId as EyeFirmwareBuildId,
@@ -14,10 +16,10 @@ use crate::{
 
 /// Tight upper bound for two successfully parsed inventories.
 ///
-/// There are 22 scalar/device fields and at most two mismatch entries for each
+/// There are 23 scalar/device fields and at most two mismatch entries for each
 /// artifact slot (one missing expected artifact and one unexpected observed
 /// artifact).
-pub const MAX_INVENTORY_MISMATCHES: usize = 22 + 2 * MAX_ARTIFACTS;
+pub const MAX_INVENTORY_MISMATCHES: usize = 23 + 2 * MAX_ARTIFACTS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InventoryMismatch<'inventory> {
@@ -30,15 +32,19 @@ pub enum InventoryMismatch<'inventory> {
         expected: &'inventory OakMxid,
         observed: &'inventory OakMxid,
     },
-    OakRuntimeProvenance {
+    OakCompiledDepthAiHeaderSdkVersion {
         expected: &'inventory BuildProvenance,
         observed: &'inventory BuildProvenance,
     },
-    OakSdkBuildProvenance {
+    OakCompiledDepthAiHeaderSdkCommit {
         expected: &'inventory BuildProvenance,
         observed: &'inventory BuildProvenance,
     },
-    OakAdapterBuildProvenance {
+    OakCompiledDepthAiHeaderEmbeddedDeviceArtifactVersion {
+        expected: &'inventory BuildProvenance,
+        observed: &'inventory BuildProvenance,
+    },
+    OakCompiledDepthAiHeaderEmbeddedBootloaderArtifactVersion {
         expected: &'inventory BuildProvenance,
         observed: &'inventory BuildProvenance,
     },
@@ -133,10 +139,122 @@ pub enum InventoryMismatch<'inventory> {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct InventoryComparison<'inventory> {
+    expected: &'inventory DeviceInventoryManifestV1,
+    observed: &'inventory ObservedDeviceInventoryV1,
     mismatches: [Option<InventoryMismatch<'inventory>>; MAX_INVENTORY_MISMATCHES],
     len: u8,
+}
+
+impl<'inventory> PartialEq for InventoryComparison<'inventory> {
+    fn eq(&self, other: &Self) -> bool {
+        // Expected/observed references exist only to mint owned admission.
+        // Comparison semantics are exactly the reported mismatch sequence;
+        // fields intentionally excluded from comparison (such as boot IDs)
+        // must not leak into equality through those references.
+        self.mismatches[..self.len()] == other.mismatches[..other.len()]
+    }
+}
+
+impl<'inventory> Eq for InventoryComparison<'inventory> {}
+
+/// Owned capability proving that two immutable parsed snapshots compared
+/// exactly when this value was created.
+///
+/// Fields are private, so external callers can obtain this type only through
+/// [`admit_exact_inventory`] or
+/// [`InventoryComparison::into_exact_admission`], both of which require an
+/// exact comparison. This is snapshot admission evidence, not proof of
+/// continuing connectivity, authenticity, or liveness.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExactInventoryAdmission {
+    expected: DeviceInventoryManifestV1,
+    observed: ObservedDeviceInventoryV1,
+}
+
+impl ExactInventoryAdmission {
+    pub fn expected(&self) -> &DeviceInventoryManifestV1 {
+        &self.expected
+    }
+
+    pub fn observed(&self) -> &ObservedDeviceInventoryV1 {
+        &self.observed
+    }
+}
+
+/// Owned, bounded, lossless evidence for a failed exact-inventory admission.
+///
+/// Both parsed snapshots are retained, rather than copying or truncating
+/// mismatch text. [`Self::comparison`] deterministically reconstructs every
+/// typed mismatch while borrowing this report.
+#[derive(Debug, PartialEq, Eq)]
+pub struct InventoryMismatchReport(Box<InventoryMismatchEvidence>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct InventoryMismatchEvidence {
+    expected: DeviceInventoryManifestV1,
+    observed: ObservedDeviceInventoryV1,
+    mismatch_count: u8,
+}
+
+impl InventoryMismatchReport {
+    pub fn expected(&self) -> &DeviceInventoryManifestV1 {
+        &self.0.expected
+    }
+
+    pub fn observed(&self) -> &ObservedDeviceInventoryV1 {
+        &self.0.observed
+    }
+
+    pub fn comparison(&self) -> InventoryComparison<'_> {
+        let comparison = InventoryComparison::compare(&self.0.expected, &self.0.observed);
+        debug_assert_eq!(comparison.len, self.0.mismatch_count);
+        comparison
+    }
+
+    pub fn len(&self) -> usize {
+        usize::from(self.0.mismatch_count)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.mismatch_count == 0
+    }
+}
+
+impl fmt::Display for InventoryMismatchReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exact Kiko inventory admission failed with {} mismatch(es)",
+            self.len()
+        )
+    }
+}
+
+impl std::error::Error for InventoryMismatchReport {}
+
+/// Compare two owned parsed snapshots and move them into the exact result.
+///
+/// This is the preferred production entrypoint when the caller owns both
+/// values: success performs no full-snapshot clone, while failure allocates
+/// one bounded report payload containing the complete original snapshots.
+pub fn admit_exact_inventory(
+    expected: DeviceInventoryManifestV1,
+    observed: ObservedDeviceInventoryV1,
+) -> Result<ExactInventoryAdmission, InventoryMismatchReport> {
+    let mismatch_count = InventoryComparison::compare(&expected, &observed).len;
+    if mismatch_count == 0 {
+        Ok(ExactInventoryAdmission { expected, observed })
+    } else {
+        Err(InventoryMismatchReport(Box::new(
+            InventoryMismatchEvidence {
+                expected,
+                observed,
+                mismatch_count,
+            },
+        )))
+    }
 }
 
 impl<'inventory> InventoryComparison<'inventory> {
@@ -145,6 +263,8 @@ impl<'inventory> InventoryComparison<'inventory> {
         observed: &'inventory ObservedDeviceInventoryV1,
     ) -> Self {
         let mut output = Self {
+            expected,
+            observed,
             mismatches: core::array::from_fn(|_| None),
             len: 0,
         };
@@ -231,6 +351,28 @@ impl<'inventory> InventoryComparison<'inventory> {
             .map(|mismatch| mismatch.as_ref().expect("comparison prefix is initialized"))
     }
 
+    /// Convert an exact borrowed comparison into owned admission evidence.
+    ///
+    /// A non-exact comparison returns an owned report containing both complete
+    /// bounded snapshots, so no mismatch values or identities are lost when
+    /// the original inputs go out of scope.
+    pub fn into_exact_admission(self) -> Result<ExactInventoryAdmission, InventoryMismatchReport> {
+        if self.is_exact_match() {
+            Ok(ExactInventoryAdmission {
+                expected: self.expected.clone(),
+                observed: self.observed.clone(),
+            })
+        } else {
+            Err(InventoryMismatchReport(Box::new(
+                InventoryMismatchEvidence {
+                    expected: self.expected.clone(),
+                    observed: self.observed.clone(),
+                    mismatch_count: self.len,
+                },
+            )))
+        }
+    }
+
     fn push(&mut self, mismatch: InventoryMismatch<'inventory>) {
         let index = usize::from(self.len);
         let slot = self
@@ -253,23 +395,41 @@ fn compare_oak<'inventory>(
             observed: observed.mxid(),
         });
     }
-    if expected.runtime_provenance() != observed.runtime_provenance() {
-        output.push(InventoryMismatch::OakRuntimeProvenance {
-            expected: expected.runtime_provenance(),
-            observed: observed.runtime_provenance(),
+    if expected.compiled_depthai_header_sdk_version()
+        != observed.compiled_depthai_header_sdk_version()
+    {
+        output.push(InventoryMismatch::OakCompiledDepthAiHeaderSdkVersion {
+            expected: expected.compiled_depthai_header_sdk_version(),
+            observed: observed.compiled_depthai_header_sdk_version(),
         });
     }
-    if expected.sdk_build_provenance() != observed.sdk_build_provenance() {
-        output.push(InventoryMismatch::OakSdkBuildProvenance {
-            expected: expected.sdk_build_provenance(),
-            observed: observed.sdk_build_provenance(),
+    if expected.compiled_depthai_header_sdk_commit()
+        != observed.compiled_depthai_header_sdk_commit()
+    {
+        output.push(InventoryMismatch::OakCompiledDepthAiHeaderSdkCommit {
+            expected: expected.compiled_depthai_header_sdk_commit(),
+            observed: observed.compiled_depthai_header_sdk_commit(),
         });
     }
-    if expected.adapter_build_provenance() != observed.adapter_build_provenance() {
-        output.push(InventoryMismatch::OakAdapterBuildProvenance {
-            expected: expected.adapter_build_provenance(),
-            observed: observed.adapter_build_provenance(),
-        });
+    if expected.compiled_depthai_header_embedded_device_artifact_version()
+        != observed.compiled_depthai_header_embedded_device_artifact_version()
+    {
+        output.push(
+            InventoryMismatch::OakCompiledDepthAiHeaderEmbeddedDeviceArtifactVersion {
+                expected: expected.compiled_depthai_header_embedded_device_artifact_version(),
+                observed: observed.compiled_depthai_header_embedded_device_artifact_version(),
+            },
+        );
+    }
+    if expected.compiled_depthai_header_embedded_bootloader_artifact_version()
+        != observed.compiled_depthai_header_embedded_bootloader_artifact_version()
+    {
+        output.push(
+            InventoryMismatch::OakCompiledDepthAiHeaderEmbeddedBootloaderArtifactVersion {
+                expected: expected.compiled_depthai_header_embedded_bootloader_artifact_version(),
+                observed: observed.compiled_depthai_header_embedded_bootloader_artifact_version(),
+            },
+        );
     }
 }
 

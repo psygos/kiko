@@ -7,7 +7,9 @@ and artifact hashing for Linux and macOS.
 
 Weak values are parsed into bounded domain types once and compared exactly.
 Already-parsed inventory comparison is allocation-free and borrows both
-snapshots.
+snapshots. An exact comparison can be consumed to mint an owned
+`ExactInventoryAdmission`; a mismatch instead produces an owned, bounded
+`InventoryMismatchReport` that retains both complete parsed snapshots.
 
 ## Contract
 
@@ -40,6 +42,70 @@ bounded identity storage. It does not accept a different device, build,
 capability set, path, or digest as a substitute. STM32 and eye boot IDs are
 retained in observed identities but are not compared: they are intentionally
 per-boot values and have no stable counterpart in the manifest.
+`InventoryComparison` equality is defined solely by the ordered mismatch
+prefix, so these intentionally ignored boot IDs cannot change comparison
+equality through the internal references retained for admission conversion.
+
+`ExactInventoryAdmission` has private fields and is constructed only through
+an exact comparison. Production callers that own both parsed snapshots should
+use `admit_exact_inventory`, which performs that comparison and moves both
+inputs into the result without cloning them. The borrowed
+`InventoryComparison::into_exact_admission` path remains available when a
+caller cannot transfer ownership. Either result owns immutable snapshots, so
+its evidence remains available after the original inputs are dropped and
+cannot silently refer to subsequently mutated DTOs. It proves exact snapshot
+agreement only; it does not prove ongoing device liveness. On failure, the
+mismatch report owns the same full snapshots and can reconstruct the complete
+typed comparison without truncated strings, fixed-message buffers, or a
+dependency on the original inputs' lifetimes. Only the failure path boxes this
+fixed-capacity payload, so the `Err` handle is one pointer. The `Ok` admission
+remains inline and owns both complete snapshots; it is multi-KiB and therefore
+still determines the overall `Result` size.
+
+## OAK evidence semantics
+
+The expected and observed OAK DTOs are deliberately different Rust types.
+`OakManifestV1Dto` is an expectation; `ObservedOakV1Dto` is a caller-supplied
+probe result. The latter must be assembled from the exact connected-device
+MXID and `oak_sys::depthai_build_metadata()`:
+
+- `compiled_depthai_header_sdk_version` and
+  `compiled_depthai_header_sdk_commit` preserve `dai::build::VERSION` and
+  `dai::build::COMMIT` from the `depthai/build/version.hpp` used to compile
+  `oak_device.cpp`;
+- `compiled_depthai_header_embedded_device_artifact_version` and
+  `compiled_depthai_header_embedded_bootloader_artifact_version` preserve the
+  corresponding `dai::build::DEVICE_VERSION` and
+  `dai::build::BOOTLOADER_VERSION` header constants.
+
+These four values prove only compiled-header metadata. Kiko's build can resolve
+DepthAI include and library roots independently, and this query does not
+inspect the linked or dynamically loaded library. It therefore does **not**
+prove that the runtime library matches the compiled header. The embedded
+artifact fields are also **not** readbacks of firmware or bootloader code
+currently executing on the physical OAK. The inventory makes neither claim.
+The former `runtime_provenance`, `sdk_build_provenance`, and
+`adapter_build_provenance` strings were removed because their sources and
+semantics could not be established by the runtime boundary. Host executable,
+runtime-library, or adapter provenance belongs in a separately hashed
+deployment artifact until Kiko has a typed, reproducible identity source for
+it.
+
+### Draft V1 migration status
+
+This field correction applies to an unreleased draft V1, not a deployed wire
+contract. At the time of the correction, `crates/kiko-device-inventory` was
+absent from `main`, no repository tag contained its introducing commits, the
+integration branch had not been pushed, and no production inventory caller
+constructed an observed OAK report. The earlier ambiguous keys therefore had
+neither a released decoder nor a valid admission meaning.
+
+Local branch-only draft manifests must replace those three keys with the four
+exact compiled-DepthAI-header fields above. The loader uses
+`deny_unknown_fields`, so an old draft fails closed instead of being silently
+reinterpreted. After V1 is published or deployed, every incompatible wire
+change must introduce a new schema version and correspondingly named
+DTO/domain entrypoint.
 
 ## Unix host boundary
 
@@ -103,6 +169,13 @@ signature, authorization, provenance, or authenticity. It also does not
 establish physical identity, connectivity, readiness, calibration quality, or
 safe motion.
 
+In particular, an observed OAK DTO remains a caller claim even though its
+field names correspond exactly to APIs available from `oak-sys`. This crate
+cannot prove that the caller sourced those values from the same open device;
+the production owner must construct the DTO directly from its one OAK handle
+and linked-build query, then retain the resulting admission capability in that
+same startup epoch.
+
 Hashing is not an atomic filesystem snapshot. The code detects a file-length
 change between metadata and end of read, but a concurrent writer can replace
 bytes without changing the length and can make a streamed digest represent
@@ -116,7 +189,7 @@ From the workspace root:
 
 ```sh
 cargo test -p kiko-device-inventory
-cargo clippy -p kiko-device-inventory --all-targets -- -D warnings
+cargo clippy -p kiko-device-inventory --all-targets --no-deps -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc -p kiko-device-inventory --no-deps
 cargo check -p kiko-device-inventory --target aarch64-unknown-linux-gnu
 cargo bench -p kiko-device-inventory --bench inventory -- 100000

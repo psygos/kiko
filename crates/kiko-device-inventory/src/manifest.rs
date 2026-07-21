@@ -20,9 +20,10 @@ pub const REQUIRED_EYE_CAPABILITY_BITS: u32 = EyeCapabilities::KNOWN_BITS;
 #[serde(deny_unknown_fields)]
 pub struct OakManifestV1Dto {
     pub mxid: String,
-    pub runtime_provenance: String,
-    pub sdk_build_provenance: String,
-    pub adapter_build_provenance: String,
+    pub compiled_depthai_header_sdk_version: String,
+    pub compiled_depthai_header_sdk_commit: String,
+    pub compiled_depthai_header_embedded_device_artifact_version: String,
+    pub compiled_depthai_header_embedded_bootloader_artifact_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -152,31 +153,38 @@ pub(crate) fn parse_oak(dto: OakManifestV1Dto) -> Result<OakIdentity, InventoryP
         field: TextField::OakMxid,
         source,
     })?;
-    let runtime_provenance = BuildProvenance::parse(dto.runtime_provenance).map_err(|source| {
-        InventoryParseError::InvalidText {
-            field: TextField::OakRuntimeProvenance,
-            source,
-        }
-    })?;
-    let sdk_build_provenance =
-        BuildProvenance::parse(dto.sdk_build_provenance).map_err(|source| {
+    let compiled_depthai_header_sdk_version =
+        BuildProvenance::parse(dto.compiled_depthai_header_sdk_version).map_err(|source| {
             InventoryParseError::InvalidText {
-                field: TextField::OakSdkBuildProvenance,
+                field: TextField::OakCompiledDepthAiHeaderSdkVersion,
                 source,
             }
         })?;
-    let adapter_build_provenance =
-        BuildProvenance::parse(dto.adapter_build_provenance).map_err(|source| {
+    let compiled_depthai_header_sdk_commit =
+        BuildProvenance::parse(dto.compiled_depthai_header_sdk_commit).map_err(|source| {
             InventoryParseError::InvalidText {
-                field: TextField::OakAdapterBuildProvenance,
+                field: TextField::OakCompiledDepthAiHeaderSdkCommit,
                 source,
             }
         })?;
+    let compiled_depthai_header_embedded_device_artifact_version =
+        BuildProvenance::parse(dto.compiled_depthai_header_embedded_device_artifact_version)
+            .map_err(|source| InventoryParseError::InvalidText {
+                field: TextField::OakCompiledDepthAiHeaderEmbeddedDeviceArtifactVersion,
+                source,
+            })?;
+    let compiled_depthai_header_embedded_bootloader_artifact_version =
+        BuildProvenance::parse(dto.compiled_depthai_header_embedded_bootloader_artifact_version)
+            .map_err(|source| InventoryParseError::InvalidText {
+                field: TextField::OakCompiledDepthAiHeaderEmbeddedBootloaderArtifactVersion,
+                source,
+            })?;
     Ok(OakIdentity::new(
         mxid,
-        runtime_provenance,
-        sdk_build_provenance,
-        adapter_build_provenance,
+        compiled_depthai_header_sdk_version,
+        compiled_depthai_header_sdk_commit,
+        compiled_depthai_header_embedded_device_artifact_version,
+        compiled_depthai_header_embedded_bootloader_artifact_version,
     ))
 }
 

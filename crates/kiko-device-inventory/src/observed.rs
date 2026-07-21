@@ -12,6 +12,22 @@ use crate::{
 
 pub const OBSERVED_DEVICE_INVENTORY_V1: u32 = 1;
 
+/// Caller-supplied OAK evidence with the same field semantics as the manifest.
+///
+/// `mxid` must come from the identity of the device that was actually opened.
+/// The remaining values come from `dai::build::*` constants in the DepthAI
+/// header used to compile the native bridge. They prove neither the identity
+/// of a linked/runtime DepthAI library nor firmware or bootloader readback from
+/// the physical device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedOakV1Dto {
+    pub mxid: String,
+    pub compiled_depthai_header_sdk_version: String,
+    pub compiled_depthai_header_sdk_commit: String,
+    pub compiled_depthai_header_embedded_device_artifact_version: String,
+    pub compiled_depthai_header_embedded_bootloader_artifact_version: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedStm32V1Dto {
     pub serial_by_id_path: String,
@@ -51,7 +67,7 @@ pub struct ObservedEyeV1Dto {
 pub struct ObservedDeviceInventoryV1Dto {
     pub schema_version: u32,
     pub robot_id: String,
-    pub oak: Option<OakManifestV1Dto>,
+    pub oak: Option<ObservedOakV1Dto>,
     pub stm32: Option<ObservedStm32V1Dto>,
     pub head: Option<ObservedHeadV1Dto>,
     pub eye: Option<ObservedEyeV1Dto>,
@@ -82,7 +98,7 @@ impl ObservedDeviceInventoryV1 {
                 field: TextField::RobotId,
                 source,
             })?;
-        let oak = dto.oak.map(parse_oak).transpose()?;
+        let oak = dto.oak.map(parse_observed_oak).transpose()?;
         let stm32 = dto.stm32.map(parse_observed_stm32).transpose()?;
         let head = dto.head.map(parse_observed_head).transpose()?;
         let eye = dto.eye.map(parse_observed_eye).transpose()?;
@@ -142,6 +158,18 @@ impl ObservedDeviceInventoryV1 {
     pub fn artifacts(&self) -> &ArtifactSet {
         &self.artifacts
     }
+}
+
+fn parse_observed_oak(dto: ObservedOakV1Dto) -> Result<OakIdentity, InventoryParseError> {
+    parse_oak(OakManifestV1Dto {
+        mxid: dto.mxid,
+        compiled_depthai_header_sdk_version: dto.compiled_depthai_header_sdk_version,
+        compiled_depthai_header_sdk_commit: dto.compiled_depthai_header_sdk_commit,
+        compiled_depthai_header_embedded_device_artifact_version: dto
+            .compiled_depthai_header_embedded_device_artifact_version,
+        compiled_depthai_header_embedded_bootloader_artifact_version: dto
+            .compiled_depthai_header_embedded_bootloader_artifact_version,
+    })
 }
 
 fn parse_observed_stm32(dto: ObservedStm32V1Dto) -> Result<ObservedStm32, InventoryParseError> {

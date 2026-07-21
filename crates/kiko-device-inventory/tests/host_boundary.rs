@@ -51,9 +51,10 @@ fn manifest_json(calibration: &[u8], plant: &[u8]) -> Vec<u8> {
         "robot_id": "kiko-production-01",
         "oak": {
             "mxid": "A1B2C3D4E5F60708",
-            "runtime_provenance": "depthai-runtime@2.29.0",
-            "sdk_build_provenance": "depthai-core@2.29.0+abc123",
-            "adapter_build_provenance": "kiko-oak-adapter@abc123"
+            "compiled_depthai_header_sdk_version": "3.6.1",
+            "compiled_depthai_header_sdk_commit": "abc123",
+            "compiled_depthai_header_embedded_device_artifact_version": "device-1",
+            "compiled_depthai_header_embedded_bootloader_artifact_version": "bootloader-1"
         },
         "stm32": {
             "serial_by_id_path": "/dev/serial/by-id/usb-Kiko_STM32_A1-if00",
@@ -173,6 +174,25 @@ fn duplicate_unknown_and_trailing_json_are_rejected() {
         Err(ManifestLoadError::Json(
             ManifestJsonError::TrailingData { .. }
         ))
+    ));
+}
+
+#[test]
+fn ambiguous_legacy_oak_provenance_fields_cannot_enter_the_typed_manifest() {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&manifest_json(b"calibration", b"plant")).expect("fixture");
+    value["oak"] = json!({
+        "mxid": "A1B2C3D4E5F60708",
+        "runtime_provenance": "unverified-device-runtime",
+        "sdk_build_provenance": "unspecified-sdk-build-semantics",
+        "adapter_build_provenance": "caller-asserted-adapter"
+    });
+
+    assert!(matches!(
+        load_expected_manifest_v1_from_slice(
+            &serde_json::to_vec(&value).expect("legacy OAK fixture")
+        ),
+        Err(ManifestLoadError::Json(ManifestJsonError::Decode { .. }))
     ));
 }
 

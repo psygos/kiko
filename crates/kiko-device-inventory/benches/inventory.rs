@@ -5,8 +5,8 @@ use kiko_device_inventory::{
     ArtifactDigestDto, DEVICE_INVENTORY_MANIFEST_V1, DeviceInventoryManifestV1,
     DeviceInventoryManifestV1Dto, EyeManifestV1Dto, HeadManifestV1Dto, InventoryComparison,
     OBSERVED_DEVICE_INVENTORY_V1, OakManifestV1Dto, ObservedDeviceInventoryV1,
-    ObservedDeviceInventoryV1Dto, ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedStm32V1Dto,
-    Stm32ManifestV1Dto,
+    ObservedDeviceInventoryV1Dto, ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedOakV1Dto,
+    ObservedStm32V1Dto, Stm32ManifestV1Dto,
 };
 use robot_protocol::v2::{ControllerCapabilities, VERSION as ROBOT_PROTOCOL_VERSION};
 
@@ -20,9 +20,23 @@ fn artifact(id: &str, byte: u8) -> ArtifactDigestDto {
 fn oak() -> OakManifestV1Dto {
     OakManifestV1Dto {
         mxid: "A1B2C3D4E5F60708".into(),
-        runtime_provenance: "depthai-runtime@2.29.0".into(),
-        sdk_build_provenance: "depthai-core@2.29.0+abc123".into(),
-        adapter_build_provenance: "kiko-oak-adapter@abc123".into(),
+        compiled_depthai_header_sdk_version: "3.6.1".into(),
+        compiled_depthai_header_sdk_commit: "abc123".into(),
+        compiled_depthai_header_embedded_device_artifact_version: "device-1".into(),
+        compiled_depthai_header_embedded_bootloader_artifact_version: "bootloader-1".into(),
+    }
+}
+
+fn observed_oak() -> ObservedOakV1Dto {
+    let expected = oak();
+    ObservedOakV1Dto {
+        mxid: expected.mxid,
+        compiled_depthai_header_sdk_version: expected.compiled_depthai_header_sdk_version,
+        compiled_depthai_header_sdk_commit: expected.compiled_depthai_header_sdk_commit,
+        compiled_depthai_header_embedded_device_artifact_version: expected
+            .compiled_depthai_header_embedded_device_artifact_version,
+        compiled_depthai_header_embedded_bootloader_artifact_version: expected
+            .compiled_depthai_header_embedded_bootloader_artifact_version,
     }
 }
 
@@ -69,7 +83,7 @@ fn observed_dto() -> ObservedDeviceInventoryV1Dto {
     ObservedDeviceInventoryV1Dto {
         schema_version: OBSERVED_DEVICE_INVENTORY_V1,
         robot_id: "kiko-production-01".into(),
-        oak: Some(oak()),
+        oak: Some(observed_oak()),
         stm32: Some(ObservedStm32V1Dto {
             serial_by_id_path: "/dev/serial/by-id/usb-Kiko_STM32_A1-if00".into(),
             control_endpoint_identity: "unix:/run/kiko/robot-v2.sock".into(),

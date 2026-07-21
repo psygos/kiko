@@ -6,8 +6,8 @@ use kiko_device_inventory::{
     MAX_CONTROL_ENDPOINT_ID_BYTES, MAX_INVENTORY_MISMATCHES, MAX_OAK_MXID_BYTES,
     MAX_OBSERVED_HEAD_SERVOS, MAX_PLANT_ARTIFACTS, MAX_ROBOT_ID_BYTES, MAX_SERIAL_BY_ID_PATH_BYTES,
     OBSERVED_DEVICE_INVENTORY_V1, OakManifestV1Dto, ObservedDeviceInventoryV1,
-    ObservedDeviceInventoryV1Dto, ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedStm32V1Dto,
-    Stm32ManifestV1Dto, TextField,
+    ObservedDeviceInventoryV1Dto, ObservedEyeV1Dto, ObservedHeadV1Dto, ObservedOakV1Dto,
+    ObservedStm32V1Dto, Stm32ManifestV1Dto, TextField, admit_exact_inventory,
 };
 use kiko_head_protocol::HeadJoint;
 use robot_protocol::v2::{ControllerCapabilities, VERSION as ROBOT_PROTOCOL_VERSION};
@@ -23,9 +23,23 @@ fn digest(artifact_id: impl Into<String>, byte: u8) -> ArtifactDigestDto {
 fn oak() -> OakManifestV1Dto {
     OakManifestV1Dto {
         mxid: "A1B2C3D4E5F60708".into(),
-        runtime_provenance: "depthai-runtime@2.29.0".into(),
-        sdk_build_provenance: "depthai-core@2.29.0+abc123".into(),
-        adapter_build_provenance: "kiko-oak-adapter@abc123".into(),
+        compiled_depthai_header_sdk_version: "3.6.1".into(),
+        compiled_depthai_header_sdk_commit: "abc123".into(),
+        compiled_depthai_header_embedded_device_artifact_version: "device-1".into(),
+        compiled_depthai_header_embedded_bootloader_artifact_version: "bootloader-1".into(),
+    }
+}
+
+fn observed_oak() -> ObservedOakV1Dto {
+    let expected = oak();
+    ObservedOakV1Dto {
+        mxid: expected.mxid,
+        compiled_depthai_header_sdk_version: expected.compiled_depthai_header_sdk_version,
+        compiled_depthai_header_sdk_commit: expected.compiled_depthai_header_sdk_commit,
+        compiled_depthai_header_embedded_device_artifact_version: expected
+            .compiled_depthai_header_embedded_device_artifact_version,
+        compiled_depthai_header_embedded_bootloader_artifact_version: expected
+            .compiled_depthai_header_embedded_bootloader_artifact_version,
     }
 }
 
@@ -121,7 +135,7 @@ fn observed_dto() -> ObservedDeviceInventoryV1Dto {
     ObservedDeviceInventoryV1Dto {
         schema_version: OBSERVED_DEVICE_INVENTORY_V1,
         robot_id: "kiko-production-01".into(),
-        oak: Some(oak()),
+        oak: Some(observed_oak()),
         stm32: Some(observed_stm32()),
         head: Some(observed_head()),
         eye: Some(observed_eye()),
@@ -151,6 +165,109 @@ fn exact_inventory_matches_without_substitution() {
     assert_eq!(comparison.iter().count(), 0);
     assert_eq!(observed.stm32().expect("STM32").boot_id().get(), 71);
     assert_eq!(observed.eye().expect("eye").boot_id().get(), 81);
+}
+
+#[test]
+fn comparison_equality_ignores_intentionally_uncompared_boot_ids() {
+    let expected = DeviceInventoryManifestV1::parse(manifest_dto()).expect("manifest");
+    let first = ObservedDeviceInventoryV1::parse(observed_dto()).expect("first observation");
+    let mut second_dto = observed_dto();
+    second_dto.stm32.as_mut().expect("STM32").controller_boot_id = 72;
+    second_dto.eye.as_mut().expect("eye").device_boot_id = 82;
+    let second = ObservedDeviceInventoryV1::parse(second_dto).expect("second observation");
+
+    assert_ne!(
+        first.stm32().expect("first STM32").boot_id(),
+        second.stm32().expect("second STM32").boot_id()
+    );
+    assert_ne!(
+        first.eye().expect("first eye").boot_id(),
+        second.eye().expect("second eye").boot_id()
+    );
+    let first_comparison = InventoryComparison::compare(&expected, &first);
+    let second_comparison = InventoryComparison::compare(&expected, &second);
+    assert!(first_comparison.is_exact_match());
+    assert!(second_comparison.is_exact_match());
+    assert_eq!(first_comparison, second_comparison);
+}
+
+#[test]
+fn borrowed_exact_comparison_mints_owned_admission() {
+    let admission = {
+        let (expected, observed) = parse_pair();
+        InventoryComparison::compare(&expected, &observed)
+            .into_exact_admission()
+            .expect("exact inventory admission")
+    };
+
+    assert_eq!(
+        admission.expected().robot_id().as_str(),
+        "kiko-production-01"
+    );
+    assert_eq!(
+        admission.observed().stm32().expect("STM32").boot_id().get(),
+        71
+    );
+    assert!(
+        InventoryComparison::compare(admission.expected(), admission.observed()).is_exact_match()
+    );
+}
+
+#[test]
+fn consuming_admission_moves_owned_snapshots_through_the_same_exact_gate() {
+    let (expected, observed) = parse_pair();
+    let admission = admit_exact_inventory(expected, observed).expect("exact owned admission");
+
+    assert_eq!(admission.observed().eye().expect("eye").boot_id().get(), 81);
+    assert!(
+        InventoryComparison::compare(admission.expected(), admission.observed()).is_exact_match()
+    );
+
+    let expected = DeviceInventoryManifestV1::parse(manifest_dto()).expect("manifest");
+    let mut dto = observed_dto();
+    dto.robot_id = "other-robot".into();
+    let observed = ObservedDeviceInventoryV1::parse(dto).expect("contrary observation");
+    let report = admit_exact_inventory(expected, observed).expect_err("must reject mismatch");
+    assert_eq!(report.len(), 1);
+    assert!(matches!(
+        report.comparison().iter().next(),
+        Some(InventoryMismatch::RobotId { .. })
+    ));
+}
+
+#[test]
+fn failed_admission_owns_every_bounded_mismatch_after_inputs_are_dropped() {
+    let report = {
+        let expected = DeviceInventoryManifestV1::parse(manifest_dto()).expect("manifest");
+        let mut dto = observed_dto();
+        dto.robot_id = "other-robot".into();
+        let oak = dto.oak.as_mut().expect("OAK");
+        oak.mxid = "BBBBBBBBBBBBBBBB".into();
+        oak.compiled_depthai_header_sdk_commit = "other-commit".into();
+        dto.calibration_artifacts[0].sha256 = [0x91; 32];
+        let observed = ObservedDeviceInventoryV1::parse(dto).expect("contrary observation");
+        InventoryComparison::compare(&expected, &observed)
+            .into_exact_admission()
+            .expect_err("mismatch must not mint admission")
+    };
+
+    assert!(!report.is_empty());
+    assert_eq!(report.len(), 4);
+    assert_eq!(report.expected().robot_id().as_str(), "kiko-production-01");
+    assert_eq!(report.observed().robot_id().as_str(), "other-robot");
+    let comparison = report.comparison();
+    let mismatches = comparison.iter().collect::<Vec<_>>();
+    assert!(matches!(mismatches[0], InventoryMismatch::RobotId { .. }));
+    assert!(matches!(mismatches[1], InventoryMismatch::OakMxid { .. }));
+    assert!(matches!(
+        mismatches[2],
+        InventoryMismatch::OakCompiledDepthAiHeaderSdkCommit { .. }
+    ));
+    assert!(matches!(
+        mismatches[3],
+        InventoryMismatch::ArtifactDigest { .. }
+    ));
+    assert!(report.to_string().contains("4 mismatch(es)"));
 }
 
 #[test]
@@ -236,9 +353,10 @@ fn text_identities_are_bounded_nonzero_and_oak_mxids_are_canonical() {
             }) as fn(&mut DeviceInventoryManifestV1Dto),
         ),
         (
-            TextField::OakRuntimeProvenance,
+            TextField::OakCompiledDepthAiHeaderSdkVersion,
             |dto: &mut DeviceInventoryManifestV1Dto| {
-                dto.oak.runtime_provenance = "a".repeat(MAX_BUILD_PROVENANCE_BYTES + 1);
+                dto.oak.compiled_depthai_header_sdk_version =
+                    "a".repeat(MAX_BUILD_PROVENANCE_BYTES + 1);
             },
         ),
         (
@@ -707,9 +825,11 @@ fn every_scalar_fault_is_accumulated_in_stable_order() {
     dto.robot_id = "other-robot".into();
     let oak = dto.oak.as_mut().expect("OAK");
     oak.mxid = "BBBBBBBBBBBBBBBB".into();
-    oak.runtime_provenance = "other-runtime".into();
-    oak.sdk_build_provenance = "other-sdk".into();
-    oak.adapter_build_provenance = "other-adapter".into();
+    oak.compiled_depthai_header_sdk_version = "other-sdk-version".into();
+    oak.compiled_depthai_header_sdk_commit = "other-sdk-commit".into();
+    oak.compiled_depthai_header_embedded_device_artifact_version = "other-device-artifact".into();
+    oak.compiled_depthai_header_embedded_bootloader_artifact_version =
+        "other-bootloader-artifact".into();
     let stm32 = dto.stm32.as_mut().expect("STM32");
     stm32.serial_by_id_path = "/dev/serial/by-id/usb-other-stm32".into();
     stm32.control_endpoint_identity = "tcp://127.0.0.1:5001".into();
@@ -734,87 +854,91 @@ fn every_scalar_fault_is_accumulated_in_stable_order() {
 
     let comparison = InventoryComparison::compare(&expected, &observed);
     let mismatches = comparison.iter().collect::<Vec<_>>();
-    assert_eq!(mismatches.len(), 22);
+    assert_eq!(mismatches.len(), 23);
     assert!(matches!(mismatches[0], InventoryMismatch::RobotId { .. }));
     assert!(matches!(mismatches[1], InventoryMismatch::OakMxid { .. }));
     assert!(matches!(
         mismatches[2],
-        InventoryMismatch::OakRuntimeProvenance { .. }
+        InventoryMismatch::OakCompiledDepthAiHeaderSdkVersion { .. }
     ));
     assert!(matches!(
         mismatches[3],
-        InventoryMismatch::OakSdkBuildProvenance { .. }
+        InventoryMismatch::OakCompiledDepthAiHeaderSdkCommit { .. }
     ));
     assert!(matches!(
         mismatches[4],
-        InventoryMismatch::OakAdapterBuildProvenance { .. }
+        InventoryMismatch::OakCompiledDepthAiHeaderEmbeddedDeviceArtifactVersion { .. }
     ));
     assert!(matches!(
         mismatches[5],
-        InventoryMismatch::Stm32SerialPath { .. }
+        InventoryMismatch::OakCompiledDepthAiHeaderEmbeddedBootloaderArtifactVersion { .. }
     ));
     assert!(matches!(
         mismatches[6],
-        InventoryMismatch::Stm32ControlEndpoint { .. }
+        InventoryMismatch::Stm32SerialPath { .. }
     ));
     assert!(matches!(
         mismatches[7],
-        InventoryMismatch::Stm32ControllerUid { .. }
+        InventoryMismatch::Stm32ControlEndpoint { .. }
     ));
     assert!(matches!(
         mismatches[8],
-        InventoryMismatch::Stm32FirmwareAbi { .. }
+        InventoryMismatch::Stm32ControllerUid { .. }
     ));
     assert!(matches!(
         mismatches[9],
-        InventoryMismatch::Stm32FirmwareBuildId { .. }
+        InventoryMismatch::Stm32FirmwareAbi { .. }
     ));
     assert!(matches!(
         mismatches[10],
-        InventoryMismatch::Stm32HardwareProfile { .. }
+        InventoryMismatch::Stm32FirmwareBuildId { .. }
     ));
     assert!(matches!(
         mismatches[11],
-        InventoryMismatch::Stm32Capabilities { .. }
+        InventoryMismatch::Stm32HardwareProfile { .. }
     ));
     assert!(matches!(
         mismatches[12],
-        InventoryMismatch::HeadSerialPath { .. }
+        InventoryMismatch::Stm32Capabilities { .. }
     ));
     assert!(matches!(
         mismatches[13],
-        InventoryMismatch::HeadBaudRate { .. }
+        InventoryMismatch::HeadSerialPath { .. }
     ));
     assert!(matches!(
         mismatches[14],
-        InventoryMismatch::HeadDtrState { .. }
+        InventoryMismatch::HeadBaudRate { .. }
     ));
     assert!(matches!(
         mismatches[15],
-        InventoryMismatch::HeadRtsState { .. }
+        InventoryMismatch::HeadDtrState { .. }
     ));
     assert!(matches!(
         mismatches[16],
-        InventoryMismatch::HeadServoIds { .. }
+        InventoryMismatch::HeadRtsState { .. }
     ));
     assert!(matches!(
         mismatches[17],
-        InventoryMismatch::EyeSerialPath { .. }
+        InventoryMismatch::HeadServoIds { .. }
     ));
     assert!(matches!(
         mismatches[18],
-        InventoryMismatch::EyeProtocolVersion { .. }
+        InventoryMismatch::EyeSerialPath { .. }
     ));
     assert!(matches!(
         mismatches[19],
-        InventoryMismatch::EyeDeviceUid { .. }
+        InventoryMismatch::EyeProtocolVersion { .. }
     ));
     assert!(matches!(
         mismatches[20],
-        InventoryMismatch::EyeFirmwareBuildId { .. }
+        InventoryMismatch::EyeDeviceUid { .. }
     ));
     assert!(matches!(
         mismatches[21],
+        InventoryMismatch::EyeFirmwareBuildId { .. }
+    ));
+    assert!(matches!(
+        mismatches[22],
         InventoryMismatch::EyeCapabilities { .. }
     ));
 }
@@ -844,9 +968,11 @@ fn comparison_capacity_is_the_tight_reachable_bound() {
     observed_dto.robot_id = "other-robot".into();
     let oak = observed_dto.oak.as_mut().expect("OAK");
     oak.mxid = "BBBBBBBBBBBBBBBB".into();
-    oak.runtime_provenance = "other-runtime".into();
-    oak.sdk_build_provenance = "other-sdk".into();
-    oak.adapter_build_provenance = "other-adapter".into();
+    oak.compiled_depthai_header_sdk_version = "other-sdk-version".into();
+    oak.compiled_depthai_header_sdk_commit = "other-sdk-commit".into();
+    oak.compiled_depthai_header_embedded_device_artifact_version = "other-device-artifact".into();
+    oak.compiled_depthai_header_embedded_bootloader_artifact_version =
+        "other-bootloader-artifact".into();
     let stm32 = observed_dto.stm32.as_mut().expect("STM32");
     stm32.serial_by_id_path = "/dev/serial/by-id/usb-other-stm32".into();
     stm32.control_endpoint_identity = "tcp://[::1]:5002".into();
@@ -888,7 +1014,7 @@ fn comparison_capacity_is_the_tight_reachable_bound() {
     let comparison = InventoryComparison::compare(&expected, &observed);
     assert_eq!(comparison.len(), MAX_INVENTORY_MISMATCHES);
     assert_eq!(comparison.iter().count(), MAX_INVENTORY_MISMATCHES);
-    assert!(comparison.iter().take(22).all(|mismatch| !matches!(
+    assert!(comparison.iter().take(23).all(|mismatch| !matches!(
         mismatch,
         InventoryMismatch::MissingArtifact { .. }
             | InventoryMismatch::ArtifactDigest { .. }
@@ -897,14 +1023,14 @@ fn comparison_capacity_is_the_tight_reachable_bound() {
     assert!(
         comparison
             .iter()
-            .skip(22)
+            .skip(23)
             .take(12)
             .all(|mismatch| matches!(mismatch, InventoryMismatch::MissingArtifact { .. }))
     );
     assert!(
         comparison
             .iter()
-            .skip(34)
+            .skip(35)
             .all(|mismatch| matches!(mismatch, InventoryMismatch::UnexpectedArtifact { .. }))
     );
 }
@@ -913,6 +1039,7 @@ fn comparison_capacity_is_the_tight_reachable_bound() {
 fn comparison_storage_retains_borrowed_evidence_instead_of_inline_identity_copies() {
     assert!(core::mem::size_of::<InventoryMismatch<'static>>() <= 64);
     assert!(core::mem::size_of::<InventoryComparison<'static>>() <= 4_096);
+    assert!(core::mem::size_of::<kiko_device_inventory::InventoryMismatchReport>() <= 64);
 }
 
 #[test]

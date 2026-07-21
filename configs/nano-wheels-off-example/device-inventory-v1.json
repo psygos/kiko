@@ -3,9 +3,10 @@
   "robot_id": "REPLACE-kiko-robot",
   "oak": {
     "mxid": "DEADDEADDEADDEAD",
-    "runtime_provenance": "REPLACE-depthai-runtime",
-    "sdk_build_provenance": "REPLACE-depthai-core",
-    "adapter_build_provenance": "REPLACE-kiko-oak-adapter"
+    "compiled_depthai_header_sdk_version": "REPLACE-compiled-depthai-header-sdk-version",
+    "compiled_depthai_header_sdk_commit": "REPLACE-compiled-depthai-header-sdk-commit",
+    "compiled_depthai_header_embedded_device_artifact_version": "REPLACE-compiled-depthai-header-embedded-device-artifact-version",
+    "compiled_depthai_header_embedded_bootloader_artifact_version": "REPLACE-compiled-depthai-header-embedded-bootloader-artifact-version"
   },
   "stm32": {
     "serial_by_id_path": "/dev/serial/by-id/REPLACE_STM32_SERIAL_BY_ID",
