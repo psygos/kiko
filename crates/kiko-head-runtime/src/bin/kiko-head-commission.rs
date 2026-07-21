@@ -1,8 +1,9 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -10,18 +11,25 @@ use std::time::Duration;
 use kiko_head_protocol::HeadJoint;
 use kiko_head_runtime::{
     ActorExit, HeadProbeConfig, HeadProbeConfigInput, HeadProbeReport, ObservedHoldConfig,
-    ObservedHoldConfigInput, PhysicalTorqueEnableConsent, SerialConfigurationEvidence,
-    TorqueDisableReport, VerifiedNaturalHoldEvidence, probe_serial_head, start_serial_head_actor,
+    ObservedHoldConfigInput, PhysicalHeadMotionConsent, PhysicalTorqueEnableConsent,
+    ReturnToTargetConfig, ReturnToTargetConfigInput, SerialConfigurationEvidence,
+    TorqueDisableReport, VerifiedHeadReturnEvidence, VerifiedNaturalHoldEvidence,
+    probe_serial_head, start_serial_head_actor, start_serial_head_return_actor,
 };
 use serde::Deserialize;
 
 const CONFIG_SCHEMA_VERSION: u8 = 1;
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
+#[cfg(target_os = "linux")]
+const O_NOFOLLOW: i32 = 0o400000;
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW: i32 = 0x100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Probe,
     HoldObserved,
+    ReturnToTarget,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -37,9 +45,15 @@ enum CliError {
     MissingConfigPath,
     DuplicateConfig,
     DuplicateHoldObserved,
+    DuplicateReturnToTarget,
     DuplicatePhysicalConsent,
+    DuplicatePhysicalMotionConsent,
+    ConflictingMotionModes,
     HoldRequiresPhysicalConsent,
-    ConsentRequiresHold,
+    ReturnRequiresPhysicalConsent,
+    ReturnRequiresPhysicalMotionConsent,
+    TorqueConsentRequiresMotionMode,
+    MotionConsentRequiresReturn,
     UnknownArgument(OsString),
 }
 
@@ -53,13 +67,31 @@ impl fmt::Display for CliError {
             Self::DuplicateHoldObserved => {
                 formatter.write_str("--hold-observed was provided more than once")
             }
+            Self::DuplicateReturnToTarget => {
+                formatter.write_str("--return-to-target was provided more than once")
+            }
             Self::DuplicatePhysicalConsent => {
                 formatter.write_str("--physical-torque-consent was provided more than once")
             }
+            Self::DuplicatePhysicalMotionConsent => {
+                formatter.write_str("--physical-motion-consent was provided more than once")
+            }
+            Self::ConflictingMotionModes => {
+                formatter.write_str("--hold-observed and --return-to-target are mutually exclusive")
+            }
             Self::HoldRequiresPhysicalConsent => formatter
                 .write_str("--hold-observed requires the separate --physical-torque-consent flag"),
-            Self::ConsentRequiresHold => {
-                formatter.write_str("--physical-torque-consent requires --hold-observed")
+            Self::ReturnRequiresPhysicalConsent => formatter.write_str(
+                "--return-to-target requires the separate --physical-torque-consent flag",
+            ),
+            Self::ReturnRequiresPhysicalMotionConsent => formatter.write_str(
+                "--return-to-target requires the separate --physical-motion-consent flag",
+            ),
+            Self::TorqueConsentRequiresMotionMode => formatter.write_str(
+                "--physical-torque-consent requires --hold-observed or --return-to-target",
+            ),
+            Self::MotionConsentRequiresReturn => {
+                formatter.write_str("--physical-motion-consent requires --return-to-target")
             }
             Self::UnknownArgument(argument) => write!(formatter, "unknown argument {argument:?}"),
         }
@@ -101,7 +133,10 @@ enum ConfigFileError {
     },
     Probe(kiko_head_runtime::ConfigParseError),
     Hold(kiko_head_runtime::ObservedHoldConfigParseError),
+    Return(kiko_head_runtime::ReturnToTargetConfigParseError),
+    ConflictingConfigurations,
     HoldModeMissingConfiguration,
+    ReturnModeMissingConfiguration,
 }
 
 impl fmt::Display for ConfigFileError {
@@ -159,9 +194,15 @@ impl fmt::Display for ConfigFileError {
             ),
             Self::Probe(_) => formatter.write_str("probe configuration is invalid"),
             Self::Hold(_) => formatter.write_str("observed-hold configuration is invalid"),
+            Self::Return(_) => formatter.write_str("return-to-target configuration is invalid"),
+            Self::ConflictingConfigurations => {
+                formatter.write_str("hold_observed and return_to_target cannot both be configured")
+            }
             Self::HoldModeMissingConfiguration => {
                 formatter.write_str("--hold-observed requires a hold_observed configuration object")
             }
+            Self::ReturnModeMissingConfiguration => formatter
+                .write_str("--return-to-target requires a return_to_target configuration object"),
         }
     }
 }
@@ -173,13 +214,16 @@ impl Error for ConfigFileError {
             Self::Json(source) => Some(source),
             Self::Probe(source) => Some(source),
             Self::Hold(source) => Some(source),
+            Self::Return(source) => Some(source),
             Self::PathMustBeAbsolute { .. }
             | Self::PathContainsTraversal { .. }
             | Self::NotRegularFile { .. }
             | Self::SymbolicLink { .. }
             | Self::TooLarge { .. }
             | Self::UnsupportedSchema { .. }
-            | Self::HoldModeMissingConfiguration => None,
+            | Self::ConflictingConfigurations
+            | Self::HoldModeMissingConfiguration
+            | Self::ReturnModeMissingConfiguration => None,
         }
     }
 }
@@ -190,6 +234,7 @@ struct ConfigFileInput {
     schema_version: u8,
     probe: ProbeInput,
     hold_observed: Option<HoldInput>,
+    return_to_target: Option<ReturnInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,9 +261,37 @@ struct HoldInput {
     maximum_hold_ms: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReturnInput {
+    write_timeout_ms: u64,
+    arming_freshness_ms: u64,
+    write_attempts: u8,
+    redundant_read_tolerance_ticks: u16,
+    readback_tolerance_ticks: u16,
+    final_target_tolerance_ticks: u16,
+    path_corridor_tolerance_ticks: u16,
+    direction_regression_tolerance_ticks: u16,
+    goal_speed_ticks_per_second: u16,
+    torque_limit_permille: [u16; 4],
+    minimum_start_ticks: [u16; 4],
+    maximum_start_ticks: [u16; 4],
+    target_ticks: [u16; 4],
+    maximum_travel_ticks: [u16; 4],
+    maximum_hold_ms: u64,
+    physical_motion_consent: PhysicalMotionConsentInput,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PhysicalMotionConsentInput {
+    ReturnToReviewedTarget,
+}
+
 struct CommissionConfig {
     probe: HeadProbeConfig,
     hold: Option<ObservedHoldConfig>,
+    head_return: Option<ReturnToTargetConfig>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,6 +299,11 @@ enum StopReason {
     MaximumDuration,
     Interrupt,
     Terminate,
+}
+
+enum WaitOutcome<T> {
+    Completed(T),
+    Stopped(Result<StopReason, std::io::Error>),
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -262,6 +340,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             .hold
             .ok_or(ConfigFileError::HoldModeMissingConfiguration)?;
         run_observed_hold(hold).await?;
+    } else if cli.mode == Mode::ReturnToTarget {
+        let head_return = config
+            .head_return
+            .ok_or(ConfigFileError::ReturnModeMissingConfiguration)?;
+        run_return_to_target(head_return).await?;
     }
     Ok(())
 }
@@ -270,7 +353,9 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, CliEr
     let mut arguments = arguments.into_iter();
     let mut config_path = None;
     let mut hold_observed = false;
+    let mut return_to_target = false;
     let mut physical_consent = false;
+    let mut physical_motion_consent = false;
     while let Some(argument) = arguments.next() {
         match argument.to_str() {
             Some("--help" | "-h") => return Err(CliError::HelpRequested),
@@ -286,20 +371,45 @@ fn parse_cli(arguments: impl IntoIterator<Item = OsString>) -> Result<Cli, CliEr
                 }
                 hold_observed = true;
             }
+            Some("--return-to-target") => {
+                if return_to_target {
+                    return Err(CliError::DuplicateReturnToTarget);
+                }
+                return_to_target = true;
+            }
             Some("--physical-torque-consent") => {
                 if physical_consent {
                     return Err(CliError::DuplicatePhysicalConsent);
                 }
                 physical_consent = true;
             }
+            Some("--physical-motion-consent") => {
+                if physical_motion_consent {
+                    return Err(CliError::DuplicatePhysicalMotionConsent);
+                }
+                physical_motion_consent = true;
+            }
             _ => return Err(CliError::UnknownArgument(argument)),
         }
     }
-    let mode = match (hold_observed, physical_consent) {
-        (false, false) => Mode::Probe,
-        (true, true) => Mode::HoldObserved,
-        (true, false) => return Err(CliError::HoldRequiresPhysicalConsent),
-        (false, true) => return Err(CliError::ConsentRequiresHold),
+    let mode = match (
+        hold_observed,
+        return_to_target,
+        physical_consent,
+        physical_motion_consent,
+    ) {
+        (false, false, false, false) => Mode::Probe,
+        (true, false, true, false) => Mode::HoldObserved,
+        (false, true, true, true) => Mode::ReturnToTarget,
+        (true, true, _, _) => return Err(CliError::ConflictingMotionModes),
+        (true, false, false, _) => return Err(CliError::HoldRequiresPhysicalConsent),
+        (true, false, true, true) => return Err(CliError::MotionConsentRequiresReturn),
+        (false, true, false, _) => return Err(CliError::ReturnRequiresPhysicalConsent),
+        (false, true, true, false) => {
+            return Err(CliError::ReturnRequiresPhysicalMotionConsent);
+        }
+        (false, false, true, _) => return Err(CliError::TorqueConsentRequiresMotionMode),
+        (false, false, false, true) => return Err(CliError::MotionConsentRequiresReturn),
     };
     Ok(Cli {
         config_path: config_path.ok_or(CliError::MissingConfig)?,
@@ -327,7 +437,9 @@ fn load_config(path: &Path) -> Result<CommissionConfig, ConfigFileError> {
             path: path.to_owned(),
         });
     }
-    let mut file = File::open(path).map_err(|source| ConfigFileError::Read {
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|source| ConfigFileError::Read {
         path: path.to_owned(),
         source,
     })?;
@@ -400,7 +512,43 @@ fn load_config(path: &Path) -> Result<CommissionConfig, ConfigFileError> {
         })
         .transpose()
         .map_err(ConfigFileError::Hold)?;
-    Ok(CommissionConfig { probe, hold })
+    let head_return = input
+        .return_to_target
+        .map(|head_return| {
+            let PhysicalMotionConsentInput::ReturnToReviewedTarget =
+                head_return.physical_motion_consent;
+            ReturnToTargetConfig::parse(
+                &probe,
+                ReturnToTargetConfigInput {
+                    write_timeout_ms: head_return.write_timeout_ms,
+                    arming_freshness_ms: head_return.arming_freshness_ms,
+                    write_attempts: head_return.write_attempts,
+                    redundant_read_tolerance_ticks: head_return.redundant_read_tolerance_ticks,
+                    readback_tolerance_ticks: head_return.readback_tolerance_ticks,
+                    final_target_tolerance_ticks: head_return.final_target_tolerance_ticks,
+                    path_corridor_tolerance_ticks: head_return.path_corridor_tolerance_ticks,
+                    direction_regression_tolerance_ticks: head_return
+                        .direction_regression_tolerance_ticks,
+                    goal_speed_ticks_per_second: head_return.goal_speed_ticks_per_second,
+                    torque_limit_permille: head_return.torque_limit_permille,
+                    minimum_start_ticks: head_return.minimum_start_ticks,
+                    maximum_start_ticks: head_return.maximum_start_ticks,
+                    target_ticks: head_return.target_ticks,
+                    maximum_travel_ticks: head_return.maximum_travel_ticks,
+                    maximum_hold_ms: head_return.maximum_hold_ms,
+                },
+            )
+        })
+        .transpose()
+        .map_err(ConfigFileError::Return)?;
+    if hold.is_some() && head_return.is_some() {
+        return Err(ConfigFileError::ConflictingConfigurations);
+    }
+    Ok(CommissionConfig {
+        probe,
+        hold,
+        head_return,
+    })
 }
 
 fn path_contains_dot_segment(path: &Path) -> bool {
@@ -413,8 +561,8 @@ fn path_contains_dot_segment(path: &Path) -> bool {
 async fn run_observed_hold(config: ObservedHoldConfig) -> Result<(), Box<dyn Error>> {
     let maximum_duration = config.maximum_duration();
     // Install both handlers before opening the port or issuing any command
-    // that can energise torque. Signals arriving during bounded startup remain
-    // pending and are handled immediately after startup reports its evidence.
+    // that can energise torque. Startup itself is cancellable; a signal does
+    // not merely remain pending while further physical writes continue.
     let mut stop_signals = StopSignals::install()?;
     let (serial, handle, startup, task) = start_serial_head_actor(
         config.runtime().clone(),
@@ -423,12 +571,34 @@ async fn run_observed_hold(config: ObservedHoldConfig) -> Result<(), Box<dyn Err
     )?;
     print_serial("hold_serial", &serial);
 
-    let startup_result = match startup.wait().await {
-        Ok(result) => result,
-        Err(source) => {
+    let startup_outcome = {
+        let startup_wait = startup.wait();
+        tokio::pin!(startup_wait);
+        tokio::select! {
+            result = &mut startup_wait => WaitOutcome::Completed(result),
+            stop = stop_signals.wait_signal() => WaitOutcome::Stopped(stop),
+        }
+    };
+    let startup_result = match startup_outcome {
+        WaitOutcome::Completed(Ok(result)) => result,
+        WaitOutcome::Stopped(stop) => {
+            let shutdown = handle.shutdown().await;
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            println!("hold_stop reason={:?}", stop?);
+            shutdown?;
+            return Ok(());
+        }
+        WaitOutcome::Completed(Err(source)) => {
             drop(handle);
             let exit = task.join().await?;
             print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
             return Err(Box::new(source));
         }
     };
@@ -438,6 +608,9 @@ async fn run_observed_hold(config: ObservedHoldConfig) -> Result<(), Box<dyn Err
             drop(handle);
             let exit = task.join().await?;
             print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
             return Err(Box::new(source));
         }
     };
@@ -448,12 +621,136 @@ async fn run_observed_hold(config: ObservedHoldConfig) -> Result<(), Box<dyn Err
     let exit = task.join().await?;
     print_actor_exit(&exit);
 
-    let stop = stop?;
-    println!("hold_stop reason={stop:?}");
-    shutdown?;
     if !exit.torque_disable().all_writes_completed() {
         return Err(Box::new(CleanupIncomplete));
     }
+    let stop = stop?;
+    println!("hold_stop reason={stop:?}");
+    shutdown?;
+    Ok(())
+}
+
+async fn run_return_to_target(config: ReturnToTargetConfig) -> Result<(), Box<dyn Error>> {
+    let maximum_duration = config.maximum_duration();
+    let mut stop_signals = StopSignals::install()?;
+    let (serial, handle, startup, task) = start_serial_head_return_actor(
+        config,
+        PhysicalTorqueEnableConsent::explicitly_granted(),
+        PhysicalHeadMotionConsent::explicitly_granted(),
+    )?;
+    print_serial("return_serial", &serial);
+
+    let startup_outcome = {
+        let startup_wait = startup.wait();
+        tokio::pin!(startup_wait);
+        tokio::select! {
+            result = &mut startup_wait => WaitOutcome::Completed(result),
+            stop = stop_signals.wait_signal() => WaitOutcome::Stopped(stop),
+        }
+    };
+    let startup_result = match startup_outcome {
+        WaitOutcome::Completed(Ok(result)) => result,
+        WaitOutcome::Stopped(stop) => {
+            let shutdown = handle.shutdown().await;
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            println!("hold_stop reason={:?}", stop?);
+            shutdown?;
+            return Ok(());
+        }
+        WaitOutcome::Completed(Err(source)) => {
+            drop(handle);
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            return Err(Box::new(source));
+        }
+    };
+    let hold = match startup_result {
+        Ok(evidence) => evidence,
+        Err(source) => {
+            drop(handle);
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            return Err(Box::new(source));
+        }
+    };
+    print_hold_started(&hold, maximum_duration);
+
+    let return_outcome = {
+        let return_wait = handle.return_to_target();
+        tokio::pin!(return_wait);
+        tokio::select! {
+            result = &mut return_wait => WaitOutcome::Completed(result),
+            stop = stop_signals.wait_signal() => WaitOutcome::Stopped(stop),
+        }
+    };
+    let return_result = match return_outcome {
+        WaitOutcome::Completed(Ok(result)) => result,
+        WaitOutcome::Stopped(stop) => {
+            let shutdown = handle.shutdown().await;
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            println!("hold_stop reason={:?}", stop?);
+            shutdown?;
+            return Ok(());
+        }
+        WaitOutcome::Completed(Err(source)) => {
+            // Losing the command receipt must not let the current-thread Tokio
+            // runtime exit before the actor's four-joint cleanup completes.
+            drop(handle);
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            return Err(Box::new(source));
+        }
+    };
+    let returned = match return_result {
+        Ok(evidence) => evidence,
+        Err(source) => {
+            // A commissioning recovery write is not continuously supervised.
+            // Preserve the typed return error, but end the lease and clean up
+            // immediately instead of blindly holding for maximum_hold_ms.
+            eprintln!(
+                "return_failed owner_retained={} error={source}",
+                source.retains_owner_after_fault()
+            );
+            let shutdown = handle.shutdown().await;
+            let exit = task.join().await?;
+            print_actor_exit(&exit);
+            if !exit.torque_disable().all_writes_completed() {
+                return Err(Box::new(CleanupIncomplete));
+            }
+            shutdown?;
+            return Err(Box::new(source));
+        }
+    };
+    print_return_completed(&returned, maximum_duration);
+
+    let stop = stop_signals.wait(maximum_duration).await;
+    let shutdown = handle.shutdown().await;
+    let exit = task.join().await?;
+    print_actor_exit(&exit);
+
+    if !exit.torque_disable().all_writes_completed() {
+        return Err(Box::new(CleanupIncomplete));
+    }
+    let stop = stop?;
+    println!("hold_stop reason={stop:?}");
+    shutdown?;
     Ok(())
 }
 
@@ -473,6 +770,12 @@ impl StopSignals {
     async fn wait(&mut self, maximum_duration: Duration) -> Result<StopReason, std::io::Error> {
         tokio::select! {
             () = tokio::time::sleep(maximum_duration) => Ok(StopReason::MaximumDuration),
+            stop = self.wait_signal() => stop,
+        }
+    }
+
+    async fn wait_signal(&mut self) -> Result<StopReason, std::io::Error> {
+        tokio::select! {
             signal = self.interrupt.recv() => signal
                 .map(|()| StopReason::Interrupt)
                 .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SIGINT stream closed")),
@@ -542,8 +845,53 @@ fn print_hold_started(evidence: &VerifiedNaturalHoldEvidence, maximum_duration: 
     );
 }
 
+fn print_return_completed(evidence: &VerifiedHeadReturnEvidence, maximum_duration: Duration) {
+    println!(
+        "return_completed start_ticks={:?} target_ticks={:?} waypoint_cycles={} maximum_hold_ms={}",
+        evidence
+            .start_pose()
+            .positions()
+            .map(kiko_head_protocol::PositionTicks::get),
+        evidence
+            .target()
+            .positions()
+            .map(kiko_head_protocol::PositionTicks::get),
+        evidence.waypoint_writes().len(),
+        maximum_duration.as_millis(),
+    );
+    for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+        let first = evidence.first_stopped()[index];
+        let second = evidence.second_stopped()[index];
+        println!(
+            "return_final joint={} first_ticks={} second_ticks={} first_moving={} second_moving={} load_raw={} voltage_raw={} temperature_raw={} current_raw={} device_status_raw={}",
+            joint_name(joint),
+            first.position().get(),
+            second.position().get(),
+            first.is_moving(),
+            second.is_moving(),
+            second.load_raw(),
+            second.voltage_raw(),
+            second.temperature_raw(),
+            second.current_raw(),
+            second.device_status_raw(),
+        );
+    }
+}
+
 fn print_actor_exit(exit: &ActorExit) {
     println!("hold_exit termination={:?}", exit.termination());
+    if let Err(source) = exit.startup() {
+        eprintln!("hold_exit startup_error={source}");
+    }
+    if let Some(result) = exit.head_return() {
+        match result {
+            Ok(evidence) => println!(
+                "return_exit completed=true waypoint_batches={}",
+                evidence.waypoint_writes().len()
+            ),
+            Err(source) => eprintln!("return_exit completed=false error={source}"),
+        }
+    }
     print_cleanup(exit.torque_disable());
 }
 
@@ -577,7 +925,7 @@ const fn joint_name(joint: HeadJoint) -> &'static str {
 
 fn print_usage() {
     eprintln!(
-        "usage: kiko-head-commission --config /absolute/path.json [--hold-observed --physical-torque-consent]"
+        "usage: kiko-head-commission --config /absolute/path.json [--hold-observed --physical-torque-consent | --return-to-target --physical-torque-consent --physical-motion-consent]"
     );
 }
 
@@ -624,7 +972,7 @@ mod tests {
                 "/tmp/head.json",
                 "--physical-torque-consent"
             ])),
-            Err(CliError::ConsentRequiresHold)
+            Err(CliError::TorqueConsentRequiresMotionMode)
         ));
     }
 
@@ -645,6 +993,28 @@ mod tests {
     }
 
     #[test]
+    fn return_requires_both_physical_consents() {
+        let cli = parse_cli(os(&[
+            "--config",
+            "/tmp/head.json",
+            "--return-to-target",
+            "--physical-torque-consent",
+            "--physical-motion-consent",
+        ]))
+        .expect("explicitly consented return CLI");
+        assert_eq!(cli.mode, Mode::ReturnToTarget);
+        assert!(matches!(
+            parse_cli(os(&[
+                "--config",
+                "/tmp/head.json",
+                "--return-to-target",
+                "--physical-torque-consent",
+            ])),
+            Err(CliError::ReturnRequiresPhysicalMotionConsent)
+        ));
+    }
+
+    #[test]
     fn strict_json_rejects_unknown_fields_before_domain_parsing() {
         let json = br#"{
             "schema_version": 1,
@@ -658,6 +1028,52 @@ mod tests {
             "hold_observed": null
         }"#;
         assert!(serde_json::from_slice::<ConfigFileInput>(json).is_err());
+    }
+
+    #[test]
+    fn strict_json_maps_every_distinct_return_tolerance() {
+        let path = temporary_path("valid-return");
+        let json = br#"{
+            "schema_version": 1,
+            "probe": {
+                "device_path": "/dev/serial/by-id/usb-Kiko_head_test",
+                "response_timeout_ms": 100,
+                "request_timeout_ms": 100,
+                "noise_budget_bytes": 16
+            },
+            "hold_observed": null,
+            "return_to_target": {
+                "write_timeout_ms": 1,
+                "arming_freshness_ms": 250,
+                "write_attempts": 1,
+                "redundant_read_tolerance_ticks": 10,
+                "readback_tolerance_ticks": 20,
+                "final_target_tolerance_ticks": 0,
+                "path_corridor_tolerance_ticks": 0,
+                "direction_regression_tolerance_ticks": 0,
+                "goal_speed_ticks_per_second": 100,
+                "torque_limit_permille": [600, 400, 400, 400],
+                "minimum_start_ticks": [2127, 2558, 2925, 2930],
+                "maximum_start_ticks": [2127, 2558, 2925, 2930],
+                "target_ticks": [2127, 2558, 2925, 2930],
+                "maximum_travel_ticks": [1, 1, 1, 1],
+                "maximum_hold_ms": 1000,
+                "physical_motion_consent": "return_to_reviewed_target"
+            }
+        }"#;
+        fs::write(&path, json).expect("write valid return configuration");
+
+        let config = load_config(&path).expect("strict return configuration");
+
+        fs::remove_file(&path).expect("remove valid return configuration");
+        assert!(config.hold.is_none());
+        assert_eq!(
+            config
+                .head_return
+                .expect("return configuration")
+                .maximum_duration(),
+            Duration::from_millis(1_000)
+        );
     }
 
     #[test]

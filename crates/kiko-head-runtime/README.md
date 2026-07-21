@@ -4,10 +4,16 @@
 STS head servos. Its `kiko-head-commission` binary is read-only by default: it
 reads the torque-switch register and qualified telemetry window for the four
 fixed servo IDs and reports exactly what it observed. The runtime implements
-one separately gated energising operation: capture the physical pose twice,
-command that same observed pose with explicit nonzero speed and torque limits,
-enable torque, and read back all four positions. It exposes no calibrated
-motion command.
+two separately gated energising operations:
+
+- capture the physical pose twice, command that same observed pose with
+  explicit nonzero speed and torque limits, enable torque, and read back all
+  four positions; and
+- from an admitted start window, execute one bounded waypoint return to one
+  exact, reviewed raw-encoder target.
+
+Neither operation is an unbounded production head controller, an angular
+calibration, or permission to infer a target from a camera observation.
 
 ## Commissioning command
 
@@ -31,7 +37,8 @@ components. A read-only file needs only:
     "request_timeout_ms": 100,
     "noise_budget_bytes": 32
   },
-  "hold_observed": null
+  "hold_observed": null,
+  "return_to_target": null
 }
 ```
 
@@ -58,6 +65,80 @@ SIGTERM, or the configured duration initiates a four-joint torque-disable; the
 per-joint cleanup result is printed. SIGKILL, power loss, or process failure
 cannot provide that cleanup guarantee.
 
+## Bounded return-to-target command
+
+`return_to_target` is a separate strict configuration object. It contains the
+same runtime tuning fields as `hold_observed`, plus exact
+`minimum_start_ticks`, `maximum_start_ticks`, `target_ticks`, and
+`maximum_travel_ticks` arrays in bow/curl/yaw/roll order. It also separates the
+startup-hold `readback_tolerance_ticks` from
+`final_target_tolerance_ticks`, `path_corridor_tolerance_ticks`, and
+`direction_regression_tolerance_ticks`; all are raw encoder ticks. Completion
+and direction tolerances cannot exceed the corridor tolerance, and none of the
+three return tolerances can exceed the corresponding travel limit. Each
+nonzero travel limit is at most 512 ticks and must cover the target's distance
+from both ends of the corresponding admitted start window. The object also
+requires the literal JSON consent value:
+
+```json
+"physical_motion_consent": "return_to_reviewed_target"
+```
+
+The process boundary independently requires all three CLI flags:
+
+```text
+--return-to-target --physical-torque-consent --physical-motion-consent
+```
+
+The command first establishes and verifies the observed-position hold. It then
+reads all four complete telemetry windows on each control cycle and commands a
+goal no more than 50 ticks ahead of each fresh position, at the configured
+nonzero speed. The control period is 100 ms, the per-joint no-progress deadline
+is 2 s, and the whole motion deadline is 20 s; these timing and step values are
+fixed in the typed runtime rather than accepted from JSON. The exact target is
+complete only after two consecutive, stopped, status-zero telemetry sets are
+inside the final tolerance and agree inside the redundant-read tolerance.
+
+At command time the actor reads two new complete, stopped, status-zero,
+identity-ordered telemetry sets. Each four-joint set must span no more than one
+100 ms control period, must still be no older than that period when admitted,
+and corresponding positions must agree within the parsed redundant-read
+tolerance. The freshest pose must still lie inside all four reviewed start
+windows, and the actor rechecks its target distance against every travel limit.
+Motion is not initialized from the earlier startup-hold pose.
+
+Only a specialized `HeadReturnActorHandle`, created by consuming one complete
+`ReturnToTargetConfig` and both physical-consent tokens, can issue the private
+zero-argument return command. Target, device, start bounds, speed, torque,
+tolerances, and travel limits therefore cannot be cross-paired at the command
+API. Every telemetry identity and device-status field is checked before any
+position from that set may influence motion or recovery.
+
+The complete path geometry for all four joints is admitted before a recovery
+pose capability exists. A corridor departure therefore cannot authorize a new
+goal from rejected telemetry. For a later kinematic fault such as timeout,
+direction regression, no progress, or final-sample disagreement, the actor may
+try once to replace the outstanding waypoint with the complete admitted
+four-joint present pose. `KinematicFaultRecoveryWritten` is emitted only if all
+four host writes complete and the actor remains the serial owner. Partial
+recovery or waypoint batches retain the exact completed prefix and original
+kinematic fault in the typed error. This is write-completion evidence, not a
+servo acknowledgement or stopped readback.
+
+Clock regression, identity/order mismatch, device status, telemetry failure,
+or an incomplete recovery write terminates the actor and attempts four-joint
+torque-disable cleanup. The commissioning CLI also shuts down immediately
+after every return fault, including an owner-retaining fault; it does not turn
+an unsupervised recovery write into a long hold. A successful return remains
+actively held only until SIGINT, SIGTERM, the configured hold duration, handle
+loss, or an actor fault initiates that same cleanup. This bounded hold performs
+no periodic health telemetry and is explicitly not a production supervisor.
+
+One actor admits at most one return attempt. A second request during motion is
+reported as `CommandAlreadyInProgress`; a request after the recorded attempt is
+reported separately as `CommandAlreadyAttempted` rather than being mislabeled
+as concurrent work.
+
 ## Boundary contract
 
 Weak process configuration is admitted once by `HeadRuntimeConfig::parse`.
@@ -82,7 +163,11 @@ electrical probe measured them.
 Starting the actor requires `PhysicalTorqueEnableConsent::explicitly_granted()`.
 Natural hold is not guaranteed to be motionless: the head can move between the
 second observation and torque engagement or settle within the configured
-readback bound. No pre-recorded/calibrated target is sent.
+readback bound. A return additionally requires
+`PhysicalHeadMotionConsent::explicitly_granted()`. The entire parsed
+`ReturnToTargetConfig` is consumed by `spawn_head_return_actor` or
+`start_serial_head_return_actor`; the internal motion plan is not public and
+cannot be supplied later by a command caller.
 
 Both generic and production spawn paths first require an active Tokio runtime.
 Absence is returned as a typed error; production checks this before opening or
@@ -101,8 +186,8 @@ Startup is ordered and fail-closed:
    still inside the typed arming-freshness bound and that the remaining window
    covers every configured bounded write attempt; otherwise fail and disable.
 7. Read exact full telemetry twice for each expected ID. Both samples must be
-   stopped, each must agree with its observed target, and the pair must agree
-   with each other inside the configured tick bound.
+   status zero and stopped, each must agree with its observed target, and the
+   pair must agree with each other inside the configured tick bound.
 
 Every status response is delimited into a fixed 21-byte buffer. Prefix noise is
 bounded and counted. After `FF FF`, the frame is never silently skipped:
@@ -122,6 +207,13 @@ goal, speed, torque-limit, or torque-switch registers. Therefore this evidence
 does **not** claim those register writes were acknowledged or independently
 read back.
 
+Return success is `VerifiedHeadReturnEvidence`: it retains the startup-hold
+pose, the two fresh command-time telemetry sets and their monotonic receive
+times, the fresh command-time start pose, exact reviewed target, every complete
+four-joint waypoint write cycle, and the two final stopped telemetry sets. The
+exact reviewed target must have completed one full four-joint write before
+tolerance-based stopped samples can produce success.
+
 On startup fault, requested shutdown, or loss of the public handle, the actor
 attempts a torque-disable write for every joint even if an earlier disable
 fails. `all_writes_completed` means only that all four host writes completed.
@@ -135,6 +227,35 @@ An open, exclusivity, or serial-configuration error occurs before an actor or a
 qualified bus exists. That path sends no protocol byte and reports
 `SerialOpenError`; it cannot truthfully claim that torque-disable was attempted.
 
+## Recorded physical evidence and present state
+
+The detailed run record is in `docs/nano-bench-evidence-2026-07-21.md`. The
+first return attempt started at `[2337, 2938, 2748, 2748]` ticks with a 10-tick
+waypoint lead, speed 50 ticks/s, and torque limits `[600, 400, 400, 400]`
+permille. It moved, then Curl reported `NoProgress` after 2 s with a best
+remaining distance of 391 ticks. The then-running actor torque-disabled during
+cleanup, and the operator observed the gravity-loaded neck fall. That outcome
+is a failed return, not a successful safety demonstration.
+
+The lead was changed to 50 ticks without increasing the 50 ticks/s speed or the
+torque limits, and recoverable kinematic faults gained the evidenced
+present-pose-write/owner-retention path described above. A second attempt
+returned from
+`[2211, 2576, 2858, 2906]` to `[2155, 2545, 2943, 2876]` in 18 waypoint cycles.
+Its two stopped final samples agreed at bow 2160, curl 2548, yaw 2941, and roll
+2874 ticks; all four device-status values were zero. After the bounded hold
+ended, all four torque-disable writes completed. At the end of that session no
+head process was running and the neck was free, not actively held. These facts
+qualify one bounded return transaction; they do not qualify continuous
+supervision or cold-boot head ownership.
+
+The physical run above predates the later config-bound owner, command-time
+start admission, bounded-span telemetry, hard I/O-inclusive deadlines,
+all-joint recovery capability, lossless partial-batch errors, exact-target
+write requirement, startup device-status rejection, and signal-driven CLI
+shutdown described in this README. Those later changes have software test
+evidence only and must not be retroactively described as physically qualified.
+
 ## Evidence and validation
 
 The deterministic transport/clock suite covers nominal ordering, bounded noise
@@ -142,7 +263,13 @@ resynchronisation, truncation, wrong ID, checksum corruption, timeout, partial
 write failure, explicit zero-progress retry, stale observations, moving and
 unstable readbacks, readback mismatch, cancellation by handle drop, shutdown
 queued during an in-flight startup fault, absent Tokio runtime, and continued
-four-joint shutdown after disable failures.
+four-joint shutdown after disable failures. The return controller suite also
+covers 50-tick non-crossing waypoints, consecutive stopped completion, travel
+admission, full-set status precedence, corridor/direction/no-progress/motion
+deadlines, clock regression, final-sample disagreement, and the narrow fault
+classes allowed to attempt a recovery write. Focused aarch64 software-only runs
+on the Nano passed 17 protocol tests, 41 runtime library tests, and 8
+commissioning-binary tests after this hardening slice.
 
 Run the host checks with:
 
@@ -153,6 +280,6 @@ cargo doc -p kiko-head-runtime --no-deps
 cargo check -p kiko-head-runtime --target aarch64-unknown-linux-gnu
 ```
 
-No physical-head test, electrical DTR/RTS measurement, or movement benchmark is
-reported here. No performance claim is made, so there is no synthetic benchmark
-standing in for hardware evidence.
+No electrical DTR/RTS measurement or movement benchmark is reported here. The
+single physical return above is behavioral evidence, not a performance claim;
+there is no synthetic benchmark standing in for hardware evidence.

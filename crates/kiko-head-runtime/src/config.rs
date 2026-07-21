@@ -2,8 +2,9 @@ use std::fmt;
 use std::time::Duration;
 
 use kiko_head_protocol::{
-    FrameBuildError, GoalSpeedTicksPerSecond, HeadJoint, HeadPose, HeadTorqueLimits,
-    PositionAgreementError, PositionAgreementTicks, PositionTicks, TorqueLimitPermille,
+    ExactHeadTargetPose, ExactHeadTargetPoseError, FrameBuildError, GoalSpeedTicksPerSecond,
+    HeadJoint, HeadPose, HeadTorqueLimits, PositionAgreementError, PositionAgreementTicks,
+    PositionTicks, TorqueLimitPermille,
 };
 
 const MAX_DEVICE_PATH_BYTES: usize = 512;
@@ -13,6 +14,15 @@ const MAX_ARMING_FRESHNESS_MS: u64 = 5_000;
 const MAX_WRITE_ATTEMPTS: u8 = 8;
 const MAX_NOISE_BUDGET_BYTES: u16 = 1_024;
 const MAX_HOLD_DURATION_MS: u64 = 900_000;
+pub const HEAD_RETURN_POSITION_STEP_TICKS: u16 = 50;
+pub const HEAD_RETURN_CONTROL_PERIOD: Duration = Duration::from_millis(100);
+pub const HEAD_RETURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(2);
+pub const HEAD_RETURN_MOTION_TIMEOUT: Duration = Duration::from_secs(20);
+/// A four-servo telemetry set older than one control period is not a coherent
+/// motion/recovery boundary. The serial requests themselves may have a longer
+/// diagnostic timeout, but such a delayed response cannot authorize motion.
+pub const HEAD_RETURN_TELEMETRY_SET_MAX_AGE: Duration = HEAD_RETURN_CONTROL_PERIOD;
+pub const MAX_HEAD_RETURN_TRAVEL_TICKS: u16 = 512;
 /// Maximum admitted width of one raw-encoder startup pose window.
 ///
 /// This is a structural anti-bypass bound, not a physical joint envelope. The
@@ -141,6 +151,11 @@ impl OperationTimeout {
     pub const fn get(self) -> Duration {
         self.0
     }
+
+    pub(crate) fn capped_by(self, maximum: Duration) -> Self {
+        debug_assert!(!maximum.is_zero());
+        Self(self.0.min(maximum))
+    }
 }
 
 /// Fully parsed configuration for fixed, read-only head probing.
@@ -252,6 +267,328 @@ pub struct ObservedHoldConfigInput {
     pub minimum_ticks: [u16; 4],
     pub maximum_ticks: [u16; 4],
     pub maximum_hold_ms: u64,
+}
+
+/// Weak fields for one explicitly reviewed return-to-target transaction.
+/// Start windows, target, and travel limits are all in canonical
+/// bow/curl/yaw/roll order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReturnToTargetConfigInput {
+    pub write_timeout_ms: u64,
+    pub arming_freshness_ms: u64,
+    pub write_attempts: u8,
+    pub redundant_read_tolerance_ticks: u16,
+    /// Startup observed-position hold readback tolerance only.
+    pub readback_tolerance_ticks: u16,
+    /// Completion distance from the reviewed target.
+    pub final_target_tolerance_ticks: u16,
+    /// Maximum encoder noise margin around the admitted start-to-target path.
+    pub path_corridor_tolerance_ticks: u16,
+    /// Maximum regression from the best observed target distance.
+    pub direction_regression_tolerance_ticks: u16,
+    pub goal_speed_ticks_per_second: u16,
+    pub torque_limit_permille: [u16; 4],
+    pub minimum_start_ticks: [u16; 4],
+    pub maximum_start_ticks: [u16; 4],
+    pub target_ticks: [u16; 4],
+    pub maximum_travel_ticks: [u16; 4],
+    pub maximum_hold_ms: u64,
+}
+
+/// Fully parsed target and structural travel bounds. Timing of the motion
+/// transaction is fixed by this crate rather than accepted from weak input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadReturnPlan {
+    target: ExactHeadTargetPose,
+    maximum_travel_ticks: [u16; 4],
+    final_target_tolerance: PositionAgreementTicks,
+    path_corridor_tolerance: PositionAgreementTicks,
+    direction_regression_tolerance: PositionAgreementTicks,
+    final_sample_tolerance: PositionAgreementTicks,
+}
+
+impl HeadReturnPlan {
+    pub const fn target(self) -> ExactHeadTargetPose {
+        self.target
+    }
+
+    pub const fn maximum_travel_ticks(self, joint: HeadJoint) -> u16 {
+        self.maximum_travel_ticks[joint as usize]
+    }
+
+    pub const fn position_step_ticks(self) -> u16 {
+        HEAD_RETURN_POSITION_STEP_TICKS
+    }
+
+    pub const fn control_period(self) -> Duration {
+        HEAD_RETURN_CONTROL_PERIOD
+    }
+
+    pub const fn no_progress_timeout(self) -> Duration {
+        HEAD_RETURN_NO_PROGRESS_TIMEOUT
+    }
+
+    pub const fn motion_timeout(self) -> Duration {
+        HEAD_RETURN_MOTION_TIMEOUT
+    }
+
+    pub const fn telemetry_set_max_age(self) -> Duration {
+        HEAD_RETURN_TELEMETRY_SET_MAX_AGE
+    }
+
+    pub const fn final_target_tolerance(self) -> PositionAgreementTicks {
+        self.final_target_tolerance
+    }
+
+    pub const fn path_corridor_tolerance(self) -> PositionAgreementTicks {
+        self.path_corridor_tolerance
+    }
+
+    pub const fn direction_regression_tolerance(self) -> PositionAgreementTicks {
+        self.direction_regression_tolerance
+    }
+
+    pub const fn final_sample_tolerance(self) -> PositionAgreementTicks {
+        self.final_sample_tolerance
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        target: ExactHeadTargetPose,
+        maximum_travel_ticks: [u16; 4],
+        final_target_tolerance: PositionAgreementTicks,
+        path_corridor_tolerance: PositionAgreementTicks,
+        direction_regression_tolerance: PositionAgreementTicks,
+        final_sample_tolerance: PositionAgreementTicks,
+    ) -> Self {
+        Self {
+            target,
+            maximum_travel_ticks,
+            final_target_tolerance,
+            path_corridor_tolerance,
+            direction_regression_tolerance,
+            final_sample_tolerance,
+        }
+    }
+}
+
+/// Parsed return transaction derived from one already parsed probe boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReturnToTargetConfig {
+    runtime: HeadRuntimeConfig,
+    start_bounds: ConfiguredHeadPoseBounds,
+    plan: HeadReturnPlan,
+    maximum_duration: Duration,
+}
+
+impl ReturnToTargetConfig {
+    pub fn parse(
+        probe: &HeadProbeConfig,
+        input: ReturnToTargetConfigInput,
+    ) -> Result<Self, ReturnToTargetConfigParseError> {
+        let start_bounds =
+            ConfiguredHeadPoseBounds::try_new(input.minimum_start_ticks, input.maximum_start_ticks)
+                .map_err(ReturnToTargetConfigParseError::StartBounds)?;
+        let target = ExactHeadTargetPose::try_from_ticks(input.target_ticks)
+            .map_err(ReturnToTargetConfigParseError::Target)?;
+        let final_target_tolerance = parse_return_tolerance(
+            "final_target_tolerance_ticks",
+            input.final_target_tolerance_ticks,
+        )?;
+        let path_corridor_tolerance = parse_return_tolerance(
+            "path_corridor_tolerance_ticks",
+            input.path_corridor_tolerance_ticks,
+        )?;
+        let direction_regression_tolerance = parse_return_tolerance(
+            "direction_regression_tolerance_ticks",
+            input.direction_regression_tolerance_ticks,
+        )?;
+        if final_target_tolerance > path_corridor_tolerance {
+            return Err(ReturnToTargetConfigParseError::ToleranceOrdering {
+                smaller_field: "final_target_tolerance_ticks",
+                smaller_value: final_target_tolerance.get(),
+                larger_field: "path_corridor_tolerance_ticks",
+                larger_value: path_corridor_tolerance.get(),
+            });
+        }
+        if direction_regression_tolerance > path_corridor_tolerance {
+            return Err(ReturnToTargetConfigParseError::ToleranceOrdering {
+                smaller_field: "direction_regression_tolerance_ticks",
+                smaller_value: direction_regression_tolerance.get(),
+                larger_field: "path_corridor_tolerance_ticks",
+                larger_value: path_corridor_tolerance.get(),
+            });
+        }
+        for joint in HeadJoint::ALL {
+            let index = joint as usize;
+            let configured_limit = input.maximum_travel_ticks[index];
+            if configured_limit == 0 || configured_limit > MAX_HEAD_RETURN_TRAVEL_TICKS {
+                return Err(ReturnToTargetConfigParseError::InvalidMaximumTravel {
+                    joint,
+                    value: configured_limit,
+                    maximum: MAX_HEAD_RETURN_TRAVEL_TICKS,
+                });
+            }
+            let target_ticks = target.position(joint).get();
+            let required = target_ticks
+                .abs_diff(start_bounds.minimum(joint).get())
+                .max(target_ticks.abs_diff(start_bounds.maximum(joint).get()));
+            if required > configured_limit {
+                return Err(ReturnToTargetConfigParseError::TravelAboveMaximum {
+                    joint,
+                    required_ticks: required,
+                    maximum_ticks: configured_limit,
+                });
+            }
+            for (field, tolerance) in [
+                ("final_target_tolerance_ticks", final_target_tolerance),
+                ("path_corridor_tolerance_ticks", path_corridor_tolerance),
+                (
+                    "direction_regression_tolerance_ticks",
+                    direction_regression_tolerance,
+                ),
+            ] {
+                if tolerance.get() > configured_limit {
+                    return Err(ReturnToTargetConfigParseError::ToleranceAboveTravel {
+                        joint,
+                        field,
+                        tolerance_ticks: tolerance.get(),
+                        maximum_travel_ticks: configured_limit,
+                    });
+                }
+            }
+        }
+        if !(1..=MAX_HOLD_DURATION_MS).contains(&input.maximum_hold_ms) {
+            return Err(ReturnToTargetConfigParseError::DurationOutOfRange {
+                milliseconds: input.maximum_hold_ms,
+                minimum_ms: 1,
+                maximum_ms: MAX_HOLD_DURATION_MS,
+            });
+        }
+        let runtime = HeadRuntimeConfig::parse_tuning(
+            probe.device.clone(),
+            probe.response_timeout,
+            probe.noise_budget_bytes,
+            RuntimeTuningInput {
+                write_timeout_ms: input.write_timeout_ms,
+                arming_freshness_ms: input.arming_freshness_ms,
+                write_attempts: input.write_attempts,
+                redundant_read_tolerance_ticks: input.redundant_read_tolerance_ticks,
+                readback_tolerance_ticks: input.readback_tolerance_ticks,
+                goal_speed_ticks_per_second: input.goal_speed_ticks_per_second,
+                torque_limit_permille: input.torque_limit_permille,
+            },
+        )
+        .map_err(ReturnToTargetConfigParseError::Runtime)?;
+        let final_sample_tolerance = runtime.redundant_read_tolerance();
+        Ok(Self {
+            runtime,
+            start_bounds,
+            plan: HeadReturnPlan {
+                target,
+                maximum_travel_ticks: input.maximum_travel_ticks,
+                final_target_tolerance,
+                path_corridor_tolerance,
+                direction_regression_tolerance,
+                final_sample_tolerance,
+            },
+            maximum_duration: Duration::from_millis(input.maximum_hold_ms),
+        })
+    }
+
+    pub const fn runtime(&self) -> &HeadRuntimeConfig {
+        &self.runtime
+    }
+
+    pub const fn start_bounds(&self) -> ConfiguredHeadPoseBounds {
+        self.start_bounds
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn plan(&self) -> HeadReturnPlan {
+        self.plan
+    }
+
+    pub(crate) fn into_actor_parts(
+        self,
+    ) -> (HeadRuntimeConfig, ConfiguredHeadPoseBounds, HeadReturnPlan) {
+        (self.runtime, self.start_bounds, self.plan)
+    }
+
+    pub const fn maximum_duration(&self) -> Duration {
+        self.maximum_duration
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReturnToTargetConfigParseError {
+    Runtime(ConfigParseError),
+    StartBounds(ConfiguredHeadPoseBoundsError),
+    Target(ExactHeadTargetPoseError),
+    InvalidMaximumTravel {
+        joint: HeadJoint,
+        value: u16,
+        maximum: u16,
+    },
+    TravelAboveMaximum {
+        joint: HeadJoint,
+        required_ticks: u16,
+        maximum_ticks: u16,
+    },
+    InvalidTolerance {
+        field: &'static str,
+        source: PositionAgreementError,
+    },
+    ToleranceOrdering {
+        smaller_field: &'static str,
+        smaller_value: u16,
+        larger_field: &'static str,
+        larger_value: u16,
+    },
+    ToleranceAboveTravel {
+        joint: HeadJoint,
+        field: &'static str,
+        tolerance_ticks: u16,
+        maximum_travel_ticks: u16,
+    },
+    DurationOutOfRange {
+        milliseconds: u64,
+        minimum_ms: u64,
+        maximum_ms: u64,
+    },
+}
+
+impl fmt::Display for ReturnToTargetConfigParseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid return-to-target configuration: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for ReturnToTargetConfigParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(source) => Some(source),
+            Self::StartBounds(source) => Some(source),
+            Self::Target(source) => Some(source),
+            Self::InvalidTolerance { source, .. } => Some(source),
+            Self::InvalidMaximumTravel { .. }
+            | Self::TravelAboveMaximum { .. }
+            | Self::ToleranceOrdering { .. }
+            | Self::ToleranceAboveTravel { .. }
+            | Self::DurationOutOfRange { .. } => None,
+        }
+    }
+}
+
+fn parse_return_tolerance(
+    field: &'static str,
+    value: u16,
+) -> Result<PositionAgreementTicks, ReturnToTargetConfigParseError> {
+    PositionAgreementTicks::try_new(value)
+        .map_err(|source| ReturnToTargetConfigParseError::InvalidTolerance { field, source })
 }
 
 /// Typed, bounded observed-position hold configuration derived from an
@@ -790,6 +1127,26 @@ mod tests {
         }
     }
 
+    fn valid_return_input() -> ReturnToTargetConfigInput {
+        ReturnToTargetConfigInput {
+            write_timeout_ms: 100,
+            arming_freshness_ms: 250,
+            write_attempts: 2,
+            redundant_read_tolerance_ticks: 10,
+            readback_tolerance_ticks: 20,
+            final_target_tolerance_ticks: 20,
+            path_corridor_tolerance_ticks: 20,
+            direction_regression_tolerance_ticks: 20,
+            goal_speed_ticks_per_second: 50,
+            torque_limit_permille: [600, 400, 400, 400],
+            minimum_start_ticks: [2_496, 2_900, 2_887, 2_887],
+            maximum_start_ticks: [2_518, 2_932, 2_919, 2_919],
+            target_ticks: [2_155, 2_545, 2_943, 2_876],
+            maximum_travel_ticks: [400, 400, 64, 64],
+            maximum_hold_ms: 900_000,
+        }
+    }
+
     #[test]
     fn probe_and_hold_boundaries_parse_common_identity_once() {
         let probe = valid_probe();
@@ -803,6 +1160,116 @@ mod tests {
             probe.noise_budget_bytes()
         );
         assert_eq!(hold.maximum_duration(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn return_boundary_parses_exact_target_and_fixed_motion_policy_once() {
+        let probe = valid_probe();
+        let config =
+            ReturnToTargetConfig::parse(&probe, valid_return_input()).expect("valid return config");
+
+        assert_eq!(config.runtime().device(), probe.device());
+        assert_eq!(
+            config.plan().target().positions().map(PositionTicks::get),
+            [2_155, 2_545, 2_943, 2_876]
+        );
+        assert_eq!(config.plan().position_step_ticks(), 50);
+        assert_eq!(config.plan().control_period(), Duration::from_millis(100));
+        assert_eq!(config.plan().no_progress_timeout(), Duration::from_secs(2));
+        assert_eq!(config.plan().motion_timeout(), Duration::from_secs(20));
+        assert_eq!(
+            config.plan().telemetry_set_max_age(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(config.plan().final_target_tolerance().get(), 20);
+        assert_eq!(config.plan().path_corridor_tolerance().get(), 20);
+        assert_eq!(config.plan().direction_regression_tolerance().get(), 20);
+        assert_eq!(config.plan().final_sample_tolerance().get(), 10);
+    }
+
+    #[test]
+    fn return_boundary_rejects_targets_outside_declared_travel() {
+        let probe = valid_probe();
+        let mut input = valid_return_input();
+        input.maximum_travel_ticks[0] = 0;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::InvalidMaximumTravel {
+                joint: HeadJoint::Bow,
+                value: 0,
+                maximum: MAX_HEAD_RETURN_TRAVEL_TICKS,
+            })
+        ));
+
+        let mut input = valid_return_input();
+        input.maximum_travel_ticks[3] = MAX_HEAD_RETURN_TRAVEL_TICKS + 1;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::InvalidMaximumTravel {
+                joint: HeadJoint::Roll,
+                value,
+                maximum: MAX_HEAD_RETURN_TRAVEL_TICKS,
+            }) if value == MAX_HEAD_RETURN_TRAVEL_TICKS + 1
+        ));
+
+        let mut input = valid_return_input();
+        input.maximum_travel_ticks[1] = 300;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::TravelAboveMaximum {
+                joint: HeadJoint::Curl,
+                required_ticks: 387,
+                maximum_ticks: 300,
+            })
+        ));
+
+        let mut input = valid_return_input();
+        input.target_ticks[3] = 4_096;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::Target(
+                ExactHeadTargetPoseError::Position {
+                    joint: HeadJoint::Roll,
+                    ..
+                }
+            ))
+        ));
+
+        let mut input = valid_return_input();
+        input.maximum_hold_ms = 0;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::DurationOutOfRange {
+                milliseconds: 0,
+                ..
+            })
+        ));
+
+        let mut input = valid_return_input();
+        input.final_target_tolerance_ticks = 21;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::ToleranceOrdering {
+                smaller_field: "final_target_tolerance_ticks",
+                smaller_value: 21,
+                larger_field: "path_corridor_tolerance_ticks",
+                larger_value: 20,
+            })
+        ));
+
+        let mut input = valid_return_input();
+        input.maximum_travel_ticks[3] = 10;
+        input.minimum_start_ticks[3] = 2_876;
+        input.maximum_start_ticks[3] = 2_876;
+        assert!(matches!(
+            ReturnToTargetConfig::parse(&probe, input),
+            Err(ReturnToTargetConfigParseError::ToleranceAboveTravel {
+                joint: HeadJoint::Roll,
+                field: "final_target_tolerance_ticks",
+                tolerance_ticks: 20,
+                maximum_travel_ticks: 10,
+            })
+        ));
     }
 
     #[test]

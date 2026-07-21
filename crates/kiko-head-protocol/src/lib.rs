@@ -20,9 +20,10 @@ pub use packet::{
     build_torque_switch_read, build_torque_switch_write, parse_status_response,
 };
 pub use pose::{
-    AngleRadians, HeadJoint, HeadPose, HeadPoseError, HeadTorqueLimits, JointCalibration,
-    JointCalibrationError, JointDirection, JointLimitsRadians, NaturalHoldFrames,
-    PositionStepLimit, build_natural_hold_frames,
+    AngleRadians, ExactHeadTargetPose, ExactHeadTargetPoseError, HeadJoint, HeadPose,
+    HeadPoseError, HeadTorqueLimits, JointCalibration, JointCalibrationError, JointDirection,
+    JointLimitsRadians, NaturalHoldFrames, PositionStepLimit, TelemetryPoseSample,
+    build_natural_hold_frames,
 };
 pub use telemetry::{
     FullTelemetry, ObservedTorqueSwitch, PositionAgreementError, PositionAgreementTicks,

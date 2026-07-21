@@ -4,8 +4,8 @@ use std::time::Duration;
 use kiko_head_protocol::{
     FullTelemetry, HeadJoint, HeadPose, HeadPoseError, PositionAgreementError,
     PositionAgreementTicks, PositionTicks, PresentPosition, TelemetryParseError, TorqueSwitch,
-    ValidatedPresentPosition, build_natural_hold_frames, build_position_read,
-    build_torque_switch_write,
+    ValidatedPresentPosition, build_full_telemetry_read, build_goal_with_speed_write,
+    build_natural_hold_frames, build_position_read, build_torque_switch_write,
 };
 use tokio::runtime::{Handle, TryCurrentError};
 use tokio::sync::{mpsc, oneshot};
@@ -13,9 +13,13 @@ use tokio::task::{JoinError, JoinHandle};
 
 use crate::config::{
     ConfiguredHeadPoseBounds, HeadPoseBoundsAdmissionError, HeadPoseWithinConfiguredBounds,
-    HeadRuntimeConfig,
+    HeadReturnPlan, HeadRuntimeConfig, ReturnToTargetConfig,
 };
 use crate::framing::{FrameReadError, read_response_frame};
+use crate::motion::{
+    FreshHeadTelemetrySet, HeadMotionError, HeadReturnAction, HeadReturnController,
+    admit_stopped_return_start,
+};
 use crate::transport::{
     AsyncByteTransport, MonotonicClock, MonotonicTime, SerialConfigurationEvidence,
     SerialOpenError, SerialTransport, TokioClock, TransportFailure,
@@ -35,6 +39,16 @@ impl PhysicalTorqueEnableConsent {
     }
 }
 
+/// Separate deliberate opt-in for a command which changes physical pose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PhysicalHeadMotionConsent(());
+
+impl PhysicalHeadMotionConsent {
+    pub const fn explicitly_granted() -> Self {
+        Self(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RuntimeStage {
     ObserveFirst,
@@ -44,6 +58,8 @@ pub enum RuntimeStage {
     EnableTorque,
     VerifyFirstStoppedPosition,
     VerifySecondStoppedPosition,
+    ReturnReadTelemetry,
+    ReturnWriteWaypoint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -67,6 +83,7 @@ pub enum WritePurpose {
     TorqueLimit,
     TorqueEnable,
     TorqueDisable,
+    ReturnWaypoint,
 }
 
 /// Exact bounded retry history for one completed write.
@@ -251,6 +268,339 @@ impl VerifiedNaturalHoldEvidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadWaypointEvidence {
+    positions: [PositionTicks; 4],
+    writes: [WriteEvidence; 4],
+}
+
+impl HeadWaypointEvidence {
+    pub const fn positions(&self) -> [PositionTicks; 4] {
+        self.positions
+    }
+
+    pub const fn writes(&self) -> &[WriteEvidence; 4] {
+        &self.writes
+    }
+}
+
+/// One complete status-zero, identity-ordered telemetry set together with the
+/// monotonic receive times used for its bounded-span/freshness admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadTelemetrySetEvidence {
+    samples: [FullTelemetry; 4],
+    received_at: [MonotonicTime; 4],
+    admitted_at: MonotonicTime,
+}
+
+impl HeadTelemetrySetEvidence {
+    pub const fn samples(&self) -> &[FullTelemetry; 4] {
+        &self.samples
+    }
+
+    pub const fn received_at(&self) -> &[MonotonicTime; 4] {
+        &self.received_at
+    }
+
+    pub const fn admitted_at(&self) -> MonotonicTime {
+        self.admitted_at
+    }
+}
+
+impl From<FreshHeadTelemetrySet> for HeadTelemetrySetEvidence {
+    fn from(set: FreshHeadTelemetrySet) -> Self {
+        Self {
+            samples: set.samples(),
+            received_at: set.received_at(),
+            admitted_at: set.admitted_at(),
+        }
+    }
+}
+
+/// Lossless prefix evidence for a four-joint waypoint batch. Every `Some`
+/// entry completed before `source`; later `None` entries were not attempted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadWaypointBatchWriteError {
+    positions: [PositionTicks; 4],
+    completed_writes: [Option<WriteEvidence>; 4],
+    failure: HeadWaypointBatchFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadWaypointBatchFailure {
+    Frame(FrameWriteError),
+    Deadline {
+        source: HeadMotionError,
+        io: Option<FrameWriteError>,
+    },
+    Cancelled {
+        cause: CancellationCause,
+        stage: RuntimeStage,
+        joint: HeadJoint,
+    },
+}
+
+impl HeadWaypointBatchWriteError {
+    pub const fn positions(&self) -> [PositionTicks; 4] {
+        self.positions
+    }
+
+    pub const fn completed_writes(&self) -> &[Option<WriteEvidence>; 4] {
+        &self.completed_writes
+    }
+
+    pub const fn failure(&self) -> &HeadWaypointBatchFailure {
+        &self.failure
+    }
+}
+
+impl fmt::Display for HeadWaypointBatchWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .write_str("four-joint waypoint batch failed after its recorded completed prefix: ")?;
+        match &self.failure {
+            HeadWaypointBatchFailure::Frame(source) => write!(formatter, "{source}"),
+            HeadWaypointBatchFailure::Deadline { source, .. } => write!(formatter, "{source}"),
+            HeadWaypointBatchFailure::Cancelled {
+                cause,
+                stage,
+                joint,
+            } => write!(
+                formatter,
+                "cancelled by {cause:?} at {stage:?} for {joint:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for HeadWaypointBatchWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.failure {
+            HeadWaypointBatchFailure::Frame(source) => Some(source),
+            HeadWaypointBatchFailure::Deadline { source, .. } => Some(source),
+            HeadWaypointBatchFailure::Cancelled { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterruptedTelemetryRead {
+    joint: HeadJoint,
+    source: Option<RequestError>,
+}
+
+impl InterruptedTelemetryRead {
+    pub const fn joint(&self) -> HeadJoint {
+        self.joint
+    }
+
+    pub const fn source_error(&self) -> Option<&RequestError> {
+        self.source.as_ref()
+    }
+}
+
+/// Evidence emitted only after the bounded waypoint stream commands the exact
+/// reviewed target and two complete stopped telemetry samples lie inside the
+/// configured final tolerance and agree with each other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedHeadReturnEvidence {
+    started_at: MonotonicTime,
+    completed_at: MonotonicTime,
+    start_pose: HeadPose,
+    start_first: HeadTelemetrySetEvidence,
+    start_second: HeadTelemetrySetEvidence,
+    target: kiko_head_protocol::ExactHeadTargetPose,
+    waypoint_writes: Vec<HeadWaypointEvidence>,
+    first_stopped: HeadTelemetrySetEvidence,
+    second_stopped: HeadTelemetrySetEvidence,
+}
+
+impl VerifiedHeadReturnEvidence {
+    pub const fn started_at(&self) -> MonotonicTime {
+        self.started_at
+    }
+
+    pub const fn completed_at(&self) -> MonotonicTime {
+        self.completed_at
+    }
+
+    pub const fn start_pose(&self) -> HeadPose {
+        self.start_pose
+    }
+
+    pub const fn target(&self) -> kiko_head_protocol::ExactHeadTargetPose {
+        self.target
+    }
+
+    pub const fn start_first(&self) -> &HeadTelemetrySetEvidence {
+        &self.start_first
+    }
+
+    pub const fn start_second(&self) -> &HeadTelemetrySetEvidence {
+        &self.start_second
+    }
+
+    pub fn waypoint_writes(&self) -> &[HeadWaypointEvidence] {
+        &self.waypoint_writes
+    }
+
+    pub const fn first_stopped(&self) -> &[FullTelemetry; 4] {
+        self.first_stopped.samples()
+    }
+
+    pub const fn second_stopped(&self) -> &[FullTelemetry; 4] {
+        self.second_stopped.samples()
+    }
+
+    pub const fn first_stopped_set(&self) -> &HeadTelemetrySetEvidence {
+        &self.first_stopped
+    }
+
+    pub const fn second_stopped_set(&self) -> &HeadTelemetrySetEvidence {
+        &self.second_stopped
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HeadReturnError {
+    CommandBeforeStartup,
+    CommandAlreadyInProgress,
+    CommandAlreadyAttempted,
+    Cancelled {
+        cause: CancellationCause,
+        stage: RuntimeStage,
+        joint: HeadJoint,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    TelemetryRead {
+        joint: HeadJoint,
+        source: RequestError,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    /// No new untrusted goal was written; the actor retains the last complete
+    /// admitted per-joint goals and remains the serial owner.
+    KinematicFaultExistingGoalRetained {
+        source: HeadMotionError,
+        commanded_positions: [PositionTicks; 4],
+        interrupted_read: Option<Box<InterruptedTelemetryRead>>,
+        interrupted_write: Option<Box<HeadWaypointBatchWriteError>>,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    KinematicFaultRecoveryWritten {
+        source: HeadMotionError,
+        held_positions: [PositionTicks; 4],
+        hold_writes: Box<[WriteEvidence; 4]>,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    KinematicFaultRecoveryWriteFailed {
+        source: HeadMotionError,
+        recovery_write: Box<HeadWaypointBatchWriteError>,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    Motion {
+        source: HeadMotionError,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+    WaypointWrite {
+        source: Box<HeadWaypointBatchWriteError>,
+        waypoint_writes: Vec<HeadWaypointEvidence>,
+    },
+}
+
+impl fmt::Display for HeadReturnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Kiko return-to-target transaction failed: {self:?}"
+        )
+    }
+}
+
+impl std::error::Error for HeadReturnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TelemetryRead { source, .. } => Some(source),
+            Self::KinematicFaultExistingGoalRetained { source, .. }
+            | Self::KinematicFaultRecoveryWritten { source, .. }
+            | Self::KinematicFaultRecoveryWriteFailed { source, .. }
+            | Self::Motion { source, .. } => Some(source),
+            Self::WaypointWrite { source, .. } => Some(source),
+            Self::CommandBeforeStartup
+            | Self::CommandAlreadyInProgress
+            | Self::CommandAlreadyAttempted
+            | Self::Cancelled { .. } => None,
+        }
+    }
+}
+
+impl HeadReturnError {
+    /// True only for typed outcomes which explicitly preserve the actor and its
+    /// previously admitted goal state. A successful recovery write remains host
+    /// completion evidence, not register acknowledgement or stopped readback.
+    pub const fn retains_owner_after_fault(&self) -> bool {
+        matches!(
+            self,
+            Self::KinematicFaultExistingGoalRetained { .. }
+                | Self::KinematicFaultRecoveryWritten { .. }
+        )
+    }
+
+    pub fn waypoint_writes(&self) -> &[HeadWaypointEvidence] {
+        match self {
+            Self::Cancelled {
+                waypoint_writes, ..
+            }
+            | Self::TelemetryRead {
+                waypoint_writes, ..
+            }
+            | Self::KinematicFaultExistingGoalRetained {
+                waypoint_writes, ..
+            }
+            | Self::KinematicFaultRecoveryWritten {
+                waypoint_writes, ..
+            }
+            | Self::KinematicFaultRecoveryWriteFailed {
+                waypoint_writes, ..
+            }
+            | Self::Motion {
+                waypoint_writes, ..
+            }
+            | Self::WaypointWrite {
+                waypoint_writes, ..
+            } => waypoint_writes,
+            Self::CommandBeforeStartup
+            | Self::CommandAlreadyInProgress
+            | Self::CommandAlreadyAttempted => &[],
+        }
+    }
+
+    fn with_waypoint_writes(self, waypoint_writes: Vec<HeadWaypointEvidence>) -> Self {
+        match self {
+            Self::Cancelled {
+                cause,
+                stage,
+                joint,
+                ..
+            } => Self::Cancelled {
+                cause,
+                stage,
+                joint,
+                waypoint_writes,
+            },
+            Self::TelemetryRead { joint, source, .. } => Self::TelemetryRead {
+                joint,
+                source,
+                waypoint_writes,
+            },
+            Self::Motion { source, .. } => Self::Motion {
+                source,
+                waypoint_writes,
+            },
+            other => other,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameWriteError {
     pub joint: HeadJoint,
     pub purpose: WritePurpose,
@@ -350,6 +700,12 @@ pub enum HeadRuntimeError {
         sample: VerificationSample,
         position: PositionTicks,
     },
+    ReadbackDeviceStatus {
+        joint: HeadJoint,
+        sample: VerificationSample,
+        position: PositionTicks,
+        raw: u8,
+    },
     ReadbackUnstable {
         joint: HeadJoint,
         first: PositionTicks,
@@ -400,6 +756,7 @@ impl std::error::Error for HeadRuntimeError {
             Self::Cancelled { .. }
             | Self::ReadbackMismatch { .. }
             | Self::ReadbackMoving { .. }
+            | Self::ReadbackDeviceStatus { .. }
             | Self::ReadbackUnstable { .. }
             | Self::ObservationClockRegression { .. }
             | Self::ObservationStaleBeforeArming { .. }
@@ -463,11 +820,13 @@ pub enum ActorTermination {
     HandleDropped,
     StartupFault,
     StartupFaultWithShutdownRequested,
+    HeadReturnFault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActorExit {
     startup: Result<VerifiedNaturalHoldEvidence, HeadRuntimeError>,
+    head_return: Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
     termination: ActorTermination,
     torque_disable: TorqueDisableReport,
 }
@@ -475,6 +834,12 @@ pub struct ActorExit {
 impl ActorExit {
     pub const fn startup(&self) -> &Result<VerifiedNaturalHoldEvidence, HeadRuntimeError> {
         &self.startup
+    }
+
+    pub const fn head_return(
+        &self,
+    ) -> Option<&Result<VerifiedHeadReturnEvidence, HeadReturnError>> {
+        self.head_return.as_ref()
     }
 
     pub const fn termination(&self) -> &ActorTermination {
@@ -487,6 +852,9 @@ impl ActorExit {
 }
 
 enum HeadCommand {
+    ReturnToTarget {
+        response: oneshot::Sender<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
+    },
     Shutdown {
         response: oneshot::Sender<TorqueDisableReport>,
     },
@@ -510,6 +878,53 @@ impl HeadActorHandle {
             .map_err(|_| ShutdownError::ActorStoppedBeforeReporting)
     }
 }
+
+/// Motion endpoint produced only by a complete `ReturnToTargetConfig`. The
+/// reviewed target, bounds, speed, torque, and tolerances are stored in the
+/// actor; no command can cross-pair a plan from another configuration/device.
+pub struct HeadReturnActorHandle {
+    commands: mpsc::Sender<HeadCommand>,
+}
+
+impl HeadReturnActorHandle {
+    pub async fn return_to_target(
+        &self,
+    ) -> Result<Result<VerifiedHeadReturnEvidence, HeadReturnError>, HeadCommandError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::ReturnToTarget { response })
+            .await
+            .map_err(|_| HeadCommandError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| HeadCommandError::ActorStoppedBeforeReporting)
+    }
+
+    pub async fn shutdown(self) -> Result<TorqueDisableReport, ShutdownError> {
+        let (response, result) = oneshot::channel();
+        self.commands
+            .send(HeadCommand::Shutdown { response })
+            .await
+            .map_err(|_| ShutdownError::ActorAlreadyStopped)?;
+        result
+            .await
+            .map_err(|_| ShutdownError::ActorStoppedBeforeReporting)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadCommandError {
+    ActorAlreadyStopped,
+    ActorStoppedBeforeReporting,
+}
+
+impl fmt::Display for HeadCommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "head motion command failed: {self:?}")
+    }
+}
+
+impl std::error::Error for HeadCommandError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownError {
@@ -616,14 +1031,43 @@ where
 {
     let runtime =
         Handle::try_current().map_err(|source| HeadActorSpawnError::NoTokioRuntime { source })?;
-    Ok(spawn_head_actor_on(
+    let (commands, startup, task) = spawn_head_actor_on(
         &runtime,
         transport,
         clock,
         config,
         configured_pose_bounds,
         consent,
-    ))
+        None,
+    );
+    Ok((HeadActorHandle { commands }, startup, task))
+}
+
+/// Spawn the testable return owner from one inseparable parsed configuration.
+pub fn spawn_head_return_actor<T, C>(
+    transport: T,
+    clock: C,
+    config: ReturnToTargetConfig,
+    torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+) -> Result<(HeadReturnActorHandle, StartupReceipt, HeadActorTask), HeadActorSpawnError>
+where
+    T: AsyncByteTransport,
+    C: MonotonicClock,
+{
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorSpawnError::NoTokioRuntime { source })?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let (commands, startup, task) = spawn_head_actor_on(
+        &runtime,
+        transport,
+        clock,
+        runtime_config,
+        start_bounds,
+        torque_consent,
+        Some(plan),
+    );
+    Ok((HeadReturnActorHandle { commands }, startup, task))
 }
 
 fn spawn_head_actor_on<T, C>(
@@ -633,7 +1077,8 @@ fn spawn_head_actor_on<T, C>(
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
     _consent: PhysicalTorqueEnableConsent,
-) -> (HeadActorHandle, StartupReceipt, HeadActorTask)
+    return_plan: Option<HeadReturnPlan>,
+) -> (mpsc::Sender<HeadCommand>, StartupReceipt, HeadActorTask)
 where
     T: AsyncByteTransport,
     C: MonotonicClock,
@@ -645,10 +1090,11 @@ where
         clock,
         config,
         configured_pose_bounds,
+        return_plan,
     };
     let task = runtime.spawn(actor.run(receiver, startup_sender));
     (
-        HeadActorHandle { commands },
+        commands,
         StartupReceipt {
             result: startup_result,
         },
@@ -684,8 +1130,52 @@ pub fn start_serial_head_actor(
         config,
         configured_pose_bounds,
         consent,
+        None,
     );
-    Ok((serial_evidence, handle, startup, task))
+    Ok((
+        serial_evidence,
+        HeadActorHandle { commands: handle },
+        startup,
+        task,
+    ))
+}
+
+/// Open and exclusively own the configured bus for one config-bound return
+/// transaction. No target/limits can be supplied later through the command API.
+pub fn start_serial_head_return_actor(
+    config: ReturnToTargetConfig,
+    torque_consent: PhysicalTorqueEnableConsent,
+    _motion_consent: PhysicalHeadMotionConsent,
+) -> Result<
+    (
+        SerialConfigurationEvidence,
+        HeadReturnActorHandle,
+        StartupReceipt,
+        HeadActorTask,
+    ),
+    HeadActorStartError,
+> {
+    let runtime =
+        Handle::try_current().map_err(|source| HeadActorStartError::NoTokioRuntime { source })?;
+    let (runtime_config, start_bounds, plan) = config.into_actor_parts();
+    let transport = SerialTransport::open(runtime_config.device())
+        .map_err(|source| HeadActorStartError::Serial { source })?;
+    let serial_evidence = transport.evidence().clone();
+    let (commands, startup, task) = spawn_head_actor_on(
+        &runtime,
+        transport,
+        TokioClock::new(),
+        runtime_config,
+        start_bounds,
+        torque_consent,
+        Some(plan),
+    );
+    Ok((
+        serial_evidence,
+        HeadReturnActorHandle { commands },
+        startup,
+        task,
+    ))
 }
 
 struct HeadActor<T, C> {
@@ -693,6 +1183,7 @@ struct HeadActor<T, C> {
     clock: C,
     config: HeadRuntimeConfig,
     configured_pose_bounds: ConfiguredHeadPoseBounds,
+    return_plan: Option<HeadReturnPlan>,
 }
 
 struct ControlState {
@@ -709,6 +1200,63 @@ impl ControlState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ReturnOperationBudget<'a> {
+    Initial {
+        plan: HeadReturnPlan,
+        started_at: MonotonicTime,
+    },
+    Moving(&'a HeadReturnController),
+}
+
+impl ReturnOperationBudget<'_> {
+    fn remaining(self, now: MonotonicTime) -> Result<Duration, HeadMotionError> {
+        match self {
+            Self::Initial { plan, started_at } => {
+                let elapsed = now.checked_duration_since(started_at).ok_or(
+                    HeadMotionError::ClockRegression {
+                        previous: started_at,
+                        observed: now,
+                    },
+                )?;
+                if elapsed >= plan.motion_timeout() {
+                    return Err(HeadMotionError::MotionTimeout {
+                        elapsed,
+                        maximum: plan.motion_timeout(),
+                    });
+                }
+                Ok(plan
+                    .motion_timeout()
+                    .checked_sub(elapsed)
+                    .expect("elapsed is inside the initial return deadline"))
+            }
+            Self::Moving(controller) => controller.remaining_operation_budget(now),
+        }
+    }
+}
+
+enum ReturnFrameWriteFailure {
+    Frame(FrameWriteError),
+    Deadline {
+        source: HeadMotionError,
+        io: Option<FrameWriteError>,
+    },
+}
+
+enum ReturnTelemetrySetFailure {
+    Command(Box<HeadReturnError>),
+    Read {
+        joint: HeadJoint,
+        source: RequestError,
+    },
+    Deadline {
+        joint: HeadJoint,
+        source: HeadMotionError,
+        io: Option<RequestError>,
+    },
+    Admission(HeadMotionError),
+}
+
 impl<T, C> HeadActor<T, C>
 where
     T: AsyncByteTransport,
@@ -721,32 +1269,45 @@ where
     ) -> ActorExit {
         let mut control = ControlState::new();
         let startup = self.startup(&mut commands, &mut control).await;
+        let mut head_return = None;
         // Startup observation is optional to the actor's safety. If the caller
         // dropped its receipt, the complete result still remains in ActorExit.
         let _startup_receiver_present = startup_sender.send(startup.clone()).is_ok();
 
         let termination = if let Some(termination) = control.termination.clone() {
             termination
-        } else if startup.is_err() {
-            // Reject future commands, then drain a shutdown that was already
-            // queued while the failing operation was in flight.
-            commands.close();
-            match commands.try_recv() {
-                Ok(HeadCommand::Shutdown { response }) => {
-                    control.shutdown_response = Some(response);
-                    ActorTermination::StartupFaultWithShutdownRequested
-                }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    ActorTermination::StartupFault
-                }
-            }
         } else {
-            match commands.recv().await {
-                Some(HeadCommand::Shutdown { response }) => {
-                    control.shutdown_response = Some(response);
-                    ActorTermination::RequestedShutdown
+            match startup.as_ref() {
+                Err(_) => {
+                    // Reject future commands, then drain a shutdown that was
+                    // already queued while the failing operation was in flight.
+                    commands.close();
+                    match commands.try_recv() {
+                        Ok(HeadCommand::Shutdown { response }) => {
+                            control.shutdown_response = Some(response);
+                            ActorTermination::StartupFaultWithShutdownRequested
+                        }
+                        Ok(HeadCommand::ReturnToTarget { response }) => {
+                            let _requester_present = response
+                                .send(Err(HeadReturnError::CommandBeforeStartup))
+                                .is_ok();
+                            ActorTermination::StartupFault
+                        }
+                        Err(
+                            mpsc::error::TryRecvError::Empty
+                            | mpsc::error::TryRecvError::Disconnected,
+                        ) => ActorTermination::StartupFault,
+                    }
                 }
-                None => ActorTermination::HandleDropped,
+                Ok(evidence) => {
+                    self.run_commands(
+                        &mut commands,
+                        &mut control,
+                        evidence.observed_pose(),
+                        &mut head_return,
+                    )
+                    .await
+                }
             }
         };
         commands.close();
@@ -758,8 +1319,52 @@ where
         }
         ActorExit {
             startup,
+            head_return,
             termination,
             torque_disable,
+        }
+    }
+
+    async fn run_commands(
+        &mut self,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+        start_pose: HeadPose,
+        head_return: &mut Option<Result<VerifiedHeadReturnEvidence, HeadReturnError>>,
+    ) -> ActorTermination {
+        loop {
+            match commands.recv().await {
+                Some(HeadCommand::Shutdown { response }) => {
+                    control.shutdown_response = Some(response);
+                    return ActorTermination::RequestedShutdown;
+                }
+                Some(HeadCommand::ReturnToTarget { response }) => {
+                    if head_return.is_some() {
+                        let _requester_present = response
+                            .send(Err(HeadReturnError::CommandAlreadyAttempted))
+                            .is_ok();
+                        continue;
+                    }
+                    let plan = self
+                        .return_plan
+                        .expect("only a config-bound return handle can send this private command");
+                    let result = self
+                        .execute_return_to_target(start_pose, plan, commands, control)
+                        .await;
+                    let owner_retained_after_fault = result
+                        .as_ref()
+                        .is_err_and(HeadReturnError::retains_owner_after_fault);
+                    let _requester_present = response.send(result.clone()).is_ok();
+                    *head_return = Some(result.clone());
+                    if result.is_err() && !owner_retained_after_fault {
+                        return control
+                            .termination
+                            .clone()
+                            .unwrap_or(ActorTermination::HeadReturnFault);
+                    }
+                }
+                None => return ActorTermination::HandleDropped,
+            }
         }
     }
 
@@ -896,6 +1501,502 @@ where
             torque_enable_writes,
             readbacks,
         })
+    }
+
+    async fn execute_return_to_target(
+        &mut self,
+        startup_pose: HeadPose,
+        plan: HeadReturnPlan,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+    ) -> Result<VerifiedHeadReturnEvidence, HeadReturnError> {
+        let started_at = self.clock.now();
+        let mut commanded_positions = startup_pose.positions();
+        let mut waypoint_writes = Vec::with_capacity(
+            usize::try_from(plan.motion_timeout().as_millis() / plan.control_period().as_millis())
+                .expect("fixed return cycle bound fits usize"),
+        );
+        let initial_budget = ReturnOperationBudget::Initial { plan, started_at };
+        let start_first = match self
+            .read_return_telemetry_set(commands, control, initial_budget, plan)
+            .await
+        {
+            Ok(set) => set,
+            Err(source) => {
+                return Err(map_return_telemetry_failure(
+                    source,
+                    commanded_positions,
+                    waypoint_writes,
+                ));
+            }
+        };
+        let start_second = match self
+            .read_return_telemetry_set(commands, control, initial_budget, plan)
+            .await
+        {
+            Ok(set) => set,
+            Err(source) => {
+                return Err(map_return_telemetry_failure(
+                    source,
+                    commanded_positions,
+                    waypoint_writes,
+                ));
+            }
+        };
+        let start_pose = match admit_stopped_return_start(
+            start_first,
+            start_second,
+            self.config.redundant_read_tolerance(),
+        ) {
+            Ok(pose) => pose,
+            Err(source) => {
+                return Err(retain_existing_goal_error(
+                    source,
+                    commanded_positions,
+                    None,
+                    None,
+                    waypoint_writes,
+                ));
+            }
+        };
+        if let Err(source) = self.configured_pose_bounds.admit(start_pose) {
+            return Err(retain_existing_goal_error(
+                HeadMotionError::ReturnStartOutsideConfiguredBounds { source },
+                commanded_positions,
+                None,
+                None,
+                waypoint_writes,
+            ));
+        }
+        let motion_started_at = self.clock.now();
+        let mut controller =
+            match HeadReturnController::try_new(plan, start_pose, started_at, motion_started_at) {
+                Ok(controller) => controller,
+                Err(source) => {
+                    return Err(retain_existing_goal_error(
+                        source,
+                        commanded_positions,
+                        None,
+                        None,
+                        waypoint_writes,
+                    ));
+                }
+            };
+        let mut interval = tokio::time::interval(plan.control_period());
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            if let Err(source) = self.check_return_control(
+                commands,
+                control,
+                RuntimeStage::ReturnReadTelemetry,
+                HeadJoint::Bow,
+            ) {
+                return Err(source.with_waypoint_writes(waypoint_writes));
+            }
+            if let Err(source) = controller.remaining_operation_budget(self.clock.now()) {
+                return Err(retain_existing_goal_error(
+                    source,
+                    commanded_positions,
+                    None,
+                    None,
+                    waypoint_writes,
+                ));
+            }
+            let telemetry = match self
+                .read_return_telemetry_set(
+                    commands,
+                    control,
+                    ReturnOperationBudget::Moving(&controller),
+                    plan,
+                )
+                .await
+            {
+                Ok(set) => set,
+                Err(source) => {
+                    return Err(map_return_telemetry_failure(
+                        source,
+                        commanded_positions,
+                        waypoint_writes,
+                    ));
+                }
+            };
+            let action = match controller.advance(self.clock.now(), telemetry) {
+                Ok(action) => action,
+                Err(fault) if fault.recovery().is_some() => {
+                    let positions = fault
+                        .recovery()
+                        .expect("guard admitted the recovery capability")
+                        .positions();
+                    match self
+                        .write_return_waypoints(positions, commands, control, None)
+                        .await
+                    {
+                        Ok(hold_writes) => {
+                            return Err(HeadReturnError::KinematicFaultRecoveryWritten {
+                                source: fault.into_source(),
+                                held_positions: positions,
+                                hold_writes: Box::new(hold_writes),
+                                waypoint_writes,
+                            });
+                        }
+                        Err(recovery_write) => {
+                            return Err(HeadReturnError::KinematicFaultRecoveryWriteFailed {
+                                source: fault.into_source(),
+                                recovery_write: Box::new(recovery_write),
+                                waypoint_writes,
+                            });
+                        }
+                    }
+                }
+                Err(fault) if fault.source().permits_existing_goal_retention() => {
+                    return Err(retain_existing_goal_error(
+                        fault.into_source(),
+                        commanded_positions,
+                        None,
+                        None,
+                        waypoint_writes,
+                    ));
+                }
+                Err(fault) => {
+                    return Err(HeadReturnError::Motion {
+                        source: fault.into_source(),
+                        waypoint_writes,
+                    });
+                }
+            };
+            match action {
+                HeadReturnAction::WriteWaypoints(positions) => {
+                    let writes = match self
+                        .write_return_waypoints(
+                            positions,
+                            commands,
+                            control,
+                            Some(ReturnOperationBudget::Moving(&controller)),
+                        )
+                        .await
+                    {
+                        Ok(writes) => writes,
+                        Err(source) => {
+                            apply_completed_waypoint_prefix(&mut commanded_positions, &source);
+                            if let HeadWaypointBatchFailure::Deadline {
+                                source: deadline, ..
+                            } = source.failure()
+                            {
+                                return Err(retain_existing_goal_error(
+                                    deadline.clone(),
+                                    commanded_positions,
+                                    None,
+                                    Some(Box::new(source)),
+                                    waypoint_writes,
+                                ));
+                            }
+                            return Err(HeadReturnError::WaypointWrite {
+                                source: Box::new(source),
+                                waypoint_writes,
+                            });
+                        }
+                    };
+                    commanded_positions = positions;
+                    controller.record_waypoint_written(positions);
+                    waypoint_writes.push(HeadWaypointEvidence { positions, writes });
+                }
+                HeadReturnAction::AwaitSecondStoppedSample => {}
+                HeadReturnAction::Complete(sets) => {
+                    return Ok(VerifiedHeadReturnEvidence {
+                        started_at,
+                        completed_at: self.clock.now(),
+                        start_pose,
+                        start_first: start_first.into(),
+                        start_second: start_second.into(),
+                        target: plan.target(),
+                        waypoint_writes,
+                        first_stopped: sets[0].into(),
+                        second_stopped: sets[1].into(),
+                    });
+                }
+            }
+        }
+    }
+
+    async fn read_return_telemetry_set(
+        &mut self,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+        budget: ReturnOperationBudget<'_>,
+        plan: HeadReturnPlan,
+    ) -> Result<FreshHeadTelemetrySet, ReturnTelemetrySetFailure> {
+        let bow = self
+            .read_return_joint(HeadJoint::Bow, commands, control, budget)
+            .await?;
+        let curl = self
+            .read_return_joint(HeadJoint::Curl, commands, control, budget)
+            .await?;
+        let yaw = self
+            .read_return_joint(HeadJoint::Yaw, commands, control, budget)
+            .await?;
+        let roll = self
+            .read_return_joint(HeadJoint::Roll, commands, control, budget)
+            .await?;
+        let responses = [bow, curl, yaw, roll];
+        let samples = std::array::from_fn(|index| *responses[index].value());
+        let received_at = std::array::from_fn(|index| responses[index].received_at());
+        FreshHeadTelemetrySet::try_new(
+            samples,
+            received_at,
+            self.clock.now(),
+            plan.telemetry_set_max_age(),
+        )
+        .map_err(ReturnTelemetrySetFailure::Admission)
+    }
+
+    async fn read_return_joint(
+        &mut self,
+        joint: HeadJoint,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+        budget: ReturnOperationBudget<'_>,
+    ) -> Result<ResponseEvidence<FullTelemetry>, ReturnTelemetrySetFailure> {
+        self.check_return_control(commands, control, RuntimeStage::ReturnReadTelemetry, joint)
+            .map_err(|source| ReturnTelemetrySetFailure::Command(Box::new(source)))?;
+        let request = build_full_telemetry_read(joint.servo_id());
+        let request_write = match self
+            .write_frame_before_deadline(
+                joint,
+                WritePurpose::TelemetryReadRequest,
+                request.as_bytes(),
+                budget,
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(ReturnFrameWriteFailure::Frame(source)) => {
+                return Err(ReturnTelemetrySetFailure::Read {
+                    joint,
+                    source: RequestError::RequestWrite(source),
+                });
+            }
+            Err(ReturnFrameWriteFailure::Deadline { source, io }) => {
+                return Err(ReturnTelemetrySetFailure::Deadline {
+                    joint,
+                    source,
+                    io: io.map(RequestError::RequestWrite),
+                });
+            }
+        };
+        let remaining = budget.remaining(self.clock.now()).map_err(|source| {
+            ReturnTelemetrySetFailure::Deadline {
+                joint,
+                source,
+                // The request write completed, but the operation budget expired
+                // before a response read began. Do not fabricate an I/O failure.
+                io: None,
+            }
+        })?;
+        let frame = match read_response_frame(
+            &mut self.transport,
+            &self.clock,
+            self.config.response_timeout().capped_by(remaining),
+            self.config.noise_budget_bytes(),
+        )
+        .await
+        {
+            Ok(frame) => frame,
+            Err(source) => {
+                let deadline = budget.remaining(self.clock.now()).err();
+                return Err(match deadline {
+                    Some(deadline) => ReturnTelemetrySetFailure::Deadline {
+                        joint,
+                        source: deadline,
+                        io: Some(RequestError::ResponseFrame(source)),
+                    },
+                    None => ReturnTelemetrySetFailure::Read {
+                        joint,
+                        source: RequestError::ResponseFrame(source),
+                    },
+                });
+            }
+        };
+        let value = FullTelemetry::parse(frame.as_bytes(), joint.servo_id()).map_err(|source| {
+            ReturnTelemetrySetFailure::Read {
+                joint,
+                source: RequestError::Telemetry(source),
+            }
+        })?;
+        Ok(ResponseEvidence {
+            value,
+            request_write,
+            discarded_noise_bytes: frame.discarded_noise_bytes(),
+            received_at: self.clock.now(),
+        })
+    }
+
+    async fn write_return_waypoints(
+        &mut self,
+        positions: [PositionTicks; 4],
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+        budget: Option<ReturnOperationBudget<'_>>,
+    ) -> Result<[WriteEvidence; 4], HeadWaypointBatchWriteError> {
+        let frames = HeadJoint::ALL.map(|joint| {
+            build_goal_with_speed_write(
+                joint.servo_id(),
+                positions[joint as usize],
+                self.config.goal_speed(),
+            )
+        });
+        let mut completed_writes: [Option<WriteEvidence>; 4] = std::array::from_fn(|_| None);
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            if let Err(error) = self.check_return_control(
+                commands,
+                control,
+                RuntimeStage::ReturnWriteWaypoint,
+                joint,
+            ) {
+                let HeadReturnError::Cancelled {
+                    cause,
+                    stage,
+                    joint,
+                    ..
+                } = error
+                else {
+                    unreachable!("only cancellation can stop an in-flight private batch")
+                };
+                return Err(HeadWaypointBatchWriteError {
+                    positions,
+                    completed_writes,
+                    failure: HeadWaypointBatchFailure::Cancelled {
+                        cause,
+                        stage,
+                        joint,
+                    },
+                });
+            }
+            let result = match budget {
+                Some(budget) => self
+                    .write_frame_before_deadline(
+                        joint,
+                        WritePurpose::ReturnWaypoint,
+                        frames[index].as_bytes(),
+                        budget,
+                    )
+                    .await
+                    .map_err(|source| match source {
+                        ReturnFrameWriteFailure::Frame(source) => {
+                            HeadWaypointBatchFailure::Frame(source)
+                        }
+                        ReturnFrameWriteFailure::Deadline { source, io } => {
+                            HeadWaypointBatchFailure::Deadline { source, io }
+                        }
+                    }),
+                None => self
+                    .write_frame(
+                        joint,
+                        WritePurpose::ReturnWaypoint,
+                        frames[index].as_bytes(),
+                    )
+                    .await
+                    .map_err(HeadWaypointBatchFailure::Frame),
+            };
+            match result {
+                Ok(evidence) => completed_writes[index] = Some(evidence),
+                Err(failure) => {
+                    return Err(HeadWaypointBatchWriteError {
+                        positions,
+                        completed_writes,
+                        failure,
+                    });
+                }
+            }
+        }
+        Ok(completed_writes
+            .map(|write| write.expect("all four batch writes completed on the success path")))
+    }
+
+    async fn write_frame_before_deadline(
+        &mut self,
+        joint: HeadJoint,
+        purpose: WritePurpose,
+        bytes: &[u8],
+        budget: ReturnOperationBudget<'_>,
+    ) -> Result<WriteEvidence, ReturnFrameWriteFailure> {
+        let mut recovered_failures = Vec::new();
+        let maximum_attempts = self.config.write_attempts().get();
+        let mut attempt = 1_u8;
+        loop {
+            let remaining = budget
+                .remaining(self.clock.now())
+                .map_err(|source| ReturnFrameWriteFailure::Deadline { source, io: None })?;
+            let timeout = self.config.write_timeout().get().min(remaining);
+            match self.transport.write_all(bytes, timeout).await {
+                Ok(()) => {
+                    return Ok(WriteEvidence {
+                        attempts_used: attempt,
+                        recovered_failures,
+                        completed_at: self.clock.now(),
+                    });
+                }
+                Err(source) => {
+                    let frame_error = FrameWriteError {
+                        joint,
+                        purpose,
+                        attempts_used: attempt,
+                        recovered_failures: recovered_failures.clone(),
+                        source: source.clone(),
+                    };
+                    if let Err(deadline) = budget.remaining(self.clock.now()) {
+                        return Err(ReturnFrameWriteFailure::Deadline {
+                            source: deadline,
+                            io: Some(frame_error),
+                        });
+                    }
+                    if attempt < maximum_attempts && source.is_retryable_without_progress() {
+                        recovered_failures.push(source);
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(ReturnFrameWriteFailure::Frame(frame_error));
+                }
+            }
+        }
+    }
+
+    fn check_return_control(
+        &self,
+        commands: &mut mpsc::Receiver<HeadCommand>,
+        control: &mut ControlState,
+        stage: RuntimeStage,
+        joint: HeadJoint,
+    ) -> Result<(), HeadReturnError> {
+        match commands.try_recv() {
+            Ok(HeadCommand::Shutdown { response }) => {
+                control.termination = Some(ActorTermination::RequestedShutdown);
+                control.shutdown_response = Some(response);
+                Err(HeadReturnError::Cancelled {
+                    cause: CancellationCause::RequestedShutdown,
+                    stage,
+                    joint,
+                    waypoint_writes: Vec::new(),
+                })
+            }
+            Ok(HeadCommand::ReturnToTarget { response }) => {
+                let _requester_present = response
+                    .send(Err(HeadReturnError::CommandAlreadyInProgress))
+                    .is_ok();
+                Ok(())
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                control.termination = Some(ActorTermination::HandleDropped);
+                Err(HeadReturnError::Cancelled {
+                    cause: CancellationCause::HandleDropped,
+                    stage,
+                    joint,
+                    waypoint_writes: Vec::new(),
+                })
+            }
+            Err(mpsc::error::TryRecvError::Empty) => Ok(()),
+        }
     }
 
     async fn observe_joint(
@@ -1273,6 +2374,14 @@ where
         target: PositionTicks,
         telemetry: &FullTelemetry,
     ) -> Result<u16, HeadRuntimeError> {
+        if telemetry.device_status_raw() != 0 {
+            return Err(HeadRuntimeError::ReadbackDeviceStatus {
+                joint,
+                sample,
+                position: telemetry.position(),
+                raw: telemetry.device_status_raw(),
+            });
+        }
         if telemetry.is_moving() {
             return Err(HeadRuntimeError::ReadbackMoving {
                 joint,
@@ -1354,6 +2463,12 @@ where
                     joint,
                 })
             }
+            Ok(HeadCommand::ReturnToTarget { response }) => {
+                let _requester_present = response
+                    .send(Err(HeadReturnError::CommandBeforeStartup))
+                    .is_ok();
+                Ok(())
+            }
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 control.termination = Some(ActorTermination::HandleDropped);
                 Err(HeadRuntimeError::Cancelled {
@@ -1390,6 +2505,66 @@ where
     }
 }
 
+fn retain_existing_goal_error(
+    source: HeadMotionError,
+    commanded_positions: [PositionTicks; 4],
+    interrupted_read: Option<Box<InterruptedTelemetryRead>>,
+    interrupted_write: Option<Box<HeadWaypointBatchWriteError>>,
+    waypoint_writes: Vec<HeadWaypointEvidence>,
+) -> HeadReturnError {
+    HeadReturnError::KinematicFaultExistingGoalRetained {
+        source,
+        commanded_positions,
+        interrupted_read,
+        interrupted_write,
+        waypoint_writes,
+    }
+}
+
+fn map_return_telemetry_failure(
+    failure: ReturnTelemetrySetFailure,
+    commanded_positions: [PositionTicks; 4],
+    waypoint_writes: Vec<HeadWaypointEvidence>,
+) -> HeadReturnError {
+    match failure {
+        ReturnTelemetrySetFailure::Command(source) => {
+            (*source).with_waypoint_writes(waypoint_writes)
+        }
+        ReturnTelemetrySetFailure::Deadline { joint, source, io } => retain_existing_goal_error(
+            source,
+            commanded_positions,
+            Some(Box::new(InterruptedTelemetryRead { joint, source: io })),
+            None,
+            waypoint_writes,
+        ),
+        ReturnTelemetrySetFailure::Read { joint, source } => HeadReturnError::TelemetryRead {
+            joint,
+            source,
+            waypoint_writes,
+        },
+        ReturnTelemetrySetFailure::Admission(source)
+            if source.permits_existing_goal_retention() =>
+        {
+            retain_existing_goal_error(source, commanded_positions, None, None, waypoint_writes)
+        }
+        ReturnTelemetrySetFailure::Admission(source) => HeadReturnError::Motion {
+            source,
+            waypoint_writes,
+        },
+    }
+}
+
+fn apply_completed_waypoint_prefix(
+    commanded_positions: &mut [PositionTicks; 4],
+    error: &HeadWaypointBatchWriteError,
+) {
+    for (index, completed) in error.completed_writes().iter().enumerate() {
+        if completed.is_some() {
+            commanded_positions[index] = error.positions()[index];
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
@@ -1401,7 +2576,9 @@ mod tests {
     use kiko_head_protocol::{ResponseParseError, ServoId, TelemetryParseError};
 
     use super::*;
-    use crate::config::HeadRuntimeConfigInput;
+    use crate::config::{
+        HeadProbeConfig, HeadProbeConfigInput, HeadRuntimeConfigInput, ReturnToTargetConfigInput,
+    };
     use crate::transport::{TransportFailureKind, TransportOperation};
 
     #[derive(Clone, Default)]
@@ -1412,6 +2589,11 @@ mod tests {
     impl TestClock {
         fn advance_one_millisecond(&self) {
             self.nanoseconds.fetch_add(1_000_000, Ordering::Relaxed);
+        }
+
+        fn set_milliseconds(&self, milliseconds: u64) {
+            self.nanoseconds
+                .store(milliseconds * 1_000_000, Ordering::Relaxed);
         }
     }
 
@@ -1438,8 +2620,10 @@ mod tests {
     #[derive(Default)]
     struct FakeShared {
         writes: Vec<Vec<u8>>,
+        write_timeouts: Vec<Duration>,
         write_failures: BTreeMap<usize, TransportFailure>,
         read_calls: usize,
+        read_timeouts: Vec<Duration>,
     }
 
     struct FakeTransport {
@@ -1468,12 +2652,13 @@ mod tests {
         async fn write_all(
             &mut self,
             bytes: &[u8],
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<(), TransportFailure> {
             self.clock.advance_one_millisecond();
             let mut shared = self.shared.lock().expect("fake transport mutex");
             let call = shared.writes.len();
             shared.writes.push(bytes.to_vec());
+            shared.write_timeouts.push(timeout);
             match shared.write_failures.remove(&call) {
                 Some(source) => Err(source),
                 None => Ok(()),
@@ -1483,10 +2668,14 @@ mod tests {
         async fn read_some(
             &mut self,
             bytes: &mut [u8],
-            _timeout: Duration,
+            timeout: Duration,
         ) -> Result<usize, TransportFailure> {
             self.clock.advance_one_millisecond();
-            self.shared.lock().expect("fake transport mutex").read_calls += 1;
+            {
+                let mut shared = self.shared.lock().expect("fake transport mutex");
+                shared.read_calls += 1;
+                shared.read_timeouts.push(timeout);
+            }
             loop {
                 if !self.pending.is_empty() {
                     let read = bytes.len().min(self.pending.len());
@@ -1561,8 +2750,18 @@ mod tests {
     }
 
     fn telemetry_response_with_moving(joint: HeadJoint, position: u16, moving: bool) -> Vec<u8> {
+        telemetry_response_with_status(joint, position, moving, 0)
+    }
+
+    fn telemetry_response_with_status(
+        joint: HeadJoint,
+        position: u16,
+        moving: bool,
+        device_status_raw: u8,
+    ) -> Vec<u8> {
         let mut telemetry = [0_u8; 15];
         telemetry[..2].copy_from_slice(&position.to_le_bytes());
+        telemetry[9] = device_status_raw;
         telemetry[10] = u8::from(moving);
         status(joint.servo_id(), &telemetry)
     }
@@ -1579,6 +2778,75 @@ mod tests {
             reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
         }
         reads
+    }
+
+    fn successful_reads_with_stationary_return() -> Vec<ReadAction> {
+        let positions = [2_127_u16, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        // Two fresh command-start sets, one set which causes the exact target
+        // write, and two stopped completion sets.
+        for _ in 0..5 {
+            for (joint, position) in HeadJoint::ALL.into_iter().zip(positions) {
+                reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+            }
+        }
+        reads
+    }
+
+    fn valid_return_config(
+        target: [u16; 4],
+        maximum_travel_ticks: [u16; 4],
+    ) -> ReturnToTargetConfig {
+        let probe = HeadProbeConfig::parse(HeadProbeConfigInput {
+            device_path: "/dev/serial/by-id/usb-Kiko_head_test".to_owned(),
+            response_timeout_ms: 100,
+            request_timeout_ms: 100,
+            noise_budget_bytes: 16,
+        })
+        .expect("test probe configuration");
+        ReturnToTargetConfig::parse(
+            &probe,
+            ReturnToTargetConfigInput {
+                write_timeout_ms: 1,
+                arming_freshness_ms: 250,
+                write_attempts: 1,
+                redundant_read_tolerance_ticks: 10,
+                readback_tolerance_ticks: 20,
+                final_target_tolerance_ticks: 0,
+                path_corridor_tolerance_ticks: 0,
+                direction_regression_tolerance_ticks: 0,
+                goal_speed_ticks_per_second: 100,
+                torque_limit_permille: [600, 400, 400, 400],
+                minimum_start_ticks: target,
+                maximum_start_ticks: target,
+                target_ticks: target,
+                maximum_travel_ticks,
+                maximum_hold_ms: 1_000,
+            },
+        )
+        .expect("test return configuration")
+    }
+
+    fn spawn_return_fake(
+        reads: Vec<ReadAction>,
+        config: ReturnToTargetConfig,
+    ) -> (
+        HeadReturnActorHandle,
+        StartupReceipt,
+        HeadActorTask,
+        Arc<Mutex<FakeShared>>,
+    ) {
+        let clock = TestClock::default();
+        let (transport, shared) = FakeTransport::new(clock.clone(), reads);
+        let (handle, startup, task) = spawn_head_return_actor(
+            transport,
+            clock,
+            config,
+            PhysicalTorqueEnableConsent::explicitly_granted(),
+            PhysicalHeadMotionConsent::explicitly_granted(),
+        )
+        .expect("test runtime is active");
+        (handle, startup, task, shared)
     }
 
     fn spawn_fake(
@@ -1734,6 +3002,291 @@ mod tests {
             shared.writes[32..]
                 .iter()
                 .all(|write| write[5..=6] == [40, 0])
+        );
+    }
+
+    #[tokio::test]
+    async fn stationary_return_requires_two_samples_and_retains_exact_evidence() {
+        let target = [2_127, 2_558, 2_925, 2_930];
+        let (handle, receipt, task, shared) = spawn_return_fake(
+            successful_reads_with_stationary_return(),
+            valid_return_config(target, [1; 4]),
+        );
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let evidence = handle
+            .return_to_target()
+            .await
+            .expect("actor command receipt")
+            .expect("verified stationary return");
+        assert_eq!(
+            evidence.target().positions().map(PositionTicks::get),
+            target
+        );
+        assert_eq!(evidence.waypoint_writes().len(), 1);
+        assert_eq!(
+            evidence.waypoint_writes()[0]
+                .positions()
+                .map(PositionTicks::get),
+            target
+        );
+        assert!(
+            evidence
+                .first_stopped()
+                .iter()
+                .chain(evidence.second_stopped())
+                .all(|sample| !sample.is_moving() && sample.device_status_raw() == 0)
+        );
+        assert_eq!(
+            handle
+                .return_to_target()
+                .await
+                .expect("second request receives a typed actor response"),
+            Err(HeadReturnError::CommandAlreadyAttempted)
+        );
+
+        let recorded = evidence.clone();
+        let disable = handle.shutdown().await.expect("shutdown report");
+        assert!(disable.all_writes_completed());
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.head_return(), Some(&Ok(recorded)));
+        assert_eq!(exit.termination(), &ActorTermination::RequestedShutdown);
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.read_calls, 144);
+        assert_eq!(shared.writes.len(), 60);
+        assert_eq!(
+            shared
+                .writes
+                .iter()
+                .filter(|write| write.get(4) == Some(&3) && write.get(5) == Some(&42))
+                .count(),
+            8,
+            "the return writes the exact four-joint target once before completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn return_deadline_caps_io_and_never_fabricates_an_unstarted_response_read() {
+        fn plan() -> HeadReturnPlan {
+            let zero = PositionAgreementTicks::try_new(0).expect("zero tolerance");
+            HeadReturnPlan::for_test(
+                kiko_head_protocol::ExactHeadTargetPose::try_from_ticks([
+                    2_127, 2_558, 2_925, 2_930,
+                ])
+                .expect("target"),
+                [1; 4],
+                zero,
+                zero,
+                zero,
+                zero,
+            )
+        }
+
+        let clock = TestClock::default();
+        clock.set_milliseconds(19_999);
+        let (transport, shared) = FakeTransport::new(
+            clock.clone(),
+            vec![ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_127))],
+        );
+        let mut actor = HeadActor {
+            transport,
+            clock,
+            config: valid_config(1),
+            configured_pose_bounds: valid_pose_bounds(),
+            return_plan: Some(plan()),
+        };
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+        let failure = actor
+            .read_return_joint(
+                HeadJoint::Bow,
+                &mut receiver,
+                &mut control,
+                ReturnOperationBudget::Initial {
+                    plan: plan(),
+                    started_at: MonotonicTime::from_duration_since_origin(Duration::ZERO),
+                },
+            )
+            .await
+            .expect_err("deadline expires immediately after the request write");
+        drop(commands);
+
+        assert!(matches!(
+            failure,
+            ReturnTelemetrySetFailure::Deadline {
+                joint: HeadJoint::Bow,
+                source: HeadMotionError::MotionTimeout { .. },
+                io: None,
+            }
+        ));
+        {
+            let shared = shared.lock().expect("fake state");
+            assert_eq!(shared.write_timeouts, [Duration::from_millis(1)]);
+            assert_eq!(shared.read_calls, 0);
+            assert!(shared.read_timeouts.is_empty());
+        }
+
+        let clock = TestClock::default();
+        clock.set_milliseconds(19_998);
+        let (transport, shared) = FakeTransport::new(
+            clock.clone(),
+            vec![ReadAction::Bytes(telemetry_response(HeadJoint::Bow, 2_127))],
+        );
+        let mut actor = HeadActor {
+            transport,
+            clock,
+            config: valid_config(1),
+            configured_pose_bounds: valid_pose_bounds(),
+            return_plan: Some(plan()),
+        };
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+        let failure = actor
+            .read_return_joint(
+                HeadJoint::Bow,
+                &mut receiver,
+                &mut control,
+                ReturnOperationBudget::Initial {
+                    plan: plan(),
+                    started_at: MonotonicTime::from_duration_since_origin(Duration::ZERO),
+                },
+            )
+            .await
+            .expect_err("the response read is capped by the remaining motion deadline");
+        drop(commands);
+
+        assert!(matches!(
+            failure,
+            ReturnTelemetrySetFailure::Deadline {
+                joint: HeadJoint::Bow,
+                source: HeadMotionError::MotionTimeout { .. },
+                io: Some(RequestError::ResponseFrame(FrameReadError::Transport {
+                    source,
+                    ..
+                })),
+            } if source.kind() == TransportFailureKind::TimedOut
+        ));
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.write_timeouts, [Duration::from_millis(1)]);
+        assert_eq!(shared.read_calls, 1);
+        assert_eq!(shared.read_timeouts, [Duration::from_millis(1)]);
+    }
+
+    #[tokio::test]
+    async fn waypoint_batch_failure_retains_the_exact_completed_prefix() {
+        let clock = TestClock::default();
+        let (transport, shared) = FakeTransport::new(clock.clone(), Vec::new());
+        shared
+            .lock()
+            .expect("fake state")
+            .write_failures
+            .insert(1, TransportFailure::timed_out(TransportOperation::Write, 0));
+        let mut actor = HeadActor {
+            transport,
+            clock,
+            config: valid_config(1),
+            configured_pose_bounds: valid_pose_bounds(),
+            return_plan: None,
+        };
+        let positions =
+            kiko_head_protocol::ExactHeadTargetPose::try_from_ticks([2_127, 2_558, 2_925, 2_930])
+                .expect("target")
+                .positions();
+        let (commands, mut receiver) = mpsc::channel(1);
+        let mut control = ControlState::new();
+
+        let error = actor
+            .write_return_waypoints(positions, &mut receiver, &mut control, None)
+            .await
+            .expect_err("second joint write fails");
+        drop(commands);
+
+        assert_eq!(error.positions(), positions);
+        assert!(error.completed_writes()[0].is_some());
+        assert!(error.completed_writes()[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            error.failure(),
+            HeadWaypointBatchFailure::Frame(FrameWriteError {
+                joint: HeadJoint::Curl,
+                attempts_used: 1,
+                source,
+                ..
+            }) if source.kind() == TransportFailureKind::TimedOut
+        ));
+        let mut commanded = [PositionTicks::MIN; 4];
+        apply_completed_waypoint_prefix(&mut commanded, &error);
+        assert_eq!(commanded[0], positions[0]);
+        assert_eq!(commanded[1..], [PositionTicks::MIN; 3]);
+        assert_eq!(shared.lock().expect("fake state").writes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn config_bound_return_rejects_fresh_start_drift_and_retains_existing_goal() {
+        let target = [2_127, 2_558, 2_925, 2_930];
+        let drifted = [2_129, 2_558, 2_925, 2_930];
+        let mut reads = successful_reads();
+        for _ in 0..2 {
+            for (joint, position) in HeadJoint::ALL.into_iter().zip(drifted) {
+                reads.push(ReadAction::Bytes(telemetry_response(joint, position)));
+            }
+        }
+        let (handle, receipt, task, shared) =
+            spawn_return_fake(reads, valid_return_config(target, [1; 4]));
+        receipt
+            .wait()
+            .await
+            .expect("startup channel")
+            .expect("verified natural hold");
+
+        let error = handle
+            .return_to_target()
+            .await
+            .expect("actor command receipt")
+            .expect_err("start-to-target travel must be admitted again by the actor");
+        assert!(matches!(
+            &error,
+            HeadReturnError::KinematicFaultExistingGoalRetained {
+                source: HeadMotionError::ReturnStartOutsideConfiguredBounds {
+                    source: HeadPoseBoundsAdmissionError::OutsideConfiguredWindow {
+                        joint: HeadJoint::Bow,
+                        observed,
+                        minimum,
+                        maximum,
+                    },
+                },
+                commanded_positions,
+                waypoint_writes,
+                ..
+            } if observed.get() == 2_129
+                && minimum.get() == 2_127
+                && maximum.get() == 2_127
+                && commanded_positions.map(PositionTicks::get) == target
+                && waypoint_writes.is_empty()
+        ));
+
+        let disable = handle.shutdown().await.expect("shutdown report");
+        assert!(disable.all_writes_completed());
+        let exit = task.join().await.expect("actor task");
+        assert_eq!(exit.termination(), &ActorTermination::RequestedShutdown);
+        assert_eq!(exit.head_return(), Some(&Err(error)));
+        assert!(exit.torque_disable().all_writes_completed());
+
+        let shared = shared.lock().expect("fake state");
+        assert_eq!(shared.read_calls, 96);
+        assert_eq!(shared.writes.len(), 44);
+        assert_eq!(
+            shared
+                .writes
+                .iter()
+                .filter(|write| write.get(4) == Some(&3) && write.get(5) == Some(&42))
+                .count(),
+            4,
+            "only the startup observed-pose goals are permitted"
         );
     }
 
@@ -2156,6 +3709,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn nonzero_startup_readback_device_status_never_claims_hold() {
+        let mut reads = successful_reads();
+        reads[8] = ReadAction::Bytes(telemetry_response_with_status(
+            HeadJoint::Bow,
+            2_127,
+            false,
+            7,
+        ));
+        let (error, exit, _) = run_startup_fault(reads, valid_config(1)).await;
+        assert!(matches!(
+            error,
+            HeadRuntimeError::ReadbackDeviceStatus {
+                joint: HeadJoint::Bow,
+                sample: VerificationSample::First,
+                position,
+                raw: 7,
+            } if position.get() == 2_127
+        ));
+        assert!(exit.torque_disable().all_writes_completed());
     }
 
     #[tokio::test]

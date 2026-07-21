@@ -2,9 +2,10 @@ use core::fmt;
 use core::num::NonZeroU16;
 
 use crate::{
-    CommandFrame, GoalSpeedTicksPerSecond, PositionTicks, ServoId, TorqueLimitPermille,
-    TorqueSwitch, ValidatedPresentPosition, build_full_telemetry_read, build_goal_with_speed_write,
-    build_torque_limit_write, build_torque_switch_write,
+    CommandFrame, FullTelemetry, GoalSpeedTicksPerSecond, PositionAgreementTicks, PositionTicks,
+    ServoId, TorqueLimitPermille, TorqueSwitch, ValidatedPresentPosition,
+    build_full_telemetry_read, build_goal_with_speed_write, build_torque_limit_write,
+    build_torque_switch_write,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -70,6 +71,106 @@ impl HeadPose {
     pub const fn positions(self) -> [PositionTicks; 4] {
         self.positions
     }
+
+    /// Admit the freshest positions from two complete telemetry sets only when
+    /// both sets carry the exact canonical IDs and each joint agrees inside the
+    /// already parsed tolerance. Runtime-specific status, stopped-state, and
+    /// timestamp admission occurs before this protocol-level pose constructor.
+    pub fn try_from_telemetry_pair(
+        first: [FullTelemetry; 4],
+        second: [FullTelemetry; 4],
+        tolerance: PositionAgreementTicks,
+    ) -> Result<Self, HeadPoseError> {
+        let mut positions = [PositionTicks::MIN; 4];
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            let expected = joint.servo_id();
+            for (sample, actual) in [
+                (TelemetryPoseSample::First, first[index].id()),
+                (TelemetryPoseSample::Second, second[index].id()),
+            ] {
+                if actual != expected {
+                    return Err(HeadPoseError::TelemetryServoIdMismatch {
+                        joint,
+                        sample,
+                        expected,
+                        actual,
+                    });
+                }
+            }
+            let difference = first[index]
+                .position()
+                .get()
+                .abs_diff(second[index].position().get());
+            if difference > tolerance.get() {
+                return Err(HeadPoseError::TelemetrySamplesDisagree {
+                    joint,
+                    first: first[index].position(),
+                    second: second[index].position(),
+                    difference_ticks: difference,
+                    tolerance,
+                });
+            }
+            positions[index] = second[index].position();
+        }
+        Ok(Self { positions })
+    }
+}
+
+/// Exact reviewed command target in canonical bow/curl/yaw/roll order.
+///
+/// This is deliberately distinct from [`HeadPose`]: an observed pose can only
+/// be constructed from redundant servo reads, while a command target enters at
+/// a configuration boundary and must retain that different provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExactHeadTargetPose {
+    positions: [PositionTicks; 4],
+}
+
+impl ExactHeadTargetPose {
+    pub fn try_from_ticks(ticks: [u16; 4]) -> Result<Self, ExactHeadTargetPoseError> {
+        let mut positions = [PositionTicks::MIN; 4];
+        for (index, joint) in HeadJoint::ALL.into_iter().enumerate() {
+            positions[index] = PositionTicks::try_new(ticks[index]).map_err(|source| {
+                ExactHeadTargetPoseError::Position {
+                    joint,
+                    value: ticks[index],
+                    source,
+                }
+            })?;
+        }
+        Ok(Self { positions })
+    }
+
+    pub const fn position(self, joint: HeadJoint) -> PositionTicks {
+        self.positions[joint.index()]
+    }
+
+    pub const fn positions(self) -> [PositionTicks; 4] {
+        self.positions
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactHeadTargetPoseError {
+    Position {
+        joint: HeadJoint,
+        value: u16,
+        source: crate::FrameBuildError,
+    },
+}
+
+impl fmt::Display for ExactHeadTargetPoseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid exact Kiko head target: {self:?}")
+    }
+}
+
+impl core::error::Error for ExactHeadTargetPoseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Position { source, .. } => Some(source),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +180,25 @@ pub enum HeadPoseError {
         expected: ServoId,
         actual: ServoId,
     },
+    TelemetryServoIdMismatch {
+        joint: HeadJoint,
+        sample: TelemetryPoseSample,
+        expected: ServoId,
+        actual: ServoId,
+    },
+    TelemetrySamplesDisagree {
+        joint: HeadJoint,
+        first: PositionTicks,
+        second: PositionTicks,
+        difference_ticks: u16,
+        tolerance: PositionAgreementTicks,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TelemetryPoseSample {
+    First,
+    Second,
 }
 
 impl fmt::Display for HeadPoseError {
@@ -450,6 +570,16 @@ mod tests {
         .expect("qualified")
     }
 
+    fn full_telemetry(joint: HeadJoint, position: u16) -> FullTelemetry {
+        let mut bytes = [0_u8; 21];
+        bytes[..5].copy_from_slice(&[0xff, 0xff, joint.servo_id().get(), 17, 0]);
+        bytes[5..7].copy_from_slice(&position.to_le_bytes());
+        bytes[20] = !bytes[2..20]
+            .iter()
+            .fold(0_u8, |sum, byte| sum.wrapping_add(*byte));
+        FullTelemetry::parse(&bytes, joint.servo_id()).expect("full telemetry")
+    }
+
     #[test]
     fn canonical_pose_rejects_reordered_or_duplicate_ids() {
         let valid = [
@@ -466,6 +596,46 @@ mod tests {
             HeadPose::try_from_validated(reordered),
             Err(HeadPoseError::ServoIdMismatch {
                 joint: HeadJoint::Bow,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn telemetry_pose_requires_two_canonical_agreeing_sets_and_uses_the_freshest() {
+        let first: [FullTelemetry; 4] = core::array::from_fn(|index| {
+            full_telemetry(HeadJoint::ALL[index], [2_120, 2_550, 2_920, 2_925][index])
+        });
+        let second: [FullTelemetry; 4] = core::array::from_fn(|index| {
+            full_telemetry(HeadJoint::ALL[index], [2_127, 2_558, 2_925, 2_930][index])
+        });
+        let tolerance = PositionAgreementTicks::try_new(10).expect("tolerance");
+        let pose = HeadPose::try_from_telemetry_pair(first, second, tolerance)
+            .expect("canonical agreeing telemetry");
+        assert_eq!(
+            pose.positions().map(PositionTicks::get),
+            [2_127, 2_558, 2_925, 2_930]
+        );
+
+        let mut reordered = first;
+        reordered.swap(0, 1);
+        assert!(matches!(
+            HeadPose::try_from_telemetry_pair(reordered, second, tolerance),
+            Err(HeadPoseError::TelemetryServoIdMismatch {
+                joint: HeadJoint::Bow,
+                sample: TelemetryPoseSample::First,
+                ..
+            })
+        ));
+
+        let disagreeing: [FullTelemetry; 4] = core::array::from_fn(|index| {
+            full_telemetry(HeadJoint::ALL[index], [2_131, 2_558, 2_925, 2_930][index])
+        });
+        assert!(matches!(
+            HeadPose::try_from_telemetry_pair(first, disagreeing, tolerance),
+            Err(HeadPoseError::TelemetrySamplesDisagree {
+                joint: HeadJoint::Bow,
+                difference_ticks: 11,
                 ..
             })
         ));
@@ -559,6 +729,25 @@ mod tests {
             .get(),
             120
         );
+    }
+
+    #[test]
+    fn exact_target_parses_canonical_ticks_once() {
+        let target = ExactHeadTargetPose::try_from_ticks([2_155, 2_545, 2_943, 2_876])
+            .expect("reviewed target");
+        assert_eq!(
+            target.positions().map(PositionTicks::get),
+            [2_155, 2_545, 2_943, 2_876]
+        );
+
+        assert!(matches!(
+            ExactHeadTargetPose::try_from_ticks([2_155, 4_096, 2_943, 2_876]),
+            Err(ExactHeadTargetPoseError::Position {
+                joint: HeadJoint::Curl,
+                value: 4_096,
+                ..
+            })
+        ));
     }
 
     #[test]
